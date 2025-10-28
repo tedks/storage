@@ -255,5 +255,78 @@ def parse_size(size_str: str) -> int:
         raise ValueError(f"Invalid size format: {size_str}")
 
 
+@main.command('resolve')
+@click.argument('directory', type=click.Path(exists=True))
+@click.option('--auto', type=click.Choice(['local', 'remote', 'both']), help='Automatically resolve all conflicts')
+def resolve_conflicts(directory, auto):
+    """
+    Resolve file conflicts in a directory
+
+    Shows all conflicts and allows interactive or automatic resolution.
+
+    DIRECTORY: Directory to scan for conflicts
+
+    Examples:
+        storage resolve /mnt/storage/documents
+        storage resolve /mnt/storage --auto local
+    """
+    from .conflicts import ConflictResolver
+    from .state import StateManager
+
+    dir_path = Path(directory)
+    state_manager = StateManager(":memory:")  # Temporary for conflict resolution
+    resolver = ConflictResolver(state_manager)
+
+    # Find conflicts
+    conflicts = resolver.list_conflicts(dir_path)
+
+    if not conflicts:
+        click.echo("No conflicts found.")
+        return
+
+    click.echo(f"Found {len(conflicts)} conflict(s):\n")
+
+    for base, local_file, remote_file, timestamp in conflicts:
+        click.echo(f"Conflict: {base}")
+        click.echo(f"  Local:  {local_file.name}")
+        click.echo(f"  Remote: {remote_file.name}")
+        click.echo(f"  Time:   {timestamp}")
+
+        if auto:
+            # Automatic resolution
+            if auto == 'local':
+                resolver.resolve_with_local(local_file, remote_file, base)
+                click.echo(f"  → Resolved with LOCAL version\n")
+            elif auto == 'remote':
+                resolver.resolve_with_remote(local_file, remote_file, base)
+                click.echo(f"  → Resolved with REMOTE version\n")
+            elif auto == 'both':
+                resolver.resolve_with_both(local_file, remote_file, base)
+                click.echo(f"  → Kept BOTH versions\n")
+        else:
+            # Interactive resolution
+            click.echo("\nChoose resolution:")
+            click.echo("  l - Use local version")
+            click.echo("  r - Use remote version")
+            click.echo("  b - Keep both")
+            click.echo("  s - Skip this conflict")
+
+            choice = click.prompt("Choice", type=str, default='s').lower()
+
+            if choice == 'l':
+                resolver.resolve_with_local(local_file, remote_file, base)
+                click.echo("Resolved with local version\n")
+            elif choice == 'r':
+                resolver.resolve_with_remote(local_file, remote_file, base)
+                click.echo("Resolved with remote version\n")
+            elif choice == 'b':
+                resolver.resolve_with_both(local_file, remote_file, base)
+                click.echo("Kept both versions\n")
+            else:
+                click.echo("Skipped\n")
+
+    click.echo("Conflict resolution complete.")
+
+
 if __name__ == '__main__':
     main()
