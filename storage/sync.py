@@ -11,14 +11,24 @@ import queue
 import logging
 from pathlib import Path
 from typing import Dict, Optional, Set
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from .backends.base import Backend
 from .state import StateManager, SyncStatus, FileMetadata, FileLocation
 from .replication import ReplicationManager
 from .cache import CacheManager
+from .conflicts import ConflictDetector
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class SyncConfig:
+    """Configuration for sync behavior"""
+    monitor_interval: float = 5.0  # Seconds between dirty file checks
+    max_retries: int = 3  # Maximum retry attempts per task
+    retry_delay: float = 1.0  # Delay between retries
+    high_priority_threshold: int = 100  # Priority for immediate syncs
 
 
 @dataclass
@@ -27,11 +37,15 @@ class SyncTask:
     virtual_path: str
     priority: int = 0  # Higher priority = sync sooner
     retry_count: int = 0
-    max_retries: int = 3
+    queued_time: float = field(default_factory=time.time)
 
     def __lt__(self, other):
         # For priority queue - higher priority first
         return self.priority > other.priority
+
+    def age(self) -> float:
+        """Get age of task in seconds"""
+        return time.time() - self.queued_time
 
 
 class SyncWorker(threading.Thread):
@@ -43,15 +57,22 @@ class SyncWorker(threading.Thread):
 
     def __init__(self, worker_id: int, task_queue: queue.PriorityQueue,
                  state_manager: StateManager, cache_manager: CacheManager,
-                 replication_manager: ReplicationManager):
+                 replication_manager: ReplicationManager, config: SyncConfig):
         super().__init__(daemon=True, name=f"SyncWorker-{worker_id}")
         self.worker_id = worker_id
         self.task_queue = task_queue
         self.state_manager = state_manager
         self.cache_manager = cache_manager
         self.replication_manager = replication_manager
+        self.config = config
+        self.conflict_detector = ConflictDetector(state_manager)
         self._stop_event = threading.Event()
         self._active_task: Optional[str] = None
+        self._stats = {
+            'synced': 0,
+            'failed': 0,
+            'conflicts': 0
+        }
 
     def run(self):
         """Main worker loop"""
@@ -129,11 +150,14 @@ class SyncWorker(threading.Thread):
         for backend in target_backends:
             try:
                 # Check for conflicts before syncing
-                conflict = self._check_conflict(task.virtual_path, backend, checksum)
+                conflict = self.conflict_detector.check_conflict(
+                    task.virtual_path, backend, checksum
+                )
                 if conflict:
                     logger.warning(f"Conflict detected for {task.virtual_path} on {backend.name}")
                     metadata.sync_status = SyncStatus.CONFLICT
                     self.state_manager.set_file_metadata(metadata)
+                    self._stats['conflicts'] += 1
                     return
 
                 # Copy to backend
@@ -164,6 +188,7 @@ class SyncWorker(threading.Thread):
             # Successfully synced to required replicas
             metadata.sync_status = SyncStatus.CLEAN
             metadata.last_modified = time.time()
+            self._stats['synced'] += 1
             logger.info(f"Successfully synced {task.virtual_path} to {successful_syncs} backends")
         elif successful_syncs > 0:
             # Partial success - keep as dirty to retry later
@@ -172,43 +197,25 @@ class SyncWorker(threading.Thread):
         else:
             # Complete failure
             metadata.sync_status = SyncStatus.ERROR
+            self._stats['failed'] += 1
             logger.error(f"Failed to sync {task.virtual_path} to any backend")
 
         self.state_manager.set_file_metadata(metadata)
 
-    def _check_conflict(self, virtual_path: str, backend: Backend, expected_checksum: str) -> bool:
-        """
-        Check if a conflict exists on the backend
-
-        Returns True if the file exists on backend with different checksum
-        """
-        if not backend.exists(virtual_path):
-            return False
-
-        # Get existing locations
-        locations = self.state_manager.get_file_locations(virtual_path)
-
-        for location in locations:
-            if location.backend_name == backend.name:
-                # File was previously synced here, check if it changed
-                if location.checksum != expected_checksum:
-                    # Checksums don't match - potential conflict
-                    # TODO: More sophisticated conflict detection
-                    return True
-
-        return False
 
     def _handle_task_failure(self, task: SyncTask, error: str):
         """Handle failed sync task"""
         task.retry_count += 1
 
-        if task.retry_count < task.max_retries:
-            # Re-queue with lower priority
+        if task.retry_count < self.config.max_retries:
+            # Re-queue with lower priority and delay
             task.priority -= 10
-            logger.info(f"Re-queueing {task.virtual_path} (retry {task.retry_count}/{task.max_retries})")
+            logger.info(f"Re-queueing {task.virtual_path} (retry {task.retry_count}/{self.config.max_retries})")
+            time.sleep(self.config.retry_delay * task.retry_count)  # Exponential backoff
             self.task_queue.put(task)
         else:
             logger.error(f"Max retries exceeded for {task.virtual_path}: {error}")
+            self._stats['failed'] += 1
             # Mark as error
             metadata = self.state_manager.get_file_metadata(task.virtual_path)
             if metadata:
@@ -223,6 +230,10 @@ class SyncWorker(threading.Thread):
         """Get currently active task"""
         return self._active_task
 
+    def get_stats(self) -> dict:
+        """Get worker statistics"""
+        return self._stats.copy()
+
 
 class SyncManager:
     """
@@ -232,7 +243,8 @@ class SyncManager:
     """
 
     def __init__(self, state_manager: StateManager, cache_manager: CacheManager,
-                 replication_manager: ReplicationManager, num_workers: int = 2):
+                 replication_manager: ReplicationManager, num_workers: int = 2,
+                 config: Optional[SyncConfig] = None):
         """
         Initialize sync manager
 
@@ -241,11 +253,13 @@ class SyncManager:
             cache_manager: Cache manager instance
             replication_manager: Replication manager instance
             num_workers: Number of sync worker threads
+            config: Sync configuration (uses defaults if None)
         """
         self.state_manager = state_manager
         self.cache_manager = cache_manager
         self.replication_manager = replication_manager
         self.num_workers = num_workers
+        self.config = config or SyncConfig()
 
         # Task queue (priority queue)
         self.task_queue = queue.PriorityQueue()
@@ -269,7 +283,8 @@ class SyncManager:
         for i in range(self.num_workers):
             worker = SyncWorker(
                 i, self.task_queue, self.state_manager,
-                self.cache_manager, self.replication_manager
+                self.cache_manager, self.replication_manager,
+                self.config
             )
             worker.start()
             self.workers.append(worker)
@@ -318,7 +333,7 @@ class SyncManager:
                     self.queue_sync(metadata.virtual_path, priority=50)
 
                 # Sleep before next check
-                time.sleep(5.0)
+                time.sleep(self.config.monitor_interval)
 
             except Exception as e:
                 logger.error(f"Monitor loop error: {e}")
@@ -396,3 +411,27 @@ class SyncManager:
                 if timeout and (time.time() - start) > timeout:
                     break
                 time.sleep(0.1)
+
+    def get_stats(self) -> dict:
+        """Get combined statistics from all workers"""
+        stats = {
+            'total_synced': 0,
+            'total_failed': 0,
+            'total_conflicts': 0,
+            'queue_size': self.get_queue_size(),
+            'active_tasks': len(self.get_active_tasks()),
+            'workers': []
+        }
+
+        for worker in self.workers:
+            worker_stats = worker.get_stats()
+            stats['total_synced'] += worker_stats['synced']
+            stats['total_failed'] += worker_stats['failed']
+            stats['total_conflicts'] += worker_stats['conflicts']
+            stats['workers'].append({
+                'id': worker.worker_id,
+                'stats': worker_stats,
+                'active_task': worker.get_active_task()
+            })
+
+        return stats
