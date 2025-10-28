@@ -4,11 +4,14 @@ Storage is a meta-filesystem that multiplexes an abstract filesystem over multip
 
 ## Features
 
-- **Multiple Backing Filesystems**: Store your data across multiple physical filesystems transparently
-- **Extended Attribute Metadata**: Control storage distribution using YAML documents in extended attributes
-- **Flexible Configuration**: Use `/etc/storagetab` for system-wide mounts (similar to `/etc/fstab`)
+- **Local Cache with LRU**: Local cache mirrors remote files with automatic LRU eviction
+- **N-way Replication**: Configure per-directory replication (1 to N copies, or -1 for all backends)
+- **Multiple Backend Types**: Local filesystems, SSH/SFTP remotes (coming soon)
+- **Background Sync**: Writes go to cache first, sync to backends in background
+- **Extended Attribute Configuration**: Control replication, encryption, and recomputation via xattrs
+- **File Recomputation**: Mark files as recomputable for automatic space reclamation
 - **FUSE-based**: Runs in userspace, no kernel modules required
-- **Simple CLI**: Easy-to-use command-line interface for mounting and managing storage
+- **SQLite State Tracking**: Efficient metadata tracking with optional extended attributes
 
 ## Installation
 
@@ -24,119 +27,167 @@ pip install -e .
 
 ### Basic Usage
 
-Mount a Storage filesystem with multiple backing directories:
+Mount a Storage filesystem with local cache and multiple backing filesystems:
 
 ```bash
-storage mount /mnt/storage /mnt/disk1 /mnt/disk2 /mnt/disk3
+# Mount with 3 backing filesystems and 50GB cache
+storage mount /mnt/storage /srv/raid /srv/chunk0 /srv/chunk1 \
+  --cache /var/cache/storage \
+  --cache-size 50G
 ```
 
-This creates a unified filesystem at `/mnt/storage` backed by three different directories.
+This creates a unified filesystem at `/mnt/storage` backed by three directories with a local cache.
 
-### Using /etc/storagetab
-
-Create a configuration file at `/etc/storagetab`:
-
-```
-# Storage mount configuration
-# Format: <mountpoint> <backing_paths> <options>
-#
-/mnt/storage /mnt/disk1,/mnt/disk2,/mnt/disk3 defaults
-/home/user/docs /mnt/backup1,/mnt/backup2 replication=2
-```
-
-Then mount all configured filesystems:
+### Configure Replication
 
 ```bash
-storage mount-all
-```
+# Set backups directory to replicate across all backends
+storage configure /mnt/storage/backups --replicas -1
 
-Or mount a specific entry:
+# Set downloads to replicate to 2 backends
+storage configure /mnt/storage/downloads --replicas 2
 
-```bash
-storage mount-all /mnt/storage
+# View configuration
+storage info /mnt/storage/backups
 ```
 
 ## CLI Commands
 
 ### mount
 
-Mount a Storage filesystem manually:
+Mount a Storage filesystem:
 
 ```bash
-storage mount [OPTIONS] MOUNTPOINT BACKING_PATHS...
+storage mount MOUNTPOINT BACKING_PATHS... [OPTIONS]
+
+Required:
+  -c, --cache PATH         Local cache directory
 
 Options:
-  -f, --foreground    Run in foreground
-  -o, --options TEXT  Mount options (comma-separated)
+  -s, --cache-size SIZE    Cache size (e.g., 10G, 500M) [default: 10G]
+  -d, --database PATH      State database path [default: cache/.storage.db]
+  -f, --foreground         Run in foreground
 ```
 
 Example:
 ```bash
-storage mount -f /mnt/storage /mnt/disk1 /mnt/disk2
+storage mount /mnt/storage /srv/raid /srv/chunk0 /srv/chunk1 \
+  -c /var/cache/storage -s 100G -f
 ```
 
-### mount-all
+### configure
 
-Mount filesystems from `/etc/storagetab`:
+Configure storage settings for files/directories:
 
 ```bash
-storage mount-all [OPTIONS] [MOUNTPOINT]
+storage configure PATH [OPTIONS]
 
 Options:
-  -c, --config TEXT   Path to storagetab config file
-  -f, --foreground    Run in foreground
+  -r, --replicas N             Number of replicas (-1 for all)
+  -b, --backends LIST          Preferred backends (comma-separated)
+  --recomputable              Mark as recomputable
+  --recompute-cmd CMD         Command to recompute file
 ```
 
-### show-config
-
-Display the current storagetab configuration:
-
+Examples:
 ```bash
-storage show-config [CONFIG_PATH]
+# Replicate across all backends
+storage configure /mnt/storage/critical --replicas -1
+
+# Mark downloads as recomputable
+storage configure /mnt/storage/downloads --recomputable \
+  --recompute-cmd "wget https://example.com/file"
 ```
 
 ### info
 
-Show storage metadata for a specific path:
+Show storage configuration for a path:
 
 ```bash
 storage info PATH
 ```
 
-## Storage Metadata
+## Configuration System
 
-Storage uses extended attributes to store YAML metadata about how files and directories should be stored. This metadata controls:
+Storage uses extended attributes to store YAML configuration for files and directories:
 
-- **backing_filesystems**: Which backing filesystems to use
-- **replication_count**: How many copies to maintain
-- **preferred_filesystem**: Primary backing filesystem for this path
-- **custom_config**: Additional custom configuration
+- **replica_count**: Number of replicas (1-N, or -1 for all backends)
+- **preferred_backends**: Preferred backing filesystems (list)
+- **encrypted**: Transparent encryption enabled
+- **encryption_backends**: Which backends to encrypt for
+- **recomputable**: File can be recomputed if deleted
+- **recompute_cmd**: Command to recreate the file
 
-Metadata is inherited from parent directories if not explicitly set.
+Configuration is hierarchical - child directories inherit from parents, with the maximum replica count being selected along any path.
 
 ## Architecture
 
 ### Components
 
-1. **BackingManager** (`storage/backing.py`): Manages multiple backing filesystems
-2. **XAttrManager** (`storage/xattr.py`): Handles extended attribute YAML metadata
-3. **StorageFS** (`storage/fs.py`): FUSE filesystem implementation
-4. **StorageTabConfig** (`storage/config.py`): Configuration file parser
-5. **CLI** (`storage/cli.py`): Command-line interface
+1. **StateManager** (`storage/state.py`): SQLite database + xattr metadata tracking
+2. **CacheManager** (`storage/cache.py`): LRU cache management
+3. **ReplicationManager** (`storage/replication.py`): N-way replication across backends
+4. **Backend Abstraction** (`storage/backends/`): Local and remote filesystem support
+5. **StorageFS** (`storage/fs.py`): FUSE filesystem implementation
+6. **CLI** (`storage/cli.py`): Command-line tools
 
 ### How It Works
 
-1. The FUSE filesystem layer receives filesystem operations
-2. Paths are resolved to backing filesystems using metadata
-3. Extended attributes store configuration in YAML format
-4. Operations are forwarded to the appropriate backing filesystem
-5. Multiple backing filesystems appear as a single unified view
+**Read Path:**
+1. Check local cache for file
+2. If not cached, download from best available backend
+3. Future: Recompute if configured and available
+
+**Write Path:**
+1. Write to local cache first (ensure at least one copy)
+2. Mark file as dirty in state database
+3. Future: Background sync to configured replicas
+
+**Cache Management:**
+1. Track file access times for LRU
+2. Evict clean files when space needed
+3. Prefer evicting recomputable files
+4. Never evict dirty (unsynced) files
+
+**Replication:**
+1. Use extended attributes for per-directory configuration
+2. Select backends using consistent hashing
+3. Respect preferred backends and speed priorities
+4. Future: Background sync workers
+
+## Implementation Status
+
+✅ **Implemented:**
+- State tracking (SQLite + extended attributes)
+- Local cache with LRU eviction
+- Local filesystem backends
+- N-way replication manager
+- Basic FUSE operations (read, write, create, delete)
+- Configuration via extended attributes
+- CLI tools (mount, configure, info)
+
+⏳ **Not Yet Implemented:**
+- Background sync workers (writes only go to cache currently)
+- Remote backends (SSH/SFTP planned)
+- Recomputation engine
+- Transparent encryption
+- Conflict resolution
+- Advanced space management (defragmentation, over-replication cleanup)
 
 ## Requirements
 
 - Python 3.7+
 - FUSE support (libfuse)
-- Extended attribute support in backing filesystems
+- Extended attribute support in filesystems
+- SQLite3
+
+## Limitations (Current Version)
+
+- Files are written to cache but not automatically synced to backends (background sync TODO)
+- Only local backends supported (remote backends TODO)
+- No encryption yet
+- No conflict detection/resolution
+- Basic space management only
 
 ## License
 
