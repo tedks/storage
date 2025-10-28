@@ -149,7 +149,9 @@ def mount(mountpoint, backing_paths, cache, cache_size, database, workers, remot
 @click.option('-b', '--backends', help='Preferred backends (comma-separated)')
 @click.option('--recomputable/--no-recomputable', default=None, help='Mark as recomputable')
 @click.option('--recompute-cmd', help='Command to recompute file (use $STORAGE_OUTPUT for output path)')
-def configure(path, replicas, backends, recomputable, recompute_cmd):
+@click.option('--encrypt/--no-encrypt', default=None, help='Enable/disable encryption')
+@click.option('--encrypt-backends', help='Backends to encrypt for (comma-separated)')
+def configure(path, replicas, backends, recomputable, recompute_cmd, encrypt, encrypt_backends):
     """
     Configure storage settings for a file or directory
 
@@ -177,6 +179,12 @@ def configure(path, replicas, backends, recomputable, recompute_cmd):
     if recompute_cmd is not None:
         config.recompute_cmd = recompute_cmd
 
+    if encrypt is not None:
+        config.encrypted = encrypt
+
+    if encrypt_backends:
+        config.encryption_backends = [b.strip() for b in encrypt_backends.split(',')]
+
     # Save config
     StateManager.set_file_config(path_obj, config)
 
@@ -184,6 +192,10 @@ def configure(path, replicas, backends, recomputable, recompute_cmd):
     click.echo(f"  Replica count: {config.replica_count}")
     if config.preferred_backends:
         click.echo(f"  Preferred backends: {', '.join(config.preferred_backends)}")
+    if config.encrypted:
+        click.echo(f"  Encryption: enabled")
+        if config.encryption_backends:
+            click.echo(f"  Encrypt for backends: {', '.join(config.encryption_backends)}")
     if config.recomputable:
         click.echo(f"  Recomputable: yes")
         if config.recompute_cmd:
