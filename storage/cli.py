@@ -148,7 +148,7 @@ def mount(mountpoint, backing_paths, cache, cache_size, database, workers, remot
 @click.option('-r', '--replicas', type=int, help='Number of replicas (-1 for all)')
 @click.option('-b', '--backends', help='Preferred backends (comma-separated)')
 @click.option('--recomputable/--no-recomputable', default=None, help='Mark as recomputable')
-@click.option('--recompute-cmd', help='Command to recompute file')
+@click.option('--recompute-cmd', help='Command to recompute file (use $STORAGE_OUTPUT for output path)')
 def configure(path, replicas, backends, recomputable, recompute_cmd):
     """
     Configure storage settings for a file or directory
@@ -188,6 +188,10 @@ def configure(path, replicas, backends, recomputable, recompute_cmd):
         click.echo(f"  Recomputable: yes")
         if config.recompute_cmd:
             click.echo(f"  Recompute command: {config.recompute_cmd}")
+            click.echo(f"\nEnvironment variables available:")
+            click.echo(f"  $STORAGE_PATH - Virtual path of the file")
+            click.echo(f"  $STORAGE_CACHE_PATH - Local cache path")
+            click.echo(f"  $STORAGE_OUTPUT - Where to write output (same as CACHE_PATH)")
 
 
 @main.command()

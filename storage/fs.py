@@ -20,6 +20,7 @@ from .cache import CacheManager
 from .state import StateManager, FileMetadata, FileConfig, SyncStatus
 from .replication import ReplicationManager
 from .sync import SyncManager
+from .recompute import RecomputeEngine
 
 
 class StorageFS(Operations):
@@ -56,6 +57,9 @@ class StorageFS(Operations):
         )
         self.sync_manager.start()
 
+        # Recomputation engine
+        self.recompute_engine = RecomputeEngine(self.state_manager)
+
         # File descriptor tracking
         self._fd_counter = 0
         self._fd_map = {}  # fd -> (virtual_path, cache_path, flags)
@@ -68,11 +72,13 @@ class StorageFS(Operations):
 
     def _ensure_file_in_cache(self, virtual_path: str) -> bool:
         """
-        Ensure a file is in the cache, downloading if necessary
+        Ensure a file is in the cache, downloading or recomputing if necessary
 
         Returns:
             True if file is available in cache, False otherwise
         """
+        cache_path = self.cache_manager.get_cache_path(virtual_path)
+
         # Check if already cached
         if self.cache_manager.is_cached(virtual_path):
             self.cache_manager.mark_accessed(virtual_path)
@@ -84,6 +90,16 @@ class StorageFS(Operations):
         if backend:
             # Download to cache
             if self.cache_manager.cache_file(virtual_path, backend):
+                return True
+
+        # File not in cache or backends - try recomputation
+        if self.recompute_engine.can_recompute(virtual_path, cache_path):
+            # Recompute the file synchronously (blocks until complete)
+            result = self.recompute_engine.recompute_file(virtual_path, cache_path, timeout=30.0)
+
+            if result.success:
+                # File was recomputed successfully
+                self.cache_manager.mark_accessed(virtual_path)
                 return True
 
         # File not available
