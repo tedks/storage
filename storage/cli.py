@@ -22,8 +22,9 @@ def main():
 @click.option('-c', '--cache', required=True, help='Local cache directory')
 @click.option('-s', '--cache-size', default='10G', help='Cache size (e.g., 10G, 500M)')
 @click.option('-d', '--database', help='State database path (default: cache/.storage.db)')
+@click.option('-w', '--workers', default=2, help='Number of sync worker threads')
 @click.option('-f', '--foreground', is_flag=True, help='Run in foreground')
-def mount(mountpoint, backing_paths, cache, cache_size, database, foreground):
+def mount(mountpoint, backing_paths, cache, cache_size, database, workers, foreground):
     """
     Mount a Storage filesystem
 
@@ -75,6 +76,7 @@ def mount(mountpoint, backing_paths, cache, cache_size, database, foreground):
     click.echo(f"  Cache size: {cache_size} ({cache_size_bytes:,} bytes)")
     click.echo(f"  Database: {db_path}")
     click.echo(f"  Backends: {len(backends)}")
+    click.echo(f"  Sync workers: {workers}")
     click.echo(f"\nPress Ctrl+C to unmount\n")
 
     try:
@@ -84,7 +86,8 @@ def mount(mountpoint, backing_paths, cache, cache_size, database, foreground):
             db_path,
             backends,
             cache_size_bytes,
-            foreground=foreground
+            foreground=foreground,
+            num_sync_workers=workers
         )
     except Exception as e:
         click.echo(f"Error mounting filesystem: {e}", err=True)

@@ -19,6 +19,7 @@ from .backends.base import Backend
 from .cache import CacheManager
 from .state import StateManager, FileMetadata, FileConfig, SyncStatus
 from .replication import ReplicationManager
+from .sync import SyncManager
 
 
 class StorageFS(Operations):
@@ -30,7 +31,7 @@ class StorageFS(Operations):
     """
 
     def __init__(self, cache_root: Path, state_db: Path, backends: Dict[str, Backend],
-                 cache_size: int):
+                 cache_size: int, num_sync_workers: int = 2):
         """
         Initialize Storage filesystem
 
@@ -39,11 +40,21 @@ class StorageFS(Operations):
             state_db: Path to SQLite state database
             backends: Dictionary of backend name -> Backend instance
             cache_size: Maximum cache size in bytes
+            num_sync_workers: Number of background sync worker threads
         """
         self.state_manager = StateManager(str(state_db))
         self.cache_manager = CacheManager(cache_root, self.state_manager, cache_size)
         self.replication_manager = ReplicationManager(self.state_manager, backends)
         self.backends = backends
+
+        # Background sync manager
+        self.sync_manager = SyncManager(
+            self.state_manager,
+            self.cache_manager,
+            self.replication_manager,
+            num_workers=num_sync_workers
+        )
+        self.sync_manager.start()
 
         # File descriptor tracking
         self._fd_counter = 0
@@ -320,7 +331,10 @@ class StorageFS(Operations):
             # Flush cache
             self.cache_manager.flush_file(path)
 
-            # TODO: Trigger background sync if dirty
+            # Trigger background sync if dirty
+            metadata = self.state_manager.get_file_metadata(path)
+            if metadata and metadata.sync_status == SyncStatus.DIRTY:
+                self.sync_manager.queue_sync(path, priority=100)
 
             return 0
 
@@ -416,12 +430,16 @@ class StorageFS(Operations):
 
     def destroy(self, path):
         """Cleanup on unmount"""
+        # Stop sync workers
+        self.sync_manager.stop()
+
+        # Close state manager
         self.state_manager.close()
 
 
 def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
                  backends: Dict[str, Backend], cache_size: int,
-                 foreground: bool = False):
+                 foreground: bool = False, num_sync_workers: int = 2):
     """
     Mount a Storage filesystem
 
@@ -432,6 +450,7 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
         backends: Dictionary of backends
         cache_size: Maximum cache size in bytes
         foreground: Run in foreground (default: False)
+        num_sync_workers: Number of background sync workers
     """
-    fs = StorageFS(cache_root, state_db, backends, cache_size)
+    fs = StorageFS(cache_root, state_db, backends, cache_size, num_sync_workers)
     FUSE(fs, mountpoint, nothreads=True, foreground=foreground, allow_other=True)
