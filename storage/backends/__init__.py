@@ -9,5 +9,6 @@ Supports multiple types of backing filesystems:
 
 from .base import Backend, BackendType, BackendInfo
 from .local import LocalBackend
+from .ssh import SSHBackend
 
-__all__ = ['Backend', 'BackendType', 'BackendInfo', 'LocalBackend']
+__all__ = ['Backend', 'BackendType', 'BackendInfo', 'LocalBackend', 'SSHBackend']

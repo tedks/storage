@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 from .backends.local import LocalBackend
+from .backends.ssh import SSHBackend
 from .fs import mount_storage
 
 
@@ -23,16 +24,23 @@ def main():
 @click.option('-s', '--cache-size', default='10G', help='Cache size (e.g., 10G, 500M)')
 @click.option('-d', '--database', help='State database path (default: cache/.storage.db)')
 @click.option('-w', '--workers', default=2, help='Number of sync worker threads')
+@click.option('-r', '--remote', multiple=True, help='Remote backend (ssh://user@host:/path)')
+@click.option('-k', '--key-file', help='SSH private key file')
 @click.option('-f', '--foreground', is_flag=True, help='Run in foreground')
-def mount(mountpoint, backing_paths, cache, cache_size, database, workers, foreground):
+def mount(mountpoint, backing_paths, cache, cache_size, database, workers, remote, key_file, foreground):
     """
     Mount a Storage filesystem
 
     MOUNTPOINT: Where to mount the Storage filesystem
-    BACKING_PATHS: One or more backing filesystem paths
+    BACKING_PATHS: One or more local backing filesystem paths
+
+    Remote backends can be specified with --remote:
+        --remote ssh://user@host:/remote/path
 
     Example:
-        storage mount /mnt/storage /srv/raid /srv/chunk0 /srv/chunk1 -c /var/cache/storage -s 50G
+        storage mount /mnt/storage /srv/raid /srv/chunk0 \\
+          -c /var/cache/storage -s 50G \\
+          --remote ssh://user@example.com:/backup
     """
     # Parse cache size
     try:
@@ -55,15 +63,56 @@ def mount(mountpoint, backing_paths, cache, cache_size, database, workers, foreg
 
     # Create backends
     backends = {}
+    backend_count = 0
+
+    # Add local backends
     for i, path in enumerate(backing_paths):
         try:
-            name = f"backend{i}"
+            name = f"local{i}"
             # Local backends get speed priority based on order (assuming first is fastest)
             backend = LocalBackend(name, path, speed_priority=i * 10)
             backends[name] = backend
-            click.echo(f"Added backend: {name} -> {path} (priority: {i * 10})")
+            backend_count += 1
+            click.echo(f"Added local backend: {name} -> {path} (priority: {i * 10})")
         except ValueError as e:
             click.echo(f"Error: {e}", err=True)
+            sys.exit(1)
+
+    # Add remote backends
+    for i, remote_spec in enumerate(remote):
+        try:
+            name = f"remote{i}"
+            # Parse ssh://user@host:/path
+            if not remote_spec.startswith('ssh://'):
+                click.echo(f"Error: Remote backend must start with ssh://", err=True)
+                sys.exit(1)
+
+            # Remove ssh:// prefix
+            spec = remote_spec[6:]
+
+            # Parse user@host:/path
+            if '@' not in spec or ':' not in spec:
+                click.echo(f"Error: Invalid remote format. Use ssh://user@host:/path", err=True)
+                sys.exit(1)
+
+            user_host, remote_path = spec.split(':', 1)
+            username, host = user_host.split('@', 1)
+
+            # Create SSH backend
+            backend = SSHBackend(
+                name=name,
+                host=host,
+                remote_path=remote_path,
+                username=username,
+                key_filename=key_file,
+                speed_priority=50 + i * 10  # Remote backends are slower
+            )
+            backends[name] = backend
+            backend_count += 1
+            click.echo(f"Added SSH backend: {name} -> {username}@{host}:{remote_path} (priority: {50 + i * 10})")
+
+        except Exception as e:
+            click.echo(f"Error adding remote backend {remote_spec}: {e}", err=True)
             sys.exit(1)
 
     if not backends:
