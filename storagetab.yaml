@@ -1,0 +1,7 @@
+filesystems:
+  - path: ./disk1
+    size: 1TB
+  - path: ./disk2
+    size: 500GB
+  - path: ./backup
+    size: 250GB
