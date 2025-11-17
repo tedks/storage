@@ -23,6 +23,7 @@ class TestKeyPersistence(unittest.TestCase):
 
         # Persisted on disk
         self.assertTrue(self.key_file.exists())
+        self.assertEqual(self.key_file.stat().st_mode & 0o777, 0o600)
 
         ciphertext = key.encrypt(b"secret")
 

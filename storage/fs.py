@@ -15,6 +15,7 @@ import logging
 import fcntl
 import stat
 import time
+import hashlib
 from fuse import FUSE, FuseOSError, Operations
 from pathlib import Path
 from typing import Dict, Optional, Set
@@ -137,36 +138,19 @@ class StorageFS(Operations):
                 'st_nlink', 'st_size', 'st_uid'))
         except OSError as e:
             # Fallback: query backends for non-cached entries (e.g., remote-only files)
-            now = time.time()
             for backend_name, backend in self.backends.items():
                 try:
-                    if backend.isdir(path):
-                        return {
-                            'st_atime': now,
-                            'st_ctime': now,
-                            'st_gid': os.getgid(),
-                            'st_mode': stat.S_IFDIR | 0o755,
-                            'st_mtime': now,
-                            'st_nlink': 2,
-                            'st_size': 0,
-                            'st_uid': os.getuid(),
-                        }
-                    if backend.exists(path):
-                        size = 0
-                        try:
-                            size = backend.get_size(path)
-                        except Exception:
-                            pass
-                        return {
-                            'st_atime': now,
-                            'st_ctime': now,
-                            'st_gid': os.getgid(),
-                            'st_mode': stat.S_IFREG | 0o644,
-                            'st_mtime': now,
-                            'st_nlink': 1,
-                            'st_size': size,
-                            'st_uid': os.getuid(),
-                        }
+                    st = backend.stat(path)
+                    return {
+                        'st_atime': getattr(st, 'st_atime', time.time()),
+                        'st_ctime': getattr(st, 'st_ctime', getattr(st, 'st_mtime', time.time())),
+                        'st_gid': getattr(st, 'st_gid', os.getgid()),
+                        'st_mode': getattr(st, 'st_mode', stat.S_IFREG | 0o644),
+                        'st_mtime': getattr(st, 'st_mtime', time.time()),
+                        'st_nlink': getattr(st, 'st_nlink', 1),
+                        'st_size': getattr(st, 'st_size', 0),
+                        'st_uid': getattr(st, 'st_uid', os.getuid()),
+                    }
                 except Exception as be:
                     self.logger.debug("getattr backend fallback failed for %s on %s: %s", path, backend_name, be)
 
@@ -183,23 +167,24 @@ class StorageFS(Operations):
             entries.update(os.listdir(str(cache_path)))
 
         # Merge listings from backends; cache for fallback on connection issues
-        dir_cache = self._dir_cache.setdefault(path, {})
+        with self._dir_cache_lock:
+            dir_cache = self._dir_cache.setdefault(path, {})
 
-        for backend_name, backend in self.backends.items():
-            try:
-                if backend.isdir(path):
-                    backend_entries = set(backend.listdir(path))
-                else:
-                    backend_entries = set()
-                entries.update(backend_entries)
-                dir_cache[backend_name] = backend_entries
-            except Exception as exc:
-                cached = dir_cache.get(backend_name, set())
-                if cached:
-                    entries.update(cached)
-                self.logger.debug(
-                    "readdir fallback for %s on backend %s due to %s", path, backend_name, exc
-                )
+            for backend_name, backend in self.backends.items():
+                try:
+                    if backend.isdir(path):
+                        backend_entries = set(backend.listdir(path))
+                    else:
+                        backend_entries = set()
+                    entries.update(backend_entries)
+                    dir_cache[backend_name] = backend_entries
+                except Exception as exc:
+                    cached = dir_cache.get(backend_name, set())
+                    if cached:
+                        entries.update(cached)
+                    self.logger.debug(
+                        "readdir fallback for %s on backend %s due to %s", path, backend_name, exc
+                    )
 
         for r in sorted(entries):
             yield r
@@ -606,7 +591,8 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
             )
 
     # Prevent duplicate mounts on the same cache/mountpoint
-    lock_path = cache_root / '.storage.mount.lock'
+    mount_hash = hashlib.sha256(str(mountpoint).encode('utf-8')).hexdigest()[:12]
+    lock_path = cache_root / f'.storage.mount.{mount_hash}.lock'
     try:
         lock_file = _acquire_mount_lock(lock_path, mountpoint)
         logger.info("Acquired mount lock at %s for %s", lock_path, mountpoint)

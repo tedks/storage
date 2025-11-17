@@ -284,6 +284,11 @@ class SSHBackend(Backend):
         # SFTP writes are synchronous
         pass
 
+    def stat(self, virtual_path: str):
+        self._ensure_connected()
+        remote_path = str(self._resolve_path(virtual_path))
+        return self._sftp_client.stat(remote_path)
+
     def close(self):
         """Close SSH/SFTP connections"""
         if self._sftp_client:

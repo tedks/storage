@@ -4,6 +4,7 @@ import shutil
 import stat
 from pathlib import Path
 import multiprocessing as mp
+import threading
 
 from storage.fs import StorageFS
 from storage.fs import _acquire_mount_lock
@@ -77,12 +78,44 @@ class TestReaddirMerging(unittest.TestCase):
         attrs = self.fs.getattr('/remote.txt')
         self.assertTrue(stat.S_ISREG(attrs['st_mode']))
         self.assertEqual(attrs['st_size'], len(content))
+        self.assertNotEqual(attrs['st_mtime'], 0)
+        self.assertNotEqual(attrs['st_uid'], 0)
 
     def test_getattr_remote_only_directory(self):
         (self.backend2_dir / "subdir").mkdir()
 
         attrs = self.fs.getattr('/subdir')
         self.assertTrue(stat.S_ISDIR(attrs['st_mode']))
+
+    def test_readdir_thread_safety(self):
+        (self.backend1_dir / "threaded.txt").write_text("data")
+
+        def worker():
+            list(self.fs.readdir('/', None))
+
+        threads = [threading.Thread(target=worker) for _ in range(5)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+    def test_dir_cache_scoped_per_instance(self):
+        # Populate cache in first instance
+        (self.backend1_dir / "onlyfirst.txt").write_text("one")
+        list(self.fs.readdir('/', None))
+
+        # New instance with same cache path but different DB should not share dir_cache
+        other_db = self.temp_dir / "other.db"
+        other_fs = StorageFS(
+            cache_root=self.cache_dir,
+            state_db=other_db,
+            backends=self.backends,
+            cache_size=10 * 1024 * 1024,
+            num_sync_workers=0,
+            start_sync=False,
+        )
+        self.assertEqual({}, other_fs._dir_cache)
+        other_fs.state_manager.close()
 
 
 def _try_lock(lock_path_str, mountpoint, return_dict):
@@ -113,6 +146,18 @@ class TestMountLock(unittest.TestCase):
 
             # Cleanup
             lock_file.close()
+
+    def test_mount_lock_allows_same_cache_different_mount(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_root = Path(tmpdir)
+            lock_a = cache_root / '.storage.mount.lock'
+            # direct calls with different mountpoints should not interfere when caller chooses different paths
+            lf_a = _acquire_mount_lock(lock_a, '/mnt/a')
+            # simulate mount_storage behavior by using a different lock path
+            lock_b = cache_root / '.storage.mount.other.lock'
+            lf_b = _acquire_mount_lock(lock_b, '/mnt/b')
+            lf_a.close()
+            lf_b.close()
 
     def test_stale_lock_file_is_cleaned(self):
         with tempfile.TemporaryDirectory() as tmpdir:

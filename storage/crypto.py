@@ -140,6 +140,7 @@ class KeyManager:
 
             self.key_storage_path.parent.mkdir(parents=True, exist_ok=True)
             self.key_storage_path.write_text(json.dumps(records))
+            os.chmod(self.key_storage_path, 0o600)
         except Exception as exc:
             logging.getLogger(__name__).warning(
                 "Failed to save encryption keys to %s: %s", self.key_storage_path, exc

@@ -6,6 +6,7 @@ import os
 import shutil
 from pathlib import Path
 from typing import List, Optional
+import os
 
 from .base import Backend, BackendType
 
@@ -130,6 +131,9 @@ class LocalBackend(Backend):
             return stat.f_bavail * stat.f_frsize
         except Exception:
             return None
+
+    def stat(self, virtual_path: str) -> os.stat_result:
+        return os.lstat(self._resolve_path(virtual_path))
 
     def sync(self):
         """Sync any buffered writes to storage"""
