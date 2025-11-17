@@ -19,7 +19,7 @@ def main():
 
 @main.command()
 @click.argument('mountpoint', type=click.Path())
-@click.argument('backing_paths', nargs=-1, required=True)
+@click.argument('backing_paths', nargs=-1, required=False)
 @click.option('-c', '--cache', required=True, help='Local cache directory')
 @click.option('-s', '--cache-size', default='10G', help='Cache size (e.g., 10G, 500M)')
 @click.option('-d', '--database', help='State database path (default: cache/.storage.db)')
@@ -32,15 +32,22 @@ def mount(mountpoint, backing_paths, cache, cache_size, database, workers, remot
     Mount a Storage filesystem
 
     MOUNTPOINT: Where to mount the Storage filesystem
-    BACKING_PATHS: One or more local backing filesystem paths
+    BACKING_PATHS: Zero or more local backing filesystem paths (optional)
 
     Remote backends can be specified with --remote:
         --remote ssh://user@host:/remote/path
 
-    Example:
+    Examples:
+        # With local and remote backends
         storage mount /mnt/storage /srv/raid /srv/chunk0 \\
           -c /var/cache/storage -s 50G \\
           --remote ssh://user@example.com:/backup
+
+        # Remote-only backends
+        storage mount /mnt/storage \\
+          -c /var/cache/storage -s 5G \\
+          --remote ssh://host1:/path1 \\
+          --remote ssh://host2:/path2
     """
     # Parse cache size
     try:
