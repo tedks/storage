@@ -170,6 +170,7 @@ storage configure /mnt/storage/documents --replicas 2
 10. **Web UI** - Optional web interface for monitoring and management
 11. **Metrics/monitoring** - Prometheus/Grafana integration
 12. **Smart backend optimization** - Hot/cold file movement based on access patterns (extend spacemgmt smart optimization TODO)
+13. **Persist directory listings to cache** - On readdir, asynchronously mirror directory entries into local cache (create dirs/empty files, handle conflicting names as <name>.<remote>) so listings survive backend outages
 13. **Remote inotify daemon for state refresh** - Push remote dir changes into local sqlite/xattr cache to avoid stale listings when backends unreachable
 14. **Secure key storage backend** - Replace local ~/.local/storage key file with keystore/HSM/agent integration for persisted keys
 
