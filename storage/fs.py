@@ -455,7 +455,8 @@ class StorageFS(Operations):
 
 def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
                  backends: Dict[str, Backend], cache_size: int,
-                 foreground: bool = False, num_sync_workers: int = 2):
+                 foreground: bool = False, num_sync_workers: int = 2,
+                 allow_other: Optional[bool] = None):
     """
     Mount a Storage filesystem
 
@@ -467,6 +468,39 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
         cache_size: Maximum cache size in bytes
         foreground: Run in foreground (default: False)
         num_sync_workers: Number of background sync workers
+        allow_other: Allow other users to access the mount (requires root or fuse.conf setting).
+                     If None, auto-detects based on whether running as root.
+
+    Raises:
+        PermissionError: If allow_other=True but not running as root and user_allow_other not set
     """
+    import logging
+    logger = logging.getLogger(__name__)
+
+    is_root = os.geteuid() == 0
+
+    # Auto-detect allow_other if not specified
+    if allow_other is None:
+        allow_other = is_root
+        if not is_root:
+            logger.warning("Not running as root - mounting with allow_other=False (only you can access)")
+
+    # Validate allow_other setting
+    if allow_other and not is_root:
+        # Check if user_allow_other is set in /etc/fuse.conf
+        try:
+            with open('/etc/fuse.conf', 'r') as f:
+                fuse_conf = f.read()
+                if 'user_allow_other' not in fuse_conf:
+                    raise PermissionError(
+                        "allow_other=True requires either root privileges or 'user_allow_other' "
+                        "to be set in /etc/fuse.conf"
+                    )
+        except FileNotFoundError:
+            raise PermissionError(
+                "allow_other=True requires either root privileges or 'user_allow_other' "
+                "to be set in /etc/fuse.conf (file not found)"
+            )
+
     fs = StorageFS(cache_root, state_db, backends, cache_size, num_sync_workers)
-    FUSE(fs, mountpoint, nothreads=True, foreground=foreground, allow_other=True)
+    FUSE(fs, mountpoint, nothreads=True, foreground=foreground, allow_other=allow_other)

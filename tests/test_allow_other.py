@@ -1,0 +1,212 @@
+"""
+Tests for allow_other functionality in FUSE mount
+"""
+
+import unittest
+import os
+import tempfile
+from pathlib import Path
+from unittest.mock import patch, mock_open, MagicMock
+
+from storage.fs import mount_storage
+from storage.backends.local import LocalBackend
+
+
+class TestAllowOther(unittest.TestCase):
+    """Test allow_other parameter handling"""
+
+    def setUp(self):
+        """Set up test fixtures"""
+        self.temp_dir = tempfile.mkdtemp()
+        self.cache_root = Path(self.temp_dir) / 'cache'
+        self.cache_root.mkdir()
+        self.state_db = self.cache_root / 'state.db'
+        self.mount_point = Path(self.temp_dir) / 'mount'
+        self.mount_point.mkdir()
+        self.backend_path = Path(self.temp_dir) / 'backend'
+        self.backend_path.mkdir()
+
+        self.backends = {
+            'local0': LocalBackend('local0', str(self.backend_path))
+        }
+
+    def tearDown(self):
+        """Clean up test fixtures"""
+        import shutil
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    @patch('storage.fs.FUSE')
+    @patch('os.geteuid')
+    def test_allow_other_auto_detect_root(self, mock_geteuid, mock_fuse):
+        """Test that allow_other=True when running as root"""
+        mock_geteuid.return_value = 0  # Simulate root
+
+        mount_storage(
+            str(self.mount_point),
+            self.cache_root,
+            self.state_db,
+            self.backends,
+            1024 * 1024 * 100,  # 100MB
+            foreground=True,
+            allow_other=None  # Auto-detect
+        )
+
+        # Verify FUSE was called with allow_other=True
+        mock_fuse.assert_called_once()
+        args, kwargs = mock_fuse.call_args
+        self.assertTrue(kwargs['allow_other'])
+
+    @patch('storage.fs.FUSE')
+    @patch('os.geteuid')
+    def test_allow_other_auto_detect_non_root(self, mock_geteuid, mock_fuse):
+        """Test that allow_other=False when running as non-root"""
+        mock_geteuid.return_value = 1000  # Simulate non-root user
+
+        with self.assertLogs('storage.fs', level='WARNING') as log:
+            mount_storage(
+                str(self.mount_point),
+                self.cache_root,
+                self.state_db,
+                self.backends,
+                1024 * 1024 * 100,
+                foreground=True,
+                allow_other=None  # Auto-detect
+            )
+
+        # Verify warning was logged
+        self.assertTrue(any('allow_other=False' in msg for msg in log.output))
+
+        # Verify FUSE was called with allow_other=False
+        mock_fuse.assert_called_once()
+        args, kwargs = mock_fuse.call_args
+        self.assertFalse(kwargs['allow_other'])
+
+    @patch('storage.fs.FUSE')
+    @patch('os.geteuid')
+    def test_allow_other_explicit_true_as_root(self, mock_geteuid, mock_fuse):
+        """Test explicit allow_other=True as root"""
+        mock_geteuid.return_value = 0  # Root
+
+        mount_storage(
+            str(self.mount_point),
+            self.cache_root,
+            self.state_db,
+            self.backends,
+            1024 * 1024 * 100,
+            foreground=True,
+            allow_other=True
+        )
+
+        # Verify FUSE was called with allow_other=True
+        mock_fuse.assert_called_once()
+        args, kwargs = mock_fuse.call_args
+        self.assertTrue(kwargs['allow_other'])
+
+    @patch('storage.fs.FUSE')
+    @patch('os.geteuid')
+    def test_allow_other_explicit_false_as_root(self, mock_geteuid, mock_fuse):
+        """Test explicit allow_other=False as root (should work)"""
+        mock_geteuid.return_value = 0  # Root
+
+        mount_storage(
+            str(self.mount_point),
+            self.cache_root,
+            self.state_db,
+            self.backends,
+            1024 * 1024 * 100,
+            foreground=True,
+            allow_other=False
+        )
+
+        # Verify FUSE was called with allow_other=False
+        mock_fuse.assert_called_once()
+        args, kwargs = mock_fuse.call_args
+        self.assertFalse(kwargs['allow_other'])
+
+    @patch('storage.fs.FUSE')
+    @patch('os.geteuid')
+    @patch('builtins.open', new_callable=mock_open, read_data='')
+    def test_allow_other_true_non_root_no_user_allow_other(self, mock_file, mock_geteuid, mock_fuse):
+        """Test allow_other=True as non-root without user_allow_other in fuse.conf"""
+        mock_geteuid.return_value = 1000  # Non-root
+
+        with self.assertRaises(PermissionError) as ctx:
+            mount_storage(
+                str(self.mount_point),
+                self.cache_root,
+                self.state_db,
+                self.backends,
+                1024 * 1024 * 100,
+                foreground=True,
+                allow_other=True
+            )
+
+        self.assertIn('user_allow_other', str(ctx.exception))
+        self.assertIn('fuse.conf', str(ctx.exception))
+
+    @patch('storage.fs.FUSE')
+    @patch('os.geteuid')
+    @patch('builtins.open', new_callable=mock_open, read_data='user_allow_other\n')
+    def test_allow_other_true_non_root_with_user_allow_other(self, mock_file, mock_geteuid, mock_fuse):
+        """Test allow_other=True as non-root WITH user_allow_other in fuse.conf"""
+        mock_geteuid.return_value = 1000  # Non-root
+
+        mount_storage(
+            str(self.mount_point),
+            self.cache_root,
+            self.state_db,
+            self.backends,
+            1024 * 1024 * 100,
+            foreground=True,
+            allow_other=True
+        )
+
+        # Verify FUSE was called with allow_other=True
+        mock_fuse.assert_called_once()
+        args, kwargs = mock_fuse.call_args
+        self.assertTrue(kwargs['allow_other'])
+
+    @patch('storage.fs.FUSE')
+    @patch('os.geteuid')
+    @patch('builtins.open', side_effect=FileNotFoundError())
+    def test_allow_other_true_non_root_fuse_conf_missing(self, mock_file, mock_geteuid, mock_fuse):
+        """Test allow_other=True as non-root when fuse.conf doesn't exist"""
+        mock_geteuid.return_value = 1000  # Non-root
+
+        with self.assertRaises(PermissionError) as ctx:
+            mount_storage(
+                str(self.mount_point),
+                self.cache_root,
+                self.state_db,
+                self.backends,
+                1024 * 1024 * 100,
+                foreground=True,
+                allow_other=True
+            )
+
+        self.assertIn('file not found', str(ctx.exception))
+
+    @patch('storage.fs.FUSE')
+    @patch('os.geteuid')
+    def test_allow_other_false_non_root(self, mock_geteuid, mock_fuse):
+        """Test explicit allow_other=False as non-root (should work)"""
+        mock_geteuid.return_value = 1000  # Non-root
+
+        mount_storage(
+            str(self.mount_point),
+            self.cache_root,
+            self.state_db,
+            self.backends,
+            1024 * 1024 * 100,
+            foreground=True,
+            allow_other=False
+        )
+
+        # Verify FUSE was called with allow_other=False
+        mock_fuse.assert_called_once()
+        args, kwargs = mock_fuse.call_args
+        self.assertFalse(kwargs['allow_other'])
+
+
+if __name__ == '__main__':
+    unittest.main()

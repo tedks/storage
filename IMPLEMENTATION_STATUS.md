@@ -1,6 +1,6 @@
 # Storage Implementation Status
 
-## ✅ ALL FEATURES COMPLETE
+## 🚧 CORE FEATURES IMPLEMENTED - SOME LIMITATIONS
 
 ### 1. Background Sync Workers ✅
 - **Implementation**: `storage/sync.py`
@@ -52,35 +52,38 @@
 - **Usage**: `storage configure /path --recomputable --recompute-cmd 'wget -O $STORAGE_OUTPUT https://...'`
 - **Commits**: 076bd02, 347a50a
 
-### 5. Transparent Encryption ✅
+### 5. Transparent Encryption ⚠️
 - **Implementation**: `storage/crypto.py`
-- **Features**:
-  - Fernet-based encryption (AES-128-CBC + HMAC)
-  - EncryptionKey with PBKDF2 key derivation
-  - KeyManager for multiple keys
-  - CryptoManager for transparent encryption/decryption
-  - Per-file and per-backend encryption policies
-  - Default key auto-generation
-  - CLI integration with --encrypt flag
+- **Implemented Features**:
+  - ✅ Fernet-based encryption (AES-128-CBC + HMAC)
+  - ✅ EncryptionKey with PBKDF2 key derivation
+  - ✅ KeyManager for multiple keys
+  - ✅ CryptoManager for transparent encryption/decryption
+  - ✅ Per-file and per-backend encryption policies
+  - ✅ Default key auto-generation (in-memory)
+  - ✅ CLI integration with --encrypt flag
+- **Known Limitations**:
+  - ⚠️ Encryption keys are ephemeral (in-memory only)
+  - ⚠️ Key storage not implemented (_load_keys/_save_keys are stubs - TODOs at lines 114, 119)
+  - ⚠️ Keys don't persist across restarts - each mount generates new default key
+  - ⚠️ Files encrypted in one session cannot be decrypted in another session
 - **Usage**: `storage configure /path --encrypt [--encrypt-backends remote0,remote1]`
 - **Commit**: 6fbb530
 
-### 6. Advanced Space Management ✅
+### 6. Advanced Space Management ⚠️
 - **Implementation**: `storage/spacemgmt.py`, `storage/cache.py`
-- **Features**:
-  - Backend space usage monitoring
-  - Over-replication detection and cleanup
-  - Defragmentation (move files between backends)
-  - Space reclamation via recomputable files
-  - LRU cache eviction (from CacheManager)
-  - Comprehensive space usage reporting
-  - Dry-run mode for all operations
-- **Components**:
-  - SpaceManager: Main management class
-  - Backend usage tracking
-  - Over-replication cleanup (removes from slowest backends)
-  - Defragmentation support
-  - Space report generation
+- **Implemented Features**:
+  - ✅ Backend space usage monitoring
+  - ✅ LRU cache eviction (from CacheManager)
+  - ✅ Comprehensive space usage reporting
+  - ✅ Dry-run mode for all operations
+  - ✅ Space reclamation via recomputable files (cache only)
+- **Stub/Incomplete Features**:
+  - ⚠️ Over-replication detection (returns empty list - TODO at line 76)
+  - ⚠️ Over-replication cleanup (depends on detection, does nothing)
+  - ⚠️ Defragmentation (structure exists but doesn't move files - TODO at line 168)
+  - ⚠️ Backend-specific over-replication cleanup (TODO at line 199)
+  - ⚠️ Smart optimization (hot/cold file movement - TODO at line 254)
 - **Commit**: fdd7dc2
 
 ## Architecture Summary
@@ -139,16 +142,38 @@ storage configure /mnt/storage/important --replicas -1
 storage configure /mnt/storage/documents --replicas 2
 ```
 
-## Recommended Next Steps (Optional Enhancements)
+## Recommended Next Steps
 
-1. **Add encryption to sync path** - Integrate CryptoManager into background sync
-2. **Add SSH backend tests** - Mock SFTP connections for testing
-3. **Performance testing** - Benchmark with large files and many backends
-4. **Documentation** - Man pages, examples, troubleshooting guide
-5. **Key storage security** - Implement encrypted key file storage
-6. **Three-way merge** - Add merge support in conflict resolver
-7. **Web UI** - Optional web interface for monitoring and management
-8. **Metrics/monitoring** - Prometheus/Grafana integration
+### Critical (Required for Basic Functionality)
+1. **Implement directory merging across backends** (`fs.py:133`)
+   - Make `readdir()` query all backends and merge results
+   - Critical for remote filesystem use case
+
+2. **Implement key persistence** (`crypto.py:114`, `crypto.py:119`)
+   - Save/load encryption keys securely
+   - Required for encryption to be usable across sessions
+
+### High Priority (Claimed but Incomplete)
+3. **Implement over-replication detection** (`spacemgmt.py:76`)
+   - Query state database for file locations
+   - Compare against replica_count configuration
+
+4. **Implement defragmentation file queries** (`spacemgmt.py:168`)
+   - Track which files are on which backends
+   - Enable actual file movement between backends
+
+5. **Propagate directory operations to backends**
+   - mkdir/rmdir/unlink/rename should sync to backends
+   - Either sync immediately or queue for background workers
+
+### Optional Enhancements
+6. **Add SSH backend tests** - Mock SFTP connections for testing
+7. **Performance testing** - Benchmark with large files and many backends
+8. **Documentation** - Man pages, examples, troubleshooting guide
+9. **Three-way merge** - Add merge support in conflict resolver
+10. **Web UI** - Optional web interface for monitoring and management
+11. **Metrics/monitoring** - Prometheus/Grafana integration
+12. **Smart backend optimization** - Hot/cold file movement based on access patterns
 
 ## Performance Characteristics
 
@@ -160,27 +185,76 @@ storage configure /mnt/storage/documents --replicas 2
 
 ## Known Limitations
 
-1. No automatic conflict resolution (by design - user must resolve)
-2. Whole-file caching (no partial file caching)
-3. No support for very large files (>cache size)
-4. Directory operations not replicated yet
-5. Extended attributes may not work on all filesystems
-6. No built-in encryption yet
+### Critical Limitations
+1. **Directory listing does not merge files from backends** (`fs.py:133`)
+   - Only files in cache are visible via `ls`/`readdir()`
+   - Files that exist only on remote backends are invisible
+   - Files can still be accessed directly by path if you know the filename
+   - This significantly impacts the "remote filesystem with cache" use case
+
+### Directory Operations
+2. **Directory operations not replicated to backends** (by design - cache-first)
+   - mkdir/rmdir only affect cache (`fs.py:146`, `fs.py:158`)
+   - File deletions (unlink) only remove from cache (`fs.py:173`)
+   - Renames only update cache (`fs.py:187`)
+   - Background sync only propagates file *content*, not directory structure
+
+### Space Management Limitations
+3. **Over-replication detection not implemented** (`spacemgmt.py:76`)
+   - `find_over_replicated_files()` returns empty list (stub)
+   - `cleanup_over_replication()` does nothing as a result
+4. **Defragmentation not implemented** (`spacemgmt.py:168`)
+   - Structure exists but file movement not implemented
+   - Returns 0 bytes moved
+5. **Backend-specific space reclamation incomplete** (`spacemgmt.py:199`)
+   - Can only reclaim space from cache, not backends
+
+### Encryption Limitations
+6. **Encryption keys are ephemeral**
+   - Keys only exist in-memory during mount session
+   - Key persistence not implemented (`crypto.py:114`, `crypto.py:119`)
+   - Files encrypted in one session cannot be decrypted in future sessions
+   - Each mount generates a new default key
+
+### General Limitations
+7. No automatic conflict resolution (by design - user must resolve)
+8. Whole-file caching (no partial file caching)
+9. No support for very large files (>cache size)
+10. Extended attributes may not work on all filesystems
 
 ## Design Compliance
 
-The implementation FULLY implements the DESIGN.md specification:
+### Fully Implemented ✅
 - ✅ Local cache with LRU management
 - ✅ N-way replication across backends
 - ✅ Background sync workers with retry logic
 - ✅ Hierarchical configuration (max replica count inheritance)
-- ✅ Remote filesystem support (SSH/SFTP)
+- ✅ Remote filesystem support (SSH/SFTP with auto-reconnection)
 - ✅ Conflict detection (checksum-based)
-- ✅ Conflict resolution (interactive CLI tool)
-- ✅ Recomputation engine (command execution, timeout handling)
-- ✅ Transparent encryption (Fernet, per-file/per-backend)
-- ✅ Space management (LRU, recomputable deletion, defrag, cleanup)
-- ✅ All three main use cases supported:
-  1. ✅ Remote filesystems with local cache (offline usage)
-  2. ✅ Multiple RAIDs with flexible replication
-  3. ✅ Cloud storage with transparent encryption
+- ✅ Conflict resolution (interactive CLI tool with auto modes)
+- ✅ Recomputation engine (command execution, timeout handling, async support)
+- ✅ FUSE filesystem with smart allow_other handling
+
+### Partially Implemented ⚠️
+- ⚠️ Transparent encryption (works but keys don't persist)
+- ⚠️ Space management (LRU and cache reclamation work, but over-replication detection and defrag are stubs)
+- ⚠️ Directory operations (cache-only, not synced to backends)
+
+### Not Working ❌
+- ❌ Directory listing from backends (only shows cached files)
+- ❌ Over-replication cleanup (detection returns empty)
+- ❌ Defragmentation (stub implementation)
+
+### Use Case Support Assessment
+1. ⚠️ **Remote filesystems with local cache**
+   - Works for known files (can read/write by path)
+   - **Does not work** for discovering remote files (directory listing broken)
+   - Offline usage works if files were previously cached
+
+2. ✅ **Multiple RAIDs with flexible replication**
+   - Fully functional for cache-first workflows
+   - Background sync properly replicates to backends
+
+3. ⚠️ **Cloud storage with transparent encryption**
+   - Encryption works within a single session
+   - **Does not work** across sessions (key persistence missing)
