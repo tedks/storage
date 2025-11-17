@@ -13,6 +13,8 @@ import errno
 import threading
 import logging
 import fcntl
+import stat
+import time
 from fuse import FUSE, FuseOSError, Operations
 from pathlib import Path
 from typing import Dict, Optional, Set
@@ -134,6 +136,40 @@ class StorageFS(Operations):
                 'st_atime', 'st_ctime', 'st_gid', 'st_mode', 'st_mtime',
                 'st_nlink', 'st_size', 'st_uid'))
         except OSError as e:
+            # Fallback: query backends for non-cached entries (e.g., remote-only files)
+            now = time.time()
+            for backend_name, backend in self.backends.items():
+                try:
+                    if backend.isdir(path):
+                        return {
+                            'st_atime': now,
+                            'st_ctime': now,
+                            'st_gid': os.getgid(),
+                            'st_mode': stat.S_IFDIR | 0o755,
+                            'st_mtime': now,
+                            'st_nlink': 2,
+                            'st_size': 0,
+                            'st_uid': os.getuid(),
+                        }
+                    if backend.exists(path):
+                        size = 0
+                        try:
+                            size = backend.get_size(path)
+                        except Exception:
+                            pass
+                        return {
+                            'st_atime': now,
+                            'st_ctime': now,
+                            'st_gid': os.getgid(),
+                            'st_mode': stat.S_IFREG | 0o644,
+                            'st_mtime': now,
+                            'st_nlink': 1,
+                            'st_size': size,
+                            'st_uid': os.getuid(),
+                        }
+                except Exception as be:
+                    self.logger.debug("getattr backend fallback failed for %s on %s: %s", path, backend_name, be)
+
             raise FuseOSError(e.errno)
 
     def readdir(self, path, fh):

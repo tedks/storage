@@ -1,6 +1,7 @@
 import unittest
 import tempfile
 import shutil
+import stat
 from pathlib import Path
 import multiprocessing as mp
 
@@ -68,6 +69,20 @@ class TestReaddirMerging(unittest.TestCase):
 
         # Restore for cleanliness
         self.backends['backend1'].listdir = original
+
+    def test_getattr_remote_only_file(self):
+        content = "hello"
+        (self.backend1_dir / "remote.txt").write_text(content)
+
+        attrs = self.fs.getattr('/remote.txt')
+        self.assertTrue(stat.S_ISREG(attrs['st_mode']))
+        self.assertEqual(attrs['st_size'], len(content))
+
+    def test_getattr_remote_only_directory(self):
+        (self.backend2_dir / "subdir").mkdir()
+
+        attrs = self.fs.getattr('/subdir')
+        self.assertTrue(stat.S_ISDIR(attrs['st_mode']))
 
 
 def _try_lock(lock_path_str, mountpoint, return_dict):
