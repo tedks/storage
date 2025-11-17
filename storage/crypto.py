@@ -6,12 +6,14 @@ Supports per-file and per-backend encryption policies.
 """
 
 import os
+import json
 import hashlib
+import logging
 from pathlib import Path
 from typing import Optional, Dict
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat.backends import default_backend
 
 from .state import StateManager, FileConfig
@@ -29,7 +31,8 @@ class EncryptionKey:
             key_material: 32-byte key material
         """
         self.key_id = key_id
-        self.fernet = Fernet(Fernet.generate_key() if len(key_material) != 44 else key_material)
+        self.key_material = key_material if len(key_material) == 44 else Fernet.generate_key()
+        self.fernet = Fernet(self.key_material)
 
     @classmethod
     def from_password(cls, key_id: str, password: str, salt: Optional[bytes] = None) -> 'EncryptionKey':
@@ -47,7 +50,7 @@ class EncryptionKey:
         if salt is None:
             salt = os.urandom(16)
 
-        kdf = PBKDF2(
+        kdf = PBKDF2HMAC(
             algorithm=hashes.SHA256(),
             length=32,
             salt=salt,
@@ -85,9 +88,10 @@ class KeyManager:
             key_storage_path: Path to store keys (optional)
         """
         self.keys: Dict[str, EncryptionKey] = {}
-        self.key_storage_path = key_storage_path
+        self.key_storage_path = key_storage_path or Path.home() / ".local" / "storage" / "keys.json"
+        self.key_storage_path.parent.mkdir(parents=True, exist_ok=True)
 
-        if key_storage_path and key_storage_path.exists():
+        if self.key_storage_path.exists():
             self._load_keys()
 
     def add_key(self, key: EncryptionKey):
@@ -111,13 +115,35 @@ class KeyManager:
 
     def _load_keys(self):
         """Load keys from storage"""
-        # TODO: Implement secure key storage
-        pass
+        try:
+            data = json.loads(self.key_storage_path.read_text())
+            for record in data:
+                key_id = record.get("key_id")
+                material_str = record.get("key_material")
+                if not key_id or not material_str:
+                    continue
+                self.keys[key_id] = EncryptionKey(key_id, material_str.encode('utf-8'))
+        except FileNotFoundError:
+            return
+        except Exception as exc:
+            logging.getLogger(__name__).warning(
+                "Failed to load encryption keys from %s: %s", self.key_storage_path, exc
+            )
 
     def _save_keys(self):
         """Save keys to storage"""
-        # TODO: Implement secure key storage
-        pass
+        try:
+            records = [{
+                "key_id": key.key_id,
+                "key_material": key.key_material.decode('utf-8')
+            } for key in self.keys.values()]
+
+            self.key_storage_path.parent.mkdir(parents=True, exist_ok=True)
+            self.key_storage_path.write_text(json.dumps(records))
+        except Exception as exc:
+            logging.getLogger(__name__).warning(
+                "Failed to save encryption keys to %s: %s", self.key_storage_path, exc
+            )
 
 
 class CryptoManager:
