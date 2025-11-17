@@ -145,24 +145,20 @@ storage configure /mnt/storage/documents --replicas 2
 ## Recommended Next Steps
 
 ### Critical (Required for Basic Functionality)
-1. **Implement directory merging across backends** (`fs.py:133`)
-   - Make `readdir()` query all backends and merge results
-   - Critical for remote filesystem use case
-
-2. **Implement key persistence** (`crypto.py:114`, `crypto.py:119`)
+1. **Implement key persistence** (`crypto.py:114`, `crypto.py:119`)
    - Save/load encryption keys securely
    - Required for encryption to be usable across sessions
 
 ### High Priority (Claimed but Incomplete)
-3. **Implement over-replication detection** (`spacemgmt.py:76`)
+2. **Implement over-replication detection** (`spacemgmt.py:76`)
    - Query state database for file locations
    - Compare against replica_count configuration
 
-4. **Implement defragmentation file queries** (`spacemgmt.py:168`)
+3. **Implement defragmentation file queries** (`spacemgmt.py:168`)
    - Track which files are on which backends
    - Enable actual file movement between backends
 
-5. **Propagate directory operations to backends**
+4. **Propagate directory operations to backends**
    - mkdir/rmdir/unlink/rename should sync to backends
    - Either sync immediately or queue for background workers
 
@@ -188,27 +184,20 @@ storage configure /mnt/storage/documents --replicas 2
 ## Known Limitations
 
 ### Critical Limitations
-1. **Directory listing does not merge files from backends** (`fs.py:133`)
-   - Only files in cache are visible via `ls`/`readdir()`
-   - Files that exist only on remote backends are invisible
-   - Files can still be accessed directly by path if you know the filename
-   - This significantly impacts the "remote filesystem with cache" use case
-
-### Directory Operations
-2. **Directory operations not replicated to backends** (by design - cache-first)
+1. **Directory operations not replicated to backends** (by design - cache-first)
    - mkdir/rmdir only affect cache (`fs.py:146`, `fs.py:158`)
    - File deletions (unlink) only remove from cache (`fs.py:173`)
    - Renames only update cache (`fs.py:187`)
    - Background sync only propagates file *content*, not directory structure
 
 ### Space Management Limitations
-3. **Over-replication detection not implemented** (`spacemgmt.py:76`)
+2. **Over-replication detection not implemented** (`spacemgmt.py:76`)
    - `find_over_replicated_files()` returns empty list (stub)
    - `cleanup_over_replication()` does nothing as a result
-4. **Defragmentation not implemented** (`spacemgmt.py:168`)
+3. **Defragmentation not implemented** (`spacemgmt.py:168`)
    - Structure exists but file movement not implemented
    - Returns 0 bytes moved
-5. **Backend-specific space reclamation incomplete** (`spacemgmt.py:199`)
+4. **Backend-specific space reclamation incomplete** (`spacemgmt.py:199`)
    - Can only reclaim space from cache, not backends
 
 ### Encryption Limitations
