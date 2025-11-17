@@ -41,12 +41,9 @@ class SSHBackend(Backend):
         self.key_filename = key_filename
         self.connect_timeout = connect_timeout
 
-        # SSH/SFTP connections
+        # SSH/SFTP connections (lazy connected)
         self._ssh_client: Optional[paramiko.SSHClient] = None
         self._sftp_client: Optional[paramiko.SFTPClient] = None
-
-        # Connect
-        self._connect()
 
     def _connect(self):
         """Establish SSH/SFTP connection"""

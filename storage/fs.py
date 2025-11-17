@@ -34,7 +34,7 @@ class StorageFS(Operations):
     """
 
     def __init__(self, cache_root: Path, state_db: Path, backends: Dict[str, Backend],
-                 cache_size: int, num_sync_workers: int = 2):
+                 cache_size: int, num_sync_workers: int = 2, start_sync: bool = True):
         """
         Initialize Storage filesystem
 
@@ -57,7 +57,10 @@ class StorageFS(Operations):
             self.replication_manager,
             num_workers=num_sync_workers
         )
-        self.sync_manager.start()
+        self._sync_started = False
+        if start_sync:
+            self.sync_manager.start()
+            self._sync_started = True
 
         # Recomputation engine
         self.recompute_engine = RecomputeEngine(self.state_manager)
@@ -72,6 +75,12 @@ class StorageFS(Operations):
         self._dir_cache_lock = threading.Lock()
 
         self.logger = logging.getLogger(__name__)
+
+    def init(self, path):
+        """FUSE init hook (runs after mount, post-fork in background mode)."""
+        if not self._sync_started:
+            self.sync_manager.start()
+            self._sync_started = True
 
     def _get_config(self, virtual_path: str) -> FileConfig:
         """Get configuration for a file"""
@@ -491,7 +500,8 @@ def _acquire_mount_lock(lock_path: Path, mountpoint: str):
             except OSError:
                 pass
 
-    lock_file = open(lock_path, 'w+')
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT)
+    lock_file = os.fdopen(fd, 'r+')
     try:
         fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
@@ -568,7 +578,7 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
         logger.error(str(e))
         raise
 
-    fs = StorageFS(cache_root, state_db, backends, cache_size, num_sync_workers)
+    fs = StorageFS(cache_root, state_db, backends, cache_size, num_sync_workers, start_sync=False)
     try:
         FUSE(fs, mountpoint, nothreads=True, foreground=foreground, allow_other=allow_other)
     finally:
