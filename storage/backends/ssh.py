@@ -16,7 +16,8 @@ class SSHBackend(Backend):
     def __init__(self, name: str, host: str, remote_path: str,
                  username: str, password: Optional[str] = None,
                  key_filename: Optional[str] = None,
-                 port: int = 22, speed_priority: int = 50):
+                 port: int = 22, speed_priority: int = 50,
+                 connect_timeout: float = 10.0):
         """
         Initialize SSH backend
 
@@ -38,6 +39,7 @@ class SSHBackend(Backend):
         self.username = username
         self.password = password
         self.key_filename = key_filename
+        self.connect_timeout = connect_timeout
 
         # SSH/SFTP connections
         self._ssh_client: Optional[paramiko.SSHClient] = None
@@ -56,6 +58,8 @@ class SSHBackend(Backend):
                 'hostname': self.host,
                 'port': self.port,
                 'username': self.username,
+                'timeout': self.connect_timeout,
+                'banner_timeout': self.connect_timeout,
             }
 
             if self.password:
@@ -65,6 +69,14 @@ class SSHBackend(Backend):
 
             self._ssh_client.connect(**connect_kwargs)
             self._sftp_client = self._ssh_client.open_sftp()
+
+            # Ensure the underlying socket respects the timeout for SFTP ops
+            transport = self._ssh_client.get_transport()
+            if transport and transport.sock:
+                try:
+                    transport.sock.settimeout(self.connect_timeout)
+                except Exception:
+                    pass
 
             self.set_available(True)
 
