@@ -1,0 +1,283 @@
+"""
+Local cache manager with LRU eviction
+
+Manages the local cache of files from remote backing filesystems.
+Files are cached on first access and evicted using LRU when space is needed.
+"""
+
+import os
+import time
+import threading
+from pathlib import Path
+from typing import Optional, List, Set
+
+from .state import StateManager, FileMetadata, SyncStatus
+from .backends.base import Backend
+
+
+class CacheManager:
+    """
+    Manages local cache with LRU eviction
+
+    The cache stores complete files downloaded from remote backends.
+    Access (read or write) updates the LRU timestamp.
+    """
+
+    def __init__(self, cache_root: Path, state_manager: StateManager, max_size_bytes: int):
+        """
+        Initialize cache manager
+
+        Args:
+            cache_root: Root directory for cache storage
+            state_manager: State manager instance
+            max_size_bytes: Maximum cache size in bytes
+        """
+        self.cache_root = cache_root
+        self.state_manager = state_manager
+        self.max_size_bytes = max_size_bytes
+        self._lock = threading.RLock()
+
+        # Ensure cache root exists
+        self.cache_root.mkdir(parents=True, exist_ok=True)
+
+    def get_cache_path(self, virtual_path: str) -> Path:
+        """Get the local cache path for a virtual file"""
+        # Remove leading slash and resolve within cache
+        relative_path = virtual_path.lstrip('/')
+        return self.cache_root / relative_path
+
+    def is_cached(self, virtual_path: str) -> bool:
+        """Check if a file is in the cache"""
+        cache_path = self.get_cache_path(virtual_path)
+        return cache_path.exists() and cache_path.is_file()
+
+    def get_cached_size(self, virtual_path: str) -> int:
+        """Get size of cached file"""
+        cache_path = self.get_cache_path(virtual_path)
+        if cache_path.exists():
+            return cache_path.stat().st_size
+        return 0
+
+    def get_total_cache_size(self) -> int:
+        """Calculate total size of cache in bytes"""
+        total = 0
+        for root, dirs, files in os.walk(self.cache_root):
+            for name in files:
+                filepath = Path(root) / name
+                try:
+                    total += filepath.stat().st_size
+                except OSError:
+                    pass
+        return total
+
+    def get_free_space_needed(self, required_bytes: int) -> int:
+        """
+        Calculate how much space needs to be freed
+
+        Returns:
+            Bytes to free (0 if enough space available)
+        """
+        current_size = self.get_total_cache_size()
+        available = self.max_size_bytes - current_size
+
+        if available >= required_bytes:
+            return 0
+
+        return required_bytes - available
+
+    def evict_lru_files(self, bytes_needed: int) -> bool:
+        """
+        Evict least recently used files to free space
+
+        Only evicts files that are:
+        - Clean (fully synced)
+        - Not recomputable (those handled separately)
+
+        Args:
+            bytes_needed: Amount of space to free in bytes
+
+        Returns:
+            True if enough space was freed, False otherwise
+        """
+        with self._lock:
+            freed = 0
+            lru_files = self.state_manager.get_lru_files(limit=1000)
+
+            for metadata in lru_files:
+                if freed >= bytes_needed:
+                    break
+
+                # Skip files that aren't clean
+                if metadata.sync_status != SyncStatus.CLEAN:
+                    continue
+
+                # Skip recomputable files (handled separately)
+                if metadata.recomputable:
+                    continue
+
+                # Evict this file
+                cache_path = self.get_cache_path(metadata.virtual_path)
+                if cache_path.exists():
+                    try:
+                        file_size = cache_path.stat().st_size
+                        cache_path.unlink()
+                        freed += file_size
+
+                        # Remove cache location from state
+                        self.state_manager.remove_file_location(metadata.virtual_path, "cache")
+
+                    except OSError as e:
+                        print(f"Warning: Failed to evict {metadata.virtual_path}: {e}")
+
+            return freed >= bytes_needed
+
+    def evict_recomputable_files(self, bytes_needed: int) -> bool:
+        """
+        Evict recomputable files to free space
+
+        Args:
+            bytes_needed: Amount of space to free in bytes
+
+        Returns:
+            True if enough space was freed, False otherwise
+        """
+        with self._lock:
+            freed = 0
+            recomputable = self.state_manager.get_recomputable_files()
+
+            for metadata in recomputable:
+                if freed >= bytes_needed:
+                    break
+
+                cache_path = self.get_cache_path(metadata.virtual_path)
+                if cache_path.exists():
+                    try:
+                        file_size = cache_path.stat().st_size
+                        # Truncate to preserve xattrs
+                        with open(cache_path, 'wb') as f:
+                            f.truncate(0)
+                        freed += file_size
+
+                        # Update metadata to show file needs recomputation
+                        metadata.size = 0
+                        metadata.checksum = None
+                        self.state_manager.set_file_metadata(metadata)
+
+                    except OSError as e:
+                        print(f"Warning: Failed to evict recomputable {metadata.virtual_path}: {e}")
+
+            return freed >= bytes_needed
+
+    def ensure_space(self, bytes_needed: int) -> bool:
+        """
+        Ensure enough cache space is available
+
+        Attempts eviction in this order:
+        1. LRU non-recomputable files
+        2. Recomputable files (smallest first)
+
+        Args:
+            bytes_needed: Amount of space needed in bytes
+
+        Returns:
+            True if space was made available, False if insufficient space
+        """
+        space_needed = self.get_free_space_needed(bytes_needed)
+
+        if space_needed <= 0:
+            return True  # Already have enough space
+
+        # Try evicting LRU files first
+        if self.evict_lru_files(space_needed):
+            return True
+
+        # Try evicting recomputable files
+        if self.evict_recomputable_files(space_needed):
+            return True
+
+        # Could not free enough space
+        return False
+
+    def cache_file(self, virtual_path: str, backend: Backend) -> bool:
+        """
+        Download a file from backend into cache
+
+        Args:
+            virtual_path: Virtual path of file
+            backend: Backend to download from
+
+        Returns:
+            True if successfully cached, False otherwise
+        """
+        with self._lock:
+            cache_path = self.get_cache_path(virtual_path)
+
+            # Check if backend has the file
+            if not backend.exists(virtual_path):
+                return False
+
+            # Get file size to ensure we have space
+            file_size = backend.get_size(virtual_path)
+
+            # Ensure we have space
+            if not self.ensure_space(file_size):
+                print(f"Warning: Insufficient cache space for {virtual_path}")
+                return False
+
+            # Download file
+            try:
+                backend.copy_to_local(virtual_path, cache_path)
+
+                # Update access time in state
+                self.state_manager.update_access_time(virtual_path)
+
+                return True
+
+            except Exception as e:
+                print(f"Error caching {virtual_path} from {backend.name}: {e}")
+                return False
+
+    def mark_accessed(self, virtual_path: str):
+        """Mark a file as accessed (update LRU)"""
+        self.state_manager.update_access_time(virtual_path)
+
+    def flush_file(self, virtual_path: str):
+        """Flush a cached file to ensure writes are synced"""
+        cache_path = self.get_cache_path(virtual_path)
+        if cache_path.exists():
+            try:
+                # Open and sync file
+                with open(cache_path, 'rb') as f:
+                    os.fsync(f.fileno())
+            except OSError:
+                pass
+
+    def create_cached_file(self, virtual_path: str) -> Path:
+        """
+        Create a new file in cache
+
+        Args:
+            virtual_path: Virtual path of file
+
+        Returns:
+            Path to created cache file
+        """
+        with self._lock:
+            cache_path = self.get_cache_path(virtual_path)
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cache_path.touch()
+
+            # Mark as accessed
+            self.mark_accessed(virtual_path)
+
+            return cache_path
+
+    def delete_cached_file(self, virtual_path: str):
+        """Delete a file from cache"""
+        with self._lock:
+            cache_path = self.get_cache_path(virtual_path)
+            if cache_path.exists():
+                try:
+                    cache_path.unlink()
+                except OSError as e:
+                    print(f"Warning: Failed to delete cache file {virtual_path}: {e}")

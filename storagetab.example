@@ -1,0 +1,19 @@
+# Storage mount configuration
+# Format: <mountpoint> <backing_paths> <options>
+#
+# This file is similar to /etc/fstab but for Storage filesystems.
+# Each line defines a Storage mount with its backing filesystems.
+#
+# Example entries:
+
+# Basic mount with three backing filesystems
+/mnt/storage /mnt/disk1,/mnt/disk2,/mnt/disk3 defaults
+
+# Mount with replication
+/home/user/documents /mnt/backup1,/mnt/backup2 replication=2
+
+# Mount with custom options
+/var/data /data/disk1,/data/disk2,/data/disk3 replication=1,auto=true
+
+# To mount all entries: storage mount-all
+# To mount specific entry: storage mount-all /mnt/storage
