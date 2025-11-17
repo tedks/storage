@@ -27,7 +27,9 @@ def main():
 @click.option('-r', '--remote', multiple=True, help='Remote backend (ssh://user@host:/path)')
 @click.option('-k', '--key-file', help='SSH private key file')
 @click.option('-f', '--foreground', is_flag=True, help='Run in foreground')
-def mount(mountpoint, backing_paths, cache, cache_size, database, workers, remote, key_file, foreground):
+@click.option('--allow-other/--no-allow-other', default=None,
+              help='Allow other users to access mount (requires root or fuse.conf setting). Auto-detects if not specified.')
+def mount(mountpoint, backing_paths, cache, cache_size, database, workers, remote, key_file, foreground, allow_other):
     """
     Mount a Storage filesystem
 
@@ -143,8 +145,16 @@ def mount(mountpoint, backing_paths, cache, cache_size, database, workers, remot
             backends,
             cache_size_bytes,
             foreground=foreground,
-            num_sync_workers=workers
+            num_sync_workers=workers,
+            allow_other=allow_other
         )
+    except PermissionError as e:
+        click.echo(f"Permission error: {e}", err=True)
+        click.echo("\nTo fix this, either:", err=True)
+        click.echo("  1. Run as root (sudo)", err=True)
+        click.echo("  2. Remove the --allow-other flag", err=True)
+        click.echo("  3. Add 'user_allow_other' to /etc/fuse.conf", err=True)
+        sys.exit(1)
     except Exception as e:
         click.echo(f"Error mounting filesystem: {e}", err=True)
         sys.exit(1)
