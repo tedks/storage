@@ -11,9 +11,11 @@ Main filesystem layer that provides:
 import os
 import errno
 import threading
+import logging
+import fcntl
 from fuse import FUSE, FuseOSError, Operations
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Set
 
 from .backends.base import Backend
 from .cache import CacheManager
@@ -64,6 +66,12 @@ class StorageFS(Operations):
         self._fd_counter = 0
         self._fd_map = {}  # fd -> (virtual_path, cache_path, flags)
         self._fd_lock = threading.Lock()
+
+        # Directory listing cache (per directory, per backend) for fallback when backend unavailable
+        self._dir_cache: Dict[str, Dict[str, Set[str]]] = {}
+        self._dir_cache_lock = threading.Lock()
+
+        self.logger = logging.getLogger(__name__)
 
     def _get_config(self, virtual_path: str) -> FileConfig:
         """Get configuration for a file"""
@@ -123,16 +131,32 @@ class StorageFS(Operations):
         """Read directory contents"""
         cache_path = self.cache_manager.get_cache_path(path)
 
-        dirents = ['.', '..']
+        entries: Set[str] = {'.', '..'}
 
         # Get from cache
         if cache_path.exists() and cache_path.is_dir():
-            dirents.extend(os.listdir(str(cache_path)))
+            entries.update(os.listdir(str(cache_path)))
 
-        # Also merge from backends (union view)
-        # TODO: Implement proper directory merging across backends
+        # Merge listings from backends; cache for fallback on connection issues
+        dir_cache = self._dir_cache.setdefault(path, {})
 
-        for r in dirents:
+        for backend_name, backend in self.backends.items():
+            try:
+                if backend.isdir(path):
+                    backend_entries = set(backend.listdir(path))
+                else:
+                    backend_entries = set()
+                entries.update(backend_entries)
+                dir_cache[backend_name] = backend_entries
+            except Exception as exc:
+                cached = dir_cache.get(backend_name, set())
+                if cached:
+                    entries.update(cached)
+                self.logger.debug(
+                    "readdir fallback for %s on backend %s due to %s", path, backend_name, exc
+                )
+
+        for r in sorted(entries):
             yield r
 
     def mkdir(self, path, mode):
@@ -453,6 +477,39 @@ class StorageFS(Operations):
         self.state_manager.close()
 
 
+def _acquire_mount_lock(lock_path: Path, mountpoint: str):
+    """Take an exclusive, non-blocking lock to prevent duplicate mounts."""
+    # Clean up stale lock files (pid not running)
+    if lock_path.exists():
+        try:
+            existing_pid = int(lock_path.read_text().strip())
+            # kill(pid, 0) checks for existence without signal delivery
+            os.kill(existing_pid, 0)
+        except (ValueError, ProcessLookupError, OSError):
+            try:
+                lock_path.unlink()
+            except OSError:
+                pass
+
+    lock_file = open(lock_path, 'w+')
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        try:
+            existing = lock_file.read().strip()
+        finally:
+            lock_file.close()
+        raise RuntimeError(
+            f"Mount already active for {mountpoint}" + (f" (pid {existing})" if existing else "")
+        )
+
+    lock_file.seek(0)
+    lock_file.truncate()
+    lock_file.write(str(os.getpid()))
+    lock_file.flush()
+    return lock_file
+
+
 def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
                  backends: Dict[str, Backend], cache_size: int,
                  foreground: bool = False, num_sync_workers: int = 2,
@@ -502,5 +559,20 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
                 "to be set in /etc/fuse.conf (file not found)"
             )
 
+    # Prevent duplicate mounts on the same cache/mountpoint
+    lock_path = cache_root / '.storage.mount.lock'
+    try:
+        lock_file = _acquire_mount_lock(lock_path, mountpoint)
+        logger.info("Acquired mount lock at %s for %s", lock_path, mountpoint)
+    except RuntimeError as e:
+        logger.error(str(e))
+        raise
+
     fs = StorageFS(cache_root, state_db, backends, cache_size, num_sync_workers)
-    FUSE(fs, mountpoint, nothreads=True, foreground=foreground, allow_other=allow_other)
+    try:
+        FUSE(fs, mountpoint, nothreads=True, foreground=foreground, allow_other=allow_other)
+    finally:
+        try:
+            lock_file.close()
+        except Exception:
+            pass
