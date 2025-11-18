@@ -11,13 +11,18 @@ Main filesystem layer that provides:
 import os
 import errno
 import threading
+import logging
+import fcntl
+import stat
+import time
+import hashlib
 from fuse import FUSE, FuseOSError, Operations
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Set
 
 from .backends.base import Backend
 from .cache import CacheManager
-from .state import StateManager, FileMetadata, FileConfig, SyncStatus
+from .state import StateManager, FileMetadata, FileConfig, SyncStatus, FileLocation
 from .replication import ReplicationManager
 from .sync import SyncManager
 from .recompute import RecomputeEngine
@@ -32,7 +37,7 @@ class StorageFS(Operations):
     """
 
     def __init__(self, cache_root: Path, state_db: Path, backends: Dict[str, Backend],
-                 cache_size: int, num_sync_workers: int = 2):
+                 cache_size: int, num_sync_workers: int = 2, start_sync: bool = True):
         """
         Initialize Storage filesystem
 
@@ -55,7 +60,10 @@ class StorageFS(Operations):
             self.replication_manager,
             num_workers=num_sync_workers
         )
-        self.sync_manager.start()
+        self._sync_started = False
+        if start_sync:
+            self.sync_manager.start()
+            self._sync_started = True
 
         # Recomputation engine
         self.recompute_engine = RecomputeEngine(self.state_manager)
@@ -64,6 +72,23 @@ class StorageFS(Operations):
         self._fd_counter = 0
         self._fd_map = {}  # fd -> (virtual_path, cache_path, flags)
         self._fd_lock = threading.Lock()
+
+        # Directory listing cache (per directory, per backend) for fallback when backend unavailable
+        self._dir_cache: Dict[str, Dict[str, Set[str]]] = {}
+        self._dir_cache_lock = threading.Lock()
+
+        self.logger = logging.getLogger(__name__)
+
+    def init(self, path):
+        """
+        FUSE init hook (runs after mount, post-fork in background mode).
+
+        Args:
+            path: Mount path provided by FUSE (unused in this implementation).
+        """
+        if not self._sync_started:
+            self.sync_manager.start()
+            self._sync_started = True
 
     def _get_config(self, virtual_path: str) -> FileConfig:
         """Get configuration for a file"""
@@ -87,9 +112,72 @@ class StorageFS(Operations):
         # Try to download from a backend
         backend = self.replication_manager.get_backend_for_read(virtual_path)
 
+        # If state is unaware, probe backends by availability/priority
+        if not backend:
+            available = [b for b in self.backends.values() if b.is_available()]
+            available.sort(key=lambda b: b.speed_priority)
+            for cand in available:
+                try:
+                    if cand.exists(virtual_path):
+                        backend = cand
+                        break
+                except Exception:
+                    continue
+
         if backend:
             # Download to cache
             if self.cache_manager.cache_file(virtual_path, backend):
+                # Populate state metadata and locations if missing
+                cache_path = self.cache_manager.get_cache_path(virtual_path)
+                try:
+                    st = os.lstat(str(cache_path))
+                except OSError:
+                    return True
+
+                metadata = self.state_manager.get_file_metadata(virtual_path)
+                if not metadata:
+                    config = self._get_config(virtual_path)
+                    metadata = FileMetadata(
+                        virtual_path=virtual_path,
+                        size=st.st_size,
+                        checksum=None,
+                        last_access=time.time(),
+                        last_modified=st.st_mtime,
+                        sync_status=SyncStatus.CLEAN,
+                        replica_count=config.replica_count,
+                        recomputable=config.recomputable,
+                        recompute_cmd=config.recompute_cmd,
+                        encrypted=config.encrypted,
+                        encryption_key_id=None,
+                    )
+                    self.state_manager.set_file_metadata(metadata)
+
+                # Record locations
+                try:
+                    self.state_manager.add_file_location(
+                        FileLocation(
+                            virtual_path=virtual_path,
+                            backend_name=backend.name,
+                            checksum=metadata.checksum or '',
+                            last_synced=time.time(),
+                            is_cached=False,
+                        )
+                    )
+                except Exception:
+                    pass
+                try:
+                    self.state_manager.add_file_location(
+                        FileLocation(
+                            virtual_path=virtual_path,
+                            backend_name="cache",
+                            checksum=metadata.checksum or '',
+                            last_synced=time.time(),
+                            is_cached=True,
+                        )
+                    )
+                except Exception:
+                    pass
+
                 return True
 
         # File not in cache or backends - try recomputation
@@ -117,22 +205,56 @@ class StorageFS(Operations):
                 'st_atime', 'st_ctime', 'st_gid', 'st_mode', 'st_mtime',
                 'st_nlink', 'st_size', 'st_uid'))
         except OSError as e:
+            # Fallback: query backends for non-cached entries (e.g., remote-only files)
+            for backend_name, backend in self.backends.items():
+                try:
+                    st = backend.stat(path)
+                    return {
+                        'st_atime': getattr(st, 'st_atime', time.time()),
+                        'st_ctime': getattr(st, 'st_ctime', getattr(st, 'st_mtime', time.time())),
+                        'st_gid': getattr(st, 'st_gid', os.getgid()),
+                        'st_mode': getattr(st, 'st_mode', stat.S_IFREG | 0o644),
+                        'st_mtime': getattr(st, 'st_mtime', time.time()),
+                        'st_nlink': getattr(st, 'st_nlink', 1),
+                        'st_size': getattr(st, 'st_size', 0),
+                        'st_uid': getattr(st, 'st_uid', os.getuid()),
+                    }
+                except Exception as be:
+                    self.logger.debug("getattr backend fallback failed for %s on %s: %s", path, backend_name, be)
+
             raise FuseOSError(e.errno)
 
     def readdir(self, path, fh):
         """Read directory contents"""
         cache_path = self.cache_manager.get_cache_path(path)
 
-        dirents = ['.', '..']
+        entries: Set[str] = {'.', '..'}
 
         # Get from cache
         if cache_path.exists() and cache_path.is_dir():
-            dirents.extend(os.listdir(str(cache_path)))
+            entries.update(os.listdir(str(cache_path)))
 
-        # Also merge from backends (union view)
-        # TODO: Implement proper directory merging across backends
+        # Merge listings from backends; cache for fallback on connection issues
+        with self._dir_cache_lock:
+            dir_cache = self._dir_cache.setdefault(path, {})
 
-        for r in dirents:
+            for backend_name, backend in self.backends.items():
+                try:
+                    if backend.isdir(path):
+                        backend_entries = set(backend.listdir(path))
+                    else:
+                        backend_entries = set()
+                    entries.update(backend_entries)
+                    dir_cache[backend_name] = backend_entries
+                except Exception as exc:
+                    cached = dir_cache.get(backend_name, set())
+                    if cached:
+                        entries.update(cached)
+                    self.logger.debug(
+                        "readdir fallback for %s on backend %s due to %s", path, backend_name, exc
+                    )
+
+        for r in sorted(entries):
             yield r
 
     def mkdir(self, path, mode):
@@ -453,6 +575,34 @@ class StorageFS(Operations):
         self.state_manager.close()
 
 
+def _acquire_mount_lock(lock_path: Path, mountpoint: str):
+    """Take an exclusive, non-blocking lock to prevent duplicate mounts."""
+    lock_file = None
+    try:
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+        lock_file = os.fdopen(fd, 'r+')
+        try:
+            fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            try:
+                existing = lock_file.read().strip()
+            finally:
+                lock_file.close()
+            raise RuntimeError(
+                f"Mount already active for {mountpoint}" + (f" (pid {existing})" if existing else "")
+            )
+
+        lock_file.seek(0)
+        lock_file.truncate()
+        lock_file.write(str(os.getpid()))
+        lock_file.flush()
+        return lock_file
+    except Exception:
+        if lock_file:
+            lock_file.close()
+        raise
+
+
 def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
                  backends: Dict[str, Backend], cache_size: int,
                  foreground: bool = False, num_sync_workers: int = 2,
@@ -474,7 +624,6 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
     Raises:
         PermissionError: If allow_other=True but not running as root and user_allow_other not set
     """
-    import logging
     logger = logging.getLogger(__name__)
 
     is_root = os.geteuid() == 0
@@ -502,5 +651,21 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
                 "to be set in /etc/fuse.conf (file not found)"
             )
 
-    fs = StorageFS(cache_root, state_db, backends, cache_size, num_sync_workers)
-    FUSE(fs, mountpoint, nothreads=True, foreground=foreground, allow_other=allow_other)
+    # Prevent duplicate mounts on the same cache/mountpoint
+    mount_hash = hashlib.sha256(str(mountpoint).encode('utf-8')).hexdigest()[:12]
+    lock_path = cache_root / f'.storage.mount.{mount_hash}.lock'
+    try:
+        lock_file = _acquire_mount_lock(lock_path, mountpoint)
+        logger.info("Acquired mount lock at %s for %s", lock_path, mountpoint)
+    except RuntimeError as e:
+        logger.error(str(e))
+        raise
+
+    fs = StorageFS(cache_root, state_db, backends, cache_size, num_sync_workers, start_sync=False)
+    try:
+        FUSE(fs, mountpoint, nothreads=True, foreground=foreground, allow_other=allow_other)
+    finally:
+        try:
+            lock_file.close()
+        except Exception:
+            logger.exception("Exception occurred while closing mount lock file")

@@ -16,7 +16,8 @@ class SSHBackend(Backend):
     def __init__(self, name: str, host: str, remote_path: str,
                  username: str, password: Optional[str] = None,
                  key_filename: Optional[str] = None,
-                 port: int = 22, speed_priority: int = 50):
+                 port: int = 22, speed_priority: int = 50,
+                 connect_timeout: float = 10.0):
         """
         Initialize SSH backend
 
@@ -29,6 +30,7 @@ class SSHBackend(Backend):
             key_filename: Path to private key file
             port: SSH port (default 22)
             speed_priority: Speed priority (default 50 for remote)
+            connect_timeout: Timeout in seconds for SSH banner/connect and SFTP socket ops
         """
         super().__init__(name, BackendType.SSH, is_remote=True, speed_priority=speed_priority)
 
@@ -38,13 +40,11 @@ class SSHBackend(Backend):
         self.username = username
         self.password = password
         self.key_filename = key_filename
+        self.connect_timeout = connect_timeout
 
-        # SSH/SFTP connections
+        # SSH/SFTP connections (lazy connected)
         self._ssh_client: Optional[paramiko.SSHClient] = None
         self._sftp_client: Optional[paramiko.SFTPClient] = None
-
-        # Connect
-        self._connect()
 
     def _connect(self):
         """Establish SSH/SFTP connection"""
@@ -56,6 +56,8 @@ class SSHBackend(Backend):
                 'hostname': self.host,
                 'port': self.port,
                 'username': self.username,
+                'timeout': self.connect_timeout,
+                'banner_timeout': self.connect_timeout,
             }
 
             if self.password:
@@ -65,6 +67,15 @@ class SSHBackend(Backend):
 
             self._ssh_client.connect(**connect_kwargs)
             self._sftp_client = self._ssh_client.open_sftp()
+
+            # Ensure the underlying socket respects the timeout for SFTP ops
+            transport = self._ssh_client.get_transport()
+            if transport and transport.sock:
+                try:
+                    transport.sock.settimeout(self.connect_timeout)
+                except Exception:
+                    # Best-effort; SFTP may still function without socket-level timeout
+                    pass
 
             self.set_available(True)
 
@@ -274,6 +285,11 @@ class SSHBackend(Backend):
         """Sync any buffered writes"""
         # SFTP writes are synchronous
         pass
+
+    def stat(self, virtual_path: str):
+        self._ensure_connected()
+        remote_path = str(self._resolve_path(virtual_path))
+        return self._sftp_client.stat(remote_path)
 
     def close(self):
         """Close SSH/SFTP connections"""

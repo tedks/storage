@@ -145,35 +145,41 @@ storage configure /mnt/storage/documents --replicas 2
 ## Recommended Next Steps
 
 ### Critical (Required for Basic Functionality)
-1. **Implement directory merging across backends** (`fs.py:133`)
-   - Make `readdir()` query all backends and merge results
-   - Critical for remote filesystem use case
-
-2. **Implement key persistence** (`crypto.py:114`, `crypto.py:119`)
-   - Save/load encryption keys securely
-   - Required for encryption to be usable across sessions
+1. **Implement key persistence** (`crypto.py:114`, `crypto.py:119`) — DONE
+   - Keys now persist to `~/.local/storage/keys.json` with 0600 perms; secure keystore still TODO
 
 ### High Priority (Claimed but Incomplete)
-3. **Implement over-replication detection** (`spacemgmt.py:76`)
+2. **Implement over-replication detection** (`spacemgmt.py:76`)
    - Query state database for file locations
    - Compare against replica_count configuration
 
-4. **Implement defragmentation file queries** (`spacemgmt.py:168`)
+3. **Implement defragmentation file queries** (`spacemgmt.py:168`)
    - Track which files are on which backends
    - Enable actual file movement between backends
 
-5. **Propagate directory operations to backends**
+4. **Propagate directory operations to backends**
    - mkdir/rmdir/unlink/rename should sync to backends
    - Either sync immediately or queue for background workers
 
 ### Optional Enhancements
-6. **Add SSH backend tests** - Mock SFTP connections for testing
-7. **Performance testing** - Benchmark with large files and many backends
+5. **Add SSH backend tests** - Mock SFTP connections to validate ssh backend behavior and regressions
+6. **Performance benchmarks** - Benchmark mount/read/write/sync throughput and latency across many backends and file sizes
+7. **Conflict-resolution tooling** - Keep resolution manual, but add helper tools (better diff/merge prompts, reporting) to make user-led resolution easier
 8. **Documentation** - Man pages, examples, troubleshooting guide
-9. **Three-way merge** - Add merge support in conflict resolver
-10. **Web UI** - Optional web interface for monitoring and management
-11. **Metrics/monitoring** - Prometheus/Grafana integration
-12. **Smart backend optimization** - Hot/cold file movement based on access patterns
+9. **Web UI** - Optional web interface for monitoring and management
+10. **Metrics/monitoring** - Prometheus/Grafana integration
+11. **Smart backend optimization** - Hot/cold file movement based on access patterns (extend spacemgmt smart optimization TODO)
+12. **Persist directory listings to cache** - On readdir, asynchronously mirror directory entries into local cache (create dirs/empty files, handle conflicting names as <name>.<remote>) so listings survive backend outages (planned)
+13. **Remote inotify daemon for state refresh** - Push remote dir changes into local sqlite/xattr cache to avoid stale listings when backends unreachable (planned)
+14. **Secure key storage backend** - Replace local ~/.local/storage key file with keystore/HSM/agent integration for persisted keys (planned)
+
+## Recent Worklog (codex_finish_implementation)
+
+- Merged backend directory listings and backend-stat fallback so remote-only files/dirs are visible with accurate metadata; added thread-safe dir cache and hashed per-mount lock files.
+- Remote reads now probe available backends, download to cache, and populate state metadata/locations even when state was unaware of the file.
+- SSH backend now lazy-connects with connect timeouts; sync workers start post-FUSE init to avoid pre-fork threads. Added mount/unmount scripts with lock safety.
+- Encryption keys now persist to `~/.local/storage/keys.json` with 0600 perms; Fernet key format clarified. Secure keystore remains TODO.
+- Added tests for remote getattr/open, dir cache thread safety/scoping, mount locks, and key persistence.
 
 ## Performance Characteristics
 
@@ -186,35 +192,31 @@ storage configure /mnt/storage/documents --replicas 2
 ## Known Limitations
 
 ### Critical Limitations
-1. **Directory listing does not merge files from backends** (`fs.py:133`)
-   - Only files in cache are visible via `ls`/`readdir()`
-   - Files that exist only on remote backends are invisible
-   - Files can still be accessed directly by path if you know the filename
-   - This significantly impacts the "remote filesystem with cache" use case
-
-### Directory Operations
-2. **Directory operations not replicated to backends** (by design - cache-first)
+1. **Directory operations not replicated to backends** (by design - cache-first)
    - mkdir/rmdir only affect cache (`fs.py:146`, `fs.py:158`)
    - File deletions (unlink) only remove from cache (`fs.py:173`)
    - Renames only update cache (`fs.py:187`)
    - Background sync only propagates file *content*, not directory structure
 
 ### Space Management Limitations
-3. **Over-replication detection not implemented** (`spacemgmt.py:76`)
+2. **Over-replication detection not implemented** (`spacemgmt.py:76`)
    - `find_over_replicated_files()` returns empty list (stub)
    - `cleanup_over_replication()` does nothing as a result
-4. **Defragmentation not implemented** (`spacemgmt.py:168`)
+3. **Defragmentation not implemented** (`spacemgmt.py:168`)
    - Structure exists but file movement not implemented
    - Returns 0 bytes moved
-5. **Backend-specific space reclamation incomplete** (`spacemgmt.py:199`)
+4. **Backend-specific space reclamation incomplete** (`spacemgmt.py:199`)
    - Can only reclaim space from cache, not backends
 
 ### Encryption Limitations
-6. **Encryption keys are ephemeral**
-   - Keys only exist in-memory during mount session
-   - Key persistence not implemented (`crypto.py:114`, `crypto.py:119`)
-   - Files encrypted in one session cannot be decrypted in future sessions
-   - Each mount generates a new default key
+5. **Persisted keys lack secure keystore**
+   - Keys are persisted locally with 0600 perms but not encrypted at rest
+
+### General Limitations
+6. No automatic conflict resolution (by design - user must resolve)
+7. Whole-file caching (no partial file caching)
+8. No support for very large files (>cache size)
+9. Extended attributes may not work on all filesystems
 
 ### General Limitations
 7. No automatic conflict resolution (by design - user must resolve)
@@ -236,19 +238,17 @@ storage configure /mnt/storage/documents --replicas 2
 - ✅ FUSE filesystem with smart allow_other handling
 
 ### Partially Implemented ⚠️
-- ⚠️ Transparent encryption (works but keys don't persist)
+- ⚠️ Transparent encryption (works, keys persist locally but not in a secure keystore)
 - ⚠️ Space management (LRU and cache reclamation work, but over-replication detection and defrag are stubs)
 - ⚠️ Directory operations (cache-only, not synced to backends)
 
 ### Not Working ❌
-- ❌ Directory listing from backends (only shows cached files)
 - ❌ Over-replication cleanup (detection returns empty)
 - ❌ Defragmentation (stub implementation)
 
 ### Use Case Support Assessment
 1. ⚠️ **Remote filesystems with local cache**
-   - Works for known files (can read/write by path)
-   - **Does not work** for discovering remote files (directory listing broken)
+   - Works for discovering and reading remote files (directory listing merged across backends; backend stat fallback)
    - Offline usage works if files were previously cached
 
 2. ✅ **Multiple RAIDs with flexible replication**
@@ -256,5 +256,5 @@ storage configure /mnt/storage/documents --replicas 2
    - Background sync properly replicates to backends
 
 3. ⚠️ **Cloud storage with transparent encryption**
-   - Encryption works within a single session
-   - **Does not work** across sessions (key persistence missing)
+   - Encryption works within a single session; keys persisted locally
+   - No secure keystore yet; keys stored in local file with 0600 perms

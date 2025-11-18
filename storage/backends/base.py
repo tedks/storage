@@ -8,6 +8,7 @@ from abc import ABC, abstractmethod
 from enum import Enum
 from pathlib import Path
 from typing import Optional, List
+import os
 from dataclasses import dataclass
 
 
@@ -121,6 +122,10 @@ class Backend(ABC):
     def get_free_space(self) -> Optional[int]:
         """Get free space in bytes, None if unknown"""
         pass
+
+    def stat(self, virtual_path: str) -> os.stat_result:
+        """Get full stat info for a path"""
+        raise NotImplementedError
 
     @abstractmethod
     def sync(self):
