@@ -74,6 +74,7 @@ class SSHBackend(Backend):
                 try:
                     transport.sock.settimeout(self.connect_timeout)
                 except Exception:
+                    # Best-effort; SFTP may still function without socket-level timeout
                     pass
 
             self.set_available(True)

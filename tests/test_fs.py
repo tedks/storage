@@ -5,6 +5,7 @@ import stat
 from pathlib import Path
 import multiprocessing as mp
 import threading
+import os
 
 from storage.fs import StorageFS
 from storage.fs import _acquire_mount_lock
@@ -86,6 +87,22 @@ class TestReaddirMerging(unittest.TestCase):
 
         attrs = self.fs.getattr('/subdir')
         self.assertTrue(stat.S_ISDIR(attrs['st_mode']))
+
+    def test_open_reads_remote_only_file_and_populates_state(self):
+        content = "remote-data"
+        (self.backend1_dir / "remote.txt").write_text(content)
+
+        vfd = self.fs.open('/remote.txt', os.O_RDONLY)
+        data = self.fs.read('/remote.txt', 1024, 0, vfd)
+        self.fs.release('/remote.txt', vfd)
+
+        self.assertEqual(data.decode(), content)
+        meta = self.fs.state_manager.get_file_metadata('/remote.txt')
+        self.assertIsNotNone(meta)
+        locations = self.fs.state_manager.get_file_locations('/remote.txt')
+        backend_names = {loc.backend_name for loc in locations}
+        self.assertIn('backend1', backend_names)
+        self.assertIn('cache', backend_names)
 
     def test_readdir_thread_safety(self):
         (self.backend1_dir / "threaded.txt").write_text("data")

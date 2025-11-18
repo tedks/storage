@@ -22,7 +22,7 @@ from typing import Dict, Optional, Set
 
 from .backends.base import Backend
 from .cache import CacheManager
-from .state import StateManager, FileMetadata, FileConfig, SyncStatus
+from .state import StateManager, FileMetadata, FileConfig, SyncStatus, FileLocation
 from .replication import ReplicationManager
 from .sync import SyncManager
 from .recompute import RecomputeEngine
@@ -112,9 +112,72 @@ class StorageFS(Operations):
         # Try to download from a backend
         backend = self.replication_manager.get_backend_for_read(virtual_path)
 
+        # If state is unaware, probe backends by availability/priority
+        if not backend:
+            available = [b for b in self.backends.values() if b.is_available()]
+            available.sort(key=lambda b: b.speed_priority)
+            for cand in available:
+                try:
+                    if cand.exists(virtual_path):
+                        backend = cand
+                        break
+                except Exception:
+                    continue
+
         if backend:
             # Download to cache
             if self.cache_manager.cache_file(virtual_path, backend):
+                # Populate state metadata and locations if missing
+                cache_path = self.cache_manager.get_cache_path(virtual_path)
+                try:
+                    st = os.lstat(str(cache_path))
+                except OSError:
+                    return True
+
+                metadata = self.state_manager.get_file_metadata(virtual_path)
+                if not metadata:
+                    config = self._get_config(virtual_path)
+                    metadata = FileMetadata(
+                        virtual_path=virtual_path,
+                        size=st.st_size,
+                        checksum=None,
+                        last_access=time.time(),
+                        last_modified=st.st_mtime,
+                        sync_status=SyncStatus.CLEAN,
+                        replica_count=config.replica_count,
+                        recomputable=config.recomputable,
+                        recompute_cmd=config.recompute_cmd,
+                        encrypted=config.encrypted,
+                        encryption_key_id=None,
+                    )
+                    self.state_manager.set_file_metadata(metadata)
+
+                # Record locations
+                try:
+                    self.state_manager.add_file_location(
+                        FileLocation(
+                            virtual_path=virtual_path,
+                            backend_name=backend.name,
+                            checksum=metadata.checksum or '',
+                            last_synced=time.time(),
+                            is_cached=False,
+                        )
+                    )
+                except Exception:
+                    pass
+                try:
+                    self.state_manager.add_file_location(
+                        FileLocation(
+                            virtual_path=virtual_path,
+                            backend_name="cache",
+                            checksum=metadata.checksum or '',
+                            last_synced=time.time(),
+                            is_cached=True,
+                        )
+                    )
+                except Exception:
+                    pass
+
                 return True
 
         # File not in cache or backends - try recomputation
@@ -514,19 +577,6 @@ class StorageFS(Operations):
 
 def _acquire_mount_lock(lock_path: Path, mountpoint: str):
     """Take an exclusive, non-blocking lock to prevent duplicate mounts."""
-    # Clean up stale lock files (pid not running)
-    if lock_path.exists():
-        try:
-            existing_pid = int(lock_path.read_text().strip())
-            # kill(pid, 0) checks for existence without signal delivery
-            os.kill(existing_pid, 0)
-        except (ValueError, ProcessLookupError, OSError):
-            try:
-                lock_path.unlink()
-            except OSError:
-                # Ignore errors when removing stale lock file
-                pass
-
     lock_file = None
     try:
         fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
