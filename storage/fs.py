@@ -562,7 +562,6 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
     Raises:
         PermissionError: If allow_other=True but not running as root and user_allow_other not set
     """
-    import logging
     logger = logging.getLogger(__name__)
 
     is_root = os.geteuid() == 0
