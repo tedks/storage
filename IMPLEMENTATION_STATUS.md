@@ -145,9 +145,8 @@ storage configure /mnt/storage/documents --replicas 2
 ## Recommended Next Steps
 
 ### Critical (Required for Basic Functionality)
-1. **Implement key persistence** (`crypto.py:114`, `crypto.py:119`)
-   - Save/load encryption keys securely
-   - Required for encryption to be usable across sessions
+1. **Implement key persistence** (`crypto.py:114`, `crypto.py:119`) — DONE
+   - Keys now persist to `~/.local/storage/keys.json` with 0600 perms; secure keystore still TODO
 
 ### High Priority (Claimed but Incomplete)
 2. **Implement over-replication detection** (`spacemgmt.py:76`)
@@ -170,9 +169,17 @@ storage configure /mnt/storage/documents --replicas 2
 9. **Web UI** - Optional web interface for monitoring and management
 10. **Metrics/monitoring** - Prometheus/Grafana integration
 11. **Smart backend optimization** - Hot/cold file movement based on access patterns (extend spacemgmt smart optimization TODO)
-12. **Persist directory listings to cache** - On readdir, asynchronously mirror directory entries into local cache (create dirs/empty files, handle conflicting names as <name>.<remote>) so listings survive backend outages
-13. **Remote inotify daemon for state refresh** - Push remote dir changes into local sqlite/xattr cache to avoid stale listings when backends unreachable
-14. **Secure key storage backend** - Replace local ~/.local/storage key file with keystore/HSM/agent integration for persisted keys
+12. **Persist directory listings to cache** - On readdir, asynchronously mirror directory entries into local cache (create dirs/empty files, handle conflicting names as <name>.<remote>) so listings survive backend outages (planned)
+13. **Remote inotify daemon for state refresh** - Push remote dir changes into local sqlite/xattr cache to avoid stale listings when backends unreachable (planned)
+14. **Secure key storage backend** - Replace local ~/.local/storage key file with keystore/HSM/agent integration for persisted keys (planned)
+
+## Recent Worklog (codex_finish_implementation)
+
+- Merged backend directory listings and backend-stat fallback so remote-only files/dirs are visible with accurate metadata; added thread-safe dir cache and hashed per-mount lock files.
+- Remote reads now probe available backends, download to cache, and populate state metadata/locations even when state was unaware of the file.
+- SSH backend now lazy-connects with connect timeouts; sync workers start post-FUSE init to avoid pre-fork threads. Added mount/unmount scripts with lock safety.
+- Encryption keys now persist to `~/.local/storage/keys.json` with 0600 perms; Fernet key format clarified. Secure keystore remains TODO.
+- Added tests for remote getattr/open, dir cache thread safety/scoping, mount locks, and key persistence.
 
 ## Performance Characteristics
 
@@ -202,11 +209,14 @@ storage configure /mnt/storage/documents --replicas 2
    - Can only reclaim space from cache, not backends
 
 ### Encryption Limitations
-6. **Encryption keys are ephemeral**
-   - Keys only exist in-memory during mount session
-   - Key persistence not implemented (`crypto.py:114`, `crypto.py:119`)
-   - Files encrypted in one session cannot be decrypted in future sessions
-   - Each mount generates a new default key
+5. **Persisted keys lack secure keystore**
+   - Keys are persisted locally with 0600 perms but not encrypted at rest
+
+### General Limitations
+6. No automatic conflict resolution (by design - user must resolve)
+7. Whole-file caching (no partial file caching)
+8. No support for very large files (>cache size)
+9. Extended attributes may not work on all filesystems
 
 ### General Limitations
 7. No automatic conflict resolution (by design - user must resolve)
@@ -228,19 +238,17 @@ storage configure /mnt/storage/documents --replicas 2
 - ✅ FUSE filesystem with smart allow_other handling
 
 ### Partially Implemented ⚠️
-- ⚠️ Transparent encryption (works but keys don't persist)
+- ⚠️ Transparent encryption (works, keys persist locally but not in a secure keystore)
 - ⚠️ Space management (LRU and cache reclamation work, but over-replication detection and defrag are stubs)
 - ⚠️ Directory operations (cache-only, not synced to backends)
 
 ### Not Working ❌
-- ❌ Directory listing from backends (only shows cached files)
 - ❌ Over-replication cleanup (detection returns empty)
 - ❌ Defragmentation (stub implementation)
 
 ### Use Case Support Assessment
 1. ⚠️ **Remote filesystems with local cache**
-   - Works for known files (can read/write by path)
-   - **Does not work** for discovering remote files (directory listing broken)
+   - Works for discovering and reading remote files (directory listing merged across backends; backend stat fallback)
    - Offline usage works if files were previously cached
 
 2. ✅ **Multiple RAIDs with flexible replication**
@@ -248,5 +256,5 @@ storage configure /mnt/storage/documents --replicas 2
    - Background sync properly replicates to backends
 
 3. ⚠️ **Cloud storage with transparent encryption**
-   - Encryption works within a single session
-   - **Does not work** across sessions (key persistence missing)
+   - Encryption works within a single session; keys persisted locally
+   - No secure keystore yet; keys stored in local file with 0600 perms
