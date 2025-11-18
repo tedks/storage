@@ -1,5 +1,5 @@
 #!/bin/bash
-set -euo pipefail
+set -eo pipefail
 
 MOUNTPOINT=${1:-"$HOME/Downloads/storage-test"}
 

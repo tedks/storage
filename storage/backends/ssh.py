@@ -30,6 +30,7 @@ class SSHBackend(Backend):
             key_filename: Path to private key file
             port: SSH port (default 22)
             speed_priority: Speed priority (default 50 for remote)
+            connect_timeout: Timeout in seconds for SSH banner/connect and SFTP socket ops
         """
         super().__init__(name, BackendType.SSH, is_remote=True, speed_priority=speed_priority)
 

@@ -80,7 +80,12 @@ class StorageFS(Operations):
         self.logger = logging.getLogger(__name__)
 
     def init(self, path):
-        """FUSE init hook (runs after mount, post-fork in background mode)."""
+        """
+        FUSE init hook (runs after mount, post-fork in background mode).
+
+        Args:
+            path: Mount path provided by FUSE (unused in this implementation).
+        """
         if not self._sync_started:
             self.sync_manager.start()
             self._sync_started = True
@@ -519,26 +524,33 @@ def _acquire_mount_lock(lock_path: Path, mountpoint: str):
             try:
                 lock_path.unlink()
             except OSError:
+                # Ignore errors when removing stale lock file
                 pass
 
-    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT)
-    lock_file = os.fdopen(fd, 'r+')
+    lock_file = None
     try:
-        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+        lock_file = os.fdopen(fd, 'r+')
         try:
-            existing = lock_file.read().strip()
-        finally:
-            lock_file.close()
-        raise RuntimeError(
-            f"Mount already active for {mountpoint}" + (f" (pid {existing})" if existing else "")
-        )
+            fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            try:
+                existing = lock_file.read().strip()
+            finally:
+                lock_file.close()
+            raise RuntimeError(
+                f"Mount already active for {mountpoint}" + (f" (pid {existing})" if existing else "")
+            )
 
-    lock_file.seek(0)
-    lock_file.truncate()
-    lock_file.write(str(os.getpid()))
-    lock_file.flush()
-    return lock_file
+        lock_file.seek(0)
+        lock_file.truncate()
+        lock_file.write(str(os.getpid()))
+        lock_file.flush()
+        return lock_file
+    except Exception:
+        if lock_file:
+            lock_file.close()
+        raise
 
 
 def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
@@ -606,4 +618,4 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
         try:
             lock_file.close()
         except Exception:
-            pass
+            logger.exception("Exception occurred while closing mount lock file")

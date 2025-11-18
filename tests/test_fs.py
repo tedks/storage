@@ -122,8 +122,7 @@ def _try_lock(lock_path_str, mountpoint, return_dict):
     lock_path = Path(lock_path_str)
     try:
         with _acquire_mount_lock(lock_path, mountpoint) as lf:
-            lf.close()
-        return_dict['acquired'] = True
+            return_dict['acquired'] = True
     except RuntimeError:
         return_dict['acquired'] = False
 
@@ -144,7 +143,7 @@ class TestMountLock(unittest.TestCase):
 
             self.assertFalse(ret.get('acquired', True))
 
-            # Cleanup
+            # Release lock after verification
             lock_file.close()
 
     def test_mount_lock_allows_same_cache_different_mount(self):

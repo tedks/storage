@@ -163,14 +163,14 @@ storage configure /mnt/storage/documents --replicas 2
    - Either sync immediately or queue for background workers
 
 ### Optional Enhancements
-6. **Add SSH backend tests** - Mock SFTP connections to validate ssh backend behavior and regressions
-7. **Performance benchmarks** - Benchmark mount/read/write/sync throughput and latency across many backends and file sizes
-8. **Conflict-resolution tooling** - Keep resolution manual, but add helper tools (better diff/merge prompts, reporting) to make user-led resolution easier
-9. **Documentation** - Man pages, examples, troubleshooting guide
-10. **Web UI** - Optional web interface for monitoring and management
-11. **Metrics/monitoring** - Prometheus/Grafana integration
-12. **Smart backend optimization** - Hot/cold file movement based on access patterns (extend spacemgmt smart optimization TODO)
-13. **Persist directory listings to cache** - On readdir, asynchronously mirror directory entries into local cache (create dirs/empty files, handle conflicting names as <name>.<remote>) so listings survive backend outages
+5. **Add SSH backend tests** - Mock SFTP connections to validate ssh backend behavior and regressions
+6. **Performance benchmarks** - Benchmark mount/read/write/sync throughput and latency across many backends and file sizes
+7. **Conflict-resolution tooling** - Keep resolution manual, but add helper tools (better diff/merge prompts, reporting) to make user-led resolution easier
+8. **Documentation** - Man pages, examples, troubleshooting guide
+9. **Web UI** - Optional web interface for monitoring and management
+10. **Metrics/monitoring** - Prometheus/Grafana integration
+11. **Smart backend optimization** - Hot/cold file movement based on access patterns (extend spacemgmt smart optimization TODO)
+12. **Persist directory listings to cache** - On readdir, asynchronously mirror directory entries into local cache (create dirs/empty files, handle conflicting names as <name>.<remote>) so listings survive backend outages
 13. **Remote inotify daemon for state refresh** - Push remote dir changes into local sqlite/xattr cache to avoid stale listings when backends unreachable
 14. **Secure key storage backend** - Replace local ~/.local/storage key file with keystore/HSM/agent integration for persisted keys
 

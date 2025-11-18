@@ -28,7 +28,7 @@ class EncryptionKey:
 
         Args:
             key_id: Unique identifier for this key
-            key_material: 32-byte key material
+            key_material: Fernet-compatible key material (44-byte base64 encoded or will be generated)
         """
         self.key_id = key_id
         self.key_material = key_material if len(key_material) == 44 else Fernet.generate_key()
@@ -139,7 +139,11 @@ class KeyManager:
             } for key in self.keys.values()]
 
             self.key_storage_path.parent.mkdir(parents=True, exist_ok=True)
-            self.key_storage_path.write_text(json.dumps(records))
+
+            flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+            mode = 0o600
+            with os.fdopen(os.open(self.key_storage_path, flags, mode), 'w') as f:
+                f.write(json.dumps(records))
             os.chmod(self.key_storage_path, 0o600)
         except Exception as exc:
             logging.getLogger(__name__).warning(
