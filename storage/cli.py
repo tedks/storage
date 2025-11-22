@@ -5,6 +5,7 @@ CLI tool for Storage filesystem
 import click
 import sys
 from pathlib import Path
+from typing import Optional
 
 from .backends.local import LocalBackend
 from .backends.ssh import SSHBackend
@@ -282,6 +283,117 @@ def parse_size(size_str: str) -> int:
         return int(size_str)
     except ValueError:
         raise ValueError(f"Invalid size format: {size_str}")
+
+
+def _scan_conflict_groups(directory: Path):
+    """Return list of (base, {backend: path}) conflicts in directory."""
+    groups = {}
+    for entry in directory.iterdir():
+        if entry.is_dir():
+            continue
+        parts = entry.name.split('.')
+        if len(parts) < 2:
+            continue
+        backend = parts[-1]
+        base = '.'.join(parts[:-1])
+        if not base:
+            continue
+        groups.setdefault(base, {})[backend] = entry
+
+    conflicts = []
+    for base, files in groups.items():
+        if len(files) >= 2:
+            conflicts.append((base, files))
+    return conflicts
+
+
+def _attempt_merge_bytes(content_a: bytes, content_b: bytes) -> Optional[bytes]:
+    """
+    Simple 2-way merge:
+    - if identical, return either
+    - if one is a prefix of the other, return the longer
+    - otherwise, return None to signal conflict
+    """
+    if content_a == content_b:
+        return content_a
+    if content_a.startswith(content_b):
+        return content_a
+    if content_b.startswith(content_a):
+        return content_b
+    return None
+
+
+@main.command('conflicts')
+@click.argument('directory', type=click.Path(exists=True))
+@click.option('--take', '--use', '--resolve', 'take_backend', help='Backend name to take for all conflicts')
+@click.option('--merge', '--meld', 'merge', is_flag=True, help='Attempt an automatic merge')
+def conflicts(directory, take_backend, merge):
+    """
+    List and resolve checksum conflicts in a mounted directory.
+
+    When files differ across backends they appear as <name>.<backend>.
+    Use --take/--use/--resolve BACKEND to pick one version everywhere,
+    or --merge/--meld to attempt a trivial merge when possible.
+    """
+    dir_path = Path(directory)
+    conflict_groups = _scan_conflict_groups(dir_path)
+
+    if not conflict_groups:
+        click.echo("No conflicts detected.")
+        return
+
+    if take_backend and merge:
+        click.echo("Choose either --take or --merge, not both.", err=True)
+        sys.exit(2)
+
+    if not take_backend and not merge:
+        click.echo(f"Found {len(conflict_groups)} conflict(s):")
+        for base, files in conflict_groups:
+            backends = ', '.join(sorted(files.keys()))
+            click.echo(f"  {base}: {backends}")
+        click.echo("\nUse --take <backend> or --merge to resolve.")
+        return
+
+    for base, files in conflict_groups:
+        if take_backend:
+            if take_backend not in files:
+                click.echo(f"Skipping {base}: no version from {take_backend}")
+                continue
+            source_bytes = files[take_backend].read_bytes()
+            for backend, path in files.items():
+                if backend == take_backend:
+                    # Ensure the source file has the selected content
+                    path.write_bytes(source_bytes)
+                    continue
+                path.write_bytes(source_bytes)
+            # Update the base name for convenience
+            try:
+                (dir_path / base).write_bytes(source_bytes)
+            except Exception:
+                pass
+            click.echo(f"{base}: took {take_backend}")
+        elif merge:
+            if len(files) < 2:
+                continue
+            # Take first two for merge attempt
+            backends = sorted(files.keys())
+            content_a = files[backends[0]].read_bytes()
+            content_b = files[backends[1]].read_bytes()
+            merged = _attempt_merge_bytes(content_a, content_b)
+            if merged is None:
+                click.echo(f"{base}: merge failed (manual resolution required)")
+                continue
+            for path in files.values():
+                path.write_bytes(merged)
+            try:
+                (dir_path / base).write_bytes(merged)
+            except Exception:
+                pass
+            click.echo(f"{base}: merged cleanly")
+
+    click.echo("Conflict resolution complete.")
+
+main.add_command(conflicts, name="conflict")
 
 
 @main.command('resolve')
