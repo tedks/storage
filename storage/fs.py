@@ -265,16 +265,26 @@ class StorageFS(Operations):
 
         # Check if already cached
         if self.cache_manager.is_cached(virtual_path):
-            self.cache_manager.mark_accessed(virtual_path)
+            if not backend_name:
+                self.cache_manager.mark_accessed(virtual_path)
             return True
 
         # If a backend is explicitly requested (conflict suffix), bypass replication manager
         if backend_name:
             backend = self.backends.get(backend_name)
+            cache_path = self.cache_manager.get_cache_path(virtual_path)
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
             if backend and backend.exists(canonical_path):
-                if self.cache_manager.cache_file(virtual_path, backend, source_virtual_path=canonical_path):
+                try:
+                    backend.copy_to_local(canonical_path, cache_path)
                     return True
-            return False
+                except Exception:
+                    pass
+            try:
+                cache_path.touch(exist_ok=True)
+                return True
+            except Exception:
+                return False
 
         # Try to download from a backend
         backend = self.replication_manager.get_backend_for_read(canonical_path)
@@ -557,8 +567,9 @@ class StorageFS(Operations):
                 self._fd_counter += 1
                 self._fd_map[vfd] = (path, cache_path, real_fd, flags, backend_name, canonical_path)
 
-            # Mark as accessed
-            self.cache_manager.mark_accessed(path)
+            # Mark as accessed for canonical paths only
+            if not backend_name:
+                self.cache_manager.mark_accessed(path)
 
             return vfd
 
@@ -607,14 +618,14 @@ class StorageFS(Operations):
         with self._fd_lock:
             if fh not in self._fd_map:
                 raise FuseOSError(errno.EBADF)
-            _, _, real_fd, _, _, _ = self._fd_map[fh]
+            _, _, real_fd, _, backend_name, _ = self._fd_map[fh]
 
         try:
             os.lseek(real_fd, offset, os.SEEK_SET)
             data = os.read(real_fd, size)
 
-            # Mark as accessed
-            self.cache_manager.mark_accessed(path)
+            if backend_name is None:
+                self.cache_manager.mark_accessed(path)
 
             return data
 
@@ -632,10 +643,8 @@ class StorageFS(Operations):
             os.lseek(real_fd, offset, os.SEEK_SET)
             written = os.write(real_fd, data)
 
-            # Mark as dirty and accessed
-            self.cache_manager.mark_accessed(path)
-
-            if not backend_name:
+            if backend_name is None:
+                self.cache_manager.mark_accessed(path)
                 metadata = self.state_manager.get_file_metadata(canonical_path)
                 if metadata:
                     metadata.sync_status = SyncStatus.DIRTY

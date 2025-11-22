@@ -163,6 +163,8 @@ class TestLocalConflictMount(BaseConflictMountTest):
                 "storage.cli",
                 "conflicts",
                 str(self.mount_dir),
+                "--file",
+                conflict0,
                 "--take",
                 self.backend0_name,
             ],
