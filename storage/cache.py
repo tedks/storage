@@ -198,26 +198,28 @@ class CacheManager:
         # Could not free enough space
         return False
 
-    def cache_file(self, virtual_path: str, backend: Backend) -> bool:
+    def cache_file(self, virtual_path: str, backend: Backend, source_virtual_path: str = None) -> bool:
         """
         Download a file from backend into cache
 
         Args:
             virtual_path: Virtual path of file
             backend: Backend to download from
+            source_virtual_path: Virtual path to read from backend (defaults to virtual_path)
 
         Returns:
             True if successfully cached, False otherwise
         """
+        source_virtual_path = source_virtual_path or virtual_path
         with self._lock:
             cache_path = self.get_cache_path(virtual_path)
 
             # Check if backend has the file
-            if not backend.exists(virtual_path):
+            if not backend.exists(source_virtual_path):
                 return False
 
             # Get file size to ensure we have space
-            file_size = backend.get_size(virtual_path)
+            file_size = backend.get_size(source_virtual_path)
 
             # Ensure we have space
             if not self.ensure_space(file_size):
@@ -226,7 +228,7 @@ class CacheManager:
 
             # Download file
             try:
-                backend.copy_to_local(virtual_path, cache_path)
+                backend.copy_to_local(source_virtual_path, cache_path)
 
                 # Update access time in state
                 self.state_manager.update_access_time(virtual_path)

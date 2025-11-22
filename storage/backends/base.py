@@ -139,3 +139,19 @@ class Backend(ABC):
     def set_available(self, available: bool):
         """Set backend availability status"""
         self._available = available
+
+    # Optional capabilities -------------------------------------------------
+    def get_fast_checksum(self, virtual_path: str) -> str:
+        """
+        Compute a checksum on the backend side without routing through the cache.
+        Implementations should avoid downloading the full file to the caller.
+        """
+        raise NotImplementedError
+
+    def set_xattr(self, virtual_path: str, name: str, value: bytes):
+        """Set an extended attribute on the backend file (best-effort)."""
+        raise NotImplementedError
+
+    def get_xattr(self, virtual_path: str, name: str):
+        """Get an extended attribute from the backend file (best-effort)."""
+        raise NotImplementedError
