@@ -9,6 +9,7 @@ from typing import List, Optional
 import os
 
 from .base import Backend, BackendType
+from ..checksums import fast_checksum_file
 
 
 class LocalBackend(Backend):
@@ -147,3 +148,24 @@ class LocalBackend(Backend):
 
     def __repr__(self):
         return f"LocalBackend(name={self.name}, root={self.root_path})"
+
+    # ------------------------------------------------------------------ #
+    # Optional capabilities used by conflict detection
+    # ------------------------------------------------------------------ #
+    def get_fast_checksum(self, virtual_path: str) -> str:
+        """Compute checksum directly from the real file without caching."""
+        real_path = self._resolve_path(virtual_path)
+        return fast_checksum_file(real_path)
+
+    def set_xattr(self, virtual_path: str, name: str, value: bytes):
+        try:
+            os.setxattr(str(self._resolve_path(virtual_path)), name, value)
+        except OSError:
+            # Best effort; some filesystems may not support xattrs
+            pass
+
+    def get_xattr(self, virtual_path: str, name: str):
+        try:
+            return os.getxattr(str(self._resolve_path(virtual_path)), name)
+        except OSError:
+            return None

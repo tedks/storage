@@ -16,6 +16,8 @@ import fcntl
 import stat
 import time
 import hashlib
+import yaml
+import concurrent.futures
 from fuse import FUSE, FuseOSError, Operations
 from pathlib import Path
 from typing import Dict, Optional, Set
@@ -26,6 +28,7 @@ from .state import StateManager, FileMetadata, FileConfig, SyncStatus, FileLocat
 from .replication import ReplicationManager
 from .sync import SyncManager
 from .recompute import RecomputeEngine
+from .checksums import ChecksumRecord
 
 
 class StorageFS(Operations):
@@ -35,6 +38,9 @@ class StorageFS(Operations):
     Implements a filesystem that multiplexes over multiple backing filesystems
     with local caching, replication, and background sync.
     """
+
+    CHECKSUM_XATTR = "user.storage.checksums"
+    _STUB_XATTR = "user.storage.stub"
 
     def __init__(self, cache_root: Path, state_db: Path, backends: Dict[str, Backend],
                  cache_size: int, num_sync_workers: int = 2, start_sync: bool = True):
@@ -70,12 +76,19 @@ class StorageFS(Operations):
 
         # File descriptor tracking
         self._fd_counter = 0
-        self._fd_map = {}  # fd -> (virtual_path, cache_path, flags)
+        # fd -> (virtual_path, cache_path, real_fd, flags, backend_hint, canonical_path)
+        self._fd_map = {}
         self._fd_lock = threading.Lock()
 
         # Directory listing cache (per directory, per backend) for fallback when backend unavailable
         self._dir_cache: Dict[str, Dict[str, Set[str]]] = {}
         self._dir_cache_lock = threading.Lock()
+
+        # Per-backend checksum index used for conflict surfacing
+        self._checksum_lock = threading.RLock()
+        self._checksum_records: Dict[tuple, ChecksumRecord] = {}
+        self._checksum_tasks: Dict[tuple, concurrent.futures.Future] = {}
+        self._checksum_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 
         self.logger = logging.getLogger(__name__)
 
@@ -95,22 +108,186 @@ class StorageFS(Operations):
         cache_path = self.cache_manager.get_cache_path(virtual_path)
         return self.state_manager.get_inherited_config(cache_path)
 
-    def _ensure_file_in_cache(self, virtual_path: str) -> bool:
+    # ------------------------------------------------------------------ #
+    # Conflict / checksum helpers
+    # ------------------------------------------------------------------ #
+    def _resolve_backend_target(self, path: str) -> tuple[str, Optional[str]]:
+        """
+        Split a virtual path into (canonical_path, backend_name).
+
+        If the name ends with .<backend>, we interpret that suffix as a request
+        to operate directly on that backend while keeping the canonical path
+        (without suffix) for remote operations.
+        """
+        p = Path(path)
+        name = p.name
+        for backend_name in self.backends.keys():
+            suffix = f".{backend_name}"
+            if name.endswith(suffix):
+                base = name[: -len(suffix)]
+                canonical = str(p.parent / base)
+                if not canonical.startswith("/"):
+                    canonical = "/" + canonical
+                return canonical, backend_name
+        canonical = path if path.startswith("/") else "/" + path
+        return canonical, None
+
+    def _record_checksum(self, canonical_path: str, backend_name: str, checksum: str, timestamp: float):
+        """Record a checksum for (path, backend) and keep only the latest."""
+        key = (canonical_path, backend_name)
+        with self._checksum_lock:
+            self._checksum_records[key] = ChecksumRecord(checksum=checksum, timestamp=timestamp)
+
+    def _aggregate_checksums_yaml(self, canonical_path: str) -> bytes:
+        """Return YAML list of '<backend>:<checksum>:<timestamp>' entries."""
+        with self._checksum_lock:
+            entries = [
+                f"{backend}:{record.checksum}:{record.timestamp}"
+                for (path, backend), record in self._checksum_records.items()
+                if path == canonical_path
+            ]
+        return yaml.dump(entries, default_flow_style=False).encode()
+
+    def _schedule_directory_checksums(self, dir_path: str, backend_entries: Dict[str, Set[str]]):
+        """Queue checksum computations for every file in the directory."""
+        for backend_name, names in backend_entries.items():
+            backend = self.backends.get(backend_name)
+            if not backend:
+                continue
+            for name in names:
+                virtual_child = str(Path(dir_path) / name)
+                try:
+                    if backend.isdir(virtual_child):
+                        continue
+                except Exception:
+                    pass
+                self._schedule_checksum_task(backend, virtual_child)
+
+    def _schedule_checksum_task(self, backend: Backend, canonical_path: str):
+        key = (canonical_path, backend.name)
+        with self._checksum_lock:
+            if key in self._checksum_tasks:
+                return
+
+            future = self._checksum_executor.submit(
+                self._compute_and_store_checksum, backend, canonical_path
+            )
+            self._checksum_tasks[key] = future
+
+            def _cleanup(_):
+                with self._checksum_lock:
+                    self._checksum_tasks.pop(key, None)
+
+            future.add_done_callback(_cleanup)
+
+    def _compute_and_store_checksum(self, backend: Backend, canonical_path: str):
+        """Compute checksum on backend side and store in xattr + memory."""
+        try:
+            checksum = backend.get_fast_checksum(canonical_path)
+            ts = time.time()
+            # Write to backend xattr (best effort)
+            try:
+                yaml_blob = yaml.dump(
+                    [f"{backend.name}:{checksum}:{ts}"], default_flow_style=False
+                ).encode()
+                backend.set_xattr(canonical_path, self.CHECKSUM_XATTR, yaml_blob)
+            except Exception:
+                pass
+
+            self._record_checksum(canonical_path, backend.name, checksum, ts)
+        except Exception as exc:
+            self.logger.debug("checksum for %s on %s failed: %s", canonical_path, backend.name, exc)
+
+    def _apply_conflict_view(self, dir_path: str, base_entries: Set[str]) -> Set[str]:
+        """
+        Convert raw directory entries into conflict-aware view.
+
+        If multiple backends contain the same name with differing checksums,
+        present them as <name>.<backend>. Otherwise present the plain name.
+        """
+        with self._dir_cache_lock:
+            backend_entries = self._dir_cache.get(dir_path, {})
+
+        aggregated: Dict[str, Set[str]] = {}
+        for backend_name, names in backend_entries.items():
+            for name in names:
+                aggregated.setdefault(name, set()).add(backend_name)
+
+        visible: Set[str] = set()
+        for name, backend_names in aggregated.items():
+            if len(backend_names) <= 1:
+                visible.add(name)
+                continue
+
+            canonical = str(Path(dir_path) / name)
+            with self._checksum_lock:
+                checks = [
+                    self._checksum_records.get((canonical, backend))
+                    for backend in backend_names
+                ]
+            if all(checks) and len({c.checksum for c in checks if c}) > 1:
+                for backend in backend_names:
+                    visible.add(f"{name}.{backend}")
+            else:
+                visible.add(name)
+
+        # Keep any purely cached entries (new files not on backends yet)
+        for entry in base_entries:
+            if entry in aggregated:
+                continue
+
+            # Suppress cached conflict artifacts once checksums agree
+            suppressed = False
+            for backend_name in self.backends.keys():
+                suffix = f".{backend_name}"
+                if entry.endswith(suffix):
+                    base_candidate = entry[: -len(suffix)]
+                    if base_candidate in aggregated:
+                        suppressed = True
+                        break
+            if suppressed:
+                continue
+
+            visible.add(entry)
+
+        return visible
+    def _ensure_file_in_cache(self, virtual_path: str,
+                              canonical_path: Optional[str] = None,
+                              backend_name: Optional[str] = None) -> bool:
         """
         Ensure a file is in the cache, downloading or recomputing if necessary
 
         Returns:
             True if file is available in cache, False otherwise
         """
+        canonical_path = canonical_path or virtual_path
         cache_path = self.cache_manager.get_cache_path(virtual_path)
 
         # Check if already cached
         if self.cache_manager.is_cached(virtual_path):
-            self.cache_manager.mark_accessed(virtual_path)
+            if not backend_name:
+                self.cache_manager.mark_accessed(virtual_path)
             return True
 
+        # If a backend is explicitly requested (conflict suffix), bypass replication manager
+        if backend_name:
+            backend = self.backends.get(backend_name)
+            cache_path = self.cache_manager.get_cache_path(virtual_path)
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            if backend and backend.exists(canonical_path):
+                try:
+                    backend.copy_to_local(canonical_path, cache_path)
+                    return True
+                except Exception:
+                    pass
+            try:
+                cache_path.touch(exist_ok=True)
+                return True
+            except Exception:
+                return False
+
         # Try to download from a backend
-        backend = self.replication_manager.get_backend_for_read(virtual_path)
+        backend = self.replication_manager.get_backend_for_read(canonical_path)
 
         # If state is unaware, probe backends by availability/priority
         if not backend:
@@ -118,7 +295,7 @@ class StorageFS(Operations):
             available.sort(key=lambda b: b.speed_priority)
             for cand in available:
                 try:
-                    if cand.exists(virtual_path):
+                    if cand.exists(canonical_path):
                         backend = cand
                         break
                 except Exception:
@@ -126,7 +303,7 @@ class StorageFS(Operations):
 
         if backend:
             # Download to cache
-            if self.cache_manager.cache_file(virtual_path, backend):
+            if self.cache_manager.cache_file(virtual_path, backend, source_virtual_path=canonical_path):
                 # Populate state metadata and locations if missing
                 cache_path = self.cache_manager.get_cache_path(virtual_path)
                 try:
@@ -134,11 +311,11 @@ class StorageFS(Operations):
                 except OSError:
                     return True
 
-                metadata = self.state_manager.get_file_metadata(virtual_path)
+                metadata = self.state_manager.get_file_metadata(canonical_path)
                 if not metadata:
-                    config = self._get_config(virtual_path)
+                    config = self._get_config(canonical_path)
                     metadata = FileMetadata(
-                        virtual_path=virtual_path,
+                        virtual_path=canonical_path,
                         size=st.st_size,
                         checksum=None,
                         last_access=time.time(),
@@ -156,7 +333,7 @@ class StorageFS(Operations):
                 try:
                     self.state_manager.add_file_location(
                         FileLocation(
-                            virtual_path=virtual_path,
+                            virtual_path=canonical_path,
                             backend_name=backend.name,
                             checksum=metadata.checksum or '',
                             last_synced=time.time(),
@@ -168,7 +345,7 @@ class StorageFS(Operations):
                 try:
                     self.state_manager.add_file_location(
                         FileLocation(
-                            virtual_path=virtual_path,
+                            virtual_path=canonical_path,
                             backend_name="cache",
                             checksum=metadata.checksum or '',
                             last_synced=time.time(),
@@ -197,6 +374,7 @@ class StorageFS(Operations):
 
     def getattr(self, path, fh=None):
         """Get file attributes"""
+        canonical_path, backend_name = self._resolve_backend_target(path)
         cache_path = self.cache_manager.get_cache_path(path)
 
         try:
@@ -206,9 +384,17 @@ class StorageFS(Operations):
                 'st_nlink', 'st_size', 'st_uid'))
         except OSError as e:
             # Fallback: query backends for non-cached entries (e.g., remote-only files)
-            for backend_name, backend in self.backends.items():
+            backend_iter = []
+            if backend_name:
+                backend_iter = [(backend_name, self.backends.get(backend_name))]
+            else:
+                backend_iter = list(self.backends.items())
+
+            for bname, backend in backend_iter:
+                if not backend:
+                    continue
                 try:
-                    st = backend.stat(path)
+                    st = backend.stat(canonical_path)
                     return {
                         'st_atime': getattr(st, 'st_atime', time.time()),
                         'st_ctime': getattr(st, 'st_ctime', getattr(st, 'st_mtime', time.time())),
@@ -220,7 +406,7 @@ class StorageFS(Operations):
                         'st_uid': getattr(st, 'st_uid', os.getuid()),
                     }
                 except Exception as be:
-                    self.logger.debug("getattr backend fallback failed for %s on %s: %s", path, backend_name, be)
+                    self.logger.debug("getattr backend fallback failed for %s on %s: %s", canonical_path, bname, be)
 
             raise FuseOSError(e.errno)
 
@@ -254,7 +440,13 @@ class StorageFS(Operations):
                         "readdir fallback for %s on backend %s due to %s", path, backend_name, exc
                     )
 
-        for r in sorted(entries):
+        # Schedule checksum computation in background
+        self._schedule_directory_checksums(path, dir_cache)
+
+        # Apply conflict view using known checksums
+        visible_entries = self._apply_conflict_view(path, entries)
+
+        for r in sorted(visible_entries):
             yield r
 
     def mkdir(self, path, mode):
@@ -284,15 +476,21 @@ class StorageFS(Operations):
 
     def unlink(self, path):
         """Remove a file"""
+        canonical_path, backend_name = self._resolve_backend_target(path)
         cache_path = self.cache_manager.get_cache_path(path)
 
         try:
             cache_path.unlink()
 
             # Remove from state tracking
-            self.state_manager.delete_file(path)
-
-            # TODO: Propagate to backends in background
+            if not backend_name:
+                self.state_manager.delete_file(canonical_path)
+            backend = self.backends.get(backend_name) if backend_name else None
+            if backend:
+                try:
+                    backend.delete_file(canonical_path)
+                except Exception:
+                    pass
 
         except OSError as e:
             raise FuseOSError(e.errno)
@@ -331,6 +529,7 @@ class StorageFS(Operations):
 
     def truncate(self, path, length, fh=None):
         """Truncate a file"""
+        canonical_path, backend_name = self._resolve_backend_target(path)
         cache_path = self.cache_manager.get_cache_path(path)
 
         try:
@@ -338,10 +537,11 @@ class StorageFS(Operations):
                 f.truncate(length)
 
             # Mark as dirty
-            metadata = self.state_manager.get_file_metadata(path)
-            if metadata:
-                metadata.sync_status = SyncStatus.DIRTY
-                self.state_manager.set_file_metadata(metadata)
+            if not backend_name:
+                metadata = self.state_manager.get_file_metadata(canonical_path)
+                if metadata:
+                    metadata.sync_status = SyncStatus.DIRTY
+                    self.state_manager.set_file_metadata(metadata)
 
         except OSError as e:
             raise FuseOSError(e.errno)
@@ -350,8 +550,9 @@ class StorageFS(Operations):
 
     def open(self, path, flags):
         """Open a file"""
+        canonical_path, backend_name = self._resolve_backend_target(path)
         # Ensure file is in cache
-        if not self._ensure_file_in_cache(path):
+        if not self._ensure_file_in_cache(path, canonical_path, backend_name):
             # File doesn't exist
             raise FuseOSError(errno.ENOENT)
 
@@ -364,10 +565,11 @@ class StorageFS(Operations):
             with self._fd_lock:
                 vfd = self._fd_counter
                 self._fd_counter += 1
-                self._fd_map[vfd] = (path, cache_path, real_fd, flags)
+                self._fd_map[vfd] = (path, cache_path, real_fd, flags, backend_name, canonical_path)
 
-            # Mark as accessed
-            self.cache_manager.mark_accessed(path)
+            # Mark as accessed for canonical paths only
+            if not backend_name:
+                self.cache_manager.mark_accessed(path)
 
             return vfd
 
@@ -376,6 +578,7 @@ class StorageFS(Operations):
 
     def create(self, path, mode, fi=None):
         """Create a file"""
+        canonical_path, backend_name = self._resolve_backend_target(path)
         cache_path = self.cache_manager.create_cached_file(path)
 
         try:
@@ -385,13 +588,13 @@ class StorageFS(Operations):
             with self._fd_lock:
                 vfd = self._fd_counter
                 self._fd_counter += 1
-                self._fd_map[vfd] = (path, cache_path, real_fd, os.O_WRONLY)
+                self._fd_map[vfd] = (path, cache_path, real_fd, os.O_WRONLY, backend_name, canonical_path)
 
             # Create metadata
             import time
-            config = self._get_config(path)
+            config = self._get_config(canonical_path)
             metadata = FileMetadata(
-                virtual_path=path,
+                virtual_path=canonical_path,
                 size=0,
                 checksum=None,
                 last_access=time.time(),
@@ -415,14 +618,14 @@ class StorageFS(Operations):
         with self._fd_lock:
             if fh not in self._fd_map:
                 raise FuseOSError(errno.EBADF)
-            _, _, real_fd, _ = self._fd_map[fh]
+            _, _, real_fd, _, backend_name, _ = self._fd_map[fh]
 
         try:
             os.lseek(real_fd, offset, os.SEEK_SET)
             data = os.read(real_fd, size)
 
-            # Mark as accessed
-            self.cache_manager.mark_accessed(path)
+            if backend_name is None:
+                self.cache_manager.mark_accessed(path)
 
             return data
 
@@ -434,21 +637,20 @@ class StorageFS(Operations):
         with self._fd_lock:
             if fh not in self._fd_map:
                 raise FuseOSError(errno.EBADF)
-            _, _, real_fd, _ = self._fd_map[fh]
+            _, _, real_fd, _, backend_name, canonical_path = self._fd_map[fh]
 
         try:
             os.lseek(real_fd, offset, os.SEEK_SET)
             written = os.write(real_fd, data)
 
-            # Mark as dirty and accessed
-            self.cache_manager.mark_accessed(path)
-
-            metadata = self.state_manager.get_file_metadata(path)
-            if metadata:
-                metadata.sync_status = SyncStatus.DIRTY
-                import time
-                metadata.last_modified = time.time()
-                self.state_manager.set_file_metadata(metadata)
+            if backend_name is None:
+                self.cache_manager.mark_accessed(path)
+                metadata = self.state_manager.get_file_metadata(canonical_path)
+                if metadata:
+                    metadata.sync_status = SyncStatus.DIRTY
+                    import time
+                    metadata.last_modified = time.time()
+                    self.state_manager.set_file_metadata(metadata)
 
             return written
 
@@ -460,7 +662,7 @@ class StorageFS(Operations):
         with self._fd_lock:
             if fh not in self._fd_map:
                 return 0
-            _, _, real_fd, _ = self._fd_map[fh]
+            _, cache_path, real_fd, _, backend_name, canonical_path = self._fd_map[fh]
             del self._fd_map[fh]
 
         try:
@@ -469,10 +671,30 @@ class StorageFS(Operations):
             # Flush cache
             self.cache_manager.flush_file(path)
 
-            # Trigger background sync if dirty
-            metadata = self.state_manager.get_file_metadata(path)
-            if metadata and metadata.sync_status == SyncStatus.DIRTY:
-                self.sync_manager.queue_sync(path, priority=100)
+            # If this is a backend-specific view, push changes directly there
+            if backend_name:
+                backend = self.backends.get(backend_name)
+                if backend:
+                    try:
+                        backend.copy_from_local(cache_path, canonical_path)
+                        backend.sync()
+                        checksum = backend.get_fast_checksum(canonical_path)
+                        ts = time.time()
+                        self._record_checksum(canonical_path, backend_name, checksum, ts)
+                        try:
+                            yaml_blob = yaml.dump(
+                                [f"{backend_name}:{checksum}:{ts}"], default_flow_style=False
+                            ).encode()
+                            backend.set_xattr(canonical_path, self.CHECKSUM_XATTR, yaml_blob)
+                        except Exception:
+                            pass
+                    except Exception as exc:
+                        self.logger.error("direct sync failed for %s on %s: %s", canonical_path, backend_name, exc)
+            else:
+                # Trigger background sync if dirty
+                metadata = self.state_manager.get_file_metadata(canonical_path)
+                if metadata and metadata.sync_status == SyncStatus.DIRTY:
+                    self.sync_manager.queue_sync(canonical_path, priority=100)
 
             return 0
 
@@ -484,7 +706,7 @@ class StorageFS(Operations):
         with self._fd_lock:
             if fh not in self._fd_map:
                 return 0
-            _, _, real_fd, _ = self._fd_map[fh]
+            _, _, real_fd, _, _, _ = self._fd_map[fh]
 
         try:
             if datasync:
@@ -500,6 +722,11 @@ class StorageFS(Operations):
 
     def getxattr(self, path, name, position=0):
         """Get extended attribute"""
+        canonical_path, _ = self._resolve_backend_target(path)
+
+        if name == self.CHECKSUM_XATTR:
+            return self._aggregate_checksums_yaml(canonical_path)
+
         cache_path = self.cache_manager.get_cache_path(path)
 
         try:
@@ -509,6 +736,9 @@ class StorageFS(Operations):
 
     def setxattr(self, path, name, value, options, position=0):
         """Set extended attribute"""
+        if name == self.CHECKSUM_XATTR:
+            # Ignore manual writes; checksum attrs are derived
+            return
         cache_path = self.cache_manager.get_cache_path(path)
 
         try:
@@ -518,15 +748,28 @@ class StorageFS(Operations):
 
     def listxattr(self, path):
         """List extended attributes"""
+        canonical_path, _ = self._resolve_backend_target(path)
         cache_path = self.cache_manager.get_cache_path(path)
 
         try:
-            return os.listxattr(str(cache_path))
+            attrs = set(os.listxattr(str(cache_path)))
         except OSError:
-            return []
+            attrs = set()
+
+        # Expose checksum key if we have data
+        with self._checksum_lock:
+            has_checksum = any(
+                key[0] == canonical_path for key in self._checksum_records.keys()
+            )
+        if has_checksum:
+            attrs.add(self.CHECKSUM_XATTR)
+        return list(attrs)
 
     def removexattr(self, path, name):
         """Remove extended attribute"""
+        if name == self.CHECKSUM_XATTR:
+            # Derived; ignore removals
+            return
         cache_path = self.cache_manager.get_cache_path(path)
 
         try:
@@ -568,6 +811,10 @@ class StorageFS(Operations):
 
     def destroy(self, path):
         """Cleanup on unmount"""
+        try:
+            self._checksum_executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
         # Stop sync workers
         self.sync_manager.stop()
 

@@ -6,6 +6,7 @@ import os
 import paramiko
 from pathlib import Path, PurePosixPath
 from typing import List, Optional
+import shlex
 
 from .base import Backend, BackendType
 
@@ -309,3 +310,57 @@ class SSHBackend(Backend):
 
     def __repr__(self):
         return f"SSHBackend(name={self.name}, host={self.host}, remote_path={self.remote_path})"
+
+    # ------------------------------------------------------------------ #
+    # Optional capabilities used by conflict detection
+    # ------------------------------------------------------------------ #
+    def _shell_quote(self, value: str) -> str:
+        return shlex.quote(value)
+
+    def get_fast_checksum(self, virtual_path: str) -> str:
+        """
+        Compute checksum on the remote side without downloading the full file.
+
+        Falls back to SHA256 via ssh exec. If that fails, raises an exception.
+        """
+        self._ensure_connected()
+        remote_path = str(self._resolve_path(virtual_path))
+        cmd = f"sha256sum {self._shell_quote(remote_path)}"
+        _, stdout, stderr = self._ssh_client.exec_command(
+            cmd, timeout=self.connect_timeout
+        )
+        output = stdout.read().decode().strip()
+        if not output:
+            raise RuntimeError(f"checksum command failed: {stderr.read().decode()}")
+        return output.split()[0]
+
+    def set_xattr(self, virtual_path: str, name: str, value: bytes):
+        """Best-effort remote setfattr."""
+        try:
+            self._ensure_connected()
+            remote_path = str(self._resolve_path(virtual_path))
+            value_str = value.decode() if isinstance(value, (bytes, bytearray)) else str(value)
+            cmd = (
+                f"setfattr -n {self._shell_quote(name)} "
+                f"-v {self._shell_quote(value_str)} {self._shell_quote(remote_path)}"
+            )
+            self._ssh_client.exec_command(cmd, timeout=self.connect_timeout)
+        except Exception:
+            # Remote might not support xattrs; ignore
+            pass
+
+    def get_xattr(self, virtual_path: str, name: str):
+        try:
+            self._ensure_connected()
+            remote_path = str(self._resolve_path(virtual_path))
+            cmd = (
+                f"getfattr --absolute-names --only-values "
+                f"-n {self._shell_quote(name)} {self._shell_quote(remote_path)}"
+            )
+            _, stdout, _ = self._ssh_client.exec_command(
+                cmd, timeout=self.connect_timeout
+            )
+            data = stdout.read()
+            return data if data else None
+        except Exception:
+            return None
