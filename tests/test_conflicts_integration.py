@@ -185,6 +185,48 @@ class TestLocalConflictMount(BaseConflictMountTest):
         self.assertEqual((self.backend1_dir / "report.txt").read_text(), "alpha\n")
 
 
+class TestConflictMerge(BaseConflictMountTest):
+    """Conflicts resolved via external merge tool."""
+
+    def test_merge_uses_external_tool(self):
+        try:
+            os.listdir(self.mount_dir)
+        except Exception as exc:
+            self.skipTest(f"Mount unavailable: {exc}")
+
+        # Ensure both backend conflict files appear
+        conflict0 = f"report.txt.{self.backend0_name}"
+        conflict1 = f"report.txt.{self.backend1_name}"
+        entries = self._listdir_until(
+            lambda names: conflict0 in names and conflict1 in names
+        )
+        self.assertIn(conflict0, entries)
+        self.assertIn(conflict1, entries)
+
+        # Use merge; this relies on git merge-file or diff3 being installed in the test env
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "storage.cli",
+                "conflicts",
+                str(self.mount_dir),
+                "--file",
+                "report.txt",
+                "--merge",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            self.fail(f"conflicts merge failed: {result.stderr}")
+
+        final_entries = self._listdir_until(lambda names: "report.txt" in names)
+        self.assertIn("report.txt", final_entries)
+        self.assertNotIn(conflict0, final_entries)
+        self.assertNotIn(conflict1, final_entries)
+
+
 class LoopbackRemoteBackend(LocalBackend):
     """A LocalBackend flagged as remote to exercise remote code paths."""
 
