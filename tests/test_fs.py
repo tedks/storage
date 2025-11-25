@@ -7,10 +7,12 @@ import multiprocessing as mp
 import threading
 import os
 import time
+from unittest.mock import patch
 
 from storage.fs import StorageFS
 from storage.fs import _acquire_mount_lock
 from storage.backends.local import LocalBackend
+from storage.sync import DirOperation
 
 
 class TestReaddirMerging(unittest.TestCase):
@@ -183,6 +185,28 @@ class TestReaddirMerging(unittest.TestCase):
         new_meta = self.fs.state_manager.get_file_metadata('/renamed/file.txt')
         self.assertIsNone(old_meta)
         self.assertIsNotNone(new_meta)
+
+    def test_mkdir_retry_targets_failed_backend(self):
+        path = '/needretry'
+        original = self.backends['backend2'].mkdir
+
+        def failing_mkdir(_path):
+            raise RuntimeError("backend2 offline")
+
+        self.backends['backend2'].mkdir = failing_mkdir
+        try:
+            with patch.object(self.fs.sync_manager, 'queue_dir_sync') as mock_queue:
+                self.fs.mkdir(path, 0o755)
+            mock_queue.assert_called_with(
+                path,
+                DirOperation.MKDIR,
+                mode=0o755,
+                backend_hint='backend2',
+                priority=80,
+                force=True,
+            )
+        finally:
+            self.backends['backend2'].mkdir = original
 
 
 def _try_lock(lock_path_str, mountpoint, return_dict):
