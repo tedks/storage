@@ -513,6 +513,8 @@ class SyncManager:
                 self._queued_dir_tasks.discard(key)
             else:
                 self._queued_tasks.discard(task.virtual_path)
+            logger.debug("Completed %s task for %s", getattr(task, 'operation', 'file'),
+                         getattr(task, 'virtual_path', 'unknown'))
 
     def get_queue_size(self) -> int:
         """Get number of pending sync tasks"""
