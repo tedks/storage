@@ -9,8 +9,9 @@ import time
 import threading
 import queue
 import logging
+from enum import Enum
 from pathlib import Path
-from typing import Dict, Optional, Set
+from typing import Dict, Optional, Set, Union, Tuple, List
 from dataclasses import dataclass, field
 
 from .backends.base import Backend
@@ -48,6 +49,32 @@ class SyncTask:
         return time.time() - self.queued_time
 
 
+class DirOperation(Enum):
+    """Directory-level operations that need syncing"""
+    MKDIR = "mkdir"
+    RMDIR = "rmdir"
+    RENAME = "rename"
+
+
+@dataclass
+class DirSyncTask:
+    """Represents a directory sync task"""
+    virtual_path: str
+    operation: DirOperation
+    new_path: Optional[str] = None
+    mode: int = 0o755
+    backend_hint: Optional[str] = None
+    priority: int = 0
+    retry_count: int = 0
+    queued_time: float = field(default_factory=time.time)
+
+    def __lt__(self, other):
+        return self.priority > other.priority
+
+    def age(self) -> float:
+        return time.time() - self.queued_time
+
+
 class SyncWorker(threading.Thread):
     """
     Worker thread that syncs files from cache to backends
@@ -57,7 +84,8 @@ class SyncWorker(threading.Thread):
 
     def __init__(self, worker_id: int, task_queue: queue.PriorityQueue,
                  state_manager: StateManager, cache_manager: CacheManager,
-                 replication_manager: ReplicationManager, config: SyncConfig):
+                 replication_manager: ReplicationManager, config: SyncConfig,
+                 task_complete_cb=None):
         super().__init__(daemon=True, name=f"SyncWorker-{worker_id}")
         self.worker_id = worker_id
         self.task_queue = task_queue
@@ -73,6 +101,7 @@ class SyncWorker(threading.Thread):
             'failed': 0,
             'conflicts': 0
         }
+        self._task_complete_cb = task_complete_cb
 
     def run(self):
         """Main worker loop"""
@@ -89,10 +118,17 @@ class SyncWorker(threading.Thread):
                 self._active_task = task.virtual_path
 
                 try:
-                    self._process_task(task)
+                    if isinstance(task, DirSyncTask):
+                        success = self._process_dir_task(task)
+                    else:
+                        success = self._process_task(task)
+                    if success:
+                        self._notify_task_complete(task)
                 except Exception as e:
                     logger.error(f"Error processing sync task {task.virtual_path}: {e}")
-                    self._handle_task_failure(task, str(e))
+                    completed = self._handle_task_failure(task, str(e))
+                    if completed:
+                        self._notify_task_complete(task)
                 finally:
                     self._active_task = None
                     self.task_queue.task_done()
@@ -102,7 +138,14 @@ class SyncWorker(threading.Thread):
 
         logger.info(f"Sync worker {self.worker_id} stopped")
 
-    def _process_task(self, task: SyncTask):
+    def _notify_task_complete(self, task):
+        if self._task_complete_cb:
+            try:
+                self._task_complete_cb(task)
+            except Exception:
+                logger.exception("Task completion callback failed")
+
+    def _process_task(self, task: SyncTask) -> bool:
         """Process a single sync task"""
         logger.debug(f"Worker {self.worker_id} syncing {task.virtual_path}")
 
@@ -139,7 +182,7 @@ class SyncWorker(threading.Thread):
             logger.warning(f"No backends available for {task.virtual_path}")
             metadata.sync_status = SyncStatus.ERROR
             self.state_manager.set_file_metadata(metadata)
-            return
+            return False
 
         # Compute checksum
         checksum = self.state_manager.compute_checksum(cache_path)
@@ -154,11 +197,11 @@ class SyncWorker(threading.Thread):
                     task.virtual_path, backend, checksum
                 )
                 if conflict:
-                    logger.warning(f"Conflict detected for {task.virtual_path} on {backend.name}")
-                    metadata.sync_status = SyncStatus.CONFLICT
-                    self.state_manager.set_file_metadata(metadata)
-                    self._stats['conflicts'] += 1
-                    return
+                        logger.warning(f"Conflict detected for {task.virtual_path} on {backend.name}")
+                        metadata.sync_status = SyncStatus.CONFLICT
+                        self.state_manager.set_file_metadata(metadata)
+                        self._stats['conflicts'] += 1
+                        return True
 
                 # Copy to backend
                 backend.copy_from_local(cache_path, task.virtual_path)
@@ -201,9 +244,10 @@ class SyncWorker(threading.Thread):
             logger.error(f"Failed to sync {task.virtual_path} to any backend")
 
         self.state_manager.set_file_metadata(metadata)
+        return True
 
 
-    def _handle_task_failure(self, task: SyncTask, error: str):
+    def _handle_task_failure(self, task: Union[SyncTask, DirSyncTask], error: str) -> bool:
         """Handle failed sync task"""
         task.retry_count += 1
 
@@ -213,14 +257,56 @@ class SyncWorker(threading.Thread):
             logger.info(f"Re-queueing {task.virtual_path} (retry {task.retry_count}/{self.config.max_retries})")
             time.sleep(self.config.retry_delay * task.retry_count)  # Exponential backoff
             self.task_queue.put(task)
-        else:
-            logger.error(f"Max retries exceeded for {task.virtual_path}: {error}")
-            self._stats['failed'] += 1
-            # Mark as error
+            return False
+
+        logger.error(f"Max retries exceeded for {task.virtual_path}: {error}")
+        self._stats['failed'] += 1
+        if isinstance(task, SyncTask):
             metadata = self.state_manager.get_file_metadata(task.virtual_path)
             if metadata:
                 metadata.sync_status = SyncStatus.ERROR
                 self.state_manager.set_file_metadata(metadata)
+        return True
+
+    def _select_dir_backends(self, backend_hint: Optional[str]) -> List[Backend]:
+        if backend_hint:
+            backend = self.replication_manager.backends.get(backend_hint)
+            return [backend] if backend else []
+        return self.replication_manager.get_available_backends()
+
+    def _process_dir_task(self, task: DirSyncTask) -> bool:
+        logger.debug(f"Worker {self.worker_id} processing dir op {task.operation.value} on {task.virtual_path}")
+
+        backends = self._select_dir_backends(task.backend_hint)
+
+        if not backends:
+            raise RuntimeError(f"No backends available for dir operation {task.operation.value}")
+
+        success = True
+        for backend in backends:
+            if not backend:
+                continue
+            try:
+                if task.operation == DirOperation.MKDIR:
+                    backend.mkdir(task.virtual_path)
+                elif task.operation == DirOperation.RMDIR:
+                    backend.rmdir(task.virtual_path)
+                elif task.operation == DirOperation.RENAME:
+                    if not task.new_path:
+                        raise ValueError("Rename dir task missing new_path")
+                    backend.rename(task.virtual_path, task.new_path)
+                logger.debug("Dir op %s succeeded for %s on %s",
+                             task.operation.value, task.virtual_path, backend.name)
+            except Exception as exc:
+                success = False
+                logger.warning("Dir op %s failed for %s on %s: %s",
+                               task.operation.value, task.virtual_path, backend.name, exc)
+
+        if not success:
+            raise RuntimeError(f"Dir op {task.operation.value} failed for {task.virtual_path}")
+
+        self._stats['synced'] += 1
+        return True
 
     def stop(self):
         """Stop the worker thread"""
@@ -269,6 +355,7 @@ class SyncManager:
         self._running = False
         self._monitor_thread = None
         self._queued_tasks: Set[str] = set()
+        self._queued_dir_tasks: Set[Tuple[str, str, Optional[str]]] = set()
         self._queue_lock = threading.Lock()
 
     def start(self):
@@ -284,7 +371,7 @@ class SyncManager:
             worker = SyncWorker(
                 i, self.task_queue, self.state_manager,
                 self.cache_manager, self.replication_manager,
-                self.config
+                self.config, self._task_complete
             )
             worker.start()
             self.workers.append(worker)
@@ -392,6 +479,40 @@ class SyncManager:
                 return False
 
             time.sleep(0.1)
+
+    def queue_dir_sync(self, virtual_path: str, operation: DirOperation,
+                       new_path: Optional[str] = None, mode: int = 0o755,
+                       priority: int = 50, backend_hint: Optional[str] = None,
+                       force: bool = False):
+        """Queue a directory operation for syncing."""
+        if virtual_path and not virtual_path.startswith('/'):
+            virtual_path = '/' + virtual_path
+        if new_path and not new_path.startswith('/'):
+            new_path = '/' + new_path
+        key = (operation.value, virtual_path, new_path or backend_hint or "*")
+        with self._queue_lock:
+            if not force and key in self._queued_dir_tasks:
+                return
+
+            task = DirSyncTask(
+                virtual_path=virtual_path,
+                operation=operation,
+                new_path=new_path,
+                mode=mode,
+                backend_hint=backend_hint,
+                priority=priority,
+            )
+            self.task_queue.put(task)
+            self._queued_dir_tasks.add(key)
+            logger.debug("Queued dir sync %s for %s", operation.value, virtual_path)
+
+    def _task_complete(self, task: Union[SyncTask, DirSyncTask]):
+        with self._queue_lock:
+            if isinstance(task, DirSyncTask):
+                key = (task.operation.value, task.virtual_path, task.new_path or task.backend_hint or "*")
+                self._queued_dir_tasks.discard(key)
+            else:
+                self._queued_tasks.discard(task.virtual_path)
 
     def get_queue_size(self) -> int:
         """Get number of pending sync tasks"""

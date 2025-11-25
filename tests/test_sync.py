@@ -17,7 +17,7 @@ from storage.state import StateManager, FileMetadata, SyncStatus, FileConfig, Fi
 from storage.cache import CacheManager
 from storage.backends.local import LocalBackend
 from storage.replication import ReplicationManager
-from storage.sync import SyncManager, SyncTask
+from storage.sync import SyncManager, SyncTask, DirSyncTask, DirOperation
 
 
 class TestSyncTask(unittest.TestCase):
@@ -359,6 +359,151 @@ class TestSyncConflicts(unittest.TestCase):
         # Should be marked as CONFLICT
         updated_metadata = self.state_manager.get_file_metadata(test_file)
         self.assertEqual(updated_metadata.sync_status, SyncStatus.CONFLICT)
+
+
+class TestDirSyncTask(unittest.TestCase):
+    def test_dir_sync_task_creation(self):
+        task = DirSyncTask("/dir", DirOperation.MKDIR, priority=100)
+        self.assertEqual(task.virtual_path, "/dir")
+        self.assertEqual(task.operation, DirOperation.MKDIR)
+        self.assertEqual(task.priority, 100)
+
+    def test_dir_sync_task_rename(self):
+        task = DirSyncTask("/old", DirOperation.RENAME, new_path="/new", backend_hint="backend1")
+        self.assertEqual(task.new_path, "/new")
+        self.assertEqual(task.backend_hint, "backend1")
+
+    def test_dir_sync_task_priority(self):
+        fast = DirSyncTask("/fast", DirOperation.RMDIR, priority=50)
+        slow = DirSyncTask("/slow", DirOperation.RMDIR, priority=10)
+        self.assertTrue(fast < slow)
+
+
+class TestDirSyncOperations(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.cache_dir = Path(self.temp_dir) / "cache"
+        self.backend1_dir = Path(self.temp_dir) / "backend1"
+        self.backend2_dir = Path(self.temp_dir) / "backend2"
+        self.db_path = Path(self.temp_dir) / "state.db"
+
+        self.cache_dir.mkdir()
+        self.backend1_dir.mkdir()
+        self.backend2_dir.mkdir()
+
+        self.state_manager = StateManager(str(self.db_path))
+        self.cache_manager = CacheManager(self.cache_dir, self.state_manager, 32 * 1024 * 1024)
+        self.backends = {
+            "backend1": LocalBackend("backend1", str(self.backend1_dir), speed_priority=0),
+            "backend2": LocalBackend("backend2", str(self.backend2_dir), speed_priority=5),
+        }
+        self.replication_manager = ReplicationManager(self.state_manager, self.backends)
+        self.sync_manager = SyncManager(
+            self.state_manager,
+            self.cache_manager,
+            self.replication_manager,
+            num_workers=1,
+        )
+
+    def tearDown(self):
+        self.sync_manager.stop()
+        self.state_manager.close()
+        import shutil
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _wait_for(self, predicate, timeout=5.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if predicate():
+                return True
+            time.sleep(0.05)
+        return predicate()
+
+    def test_mkdir_sync(self):
+        self.sync_manager.start()
+        test_dir = "/queued"
+        self.sync_manager.queue_dir_sync(test_dir, DirOperation.MKDIR, priority=100)
+        self.assertTrue(self._wait_for(lambda: (self.backend1_dir / 'queued').is_dir()))
+        self.assertTrue(self._wait_for(lambda: (self.backend2_dir / 'queued').is_dir()))
+
+    def test_rmdir_sync(self):
+        self.sync_manager.start()
+        test_dir = "/toremove"
+        (self.backend1_dir / "toremove").mkdir()
+        (self.backend2_dir / "toremove").mkdir()
+        self.sync_manager.queue_dir_sync(test_dir, DirOperation.RMDIR, priority=100)
+        self.assertTrue(self._wait_for(lambda: not (self.backend1_dir / 'toremove').exists()))
+        self.assertTrue(self._wait_for(lambda: not (self.backend2_dir / 'toremove').exists()))
+
+    def test_rename_file_sync(self):
+        self.sync_manager.start()
+        old_path = "/oldname.txt"
+        new_path = "/newname.txt"
+        for backend_dir in (self.backend1_dir, self.backend2_dir):
+            fpath = backend_dir / old_path.lstrip('/')
+            fpath.parent.mkdir(parents=True, exist_ok=True)
+            fpath.write_text("payload")
+        new_cache = self.cache_manager.get_cache_path(new_path)
+        new_cache.parent.mkdir(parents=True, exist_ok=True)
+        new_cache.write_text("payload")
+
+        self.sync_manager.queue_dir_sync(old_path, DirOperation.RENAME, new_path=new_path, priority=100)
+
+        self.assertTrue(self._wait_for(lambda: (self.backend1_dir / new_path.lstrip('/')).exists()))
+        self.assertTrue(self._wait_for(lambda: (self.backend2_dir / new_path.lstrip('/')).exists()))
+        self.assertTrue(self._wait_for(lambda: not (self.backend1_dir / old_path.lstrip('/')).exists()))
+
+
+class TestStateManagerRename(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.db_path = Path(self.temp_dir) / "state.db"
+        self.state_manager = StateManager(str(self.db_path))
+
+    def tearDown(self):
+        self.state_manager.close()
+        import shutil
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_rename_file_metadata(self):
+        meta = FileMetadata(
+            virtual_path="/old.txt",
+            size=10,
+            checksum="abc",
+            last_access=time.time(),
+            last_modified=time.time(),
+            sync_status=SyncStatus.CLEAN,
+            replica_count=1,
+            recomputable=False,
+            recompute_cmd=None,
+            encrypted=False,
+            encryption_key_id=None,
+        )
+        self.state_manager.set_file_metadata(meta)
+        self.state_manager.rename_file("/old.txt", "/new.txt")
+        self.assertIsNone(self.state_manager.get_file_metadata("/old.txt"))
+        renamed = self.state_manager.get_file_metadata("/new.txt")
+        self.assertIsNotNone(renamed)
+        self.assertEqual(renamed.size, 10)
+
+    def test_rename_path_recursive(self):
+        child = FileMetadata(
+            virtual_path="/dir/child.txt",
+            size=1,
+            checksum="x",
+            last_access=time.time(),
+            last_modified=time.time(),
+            sync_status=SyncStatus.CLEAN,
+            replica_count=1,
+            recomputable=False,
+            recompute_cmd=None,
+            encrypted=False,
+            encryption_key_id=None,
+        )
+        self.state_manager.set_file_metadata(child)
+        self.state_manager.rename_path("/dir", "/renamed")
+        self.assertIsNone(self.state_manager.get_file_metadata("/dir/child.txt"))
+        self.assertIsNotNone(self.state_manager.get_file_metadata("/renamed/child.txt"))
 
 
 if __name__ == '__main__':

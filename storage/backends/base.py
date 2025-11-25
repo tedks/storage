@@ -119,6 +119,11 @@ class Backend(ABC):
         pass
 
     @abstractmethod
+    def rename(self, old_virtual_path: str, new_virtual_path: str):
+        """Rename or move a path on this backend."""
+        pass
+
+    @abstractmethod
     def get_free_space(self) -> Optional[int]:
         """Get free space in bytes, None if unknown"""
         pass

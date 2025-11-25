@@ -16,12 +16,15 @@ Storage is a meta-filesystem that multiplexes an abstract filesystem over multip
 ## Installation
 
 ```bash
-# Install dependencies
-pip install -r requirements.txt
+# Set up local virtualenv (recommended)
+./setup-venv.sh
 
-# Install the package
+# Or install manually
+pip install -r requirements.txt
 pip install -e .
 ```
+
+The `setup-venv.sh` helper script creates `.venv/`, installs/upgrades `pip`, and applies `requirements.txt`. Activate it via `source .venv/bin/activate` before hacking or running pytest.
 
 ## Quick Start
 

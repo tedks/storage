@@ -276,6 +276,25 @@ class SSHBackend(Backend):
         # Upload file
         self._sftp_client.put(str(local_path), remote_path)
 
+    def rename(self, old_virtual_path: str, new_virtual_path: str):
+        """Rename a file or directory on the remote backend."""
+        self._ensure_connected()
+
+        old_remote = str(self._resolve_path(old_virtual_path))
+        new_remote = str(self._resolve_path(new_virtual_path))
+        parent = str(PurePosixPath(new_remote).parent)
+
+        try:
+            self._sftp_client.stat(parent)
+        except FileNotFoundError:
+            self._mkdir_recursive(parent)
+
+        try:
+            self._sftp_client.rename(old_remote, new_remote)
+        except FileNotFoundError:
+            # Nothing to rename; best-effort
+            pass
+
     def get_free_space(self) -> Optional[int]:
         """Get free space on remote (if supported)"""
         # SFTP doesn't have a standard way to get free space
