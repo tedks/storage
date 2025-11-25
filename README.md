@@ -144,7 +144,7 @@ Configuration is hierarchical - child directories inherit from parents, with the
 **Write Path:**
 1. Write to local cache first (ensure at least one copy)
 2. Mark file as dirty in state database
-3. Future: Background sync to configured replicas
+3. Background sync to configured replicas (directory operations run best-effort synchronously and queue backend-specific retries when any replica is offline)
 
 **Cache Management:**
 1. Track file access times for LRU
@@ -156,7 +156,7 @@ Configuration is hierarchical - child directories inherit from parents, with the
 1. Use extended attributes for per-directory configuration
 2. Select backends using consistent hashing
 3. Respect preferred backends and speed priorities
-4. Future: Background sync workers
+4. Propagate via background sync workers with retry/backoff
 
 ## Implementation Status
 

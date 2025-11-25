@@ -208,6 +208,76 @@ class TestReaddirMerging(unittest.TestCase):
         finally:
             self.backends['backend2'].mkdir = original
 
+    def test_rmdir_retry_targets_failed_backend(self):
+        path = '/deleteme'
+        self.fs.mkdir(path, 0o755)
+        original = self.backends['backend1'].rmdir
+
+        def failing_rmdir(_path):
+            raise RuntimeError("backend1 busy")
+
+        self.backends['backend1'].rmdir = failing_rmdir
+        try:
+            with patch.object(self.fs.sync_manager, 'queue_dir_sync') as mock_queue:
+                self.fs.rmdir(path)
+            mock_queue.assert_called_with(
+                path,
+                DirOperation.RMDIR,
+                backend_hint='backend1',
+                priority=80,
+                force=True,
+            )
+        finally:
+            self.backends['backend1'].rmdir = original
+
+    def test_rename_retry_targets_failed_backend(self):
+        self.fs.mkdir('/orig', 0o755)
+        target = '/renamed'
+        original = self.backends['backend2'].rename
+
+        def failing_rename(old, new):
+            raise RuntimeError("backend2 down")
+
+        self.backends['backend2'].rename = failing_rename
+        try:
+            with patch.object(self.fs.sync_manager, 'queue_dir_sync') as mock_queue:
+                self.fs.rename('/orig', target)
+            mock_queue.assert_called_with(
+                '/orig',
+                DirOperation.RENAME,
+                new_path=target,
+                backend_hint='backend2',
+                priority=90,
+                force=True,
+            )
+        finally:
+            self.backends['backend2'].rename = original
+
+    def test_mkdir_retry_eventually_replicates(self):
+        path = '/asyncdir'
+        backend2 = self.backends['backend2']
+        call_count = {'n': 0}
+        original = backend2.mkdir
+
+        def flaky_mkdir(target):
+            call_count['n'] += 1
+            if call_count['n'] == 1:
+                raise RuntimeError("transient failure")
+            return original(target)
+
+        backend2.mkdir = flaky_mkdir
+        try:
+            self.fs.mkdir(path, 0o755)
+            # Should not exist on backend2 immediately
+            self.assertFalse(backend2.isdir(path))
+
+            def replicated():
+                return backend2.isdir(path)
+
+            self.assertTrue(self._wait_for(replicated, timeout=5.0))
+        finally:
+            backend2.mkdir = original
+
 
 def _try_lock(lock_path_str, mountpoint, return_dict):
     lock_path = Path(lock_path_str)

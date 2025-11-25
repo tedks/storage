@@ -528,6 +528,149 @@ class TestHierarchicalRename(unittest.TestCase):
         self.state_manager.close()
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
+    def _write_meta(self, path: str):
+        meta = FileMetadata(
+            virtual_path=path,
+            size=100,
+            checksum="abc",
+            last_access=time.time(),
+            last_modified=time.time(),
+            sync_status=SyncStatus.CLEAN,
+            replica_count=1,
+            recomputable=False,
+            recompute_cmd=None,
+            encrypted=False,
+            encryption_key_id=None,
+        )
+        self.state_manager.set_file_metadata(meta)
+
+    def test_single_file(self):
+        self._write_meta("/old.txt")
+        renamed = self.state_manager.rename_path("/old.txt", "/new.txt")
+        self.assertEqual(len(renamed), 1)
+        self.assertIsNone(self.state_manager.get_file_metadata("/old.txt"))
+        self.assertIsNotNone(self.state_manager.get_file_metadata("/new.txt"))
+
+    def test_directory_children(self):
+        self._write_meta("/dir/a.txt")
+        self._write_meta("/dir/b.txt")
+        self._write_meta("/dir/sub/c.txt")
+        renamed = self.state_manager.rename_path("/dir", "/newdir")
+        self.assertEqual(len(renamed), 3)
+        self.assertIsNotNone(self.state_manager.get_file_metadata("/newdir/a.txt"))
+        self.assertIsNotNone(self.state_manager.get_file_metadata("/newdir/sub/c.txt"))
+
+    def test_keep_locations_in_sync(self):
+        self._write_meta("/dir/file.txt")
+        location = FileLocation(
+            virtual_path="/dir/file.txt",
+            backend_name="backend1",
+            checksum="abc",
+            last_synced=time.time(),
+            is_cached=False,
+        )
+        self.state_manager.add_file_location(location)
+        self.state_manager.rename_path("/dir", "/new")
+        self.assertEqual(len(self.state_manager.get_file_locations("/dir/file.txt")), 0)
+        new_locs = self.state_manager.get_file_locations("/new/file.txt")
+        self.assertEqual(len(new_locs), 1)
+        self.assertEqual(new_locs[0].backend_name, "backend1")
+
+    def test_path_normalization(self):
+        self._write_meta("/dir/file.txt")
+        self.state_manager.rename_path("dir/", "newdir")
+        self.assertIsNotNone(self.state_manager.get_file_metadata("/newdir/file.txt"))
+
+
+class TestBackendRename(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.backend_root = Path(self.temp_dir) / "backend"
+        self.backend_root.mkdir()
+        self.backend = LocalBackend("test", str(self.backend_root))
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_file_rename(self):
+        old_file = self.backend_root / "old.txt"
+        old_file.write_text("data")
+        self.backend.rename("/old.txt", "/new.txt")
+        self.assertFalse(old_file.exists())
+        self.assertEqual((self.backend_root / "new.txt").read_text(), "data")
+
+    def test_directory_rename(self):
+        old_dir = self.backend_root / "olddir"
+        old_dir.mkdir()
+        (old_dir / "file.txt").write_text("payload")
+        self.backend.rename("/olddir", "/newdir")
+        self.assertFalse(old_dir.exists())
+        self.assertTrue((self.backend_root / "newdir" / "file.txt").exists())
+
+    def test_creates_parent_directories(self):
+        src = self.backend_root / "file.txt"
+        src.write_text("payload")
+        self.backend.rename("/file.txt", "/nested/dir/file.txt")
+        self.assertFalse(src.exists())
+        self.assertTrue((self.backend_root / "nested/dir/file.txt").exists())
+
+
+class TestDirQueueDedup(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.cache_dir = Path(self.temp_dir) / "cache"
+        self.backend_dir = Path(self.temp_dir) / "backend"
+        self.cache_dir.mkdir()
+        self.backend_dir.mkdir()
+        self.state_manager = StateManager(str(Path(self.temp_dir) / "state.db"))
+        self.cache_manager = CacheManager(self.cache_dir, self.state_manager, 1_048_576)
+        self.replication_manager = ReplicationManager(
+            self.state_manager,
+            {"backend": LocalBackend("backend", str(self.backend_dir))},
+        )
+        self.sync_manager = SyncManager(
+            self.state_manager,
+            self.cache_manager,
+            self.replication_manager,
+            num_workers=0,
+        )
+
+    def tearDown(self):
+        self.state_manager.close()
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_queue_dir_sync_dedupes_same_backend(self):
+        self.sync_manager.queue_dir_sync("/dedupe", DirOperation.MKDIR, backend_hint="backend")
+        size_before = self.sync_manager.task_queue.qsize()
+        self.sync_manager.queue_dir_sync("/dedupe", DirOperation.MKDIR, backend_hint="backend")
+        self.assertEqual(self.sync_manager.task_queue.qsize(), size_before)
+
+    def test_queue_dir_sync_allows_different_backends(self):
+        self.sync_manager.replication_manager.backends['backend2'] = LocalBackend(
+            "backend2", str(self.backend_dir)
+        )
+        self.sync_manager.queue_dir_sync("/dir", DirOperation.MKDIR, backend_hint="backend")
+        self.sync_manager.queue_dir_sync("/dir", DirOperation.MKDIR, backend_hint="backend2")
+        self.assertEqual(self.sync_manager.task_queue.qsize(), 2)
+
+    def test_task_complete_releases_dir_key(self):
+        task = DirSyncTask("/dir", DirOperation.MKDIR, backend_hint="backend")
+        self.sync_manager.queue_dir_sync(task.virtual_path, task.operation, backend_hint=task.backend_hint)
+        self.sync_manager._task_complete(task)
+        self.sync_manager.queue_dir_sync(task.virtual_path, task.operation, backend_hint=task.backend_hint)
+        self.assertEqual(self.sync_manager.task_queue.qsize(), 2)
+
+
+class TestHierarchicalRename(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.db_path = Path(self.temp_dir) / "state.db"
+        self.state_manager = StateManager(str(self.db_path))
+
+    def tearDown(self):
+        self.state_manager.close()
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
     def _create_metadata(self, path: str):
         meta = FileMetadata(
             virtual_path=path,
