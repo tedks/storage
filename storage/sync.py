@@ -489,7 +489,7 @@ class SyncManager:
             virtual_path = '/' + virtual_path
         if new_path and not new_path.startswith('/'):
             new_path = '/' + new_path
-        key = (operation.value, virtual_path, new_path or backend_hint or "*")
+        key = (operation.value, virtual_path, new_path or "", backend_hint or "*")
         with self._queue_lock:
             if not force and key in self._queued_dir_tasks:
                 return
@@ -509,7 +509,7 @@ class SyncManager:
     def _task_complete(self, task: Union[SyncTask, DirSyncTask]):
         with self._queue_lock:
             if isinstance(task, DirSyncTask):
-                key = (task.operation.value, task.virtual_path, task.new_path or task.backend_hint or "*")
+                key = (task.operation.value, task.virtual_path, task.new_path or "", task.backend_hint or "*")
                 self._queued_dir_tasks.discard(key)
             else:
                 self._queued_tasks.discard(task.virtual_path)

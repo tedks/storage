@@ -20,7 +20,7 @@ import yaml
 import concurrent.futures
 from fuse import FUSE, FuseOSError, Operations
 from pathlib import Path
-from typing import Dict, Optional, Set
+from typing import Dict, Optional, Set, List
 
 from .backends.base import Backend
 from .cache import CacheManager
@@ -140,6 +140,36 @@ class StorageFS(Operations):
             path = '/' + path
         with self._dir_cache_lock:
             self._dir_cache.pop(path, None)
+
+    def _get_target_backends(self, backend_hint: Optional[str]) -> List[Backend]:
+        """Return the backend instances affected by an operation."""
+        if backend_hint:
+            backend = self.backends.get(backend_hint)
+            return [backend] if backend else []
+        return list(self.backends.values())
+
+    def _propagate_dir_operation(self, operation: DirOperation, path: str,
+                                 backend_hint: Optional[str] = None,
+                                 new_path: Optional[str] = None) -> List[str]:
+        """Best-effort synchronous propagation; returns backend names that failed."""
+        failures: List[str] = []
+        for backend in self._get_target_backends(backend_hint):
+            if not backend:
+                continue
+            try:
+                if operation == DirOperation.MKDIR:
+                    backend.mkdir(path)
+                elif operation == DirOperation.RMDIR:
+                    backend.rmdir(path)
+                elif operation == DirOperation.RENAME:
+                    if not new_path:
+                        raise ValueError("rename requires new_path")
+                    backend.rename(path, new_path)
+            except Exception as exc:
+                failures.append(backend.name)
+                self.logger.debug("dir op %s failed for %s on %s: %s",
+                                   operation.value, path, backend.name, exc)
+        return failures
 
     def _record_checksum(self, canonical_path: str, backend_name: str, checksum: str, timestamp: float):
         """Record a checksum for (path, backend) and keep only the latest."""
@@ -467,17 +497,21 @@ class StorageFS(Operations):
             cache_path.mkdir(parents=True, exist_ok=False)
             os.chmod(cache_path, mode)
 
+            failures = self._propagate_dir_operation(DirOperation.MKDIR, canonical_path, backend_hint=backend_name)
+
             parent_dir = str(Path(canonical_path).parent)
             self._invalidate_dir_cache_entry(parent_dir)
             self._invalidate_dir_cache_entry(canonical_path)
 
-            self.sync_manager.queue_dir_sync(
-                canonical_path,
-                DirOperation.MKDIR,
-                mode=mode,
-                backend_hint=backend_name,
-                priority=80,
-            )
+            for failed_backend in failures:
+                self.sync_manager.queue_dir_sync(
+                    canonical_path,
+                    DirOperation.MKDIR,
+                    mode=mode,
+                    backend_hint=failed_backend,
+                    priority=80,
+                    force=True,
+                )
 
         except OSError as e:
             raise FuseOSError(e.errno)
@@ -490,16 +524,20 @@ class StorageFS(Operations):
         try:
             cache_path.rmdir()
 
+            failures = self._propagate_dir_operation(DirOperation.RMDIR, canonical_path, backend_hint=backend_name)
+
             parent_dir = str(Path(canonical_path).parent)
             self._invalidate_dir_cache_entry(parent_dir)
             self._invalidate_dir_cache_entry(canonical_path)
 
-            self.sync_manager.queue_dir_sync(
-                canonical_path,
-                DirOperation.RMDIR,
-                backend_hint=backend_name,
-                priority=80,
-            )
+            for failed_backend in failures:
+                self.sync_manager.queue_dir_sync(
+                    canonical_path,
+                    DirOperation.RMDIR,
+                    backend_hint=failed_backend,
+                    priority=80,
+                    force=True,
+                )
 
         except OSError as e:
             raise FuseOSError(e.errno)
@@ -544,6 +582,13 @@ class StorageFS(Operations):
 
             is_directory = new_cache.is_dir()
 
+            failures = self._propagate_dir_operation(
+                DirOperation.RENAME,
+                old_canonical,
+                backend_hint=old_backend,
+                new_path=new_canonical,
+            )
+
             parent_old = str(Path(old_canonical).parent)
             parent_new = str(Path(new_canonical).parent)
             self._invalidate_dir_cache_entry(parent_old)
@@ -557,13 +602,15 @@ class StorageFS(Operations):
                     if metadata and metadata.sync_status == SyncStatus.DIRTY:
                         self.sync_manager.queue_sync(updated, priority=80, force=True)
 
-            self.sync_manager.queue_dir_sync(
-                old_canonical,
-                DirOperation.RENAME,
-                new_path=new_canonical,
-                backend_hint=old_backend,
-                priority=90,
-            )
+            for failed_backend in failures:
+                self.sync_manager.queue_dir_sync(
+                    old_canonical,
+                    DirOperation.RENAME,
+                    new_path=new_canonical,
+                    backend_hint=failed_backend,
+                    priority=90,
+                    force=True,
+                )
 
         except OSError as e:
             raise FuseOSError(e.errno)
