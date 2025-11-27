@@ -125,6 +125,15 @@ class LocalBackend(Backend):
         real_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(local_path, real_path)
 
+    def rename(self, old_virtual_path: str, new_virtual_path: str):
+        """Rename a file or directory on the backend."""
+        old_path = self._resolve_path(old_virtual_path)
+        new_path = self._resolve_path(new_virtual_path)
+        new_path.parent.mkdir(parents=True, exist_ok=True)
+        if not old_path.exists():
+            return
+        os.replace(old_path, new_path)
+
     def get_free_space(self) -> Optional[int]:
         """Get free space in bytes"""
         try:

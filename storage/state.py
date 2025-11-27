@@ -15,7 +15,7 @@ import hashlib
 import time
 import yaml
 from pathlib import Path
-from typing import Optional, List, Dict, Set
+from typing import Optional, List, Dict, Set, Tuple
 from enum import Enum
 from dataclasses import dataclass, asdict
 
@@ -237,6 +237,60 @@ class StateManager:
             (virtual_path, backend_name)
         )
         self.conn.commit()
+
+    @staticmethod
+    def _normalize_virtual_path(path: str) -> str:
+        """Ensure virtual paths consistently start with '/' and have no trailing slash."""
+        if not path:
+            return '/'
+        if not path.startswith('/'):
+            path = '/' + path
+        if len(path) > 1 and path.endswith('/'):
+            path = path.rstrip('/')
+        return path
+
+    def rename_path(self, old_virtual_path: str, new_virtual_path: str) -> List[Tuple[str, str]]:
+        """Rename metadata entries from old path (and descendants) to new path."""
+        old_path = self._normalize_virtual_path(old_virtual_path)
+        new_path = self._normalize_virtual_path(new_virtual_path)
+
+        if old_path == new_path:
+            return []
+
+        like_pattern = f"{old_path}/%"
+        cursor = self.conn.execute(
+            'SELECT virtual_path FROM files WHERE virtual_path = ? OR virtual_path LIKE ?',
+            (old_path, like_pattern)
+        )
+        rename_map: List[Tuple[str, str]] = []
+
+        for row in cursor.fetchall():
+            current_path = row['virtual_path']
+            if old_path == '/':
+                suffix = current_path
+            else:
+                suffix = current_path[len(old_path):]
+            new_entry = new_path + suffix
+            rename_map.append((current_path, new_entry))
+
+        for original, updated in rename_map:
+            self.conn.execute(
+                'UPDATE files SET virtual_path = ? WHERE virtual_path = ?',
+                (updated, original)
+            )
+            self.conn.execute(
+                'UPDATE file_locations SET virtual_path = ? WHERE virtual_path = ?',
+                (updated, original)
+            )
+
+        if rename_map:
+            self.conn.commit()
+
+        return rename_map
+
+    def rename_file(self, old_virtual_path: str, new_virtual_path: str):
+        """Rename a single file entry (alias for rename_path)."""
+        self.rename_path(old_virtual_path, new_virtual_path)
 
     def update_access_time(self, virtual_path: str):
         """Update last access time (for LRU)"""

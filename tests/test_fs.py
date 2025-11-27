@@ -6,10 +6,13 @@ from pathlib import Path
 import multiprocessing as mp
 import threading
 import os
+import time
+from unittest.mock import patch
 
 from storage.fs import StorageFS
 from storage.fs import _acquire_mount_lock
 from storage.backends.local import LocalBackend
+from storage.sync import DirOperation
 
 
 class TestReaddirMerging(unittest.TestCase):
@@ -40,6 +43,14 @@ class TestReaddirMerging(unittest.TestCase):
         self.fs.sync_manager.stop()
         self.fs.state_manager.close()
         shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _wait_for(self, predicate, timeout=5.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if predicate():
+                return True
+            time.sleep(0.05)
+        return predicate()
 
     def test_readdir_merges_backends_and_cache(self):
         # Files on different backends
@@ -133,6 +144,139 @@ class TestReaddirMerging(unittest.TestCase):
         )
         self.assertEqual({}, other_fs._dir_cache)
         other_fs.state_manager.close()
+
+    def test_mkdir_propagates_to_backends(self):
+        self.fs.mkdir('/newdir', 0o755)
+
+        self.assertTrue((self.cache_dir / 'newdir').is_dir())
+        self.assertTrue(self._wait_for(lambda: self.backends['backend1'].isdir('/newdir')))
+        self.assertTrue(self._wait_for(lambda: self.backends['backend2'].isdir('/newdir')))
+
+    def test_rmdir_propagates_to_backends(self):
+        path = '/todelete'
+        self.fs.mkdir(path, 0o755)
+        self.assertTrue((self.cache_dir / 'todelete').is_dir())
+
+        self.fs.rmdir(path)
+
+        self.assertFalse((self.cache_dir / 'todelete').exists())
+        self.assertTrue(self._wait_for(lambda: not self.backends['backend1'].isdir(path)))
+        self.assertTrue(self._wait_for(lambda: not self.backends['backend2'].isdir(path)))
+
+    def test_rename_directory_syncs_backends_and_state(self):
+        self.fs.mkdir('/dir', 0o755)
+        vfd = self.fs.create('/dir/file.txt', 0o644)
+        data = b'data'
+        self.fs.write('/dir/file.txt', data, 0, vfd)
+        self.fs.release('/dir/file.txt', vfd)
+
+        self.assertTrue(self.fs.sync_manager.sync_now('/dir/file.txt', timeout=5.0))
+
+        self.fs.rename('/dir', '/renamed')
+
+        self.assertTrue((self.cache_dir / 'renamed').is_dir())
+        self.assertFalse((self.cache_dir / 'dir').exists())
+
+        self.assertTrue(self._wait_for(lambda: not self.backend1_dir.joinpath('dir').exists()))
+        self.assertTrue(self._wait_for(lambda: self.backend1_dir.joinpath('renamed').is_dir()))
+        self.assertTrue(self._wait_for(lambda: self.backend1_dir.joinpath('renamed', 'file.txt').exists()))
+
+        old_meta = self.fs.state_manager.get_file_metadata('/dir/file.txt')
+        new_meta = self.fs.state_manager.get_file_metadata('/renamed/file.txt')
+        self.assertIsNone(old_meta)
+        self.assertIsNotNone(new_meta)
+
+    def test_mkdir_retry_targets_failed_backend(self):
+        path = '/needretry'
+        original = self.backends['backend2'].mkdir
+
+        def failing_mkdir(_path):
+            raise RuntimeError("backend2 offline")
+
+        self.backends['backend2'].mkdir = failing_mkdir
+        try:
+            with patch.object(self.fs.sync_manager, 'queue_dir_sync') as mock_queue:
+                self.fs.mkdir(path, 0o755)
+            mock_queue.assert_called_with(
+                path,
+                DirOperation.MKDIR,
+                mode=0o755,
+                backend_hint='backend2',
+                priority=80,
+                force=True,
+            )
+        finally:
+            self.backends['backend2'].mkdir = original
+
+    def test_rmdir_retry_targets_failed_backend(self):
+        path = '/deleteme'
+        self.fs.mkdir(path, 0o755)
+        original = self.backends['backend1'].rmdir
+
+        def failing_rmdir(_path):
+            raise RuntimeError("backend1 busy")
+
+        self.backends['backend1'].rmdir = failing_rmdir
+        try:
+            with patch.object(self.fs.sync_manager, 'queue_dir_sync') as mock_queue:
+                self.fs.rmdir(path)
+            mock_queue.assert_called_with(
+                path,
+                DirOperation.RMDIR,
+                backend_hint='backend1',
+                priority=80,
+                force=True,
+            )
+        finally:
+            self.backends['backend1'].rmdir = original
+
+    def test_rename_retry_targets_failed_backend(self):
+        self.fs.mkdir('/orig', 0o755)
+        target = '/renamed'
+        original = self.backends['backend2'].rename
+
+        def failing_rename(old, new):
+            raise RuntimeError("backend2 down")
+
+        self.backends['backend2'].rename = failing_rename
+        try:
+            with patch.object(self.fs.sync_manager, 'queue_dir_sync') as mock_queue:
+                self.fs.rename('/orig', target)
+            mock_queue.assert_called_with(
+                '/orig',
+                DirOperation.RENAME,
+                new_path=target,
+                backend_hint='backend2',
+                priority=90,
+                force=True,
+            )
+        finally:
+            self.backends['backend2'].rename = original
+
+    def test_mkdir_retry_eventually_replicates(self):
+        path = '/asyncdir'
+        backend2 = self.backends['backend2']
+        call_count = {'n': 0}
+        original = backend2.mkdir
+
+        def flaky_mkdir(target):
+            call_count['n'] += 1
+            if call_count['n'] == 1:
+                raise RuntimeError("transient failure")
+            return original(target)
+
+        backend2.mkdir = flaky_mkdir
+        try:
+            self.fs.mkdir(path, 0o755)
+            # Should not exist on backend2 immediately
+            self.assertFalse(backend2.isdir(path))
+
+            def replicated():
+                return backend2.isdir(path)
+
+            self.assertTrue(self._wait_for(replicated, timeout=5.0))
+        finally:
+            backend2.mkdir = original
 
 
 def _try_lock(lock_path_str, mountpoint, return_dict):
