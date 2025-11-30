@@ -1,0 +1,3 @@
+Agent testing guidelines:
+- Use the provided venv setup (e.g., run setup-venv.sh) and activate it before running tests.
+- Run the test suite from the venv before committing to catch regressions early.
