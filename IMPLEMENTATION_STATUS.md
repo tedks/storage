@@ -216,6 +216,13 @@ storage configure /mnt/storage/documents --replicas 2
 8. No support for very large files (>cache size)
 9. Extended attributes may not work on all filesystems
 
+### CLI Limitations
+- `info` reads only inherited xattr config; it does not show live backend locations, replica state, or sync/dirty status.
+- `configure` writes xattrs only; no validation that backends exist and no state DB updates.
+- `conflicts` (alias `conflict`) scans for `<name>.<backend>` files, not the `.local/.remote.<ts>` names produced by ConflictDetector; it works locally and does not inform sync/state.
+- `resolve` operates on `.local/.remote.<ts>` files using an in-memory StateManager; it renames/deletes files locally and does not update state DB or queues.
+- None of the CLI helpers surface per-backend health/availability, so output can diverge from actual remote status.
+
 ## Design Compliance
 
 ### Fully Implemented ✅
@@ -233,6 +240,7 @@ storage configure /mnt/storage/documents --replicas 2
 - ⚠️ Transparent encryption (works, keys persist locally but not in a secure keystore)
 - ⚠️ Space management (LRU and cache reclamation work, but over-replication detection and defrag are stubs)
 - ⚠️ Directory operations (mkdir/rmdir/rename propagate with backend-targeted retries; unlink still cache + hinted backend only)
+- ⚠️ CLI coverage (`info`, `configure`, `conflict(s)`, `resolve` are xattr/local helpers and do not reflect backend status or update state/sync)
 
 ### Not Working ❌
 - ❌ Over-replication cleanup (detection returns empty)
