@@ -10,9 +10,10 @@
   - Automatic monitoring of dirty files (configurable interval)
   - Conflict detection before syncing
   - Retry logic with exponential backoff
+  - Directory sync queue dedup keyed by op/path/new_path/backend with backend-targeted retries for mkdir/rmdir/rename
   - Statistics tracking (synced, failed, conflicts)
   - Configurable SyncConfig for all parameters
-- **Tests**: `tests/test_sync.py` (8 tests, all passing)
+- **Tests**: `tests/test_sync.py` (39 tests covering queueing, conflicts, dir sync, rename)
 - **Commits**: 93f6795, 9777ba3, a2fe5b2
 
 ### 2. Remote Backends (SSH/SFTP) ✅
@@ -110,10 +111,10 @@ storage/
 
 ## Test Coverage
 
-- **Sync tests**: `tests/test_sync.py` (8 tests - unit, integration, system)
+- **Sync tests**: `tests/test_sync.py` (39 tests across queueing, conflict detection, dir sync dedup/backoff, hierarchical/backend rename, path normalization)
+- **Filesystem tests**: `tests/test_fs.py` (17 tests including dir retry targeting and propagation)
 - **Recomputation tests**: `tests/test_recompute.py` (14 tests - unit, integration, async)
-- **System tests**: Full FUSE mount integration with sync validation
-- **Total**: 22 passing tests covering core functionality
+- **Total**: 70 tests covering core functionality and recent dir sync behavior
 
 ## Usage Examples
 
@@ -157,9 +158,8 @@ storage configure /mnt/storage/documents --replicas 2
    - Track which files are on which backends
    - Enable actual file movement between backends
 
-4. **Propagate directory operations to backends**
-   - mkdir/rmdir/unlink/rename should sync to backends
-   - Either sync immediately or queue for background workers
+4. **Harden directory unlink propagation**
+   - unlink currently removes from cache + hinted backend only; extend to multi-backend retries and queue consistency
 
 ### Optional Enhancements
 5. **Add SSH backend tests** - Mock SFTP connections to validate ssh backend behavior and regressions
@@ -192,11 +192,9 @@ storage configure /mnt/storage/documents --replicas 2
 ## Known Limitations
 
 ### Critical Limitations
-1. **Directory operations not replicated to backends** (by design - cache-first)
-   - mkdir/rmdir only affect cache (`fs.py:146`, `fs.py:158`)
-   - File deletions (unlink) only remove from cache (`fs.py:173`)
-   - Renames only update cache (`fs.py:187`)
-   - Background sync only propagates file *content*, not directory structure
+1. **Directory operations partially replicated**
+   - mkdir/rmdir/rename now propagate best-effort to all backends (or the hinted backend) and queue backend-specific retries when a replica is offline
+   - unlink still removes from cache and the hinted backend only; no queued retries yet
 
 ### Space Management Limitations
 2. **Over-replication detection not implemented** (`spacemgmt.py:76`)
@@ -218,12 +216,6 @@ storage configure /mnt/storage/documents --replicas 2
 8. No support for very large files (>cache size)
 9. Extended attributes may not work on all filesystems
 
-### General Limitations
-7. No automatic conflict resolution (by design - user must resolve)
-8. Whole-file caching (no partial file caching)
-9. No support for very large files (>cache size)
-10. Extended attributes may not work on all filesystems
-
 ## Design Compliance
 
 ### Fully Implemented ✅
@@ -240,7 +232,7 @@ storage configure /mnt/storage/documents --replicas 2
 ### Partially Implemented ⚠️
 - ⚠️ Transparent encryption (works, keys persist locally but not in a secure keystore)
 - ⚠️ Space management (LRU and cache reclamation work, but over-replication detection and defrag are stubs)
-- ⚠️ Directory operations (cache-only, not synced to backends)
+- ⚠️ Directory operations (mkdir/rmdir/rename propagate with backend-targeted retries; unlink still cache + hinted backend only)
 
 ### Not Working ❌
 - ❌ Over-replication cleanup (detection returns empty)
