@@ -1,8 +1,8 @@
 # Storage Implementation Status
 
-## 🚧 CORE FEATURES IMPLEMENTED - SOME LIMITATIONS
+## CORE FEATURES IMPLEMENTED - SOME LIMITATIONS
 
-### 1. Background Sync Workers ✅
+### 1. Background Sync Workers (done)
 - **Implementation**: `storage/sync.py`
 - **Features**:
   - Priority-based task queue
@@ -16,7 +16,7 @@
 - **Tests**: `tests/test_sync.py` (39 tests covering queueing, conflicts, dir sync, rename)
 - **Commits**: 93f6795, 9777ba3, a2fe5b2
 
-### 2. Remote Backends (SSH/SFTP) ✅
+### 2. Remote Backends (SSH/SFTP) (done)
 - **Implementation**: `storage/backends/ssh.py`
 - **Features**:
   - Full SFTP file operations
@@ -28,7 +28,7 @@
 - **Usage**: `storage mount /mnt/storage /local --remote ssh://user@host:/path --key-file ~/.ssh/id_rsa`
 - **Commit**: c6d8369
 
-### 3. Conflict Detection and Resolution ✅
+### 3. Conflict Detection and Resolution (done)
 - **Implementation**: `storage/conflicts.py`, `storage/cli.py`
 - **Features**:
   - ConflictDetector for checking conflicts (integrated into sync)
@@ -39,7 +39,7 @@
 - **Usage**: `storage resolve /mnt/storage [--auto local|remote|both]`
 - **Commits**: a2fe5b2, d5640ee
 
-### 4. Recomputation Engine ✅
+### 4. Recomputation Engine (done)
 - **Implementation**: `storage/recompute.py`
 - **Features**:
   - Execute commands to recreate deleted files
@@ -53,38 +53,38 @@
 - **Usage**: `storage configure /path --recomputable --recompute-cmd 'wget -O $STORAGE_OUTPUT https://...'`
 - **Commits**: 076bd02, 347a50a
 
-### 5. Transparent Encryption ⚠️
+### 5. Transparent Encryption (partial)
 - **Implementation**: `storage/crypto.py`
 - **Implemented Features**:
-  - ✅ Fernet-based encryption (AES-128-CBC + HMAC)
-  - ✅ EncryptionKey with PBKDF2 key derivation
-  - ✅ KeyManager for multiple keys
-  - ✅ CryptoManager for transparent encryption/decryption
-  - ✅ Per-file and per-backend encryption policies
-  - ✅ Default key auto-generation (in-memory)
-  - ✅ CLI integration with --encrypt flag
+  - (done) Fernet-based encryption (AES-128-CBC + HMAC)
+  - (done) EncryptionKey with PBKDF2 key derivation
+  - (done) KeyManager for multiple keys
+  - (done) CryptoManager for transparent encryption/decryption
+  - (done) Per-file and per-backend encryption policies
+  - (done) Default key auto-generation (in-memory)
+  - (done) CLI integration with --encrypt flag
 - **Known Limitations**:
-  - ⚠️ Encryption keys are ephemeral (in-memory only)
-  - ⚠️ Key storage not implemented (_load_keys/_save_keys are stubs - TODOs at lines 114, 119)
-  - ⚠️ Keys don't persist across restarts - each mount generates new default key
-  - ⚠️ Files encrypted in one session cannot be decrypted in another session
+  - (partial) Encryption keys are ephemeral (in-memory only)
+  - (partial) Key storage not implemented (_load_keys/_save_keys are stubs - TODOs at lines 114, 119)
+  - (partial) Keys don't persist across restarts - each mount generates new default key
+  - (partial) Files encrypted in one session cannot be decrypted in another session
 - **Usage**: `storage configure /path --encrypt [--encrypt-backends remote0,remote1]`
 - **Commit**: 6fbb530
 
-### 6. Advanced Space Management ⚠️
+### 6. Advanced Space Management (partial)
 - **Implementation**: `storage/spacemgmt.py`, `storage/cache.py`
 - **Implemented Features**:
-  - ✅ Backend space usage monitoring
-  - ✅ LRU cache eviction (from CacheManager)
-  - ✅ Comprehensive space usage reporting
-  - ✅ Dry-run mode for all operations
-  - ✅ Space reclamation via recomputable files (cache only)
+  - (done) Backend space usage monitoring
+  - (done) LRU cache eviction (from CacheManager)
+  - (done) Comprehensive space usage reporting
+  - (done) Dry-run mode for all operations
+  - (done) Space reclamation via recomputable files (cache only)
 - **Stub/Incomplete Features**:
-  - ⚠️ Over-replication detection (returns empty list - TODO at line 76)
-  - ⚠️ Over-replication cleanup (depends on detection, does nothing)
-  - ⚠️ Defragmentation (structure exists but doesn't move files - TODO at line 168)
-  - ⚠️ Backend-specific over-replication cleanup (TODO at line 199)
-  - ⚠️ Smart optimization (hot/cold file movement - TODO at line 254)
+  - (partial) Over-replication detection (returns empty list - TODO at line 76)
+  - (partial) Over-replication cleanup (depends on detection, does nothing)
+  - (partial) Defragmentation (structure exists but doesn't move files - TODO at line 168)
+  - (partial) Backend-specific over-replication cleanup (TODO at line 199)
+  - (partial) Smart optimization (hot/cold file movement - TODO at line 254)
 - **Commit**: fdd7dc2
 
 ## Architecture Summary
@@ -92,21 +92,21 @@
 ```
 storage/
 ├── __init__.py
-├── state.py           # SQLite + xattr metadata ✅
-├── cache.py           # LRU cache management ✅
-├── sync.py            # Background sync workers ✅
-├── conflicts.py       # Conflict detection/resolution ✅
-├── replication.py     # N-way replication logic ✅
-├── recompute.py       # File recomputation engine ✅
-├── crypto.py          # Transparent encryption ✅
-├── spacemgmt.py       # Advanced space management ✅
-├── fs.py              # FUSE filesystem ✅
-├── cli.py             # CLI commands ✅
+├── state.py           # SQLite + xattr metadata (done)
+├── cache.py           # LRU cache management (done)
+├── sync.py            # Background sync workers (done)
+├── conflicts.py       # Conflict detection/resolution (done)
+├── replication.py     # N-way replication logic (done)
+├── recompute.py       # File recomputation engine (done)
+├── crypto.py          # Transparent encryption (done)
+├── spacemgmt.py       # Advanced space management (done)
+├── fs.py              # FUSE filesystem (done)
+├── cli.py             # CLI commands (done)
 └── backends/
     ├── __init__.py
-    ├── base.py        # Backend interface ✅
-    ├── local.py       # Local filesystem ✅
-    └── ssh.py         # SSH/SFTP remote ✅
+    ├── base.py        # Backend interface (done)
+    ├── local.py       # Local filesystem (done)
+    └── ssh.py         # SSH/SFTP remote (done)
 ```
 
 ## Test Coverage
@@ -225,36 +225,36 @@ storage configure /mnt/storage/documents --replicas 2
 
 ## Design Compliance
 
-### Fully Implemented ✅
-- ✅ Local cache with LRU management
-- ✅ N-way replication across backends
-- ✅ Background sync workers with retry logic
-- ✅ Hierarchical configuration (max replica count inheritance)
-- ✅ Remote filesystem support (SSH/SFTP with auto-reconnection)
-- ✅ Conflict detection (checksum-based)
-- ✅ Conflict resolution (interactive CLI tool with auto modes)
-- ✅ Recomputation engine (command execution, timeout handling, async support)
-- ✅ FUSE filesystem with smart allow_other handling
+### Fully Implemented (done)
+- (done) Local cache with LRU management
+- (done) N-way replication across backends
+- (done) Background sync workers with retry logic
+- (done) Hierarchical configuration (max replica count inheritance)
+- (done) Remote filesystem support (SSH/SFTP with auto-reconnection)
+- (done) Conflict detection (checksum-based)
+- (done) Conflict resolution (interactive CLI tool with auto modes)
+- (done) Recomputation engine (command execution, timeout handling, async support)
+- (done) FUSE filesystem with smart allow_other handling
 
-### Partially Implemented ⚠️
-- ⚠️ Transparent encryption (works, keys persist locally but not in a secure keystore)
-- ⚠️ Space management (LRU and cache reclamation work, but over-replication detection and defrag are stubs)
-- ⚠️ Directory operations (mkdir/rmdir/rename propagate with backend-targeted retries; unlink still cache + hinted backend only)
-- ⚠️ CLI coverage (`info`, `configure`, `conflict(s)`, `resolve` are xattr/local helpers and do not reflect backend status or update state/sync)
+### Partially Implemented (partial)
+- (partial) Transparent encryption (works, keys persist locally but not in a secure keystore)
+- (partial) Space management (LRU and cache reclamation work, but over-replication detection and defrag are stubs)
+- (partial) Directory operations (mkdir/rmdir/rename propagate with backend-targeted retries; unlink still cache + hinted backend only)
+- (partial) CLI coverage (`info`, `configure`, `conflict(s)`, `resolve` are xattr/local helpers and do not reflect backend status or update state/sync)
 
-### Not Working ❌
-- ❌ Over-replication cleanup (detection returns empty)
-- ❌ Defragmentation (stub implementation)
+### Not Working (not working)
+- (not working) Over-replication cleanup (detection returns empty)
+- (not working) Defragmentation (stub implementation)
 
 ### Use Case Support Assessment
-1. ⚠️ **Remote filesystems with local cache**
+1. (partial) **Remote filesystems with local cache**
    - Works for discovering and reading remote files (directory listing merged across backends; backend stat fallback)
    - Offline usage works if files were previously cached
 
-2. ✅ **Multiple RAIDs with flexible replication**
+2. (done) **Multiple RAIDs with flexible replication**
    - Fully functional for cache-first workflows
    - Background sync properly replicates to backends
 
-3. ⚠️ **Cloud storage with transparent encryption**
+3. (partial) **Cloud storage with transparent encryption**
    - Encryption works within a single session; keys persisted locally
    - No secure keystore yet; keys stored in local file with 0600 perms
