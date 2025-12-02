@@ -1,0 +1,28 @@
+module(
+    name = "storage",
+    version = "0.1.0",
+    compatibility_level = 1,
+)
+
+# Python rules and toolchains
+bazel_dep(name = "rules_python", version = "1.6.3")
+bazel_dep(name = "bazel_skylib", version = "1.8.1")
+bazel_dep(name = "bazel_features", version = "1.21.0")
+
+python = use_extension("@rules_python//python/extensions:python.bzl", "python")
+python.defaults(python_version = "3.11")
+python.toolchain(
+    python_version = "3.11",
+)
+use_repo(python, "python_3_11", "python_3_11_host", "pythons_hub")
+
+# Bring in PyPI dependencies from the existing requirements.txt
+pip = use_extension("@rules_python//python/extensions:pip.bzl", "pip")
+pip.parse(
+    hub_name = "pypi",
+    python_version = "3.11",
+    requirements_lock = "//:requirements.lock",
+)
+use_repo(pip, "pypi")
+
+register_toolchains("@pythons_hub//:all")
