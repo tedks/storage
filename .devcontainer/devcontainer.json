@@ -1,0 +1,24 @@
+{
+  "name": "storage-nix",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
+  "remoteUser": "dev",
+  "workspaceFolder": "/workspace",
+  "mounts": [
+    "source=storage-nix-store,target=/nix,type=volume"
+  ],
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "mkhl.direnv",
+        "timonwong.shellcheck",
+        "ms-python.python",
+        "bazelbuild.vscode-bazel"
+      ]
+    }
+  },
+  "postCreateCommand": ". \"$HOME/.nix-profile/etc/profile.d/nix.sh\" && nix develop . --command true",
+  "features": {}
+}
