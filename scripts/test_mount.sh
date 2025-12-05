@@ -22,11 +22,11 @@ echo "Backends:"
 echo "  - remote0: ssh://tedks@drynwyn:/srv/raid/warez/Downloads/storage-test"
 echo "  - remote1: ssh://tedks@framework0:/home/tedks/Downloads/storage-test"
 echo
-echo "Use test_unmount.sh to unmount and stop the daemon"
+echo "Use scripts/test_unmount.sh to unmount and stop the daemon"
 echo
 
 # Mount the filesystem using virtualenv python
-./venv/bin/python3 -m storage.cli mount ~/Downloads/storage-test \
+.venv/bin/python3 -m storage.cli mount ~/Downloads/storage-test \
   --cache ~/Downloads/storage-cache \
   --cache-size 5G \
   --remote ssh://tedks@drynwyn:/srv/raid/warez/Downloads/storage-test \
