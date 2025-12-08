@@ -212,7 +212,10 @@ echo "Found Nix: $("${NIX_BIN}" "${NIX_ARGS[@]}" --version)"
 echo "Entering Nix development shell..."
 DEV_SHELL_CMD=()
 if [[ -n "${NIX_SHELL_COMMAND:-}" ]]; then
-  DEV_SHELL_CMD=(--command "${NIX_SHELL_COMMAND}")
+  # Respect shell-style quoting in NIX_SHELL_COMMAND so arguments survive spaces.
+  # shellcheck disable=SC2086 # intentional word splitting via eval
+  eval "set -- ${NIX_SHELL_COMMAND}"
+  DEV_SHELL_CMD=(--command "$@")
 fi
 
 exec "${NIX_BIN}" "${NIX_ARGS[@]}" --extra-experimental-features "nix-command flakes" develop "${repo_root}" "${DEV_SHELL_CMD[@]}"
