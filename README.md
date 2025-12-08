@@ -34,6 +34,11 @@ The `setup-venv.sh` helper script creates `.venv/`, installs/upgrades `pip`, and
 - **Bazel**: Build/test from the dev shell: `bazel build //:storage_cli` and `bazel test //:storage_tests`.
 - **Helper script**: `./scripts/ensure-nix-shell.sh` will fetch nix-portable if Nix is absent, then run `nix develop`.
 
+## Testing
+
+- **Pytest (venv)**: Activate the virtualenv (`source .venv/bin/activate`) and run `pytest`.
+- **Bazel**: From the Nix dev shell, run `bazel test //:storage_tests` (or `bazel test //...` for everything). This uses the hermetic Bazel toolchain and the repo’s pinned Python deps.
+
 ## Quick Start
 
 ### Basic Usage
