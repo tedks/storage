@@ -216,6 +216,8 @@ class StorageFS(Operations):
         if names is None:
             return
         self._store_dir_cache_entry(path, backend_name, names, mtime, time.time())
+        if self.logger.isEnabledFor(logging.DEBUG):
+            self.logger.debug("dir refresh complete path=%s backend=%s entries=%d", path, backend_name, len(names))
         self._notify_dir_changed(path)
 
     def _refresh_dir_listing_sync(self, path: str, backend: Backend):
@@ -224,6 +226,8 @@ class StorageFS(Operations):
             mtime = backend.get_dir_mtime(path)
             return backend_entries, mtime
         except Exception as exc:
+            if self.logger.isEnabledFor(logging.DEBUG):
+                self.logger.debug("dir refresh failed for %s on %s: %s", path, backend.name, exc)
             self.logger.debug("dir refresh failed for %s on %s: %s", path, backend.name, exc)
             return None, None
 
@@ -569,13 +573,19 @@ class StorageFS(Operations):
                 entries.update(cache_entry.names)
                 # Fresh cache: probe mtime in background to detect changes
                 if now - cache_entry.fetched_at < self.DIR_CACHE_TTL:
+                    if self.logger.isEnabledFor(logging.DEBUG):
+                        self.logger.debug("readdir cache-hit (fresh) path=%s backend=%s", path, backend_name)
                     self._schedule_mtime_probe(path, backend_name, backend, cache_entry.mtime)
                     continue
                 # Stale cache: serve cached but trigger refresh
+                if self.logger.isEnabledFor(logging.DEBUG):
+                    self.logger.debug("readdir cache-hit (stale -> refresh) path=%s backend=%s", path, backend_name)
                 self._schedule_full_dir_refresh(path, backend_name, backend)
                 continue
 
             # No cache: populate synchronously
+            if self.logger.isEnabledFor(logging.DEBUG):
+                self.logger.debug("readdir cache-miss path=%s backend=%s", path, backend_name)
             backend_entries, mtime = self._refresh_dir_listing_sync(path, backend)
             if backend_entries is not None:
                 entries.update(backend_entries)
@@ -1071,7 +1081,8 @@ def _acquire_mount_lock(lock_path: Path, mountpoint: str):
 def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
                  backends: Dict[str, Backend], cache_size: int,
                  foreground: bool = False, num_sync_workers: int = 2,
-                 allow_other: Optional[bool] = None):
+                 allow_other: Optional[bool] = None,
+                 debug: bool = False):
     """
     Mount a Storage filesystem
 
@@ -1085,10 +1096,15 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
         num_sync_workers: Number of background sync workers
         allow_other: Allow other users to access the mount (requires root or fuse.conf setting).
                      If None, auto-detects based on whether running as root.
+        debug: Enable verbose debug logging
 
     Raises:
         PermissionError: If allow_other=True but not running as root and user_allow_other not set
     """
+    logging.basicConfig(
+        level=logging.DEBUG if debug else logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
     logger = logging.getLogger(__name__)
 
     is_root = os.geteuid() == 0

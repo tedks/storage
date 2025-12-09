@@ -32,7 +32,8 @@ def main():
 @click.option('-f', '--foreground', is_flag=True, help='Run in foreground')
 @click.option('--allow-other/--no-allow-other', default=None,
               help='Allow other users to access mount (requires root or fuse.conf setting). Auto-detects if not specified.')
-def mount(mountpoint, backing_paths, cache, cache_size, database, workers, remote, key_file, foreground, allow_other):
+@click.option('--debug', is_flag=True, help='Enable verbose debug logging')
+def mount(mountpoint, backing_paths, cache, cache_size, database, workers, remote, key_file, foreground, allow_other, debug):
     """
     Mount a Storage filesystem
 
@@ -149,7 +150,8 @@ def mount(mountpoint, backing_paths, cache, cache_size, database, workers, remot
             cache_size_bytes,
             foreground=foreground,
             num_sync_workers=workers,
-            allow_other=allow_other
+            allow_other=allow_other,
+            debug=debug,
         )
     except PermissionError as e:
         click.echo(f"Permission error: {e}", err=True)

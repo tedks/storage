@@ -69,6 +69,7 @@ class SSHBackend(Backend):
             if self.key_filename:
                 connect_kwargs['key_filename'] = self.key_filename
             else:
+                connect_kwargs['allow_agent'] = False
                 connect_kwargs['look_for_keys'] = False
 
             self._ssh_client.connect(**connect_kwargs)
