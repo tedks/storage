@@ -34,3 +34,16 @@ py_test(
         "@pypi//pytest_timeout",
     ],
 )
+
+py_test(
+    name = "storage_benchmarks",
+    srcs = ["tests/pytest_main.py"] + glob(["tests/benchmarks/*.py"]),
+    main = "tests/pytest_main.py",
+    tags = ["benchmark"],
+    deps = [
+        ":storage_lib",
+        "@pypi//pytest",
+        "@pypi//pytest_timeout",
+        "@pypi//pytest_benchmark",
+    ],
+)

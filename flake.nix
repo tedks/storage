@@ -21,6 +21,7 @@
             python
             python.pkgs.pip
             python.pkgs.virtualenv
+            python.pkgs.pip-tools
           ];
 
           shellHook = ''

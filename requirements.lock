@@ -28,6 +28,8 @@ paramiko==4.0.0
     # via -r requirements.txt
 pluggy==1.6.0
     # via pytest
+py-cpuinfo==9.0.0
+    # via pytest-benchmark
 pycparser==2.23
     # via cffi
 pygments==2.19.2
@@ -37,7 +39,10 @@ pynacl==1.6.1
 pytest==9.0.1
     # via
     #   -r requirements.txt
+    #   pytest-benchmark
     #   pytest-timeout
+pytest-benchmark==4.0.0
+    # via -r requirements.txt
 pytest-timeout==2.4.0
     # via -r requirements.txt
 pyyaml==6.0.3
