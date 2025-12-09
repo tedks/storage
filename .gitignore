@@ -45,6 +45,9 @@ htmlcov/
 .nix-portable
 nix-portable
 
+# Bazel outputs
+bazel-*
+
 # OS
 .DS_Store
 Thumbs.db
