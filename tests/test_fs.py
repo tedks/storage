@@ -42,6 +42,7 @@ class TestReaddirMerging(unittest.TestCase):
     def tearDown(self):
         self.fs.sync_manager.stop()
         self.fs.state_manager.close()
+        self.fs._dir_refresh_executor.shutdown(wait=True, cancel_futures=True)
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     def _wait_for(self, predicate, timeout=5.0):
@@ -185,6 +186,40 @@ class TestReaddirMerging(unittest.TestCase):
         new_meta = self.fs.state_manager.get_file_metadata('/renamed/file.txt')
         self.assertIsNone(old_meta)
         self.assertIsNotNone(new_meta)
+
+    def test_readdir_serves_cache_when_fresh(self):
+        (self.backend1_dir / "fresh.txt").write_text("cached")
+        list(self.fs.readdir('/', None))  # populate cache
+
+        # Break backend listdir; should still serve from cache because TTL not expired
+        original = self.backends['backend1'].listdir
+
+        def failing_listdir(_path):
+            raise RuntimeError("should not be called on fresh cache")
+
+        self.backends['backend1'].listdir = failing_listdir
+        try:
+            entries = set(self.fs.readdir('/', None))
+            self.assertIn('fresh.txt', entries)
+        finally:
+            self.backends['backend1'].listdir = original
+
+    def test_readdir_refreshes_after_dir_mtime_change(self):
+        (self.backend1_dir / "old.txt").write_text("old")
+        list(self.fs.readdir('/', None))  # initial cache
+
+        # Ensure mtime changes
+        time.sleep(1.1)
+        (self.backend1_dir / "new.txt").write_text("new")
+
+        # First readdir may return cached view but should schedule probe+refresh
+        first_view = set(self.fs.readdir('/', None))
+        self.assertNotIn('new.txt', first_view)
+
+        def has_new():
+            return 'new.txt' in set(self.fs.readdir('/', None))
+
+        self.assertTrue(self._wait_for(has_new, timeout=5.0))
 
     def test_mkdir_retry_targets_failed_backend(self):
         path = '/needretry'
