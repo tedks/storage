@@ -3,10 +3,11 @@ SSH/SFTP backend implementation for remote filesystems
 """
 
 import os
+import shlex
+import logging
 import paramiko
 from pathlib import Path, PurePosixPath
 from typing import List, Optional
-import shlex
 
 from .base import Backend, BackendType
 
@@ -42,6 +43,7 @@ class SSHBackend(Backend):
         self.password = password
         self.key_filename = key_filename
         self.connect_timeout = connect_timeout
+        self.logger = logging.getLogger(__name__)
 
         # SSH/SFTP connections (lazy connected)
         self._ssh_client: Optional[paramiko.SSHClient] = None
@@ -59,12 +61,15 @@ class SSHBackend(Backend):
                 'username': self.username,
                 'timeout': self.connect_timeout,
                 'banner_timeout': self.connect_timeout,
+                'auth_timeout': self.connect_timeout,
             }
 
             if self.password:
                 connect_kwargs['password'] = self.password
             if self.key_filename:
                 connect_kwargs['key_filename'] = self.key_filename
+            else:
+                connect_kwargs['look_for_keys'] = False
 
             self._ssh_client.connect(**connect_kwargs)
             self._sftp_client = self._ssh_client.open_sftp()
@@ -80,8 +85,16 @@ class SSHBackend(Backend):
 
             self.set_available(True)
 
+        except paramiko.AuthenticationException as e:
+            self.logger.error("SSH authentication failed for %s@%s:%s: %s", self.username, self.host, self.port, e)
+            self.set_available(False)
+            raise
+        except paramiko.SSHException as e:
+            self.logger.error("SSH handshake failed for %s@%s:%s: %s", self.username, self.host, self.port, e)
+            self.set_available(False)
+            raise
         except Exception as e:
-            print(f"Failed to connect to {self.host}: {e}")
+            self.logger.error("Failed to connect to %s@%s:%s: %s", self.username, self.host, self.port, e)
             self.set_available(False)
             raise
 
