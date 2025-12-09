@@ -3,46 +3,47 @@
 ## Issues
 
 ### 1. Directory listings always hit every backend
-`StorageFS.readdir` unconditionally calls `backend.isdir` and `backend.listdir` for every backend on every call, even when the cache already has a fresh view and when the caller only needs a quick GUI refresh. The per‑backend listings are only used to populate `_dir_cache` as a fallback when later calls fail, so there is no fast path that serves directly from cache. Each listing therefore incurs at least two network round‑trips per backend (stat + list) and the results are merged per call. On high‑latency SSH backends this dominates the time to render directories and keeps the single FUSE thread busy. (storage/fs.py:452‑489)
+`StorageFS.readdir` still walks every backend on every call. Even if cache data are present, we re‑`stat` and `listdir` each backend, then merge. That means two network round‑trips per backend per GUI refresh, keeps the single FUSE thread occupied, and makes “cached” directories feel uncached. We also have no notion of remote directory freshness beyond the last listing; mtime on the backend isn’t checked first, and we don’t emit invalidate notifications to the kernel to wake up watchers.
 
 #### Proposed Solution
-- Add a TTLed directory cache: if a directory was fetched within (configurable) N seconds and no invalidation event occurred, serve directly from the cached entries and return immediately.
-- Record an `mtime`/`generation` for cached dirs and only refresh when expired or explicitly invalidated by local writes/renames.
-- Make backend listing lazy: issue async refresh in the background while the cached result is returned to the caller.
-- Consider per‑backend debounce (only one in‑flight list per dir/backend) to avoid stampedes.
+- Fast path from cache: if we have cached entries and they are younger than a configurable TTL **and** no local invalidation (mkdir/rmdir/rename/unlink on that path) has occurred, return immediately.
+- In parallel, fire async per‑backend probes that fetch only directory `mtime` (e.g., `sftp.stat` on the dir or a lightweight `ls -ld --time-style=+%s`); if any backend reports newer mtime than cached, trigger a full `listdir` refresh for that backend and update cache.
+- Emit change notifications to userspace via FUSE `notify_inval_entry` / `notify_inval_inode` after refreshing so GUI file managers update automatically; use per‑backend refresh completion to drive these.
+- Allow parallel backend refreshes but collapse multiple in‑flight refreshes for the same (dir, backend) pair to a single request to avoid stampedes.
 
 ### 2. Per‑entry checksums scheduled on every readdir
-After merging entries, `readdir` calls `_schedule_directory_checksums` for every backend entry every time. For SSH backends `get_fast_checksum` shells out to `sha256sum` over SSH, which reads the entire file. This adds O(files × backends) remote work per directory view; large directories cause prolonged CPU/network usage, slowing subsequent operations and blocking channel availability. (storage/fs.py:482‑486, 190‑238; storage/backends/ssh.py:339‑355)
+Every `readdir` schedules checksum work for every entry on every backend. On SSH backends `get_fast_checksum` shells out to `sha256sum`, reading whole files. We do this even when nothing has changed, consuming bandwidth, CPU, and SSH channels. We also ignore the timestamps already stored in checksum xattrs, so we can’t skip work when the backend file is older than the cached checksum.
 
 #### Proposed Solution
-- Stop scheduling checksums from `readdir`; instead trigger on demand (first read/open) or via a periodic background sweeper with rate limits.
-- Cache checksum completion per (path, backend) with a TTL and skip rescheduling while valid.
-- For SSH, prefer `sftp.stat` + size/mtime fast path, and only fall back to remote `sha256sum` when conflict detection actually needs content.
-- Bound the checksum executor queue and add backpressure to avoid overwhelming SSH channels.
+- Make checksum scheduling conditional: if cached checksum xattr timestamp is newer than remote dir/file mtime (from the lightweight probe above), skip scheduling.
+- Move checksum work off `readdir`: queue on first open/read or via a low‑rate background sweeper. Keep a per‑(path, backend) TTL to prevent rescheduling while still fresh.
+- Prefer metadata‑only validation: if size/mtime match and checksum timestamp ≥ remote mtime, trust it; only run `sha256sum` (or faster `b2sum` if available) when metadata differs or on conflict detection.
+- Reuse SSH multiplexed sessions for checksum execs to avoid repeated handshakes (see issue 4) and ensure channels are closed; keep a small bounded queue to avoid unbounded channel creation while still allowing multiplexing.
 
 ### 3. File open blocks on full download and full cache scan
-`open` calls `_ensure_file_in_cache` → `cache_file`, which first walks the entire cache (`get_total_cache_size` uses `os.walk`) to compute size, then downloads the entire remote file before returning. Even small reads pay an O(cache_files) walk plus a full‑file copy, so “open” in editors or GUI becomes “download whole file”. Large files or slow links make open feel hung. (storage/fs.py:657‑410; storage/cache.py:61‑87, 201‑240)
+`open` currently walks the entire cache to compute size and then downloads the entire file before returning. The first read blocks on a full fetch even if the caller asked for a small prefix. On slow/remote links this feels like a hang, and the cache walk is O(total files) per miss.
 
 #### Proposed Solution
-- Maintain cached cache‑size metadata (update incrementally on add/evict) to avoid full `os.walk` per download.
-- Support streaming/on‑demand reads: allow opening a sparse stub that fetches blocks on demand, or at least defer full download to a background thread while serving the first read via SFTP.
-- Add a size threshold: small files eager‑cache; large files use ranged reads or partial prefetch.
-- Surface progress/timeout and allow caller to see ENODATA instead of blocking indefinitely.
+- Maintain cache size accounting incrementally (update counters on add/evict) to avoid `os.walk` on every fetch.
+- On first open, fetch only the requested range into cache via SFTP/SSH and return promptly; immediately kick off a background full‑file download to fill the cache, updating file as data arrive.
+- Use a faster bulk transfer tool for the background fetch when possible: rsync over SSH with `--partial --inplace`, tar|ssh stream, or HPN‑SSH/parallelized copy on high‑latency links; fall back to tuned sftp (`-R`, `-B`) when rsync isn’t available.
+- Emit inotify/FUSE notifications when the background download completes so readers can revalidate size and GUI progress bars can refresh.
+- Make eager full‑download optional/size‑thresholded (e.g., eager for <N MB; staged for larger files).
 
 ### 4. SSH channel/session leak from checksum/xattr tasks
-Checksum tasks and xattr setters run via `SSHClient.exec_command`, which opens a new channel per request. Tasks are launched without concurrency limits and without closing/reusing channels. Under sustained `readdir` traffic (issue #2) channel numbers climb until the server rejects new channels, producing log spam: `Secsh channel <N> open FAILED: Connect failed`. There is no pooling or throttling, and failures don’t trigger backoff. (storage/fs.py:205‑238; storage/backends/ssh.py:339‑384)
+Checksum/xattr tasks spawn `exec_command` per item, each opening a new SSH channel. Because we schedule many (issue 2), channel numbers climb until the server refuses new channels, producing the “Secsh channel … open FAILED” spam. We also pay full handshake cost per command.
 
 #### Proposed Solution
-- Introduce a per‑backend semaphore limiting concurrent execs/SFTP ops (e.g., 4–8).
-- Reuse a bounded channel pool or serialize `exec_command` via the semaphore; ensure channels are closed in `finally`.
-- Add exponential backoff when channel open fails and temporarily mark backend unavailable to shed load.
-- Allow disabling remote checksum/xattr over SSH entirely via config for latency‑sensitive deployments.
+- Enable OpenSSH ControlMaster/ControlPath to multiplex channels over a single TCP connection per backend, avoiding repeated handshakes while still allowing many concurrent channels.
+- Implement a small channel‑use queue to ensure channels are closed in `finally` and to prevent leak from runaway task creation while still honoring multiplexing (light bound, not heavy throttling).
+- Keep xattr reads/writes over the multiplexed session; ensure `set_xattr`/`get_xattr` use the shared control socket and are exception‑safe.
+- Optionally allow disabling remote checksum/xattr over SSH for latency‑sensitive deployments.
 
 ### 5. Dead transports never reconnected
 `SSHBackend._ensure_connected` only reconnects when `_ssh_client`/`_sftp_client` is `None`. If the underlying transport drops (idle timeout, server reset), the objects remain non‑None and subsequent operations reuse a dead session, yielding repeated channel‑open failures and “connect failed” spam instead of a clean reconnect. Availability flags are never cleared on such errors, so selection logic keeps sending work to the dead backend. (storage/backends/ssh.py:93‑107)
 
 #### Proposed Solution
-- Add connection liveness checks (e.g., `transport.is_active()`, lightweight `sftp.listdir('.')`) before use; on failure, close and reconnect with backoff.
-- On repeated failures, set `_available=False` so replication/read selection can bypass the backend until a successful reconnect.
-- Record last‑error timestamps and throttle reconnect attempts to avoid rapid churn.
-- Optionally expose a health thread that pings/removes stale sessions and refreshes `_sftp_client`.
+- Add liveness checks (e.g., `transport.is_active()` plus a lightweight `sftp.listdir('.')`) before use; if dead, close and reconnect.
+- Mark backend unavailable on consecutive failures so selection can bypass it until a successful reconnect clears the flag.
+- Record last‑error timestamps and throttle reconnect attempts to avoid churn.
+- Optionally run a health thread to refresh dead sessions proactively.
