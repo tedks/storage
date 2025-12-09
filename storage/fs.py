@@ -32,6 +32,11 @@ from .recompute import RecomputeEngine
 from .checksums import ChecksumRecord
 
 
+@dataclass
+class DirCacheEntry:
+    names: Set[str]
+    mtime: Optional[float]
+    fetched_at: float
 class StorageFS(Operations):
     """
     Storage FUSE filesystem
@@ -42,13 +47,6 @@ class StorageFS(Operations):
 
     CHECKSUM_XATTR = "user.storage.checksums"
     _STUB_XATTR = "user.storage.stub"
-
-
-@dataclass
-class DirCacheEntry:
-    names: Set[str]
-    mtime: Optional[float]
-    fetched_at: float
 
     def __init__(self, cache_root: Path, state_db: Path, backends: Dict[str, Backend],
                  cache_size: int, num_sync_workers: int = 2, start_sync: bool = True):
