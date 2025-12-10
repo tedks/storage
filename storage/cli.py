@@ -331,12 +331,12 @@ def _attempt_merge_bytes(content_a: bytes, content_b: bytes) -> Optional[bytes]:
     return None
 
 
-def _select_merge_tool() -> str:
-    """Pick an external 3-way merge tool."""
+def _select_merge_tool() -> Optional[str]:
+    """Pick an external 3-way merge tool if available."""
     for tool in ("git", "diff3"):
         if shutil.which(tool):
             return tool
-    raise click.ClickException("No merge tool found (need git or diff3 installed)")
+    return None
 
 
 def _run_merge_tool(tool: str, local: Path, ancestor: Path, remote: Path) -> Optional[bytes]:
@@ -450,9 +450,13 @@ def conflicts(directory, target_file, take_backend, merge):
                 tmp.close()
                 ancestor_path = Path(tmp.name)
 
+            if not merge_tool:
+                click.echo(f"{base}: merge requested but no git or diff3 available")
+                continue
+
             merged = _run_merge_tool(merge_tool, local_path, ancestor_path, remote_path)
             if merged is None:
-                click.echo(f"{base}: merge tool failed")
+                click.echo(f"{base}: merge tool {merge_tool} failed")
                 continue
 
             base_path.write_bytes(merged)

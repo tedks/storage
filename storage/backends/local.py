@@ -108,6 +108,27 @@ class LocalBackend(Backend):
             return []
         return os.listdir(real_path)
 
+    def listdir_attrs(self, virtual_path: str):
+        real_path = self._resolve_path(virtual_path)
+        if not real_path.exists() or not real_path.is_dir():
+            return []
+        result = []
+        with os.scandir(real_path) as it:
+            for entry in it:
+                try:
+                    st = entry.stat(follow_symlinks=False)
+                    result.append((entry.name, {
+                        'st_mode': st.st_mode,
+                        'st_size': st.st_size,
+                        'st_mtime': st.st_mtime,
+                        'st_gid': st.st_gid,
+                        'st_uid': st.st_uid,
+                        'st_nlink': st.st_nlink,
+                    }))
+                except FileNotFoundError:
+                    continue
+        return result
+
     def isdir(self, virtual_path: str) -> bool:
         """Check if path is a directory"""
         real_path = self._resolve_path(virtual_path)

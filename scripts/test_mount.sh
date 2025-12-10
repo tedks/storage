@@ -29,6 +29,6 @@ echo
 .venv/bin/python3 -m storage.cli mount ~/Downloads/storage-test \
   --cache ~/Downloads/storage-cache \
   --cache-size 5G \
-  --remote ssh://tedks@drynwyn:/srv/raid/warez/Downloads/storage-test \
-  --remote ssh://tedks@framework0:/home/tedks/Downloads/storage-test \
+  --remote ssh://tedks@drynwyn.local:/srv/raid/warez/Downloads/storage-test \
+  --remote ssh://tedks@framework0.local:/home/tedks/Downloads/storage-test \
   --key-file ~/.ssh/id_rsa

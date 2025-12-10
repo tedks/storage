@@ -83,6 +83,13 @@ class SSHBackend(Backend):
                 except Exception:
                     # Best-effort; SFTP may still function without socket-level timeout
                     pass
+            # Also set channel-level timeout so listdir/stat calls don't hang forever
+            try:
+                chan = self._sftp_client.get_channel()
+                if chan:
+                    chan.settimeout(self.connect_timeout)
+            except Exception:
+                pass
 
             self.set_available(True)
 
@@ -247,6 +254,30 @@ class SSHBackend(Backend):
             return self._sftp_client.listdir(remote_path)
         except FileNotFoundError:
             return []
+
+    def listdir_attrs(self, virtual_path: str):
+        """List directory contents with attributes to avoid per-entry stat."""
+        self._ensure_connected()
+        remote_path = str(self._resolve_path(virtual_path))
+        try:
+            attrs = self._sftp_client.listdir_attr(remote_path)
+            result = []
+            for attr in attrs:
+                # attr.filename is bytes on some servers; ensure str
+                name = attr.filename
+                if isinstance(name, bytes):
+                    name = name.decode()
+                result.append((name, {
+                    'st_mode': getattr(attr, 'st_mode', None),
+                    'st_size': getattr(attr, 'st_size', 0),
+                    'st_mtime': getattr(attr, 'st_mtime', time.time()),
+                    'st_gid': getattr(attr, 'st_gid', os.getgid()),
+                    'st_uid': getattr(attr, 'st_uid', os.getuid()),
+                    'st_nlink': getattr(attr, 'st_nlink', 1),
+                }))
+            return result
+        except Exception:
+            return None
 
     def isdir(self, virtual_path: str) -> bool:
         """Check if path is a directory on remote"""

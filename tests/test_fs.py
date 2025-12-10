@@ -8,11 +8,25 @@ import threading
 import os
 import time
 from unittest.mock import patch
+import errno
+from fuse import FuseOSError
 
 from storage.fs import StorageFS
 from storage.fs import _acquire_mount_lock
 from storage.backends.local import LocalBackend
 from storage.sync import DirOperation
+
+
+class _SlowBackend(LocalBackend):
+    """Local backend that delays directory listings to simulate slow SSH/SFTP."""
+
+    def __init__(self, *args, delay: float = 0.5, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._delay = delay
+
+    def listdir_attrs(self, virtual_path: str):
+        time.sleep(self._delay)
+        return super().listdir_attrs(virtual_path)
 
 
 class TestReaddirMerging(unittest.TestCase):
@@ -312,6 +326,49 @@ class TestReaddirMerging(unittest.TestCase):
             self.assertTrue(self._wait_for(replicated, timeout=5.0))
         finally:
             backend2.mkdir = original
+
+    def test_missing_remote_file_returns_enoent(self):
+        missing = "/does_not_exist.txt"
+        with self.assertRaises(FuseOSError) as ctx:
+            self.fs.getattr(missing)
+        self.assertEqual(ctx.exception.errno, errno.ENOENT)
+
+        with self.assertRaises(FuseOSError) as ctx2:
+            self.fs.open(missing, os.O_RDONLY)
+        self.assertEqual(ctx2.exception.errno, errno.ENOENT)
+
+        cache_path = self.cache_dir / missing.lstrip("/")
+        self.assertFalse(cache_path.exists())
+
+    def test_readdir_returns_first_backend_quickly(self):
+        """Readdir should not block on slow backends; first responder wins."""
+        # Replace backend2 with slow listing backend
+        slow_backend_root = self.temp_dir / "backend2_slow"
+        slow_backend_root.mkdir()
+        slow_backend = _SlowBackend("backend2", str(slow_backend_root), delay=0.6)
+        self.backends["backend2"] = slow_backend
+
+        # Populate entries
+        (self.backend1_dir / "fast.txt").write_text("one")
+        (slow_backend_root / "slow.txt").write_text("two")
+
+        # Make readdir impatient for the test
+        self.fs.DIR_FIRST_WAIT = 0.2
+
+        start = time.perf_counter()
+        first_entries = set(self.fs.readdir('/', None))
+        elapsed = time.perf_counter() - start
+
+        self.assertIn('fast.txt', first_entries)
+        # The slow backend should not hold up the first response
+        self.assertLess(elapsed, 0.4)
+        self.assertNotIn('slow.txt', first_entries)
+
+        # Wait for background refresh to pick up slow backend
+        def has_slow():
+            return 'slow.txt' in set(self.fs.readdir('/', None))
+
+        self.assertTrue(self._wait_for(has_slow, timeout=2.0))
 
 
 def _try_lock(lock_path_str, mountpoint, return_dict):

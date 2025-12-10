@@ -37,6 +37,7 @@ class DirCacheEntry:
     names: Set[str]
     mtime: Optional[float]
     fetched_at: float
+    attrs: Dict[str, dict] | None = None
 class StorageFS(Operations):
     """
     Storage FUSE filesystem
@@ -92,6 +93,8 @@ class StorageFS(Operations):
         self._dir_refresh_inflight: Set[tuple] = set()
         self._dir_refresh_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
         self.DIR_CACHE_TTL = 2.0  # seconds
+        # How long readdir waits for the first backend response before returning cached/local data
+        self.DIR_FIRST_WAIT = 2.0  # seconds
 
         # Per-backend checksum index used for conflict surfacing
         self._checksum_lock = threading.RLock()
@@ -159,11 +162,12 @@ class StorageFS(Operations):
             return self._dir_cache.get(path, {}).get(backend_name)
 
     def _store_dir_cache_entry(self, path: str, backend_name: str,
-                               names: Set[str], mtime: Optional[float], fetched_at: Optional[float] = None):
+                               names: Set[str], mtime: Optional[float], fetched_at: Optional[float] = None,
+                               attrs: Optional[Dict[str, dict]] = None):
         fetched_at = fetched_at or time.time()
         with self._dir_cache_lock:
             dir_cache = self._dir_cache.setdefault(path, {})
-            dir_cache[backend_name] = DirCacheEntry(set(names), mtime, fetched_at)
+            dir_cache[backend_name] = DirCacheEntry(set(names), mtime, fetched_at, attrs)
 
     def _schedule_mtime_probe(self, path: str, backend_name: str,
                               backend: Backend, cached_mtime: Optional[float]):
@@ -212,24 +216,40 @@ class StorageFS(Operations):
         future.add_done_callback(_on_done)
 
     def _refresh_dir_listing_async(self, path: str, backend_name: str, backend: Backend):
-        names, mtime = self._refresh_dir_listing_sync(path, backend)
-        if names is None:
-            return
-        self._store_dir_cache_entry(path, backend_name, names, mtime, time.time())
-        if self.logger.isEnabledFor(logging.DEBUG):
-            self.logger.debug("dir refresh complete path=%s backend=%s entries=%d", path, backend_name, len(names))
-        self._notify_dir_changed(path)
-
-    def _refresh_dir_listing_sync(self, path: str, backend: Backend):
         try:
-            backend_entries = set(backend.listdir(path)) if backend.isdir(path) else set()
+            names, mtime, attrs = self._refresh_dir_listing_sync(path, backend, with_attrs=True)
+            if names is None:
+                return
+            self._store_dir_cache_entry(path, backend_name, names, mtime, time.time(), attrs)
+            if self.logger.isEnabledFor(logging.DEBUG):
+                self.logger.debug("dir refresh complete path=%s backend=%s entries=%d", path, backend_name, len(names))
+            self._notify_dir_changed(path)
+        except Exception as exc:
+            self.logger.error("dir refresh crashed path=%s backend=%s: %s", path, backend_name, exc)
+
+    def _refresh_dir_listing_sync(self, path: str, backend: Backend, with_attrs: bool = False):
+        try:
+            start = time.perf_counter()
+            attrs_map = None
+            if with_attrs:
+                listed = backend.listdir_attrs(path)
+                if listed is not None:
+                    backend_entries = {name for name, _ in listed}
+                    attrs_map = {name: attr for name, attr in listed}
+                else:
+                    backend_entries = set(backend.listdir(path)) if backend.isdir(path) else set()
+            else:
+                backend_entries = set(backend.listdir(path)) if backend.isdir(path) else set()
             mtime = backend.get_dir_mtime(path)
-            return backend_entries, mtime
+            if self.logger.isEnabledFor(logging.DEBUG):
+                self.logger.debug("dir refresh sync path=%s backend=%s entries=%d elapsed=%.3fs",
+                                  path, backend.name, len(backend_entries), time.perf_counter() - start)
+            return backend_entries, mtime, attrs_map
         except Exception as exc:
             if self.logger.isEnabledFor(logging.DEBUG):
                 self.logger.debug("dir refresh failed for %s on %s: %s", path, backend.name, exc)
             self.logger.debug("dir refresh failed for %s on %s: %s", path, backend.name, exc)
-            return None, None
+            return None, None, None
 
     def _notify_dir_changed(self, path: str):
         """
@@ -289,19 +309,35 @@ class StorageFS(Operations):
             ]
         return yaml.dump(entries, default_flow_style=False).encode()
 
-    def _schedule_directory_checksums(self, dir_path: str, backend_entries: Dict[str, Set[str]]):
-        """Queue checksum computations for every file in the directory."""
-        for backend_name, names in backend_entries.items():
+    def _schedule_directory_checksums(self, dir_path: str,
+                                      backend_entries: Dict[str, DirCacheEntry]):
+        """
+        Queue checksum computations for every file in the directory.
+
+        Uses cached attrs to avoid per-entry remote stats; only falls back to
+        backend.isdir() when no metadata is available.
+        """
+        for backend_name, entry in backend_entries.items():
             backend = self.backends.get(backend_name)
             if not backend:
                 continue
+            names = entry.names if entry else set()
+            attrs = entry.attrs if entry else {}
             for name in names:
                 virtual_child = str(Path(dir_path) / name)
-                try:
-                    if backend.isdir(virtual_child):
+                # Skip directories when we already know the mode
+                mode = None
+                if attrs:
+                    mode = attrs.get(name, {}).get('st_mode')
+                if mode is not None:
+                    if stat.S_ISDIR(mode):
                         continue
-                except Exception:
-                    pass
+                else:
+                    try:
+                        if backend.isdir(virtual_child):
+                            continue
+                    except Exception:
+                        pass
                 self._schedule_checksum_task(backend, virtual_child)
 
     def _schedule_checksum_task(self, backend: Backend, canonical_path: str):
@@ -529,6 +565,7 @@ class StorageFS(Operations):
         """Get file attributes"""
         canonical_path, backend_name = self._resolve_backend_target(path)
         cache_path = self.cache_manager.get_cache_path(path)
+        started = time.perf_counter()
 
         try:
             st = os.lstat(str(cache_path))
@@ -536,6 +573,24 @@ class StorageFS(Operations):
                 'st_atime', 'st_ctime', 'st_gid', 'st_mode', 'st_mtime',
                 'st_nlink', 'st_size', 'st_uid'))
         except OSError as e:
+            # Try dir-cache attributes to avoid remote stat bursts
+            parent = str(Path(canonical_path).parent)
+            name = Path(canonical_path).name
+            with self._dir_cache_lock:
+                cached = self._dir_cache.get(parent, {})
+                for entry in cached.values():
+                    if entry.attrs and name in entry.attrs:
+                        a = entry.attrs[name]
+                        return {
+                            'st_atime': a.get('st_atime', time.time()),
+                            'st_ctime': a.get('st_ctime', a.get('st_mtime', time.time())),
+                            'st_gid': a.get('st_gid', os.getgid()),
+                            'st_mode': a.get('st_mode', stat.S_IFREG | 0o644),
+                            'st_mtime': a.get('st_mtime', time.time()),
+                            'st_nlink': a.get('st_nlink', 1),
+                            'st_size': a.get('st_size', 0),
+                            'st_uid': a.get('st_uid', os.getuid()),
+                        }
             # Fallback: query backends for non-cached entries (e.g., remote-only files)
             backend_iter = []
             if backend_name:
@@ -562,12 +617,17 @@ class StorageFS(Operations):
                     self.logger.debug("getattr backend fallback failed for %s on %s: %s", canonical_path, bname, be)
 
             raise FuseOSError(e.errno)
+        finally:
+            if self.logger.isEnabledFor(logging.DEBUG):
+                self.logger.debug("getattr path=%s backend_hint=%s elapsed=%.3fs",
+                                  path, backend_name, time.perf_counter() - started)
 
     def readdir(self, path, fh):
         """Read directory contents"""
         cache_path = self.cache_manager.get_cache_path(path)
 
         entries: Set[str] = {'.', '..'}
+        req_start = time.perf_counter()
 
         # Get from cache
         if cache_path.exists() and cache_path.is_dir():
@@ -579,6 +639,8 @@ class StorageFS(Operations):
         with self._dir_cache_lock:
             dir_cache = self._dir_cache.setdefault(path, {}).copy()
 
+        # Collect backends that need a fresh listing
+        uncached_backends = []
         for backend_name, backend in self.backends.items():
             cache_entry = dir_cache.get(backend_name)
             if cache_entry:
@@ -588,35 +650,90 @@ class StorageFS(Operations):
                     if self.logger.isEnabledFor(logging.DEBUG):
                         self.logger.debug("readdir cache-hit (fresh) path=%s backend=%s", path, backend_name)
                     self._schedule_mtime_probe(path, backend_name, backend, cache_entry.mtime)
-                    continue
-                # Stale cache: serve cached but trigger refresh
-                if self.logger.isEnabledFor(logging.DEBUG):
-                    self.logger.debug("readdir cache-hit (stale -> refresh) path=%s backend=%s", path, backend_name)
-                self._schedule_full_dir_refresh(path, backend_name, backend)
+                else:
+                    if self.logger.isEnabledFor(logging.DEBUG):
+                        self.logger.debug("readdir cache-hit (stale -> refresh) path=%s backend=%s", path, backend_name)
+                    self._schedule_full_dir_refresh(path, backend_name, backend)
                 continue
 
-            # No cache: populate synchronously
+            uncached_backends.append((backend_name, backend))
+
+        # Kick off concurrent listings for uncached backends and return after first completes
+        futures: Dict[concurrent.futures.Future, tuple] = {}
+
+        def _store_future_result(fut: concurrent.futures.Future):
+            try:
+                names, mtime, attrs = fut.result()
+                bname, _backend = futures[fut]
+                if names is None:
+                    return
+                self._store_dir_cache_entry(path, bname, names, mtime, time.time(), attrs)
+                if self.logger.isEnabledFor(logging.DEBUG):
+                    self.logger.debug("readdir async refresh stored path=%s backend=%s entries=%d", path, bname, len(names))
+            except Exception as exc:
+                bname, _ = futures.get(fut, ("<unknown>", None))
+                self.logger.debug("readdir async refresh failed path=%s backend=%s: %s", path, bname, exc)
+
+        for backend_name, backend in uncached_backends:
             if self.logger.isEnabledFor(logging.DEBUG):
-                self.logger.debug("readdir cache-miss path=%s backend=%s", path, backend_name)
-            backend_entries, mtime = self._refresh_dir_listing_sync(path, backend)
-            if backend_entries is not None:
-                entries.update(backend_entries)
-                self._store_dir_cache_entry(path, backend_name, backend_entries, mtime, now)
+                self.logger.debug("readdir cache-miss path=%s backend=%s (async)", path, backend_name)
+            fut = self._dir_refresh_executor.submit(self._refresh_dir_listing_sync, path, backend, True)
+            futures[fut] = (backend_name, backend)
+
+        if futures:
+            done, pending = concurrent.futures.wait(
+                futures.keys(),
+                timeout=self.DIR_FIRST_WAIT,
+                return_when=concurrent.futures.FIRST_COMPLETED,
+            )
+            if done:
+                first = next(iter(done))
+                try:
+                    names, mtime, attrs = first.result()
+                    bname, _ = futures[first]
+                    if names is not None:
+                        entries.update(names)
+                        self._store_dir_cache_entry(path, bname, names, mtime, now, attrs)
+                except Exception as exc:
+                    bname, _ = futures.get(first, ("<unknown>", None))
+                    self.logger.debug("readdir first backend failed path=%s backend=%s: %s", path, bname, exc)
+                # Process any other finished futures without blocking and include their entries
+                for fut in done - {first}:
+                    try:
+                        names, mtime, attrs = fut.result()
+                        bname, _ = futures[fut]
+                        if names is not None:
+                            entries.update(names)
+                            self._store_dir_cache_entry(path, bname, names, mtime, time.time(), attrs)
+                    except Exception as exc:
+                        bname, _ = futures.get(fut, ("<unknown>", None))
+                        self.logger.debug("readdir async backend failed path=%s backend=%s: %s", path, bname, exc)
             else:
-                # Nothing to add and nothing cached
-                pass
+                if self.logger.isEnabledFor(logging.DEBUG):
+                    self.logger.debug("readdir timed out waiting for first backend path=%s after %.2fs",
+                                      path, self.DIR_FIRST_WAIT)
+
+            # Remaining futures continue in background and update cache when done
+            for fut in pending:
+                fut.add_done_callback(_store_future_result)
+        # If no futures, we already had cache or no backends
 
         # Schedule checksum computation in background
-        self._schedule_directory_checksums(path, {
-            name: (self._get_dir_cache_entry(path, name).names if self._get_dir_cache_entry(path, name) else set())
+        checksum_entries = {
+            name: self._get_dir_cache_entry(path, name)
             for name in self.backends.keys()
-        })
+        }
+        self._schedule_directory_checksums(path, checksum_entries)
 
         # Apply conflict view using known checksums
         visible_entries = self._apply_conflict_view(path, entries)
 
         for r in sorted(visible_entries):
             yield r
+
+        if self.logger.isEnabledFor(logging.DEBUG):
+            self.logger.debug("readdir done path=%s elapsed=%.3fs entries=%d", path,
+                              time.perf_counter() - req_start, len(visible_entries))
 
     def mkdir(self, path, mode):
         """Create a directory"""
@@ -689,6 +806,9 @@ class StorageFS(Operations):
                     backend.delete_file(canonical_path)
                 except Exception:
                     pass
+
+            parent_dir = str(Path(canonical_path).parent)
+            self._invalidate_dir_cache_entry(parent_dir)
 
         except OSError as e:
             raise FuseOSError(e.errno)
@@ -843,6 +963,9 @@ class StorageFS(Operations):
                 encryption_key_id=None
             )
             self.state_manager.set_file_metadata(metadata)
+
+            parent_dir = str(Path(canonical_path).parent)
+            self._invalidate_dir_cache_entry(parent_dir)
 
             return vfd
 
