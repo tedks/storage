@@ -8,6 +8,7 @@ Files are cached on first access and evicted using LRU when space is needed.
 import os
 import time
 import threading
+import logging
 from pathlib import Path
 from typing import Optional, List, Set
 
@@ -36,6 +37,7 @@ class CacheManager:
         self.state_manager = state_manager
         self.max_size_bytes = max_size_bytes
         self._lock = threading.RLock()
+        self.logger = logging.getLogger(__name__)
 
         # Ensure cache root exists
         self.cache_root.mkdir(parents=True, exist_ok=True)
@@ -196,6 +198,8 @@ class CacheManager:
             return True
 
         # Could not free enough space
+        if self.logger.isEnabledFor(logging.DEBUG):
+            self.logger.debug("ensure_space failed bytes_needed=%d space_needed=%d", bytes_needed, space_needed)
         return False
 
     def cache_file(self, virtual_path: str, backend: Backend, source_virtual_path: str = None) -> bool:
@@ -223,12 +227,18 @@ class CacheManager:
 
             # Ensure we have space
             if not self.ensure_space(file_size):
-                print(f"Warning: Insufficient cache space for {virtual_path}")
+                self.logger.warning("Insufficient cache space for %s (size=%d)", virtual_path, file_size)
                 return False
 
             # Download file
             try:
+                start = time.perf_counter()
+                if self.logger.isEnabledFor(logging.DEBUG):
+                    self.logger.debug("cache_file start path=%s size=%d backend=%s", virtual_path, file_size, backend.name)
                 backend.copy_to_local(source_virtual_path, cache_path)
+                if self.logger.isEnabledFor(logging.DEBUG):
+                    self.logger.debug("cache_file done path=%s size=%d backend=%s elapsed=%.3fs",
+                                      virtual_path, file_size, backend.name, time.perf_counter() - start)
 
                 # Update access time in state
                 self.state_manager.update_access_time(virtual_path)
@@ -236,7 +246,7 @@ class CacheManager:
                 return True
 
             except Exception as e:
-                print(f"Error caching {virtual_path} from {backend.name}: {e}")
+                self.logger.error("Error caching %s from %s: %s", virtual_path, backend.name, e)
                 return False
 
     def mark_accessed(self, virtual_path: str):

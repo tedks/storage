@@ -406,6 +406,8 @@ class StorageFS(Operations):
 
         # Check if already cached
         if self.cache_manager.is_cached(virtual_path):
+            if self.logger.isEnabledFor(logging.DEBUG):
+                self.logger.debug("cache hit for %s (backend_hint=%s)", virtual_path, backend_name)
             if not backend_name:
                 self.cache_manager.mark_accessed(virtual_path)
             return True
@@ -417,9 +419,13 @@ class StorageFS(Operations):
             cache_path.parent.mkdir(parents=True, exist_ok=True)
             if backend and backend.exists(canonical_path):
                 try:
+                    if self.logger.isEnabledFor(logging.DEBUG):
+                        self.logger.debug("direct backend fetch for %s via %s", canonical_path, backend_name)
                     backend.copy_to_local(canonical_path, cache_path)
                     return True
-                except Exception:
+                except Exception as exc:
+                    if self.logger.isEnabledFor(logging.DEBUG):
+                        self.logger.debug("direct backend fetch failed %s via %s: %s", canonical_path, backend_name, exc)
                     pass
             try:
                 cache_path.touch(exist_ok=True)
@@ -444,6 +450,8 @@ class StorageFS(Operations):
 
         if backend:
             # Download to cache
+            if self.logger.isEnabledFor(logging.DEBUG):
+                self.logger.debug("cache miss for %s using backend=%s", canonical_path, backend.name)
             if self.cache_manager.cache_file(virtual_path, backend, source_virtual_path=canonical_path):
                 # Populate state metadata and locations if missing
                 cache_path = self.cache_manager.get_cache_path(virtual_path)
@@ -504,11 +512,15 @@ class StorageFS(Operations):
             result = self.recompute_engine.recompute_file(virtual_path, cache_path, timeout=30.0)
 
             if result.success:
+                if self.logger.isEnabledFor(logging.DEBUG):
+                    self.logger.debug("recomputed %s into cache", virtual_path)
                 # File was recomputed successfully
                 self.cache_manager.mark_accessed(virtual_path)
                 return True
 
         # File not available
+        if self.logger.isEnabledFor(logging.DEBUG):
+            self.logger.debug("file not available %s (backend_hint=%s)", virtual_path, backend_name)
         return False
 
     # Filesystem methods

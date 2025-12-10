@@ -32,7 +32,7 @@ def main():
 @click.option('-f', '--foreground', is_flag=True, help='Run in foreground')
 @click.option('--allow-other/--no-allow-other', default=None,
               help='Allow other users to access mount (requires root or fuse.conf setting). Auto-detects if not specified.')
-@click.option('--debug', is_flag=True, help='Enable verbose debug logging')
+@click.option('--debug', is_flag=True, help='Enable verbose debug logging (also enables verbose SSH logging)')
 def mount(mountpoint, backing_paths, cache, cache_size, database, workers, remote, key_file, foreground, allow_other, debug):
     """
     Mount a Storage filesystem
@@ -140,6 +140,10 @@ def mount(mountpoint, backing_paths, cache, cache_size, database, workers, remot
     click.echo(f"  Backends: {len(backends)}")
     click.echo(f"  Sync workers: {workers}")
     click.echo(f"\nPress Ctrl+C to unmount\n")
+
+    # Trim paramiko noise unless debugging
+    import logging
+    logging.getLogger("paramiko").setLevel(logging.DEBUG if debug else logging.WARNING)
 
     try:
         mount_storage(
