@@ -103,6 +103,18 @@ class Backend(ABC):
         """List directory contents"""
         pass
 
+    def listdir_attrs(self, virtual_path: str):
+        """
+        List directory contents with stat-like attributes in one call.
+
+        Returns an iterable of (name, attr_dict) where attr_dict contains
+        st_mode, st_size, st_mtime, st_gid, st_uid, st_nlink.
+
+        Returns None to fall back to listdir + per-entry stat calls.
+        Backends should override this to avoid N+1 round trips.
+        """
+        return None
+
     @abstractmethod
     def isdir(self, virtual_path: str) -> bool:
         """Check if path is a directory"""

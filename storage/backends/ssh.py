@@ -5,6 +5,7 @@ SSH/SFTP backend implementation for remote filesystems
 import os
 import shlex
 import logging
+import time
 import paramiko
 from pathlib import Path, PurePosixPath
 from typing import List, Optional
@@ -259,6 +260,30 @@ class SSHBackend(Backend):
             return self._sftp_client.listdir(remote_path)
         except FileNotFoundError:
             return []
+
+    def listdir_attrs(self, virtual_path: str):
+        """List directory contents with attributes using SFTP listdir_attr."""
+        self._ensure_connected()
+        remote_path = str(self._resolve_path(virtual_path))
+        try:
+            attrs = self._sftp_client.listdir_attr(remote_path)
+            result = []
+            for attr in attrs:
+                # attr.filename may be bytes on some servers
+                name = attr.filename
+                if isinstance(name, bytes):
+                    name = name.decode()
+                result.append((name, {
+                    'st_mode': getattr(attr, 'st_mode', None),
+                    'st_size': getattr(attr, 'st_size', 0),
+                    'st_mtime': getattr(attr, 'st_mtime', time.time()),
+                    'st_gid': getattr(attr, 'st_gid', os.getgid()),
+                    'st_uid': getattr(attr, 'st_uid', os.getuid()),
+                    'st_nlink': getattr(attr, 'st_nlink', 1),
+                }))
+            return result
+        except Exception:
+            return None
 
     def isdir(self, virtual_path: str) -> bool:
         """Check if path is a directory on remote"""
