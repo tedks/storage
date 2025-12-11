@@ -959,7 +959,8 @@ def _acquire_mount_lock(lock_path: Path, mountpoint: str):
 def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
                  backends: Dict[str, Backend], cache_size: int,
                  foreground: bool = False, num_sync_workers: int = 2,
-                 allow_other: Optional[bool] = None):
+                 allow_other: Optional[bool] = None,
+                 debug: bool = False):
     """
     Mount a Storage filesystem
 
@@ -973,10 +974,15 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
         num_sync_workers: Number of background sync workers
         allow_other: Allow other users to access the mount (requires root or fuse.conf setting).
                      If None, auto-detects based on whether running as root.
+        debug: Enable verbose debug logging
 
     Raises:
         PermissionError: If allow_other=True but not running as root and user_allow_other not set
     """
+    logging.basicConfig(
+        level=logging.DEBUG if debug else logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
     logger = logging.getLogger(__name__)
 
     is_root = os.geteuid() == 0
