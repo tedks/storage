@@ -149,6 +149,20 @@ class Backend(ABC):
         """Sync any buffered writes to storage"""
         pass
 
+    def get_dir_mtime(self, virtual_path: str) -> Optional[float]:
+        """
+        Return directory modification time if available.
+
+        Used for cache validation - if remote mtime is newer than cached,
+        a refresh is needed. Default implementation uses stat(); backends
+        may override for efficiency.
+        """
+        try:
+            st = self.stat(virtual_path)
+            return getattr(st, 'st_mtime', None)
+        except Exception:
+            return None
+
     def is_available(self) -> bool:
         """Check if backend is currently available"""
         return self._available
