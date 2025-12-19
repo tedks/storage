@@ -48,3 +48,9 @@ nix-portable
 # OS
 .DS_Store
 Thumbs.db
+
+# Bazel
+bazel-bin
+bazel-out
+bazel-testlogs
+
