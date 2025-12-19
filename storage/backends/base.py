@@ -103,6 +103,18 @@ class Backend(ABC):
         """List directory contents"""
         pass
 
+    def listdir_attrs(self, virtual_path: str):
+        """
+        List directory contents with stat-like attributes in one call.
+
+        Returns an iterable of (name, attr_dict) where attr_dict contains
+        st_mode, st_size, st_mtime, st_gid, st_uid, st_nlink.
+
+        Returns None to fall back to listdir + per-entry stat calls.
+        Backends should override this to avoid N+1 round trips.
+        """
+        return None
+
     @abstractmethod
     def isdir(self, virtual_path: str) -> bool:
         """Check if path is a directory"""
@@ -136,6 +148,20 @@ class Backend(ABC):
     def sync(self):
         """Sync any buffered writes to storage"""
         pass
+
+    def get_dir_mtime(self, virtual_path: str) -> Optional[float]:
+        """
+        Return directory modification time if available.
+
+        Used for cache validation - if remote mtime is newer than cached,
+        a refresh is needed. Default implementation uses stat(); backends
+        may override for efficiency.
+        """
+        try:
+            st = self.stat(virtual_path)
+            return getattr(st, 'st_mtime', None)
+        except Exception:
+            return None
 
     def is_available(self) -> bool:
         """Check if backend is currently available"""

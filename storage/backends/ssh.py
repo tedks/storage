@@ -3,10 +3,12 @@ SSH/SFTP backend implementation for remote filesystems
 """
 
 import os
+import shlex
+import logging
+import time
 import paramiko
 from pathlib import Path, PurePosixPath
 from typing import List, Optional
-import shlex
 
 from .base import Backend, BackendType
 
@@ -42,6 +44,7 @@ class SSHBackend(Backend):
         self.password = password
         self.key_filename = key_filename
         self.connect_timeout = connect_timeout
+        self.logger = logging.getLogger(__name__)
 
         # SSH/SFTP connections (lazy connected)
         self._ssh_client: Optional[paramiko.SSHClient] = None
@@ -59,12 +62,17 @@ class SSHBackend(Backend):
                 'username': self.username,
                 'timeout': self.connect_timeout,
                 'banner_timeout': self.connect_timeout,
+                'auth_timeout': self.connect_timeout,
             }
 
             if self.password:
                 connect_kwargs['password'] = self.password
             if self.key_filename:
                 connect_kwargs['key_filename'] = self.key_filename
+            else:
+                # Prevent agent/key probing delays when no explicit key provided
+                connect_kwargs['allow_agent'] = False
+                connect_kwargs['look_for_keys'] = False
 
             self._ssh_client.connect(**connect_kwargs)
             self._sftp_client = self._ssh_client.open_sftp()
@@ -78,10 +86,29 @@ class SSHBackend(Backend):
                     # Best-effort; SFTP may still function without socket-level timeout
                     pass
 
+            # Also set channel-level timeout so listdir/stat calls don't hang forever
+            try:
+                chan = self._sftp_client.get_channel()
+                if chan:
+                    chan.settimeout(self.connect_timeout)
+            except Exception:
+                pass
+
             self.set_available(True)
 
+        except paramiko.AuthenticationException as e:
+            self.logger.error("SSH authentication failed for %s@%s:%s: %s",
+                              self.username, self.host, self.port, e)
+            self.set_available(False)
+            raise
+        except paramiko.SSHException as e:
+            self.logger.error("SSH handshake failed for %s@%s:%s: %s",
+                              self.username, self.host, self.port, e)
+            self.set_available(False)
+            raise
         except Exception as e:
-            print(f"Failed to connect to {self.host}: {e}")
+            self.logger.error("Failed to connect to %s@%s:%s: %s",
+                              self.username, self.host, self.port, e)
             self.set_available(False)
             raise
 
@@ -233,6 +260,30 @@ class SSHBackend(Backend):
             return self._sftp_client.listdir(remote_path)
         except FileNotFoundError:
             return []
+
+    def listdir_attrs(self, virtual_path: str):
+        """List directory contents with attributes using SFTP listdir_attr."""
+        self._ensure_connected()
+        remote_path = str(self._resolve_path(virtual_path))
+        try:
+            attrs = self._sftp_client.listdir_attr(remote_path)
+            result = []
+            for attr in attrs:
+                # attr.filename may be bytes on some servers
+                name = attr.filename
+                if isinstance(name, bytes):
+                    name = name.decode()
+                result.append((name, {
+                    'st_mode': getattr(attr, 'st_mode', None),
+                    'st_size': getattr(attr, 'st_size', 0),
+                    'st_mtime': getattr(attr, 'st_mtime', time.time()),
+                    'st_gid': getattr(attr, 'st_gid', os.getgid()),
+                    'st_uid': getattr(attr, 'st_uid', os.getuid()),
+                    'st_nlink': getattr(attr, 'st_nlink', 1),
+                }))
+            return result
+        except Exception:
+            return None
 
     def isdir(self, virtual_path: str) -> bool:
         """Check if path is a directory on remote"""

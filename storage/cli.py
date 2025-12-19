@@ -32,7 +32,8 @@ def main():
 @click.option('-f', '--foreground', is_flag=True, help='Run in foreground')
 @click.option('--allow-other/--no-allow-other', default=None,
               help='Allow other users to access mount (requires root or fuse.conf setting). Auto-detects if not specified.')
-def mount(mountpoint, backing_paths, cache, cache_size, database, workers, remote, key_file, foreground, allow_other):
+@click.option('--debug', is_flag=True, help='Enable verbose debug logging')
+def mount(mountpoint, backing_paths, cache, cache_size, database, workers, remote, key_file, foreground, allow_other, debug):
     """
     Mount a Storage filesystem
 
@@ -140,6 +141,10 @@ def mount(mountpoint, backing_paths, cache, cache_size, database, workers, remot
     click.echo(f"  Sync workers: {workers}")
     click.echo(f"\nPress Ctrl+C to unmount\n")
 
+    # Suppress paramiko noise unless debugging
+    import logging
+    logging.getLogger("paramiko").setLevel(logging.DEBUG if debug else logging.WARNING)
+
     try:
         mount_storage(
             str(mountpoint_path),
@@ -149,7 +154,8 @@ def mount(mountpoint, backing_paths, cache, cache_size, database, workers, remot
             cache_size_bytes,
             foreground=foreground,
             num_sync_workers=workers,
-            allow_other=allow_other
+            allow_other=allow_other,
+            debug=debug,
         )
     except PermissionError as e:
         click.echo(f"Permission error: {e}", err=True)
@@ -325,12 +331,12 @@ def _attempt_merge_bytes(content_a: bytes, content_b: bytes) -> Optional[bytes]:
     return None
 
 
-def _select_merge_tool() -> str:
-    """Pick an external 3-way merge tool."""
+def _select_merge_tool() -> Optional[str]:
+    """Pick an external 3-way merge tool if available."""
     for tool in ("git", "diff3"):
         if shutil.which(tool):
             return tool
-    raise click.ClickException("No merge tool found (need git or diff3 installed)")
+    return None
 
 
 def _run_merge_tool(tool: str, local: Path, ancestor: Path, remote: Path) -> Optional[bytes]:
@@ -428,6 +434,9 @@ def conflicts(directory, target_file, take_backend, merge):
             click.echo(f"{base}: took {take_backend}")
         elif merge:
             merge_tool = _select_merge_tool()
+            if not merge_tool:
+                click.echo(f"{base}: merge requested but no git or diff3 available")
+                continue
             if len(files) < 2:
                 click.echo(f"{base}: not enough versions to merge")
                 continue
@@ -446,7 +455,7 @@ def conflicts(directory, target_file, take_backend, merge):
 
             merged = _run_merge_tool(merge_tool, local_path, ancestor_path, remote_path)
             if merged is None:
-                click.echo(f"{base}: merge tool failed")
+                click.echo(f"{base}: merge tool {merge_tool} failed")
                 continue
 
             base_path.write_bytes(merged)
