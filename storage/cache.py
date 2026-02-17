@@ -39,6 +39,26 @@ class CacheManager:
 
         # Ensure cache root exists
         self.cache_root.mkdir(parents=True, exist_ok=True)
+        self._current_size_bytes = self._scan_total_cache_size()
+        self._size_dirty = False
+
+    def _scan_total_cache_size(self) -> int:
+        """Calculate total size of cache in bytes by scanning the filesystem."""
+        total = 0
+        for root, dirs, files in os.walk(self.cache_root):
+            for name in files:
+                filepath = Path(root) / name
+                try:
+                    total += filepath.stat().st_size
+                except OSError:
+                    pass
+        return total
+
+    def _ensure_size_current_locked(self):
+        """Refresh tracked size if it has been marked dirty by direct writes."""
+        if self._size_dirty:
+            self._current_size_bytes = self._scan_total_cache_size()
+            self._size_dirty = False
 
     def get_cache_path(self, virtual_path: str) -> Path:
         """Get the local cache path for a virtual file"""
@@ -60,15 +80,14 @@ class CacheManager:
 
     def get_total_cache_size(self) -> int:
         """Calculate total size of cache in bytes"""
-        total = 0
-        for root, dirs, files in os.walk(self.cache_root):
-            for name in files:
-                filepath = Path(root) / name
-                try:
-                    total += filepath.stat().st_size
-                except OSError:
-                    pass
-        return total
+        with self._lock:
+            self._ensure_size_current_locked()
+            return self._current_size_bytes
+
+    def mark_cache_size_dirty(self):
+        """Mark cache size accounting as stale after direct external file mutations."""
+        with self._lock:
+            self._size_dirty = True
 
     def get_free_space_needed(self, required_bytes: int) -> int:
         """
@@ -77,8 +96,9 @@ class CacheManager:
         Returns:
             Bytes to free (0 if enough space available)
         """
-        current_size = self.get_total_cache_size()
-        available = self.max_size_bytes - current_size
+        with self._lock:
+            self._ensure_size_current_locked()
+            available = self.max_size_bytes - self._current_size_bytes
 
         if available >= required_bytes:
             return 0
@@ -122,6 +142,7 @@ class CacheManager:
                         file_size = cache_path.stat().st_size
                         cache_path.unlink()
                         freed += file_size
+                        self._current_size_bytes = max(0, self._current_size_bytes - file_size)
 
                         # Remove cache location from state
                         self.state_manager.remove_file_location(metadata.virtual_path, "cache")
@@ -157,6 +178,7 @@ class CacheManager:
                         with open(cache_path, 'wb') as f:
                             f.truncate(0)
                         freed += file_size
+                        self._current_size_bytes = max(0, self._current_size_bytes - file_size)
 
                         # Update metadata to show file needs recomputation
                         metadata.size = 0
@@ -213,6 +235,7 @@ class CacheManager:
         source_virtual_path = source_virtual_path or virtual_path
         with self._lock:
             cache_path = self.get_cache_path(virtual_path)
+            existing_size = cache_path.stat().st_size if cache_path.exists() else 0
 
             # Check if backend has the file
             if not backend.exists(source_virtual_path):
@@ -229,6 +252,9 @@ class CacheManager:
             # Download file
             try:
                 backend.copy_to_local(source_virtual_path, cache_path)
+                new_size = cache_path.stat().st_size if cache_path.exists() else 0
+                self._current_size_bytes += (new_size - existing_size)
+                self._size_dirty = False
 
                 # Update access time in state
                 self.state_manager.update_access_time(virtual_path)
@@ -236,6 +262,7 @@ class CacheManager:
                 return True
 
             except Exception as e:
+                self._size_dirty = True
                 print(f"Error caching {virtual_path} from {backend.name}: {e}")
                 return False
 
@@ -266,8 +293,12 @@ class CacheManager:
         """
         with self._lock:
             cache_path = self.get_cache_path(virtual_path)
+            existing_size = cache_path.stat().st_size if cache_path.exists() else 0
             cache_path.parent.mkdir(parents=True, exist_ok=True)
             cache_path.touch()
+            new_size = cache_path.stat().st_size if cache_path.exists() else 0
+            self._current_size_bytes += (new_size - existing_size)
+            self._size_dirty = False
 
             # Mark as accessed
             self.mark_accessed(virtual_path)
@@ -280,6 +311,10 @@ class CacheManager:
             cache_path = self.get_cache_path(virtual_path)
             if cache_path.exists():
                 try:
+                    file_size = cache_path.stat().st_size
                     cache_path.unlink()
+                    self._current_size_bytes = max(0, self._current_size_bytes - file_size)
+                    self._size_dirty = False
                 except OSError as e:
+                    self._size_dirty = True
                     print(f"Warning: Failed to delete cache file {virtual_path}: {e}")
