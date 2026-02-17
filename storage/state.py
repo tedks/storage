@@ -13,6 +13,7 @@ import os
 import sqlite3
 import hashlib
 import time
+import threading
 import yaml
 from pathlib import Path
 from typing import Optional, List, Dict, Set, Tuple
@@ -110,12 +111,35 @@ class StateManager:
     """Manages file state in SQLite database"""
 
     XATTR_CONFIG_NAME = "user.storage.config"
+    ACCESS_DEBOUNCE_SECONDS = 0.25
+    ACCESS_FLUSH_INTERVAL_SECONDS = 0.5
+    ACCESS_FLUSH_BATCH_SIZE = 256
 
     def __init__(self, db_path: str):
         self.db_path = db_path
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
+        self._access_lock = threading.RLock()
+        self._pending_access_updates: Dict[str, float] = {}
+        self._recent_access_updates: Dict[str, float] = {}
+        self._last_access_flush_mono = time.monotonic()
+        self._configure_connection()
         self._init_db()
+
+    def _configure_connection(self):
+        """Configure SQLite pragmas for lower write amplification."""
+        pragmas = (
+            "PRAGMA journal_mode=WAL",
+            "PRAGMA synchronous=NORMAL",
+            "PRAGMA temp_store=MEMORY",
+            "PRAGMA busy_timeout=5000",
+        )
+        for pragma in pragmas:
+            try:
+                self.conn.execute(pragma)
+            except sqlite3.DatabaseError:
+                # In-memory DBs and some filesystems may not support all pragmas.
+                continue
 
     def _init_db(self):
         """Initialize database schema"""
@@ -150,6 +174,30 @@ class StateManager:
             CREATE INDEX IF NOT EXISTS idx_cached ON file_locations(is_cached);
         ''')
         self.conn.commit()
+
+    def _flush_access_updates(self, force: bool = False):
+        """Flush pending access-time updates in a single commit."""
+        with self._access_lock:
+            if not self._pending_access_updates:
+                return
+
+            now_mono = time.monotonic()
+            should_flush = (
+                force
+                or len(self._pending_access_updates) >= self.ACCESS_FLUSH_BATCH_SIZE
+                or (now_mono - self._last_access_flush_mono) >= self.ACCESS_FLUSH_INTERVAL_SECONDS
+            )
+            if not should_flush:
+                return
+
+            rows = [(ts, path) for path, ts in self._pending_access_updates.items()]
+            self.conn.executemany(
+                'UPDATE files SET last_access = ? WHERE virtual_path = ?',
+                rows
+            )
+            self.conn.commit()
+            self._pending_access_updates.clear()
+            self._last_access_flush_mono = now_mono
 
     def get_file_metadata(self, virtual_path: str) -> Optional[FileMetadata]:
         """Get metadata for a file"""
@@ -295,14 +343,18 @@ class StateManager:
     def update_access_time(self, virtual_path: str):
         """Update last access time (for LRU)"""
         now = time.time()
-        self.conn.execute(
-            'UPDATE files SET last_access = ? WHERE virtual_path = ?',
-            (now, virtual_path)
-        )
-        self.conn.commit()
+        with self._access_lock:
+            recent = self._recent_access_updates.get(virtual_path)
+            if recent is not None and (now - recent) < self.ACCESS_DEBOUNCE_SECONDS:
+                return
+
+            self._recent_access_updates[virtual_path] = now
+            self._pending_access_updates[virtual_path] = now
+        self._flush_access_updates(force=False)
 
     def get_lru_files(self, limit: int = 100) -> List[FileMetadata]:
         """Get least recently used files"""
+        self._flush_access_updates(force=True)
         cursor = self.conn.execute('''
             SELECT * FROM files
             WHERE sync_status = ?
@@ -402,4 +454,5 @@ class StateManager:
 
     def close(self):
         """Close database connection"""
+        self._flush_access_updates(force=True)
         self.conn.close()

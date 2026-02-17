@@ -7,6 +7,7 @@ configurations with maximum replica count.
 """
 
 import hashlib
+import time
 from typing import List, Dict, Optional, Set
 from pathlib import Path
 
@@ -228,8 +229,6 @@ class ReplicationManager:
         Returns:
             Dictionary of backend_name -> success status
         """
-        import time
-
         results = {}
 
         if not cache_path.exists():

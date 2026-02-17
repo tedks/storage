@@ -524,16 +524,24 @@ class SyncManager:
         """Get list of currently active sync tasks"""
         return [w.get_active_task() for w in self.workers if w.get_active_task()]
 
-    def wait_for_completion(self, timeout: Optional[float] = None):
-        """Wait for all queued tasks to complete"""
-        if timeout:
+    def wait_for_completion(self, timeout: Optional[float] = None) -> bool:
+        """
+        Wait for all queued tasks to complete.
+
+        Returns:
+            True if all queued work completed before timeout.
+        """
+        if timeout is None:
             self.task_queue.join()
-        else:
-            start = time.time()
-            while not self.task_queue.empty():
-                if timeout and (time.time() - start) > timeout:
-                    break
-                time.sleep(0.1)
+            return True
+
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self.task_queue.unfinished_tasks == 0:
+                return True
+            time.sleep(0.05)
+
+        return self.task_queue.unfinished_tasks == 0
 
     def get_stats(self) -> dict:
         """Get combined statistics from all workers"""
