@@ -127,6 +127,27 @@ class TestReaddirMerging(unittest.TestCase):
         for t in threads:
             t.join()
 
+    def test_readdir_prefers_listdir_attrs_when_available(self):
+        (self.backend1_dir / "attrs.txt").write_text("data")
+
+        with patch.object(self.backends["backend1"], "listdir", side_effect=RuntimeError("listdir should not be used")):
+            entries = set(self.fs.readdir('/', None))
+
+        self.assertIn("attrs.txt", entries)
+
+    def test_readdir_schedules_checksums_only_for_collisions(self):
+        (self.backend1_dir / "left.txt").write_text("left")
+        (self.backend2_dir / "right.txt").write_text("right")
+
+        with patch.object(self.fs, "_schedule_checksum_task") as schedule_task:
+            list(self.fs.readdir('/', None))
+        schedule_task.assert_not_called()
+
+        (self.backend2_dir / "left.txt").write_text("same-name")
+        with patch.object(self.fs, "_schedule_checksum_task") as schedule_task:
+            list(self.fs.readdir('/', None))
+        self.assertEqual(schedule_task.call_count, 2)
+
     def test_dir_cache_scoped_per_instance(self):
         # Populate cache in first instance
         (self.backend1_dir / "onlyfirst.txt").write_text("one")
