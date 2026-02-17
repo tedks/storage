@@ -188,12 +188,20 @@ class StorageFS(Operations):
         return yaml.dump(entries, default_flow_style=False).encode()
 
     def _schedule_directory_checksums(self, dir_path: str, backend_entries: Dict[str, Set[str]]):
-        """Queue checksum computations for every file in the directory."""
+        """Queue checksum computations for backend collisions in the directory."""
+        owners: Dict[str, Set[str]] = {}
+        for backend_name, names in backend_entries.items():
+            for name in names:
+                owners.setdefault(name, set()).add(backend_name)
+
         for backend_name, names in backend_entries.items():
             backend = self.backends.get(backend_name)
             if not backend:
                 continue
             for name in names:
+                # Avoid expensive checksum work for entries that only exist on one backend.
+                if len(owners.get(name, set())) <= 1:
+                    continue
                 virtual_child = str(Path(dir_path) / name)
                 try:
                     if backend.isdir(virtual_child):
@@ -465,10 +473,11 @@ class StorageFS(Operations):
 
             for backend_name, backend in self.backends.items():
                 try:
-                    if backend.isdir(path):
+                    attrs = backend.listdir_attrs(path)
+                    if attrs is None:
                         backend_entries = set(backend.listdir(path))
                     else:
-                        backend_entries = set()
+                        backend_entries = {name for name, _ in attrs}
                     entries.update(backend_entries)
                     dir_cache[backend_name] = backend_entries
                 except Exception as exc:
