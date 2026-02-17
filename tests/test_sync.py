@@ -227,6 +227,24 @@ class TestSyncManager(unittest.TestCase):
         updated_metadata = self.state_manager.get_file_metadata(test_file)
         self.assertEqual(updated_metadata.sync_status, SyncStatus.CLEAN)
 
+    def test_wait_for_completion_timeout(self):
+        """wait_for_completion should honor timeout when work is unfinished."""
+        # Queue an item without starting workers.
+        self.sync_manager.task_queue.put(SyncTask("/never-runs.txt", priority=1))
+
+        start = time.time()
+        completed = self.sync_manager.wait_for_completion(timeout=0.2)
+        elapsed = time.time() - start
+
+        self.assertFalse(completed)
+        self.assertGreaterEqual(elapsed, 0.2)
+        self.assertLess(elapsed, 1.0)
+
+        # Drain and mark done so queue has no unfinished tasks.
+        _task = self.sync_manager.task_queue.get_nowait()
+        self.sync_manager.task_queue.task_done()
+        self.assertTrue(self.sync_manager.wait_for_completion(timeout=0.1))
+
     def test_dirty_file_monitoring(self):
         """Test that sync manager automatically picks up dirty files"""
         self.sync_manager.start()
