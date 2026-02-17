@@ -549,6 +549,7 @@ class StorageFS(Operations):
 
         try:
             cache_path.unlink()
+            self.cache_manager.mark_cache_size_dirty()
 
             # Remove from state tracking
             if not backend_name:
@@ -641,6 +642,7 @@ class StorageFS(Operations):
         try:
             with open(cache_path, 'r+b') as f:
                 f.truncate(length)
+            self.cache_manager.mark_cache_size_dirty()
 
             # Mark as dirty
             if not backend_name:
@@ -748,6 +750,7 @@ class StorageFS(Operations):
         try:
             os.lseek(real_fd, offset, os.SEEK_SET)
             written = os.write(real_fd, data)
+            self.cache_manager.mark_cache_size_dirty()
 
             if backend_name is None:
                 self.cache_manager.mark_accessed(path)
