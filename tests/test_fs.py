@@ -1,4 +1,5 @@
 import unittest
+import errno
 import tempfile
 import shutil
 import stat
@@ -8,11 +9,34 @@ import threading
 import os
 import time
 from unittest.mock import patch
+from fuse import FuseOSError
 
 from storage.fs import StorageFS
 from storage.fs import _acquire_mount_lock
 from storage.backends.local import LocalBackend
 from storage.sync import DirOperation
+
+
+class SlowRangeLocalBackend(LocalBackend):
+    """Local backend test double with controllable read/copy latency and failures."""
+
+    def __init__(self, name, root_path, range_delay=0.0, copy_delay=0.0, fail_after_offset=None):
+        super().__init__(name, root_path)
+        self.range_delay = range_delay
+        self.copy_delay = copy_delay
+        self.fail_after_offset = fail_after_offset
+
+    def read_file(self, virtual_path: str, offset: int, size: int) -> bytes:
+        if self.fail_after_offset is not None and offset >= self.fail_after_offset:
+            raise OSError(errno.EIO, "simulated backend range read failure")
+        if self.range_delay:
+            time.sleep(self.range_delay)
+        return super().read_file(virtual_path, offset, size)
+
+    def copy_to_local(self, virtual_path: str, local_path: Path):
+        if self.copy_delay:
+            time.sleep(self.copy_delay)
+        return super().copy_to_local(virtual_path, local_path)
 
 
 class TestReaddirMerging(unittest.TestCase):
@@ -298,6 +322,124 @@ class TestReaddirMerging(unittest.TestCase):
             self.assertTrue(self._wait_for(replicated, timeout=5.0))
         finally:
             backend2.mkdir = original
+
+
+class TestStreamingReadPrefetch(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = Path(tempfile.mkdtemp())
+        self.cache_dir = self.temp_dir / "cache"
+        self.cache_dir.mkdir()
+        self.backend_dir = self.temp_dir / "backend"
+        self.backend_dir.mkdir()
+        self.db_path = self.temp_dir / "state.db"
+
+        self.backend = SlowRangeLocalBackend(
+            "backend",
+            str(self.backend_dir),
+            range_delay=0.02,
+            copy_delay=0.35,
+        )
+
+        self.fs = StorageFS(
+            cache_root=self.cache_dir,
+            state_db=self.db_path,
+            backends={"backend": self.backend},
+            cache_size=32 * 1024 * 1024,
+            num_sync_workers=0,
+            start_sync=False,
+            streaming_reads=True,
+            streaming_chunk_size=32 * 1024,
+            max_streaming_sessions=2,
+        )
+
+    def tearDown(self):
+        try:
+            self.fs.destroy('/')
+        except Exception:
+            pass
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _wait_for(self, predicate, timeout=5.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if predicate():
+                return True
+            time.sleep(0.05)
+        return predicate()
+
+    def test_streaming_open_and_read_without_waiting_full_copy(self):
+        payload = os.urandom(256 * 1024)
+        remote_file = self.backend_dir / "large.bin"
+        remote_file.write_bytes(payload)
+
+        start = time.perf_counter()
+        vfd = self.fs.open('/large.bin', os.O_RDONLY)
+        elapsed = time.perf_counter() - start
+
+        # Legacy full copy path sleeps for 0.35s; streaming open should return much sooner.
+        self.assertLess(elapsed, 0.20)
+
+        first = self.fs.read('/large.bin', 4096, 0, vfd)
+        self.assertEqual(first, payload[:4096])
+
+        self.fs.release('/large.bin', vfd)
+
+        cache_path = self.cache_dir / "large.bin"
+        partial_path = self.cache_dir / "large.bin.storage.partial"
+        self.assertTrue(self._wait_for(lambda: cache_path.exists() and not partial_path.exists(), timeout=8.0))
+        self.assertEqual(cache_path.read_bytes(), payload)
+
+    def test_streaming_seek_fetches_missed_range(self):
+        payload = os.urandom(256 * 1024)
+        (self.backend_dir / "seek.bin").write_bytes(payload)
+
+        vfd = self.fs.open('/seek.bin', os.O_RDONLY)
+        prefix = self.fs.read('/seek.bin', 1024, 0, vfd)
+        self.assertEqual(prefix, payload[:1024])
+
+        offset = 180 * 1024
+        jumped = self.fs.read('/seek.bin', 1024, offset, vfd)
+        self.assertEqual(jumped, payload[offset:offset + 1024])
+
+        self.fs.release('/seek.bin', vfd)
+
+    def test_streaming_read_surfaces_backend_range_failures(self):
+        self.backend.fail_after_offset = 64 * 1024
+        payload = os.urandom(128 * 1024)
+        (self.backend_dir / "fault.bin").write_bytes(payload)
+
+        vfd = self.fs.open('/fault.bin', os.O_RDONLY)
+        ok = self.fs.read('/fault.bin', 4096, 0, vfd)
+        self.assertEqual(ok, payload[:4096])
+
+        with self.assertRaises(FuseOSError) as ctx:
+            self.fs.read('/fault.bin', 4096, 96 * 1024, vfd)
+        self.assertEqual(ctx.exception.errno, errno.EIO)
+
+        self.fs.release('/fault.bin', vfd)
+
+    def test_streaming_session_is_shared_across_readers(self):
+        payload = os.urandom(512 * 1024)
+        (self.backend_dir / "shared.bin").write_bytes(payload)
+
+        vfd_a = self.fs.open('/shared.bin', os.O_RDONLY)
+        vfd_b = self.fs.open('/shared.bin', os.O_RDONLY)
+
+        with self.fs._fd_lock:
+            entry_a = self.fs._fd_map[vfd_a]
+            entry_b = self.fs._fd_map[vfd_b]
+
+        self.assertIsNotNone(entry_a.prefetch_session)
+        self.assertIs(entry_a.prefetch_session, entry_b.prefetch_session)
+
+        read_a = self.fs.read('/shared.bin', 2048, 0, vfd_a)
+        read_b = self.fs.read('/shared.bin', 2048, 2048, vfd_b)
+        self.assertEqual(read_a, payload[:2048])
+        self.assertEqual(read_b, payload[2048:4096])
+
+        self.fs.release('/shared.bin', vfd_a)
+        self.fs.release('/shared.bin', vfd_b)
+
 
 
 def _try_lock(lock_path_str, mountpoint, return_dict):
