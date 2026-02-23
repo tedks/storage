@@ -146,6 +146,8 @@ class StorageFS(Operations):
         # Directory listing cache (per directory, per backend) for fallback when backend unavailable
         self._dir_cache: Dict[str, Dict[str, Set[str]]] = {}
         self._dir_cache_lock = threading.Lock()
+        self._readdir_snapshot_ttl = 1.0
+        self._readdir_snapshot: Dict[str, Tuple[float, List[str]]] = {}
 
         # Per-backend checksum index used for conflict surfacing
         self._checksum_lock = threading.RLock()
@@ -203,6 +205,7 @@ class StorageFS(Operations):
             path = '/' + path
         with self._dir_cache_lock:
             self._dir_cache.pop(path, None)
+            self._readdir_snapshot.pop(path, None)
 
     def _get_target_backends(self, backend_hint: Optional[str]) -> List[Backend]:
         """Return the backend instances affected by an operation."""
@@ -478,31 +481,39 @@ class StorageFS(Operations):
             os.lseek(session.io_fd, offset, os.SEEK_SET)
             os.write(session.io_fd, data)
 
-    def _fetch_range_into_session(self, session: PrefetchSession, start: int, end: int, source: str):
-        read_size = end - start
-        if read_size <= 0:
-            return
+    def _fetch_range_into_session(self, session: PrefetchSession, start: int, end: int, source: str) -> int:
+        target_end = min(end, session.file_size)
+        if start >= target_end:
+            return start
 
-        data = session.backend.read_file(session.canonical_path, start, read_size)
-        if data is None:
-            data = b""
+        cursor = start
+        chunks: List[Tuple[int, bytes]] = []
+        total_bytes = 0
 
-        if start >= session.file_size:
-            data = b""
+        while cursor < target_end:
+            remaining = target_end - cursor
+            chunk = session.backend.read_file(session.canonical_path, cursor, remaining)
+            if chunk is None:
+                chunk = b""
 
-        max_bytes = max(0, session.file_size - start)
-        if len(data) > max_bytes:
-            data = data[:max_bytes]
+            max_bytes = max(0, session.file_size - cursor)
+            if len(chunk) > max_bytes:
+                chunk = chunk[:max_bytes]
 
-        fetched_end = start + len(data)
+            if len(chunk) == 0:
+                break
 
-        if start < session.file_size and len(data) == 0:
+            chunks.append((cursor, chunk))
+            cursor += len(chunk)
+            total_bytes += len(chunk)
+
+        fetched_end = cursor
+
+        if start < session.file_size and fetched_end == start:
             raise IOError(f"range fetch returned no data for {session.canonical_path} at offset {start}")
 
-        if fetched_end < end and fetched_end < session.file_size:
-            raise IOError(f"short read for {session.canonical_path} [{start}, {end})")
-
-        self._write_session_bytes(session, start, data)
+        for chunk_offset, chunk_data in chunks:
+            self._write_session_bytes(session, chunk_offset, chunk_data)
 
         with session.lock:
             self._add_available_range(session.available_ranges, start, fetched_end)
@@ -511,7 +522,8 @@ class StorageFS(Operations):
             session.condition.notify_all()
 
         self._record_streaming_stat(f"{source}_fetches", 1)
-        self._record_streaming_stat(f"{source}_remote_bytes", len(data))
+        self._record_streaming_stat(f"{source}_remote_bytes", total_bytes)
+        return fetched_end
 
     def _ensure_streaming_range(self, session: PrefetchSession, start: int, end: int):
         if start >= end:
@@ -541,7 +553,7 @@ class StorageFS(Operations):
                 session.in_flight_chunks.add(chunk_start)
 
             try:
-                self._fetch_range_into_session(session, chunk_start, chunk_end, source="foreground")
+                _ = self._fetch_range_into_session(session, chunk_start, chunk_end, source="foreground")
             except Exception as exc:
                 with session.lock:
                     if session.error is None:
@@ -694,8 +706,8 @@ class StorageFS(Operations):
                 session.in_flight_chunks.add(chunk_start)
 
             try:
-                self._fetch_range_into_session(session, chunk_start, chunk_end, source="background")
-                cursor = chunk_end
+                fetched_end = self._fetch_range_into_session(session, chunk_start, chunk_end, source="background")
+                cursor = max(fetched_end, chunk_start + 1)
             except Exception as exc:
                 with session.lock:
                     if session.error is None:
@@ -712,8 +724,10 @@ class StorageFS(Operations):
         with session.lock:
             has_error = session.error is not None
             no_readers = session.refcount == 0
+            stopped = session.stop_requested
+            finalized = session.finalized
 
-        if has_error and no_readers:
+        if (has_error or (stopped and not finalized)) and no_readers:
             self._cleanup_failed_session(session)
 
     def _create_or_attach_prefetch_session(self, virtual_path: str, canonical_path: str) -> Optional[PrefetchSession]:
@@ -734,22 +748,38 @@ class StorageFS(Operations):
 
         backend = self._select_backend_for_read(canonical_path)
         if not backend:
+            self.logger.debug("streaming session unavailable: no readable backend for %s", canonical_path)
             return None
 
         if not backend.supports_range_reads():
+            self.logger.debug(
+                "streaming session unavailable: backend %s lacks range-read support for %s",
+                backend.name,
+                canonical_path,
+            )
             return None
 
         try:
-            if not backend.exists(canonical_path):
-                return None
             file_size = backend.get_size(canonical_path)
-        except Exception:
+        except Exception as exc:
+            self.logger.debug(
+                "streaming session unavailable: failed to stat %s on %s: %s",
+                canonical_path,
+                backend.name,
+                exc,
+            )
             return None
 
         if file_size < 0:
+            self.logger.debug("streaming session unavailable: invalid size %s for %s", file_size, canonical_path)
             return None
 
         if not self.cache_manager.ensure_space(file_size):
+            self.logger.warning(
+                "streaming session unavailable: insufficient cache space for %s (%d bytes)",
+                canonical_path,
+                file_size,
+            )
             return None
 
         final_cache_path = self.cache_manager.get_cache_path(virtual_path)
@@ -761,7 +791,12 @@ class StorageFS(Operations):
             partial_cache_path.unlink(missing_ok=True)
             io_fd = os.open(str(partial_cache_path), os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o644)
             os.ftruncate(io_fd, file_size)
-        except OSError:
+        except OSError as exc:
+            self.logger.debug(
+                "streaming session unavailable: failed to prepare partial cache file %s: %s",
+                partial_cache_path,
+                exc,
+            )
             if io_fd >= 0:
                 os.close(io_fd)
             return None
@@ -800,6 +835,13 @@ class StorageFS(Operations):
             daemon=True,
             name=f"storage-prefetch-{canonical_path}",
         )
+        self.logger.debug(
+            "streaming session started for %s via backend %s (size=%d, chunk=%d)",
+            canonical_path,
+            backend.name,
+            file_size,
+            session.chunk_size,
+        )
         session.worker = worker
         worker.start()
 
@@ -812,13 +854,23 @@ class StorageFS(Operations):
             has_error = session.error is not None
             finalized = session.finalized
             no_readers = session.refcount == 0
+            stop_for_orphan = no_readers and not finalized and not has_error
+            if stop_for_orphan:
+                session.stop_requested = True
+                session.condition.notify_all()
 
-        if has_error and no_readers:
-            worker = session.worker
+        worker = session.worker
+
+        if (has_error or stop_for_orphan) and no_readers:
             if worker and worker.is_alive():
                 worker.join(timeout=2.0)
-            self._cleanup_failed_session(session)
-            return
+            if worker and worker.is_alive():
+                return
+            with session.lock:
+                finalized = session.finalized
+            if not finalized:
+                self._cleanup_failed_session(session)
+                return
 
         if finalized and no_readers:
             self._close_streaming_session_resources(session)
@@ -972,6 +1024,14 @@ class StorageFS(Operations):
 
     def readdir(self, path, fh):
         """Read directory contents"""
+        now = time.monotonic()
+        with self._dir_cache_lock:
+            snapshot = self._readdir_snapshot.get(path)
+        if snapshot and (now - snapshot[0]) <= self._readdir_snapshot_ttl:
+            for entry in snapshot[1]:
+                yield entry
+            return
+
         cache_path = self.cache_manager.get_cache_path(path)
 
         entries: Set[str] = {'.', '..'}
@@ -1009,9 +1069,13 @@ class StorageFS(Operations):
 
         # Apply conflict view using known checksums
         visible_entries = self._apply_conflict_view(path, entries)
+        ordered_entries = sorted(visible_entries)
 
-        for r in sorted(visible_entries):
-            yield r
+        with self._dir_cache_lock:
+            self._readdir_snapshot[path] = (time.monotonic(), ordered_entries)
+
+        for entry in ordered_entries:
+            yield entry
 
     def mkdir(self, path, mode):
         """Create a directory"""
@@ -1075,6 +1139,10 @@ class StorageFS(Operations):
         try:
             cache_path.unlink()
             self.cache_manager.mark_cache_size_dirty()
+
+            parent_dir = str(Path(canonical_path).parent)
+            self._invalidate_dir_cache_entry(parent_dir)
+            self._invalidate_dir_cache_entry(canonical_path)
 
             # Remove from state tracking
             if not backend_name:
@@ -1200,6 +1268,8 @@ class StorageFS(Operations):
                 if not cache_path.exists() and prefetch_session.final_cache_path.exists():
                     # Session finished before open() reached os.open.
                     cache_path = prefetch_session.final_cache_path
+            else:
+                self.logger.debug("streaming open fallback to full-file cache path for %s", canonical_path)
 
         # Fallback path: preserve existing full-file cache semantics.
         if prefetch_session is None:
@@ -1269,6 +1339,10 @@ class StorageFS(Operations):
                 encryption_key_id=None
             )
             self.state_manager.set_file_metadata(metadata)
+
+            parent_dir = str(Path(canonical_path).parent)
+            self._invalidate_dir_cache_entry(parent_dir)
+            self._invalidate_dir_cache_entry(canonical_path)
 
             return vfd
 
