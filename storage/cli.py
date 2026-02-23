@@ -33,7 +33,14 @@ def main():
 @click.option('--allow-other/--no-allow-other', default=None,
               help='Allow other users to access mount (requires root or fuse.conf setting). Auto-detects if not specified.')
 @click.option('--debug', is_flag=True, help='Enable verbose debug logging')
-def mount(mountpoint, backing_paths, cache, cache_size, database, workers, remote, key_file, foreground, allow_other, debug):
+@click.option('--streaming-reads/--no-streaming-reads', default=True,
+              help='Stream uncached reads while prefetching files in the background.')
+@click.option('--streaming-chunk-size', default='1M',
+              help='Chunk size for streaming range reads (e.g., 256K, 1M).')
+@click.option('--max-streaming-sessions', default=8, type=int,
+              help='Maximum number of concurrent streaming prefetch sessions.')
+def mount(mountpoint, backing_paths, cache, cache_size, database, workers, remote, key_file, foreground,
+          allow_other, debug, streaming_reads, streaming_chunk_size, max_streaming_sessions):
     """
     Mount a Storage filesystem
 
@@ -60,6 +67,12 @@ def mount(mountpoint, backing_paths, cache, cache_size, database, workers, remot
         cache_size_bytes = parse_size(cache_size)
     except ValueError as e:
         click.echo(f"Error: Invalid cache size: {e}", err=True)
+        sys.exit(1)
+
+    try:
+        streaming_chunk_bytes = parse_size(streaming_chunk_size)
+    except ValueError as e:
+        click.echo(f"Error: Invalid streaming chunk size: {e}", err=True)
         sys.exit(1)
 
     # Setup paths
@@ -139,6 +152,9 @@ def mount(mountpoint, backing_paths, cache, cache_size, database, workers, remot
     click.echo(f"  Database: {db_path}")
     click.echo(f"  Backends: {len(backends)}")
     click.echo(f"  Sync workers: {workers}")
+    click.echo(f"  Streaming reads: {'enabled' if streaming_reads else 'disabled'}")
+    click.echo(f"  Streaming chunk: {streaming_chunk_size} ({streaming_chunk_bytes:,} bytes)")
+    click.echo(f"  Max streaming sessions: {max_streaming_sessions}")
     click.echo(f"\nPress Ctrl+C to unmount\n")
 
     # Suppress paramiko noise unless debugging
@@ -156,6 +172,9 @@ def mount(mountpoint, backing_paths, cache, cache_size, database, workers, remot
             num_sync_workers=workers,
             allow_other=allow_other,
             debug=debug,
+            streaming_reads=streaming_reads,
+            streaming_chunk_size=streaming_chunk_bytes,
+            max_streaming_sessions=max_streaming_sessions,
         )
     except PermissionError as e:
         click.echo(f"Permission error: {e}", err=True)
