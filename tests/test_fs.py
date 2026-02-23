@@ -20,18 +20,23 @@ from storage.sync import DirOperation
 class SlowRangeLocalBackend(LocalBackend):
     """Local backend test double with controllable read/copy latency and failures."""
 
-    def __init__(self, name, root_path, range_delay=0.0, copy_delay=0.0, fail_after_offset=None):
+    def __init__(self, name, root_path, range_delay=0.0, copy_delay=0.0,
+                 fail_after_offset=None, max_read_bytes=None):
         super().__init__(name, root_path)
         self.range_delay = range_delay
         self.copy_delay = copy_delay
         self.fail_after_offset = fail_after_offset
+        self.max_read_bytes = max_read_bytes
 
     def read_file(self, virtual_path: str, offset: int, size: int) -> bytes:
         if self.fail_after_offset is not None and offset >= self.fail_after_offset:
             raise OSError(errno.EIO, "simulated backend range read failure")
         if self.range_delay:
             time.sleep(self.range_delay)
-        return super().read_file(virtual_path, offset, size)
+        data = super().read_file(virtual_path, offset, size)
+        if self.max_read_bytes is not None and len(data) > self.max_read_bytes:
+            return data[:self.max_read_bytes]
+        return data
 
     def copy_to_local(self, virtual_path: str, local_path: Path):
         if self.copy_delay:
@@ -107,6 +112,16 @@ class TestReaddirMerging(unittest.TestCase):
         # Restore for cleanliness
         self.backends['backend1'].listdir = original
 
+    def test_readdir_uses_recent_snapshot_for_bursty_calls(self):
+        (self.backend1_dir / "snap.txt").write_text("data")
+        entries = set(self.fs.readdir('/', None))
+        self.assertIn('snap.txt', entries)
+
+        with patch.object(self.backends['backend1'], 'listdir_attrs', side_effect=RuntimeError('should not be called')):
+            snap_entries = set(self.fs.readdir('/', None))
+        self.assertIn('snap.txt', snap_entries)
+
+
     def test_getattr_remote_only_file(self):
         content = "hello"
         (self.backend1_dir / "remote.txt").write_text(content)
@@ -168,6 +183,7 @@ class TestReaddirMerging(unittest.TestCase):
         schedule_task.assert_not_called()
 
         (self.backend2_dir / "left.txt").write_text("same-name")
+        self.fs._invalidate_dir_cache_entry('/')
         with patch.object(self.fs, "_schedule_checksum_task") as schedule_task:
             list(self.fs.readdir('/', None))
         self.assertEqual(schedule_task.call_count, 2)
@@ -382,12 +398,12 @@ class TestStreamingReadPrefetch(unittest.TestCase):
         first = self.fs.read('/large.bin', 4096, 0, vfd)
         self.assertEqual(first, payload[:4096])
 
-        self.fs.release('/large.bin', vfd)
-
         cache_path = self.cache_dir / "large.bin"
         partial_path = self.cache_dir / "large.bin.storage.partial"
         self.assertTrue(self._wait_for(lambda: cache_path.exists() and not partial_path.exists(), timeout=8.0))
         self.assertEqual(cache_path.read_bytes(), payload)
+
+        self.fs.release('/large.bin', vfd)
 
     def test_streaming_seek_fetches_missed_range(self):
         payload = os.urandom(256 * 1024)
@@ -402,6 +418,22 @@ class TestStreamingReadPrefetch(unittest.TestCase):
         self.assertEqual(jumped, payload[offset:offset + 1024])
 
         self.fs.release('/seek.bin', vfd)
+
+    def test_streaming_tolerates_backend_short_reads(self):
+        self.backend.max_read_bytes = 1024
+        payload = os.urandom(192 * 1024)
+        (self.backend_dir / "short.bin").write_bytes(payload)
+
+        vfd = self.fs.open('/short.bin', os.O_RDONLY)
+        head = self.fs.read('/short.bin', 8192, 0, vfd)
+        self.assertEqual(head, payload[:8192])
+
+        middle_offset = 64 * 1024
+        middle = self.fs.read('/short.bin', 4096, middle_offset, vfd)
+        self.assertEqual(middle, payload[middle_offset:middle_offset + 4096])
+
+        self.fs.release('/short.bin', vfd)
+
 
     def test_streaming_read_surfaces_backend_range_failures(self):
         self.backend.fail_after_offset = 64 * 1024
@@ -439,6 +471,29 @@ class TestStreamingReadPrefetch(unittest.TestCase):
 
         self.fs.release('/shared.bin', vfd_a)
         self.fs.release('/shared.bin', vfd_b)
+
+
+
+    def test_streaming_orphan_prefetch_is_cancelled_after_release(self):
+        self.backend.range_delay = 0.03
+        payload = os.urandom(2 * 1024 * 1024)
+        (self.backend_dir / "orphan.bin").write_bytes(payload)
+
+        vfd = self.fs.open('/orphan.bin', os.O_RDONLY)
+        _ = self.fs.read('/orphan.bin', 4096, 0, vfd)
+        self.fs.release('/orphan.bin', vfd)
+
+        self.assertTrue(
+            self._wait_for(
+                lambda: '/orphan.bin' not in self.fs._prefetch_sessions,
+                timeout=5.0,
+            )
+        )
+
+        cache_path = self.cache_dir / "orphan.bin"
+        partial_path = self.cache_dir / "orphan.bin.storage.partial"
+        self.assertFalse(cache_path.exists())
+        self.assertFalse(partial_path.exists())
 
 
 
