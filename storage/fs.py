@@ -17,6 +17,8 @@ import stat
 import time
 import hashlib
 import yaml
+import json
+import socket
 import concurrent.futures
 from dataclasses import dataclass, field
 from fuse import FUSE, FuseOSError, Operations
@@ -117,11 +119,17 @@ class StorageFS(Operations):
         self._streaming_stats_lock = threading.Lock()
         self._streaming_stats = {
             "streamed_opens": 0,
+            "streaming_fallback_opens": 0,
             "foreground_remote_bytes": 0,
             "background_remote_bytes": 0,
             "foreground_fetches": 0,
             "background_fetches": 0,
         }
+        self._control_socket_path = self.cache_manager.cache_root / ".storage.control.sock"
+        self._control_stop_event = threading.Event()
+        self._control_socket_lock = threading.Lock()
+        self._control_socket: Optional[socket.socket] = None
+        self._control_thread: Optional[threading.Thread] = None
 
         # Background sync manager
         self.sync_manager = SyncManager(
@@ -156,6 +164,7 @@ class StorageFS(Operations):
         self._checksum_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 
         self._cleanup_stale_partials()
+        self._start_control_server()
 
     def init(self, path):
         """
@@ -464,6 +473,115 @@ class StorageFS(Operations):
             merged.append((start, end))
 
         ranges[:] = merged
+
+    def _streaming_stats_snapshot(self) -> Dict[str, object]:
+        """Return a point-in-time snapshot of streaming counters."""
+        with self._streaming_stats_lock:
+            stats = dict(self._streaming_stats)
+
+        with self._prefetch_sessions_lock:
+            active_sessions = len(self._prefetch_sessions)
+
+        stats.update({
+            "active_sessions": active_sessions,
+            "pid": os.getpid(),
+            "timestamp": time.time(),
+            "streaming_enabled": bool(self._streaming_reads),
+        })
+        return stats
+
+    def _handle_control_request(self, request: str) -> Dict[str, object]:
+        if request == "streaming-stats":
+            return self._streaming_stats_snapshot()
+        return {"error": f"unsupported request: {request}"}
+
+    def _control_server_loop(self):
+        """Serve simple debug requests from local CLI clients."""
+        while not self._control_stop_event.is_set():
+            with self._control_socket_lock:
+                control_socket = self._control_socket
+
+            if control_socket is None:
+                return
+
+            try:
+                conn, _ = control_socket.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                if self._control_stop_event.is_set():
+                    return
+                continue
+
+            with conn:
+                try:
+                    conn.settimeout(2.0)
+                    payload = conn.recv(4096)
+                    request = payload.decode("utf-8", errors="replace").strip()
+                    response = self._handle_control_request(request)
+                except Exception as exc:
+                    response = {"error": f"control request failed: {exc}"}
+
+                try:
+                    conn.sendall((json.dumps(response, sort_keys=True) + "\n").encode("utf-8"))
+                except Exception:
+                    pass
+
+    def _start_control_server(self):
+        """Start the local control socket used by debug commands."""
+        self._control_stop_event.clear()
+
+        try:
+            self._control_socket_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+        try:
+            control_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            control_socket.bind(str(self._control_socket_path))
+            os.chmod(self._control_socket_path, 0o600)
+            control_socket.listen(8)
+            control_socket.settimeout(0.5)
+        except OSError as exc:
+            self.logger.warning("failed to start control socket at %s: %s", self._control_socket_path, exc)
+            try:
+                control_socket.close()
+            except Exception:
+                pass
+            return
+
+        with self._control_socket_lock:
+            self._control_socket = control_socket
+
+        self._control_thread = threading.Thread(
+            target=self._control_server_loop,
+            daemon=True,
+            name="storage-control-socket",
+        )
+        self._control_thread.start()
+
+    def _stop_control_server(self):
+        self._control_stop_event.set()
+
+        with self._control_socket_lock:
+            control_socket = self._control_socket
+            self._control_socket = None
+
+        if control_socket is not None:
+            try:
+                control_socket.close()
+            except OSError:
+                pass
+
+        control_thread = self._control_thread
+        self._control_thread = None
+        if control_thread and control_thread.is_alive():
+            control_thread.join(timeout=2.0)
+
+        try:
+            self._control_socket_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
     def _record_streaming_stat(self, key: str, value: int = 1):
         with self._streaming_stats_lock:
@@ -1269,6 +1387,7 @@ class StorageFS(Operations):
                     # Session finished before open() reached os.open.
                     cache_path = prefetch_session.final_cache_path
             else:
+                self._record_streaming_stat("streaming_fallback_opens", 1)
                 self.logger.debug("streaming open fallback to full-file cache path for %s", canonical_path)
 
         # Fallback path: preserve existing full-file cache semantics.
@@ -1570,6 +1689,8 @@ class StorageFS(Operations):
 
     def destroy(self, path):
         """Cleanup on unmount"""
+        self._stop_control_server()
+
         with self._prefetch_sessions_lock:
             sessions = list(self._prefetch_sessions.values())
             self._prefetch_sessions.clear()
