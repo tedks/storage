@@ -574,10 +574,6 @@ class StorageFS(Operations):
             "timestamp": time.time(),
             "streaming_enabled": bool(self._streaming_reads),
         })
-        # Backward-compatible aliases for existing tooling.
-        stats["active_sessions"] = active_streaming_sessions
-        if "streamed_opens" not in stats:
-            stats["streamed_opens"] = stats.get("streaming_sessions_started", 0)
         return stats
 
     def _handle_control_request(self, request: str) -> Dict[str, object]:

@@ -73,8 +73,6 @@ class TestDebugStreamingStatsCLI(unittest.TestCase):
         self.assertTrue(payload["streaming_enabled"])
         self.assertEqual(payload["active_streaming_sessions"], 0)
         self.assertEqual(payload["streaming_sessions_started"], 0)
-        self.assertEqual(payload["active_sessions"], payload["active_streaming_sessions"])
-        self.assertEqual(payload["streamed_opens"], payload["streaming_sessions_started"])
         self.assertEqual(payload["streaming_fallback_opens"], 0)
         self.assertEqual(payload["foreground_fetches"], 0)
         self.assertEqual(payload["background_fetches"], 0)
