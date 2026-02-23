@@ -7,6 +7,7 @@ from pathlib import Path
 import multiprocessing as mp
 import threading
 import os
+import json
 import time
 from unittest.mock import patch
 from fuse import FuseOSError
@@ -419,6 +420,67 @@ class TestStreamingReadPrefetch(unittest.TestCase):
 
         self.fs.release('/seek.bin', vfd)
 
+    def test_streaming_prefetch_follows_first_read_forward(self):
+        self.backend.range_delay = 0.03
+        payload = os.urandom(2 * 1024 * 1024)
+        (self.backend_dir / "follow.bin").write_bytes(payload)
+
+        vfd = self.fs.open('/follow.bin', os.O_RDONLY)
+        offset = 1024 * 1024
+        sample = self.fs.read('/follow.bin', 4096, offset, vfd)
+        self.assertEqual(sample, payload[offset:offset + 4096])
+
+        chunk = self.fs._streaming_chunk_size
+        with self.fs._prefetch_sessions_lock:
+            session = self.fs._prefetch_sessions.get('/follow.bin')
+        self.assertIsNotNone(session)
+
+        time.sleep(0.15)
+        with session.lock:
+            ranges = list(session.available_ranges)
+
+        self.assertTrue(self.fs._is_range_available(ranges, offset, offset + 4096))
+        self.assertFalse(self.fs._is_range_available(ranges, 0, chunk))
+        self.fs.release('/follow.bin', vfd)
+
+    def test_streaming_state_xattr_tracks_progress(self):
+        payload = os.urandom(256 * 1024)
+        (self.backend_dir / "xattr.bin").write_bytes(payload)
+
+        vfd = self.fs.open('/xattr.bin', os.O_RDONLY)
+        first = self.fs.read('/xattr.bin', 4096, 0, vfd)
+        self.assertEqual(first, payload[:4096])
+
+        cache_path = self.cache_dir / "xattr.bin"
+        partial_path = self.cache_dir / "xattr.bin.storage.partial"
+        self.assertTrue(self._wait_for(lambda: partial_path.exists() or cache_path.exists(), timeout=3.0))
+        probe_path = partial_path if partial_path.exists() else cache_path
+
+        try:
+            raw = os.getxattr(str(probe_path), self.fs._STREAM_STATE_XATTR)
+        except OSError as exc:
+            if exc.errno in (getattr(errno, "EOPNOTSUPP", -1), getattr(errno, "ENOTSUP", -1), getattr(errno, "ENODATA", -1)):
+                self.skipTest("xattrs unsupported in this environment")
+            raise
+
+        state = json.loads(raw.decode())
+        self.assertEqual(state["file_size"], len(payload))
+        self.assertGreaterEqual(state["downloaded_bytes"], 4096)
+
+        self.fs.release('/xattr.bin', vfd)
+        self.assertTrue(self._wait_for(lambda: cache_path.exists(), timeout=8.0))
+
+        try:
+            final_raw = os.getxattr(str(cache_path), self.fs._STREAM_STATE_XATTR)
+        except OSError as exc:
+            if exc.errno in (getattr(errno, "EOPNOTSUPP", -1), getattr(errno, "ENOTSUP", -1), getattr(errno, "ENODATA", -1)):
+                self.skipTest("xattrs unsupported in this environment")
+            raise
+
+        final_state = json.loads(final_raw.decode())
+        self.assertEqual(final_state["status"], "complete")
+        self.assertTrue(final_state["finalized"])
+
     def test_streaming_tolerates_backend_short_reads(self):
         self.backend.max_read_bytes = 1024
         payload = os.urandom(192 * 1024)
@@ -474,7 +536,7 @@ class TestStreamingReadPrefetch(unittest.TestCase):
 
 
 
-    def test_streaming_orphan_prefetch_is_cancelled_after_release(self):
+    def test_streaming_prefetch_continues_after_last_reader_release(self):
         self.backend.range_delay = 0.03
         payload = os.urandom(2 * 1024 * 1024)
         (self.backend_dir / "orphan.bin").write_bytes(payload)
@@ -486,15 +548,14 @@ class TestStreamingReadPrefetch(unittest.TestCase):
         self.assertTrue(
             self._wait_for(
                 lambda: '/orphan.bin' not in self.fs._prefetch_sessions,
-                timeout=5.0,
+                timeout=8.0,
             )
         )
 
         cache_path = self.cache_dir / "orphan.bin"
         partial_path = self.cache_dir / "orphan.bin.storage.partial"
-        self.assertFalse(cache_path.exists())
+        self.assertTrue(cache_path.exists())
         self.assertFalse(partial_path.exists())
-
 
 
 def _try_lock(lock_path_str, mountpoint, return_dict):

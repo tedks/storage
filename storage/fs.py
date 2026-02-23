@@ -54,6 +54,7 @@ class PrefetchSession:
     stop_requested: bool = False
     error: Optional[Exception] = None
     worker: Optional[threading.Thread] = None
+    has_foreground_read: bool = False
     last_foreground_offset: int = 0
 
     def __post_init__(self):
@@ -86,6 +87,7 @@ class StorageFS(Operations):
     CHECKSUM_XATTR = "user.storage.checksums"
     _STUB_XATTR = "user.storage.stub"
     _PARTIAL_SUFFIX = ".storage.partial"
+    _STREAM_STATE_XATTR = "user.storage.stream"
 
     def __init__(self, cache_root: Path, state_db: Path, backends: Dict[str, Backend],
                  cache_size: int, num_sync_workers: int = 2, start_sync: bool = True,
@@ -474,6 +476,52 @@ class StorageFS(Operations):
 
         ranges[:] = merged
 
+    @staticmethod
+    def _contiguous_available_prefix(ranges: List[Tuple[int, int]], file_size: int) -> int:
+        cursor = 0
+        for range_start, range_end in ranges:
+            if range_end <= cursor:
+                continue
+            if range_start > cursor:
+                break
+            cursor = max(cursor, range_end)
+            if cursor >= file_size:
+                return file_size
+        return min(cursor, file_size)
+
+    def _snapshot_streaming_state(self, session: PrefetchSession, status: str) -> Dict[str, object]:
+        with session.lock:
+            ranges = list(session.available_ranges)
+            downloaded_bytes = sum(max(0, end - start) for start, end in ranges)
+            contiguous_bytes = self._contiguous_available_prefix(ranges, session.file_size)
+            payload = {
+                "status": status,
+                "path": session.canonical_path,
+                "backend": session.backend.name,
+                "file_size": session.file_size,
+                "downloaded_bytes": downloaded_bytes,
+                "contiguous_bytes": contiguous_bytes,
+                "prefetch_complete": bool(session.prefetch_complete),
+                "finalized": bool(session.finalized),
+                "active_readers": session.refcount,
+                "has_foreground_read": bool(session.has_foreground_read),
+                "updated_at": time.time(),
+            }
+            if session.error is not None:
+                payload["error"] = str(session.error)
+        return payload
+
+    def _update_streaming_state_xattr(self, session: PrefetchSession, status: str):
+        payload = self._snapshot_streaming_state(session, status)
+
+        with session.lock:
+            target_path = session.final_cache_path if session.finalized else session.partial_cache_path
+
+        try:
+            os.setxattr(str(target_path), self._STREAM_STATE_XATTR, json.dumps(payload, sort_keys=True).encode("utf-8"))
+        except OSError:
+            pass
+
     def _streaming_stats_snapshot(self) -> Dict[str, object]:
         """Return a point-in-time snapshot of streaming counters."""
         with self._streaming_stats_lock:
@@ -641,6 +689,7 @@ class StorageFS(Operations):
 
         self._record_streaming_stat(f"{source}_fetches", 1)
         self._record_streaming_stat(f"{source}_remote_bytes", total_bytes)
+        self._update_streaming_state_xattr(session, "prefetching")
         return fetched_end
 
     def _ensure_streaming_range(self, session: PrefetchSession, start: int, end: int):
@@ -650,6 +699,9 @@ class StorageFS(Operations):
         while True:
             with session.lock:
                 session.last_foreground_offset = start
+                if not session.has_foreground_read:
+                    session.has_foreground_read = True
+                    session.condition.notify_all()
 
                 if self._is_range_available(session.available_ranges, start, end):
                     return
@@ -677,6 +729,7 @@ class StorageFS(Operations):
                     if session.error is None:
                         session.error = exc
                     session.condition.notify_all()
+                self._update_streaming_state_xattr(session, "error")
                 raise FuseOSError(errno.EIO)
             finally:
                 with session.lock:
@@ -701,6 +754,7 @@ class StorageFS(Operations):
                 self._prefetch_sessions.pop(session.canonical_path, None)
 
     def _cleanup_failed_session(self, session: PrefetchSession):
+        self._update_streaming_state_xattr(session, "failed")
         self._remove_prefetch_session(session)
         self._close_streaming_session_resources(session)
         try:
@@ -790,6 +844,8 @@ class StorageFS(Operations):
             should_close = session.refcount == 0
             session.condition.notify_all()
 
+        self._update_streaming_state_xattr(session, "complete")
+
         self._remove_prefetch_session(session)
 
         if should_close:
@@ -797,18 +853,29 @@ class StorageFS(Operations):
 
     def _background_prefetch_worker(self, session: PrefetchSession):
         cursor = 0
+        wrapped = False
 
-        while cursor < session.file_size:
+        while True:
             with session.lock:
                 if session.stop_requested or session.error is not None:
                     break
 
-                # Re-anchor background prefetch after large foreground seeks.
-                if session.last_foreground_offset > cursor + (session.chunk_size * 4):
-                    cursor = (session.last_foreground_offset // session.chunk_size) * session.chunk_size
+                if not session.has_foreground_read:
+                    session.condition.wait(timeout=0.05)
+                    continue
+
+                if not wrapped:
+                    desired_start = (session.last_foreground_offset // session.chunk_size) * session.chunk_size
+                    if cursor < desired_start:
+                        cursor = desired_start
 
                 if cursor >= session.file_size:
-                    break
+                    missing = self._first_missing_range(session.available_ranges, 0, session.file_size)
+                    if missing is None:
+                        break
+                    cursor = (missing[0] // session.chunk_size) * session.chunk_size
+                    wrapped = True
+                    continue
 
                 chunk_start = cursor
                 chunk_end = min(chunk_start + session.chunk_size, session.file_size)
@@ -831,6 +898,7 @@ class StorageFS(Operations):
                     if session.error is None:
                         session.error = exc
                     session.condition.notify_all()
+                self._update_streaming_state_xattr(session, "error")
                 break
             finally:
                 with session.lock:
@@ -962,6 +1030,7 @@ class StorageFS(Operations):
         )
         session.worker = worker
         worker.start()
+        self._update_streaming_state_xattr(session, "awaiting-read")
 
         return session
 
@@ -972,14 +1041,10 @@ class StorageFS(Operations):
             has_error = session.error is not None
             finalized = session.finalized
             no_readers = session.refcount == 0
-            stop_for_orphan = no_readers and not finalized and not has_error
-            if stop_for_orphan:
-                session.stop_requested = True
-                session.condition.notify_all()
 
         worker = session.worker
 
-        if (has_error or stop_for_orphan) and no_readers:
+        if has_error and no_readers:
             if worker and worker.is_alive():
                 worker.join(timeout=2.0)
             if worker and worker.is_alive():
@@ -1710,7 +1775,6 @@ class StorageFS(Operations):
                     session.partial_cache_path.unlink(missing_ok=True)
                 except OSError:
                     pass
-
         if sessions:
             self.cache_manager.mark_cache_size_dirty()
 
