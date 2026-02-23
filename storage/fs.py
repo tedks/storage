@@ -55,6 +55,8 @@ class PrefetchSession:
     error: Optional[Exception] = None
     worker: Optional[threading.Thread] = None
     has_foreground_read: bool = False
+    last_logged_status: str = ""
+    last_logged_downloaded_bytes: int = 0
     last_foreground_offset: int = 0
 
     def __post_init__(self):
@@ -120,7 +122,7 @@ class StorageFS(Operations):
         self._prefetch_sessions_lock = threading.RLock()
         self._streaming_stats_lock = threading.Lock()
         self._streaming_stats = {
-            "streamed_opens": 0,
+            "streaming_sessions_started": 0,
             "streaming_fallback_opens": 0,
             "foreground_remote_bytes": 0,
             "background_remote_bytes": 0,
@@ -511,8 +513,44 @@ class StorageFS(Operations):
                 payload["error"] = str(session.error)
         return payload
 
+    def _log_streaming_state_change(self, session: PrefetchSession, payload: Dict[str, object]):
+        status = str(payload.get("status", "unknown"))
+        downloaded = int(payload.get("downloaded_bytes", 0))
+        contiguous = int(payload.get("contiguous_bytes", 0))
+        file_size = int(payload.get("file_size", 0))
+        readers = int(payload.get("active_readers", 0))
+
+        should_log = False
+        with session.lock:
+            if status != session.last_logged_status:
+                should_log = True
+                session.last_logged_status = status
+                session.last_logged_downloaded_bytes = downloaded
+            elif downloaded >= file_size and downloaded != session.last_logged_downloaded_bytes:
+                should_log = True
+                session.last_logged_downloaded_bytes = downloaded
+            elif downloaded - session.last_logged_downloaded_bytes >= max(1, session.chunk_size * 4):
+                should_log = True
+                session.last_logged_downloaded_bytes = downloaded
+
+        if not should_log:
+            return
+
+        error_text = payload.get("error")
+        if error_text:
+            self.logger.info(
+                "streaming %s path=%s backend=%s downloaded=%d/%d contiguous=%d readers=%d error=%s",
+                status, session.canonical_path, session.backend.name, downloaded, file_size, contiguous, readers, error_text
+            )
+        else:
+            self.logger.info(
+                "streaming %s path=%s backend=%s downloaded=%d/%d contiguous=%d readers=%d",
+                status, session.canonical_path, session.backend.name, downloaded, file_size, contiguous, readers
+            )
+
     def _update_streaming_state_xattr(self, session: PrefetchSession, status: str):
         payload = self._snapshot_streaming_state(session, status)
+        self._log_streaming_state_change(session, payload)
 
         with session.lock:
             target_path = session.final_cache_path if session.finalized else session.partial_cache_path
@@ -528,14 +566,18 @@ class StorageFS(Operations):
             stats = dict(self._streaming_stats)
 
         with self._prefetch_sessions_lock:
-            active_sessions = len(self._prefetch_sessions)
+            active_streaming_sessions = len(self._prefetch_sessions)
 
         stats.update({
-            "active_sessions": active_sessions,
+            "active_streaming_sessions": active_streaming_sessions,
             "pid": os.getpid(),
             "timestamp": time.time(),
             "streaming_enabled": bool(self._streaming_reads),
         })
+        # Backward-compatible aliases for existing tooling.
+        stats["active_sessions"] = active_streaming_sessions
+        if "streamed_opens" not in stats:
+            stats["streamed_opens"] = stats.get("streaming_sessions_started", 0)
         return stats
 
     def _handle_control_request(self, request: str) -> Dict[str, object]:
@@ -922,6 +964,7 @@ class StorageFS(Operations):
             if existing:
                 with existing.lock:
                     existing.refcount += 1
+                self.logger.info("streaming attach path=%s backend=%s readers=%d", canonical_path, existing.backend.name, existing.refcount)
                 return existing
 
             if len(self._prefetch_sessions) >= self._max_streaming_sessions:
@@ -1004,6 +1047,7 @@ class StorageFS(Operations):
             if existing:
                 with existing.lock:
                     existing.refcount += 1
+                self.logger.info("streaming attach path=%s backend=%s readers=%d", canonical_path, existing.backend.name, existing.refcount)
                 self._close_streaming_session_resources(session)
                 try:
                     partial_cache_path.unlink(missing_ok=True)
@@ -1013,7 +1057,7 @@ class StorageFS(Operations):
             self._prefetch_sessions[canonical_path] = session
 
         self.cache_manager.mark_cache_size_dirty()
-        self._record_streaming_stat("streamed_opens", 1)
+        self._record_streaming_stat("streaming_sessions_started", 1)
 
         worker = threading.Thread(
             target=self._background_prefetch_worker,
@@ -1021,7 +1065,7 @@ class StorageFS(Operations):
             daemon=True,
             name=f"storage-prefetch-{canonical_path}",
         )
-        self.logger.debug(
+        self.logger.info(
             "streaming session started for %s via backend %s (size=%d, chunk=%d)",
             canonical_path,
             backend.name,
@@ -1453,7 +1497,7 @@ class StorageFS(Operations):
                     cache_path = prefetch_session.final_cache_path
             else:
                 self._record_streaming_stat("streaming_fallback_opens", 1)
-                self.logger.debug("streaming open fallback to full-file cache path for %s", canonical_path)
+                self.logger.info("streaming fallback path=%s reason=unavailable-session", canonical_path)
 
         # Fallback path: preserve existing full-file cache semantics.
         if prefetch_session is None:
