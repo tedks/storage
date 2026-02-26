@@ -389,18 +389,19 @@ class TestStreamingReadPrefetch(unittest.TestCase):
         remote_file = self.backend_dir / "large.bin"
         remote_file.write_bytes(payload)
 
-        start = time.perf_counter()
         vfd = self.fs.open('/large.bin', os.O_RDONLY)
-        elapsed = time.perf_counter() - start
+        with self.fs._fd_lock:
+            entry = self.fs._fd_map[vfd]
+        self.assertIsNotNone(entry.prefetch_session)
 
-        # Legacy full copy path sleeps for 0.35s; streaming open should return much sooner.
-        self.assertLess(elapsed, 0.20)
+        cache_path = self.cache_dir / "large.bin"
+        partial_path = self.cache_dir / "large.bin.storage.partial"
+        self.assertTrue(partial_path.exists())
+        self.assertFalse(cache_path.exists())
 
         first = self.fs.read('/large.bin', 4096, 0, vfd)
         self.assertEqual(first, payload[:4096])
 
-        cache_path = self.cache_dir / "large.bin"
-        partial_path = self.cache_dir / "large.bin.storage.partial"
         self.assertTrue(self._wait_for(lambda: cache_path.exists() and not partial_path.exists(), timeout=8.0))
         self.assertEqual(cache_path.read_bytes(), payload)
 

@@ -169,16 +169,17 @@ class TestStreamingSystemRegression(unittest.TestCase):
         self.assertGreater(stats["background_fetches"], 0)
         self.assertEqual(stats["streaming_fallback_opens"], 0)
 
-        reopen_start = time.perf_counter()
+        pre_reopen_stats = self.fs._streaming_stats_snapshot()
         fd2 = os.open(str(mount_file), os.O_RDONLY)
         try:
             reopen_head = os.pread(fd2, 128 * 1024, 0)
         finally:
             os.close(fd2)
-        reopen_elapsed = time.perf_counter() - reopen_start
+        post_reopen_stats = self.fs._streaming_stats_snapshot()
 
         self.assertEqual(reopen_head, self.payload[: len(reopen_head)])
-        self.assertLess(reopen_elapsed, 0.5)
+        self.assertEqual(post_reopen_stats["foreground_fetches"], pre_reopen_stats["foreground_fetches"])
+        self.assertEqual(post_reopen_stats["foreground_remote_bytes"], pre_reopen_stats["foreground_remote_bytes"])
 
         cache_path = self.cache_dir / "movie.bin"
         partial_path = self.cache_dir / "movie.bin.storage.partial"
