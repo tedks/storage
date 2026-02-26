@@ -10,7 +10,7 @@ import threading
 import time
 import paramiko
 from pathlib import Path, PurePosixPath
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from .base import Backend, BackendType
 
@@ -50,16 +50,39 @@ class SSHBackend(Backend):
         self.sftp_operation_timeout = max(60.0, float(connect_timeout) * 6.0)
         self.logger = logging.getLogger(__name__)
 
-        # SSH/SFTP connections (lazy connected)
-        self._ssh_client: Optional[paramiko.SSHClient] = None
-        self._sftp_client: Optional[paramiko.SFTPClient] = None
-        self._client_lock = threading.RLock()
+        # Per-thread SSH/SFTP connections (lazy connected). This avoids
+        # cross-thread contention and prevents one thread from closing a
+        # live channel owned by another thread.
+        self._thread_local = threading.local()
+        self._thread_clients: Dict[int, Tuple[paramiko.SSHClient, paramiko.SFTPClient]] = {}
+        self._thread_clients_lock = threading.Lock()
+
+    def _set_thread_clients(self, ssh_client: paramiko.SSHClient, sftp_client: paramiko.SFTPClient):
+        self._thread_local.ssh_client = ssh_client
+        self._thread_local.sftp_client = sftp_client
+        with self._thread_clients_lock:
+            self._thread_clients[threading.get_ident()] = (ssh_client, sftp_client)
+
+    def _get_thread_clients(self) -> Tuple[Optional[paramiko.SSHClient], Optional[paramiko.SFTPClient]]:
+        ssh_client = getattr(self._thread_local, "ssh_client", None)
+        sftp_client = getattr(self._thread_local, "sftp_client", None)
+        return ssh_client, sftp_client
+
+    @staticmethod
+    def _transport_active(ssh_client: Optional[paramiko.SSHClient]) -> bool:
+        if ssh_client is None:
+            return False
+        try:
+            transport = ssh_client.get_transport()
+            return bool(transport and transport.is_active())
+        except Exception:
+            return False
 
     def _connect(self):
-        """Establish SSH/SFTP connection"""
+        """Establish per-thread SSH/SFTP connection."""
         try:
-            self._ssh_client = paramiko.SSHClient()
-            self._ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            ssh_client = paramiko.SSHClient()
+            ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
             connect_kwargs = {
                 'hostname': self.host,
@@ -79,12 +102,12 @@ class SSHBackend(Backend):
                 connect_kwargs['allow_agent'] = False
                 connect_kwargs['look_for_keys'] = False
 
-            self._ssh_client.connect(**connect_kwargs)
-            self._sftp_client = self._ssh_client.open_sftp()
+            ssh_client.connect(**connect_kwargs)
+            sftp_client = ssh_client.open_sftp()
 
             # Keep SFTP socket/channel timeouts above connect timeout to tolerate
             # large files and slower links without spurious range-read aborts.
-            transport = self._ssh_client.get_transport()
+            transport = ssh_client.get_transport()
             if transport and transport.sock:
                 try:
                     transport.sock.settimeout(self.sftp_operation_timeout)
@@ -93,12 +116,13 @@ class SSHBackend(Backend):
                     pass
 
             try:
-                chan = self._sftp_client.get_channel()
+                chan = sftp_client.get_channel()
                 if chan:
                     chan.settimeout(self.sftp_operation_timeout)
             except Exception:
                 pass
 
+            self._set_thread_clients(ssh_client, sftp_client)
             self.set_available(True)
 
         except paramiko.AuthenticationException as e:
@@ -109,12 +133,10 @@ class SSHBackend(Backend):
         except paramiko.SSHException as e:
             self.logger.error("SSH handshake failed for %s@%s:%s: %s",
                               self.username, self.host, self.port, e)
-            self.set_available(False)
             raise
         except Exception as e:
             self.logger.error("Failed to connect to %s@%s:%s: %s",
                               self.username, self.host, self.port, e)
-            self.set_available(False)
             raise
 
     def _resolve_path(self, virtual_path: str) -> PurePosixPath:
@@ -123,37 +145,51 @@ class SSHBackend(Backend):
         return self.remote_path / relative_path
 
     def _ensure_connected(self):
-        """Ensure connection is active, reconnect if needed"""
-        if not self._sftp_client or not self._ssh_client:
+        """Ensure current thread has an active SSH/SFTP connection."""
+        ssh_client, sftp_client = self._get_thread_clients()
+        if sftp_client is None or not self._transport_active(ssh_client):
+            self._reset_connection()
             self._connect()
 
+    def _current_clients(self) -> Tuple[paramiko.SSHClient, paramiko.SFTPClient]:
+        self._ensure_connected()
+        ssh_client, sftp_client = self._get_thread_clients()
+        if ssh_client is None or sftp_client is None:
+            raise RuntimeError("SSH backend has no active thread client")
+        return ssh_client, sftp_client
+
     def _reset_connection(self):
-        """Drop current SSH/SFTP clients so the next operation reconnects."""
+        """Drop current thread's SSH/SFTP clients so the next operation reconnects."""
+        thread_id = threading.get_ident()
+        ssh_client, sftp_client = self._get_thread_clients()
+
+        with self._thread_clients_lock:
+            pair = self._thread_clients.pop(thread_id, None)
+            if pair:
+                ssh_client, sftp_client = pair
+
         try:
-            if self._sftp_client:
-                self._sftp_client.close()
+            if sftp_client:
+                sftp_client.close()
         except Exception:
             pass
         try:
-            if self._ssh_client:
-                self._ssh_client.close()
+            if ssh_client:
+                ssh_client.close()
         except Exception:
             pass
-        self._sftp_client = None
-        self._ssh_client = None
-        self.set_available(False)
+
+        self._thread_local.ssh_client = None
+        self._thread_local.sftp_client = None
 
     def exists(self, virtual_path: str) -> bool:
         """Check if a file exists on remote"""
-        if not self.is_available():
-            return False
+        remote_path = str(self._resolve_path(virtual_path))
 
         for attempt in range(2):
             try:
-                with self._client_lock:
-                    self._ensure_connected()
-                    remote_path = str(self._resolve_path(virtual_path))
-                    self._sftp_client.stat(remote_path)
+                _, sftp_client = self._current_clients()
+                sftp_client.stat(remote_path)
                 return True
             except FileNotFoundError:
                 return False
@@ -164,8 +200,7 @@ class SSHBackend(Backend):
                     attempt + 1,
                     exc,
                 )
-                with self._client_lock:
-                    self._reset_connection()
+                self._reset_connection()
                 if attempt == 1:
                     return False
             except Exception as exc:
@@ -181,11 +216,10 @@ class SSHBackend(Backend):
         last_exc = None
         for attempt in range(2):
             try:
-                with self._client_lock:
-                    self._ensure_connected()
-                    with self._sftp_client.open(remote_path, 'rb') as f:
-                        f.seek(offset)
-                        return f.read(size)
+                _, sftp_client = self._current_clients()
+                with sftp_client.open(remote_path, 'rb') as f:
+                    f.seek(offset)
+                    return f.read(size)
             except FileNotFoundError:
                 raise
             except (socket.timeout, EOFError, paramiko.SSHException, OSError) as exc:
@@ -198,8 +232,7 @@ class SSHBackend(Backend):
                     attempt + 1,
                     exc,
                 )
-                with self._client_lock:
-                    self._reset_connection()
+                self._reset_connection()
                 if attempt == 1:
                     raise
 
@@ -209,80 +242,77 @@ class SSHBackend(Backend):
 
     def write_file(self, virtual_path: str, data: bytes, offset: int):
         """Write data to remote file"""
-        self._ensure_connected()
-
+        _, sftp_client = self._current_clients()
         remote_path = str(self._resolve_path(virtual_path))
 
         # Ensure parent directory exists
         parent = str(PurePosixPath(remote_path).parent)
         try:
-            self._sftp_client.stat(parent)
+            sftp_client.stat(parent)
         except FileNotFoundError:
-            self._mkdir_recursive(parent)
+            self._mkdir_recursive(parent, sftp_client=sftp_client)
 
         # Open or create file
         mode = 'r+b' if self.exists(virtual_path) else 'wb'
 
-        with self._sftp_client.open(remote_path, mode) as f:
+        with sftp_client.open(remote_path, mode) as f:
             f.seek(offset)
             f.write(data)
 
     def create_file(self, virtual_path: str):
         """Create a new empty file on remote"""
-        self._ensure_connected()
-
+        _, sftp_client = self._current_clients()
         remote_path = str(self._resolve_path(virtual_path))
 
         # Ensure parent directory exists
         parent = str(PurePosixPath(remote_path).parent)
         try:
-            self._sftp_client.stat(parent)
+            sftp_client.stat(parent)
         except FileNotFoundError:
-            self._mkdir_recursive(parent)
+            self._mkdir_recursive(parent, sftp_client=sftp_client)
 
         # Create empty file
-        with self._sftp_client.open(remote_path, 'wb') as f:
+        with sftp_client.open(remote_path, 'wb'):
             pass
 
     def delete_file(self, virtual_path: str):
         """Delete a file from remote"""
-        self._ensure_connected()
-
+        _, sftp_client = self._current_clients()
         remote_path = str(self._resolve_path(virtual_path))
 
         try:
-            self._sftp_client.remove(remote_path)
+            sftp_client.remove(remote_path)
         except FileNotFoundError:
             pass
 
     def truncate_file(self, virtual_path: str):
         """Truncate a file to zero length"""
-        self._ensure_connected()
-
+        _, sftp_client = self._current_clients()
         remote_path = str(self._resolve_path(virtual_path))
 
-        with self._sftp_client.open(remote_path, 'wb') as f:
+        with sftp_client.open(remote_path, 'wb') as f:
             f.truncate(0)
 
     def get_size(self, virtual_path: str) -> int:
         """Get file size"""
-        with self._client_lock:
-            self._ensure_connected()
-            remote_path = str(self._resolve_path(virtual_path))
-            stat = self._sftp_client.stat(remote_path)
-            return stat.st_size
+        _, sftp_client = self._current_clients()
+        remote_path = str(self._resolve_path(virtual_path))
+        stat_result = sftp_client.stat(remote_path)
+        return stat_result.st_size
 
     def mkdir(self, virtual_path: str):
         """Create a directory on remote"""
-        self._ensure_connected()
-
+        _, sftp_client = self._current_clients()
         remote_path = str(self._resolve_path(virtual_path))
-        self._mkdir_recursive(remote_path)
+        self._mkdir_recursive(remote_path, sftp_client=sftp_client)
 
-    def _mkdir_recursive(self, remote_path: str):
+    def _mkdir_recursive(self, remote_path: str, sftp_client: Optional[paramiko.SFTPClient] = None):
         """Recursively create directories on remote"""
+        if sftp_client is None:
+            _, sftp_client = self._current_clients()
+
         try:
-            self._sftp_client.stat(remote_path)
+            sftp_client.stat(remote_path)
             return  # Already exists
         except FileNotFoundError:
             pass
@@ -290,119 +320,110 @@ class SSHBackend(Backend):
         # Try to create parent first
         parent = str(PurePosixPath(remote_path).parent)
         if parent != remote_path:  # Not root
-            self._mkdir_recursive(parent)
+            self._mkdir_recursive(parent, sftp_client=sftp_client)
 
         # Create this directory
         try:
-            self._sftp_client.mkdir(remote_path)
+            sftp_client.mkdir(remote_path)
         except OSError:
             pass  # May already exist due to race condition
 
     def rmdir(self, virtual_path: str):
         """Remove a directory from remote"""
-        self._ensure_connected()
-
+        _, sftp_client = self._current_clients()
         remote_path = str(self._resolve_path(virtual_path))
 
         try:
-            self._sftp_client.rmdir(remote_path)
+            sftp_client.rmdir(remote_path)
         except FileNotFoundError:
             pass
 
     def listdir(self, virtual_path: str) -> List[str]:
         """List directory contents on remote"""
-        with self._client_lock:
-            self._ensure_connected()
-            remote_path = str(self._resolve_path(virtual_path))
+        _, sftp_client = self._current_clients()
+        remote_path = str(self._resolve_path(virtual_path))
 
-            try:
-                return self._sftp_client.listdir(remote_path)
-            except FileNotFoundError:
-                return []
+        try:
+            return sftp_client.listdir(remote_path)
+        except FileNotFoundError:
+            return []
 
     def listdir_attrs(self, virtual_path: str):
         """List directory contents with attributes using SFTP listdir_attr."""
-        with self._client_lock:
-            self._ensure_connected()
-            remote_path = str(self._resolve_path(virtual_path))
-            try:
-                attrs = self._sftp_client.listdir_attr(remote_path)
-                result = []
-                for attr in attrs:
-                    # attr.filename may be bytes on some servers
-                    name = attr.filename
-                    if isinstance(name, bytes):
-                        name = name.decode()
-                    result.append((name, {
-                        'st_mode': getattr(attr, 'st_mode', None),
-                        'st_size': getattr(attr, 'st_size', 0),
-                        'st_mtime': getattr(attr, 'st_mtime', time.time()),
-                        'st_gid': getattr(attr, 'st_gid', os.getgid()),
-                        'st_uid': getattr(attr, 'st_uid', os.getuid()),
-                        'st_nlink': getattr(attr, 'st_nlink', 1),
-                    }))
-                return result
-            except Exception:
-                return None
+        _, sftp_client = self._current_clients()
+        remote_path = str(self._resolve_path(virtual_path))
+        try:
+            attrs = sftp_client.listdir_attr(remote_path)
+            result = []
+            for attr in attrs:
+                # attr.filename may be bytes on some servers
+                name = attr.filename
+                if isinstance(name, bytes):
+                    name = name.decode()
+                result.append((name, {
+                    'st_mode': getattr(attr, 'st_mode', None),
+                    'st_size': getattr(attr, 'st_size', 0),
+                    'st_mtime': getattr(attr, 'st_mtime', time.time()),
+                    'st_gid': getattr(attr, 'st_gid', os.getgid()),
+                    'st_uid': getattr(attr, 'st_uid', os.getuid()),
+                    'st_nlink': getattr(attr, 'st_nlink', 1),
+                }))
+            return result
+        except Exception:
+            return None
 
     def isdir(self, virtual_path: str) -> bool:
         """Check if path is a directory on remote"""
-        if not self.is_available():
-            return False
-
         try:
-            with self._client_lock:
-                self._ensure_connected()
-                remote_path = str(self._resolve_path(virtual_path))
-                stat = self._sftp_client.stat(remote_path)
+            _, sftp_client = self._current_clients()
+            remote_path = str(self._resolve_path(virtual_path))
+            stat_result = sftp_client.stat(remote_path)
             import stat as stat_module
-            return stat_module.S_ISDIR(stat.st_mode)
+            return stat_module.S_ISDIR(stat_result.st_mode)
         except Exception:
             return False
 
     def copy_to_local(self, virtual_path: str, local_path: Path):
         """Copy a file from remote to local path"""
-        self._ensure_connected()
-
+        _, sftp_client = self._current_clients()
         remote_path = str(self._resolve_path(virtual_path))
 
         # Ensure local parent directory exists
         local_path.parent.mkdir(parents=True, exist_ok=True)
 
         # Download file
-        self._sftp_client.get(remote_path, str(local_path))
+        sftp_client.get(remote_path, str(local_path))
 
     def copy_from_local(self, local_path: Path, virtual_path: str):
         """Copy a local file to remote"""
-        self._ensure_connected()
-
+        _, sftp_client = self._current_clients()
         remote_path = str(self._resolve_path(virtual_path))
 
         # Ensure remote parent directory exists
         parent = str(PurePosixPath(remote_path).parent)
         try:
-            self._sftp_client.stat(parent)
+            sftp_client.stat(parent)
         except FileNotFoundError:
-            self._mkdir_recursive(parent)
+            self._mkdir_recursive(parent, sftp_client=sftp_client)
 
         # Upload file
-        self._sftp_client.put(str(local_path), remote_path)
+        sftp_client.put(str(local_path), remote_path)
 
     def rename(self, old_virtual_path: str, new_virtual_path: str):
         """Rename a file or directory on the remote backend."""
-        self._ensure_connected()
+        _, sftp_client = self._current_clients()
 
         old_remote = str(self._resolve_path(old_virtual_path))
         new_remote = str(self._resolve_path(new_virtual_path))
         parent = str(PurePosixPath(new_remote).parent)
 
         try:
-            self._sftp_client.stat(parent)
+            sftp_client.stat(parent)
         except FileNotFoundError:
-            self._mkdir_recursive(parent)
+            self._mkdir_recursive(parent, sftp_client=sftp_client)
 
         try:
-            self._sftp_client.rename(old_remote, new_remote)
+            sftp_client.rename(old_remote, new_remote)
         except FileNotFoundError:
             # Nothing to rename; best-effort
             pass
@@ -419,21 +440,28 @@ class SSHBackend(Backend):
         pass
 
     def stat(self, virtual_path: str):
-        with self._client_lock:
-            self._ensure_connected()
-            remote_path = str(self._resolve_path(virtual_path))
-            return self._sftp_client.stat(remote_path)
+        _, sftp_client = self._current_clients()
+        remote_path = str(self._resolve_path(virtual_path))
+        return sftp_client.stat(remote_path)
 
     def close(self):
         """Close SSH/SFTP connections"""
-        if self._sftp_client:
-            self._sftp_client.close()
-            self._sftp_client = None
+        with self._thread_clients_lock:
+            clients = list(self._thread_clients.values())
+            self._thread_clients.clear()
 
-        if self._ssh_client:
-            self._ssh_client.close()
-            self._ssh_client = None
+        for ssh_client, sftp_client in clients:
+            try:
+                sftp_client.close()
+            except Exception:
+                pass
+            try:
+                ssh_client.close()
+            except Exception:
+                pass
 
+        self._thread_local.ssh_client = None
+        self._thread_local.sftp_client = None
         self.set_available(False)
 
     def __del__(self):
@@ -455,10 +483,10 @@ class SSHBackend(Backend):
 
         Falls back to SHA256 via ssh exec. If that fails, raises an exception.
         """
-        self._ensure_connected()
+        ssh_client, _ = self._current_clients()
         remote_path = str(self._resolve_path(virtual_path))
         cmd = f"sha256sum {self._shell_quote(remote_path)}"
-        _, stdout, stderr = self._ssh_client.exec_command(
+        _, stdout, stderr = ssh_client.exec_command(
             cmd, timeout=self.connect_timeout
         )
         output = stdout.read().decode().strip()
@@ -469,27 +497,27 @@ class SSHBackend(Backend):
     def set_xattr(self, virtual_path: str, name: str, value: bytes):
         """Best-effort remote setfattr."""
         try:
-            self._ensure_connected()
+            ssh_client, _ = self._current_clients()
             remote_path = str(self._resolve_path(virtual_path))
             value_str = value.decode() if isinstance(value, (bytes, bytearray)) else str(value)
             cmd = (
                 f"setfattr -n {self._shell_quote(name)} "
                 f"-v {self._shell_quote(value_str)} {self._shell_quote(remote_path)}"
             )
-            self._ssh_client.exec_command(cmd, timeout=self.connect_timeout)
+            ssh_client.exec_command(cmd, timeout=self.connect_timeout)
         except Exception:
             # Remote might not support xattrs; ignore
             pass
 
     def get_xattr(self, virtual_path: str, name: str):
         try:
-            self._ensure_connected()
+            ssh_client, _ = self._current_clients()
             remote_path = str(self._resolve_path(virtual_path))
             cmd = (
                 f"getfattr --absolute-names --only-values "
                 f"-n {self._shell_quote(name)} {self._shell_quote(remote_path)}"
             )
-            _, stdout, _ = self._ssh_client.exec_command(
+            _, stdout, _ = ssh_client.exec_command(
                 cmd, timeout=self.connect_timeout
             )
             data = stdout.read()

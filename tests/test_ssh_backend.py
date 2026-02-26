@@ -1,0 +1,224 @@
+import io
+import socket
+import threading
+import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
+
+from storage.backends.ssh import SSHBackend
+
+
+class _FakeSocket:
+    def __init__(self):
+        self.timeout = None
+
+    def settimeout(self, timeout):
+        self.timeout = timeout
+
+
+class _FakeTransport:
+    def __init__(self):
+        self.sock = _FakeSocket()
+        self._active = True
+
+    def is_active(self):
+        return self._active
+
+
+class _FakeChannel:
+    def __init__(self):
+        self.timeout = None
+
+    def settimeout(self, timeout):
+        self.timeout = timeout
+
+
+class _FakeRemoteFile:
+    def __init__(self, data: bytes):
+        self._data = data
+        self._offset = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        return False
+
+    def seek(self, offset: int):
+        self._offset = offset
+
+    def read(self, size: int):
+        start = self._offset
+        end = start + size
+        chunk = self._data[start:end]
+        self._offset += len(chunk)
+        return chunk
+
+    def write(self, data: bytes):
+        return len(data)
+
+    def truncate(self, _size: int):
+        pass
+
+
+class _FakeSFTPClient:
+    def __init__(self, payload: bytes, fail_open_count: int = 0):
+        self.payload = payload
+        self.fail_open_count = fail_open_count
+        self.closed = False
+        self._channel = _FakeChannel()
+
+    def get_channel(self):
+        return self._channel
+
+    def stat(self, _path: str):
+        return SimpleNamespace(st_size=len(self.payload), st_mode=0o100644)
+
+    def open(self, _path: str, _mode: str):
+        if self.fail_open_count > 0:
+            self.fail_open_count -= 1
+            raise socket.timeout("simulated timeout")
+        return _FakeRemoteFile(self.payload)
+
+    def close(self):
+        self.closed = True
+
+    def remove(self, _path: str):
+        pass
+
+    def mkdir(self, _path: str):
+        pass
+
+    def rmdir(self, _path: str):
+        pass
+
+    def listdir(self, _path: str):
+        return []
+
+    def listdir_attr(self, _path: str):
+        return []
+
+    def get(self, _remote_path: str, _local_path: str):
+        pass
+
+    def put(self, _local_path: str, _remote_path: str):
+        pass
+
+    def rename(self, _old_path: str, _new_path: str):
+        pass
+
+
+class _FakeSSHClient:
+    def __init__(self, sftp_client: _FakeSFTPClient):
+        self.sftp_client = sftp_client
+        self.transport = _FakeTransport()
+        self.closed = False
+
+    def set_missing_host_key_policy(self, _policy):
+        pass
+
+    def connect(self, **_kwargs):
+        pass
+
+    def open_sftp(self):
+        return self.sftp_client
+
+    def get_transport(self):
+        return self.transport
+
+    def exec_command(self, _cmd: str, timeout=None):
+        _ = timeout
+        return None, io.BytesIO(b"deadbeef  file\n"), io.BytesIO(b"")
+
+    def close(self):
+        self.closed = True
+        self.transport._active = False
+
+
+class TestSSHBackendThreadedClients(unittest.TestCase):
+    def _new_backend(self):
+        return SSHBackend(
+            name="ssh0",
+            host="example.local",
+            remote_path="/data",
+            username="test",
+            key_filename="/tmp/id_test",
+        )
+
+    @patch("storage.backends.ssh.paramiko.AutoAddPolicy")
+    @patch("storage.backends.ssh.paramiko.SSHClient")
+    def test_read_retry_does_not_quarantine_backend(self, mock_ssh_client_cls, mock_auto_add_policy):
+        _ = mock_auto_add_policy
+        payload = b"abcdefghijklmnopqrstuvwxyz"
+
+        first = _FakeSSHClient(_FakeSFTPClient(payload=payload, fail_open_count=1))
+        second = _FakeSSHClient(_FakeSFTPClient(payload=payload))
+        mock_ssh_client_cls.side_effect = [first, second]
+
+        backend = self._new_backend()
+        data = backend.read_file("/movie.bin", 0, 8)
+
+        self.assertEqual(data, payload[:8])
+        self.assertTrue(backend.is_available())
+        self.assertEqual(mock_ssh_client_cls.call_count, 2)
+        self.assertTrue(first.closed)
+        self.assertFalse(second.closed)
+
+        backend.close()
+
+    @patch("storage.backends.ssh.paramiko.AutoAddPolicy")
+    @patch("storage.backends.ssh.paramiko.SSHClient")
+    def test_reset_closes_only_calling_thread_client(self, mock_ssh_client_cls, mock_auto_add_policy):
+        _ = mock_auto_add_policy
+        payload = b"x" * 1024
+        created = []
+
+        def _factory():
+            client = _FakeSSHClient(_FakeSFTPClient(payload=payload))
+            created.append(client)
+            return client
+
+        mock_ssh_client_cls.side_effect = _factory
+        backend = self._new_backend()
+
+        barrier = threading.Barrier(2)
+        seen_clients = {}
+        still_open = {}
+        errors = []
+
+        def _worker(name: str, do_reset: bool):
+            try:
+                self.assertEqual(backend.get_size("/movie.bin"), len(payload))
+                ssh_client, _ = backend._get_thread_clients()
+                seen_clients[name] = ssh_client
+                barrier.wait(timeout=3)
+                if do_reset:
+                    backend._reset_connection()
+                barrier.wait(timeout=3)
+                still_open[name] = not ssh_client.closed
+            except Exception as exc:  # pragma: no cover - explicit test failure path
+                errors.append(exc)
+
+        t1 = threading.Thread(target=_worker, args=("a", True))
+        t2 = threading.Thread(target=_worker, args=("b", False))
+        t1.start()
+        t2.start()
+        t1.join(timeout=5)
+        t2.join(timeout=5)
+
+        if errors:
+            raise errors[0]
+
+        self.assertEqual(len(created), 2)
+        self.assertIsNotNone(seen_clients.get("a"))
+        self.assertIsNotNone(seen_clients.get("b"))
+        self.assertIsNot(seen_clients["a"], seen_clients["b"])
+        self.assertFalse(still_open["a"])
+        self.assertTrue(still_open["b"])
+
+        backend.close()
+        self.assertTrue(seen_clients["b"].closed)
+
+
+if __name__ == "__main__":
+    unittest.main()
