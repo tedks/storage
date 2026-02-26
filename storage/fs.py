@@ -820,9 +820,13 @@ class StorageFS(Operations):
                 return
             if not self._is_range_available(session.available_ranges, 0, session.file_size):
                 return
+            io_fd = session.io_fd
+
+        if io_fd < 0:
+            return
 
         try:
-            os.fsync(session.io_fd)
+            os.fsync(io_fd)
             session.final_cache_path.parent.mkdir(parents=True, exist_ok=True)
             os.replace(session.partial_cache_path, session.final_cache_path)
         except OSError as exc:
@@ -1071,6 +1075,18 @@ class StorageFS(Operations):
                 except OSError:
                     pass
                 return existing
+            if len(self._prefetch_sessions) >= self._max_streaming_sessions:
+                self.logger.warning(
+                    "Streaming session limit reached (%d) during registration; falling back to full-file cache for %s",
+                    self._max_streaming_sessions,
+                    canonical_path,
+                )
+                self._close_streaming_session_resources(session)
+                try:
+                    partial_cache_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                return None
             self._prefetch_sessions[canonical_path] = session
 
         self.cache_manager.mark_cache_size_dirty()
@@ -1523,7 +1539,14 @@ class StorageFS(Operations):
             cache_path = self.cache_manager.get_cache_path(path)
 
         try:
-            real_fd = os.open(str(cache_path), flags)
+            try:
+                real_fd = os.open(str(cache_path), flags)
+            except FileNotFoundError:
+                if prefetch_session is not None and prefetch_session.final_cache_path.exists():
+                    cache_path = prefetch_session.final_cache_path
+                    real_fd = os.open(str(cache_path), flags)
+                else:
+                    raise
 
             with self._fd_lock:
                 vfd = self._fd_counter
@@ -1663,13 +1686,22 @@ class StorageFS(Operations):
         if entry is None:
             return 0
 
+        close_error: Optional[OSError] = None
         try:
             os.close(entry.real_fd)
+        except OSError as exc:
+            close_error = exc
 
-            if entry.prefetch_session is not None:
-                self._release_prefetch_session(entry.prefetch_session)
-                return 0
+        if entry.prefetch_session is not None:
+            self._release_prefetch_session(entry.prefetch_session)
+            if close_error is not None:
+                raise FuseOSError(close_error.errno)
+            return 0
 
+        if close_error is not None:
+            raise FuseOSError(close_error.errno)
+
+        try:
             self.cache_manager.flush_file(path)
 
             if entry.backend_name:
@@ -1830,6 +1862,13 @@ class StorageFS(Operations):
             worker = session.worker
             if worker and worker.is_alive():
                 worker.join(timeout=2.0)
+            if worker and worker.is_alive():
+                self.logger.warning(
+                    "Streaming worker still alive during destroy; skipping forced close for %s",
+                    session.canonical_path,
+                )
+                continue
+
             self._close_streaming_session_resources(session)
             if not session.finalized:
                 try:

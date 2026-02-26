@@ -557,6 +557,54 @@ class TestStreamingReadPrefetch(unittest.TestCase):
         self.assertTrue(cache_path.exists())
         self.assertFalse(partial_path.exists())
 
+    def test_streaming_open_retries_on_partial_enoent_with_final_fallback(self):
+        payload = os.urandom(256 * 1024)
+        (self.backend_dir / "race.bin").write_bytes(payload)
+
+        seed_vfd = self.fs.open('/race.bin', os.O_RDONLY)
+        with self.fs._fd_lock:
+            seed_entry = self.fs._fd_map[seed_vfd]
+        self.assertIsNotNone(seed_entry.prefetch_session)
+        session = seed_entry.prefetch_session
+
+        session.final_cache_path.parent.mkdir(parents=True, exist_ok=True)
+        session.final_cache_path.write_bytes(payload)
+
+        real_os_open = os.open
+        partial_path = str(session.partial_cache_path)
+        raised_once = {"value": False}
+
+        def flaky_open(path, flags, mode=0o777):
+            if path == partial_path and not raised_once["value"]:
+                raised_once["value"] = True
+                raise FileNotFoundError(errno.ENOENT, "simulated partial rename race", path)
+            return real_os_open(path, flags, mode)
+
+        with patch("storage.fs.os.open", side_effect=flaky_open):
+            retry_vfd = self.fs.open('/race.bin', os.O_RDONLY)
+
+        self.fs.release('/race.bin', retry_vfd)
+        self.fs.release('/race.bin', seed_vfd)
+
+    def test_streaming_release_drops_reader_ref_when_close_fails(self):
+        payload = os.urandom(128 * 1024)
+        (self.backend_dir / "closefail.bin").write_bytes(payload)
+
+        vfd = self.fs.open('/closefail.bin', os.O_RDONLY)
+        with self.fs._fd_lock:
+            entry = self.fs._fd_map[vfd]
+        self.assertIsNotNone(entry.prefetch_session)
+
+        with self.assertRaises(FuseOSError) as ctx:
+            with patch("storage.fs.os.close", side_effect=OSError(errno.EIO, "simulated close failure")):
+                self.fs.release('/closefail.bin', vfd)
+
+        self.assertEqual(ctx.exception.errno, errno.EIO)
+        with entry.prefetch_session.lock:
+            self.assertEqual(entry.prefetch_session.refcount, 0)
+        with self.fs._fd_lock:
+            self.assertNotIn(vfd, self.fs._fd_map)
+
 
 def _try_lock(lock_path_str, mountpoint, return_dict):
     lock_path = Path(lock_path_str)

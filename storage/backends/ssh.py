@@ -5,9 +5,11 @@ SSH/SFTP backend implementation for remote filesystems
 import os
 import shlex
 import socket
+import stat as stat_module
 import logging
 import threading
 import time
+import weakref
 import paramiko
 from pathlib import Path, PurePosixPath
 from typing import Dict, List, Optional, Tuple
@@ -54,14 +56,56 @@ class SSHBackend(Backend):
         # cross-thread contention and prevents one thread from closing a
         # live channel owned by another thread.
         self._thread_local = threading.local()
-        self._thread_clients: Dict[int, Tuple[paramiko.SSHClient, paramiko.SFTPClient]] = {}
+        self._thread_clients: Dict[int, Tuple[paramiko.SSHClient, paramiko.SFTPClient, weakref.ReferenceType[threading.Thread]]] = {}
         self._thread_clients_lock = threading.Lock()
 
+    @staticmethod
+    def _close_client_pair(ssh_client: Optional[paramiko.SSHClient], sftp_client: Optional[paramiko.SFTPClient]):
+        try:
+            if sftp_client:
+                sftp_client.close()
+        except Exception:
+            pass
+        try:
+            if ssh_client:
+                ssh_client.close()
+        except Exception:
+            pass
+
+    def _prune_stale_thread_clients(self, exclude_thread_id: Optional[int] = None):
+        stale_clients: List[Tuple[paramiko.SSHClient, paramiko.SFTPClient]] = []
+
+        with self._thread_clients_lock:
+            for thread_id, entry in list(self._thread_clients.items()):
+                if exclude_thread_id is not None and thread_id == exclude_thread_id:
+                    continue
+
+                ssh_client, sftp_client, thread_ref = entry
+                thread_obj = thread_ref()
+                if thread_obj is None or not thread_obj.is_alive():
+                    self._thread_clients.pop(thread_id, None)
+                    stale_clients.append((ssh_client, sftp_client))
+
+        for ssh_client, sftp_client in stale_clients:
+            self._close_client_pair(ssh_client, sftp_client)
+
     def _set_thread_clients(self, ssh_client: paramiko.SSHClient, sftp_client: paramiko.SFTPClient):
+        thread_id = threading.get_ident()
+        self._prune_stale_thread_clients(exclude_thread_id=thread_id)
+
+        old_pair: Optional[Tuple[paramiko.SSHClient, paramiko.SFTPClient]] = None
+        thread_ref = weakref.ref(threading.current_thread())
+        with self._thread_clients_lock:
+            previous = self._thread_clients.get(thread_id)
+            if previous is not None:
+                old_pair = (previous[0], previous[1])
+            self._thread_clients[thread_id] = (ssh_client, sftp_client, thread_ref)
+
         self._thread_local.ssh_client = ssh_client
         self._thread_local.sftp_client = sftp_client
-        with self._thread_clients_lock:
-            self._thread_clients[threading.get_ident()] = (ssh_client, sftp_client)
+
+        if old_pair is not None and old_pair != (ssh_client, sftp_client):
+            self._close_client_pair(old_pair[0], old_pair[1])
 
     def _get_thread_clients(self) -> Tuple[Optional[paramiko.SSHClient], Optional[paramiko.SFTPClient]]:
         ssh_client = getattr(self._thread_local, "ssh_client", None)
@@ -152,6 +196,7 @@ class SSHBackend(Backend):
             self._connect()
 
     def _current_clients(self) -> Tuple[paramiko.SSHClient, paramiko.SFTPClient]:
+        self._prune_stale_thread_clients(exclude_thread_id=threading.get_ident())
         self._ensure_connected()
         ssh_client, sftp_client = self._get_thread_clients()
         if ssh_client is None or sftp_client is None:
@@ -166,18 +211,10 @@ class SSHBackend(Backend):
         with self._thread_clients_lock:
             pair = self._thread_clients.pop(thread_id, None)
             if pair:
-                ssh_client, sftp_client = pair
+                ssh_client = pair[0]
+                sftp_client = pair[1]
 
-        try:
-            if sftp_client:
-                sftp_client.close()
-        except Exception:
-            pass
-        try:
-            if ssh_client:
-                ssh_client.close()
-        except Exception:
-            pass
+        self._close_client_pair(ssh_client, sftp_client)
 
         self._thread_local.ssh_client = None
         self._thread_local.sftp_client = None
@@ -378,7 +415,6 @@ class SSHBackend(Backend):
             _, sftp_client = self._current_clients()
             remote_path = str(self._resolve_path(virtual_path))
             stat_result = sftp_client.stat(remote_path)
-            import stat as stat_module
             return stat_module.S_ISDIR(stat_result.st_mode)
         except Exception:
             return False
@@ -434,6 +470,10 @@ class SSHBackend(Backend):
         # Would need to execute df command via SSH
         return None
 
+    def supports_range_reads(self) -> bool:
+        """SSH backend supports offset/size reads via SFTP seek/read."""
+        return True
+
     def sync(self):
         """Sync any buffered writes"""
         # SFTP writes are synchronous
@@ -447,18 +487,11 @@ class SSHBackend(Backend):
     def close(self):
         """Close SSH/SFTP connections"""
         with self._thread_clients_lock:
-            clients = list(self._thread_clients.values())
+            clients = [(entry[0], entry[1]) for entry in self._thread_clients.values()]
             self._thread_clients.clear()
 
         for ssh_client, sftp_client in clients:
-            try:
-                sftp_client.close()
-            except Exception:
-                pass
-            try:
-                ssh_client.close()
-            except Exception:
-                pass
+            self._close_client_pair(ssh_client, sftp_client)
 
         self._thread_local.ssh_client = None
         self._thread_local.sftp_client = None

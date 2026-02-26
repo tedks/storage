@@ -173,7 +173,7 @@ class Backend(ABC):
 
     def supports_range_reads(self) -> bool:
         """Return whether this backend supports offset+size reads."""
-        return True
+        return False
 
     # Optional capabilities -------------------------------------------------
     def get_fast_checksum(self, virtual_path: str) -> str:

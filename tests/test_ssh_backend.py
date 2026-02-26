@@ -219,6 +219,38 @@ class TestSSHBackendThreadedClients(unittest.TestCase):
         backend.close()
         self.assertTrue(seen_clients["b"].closed)
 
+    @patch("storage.backends.ssh.paramiko.AutoAddPolicy")
+    @patch("storage.backends.ssh.paramiko.SSHClient")
+    def test_prune_stale_thread_clients_closes_dead_thread_connections(self, mock_ssh_client_cls, mock_auto_add_policy):
+        _ = mock_auto_add_policy
+        payload = b"y" * 1024
+        created = []
+
+        def _factory():
+            client = _FakeSSHClient(_FakeSFTPClient(payload=payload))
+            created.append(client)
+            return client
+
+        mock_ssh_client_cls.side_effect = _factory
+        backend = self._new_backend()
+
+        worker = threading.Thread(target=lambda: backend.get_size("/movie.bin"))
+        worker.start()
+        worker.join(timeout=5)
+        self.assertFalse(worker.is_alive())
+
+        with backend._thread_clients_lock:
+            self.assertEqual(len(backend._thread_clients), 1)
+
+        backend._prune_stale_thread_clients()
+
+        with backend._thread_clients_lock:
+            self.assertEqual(len(backend._thread_clients), 0)
+
+        self.assertEqual(len(created), 1)
+        self.assertTrue(created[0].closed)
+        backend.close()
+
 
 if __name__ == "__main__":
     unittest.main()
