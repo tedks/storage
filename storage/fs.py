@@ -510,7 +510,11 @@ class StorageFS(Operations):
                 "updated_at": time.time(),
             }
             if session.error is not None:
-                payload["error"] = str(session.error)
+                error_text = str(session.error).strip()
+                if not error_text:
+                    error_text = repr(session.error)
+                payload["error"] = error_text
+                payload["error_type"] = type(session.error).__name__
         return payload
 
     def _log_streaming_state_change(self, session: PrefetchSession, payload: Dict[str, object]):
@@ -537,10 +541,11 @@ class StorageFS(Operations):
             return
 
         error_text = payload.get("error")
+        error_type = payload.get("error_type")
         if error_text:
             self.logger.info(
-                "streaming %s path=%s backend=%s downloaded=%d/%d contiguous=%d readers=%d error=%s",
-                status, session.canonical_path, session.backend.name, downloaded, file_size, contiguous, readers, error_text
+                "streaming %s path=%s backend=%s downloaded=%d/%d contiguous=%d readers=%d error_type=%s error=%s",
+                status, session.canonical_path, session.backend.name, downloaded, file_size, contiguous, readers, error_type, error_text
             )
         else:
             self.logger.info(
@@ -763,6 +768,14 @@ class StorageFS(Operations):
             try:
                 _ = self._fetch_range_into_session(session, chunk_start, chunk_end, source="foreground")
             except Exception as exc:
+                self.logger.warning(
+                    "streaming foreground fetch failed path=%s backend=%s chunk=[%d,%d): %r",
+                    session.canonical_path,
+                    session.backend.name,
+                    chunk_start,
+                    chunk_end,
+                    exc,
+                )
                 with session.lock:
                     if session.error is None:
                         session.error = exc
@@ -932,6 +945,14 @@ class StorageFS(Operations):
                 fetched_end = self._fetch_range_into_session(session, chunk_start, chunk_end, source="background")
                 cursor = max(fetched_end, chunk_start + 1)
             except Exception as exc:
+                self.logger.warning(
+                    "streaming background fetch failed path=%s backend=%s chunk=[%d,%d): %r",
+                    session.canonical_path,
+                    session.backend.name,
+                    chunk_start,
+                    chunk_end,
+                    exc,
+                )
                 with session.lock:
                     if session.error is None:
                         session.error = exc

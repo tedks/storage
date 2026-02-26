@@ -4,7 +4,9 @@ SSH/SFTP backend implementation for remote filesystems
 
 import os
 import shlex
+import socket
 import logging
+import threading
 import time
 import paramiko
 from pathlib import Path, PurePosixPath
@@ -33,7 +35,7 @@ class SSHBackend(Backend):
             key_filename: Path to private key file
             port: SSH port (default 22)
             speed_priority: Speed priority (default 50 for remote)
-            connect_timeout: Timeout in seconds for SSH banner/connect and SFTP socket ops
+            connect_timeout: Timeout in seconds for SSH connection/auth handshakes
         """
         super().__init__(name, BackendType.SSH, is_remote=True, speed_priority=speed_priority)
 
@@ -44,11 +46,14 @@ class SSHBackend(Backend):
         self.password = password
         self.key_filename = key_filename
         self.connect_timeout = connect_timeout
+        # Keep I/O timeout higher than connect timeout to avoid aborting large/slow reads.
+        self.sftp_operation_timeout = max(60.0, float(connect_timeout) * 6.0)
         self.logger = logging.getLogger(__name__)
 
         # SSH/SFTP connections (lazy connected)
         self._ssh_client: Optional[paramiko.SSHClient] = None
         self._sftp_client: Optional[paramiko.SFTPClient] = None
+        self._client_lock = threading.RLock()
 
     def _connect(self):
         """Establish SSH/SFTP connection"""
@@ -77,20 +82,20 @@ class SSHBackend(Backend):
             self._ssh_client.connect(**connect_kwargs)
             self._sftp_client = self._ssh_client.open_sftp()
 
-            # Ensure the underlying socket respects the timeout for SFTP ops
+            # Keep SFTP socket/channel timeouts above connect timeout to tolerate
+            # large files and slower links without spurious range-read aborts.
             transport = self._ssh_client.get_transport()
             if transport and transport.sock:
                 try:
-                    transport.sock.settimeout(self.connect_timeout)
+                    transport.sock.settimeout(self.sftp_operation_timeout)
                 except Exception:
                     # Best-effort; SFTP may still function without socket-level timeout
                     pass
 
-            # Also set channel-level timeout so listdir/stat calls don't hang forever
             try:
                 chan = self._sftp_client.get_channel()
                 if chan:
-                    chan.settimeout(self.connect_timeout)
+                    chan.settimeout(self.sftp_operation_timeout)
             except Exception:
                 pass
 
@@ -122,31 +127,85 @@ class SSHBackend(Backend):
         if not self._sftp_client or not self._ssh_client:
             self._connect()
 
+    def _reset_connection(self):
+        """Drop current SSH/SFTP clients so the next operation reconnects."""
+        try:
+            if self._sftp_client:
+                self._sftp_client.close()
+        except Exception:
+            pass
+        try:
+            if self._ssh_client:
+                self._ssh_client.close()
+        except Exception:
+            pass
+        self._sftp_client = None
+        self._ssh_client = None
+        self.set_available(False)
+
     def exists(self, virtual_path: str) -> bool:
         """Check if a file exists on remote"""
         if not self.is_available():
             return False
 
-        try:
-            self._ensure_connected()
-            remote_path = str(self._resolve_path(virtual_path))
-            self._sftp_client.stat(remote_path)
-            return True
-        except FileNotFoundError:
-            return False
-        except Exception as e:
-            print(f"Error checking existence of {virtual_path}: {e}")
-            return False
+        for attempt in range(2):
+            try:
+                with self._client_lock:
+                    self._ensure_connected()
+                    remote_path = str(self._resolve_path(virtual_path))
+                    self._sftp_client.stat(remote_path)
+                return True
+            except FileNotFoundError:
+                return False
+            except (socket.timeout, EOFError, paramiko.SSHException, OSError) as exc:
+                self.logger.warning(
+                    "SFTP exists() failed on %s attempt=%d/2: %r",
+                    virtual_path,
+                    attempt + 1,
+                    exc,
+                )
+                with self._client_lock:
+                    self._reset_connection()
+                if attempt == 1:
+                    return False
+            except Exception as exc:
+                self.logger.warning("Error checking existence of %s: %r", virtual_path, exc)
+                return False
+
+        return False
 
     def read_file(self, virtual_path: str, offset: int, size: int) -> bytes:
-        """Read data from remote file"""
-        self._ensure_connected()
-
+        """Read data from remote file with one reconnect/retry on transport errors."""
         remote_path = str(self._resolve_path(virtual_path))
 
-        with self._sftp_client.open(remote_path, 'rb') as f:
-            f.seek(offset)
-            return f.read(size)
+        last_exc = None
+        for attempt in range(2):
+            try:
+                with self._client_lock:
+                    self._ensure_connected()
+                    with self._sftp_client.open(remote_path, 'rb') as f:
+                        f.seek(offset)
+                        return f.read(size)
+            except FileNotFoundError:
+                raise
+            except (socket.timeout, EOFError, paramiko.SSHException, OSError) as exc:
+                last_exc = exc
+                self.logger.warning(
+                    "SFTP read failed on %s (offset=%d size=%d attempt=%d/2): %r",
+                    virtual_path,
+                    offset,
+                    size,
+                    attempt + 1,
+                    exc,
+                )
+                with self._client_lock:
+                    self._reset_connection()
+                if attempt == 1:
+                    raise
+
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError(f"read_file failed unexpectedly for {virtual_path}")
 
     def write_file(self, virtual_path: str, data: bytes, offset: int):
         """Write data to remote file"""
@@ -207,11 +266,11 @@ class SSHBackend(Backend):
 
     def get_size(self, virtual_path: str) -> int:
         """Get file size"""
-        self._ensure_connected()
-
-        remote_path = str(self._resolve_path(virtual_path))
-        stat = self._sftp_client.stat(remote_path)
-        return stat.st_size
+        with self._client_lock:
+            self._ensure_connected()
+            remote_path = str(self._resolve_path(virtual_path))
+            stat = self._sftp_client.stat(remote_path)
+            return stat.st_size
 
     def mkdir(self, virtual_path: str):
         """Create a directory on remote"""
@@ -252,38 +311,39 @@ class SSHBackend(Backend):
 
     def listdir(self, virtual_path: str) -> List[str]:
         """List directory contents on remote"""
-        self._ensure_connected()
+        with self._client_lock:
+            self._ensure_connected()
+            remote_path = str(self._resolve_path(virtual_path))
 
-        remote_path = str(self._resolve_path(virtual_path))
-
-        try:
-            return self._sftp_client.listdir(remote_path)
-        except FileNotFoundError:
-            return []
+            try:
+                return self._sftp_client.listdir(remote_path)
+            except FileNotFoundError:
+                return []
 
     def listdir_attrs(self, virtual_path: str):
         """List directory contents with attributes using SFTP listdir_attr."""
-        self._ensure_connected()
-        remote_path = str(self._resolve_path(virtual_path))
-        try:
-            attrs = self._sftp_client.listdir_attr(remote_path)
-            result = []
-            for attr in attrs:
-                # attr.filename may be bytes on some servers
-                name = attr.filename
-                if isinstance(name, bytes):
-                    name = name.decode()
-                result.append((name, {
-                    'st_mode': getattr(attr, 'st_mode', None),
-                    'st_size': getattr(attr, 'st_size', 0),
-                    'st_mtime': getattr(attr, 'st_mtime', time.time()),
-                    'st_gid': getattr(attr, 'st_gid', os.getgid()),
-                    'st_uid': getattr(attr, 'st_uid', os.getuid()),
-                    'st_nlink': getattr(attr, 'st_nlink', 1),
-                }))
-            return result
-        except Exception:
-            return None
+        with self._client_lock:
+            self._ensure_connected()
+            remote_path = str(self._resolve_path(virtual_path))
+            try:
+                attrs = self._sftp_client.listdir_attr(remote_path)
+                result = []
+                for attr in attrs:
+                    # attr.filename may be bytes on some servers
+                    name = attr.filename
+                    if isinstance(name, bytes):
+                        name = name.decode()
+                    result.append((name, {
+                        'st_mode': getattr(attr, 'st_mode', None),
+                        'st_size': getattr(attr, 'st_size', 0),
+                        'st_mtime': getattr(attr, 'st_mtime', time.time()),
+                        'st_gid': getattr(attr, 'st_gid', os.getgid()),
+                        'st_uid': getattr(attr, 'st_uid', os.getuid()),
+                        'st_nlink': getattr(attr, 'st_nlink', 1),
+                    }))
+                return result
+            except Exception:
+                return None
 
     def isdir(self, virtual_path: str) -> bool:
         """Check if path is a directory on remote"""
@@ -291,12 +351,13 @@ class SSHBackend(Backend):
             return False
 
         try:
-            self._ensure_connected()
-            remote_path = str(self._resolve_path(virtual_path))
-            stat = self._sftp_client.stat(remote_path)
+            with self._client_lock:
+                self._ensure_connected()
+                remote_path = str(self._resolve_path(virtual_path))
+                stat = self._sftp_client.stat(remote_path)
             import stat as stat_module
             return stat_module.S_ISDIR(stat.st_mode)
-        except:
+        except Exception:
             return False
 
     def copy_to_local(self, virtual_path: str, local_path: Path):
@@ -358,9 +419,10 @@ class SSHBackend(Backend):
         pass
 
     def stat(self, virtual_path: str):
-        self._ensure_connected()
-        remote_path = str(self._resolve_path(virtual_path))
-        return self._sftp_client.stat(remote_path)
+        with self._client_lock:
+            self._ensure_connected()
+            remote_path = str(self._resolve_path(virtual_path))
+            return self._sftp_client.stat(remote_path)
 
     def close(self):
         """Close SSH/SFTP connections"""
