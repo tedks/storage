@@ -171,6 +171,10 @@ class Backend(ABC):
         """Set backend availability status"""
         self._available = available
 
+    def supports_range_reads(self) -> bool:
+        """Return whether this backend supports offset+size reads."""
+        return False
+
     # Optional capabilities -------------------------------------------------
     def get_fast_checksum(self, virtual_path: str) -> str:
         """

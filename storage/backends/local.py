@@ -181,6 +181,10 @@ class LocalBackend(Backend):
     def __repr__(self):
         return f"LocalBackend(name={self.name}, root={self.root_path})"
 
+    def supports_range_reads(self) -> bool:
+        """Local backend supports offset/size reads."""
+        return True
+
     # ------------------------------------------------------------------ #
     # Optional capabilities used by conflict detection
     # ------------------------------------------------------------------ #

@@ -6,6 +6,8 @@ import click
 import sys
 import subprocess
 import shutil
+import json
+import socket
 from pathlib import Path
 from typing import Optional
 
@@ -33,7 +35,14 @@ def main():
 @click.option('--allow-other/--no-allow-other', default=None,
               help='Allow other users to access mount (requires root or fuse.conf setting). Auto-detects if not specified.')
 @click.option('--debug', is_flag=True, help='Enable verbose debug logging')
-def mount(mountpoint, backing_paths, cache, cache_size, database, workers, remote, key_file, foreground, allow_other, debug):
+@click.option('--streaming-reads/--no-streaming-reads', default=True,
+              help='Stream uncached reads while prefetching files in the background.')
+@click.option('--streaming-chunk-size', default='1M',
+              help='Chunk size for streaming range reads (e.g., 256K, 1M).')
+@click.option('--max-streaming-sessions', default=8, type=int,
+              help='Maximum number of concurrent streaming prefetch sessions.')
+def mount(mountpoint, backing_paths, cache, cache_size, database, workers, remote, key_file, foreground,
+          allow_other, debug, streaming_reads, streaming_chunk_size, max_streaming_sessions):
     """
     Mount a Storage filesystem
 
@@ -60,6 +69,12 @@ def mount(mountpoint, backing_paths, cache, cache_size, database, workers, remot
         cache_size_bytes = parse_size(cache_size)
     except ValueError as e:
         click.echo(f"Error: Invalid cache size: {e}", err=True)
+        sys.exit(1)
+
+    try:
+        streaming_chunk_bytes = parse_size(streaming_chunk_size)
+    except ValueError as e:
+        click.echo(f"Error: Invalid streaming chunk size: {e}", err=True)
         sys.exit(1)
 
     # Setup paths
@@ -139,6 +154,9 @@ def mount(mountpoint, backing_paths, cache, cache_size, database, workers, remot
     click.echo(f"  Database: {db_path}")
     click.echo(f"  Backends: {len(backends)}")
     click.echo(f"  Sync workers: {workers}")
+    click.echo(f"  Streaming reads: {'enabled' if streaming_reads else 'disabled'}")
+    click.echo(f"  Streaming chunk: {streaming_chunk_size} ({streaming_chunk_bytes:,} bytes)")
+    click.echo(f"  Max streaming sessions: {max_streaming_sessions}")
     click.echo(f"\nPress Ctrl+C to unmount\n")
 
     # Suppress paramiko noise unless debugging
@@ -156,6 +174,9 @@ def mount(mountpoint, backing_paths, cache, cache_size, database, workers, remot
             num_sync_workers=workers,
             allow_other=allow_other,
             debug=debug,
+            streaming_reads=streaming_reads,
+            streaming_chunk_size=streaming_chunk_bytes,
+            max_streaming_sessions=max_streaming_sessions,
         )
     except PermissionError as e:
         click.echo(f"Permission error: {e}", err=True)
@@ -261,6 +282,72 @@ def info(path):
 
     if config.custom:
         click.echo(f"  Custom config: {config.custom}")
+
+
+@main.group()
+def debug():
+    """Debug and diagnostics commands."""
+    pass
+
+
+def _request_control_payload(cache_root: Path, request: str, timeout: float = 2.0) -> dict:
+    socket_path = cache_root / ".storage.control.sock"
+    if not socket_path.exists():
+        raise click.ClickException(f"No running mount control socket at {socket_path}")
+
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(timeout)
+            sock.connect(str(socket_path))
+            sock.sendall((request + "\n").encode("utf-8"))
+
+            data = b""
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+    except (OSError, TimeoutError) as exc:
+        raise click.ClickException(f"Failed to query control socket {socket_path}: {exc}") from exc
+
+    if not data:
+        raise click.ClickException(f"No response from control socket {socket_path}")
+
+    try:
+        payload = json.loads(data.decode("utf-8"))
+    except json.JSONDecodeError as exc:
+        raise click.ClickException(f"Invalid response from control socket {socket_path}: {exc}") from exc
+
+    if isinstance(payload, dict) and payload.get("error"):
+        raise click.ClickException(str(payload["error"]))
+
+    return payload
+
+
+@debug.command("streaming-stats")
+@click.option('-c', '--cache', required=True, type=click.Path(), help='Cache directory used by the mount')
+@click.option('--timeout', default=2.0, type=float, show_default=True, help='Control socket timeout in seconds')
+@click.option('--json-output', is_flag=True, help='Print raw JSON stats')
+def debug_streaming_stats(cache, timeout, json_output):
+    """Show live streaming-read stats from a running mount."""
+    cache_root = Path(cache).resolve()
+    payload = _request_control_payload(cache_root, "streaming-stats", timeout=timeout)
+
+    if json_output:
+        click.echo(json.dumps(payload, sort_keys=True, indent=2))
+        return
+
+    click.echo(f"Streaming stats from {cache_root}:")
+    click.echo(f"  PID: {payload.get('pid')}")
+    click.echo(f"  Timestamp: {payload.get('timestamp')}")
+    click.echo(f"  Streaming enabled: {payload.get('streaming_enabled')}")
+    click.echo(f"  Active streaming sessions: {payload.get('active_streaming_sessions')}")
+    click.echo(f"  Streaming sessions started: {payload.get('streaming_sessions_started', 0)}")
+    click.echo(f"  Fallback opens: {payload.get('streaming_fallback_opens', 0)}")
+    click.echo(f"  Foreground fetches: {payload.get('foreground_fetches', 0)}")
+    click.echo(f"  Background fetches: {payload.get('background_fetches', 0)}")
+    click.echo(f"  Foreground bytes: {payload.get('foreground_remote_bytes', 0)}")
+    click.echo(f"  Background bytes: {payload.get('background_remote_bytes', 0)}")
 
 
 def parse_size(size_str: str) -> int:
