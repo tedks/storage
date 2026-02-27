@@ -289,8 +289,9 @@ class SSHBackend(Backend):
         except FileNotFoundError:
             self._mkdir_recursive(parent, sftp_client=sftp_client)
 
-        # Open or create file
+        # Open or create file. exists() may reconnect, so reacquire client afterward.
         mode = 'r+b' if self.exists(virtual_path) else 'wb'
+        _, sftp_client = self._current_clients()
 
         with sftp_client.open(remote_path, mode) as f:
             f.seek(offset)

@@ -606,6 +606,29 @@ class TestStreamingReadPrefetch(unittest.TestCase):
         with self.fs._fd_lock:
             self.assertNotIn(vfd, self.fs._fd_map)
 
+    def test_streaming_release_before_first_read_cleans_session(self):
+        for index in range(4):
+            payload = os.urandom(64 * 1024)
+            (self.backend_dir / f"idle-{index}.bin").write_bytes(payload)
+
+        for index in range(3):
+            path = f"/idle-{index}.bin"
+            vfd = self.fs.open(path, os.O_RDONLY)
+            self.fs.release(path, vfd)
+
+            partial_path = self.cache_dir / f"idle-{index}.bin.storage.partial"
+            final_path = self.cache_dir / f"idle-{index}.bin"
+            self.assertFalse(partial_path.exists())
+            self.assertFalse(final_path.exists())
+
+        self.assertTrue(self._wait_for(lambda: len(self.fs._prefetch_sessions) == 0, timeout=3.0))
+
+        vfd = self.fs.open('/idle-3.bin', os.O_RDONLY)
+        with self.fs._fd_lock:
+            entry = self.fs._fd_map[vfd]
+        self.assertIsNotNone(entry.prefetch_session)
+        self.fs.release('/idle-3.bin', vfd)
+
 
 def _try_lock(lock_path_str, mountpoint, return_dict):
     lock_path = Path(lock_path_str)

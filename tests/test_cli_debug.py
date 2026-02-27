@@ -60,6 +60,9 @@ class TestDebugStreamingStatsCLI(unittest.TestCase):
             streaming_reads=True,
         )
         socket_path = cache_dir / ".storage.control.sock"
+        self.assertFalse(socket_path.exists())
+        self.fs.init("/")
+        socket_path = cache_dir / ".storage.control.sock"
         self._wait_for_socket(socket_path)
 
         result = self.runner.invoke(

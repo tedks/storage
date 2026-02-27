@@ -168,7 +168,6 @@ class StorageFS(Operations):
         self._checksum_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 
         self._cleanup_stale_partials()
-        self._start_control_server()
 
     def init(self, path):
         """
@@ -177,6 +176,10 @@ class StorageFS(Operations):
         Args:
             path: Mount path provided by FUSE (unused in this implementation).
         """
+        control_thread = self._control_thread
+        if control_thread is None or not control_thread.is_alive():
+            self._start_control_server()
+
         if not self._sync_started:
             self.sync_manager.start()
             self._sync_started = True
@@ -814,6 +817,16 @@ class StorageFS(Operations):
             pass
         self.cache_manager.mark_cache_size_dirty()
 
+    def _cleanup_cancelled_session(self, session: PrefetchSession):
+        self._update_streaming_state_xattr(session, "cancelled")
+        self._remove_prefetch_session(session)
+        self._close_streaming_session_resources(session)
+        try:
+            session.partial_cache_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        self.cache_manager.mark_cache_size_dirty()
+
     def _finalize_streaming_session(self, session: PrefetchSession):
         with session.lock:
             if session.finalized or session.error is not None:
@@ -1118,8 +1131,28 @@ class StorageFS(Operations):
             has_error = session.error is not None
             finalized = session.finalized
             no_readers = session.refcount == 0
+            had_foreground_read = session.has_foreground_read
 
         worker = session.worker
+
+        if no_readers and not finalized and not has_error and not had_foreground_read:
+            with session.lock:
+                session.stop_requested = True
+                session.condition.notify_all()
+
+            if worker and worker.is_alive():
+                worker.join(timeout=2.0)
+
+            with self._prefetch_sessions_lock:
+                still_registered = self._prefetch_sessions.get(session.canonical_path) is session
+
+            if still_registered:
+                with session.lock:
+                    finalized = session.finalized
+                    has_error = session.error is not None
+                if not finalized and not has_error:
+                    self._cleanup_cancelled_session(session)
+            return
 
         if has_error and no_readers:
             if worker and worker.is_alive():

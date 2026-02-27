@@ -62,16 +62,23 @@ class _FakeRemoteFile:
 
 
 class _FakeSFTPClient:
-    def __init__(self, payload: bytes, fail_open_count: int = 0):
+    def __init__(self, payload: bytes, fail_open_count: int = 0,
+                 fail_stat_count: int = 0, fail_stat_match: str = None):
         self.payload = payload
         self.fail_open_count = fail_open_count
+        self.fail_stat_count = fail_stat_count
+        self.fail_stat_match = fail_stat_match
         self.closed = False
         self._channel = _FakeChannel()
 
     def get_channel(self):
         return self._channel
 
-    def stat(self, _path: str):
+    def stat(self, path: str):
+        if self.fail_stat_count > 0:
+            if self.fail_stat_match is None or self.fail_stat_match in path:
+                self.fail_stat_count -= 1
+                raise socket.timeout("simulated stat timeout")
         return SimpleNamespace(st_size=len(self.payload), st_mode=0o100644)
 
     def open(self, _path: str, _mode: str):
@@ -249,6 +256,24 @@ class TestSSHBackendThreadedClients(unittest.TestCase):
 
         self.assertEqual(len(created), 1)
         self.assertTrue(created[0].closed)
+        backend.close()
+
+    @patch("storage.backends.ssh.paramiko.AutoAddPolicy")
+    @patch("storage.backends.ssh.paramiko.SSHClient")
+    def test_write_file_reacquires_client_after_exists_reconnect(self, mock_ssh_client_cls, mock_auto_add_policy):
+        _ = mock_auto_add_policy
+
+        first = _FakeSSHClient(
+            _FakeSFTPClient(payload=b"", fail_stat_count=1, fail_stat_match="movie.bin")
+        )
+        second = _FakeSSHClient(_FakeSFTPClient(payload=b""))
+        mock_ssh_client_cls.side_effect = [first, second]
+
+        backend = self._new_backend()
+        backend.write_file("/movie.bin", b"abc", 0)
+
+        self.assertTrue(first.closed)
+        self.assertFalse(second.closed)
         backend.close()
 
 
