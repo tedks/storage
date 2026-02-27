@@ -68,6 +68,7 @@ class _FakeSFTPClient:
         self.fail_open_count = fail_open_count
         self.fail_stat_count = fail_stat_count
         self.fail_stat_match = fail_stat_match
+        self.open_calls = []
         self.closed = False
         self._channel = _FakeChannel()
 
@@ -81,7 +82,10 @@ class _FakeSFTPClient:
                 raise socket.timeout("simulated stat timeout")
         return SimpleNamespace(st_size=len(self.payload), st_mode=0o100644)
 
-    def open(self, _path: str, _mode: str):
+    def open(self, path: str, mode: str):
+        self.open_calls.append((path, mode))
+        if self.closed:
+            raise OSError("simulated closed sftp client")
         if self.fail_open_count > 0:
             self.fail_open_count -= 1
             raise socket.timeout("simulated timeout")
@@ -274,6 +278,8 @@ class TestSSHBackendThreadedClients(unittest.TestCase):
 
         self.assertTrue(first.closed)
         self.assertFalse(second.closed)
+        self.assertEqual(len(first.sftp_client.open_calls), 0)
+        self.assertEqual(len(second.sftp_client.open_calls), 1)
         backend.close()
 
 

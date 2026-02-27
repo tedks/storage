@@ -807,25 +807,24 @@ class StorageFS(Operations):
             if current is session:
                 self._prefetch_sessions.pop(session.canonical_path, None)
 
-    def _cleanup_failed_session(self, session: PrefetchSession):
-        self._update_streaming_state_xattr(session, "failed")
-        self._remove_prefetch_session(session)
+    def _discard_unregistered_prefetch_session(self, session: PrefetchSession):
         self._close_streaming_session_resources(session)
         try:
             session.partial_cache_path.unlink(missing_ok=True)
         except OSError:
             pass
+
+    def _cleanup_prefetch_session(self, session: PrefetchSession, status: str):
+        self._update_streaming_state_xattr(session, status)
+        self._remove_prefetch_session(session)
+        self._discard_unregistered_prefetch_session(session)
         self.cache_manager.mark_cache_size_dirty()
 
+    def _cleanup_failed_session(self, session: PrefetchSession):
+        self._cleanup_prefetch_session(session, "failed")
+
     def _cleanup_cancelled_session(self, session: PrefetchSession):
-        self._update_streaming_state_xattr(session, "cancelled")
-        self._remove_prefetch_session(session)
-        self._close_streaming_session_resources(session)
-        try:
-            session.partial_cache_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-        self.cache_manager.mark_cache_size_dirty()
+        self._cleanup_prefetch_session(session, "cancelled")
 
     def _finalize_streaming_session(self, session: PrefetchSession):
         with session.lock:
@@ -989,8 +988,10 @@ class StorageFS(Operations):
             stopped = session.stop_requested
             finalized = session.finalized
 
-        if (has_error or (stopped and not finalized)) and no_readers:
+        if has_error and no_readers:
             self._cleanup_failed_session(session)
+        elif stopped and not finalized and no_readers:
+            self._cleanup_cancelled_session(session)
 
     def _create_or_attach_prefetch_session(self, virtual_path: str, canonical_path: str) -> Optional[PrefetchSession]:
         with self._prefetch_sessions_lock:
@@ -1082,11 +1083,7 @@ class StorageFS(Operations):
                 with existing.lock:
                     existing.refcount += 1
                 self.logger.info("streaming attach path=%s backend=%s readers=%d", canonical_path, existing.backend.name, existing.refcount)
-                self._close_streaming_session_resources(session)
-                try:
-                    partial_cache_path.unlink(missing_ok=True)
-                except OSError:
-                    pass
+                self._discard_unregistered_prefetch_session(session)
                 return existing
             if len(self._prefetch_sessions) >= self._max_streaming_sessions:
                 self.logger.warning(
@@ -1094,11 +1091,7 @@ class StorageFS(Operations):
                     self._max_streaming_sessions,
                     canonical_path,
                 )
-                self._close_streaming_session_resources(session)
-                try:
-                    partial_cache_path.unlink(missing_ok=True)
-                except OSError:
-                    pass
+                self._discard_unregistered_prefetch_session(session)
                 return None
             self._prefetch_sessions[canonical_path] = session
 
@@ -1142,6 +1135,8 @@ class StorageFS(Operations):
 
             if worker and worker.is_alive():
                 worker.join(timeout=2.0)
+            if worker and worker.is_alive():
+                return
 
             with self._prefetch_sessions_lock:
                 still_registered = self._prefetch_sessions.get(session.canonical_path) is session

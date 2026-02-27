@@ -629,6 +629,19 @@ class TestStreamingReadPrefetch(unittest.TestCase):
         self.assertIsNotNone(entry.prefetch_session)
         self.fs.release('/idle-3.bin', vfd)
 
+    def test_streaming_release_before_first_read_marks_cancelled_not_failed(self):
+        payload = os.urandom(64 * 1024)
+        (self.backend_dir / "cancelled.bin").write_bytes(payload)
+
+        with patch.object(self.fs, "_cleanup_cancelled_session", wraps=self.fs._cleanup_cancelled_session) as cancelled_cleanup:
+            with patch.object(self.fs, "_cleanup_failed_session", wraps=self.fs._cleanup_failed_session) as failed_cleanup:
+                vfd = self.fs.open('/cancelled.bin', os.O_RDONLY)
+                self.fs.release('/cancelled.bin', vfd)
+
+                self.assertTrue(self._wait_for(lambda: len(self.fs._prefetch_sessions) == 0, timeout=3.0))
+                self.assertGreaterEqual(cancelled_cleanup.call_count, 1)
+                self.assertEqual(failed_cleanup.call_count, 0)
+
 
 def _try_lock(lock_path_str, mountpoint, return_dict):
     lock_path = Path(lock_path_str)
