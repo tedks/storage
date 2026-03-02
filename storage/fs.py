@@ -87,6 +87,7 @@ class StorageFS(Operations):
     """
 
     CHECKSUM_XATTR = "user.storage.checksums"
+    CACHE_STATE_XATTR = "user.storage.cache"
     _STUB_XATTR = "user.storage.stub"
     _PARTIAL_SUFFIX = ".storage.partial"
     _STREAM_STATE_XATTR = "user.storage.stream"
@@ -188,6 +189,48 @@ class StorageFS(Operations):
         """Get configuration for a file"""
         cache_path = self.cache_manager.get_cache_path(virtual_path)
         return self.state_manager.get_inherited_config(cache_path)
+
+    def _backend_availability(self) -> Tuple[List[str], List[str]]:
+        """Return backend names split by current availability."""
+        available: List[str] = []
+        unavailable: List[str] = []
+        for name, backend in self.backends.items():
+            if backend.is_available():
+                available.append(name)
+            else:
+                unavailable.append(name)
+        return available, unavailable
+
+    def _cache_state_payload(self, path: str, canonical_path: str) -> Dict[str, object]:
+        """Build synthetic cache-state xattr payload for a virtual path."""
+        cache_path = self.cache_manager.get_cache_path(path)
+        partial_path = self._partial_cache_path(cache_path)
+        available_backends, unavailable_backends = self._backend_availability()
+
+        cache_present = bool(cache_path.exists() and cache_path.is_file())
+        partial_present = bool(partial_path.exists() and partial_path.is_file())
+
+        payload: Dict[str, object] = {
+            "path": canonical_path,
+            "cache_path": str(cache_path),
+            "cache_present": cache_present,
+            "partial_present": partial_present,
+            "backend_available": available_backends,
+            "backend_unavailable": unavailable_backends,
+            "updated_at": time.time(),
+        }
+
+        try:
+            payload["cache_size"] = cache_path.stat().st_size if cache_present else 0
+        except OSError:
+            payload["cache_size"] = 0
+
+        try:
+            payload["partial_size"] = partial_path.stat().st_size if partial_present else 0
+        except OSError:
+            payload["partial_size"] = 0
+
+        return payload
 
     # ------------------------------------------------------------------ #
     # Conflict / checksum helpers
@@ -1181,22 +1224,27 @@ class StorageFS(Operations):
                 self.cache_manager.mark_accessed(virtual_path)
             return True
 
-        # If a backend is explicitly requested (conflict suffix), bypass replication manager
+        # If a backend is explicitly requested (conflict suffix), bypass replication manager.
         if backend_name:
             backend = self.backends.get(backend_name)
             cache_path = self.cache_manager.get_cache_path(virtual_path)
             cache_path.parent.mkdir(parents=True, exist_ok=True)
+
             if backend and backend.exists(canonical_path):
                 try:
                     backend.copy_to_local(canonical_path, cache_path)
                     return True
                 except Exception:
                     pass
-            try:
-                cache_path.touch(exist_ok=True)
+
+            # Graceful fallback when a cached copy already exists locally.
+            if cache_path.exists() and cache_path.is_file():
                 return True
-            except Exception:
-                return False
+
+            if backend and not backend.is_available():
+                raise FuseOSError(errno.EHOSTUNREACH)
+
+            return False
 
         # Try to download from a backend
         backend = self._select_backend_for_read(canonical_path)
@@ -1267,6 +1315,10 @@ class StorageFS(Operations):
                 self.cache_manager.mark_accessed(virtual_path)
                 return True
 
+        available_backends, _ = self._backend_availability()
+        if not available_backends and self.backends:
+            raise FuseOSError(errno.EHOSTUNREACH)
+
         # File not available
         return False
 
@@ -1308,6 +1360,10 @@ class StorageFS(Operations):
                 except Exception as be:
                     self.logger.debug("getattr backend fallback failed for %s on %s: %s", canonical_path, bname, be)
 
+            available_backends, _ = self._backend_availability()
+            if not available_backends and self.backends:
+                raise FuseOSError(errno.EHOSTUNREACH)
+
             raise FuseOSError(e.errno)
 
     def readdir(self, path, fh):
@@ -1336,6 +1392,12 @@ class StorageFS(Operations):
             dir_cache = self._dir_cache.setdefault(path, {})
 
             for backend_name, backend in self.backends.items():
+                if not backend.is_available():
+                    cached = dir_cache.get(backend_name, set())
+                    if cached:
+                        entries.update(cached)
+                    continue
+
                 try:
                     attrs = backend.listdir_attrs(path)
                     if attrs is None:
@@ -1791,6 +1853,10 @@ class StorageFS(Operations):
         if name == self.CHECKSUM_XATTR:
             return self._aggregate_checksums_yaml(canonical_path)
 
+        if name == self.CACHE_STATE_XATTR:
+            payload = self._cache_state_payload(path, canonical_path)
+            return json.dumps(payload, sort_keys=True).encode("utf-8")
+
         cache_path = self.cache_manager.get_cache_path(path)
 
         try:
@@ -1800,8 +1866,8 @@ class StorageFS(Operations):
 
     def setxattr(self, path, name, value, options, position=0):
         """Set extended attribute"""
-        if name == self.CHECKSUM_XATTR:
-            # Ignore manual writes; checksum attrs are derived
+        if name in {self.CHECKSUM_XATTR, self.CACHE_STATE_XATTR}:
+            # Ignore manual writes for derived attrs.
             return
         cache_path = self.cache_manager.get_cache_path(path)
 
@@ -1827,12 +1893,14 @@ class StorageFS(Operations):
             )
         if has_checksum:
             attrs.add(self.CHECKSUM_XATTR)
+
+        attrs.add(self.CACHE_STATE_XATTR)
         return list(attrs)
 
     def removexattr(self, path, name):
         """Remove extended attribute"""
-        if name == self.CHECKSUM_XATTR:
-            # Derived; ignore removals
+        if name in {self.CHECKSUM_XATTR, self.CACHE_STATE_XATTR}:
+            # Derived; ignore removals.
             return
         cache_path = self.cache_manager.get_cache_path(path)
 

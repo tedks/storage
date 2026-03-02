@@ -155,6 +155,61 @@ class TestReaddirMerging(unittest.TestCase):
         self.assertIn('backend1', backend_names)
         self.assertIn('cache', backend_names)
 
+
+    def test_open_uses_cache_when_backends_unavailable(self):
+        content = "cached-data"
+        (self.backend1_dir / "cached.txt").write_text(content)
+
+        first_fd = self.fs.open('/cached.txt', os.O_RDONLY)
+        _ = self.fs.read('/cached.txt', 1024, 0, first_fd)
+        self.fs.release('/cached.txt', first_fd)
+
+        self.backends["backend1"].set_available(False)
+        self.backends["backend2"].set_available(False)
+
+        second_fd = self.fs.open('/cached.txt', os.O_RDONLY)
+        reread = self.fs.read('/cached.txt', 1024, 0, second_fd)
+        self.fs.release('/cached.txt', second_fd)
+
+        self.assertEqual(reread.decode(), content)
+
+    def test_open_uncached_returns_hostunreach_when_all_backends_unavailable(self):
+        (self.backend1_dir / "offline.txt").write_text("offline")
+
+        self.backends["backend1"].set_available(False)
+        self.backends["backend2"].set_available(False)
+
+        with self.assertRaises(FuseOSError) as ctx:
+            self.fs.open('/offline.txt', os.O_RDONLY)
+        self.assertEqual(ctx.exception.errno, errno.EHOSTUNREACH)
+
+    def test_cache_state_xattr_reports_cache_presence_and_backend_availability(self):
+        content = "xattr-data"
+        (self.backend1_dir / "xattr.txt").write_text(content)
+
+        raw_before = self.fs.getxattr('/xattr.txt', StorageFS.CACHE_STATE_XATTR)
+        state_before = json.loads(raw_before.decode("utf-8"))
+        self.assertFalse(state_before["cache_present"])
+        self.assertIn("backend1", state_before["backend_available"])
+
+        fd = self.fs.open('/xattr.txt', os.O_RDONLY)
+        _ = self.fs.read('/xattr.txt', 1024, 0, fd)
+        self.fs.release('/xattr.txt', fd)
+
+        raw_cached = self.fs.getxattr('/xattr.txt', StorageFS.CACHE_STATE_XATTR)
+        state_cached = json.loads(raw_cached.decode("utf-8"))
+        self.assertTrue(state_cached["cache_present"])
+        self.assertEqual(state_cached["cache_size"], len(content))
+
+        self.backends["backend1"].set_available(False)
+        self.backends["backend2"].set_available(False)
+
+        raw_offline = self.fs.getxattr('/xattr.txt', StorageFS.CACHE_STATE_XATTR)
+        state_offline = json.loads(raw_offline.decode("utf-8"))
+        self.assertEqual(state_offline["backend_available"], [])
+        self.assertIn("backend1", state_offline["backend_unavailable"])
+        self.assertIn("backend2", state_offline["backend_unavailable"])
+
     def test_readdir_thread_safety(self):
         (self.backend1_dir / "threaded.txt").write_text("data")
 

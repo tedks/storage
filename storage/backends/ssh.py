@@ -58,6 +58,9 @@ class SSHBackend(Backend):
         self._thread_local = threading.local()
         self._thread_clients: Dict[int, Tuple[paramiko.SSHClient, paramiko.SFTPClient, weakref.ReferenceType[threading.Thread]]] = {}
         self._thread_clients_lock = threading.Lock()
+        self._availability_lock = threading.Lock()
+        self._connect_retry_backoff = max(0.5, min(3.0, float(connect_timeout) / 2.0))
+        self._next_connect_retry_at = 0.0
 
     @staticmethod
     def _close_client_pair(ssh_client: Optional[paramiko.SSHClient], sftp_client: Optional[paramiko.SFTPClient]):
@@ -122,6 +125,19 @@ class SSHBackend(Backend):
         except Exception:
             return False
 
+    def _mark_available(self):
+        with self._availability_lock:
+            self._next_connect_retry_at = 0.0
+        self.set_available(True)
+
+    def _mark_unavailable(self):
+        with self._availability_lock:
+            self._next_connect_retry_at = max(
+                self._next_connect_retry_at,
+                time.monotonic() + self._connect_retry_backoff,
+            )
+        self.set_available(False)
+
     def _connect(self):
         """Establish per-thread SSH/SFTP connection."""
         try:
@@ -167,20 +183,22 @@ class SSHBackend(Backend):
                 pass
 
             self._set_thread_clients(ssh_client, sftp_client)
-            self.set_available(True)
+            self._mark_available()
 
         except paramiko.AuthenticationException as e:
             self.logger.error("SSH authentication failed for %s@%s:%s: %s",
                               self.username, self.host, self.port, e)
-            self.set_available(False)
+            self._mark_unavailable()
             raise
         except paramiko.SSHException as e:
             self.logger.error("SSH handshake failed for %s@%s:%s: %s",
                               self.username, self.host, self.port, e)
+            self._mark_unavailable()
             raise
         except Exception as e:
             self.logger.error("Failed to connect to %s@%s:%s: %s",
                               self.username, self.host, self.port, e)
+            self._mark_unavailable()
             raise
 
     def _resolve_path(self, virtual_path: str) -> PurePosixPath:
@@ -191,9 +209,19 @@ class SSHBackend(Backend):
     def _ensure_connected(self):
         """Ensure current thread has an active SSH/SFTP connection."""
         ssh_client, sftp_client = self._get_thread_clients()
-        if sftp_client is None or not self._transport_active(ssh_client):
-            self._reset_connection()
-            self._connect()
+        if sftp_client is not None and self._transport_active(ssh_client):
+            return
+
+        with self._availability_lock:
+            next_retry_at = self._next_connect_retry_at
+
+        if not self.is_available() and time.monotonic() < next_retry_at:
+            raise ConnectionError(
+                f"SSH backend {self.name} is temporarily unavailable after a disconnect"
+            )
+
+        self._reset_connection()
+        self._connect()
 
     def _current_clients(self) -> Tuple[paramiko.SSHClient, paramiko.SFTPClient]:
         self._prune_stale_thread_clients(exclude_thread_id=threading.get_ident())
@@ -239,6 +267,7 @@ class SSHBackend(Backend):
                 )
                 self._reset_connection()
                 if attempt == 1:
+                    self._mark_unavailable()
                     return False
             except Exception as exc:
                 self.logger.warning("Error checking existence of %s: %r", virtual_path, exc)
@@ -271,6 +300,7 @@ class SSHBackend(Backend):
                 )
                 self._reset_connection()
                 if attempt == 1:
+                    self._mark_unavailable()
                     raise
 
         if last_exc is not None:
@@ -333,10 +363,16 @@ class SSHBackend(Backend):
 
     def get_size(self, virtual_path: str) -> int:
         """Get file size"""
-        _, sftp_client = self._current_clients()
         remote_path = str(self._resolve_path(virtual_path))
-        stat_result = sftp_client.stat(remote_path)
-        return stat_result.st_size
+        try:
+            _, sftp_client = self._current_clients()
+            stat_result = sftp_client.stat(remote_path)
+            return stat_result.st_size
+        except (socket.timeout, EOFError, paramiko.SSHException, OSError) as exc:
+            self.logger.warning("SFTP get_size failed on %s: %r", virtual_path, exc)
+            self._mark_unavailable()
+            self._reset_connection()
+            raise
 
     def mkdir(self, virtual_path: str):
         """Create a directory on remote"""
@@ -378,19 +414,24 @@ class SSHBackend(Backend):
 
     def listdir(self, virtual_path: str) -> List[str]:
         """List directory contents on remote"""
-        _, sftp_client = self._current_clients()
         remote_path = str(self._resolve_path(virtual_path))
 
         try:
+            _, sftp_client = self._current_clients()
             return sftp_client.listdir(remote_path)
         except FileNotFoundError:
             return []
+        except (socket.timeout, EOFError, paramiko.SSHException, OSError) as exc:
+            self.logger.warning("SFTP listdir failed on %s: %r", virtual_path, exc)
+            self._mark_unavailable()
+            self._reset_connection()
+            raise
 
     def listdir_attrs(self, virtual_path: str):
         """List directory contents with attributes using SFTP listdir_attr."""
-        _, sftp_client = self._current_clients()
         remote_path = str(self._resolve_path(virtual_path))
         try:
+            _, sftp_client = self._current_clients()
             attrs = sftp_client.listdir_attr(remote_path)
             result = []
             for attr in attrs:
@@ -407,6 +448,11 @@ class SSHBackend(Backend):
                     'st_nlink': getattr(attr, 'st_nlink', 1),
                 }))
             return result
+        except (socket.timeout, EOFError, paramiko.SSHException, OSError) as exc:
+            self.logger.warning("SFTP listdir_attrs failed on %s: %r", virtual_path, exc)
+            self._mark_unavailable()
+            self._reset_connection()
+            return None
         except Exception:
             return None
 
@@ -417,19 +463,30 @@ class SSHBackend(Backend):
             remote_path = str(self._resolve_path(virtual_path))
             stat_result = sftp_client.stat(remote_path)
             return stat_module.S_ISDIR(stat_result.st_mode)
+        except (socket.timeout, EOFError, paramiko.SSHException, OSError) as exc:
+            self.logger.warning("SFTP isdir failed on %s: %r", virtual_path, exc)
+            self._mark_unavailable()
+            self._reset_connection()
+            return False
         except Exception:
             return False
 
     def copy_to_local(self, virtual_path: str, local_path: Path):
         """Copy a file from remote to local path"""
-        _, sftp_client = self._current_clients()
         remote_path = str(self._resolve_path(virtual_path))
 
         # Ensure local parent directory exists
         local_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Download file
-        sftp_client.get(remote_path, str(local_path))
+        try:
+            _, sftp_client = self._current_clients()
+            # Download file
+            sftp_client.get(remote_path, str(local_path))
+        except (socket.timeout, EOFError, paramiko.SSHException, OSError) as exc:
+            self.logger.warning("SFTP copy_to_local failed on %s: %r", virtual_path, exc)
+            self._mark_unavailable()
+            self._reset_connection()
+            raise
 
     def copy_from_local(self, local_path: Path, virtual_path: str):
         """Copy a local file to remote"""
@@ -481,9 +538,15 @@ class SSHBackend(Backend):
         pass
 
     def stat(self, virtual_path: str):
-        _, sftp_client = self._current_clients()
         remote_path = str(self._resolve_path(virtual_path))
-        return sftp_client.stat(remote_path)
+        try:
+            _, sftp_client = self._current_clients()
+            return sftp_client.stat(remote_path)
+        except (socket.timeout, EOFError, paramiko.SSHException, OSError) as exc:
+            self.logger.warning("SFTP stat failed on %s: %r", virtual_path, exc)
+            self._mark_unavailable()
+            self._reset_connection()
+            raise
 
     def close(self):
         """Close SSH/SFTP connections"""
@@ -496,7 +559,7 @@ class SSHBackend(Backend):
 
         self._thread_local.ssh_client = None
         self._thread_local.sftp_client = None
-        self.set_available(False)
+        self._mark_unavailable()
 
     def __del__(self):
         """Cleanup on deletion"""
