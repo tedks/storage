@@ -407,6 +407,55 @@ class TestStreamingReadPrefetch(unittest.TestCase):
 
         self.fs.release('/large.bin', vfd)
 
+    def test_streaming_open_uses_cached_file_without_prefetch_session(self):
+        payload = os.urandom(128 * 1024)
+        (self.backend_dir / "warm.bin").write_bytes(payload)
+
+        cache_path = self.cache_dir / "warm.bin"
+        cache_path.write_bytes(payload)
+        partial_path = self.cache_dir / "warm.bin.storage.partial"
+        self.assertFalse(partial_path.exists())
+
+        stats_before = self.fs._streaming_stats_snapshot()
+
+        vfd_first = self.fs.open('/warm.bin', os.O_RDONLY)
+        with self.fs._fd_lock:
+            first_entry = self.fs._fd_map[vfd_first]
+        self.assertIsNone(first_entry.prefetch_session)
+        first = self.fs.read('/warm.bin', 4096, 0, vfd_first)
+        self.assertEqual(first, payload[:4096])
+        self.fs.release('/warm.bin', vfd_first)
+
+        vfd_second = self.fs.open('/warm.bin', os.O_RDONLY)
+        with self.fs._fd_lock:
+            second_entry = self.fs._fd_map[vfd_second]
+        self.assertIsNone(second_entry.prefetch_session)
+        second = self.fs.read('/warm.bin', 4096, 8192, vfd_second)
+        self.assertEqual(second, payload[8192:12288])
+        self.fs.release('/warm.bin', vfd_second)
+
+        with self.fs._prefetch_sessions_lock:
+            self.assertNotIn('/warm.bin', self.fs._prefetch_sessions)
+        self.assertFalse(partial_path.exists())
+
+        stats_after = self.fs._streaming_stats_snapshot()
+        self.assertEqual(
+            stats_after["streaming_sessions_started"],
+            stats_before["streaming_sessions_started"],
+        )
+        self.assertEqual(
+            stats_after["streaming_fallback_opens"],
+            stats_before["streaming_fallback_opens"],
+        )
+        self.assertEqual(
+            stats_after["foreground_fetches"],
+            stats_before["foreground_fetches"],
+        )
+        self.assertEqual(
+            stats_after["background_fetches"],
+            stats_before["background_fetches"],
+        )
+
     def test_streaming_seek_fetches_missed_range(self):
         payload = os.urandom(256 * 1024)
         (self.backend_dir / "seek.bin").write_bytes(payload)
