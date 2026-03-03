@@ -2,6 +2,7 @@
 SSH/SFTP backend implementation for remote filesystems
 """
 
+import errno
 import os
 import shlex
 import socket
@@ -138,6 +139,35 @@ class SSHBackend(Backend):
             )
         self.set_available(False)
 
+    @staticmethod
+    def _is_transient_oserror(exc: OSError) -> bool:
+        """Return True when an OSError likely indicates connection loss."""
+        transient_errnos = {
+            errno.ECONNABORTED,
+            errno.ECONNRESET,
+            errno.ENETRESET,
+            errno.ESHUTDOWN,
+            errno.EHOSTDOWN,
+            errno.EHOSTUNREACH,
+            errno.ENETDOWN,
+            errno.ENETUNREACH,
+            errno.ETIMEDOUT,
+            errno.EPIPE,
+        }
+        if exc.errno in transient_errnos:
+            return True
+
+        message = str(exc).lower()
+        markers = (
+            "socket is closed",
+            "connection reset",
+            "connection timed out",
+            "broken pipe",
+            "connection aborted",
+            "eof",
+        )
+        return any(marker in message for marker in markers)
+
     def _connect(self):
         """Establish per-thread SSH/SFTP connection."""
         try:
@@ -258,7 +288,21 @@ class SSHBackend(Backend):
                 return True
             except FileNotFoundError:
                 return False
-            except (socket.timeout, EOFError, paramiko.SSHException, OSError) as exc:
+            except (socket.timeout, EOFError, paramiko.SSHException) as exc:
+                self.logger.warning(
+                    "SFTP exists() failed on %s attempt=%d/2: %r",
+                    virtual_path,
+                    attempt + 1,
+                    exc,
+                )
+                self._reset_connection()
+                if attempt == 1:
+                    self._mark_unavailable()
+                    return False
+            except OSError as exc:
+                if not self._is_transient_oserror(exc):
+                    self.logger.warning("Error checking existence of %s: %r", virtual_path, exc)
+                    return False
                 self.logger.warning(
                     "SFTP exists() failed on %s attempt=%d/2: %r",
                     virtual_path,
@@ -288,7 +332,23 @@ class SSHBackend(Backend):
                     return f.read(size)
             except FileNotFoundError:
                 raise
-            except (socket.timeout, EOFError, paramiko.SSHException, OSError) as exc:
+            except (socket.timeout, EOFError, paramiko.SSHException) as exc:
+                last_exc = exc
+                self.logger.warning(
+                    "SFTP read failed on %s (offset=%d size=%d attempt=%d/2): %r",
+                    virtual_path,
+                    offset,
+                    size,
+                    attempt + 1,
+                    exc,
+                )
+                self._reset_connection()
+                if attempt == 1:
+                    self._mark_unavailable()
+                    raise
+            except OSError as exc:
+                if not self._is_transient_oserror(exc):
+                    raise
                 last_exc = exc
                 self.logger.warning(
                     "SFTP read failed on %s (offset=%d size=%d attempt=%d/2): %r",
@@ -368,10 +428,18 @@ class SSHBackend(Backend):
             _, sftp_client = self._current_clients()
             stat_result = sftp_client.stat(remote_path)
             return stat_result.st_size
-        except (socket.timeout, EOFError, paramiko.SSHException, OSError) as exc:
+        except FileNotFoundError:
+            raise
+        except (socket.timeout, EOFError, paramiko.SSHException) as exc:
             self.logger.warning("SFTP get_size failed on %s: %r", virtual_path, exc)
             self._mark_unavailable()
             self._reset_connection()
+            raise
+        except OSError as exc:
+            if self._is_transient_oserror(exc):
+                self.logger.warning("SFTP get_size failed on %s: %r", virtual_path, exc)
+                self._mark_unavailable()
+                self._reset_connection()
             raise
 
     def mkdir(self, virtual_path: str):
@@ -421,10 +489,16 @@ class SSHBackend(Backend):
             return sftp_client.listdir(remote_path)
         except FileNotFoundError:
             return []
-        except (socket.timeout, EOFError, paramiko.SSHException, OSError) as exc:
+        except (socket.timeout, EOFError, paramiko.SSHException) as exc:
             self.logger.warning("SFTP listdir failed on %s: %r", virtual_path, exc)
             self._mark_unavailable()
             self._reset_connection()
+            raise
+        except OSError as exc:
+            if self._is_transient_oserror(exc):
+                self.logger.warning("SFTP listdir failed on %s: %r", virtual_path, exc)
+                self._mark_unavailable()
+                self._reset_connection()
             raise
 
     def listdir_attrs(self, virtual_path: str):
@@ -448,10 +522,16 @@ class SSHBackend(Backend):
                     'st_nlink': getattr(attr, 'st_nlink', 1),
                 }))
             return result
-        except (socket.timeout, EOFError, paramiko.SSHException, OSError) as exc:
+        except (socket.timeout, EOFError, paramiko.SSHException) as exc:
             self.logger.warning("SFTP listdir_attrs failed on %s: %r", virtual_path, exc)
             self._mark_unavailable()
             self._reset_connection()
+            return None
+        except OSError as exc:
+            if self._is_transient_oserror(exc):
+                self.logger.warning("SFTP listdir_attrs failed on %s: %r", virtual_path, exc)
+                self._mark_unavailable()
+                self._reset_connection()
             return None
         except Exception:
             return None
@@ -463,10 +543,16 @@ class SSHBackend(Backend):
             remote_path = str(self._resolve_path(virtual_path))
             stat_result = sftp_client.stat(remote_path)
             return stat_module.S_ISDIR(stat_result.st_mode)
-        except (socket.timeout, EOFError, paramiko.SSHException, OSError) as exc:
+        except (socket.timeout, EOFError, paramiko.SSHException) as exc:
             self.logger.warning("SFTP isdir failed on %s: %r", virtual_path, exc)
             self._mark_unavailable()
             self._reset_connection()
+            return False
+        except OSError as exc:
+            if self._is_transient_oserror(exc):
+                self.logger.warning("SFTP isdir failed on %s: %r", virtual_path, exc)
+                self._mark_unavailable()
+                self._reset_connection()
             return False
         except Exception:
             return False
@@ -482,10 +568,18 @@ class SSHBackend(Backend):
             _, sftp_client = self._current_clients()
             # Download file
             sftp_client.get(remote_path, str(local_path))
-        except (socket.timeout, EOFError, paramiko.SSHException, OSError) as exc:
+        except FileNotFoundError:
+            raise
+        except (socket.timeout, EOFError, paramiko.SSHException) as exc:
             self.logger.warning("SFTP copy_to_local failed on %s: %r", virtual_path, exc)
             self._mark_unavailable()
             self._reset_connection()
+            raise
+        except OSError as exc:
+            if self._is_transient_oserror(exc):
+                self.logger.warning("SFTP copy_to_local failed on %s: %r", virtual_path, exc)
+                self._mark_unavailable()
+                self._reset_connection()
             raise
 
     def copy_from_local(self, local_path: Path, virtual_path: str):
@@ -542,10 +636,18 @@ class SSHBackend(Backend):
         try:
             _, sftp_client = self._current_clients()
             return sftp_client.stat(remote_path)
-        except (socket.timeout, EOFError, paramiko.SSHException, OSError) as exc:
+        except FileNotFoundError:
+            raise
+        except (socket.timeout, EOFError, paramiko.SSHException) as exc:
             self.logger.warning("SFTP stat failed on %s: %r", virtual_path, exc)
             self._mark_unavailable()
             self._reset_connection()
+            raise
+        except OSError as exc:
+            if self._is_transient_oserror(exc):
+                self.logger.warning("SFTP stat failed on %s: %r", virtual_path, exc)
+                self._mark_unavailable()
+                self._reset_connection()
             raise
 
     def close(self):

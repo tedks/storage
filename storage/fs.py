@@ -1392,12 +1392,6 @@ class StorageFS(Operations):
             dir_cache = self._dir_cache.setdefault(path, {})
 
             for backend_name, backend in self.backends.items():
-                if not backend.is_available():
-                    cached = dir_cache.get(backend_name, set())
-                    if cached:
-                        entries.update(cached)
-                    continue
-
                 try:
                     attrs = backend.listdir_attrs(path)
                     if attrs is None:

@@ -203,6 +203,28 @@ class TestSSHBackendThreadedClients(unittest.TestCase):
 
     @patch("storage.backends.ssh.paramiko.AutoAddPolicy")
     @patch("storage.backends.ssh.paramiko.SSHClient")
+    def test_stat_missing_file_does_not_mark_backend_unavailable(self, mock_ssh_client_cls, mock_auto_add_policy):
+        _ = mock_auto_add_policy
+
+        fake = _FakeSSHClient(_FakeSFTPClient(payload=b""))
+
+        def _missing(_path):
+            raise FileNotFoundError("missing")
+
+        fake.sftp_client.stat = _missing
+        mock_ssh_client_cls.return_value = fake
+
+        backend = self._new_backend()
+
+        with self.assertRaises(FileNotFoundError):
+            backend.stat("/missing.bin")
+
+        self.assertTrue(backend.is_available())
+
+        backend.close()
+
+    @patch("storage.backends.ssh.paramiko.AutoAddPolicy")
+    @patch("storage.backends.ssh.paramiko.SSHClient")
     def test_reset_closes_only_calling_thread_client(self, mock_ssh_client_cls, mock_auto_add_policy):
         _ = mock_auto_add_policy
         payload = b"x" * 1024

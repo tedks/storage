@@ -210,6 +210,14 @@ class TestReaddirMerging(unittest.TestCase):
         self.assertIn("backend1", state_offline["backend_unavailable"])
         self.assertIn("backend2", state_offline["backend_unavailable"])
 
+    def test_readdir_probes_backend_even_if_marked_unavailable(self):
+        self.backends["backend1"].set_available(False)
+        (self.backend1_dir / "recover.txt").write_text("data")
+
+        entries = set(self.fs.readdir('/', None))
+
+        self.assertIn("recover.txt", entries)
+
     def test_readdir_thread_safety(self):
         (self.backend1_dir / "threaded.txt").write_text("data")
 
