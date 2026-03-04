@@ -61,6 +61,8 @@ class SSHBackend(Backend):
         self._thread_clients_lock = threading.Lock()
         self._availability_lock = threading.Lock()
         self._connect_retry_backoff = max(0.5, min(3.0, float(connect_timeout) / 2.0))
+        self._connect_retry_backoff_max = max(30.0, float(connect_timeout) * 6.0)
+        self._connect_failure_count = 0
         self._next_connect_retry_at = 0.0
 
     @staticmethod
@@ -128,14 +130,20 @@ class SSHBackend(Backend):
 
     def _mark_available(self):
         with self._availability_lock:
+            self._connect_failure_count = 0
             self._next_connect_retry_at = 0.0
         self.set_available(True)
 
     def _mark_unavailable(self):
         with self._availability_lock:
+            self._connect_failure_count = min(self._connect_failure_count + 1, 16)
+            backoff = min(
+                self._connect_retry_backoff_max,
+                self._connect_retry_backoff * (2 ** (self._connect_failure_count - 1)),
+            )
             self._next_connect_retry_at = max(
                 self._next_connect_retry_at,
-                time.monotonic() + self._connect_retry_backoff,
+                time.monotonic() + backoff,
             )
         self.set_available(False)
 

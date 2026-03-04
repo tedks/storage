@@ -452,8 +452,15 @@ class StorageFS(Operations):
             return backend
 
         available = [b for b in self.backends.values() if b.is_available()]
-        available.sort(key=lambda b: b.speed_priority)
-        for candidate in available:
+        if available:
+            candidates = available
+        else:
+            # Opportunistic reprobe when all backends are marked unavailable.
+            # Backend cooldown logic prevents tight reconnect loops.
+            candidates = [b for b in self.backends.values() if b.is_remote]
+
+        candidates.sort(key=lambda b: b.speed_priority)
+        for candidate in candidates:
             try:
                 if candidate.exists(canonical_path):
                     return candidate
@@ -1344,6 +1351,12 @@ class StorageFS(Operations):
 
             for bname, backend in backend_iter:
                 if not backend:
+                    continue
+                if not backend.is_available():
+                    # Avoid repeated per-entry reconnect attempts during directory scans.
+                    # Readdir/open paths still probe periodically based on backend cooldown.
+                    if backend_name:
+                        raise FuseOSError(errno.EHOSTUNREACH)
                     continue
                 try:
                     st = backend.stat(canonical_path)

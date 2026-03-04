@@ -139,6 +139,25 @@ class TestReaddirMerging(unittest.TestCase):
         attrs = self.fs.getattr('/subdir')
         self.assertTrue(stat.S_ISDIR(attrs['st_mode']))
 
+    def test_getattr_skips_unavailable_backend(self):
+        content = "from-backend2"
+        (self.backend2_dir / "fast.txt").write_text(content)
+
+        self.backends["backend1"].set_available(False)
+
+        with patch.object(self.backends["backend1"], "stat", side_effect=AssertionError("unavailable backend should not be probed")):
+            attrs = self.fs.getattr('/fast.txt')
+
+        self.assertEqual(attrs['st_size'], len(content))
+
+    def test_getattr_targeted_unavailable_backend_returns_hostunreach(self):
+        self.backends["backend1"].set_available(False)
+
+        with self.assertRaises(FuseOSError) as ctx:
+            self.fs.getattr('/missing.backend1')
+
+        self.assertEqual(ctx.exception.errno, errno.EHOSTUNREACH)
+
     def test_open_reads_remote_only_file_and_populates_state(self):
         content = "remote-data"
         (self.backend1_dir / "remote.txt").write_text(content)
