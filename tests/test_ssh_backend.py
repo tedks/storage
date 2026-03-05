@@ -179,7 +179,7 @@ class TestSSHBackendThreadedClients(unittest.TestCase):
 
     @patch("storage.backends.ssh.paramiko.AutoAddPolicy")
     @patch("storage.backends.ssh.paramiko.SSHClient")
-    def test_exists_disconnect_sets_unavailable_and_uses_retry_backoff(self, mock_ssh_client_cls, mock_auto_add_policy):
+    def test_exists_disconnect_sets_unavailable_and_respects_probe_interval(self, mock_ssh_client_cls, mock_auto_add_policy):
         _ = mock_auto_add_policy
 
         failing = _FakeSSHClient(_FakeSFTPClient(payload=b""))
@@ -198,6 +198,33 @@ class TestSSHBackendThreadedClients(unittest.TestCase):
         # Immediate retry should short-circuit through cooldown, avoiding another client build.
         self.assertFalse(backend.exists("/movie.bin"))
         self.assertEqual(mock_ssh_client_cls.call_count, 1)
+
+        backend.close()
+
+    @patch("storage.backends.ssh.paramiko.AutoAddPolicy")
+    @patch("storage.backends.ssh.paramiko.SSHClient")
+    def test_exists_reconnects_on_next_probe_window(self, mock_ssh_client_cls, mock_auto_add_policy):
+        _ = mock_auto_add_policy
+
+        failing = _FakeSSHClient(_FakeSFTPClient(payload=b""))
+        recovered = _FakeSSHClient(_FakeSFTPClient(payload=b"ok"))
+
+        def _fail_connect(**_kwargs):
+            raise socket.timeout("simulated connect timeout")
+
+        failing.connect = _fail_connect
+        mock_ssh_client_cls.side_effect = [failing, recovered]
+
+        backend = self._new_backend()
+
+        self.assertFalse(backend.exists("/movie.bin"))
+        self.assertFalse(backend.is_available())
+
+        # Simulate probe interval elapsed and allow one reconnect probe.
+        backend._next_connect_retry_at = 0.0
+        self.assertTrue(backend.exists("/movie.bin"))
+        self.assertTrue(backend.is_available())
+        self.assertEqual(mock_ssh_client_cls.call_count, 2)
 
         backend.close()
 

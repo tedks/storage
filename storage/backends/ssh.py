@@ -60,9 +60,8 @@ class SSHBackend(Backend):
         self._thread_clients: Dict[int, Tuple[paramiko.SSHClient, paramiko.SFTPClient, weakref.ReferenceType[threading.Thread]]] = {}
         self._thread_clients_lock = threading.Lock()
         self._availability_lock = threading.Lock()
-        self._connect_retry_backoff = max(0.5, min(3.0, float(connect_timeout) / 2.0))
-        self._connect_retry_backoff_max = max(30.0, float(connect_timeout) * 6.0)
-        self._connect_failure_count = 0
+        self._probe_lock = threading.Lock()
+        self._reconnect_probe_interval = max(1.0, min(5.0, float(connect_timeout) / 2.0))
         self._next_connect_retry_at = 0.0
 
     @staticmethod
@@ -130,20 +129,14 @@ class SSHBackend(Backend):
 
     def _mark_available(self):
         with self._availability_lock:
-            self._connect_failure_count = 0
             self._next_connect_retry_at = 0.0
         self.set_available(True)
 
     def _mark_unavailable(self):
         with self._availability_lock:
-            self._connect_failure_count = min(self._connect_failure_count + 1, 16)
-            backoff = min(
-                self._connect_retry_backoff_max,
-                self._connect_retry_backoff * (2 ** (self._connect_failure_count - 1)),
-            )
             self._next_connect_retry_at = max(
                 self._next_connect_retry_at,
-                time.monotonic() + backoff,
+                time.monotonic() + self._reconnect_probe_interval,
             )
         self.set_available(False)
 
@@ -251,15 +244,34 @@ class SSHBackend(Backend):
             return
 
         with self._availability_lock:
+            is_available = self.is_available()
             next_retry_at = self._next_connect_retry_at
 
-        if not self.is_available() and time.monotonic() < next_retry_at:
+        if not is_available and time.monotonic() < next_retry_at:
             raise ConnectionError(
                 f"SSH backend {self.name} is temporarily unavailable after a disconnect"
             )
 
-        self._reset_connection()
-        self._connect()
+        # Single-probe reconnect gate: one thread probes; others fail fast.
+        if not self._probe_lock.acquire(blocking=False):
+            raise ConnectionError(
+                f"SSH backend {self.name} reconnect probe already in progress"
+            )
+        try:
+            # Recheck after acquiring probe lock to avoid duplicate probes.
+            with self._availability_lock:
+                is_available = self.is_available()
+                next_retry_at = self._next_connect_retry_at
+
+            if not is_available and time.monotonic() < next_retry_at:
+                raise ConnectionError(
+                    f"SSH backend {self.name} is temporarily unavailable after a disconnect"
+                )
+
+            self._reset_connection()
+            self._connect()
+        finally:
+            self._probe_lock.release()
 
     def _current_clients(self) -> Tuple[paramiko.SSHClient, paramiko.SFTPClient]:
         self._prune_stale_thread_clients(exclude_thread_id=threading.get_ident())
