@@ -644,6 +644,39 @@ class TestStreamingReadPrefetch(unittest.TestCase):
 
         self.fs.release('/fault.bin', vfd)
 
+    def test_streaming_failure_reuses_cached_prefix_offline(self):
+        self.backend.fail_after_offset = 64 * 1024
+        payload = os.urandom(192 * 1024)
+        (self.backend_dir / "offline-prefix.bin").write_bytes(payload)
+
+        vfd = self.fs.open('/offline-prefix.bin', os.O_RDONLY)
+        head = self.fs.read('/offline-prefix.bin', 4096, 0, vfd)
+        self.assertEqual(head, payload[:4096])
+
+        with self.assertRaises(FuseOSError):
+            self.fs.read('/offline-prefix.bin', 4096, 96 * 1024, vfd)
+
+        self.fs.release('/offline-prefix.bin', vfd)
+
+        cache_path = self.cache_dir / "offline-prefix.bin"
+        partial_path = self.cache_dir / "offline-prefix.bin.storage.partial"
+        self.assertTrue(self._wait_for(lambda: cache_path.exists(), timeout=5.0))
+        self.assertFalse(partial_path.exists())
+
+        cached_size = cache_path.stat().st_size
+        self.assertGreater(cached_size, 0)
+        self.assertLess(cached_size, len(payload))
+
+        self.backend.set_available(False)
+
+        retry_vfd = self.fs.open('/offline-prefix.bin', os.O_RDONLY)
+        retry_head = self.fs.read('/offline-prefix.bin', 4096, 0, retry_vfd)
+        retry_tail = self.fs.read('/offline-prefix.bin', 4096, max(0, cached_size - 4096), retry_vfd)
+        self.fs.release('/offline-prefix.bin', retry_vfd)
+
+        self.assertEqual(retry_head, payload[:4096])
+        self.assertEqual(retry_tail, payload[max(0, cached_size - 4096):cached_size])
+
     def test_streaming_session_is_shared_across_readers(self):
         payload = os.urandom(512 * 1024)
         (self.backend_dir / "shared.bin").write_bytes(payload)

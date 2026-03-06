@@ -612,6 +612,10 @@ class StorageFS(Operations):
 
         with session.lock:
             target_path = session.final_cache_path if session.finalized else session.partial_cache_path
+            final_path = session.final_cache_path
+
+        if not target_path.exists() and final_path.exists():
+            target_path = final_path
 
         try:
             os.setxattr(str(target_path), self._STREAM_STATE_XATTR, json.dumps(payload, sort_keys=True).encode("utf-8"))
@@ -870,7 +874,47 @@ class StorageFS(Operations):
         self._discard_unregistered_prefetch_session(session)
         self.cache_manager.mark_cache_size_dirty()
 
+    def _promote_failed_session_cache_prefix(self, session: PrefetchSession) -> bool:
+        """Promote contiguous bytes from a failed streaming session into regular cache."""
+        with session.lock:
+            ranges = list(session.available_ranges)
+            contiguous_bytes = self._contiguous_available_prefix(ranges, session.file_size)
+            partial_path = session.partial_cache_path
+            final_path = session.final_cache_path
+            io_fd = session.io_fd
+
+        if contiguous_bytes <= 0:
+            return False
+
+        try:
+            if io_fd >= 0:
+                with session.io_lock:
+                    os.ftruncate(io_fd, contiguous_bytes)
+                    os.fsync(io_fd)
+
+            final_path.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(partial_path, final_path)
+            self.logger.info(
+                "streaming partial-cache path=%s backend=%s bytes=%d",
+                session.canonical_path,
+                session.backend.name,
+                contiguous_bytes,
+            )
+            return True
+        except OSError as exc:
+            self.logger.warning(
+                "streaming partial-cache promotion failed path=%s backend=%s bytes=%d: %r",
+                session.canonical_path,
+                session.backend.name,
+                contiguous_bytes,
+                exc,
+            )
+            return False
+
     def _cleanup_failed_session(self, session: PrefetchSession):
+        if self._promote_failed_session_cache_prefix(session):
+            self._cleanup_prefetch_session(session, "partial-cache")
+            return
         self._cleanup_prefetch_session(session, "failed")
 
     def _cleanup_cancelled_session(self, session: PrefetchSession):
