@@ -1,0 +1,51 @@
+name: Storage Tests
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+      - "feature/**"
+  schedule:
+    - cron: "0 5 * * *"
+  workflow_dispatch:
+
+jobs:
+  tier-a:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v30
+
+      - name: Run Tier A Gate
+        run: nix develop --command bazel test //:storage_tests_tier_a --test_output=errors
+
+  tier-b:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v30
+
+      - name: Run Tier B Gate
+        run: nix develop --command bazel test //:storage_tests_tier_b --test_output=errors
+
+  tier-c:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v30
+
+      - name: Run Tier C Gate
+        run: nix develop --command bazel test //:storage_tests_tier_c --test_output=errors

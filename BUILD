@@ -34,3 +34,37 @@ py_test(
         "@pypi//pytest_timeout",
     ],
 )
+
+
+py_test(
+    name = "storage_tests_tier_a",
+    srcs = ["tests/pytest_main_tier_a.py"] + glob(["tests/test_*.py"]),
+    main = "tests/pytest_main_tier_a.py",
+    deps = [
+        ":storage_lib",
+        "@pypi//pytest",
+        "@pypi//pytest_timeout",
+    ],
+)
+
+py_test(
+    name = "storage_tests_tier_b",
+    srcs = ["tests/pytest_main_tier_b.py"] + glob(["tests/test_*.py"]),
+    main = "tests/pytest_main_tier_b.py",
+    deps = [
+        ":storage_lib",
+        "@pypi//pytest",
+        "@pypi//pytest_timeout",
+    ],
+)
+
+py_test(
+    name = "storage_tests_tier_c",
+    srcs = ["tests/pytest_main_tier_c.py"] + glob(["tests/test_*.py"]),
+    main = "tests/pytest_main_tier_c.py",
+    deps = [
+        ":storage_lib",
+        "@pypi//pytest",
+        "@pypi//pytest_timeout",
+    ],
+)
