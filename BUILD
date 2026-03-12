@@ -37,9 +37,9 @@ py_test(
 
 
 py_test(
-    name = "storage_tests_tier_a",
-    srcs = ["tests/pytest_main_tier_a.py"] + glob(["tests/test_*.py"]),
-    main = "tests/pytest_main_tier_a.py",
+    name = "storage_tests_fast_gate",
+    srcs = ["tests/pytest_main_fast.py"] + glob(["tests/test_*.py"]),
+    main = "tests/pytest_main_fast.py",
     deps = [
         ":storage_lib",
         "@pypi//pytest",
@@ -48,9 +48,9 @@ py_test(
 )
 
 py_test(
-    name = "storage_tests_tier_b",
-    srcs = ["tests/pytest_main_tier_b.py"] + glob(["tests/test_*.py"]),
-    main = "tests/pytest_main_tier_b.py",
+    name = "storage_tests_mounted_system_gate",
+    srcs = ["tests/pytest_main_mounted_system.py"] + glob(["tests/test_*.py"]),
+    main = "tests/pytest_main_mounted_system.py",
     deps = [
         ":storage_lib",
         "@pypi//pytest",
@@ -59,9 +59,9 @@ py_test(
 )
 
 py_test(
-    name = "storage_tests_tier_c",
-    srcs = ["tests/pytest_main_tier_c.py"] + glob(["tests/test_*.py"]),
-    main = "tests/pytest_main_tier_c.py",
+    name = "storage_tests_resilience_gate",
+    srcs = ["tests/pytest_main_resilience.py"] + glob(["tests/test_*.py"]),
+    main = "tests/pytest_main_resilience.py",
     deps = [
         ":storage_lib",
         "@pypi//pytest",

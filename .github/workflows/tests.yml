@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  tier-a:
+  fast-gate:
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
@@ -21,10 +21,10 @@ jobs:
       - name: Install Nix
         uses: cachix/install-nix-action@v30
 
-      - name: Run Tier A Gate
-        run: nix develop --command bazel test //:storage_tests_tier_a --test_output=errors
+      - name: Run Fast Gate
+        run: nix develop --command bazel test //:storage_tests_fast_gate --test_output=errors
 
-  tier-b:
+  mounted-system-gate:
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
@@ -34,10 +34,10 @@ jobs:
       - name: Install Nix
         uses: cachix/install-nix-action@v30
 
-      - name: Run Tier B Gate
-        run: nix develop --command bazel test //:storage_tests_tier_b --test_output=errors
+      - name: Run Mounted System Gate
+        run: nix develop --command bazel test //:storage_tests_mounted_system_gate --test_output=errors
 
-  tier-c:
+  resilience-gate:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
@@ -47,5 +47,5 @@ jobs:
       - name: Install Nix
         uses: cachix/install-nix-action@v30
 
-      - name: Run Tier C Gate
-        run: nix develop --command bazel test //:storage_tests_tier_c --test_output=errors
+      - name: Run Resilience Gate
+        run: nix develop --command bazel test //:storage_tests_resilience_gate --test_output=errors
