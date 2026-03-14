@@ -87,6 +87,7 @@ class StorageFS(Operations):
     """
 
     CHECKSUM_XATTR = "user.storage.checksums"
+    CACHE_STATE_XATTR = "user.storage.cache"
     _STUB_XATTR = "user.storage.stub"
     _PARTIAL_SUFFIX = ".storage.partial"
     _STREAM_STATE_XATTR = "user.storage.stream"
@@ -188,6 +189,48 @@ class StorageFS(Operations):
         """Get configuration for a file"""
         cache_path = self.cache_manager.get_cache_path(virtual_path)
         return self.state_manager.get_inherited_config(cache_path)
+
+    def _backend_availability(self) -> Tuple[List[str], List[str]]:
+        """Return backend names split by current availability."""
+        available: List[str] = []
+        unavailable: List[str] = []
+        for name, backend in self.backends.items():
+            if backend.is_available():
+                available.append(name)
+            else:
+                unavailable.append(name)
+        return available, unavailable
+
+    def _cache_state_payload(self, path: str, canonical_path: str) -> Dict[str, object]:
+        """Build synthetic cache-state xattr payload for a virtual path."""
+        cache_path = self.cache_manager.get_cache_path(path)
+        partial_path = self._partial_cache_path(cache_path)
+        available_backends, unavailable_backends = self._backend_availability()
+
+        cache_present = bool(cache_path.exists() and cache_path.is_file())
+        partial_present = bool(partial_path.exists() and partial_path.is_file())
+
+        payload: Dict[str, object] = {
+            "path": canonical_path,
+            "cache_path": str(cache_path),
+            "cache_present": cache_present,
+            "partial_present": partial_present,
+            "backend_available": available_backends,
+            "backend_unavailable": unavailable_backends,
+            "updated_at": time.time(),
+        }
+
+        try:
+            payload["cache_size"] = cache_path.stat().st_size if cache_present else 0
+        except OSError:
+            payload["cache_size"] = 0
+
+        try:
+            payload["partial_size"] = partial_path.stat().st_size if partial_present else 0
+        except OSError:
+            payload["partial_size"] = 0
+
+        return payload
 
     # ------------------------------------------------------------------ #
     # Conflict / checksum helpers
@@ -409,8 +452,15 @@ class StorageFS(Operations):
             return backend
 
         available = [b for b in self.backends.values() if b.is_available()]
-        available.sort(key=lambda b: b.speed_priority)
-        for candidate in available:
+        if available:
+            candidates = available
+        else:
+            # Opportunistic reprobe when all backends are marked unavailable.
+            # Backend cooldown logic prevents tight reconnect loops.
+            candidates = [b for b in self.backends.values() if b.is_remote]
+
+        candidates.sort(key=lambda b: b.speed_priority)
+        for candidate in candidates:
             try:
                 if candidate.exists(canonical_path):
                     return candidate
@@ -562,6 +612,10 @@ class StorageFS(Operations):
 
         with session.lock:
             target_path = session.final_cache_path if session.finalized else session.partial_cache_path
+            final_path = session.final_cache_path
+
+        if not target_path.exists() and final_path.exists():
+            target_path = final_path
 
         try:
             os.setxattr(str(target_path), self._STREAM_STATE_XATTR, json.dumps(payload, sort_keys=True).encode("utf-8"))
@@ -820,7 +874,47 @@ class StorageFS(Operations):
         self._discard_unregistered_prefetch_session(session)
         self.cache_manager.mark_cache_size_dirty()
 
+    def _promote_failed_session_cache_prefix(self, session: PrefetchSession) -> bool:
+        """Promote contiguous bytes from a failed streaming session into regular cache."""
+        with session.lock:
+            ranges = list(session.available_ranges)
+            contiguous_bytes = self._contiguous_available_prefix(ranges, session.file_size)
+            partial_path = session.partial_cache_path
+            final_path = session.final_cache_path
+            io_fd = session.io_fd
+
+        if contiguous_bytes <= 0:
+            return False
+
+        try:
+            if io_fd >= 0:
+                with session.io_lock:
+                    os.ftruncate(io_fd, contiguous_bytes)
+                    os.fsync(io_fd)
+
+            final_path.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(partial_path, final_path)
+            self.logger.info(
+                "streaming partial-cache path=%s backend=%s bytes=%d",
+                session.canonical_path,
+                session.backend.name,
+                contiguous_bytes,
+            )
+            return True
+        except OSError as exc:
+            self.logger.warning(
+                "streaming partial-cache promotion failed path=%s backend=%s bytes=%d: %r",
+                session.canonical_path,
+                session.backend.name,
+                contiguous_bytes,
+                exc,
+            )
+            return False
+
     def _cleanup_failed_session(self, session: PrefetchSession):
+        if self._promote_failed_session_cache_prefix(session):
+            self._cleanup_prefetch_session(session, "partial-cache")
+            return
         self._cleanup_prefetch_session(session, "failed")
 
     def _cleanup_cancelled_session(self, session: PrefetchSession):
@@ -1181,22 +1275,27 @@ class StorageFS(Operations):
                 self.cache_manager.mark_accessed(virtual_path)
             return True
 
-        # If a backend is explicitly requested (conflict suffix), bypass replication manager
+        # If a backend is explicitly requested (conflict suffix), bypass replication manager.
         if backend_name:
             backend = self.backends.get(backend_name)
             cache_path = self.cache_manager.get_cache_path(virtual_path)
             cache_path.parent.mkdir(parents=True, exist_ok=True)
+
             if backend and backend.exists(canonical_path):
                 try:
                     backend.copy_to_local(canonical_path, cache_path)
                     return True
                 except Exception:
                     pass
-            try:
-                cache_path.touch(exist_ok=True)
+
+            # Graceful fallback when a cached copy already exists locally.
+            if cache_path.exists() and cache_path.is_file():
                 return True
-            except Exception:
-                return False
+
+            if backend and not backend.is_available():
+                raise FuseOSError(errno.EHOSTUNREACH)
+
+            return False
 
         # Try to download from a backend
         backend = self._select_backend_for_read(canonical_path)
@@ -1267,6 +1366,10 @@ class StorageFS(Operations):
                 self.cache_manager.mark_accessed(virtual_path)
                 return True
 
+        available_backends, _ = self._backend_availability()
+        if not available_backends and self.backends:
+            raise FuseOSError(errno.EHOSTUNREACH)
+
         # File not available
         return False
 
@@ -1293,6 +1396,12 @@ class StorageFS(Operations):
             for bname, backend in backend_iter:
                 if not backend:
                     continue
+                if not backend.is_available():
+                    # Avoid repeated per-entry reconnect attempts during directory scans.
+                    # Readdir/open paths still probe periodically based on backend cooldown.
+                    if backend_name:
+                        raise FuseOSError(errno.EHOSTUNREACH)
+                    continue
                 try:
                     st = backend.stat(canonical_path)
                     return {
@@ -1307,6 +1416,10 @@ class StorageFS(Operations):
                     }
                 except Exception as be:
                     self.logger.debug("getattr backend fallback failed for %s on %s: %s", canonical_path, bname, be)
+
+            available_backends, _ = self._backend_availability()
+            if not available_backends and self.backends:
+                raise FuseOSError(errno.EHOSTUNREACH)
 
             raise FuseOSError(e.errno)
 
@@ -1791,6 +1904,10 @@ class StorageFS(Operations):
         if name == self.CHECKSUM_XATTR:
             return self._aggregate_checksums_yaml(canonical_path)
 
+        if name == self.CACHE_STATE_XATTR:
+            payload = self._cache_state_payload(path, canonical_path)
+            return json.dumps(payload, sort_keys=True).encode("utf-8")
+
         cache_path = self.cache_manager.get_cache_path(path)
 
         try:
@@ -1800,8 +1917,8 @@ class StorageFS(Operations):
 
     def setxattr(self, path, name, value, options, position=0):
         """Set extended attribute"""
-        if name == self.CHECKSUM_XATTR:
-            # Ignore manual writes; checksum attrs are derived
+        if name in {self.CHECKSUM_XATTR, self.CACHE_STATE_XATTR}:
+            # Ignore manual writes for derived attrs.
             return
         cache_path = self.cache_manager.get_cache_path(path)
 
@@ -1827,12 +1944,14 @@ class StorageFS(Operations):
             )
         if has_checksum:
             attrs.add(self.CHECKSUM_XATTR)
+
+        attrs.add(self.CACHE_STATE_XATTR)
         return list(attrs)
 
     def removexattr(self, path, name):
         """Remove extended attribute"""
-        if name == self.CHECKSUM_XATTR:
-            # Derived; ignore removals
+        if name in {self.CHECKSUM_XATTR, self.CACHE_STATE_XATTR}:
+            # Derived; ignore removals.
             return
         cache_path = self.cache_manager.get_cache_path(path)
 

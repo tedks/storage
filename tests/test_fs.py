@@ -139,6 +139,25 @@ class TestReaddirMerging(unittest.TestCase):
         attrs = self.fs.getattr('/subdir')
         self.assertTrue(stat.S_ISDIR(attrs['st_mode']))
 
+    def test_getattr_skips_unavailable_backend(self):
+        content = "from-backend2"
+        (self.backend2_dir / "fast.txt").write_text(content)
+
+        self.backends["backend1"].set_available(False)
+
+        with patch.object(self.backends["backend1"], "stat", side_effect=AssertionError("unavailable backend should not be probed")):
+            attrs = self.fs.getattr('/fast.txt')
+
+        self.assertEqual(attrs['st_size'], len(content))
+
+    def test_getattr_targeted_unavailable_backend_returns_hostunreach(self):
+        self.backends["backend1"].set_available(False)
+
+        with self.assertRaises(FuseOSError) as ctx:
+            self.fs.getattr('/missing.backend1')
+
+        self.assertEqual(ctx.exception.errno, errno.EHOSTUNREACH)
+
     def test_open_reads_remote_only_file_and_populates_state(self):
         content = "remote-data"
         (self.backend1_dir / "remote.txt").write_text(content)
@@ -154,6 +173,69 @@ class TestReaddirMerging(unittest.TestCase):
         backend_names = {loc.backend_name for loc in locations}
         self.assertIn('backend1', backend_names)
         self.assertIn('cache', backend_names)
+
+
+    def test_open_uses_cache_when_backends_unavailable(self):
+        content = "cached-data"
+        (self.backend1_dir / "cached.txt").write_text(content)
+
+        first_fd = self.fs.open('/cached.txt', os.O_RDONLY)
+        _ = self.fs.read('/cached.txt', 1024, 0, first_fd)
+        self.fs.release('/cached.txt', first_fd)
+
+        self.backends["backend1"].set_available(False)
+        self.backends["backend2"].set_available(False)
+
+        second_fd = self.fs.open('/cached.txt', os.O_RDONLY)
+        reread = self.fs.read('/cached.txt', 1024, 0, second_fd)
+        self.fs.release('/cached.txt', second_fd)
+
+        self.assertEqual(reread.decode(), content)
+
+    def test_open_uncached_returns_hostunreach_when_all_backends_unavailable(self):
+        (self.backend1_dir / "offline.txt").write_text("offline")
+
+        self.backends["backend1"].set_available(False)
+        self.backends["backend2"].set_available(False)
+
+        with self.assertRaises(FuseOSError) as ctx:
+            self.fs.open('/offline.txt', os.O_RDONLY)
+        self.assertEqual(ctx.exception.errno, errno.EHOSTUNREACH)
+
+    def test_cache_state_xattr_reports_cache_presence_and_backend_availability(self):
+        content = "xattr-data"
+        (self.backend1_dir / "xattr.txt").write_text(content)
+
+        raw_before = self.fs.getxattr('/xattr.txt', StorageFS.CACHE_STATE_XATTR)
+        state_before = json.loads(raw_before.decode("utf-8"))
+        self.assertFalse(state_before["cache_present"])
+        self.assertIn("backend1", state_before["backend_available"])
+
+        fd = self.fs.open('/xattr.txt', os.O_RDONLY)
+        _ = self.fs.read('/xattr.txt', 1024, 0, fd)
+        self.fs.release('/xattr.txt', fd)
+
+        raw_cached = self.fs.getxattr('/xattr.txt', StorageFS.CACHE_STATE_XATTR)
+        state_cached = json.loads(raw_cached.decode("utf-8"))
+        self.assertTrue(state_cached["cache_present"])
+        self.assertEqual(state_cached["cache_size"], len(content))
+
+        self.backends["backend1"].set_available(False)
+        self.backends["backend2"].set_available(False)
+
+        raw_offline = self.fs.getxattr('/xattr.txt', StorageFS.CACHE_STATE_XATTR)
+        state_offline = json.loads(raw_offline.decode("utf-8"))
+        self.assertEqual(state_offline["backend_available"], [])
+        self.assertIn("backend1", state_offline["backend_unavailable"])
+        self.assertIn("backend2", state_offline["backend_unavailable"])
+
+    def test_readdir_probes_backend_even_if_marked_unavailable(self):
+        self.backends["backend1"].set_available(False)
+        (self.backend1_dir / "recover.txt").write_text("data")
+
+        entries = set(self.fs.readdir('/', None))
+
+        self.assertIn("recover.txt", entries)
 
     def test_readdir_thread_safety(self):
         (self.backend1_dir / "threaded.txt").write_text("data")
@@ -561,6 +643,39 @@ class TestStreamingReadPrefetch(unittest.TestCase):
         self.assertEqual(ctx.exception.errno, errno.EIO)
 
         self.fs.release('/fault.bin', vfd)
+
+    def test_streaming_failure_reuses_cached_prefix_offline(self):
+        self.backend.fail_after_offset = 64 * 1024
+        payload = os.urandom(192 * 1024)
+        (self.backend_dir / "offline-prefix.bin").write_bytes(payload)
+
+        vfd = self.fs.open('/offline-prefix.bin', os.O_RDONLY)
+        head = self.fs.read('/offline-prefix.bin', 4096, 0, vfd)
+        self.assertEqual(head, payload[:4096])
+
+        with self.assertRaises(FuseOSError):
+            self.fs.read('/offline-prefix.bin', 4096, 96 * 1024, vfd)
+
+        self.fs.release('/offline-prefix.bin', vfd)
+
+        cache_path = self.cache_dir / "offline-prefix.bin"
+        partial_path = self.cache_dir / "offline-prefix.bin.storage.partial"
+        self.assertTrue(self._wait_for(lambda: cache_path.exists(), timeout=5.0))
+        self.assertFalse(partial_path.exists())
+
+        cached_size = cache_path.stat().st_size
+        self.assertGreater(cached_size, 0)
+        self.assertLess(cached_size, len(payload))
+
+        self.backend.set_available(False)
+
+        retry_vfd = self.fs.open('/offline-prefix.bin', os.O_RDONLY)
+        retry_head = self.fs.read('/offline-prefix.bin', 4096, 0, retry_vfd)
+        retry_tail = self.fs.read('/offline-prefix.bin', 4096, max(0, cached_size - 4096), retry_vfd)
+        self.fs.release('/offline-prefix.bin', retry_vfd)
+
+        self.assertEqual(retry_head, payload[:4096])
+        self.assertEqual(retry_tail, payload[max(0, cached_size - 4096):cached_size])
 
     def test_streaming_session_is_shared_across_readers(self):
         payload = os.urandom(512 * 1024)

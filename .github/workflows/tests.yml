@@ -1,0 +1,66 @@
+name: Storage Tests
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+      - "feature/**"
+  schedule:
+    - cron: "0 5 * * *"
+  workflow_dispatch:
+
+jobs:
+  fast-gate:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v30
+
+      - name: Install libfuse
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fuse3 libfuse2t64
+
+      - name: Run Fast Gate
+        run: nix develop --command bazel test //:storage_tests_fast_gate --test_output=errors
+
+  mounted-system-gate:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v30
+
+      - name: Install libfuse
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fuse3 libfuse2t64
+
+      - name: Run Mounted System Gate
+        run: nix develop --command bazel test //:storage_tests_mounted_system_gate --test_output=errors
+
+  resilience-gate:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v30
+
+      - name: Install libfuse
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fuse3 libfuse2t64
+
+      - name: Run Resilience Gate
+        run: nix develop --command bazel test //:storage_tests_resilience_gate --test_output=errors

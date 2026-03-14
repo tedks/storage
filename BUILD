@@ -34,3 +34,37 @@ py_test(
         "@pypi//pytest_timeout",
     ],
 )
+
+
+py_test(
+    name = "storage_tests_fast_gate",
+    srcs = ["tests/pytest_main_fast.py"] + glob(["tests/test_*.py"]),
+    main = "tests/pytest_main_fast.py",
+    deps = [
+        ":storage_lib",
+        "@pypi//pytest",
+        "@pypi//pytest_timeout",
+    ],
+)
+
+py_test(
+    name = "storage_tests_mounted_system_gate",
+    srcs = ["tests/pytest_main_mounted_system.py"] + glob(["tests/test_*.py"]),
+    main = "tests/pytest_main_mounted_system.py",
+    deps = [
+        ":storage_lib",
+        "@pypi//pytest",
+        "@pypi//pytest_timeout",
+    ],
+)
+
+py_test(
+    name = "storage_tests_resilience_gate",
+    srcs = ["tests/pytest_main_resilience.py"] + glob(["tests/test_*.py"]),
+    main = "tests/pytest_main_resilience.py",
+    deps = [
+        ":storage_lib",
+        "@pypi//pytest",
+        "@pypi//pytest_timeout",
+    ],
+)
