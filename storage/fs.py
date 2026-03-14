@@ -279,19 +279,27 @@ class StorageFS(Operations):
             self._dir_cache.pop(path, None)
             self._readdir_snapshot.pop(path, None)
 
-    def _get_target_backends(self, backend_hint: Optional[str]) -> List[Backend]:
+    def _get_target_backends(self, backend_hint: Optional[str],
+                             backend_names: Optional[Set[str]] = None) -> List[Backend]:
         """Return the backend instances affected by an operation."""
         if backend_hint:
             backend = self.backends.get(backend_hint)
             return [backend] if backend else []
+        if backend_names is not None:
+            return [
+                backend
+                for name, backend in self.backends.items()
+                if name in backend_names
+            ]
         return list(self.backends.values())
 
     def _propagate_dir_operation(self, operation: DirOperation, path: str,
                                  backend_hint: Optional[str] = None,
-                                 new_path: Optional[str] = None) -> List[str]:
+                                 new_path: Optional[str] = None,
+                                 backend_names: Optional[Set[str]] = None) -> List[str]:
         """Best-effort synchronous propagation; returns backend names that failed."""
         failures: List[str] = []
-        for backend in self._get_target_backends(backend_hint):
+        for backend in self._get_target_backends(backend_hint, backend_names=backend_names):
             if not backend:
                 continue
             try:
@@ -1586,15 +1594,22 @@ class StorageFS(Operations):
             new_cache.parent.mkdir(parents=True, exist_ok=True)
             old_cache.rename(new_cache)
 
-            renamed_entries = self.state_manager.rename_path(old_canonical, new_canonical)
-
             is_directory = new_cache.is_dir()
+            rename_backend_names = self.state_manager.get_location_backends(
+                old_canonical,
+                recursive=is_directory,
+            )
+            if is_directory and not rename_backend_names:
+                rename_backend_names = set(self.backends.keys())
+
+            renamed_entries = self.state_manager.rename_path(old_canonical, new_canonical)
 
             failures = self._propagate_dir_operation(
                 DirOperation.RENAME,
                 old_canonical,
                 backend_hint=old_backend,
                 new_path=new_canonical,
+                backend_names=rename_backend_names if not old_backend else None,
             )
 
             parent_old = str(Path(old_canonical).parent)

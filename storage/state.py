@@ -273,6 +273,30 @@ class StateManager:
             for row in rows
         ]
 
+    def get_location_backends(self, virtual_path: str, recursive: bool = False) -> Set[str]:
+        """
+        Return backend names that currently hold the path or subtree.
+
+        Cache-only entries are excluded because callers use this to decide which
+        remote backends need a path transform such as rename.
+        """
+        path = self._normalize_virtual_path(virtual_path)
+        params: tuple
+        query = 'SELECT DISTINCT backend_name FROM file_locations WHERE is_cached = 0 AND virtual_path = ?'
+        params = (path,)
+        if recursive:
+            query = (
+                'SELECT DISTINCT backend_name FROM file_locations '
+                'WHERE is_cached = 0 AND (virtual_path = ? OR virtual_path LIKE ?)'
+            )
+            params = (path, f"{path}/%")
+
+        with self._db_lock:
+            cursor = self.conn.execute(query, params)
+            rows = cursor.fetchall()
+
+        return {row['backend_name'] for row in rows}
+
     def add_file_location(self, location: FileLocation):
         """Record that a file exists on a backend"""
         self._execute_write('''

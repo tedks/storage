@@ -330,6 +330,47 @@ class TestReaddirMerging(unittest.TestCase):
         self.assertIsNone(old_meta)
         self.assertIsNotNone(new_meta)
 
+    def test_rename_file_targets_only_backends_with_existing_location(self):
+        vfd = self.fs.create('/staged.tmp', 0o644)
+        data = b'staged-data'
+        self.fs.write('/staged.tmp', data, 0, vfd)
+        self.fs.release('/staged.tmp', vfd)
+
+        self.assertTrue(self.fs.sync_manager.sync_now('/staged.tmp', timeout=5.0))
+
+        remote_locations = [
+            loc.backend_name
+            for loc in self.fs.state_manager.get_file_locations('/staged.tmp')
+            if not loc.is_cached
+        ]
+        self.assertEqual(1, len(remote_locations))
+        remote_backend = remote_locations[0]
+        untouched_backend = 'backend2' if remote_backend == 'backend1' else 'backend1'
+
+        original_remote_rename = self.backends[remote_backend].rename
+
+        with patch.object(
+            self.backends[remote_backend],
+            'rename',
+            wraps=original_remote_rename,
+        ) as rename_remote, patch.object(
+            self.backends[untouched_backend],
+            'rename',
+            side_effect=AssertionError("rename should not fan out to backends without the file"),
+        ):
+            self.fs.rename('/staged.tmp', '/final.txt')
+
+        rename_remote.assert_called_once_with('/staged.tmp', '/final.txt')
+        self.assertTrue(self.backends[remote_backend].exists('/final.txt'))
+        self.assertFalse(self.backends[remote_backend].exists('/staged.tmp'))
+
+        new_locations = [
+            loc.backend_name
+            for loc in self.fs.state_manager.get_file_locations('/final.txt')
+            if not loc.is_cached
+        ]
+        self.assertEqual([remote_backend], new_locations)
+
     def test_mkdir_retry_targets_failed_backend(self):
         path = '/needretry'
         original = self.backends['backend2'].mkdir
