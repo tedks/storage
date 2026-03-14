@@ -21,6 +21,11 @@ jobs:
       - name: Install Nix
         uses: cachix/install-nix-action@v30
 
+      - name: Install libfuse
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fuse3 libfuse2t64
+
       - name: Run Fast Gate
         run: nix develop --command bazel test //:storage_tests_fast_gate --test_output=errors
 
@@ -34,6 +39,11 @@ jobs:
       - name: Install Nix
         uses: cachix/install-nix-action@v30
 
+      - name: Install libfuse
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fuse3 libfuse2t64
+
       - name: Run Mounted System Gate
         run: nix develop --command bazel test //:storage_tests_mounted_system_gate --test_output=errors
 
@@ -46,6 +56,11 @@ jobs:
 
       - name: Install Nix
         uses: cachix/install-nix-action@v30
+
+      - name: Install libfuse
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fuse3 libfuse2t64
 
       - name: Run Resilience Gate
         run: nix develop --command bazel test //:storage_tests_resilience_gate --test_output=errors

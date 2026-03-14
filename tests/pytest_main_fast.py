@@ -5,8 +5,8 @@ def main() -> int:
     # Fast gate: everything except mounted system tests.
     return pytest.main([
         "tests",
-        "-k",
-        "not test_streaming_system and not test_sync_system",
+        "--ignore=tests/test_streaming_system.py",
+        "--ignore=tests/test_sync_system.py",
     ])
 
 
