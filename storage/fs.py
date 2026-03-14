@@ -141,7 +141,8 @@ class StorageFS(Operations):
             self.state_manager,
             self.cache_manager,
             self.replication_manager,
-            num_workers=num_sync_workers
+            num_workers=num_sync_workers,
+            should_sync_path_cb=self._should_sync_path,
         )
         self._sync_started = False
         if start_sync:
@@ -189,6 +190,18 @@ class StorageFS(Operations):
         """Get configuration for a file"""
         cache_path = self.cache_manager.get_cache_path(virtual_path)
         return self.state_manager.get_inherited_config(cache_path)
+
+    def _should_sync_path(self, virtual_path: str) -> bool:
+        """Only sync paths that do not currently have an open writer."""
+        with self._fd_lock:
+            for entry in self._fd_map.values():
+                if entry.canonical_path != virtual_path:
+                    continue
+                if entry.prefetch_session is not None:
+                    continue
+                if (entry.flags & os.O_ACCMODE) != os.O_RDONLY:
+                    return False
+        return True
 
     def _backend_availability(self) -> Tuple[List[str], List[str]]:
         """Return backend names split by current availability."""

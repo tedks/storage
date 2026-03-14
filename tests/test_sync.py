@@ -18,7 +18,7 @@ from storage.state import StateManager, FileMetadata, SyncStatus, FileConfig, Fi
 from storage.cache import CacheManager
 from storage.backends.local import LocalBackend
 from storage.replication import ReplicationManager
-from storage.sync import SyncManager, SyncTask, DirSyncTask, DirOperation
+from storage.sync import SyncConfig, SyncManager, SyncTask, DirSyncTask, DirOperation
 
 
 class TestSyncTask(unittest.TestCase):
@@ -184,6 +184,48 @@ class TestSyncManager(unittest.TestCase):
         # Metadata should be CLEAN
         updated_metadata = self.state_manager.get_file_metadata(test_file)
         self.assertEqual(updated_metadata.sync_status, SyncStatus.CLEAN)
+
+    def test_monitor_skips_busy_paths_until_callback_allows_sync(self):
+        """Dirty files should not be enqueued while the filesystem still reports them busy."""
+        busy_paths = {"/busy.txt"}
+
+        self.sync_manager.stop()
+        self.sync_manager = SyncManager(
+            self.state_manager,
+            self.cache_manager,
+            self.replication_manager,
+            num_workers=0,
+            config=SyncConfig(monitor_interval=0.05),
+            should_sync_path_cb=lambda path: path not in busy_paths,
+        )
+
+        test_file = "/busy.txt"
+        cache_path = self.cache_manager.get_cache_path(test_file)
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text("busy")
+
+        metadata = FileMetadata(
+            virtual_path=test_file,
+            size=4,
+            checksum=None,
+            last_access=time.time(),
+            last_modified=time.time(),
+            sync_status=SyncStatus.DIRTY,
+            replica_count=1,
+            recomputable=False,
+            recompute_cmd=None,
+            encrypted=False,
+            encryption_key_id=None,
+        )
+        self.state_manager.set_file_metadata(metadata)
+
+        self.sync_manager.start()
+        time.sleep(0.2)
+        self.assertEqual(0, self.sync_manager.get_queue_size())
+
+        busy_paths.clear()
+        time.sleep(0.2)
+        self.assertEqual(1, self.sync_manager.get_queue_size())
 
     def test_sync_now_synchronous(self):
         """Test synchronous sync operation"""

@@ -11,6 +11,7 @@ import time
 import os
 import subprocess
 import threading
+import shutil
 from pathlib import Path
 
 from storage.fs import StorageFS
@@ -91,8 +92,15 @@ class TestSyncSystemIntegration(unittest.TestCase):
         time.sleep(0.5)
 
         # Clean up temp directory
-        import shutil
         shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _wait_for(self, predicate, timeout=5.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if predicate():
+                return True
+            time.sleep(0.05)
+        return predicate()
 
     def test_write_and_sync(self):
         """Test writing file and automatic sync"""
@@ -208,6 +216,73 @@ class TestSyncSystemIntegration(unittest.TestCase):
 
         except Exception as e:
             self.skipTest(f"Cannot write multiple files: {e}")
+
+    def test_rsync_write_succeeds_and_syncs_final_file(self):
+        """Rsync into the mounted filesystem should complete without write-path errors."""
+        if shutil.which("rsync") is None:
+            self.skipTest("rsync not available")
+
+        source_dir = Path(self.temp_dir) / "source"
+        source_dir.mkdir()
+        source_file = source_dir / "movie.bin"
+
+        payload_size = 8 * 1024 * 1024
+        unit = b"abcdefghijklmnopqrstuvwxyz012345"
+        repeats = (payload_size // len(unit)) + 1
+        payload = (unit * repeats)[:payload_size]
+        source_file.write_bytes(payload)
+
+        mount_target_dir = self.mount_dir / "media"
+        try:
+            mount_target_dir.mkdir(exist_ok=True)
+        except Exception as exc:
+            self.skipTest(f"Cannot create directory in mount: {exc}")
+
+        result = subprocess.run(
+            ["rsync", "-a", str(source_file), str(mount_target_dir)],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode != 0:
+            self.fail(
+                "rsync failed with non-zero status:\n"
+                f"stdout:\n{result.stdout}\n"
+                f"stderr:\n{result.stderr}"
+            )
+
+        mounted_copy = mount_target_dir / source_file.name
+        self.assertTrue(mounted_copy.exists())
+        self.assertEqual(mounted_copy.read_bytes(), payload)
+
+        virtual_path = f"/media/{source_file.name}"
+        self.assertTrue(self.fs.sync_manager.sync_now(virtual_path, timeout=10.0))
+
+        cache_copy = self.cache_dir / "media" / source_file.name
+        self.assertTrue(cache_copy.exists())
+        self.assertEqual(cache_copy.read_bytes(), payload)
+
+        synced_backends = []
+        for backend_dir in (self.backend1_dir, self.backend2_dir):
+            candidate = backend_dir / "media" / source_file.name
+            if candidate.exists():
+                synced_backends.append(candidate)
+
+        self.assertTrue(synced_backends, "Final file should sync to at least one backend")
+        for candidate in synced_backends:
+            self.assertEqual(candidate.read_bytes(), payload)
+
+        temp_glob = f".{source_file.name}.*"
+        self.assertTrue(
+            self._wait_for(
+                lambda: not list((self.cache_dir / "media").glob(temp_glob))
+                and not list((self.backend1_dir / "media").glob(temp_glob))
+                and not list((self.backend2_dir / "media").glob(temp_glob)),
+                timeout=5.0,
+            ),
+            "rsync temp files should not persist in cache or backends",
+        )
 
 
 if __name__ == '__main__':

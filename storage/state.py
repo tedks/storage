@@ -119,12 +119,19 @@ class StateManager:
         self.db_path = db_path
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
+        self._db_lock = threading.RLock()
         self._access_lock = threading.RLock()
         self._pending_access_updates: Dict[str, float] = {}
         self._recent_access_updates: Dict[str, float] = {}
         self._last_access_flush_mono = time.monotonic()
         self._configure_connection()
         self._init_db()
+
+    def _execute_write(self, query: str, params: tuple = ()):
+        """Execute a single write statement and commit it atomically."""
+        with self._db_lock:
+            self.conn.execute(query, params)
+            self.conn.commit()
 
     def _configure_connection(self):
         """Configure SQLite pragmas for lower write amplification."""
@@ -191,21 +198,23 @@ class StateManager:
                 return
 
             rows = [(ts, path) for path, ts in self._pending_access_updates.items()]
-            self.conn.executemany(
-                'UPDATE files SET last_access = ? WHERE virtual_path = ?',
-                rows
-            )
-            self.conn.commit()
+            with self._db_lock:
+                self.conn.executemany(
+                    'UPDATE files SET last_access = ? WHERE virtual_path = ?',
+                    rows
+                )
+                self.conn.commit()
             self._pending_access_updates.clear()
             self._last_access_flush_mono = now_mono
 
     def get_file_metadata(self, virtual_path: str) -> Optional[FileMetadata]:
         """Get metadata for a file"""
-        cursor = self.conn.execute(
-            'SELECT * FROM files WHERE virtual_path = ?',
-            (virtual_path,)
-        )
-        row = cursor.fetchone()
+        with self._db_lock:
+            cursor = self.conn.execute(
+                'SELECT * FROM files WHERE virtual_path = ?',
+                (virtual_path,)
+            )
+            row = cursor.fetchone()
         if not row:
             return None
 
@@ -225,7 +234,7 @@ class StateManager:
 
     def set_file_metadata(self, metadata: FileMetadata):
         """Store or update file metadata"""
-        self.conn.execute('''
+        self._execute_write('''
             INSERT OR REPLACE INTO files
             (virtual_path, size, checksum, last_access, last_modified,
              sync_status, replica_count, recomputable, recompute_cmd,
@@ -244,14 +253,15 @@ class StateManager:
             int(metadata.encrypted),
             metadata.encryption_key_id
         ))
-        self.conn.commit()
 
     def get_file_locations(self, virtual_path: str) -> List[FileLocation]:
         """Get all locations where a file is stored"""
-        cursor = self.conn.execute(
-            'SELECT * FROM file_locations WHERE virtual_path = ?',
-            (virtual_path,)
-        )
+        with self._db_lock:
+            cursor = self.conn.execute(
+                'SELECT * FROM file_locations WHERE virtual_path = ?',
+                (virtual_path,)
+            )
+            rows = cursor.fetchall()
         return [
             FileLocation(
                 virtual_path=row['virtual_path'],
@@ -260,12 +270,12 @@ class StateManager:
                 last_synced=row['last_synced'],
                 is_cached=bool(row['is_cached'])
             )
-            for row in cursor.fetchall()
+            for row in rows
         ]
 
     def add_file_location(self, location: FileLocation):
         """Record that a file exists on a backend"""
-        self.conn.execute('''
+        self._execute_write('''
             INSERT OR REPLACE INTO file_locations
             (virtual_path, backend_name, checksum, last_synced, is_cached)
             VALUES (?, ?, ?, ?, ?)
@@ -276,15 +286,13 @@ class StateManager:
             location.last_synced,
             int(location.is_cached)
         ))
-        self.conn.commit()
 
     def remove_file_location(self, virtual_path: str, backend_name: str):
         """Remove a file location"""
-        self.conn.execute(
+        self._execute_write(
             'DELETE FROM file_locations WHERE virtual_path = ? AND backend_name = ?',
             (virtual_path, backend_name)
         )
-        self.conn.commit()
 
     @staticmethod
     def _normalize_virtual_path(path: str) -> str:
@@ -306,33 +314,34 @@ class StateManager:
             return []
 
         like_pattern = f"{old_path}/%"
-        cursor = self.conn.execute(
-            'SELECT virtual_path FROM files WHERE virtual_path = ? OR virtual_path LIKE ?',
-            (old_path, like_pattern)
-        )
         rename_map: List[Tuple[str, str]] = []
-
-        for row in cursor.fetchall():
-            current_path = row['virtual_path']
-            if old_path == '/':
-                suffix = current_path
-            else:
-                suffix = current_path[len(old_path):]
-            new_entry = new_path + suffix
-            rename_map.append((current_path, new_entry))
-
-        for original, updated in rename_map:
-            self.conn.execute(
-                'UPDATE files SET virtual_path = ? WHERE virtual_path = ?',
-                (updated, original)
-            )
-            self.conn.execute(
-                'UPDATE file_locations SET virtual_path = ? WHERE virtual_path = ?',
-                (updated, original)
+        with self._db_lock:
+            cursor = self.conn.execute(
+                'SELECT virtual_path FROM files WHERE virtual_path = ? OR virtual_path LIKE ?',
+                (old_path, like_pattern)
             )
 
-        if rename_map:
-            self.conn.commit()
+            for row in cursor.fetchall():
+                current_path = row['virtual_path']
+                if old_path == '/':
+                    suffix = current_path
+                else:
+                    suffix = current_path[len(old_path):]
+                new_entry = new_path + suffix
+                rename_map.append((current_path, new_entry))
+
+            for original, updated in rename_map:
+                self.conn.execute(
+                    'UPDATE files SET virtual_path = ? WHERE virtual_path = ?',
+                    (updated, original)
+                )
+                self.conn.execute(
+                    'UPDATE file_locations SET virtual_path = ? WHERE virtual_path = ?',
+                    (updated, original)
+                )
+
+            if rename_map:
+                self.conn.commit()
 
         return rename_map
 
@@ -355,35 +364,41 @@ class StateManager:
     def get_lru_files(self, limit: int = 100) -> List[FileMetadata]:
         """Get least recently used files"""
         self._flush_access_updates(force=True)
-        cursor = self.conn.execute('''
-            SELECT * FROM files
-            WHERE sync_status = ?
-            ORDER BY last_access ASC
-            LIMIT ?
-        ''', (SyncStatus.CLEAN.value, limit))
-
-        return [FileMetadata.from_dict(dict(row)) for row in cursor.fetchall()]
+        with self._db_lock:
+            cursor = self.conn.execute('''
+                SELECT * FROM files
+                WHERE sync_status = ?
+                ORDER BY last_access ASC
+                LIMIT ?
+            ''', (SyncStatus.CLEAN.value, limit))
+            rows = cursor.fetchall()
+        return [FileMetadata.from_dict(dict(row)) for row in rows]
 
     def get_recomputable_files(self) -> List[FileMetadata]:
         """Get all recomputable files"""
-        cursor = self.conn.execute(
-            'SELECT * FROM files WHERE recomputable = 1 ORDER BY size ASC'
-        )
-        return [FileMetadata.from_dict(dict(row)) for row in cursor.fetchall()]
+        with self._db_lock:
+            cursor = self.conn.execute(
+                'SELECT * FROM files WHERE recomputable = 1 ORDER BY size ASC'
+            )
+            rows = cursor.fetchall()
+        return [FileMetadata.from_dict(dict(row)) for row in rows]
 
     def delete_file(self, virtual_path: str):
         """Delete file from state tracking"""
-        self.conn.execute('DELETE FROM file_locations WHERE virtual_path = ?', (virtual_path,))
-        self.conn.execute('DELETE FROM files WHERE virtual_path = ?', (virtual_path,))
-        self.conn.commit()
+        with self._db_lock:
+            self.conn.execute('DELETE FROM file_locations WHERE virtual_path = ?', (virtual_path,))
+            self.conn.execute('DELETE FROM files WHERE virtual_path = ?', (virtual_path,))
+            self.conn.commit()
 
     def get_dirty_files(self) -> List[FileMetadata]:
         """Get all files that need syncing"""
-        cursor = self.conn.execute(
-            'SELECT * FROM files WHERE sync_status = ?',
-            (SyncStatus.DIRTY.value,)
-        )
-        return [FileMetadata.from_dict(dict(row)) for row in cursor.fetchall()]
+        with self._db_lock:
+            cursor = self.conn.execute(
+                'SELECT * FROM files WHERE sync_status = ?',
+                (SyncStatus.DIRTY.value,)
+            )
+            rows = cursor.fetchall()
+        return [FileMetadata.from_dict(dict(row)) for row in rows]
 
     @staticmethod
     def get_file_config(real_path: Path) -> Optional[FileConfig]:
@@ -455,4 +470,5 @@ class StateManager:
     def close(self):
         """Close database connection"""
         self._flush_access_updates(force=True)
-        self.conn.close()
+        with self._db_lock:
+            self.conn.close()
