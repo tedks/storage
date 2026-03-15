@@ -136,6 +136,11 @@ class StorageFS(Operations):
         self._control_socket: Optional[socket.socket] = None
         self._control_thread: Optional[threading.Thread] = None
 
+        # File descriptor tracking
+        self._fd_counter = 0
+        self._fd_map: Dict[int, FDEntry] = {}
+        self._fd_lock = threading.Lock()
+
         # Background sync manager
         self.sync_manager = SyncManager(
             self.state_manager,
@@ -151,11 +156,6 @@ class StorageFS(Operations):
 
         # Recomputation engine
         self.recompute_engine = RecomputeEngine(self.state_manager)
-
-        # File descriptor tracking
-        self._fd_counter = 0
-        self._fd_map: Dict[int, FDEntry] = {}
-        self._fd_lock = threading.Lock()
 
         # Directory listing cache (per directory, per backend) for fallback when backend unavailable
         self._dir_cache: Dict[str, Dict[str, Set[str]]] = {}
@@ -1595,12 +1595,10 @@ class StorageFS(Operations):
             old_cache.rename(new_cache)
 
             is_directory = new_cache.is_dir()
-            rename_backend_names = self.state_manager.get_location_backends(
-                old_canonical,
-                recursive=is_directory,
-            )
-            if is_directory and not rename_backend_names:
+            if is_directory:
                 rename_backend_names = set(self.backends.keys())
+            else:
+                rename_backend_names = self.state_manager.get_location_backends(old_canonical)
 
             renamed_entries = self.state_manager.rename_path(old_canonical, new_canonical)
 
