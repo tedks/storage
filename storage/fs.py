@@ -13,7 +13,6 @@ import errno
 import threading
 import logging
 import fcntl
-import stat
 import time
 import hashlib
 import yaml
@@ -33,6 +32,7 @@ from .sync import SyncManager, DirOperation
 from .recompute import RecomputeEngine
 from .checksums import ChecksumRecord
 from .pathing import ResolvedPath, resolve_path
+from .namespace import NamespaceService
 
 
 @dataclass
@@ -219,6 +219,24 @@ class StorageFS(Operations):
         self._checksum_tasks: Dict[tuple, concurrent.futures.Future] = {}
         self._checksum_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 
+        self.namespace = NamespaceService(
+            backends=self.backends,
+            cache_manager=self.cache_manager,
+            state_manager=self.state_manager,
+            sync_manager=self.sync_manager,
+            logger=self.logger,
+            resolve_path=lambda path: self._resolve_path(path),
+            schedule_checksum_task=lambda backend, path: self._schedule_checksum_task(backend, path),
+            partial_suffix=self._PARTIAL_SUFFIX,
+            is_hidden_entry=self._is_hidden_entry,
+            dir_cache=self._dir_cache,
+            dir_cache_lock=self._dir_cache_lock,
+            readdir_snapshot=self._readdir_snapshot,
+            readdir_snapshot_ttl=self._readdir_snapshot_ttl,
+            checksum_records=self._checksum_records,
+            checksum_lock=self._checksum_lock,
+        )
+
         self._cleanup_stale_partials()
 
     def init(self, path):
@@ -258,45 +276,11 @@ class StorageFS(Operations):
 
     def _backend_availability(self) -> Tuple[List[str], List[str]]:
         """Return backend names split by current availability."""
-        available: List[str] = []
-        unavailable: List[str] = []
-        for name, backend in self.backends.items():
-            if backend.is_available():
-                available.append(name)
-            else:
-                unavailable.append(name)
-        return available, unavailable
+        return self.namespace.backend_availability()
 
     def _cache_state_payload(self, resolved: ResolvedPath) -> Dict[str, object]:
         """Build synthetic cache-state xattr payload for a virtual path."""
-        cache_path = resolved.cache_path
-        partial_path = self._partial_cache_path(cache_path)
-        available_backends, unavailable_backends = self._backend_availability()
-
-        cache_present = bool(cache_path.exists() and cache_path.is_file())
-        partial_present = bool(partial_path.exists() and partial_path.is_file())
-
-        payload: Dict[str, object] = {
-            "path": resolved.canonical_path,
-            "cache_path": str(cache_path),
-            "cache_present": cache_present,
-            "partial_present": partial_present,
-            "backend_available": available_backends,
-            "backend_unavailable": unavailable_backends,
-            "updated_at": time.time(),
-        }
-
-        try:
-            payload["cache_size"] = cache_path.stat().st_size if cache_present else 0
-        except OSError:
-            payload["cache_size"] = 0
-
-        try:
-            payload["partial_size"] = partial_path.stat().st_size if partial_present else 0
-        except OSError:
-            payload["partial_size"] = 0
-
-        return payload
+        return self.namespace.cache_state_payload(resolved)
 
     # ------------------------------------------------------------------ #
     # Conflict / checksum helpers
@@ -307,13 +291,7 @@ class StorageFS(Operations):
 
     def _invalidate_dir_cache_entry(self, path: str):
         """Remove a directory entry from the cached listing."""
-        if not path:
-            path = '/'
-        if not path.startswith('/'):
-            path = '/' + path
-        with self._dir_cache_lock:
-            self._dir_cache.pop(path, None)
-            self._readdir_snapshot.pop(path, None)
+        self.namespace.invalidate_dir_cache_entry(path)
 
     def _invalidate_file_cache(self, virtual_path: str):
         """
@@ -430,40 +408,20 @@ class StorageFS(Operations):
     def _get_target_backends(self, backend_hint: Optional[str],
                              backend_names: Optional[Set[str]] = None) -> List[Backend]:
         """Return the backend instances affected by an operation."""
-        if backend_hint:
-            backend = self.backends.get(backend_hint)
-            return [backend] if backend else []
-        if backend_names is not None:
-            return [
-                backend
-                for name, backend in self.backends.items()
-                if name in backend_names
-            ]
-        return list(self.backends.values())
+        return self.namespace._get_target_backends(backend_hint, backend_names=backend_names)
 
     def _propagate_dir_operation(self, operation: DirOperation, path: str,
                                  backend_hint: Optional[str] = None,
                                  new_path: Optional[str] = None,
                                  backend_names: Optional[Set[str]] = None) -> List[str]:
         """Best-effort synchronous propagation; returns backend names that failed."""
-        failures: List[str] = []
-        for backend in self._get_target_backends(backend_hint, backend_names=backend_names):
-            if not backend:
-                continue
-            try:
-                if operation == DirOperation.MKDIR:
-                    backend.mkdir(path)
-                elif operation == DirOperation.RMDIR:
-                    backend.rmdir(path)
-                elif operation == DirOperation.RENAME:
-                    if not new_path:
-                        raise ValueError("rename requires new_path")
-                    backend.rename(path, new_path)
-            except Exception as exc:
-                failures.append(backend.name)
-                self.logger.debug("dir op %s failed for %s on %s: %s",
-                                   operation.value, path, backend.name, exc)
-        return failures
+        return self.namespace._propagate_dir_operation(
+            operation,
+            path,
+            backend_hint=backend_hint,
+            new_path=new_path,
+            backend_names=backend_names,
+        )
 
     def _record_checksum(self, canonical_path: str, backend_name: str, checksum: str, timestamp: float):
         """Record a checksum for (path, backend) and keep only the latest."""
@@ -483,26 +441,7 @@ class StorageFS(Operations):
 
     def _schedule_directory_checksums(self, dir_path: str, backend_entries: Dict[str, Set[str]]):
         """Queue checksum computations for backend collisions in the directory."""
-        owners: Dict[str, Set[str]] = {}
-        for backend_name, names in backend_entries.items():
-            for name in names:
-                owners.setdefault(name, set()).add(backend_name)
-
-        for backend_name, names in backend_entries.items():
-            backend = self.backends.get(backend_name)
-            if not backend:
-                continue
-            for name in names:
-                # Avoid expensive checksum work for entries that only exist on one backend.
-                if len(owners.get(name, set())) <= 1:
-                    continue
-                virtual_child = str(Path(dir_path) / name)
-                try:
-                    if backend.isdir(virtual_child):
-                        continue
-                except Exception:
-                    pass
-                self._schedule_checksum_task(backend, virtual_child)
+        self.namespace._schedule_directory_checksums(dir_path, backend_entries)
 
     def _schedule_checksum_task(self, backend: Backend, canonical_path: str):
         key = (canonical_path, backend.name)
@@ -546,52 +485,7 @@ class StorageFS(Operations):
         If multiple backends contain the same name with differing checksums,
         present them as <name>.<backend>. Otherwise present the plain name.
         """
-        with self._dir_cache_lock:
-            backend_entries = self._dir_cache.get(dir_path, {})
-
-        aggregated: Dict[str, Set[str]] = {}
-        for backend_name, names in backend_entries.items():
-            for name in names:
-                aggregated.setdefault(name, set()).add(backend_name)
-
-        visible: Set[str] = set()
-        for name, backend_names in aggregated.items():
-            if len(backend_names) <= 1:
-                visible.add(name)
-                continue
-
-            canonical = str(Path(dir_path) / name)
-            with self._checksum_lock:
-                checks = [
-                    self._checksum_records.get((canonical, backend))
-                    for backend in backend_names
-                ]
-            if all(checks) and len({c.checksum for c in checks if c}) > 1:
-                for backend in backend_names:
-                    visible.add(f"{name}.{backend}")
-            else:
-                visible.add(name)
-
-        # Keep any purely cached entries (new files not on backends yet)
-        for entry in base_entries:
-            if entry in aggregated:
-                continue
-
-            # Suppress cached conflict artifacts once checksums agree
-            suppressed = False
-            for backend_name in self.backends.keys():
-                suffix = f".{backend_name}"
-                if entry.endswith(suffix):
-                    base_candidate = entry[: -len(suffix)]
-                    if base_candidate in aggregated:
-                        suppressed = True
-                        break
-            if suppressed:
-                continue
-
-            visible.add(entry)
-
-        return visible
+        return self.namespace._apply_conflict_view(dir_path, base_entries)
 
     def _cleanup_stale_partials(self):
         """Delete stale partial-cache files left by prior crashes."""
@@ -1550,263 +1444,28 @@ class StorageFS(Operations):
 
     def getattr(self, path, fh=None):
         """Get file attributes"""
-        resolved = self._resolve_path(path)
-
-        try:
-            st = os.lstat(str(resolved.cache_path))
-            return dict((key, getattr(st, key)) for key in (
-                'st_atime', 'st_ctime', 'st_gid', 'st_mode', 'st_mtime',
-                'st_nlink', 'st_size', 'st_uid'))
-        except OSError as e:
-            # Fallback: query backends for non-cached entries (e.g., remote-only files)
-            backend_iter = []
-            if resolved.backend_name:
-                backend_iter = [(resolved.backend_name, self.backends.get(resolved.backend_name))]
-            else:
-                backend_iter = list(self.backends.items())
-
-            for bname, backend in backend_iter:
-                if not backend:
-                    continue
-                if not backend.is_available():
-                    # Avoid repeated per-entry reconnect attempts during directory scans.
-                    # Readdir/open paths still probe periodically based on backend cooldown.
-                    if resolved.backend_name:
-                        raise FuseOSError(errno.EHOSTUNREACH)
-                    continue
-                try:
-                    st = backend.stat(resolved.canonical_path)
-                    return {
-                        'st_atime': getattr(st, 'st_atime', time.time()),
-                        'st_ctime': getattr(st, 'st_ctime', getattr(st, 'st_mtime', time.time())),
-                        'st_gid': getattr(st, 'st_gid', os.getgid()),
-                        'st_mode': getattr(st, 'st_mode', stat.S_IFREG | 0o644),
-                        'st_mtime': getattr(st, 'st_mtime', time.time()),
-                        'st_nlink': getattr(st, 'st_nlink', 1),
-                        'st_size': getattr(st, 'st_size', 0),
-                        'st_uid': getattr(st, 'st_uid', os.getuid()),
-                    }
-                except Exception as be:
-                    self.logger.debug(
-                        "getattr backend fallback failed for %s on %s: %s",
-                        resolved.canonical_path,
-                        bname,
-                        be,
-                    )
-
-            available_backends, _ = self._backend_availability()
-            if not available_backends and self.backends:
-                raise FuseOSError(errno.EHOSTUNREACH)
-
-            raise FuseOSError(e.errno)
+        return self.namespace.getattr(path)
 
     def readdir(self, path, fh):
         """Read directory contents"""
-        now = time.monotonic()
-        with self._dir_cache_lock:
-            snapshot = self._readdir_snapshot.get(path)
-        if snapshot and (now - snapshot[0]) <= self._readdir_snapshot_ttl:
-            for entry in snapshot[1]:
-                yield entry
-            return
-
-        cache_path = self.cache_manager.get_cache_path(path)
-
-        entries: Set[str] = {'.', '..'}
-
-        # Get from cache, filtering internal storage artifacts.
-        if cache_path.exists() and cache_path.is_dir():
-            entries.update(
-                entry for entry in os.listdir(str(cache_path))
-                if not self._is_hidden_entry(entry)
-            )
-
-        # Merge listings from backends; cache for fallback on connection issues
-        with self._dir_cache_lock:
-            dir_cache = self._dir_cache.setdefault(path, {})
-
-            for backend_name, backend in self.backends.items():
-                try:
-                    attrs = backend.listdir_attrs(path)
-                    if attrs is None:
-                        backend_entries = set(backend.listdir(path))
-                    else:
-                        backend_entries = {name for name, _ in attrs}
-                    backend_entries = {
-                        e for e in backend_entries if not self._is_hidden_entry(e)
-                    }
-                    entries.update(backend_entries)
-                    dir_cache[backend_name] = backend_entries
-                except Exception as exc:
-                    cached = dir_cache.get(backend_name, set())
-                    if cached:
-                        entries.update(cached)
-                    self.logger.debug(
-                        "readdir fallback for %s on backend %s due to %s", path, backend_name, exc
-                    )
-
-        # Schedule checksum computation in background
-        self._schedule_directory_checksums(path, dir_cache)
-
-        # Apply conflict view using known checksums
-        visible_entries = self._apply_conflict_view(path, entries)
-        ordered_entries = sorted(visible_entries)
-
-        with self._dir_cache_lock:
-            self._readdir_snapshot[path] = (time.monotonic(), ordered_entries)
-
-        for entry in ordered_entries:
+        for entry in self.namespace.readdir(path):
             yield entry
 
     def mkdir(self, path, mode):
         """Create a directory"""
-        resolved = self._resolve_path(path)
-        cache_path = resolved.canonical_cache_path
-
-        try:
-            cache_path.mkdir(parents=True, exist_ok=False)
-            os.chmod(cache_path, mode)
-
-            failures = self._propagate_dir_operation(
-                DirOperation.MKDIR,
-                resolved.canonical_path,
-                backend_hint=resolved.backend_name,
-            )
-
-            parent_dir = resolved.parent_dir
-            self._invalidate_dir_cache_entry(parent_dir)
-            self._invalidate_dir_cache_entry(resolved.canonical_path)
-
-            for failed_backend in failures:
-                self.sync_manager.queue_dir_sync(
-                    resolved.canonical_path,
-                    DirOperation.MKDIR,
-                    mode=mode,
-                    backend_hint=failed_backend,
-                    priority=80,
-                    force=True,
-                )
-
-        except OSError as e:
-            raise FuseOSError(e.errno)
+        self.namespace.mkdir(path, mode)
 
     def rmdir(self, path):
         """Remove a directory"""
-        resolved = self._resolve_path(path)
-        cache_path = resolved.canonical_cache_path
-
-        try:
-            cache_path.rmdir()
-
-            failures = self._propagate_dir_operation(
-                DirOperation.RMDIR,
-                resolved.canonical_path,
-                backend_hint=resolved.backend_name,
-            )
-
-            parent_dir = resolved.parent_dir
-            self._invalidate_dir_cache_entry(parent_dir)
-            self._invalidate_dir_cache_entry(resolved.canonical_path)
-
-            for failed_backend in failures:
-                self.sync_manager.queue_dir_sync(
-                    resolved.canonical_path,
-                    DirOperation.RMDIR,
-                    backend_hint=failed_backend,
-                    priority=80,
-                    force=True,
-                )
-
-        except OSError as e:
-            raise FuseOSError(e.errno)
+        self.namespace.rmdir(path)
 
     def unlink(self, path):
         """Remove a file"""
-        resolved = self._resolve_path(path)
-        cache_path = resolved.cache_path
-
-        try:
-            cache_path.unlink()
-            self.cache_manager.mark_cache_size_dirty()
-
-            parent_dir = resolved.parent_dir
-            self._invalidate_dir_cache_entry(parent_dir)
-            self._invalidate_dir_cache_entry(resolved.canonical_path)
-
-            # Remove from state tracking
-            if not resolved.backend_name:
-                self.state_manager.delete_file(resolved.canonical_path)
-            backend = self.backends.get(resolved.backend_name) if resolved.backend_name else None
-            if backend:
-                try:
-                    backend.delete_file(resolved.canonical_path)
-                except Exception:
-                    pass
-
-        except OSError as e:
-            raise FuseOSError(e.errno)
+        self.namespace.unlink(path)
 
     def rename(self, old, new):
         """Rename a file or directory"""
-        old_resolved = self._resolve_path(old)
-        new_resolved = self._resolve_path(new)
-
-        if old_resolved.backend_name != new_resolved.backend_name:
-            raise FuseOSError(errno.EXDEV)
-
-        old_cache = old_resolved.canonical_cache_path
-        new_cache = new_resolved.canonical_cache_path
-
-        try:
-            new_cache.parent.mkdir(parents=True, exist_ok=True)
-            old_cache.rename(new_cache)
-
-            is_directory = new_cache.is_dir()
-            if is_directory:
-                rename_backend_names = set(self.backends.keys())
-            else:
-                rename_backend_names = self.state_manager.get_location_backends(
-                    old_resolved.canonical_path
-                )
-
-            renamed_entries = self.state_manager.rename_path(
-                old_resolved.canonical_path,
-                new_resolved.canonical_path,
-            )
-
-            failures = self._propagate_dir_operation(
-                DirOperation.RENAME,
-                old_resolved.canonical_path,
-                backend_hint=old_resolved.backend_name,
-                new_path=new_resolved.canonical_path,
-                backend_names=rename_backend_names if not old_resolved.backend_name else None,
-            )
-
-            parent_old = old_resolved.parent_dir
-            parent_new = new_resolved.parent_dir
-            self._invalidate_dir_cache_entry(parent_old)
-            self._invalidate_dir_cache_entry(parent_new)
-            self._invalidate_dir_cache_entry(old_resolved.canonical_path)
-            self._invalidate_dir_cache_entry(new_resolved.canonical_path)
-
-            if renamed_entries:
-                for _, updated in renamed_entries:
-                    metadata = self.state_manager.get_file_metadata(updated)
-                    if metadata and metadata.sync_status == SyncStatus.DIRTY:
-                        self.sync_manager.queue_sync(updated, priority=80, force=True)
-
-            for failed_backend in failures:
-                self.sync_manager.queue_dir_sync(
-                    old_resolved.canonical_path,
-                    DirOperation.RENAME,
-                    new_path=new_resolved.canonical_path,
-                    backend_hint=failed_backend,
-                    priority=90,
-                    force=True,
-                )
-
-        except OSError as e:
-            raise FuseOSError(e.errno)
+        self.namespace.rename(old, new)
 
     def chmod(self, path, mode):
         """Change file mode"""
