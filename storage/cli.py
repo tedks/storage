@@ -27,6 +27,14 @@ DEFAULT_CACHE_SIZE = "10G"
 DEFAULT_SYNC_WORKERS = 2
 DEFAULT_STREAMING_CHUNK_SIZE = "1M"
 DEFAULT_MAX_STREAMING_SESSIONS = 8
+DEFAULT_MOUNT_CONFIG_NAME = "storage.toml"
+
+
+def _default_mount_config_paths() -> Tuple[Path, ...]:
+    return (
+        Path.home() / ".config" / "storage" / DEFAULT_MOUNT_CONFIG_NAME,
+        Path("/etc/storage") / DEFAULT_MOUNT_CONFIG_NAME,
+    )
 
 
 def _load_mount_profile(config_path: Path, profile_name: str) -> Dict[str, Any]:
@@ -168,6 +176,70 @@ def _create_backends(backing_paths: Sequence[str], remote_specs: Sequence[str], 
     return backends
 
 
+def _load_mount_profile_settings(config_path: Path, profile_name: str) -> Dict[str, Any]:
+    config_profile = _load_mount_profile(config_path, profile_name)
+    config_backing_paths, config_remote = _split_backend_specs(_profile_backends(config_profile, profile_name))
+    return {
+        "mountpoint": _require_profile_string(config_profile, "mountpoint", profile_name),
+        "cache": _require_profile_string(config_profile, "cache", profile_name),
+        "cache_size": _optional_profile_string(config_profile, "cache_size", profile_name),
+        "database": _optional_profile_string(config_profile, "database", profile_name),
+        "workers": _optional_profile_int(config_profile, "workers", profile_name),
+        "key_file": _optional_profile_string(config_profile, "key_file", profile_name),
+        "foreground": _optional_profile_bool(config_profile, "foreground", profile_name),
+        "allow_other": _optional_profile_bool(config_profile, "allow_other", profile_name),
+        "debug": _optional_profile_bool(config_profile, "debug", profile_name),
+        "streaming_reads": _optional_profile_bool(config_profile, "streaming_reads", profile_name),
+        "streaming_chunk_size": _optional_profile_string(config_profile, "streaming_chunk_size", profile_name),
+        "max_streaming_sessions": _optional_profile_int(config_profile, "max_streaming_sessions", profile_name),
+        "backing_paths": config_backing_paths,
+        "remote": config_remote,
+    }
+
+
+def _target_looks_like_profile_name(mount_target: Optional[str]) -> bool:
+    if not mount_target:
+        return False
+    if mount_target.startswith(("/", ".", "~")):
+        return False
+    return "/" not in mount_target
+
+
+def _can_auto_load_mount_profile(
+    mount_target: Optional[str],
+    backing_paths: Sequence[str],
+    cache: Optional[str],
+    cache_size: Optional[str],
+    database: Optional[str],
+    workers: Optional[int],
+    remote: Sequence[str],
+    key_file: Optional[str],
+    foreground: Optional[bool],
+    allow_other: Optional[bool],
+    debug: Optional[bool],
+    streaming_reads: Optional[bool],
+    streaming_chunk_size: Optional[str],
+    max_streaming_sessions: Optional[int],
+) -> bool:
+    if not _target_looks_like_profile_name(mount_target):
+        return False
+    return not any((
+        backing_paths,
+        cache,
+        cache_size,
+        database,
+        workers is not None,
+        remote,
+        key_file,
+        foreground is not None,
+        allow_other is not None,
+        debug is not None,
+        streaming_reads is not None,
+        streaming_chunk_size,
+        max_streaming_sessions is not None,
+    ))
+
+
 @main.command()
 @click.argument('mount_target', required=False)
 @click.argument('backing_paths', nargs=-1, required=False)
@@ -212,77 +284,107 @@ def mount(mount_target, backing_paths, config_path, cache, cache_size, database,
           --remote ssh://host1:/path1 \\
           --remote ssh://host2:/path2
 
+        # Auto-discovered profile from ~/.config/storage/storage.toml
+        storage mount drynwyn-warez
+
         # TOML-configured mount
-        storage mount --config ~/.config/storage/config.toml drynwyn-warez
+        storage mount --config ~/.config/storage/storage.toml drynwyn-warez
     """
+    config_values = {
+        "mountpoint": None,
+        "cache": None,
+        "cache_size": None,
+        "database": None,
+        "workers": None,
+        "key_file": None,
+        "foreground": None,
+        "allow_other": None,
+        "debug": None,
+        "streaming_reads": None,
+        "streaming_chunk_size": None,
+        "max_streaming_sessions": None,
+        "backing_paths": (),
+        "remote": (),
+    }
     profile_name = None
     if config_path is not None:
         if not mount_target:
             raise click.ClickException("Provide the named mount profile when using --config")
         profile_name = mount_target
-        config_profile = _load_mount_profile(config_path, profile_name)
-        config_mountpoint = _require_profile_string(config_profile, "mountpoint", profile_name)
-        config_cache = _require_profile_string(config_profile, "cache", profile_name)
-        config_cache_size = _optional_profile_string(config_profile, "cache_size", profile_name)
-        config_database = _optional_profile_string(config_profile, "database", profile_name)
-        config_workers = _optional_profile_int(config_profile, "workers", profile_name)
-        config_key_file = _optional_profile_string(config_profile, "key_file", profile_name)
-        config_foreground = _optional_profile_bool(config_profile, "foreground", profile_name)
-        config_allow_other = _optional_profile_bool(config_profile, "allow_other", profile_name)
-        config_debug = _optional_profile_bool(config_profile, "debug", profile_name)
-        config_streaming_reads = _optional_profile_bool(config_profile, "streaming_reads", profile_name)
-        config_streaming_chunk_size = _optional_profile_string(config_profile, "streaming_chunk_size", profile_name)
-        config_max_streaming_sessions = _optional_profile_int(config_profile, "max_streaming_sessions", profile_name)
-        config_backing_paths, config_remote = _split_backend_specs(_profile_backends(config_profile, profile_name))
-    else:
-        config_mountpoint = None
-        config_cache = None
-        config_cache_size = None
-        config_database = None
-        config_workers = None
-        config_key_file = None
-        config_foreground = None
-        config_allow_other = None
-        config_debug = None
-        config_streaming_reads = None
-        config_streaming_chunk_size = None
-        config_max_streaming_sessions = None
-        config_backing_paths = ()
-        config_remote = ()
+        config_values = _load_mount_profile_settings(config_path, profile_name)
+    elif _can_auto_load_mount_profile(
+        mount_target,
+        backing_paths,
+        cache,
+        cache_size,
+        database,
+        workers,
+        remote,
+        key_file,
+        foreground,
+        allow_other,
+        debug,
+        streaming_reads,
+        streaming_chunk_size,
+        max_streaming_sessions,
+    ):
+        available_configs = [candidate for candidate in _default_mount_config_paths() if candidate.exists()]
+        if available_configs:
+            profile_name = mount_target
+            for candidate in available_configs:
+                try:
+                    config_values = _load_mount_profile_settings(candidate, profile_name)
+                    config_path = candidate
+                    break
+                except click.ClickException as exc:
+                    if f"Mount profile '{profile_name}' not found" in str(exc):
+                        continue
+                    raise
+            if config_path is None:
+                searched = ", ".join(str(path) for path in available_configs)
+                raise click.ClickException(
+                    f"Mount profile '{profile_name}' not found in default config files: {searched}"
+                )
 
-    mountpoint = config_mountpoint if config_mountpoint is not None else mount_target
+    mountpoint = config_values["mountpoint"] if config_values["mountpoint"] is not None else mount_target
     if not mountpoint:
         raise click.ClickException("Missing mountpoint. Provide one directly or load it from --config.")
 
-    cache = cache or config_cache
+    cache = cache or config_values["cache"]
     if not cache:
         raise click.ClickException("Missing cache directory. Provide --cache or set 'cache' in the mount profile.")
 
-    cache_size = cache_size or config_cache_size or DEFAULT_CACHE_SIZE
-    database = database or config_database
-    workers = workers if workers is not None else (config_workers if config_workers is not None else DEFAULT_SYNC_WORKERS)
-    key_file = key_file or config_key_file
-    foreground = foreground if foreground is not None else (config_foreground if config_foreground is not None else False)
-    allow_other = allow_other if allow_other is not None else config_allow_other
-    debug = debug if debug is not None else (config_debug if config_debug is not None else False)
+    cache_size = cache_size or config_values["cache_size"] or DEFAULT_CACHE_SIZE
+    database = database or config_values["database"]
+    workers = workers if workers is not None else (
+        config_values["workers"] if config_values["workers"] is not None else DEFAULT_SYNC_WORKERS
+    )
+    key_file = key_file or config_values["key_file"]
+    foreground = foreground if foreground is not None else (
+        config_values["foreground"] if config_values["foreground"] is not None else False
+    )
+    allow_other = allow_other if allow_other is not None else config_values["allow_other"]
+    debug = debug if debug is not None else (
+        config_values["debug"] if config_values["debug"] is not None else False
+    )
     streaming_reads = (
         streaming_reads if streaming_reads is not None
-        else (config_streaming_reads if config_streaming_reads is not None else True)
+        else (config_values["streaming_reads"] if config_values["streaming_reads"] is not None else True)
     )
     streaming_chunk_size = (
-        streaming_chunk_size or config_streaming_chunk_size or DEFAULT_STREAMING_CHUNK_SIZE
+        streaming_chunk_size or config_values["streaming_chunk_size"] or DEFAULT_STREAMING_CHUNK_SIZE
     )
     max_streaming_sessions = (
         max_streaming_sessions
         if max_streaming_sessions is not None
         else (
-            config_max_streaming_sessions
-            if config_max_streaming_sessions is not None
+            config_values["max_streaming_sessions"]
+            if config_values["max_streaming_sessions"] is not None
             else DEFAULT_MAX_STREAMING_SESSIONS
         )
     )
-    backing_paths = tuple(backing_paths) if backing_paths else config_backing_paths
-    remote = tuple(remote) if remote else config_remote
+    backing_paths = tuple(backing_paths) if backing_paths else config_values["backing_paths"]
+    remote = tuple(remote) if remote else config_values["remote"]
 
     # Parse cache size
     try:

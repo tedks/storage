@@ -18,7 +18,7 @@ class TestMountConfigCLI(unittest.TestCase):
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     def test_mount_uses_named_profile_from_toml_config(self):
-        config_path = self.temp_dir / "config.toml"
+        config_path = self.temp_dir / "storage.toml"
         config_path.write_text(
             """
 [mounts.drynwyn-warez]
@@ -62,12 +62,41 @@ backends = [
         self.assertEqual(2 * 1024 ** 2, kwargs["streaming_chunk_size"])
         self.assertEqual(16, kwargs["max_streaming_sessions"])
 
+    def test_mount_auto_loads_default_storage_toml(self):
+        home_dir = self.temp_dir / "home"
+        config_dir = home_dir / ".config" / "storage"
+        config_dir.mkdir(parents=True)
+        config_path = config_dir / "storage.toml"
+        config_path.write_text(
+            """
+[mounts.auto-profile]
+mountpoint = "/tmp/auto-profile"
+cache = "/tmp/auto-cache"
+backends = [
+  "ssh://tedks@drynwyn.local:/srv/raid/warez/",
+]
+""".strip()
+        )
+
+        with patch("storage.cli.mount_storage") as mock_mount:
+            result = self.runner.invoke(
+                main,
+                ["mount", "auto-profile"],
+                env={"HOME": str(home_dir)},
+            )
+
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        self.assertIn(f"Loaded mount profile: auto-profile ({config_path})", result.output)
+        mock_mount.assert_called_once()
+        self.assertEqual("/tmp/auto-profile", mock_mount.call_args.args[0])
+        self.assertEqual(Path("/tmp/auto-cache"), mock_mount.call_args.args[1])
+
     def test_mount_cli_flags_override_profile_values(self):
         local_backend = self.temp_dir / "local-backend"
         local_backend.mkdir()
         cache_dir = self.temp_dir / "cache"
         mount_dir = self.temp_dir / "mount"
-        config_path = self.temp_dir / "config.toml"
+        config_path = self.temp_dir / "storage.toml"
         config_path.write_text(
             f"""
 [mounts.override-me]
@@ -117,7 +146,7 @@ backends = [
         self.assertEqual(4, kwargs["num_sync_workers"])
 
     def test_mount_fails_when_named_profile_is_missing(self):
-        config_path = self.temp_dir / "config.toml"
+        config_path = self.temp_dir / "storage.toml"
         config_path.write_text(
             """
 [mounts.other]

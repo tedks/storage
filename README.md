@@ -107,7 +107,13 @@ backends = [
 ]
 ```
 
-Mount a named profile with:
+Save that as `~/.config/storage/storage.toml` to auto-load by name:
+
+```bash
+storage mount drynwyn-warez
+```
+
+Or mount from an explicit TOML path:
 
 ```bash
 storage mount --config ./storage.example.toml drynwyn-warez
