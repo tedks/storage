@@ -324,11 +324,85 @@ class TestReaddirMerging(unittest.TestCase):
         self.assertTrue(self._wait_for(lambda: not self.backend1_dir.joinpath('dir').exists()))
         self.assertTrue(self._wait_for(lambda: self.backend1_dir.joinpath('renamed').is_dir()))
         self.assertTrue(self._wait_for(lambda: self.backend1_dir.joinpath('renamed', 'file.txt').exists()))
+        self.assertTrue(self._wait_for(lambda: not self.backend2_dir.joinpath('dir').exists()))
+        self.assertTrue(self._wait_for(lambda: self.backend2_dir.joinpath('renamed').is_dir()))
 
         old_meta = self.fs.state_manager.get_file_metadata('/dir/file.txt')
         new_meta = self.fs.state_manager.get_file_metadata('/renamed/file.txt')
         self.assertIsNone(old_meta)
         self.assertIsNotNone(new_meta)
+
+        entries = set(self.fs.readdir('/', None))
+        self.assertIn('renamed', entries)
+        self.assertNotIn('dir', entries)
+
+    def test_rename_file_targets_only_backends_with_existing_location(self):
+        vfd = self.fs.create('/staged.tmp', 0o644)
+        data = b'staged-data'
+        self.fs.write('/staged.tmp', data, 0, vfd)
+        self.fs.release('/staged.tmp', vfd)
+
+        self.assertTrue(self.fs.sync_manager.sync_now('/staged.tmp', timeout=5.0))
+
+        remote_locations = [
+            loc.backend_name
+            for loc in self.fs.state_manager.get_file_locations('/staged.tmp')
+            if not loc.is_cached
+        ]
+        self.assertEqual(1, len(remote_locations))
+        remote_backend = remote_locations[0]
+        untouched_backend = 'backend2' if remote_backend == 'backend1' else 'backend1'
+
+        original_remote_rename = self.backends[remote_backend].rename
+
+        with patch.object(
+            self.backends[remote_backend],
+            'rename',
+            wraps=original_remote_rename,
+        ) as rename_remote, patch.object(
+            self.backends[untouched_backend],
+            'rename',
+            side_effect=AssertionError("rename should not fan out to backends without the file"),
+        ):
+            self.fs.rename('/staged.tmp', '/final.txt')
+
+        rename_remote.assert_called_once_with('/staged.tmp', '/final.txt')
+        self.assertTrue(self.backends[remote_backend].exists('/final.txt'))
+        self.assertFalse(self.backends[remote_backend].exists('/staged.tmp'))
+
+        new_locations = [
+            loc.backend_name
+            for loc in self.fs.state_manager.get_file_locations('/final.txt')
+            if not loc.is_cached
+        ]
+        self.assertEqual([remote_backend], new_locations)
+
+    def test_sync_start_initializes_fd_tracking_before_worker_callbacks(self):
+        temp_dir = Path(tempfile.mkdtemp())
+        cache_dir = temp_dir / "cache"
+        cache_dir.mkdir()
+        backend_dir = temp_dir / "backend"
+        backend_dir.mkdir()
+        state_db = temp_dir / "state.db"
+        callback_results = []
+
+        def start_side_effect(sync_manager):
+            callback_results.append(sync_manager._should_sync_path_cb('/dirty.txt'))
+
+        try:
+            with patch('storage.fs.SyncManager.start', autospec=True, side_effect=start_side_effect):
+                fs = StorageFS(
+                    cache_root=cache_dir,
+                    state_db=state_db,
+                    backends={"backend": LocalBackend("backend", str(backend_dir))},
+                    cache_size=10 * 1024 * 1024,
+                    num_sync_workers=1,
+                )
+            fs.state_manager.close()
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+        self.assertEqual([True], callback_results)
 
     def test_mkdir_retry_targets_failed_backend(self):
         path = '/needretry'

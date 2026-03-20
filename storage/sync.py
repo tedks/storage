@@ -11,7 +11,7 @@ import queue
 import logging
 from enum import Enum
 from pathlib import Path
-from typing import Dict, Optional, Set, Union, Tuple, List
+from typing import Callable, Dict, Optional, Set, Union, Tuple, List
 from dataclasses import dataclass, field
 
 from .backends.base import Backend
@@ -85,7 +85,7 @@ class SyncWorker(threading.Thread):
     def __init__(self, worker_id: int, task_queue: queue.PriorityQueue,
                  state_manager: StateManager, cache_manager: CacheManager,
                  replication_manager: ReplicationManager, config: SyncConfig,
-                 task_complete_cb=None):
+                 task_complete_cb=None, should_sync_path_cb: Optional[Callable[[str], bool]] = None):
         super().__init__(daemon=True, name=f"SyncWorker-{worker_id}")
         self.worker_id = worker_id
         self.task_queue = task_queue
@@ -102,6 +102,7 @@ class SyncWorker(threading.Thread):
             'conflicts': 0
         }
         self._task_complete_cb = task_complete_cb
+        self._should_sync_path_cb = should_sync_path_cb
 
     def run(self):
         """Main worker loop"""
@@ -153,18 +154,22 @@ class SyncWorker(threading.Thread):
         metadata = self.state_manager.get_file_metadata(task.virtual_path)
         if not metadata:
             logger.warning(f"No metadata for {task.virtual_path}, skipping")
-            return
+            return True
 
         # Skip if already clean
         if metadata.sync_status == SyncStatus.CLEAN:
             logger.debug(f"{task.virtual_path} already clean, skipping")
-            return
+            return True
+
+        if self._should_sync_path_cb and not self._should_sync_path_cb(task.virtual_path):
+            logger.debug("Deferring sync for busy path %s", task.virtual_path)
+            return True
 
         # Get cache path
         cache_path = self.cache_manager.get_cache_path(task.virtual_path)
         if not cache_path.exists():
             logger.warning(f"Cache file missing for {task.virtual_path}")
-            return
+            return True
 
         # Mark as syncing
         metadata.sync_status = SyncStatus.SYNCING
@@ -330,7 +335,8 @@ class SyncManager:
 
     def __init__(self, state_manager: StateManager, cache_manager: CacheManager,
                  replication_manager: ReplicationManager, num_workers: int = 2,
-                 config: Optional[SyncConfig] = None):
+                 config: Optional[SyncConfig] = None,
+                 should_sync_path_cb: Optional[Callable[[str], bool]] = None):
         """
         Initialize sync manager
 
@@ -346,6 +352,7 @@ class SyncManager:
         self.replication_manager = replication_manager
         self.num_workers = num_workers
         self.config = config or SyncConfig()
+        self._should_sync_path_cb = should_sync_path_cb
 
         # Task queue (priority queue)
         self.task_queue = queue.PriorityQueue()
@@ -371,7 +378,8 @@ class SyncManager:
             worker = SyncWorker(
                 i, self.task_queue, self.state_manager,
                 self.cache_manager, self.replication_manager,
-                self.config, self._task_complete
+                self.config, self._task_complete,
+                should_sync_path_cb=self._should_sync_path_cb
             )
             worker.start()
             self.workers.append(worker)
@@ -417,6 +425,8 @@ class SyncManager:
 
                 # Queue new tasks
                 for metadata in dirty_files:
+                    if self._should_sync_path_cb and not self._should_sync_path_cb(metadata.virtual_path):
+                        continue
                     self.queue_sync(metadata.virtual_path, priority=50)
 
                 # Sleep before next check

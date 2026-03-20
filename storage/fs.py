@@ -136,12 +136,18 @@ class StorageFS(Operations):
         self._control_socket: Optional[socket.socket] = None
         self._control_thread: Optional[threading.Thread] = None
 
+        # File descriptor tracking
+        self._fd_counter = 0
+        self._fd_map: Dict[int, FDEntry] = {}
+        self._fd_lock = threading.Lock()
+
         # Background sync manager
         self.sync_manager = SyncManager(
             self.state_manager,
             self.cache_manager,
             self.replication_manager,
-            num_workers=num_sync_workers
+            num_workers=num_sync_workers,
+            should_sync_path_cb=self._should_sync_path,
         )
         self._sync_started = False
         if start_sync:
@@ -150,11 +156,6 @@ class StorageFS(Operations):
 
         # Recomputation engine
         self.recompute_engine = RecomputeEngine(self.state_manager)
-
-        # File descriptor tracking
-        self._fd_counter = 0
-        self._fd_map: Dict[int, FDEntry] = {}
-        self._fd_lock = threading.Lock()
 
         # Directory listing cache (per directory, per backend) for fallback when backend unavailable
         self._dir_cache: Dict[str, Dict[str, Set[str]]] = {}
@@ -189,6 +190,18 @@ class StorageFS(Operations):
         """Get configuration for a file"""
         cache_path = self.cache_manager.get_cache_path(virtual_path)
         return self.state_manager.get_inherited_config(cache_path)
+
+    def _should_sync_path(self, virtual_path: str) -> bool:
+        """Only sync paths that do not currently have an open writer."""
+        with self._fd_lock:
+            for entry in self._fd_map.values():
+                if entry.canonical_path != virtual_path:
+                    continue
+                if entry.prefetch_session is not None:
+                    continue
+                if (entry.flags & os.O_ACCMODE) != os.O_RDONLY:
+                    return False
+        return True
 
     def _backend_availability(self) -> Tuple[List[str], List[str]]:
         """Return backend names split by current availability."""
@@ -266,19 +279,27 @@ class StorageFS(Operations):
             self._dir_cache.pop(path, None)
             self._readdir_snapshot.pop(path, None)
 
-    def _get_target_backends(self, backend_hint: Optional[str]) -> List[Backend]:
+    def _get_target_backends(self, backend_hint: Optional[str],
+                             backend_names: Optional[Set[str]] = None) -> List[Backend]:
         """Return the backend instances affected by an operation."""
         if backend_hint:
             backend = self.backends.get(backend_hint)
             return [backend] if backend else []
+        if backend_names is not None:
+            return [
+                backend
+                for name, backend in self.backends.items()
+                if name in backend_names
+            ]
         return list(self.backends.values())
 
     def _propagate_dir_operation(self, operation: DirOperation, path: str,
                                  backend_hint: Optional[str] = None,
-                                 new_path: Optional[str] = None) -> List[str]:
+                                 new_path: Optional[str] = None,
+                                 backend_names: Optional[Set[str]] = None) -> List[str]:
         """Best-effort synchronous propagation; returns backend names that failed."""
         failures: List[str] = []
-        for backend in self._get_target_backends(backend_hint):
+        for backend in self._get_target_backends(backend_hint, backend_names=backend_names):
             if not backend:
                 continue
             try:
@@ -1573,15 +1594,20 @@ class StorageFS(Operations):
             new_cache.parent.mkdir(parents=True, exist_ok=True)
             old_cache.rename(new_cache)
 
-            renamed_entries = self.state_manager.rename_path(old_canonical, new_canonical)
-
             is_directory = new_cache.is_dir()
+            if is_directory:
+                rename_backend_names = set(self.backends.keys())
+            else:
+                rename_backend_names = self.state_manager.get_location_backends(old_canonical)
+
+            renamed_entries = self.state_manager.rename_path(old_canonical, new_canonical)
 
             failures = self._propagate_dir_operation(
                 DirOperation.RENAME,
                 old_canonical,
                 backend_hint=old_backend,
                 new_path=new_canonical,
+                backend_names=rename_backend_names if not old_backend else None,
             )
 
             parent_old = str(Path(old_canonical).parent)
