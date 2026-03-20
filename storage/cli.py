@@ -8,8 +8,9 @@ import subprocess
 import shutil
 import json
 import socket
+import tomllib
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, Optional, Sequence, Tuple
 
 from .backends.local import LocalBackend
 from .backends.ssh import SSHBackend
@@ -22,31 +23,178 @@ def main():
     pass
 
 
+DEFAULT_CACHE_SIZE = "10G"
+DEFAULT_SYNC_WORKERS = 2
+DEFAULT_STREAMING_CHUNK_SIZE = "1M"
+DEFAULT_MAX_STREAMING_SESSIONS = 8
+
+
+def _load_mount_profile(config_path: Path, profile_name: str) -> Dict[str, Any]:
+    try:
+        with config_path.open("rb") as fh:
+            data = tomllib.load(fh)
+    except FileNotFoundError as exc:
+        raise click.ClickException(f"Mount config file not found: {config_path}") from exc
+    except tomllib.TOMLDecodeError as exc:
+        raise click.ClickException(f"Invalid TOML in mount config {config_path}: {exc}") from exc
+
+    profile: Optional[Dict[str, Any]] = None
+    mounts = data.get("mounts")
+    if isinstance(mounts, dict):
+        candidate = mounts.get(profile_name)
+        if isinstance(candidate, dict):
+            profile = candidate
+
+    if profile is None:
+        candidate = data.get(profile_name)
+        if isinstance(candidate, dict):
+            profile = candidate
+
+    if profile is None:
+        raise click.ClickException(
+            f"Mount profile '{profile_name}' not found in {config_path}"
+        )
+
+    return profile
+
+
+def _require_profile_string(profile: Dict[str, Any], key: str, profile_name: str) -> str:
+    value = profile.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise click.ClickException(
+            f"Mount profile '{profile_name}' must define a non-empty string '{key}'"
+        )
+    return value
+
+
+def _optional_profile_string(profile: Dict[str, Any], key: str, profile_name: str) -> Optional[str]:
+    value = profile.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise click.ClickException(
+            f"Mount profile '{profile_name}' must define '{key}' as a non-empty string when present"
+        )
+    return value
+
+
+def _optional_profile_int(profile: Dict[str, Any], key: str, profile_name: str) -> Optional[int]:
+    value = profile.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, int):
+        raise click.ClickException(
+            f"Mount profile '{profile_name}' must define '{key}' as an integer when present"
+        )
+    return value
+
+
+def _optional_profile_bool(profile: Dict[str, Any], key: str, profile_name: str) -> Optional[bool]:
+    value = profile.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, bool):
+        raise click.ClickException(
+            f"Mount profile '{profile_name}' must define '{key}' as a boolean when present"
+        )
+    return value
+
+
+def _profile_backends(profile: Dict[str, Any], profile_name: str) -> Tuple[str, ...]:
+    raw = profile.get("backends")
+    if raw is None:
+        return ()
+    if not isinstance(raw, list) or not all(isinstance(item, str) and item.strip() for item in raw):
+        raise click.ClickException(
+            f"Mount profile '{profile_name}' must define 'backends' as a list of non-empty strings"
+        )
+    return tuple(raw)
+
+
+def _split_backend_specs(backend_specs: Sequence[str]) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
+    local_backends = []
+    remote_backends = []
+    for spec in backend_specs:
+        if spec.startswith("ssh://"):
+            remote_backends.append(spec)
+        else:
+            local_backends.append(spec)
+    return tuple(local_backends), tuple(remote_backends)
+
+
+def _create_backends(backing_paths: Sequence[str], remote_specs: Sequence[str], key_file: Optional[str]):
+    backends = {}
+
+    for i, path in enumerate(backing_paths):
+        try:
+            name = f"local{i}"
+            backend = LocalBackend(name, path, speed_priority=i * 10)
+            backends[name] = backend
+            click.echo(f"Added local backend: {name} -> {path} (priority: {i * 10})")
+        except ValueError as exc:
+            raise click.ClickException(str(exc)) from exc
+
+    for i, remote_spec in enumerate(remote_specs):
+        try:
+            name = f"remote{i}"
+            if not remote_spec.startswith('ssh://'):
+                raise click.ClickException("Remote backend must start with ssh://")
+
+            spec = remote_spec[6:]
+            if '@' not in spec or ':' not in spec:
+                raise click.ClickException("Invalid remote format. Use ssh://user@host:/path")
+
+            user_host, remote_path = spec.split(':', 1)
+            username, host = user_host.split('@', 1)
+
+            backend = SSHBackend(
+                name=name,
+                host=host,
+                remote_path=remote_path,
+                username=username,
+                key_filename=key_file,
+                speed_priority=50 + i * 10,
+            )
+            backends[name] = backend
+            click.echo(f"Added SSH backend: {name} -> {username}@{host}:{remote_path} (priority: {50 + i * 10})")
+        except click.ClickException:
+            raise
+        except Exception as exc:
+            raise click.ClickException(f"Error adding remote backend {remote_spec}: {exc}") from exc
+
+    if not backends:
+        raise click.ClickException("No valid backing filesystems provided")
+
+    return backends
+
+
 @main.command()
-@click.argument('mountpoint', type=click.Path())
+@click.argument('mount_target', required=False)
 @click.argument('backing_paths', nargs=-1, required=False)
-@click.option('-c', '--cache', required=True, help='Local cache directory')
-@click.option('-s', '--cache-size', default='10G', help='Cache size (e.g., 10G, 500M)')
+@click.option('--config', 'config_path', type=click.Path(exists=True, dir_okay=False, path_type=Path),
+              help='Load a named mount profile from a TOML config file.')
+@click.option('-c', '--cache', help='Local cache directory')
+@click.option('-s', '--cache-size', help='Cache size (e.g., 10G, 500M)')
 @click.option('-d', '--database', help='State database path (default: cache/.storage.db)')
-@click.option('-w', '--workers', default=2, help='Number of sync worker threads')
+@click.option('-w', '--workers', type=int, help='Number of sync worker threads')
 @click.option('-r', '--remote', multiple=True, help='Remote backend (ssh://user@host:/path)')
 @click.option('-k', '--key-file', help='SSH private key file')
-@click.option('-f', '--foreground', is_flag=True, help='Run in foreground')
+@click.option('-f', '--foreground', is_flag=True, default=None, help='Run in foreground')
 @click.option('--allow-other/--no-allow-other', default=None,
               help='Allow other users to access mount (requires root or fuse.conf setting). Auto-detects if not specified.')
-@click.option('--debug', is_flag=True, help='Enable verbose debug logging')
-@click.option('--streaming-reads/--no-streaming-reads', default=True,
+@click.option('--debug', is_flag=True, default=None, help='Enable verbose debug logging')
+@click.option('--streaming-reads/--no-streaming-reads', default=None,
               help='Stream uncached reads while prefetching files in the background.')
-@click.option('--streaming-chunk-size', default='1M',
+@click.option('--streaming-chunk-size',
               help='Chunk size for streaming range reads (e.g., 256K, 1M).')
-@click.option('--max-streaming-sessions', default=8, type=int,
+@click.option('--max-streaming-sessions', type=int,
               help='Maximum number of concurrent streaming prefetch sessions.')
-def mount(mountpoint, backing_paths, cache, cache_size, database, workers, remote, key_file, foreground,
+def mount(mount_target, backing_paths, config_path, cache, cache_size, database, workers, remote, key_file, foreground,
           allow_other, debug, streaming_reads, streaming_chunk_size, max_streaming_sessions):
     """
     Mount a Storage filesystem
 
-    MOUNTPOINT: Where to mount the Storage filesystem
+    MOUNT_TARGET: Mountpoint path, or a named profile when --config is used
     BACKING_PATHS: Zero or more local backing filesystem paths (optional)
 
     Remote backends can be specified with --remote:
@@ -63,19 +211,89 @@ def mount(mountpoint, backing_paths, cache, cache_size, database, workers, remot
           -c /var/cache/storage -s 5G \\
           --remote ssh://host1:/path1 \\
           --remote ssh://host2:/path2
+
+        # TOML-configured mount
+        storage mount --config ~/.config/storage/config.toml drynwyn-warez
     """
+    profile_name = None
+    if config_path is not None:
+        if not mount_target:
+            raise click.ClickException("Provide the named mount profile when using --config")
+        profile_name = mount_target
+        config_profile = _load_mount_profile(config_path, profile_name)
+        config_mountpoint = _require_profile_string(config_profile, "mountpoint", profile_name)
+        config_cache = _require_profile_string(config_profile, "cache", profile_name)
+        config_cache_size = _optional_profile_string(config_profile, "cache_size", profile_name)
+        config_database = _optional_profile_string(config_profile, "database", profile_name)
+        config_workers = _optional_profile_int(config_profile, "workers", profile_name)
+        config_key_file = _optional_profile_string(config_profile, "key_file", profile_name)
+        config_foreground = _optional_profile_bool(config_profile, "foreground", profile_name)
+        config_allow_other = _optional_profile_bool(config_profile, "allow_other", profile_name)
+        config_debug = _optional_profile_bool(config_profile, "debug", profile_name)
+        config_streaming_reads = _optional_profile_bool(config_profile, "streaming_reads", profile_name)
+        config_streaming_chunk_size = _optional_profile_string(config_profile, "streaming_chunk_size", profile_name)
+        config_max_streaming_sessions = _optional_profile_int(config_profile, "max_streaming_sessions", profile_name)
+        config_backing_paths, config_remote = _split_backend_specs(_profile_backends(config_profile, profile_name))
+    else:
+        config_mountpoint = None
+        config_cache = None
+        config_cache_size = None
+        config_database = None
+        config_workers = None
+        config_key_file = None
+        config_foreground = None
+        config_allow_other = None
+        config_debug = None
+        config_streaming_reads = None
+        config_streaming_chunk_size = None
+        config_max_streaming_sessions = None
+        config_backing_paths = ()
+        config_remote = ()
+
+    mountpoint = config_mountpoint if config_mountpoint is not None else mount_target
+    if not mountpoint:
+        raise click.ClickException("Missing mountpoint. Provide one directly or load it from --config.")
+
+    cache = cache or config_cache
+    if not cache:
+        raise click.ClickException("Missing cache directory. Provide --cache or set 'cache' in the mount profile.")
+
+    cache_size = cache_size or config_cache_size or DEFAULT_CACHE_SIZE
+    database = database or config_database
+    workers = workers if workers is not None else (config_workers if config_workers is not None else DEFAULT_SYNC_WORKERS)
+    key_file = key_file or config_key_file
+    foreground = foreground if foreground is not None else (config_foreground if config_foreground is not None else False)
+    allow_other = allow_other if allow_other is not None else config_allow_other
+    debug = debug if debug is not None else (config_debug if config_debug is not None else False)
+    streaming_reads = (
+        streaming_reads if streaming_reads is not None
+        else (config_streaming_reads if config_streaming_reads is not None else True)
+    )
+    streaming_chunk_size = (
+        streaming_chunk_size or config_streaming_chunk_size or DEFAULT_STREAMING_CHUNK_SIZE
+    )
+    max_streaming_sessions = (
+        max_streaming_sessions
+        if max_streaming_sessions is not None
+        else (
+            config_max_streaming_sessions
+            if config_max_streaming_sessions is not None
+            else DEFAULT_MAX_STREAMING_SESSIONS
+        )
+    )
+    backing_paths = tuple(backing_paths) if backing_paths else config_backing_paths
+    remote = tuple(remote) if remote else config_remote
+
     # Parse cache size
     try:
         cache_size_bytes = parse_size(cache_size)
-    except ValueError as e:
-        click.echo(f"Error: Invalid cache size: {e}", err=True)
-        sys.exit(1)
+    except ValueError as exc:
+        raise click.ClickException(f"Invalid cache size: {exc}") from exc
 
     try:
         streaming_chunk_bytes = parse_size(streaming_chunk_size)
-    except ValueError as e:
-        click.echo(f"Error: Invalid streaming chunk size: {e}", err=True)
-        sys.exit(1)
+    except ValueError as exc:
+        raise click.ClickException(f"Invalid streaming chunk size: {exc}") from exc
 
     # Setup paths
     cache_root = Path(cache).resolve()
@@ -89,64 +307,10 @@ def mount(mountpoint, backing_paths, cache, cache_size, database, workers, remot
     mountpoint_path = Path(mountpoint)
     mountpoint_path.mkdir(parents=True, exist_ok=True)
 
-    # Create backends
-    backends = {}
-    backend_count = 0
+    backends = _create_backends(backing_paths, remote, key_file)
 
-    # Add local backends
-    for i, path in enumerate(backing_paths):
-        try:
-            name = f"local{i}"
-            # Local backends get speed priority based on order (assuming first is fastest)
-            backend = LocalBackend(name, path, speed_priority=i * 10)
-            backends[name] = backend
-            backend_count += 1
-            click.echo(f"Added local backend: {name} -> {path} (priority: {i * 10})")
-        except ValueError as e:
-            click.echo(f"Error: {e}", err=True)
-            sys.exit(1)
-
-    # Add remote backends
-    for i, remote_spec in enumerate(remote):
-        try:
-            name = f"remote{i}"
-            # Parse ssh://user@host:/path
-            if not remote_spec.startswith('ssh://'):
-                click.echo(f"Error: Remote backend must start with ssh://", err=True)
-                sys.exit(1)
-
-            # Remove ssh:// prefix
-            spec = remote_spec[6:]
-
-            # Parse user@host:/path
-            if '@' not in spec or ':' not in spec:
-                click.echo(f"Error: Invalid remote format. Use ssh://user@host:/path", err=True)
-                sys.exit(1)
-
-            user_host, remote_path = spec.split(':', 1)
-            username, host = user_host.split('@', 1)
-
-            # Create SSH backend
-            backend = SSHBackend(
-                name=name,
-                host=host,
-                remote_path=remote_path,
-                username=username,
-                key_filename=key_file,
-                speed_priority=50 + i * 10  # Remote backends are slower
-            )
-            backends[name] = backend
-            backend_count += 1
-            click.echo(f"Added SSH backend: {name} -> {username}@{host}:{remote_path} (priority: {50 + i * 10})")
-
-        except Exception as e:
-            click.echo(f"Error adding remote backend {remote_spec}: {e}", err=True)
-            sys.exit(1)
-
-    if not backends:
-        click.echo("Error: No valid backing filesystems provided", err=True)
-        sys.exit(1)
-
+    if profile_name is not None:
+        click.echo(f"Loaded mount profile: {profile_name} ({config_path})")
     click.echo(f"\nMounting Storage filesystem:")
     click.echo(f"  Mountpoint: {mountpoint}")
     click.echo(f"  Cache: {cache_root}")
