@@ -146,7 +146,7 @@ class TestResilienceGradient(unittest.TestCase):
             return
 
         if state == "full":
-            self.assertTrue(runtime.fs._ensure_file_in_cache(path, path))
+            self.assertTrue(runtime.fs._ensure_file_in_cache(runtime.fs._resolve_path(path)))
             return
 
         if state == "partial":
@@ -185,7 +185,7 @@ class TestResilienceGradient(unittest.TestCase):
 
     def test_invariant_cached_open_never_requires_remote(self):
         payload = self._write_remote_file("/cached.bin", 64 * 1024)
-        self.assertTrue(self.rt.fs._ensure_file_in_cache("/cached.bin", "/cached.bin"))
+        self.assertTrue(self.rt.fs._ensure_file_in_cache(self.rt.fs._resolve_path("/cached.bin")))
 
         self.rt.backend.set_available(False)
         with patch.object(self.rt.backend, "exists", side_effect=AssertionError("remote exists() must not be called")):
@@ -363,7 +363,7 @@ class TestResilienceGradient(unittest.TestCase):
 
     def test_offline_cached_open_read_is_fast(self):
         payload = self._write_remote_file("/fast.bin", 64 * 1024)
-        self.assertTrue(self.rt.fs._ensure_file_in_cache("/fast.bin", "/fast.bin"))
+        self.assertTrue(self.rt.fs._ensure_file_in_cache(self.rt.fs._resolve_path("/fast.bin")))
 
         self.rt.backend.set_available(False)
         started = time.perf_counter()
