@@ -1,0 +1,16 @@
+[mounts.drynwyn-warez]
+mountpoint = "/home/tedks/Downloads/drynwyn-warez"
+cache = "/home/tedks/Downloads/.drynwyn-chunk0-cache"
+cache_size = "50G"
+database = "/home/tedks/Downloads/.drynwyn-chunk0-cache/.storage.db"
+workers = 2
+key_file = "/home/tedks/.ssh/id_ed25519"
+foreground = true
+streaming_reads = true
+streaming_chunk_size = "1M"
+max_streaming_sessions = 8
+backends = [
+  "ssh://tedks@drynwyn.local:/srv/raid/warez/",
+  "ssh://tedks@drynwyn.local:/srv/chunk0/warez/",
+  "ssh://tedks@drynwyn.local:/srv/chunk1/warez/",
+]

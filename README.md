@@ -91,6 +91,34 @@ storage mount /mnt/storage /srv/raid /srv/chunk0 /srv/chunk1 \
   -c /var/cache/storage -s 100G -f
 ```
 
+TOML mount profiles are also supported:
+
+```toml
+[mounts.drynwyn-warez]
+mountpoint = "/home/tedks/Downloads/drynwyn-warez"
+cache = "/home/tedks/Downloads/.drynwyn-chunk0-cache"
+cache_size = "50G"
+key_file = "/home/tedks/.ssh/id_ed25519"
+foreground = true
+backends = [
+  "ssh://tedks@drynwyn.local:/srv/raid/warez/",
+  "ssh://tedks@drynwyn.local:/srv/chunk0/warez/",
+  "ssh://tedks@drynwyn.local:/srv/chunk1/warez/",
+]
+```
+
+Save that as `~/.config/storage/storage.toml` to auto-load by name:
+
+```bash
+storage mount drynwyn-warez
+```
+
+Or mount from an explicit TOML path:
+
+```bash
+storage mount --config ./storage.example.toml drynwyn-warez
+```
+
 ### configure
 
 Configure storage settings for files/directories:
