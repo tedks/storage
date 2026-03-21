@@ -871,8 +871,16 @@ class TestStreamingReadPrefetch(unittest.TestCase):
         payload = os.urandom(64 * 1024)
         (self.backend_dir / "cancelled.bin").write_bytes(payload)
 
-        with patch.object(self.fs, "_cleanup_cancelled_session", wraps=self.fs._cleanup_cancelled_session) as cancelled_cleanup:
-            with patch.object(self.fs, "_cleanup_failed_session", wraps=self.fs._cleanup_failed_session) as failed_cleanup:
+        with patch.object(
+            self.fs._streaming_manager,
+            "_cleanup_cancelled_session",
+            wraps=self.fs._streaming_manager._cleanup_cancelled_session,
+        ) as cancelled_cleanup:
+            with patch.object(
+                self.fs._streaming_manager,
+                "_cleanup_failed_session",
+                wraps=self.fs._streaming_manager._cleanup_failed_session,
+            ) as failed_cleanup:
                 vfd = self.fs.open('/cancelled.bin', os.O_RDONLY)
                 self.fs.release('/cancelled.bin', vfd)
 
