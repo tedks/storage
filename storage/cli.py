@@ -458,9 +458,12 @@ def mount(mount_target, backing_paths, config_path, cache, cache_size, database,
     click.echo(f"  Streaming chunk: {streaming_chunk_size} ({streaming_chunk_bytes:,} bytes)")
     click.echo(f"  Max streaming sessions: {max_streaming_sessions}")
     if enable_watchers:
-        click.echo(f"  Invalidation: push (inotifywait)")
-        if readdir_ttl != 1.0:
-            click.echo(f"  Note: --readdir-ttl ignored when watchers enabled")
+        from storage.backends.ssh import SSHBackend
+        non_ssh = [n for n, b in backends.items() if not isinstance(b, SSHBackend)]
+        if non_ssh:
+            click.echo(f"  Invalidation: push (SSH backends) + pull TTL={readdir_ttl}s ({', '.join(non_ssh)})")
+        else:
+            click.echo(f"  Invalidation: push (inotifywait)")
     else:
         click.echo(f"  Invalidation: pull (TTL={readdir_ttl}s)")
     click.echo(f"\nPress Ctrl+C to unmount\n")

@@ -172,13 +172,21 @@ class StorageFS(Operations):
         self._dir_cache_lock = threading.Lock()
         self._readdir_snapshot: Dict[str, Tuple[float, List[str]]] = {}
 
-        # Invalidation strategy: either pull-based (TTL) or push-based (watchers).
-        # When watchers are enabled, snapshots never expire on their own —
-        # only watcher callbacks invalidate them. This avoids redundant polling.
+        # Invalidation strategy: push-based (watchers) or pull-based (TTL).
+        # When watchers are enabled AND all backends are SSH (watchable),
+        # TTL is infinite — only watcher callbacks invalidate snapshots.
+        # If any backend is non-SSH (no watcher), TTL stays as fallback.
         self._enable_watchers = enable_watchers
         self._watchers = []
-        if enable_watchers:
+        from .backends.ssh import SSHBackend
+        all_watchable = backends and all(
+            isinstance(b, SSHBackend) for b in backends.values()
+        )
+        if enable_watchers and all_watchable:
             self._readdir_snapshot_ttl = float('inf')
+        elif enable_watchers and not all_watchable:
+            # Mixed mount: watchers for SSH backends, TTL for the rest.
+            self._readdir_snapshot_ttl = max(0.0, float(readdir_ttl))
         else:
             self._readdir_snapshot_ttl = max(0.0, float(readdir_ttl))
 
@@ -1817,16 +1825,19 @@ class StorageFS(Operations):
             cache_path = self.cache_manager.get_cache_path(path)
 
         try:
-            try:
-                real_fd = os.open(str(cache_path), flags)
-            except FileNotFoundError:
-                if prefetch_session is not None and prefetch_session.final_cache_path.exists():
-                    cache_path = prefetch_session.final_cache_path
-                    real_fd = os.open(str(cache_path), flags)
-                else:
-                    raise
-
+            # Hold _fd_lock across os.open AND _fd_map registration so that
+            # _invalidate_file_cache (which also holds _fd_lock) cannot
+            # unlink the cache file between os.open and registration.
             with self._fd_lock:
+                try:
+                    real_fd = os.open(str(cache_path), flags)
+                except FileNotFoundError:
+                    if prefetch_session is not None and prefetch_session.final_cache_path.exists():
+                        cache_path = prefetch_session.final_cache_path
+                        real_fd = os.open(str(cache_path), flags)
+                    else:
+                        raise
+
                 vfd = self._fd_counter
                 self._fd_counter += 1
                 self._fd_map[vfd] = FDEntry(
@@ -1855,9 +1866,8 @@ class StorageFS(Operations):
         cache_path = self.cache_manager.create_cached_file(path)
 
         try:
-            real_fd = os.open(str(cache_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
-
             with self._fd_lock:
+                real_fd = os.open(str(cache_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
                 vfd = self._fd_counter
                 self._fd_counter += 1
                 self._fd_map[vfd] = FDEntry(
