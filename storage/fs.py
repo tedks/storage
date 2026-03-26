@@ -110,12 +110,14 @@ class StorageFS(Operations):
             streaming_reads: Enable uncached range streaming + background prefetch
             streaming_chunk_size: Range size used for foreground/background remote reads
             max_streaming_sessions: Maximum concurrent streaming sessions
-            readdir_ttl: Seconds to cache readdir results before re-querying backends.
-                         Higher values reduce backend load; 0 disables caching.
-                         Use with enable_watchers=True for push-based invalidation.
-            enable_watchers: Start inotifywait watchers on SSH backends for
-                             push-based cache invalidation (requires inotify-tools
-                             on the remote host).
+            readdir_ttl: Seconds to cache readdir results before re-querying
+                         backends (pull-based invalidation). Ignored when
+                         enable_watchers is True.
+            enable_watchers: Use push-based cache invalidation via inotifywait
+                             on SSH backends instead of TTL polling. When True,
+                             readdir_ttl is ignored and directory listings are
+                             only invalidated by remote change events. Requires
+                             inotify-tools on the remote host.
         """
         self.state_manager = StateManager(str(state_db))
         self.cache_manager = CacheManager(cache_root, self.state_manager, cache_size)
@@ -168,13 +170,17 @@ class StorageFS(Operations):
         # Directory listing cache (per directory, per backend) for fallback when backend unavailable
         self._dir_cache: Dict[str, Dict[str, Set[str]]] = {}
         self._dir_cache_lock = threading.Lock()
-        self._readdir_snapshot_ttl = max(0.0, float(readdir_ttl))
         self._readdir_snapshot: Dict[str, Tuple[float, List[str]]] = {}
 
-        # Remote filesystem watchers for push-based cache invalidation.
-        # Started in init() (post-fork) so subprocesses survive daemonization.
-        self._watchers = []
+        # Invalidation strategy: either pull-based (TTL) or push-based (watchers).
+        # When watchers are enabled, snapshots never expire on their own —
+        # only watcher callbacks invalidate them. This avoids redundant polling.
         self._enable_watchers = enable_watchers
+        self._watchers = []
+        if enable_watchers:
+            self._readdir_snapshot_ttl = float('inf')
+        else:
+            self._readdir_snapshot_ttl = max(0.0, float(readdir_ttl))
 
         # Per-backend checksum index used for conflict surfacing
         self._checksum_lock = threading.RLock()

@@ -457,8 +457,12 @@ def mount(mount_target, backing_paths, config_path, cache, cache_size, database,
     click.echo(f"  Streaming reads: {'enabled' if streaming_reads else 'disabled'}")
     click.echo(f"  Streaming chunk: {streaming_chunk_size} ({streaming_chunk_bytes:,} bytes)")
     click.echo(f"  Max streaming sessions: {max_streaming_sessions}")
-    click.echo(f"  Readdir TTL: {readdir_ttl}s")
-    click.echo(f"  Remote watchers: {'enabled' if enable_watchers else 'disabled'}")
+    if enable_watchers:
+        click.echo(f"  Invalidation: push (inotifywait)")
+        if readdir_ttl != 1.0:
+            click.echo(f"  Note: --readdir-ttl ignored when watchers enabled")
+    else:
+        click.echo(f"  Invalidation: pull (TTL={readdir_ttl}s)")
     click.echo(f"\nPress Ctrl+C to unmount\n")
 
     # Suppress paramiko noise unless debugging

@@ -209,3 +209,20 @@ class TestConfigurableTTL(TestCase):
             )
             self.assertEqual(fs._readdir_snapshot_ttl, 0.0)
             fs.state_manager.close()
+
+    def test_watchers_override_ttl(self):
+        """When watchers are enabled, TTL should be infinite (push-only)."""
+        import math
+        from storage.fs import StorageFS
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Path(tmp) / "cache"
+            cache.mkdir()
+            db = Path(tmp) / "state.db"
+            fs = StorageFS(
+                cache_root=cache, state_db=db, backends={},
+                cache_size=1024 * 1024, num_sync_workers=0, start_sync=False,
+                readdir_ttl=5.0,  # should be ignored
+                enable_watchers=True,
+            )
+            self.assertTrue(math.isinf(fs._readdir_snapshot_ttl))
+            fs.state_manager.close()
