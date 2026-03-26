@@ -62,6 +62,17 @@ class TestRemoteWatcherParsing(TestCase):
         w = self._make_watcher(remote_path="/data/storage/")
         self.assertEqual(w.remote_path, "/data/storage")
 
+    def test_prefix_boundary_no_false_match(self):
+        """remote_path=/data must NOT match /datafile.txt."""
+        w = self._make_watcher(remote_path="/data")
+        self.assertIsNone(w._parse_event_line("CREATE /datafile.txt"))
+        self.assertIsNone(w._parse_event_line("MODIFY /data2/foo.txt"))
+        # But /data/file.txt should match.
+        self.assertEqual(
+            w._parse_event_line("CREATE /data/file.txt"),
+            "/file.txt",
+        )
+
 
 class TestRemoteWatcherMultiMount(TestCase):
     """Test that each mount gets its own watcher (no deduplication)."""

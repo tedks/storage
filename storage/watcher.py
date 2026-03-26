@@ -126,13 +126,13 @@ class RemoteWatcher:
         abs_path = abs_path.rstrip("/")
 
         # Convert absolute remote path to virtual path.
-        if abs_path.startswith(self.remote_path):
-            rel = abs_path[len(self.remote_path):]
-            if not rel:
-                rel = "/"
-            if not rel.startswith("/"):
-                rel = "/" + rel
-            return rel
+        # Use directory-boundary check to avoid /data matching /datafile.txt.
+        if abs_path == self.remote_path:
+            return "/"
+        prefix = self.remote_path if self.remote_path.endswith("/") else self.remote_path + "/"
+        if abs_path.startswith(prefix):
+            rel = abs_path[len(prefix) - 1:]  # Keep leading /
+            return rel if rel else "/"
 
         return None
 
@@ -151,10 +151,13 @@ class RemoteWatcher:
 
         while not self._stop_event.is_set():
             try:
+                # Redirect stderr to DEVNULL to prevent pipe deadlock:
+                # if inotifywait writes to stderr while we block on stdout,
+                # the stderr pipe buffer fills and both sides deadlock.
                 self._process = subprocess.Popen(
                     cmd,
                     stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
                     text=True,
                 )
 
@@ -179,10 +182,9 @@ class RemoteWatcher:
                     break
 
                 if rc != 0:
-                    stderr = self._process.stderr.read() if self._process.stderr else ""
                     logger.warning(
-                        "inotifywait exited with code %d for %s: %s",
-                        rc, self.backend_name, stderr.strip()
+                        "inotifywait exited with code %d for %s",
+                        rc, self.backend_name,
                     )
 
             except Exception:

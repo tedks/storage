@@ -299,6 +299,10 @@ class StorageFS(Operations):
         """
         Invalidate a cached file, forcing the next access to re-fetch
         from the backend.  Used by the remote watcher on push events.
+
+        Clears the cache file, the cache location record, AND the stale
+        checksum/metadata so that the next fetch recomputes them from
+        the fresh remote copy rather than reusing old values.
         """
         cache_path = self.cache_manager.get_cache_path(virtual_path)
         if cache_path.exists() and cache_path.is_file():
@@ -309,8 +313,18 @@ class StorageFS(Operations):
                     cache_path.unlink()
                     self.state_manager.remove_file_location(virtual_path, "cache")
                     self.cache_manager.mark_cache_size_dirty()
+                    # Clear stale checksum so refetch recomputes it
+                    # instead of reusing the old value for conflict detection.
+                    meta.checksum = None
+                    self.state_manager.set_file_metadata(meta)
                 except OSError:
                     pass
+
+        # Also clear in-memory checksum records for this path.
+        with self._checksum_lock:
+            stale_keys = [k for k in self._checksum_records if k[0] == virtual_path]
+            for k in stale_keys:
+                self._checksum_records.pop(k, None)
 
     def _on_remote_change(self, virtual_path: str):
         """Callback from RemoteWatcher when inotifywait detects a change."""
