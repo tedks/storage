@@ -366,9 +366,23 @@ class StorageFS(Operations):
                     future.cancel()
 
     def _on_remote_change(self, virtual_path: str):
-        """Callback from RemoteWatcher when inotifywait detects a change."""
+        """
+        Callback from RemoteWatcher when inotifywait detects a change.
+
+        Invalidates the canonical path AND any backend-suffixed conflict
+        variants (e.g. /foo.remote0, /foo.remote1) so that cached
+        conflict views are also refreshed.
+        """
         self._invalidate_dir_cache_entry(virtual_path)
         self._invalidate_file_cache(virtual_path)
+        # Also invalidate backend-suffixed conflict caches.
+        # When /foo exists on multiple backends with different content,
+        # the FUSE layer exposes /foo.remote0, /foo.remote1 etc.
+        # These are cached under the suffixed path, so a remote change
+        # to /foo must also invalidate /foo.<backend> for each backend.
+        for backend_name in self.backends:
+            suffixed = f"{virtual_path}.{backend_name}"
+            self._invalidate_file_cache(suffixed)
 
     def _start_watchers(self):
         """Start inotifywait watchers for each SSH backend."""
