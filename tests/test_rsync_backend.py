@@ -171,7 +171,9 @@ class TestRsyncLocalTransfer(TestCase):
                 cmd = mock_run.call_args[0][0]
                 self.assertIn("--bwlimit=1000", cmd)
                 self.assertIn("--exclude=*.tmp", cmd)
-                self.assertIn("--partial", cmd)
+                # --partial-dir used instead of --partial for atomic writes
+                partial_dir_args = [a for a in cmd if a.startswith("--partial-dir=")]
+                self.assertTrue(partial_dir_args, "Expected --partial-dir flag")
                 self.assertIn("-a", cmd)
 
         backend.close()

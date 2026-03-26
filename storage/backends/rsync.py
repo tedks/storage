@@ -10,8 +10,8 @@ Rsync advantages over pure SFTP:
 - Delta transfer: only sends changed blocks for modified files
 - Compression: built-in zlib compression over the wire
 - Checksumming: end-to-end verification without separate pass
-- Partial transfer resume: --partial flag
-- Batch efficiency: can transfer many files in one invocation
+- Partial transfer resume: --partial-dir keeps partials in a temp dir
+  so the destination is never corrupted on failure
 """
 
 import logging
@@ -23,6 +23,11 @@ from typing import List, Optional
 
 from .base import Backend, BackendType
 from .ssh import SSHBackend
+
+# Hidden directory on each side for rsync partial transfers.
+# rsync writes to this dir and atomically renames to destination on
+# success.  On failure, the destination is untouched.
+_PARTIAL_DIR = ".storage.rsync-tmp"
 
 
 class RsyncBackend(SSHBackend):
@@ -106,9 +111,15 @@ class RsyncBackend(SSHBackend):
         """
         Run an rsync command and return the result.
 
+        Uses --partial-dir so partials go to a temp directory instead
+        of overwriting the destination.  On success, rsync atomically
+        renames the temp file to the destination.  On failure, the
+        destination is untouched and the partial stays in the temp dir
+        for future resume.
+
         Raises RuntimeError on non-zero exit code.
         """
-        cmd = ["rsync", "-a", "--partial", "-s"]
+        cmd = ["rsync", "-a", f"--partial-dir={_PARTIAL_DIR}", "-s"]
         if self._compress:
             cmd.append("-z")
         cmd.extend(["-e", self._build_rsync_ssh_cmd()])
@@ -143,25 +154,6 @@ class RsyncBackend(SSHBackend):
 
         return result
 
-    @staticmethod
-    def _remove_partial(local_path: Path):
-        """Remove a partial file left by a failed rsync --partial download."""
-        try:
-            if local_path.exists():
-                local_path.unlink()
-        except OSError:
-            pass
-
-    def _remove_remote_partial(self, virtual_path: str):
-        """Best-effort removal of a partial file on the remote after upload failure."""
-        try:
-            _, sftp_client = self._current_clients()
-            remote_path = str(self._resolve_path(virtual_path))
-            sftp_client.remove(remote_path)
-        except Exception:
-            # Best effort — the file may not exist or SFTP may be down.
-            pass
-
     # ------------------------------------------------------------------ #
     # Override transfer methods to use rsync
     # ------------------------------------------------------------------ #
@@ -175,12 +167,8 @@ class RsyncBackend(SSHBackend):
         except subprocess.TimeoutExpired:
             self.logger.warning("rsync copy_to_local timed out for %s", virtual_path)
             self._mark_unavailable()
-            # Clean up partial file so it doesn't poison the cache.
-            self._remove_partial(local_path)
             raise
         except RuntimeError:
-            # Clean up partial file left by --partial on failure.
-            self._remove_partial(local_path)
             raise
 
     def copy_from_local(self, local_path: Path, virtual_path: str):
@@ -205,10 +193,8 @@ class RsyncBackend(SSHBackend):
         except subprocess.TimeoutExpired:
             self.logger.warning("rsync copy_from_local timed out for %s", virtual_path)
             self._mark_unavailable()
-            self._remove_remote_partial(virtual_path)
             raise
         except RuntimeError:
-            self._remove_remote_partial(virtual_path)
             raise
 
     def __repr__(self):
