@@ -712,9 +712,13 @@ class SSHBackend(Backend):
         _, stdout, stderr = ssh_client.exec_command(
             cmd, timeout=self.connect_timeout
         )
+        rc = stdout.channel.recv_exit_status()
         output = stdout.read().decode().strip()
-        if output and not output.startswith("/"):
-            return output.split()[0]
+        if rc == 0 and output:
+            token = output.split()[0]
+            # xxh128sum outputs a 32-char hex digest; validate format.
+            if len(token) == 32 and all(c in "0123456789abcdef" for c in token):
+                return token
 
         # Fallback: download to temp file and compute locally.
         import tempfile

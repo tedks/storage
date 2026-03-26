@@ -172,9 +172,9 @@ class StorageFS(Operations):
         self._readdir_snapshot: Dict[str, Tuple[float, List[str]]] = {}
 
         # Remote filesystem watchers for push-based cache invalidation.
+        # Started in init() (post-fork) so subprocesses survive daemonization.
         self._watchers = []
-        if enable_watchers:
-            self._start_watchers()
+        self._enable_watchers = enable_watchers
 
         # Per-backend checksum index used for conflict surfacing
         self._checksum_lock = threading.RLock()
@@ -198,6 +198,9 @@ class StorageFS(Operations):
         if not self._sync_started:
             self.sync_manager.start()
             self._sync_started = True
+
+        if self._enable_watchers and not self._watchers:
+            self._start_watchers()
 
     def _get_config(self, virtual_path: str) -> FileConfig:
         """Get configuration for a file"""

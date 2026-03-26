@@ -16,6 +16,7 @@ import fcntl
 import logging
 import os
 import re
+import shlex
 import threading
 import time
 from pathlib import Path, PurePosixPath
@@ -98,6 +99,7 @@ class RemoteWatcher:
         already holds it (meaning a watcher is already running).
         """
         lock_path = self._lock_path()
+        fd = -1
         try:
             fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -108,11 +110,12 @@ class RemoteWatcher:
             self._lock_fd = fd
             return True
         except (BlockingIOError, OSError):
-            # Another process holds the lock.
-            try:
-                os.close(fd)
-            except Exception:
-                pass
+            # Another process holds the lock, or open() failed.
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except Exception:
+                    pass
             return False
 
     def _release_lock(self):
@@ -143,12 +146,14 @@ class RemoteWatcher:
         target = f"{self.username}@{self.ssh_host}" if self.username else self.ssh_host
         ssh_cmd.append(target)
 
-        # inotifywait: recursive, monitor mode, CSV output, relevant events.
+        # inotifywait: recursive, monitor mode, relevant events.
+        # Quote remote_path to prevent shell injection from paths with
+        # spaces or metacharacters.
         events = ",".join(sorted(_CHANGE_EVENTS))
         inotify_cmd = (
             f"inotifywait -mrq --format '%e %w%f' "
             f"-e {events} "
-            f"{self.remote_path}"
+            f"{shlex.quote(self.remote_path)}"
         )
         ssh_cmd.append(inotify_cmd)
         return ssh_cmd

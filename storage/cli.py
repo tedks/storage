@@ -86,6 +86,17 @@ def _optional_profile_string(profile: Dict[str, Any], key: str, profile_name: st
     return value
 
 
+def _optional_profile_float(profile: Dict[str, Any], key: str, profile_name: str) -> Optional[float]:
+    value = profile.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, (int, float)):
+        raise click.ClickException(
+            f"Mount profile '{profile_name}' must define '{key}' as a number when present"
+        )
+    return float(value)
+
+
 def _optional_profile_int(profile: Dict[str, Any], key: str, profile_name: str) -> Optional[int]:
     value = profile.get(key)
     if value is None:
@@ -192,7 +203,7 @@ def _load_mount_profile_settings(config_path: Path, profile_name: str) -> Dict[s
         "streaming_reads": _optional_profile_bool(config_profile, "streaming_reads", profile_name),
         "streaming_chunk_size": _optional_profile_string(config_profile, "streaming_chunk_size", profile_name),
         "max_streaming_sessions": _optional_profile_int(config_profile, "max_streaming_sessions", profile_name),
-        "readdir_ttl": _optional_profile_string(config_profile, "readdir_ttl", profile_name),
+        "readdir_ttl": _optional_profile_float(config_profile, "readdir_ttl", profile_name),
         "enable_watchers": _optional_profile_bool(config_profile, "enable_watchers", profile_name),
         "backing_paths": config_backing_paths,
         "remote": config_remote,
@@ -400,11 +411,7 @@ def mount(mount_target, backing_paths, config_path, cache, cache_size, database,
     )
     readdir_ttl = (
         readdir_ttl if readdir_ttl is not None
-        else (
-            float(config_values["readdir_ttl"])
-            if config_values["readdir_ttl"] is not None
-            else 1.0
-        )
+        else (config_values["readdir_ttl"] if config_values["readdir_ttl"] is not None else 1.0)
     )
     enable_watchers = (
         enable_watchers if enable_watchers is not None
