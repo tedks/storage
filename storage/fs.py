@@ -95,7 +95,9 @@ class StorageFS(Operations):
     def __init__(self, cache_root: Path, state_db: Path, backends: Dict[str, Backend],
                  cache_size: int, num_sync_workers: int = 2, start_sync: bool = True,
                  streaming_reads: bool = False, streaming_chunk_size: int = 1024 * 1024,
-                 max_streaming_sessions: int = 8):
+                 max_streaming_sessions: int = 8,
+                 readdir_ttl: float = 1.0,
+                 enable_watchers: bool = False):
         """
         Initialize Storage filesystem
 
@@ -108,6 +110,12 @@ class StorageFS(Operations):
             streaming_reads: Enable uncached range streaming + background prefetch
             streaming_chunk_size: Range size used for foreground/background remote reads
             max_streaming_sessions: Maximum concurrent streaming sessions
+            readdir_ttl: Seconds to cache readdir results before re-querying backends.
+                         Higher values reduce backend load; 0 disables caching.
+                         Use with enable_watchers=True for push-based invalidation.
+            enable_watchers: Start inotifywait watchers on SSH backends for
+                             push-based cache invalidation (requires inotify-tools
+                             on the remote host).
         """
         self.state_manager = StateManager(str(state_db))
         self.cache_manager = CacheManager(cache_root, self.state_manager, cache_size)
@@ -160,8 +168,13 @@ class StorageFS(Operations):
         # Directory listing cache (per directory, per backend) for fallback when backend unavailable
         self._dir_cache: Dict[str, Dict[str, Set[str]]] = {}
         self._dir_cache_lock = threading.Lock()
-        self._readdir_snapshot_ttl = 1.0
+        self._readdir_snapshot_ttl = max(0.0, float(readdir_ttl))
         self._readdir_snapshot: Dict[str, Tuple[float, List[str]]] = {}
+
+        # Remote filesystem watchers for push-based cache invalidation.
+        self._watchers = []
+        if enable_watchers:
+            self._start_watchers()
 
         # Per-backend checksum index used for conflict surfacing
         self._checksum_lock = threading.RLock()
@@ -278,6 +291,60 @@ class StorageFS(Operations):
         with self._dir_cache_lock:
             self._dir_cache.pop(path, None)
             self._readdir_snapshot.pop(path, None)
+
+    def _invalidate_file_cache(self, virtual_path: str):
+        """
+        Invalidate a cached file, forcing the next access to re-fetch
+        from the backend.  Used by the remote watcher on push events.
+        """
+        cache_path = self.cache_manager.get_cache_path(virtual_path)
+        if cache_path.exists() and cache_path.is_file():
+            # Only remove if the file is CLEAN (not dirty/syncing).
+            meta = self.state_manager.get_file_metadata(virtual_path)
+            if meta and meta.sync_status == SyncStatus.CLEAN:
+                try:
+                    cache_path.unlink()
+                    self.state_manager.remove_file_location(virtual_path, "cache")
+                    self.cache_manager.mark_cache_size_dirty()
+                except OSError:
+                    pass
+
+    def _on_remote_change(self, virtual_path: str):
+        """Callback from RemoteWatcher when inotifywait detects a change."""
+        self._invalidate_dir_cache_entry(virtual_path)
+        self._invalidate_file_cache(virtual_path)
+
+    def _start_watchers(self):
+        """Start inotifywait watchers for each SSH backend."""
+        from .backends.ssh import SSHBackend
+        from .watcher import RemoteWatcher
+
+        for name, backend in self.backends.items():
+            if not isinstance(backend, SSHBackend):
+                continue
+
+            watcher = RemoteWatcher(
+                backend_name=name,
+                ssh_host=backend.host,
+                ssh_port=backend.port,
+                remote_path=str(backend.remote_path),
+                on_change=self._on_remote_change,
+                username=backend.username,
+                key_filename=backend.key_filename,
+                lock_dir=self.cache_manager.cache_root,
+            )
+            started = watcher.start()
+            self._watchers.append(watcher)
+            if started:
+                self.logger.info("Started watcher for SSH backend %s", name)
+            else:
+                self.logger.info("Watcher for %s already running (shared)", name)
+
+    def _stop_watchers(self):
+        """Stop all remote watchers."""
+        for watcher in self._watchers:
+            watcher.stop()
+        self._watchers.clear()
 
     def _get_target_backends(self, backend_hint: Optional[str],
                              backend_names: Optional[Set[str]] = None) -> List[Backend]:
@@ -2021,6 +2088,7 @@ class StorageFS(Operations):
     def destroy(self, path):
         """Cleanup on unmount"""
         self._stop_control_server()
+        self._stop_watchers()
 
         with self._prefetch_sessions_lock:
             sessions = list(self._prefetch_sessions.values())
@@ -2095,7 +2163,9 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
                  debug: bool = False,
                  streaming_reads: bool = False,
                  streaming_chunk_size: int = 1024 * 1024,
-                 max_streaming_sessions: int = 8):
+                 max_streaming_sessions: int = 8,
+                 readdir_ttl: float = 1.0,
+                 enable_watchers: bool = False):
     """
     Mount a Storage filesystem
 
@@ -2168,6 +2238,8 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
         streaming_reads=streaming_reads,
         streaming_chunk_size=streaming_chunk_size,
         max_streaming_sessions=max_streaming_sessions,
+        readdir_ttl=readdir_ttl,
+        enable_watchers=enable_watchers,
     )
     try:
         FUSE(fs, mountpoint, nothreads=True, foreground=foreground, allow_other=allow_other)
