@@ -152,6 +152,16 @@ class RsyncBackend(SSHBackend):
         except OSError:
             pass
 
+    def _remove_remote_partial(self, virtual_path: str):
+        """Best-effort removal of a partial file on the remote after upload failure."""
+        try:
+            _, sftp_client = self._current_clients()
+            remote_path = str(self._resolve_path(virtual_path))
+            sftp_client.remove(remote_path)
+        except Exception:
+            # Best effort — the file may not exist or SFTP may be down.
+            pass
+
     # ------------------------------------------------------------------ #
     # Override transfer methods to use rsync
     # ------------------------------------------------------------------ #
@@ -195,8 +205,10 @@ class RsyncBackend(SSHBackend):
         except subprocess.TimeoutExpired:
             self.logger.warning("rsync copy_from_local timed out for %s", virtual_path)
             self._mark_unavailable()
+            self._remove_remote_partial(virtual_path)
             raise
         except RuntimeError:
+            self._remove_remote_partial(virtual_path)
             raise
 
     def __repr__(self):
