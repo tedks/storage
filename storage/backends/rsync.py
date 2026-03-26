@@ -89,6 +89,9 @@ class RsyncBackend(SSHBackend):
         if self.key_filename:
             parts.append(f"-i {shlex.quote(self.key_filename)}")
         parts.append("-o BatchMode=yes")
+        # Match paramiko's AutoAddPolicy: accept new host keys automatically
+        # but reject changed keys (MITM protection).
+        parts.append("-o StrictHostKeyChecking=accept-new")
         parts.append(f"-o ConnectTimeout={int(self.connect_timeout)}")
         return " ".join(parts)
 
@@ -140,6 +143,15 @@ class RsyncBackend(SSHBackend):
 
         return result
 
+    @staticmethod
+    def _remove_partial(local_path: Path):
+        """Remove a partial file left by a failed rsync --partial download."""
+        try:
+            if local_path.exists():
+                local_path.unlink()
+        except OSError:
+            pass
+
     # ------------------------------------------------------------------ #
     # Override transfer methods to use rsync
     # ------------------------------------------------------------------ #
@@ -153,9 +165,12 @@ class RsyncBackend(SSHBackend):
         except subprocess.TimeoutExpired:
             self.logger.warning("rsync copy_to_local timed out for %s", virtual_path)
             self._mark_unavailable()
+            # Clean up partial file so it doesn't poison the cache.
+            self._remove_partial(local_path)
             raise
         except RuntimeError:
-            # rsync exit code 12 = network error, similar to SFTP transport errors
+            # Clean up partial file left by --partial on failure.
+            self._remove_partial(local_path)
             raise
 
     def copy_from_local(self, local_path: Path, virtual_path: str):
