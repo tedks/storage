@@ -306,28 +306,43 @@ class StorageFS(Operations):
         Invalidate a cached file, forcing the next access to re-fetch
         from the backend.  Used by the remote watcher on push events.
 
-        Clears the cache file, the cache location record, AND the stale
-        checksum/metadata so that the next fetch recomputes them from
-        the fresh remote copy rather than reusing old values.
+        Holds _fd_lock across the open-writer check and unlink so that
+        no writer can open the file between the check and the delete.
+        Skips invalidation if any thread has the file open for writing;
+        the sync worker will handle the file once the writer closes it.
         """
         cache_path = self.cache_manager.get_cache_path(virtual_path)
-        if cache_path.exists() and cache_path.is_file():
-            # Only remove if the file is CLEAN (not dirty/syncing).
+        if not (cache_path.exists() and cache_path.is_file()):
+            return
+
+        # Hold _fd_lock to prevent a writer from opening the file
+        # between our open-writer check and the unlink.  This lock is
+        # also held by open/release, so the check-then-unlink is atomic
+        # with respect to new writers.
+        with self._fd_lock:
+            for entry in self._fd_map.values():
+                if entry.canonical_path != virtual_path:
+                    continue
+                if entry.prefetch_session is not None:
+                    continue
+                if (entry.flags & os.O_ACCMODE) != os.O_RDONLY:
+                    # File has an active writer — skip invalidation.
+                    return
+
             meta = self.state_manager.get_file_metadata(virtual_path)
-            if meta and meta.sync_status == SyncStatus.CLEAN:
-                try:
-                    cache_path.unlink()
-                    self.state_manager.remove_file_location(virtual_path, "cache")
-                    self.cache_manager.mark_cache_size_dirty()
-                    # Clear stale fields so the next fetch rebuilds from
-                    # the fresh remote copy rather than reusing old values
-                    # for conflict detection or stat responses.
-                    meta.checksum = None
-                    meta.size = 0
-                    meta.last_modified = 0.0
-                    self.state_manager.set_file_metadata(meta)
-                except OSError:
-                    pass
+            if not meta or meta.sync_status != SyncStatus.CLEAN:
+                return
+
+            try:
+                cache_path.unlink()
+                self.state_manager.remove_file_location(virtual_path, "cache")
+                self.cache_manager.mark_cache_size_dirty()
+                meta.checksum = None
+                meta.size = 0
+                meta.last_modified = 0.0
+                self.state_manager.set_file_metadata(meta)
+            except OSError:
+                pass
 
         # Clear in-memory checksum records and cancel pending tasks.
         with self._checksum_lock:
