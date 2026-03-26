@@ -334,14 +334,10 @@ class StorageFS(Operations):
                 on_change=self._on_remote_change,
                 username=backend.username,
                 key_filename=backend.key_filename,
-                lock_dir=self.cache_manager.cache_root,
             )
-            started = watcher.start()
+            watcher.start()
             self._watchers.append(watcher)
-            if started:
-                self.logger.info("Started watcher for SSH backend %s", name)
-            else:
-                self.logger.info("Watcher for %s already running (shared)", name)
+            self.logger.info("Started watcher for SSH backend %s", name)
 
     def _stop_watchers(self):
         """Stop all remote watchers."""

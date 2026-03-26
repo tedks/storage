@@ -6,21 +6,22 @@ changes every TTL seconds, we run ``inotifywait`` on the remote host and
 stream change events back.  This eliminates readdir polling cost entirely
 for quiescent directories.
 
-Multiple Storage mounts on the same machine that share a backend will
-share a single watcher process (PID-file deduplication).
+Each Storage mount starts its own watcher per SSH backend.  This means
+each mount gets its own ``on_change`` callbacks without any IPC.  Multiple
+mounts on the same machine will each have their own SSH+inotifywait
+connection to the remote -- this is intentional so that every mount
+receives every event.
 """
 
 from __future__ import annotations
 
-import fcntl
 import logging
 import os
-import re
 import shlex
 import threading
 import time
-from pathlib import Path, PurePosixPath
-from typing import Callable, Dict, Optional, Set
+from pathlib import PurePosixPath
+from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +42,7 @@ class RemoteWatcher:
     Parameters
     ----------
     backend_name : str
-        Logical name of the backend (used for lock-file deduplication).
+        Logical name of the backend (for logging).
     ssh_host : str
         SSH host (user@host or host).
     ssh_port : int
@@ -54,8 +55,6 @@ class RemoteWatcher:
         SSH username.
     key_filename : str, optional
         Path to SSH private key.
-    lock_dir : Path, optional
-        Directory for PID lock files.  Defaults to ``/tmp``.
     """
 
     def __init__(
@@ -67,69 +66,18 @@ class RemoteWatcher:
         on_change: Callable[[str], None],
         username: Optional[str] = None,
         key_filename: Optional[str] = None,
-        lock_dir: Optional[Path] = None,
     ):
         self.backend_name = backend_name
         self.ssh_host = ssh_host
         self.ssh_port = ssh_port
-        self.remote_path = remote_path.rstrip("/")
+        self.remote_path = remote_path.rstrip("/") or "/"
         self.on_change = on_change
         self.username = username
         self.key_filename = key_filename
-        self.lock_dir = lock_dir or Path("/tmp")
 
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
-        self._lock_fd: Optional[int] = None
         self._process = None
-
-    # ------------------------------------------------------------------ #
-    # PID-file deduplication
-    # ------------------------------------------------------------------ #
-
-    def _lock_path(self) -> Path:
-        """Per-backend lock file so multiple mounts share one watcher."""
-        safe_name = re.sub(r"[^a-zA-Z0-9_.-]", "_", self.backend_name)
-        return self.lock_dir / f".storage.watcher.{safe_name}.lock"
-
-    def _try_acquire_lock(self) -> bool:
-        """
-        Try to acquire an exclusive lock.  Returns True if we got it
-        (meaning we should start the watcher), False if another process
-        already holds it (meaning a watcher is already running).
-        """
-        lock_path = self._lock_path()
-        fd = -1
-        try:
-            fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            # Write our PID for debugging.
-            os.ftruncate(fd, 0)
-            os.lseek(fd, 0, os.SEEK_SET)
-            os.write(fd, f"{os.getpid()}\n".encode())
-            self._lock_fd = fd
-            return True
-        except (BlockingIOError, OSError):
-            # Another process holds the lock, or open() failed.
-            if fd >= 0:
-                try:
-                    os.close(fd)
-                except Exception:
-                    pass
-            return False
-
-    def _release_lock(self):
-        if self._lock_fd is not None:
-            try:
-                fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
-                os.close(self._lock_fd)
-            except Exception:
-                pass
-            self._lock_fd = None
-            try:
-                self._lock_path().unlink(missing_ok=True)
-            except Exception:
-                pass
 
     # ------------------------------------------------------------------ #
     # SSH + inotifywait subprocess
@@ -262,20 +210,8 @@ class RemoteWatcher:
     # Public API
     # ------------------------------------------------------------------ #
 
-    def start(self) -> bool:
-        """
-        Start the watcher.
-
-        Returns True if this process started a new watcher, False if
-        another process already has one running for this backend.
-        """
-        if not self._try_acquire_lock():
-            logger.info(
-                "Watcher for %s already running (lock held by another process)",
-                self.backend_name,
-            )
-            return False
-
+    def start(self):
+        """Start the watcher thread."""
         self._stop_event.clear()
         self._thread = threading.Thread(
             target=self._watch_loop,
@@ -284,16 +220,14 @@ class RemoteWatcher:
         )
         self._thread.start()
         logger.info("Started remote watcher for %s", self.backend_name)
-        return True
 
     def stop(self):
-        """Stop the watcher and release the lock."""
+        """Stop the watcher."""
         self._stop_event.set()
         self._cleanup_process()
         if self._thread is not None:
             self._thread.join(timeout=10)
             self._thread = None
-        self._release_lock()
         logger.info("Stopped remote watcher for %s", self.backend_name)
 
     @property

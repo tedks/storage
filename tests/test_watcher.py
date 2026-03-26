@@ -2,12 +2,9 @@
 Tests for the remote filesystem watcher (inotify-based cache invalidation).
 """
 
-import os
 import tempfile
-import threading
-import time
 from pathlib import Path
-from unittest import TestCase, mock
+from unittest import TestCase
 
 from storage.watcher import RemoteWatcher
 
@@ -15,14 +12,13 @@ from storage.watcher import RemoteWatcher
 class TestRemoteWatcherParsing(TestCase):
     """Test inotifywait output parsing without actually launching SSH."""
 
-    def _make_watcher(self, on_change=None):
+    def _make_watcher(self, on_change=None, remote_path="/data/storage"):
         return RemoteWatcher(
             backend_name="test-backend",
             ssh_host="testhost",
             ssh_port=22,
-            remote_path="/data/storage",
+            remote_path=remote_path,
             on_change=on_change or (lambda p: None),
-            lock_dir=Path(tempfile.mkdtemp()),
         )
 
     def test_parse_create_event(self):
@@ -55,60 +51,60 @@ class TestRemoteWatcherParsing(TestCase):
         self.assertEqual(w._event_to_dir("/file.txt"), "/")
         self.assertEqual(w._event_to_dir("/"), "/")
 
+    def test_root_remote_path_normalizes(self):
+        """A backend rooted at / should normalize correctly."""
+        w = self._make_watcher(remote_path="/")
+        self.assertEqual(w.remote_path, "/")
+        vpath = w._parse_event_line("CREATE /etc/hosts")
+        self.assertEqual(vpath, "/etc/hosts")
 
-class TestRemoteWatcherLocking(TestCase):
-    """Test PID-file deduplication."""
+    def test_trailing_slash_stripped(self):
+        w = self._make_watcher(remote_path="/data/storage/")
+        self.assertEqual(w.remote_path, "/data/storage")
 
-    def test_first_lock_succeeds(self):
-        lock_dir = Path(tempfile.mkdtemp())
-        w = RemoteWatcher(
-            backend_name="lock-test",
-            ssh_host="h", ssh_port=22, remote_path="/data",
-            on_change=lambda p: None, lock_dir=lock_dir,
-        )
-        self.assertTrue(w._try_acquire_lock())
-        # Lock file should exist with our PID.
-        lock_path = w._lock_path()
-        self.assertTrue(lock_path.exists())
-        with open(lock_path) as f:
-            self.assertEqual(f.read().strip(), str(os.getpid()))
-        w._release_lock()
 
-    def test_second_lock_fails(self):
-        lock_dir = Path(tempfile.mkdtemp())
+class TestRemoteWatcherMultiMount(TestCase):
+    """Test that each mount gets its own watcher (no deduplication)."""
 
+    def test_two_watchers_same_backend_both_start(self):
+        """Two watchers for the same backend should both be startable."""
+        changes_1 = []
+        changes_2 = []
         w1 = RemoteWatcher(
-            backend_name="lock-test2",
+            backend_name="shared-backend",
             ssh_host="h", ssh_port=22, remote_path="/data",
-            on_change=lambda p: None, lock_dir=lock_dir,
+            on_change=changes_1.append,
         )
         w2 = RemoteWatcher(
-            backend_name="lock-test2",
+            backend_name="shared-backend",
             ssh_host="h", ssh_port=22, remote_path="/data",
-            on_change=lambda p: None, lock_dir=lock_dir,
+            on_change=changes_2.append,
         )
-        self.assertTrue(w1._try_acquire_lock())
-        self.assertFalse(w2._try_acquire_lock())
-        w1._release_lock()
+        # Both should be independently functional (no lock contention).
+        # We can't actually start them (no SSH), but verify they have
+        # independent state.
+        self.assertIsNot(w1._stop_event, w2._stop_event)
+        self.assertIsNot(w1.on_change, w2.on_change)
 
-    def test_lock_released_on_release(self):
-        lock_dir = Path(tempfile.mkdtemp())
-
+    def test_event_dispatched_to_own_callback(self):
+        """Each watcher dispatches to its own on_change, not a shared one."""
+        results = {"w1": [], "w2": []}
         w1 = RemoteWatcher(
-            backend_name="lock-test3",
-            ssh_host="h", ssh_port=22, remote_path="/data",
-            on_change=lambda p: None, lock_dir=lock_dir,
+            backend_name="test", ssh_host="h", ssh_port=22,
+            remote_path="/data", on_change=lambda p: results["w1"].append(p),
         )
         w2 = RemoteWatcher(
-            backend_name="lock-test3",
-            ssh_host="h", ssh_port=22, remote_path="/data",
-            on_change=lambda p: None, lock_dir=lock_dir,
+            backend_name="test", ssh_host="h", ssh_port=22,
+            remote_path="/data", on_change=lambda p: results["w2"].append(p),
         )
-        self.assertTrue(w1._try_acquire_lock())
-        w1._release_lock()
-        # Now w2 can acquire.
-        self.assertTrue(w2._try_acquire_lock())
-        w2._release_lock()
+
+        # Simulate an event on w1 only.
+        vpath = w1._parse_event_line("CREATE /data/subdir/file.txt")
+        if vpath:
+            w1.on_change(vpath)
+
+        self.assertEqual(results["w1"], ["/subdir/file.txt"])
+        self.assertEqual(results["w2"], [])  # w2 not notified
 
 
 class TestRemoteWatcherSSHCommand(TestCase):
@@ -128,7 +124,6 @@ class TestRemoteWatcherSSHCommand(TestCase):
         self.assertIn("-p", cmd)
         self.assertIn("22", cmd)
         self.assertIn("user@example.com", cmd)
-        # inotifywait command should be the last arg
         self.assertIn("inotifywait", cmd[-1])
         self.assertIn("/srv/storage", cmd[-1])
 
@@ -145,6 +140,19 @@ class TestRemoteWatcherSSHCommand(TestCase):
         self.assertIn("2222", cmd)
         self.assertIn("-i", cmd)
         self.assertIn("/home/user/.ssh/id_rsa", cmd)
+
+    def test_path_with_spaces_is_quoted(self):
+        """Paths with spaces must be shell-quoted in the inotifywait command."""
+        w = RemoteWatcher(
+            backend_name="space-test",
+            ssh_host="h", ssh_port=22,
+            remote_path="/data/my storage",
+            on_change=lambda p: None,
+        )
+        cmd = w._build_ssh_command()
+        inotify_part = cmd[-1]
+        # shlex.quote wraps in single quotes
+        self.assertIn("'/data/my storage'", inotify_part)
 
 
 class TestConfigurableTTL(TestCase):
