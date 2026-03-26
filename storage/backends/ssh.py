@@ -708,9 +708,11 @@ class SSHBackend(Backend):
         remote_path = str(self._resolve_path(virtual_path))
 
         # Try remote xxh128sum first (fast path, avoids download).
+        # Use sftp_operation_timeout (not connect_timeout) since hashing
+        # large files can take much longer than a connection handshake.
         cmd = f"xxh128sum {self._shell_quote(remote_path)} 2>/dev/null"
         _, stdout, stderr = ssh_client.exec_command(
-            cmd, timeout=self.connect_timeout
+            cmd, timeout=self.sftp_operation_timeout
         )
         rc = stdout.channel.recv_exit_status()
         output = stdout.read().decode().strip()

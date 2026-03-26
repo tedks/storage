@@ -313,18 +313,28 @@ class StorageFS(Operations):
                     cache_path.unlink()
                     self.state_manager.remove_file_location(virtual_path, "cache")
                     self.cache_manager.mark_cache_size_dirty()
-                    # Clear stale checksum so refetch recomputes it
-                    # instead of reusing the old value for conflict detection.
+                    # Clear stale fields so the next fetch rebuilds from
+                    # the fresh remote copy rather than reusing old values
+                    # for conflict detection or stat responses.
                     meta.checksum = None
+                    meta.size = 0
+                    meta.last_modified = 0.0
                     self.state_manager.set_file_metadata(meta)
                 except OSError:
                     pass
 
-        # Also clear in-memory checksum records for this path.
+        # Clear in-memory checksum records and cancel pending tasks.
         with self._checksum_lock:
             stale_keys = [k for k in self._checksum_records if k[0] == virtual_path]
             for k in stale_keys:
                 self._checksum_records.pop(k, None)
+            # Cancel pending checksum tasks so they don't re-insert
+            # stale results after we just cleared them.
+            stale_tasks = [k for k in self._checksum_tasks if k[0] == virtual_path]
+            for k in stale_tasks:
+                future = self._checksum_tasks.pop(k, None)
+                if future is not None:
+                    future.cancel()
 
     def _on_remote_change(self, virtual_path: str):
         """Callback from RemoteWatcher when inotifywait detects a change."""

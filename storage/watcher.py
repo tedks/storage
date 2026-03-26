@@ -86,6 +86,7 @@ class RemoteWatcher:
     def _build_ssh_command(self) -> list:
         """Build the SSH command that runs inotifywait on the remote."""
         ssh_cmd = ["ssh", "-T", "-o", "BatchMode=yes",
+                   "-o", "StrictHostKeyChecking=accept-new",
                    "-o", "ServerAliveInterval=30",
                    "-o", "ServerAliveCountMax=3",
                    "-p", str(self.ssh_port)]
