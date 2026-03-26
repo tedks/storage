@@ -105,7 +105,7 @@ class RsyncBackend(SSHBackend):
 
         Raises RuntimeError on non-zero exit code.
         """
-        cmd = ["rsync", "-a", "--partial"]
+        cmd = ["rsync", "-a", "--partial", "-s"]
         if self._compress:
             cmd.append("-z")
         cmd.extend(["-e", self._build_rsync_ssh_cmd()])
@@ -117,11 +117,15 @@ class RsyncBackend(SSHBackend):
 
         self.logger.debug("rsync: %s", " ".join(cmd))
 
+        # Use a longer timeout than SFTP: rsync transfers can legitimately
+        # take much longer than an SFTP stat/read call, especially for the
+        # large files this backend is meant to handle.
+        rsync_timeout = max(300.0, self.sftp_operation_timeout * 5)
         result = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
-            timeout=self.sftp_operation_timeout,
+            timeout=rsync_timeout,
         )
 
         if result.returncode != 0:
