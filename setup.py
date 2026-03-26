@@ -9,6 +9,7 @@ setup(
         'fusepy>=3.0.1',
         'PyYAML>=6.0',
         'click>=8.0.0',
+        'xxhash>=3.0.0',
     ],
     entry_points={
         'console_scripts': [

@@ -11,7 +11,7 @@ This module manages the state of all files in the Storage filesystem, including:
 
 import os
 import sqlite3
-import hashlib
+from .checksums import fast_checksum_file
 import time
 import threading
 import yaml
@@ -484,12 +484,8 @@ class StateManager:
 
     @staticmethod
     def compute_checksum(file_path: Path) -> str:
-        """Compute SHA256 checksum of a file"""
-        sha256 = hashlib.sha256()
-        with open(file_path, 'rb') as f:
-            while chunk := f.read(8192):
-                sha256.update(chunk)
-        return sha256.hexdigest()
+        """Compute a fast non-cryptographic checksum of a file (XXH3-128)."""
+        return fast_checksum_file(file_path)
 
     def close(self):
         """Close database connection"""
