@@ -142,6 +142,9 @@ class RemoteWatcher:
         parent = str(PurePosixPath(virtual_path).parent)
         return parent if parent != virtual_path else "/"
 
+    _MAX_BACKOFF = 300.0  # 5 minutes
+    _INITIAL_BACKOFF = 5.0
+
     def _watch_loop(self):
         """Main loop: run inotifywait over SSH and dispatch change events."""
         import subprocess
@@ -150,15 +153,18 @@ class RemoteWatcher:
         logger.info("Starting remote watcher for %s: %s",
                     self.backend_name, " ".join(cmd))
 
+        backoff = self._INITIAL_BACKOFF
+
         while not self._stop_event.is_set():
             try:
-                # Redirect stderr to DEVNULL to prevent pipe deadlock:
-                # if inotifywait writes to stderr while we block on stdout,
-                # the stderr pipe buffer fills and both sides deadlock.
+                # Capture stderr to a pipe so we can log the actual error
+                # message on failure.  Read stderr after process exits to
+                # avoid deadlock (stdout is consumed line-by-line in the
+                # loop, so only stderr accumulates).
                 self._process = subprocess.Popen(
                     cmd,
                     stdout=subprocess.PIPE,
-                    stderr=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
                     text=True,
                 )
 
@@ -183,17 +189,36 @@ class RemoteWatcher:
                     break
 
                 if rc != 0:
-                    logger.warning(
-                        "inotifywait exited with code %d for %s",
-                        rc, self.backend_name,
-                    )
+                    stderr_text = ""
+                    try:
+                        stderr_text = self._process.stderr.read().strip()
+                    except Exception:
+                        pass
+                    if stderr_text:
+                        logger.warning(
+                            "inotifywait exited with code %d for %s: %s",
+                            rc, self.backend_name, stderr_text,
+                        )
+                    else:
+                        logger.warning(
+                            "inotifywait exited with code %d for %s",
+                            rc, self.backend_name,
+                        )
+                else:
+                    # Successful run (inotifywait exited cleanly, e.g.
+                    # watched path was deleted).  Reset backoff.
+                    backoff = self._INITIAL_BACKOFF
 
             except Exception:
                 logger.exception("Watcher error for %s", self.backend_name)
 
             if not self._stop_event.is_set():
-                # Backoff before restart.
-                self._stop_event.wait(5.0)
+                logger.info(
+                    "Restarting watcher for %s in %.0fs",
+                    self.backend_name, backoff,
+                )
+                self._stop_event.wait(backoff)
+                backoff = min(backoff * 2, self._MAX_BACKOFF)
 
         self._cleanup_process()
 
