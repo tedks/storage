@@ -1599,11 +1599,13 @@ class StorageFS(Operations):
 
         entries: Set[str] = {'.', '..'}
 
-        # Get from cache
+        # Get from cache, filtering internal storage artifacts:
+        # - .storage.partial files (streaming prefetch)
+        # - .storage.rsync-tmp dirs (rsync partial-dir)
         if cache_path.exists() and cache_path.is_dir():
             entries.update(
                 entry for entry in os.listdir(str(cache_path))
-                if not entry.endswith(self._PARTIAL_SUFFIX)
+                if not entry.startswith(".storage.")
             )
 
         # Merge listings from backends; cache for fallback on connection issues
@@ -1617,6 +1619,8 @@ class StorageFS(Operations):
                         backend_entries = set(backend.listdir(path))
                     else:
                         backend_entries = {name for name, _ in attrs}
+                    # Filter internal storage artifacts from backend listings
+                    backend_entries.discard(".storage.rsync-tmp")
                     entries.update(backend_entries)
                     dir_cache[backend_name] = backend_entries
                 except Exception as exc:
