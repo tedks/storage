@@ -134,7 +134,7 @@ def _split_backend_specs(backend_specs: Sequence[str]) -> Tuple[Tuple[str, ...],
     local_backends = []
     remote_backends = []
     for spec in backend_specs:
-        if spec.startswith("ssh://"):
+        if spec.startswith("ssh://") or spec.startswith("rsync://"):
             remote_backends.append(spec)
         else:
             local_backends.append(spec)
@@ -156,26 +156,51 @@ def _create_backends(backing_paths: Sequence[str], remote_specs: Sequence[str], 
     for i, remote_spec in enumerate(remote_specs):
         try:
             name = f"remote{i}"
-            if not remote_spec.startswith('ssh://'):
-                raise click.ClickException("Remote backend must start with ssh://")
+            is_rsync = remote_spec.startswith('rsync://')
+            is_ssh = remote_spec.startswith('ssh://')
+            if not is_ssh and not is_rsync:
+                raise click.ClickException(
+                    "Remote backend must start with ssh:// or rsync://"
+                )
 
-            spec = remote_spec[6:]
+            prefix_len = 8 if is_rsync else 6  # len("rsync://") or len("ssh://")
+            spec = remote_spec[prefix_len:]
             if '@' not in spec or ':' not in spec:
-                raise click.ClickException("Invalid remote format. Use ssh://user@host:/path")
+                raise click.ClickException(
+                    f"Invalid remote format. Use {'rsync' if is_rsync else 'ssh'}://user@host:/path"
+                )
 
             user_host, remote_path = spec.split(':', 1)
             username, host = user_host.split('@', 1)
 
-            backend = SSHBackend(
-                name=name,
-                host=host,
-                remote_path=remote_path,
-                username=username,
-                key_filename=key_file,
-                speed_priority=50 + i * 10,
-            )
+            if is_rsync:
+                from .backends.rsync import RsyncBackend
+                backend = RsyncBackend(
+                    name=name,
+                    host=host,
+                    remote_path=remote_path,
+                    username=username,
+                    key_filename=key_file,
+                    speed_priority=50 + i * 10,
+                )
+                click.echo(
+                    f"Added rsync backend: {name} -> "
+                    f"{username}@{host}:{remote_path} (priority: {50 + i * 10})"
+                )
+            else:
+                backend = SSHBackend(
+                    name=name,
+                    host=host,
+                    remote_path=remote_path,
+                    username=username,
+                    key_filename=key_file,
+                    speed_priority=50 + i * 10,
+                )
+                click.echo(
+                    f"Added SSH backend: {name} -> "
+                    f"{username}@{host}:{remote_path} (priority: {50 + i * 10})"
+                )
             backends[name] = backend
-            click.echo(f"Added SSH backend: {name} -> {username}@{host}:{remote_path} (priority: {50 + i * 10})")
         except click.ClickException:
             raise
         except Exception as exc:
