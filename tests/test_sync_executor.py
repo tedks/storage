@@ -138,6 +138,25 @@ class TestSyncExecutorFileTask(_ExecutorTestBase):
         self.assertTrue(result)
         self.mock_backend.copy_from_local.assert_not_called()
 
+    def test_no_backends_returns_true_and_marks_error(self):
+        """No backends available -> returns True (task complete), marks ERROR, increments failed."""
+        meta = _make_metadata(sync_status=SyncStatus.DIRTY)
+        self.state_manager.set_file_metadata(meta)
+        self._create_cache_file()
+
+        with patch.object(
+            self.executor.replication_manager,
+            "select_backends_for_file",
+            return_value=[],
+        ):
+            task = SyncTask("/test.txt")
+            result = self.executor.process_file_task(task)
+
+        self.assertTrue(result)
+        updated = self.state_manager.get_file_metadata("/test.txt")
+        self.assertEqual(updated.sync_status, SyncStatus.ERROR)
+        self.assertEqual(self.executor.get_stats()["failed"], 1)
+
     def test_sync_success_marks_clean(self):
         """DIRTY file synced to backend -> status becomes CLEAN, location recorded."""
         meta = _make_metadata(sync_status=SyncStatus.DIRTY)

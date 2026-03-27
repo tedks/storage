@@ -81,7 +81,8 @@ class SyncExecutor:
             logger.warning("No backends available for %s", task.virtual_path)
             metadata.sync_status = SyncStatus.ERROR
             self.state_manager.set_file_metadata(metadata)
-            return False
+            self._stats["failed"] += 1
+            return True
 
         checksum = self.state_manager.compute_checksum(cache_path)
         metadata.checksum = checksum

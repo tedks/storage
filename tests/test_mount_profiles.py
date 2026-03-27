@@ -7,6 +7,7 @@ import click
 from storage.mount_profiles import (
     _load_mount_profile_settings,
     _optional_profile_float,
+    _optional_profile_int,
     parse_size,
     resolve_mount_configuration,
     split_backend_specs,
@@ -85,6 +86,40 @@ class TestOptionalProfileFloat(unittest.TestCase):
         profile = {"ttl": "fast"}
         with self.assertRaises(click.ClickException):
             _optional_profile_float(profile, "ttl", "test")
+
+    def test_bool_true_raises(self):
+        profile = {"ttl": True}
+        with self.assertRaises(click.ClickException):
+            _optional_profile_float(profile, "ttl", "test")
+
+    def test_bool_false_raises(self):
+        profile = {"ttl": False}
+        with self.assertRaises(click.ClickException):
+            _optional_profile_float(profile, "ttl", "test")
+
+
+class TestOptionalProfileInt(unittest.TestCase):
+    def test_returns_none_when_missing(self):
+        self.assertIsNone(_optional_profile_int({}, "workers", "test"))
+
+    def test_returns_int(self):
+        self.assertEqual(4, _optional_profile_int({"workers": 4}, "workers", "test"))
+
+    def test_raises_for_float(self):
+        with self.assertRaises(click.ClickException):
+            _optional_profile_int({"workers": 2.5}, "workers", "test")
+
+    def test_raises_for_string(self):
+        with self.assertRaises(click.ClickException):
+            _optional_profile_int({"workers": "4"}, "workers", "test")
+
+    def test_bool_true_raises(self):
+        with self.assertRaises(click.ClickException):
+            _optional_profile_int({"workers": True}, "workers", "test")
+
+    def test_bool_false_raises(self):
+        with self.assertRaises(click.ClickException):
+            _optional_profile_int({"workers": False}, "workers", "test")
 
 
 class TestProfileSettingsReaddirTTL(unittest.TestCase):

@@ -27,7 +27,8 @@ from .backends.base import Backend
 from .cache import CacheManager
 from .state import StateManager, FileMetadata, FileConfig, SyncStatus, FileLocation
 from .replication import ReplicationManager
-from .sync import SyncManager, DirOperation
+from .sync import SyncManager
+from .sync_tasks import DirOperation
 from .recompute import RecomputeEngine
 from .checksums import ChecksumRecord
 from .pathing import ResolvedPath, resolve_path
@@ -311,13 +312,18 @@ class StorageFS(Operations):
                 pass
 
         # Clear in-memory checksum records and cancel pending tasks.
+        # Records are keyed (canonical_path, backend), so clear both the
+        # virtual_path (which may be suffixed) and the canonical_path to
+        # cover conflict-view caches like /foo.remote0 whose checksums
+        # are stored under /foo.
+        invalidate_paths = {virtual_path, canonical_path}
         with self._checksum_lock:
-            stale_keys = [k for k in self._checksum_records if k[0] == virtual_path]
+            stale_keys = [k for k in self._checksum_records if k[0] in invalidate_paths]
             for k in stale_keys:
                 self._checksum_records.pop(k, None)
             # Cancel pending checksum tasks so they don't re-insert
             # stale results after we just cleared them.
-            stale_tasks = [k for k in self._checksum_tasks if k[0] == virtual_path]
+            stale_tasks = [k for k in self._checksum_tasks if k[0] in invalidate_paths]
             for k in stale_tasks:
                 future = self._checksum_tasks.pop(k, None)
                 if future is not None:
