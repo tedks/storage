@@ -11,7 +11,7 @@ from fuse import FuseOSError
 from .backends.base import Backend
 from .checksums import ChecksumRecord
 from .pathing import ResolvedPath
-from .sync import DirOperation
+from .sync_tasks import DirOperation
 from .state import SyncStatus
 
 
