@@ -210,8 +210,8 @@ class TestCLIRsyncParsing(TestCase):
     """Test CLI parsing of rsync:// URLs."""
 
     def test_rsync_url_recognized(self):
-        from storage.cli import _split_backend_specs
-        local, remote = _split_backend_specs([
+        from storage.mount_profiles import split_backend_specs
+        local, remote = split_backend_specs([
             "/local/path",
             "ssh://user@host:/path",
             "rsync://user@host:/path",

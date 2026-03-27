@@ -38,7 +38,7 @@ backends = [
 """.strip()
         )
 
-        with patch("storage.cli.mount_storage") as mock_mount:
+        with patch("storage.cli_mount.mount_storage") as mock_mount:
             result = self.runner.invoke(
                 main,
                 ["mount", "--config", str(config_path), "drynwyn-warez"],
@@ -78,7 +78,7 @@ backends = [
 """.strip()
         )
 
-        with patch("storage.cli.mount_storage") as mock_mount:
+        with patch("storage.cli_mount.mount_storage") as mock_mount:
             result = self.runner.invoke(
                 main,
                 ["mount", "auto-profile"],
@@ -111,7 +111,7 @@ backends = [
 """.strip()
         )
 
-        with patch("storage.cli.mount_storage") as mock_mount:
+        with patch("storage.cli_mount.mount_storage") as mock_mount:
             result = self.runner.invoke(
                 main,
                 [
