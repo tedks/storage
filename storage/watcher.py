@@ -157,15 +157,15 @@ class RemoteWatcher:
 
         while not self._stop_event.is_set():
             try:
-                # Capture stderr to a pipe so we can log the actual error
-                # message on failure.  Read stderr after process exits to
-                # avoid deadlock (stdout is consumed line-by-line in the
-                # loop, so only stderr accumulates).
+                # Start SSH+inotifywait in its own process group so we can
+                # kill the entire tree (ssh + remote shell + inotifywait)
+                # on cleanup, preventing orphaned remote processes.
                 self._process = subprocess.Popen(
                     cmd,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     text=True,
+                    start_new_session=True,
                 )
 
                 for line in self._process.stdout:
@@ -223,16 +223,27 @@ class RemoteWatcher:
         self._cleanup_process()
 
     def _cleanup_process(self):
-        if self._process is not None:
+        proc = self._process
+        if proc is None:
+            return
+        # Kill the entire process group (ssh + remote shell) so that
+        # the remote inotifywait doesn't outlive the local SSH client.
+        try:
+            os.killpg(proc.pid, 9)
+        except (ProcessLookupError, PermissionError):
+            # Process already exited or we don't own the group.
+            pass
+        except OSError:
+            # Fallback: kill just the SSH process.
             try:
-                self._process.terminate()
-                self._process.wait(timeout=5)
+                proc.kill()
             except Exception:
-                try:
-                    self._process.kill()
-                except Exception:
-                    pass
-            self._process = None
+                pass
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+        self._process = None
 
     # ------------------------------------------------------------------ #
     # Public API
