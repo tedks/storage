@@ -122,7 +122,7 @@ def _optional_profile_float(profile: Dict[str, Any], key: str, profile_name: str
     value = profile.get(key)
     if value is None:
         return None
-    if not isinstance(value, (int, float)):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise click.ClickException(
             f"Mount profile '{profile_name}' must define '{key}' as a number when present"
         )
@@ -133,7 +133,7 @@ def _optional_profile_int(profile: Dict[str, Any], key: str, profile_name: str) 
     value = profile.get(key)
     if value is None:
         return None
-    if not isinstance(value, int):
+    if isinstance(value, bool) or not isinstance(value, int):
         raise click.ClickException(
             f"Mount profile '{profile_name}' must define '{key}' as an integer when present"
         )
