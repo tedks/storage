@@ -91,6 +91,28 @@ class StorageFS(Operations):
     _STUB_XATTR = "user.storage.stub"
     _PARTIAL_SUFFIX = ".storage.partial"
     _STREAM_STATE_XATTR = "user.storage.stream"
+    # Internal artifacts that should be hidden from readdir listings.
+    # Entries matching these exactly are filtered, plus anything ending
+    # with _PARTIAL_SUFFIX.
+    _HIDDEN_NAMES = frozenset({
+        ".storage.rsync-tmp",      # rsync --partial-dir scratch directory
+        ".storage.control.sock",   # FUSE control socket
+    })
+    _HIDDEN_PREFIXES = (
+        ".storage.mount.",         # mount lock files (.storage.mount.*.lock)
+    )
+
+    @classmethod
+    def _is_hidden_entry(cls, name: str) -> bool:
+        """Return True if name is an internal artifact that should be hidden from listings."""
+        if name in cls._HIDDEN_NAMES:
+            return True
+        if name.endswith(cls._PARTIAL_SUFFIX):
+            return True
+        for prefix in cls._HIDDEN_PREFIXES:
+            if name.startswith(prefix):
+                return True
+        return False
 
     def __init__(self, cache_root: Path, state_db: Path, backends: Dict[str, Backend],
                  cache_size: int, num_sync_workers: int = 2, start_sync: bool = True,
@@ -1599,13 +1621,11 @@ class StorageFS(Operations):
 
         entries: Set[str] = {'.', '..'}
 
-        # Get from cache, filtering internal storage artifacts:
-        # - .storage.partial files (streaming prefetch)
-        # - .storage.rsync-tmp dirs (rsync partial-dir)
+        # Get from cache, filtering internal storage artifacts.
         if cache_path.exists() and cache_path.is_dir():
             entries.update(
                 entry for entry in os.listdir(str(cache_path))
-                if not entry.startswith(".storage.")
+                if not self._is_hidden_entry(entry)
             )
 
         # Merge listings from backends; cache for fallback on connection issues
@@ -1619,8 +1639,9 @@ class StorageFS(Operations):
                         backend_entries = set(backend.listdir(path))
                     else:
                         backend_entries = {name for name, _ in attrs}
-                    # Filter internal storage artifacts from backend listings
-                    backend_entries.discard(".storage.rsync-tmp")
+                    backend_entries = {
+                        e for e in backend_entries if not self._is_hidden_entry(e)
+                    }
                     entries.update(backend_entries)
                     dir_cache[backend_name] = backend_entries
                 except Exception as exc:
