@@ -400,6 +400,28 @@ class TestWatcherInvalidation(TestCase):
             finally:
                 fs.state_manager.close()
 
+    def test_invalidate_suffixed_path_clears_canonical_checksums(self):
+        """Invalidating /foo.remote0 also clears checksums keyed under canonical /foo."""
+        with tempfile.TemporaryDirectory() as tmp:
+            fs = self._make_fs(tmp)
+            try:
+                # Cache the suffixed conflict path.
+                self._cache_file(fs, "/shared.txt.local0")
+
+                from storage.checksums import ChecksumRecord
+                # Record is keyed by canonical path, not the suffixed path.
+                canonical_key = ("/shared.txt", "local0")
+                fs._checksum_records[canonical_key] = ChecksumRecord(
+                    checksum="cafebabe", timestamp=1.0,
+                )
+                self.assertIn(canonical_key, fs._checksum_records)
+
+                fs._invalidate_file_cache("/shared.txt.local0")
+
+                self.assertNotIn(canonical_key, fs._checksum_records)
+            finally:
+                fs.state_manager.close()
+
     def test_invalidate_uses_resolve_path_not_old_method(self):
         """_invalidate_file_cache works via _resolve_path (no _resolve_backend_target)."""
         with tempfile.TemporaryDirectory() as tmp:
