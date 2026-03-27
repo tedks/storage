@@ -335,7 +335,8 @@ class StorageFS(Operations):
         # Resolve canonical path for metadata lookup.  Suffixed conflict
         # paths (e.g. /foo.remote0) store metadata under the canonical
         # path (/foo), so we need to resolve it.
-        canonical_path, _ = self._resolve_backend_target(virtual_path)
+        resolved = self._resolve_path(virtual_path)
+        canonical_path = resolved.canonical_path
 
         with self._fd_lock:
             for entry in self._fd_map.values():
