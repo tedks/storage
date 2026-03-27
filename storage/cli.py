@@ -86,6 +86,17 @@ def _optional_profile_string(profile: Dict[str, Any], key: str, profile_name: st
     return value
 
 
+def _optional_profile_float(profile: Dict[str, Any], key: str, profile_name: str) -> Optional[float]:
+    value = profile.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, (int, float)):
+        raise click.ClickException(
+            f"Mount profile '{profile_name}' must define '{key}' as a number when present"
+        )
+    return float(value)
+
+
 def _optional_profile_int(profile: Dict[str, Any], key: str, profile_name: str) -> Optional[int]:
     value = profile.get(key)
     if value is None:
@@ -192,6 +203,8 @@ def _load_mount_profile_settings(config_path: Path, profile_name: str) -> Dict[s
         "streaming_reads": _optional_profile_bool(config_profile, "streaming_reads", profile_name),
         "streaming_chunk_size": _optional_profile_string(config_profile, "streaming_chunk_size", profile_name),
         "max_streaming_sessions": _optional_profile_int(config_profile, "max_streaming_sessions", profile_name),
+        "readdir_ttl": _optional_profile_float(config_profile, "readdir_ttl", profile_name),
+        "enable_watchers": _optional_profile_bool(config_profile, "enable_watchers", profile_name),
         "backing_paths": config_backing_paths,
         "remote": config_remote,
     }
@@ -220,6 +233,8 @@ def _can_auto_load_mount_profile(
     streaming_reads: Optional[bool],
     streaming_chunk_size: Optional[str],
     max_streaming_sessions: Optional[int],
+    readdir_ttl: Optional[float],
+    enable_watchers: Optional[bool],
 ) -> bool:
     if not _target_looks_like_profile_name(mount_target):
         return False
@@ -237,6 +252,8 @@ def _can_auto_load_mount_profile(
         streaming_reads is not None,
         streaming_chunk_size,
         max_streaming_sessions is not None,
+        readdir_ttl is not None,
+        enable_watchers is not None,
     ))
 
 
@@ -261,8 +278,13 @@ def _can_auto_load_mount_profile(
               help='Chunk size for streaming range reads (e.g., 256K, 1M).')
 @click.option('--max-streaming-sessions', type=int,
               help='Maximum number of concurrent streaming prefetch sessions.')
+@click.option('--readdir-ttl', type=float,
+              help='Seconds to cache directory listings (default 1.0). Higher = less backend load.')
+@click.option('--enable-watchers/--no-enable-watchers', default=None,
+              help='Run inotifywait on SSH backends for push-based cache invalidation.')
 def mount(mount_target, backing_paths, config_path, cache, cache_size, database, workers, remote, key_file, foreground,
-          allow_other, debug, streaming_reads, streaming_chunk_size, max_streaming_sessions):
+          allow_other, debug, streaming_reads, streaming_chunk_size, max_streaming_sessions,
+          readdir_ttl, enable_watchers):
     """
     Mount a Storage filesystem
 
@@ -303,6 +325,8 @@ def mount(mount_target, backing_paths, config_path, cache, cache_size, database,
         "streaming_reads": None,
         "streaming_chunk_size": None,
         "max_streaming_sessions": None,
+        "readdir_ttl": None,
+        "enable_watchers": None,
         "backing_paths": (),
         "remote": (),
     }
@@ -327,6 +351,8 @@ def mount(mount_target, backing_paths, config_path, cache, cache_size, database,
         streaming_reads,
         streaming_chunk_size,
         max_streaming_sessions,
+        readdir_ttl,
+        enable_watchers,
     ):
         available_configs = [candidate for candidate in _default_mount_config_paths() if candidate.exists()]
         if available_configs:
@@ -383,6 +409,14 @@ def mount(mount_target, backing_paths, config_path, cache, cache_size, database,
             else DEFAULT_MAX_STREAMING_SESSIONS
         )
     )
+    readdir_ttl = (
+        readdir_ttl if readdir_ttl is not None
+        else (config_values["readdir_ttl"] if config_values["readdir_ttl"] is not None else 1.0)
+    )
+    enable_watchers = (
+        enable_watchers if enable_watchers is not None
+        else (config_values["enable_watchers"] if config_values["enable_watchers"] is not None else False)
+    )
     backing_paths = tuple(backing_paths) if backing_paths else config_values["backing_paths"]
     remote = tuple(remote) if remote else config_values["remote"]
 
@@ -423,6 +457,15 @@ def mount(mount_target, backing_paths, config_path, cache, cache_size, database,
     click.echo(f"  Streaming reads: {'enabled' if streaming_reads else 'disabled'}")
     click.echo(f"  Streaming chunk: {streaming_chunk_size} ({streaming_chunk_bytes:,} bytes)")
     click.echo(f"  Max streaming sessions: {max_streaming_sessions}")
+    if enable_watchers:
+        from storage.backends.ssh import SSHBackend
+        non_ssh = [n for n, b in backends.items() if not isinstance(b, SSHBackend)]
+        if non_ssh:
+            click.echo(f"  Invalidation: push (SSH backends) + pull TTL={readdir_ttl}s ({', '.join(non_ssh)})")
+        else:
+            click.echo(f"  Invalidation: push (inotifywait)")
+    else:
+        click.echo(f"  Invalidation: pull (TTL={readdir_ttl}s)")
     click.echo(f"\nPress Ctrl+C to unmount\n")
 
     # Suppress paramiko noise unless debugging
@@ -443,6 +486,8 @@ def mount(mount_target, backing_paths, config_path, cache, cache_size, database,
             streaming_reads=streaming_reads,
             streaming_chunk_size=streaming_chunk_bytes,
             max_streaming_sessions=max_streaming_sessions,
+            readdir_ttl=readdir_ttl,
+            enable_watchers=enable_watchers,
         )
     except PermissionError as e:
         click.echo(f"Permission error: {e}", err=True)

@@ -95,7 +95,9 @@ class StorageFS(Operations):
     def __init__(self, cache_root: Path, state_db: Path, backends: Dict[str, Backend],
                  cache_size: int, num_sync_workers: int = 2, start_sync: bool = True,
                  streaming_reads: bool = False, streaming_chunk_size: int = 1024 * 1024,
-                 max_streaming_sessions: int = 8):
+                 max_streaming_sessions: int = 8,
+                 readdir_ttl: float = 1.0,
+                 enable_watchers: bool = False):
         """
         Initialize Storage filesystem
 
@@ -108,6 +110,14 @@ class StorageFS(Operations):
             streaming_reads: Enable uncached range streaming + background prefetch
             streaming_chunk_size: Range size used for foreground/background remote reads
             max_streaming_sessions: Maximum concurrent streaming sessions
+            readdir_ttl: Seconds to cache readdir results before re-querying
+                         backends (pull-based invalidation). Ignored when
+                         enable_watchers is True.
+            enable_watchers: Use push-based cache invalidation via inotifywait
+                             on SSH backends instead of TTL polling. When True,
+                             readdir_ttl is ignored and directory listings are
+                             only invalidated by remote change events. Requires
+                             inotify-tools on the remote host.
         """
         self.state_manager = StateManager(str(state_db))
         self.cache_manager = CacheManager(cache_root, self.state_manager, cache_size)
@@ -160,8 +170,25 @@ class StorageFS(Operations):
         # Directory listing cache (per directory, per backend) for fallback when backend unavailable
         self._dir_cache: Dict[str, Dict[str, Set[str]]] = {}
         self._dir_cache_lock = threading.Lock()
-        self._readdir_snapshot_ttl = 1.0
         self._readdir_snapshot: Dict[str, Tuple[float, List[str]]] = {}
+
+        # Invalidation strategy: push-based (watchers) or pull-based (TTL).
+        # When watchers are enabled AND all backends are SSH (watchable),
+        # TTL is infinite — only watcher callbacks invalidate snapshots.
+        # If any backend is non-SSH (no watcher), TTL stays as fallback.
+        self._enable_watchers = enable_watchers
+        self._watchers = []
+        from .backends.ssh import SSHBackend
+        all_watchable = backends and all(
+            isinstance(b, SSHBackend) for b in backends.values()
+        )
+        if enable_watchers and all_watchable:
+            self._readdir_snapshot_ttl = float('inf')
+        elif enable_watchers and not all_watchable:
+            # Mixed mount: watchers for SSH backends, TTL for the rest.
+            self._readdir_snapshot_ttl = max(0.0, float(readdir_ttl))
+        else:
+            self._readdir_snapshot_ttl = max(0.0, float(readdir_ttl))
 
         # Per-backend checksum index used for conflict surfacing
         self._checksum_lock = threading.RLock()
@@ -185,6 +212,9 @@ class StorageFS(Operations):
         if not self._sync_started:
             self.sync_manager.start()
             self._sync_started = True
+
+        if self._enable_watchers and not self._watchers:
+            self._start_watchers()
 
     def _get_config(self, virtual_path: str) -> FileConfig:
         """Get configuration for a file"""
@@ -278,6 +308,117 @@ class StorageFS(Operations):
         with self._dir_cache_lock:
             self._dir_cache.pop(path, None)
             self._readdir_snapshot.pop(path, None)
+
+    def _invalidate_file_cache(self, virtual_path: str):
+        """
+        Invalidate a cached file, forcing the next access to re-fetch
+        from the backend.  Used by the remote watcher on push events.
+
+        Handles both canonical paths (/foo) and backend-suffixed conflict
+        paths (/foo.remote0).  For suffixed paths, metadata is stored under
+        the canonical path, so we resolve it for the metadata lookup while
+        still unlinking the cache at the suffixed path.
+
+        Holds _fd_lock across the open-writer check and unlink so that
+        no writer can open the file between the check and the delete.
+        """
+        cache_path = self.cache_manager.get_cache_path(virtual_path)
+        if not (cache_path.exists() and cache_path.is_file()):
+            return
+
+        # Resolve canonical path for metadata lookup.  Suffixed conflict
+        # paths (e.g. /foo.remote0) store metadata under the canonical
+        # path (/foo), so we need to resolve it.
+        canonical_path, _ = self._resolve_backend_target(virtual_path)
+
+        with self._fd_lock:
+            for entry in self._fd_map.values():
+                # Check both the suffixed virtual_path and canonical_path
+                # since open() may use either.
+                if entry.virtual_path != virtual_path and entry.canonical_path != canonical_path:
+                    continue
+                if entry.prefetch_session is not None:
+                    continue
+                if (entry.flags & os.O_ACCMODE) != os.O_RDONLY:
+                    return
+
+            # For canonical paths, check metadata directly.
+            # For suffixed paths, check the canonical metadata.
+            meta = self.state_manager.get_file_metadata(canonical_path)
+            if meta and meta.sync_status != SyncStatus.CLEAN:
+                return
+
+            try:
+                cache_path.unlink()
+                self.state_manager.remove_file_location(virtual_path, "cache")
+                self.cache_manager.mark_cache_size_dirty()
+                if meta:
+                    meta.checksum = None
+                    meta.size = 0
+                    meta.last_modified = 0.0
+                    self.state_manager.set_file_metadata(meta)
+            except OSError:
+                pass
+
+        # Clear in-memory checksum records and cancel pending tasks.
+        with self._checksum_lock:
+            stale_keys = [k for k in self._checksum_records if k[0] == virtual_path]
+            for k in stale_keys:
+                self._checksum_records.pop(k, None)
+            # Cancel pending checksum tasks so they don't re-insert
+            # stale results after we just cleared them.
+            stale_tasks = [k for k in self._checksum_tasks if k[0] == virtual_path]
+            for k in stale_tasks:
+                future = self._checksum_tasks.pop(k, None)
+                if future is not None:
+                    future.cancel()
+
+    def _on_remote_change(self, virtual_path: str):
+        """
+        Callback from RemoteWatcher when inotifywait detects a change.
+
+        Invalidates the canonical path AND any backend-suffixed conflict
+        variants (e.g. /foo.remote0, /foo.remote1) so that cached
+        conflict views are also refreshed.
+        """
+        self._invalidate_dir_cache_entry(virtual_path)
+        self._invalidate_file_cache(virtual_path)
+        # Also invalidate backend-suffixed conflict caches.
+        # When /foo exists on multiple backends with different content,
+        # the FUSE layer exposes /foo.remote0, /foo.remote1 etc.
+        # These are cached under the suffixed path, so a remote change
+        # to /foo must also invalidate /foo.<backend> for each backend.
+        for backend_name in self.backends:
+            suffixed = f"{virtual_path}.{backend_name}"
+            self._invalidate_file_cache(suffixed)
+
+    def _start_watchers(self):
+        """Start inotifywait watchers for each SSH backend."""
+        from .backends.ssh import SSHBackend
+        from .watcher import RemoteWatcher
+
+        for name, backend in self.backends.items():
+            if not isinstance(backend, SSHBackend):
+                continue
+
+            watcher = RemoteWatcher(
+                backend_name=name,
+                ssh_host=backend.host,
+                ssh_port=backend.port,
+                remote_path=str(backend.remote_path),
+                on_change=self._on_remote_change,
+                username=backend.username,
+                key_filename=backend.key_filename,
+            )
+            watcher.start()
+            self._watchers.append(watcher)
+            self.logger.info("Started watcher for SSH backend %s", name)
+
+    def _stop_watchers(self):
+        """Stop all remote watchers."""
+        for watcher in self._watchers:
+            watcher.stop()
+        self._watchers.clear()
 
     def _get_target_backends(self, backend_hint: Optional[str],
                              backend_names: Optional[Set[str]] = None) -> List[Backend]:
@@ -1706,16 +1847,19 @@ class StorageFS(Operations):
             cache_path = self.cache_manager.get_cache_path(path)
 
         try:
-            try:
-                real_fd = os.open(str(cache_path), flags)
-            except FileNotFoundError:
-                if prefetch_session is not None and prefetch_session.final_cache_path.exists():
-                    cache_path = prefetch_session.final_cache_path
-                    real_fd = os.open(str(cache_path), flags)
-                else:
-                    raise
-
+            # Hold _fd_lock across os.open AND _fd_map registration so that
+            # _invalidate_file_cache (which also holds _fd_lock) cannot
+            # unlink the cache file between os.open and registration.
             with self._fd_lock:
+                try:
+                    real_fd = os.open(str(cache_path), flags)
+                except FileNotFoundError:
+                    if prefetch_session is not None and prefetch_session.final_cache_path.exists():
+                        cache_path = prefetch_session.final_cache_path
+                        real_fd = os.open(str(cache_path), flags)
+                    else:
+                        raise
+
                 vfd = self._fd_counter
                 self._fd_counter += 1
                 self._fd_map[vfd] = FDEntry(
@@ -1744,9 +1888,8 @@ class StorageFS(Operations):
         cache_path = self.cache_manager.create_cached_file(path)
 
         try:
-            real_fd = os.open(str(cache_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
-
             with self._fd_lock:
+                real_fd = os.open(str(cache_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
                 vfd = self._fd_counter
                 self._fd_counter += 1
                 self._fd_map[vfd] = FDEntry(
@@ -2021,6 +2164,7 @@ class StorageFS(Operations):
     def destroy(self, path):
         """Cleanup on unmount"""
         self._stop_control_server()
+        self._stop_watchers()
 
         with self._prefetch_sessions_lock:
             sessions = list(self._prefetch_sessions.values())
@@ -2095,7 +2239,9 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
                  debug: bool = False,
                  streaming_reads: bool = False,
                  streaming_chunk_size: int = 1024 * 1024,
-                 max_streaming_sessions: int = 8):
+                 max_streaming_sessions: int = 8,
+                 readdir_ttl: float = 1.0,
+                 enable_watchers: bool = False):
     """
     Mount a Storage filesystem
 
@@ -2168,6 +2314,8 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
         streaming_reads=streaming_reads,
         streaming_chunk_size=streaming_chunk_size,
         max_streaming_sessions=max_streaming_sessions,
+        readdir_ttl=readdir_ttl,
+        enable_watchers=enable_watchers,
     )
     try:
         FUSE(fs, mountpoint, nothreads=True, foreground=foreground, allow_other=allow_other)
