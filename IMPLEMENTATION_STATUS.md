@@ -29,14 +29,13 @@
 - **Commit**: c6d8369
 
 ### 3. Conflict Detection and Resolution (done)
-- **Implementation**: `storage/conflicts.py`, `storage/cli.py`
+- **Implementation**: `storage/conflicts.py`, `storage/cli_conflicts.py`, `storage/namespace.py`
 - **Features**:
-  - ConflictDetector for checking conflicts (integrated into sync)
-  - ConflictResolver with resolution strategies
-  - Support for .local and .remote file naming per design
-  - **storage-resolve CLI command** with interactive and automatic modes
-  - Three resolution strategies: local, remote, both
-- **Usage**: `storage resolve /mnt/storage [--auto local|remote|both]`
+  - ConflictDetector for checking conflicts (integrated into sync executor)
+  - Readdir conflict view: divergent files surfaced as `name.backend0`, `name.backend1`
+  - **storage conflicts** CLI command for listing and resolving conflicts
+  - Resolution via `--take BACKEND` (pick one version) or `--merge` (3-way merge)
+- **Usage**: `storage conflicts /mnt/storage [--file name --take backend]`
 - **Commits**: a2fe5b2, d5640ee
 
 ### 4. Recomputation Engine (done)
