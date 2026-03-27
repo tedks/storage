@@ -32,6 +32,7 @@ from .replication import ReplicationManager
 from .sync import SyncManager, DirOperation
 from .recompute import RecomputeEngine
 from .checksums import ChecksumRecord
+from .pathing import ResolvedPath, resolve_path
 
 
 @dataclass
@@ -266,9 +267,9 @@ class StorageFS(Operations):
                 unavailable.append(name)
         return available, unavailable
 
-    def _cache_state_payload(self, path: str, canonical_path: str) -> Dict[str, object]:
+    def _cache_state_payload(self, resolved: ResolvedPath) -> Dict[str, object]:
         """Build synthetic cache-state xattr payload for a virtual path."""
-        cache_path = self.cache_manager.get_cache_path(path)
+        cache_path = resolved.cache_path
         partial_path = self._partial_cache_path(cache_path)
         available_backends, unavailable_backends = self._backend_availability()
 
@@ -276,7 +277,7 @@ class StorageFS(Operations):
         partial_present = bool(partial_path.exists() and partial_path.is_file())
 
         payload: Dict[str, object] = {
-            "path": canonical_path,
+            "path": resolved.canonical_path,
             "cache_path": str(cache_path),
             "cache_present": cache_present,
             "partial_present": partial_present,
@@ -300,26 +301,9 @@ class StorageFS(Operations):
     # ------------------------------------------------------------------ #
     # Conflict / checksum helpers
     # ------------------------------------------------------------------ #
-    def _resolve_backend_target(self, path: str) -> tuple[str, Optional[str]]:
-        """
-        Split a virtual path into (canonical_path, backend_name).
-
-        If the name ends with .<backend>, we interpret that suffix as a request
-        to operate directly on that backend while keeping the canonical path
-        (without suffix) for remote operations.
-        """
-        p = Path(path)
-        name = p.name
-        for backend_name in self.backends.keys():
-            suffix = f".{backend_name}"
-            if name.endswith(suffix):
-                base = name[: -len(suffix)]
-                canonical = str(p.parent / base)
-                if not canonical.startswith("/"):
-                    canonical = "/" + canonical
-                return canonical, backend_name
-        canonical = path if path.startswith("/") else "/" + path
-        return canonical, None
+    def _resolve_path(self, path: str) -> ResolvedPath:
+        """Resolve a FUSE path into canonical and cache targets."""
+        return resolve_path(path, self.backends.keys(), self.cache_manager.get_cache_path)
 
     def _invalidate_dir_cache_entry(self, path: str):
         """Remove a directory entry from the cached listing."""
@@ -351,7 +335,8 @@ class StorageFS(Operations):
         # Resolve canonical path for metadata lookup.  Suffixed conflict
         # paths (e.g. /foo.remote0) store metadata under the canonical
         # path (/foo), so we need to resolve it.
-        canonical_path, _ = self._resolve_backend_target(virtual_path)
+        resolved = self._resolve_path(virtual_path)
+        canonical_path = resolved.canonical_path
 
         with self._fd_lock:
             for entry in self._fd_map.values():
@@ -1441,28 +1426,25 @@ class StorageFS(Operations):
         if finalized and no_readers:
             self._close_streaming_session_resources(session)
 
-    def _ensure_file_in_cache(self, virtual_path: str,
-                              canonical_path: Optional[str] = None,
-                              backend_name: Optional[str] = None) -> bool:
+    def _ensure_file_in_cache(self, resolved: ResolvedPath) -> bool:
         """
         Ensure a file is in the cache, downloading or recomputing if necessary
 
         Returns:
             True if file is available in cache, False otherwise
         """
-        canonical_path = canonical_path or virtual_path
-        cache_path = self.cache_manager.get_cache_path(virtual_path)
+        canonical_path = resolved.canonical_path
+        cache_path = resolved.cache_path
 
         # Check if already cached
-        if self.cache_manager.is_cached(virtual_path):
-            if not backend_name:
-                self.cache_manager.mark_accessed(virtual_path)
+        if self.cache_manager.is_cached(resolved.requested_path):
+            if not resolved.backend_name:
+                self.cache_manager.mark_accessed(resolved.requested_path)
             return True
 
         # If a backend is explicitly requested (conflict suffix), bypass replication manager.
-        if backend_name:
-            backend = self.backends.get(backend_name)
-            cache_path = self.cache_manager.get_cache_path(virtual_path)
+        if resolved.backend_name:
+            backend = self.backends.get(resolved.backend_name)
             cache_path.parent.mkdir(parents=True, exist_ok=True)
 
             if backend and backend.exists(canonical_path):
@@ -1486,9 +1468,12 @@ class StorageFS(Operations):
 
         if backend:
             # Download to cache
-            if self.cache_manager.cache_file(virtual_path, backend, source_virtual_path=canonical_path):
+            if self.cache_manager.cache_file(
+                resolved.requested_path,
+                backend,
+                source_virtual_path=canonical_path,
+            ):
                 # Populate state metadata and locations if missing
-                cache_path = self.cache_manager.get_cache_path(virtual_path)
                 try:
                     st = os.lstat(str(cache_path))
                 except OSError:
@@ -1541,13 +1526,17 @@ class StorageFS(Operations):
                 return True
 
         # File not in cache or backends - try recomputation
-        if self.recompute_engine.can_recompute(virtual_path, cache_path):
+        if self.recompute_engine.can_recompute(resolved.requested_path, cache_path):
             # Recompute the file synchronously (blocks until complete)
-            result = self.recompute_engine.recompute_file(virtual_path, cache_path, timeout=30.0)
+            result = self.recompute_engine.recompute_file(
+                resolved.requested_path,
+                cache_path,
+                timeout=30.0,
+            )
 
             if result.success:
                 # File was recomputed successfully
-                self.cache_manager.mark_accessed(virtual_path)
+                self.cache_manager.mark_accessed(resolved.requested_path)
                 return True
 
         available_backends, _ = self._backend_availability()
@@ -1561,19 +1550,18 @@ class StorageFS(Operations):
 
     def getattr(self, path, fh=None):
         """Get file attributes"""
-        canonical_path, backend_name = self._resolve_backend_target(path)
-        cache_path = self.cache_manager.get_cache_path(path)
+        resolved = self._resolve_path(path)
 
         try:
-            st = os.lstat(str(cache_path))
+            st = os.lstat(str(resolved.cache_path))
             return dict((key, getattr(st, key)) for key in (
                 'st_atime', 'st_ctime', 'st_gid', 'st_mode', 'st_mtime',
                 'st_nlink', 'st_size', 'st_uid'))
         except OSError as e:
             # Fallback: query backends for non-cached entries (e.g., remote-only files)
             backend_iter = []
-            if backend_name:
-                backend_iter = [(backend_name, self.backends.get(backend_name))]
+            if resolved.backend_name:
+                backend_iter = [(resolved.backend_name, self.backends.get(resolved.backend_name))]
             else:
                 backend_iter = list(self.backends.items())
 
@@ -1583,11 +1571,11 @@ class StorageFS(Operations):
                 if not backend.is_available():
                     # Avoid repeated per-entry reconnect attempts during directory scans.
                     # Readdir/open paths still probe periodically based on backend cooldown.
-                    if backend_name:
+                    if resolved.backend_name:
                         raise FuseOSError(errno.EHOSTUNREACH)
                     continue
                 try:
-                    st = backend.stat(canonical_path)
+                    st = backend.stat(resolved.canonical_path)
                     return {
                         'st_atime': getattr(st, 'st_atime', time.time()),
                         'st_ctime': getattr(st, 'st_ctime', getattr(st, 'st_mtime', time.time())),
@@ -1599,7 +1587,12 @@ class StorageFS(Operations):
                         'st_uid': getattr(st, 'st_uid', os.getuid()),
                     }
                 except Exception as be:
-                    self.logger.debug("getattr backend fallback failed for %s on %s: %s", canonical_path, bname, be)
+                    self.logger.debug(
+                        "getattr backend fallback failed for %s on %s: %s",
+                        resolved.canonical_path,
+                        bname,
+                        be,
+                    )
 
             available_backends, _ = self._backend_availability()
             if not available_backends and self.backends:
@@ -1667,22 +1660,26 @@ class StorageFS(Operations):
 
     def mkdir(self, path, mode):
         """Create a directory"""
-        canonical_path, backend_name = self._resolve_backend_target(path)
-        cache_path = self.cache_manager.get_cache_path(canonical_path)
+        resolved = self._resolve_path(path)
+        cache_path = resolved.canonical_cache_path
 
         try:
             cache_path.mkdir(parents=True, exist_ok=False)
             os.chmod(cache_path, mode)
 
-            failures = self._propagate_dir_operation(DirOperation.MKDIR, canonical_path, backend_hint=backend_name)
+            failures = self._propagate_dir_operation(
+                DirOperation.MKDIR,
+                resolved.canonical_path,
+                backend_hint=resolved.backend_name,
+            )
 
-            parent_dir = str(Path(canonical_path).parent)
+            parent_dir = resolved.parent_dir
             self._invalidate_dir_cache_entry(parent_dir)
-            self._invalidate_dir_cache_entry(canonical_path)
+            self._invalidate_dir_cache_entry(resolved.canonical_path)
 
             for failed_backend in failures:
                 self.sync_manager.queue_dir_sync(
-                    canonical_path,
+                    resolved.canonical_path,
                     DirOperation.MKDIR,
                     mode=mode,
                     backend_hint=failed_backend,
@@ -1695,21 +1692,25 @@ class StorageFS(Operations):
 
     def rmdir(self, path):
         """Remove a directory"""
-        canonical_path, backend_name = self._resolve_backend_target(path)
-        cache_path = self.cache_manager.get_cache_path(canonical_path)
+        resolved = self._resolve_path(path)
+        cache_path = resolved.canonical_cache_path
 
         try:
             cache_path.rmdir()
 
-            failures = self._propagate_dir_operation(DirOperation.RMDIR, canonical_path, backend_hint=backend_name)
+            failures = self._propagate_dir_operation(
+                DirOperation.RMDIR,
+                resolved.canonical_path,
+                backend_hint=resolved.backend_name,
+            )
 
-            parent_dir = str(Path(canonical_path).parent)
+            parent_dir = resolved.parent_dir
             self._invalidate_dir_cache_entry(parent_dir)
-            self._invalidate_dir_cache_entry(canonical_path)
+            self._invalidate_dir_cache_entry(resolved.canonical_path)
 
             for failed_backend in failures:
                 self.sync_manager.queue_dir_sync(
-                    canonical_path,
+                    resolved.canonical_path,
                     DirOperation.RMDIR,
                     backend_hint=failed_backend,
                     priority=80,
@@ -1721,24 +1722,24 @@ class StorageFS(Operations):
 
     def unlink(self, path):
         """Remove a file"""
-        canonical_path, backend_name = self._resolve_backend_target(path)
-        cache_path = self.cache_manager.get_cache_path(path)
+        resolved = self._resolve_path(path)
+        cache_path = resolved.cache_path
 
         try:
             cache_path.unlink()
             self.cache_manager.mark_cache_size_dirty()
 
-            parent_dir = str(Path(canonical_path).parent)
+            parent_dir = resolved.parent_dir
             self._invalidate_dir_cache_entry(parent_dir)
-            self._invalidate_dir_cache_entry(canonical_path)
+            self._invalidate_dir_cache_entry(resolved.canonical_path)
 
             # Remove from state tracking
-            if not backend_name:
-                self.state_manager.delete_file(canonical_path)
-            backend = self.backends.get(backend_name) if backend_name else None
+            if not resolved.backend_name:
+                self.state_manager.delete_file(resolved.canonical_path)
+            backend = self.backends.get(resolved.backend_name) if resolved.backend_name else None
             if backend:
                 try:
-                    backend.delete_file(canonical_path)
+                    backend.delete_file(resolved.canonical_path)
                 except Exception:
                     pass
 
@@ -1747,14 +1748,14 @@ class StorageFS(Operations):
 
     def rename(self, old, new):
         """Rename a file or directory"""
-        old_canonical, old_backend = self._resolve_backend_target(old)
-        new_canonical, new_backend = self._resolve_backend_target(new)
+        old_resolved = self._resolve_path(old)
+        new_resolved = self._resolve_path(new)
 
-        if old_backend != new_backend:
+        if old_resolved.backend_name != new_resolved.backend_name:
             raise FuseOSError(errno.EXDEV)
 
-        old_cache = self.cache_manager.get_cache_path(old_canonical)
-        new_cache = self.cache_manager.get_cache_path(new_canonical)
+        old_cache = old_resolved.canonical_cache_path
+        new_cache = new_resolved.canonical_cache_path
 
         try:
             new_cache.parent.mkdir(parents=True, exist_ok=True)
@@ -1764,24 +1765,29 @@ class StorageFS(Operations):
             if is_directory:
                 rename_backend_names = set(self.backends.keys())
             else:
-                rename_backend_names = self.state_manager.get_location_backends(old_canonical)
+                rename_backend_names = self.state_manager.get_location_backends(
+                    old_resolved.canonical_path
+                )
 
-            renamed_entries = self.state_manager.rename_path(old_canonical, new_canonical)
+            renamed_entries = self.state_manager.rename_path(
+                old_resolved.canonical_path,
+                new_resolved.canonical_path,
+            )
 
             failures = self._propagate_dir_operation(
                 DirOperation.RENAME,
-                old_canonical,
-                backend_hint=old_backend,
-                new_path=new_canonical,
-                backend_names=rename_backend_names if not old_backend else None,
+                old_resolved.canonical_path,
+                backend_hint=old_resolved.backend_name,
+                new_path=new_resolved.canonical_path,
+                backend_names=rename_backend_names if not old_resolved.backend_name else None,
             )
 
-            parent_old = str(Path(old_canonical).parent)
-            parent_new = str(Path(new_canonical).parent)
+            parent_old = old_resolved.parent_dir
+            parent_new = new_resolved.parent_dir
             self._invalidate_dir_cache_entry(parent_old)
             self._invalidate_dir_cache_entry(parent_new)
-            self._invalidate_dir_cache_entry(old_canonical)
-            self._invalidate_dir_cache_entry(new_canonical)
+            self._invalidate_dir_cache_entry(old_resolved.canonical_path)
+            self._invalidate_dir_cache_entry(new_resolved.canonical_path)
 
             if renamed_entries:
                 for _, updated in renamed_entries:
@@ -1791,9 +1797,9 @@ class StorageFS(Operations):
 
             for failed_backend in failures:
                 self.sync_manager.queue_dir_sync(
-                    old_canonical,
+                    old_resolved.canonical_path,
                     DirOperation.RENAME,
-                    new_path=new_canonical,
+                    new_path=new_resolved.canonical_path,
                     backend_hint=failed_backend,
                     priority=90,
                     force=True,
@@ -1822,8 +1828,8 @@ class StorageFS(Operations):
 
     def truncate(self, path, length, fh=None):
         """Truncate a file"""
-        canonical_path, backend_name = self._resolve_backend_target(path)
-        cache_path = self.cache_manager.get_cache_path(path)
+        resolved = self._resolve_path(path)
+        cache_path = resolved.cache_path
 
         try:
             with open(cache_path, 'r+b') as f:
@@ -1831,8 +1837,8 @@ class StorageFS(Operations):
             self.cache_manager.mark_cache_size_dirty()
 
             # Mark as dirty
-            if not backend_name:
-                metadata = self.state_manager.get_file_metadata(canonical_path)
+            if not resolved.backend_name:
+                metadata = self.state_manager.get_file_metadata(resolved.canonical_path)
                 if metadata:
                     metadata.sync_status = SyncStatus.DIRTY
                     self.state_manager.set_file_metadata(metadata)
@@ -1844,18 +1850,21 @@ class StorageFS(Operations):
 
     def open(self, path, flags):
         """Open a file"""
-        canonical_path, backend_name = self._resolve_backend_target(path)
-        cache_path = self.cache_manager.get_cache_path(path)
+        resolved = self._resolve_path(path)
+        cache_path = resolved.cache_path
         prefetch_session: Optional[PrefetchSession] = None
 
         # Streaming mode applies only to canonical read-only opens of uncached files.
         if (
             self._streaming_reads
-            and backend_name is None
+            and resolved.backend_name is None
             and self._is_read_only_open(flags)
-            and not self.cache_manager.is_cached(path)
+            and not self.cache_manager.is_cached(resolved.requested_path)
         ):
-            prefetch_session = self._create_or_attach_prefetch_session(path, canonical_path)
+            prefetch_session = self._create_or_attach_prefetch_session(
+                resolved.requested_path,
+                resolved.canonical_path,
+            )
             if prefetch_session:
                 cache_path = prefetch_session.partial_cache_path
                 if not cache_path.exists() and prefetch_session.final_cache_path.exists():
@@ -1863,13 +1872,16 @@ class StorageFS(Operations):
                     cache_path = prefetch_session.final_cache_path
             else:
                 self._record_streaming_stat("streaming_fallback_opens", 1)
-                self.logger.info("streaming fallback path=%s reason=unavailable-session", canonical_path)
+                self.logger.info(
+                    "streaming fallback path=%s reason=unavailable-session",
+                    resolved.canonical_path,
+                )
 
         # Fallback path: preserve existing full-file cache semantics.
         if prefetch_session is None:
-            if not self._ensure_file_in_cache(path, canonical_path, backend_name):
+            if not self._ensure_file_in_cache(resolved):
                 raise FuseOSError(errno.ENOENT)
-            cache_path = self.cache_manager.get_cache_path(path)
+            cache_path = resolved.cache_path
 
         try:
             # Hold _fd_lock across os.open AND _fd_map registration so that
@@ -1888,17 +1900,17 @@ class StorageFS(Operations):
                 vfd = self._fd_counter
                 self._fd_counter += 1
                 self._fd_map[vfd] = FDEntry(
-                    virtual_path=path,
+                    virtual_path=resolved.requested_path,
                     cache_path=cache_path,
                     real_fd=real_fd,
                     flags=flags,
-                    backend_name=backend_name,
-                    canonical_path=canonical_path,
+                    backend_name=resolved.backend_name,
+                    canonical_path=resolved.canonical_path,
                     prefetch_session=prefetch_session,
                 )
 
-            if backend_name is None:
-                self.cache_manager.mark_accessed(path)
+            if resolved.backend_name is None:
+                self.cache_manager.mark_accessed(resolved.requested_path)
 
             return vfd
 
@@ -1909,8 +1921,8 @@ class StorageFS(Operations):
 
     def create(self, path, mode, fi=None):
         """Create a file"""
-        canonical_path, backend_name = self._resolve_backend_target(path)
-        cache_path = self.cache_manager.create_cached_file(path)
+        resolved = self._resolve_path(path)
+        cache_path = self.cache_manager.create_cached_file(resolved.requested_path)
 
         try:
             with self._fd_lock:
@@ -1918,18 +1930,18 @@ class StorageFS(Operations):
                 vfd = self._fd_counter
                 self._fd_counter += 1
                 self._fd_map[vfd] = FDEntry(
-                    virtual_path=path,
+                    virtual_path=resolved.requested_path,
                     cache_path=cache_path,
                     real_fd=real_fd,
                     flags=os.O_WRONLY,
-                    backend_name=backend_name,
-                    canonical_path=canonical_path,
+                    backend_name=resolved.backend_name,
+                    canonical_path=resolved.canonical_path,
                     prefetch_session=None,
                 )
 
-            config = self._get_config(canonical_path)
+            config = self._get_config(resolved.canonical_path)
             metadata = FileMetadata(
-                virtual_path=canonical_path,
+                virtual_path=resolved.canonical_path,
                 size=0,
                 checksum=None,
                 last_access=time.time(),
@@ -1943,9 +1955,9 @@ class StorageFS(Operations):
             )
             self.state_manager.set_file_metadata(metadata)
 
-            parent_dir = str(Path(canonical_path).parent)
+            parent_dir = resolved.parent_dir
             self._invalidate_dir_cache_entry(parent_dir)
-            self._invalidate_dir_cache_entry(canonical_path)
+            self._invalidate_dir_cache_entry(resolved.canonical_path)
 
             return vfd
 
@@ -2093,19 +2105,17 @@ class StorageFS(Operations):
 
     def getxattr(self, path, name, position=0):
         """Get extended attribute"""
-        canonical_path, _ = self._resolve_backend_target(path)
+        resolved = self._resolve_path(path)
 
         if name == self.CHECKSUM_XATTR:
-            return self._aggregate_checksums_yaml(canonical_path)
+            return self._aggregate_checksums_yaml(resolved.canonical_path)
 
         if name == self.CACHE_STATE_XATTR:
-            payload = self._cache_state_payload(path, canonical_path)
+            payload = self._cache_state_payload(resolved)
             return json.dumps(payload, sort_keys=True).encode("utf-8")
 
-        cache_path = self.cache_manager.get_cache_path(path)
-
         try:
-            return os.getxattr(str(cache_path), name)
+            return os.getxattr(str(resolved.cache_path), name)
         except OSError as e:
             raise FuseOSError(e.errno)
 
@@ -2123,18 +2133,17 @@ class StorageFS(Operations):
 
     def listxattr(self, path):
         """List extended attributes"""
-        canonical_path, _ = self._resolve_backend_target(path)
-        cache_path = self.cache_manager.get_cache_path(path)
+        resolved = self._resolve_path(path)
 
         try:
-            attrs = set(os.listxattr(str(cache_path)))
+            attrs = set(os.listxattr(str(resolved.cache_path)))
         except OSError:
             attrs = set()
 
         # Expose checksum key if we have data
         with self._checksum_lock:
             has_checksum = any(
-                key[0] == canonical_path for key in self._checksum_records.keys()
+                key[0] == resolved.canonical_path for key in self._checksum_records.keys()
             )
         if has_checksum:
             attrs.add(self.CHECKSUM_XATTR)
