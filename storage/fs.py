@@ -27,7 +27,8 @@ from .backends.base import Backend
 from .cache import CacheManager
 from .state import StateManager, FileMetadata, FileConfig, SyncStatus, FileLocation
 from .replication import ReplicationManager
-from .sync import SyncManager, DirOperation
+from .sync import SyncManager
+from .sync_tasks import DirOperation
 from .recompute import RecomputeEngine
 from .checksums import ChecksumRecord
 from .pathing import ResolvedPath, resolve_path
