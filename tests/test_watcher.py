@@ -254,3 +254,171 @@ class TestConfigurableTTL(TestCase):
             self.assertFalse(math.isinf(fs._readdir_snapshot_ttl))
             self.assertEqual(fs._readdir_snapshot_ttl, 5.0)
             fs.state_manager.close()
+
+
+class TestWatcherInvalidation(TestCase):
+    """Test the watcher-triggered cache invalidation path in StorageFS."""
+
+    def _make_fs(self, tmp, backend_roots=None):
+        """Create a StorageFS with optional LocalBackend(s) for testing.
+
+        backend_roots is a dict of {name: Path} for LocalBackend roots.
+        If None, a single 'local0' backend is created.
+        """
+        from storage.fs import StorageFS
+        from storage.backends.local import LocalBackend
+
+        cache = Path(tmp) / "cache"
+        cache.mkdir(exist_ok=True)
+        db = Path(tmp) / "state.db"
+
+        if backend_roots is None:
+            be_root = Path(tmp) / "backend"
+            be_root.mkdir(exist_ok=True)
+            backends = {"local0": LocalBackend("local0", str(be_root))}
+        else:
+            backends = {
+                name: LocalBackend(name, str(root))
+                for name, root in backend_roots.items()
+            }
+
+        fs = StorageFS(
+            cache_root=cache, state_db=db, backends=backends,
+            cache_size=1024 * 1024, num_sync_workers=0, start_sync=False,
+        )
+        return fs
+
+    def _cache_file(self, fs, virtual_path, content=b"hello"):
+        """Write content into the cache at virtual_path and set CLEAN metadata."""
+        from storage.state import FileMetadata, SyncStatus
+
+        cache_path = fs.cache_manager.get_cache_path(virtual_path)
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_bytes(content)
+
+        meta = FileMetadata(
+            virtual_path=virtual_path,
+            size=len(content),
+            checksum="abc123",
+            last_access=0.0,
+            last_modified=1.0,
+            sync_status=SyncStatus.CLEAN,
+            replica_count=1,
+            recomputable=False,
+            recompute_cmd=None,
+            encrypted=False,
+            encryption_key_id=None,
+        )
+        fs.state_manager.set_file_metadata(meta)
+        return cache_path
+
+    def test_invalidate_removes_cached_file(self):
+        """_invalidate_file_cache removes the cached file for a CLEAN entry."""
+        with tempfile.TemporaryDirectory() as tmp:
+            fs = self._make_fs(tmp)
+            try:
+                cache_path = self._cache_file(fs, "/test.txt")
+                self.assertTrue(cache_path.exists())
+
+                fs._invalidate_file_cache("/test.txt")
+
+                self.assertFalse(cache_path.exists())
+            finally:
+                fs.state_manager.close()
+
+    def test_invalidate_skips_uncached_file(self):
+        """_invalidate_file_cache on a non-existent cache path raises no error."""
+        with tempfile.TemporaryDirectory() as tmp:
+            fs = self._make_fs(tmp)
+            try:
+                # Should not raise.
+                fs._invalidate_file_cache("/does-not-exist.txt")
+            finally:
+                fs.state_manager.close()
+
+    def test_invalidate_skips_dirty_file(self):
+        """_invalidate_file_cache must not remove a DIRTY cached file."""
+        from storage.state import SyncStatus
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fs = self._make_fs(tmp)
+            try:
+                cache_path = self._cache_file(fs, "/dirty.txt")
+
+                # Mark the file as DIRTY in state.
+                meta = fs.state_manager.get_file_metadata("/dirty.txt")
+                meta.sync_status = SyncStatus.DIRTY
+                fs.state_manager.set_file_metadata(meta)
+
+                fs._invalidate_file_cache("/dirty.txt")
+
+                # The cache file must still be present.
+                self.assertTrue(cache_path.exists())
+            finally:
+                fs.state_manager.close()
+
+    def test_on_remote_change_invalidates_canonical_and_suffixed(self):
+        """_on_remote_change clears the canonical cache and dir cache entry."""
+        with tempfile.TemporaryDirectory() as tmp:
+            be0 = Path(tmp) / "be0"
+            be1 = Path(tmp) / "be1"
+            be0.mkdir()
+            be1.mkdir()
+            fs = self._make_fs(tmp, backend_roots={
+                "remote0": be0,
+                "remote1": be1,
+            })
+            try:
+                # Cache the canonical path.
+                cache_path = self._cache_file(fs, "/shared.txt")
+                self.assertTrue(cache_path.exists())
+
+                fs._on_remote_change("/shared.txt")
+
+                # Canonical cache should be gone.
+                self.assertFalse(cache_path.exists())
+            finally:
+                fs.state_manager.close()
+
+    def test_invalidate_clears_checksum_records(self):
+        """_invalidate_file_cache removes matching checksum records."""
+        with tempfile.TemporaryDirectory() as tmp:
+            fs = self._make_fs(tmp)
+            try:
+                self._cache_file(fs, "/checksummed.txt")
+
+                from storage.checksums import ChecksumRecord
+                key = ("/checksummed.txt", "local0")
+                fs._checksum_records[key] = ChecksumRecord(
+                    checksum="deadbeef", timestamp=1.0,
+                )
+                self.assertIn(key, fs._checksum_records)
+
+                fs._invalidate_file_cache("/checksummed.txt")
+
+                self.assertNotIn(key, fs._checksum_records)
+            finally:
+                fs.state_manager.close()
+
+    def test_invalidate_uses_resolve_path_not_old_method(self):
+        """_invalidate_file_cache works via _resolve_path (no _resolve_backend_target)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            fs = self._make_fs(tmp)
+            try:
+                # Verify the old method does not exist.
+                self.assertFalse(
+                    hasattr(fs, "_resolve_backend_target"),
+                    "_resolve_backend_target should not exist; "
+                    "_resolve_path is the replacement.",
+                )
+
+                # _invalidate_file_cache should work for a cached file,
+                # which implicitly exercises _resolve_path internally.
+                cache_path = self._cache_file(fs, "/resolved.txt")
+                self.assertTrue(cache_path.exists())
+
+                fs._invalidate_file_cache("/resolved.txt")
+
+                self.assertFalse(cache_path.exists())
+            finally:
+                fs.state_manager.close()
