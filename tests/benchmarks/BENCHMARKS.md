@@ -99,9 +99,17 @@ python tests/benchmarks/generate_comparison_graphs.py
 | `test_rsync_vs_sftp_bench.py` | A/B comparison of shutil vs rsync, delta transfer efficiency |
 | `test_readdir_bench.py` | Directory listing warm/cold cache performance |
 
+## Results
+
+Benchmark result snapshots are stored in `tests/benchmarks/results/` with
+a date and context name.  Each directory has a README explaining what was
+measured and the relevant commits.
+
+- [`results/2026-03-26-perf-optimization/`](results/2026-03-26-perf-optimization/) — SFTP deprecation analysis (PRs #45-#47)
+
 ## Graph Generators
 
-The PNG graphs are not checked into the repository.  To regenerate:
+To regenerate graphs from current code:
 
 ```bash
 python tests/benchmarks/generate_graphs.py           # overhead, scaling, invalidation, cache
