@@ -43,7 +43,7 @@ Storage will always write to and reliably fflush and similar the local cache (or
 
 ## Write Conflicts
 
-Storage tracks write times and checksums to determine when a conflict occurs, which is when a write is about to be propagated to a filesystem where the existant file has a different checksum than the local file prior to the write. In this situation, Storage doesn't attempt to resolve the conflict in any way, but instead exposes both files to the user, with the remote file showing in the Storage abstract filesystem as "${filename}.remote.${write_timestamp}, and the local file showing as "${filename}.local.${write_timestamp}. The local file is propagated to the backing filesystems as configured under the new name, so that in the event of a local failure, the file content is not lost. The utility `storage-resolve` supports viewing and selecting canonical files, or performing common types of merges like a three-way merge for text files. 
+Storage tracks write times and checksums to determine when a conflict occurs, which is when a write is about to be propagated to a filesystem where the existant file has a different checksum than the local file prior to the write. In this situation, Storage doesn't attempt to resolve the conflict in any way, but instead exposes both files to the user via the readdir conflict view: when a file exists on multiple backends with differing checksums, readdir presents `${filename}.${backend_name}` for each variant (e.g. `photo.jpg.remote0`, `photo.jpg.remote1`). The `storage conflicts` command lists active conflicts and supports resolution via `--take BACKEND` (pick one version) or `--merge` (3-way merge for text files).
 
 ## Free Space Management
 
