@@ -698,20 +698,37 @@ class SSHBackend(Backend):
 
     def get_fast_checksum(self, virtual_path: str) -> str:
         """
-        Compute checksum on the remote side without downloading the full file.
+        Compute checksum without downloading the full file.
 
-        Falls back to SHA256 via ssh exec. If that fails, raises an exception.
+        Tries xxh128sum on the remote (matches local xxh3_128).
+        Falls back to downloading a temp copy and checksumming locally
+        so the result is always consistent with local checksums.
         """
         ssh_client, _ = self._current_clients()
         remote_path = str(self._resolve_path(virtual_path))
-        cmd = f"sha256sum {self._shell_quote(remote_path)}"
+
+        # Try remote xxh128sum first (fast path, avoids download).
+        cmd = f"xxh128sum {self._shell_quote(remote_path)} 2>/dev/null"
         _, stdout, stderr = ssh_client.exec_command(
             cmd, timeout=self.connect_timeout
         )
         output = stdout.read().decode().strip()
-        if not output:
-            raise RuntimeError(f"checksum command failed: {stderr.read().decode()}")
-        return output.split()[0]
+        if output and not output.startswith("/"):
+            return output.split()[0]
+
+        # Fallback: download to temp file and compute locally.
+        import tempfile
+        from ..checksums import fast_checksum_file
+        with tempfile.NamedTemporaryFile(delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+        try:
+            self.copy_to_local(virtual_path, tmp_path)
+            return fast_checksum_file(tmp_path)
+        finally:
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
 
     def set_xattr(self, virtual_path: str, name: str, value: bytes):
         """Best-effort remote setfattr."""

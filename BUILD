@@ -14,6 +14,7 @@ py_library(
         "@pypi//fusepy",
         "@pypi//paramiko",
         "@pypi//pyyaml",
+        "@pypi//xxhash",
     ],
 )
 

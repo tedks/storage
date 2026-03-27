@@ -7,7 +7,6 @@ than attempting automatic resolution.
 """
 
 import time
-import hashlib
 from pathlib import Path
 from typing import Optional, Tuple
 from dataclasses import dataclass
