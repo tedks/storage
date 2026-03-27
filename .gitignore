@@ -49,6 +49,9 @@ nix-portable
 .DS_Store
 Thumbs.db
 
+# Benchmark artifacts (regenerate with generate_graphs.py)
+tests/benchmarks/graphs/
+
 # Bazel
 bazel-bin
 bazel-out
