@@ -64,12 +64,12 @@ class RemoteWatcher:
         backend_name: str,
         ssh_host: str,
         ssh_port: int,
-        on_change: Callable[[str], None],
+        remote_path: str = "",
+        on_change: Optional[Callable[[str], None]] = None,
         username: Optional[str] = None,
         key_filename: Optional[str] = None,
+        *,
         remote_paths: Optional[List[str]] = None,
-        # Legacy single-path interface for backwards compatibility.
-        remote_path: Optional[str] = None,
     ):
         self.backend_name = backend_name
         self.ssh_host = ssh_host
@@ -79,13 +79,17 @@ class RemoteWatcher:
         self.key_filename = key_filename
 
         # Accept either remote_paths (list) or remote_path (single string).
-        if not remote_paths and remote_path is not None:
+        if not remote_paths and remote_path:
             remote_paths = [remote_path]
         elif not remote_paths:
             remote_paths = []
-        self._remote_paths: List[str] = [
-            (p.rstrip("/") or "/") for p in remote_paths
-        ]
+        # Sort longest-first so that overlapping prefixes like /data/sub
+        # match before /data.
+        self._remote_paths: List[str] = sorted(
+            [(p.rstrip("/") or "/") for p in remote_paths],
+            key=len,
+            reverse=True,
+        )
 
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
