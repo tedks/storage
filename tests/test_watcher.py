@@ -166,6 +166,92 @@ class TestRemoteWatcherSSHCommand(TestCase):
         self.assertIn("'/data/my storage'", inotify_part)
 
 
+class TestMultiPathWatcher(TestCase):
+    """Test coalesced multi-path watching."""
+
+    def test_multi_path_command_includes_all_paths(self):
+        w = RemoteWatcher(
+            backend_name="remote0,remote1",
+            ssh_host="host",
+            ssh_port=22,
+            remote_paths=["/srv/raid/warez", "/srv/chunk0/warez"],
+            on_change=lambda p: None,
+            username="user",
+        )
+        cmd = w._build_ssh_command()
+        inotify_part = cmd[-1]
+        self.assertIn("/srv/raid/warez", inotify_part)
+        self.assertIn("/srv/chunk0/warez", inotify_part)
+
+    def test_multi_path_parse_matches_correct_root(self):
+        w = RemoteWatcher(
+            backend_name="multi",
+            ssh_host="host",
+            ssh_port=22,
+            remote_paths=["/srv/raid/warez", "/srv/chunk0/warez"],
+            on_change=lambda p: None,
+        )
+        # Event under first path
+        self.assertEqual(
+            w._parse_event_line("CREATE /srv/raid/warez/movies/test.mkv"),
+            "/movies/test.mkv",
+        )
+        # Event under second path
+        self.assertEqual(
+            w._parse_event_line("MODIFY /srv/chunk0/warez/music/song.flac"),
+            "/music/song.flac",
+        )
+        # Event under neither path
+        self.assertIsNone(
+            w._parse_event_line("CREATE /srv/other/file.txt"),
+        )
+
+    def test_multi_path_root_event(self):
+        w = RemoteWatcher(
+            backend_name="multi",
+            ssh_host="host",
+            ssh_port=22,
+            remote_paths=["/srv/raid/warez", "/srv/chunk0/warez"],
+            on_change=lambda p: None,
+        )
+        self.assertEqual(
+            w._parse_event_line("ATTRIB /srv/chunk0/warez"),
+            "/",
+        )
+
+    def test_legacy_single_path_still_works(self):
+        w = RemoteWatcher(
+            backend_name="legacy",
+            ssh_host="host",
+            ssh_port=22,
+            remote_path="/data/storage",
+            on_change=lambda p: None,
+        )
+        self.assertEqual(w._remote_paths, ["/data/storage"])
+        self.assertEqual(
+            w._parse_event_line("CREATE /data/storage/file.txt"),
+            "/file.txt",
+        )
+
+    def test_three_paths_single_command(self):
+        w = RemoteWatcher(
+            backend_name="r0,r1,r2",
+            ssh_host="host",
+            ssh_port=22,
+            remote_paths=["/srv/raid/warez", "/srv/chunk0/warez", "/srv/chunk1/warez"],
+            on_change=lambda p: None,
+            username="tedks",
+        )
+        cmd = w._build_ssh_command()
+        inotify_part = cmd[-1]
+        # All three paths in one inotifywait command
+        self.assertIn("/srv/raid/warez", inotify_part)
+        self.assertIn("/srv/chunk0/warez", inotify_part)
+        self.assertIn("/srv/chunk1/warez", inotify_part)
+        # Only one ssh command (verified by cmd structure)
+        self.assertEqual(cmd[0], "ssh")
+
+
 class TestConfigurableTTL(TestCase):
     """Test that readdir TTL is configurable."""
 
