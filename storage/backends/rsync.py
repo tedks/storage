@@ -155,21 +155,13 @@ class RsyncBackend(SSHBackend):
         return result
 
     # ------------------------------------------------------------------ #
-    # Override transfer methods to use rsync
+    # Override write transfer to use rsync; reads use inherited SFTP
     # ------------------------------------------------------------------ #
 
-    def copy_to_local(self, virtual_path: str, local_path: Path):
-        """Download a file from remote using rsync."""
-        local_path.parent.mkdir(parents=True, exist_ok=True)
-        remote = self._remote_spec(virtual_path)
-        try:
-            self._run_rsync(remote, str(local_path))
-        except subprocess.TimeoutExpired:
-            self.logger.warning("rsync copy_to_local timed out for %s", virtual_path)
-            self._mark_unavailable()
-            raise
-        except RuntimeError:
-            raise
+    # copy_to_local is intentionally NOT overridden.  SFTP's persistent
+    # per-thread connection is faster for reads (no fork overhead, no
+    # SSH handshake per file, progressive download).  rsync is only
+    # beneficial for writes where delta compression matters.
 
     def copy_from_local(self, local_path: Path, virtual_path: str):
         """Upload a file to remote using rsync."""
