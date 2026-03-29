@@ -6,6 +6,7 @@ Per design, conflicts are exposed as separate files with timestamps rather
 than attempting automatic resolution.
 """
 
+import logging
 import time
 from pathlib import Path
 from typing import Optional, Tuple
@@ -13,6 +14,8 @@ from dataclasses import dataclass
 
 from .backends.base import Backend
 from .state import StateManager
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -51,14 +54,16 @@ class ConflictDetector:
         Returns:
             Conflict object if conflict detected, None otherwise
         """
+        logger.debug(
+            "conflict check: path=%s backend=%s local_checksum=%s",
+            virtual_path, backend.name, local_checksum[:12] if local_checksum else None,
+        )
+
         if not backend.exists(virtual_path):
-            # No conflict if file doesn't exist on backend
             return None
 
-        # Get recorded locations
         locations = self.state_manager.get_file_locations(virtual_path)
 
-        # Find this backend's recorded state
         backend_location = None
         for location in locations:
             if location.backend_name == backend.name:
@@ -66,24 +71,35 @@ class ConflictDetector:
                 break
 
         if not backend_location:
-            # File exists on backend but we have no record of it
-            # This could be a new file or external modification
-            # For now, treat as no conflict (will sync)
             return None
 
-        # Compute current backend checksum
+        # Compute current backend checksum.
+        # WARNING: this downloads the ENTIRE remote file to /tmp to hash it.
+        # For large files this is extremely expensive.  See issue #74.
         try:
-            # Download to temp location and compute checksum
             import tempfile
             with tempfile.NamedTemporaryFile(delete=False) as tmp:
                 tmp_path = Path(tmp.name)
 
+            logger.info(
+                "conflict check downloading remote file: path=%s backend=%s "
+                "recorded_checksum=%s (this downloads the entire file)",
+                virtual_path, backend.name,
+                backend_location.checksum[:12] if backend_location.checksum else None,
+            )
             backend.copy_to_local(virtual_path, tmp_path)
             remote_checksum = self.state_manager.compute_checksum(tmp_path)
             tmp_path.unlink()
+            logger.info(
+                "conflict check complete: path=%s backend=%s remote_checksum=%s",
+                virtual_path, backend.name, remote_checksum[:12],
+            )
 
         except Exception as e:
-            # Can't compute checksum, assume no conflict
+            logger.warning(
+                "conflict check failed (assuming no conflict): path=%s backend=%s error=%s",
+                virtual_path, backend.name, e,
+            )
             return None
 
         # Check for conflict
