@@ -8,14 +8,13 @@ import shlex
 import socket
 import stat as stat_module
 import logging
-import threading
 import time
-import weakref
 import paramiko
 from pathlib import Path, PurePosixPath
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 from .base import Backend, BackendType
+from .ssh_transport import SSHTransportManager
 
 
 class SSHBackend(Backend):
@@ -52,185 +51,62 @@ class SSHBackend(Backend):
         # Keep I/O timeout higher than connect timeout to avoid aborting large/slow reads.
         self.sftp_operation_timeout = max(60.0, float(connect_timeout) * 6.0)
         self.logger = logging.getLogger(__name__)
+        self._transport = SSHTransportManager(
+            backend_name=self.name,
+            host=self.host,
+            port=self.port,
+            username=self.username,
+            password=self.password,
+            key_filename=self.key_filename,
+            connect_timeout=self.connect_timeout,
+            sftp_operation_timeout=self.sftp_operation_timeout,
+            is_available=self.is_available,
+            set_available=self.set_available,
+            logger=self.logger,
+            paramiko_module=paramiko,
+        )
+        self._thread_clients = self._transport.thread_clients
+        self._thread_clients_lock = self._transport.thread_clients_lock
 
-        # Per-thread SSH/SFTP connections (lazy connected). This avoids
-        # cross-thread contention and prevents one thread from closing a
-        # live channel owned by another thread.
-        self._thread_local = threading.local()
-        self._thread_clients: Dict[int, Tuple[paramiko.SSHClient, paramiko.SFTPClient, weakref.ReferenceType[threading.Thread]]] = {}
-        self._thread_clients_lock = threading.Lock()
-        self._availability_lock = threading.Lock()
-        self._probe_lock = threading.Lock()
-        self._reconnect_probe_interval = max(1.0, min(5.0, float(connect_timeout) / 2.0))
-        self._next_connect_retry_at = 0.0
+    @property
+    def _next_connect_retry_at(self) -> float:
+        return self._transport.next_connect_retry_at
+
+    @_next_connect_retry_at.setter
+    def _next_connect_retry_at(self, value: float):
+        self._transport.next_connect_retry_at = value
 
     @staticmethod
-    def _close_client_pair(ssh_client: Optional[paramiko.SSHClient], sftp_client: Optional[paramiko.SFTPClient]):
-        try:
-            if sftp_client:
-                sftp_client.close()
-        except Exception:
-            pass
-        try:
-            if ssh_client:
-                ssh_client.close()
-        except Exception:
-            pass
+    def _close_client_pair(
+        ssh_client: Optional[paramiko.SSHClient],
+        sftp_client: Optional[paramiko.SFTPClient],
+    ):
+        SSHTransportManager.close_client_pair(ssh_client, sftp_client)
 
     def _prune_stale_thread_clients(self, exclude_thread_id: Optional[int] = None):
-        stale_clients: List[Tuple[paramiko.SSHClient, paramiko.SFTPClient]] = []
+        self._transport.prune_stale_thread_clients(exclude_thread_id=exclude_thread_id)
 
-        with self._thread_clients_lock:
-            for thread_id, entry in list(self._thread_clients.items()):
-                if exclude_thread_id is not None and thread_id == exclude_thread_id:
-                    continue
-
-                ssh_client, sftp_client, thread_ref = entry
-                thread_obj = thread_ref()
-                if thread_obj is None or not thread_obj.is_alive():
-                    self._thread_clients.pop(thread_id, None)
-                    stale_clients.append((ssh_client, sftp_client))
-
-        for ssh_client, sftp_client in stale_clients:
-            self._close_client_pair(ssh_client, sftp_client)
-
-    def _set_thread_clients(self, ssh_client: paramiko.SSHClient, sftp_client: paramiko.SFTPClient):
-        thread_id = threading.get_ident()
-        self._prune_stale_thread_clients(exclude_thread_id=thread_id)
-
-        old_pair: Optional[Tuple[paramiko.SSHClient, paramiko.SFTPClient]] = None
-        thread_ref = weakref.ref(threading.current_thread())
-        with self._thread_clients_lock:
-            previous = self._thread_clients.get(thread_id)
-            if previous is not None:
-                old_pair = (previous[0], previous[1])
-            self._thread_clients[thread_id] = (ssh_client, sftp_client, thread_ref)
-
-        self._thread_local.ssh_client = ssh_client
-        self._thread_local.sftp_client = sftp_client
-
-        if old_pair is not None and old_pair != (ssh_client, sftp_client):
-            self._close_client_pair(old_pair[0], old_pair[1])
-
-    def _get_thread_clients(self) -> Tuple[Optional[paramiko.SSHClient], Optional[paramiko.SFTPClient]]:
-        ssh_client = getattr(self._thread_local, "ssh_client", None)
-        sftp_client = getattr(self._thread_local, "sftp_client", None)
-        return ssh_client, sftp_client
+    def _get_thread_clients(
+        self,
+    ) -> Tuple[Optional[paramiko.SSHClient], Optional[paramiko.SFTPClient]]:
+        return self._transport.get_thread_clients()
 
     @staticmethod
     def _transport_active(ssh_client: Optional[paramiko.SSHClient]) -> bool:
-        if ssh_client is None:
-            return False
-        try:
-            transport = ssh_client.get_transport()
-            return bool(transport and transport.is_active())
-        except Exception:
-            return False
+        return SSHTransportManager.transport_active(ssh_client)
 
     def _mark_available(self):
-        with self._availability_lock:
-            self._next_connect_retry_at = 0.0
-        self.set_available(True)
+        self._transport.mark_available()
 
     def _mark_unavailable(self):
-        with self._availability_lock:
-            self._next_connect_retry_at = max(
-                self._next_connect_retry_at,
-                time.monotonic() + self._reconnect_probe_interval,
-            )
-        self.set_available(False)
+        self._transport.mark_unavailable()
 
     @staticmethod
     def _is_transient_oserror(exc: OSError) -> bool:
-        """Return True when an OSError likely indicates connection loss."""
-        transient_errnos = {
-            errno.ECONNABORTED,
-            errno.ECONNRESET,
-            errno.ENETRESET,
-            errno.ESHUTDOWN,
-            errno.EHOSTDOWN,
-            errno.EHOSTUNREACH,
-            errno.ENETDOWN,
-            errno.ENETUNREACH,
-            errno.ETIMEDOUT,
-            errno.EPIPE,
-        }
-        if exc.errno in transient_errnos:
-            return True
-
-        message = str(exc).lower()
-        markers = (
-            "socket is closed",
-            "connection reset",
-            "connection timed out",
-            "broken pipe",
-            "connection aborted",
-            "eof",
-        )
-        return any(marker in message for marker in markers)
+        return SSHTransportManager.is_transient_oserror(exc)
 
     def _connect(self):
-        """Establish per-thread SSH/SFTP connection."""
-        try:
-            ssh_client = paramiko.SSHClient()
-            ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-
-            connect_kwargs = {
-                'hostname': self.host,
-                'port': self.port,
-                'username': self.username,
-                'timeout': self.connect_timeout,
-                'banner_timeout': self.connect_timeout,
-                'auth_timeout': self.connect_timeout,
-            }
-
-            if self.password:
-                connect_kwargs['password'] = self.password
-            if self.key_filename:
-                connect_kwargs['key_filename'] = self.key_filename
-            else:
-                # Prevent agent/key probing delays when no explicit key provided
-                connect_kwargs['allow_agent'] = False
-                connect_kwargs['look_for_keys'] = False
-
-            ssh_client.connect(**connect_kwargs)
-            sftp_client = ssh_client.open_sftp()
-
-            # Keep SFTP socket/channel timeouts above connect timeout to tolerate
-            # large files and slower links without spurious range-read aborts.
-            transport = ssh_client.get_transport()
-            if transport and transport.sock:
-                try:
-                    transport.sock.settimeout(self.sftp_operation_timeout)
-                except Exception:
-                    # Best-effort; SFTP may still function without socket-level timeout
-                    pass
-
-            try:
-                chan = sftp_client.get_channel()
-                if chan:
-                    chan.settimeout(self.sftp_operation_timeout)
-            except Exception:
-                pass
-
-            self._set_thread_clients(ssh_client, sftp_client)
-            self._mark_available()
-
-        except paramiko.AuthenticationException as e:
-            self.logger.error("SSH authentication failed for %s@%s:%s: %s",
-                              self.username, self.host, self.port, e)
-            self._mark_unavailable()
-            raise
-        except paramiko.SSHException as e:
-            self.logger.error("SSH handshake failed for %s@%s:%s: %s",
-                              self.username, self.host, self.port, e)
-            self._mark_unavailable()
-            raise
-        except Exception as e:
-            self.logger.error("Failed to connect to %s@%s:%s: %s",
-                              self.username, self.host, self.port, e)
-            self._mark_unavailable()
-            raise
+        self._transport.connect()
 
     def _resolve_path(self, virtual_path: str) -> PurePosixPath:
         """Convert virtual path to remote path"""
@@ -239,63 +115,14 @@ class SSHBackend(Backend):
 
     def _ensure_connected(self):
         """Ensure current thread has an active SSH/SFTP connection."""
-        ssh_client, sftp_client = self._get_thread_clients()
-        if sftp_client is not None and self._transport_active(ssh_client):
-            return
-
-        with self._availability_lock:
-            is_available = self.is_available()
-            next_retry_at = self._next_connect_retry_at
-
-        if not is_available and time.monotonic() < next_retry_at:
-            raise ConnectionError(
-                f"SSH backend {self.name} is temporarily unavailable after a disconnect"
-            )
-
-        # Single-probe reconnect gate: one thread probes; others fail fast.
-        if not self._probe_lock.acquire(blocking=False):
-            raise ConnectionError(
-                f"SSH backend {self.name} reconnect probe already in progress"
-            )
-        try:
-            # Recheck after acquiring probe lock to avoid duplicate probes.
-            with self._availability_lock:
-                is_available = self.is_available()
-                next_retry_at = self._next_connect_retry_at
-
-            if not is_available and time.monotonic() < next_retry_at:
-                raise ConnectionError(
-                    f"SSH backend {self.name} is temporarily unavailable after a disconnect"
-                )
-
-            self._reset_connection()
-            self._connect()
-        finally:
-            self._probe_lock.release()
+        self._transport.ensure_connected()
 
     def _current_clients(self) -> Tuple[paramiko.SSHClient, paramiko.SFTPClient]:
-        self._prune_stale_thread_clients(exclude_thread_id=threading.get_ident())
-        self._ensure_connected()
-        ssh_client, sftp_client = self._get_thread_clients()
-        if ssh_client is None or sftp_client is None:
-            raise RuntimeError("SSH backend has no active thread client")
-        return ssh_client, sftp_client
+        return self._transport.current_clients()
 
     def _reset_connection(self):
         """Drop current thread's SSH/SFTP clients so the next operation reconnects."""
-        thread_id = threading.get_ident()
-        ssh_client, sftp_client = self._get_thread_clients()
-
-        with self._thread_clients_lock:
-            pair = self._thread_clients.pop(thread_id, None)
-            if pair:
-                ssh_client = pair[0]
-                sftp_client = pair[1]
-
-        self._close_client_pair(ssh_client, sftp_client)
-
-        self._thread_local.ssh_client = None
-        self._thread_local.sftp_client = None
+        self._transport.reset_connection()
 
     def exists(self, virtual_path: str) -> bool:
         """Check if a file exists on remote"""
@@ -672,16 +499,7 @@ class SSHBackend(Backend):
 
     def close(self):
         """Close SSH/SFTP connections"""
-        with self._thread_clients_lock:
-            clients = [(entry[0], entry[1]) for entry in self._thread_clients.values()]
-            self._thread_clients.clear()
-
-        for ssh_client, sftp_client in clients:
-            self._close_client_pair(ssh_client, sftp_client)
-
-        self._thread_local.ssh_client = None
-        self._thread_local.sftp_client = None
-        self._mark_unavailable()
+        self._transport.close()
 
     def __del__(self):
         """Cleanup on deletion"""
