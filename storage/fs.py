@@ -349,26 +349,50 @@ class StorageFS(Operations):
             self._invalidate_file_cache(suffixed)
 
     def _start_watchers(self):
-        """Start inotifywait watchers for each SSH backend."""
+        """Start inotifywait watchers, coalescing backends on the same host."""
         from .backends.ssh import SSHBackend
         from .watcher import RemoteWatcher
 
+        # Group SSH backends by connection identity so backends on the
+        # same host share a single SSH+inotifywait process.
+        host_groups: dict[tuple, list[tuple[str, str]]] = {}
+        host_meta: dict[tuple, dict] = {}
         for name, backend in self.backends.items():
             if not isinstance(backend, SSHBackend):
                 continue
+            key = (backend.host, backend.port, backend.username,
+                   backend.key_filename)
+            host_groups.setdefault(key, []).append(
+                (name, str(backend.remote_path))
+            )
+            host_meta[key] = {
+                "ssh_host": backend.host,
+                "ssh_port": backend.port,
+                "username": backend.username,
+                "key_filename": backend.key_filename,
+            }
+
+        for key, backends_on_host in host_groups.items():
+            names = [b[0] for b in backends_on_host]
+            paths = [b[1] for b in backends_on_host]
+            meta = host_meta[key]
+            label = ",".join(names)
 
             watcher = RemoteWatcher(
-                backend_name=name,
-                ssh_host=backend.host,
-                ssh_port=backend.port,
-                remote_path=str(backend.remote_path),
+                backend_name=label,
+                ssh_host=meta["ssh_host"],
+                ssh_port=meta["ssh_port"],
+                remote_paths=paths,
                 on_change=self._on_remote_change,
-                username=backend.username,
-                key_filename=backend.key_filename,
+                username=meta["username"],
+                key_filename=meta["key_filename"],
             )
             watcher.start()
             self._watchers.append(watcher)
-            self.logger.info("Started watcher for SSH backend %s", name)
+            self.logger.info(
+                "Started watcher for %s (%d paths on %s)",
+                label, len(paths), meta["ssh_host"],
+            )
 
     def _stop_watchers(self):
         """Stop all remote watchers."""

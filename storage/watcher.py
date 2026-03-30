@@ -6,11 +6,9 @@ changes every TTL seconds, we run ``inotifywait`` on the remote host and
 stream change events back.  This eliminates readdir polling cost entirely
 for quiescent directories.
 
-Each Storage mount starts its own watcher per SSH backend.  This means
-each mount gets its own ``on_change`` callbacks without any IPC.  Multiple
-mounts on the same machine will each have their own SSH+inotifywait
-connection to the remote -- this is intentional so that every mount
-receives every event.
+When multiple backends share the same SSH host, a single SSH connection
+and inotifywait process watches all paths.  Each mount still gets its
+own watcher instances (no IPC between mounts).
 """
 
 from __future__ import annotations
@@ -21,7 +19,7 @@ import shlex
 import threading
 import time
 from pathlib import PurePosixPath
-from typing import Callable, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -34,21 +32,25 @@ _CHANGE_EVENTS = frozenset({
 
 class RemoteWatcher:
     """
-    Watch a remote directory tree via ``inotifywait`` over SSH.
+    Watch one or more remote directory trees via ``inotifywait`` over SSH.
 
     When a change is detected, calls ``on_change(virtual_path)`` so the
     filesystem can invalidate its directory and file caches for that path.
 
+    Multiple remote paths on the same host are watched by a single
+    inotifywait process to avoid redundant SSH connections.
+
     Parameters
     ----------
     backend_name : str
-        Logical name of the backend (for logging).
+        Logical name for logging.  When watching multiple backends on
+        one host, this is a comma-joined label like ``remote0,remote1``.
     ssh_host : str
-        SSH host (user@host or host).
+        SSH host.
     ssh_port : int
         SSH port.
-    remote_path : str
-        Absolute path on the remote to watch (the backend root).
+    remote_paths : list of str
+        Absolute paths on the remote to watch.
     on_change : callable
         ``on_change(virtual_path: str)`` is called for each detected change.
     username : str, optional
@@ -62,22 +64,41 @@ class RemoteWatcher:
         backend_name: str,
         ssh_host: str,
         ssh_port: int,
-        remote_path: str,
-        on_change: Callable[[str], None],
+        remote_path: str = "",
+        on_change: Optional[Callable[[str], None]] = None,
         username: Optional[str] = None,
         key_filename: Optional[str] = None,
+        *,
+        remote_paths: Optional[List[str]] = None,
     ):
         self.backend_name = backend_name
         self.ssh_host = ssh_host
         self.ssh_port = ssh_port
-        self.remote_path = remote_path.rstrip("/") or "/"
         self.on_change = on_change
         self.username = username
         self.key_filename = key_filename
 
+        # Accept either remote_paths (list) or remote_path (single string).
+        if not remote_paths and remote_path:
+            remote_paths = [remote_path]
+        elif not remote_paths:
+            remote_paths = []
+        # Sort longest-first so that overlapping prefixes like /data/sub
+        # match before /data.
+        self._remote_paths: List[str] = sorted(
+            [(p.rstrip("/") or "/") for p in remote_paths],
+            key=len,
+            reverse=True,
+        )
+
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._process = None
+
+    # Legacy property for tests that read self.remote_path.
+    @property
+    def remote_path(self) -> str:
+        return self._remote_paths[0] if self._remote_paths else "/"
 
     # ------------------------------------------------------------------ #
     # SSH + inotifywait subprocess
@@ -95,14 +116,12 @@ class RemoteWatcher:
         target = f"{self.username}@{self.ssh_host}" if self.username else self.ssh_host
         ssh_cmd.append(target)
 
-        # inotifywait: recursive, monitor mode, relevant events.
-        # Quote remote_path to prevent shell injection from paths with
-        # spaces or metacharacters.
         events = ",".join(sorted(_CHANGE_EVENTS))
+        quoted_paths = " ".join(shlex.quote(p) for p in self._remote_paths)
         inotify_cmd = (
             f"inotifywait -mrq --format '%e %w%f' "
             f"-e {events} "
-            f"{shlex.quote(self.remote_path)}"
+            f"{quoted_paths}"
         )
         ssh_cmd.append(inotify_cmd)
         return ssh_cmd
@@ -112,13 +131,13 @@ class RemoteWatcher:
         Parse an inotifywait output line into a virtual path.
 
         Line format: ``EVENTS /absolute/path``
-        Returns the virtual path (relative to remote_path) or None.
+        Returns the virtual path (relative to the matching remote_path)
+        or None if it doesn't match any watched path.
         """
         line = line.strip()
         if not line:
             return None
 
-        # Split on first space: "CREATE,ISDIR /remote/root/subdir/"
         parts = line.split(" ", 1)
         if len(parts) < 2:
             return None
@@ -126,14 +145,14 @@ class RemoteWatcher:
         events_str, abs_path = parts
         abs_path = abs_path.rstrip("/")
 
-        # Convert absolute remote path to virtual path.
-        # Use directory-boundary check to avoid /data matching /datafile.txt.
-        if abs_path == self.remote_path:
-            return "/"
-        prefix = self.remote_path if self.remote_path.endswith("/") else self.remote_path + "/"
-        if abs_path.startswith(prefix):
-            rel = abs_path[len(prefix) - 1:]  # Keep leading /
-            return rel if rel else "/"
+        # Try each watched path to find which backend root this event belongs to.
+        for rpath in self._remote_paths:
+            if abs_path == rpath:
+                return "/"
+            prefix = rpath if rpath.endswith("/") else rpath + "/"
+            if abs_path.startswith(prefix):
+                rel = abs_path[len(prefix) - 1:]  # Keep leading /
+                return rel if rel else "/"
 
         return None
 
@@ -157,9 +176,6 @@ class RemoteWatcher:
 
         while not self._stop_event.is_set():
             try:
-                # Start SSH+inotifywait in its own process group so we can
-                # kill the entire tree (ssh + remote shell + inotifywait)
-                # on cleanup, preventing orphaned remote processes.
                 self._process = subprocess.Popen(
                     cmd,
                     stdout=subprocess.PIPE,
@@ -174,7 +190,6 @@ class RemoteWatcher:
                     vpath = self._parse_event_line(line)
                     if vpath is not None:
                         try:
-                            # Invalidate both the file and its parent directory.
                             self.on_change(vpath)
                             parent = self._event_to_dir(vpath)
                             if parent != vpath:
@@ -205,8 +220,6 @@ class RemoteWatcher:
                             rc, self.backend_name,
                         )
                 else:
-                    # Successful run (inotifywait exited cleanly, e.g.
-                    # watched path was deleted).  Reset backoff.
                     backoff = self._INITIAL_BACKOFF
 
             except Exception:
@@ -226,15 +239,11 @@ class RemoteWatcher:
         proc = self._process
         if proc is None:
             return
-        # Kill the entire process group (ssh + remote shell) so that
-        # the remote inotifywait doesn't outlive the local SSH client.
         try:
             os.killpg(proc.pid, 9)
         except (ProcessLookupError, PermissionError):
-            # Process already exited or we don't own the group.
             pass
         except OSError:
-            # Fallback: kill just the SSH process.
             try:
                 proc.kill()
             except Exception:
