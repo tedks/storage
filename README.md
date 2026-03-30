@@ -5,7 +5,7 @@ Storage is a meta-filesystem that multiplexes an abstract filesystem over multip
 ## Features
 
 - **Local Cache with LRU**: Local cache mirrors remote files with automatic LRU eviction
-- **N-way Replication**: Configure per-directory replication (1 to N copies, or -1 for all backends)
+- **N-way Replication**: Configure per-directory replication (1 to N copies, or -1 for all storage members)
 - **Multiple Backend Types**: Local filesystems, SSH/SFTP remotes (coming soon)
 - **Background Sync**: Writes go to cache first, sync to backends in background
 - **Extended Attribute Configuration**: Control replication, encryption, and recomputation via xattrs
@@ -170,8 +170,8 @@ Configuration is hierarchical - child directories inherit from parents, with the
 
 1. **StateManager** (`storage/state.py`): SQLite database + xattr metadata tracking
 2. **CacheManager** (`storage/cache.py`): LRU cache management
-3. **ReplicationManager** (`storage/replication.py`): N-way replication across backends
-4. **Backend Abstraction** (`storage/backends/`): Local and remote filesystem support
+3. **ReplicationManager** (`storage/replication.py`): N-way replication across storage members
+4. **Storage Member Adapters** (`storage/backends/`): Local and remote filesystem support behind one capability surface
 5. **StorageFS** (`storage/fs.py`): FUSE filesystem implementation
 6. **CLI** (`storage/cli.py`): Command-line tools
 
@@ -179,13 +179,13 @@ Configuration is hierarchical - child directories inherit from parents, with the
 
 **Read Path:**
 1. Check local cache for file
-2. If not cached, download from best available backend
+2. If not cached, download from the best available storage member
 3. Future: Recompute if configured and available
 
 **Write Path:**
 1. Write to local cache first (ensure at least one copy)
 2. Mark file as dirty in state database
-3. Background sync to configured replicas (directory operations run best-effort synchronously and queue backend-specific retries when any replica is offline)
+3. Background sync to configured replicas (directory operations run best-effort synchronously and queue member-specific retries when any replica is offline)
 
 **Cache Management:**
 1. Track file access times for LRU
@@ -195,8 +195,8 @@ Configuration is hierarchical - child directories inherit from parents, with the
 
 **Replication:**
 1. Use extended attributes for per-directory configuration
-2. Select backends using consistent hashing
-3. Respect preferred backends and speed priorities
+2. Select storage members using consistent hashing
+3. Respect preferred member choices and speed priorities
 4. Propagate via background sync workers with retry/backoff
 
 ## Implementation Status

@@ -146,19 +146,18 @@ class StorageFS(Operations):
         self._readdir_snapshot: Dict[str, Tuple[float, List[str]]] = {}
 
         # Invalidation strategy: push-based (watchers) or pull-based (TTL).
-        # When watchers are enabled AND all backends are SSH (watchable),
-        # TTL is infinite — only watcher callbacks invalidate snapshots.
-        # If any backend is non-SSH (no watcher), TTL stays as fallback.
+        # When watchers are enabled AND all storage members expose push
+        # invalidation, TTL is infinite — only watcher callbacks invalidate
+        # snapshots. If any member lacks that capability, TTL stays as fallback.
         self._enable_watchers = enable_watchers
         self._watchers = []
-        from .backends.ssh import SSHBackend
         all_watchable = backends and all(
-            isinstance(b, SSHBackend) for b in backends.values()
+            b.supports_push_invalidation() for b in backends.values()
         )
         if enable_watchers and all_watchable:
             self._readdir_snapshot_ttl = float('inf')
         elif enable_watchers and not all_watchable:
-            # Mixed mount: watchers for SSH backends, TTL for the rest.
+            # Mixed mount: push invalidation for capable members, TTL for the rest.
             self._readdir_snapshot_ttl = max(0.0, float(readdir_ttl))
         else:
             self._readdir_snapshot_ttl = max(0.0, float(readdir_ttl))
@@ -349,27 +348,24 @@ class StorageFS(Operations):
             self._invalidate_file_cache(suffixed)
 
     def _start_watchers(self):
-        """Start inotifywait watchers, coalescing backends on the same host."""
-        from .backends.ssh import SSHBackend
+        """Start push-invalidation watchers, coalescing members by watch scope."""
         from .watcher import RemoteWatcher
 
-        # Group SSH backends by connection identity so backends on the
+        # Group watch-capable members by connection identity so members on the
         # same host share a single SSH+inotifywait process.
         host_groups: dict[tuple, list[tuple[str, str]]] = {}
         host_meta: dict[tuple, dict] = {}
         for name, backend in self.backends.items():
-            if not isinstance(backend, SSHBackend):
+            watcher_spec = backend.watcher_spec()
+            if watcher_spec is None:
                 continue
-            key = (backend.host, backend.port, backend.username,
-                   backend.key_filename)
-            host_groups.setdefault(key, []).append(
-                (name, str(backend.remote_path))
-            )
+            key = watcher_spec.group_key
+            host_groups.setdefault(key, []).append((name, watcher_spec.remote_path))
             host_meta[key] = {
-                "ssh_host": backend.host,
-                "ssh_port": backend.port,
-                "username": backend.username,
-                "key_filename": backend.key_filename,
+                "ssh_host": watcher_spec.ssh_host,
+                "ssh_port": watcher_spec.ssh_port,
+                "username": watcher_spec.username,
+                "key_filename": watcher_spec.key_filename,
             }
 
         for key, backends_on_host in host_groups.items():
@@ -504,8 +500,8 @@ class StorageFS(Operations):
             candidates = available
         else:
             # Opportunistic reprobe when all backends are marked unavailable.
-            # Backend cooldown logic prevents tight reconnect loops.
-            candidates = [b for b in self.backends.values() if b.is_remote]
+            # Member cooldown logic prevents tight reconnect loops.
+            candidates = [b for b in self.backends.values() if b.supports_reconnect_probe()]
 
         candidates.sort(key=lambda b: b.speed_priority)
         for candidate in candidates:

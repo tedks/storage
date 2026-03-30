@@ -56,6 +56,7 @@ class LatencyBackend(Backend):
             backend_type=inner.backend_type,
             is_remote=inner.is_remote,
             speed_priority=inner.speed_priority,
+            capabilities=inner.capabilities,
         )
         self._inner = inner
         self.latency_s = latency_s

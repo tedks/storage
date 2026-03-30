@@ -15,7 +15,7 @@ import paramiko
 from pathlib import Path, PurePosixPath
 from typing import Dict, List, Optional, Tuple
 
-from .base import Backend, BackendType
+from .base import Backend, BackendType, StorageMemberCapabilities, WatcherSpec
 
 
 class SSHBackend(Backend):
@@ -40,7 +40,17 @@ class SSHBackend(Backend):
             speed_priority: Speed priority (default 50 for remote)
             connect_timeout: Timeout in seconds for SSH connection/auth handshakes
         """
-        super().__init__(name, BackendType.SSH, is_remote=True, speed_priority=speed_priority)
+        super().__init__(
+            name,
+            BackendType.SSH,
+            is_remote=True,
+            speed_priority=speed_priority,
+            capabilities=StorageMemberCapabilities(
+                range_reads=True,
+                push_invalidation=True,
+                transient_connectivity=True,
+            ),
+        )
 
         self.host = host
         self.port = port
@@ -236,6 +246,16 @@ class SSHBackend(Backend):
         """Convert virtual path to remote path"""
         relative_path = virtual_path.lstrip('/')
         return self.remote_path / relative_path
+
+    def watcher_spec(self) -> Optional[WatcherSpec]:
+        return WatcherSpec(
+            group_key=(self.host, self.port, self.username, self.key_filename),
+            ssh_host=self.host,
+            ssh_port=self.port,
+            username=self.username,
+            key_filename=self.key_filename,
+            remote_path=str(self.remote_path),
+        )
 
     def _ensure_connected(self):
         """Ensure current thread has an active SSH/SFTP connection."""
@@ -641,10 +661,6 @@ class SSHBackend(Backend):
         # SFTP doesn't have a standard way to get free space
         # Would need to execute df command via SSH
         return None
-
-    def supports_range_reads(self) -> bool:
-        """SSH backend supports offset/size reads via SFTP seek/read."""
-        return True
 
     def sync(self):
         """Sync any buffered writes"""

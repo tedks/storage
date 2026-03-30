@@ -36,6 +36,10 @@ class ResolvedMountConfig:
     profile_name: Optional[str] = None
     profile_source: Optional[Path] = None
 
+    @property
+    def member_specs(self) -> Tuple[str, ...]:
+        return self.backing_paths + self.remote
+
 
 def default_mount_config_paths() -> Tuple[Path, ...]:
     return (
@@ -162,26 +166,27 @@ def _profile_backends(profile: Dict[str, Any], profile_name: str) -> Tuple[str, 
     return tuple(raw)
 
 
-def split_backend_specs(backend_specs: Sequence[str]) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
-    local_backends = []
-    remote_backends = []
-    for spec in backend_specs:
+def split_storage_member_specs(member_specs: Sequence[str]) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
+    local_members = []
+    remote_members = []
+    for spec in member_specs:
         if spec.startswith("ssh://") or spec.startswith("rsync://"):
-            remote_backends.append(spec)
+            remote_members.append(spec)
         else:
-            local_backends.append(spec)
-    return tuple(local_backends), tuple(remote_backends)
+            local_members.append(spec)
+    return tuple(local_members), tuple(remote_members)
 
 
-def create_backends(backing_paths: Sequence[str], remote_specs: Sequence[str], key_file: Optional[str]):
+def create_storage_members(member_specs: Sequence[str], key_file: Optional[str]):
     backends = {}
+    local_specs, remote_specs = split_storage_member_specs(member_specs)
 
-    for i, path in enumerate(backing_paths):
+    for i, path in enumerate(local_specs):
         try:
             name = f"local{i}"
             backend = LocalBackend(name, path, speed_priority=i * 10)
             backends[name] = backend
-            click.echo(f"Added local backend: {name} -> {path} (priority: {i * 10})")
+            click.echo(f"Added local storage member: {name} -> {path} (priority: {i * 10})")
         except ValueError as exc:
             raise click.ClickException(str(exc)) from exc
 
@@ -216,7 +221,7 @@ def create_backends(backing_paths: Sequence[str], remote_specs: Sequence[str], k
                     speed_priority=50 + i * 10,
                 )
                 click.echo(
-                    f"Added rsync backend: {name} -> "
+                    f"Added rsync storage member: {name} -> "
                     f"{username}@{host}:{remote_path} (priority: {50 + i * 10})"
                 )
             else:
@@ -229,7 +234,7 @@ def create_backends(backing_paths: Sequence[str], remote_specs: Sequence[str], k
                     speed_priority=50 + i * 10,
                 )
                 click.echo(
-                    f"Added SSH backend: {name} -> "
+                    f"Added SSH storage member: {name} -> "
                     f"{username}@{host}:{remote_path} (priority: {50 + i * 10})"
                 )
             backends[name] = backend
@@ -239,14 +244,24 @@ def create_backends(backing_paths: Sequence[str], remote_specs: Sequence[str], k
             raise click.ClickException(f"Error adding remote backend {remote_spec}: {exc}") from exc
 
     if not backends:
-        raise click.ClickException("No valid backing filesystems provided")
+        raise click.ClickException("No valid storage members provided")
 
     return backends
 
 
+def split_backend_specs(backend_specs: Sequence[str]) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
+    """Compatibility wrapper for older call sites."""
+    return split_storage_member_specs(backend_specs)
+
+
+def create_backends(backing_paths: Sequence[str], remote_specs: Sequence[str], key_file: Optional[str]):
+    """Compatibility wrapper for older call sites."""
+    return create_storage_members(tuple(backing_paths) + tuple(remote_specs), key_file)
+
+
 def _load_mount_profile_settings(config_path: Path, profile_name: str) -> Dict[str, Any]:
     config_profile = _load_mount_profile(config_path, profile_name)
-    config_backing_paths, config_remote = split_backend_specs(
+    config_backing_paths, config_remote = split_storage_member_specs(
         _profile_backends(config_profile, profile_name)
     )
     return {
