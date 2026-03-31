@@ -47,7 +47,6 @@ class SSHBackend(Backend):
             speed_priority=speed_priority,
             capabilities=StorageMemberCapabilities(
                 range_reads=True,
-                push_invalidation=True,
                 transient_connectivity=True,
             ),
         )
@@ -247,7 +246,7 @@ class SSHBackend(Backend):
         relative_path = virtual_path.lstrip('/')
         return self.remote_path / relative_path
 
-    def watcher_spec(self) -> Optional[WatcherSpec]:
+    def push_invalidation_spec(self) -> Optional[WatcherSpec]:
         return WatcherSpec(
             group_key=(self.host, self.port, self.username, self.key_filename),
             ssh_host=self.host,

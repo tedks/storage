@@ -54,7 +54,7 @@ class LatencyBackend(Backend):
         super().__init__(
             name=f"latency:{inner.name}",
             backend_type=inner.backend_type,
-            is_remote=inner.is_remote,
+            is_remote=inner.transport_is_remote,
             speed_priority=inner.speed_priority,
             capabilities=inner.capabilities,
         )

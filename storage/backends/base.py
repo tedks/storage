@@ -46,11 +46,16 @@ class BackendInfo:
     """Information about a backend filesystem"""
     name: str
     backend_type: BackendType
-    is_remote: bool
+    transport_is_remote: bool
     capabilities: StorageMemberCapabilities
     speed_priority: int  # Lower is faster (0=fastest local, 100=slowest remote)
     encrypt_all: bool  # Encrypt all files written to this backend
     available: bool  # Is backend currently available/connected
+
+    @property
+    def is_remote(self) -> bool:
+        """Compatibility alias for older reporting code."""
+        return self.transport_is_remote
 
 
 class Backend(ABC):
@@ -66,6 +71,7 @@ class Backend(ABC):
     ):
         self.name = name
         self.backend_type = backend_type
+        self._transport_is_remote = bool(is_remote)
         self._capabilities = capabilities or StorageMemberCapabilities(
             transient_connectivity=is_remote
         )
@@ -75,7 +81,15 @@ class Backend(ABC):
 
     @property
     def capabilities(self) -> StorageMemberCapabilities:
-        return self._capabilities
+        return replace(
+            self._capabilities,
+            push_invalidation=self.supports_push_invalidation(),
+        )
+
+    @property
+    def transport_is_remote(self) -> bool:
+        """Return whether the transport itself is remote, independent of reconnect semantics."""
+        return self._transport_is_remote
 
     def update_capabilities(self, **changes):
         self._capabilities = replace(self._capabilities, **changes)
@@ -94,7 +108,7 @@ class Backend(ABC):
         return BackendInfo(
             name=self.name,
             backend_type=self.backend_type,
-            is_remote=self.is_remote,
+            transport_is_remote=self.transport_is_remote,
             capabilities=self.capabilities,
             speed_priority=self.speed_priority,
             encrypt_all=self.encrypt_all,
@@ -224,16 +238,24 @@ class Backend(ABC):
         return self.capabilities.range_reads
 
     def supports_push_invalidation(self) -> bool:
-        """Return whether this member can drive push-based invalidation."""
-        return self.capabilities.push_invalidation
+        """Return whether this member can drive push-based invalidation.
+
+        Override ``push_invalidation_spec()`` in subclasses rather than this
+        method so watcher eligibility and watcher metadata cannot drift apart.
+        """
+        return self.push_invalidation_spec() is not None
 
     def supports_reconnect_probe(self) -> bool:
         """Return whether this member should be opportunistically reprobed after failure."""
         return self.capabilities.transient_connectivity
 
-    def watcher_spec(self) -> Optional[WatcherSpec]:
+    def push_invalidation_spec(self) -> Optional[WatcherSpec]:
         """Return watcher metadata when the transport supports push invalidation."""
         return None
+
+    def watcher_spec(self) -> Optional[WatcherSpec]:
+        """Compatibility alias for older call sites."""
+        return self.push_invalidation_spec()
 
     # Optional capabilities -------------------------------------------------
     def get_fast_checksum(self, virtual_path: str) -> str:

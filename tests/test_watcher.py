@@ -333,19 +333,30 @@ class TestConfigurableTTL(TestCase):
     def test_watchers_override_ttl_all_push_capable_members(self):
         """When watchers are enabled and all members are watch-capable, TTL is infinite."""
         import math
-        from unittest import mock
         from storage.fs import StorageFS
-        from storage.backends.ssh import SSHBackend
-        fake_ssh = mock.MagicMock(spec=SSHBackend)
-        fake_ssh.is_available.return_value = True
-        fake_ssh.supports_push_invalidation.return_value = True
+        from storage.backends.base import WatcherSpec
+        from storage.backends.local import LocalBackend
+
+        class WatchableLoopbackMember(LocalBackend):
+            def push_invalidation_spec(self):
+                return WatcherSpec(
+                    group_key=("watch-host", 22, "user", None),
+                    ssh_host="watch-host",
+                    ssh_port=22,
+                    username="user",
+                    key_filename=None,
+                    remote_path="/srv/data",
+                )
+
         with tempfile.TemporaryDirectory() as tmp:
             cache = Path(tmp) / "cache"
             cache.mkdir()
             db = Path(tmp) / "state.db"
+            be_root = Path(tmp) / "backend"
+            be_root.mkdir()
             fs = StorageFS(
                 cache_root=cache, state_db=db,
-                backends={"ssh0": fake_ssh},
+                backends={"member0": WatchableLoopbackMember("member0", str(be_root))},
                 cache_size=1024 * 1024, num_sync_workers=0, start_sync=False,
                 readdir_ttl=5.0,
                 enable_watchers=True,
@@ -383,7 +394,7 @@ class TestConfigurableTTL(TestCase):
         from storage.fs import StorageFS
 
         class WatchableLoopbackMember(LocalBackend):
-            def watcher_spec(self):
+            def push_invalidation_spec(self):
                 return WatcherSpec(
                     group_key=("watch-host", 22, "user", None),
                     ssh_host="watch-host",
@@ -392,9 +403,6 @@ class TestConfigurableTTL(TestCase):
                     key_filename=None,
                     remote_path="/srv/data",
                 )
-
-            def supports_push_invalidation(self) -> bool:
-                return True
 
         with tempfile.TemporaryDirectory() as tmp:
             cache = Path(tmp) / "cache"

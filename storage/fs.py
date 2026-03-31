@@ -356,7 +356,7 @@ class StorageFS(Operations):
         host_groups: dict[tuple, list[tuple[str, str]]] = {}
         host_meta: dict[tuple, dict] = {}
         for name, backend in self.backends.items():
-            watcher_spec = backend.watcher_spec()
+            watcher_spec = backend.push_invalidation_spec()
             if watcher_spec is None:
                 continue
             key = watcher_spec.group_key

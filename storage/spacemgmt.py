@@ -57,7 +57,8 @@ class SpaceManager:
                 'free': free,
                 'available': backend.is_available(),
                 'speed_priority': backend.speed_priority,
-                'is_remote': backend.is_remote
+                'transport_is_remote': backend.transport_is_remote,
+                'supports_reconnect_probe': backend.supports_reconnect_probe(),
             }
 
         return usage
