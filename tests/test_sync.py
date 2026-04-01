@@ -14,7 +14,9 @@ import os
 import shutil
 from pathlib import Path
 
-from storage.state import StateManager, FileMetadata, SyncStatus, FileConfig, FileLocation
+from storage.file_config import FileConfig, set_file_config
+from storage.models import FileLocation, FileMetadata, SyncStatus
+from storage.state import StateManager
 from storage.cache import CacheManager
 from storage.backends.local import LocalBackend
 from storage.replication import ReplicationManager
@@ -120,7 +122,7 @@ class TestSyncManager(unittest.TestCase):
 
         # Set config for replication
         config = FileConfig(replica_count=2)
-        self.state_manager.set_file_config(cache_path, config)
+        set_file_config(cache_path, config)
 
         # Queue sync
         self.sync_manager.queue_sync(test_file, priority=100)
@@ -165,7 +167,7 @@ class TestSyncManager(unittest.TestCase):
 
         # Set config
         config = FileConfig(replica_count=2)
-        self.state_manager.set_file_config(cache_path, config)
+        set_file_config(cache_path, config)
 
         # Queue sync and wait
         self.sync_manager.queue_sync(test_file, priority=100)
@@ -255,7 +257,7 @@ class TestSyncManager(unittest.TestCase):
 
         # Set config
         config = FileConfig(replica_count=1)
-        self.state_manager.set_file_config(cache_path, config)
+        set_file_config(cache_path, config)
 
         # Sync now (synchronous)
         result = self.sync_manager.sync_now(test_file, timeout=5.0)
@@ -315,7 +317,7 @@ class TestSyncManager(unittest.TestCase):
 
         # Set config
         config = FileConfig(replica_count=1)
-        self.state_manager.set_file_config(cache_path, config)
+        set_file_config(cache_path, config)
 
         # Wait for monitor to pick it up (monitor runs every 5 seconds)
         time.sleep(7.0)
@@ -408,7 +410,7 @@ class TestSyncConflicts(unittest.TestCase):
 
         # Set config
         config = FileConfig(replica_count=1)
-        self.state_manager.set_file_config(cache_path, config)
+        set_file_config(cache_path, config)
 
         # Try to sync - should detect conflict
         self.sync_manager.sync_now(test_file, timeout=3.0)

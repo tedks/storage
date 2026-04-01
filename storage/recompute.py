@@ -13,7 +13,8 @@ from pathlib import Path
 from typing import Optional, Callable
 from dataclasses import dataclass
 
-from .state import StateManager, FileConfig
+from .file_config import FileConfig, get_file_config, get_inherited_config, set_file_config
+from .state import StateManager
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +61,7 @@ class RecomputeEngine:
         Returns:
             True if file is marked as recomputable and has a command
         """
-        config = self.state_manager.get_inherited_config(cache_path)
+        config = get_inherited_config(cache_path)
         return config.recomputable and bool(config.recompute_cmd)
 
     def recompute_file(self, virtual_path: str, cache_path: Path,
@@ -78,7 +79,7 @@ class RecomputeEngine:
         Returns:
             RecomputeResult with execution details
         """
-        config = self.state_manager.get_inherited_config(cache_path)
+        config = get_inherited_config(cache_path)
 
         if not config.recomputable or not config.recompute_cmd:
             return RecomputeResult(
@@ -297,10 +298,10 @@ def mark_recomputable(cache_path: Path, recompute_cmd: str, state_manager: State
         recompute_cmd: Command to execute to recreate the file
         state_manager: State manager instance
     """
-    config = state_manager.get_file_config(cache_path) or FileConfig()
+    config = get_file_config(cache_path) or FileConfig()
     config.recomputable = True
     config.recompute_cmd = recompute_cmd
-    state_manager.set_file_config(cache_path, config)
+    set_file_config(cache_path, config)
 
 
 def unmark_recomputable(cache_path: Path, state_manager: StateManager):
@@ -311,7 +312,7 @@ def unmark_recomputable(cache_path: Path, state_manager: StateManager):
         cache_path: Local cache path
         state_manager: State manager instance
     """
-    config = state_manager.get_file_config(cache_path) or FileConfig()
+    config = get_file_config(cache_path) or FileConfig()
     config.recomputable = False
     config.recompute_cmd = None
-    state_manager.set_file_config(cache_path, config)
+    set_file_config(cache_path, config)

@@ -4,7 +4,8 @@ import time
 import unittest
 from pathlib import Path
 
-from storage.state import StateManager, FileMetadata, SyncStatus
+from storage.models import FileMetadata, SyncStatus
+from storage.state import StateManager
 
 
 class TestStateAccessUpdates(unittest.TestCase):

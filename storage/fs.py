@@ -25,7 +25,9 @@ from typing import Dict, Optional, Set, List, Tuple
 
 from .backends.base import Backend
 from .cache import CacheManager
-from .state import StateManager, FileMetadata, FileConfig, SyncStatus, FileLocation
+from .file_config import FileConfig, get_inherited_config
+from .models import FileLocation, FileMetadata, SyncStatus
+from .state import StateManager
 from .replication import ReplicationManager
 from .sync import SyncManager
 from .sync_tasks import DirOperation
@@ -225,7 +227,7 @@ class StorageFS(Operations):
     def _get_config(self, virtual_path: str) -> FileConfig:
         """Get configuration for a file"""
         cache_path = self.cache_manager.get_cache_path(virtual_path)
-        return self.state_manager.get_inherited_config(cache_path)
+        return get_inherited_config(cache_path)
 
     def _should_sync_path(self, virtual_path: str) -> bool:
         """Only sync paths that do not currently have an open writer."""

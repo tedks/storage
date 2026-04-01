@@ -11,7 +11,7 @@ from typing import Dict, List, Optional, Set, Tuple
 from fuse import FuseOSError
 
 from .backends.base import Backend
-from .state import FileLocation, FileMetadata, SyncStatus
+from .models import FileLocation, FileMetadata, SyncStatus
 
 
 @dataclass

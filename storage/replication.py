@@ -12,7 +12,9 @@ from typing import List, Dict, Optional, Set
 from pathlib import Path
 
 from .backends.base import Backend
-from .state import StateManager, FileConfig, FileMetadata, FileLocation, SyncStatus
+from .file_config import FileConfig
+from .models import FileLocation
+from .state import StateManager
 
 
 class ReplicationManager:

@@ -150,7 +150,7 @@ class TestSyncSystemIntegration(unittest.TestCase):
         backend_path.write_text(test_content)
 
         # Record in state database that it exists on backend
-        from storage.state import FileLocation, FileMetadata, SyncStatus
+        from storage.models import FileLocation, FileMetadata, SyncStatus
         metadata = FileMetadata(
             virtual_path=f"/{test_file}",
             size=len(test_content),

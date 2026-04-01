@@ -466,7 +466,7 @@ class TestWatcherInvalidation(TestCase):
 
     def _cache_file(self, fs, virtual_path, content=b"hello"):
         """Write content into the cache at virtual_path and set CLEAN metadata."""
-        from storage.state import FileMetadata, SyncStatus
+        from storage.models import FileMetadata, SyncStatus
 
         cache_path = fs.cache_manager.get_cache_path(virtual_path)
         cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -514,7 +514,7 @@ class TestWatcherInvalidation(TestCase):
 
     def test_invalidate_skips_dirty_file(self):
         """_invalidate_file_cache must not remove a DIRTY cached file."""
-        from storage.state import SyncStatus
+        from storage.models import SyncStatus
 
         with tempfile.TemporaryDirectory() as tmp:
             fs = self._make_fs(tmp)

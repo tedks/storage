@@ -11,8 +11,9 @@ import threading
 from pathlib import Path
 from typing import Optional, List, Set
 
-from .state import StateManager, FileMetadata, SyncStatus
 from .backends.base import Backend
+from .models import FileMetadata, SyncStatus
+from .state import StateManager
 
 
 class CacheManager:

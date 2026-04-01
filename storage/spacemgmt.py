@@ -11,10 +11,12 @@ import logging
 from typing import List, Dict, Optional
 from pathlib import Path
 
-from .state import StateManager, FileMetadata, SyncStatus
 from .backends.base import Backend
-from .replication import ReplicationManager
 from .cache import CacheManager
+from .file_config import get_inherited_config
+from .models import FileMetadata
+from .replication import ReplicationManager
+from .state import StateManager
 
 logger = logging.getLogger(__name__)
 
@@ -99,7 +101,7 @@ class SpaceManager:
 
             # Get required replica count
             cache_path = self.cache_manager.get_cache_path(metadata.virtual_path)
-            config = self.state_manager.get_inherited_config(cache_path)
+            config = get_inherited_config(cache_path)
 
             required = config.replica_count
             if required == -1:

@@ -17,8 +17,10 @@ from unittest.mock import MagicMock, patch
 
 from storage.backends.base import Backend
 from storage.cache import CacheManager
+from storage.file_config import FileConfig
+from storage.models import FileLocation, FileMetadata, SyncStatus
 from storage.replication import ReplicationManager
-from storage.state import FileConfig, FileLocation, FileMetadata, StateManager, SyncStatus
+from storage.state import StateManager
 from storage.sync_executor import SyncExecutor
 from storage.sync_tasks import DirOperation, DirSyncTask, SyncConfig, SyncTask
 
@@ -229,7 +231,7 @@ class TestSyncExecutorFileTask(_ExecutorTestBase):
 
         two_replica_config = FileConfig(replica_count=2)
         with patch.object(self.executor.conflict_detector, "check_conflict", return_value=None), \
-             patch.object(self.state_manager, "get_inherited_config", return_value=two_replica_config):
+             patch("storage.sync_executor.get_inherited_config", return_value=two_replica_config):
             task = SyncTask("/test.txt")
             result = self.executor.process_file_task(task)
 
