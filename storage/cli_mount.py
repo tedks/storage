@@ -5,6 +5,7 @@ from typing import Optional
 
 import click
 
+from .file_config import FileConfig, get_file_config, get_inherited_config, set_file_config
 from .fs import mount_storage
 from .mount_profiles import create_storage_members, parse_size, resolve_mount_configuration
 
@@ -221,10 +222,8 @@ def configure(path, replicas, backends, recomputable, recompute_cmd, encrypt, en
         storage configure /mnt/storage/backups --replicas 3
         storage configure /mnt/storage/downloads --recomputable --recompute-cmd "wget ..."
     """
-    from .state import FileConfig, StateManager
-
     path_obj = Path(path)
-    config = StateManager.get_file_config(path_obj) or FileConfig()
+    config = get_file_config(path_obj) or FileConfig()
 
     if replicas is not None:
         config.replica_count = replicas
@@ -244,7 +243,7 @@ def configure(path, replicas, backends, recomputable, recompute_cmd, encrypt, en
     if encrypt_backends:
         config.encryption_backends = [backend.strip() for backend in encrypt_backends.split(",")]
 
-    StateManager.set_file_config(path_obj, config)
+    set_file_config(path_obj, config)
 
     click.echo(f"Updated configuration for {path}:")
     click.echo(f"  Replica count: {config.replica_count}")
@@ -268,10 +267,8 @@ def configure(path, replicas, backends, recomputable, recompute_cmd, encrypt, en
 @click.argument("path", type=click.Path(exists=True))
 def info(path):
     """Show storage information for a file or directory"""
-    from .state import StateManager
-
     path_obj = Path(path)
-    config = StateManager.get_inherited_config(path_obj)
+    config = get_inherited_config(path_obj)
 
     click.echo(f"Storage configuration for {path}:")
     click.echo(f"  Replica count: {config.replica_count}")

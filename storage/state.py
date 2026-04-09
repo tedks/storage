@@ -9,108 +9,27 @@ This module manages the state of all files in the Storage filesystem, including:
 - Conflict information
 """
 
-import os
 import sqlite3
-from .checksums import fast_checksum_file
 import time
 import threading
-import yaml
 from pathlib import Path
-from typing import Optional, List, Dict, Set, Tuple
-from enum import Enum
-from dataclasses import dataclass, asdict
+from typing import Dict, List, Optional, Set, Tuple
 
-
-class SyncStatus(Enum):
-    """Status of file synchronization"""
-    CLEAN = "clean"  # File is synced to all required backends
-    DIRTY = "dirty"  # File has unsynced changes
-    SYNCING = "syncing"  # File is currently being synced
-    ERROR = "error"  # Sync error occurred
-    CONFLICT = "conflict"  # Conflict detected
-
-
-@dataclass
-class FileMetadata:
-    """Metadata for a file in the Storage filesystem"""
-    virtual_path: str
-    size: int
-    checksum: Optional[str]  # SHA256 hash
-    last_access: float
-    last_modified: float
-    sync_status: SyncStatus
-    replica_count: int  # Configured replica count (-1 = all backends)
-    recomputable: bool
-    recompute_cmd: Optional[str]
-    encrypted: bool
-    encryption_key_id: Optional[str]
-
-    def to_dict(self) -> Dict:
-        """Convert to dictionary for storage"""
-        d = asdict(self)
-        d['sync_status'] = self.sync_status.value
-        return d
-
-    @classmethod
-    def from_dict(cls, data: Dict) -> 'FileMetadata':
-        """Create from dictionary"""
-        data['sync_status'] = SyncStatus(data['sync_status'])
-        return cls(**data)
-
-
-@dataclass
-class FileLocation:
-    """Tracks where a file is stored"""
-    virtual_path: str
-    backend_name: str
-    checksum: str
-    last_synced: float
-    is_cached: bool  # True if this is the local cache
-
-
-@dataclass
-class FileConfig:
-    """Configuration for a file/directory from extended attributes"""
-    replica_count: int = 1  # -1 for all backends
-    preferred_backends: List[str] = None  # Preferred backing filesystems
-    encrypted: bool = False
-    encryption_backends: List[str] = None  # Which backends to encrypt for
-    recomputable: bool = False
-    recompute_cmd: Optional[str] = None
-    custom: Dict = None  # Custom configuration
-
-    def __post_init__(self):
-        if self.preferred_backends is None:
-            self.preferred_backends = []
-        if self.encryption_backends is None:
-            self.encryption_backends = []
-        if self.custom is None:
-            self.custom = {}
-
-    def to_yaml(self) -> str:
-        """Convert to YAML for storage in xattrs"""
-        data = {
-            'replica_count': self.replica_count,
-            'preferred_backends': self.preferred_backends,
-            'encrypted': self.encrypted,
-            'encryption_backends': self.encryption_backends,
-            'recomputable': self.recomputable,
-            'recompute_cmd': self.recompute_cmd,
-            'custom': self.custom,
-        }
-        return yaml.dump(data, default_flow_style=False)
-
-    @classmethod
-    def from_yaml(cls, yaml_str: str) -> 'FileConfig':
-        """Create from YAML"""
-        data = yaml.safe_load(yaml_str) or {}
-        return cls(**data)
+from .checksums import fast_checksum_file
+from .file_config import (
+    XATTR_CONFIG_NAME as FILE_CONFIG_XATTR_NAME,
+    FileConfig,
+    get_file_config,
+    get_inherited_config,
+    set_file_config,
+)
+from .models import FileLocation, FileMetadata, SyncStatus
 
 
 class StateManager:
     """Manages file state in SQLite database"""
 
-    XATTR_CONFIG_NAME = "user.storage.config"
+    XATTR_CONFIG_NAME = FILE_CONFIG_XATTR_NAME
     ACCESS_DEBOUNCE_SECONDS = 0.25
     ACCESS_FLUSH_INTERVAL_SECONDS = 0.5
     ACCESS_FLUSH_BATCH_SIZE = 256
@@ -426,61 +345,18 @@ class StateManager:
 
     @staticmethod
     def get_file_config(real_path: Path) -> Optional[FileConfig]:
-        """Get configuration from file's extended attributes"""
-        try:
-            yaml_data = os.getxattr(str(real_path), StateManager.XATTR_CONFIG_NAME)
-            return FileConfig.from_yaml(yaml_data.decode('utf-8'))
-        except (OSError, KeyError):
-            return None
+        """Compatibility wrapper for xattr-backed file configuration."""
+        return get_file_config(real_path)
 
     @staticmethod
     def set_file_config(real_path: Path, config: FileConfig):
-        """Set configuration in file's extended attributes"""
-        try:
-            yaml_data = config.to_yaml().encode('utf-8')
-            os.setxattr(str(real_path), StateManager.XATTR_CONFIG_NAME, yaml_data)
-        except OSError as e:
-            print(f"Warning: Failed to set xattr on {real_path}: {e}")
+        """Compatibility wrapper for xattr-backed file configuration."""
+        set_file_config(real_path, config)
 
     @staticmethod
     def get_inherited_config(real_path: Path) -> FileConfig:
-        """Get configuration, inheriting from parent directories"""
-        # Start with defaults
-        config = FileConfig()
-
-        # Walk up directory tree, applying configurations
-        # Child configs override parent configs, but we take the max replica_count
-        current = real_path
-        configs = []
-
-        while current != current.parent:
-            file_config = StateManager.get_file_config(current)
-            if file_config:
-                configs.insert(0, file_config)
-            current = current.parent
-
-        # Apply configurations (parents first, then children)
-        for cfg in configs:
-            # Take maximum replica count as per design
-            if cfg.replica_count == -1 or config.replica_count == -1:
-                config.replica_count = -1
-            else:
-                config.replica_count = max(config.replica_count, cfg.replica_count)
-
-            # Override other settings (children win)
-            if cfg.preferred_backends:
-                config.preferred_backends = cfg.preferred_backends
-            if cfg.encrypted:
-                config.encrypted = cfg.encrypted
-            if cfg.encryption_backends:
-                config.encryption_backends = cfg.encryption_backends
-            if cfg.recomputable:
-                config.recomputable = cfg.recomputable
-                config.recompute_cmd = cfg.recompute_cmd
-            if cfg.custom:
-                config.custom.update(cfg.custom)
-
-        return config
+        """Compatibility wrapper for inherited xattr-backed configuration."""
+        return get_inherited_config(real_path)
 
     @staticmethod
     def compute_checksum(file_path: Path) -> str:

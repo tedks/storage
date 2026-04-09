@@ -16,7 +16,8 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat.backends import default_backend
 
-from .state import StateManager, FileConfig
+from .file_config import FileConfig, get_file_config, get_inherited_config, set_file_config
+from .state import StateManager
 
 
 class EncryptionKey:
@@ -189,7 +190,7 @@ class CryptoManager:
         Returns:
             True if file should be encrypted
         """
-        config = self.state_manager.get_inherited_config(cache_path)
+        config = get_inherited_config(cache_path)
 
         # Check if globally encrypted
         if config.encrypted:
@@ -316,9 +317,9 @@ def enable_encryption(cache_path: Path, state_manager: StateManager, key_id: Opt
         state_manager: State manager
         key_id: Optional key ID (uses default if None)
     """
-    config = state_manager.get_file_config(cache_path) or FileConfig()
+    config = get_file_config(cache_path) or FileConfig()
     config.encrypted = True
-    state_manager.set_file_config(cache_path, config)
+    set_file_config(cache_path, config)
 
 
 def disable_encryption(cache_path: Path, state_manager: StateManager):
@@ -329,7 +330,7 @@ def disable_encryption(cache_path: Path, state_manager: StateManager):
         cache_path: Local cache path
         state_manager: State manager
     """
-    config = state_manager.get_file_config(cache_path) or FileConfig()
+    config = get_file_config(cache_path) or FileConfig()
     config.encrypted = False
     config.encryption_backends = []
-    state_manager.set_file_config(cache_path, config)
+    set_file_config(cache_path, config)

@@ -12,8 +12,9 @@ import logging
 from typing import Callable, Optional, Set, Union, Tuple
 
 from .cache import CacheManager
+from .models import SyncStatus
 from .replication import ReplicationManager
-from .state import StateManager, SyncStatus
+from .state import StateManager
 from .sync_executor import SyncExecutor
 from .sync_tasks import DirOperation, DirSyncTask, SyncConfig, SyncTask, dir_task_key
 

@@ -10,9 +10,9 @@ from fuse import FuseOSError
 
 from .backends.base import Backend
 from .checksums import ChecksumRecord
+from .models import SyncStatus
 from .pathing import ResolvedPath
 from .sync_tasks import DirOperation
-from .state import SyncStatus
 
 
 class NamespaceService:

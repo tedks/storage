@@ -8,8 +8,10 @@ from typing import Callable, Dict, List, Optional, Union
 from .backends.base import Backend
 from .cache import CacheManager
 from .conflicts import ConflictDetector
+from .file_config import get_inherited_config
+from .models import FileLocation, SyncStatus
 from .replication import ReplicationManager
-from .state import FileLocation, StateManager, SyncStatus
+from .state import StateManager
 from .sync_tasks import DirOperation, DirSyncTask, SyncConfig, SyncTask
 
 logger = logging.getLogger(__name__)
@@ -71,7 +73,7 @@ class SyncExecutor:
         metadata.sync_status = SyncStatus.SYNCING
         self.state_manager.set_file_metadata(metadata)
 
-        config = self.state_manager.get_inherited_config(cache_path)
+        config = get_inherited_config(cache_path)
         target_backends = self.replication_manager.select_backends_for_file(
             task.virtual_path,
             config,
