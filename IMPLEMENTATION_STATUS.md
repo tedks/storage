@@ -13,7 +13,7 @@
   - Directory sync queue dedup keyed by op/path/new_path/backend with backend-targeted retries for mkdir/rmdir/rename
   - Statistics tracking (synced, failed, conflicts)
   - Configurable SyncConfig for all parameters
-- **Tests**: `tests/test_sync.py` (39 tests covering queueing, conflicts, dir sync, rename)
+- **Tests**: `tests/test_sync_manager.py`, `tests/test_sync_dir_ops.py`, `tests/test_state_rename.py`, `tests/test_local_backend.py`
 - **Commits**: 93f6795, 9777ba3, a2fe5b2
 
 ### 2. Remote Backends (SSH/SFTP) (done)
@@ -91,7 +91,9 @@
 ```
 storage/
 ├── __init__.py
-├── state.py           # SQLite + xattr metadata (done)
+├── state.py           # SQLite repository logic (done)
+├── models.py          # File metadata/location models (done)
+├── file_config.py     # Xattr-backed file configuration (done)
 ├── cache.py           # LRU cache management (done)
 ├── sync.py            # Background sync workers (done)
 ├── conflicts.py       # Conflict detection/resolution (done)
@@ -110,8 +112,8 @@ storage/
 
 ## Test Coverage
 
-- **Sync tests**: `tests/test_sync.py` (39 tests across queueing, conflict detection, dir sync dedup/backoff, hierarchical/backend rename, path normalization)
-- **Filesystem tests**: `tests/test_fs.py` (17 tests including dir retry targeting and propagation)
+- **Sync tests**: `tests/test_sync_manager.py`, `tests/test_sync_dir_ops.py`, `tests/test_state_rename.py`, `tests/test_local_backend.py`
+- **Filesystem tests**: `tests/test_fs_namespace_integration.py`, `tests/test_fs_streaming.py`, `tests/test_mount_lock.py`
 - **Recomputation tests**: `tests/test_recompute.py` (14 tests - unit, integration, async)
 - **Total**: 70 tests covering core functionality and recent dir sync behavior
 
