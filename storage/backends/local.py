@@ -1,14 +1,11 @@
-"""
-Local filesystem backend implementation
-"""
+"""Local filesystem storage-member implementation."""
 
 import os
 import shutil
 from pathlib import Path
 from typing import List, Optional
-import os
 
-from .base import Backend, BackendType
+from .base import Backend, BackendType, StorageMemberCapabilities
 from ..checksums import fast_checksum_file
 
 
@@ -24,7 +21,13 @@ class LocalBackend(Backend):
             root_path: Root directory for this backend
             speed_priority: Speed priority (default 0 for local)
         """
-        super().__init__(name, BackendType.LOCAL, is_remote=False, speed_priority=speed_priority)
+        super().__init__(
+            name,
+            BackendType.LOCAL,
+            is_remote=False,
+            speed_priority=speed_priority,
+            capabilities=StorageMemberCapabilities(range_reads=True),
+        )
         self.root_path = Path(root_path).resolve()
 
         if not self.root_path.exists():
@@ -180,10 +183,6 @@ class LocalBackend(Backend):
 
     def __repr__(self):
         return f"LocalBackend(name={self.name}, root={self.root_path})"
-
-    def supports_range_reads(self) -> bool:
-        """Local backend supports offset/size reads."""
-        return True
 
     # ------------------------------------------------------------------ #
     # Optional capabilities used by conflict detection

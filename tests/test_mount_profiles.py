@@ -10,7 +10,7 @@ from storage.mount_profiles import (
     _optional_profile_int,
     parse_size,
     resolve_mount_configuration,
-    split_backend_specs,
+    split_storage_member_specs,
 )
 
 
@@ -42,25 +42,25 @@ class TestParseSize(unittest.TestCase):
             parse_size("")
 
 
-class TestSplitBackendSpecs(unittest.TestCase):
+class TestSplitStorageMemberSpecs(unittest.TestCase):
     def test_local_paths_separated(self):
-        local, remote = split_backend_specs(["/local/path"])
+        local, remote = split_storage_member_specs(["/local/path"])
         self.assertEqual(("/local/path",), local)
         self.assertEqual((), remote)
 
     def test_ssh_urls_separated(self):
-        local, remote = split_backend_specs(["ssh://user@host:/path"])
+        local, remote = split_storage_member_specs(["ssh://user@host:/path"])
         self.assertEqual((), local)
         self.assertEqual(("ssh://user@host:/path",), remote)
 
     def test_rsync_urls_separated(self):
-        local, remote = split_backend_specs(["rsync://user@host:/path"])
+        local, remote = split_storage_member_specs(["rsync://user@host:/path"])
         self.assertEqual((), local)
         self.assertEqual(("rsync://user@host:/path",), remote)
 
     def test_mixed_specs_split(self):
         specs = ["/local/one", "ssh://user@host:/remote", "/local/two", "rsync://user@host2:/other"]
-        local, remote = split_backend_specs(specs)
+        local, remote = split_storage_member_specs(specs)
         self.assertEqual(("/local/one", "/local/two"), local)
         self.assertEqual(("ssh://user@host:/remote", "rsync://user@host2:/other"), remote)
 
@@ -192,6 +192,10 @@ class TestResolvedMountConfig(unittest.TestCase):
     def test_enable_watchers_defaults_to_false(self):
         config = self._resolve()
         self.assertFalse(config.enable_watchers)
+
+    def test_member_specs_merge_local_and_remote_inputs(self):
+        config = self._resolve(remote=["ssh://user@host:/remote"])
+        self.assertEqual(("/srv/data", "ssh://user@host:/remote"), config.member_specs)
 
     def test_readdir_ttl_from_cli_overrides_profile(self):
         toml_content = '''

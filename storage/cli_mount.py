@@ -6,7 +6,7 @@ from typing import Optional
 import click
 
 from .fs import mount_storage
-from .mount_profiles import create_backends, parse_size, resolve_mount_configuration
+from .mount_profiles import create_storage_members, parse_size, resolve_mount_configuration
 
 
 @click.command()
@@ -22,7 +22,7 @@ from .mount_profiles import create_backends, parse_size, resolve_mount_configura
 @click.option("-s", "--cache-size", help="Cache size (e.g., 10G, 500M)")
 @click.option("-d", "--database", help="State database path (default: cache/.storage.db)")
 @click.option("-w", "--workers", type=int, help="Number of sync worker threads")
-@click.option("-r", "--remote", multiple=True, help="Remote backend (ssh://user@host:/path)")
+@click.option("-r", "--remote", multiple=True, help="Remote storage member (ssh://user@host:/path)")
 @click.option("-k", "--key-file", help="SSH private key file")
 @click.option("-f", "--foreground", is_flag=True, default=None, help="Run in foreground")
 @click.option(
@@ -78,9 +78,9 @@ def mount(
     Mount a Storage filesystem
 
     MOUNT_TARGET: Mountpoint path, or a named profile when --config is used
-    BACKING_PATHS: Zero or more local backing filesystem paths (optional)
+    BACKING_PATHS: Zero or more local storage member roots (optional)
 
-    Remote backends can be specified with --remote:
+    Remote storage members can be specified with --remote:
         --remote ssh://user@host:/remote/path
 
     Examples:
@@ -142,7 +142,7 @@ def mount(
     mountpoint_path = Path(resolved.mountpoint)
     mountpoint_path.mkdir(parents=True, exist_ok=True)
 
-    backends = create_backends(resolved.backing_paths, resolved.remote, resolved.key_file)
+    backends = create_storage_members(resolved.member_specs, resolved.key_file)
 
     if resolved.profile_name is not None:
         click.echo(f"Loaded mount profile: {resolved.profile_name} ({resolved.profile_source})")
@@ -151,7 +151,7 @@ def mount(
     click.echo(f"  Cache: {cache_root}")
     click.echo(f"  Cache size: {resolved.cache_size} ({cache_size_bytes:,} bytes)")
     click.echo(f"  Database: {db_path}")
-    click.echo(f"  Backends: {len(backends)}")
+    click.echo(f"  Storage members: {len(backends)}")
     click.echo(f"  Sync workers: {resolved.workers}")
     click.echo(f"  Streaming reads: {'enabled' if resolved.streaming_reads else 'disabled'}")
     click.echo(
@@ -159,12 +159,11 @@ def mount(
     )
     click.echo(f"  Max streaming sessions: {resolved.max_streaming_sessions}")
     if resolved.enable_watchers:
-        from storage.backends.ssh import SSHBackend
-        non_ssh = [n for n, b in backends.items() if not isinstance(b, SSHBackend)]
-        if non_ssh:
+        non_watchable = [n for n, b in backends.items() if not b.supports_push_invalidation()]
+        if non_watchable:
             click.echo(
-                f"  Invalidation: push (SSH backends) + pull TTL={resolved.readdir_ttl}s "
-                f"({', '.join(non_ssh)})"
+                f"  Invalidation: push (watch-capable members) + pull TTL={resolved.readdir_ttl}s "
+                f"({', '.join(non_watchable)})"
             )
         else:
             click.echo("  Invalidation: push (inotifywait)")

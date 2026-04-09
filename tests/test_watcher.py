@@ -330,22 +330,33 @@ class TestConfigurableTTL(TestCase):
             self.assertEqual(fs._readdir_snapshot_ttl, 0.0)
             fs.state_manager.close()
 
-    def test_watchers_override_ttl_all_ssh(self):
-        """When watchers enabled and all backends are SSH, TTL is infinite."""
+    def test_watchers_override_ttl_all_push_capable_members(self):
+        """When watchers are enabled and all members are watch-capable, TTL is infinite."""
         import math
-        from unittest import mock
         from storage.fs import StorageFS
-        from storage.backends.ssh import SSHBackend
-        # Mock an SSHBackend to avoid real SSH
-        fake_ssh = mock.MagicMock(spec=SSHBackend)
-        fake_ssh.is_available.return_value = True
+        from storage.backends.base import WatcherSpec
+        from storage.backends.local import LocalBackend
+
+        class WatchableLoopbackMember(LocalBackend):
+            def push_invalidation_spec(self):
+                return WatcherSpec(
+                    group_key=("watch-host", 22, "user", None),
+                    ssh_host="watch-host",
+                    ssh_port=22,
+                    username="user",
+                    key_filename=None,
+                    remote_path="/srv/data",
+                )
+
         with tempfile.TemporaryDirectory() as tmp:
             cache = Path(tmp) / "cache"
             cache.mkdir()
             db = Path(tmp) / "state.db"
+            be_root = Path(tmp) / "backend"
+            be_root.mkdir()
             fs = StorageFS(
                 cache_root=cache, state_db=db,
-                backends={"ssh0": fake_ssh},
+                backends={"member0": WatchableLoopbackMember("member0", str(be_root))},
                 cache_size=1024 * 1024, num_sync_workers=0, start_sync=False,
                 readdir_ttl=5.0,
                 enable_watchers=True,
@@ -354,7 +365,7 @@ class TestConfigurableTTL(TestCase):
             fs.state_manager.close()
 
     def test_watchers_keep_ttl_mixed_backends(self):
-        """When watchers enabled but non-SSH backends exist, keep TTL."""
+        """When watchers are enabled but some members are not watch-capable, keep TTL."""
         import math
         from storage.fs import StorageFS
         from storage.backends.local import LocalBackend
@@ -374,6 +385,51 @@ class TestConfigurableTTL(TestCase):
             self.assertFalse(math.isinf(fs._readdir_snapshot_ttl))
             self.assertEqual(fs._readdir_snapshot_ttl, 5.0)
             fs.state_manager.close()
+
+    def test_start_watchers_uses_member_watcher_specs(self):
+        from unittest import mock
+
+        from storage.backends.base import WatcherSpec
+        from storage.backends.local import LocalBackend
+        from storage.fs import StorageFS
+
+        class WatchableLoopbackMember(LocalBackend):
+            def push_invalidation_spec(self):
+                return WatcherSpec(
+                    group_key=("watch-host", 22, "user", None),
+                    ssh_host="watch-host",
+                    ssh_port=22,
+                    username="user",
+                    key_filename=None,
+                    remote_path="/srv/data",
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Path(tmp) / "cache"
+            cache.mkdir()
+            db = Path(tmp) / "state.db"
+            be_root = Path(tmp) / "backend"
+            be_root.mkdir()
+            fs = StorageFS(
+                cache_root=cache,
+                state_db=db,
+                backends={"member0": WatchableLoopbackMember("member0", str(be_root))},
+                cache_size=1024 * 1024,
+                num_sync_workers=0,
+                start_sync=False,
+                enable_watchers=True,
+            )
+            try:
+                with mock.patch("storage.watcher.RemoteWatcher") as watcher_cls:
+                    watcher = watcher_cls.return_value
+                    fs._start_watchers()
+                    watcher.start.assert_called_once()
+                    _, kwargs = watcher_cls.call_args
+                    self.assertEqual("member0", kwargs["backend_name"])
+                    self.assertEqual("watch-host", kwargs["ssh_host"])
+                    self.assertEqual(["/srv/data"], kwargs["remote_paths"])
+            finally:
+                fs.state_manager.close()
 
 
 class TestWatcherInvalidation(TestCase):
