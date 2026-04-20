@@ -682,6 +682,11 @@ class StreamingReadManager:
                 if metadata.sync_status != SyncStatus.DIRTY:
                     metadata.sync_status = SyncStatus.CLEAN
             self.state_manager.set_file_metadata(metadata)
+            self.cache_manager.sync_cache_metadata(
+                session.canonical_path,
+                metadata,
+                cache_path=session.final_cache_path,
+            )
 
             try:
                 self.state_manager.add_file_location(

@@ -129,6 +129,20 @@ Success criteria:
 1. System can recover if local DB is deleted/corrupted.
 2. Policy behavior remains xattr-defined.
 
+Authority model:
+
+1. Cache file path and file stat are authoritative for cache presence, file identity, byte size, and mtime.
+2. `user.storage.config` remains the durable policy source of truth for placement/recompute/encryption policy.
+3. `user.storage.metadata` on cached files is the durable snapshot for cache-local file metadata such as checksum, sync status, and policy-derived file flags.
+4. SQLite remains authoritative only for operational acceleration: LRU/access ordering, queue scans, and remembered remote locations.
+
+Recovery behavior:
+
+1. `storage debug rebuild-index` reconstructs `files` rows and cache `file_locations` rows from cache files plus `user.storage.metadata`.
+2. If a cache file is missing `user.storage.metadata` but the current local index still has a row for that path, rebuild backfills the xattr from the existing row and current file stat.
+3. If a cache file is missing `user.storage.metadata` and there is no surviving local row, rebuild skips it rather than guessing and risking indexing derived cache artifacts.
+4. `storage debug verify-index` reports divergence between cache files, cache metadata xattrs, and SQLite rows without mutating state.
+
 ### Phase 7: Language Migration Spikes (Rust, Go, OCaml)
 
 Goals:
@@ -219,4 +233,3 @@ Base chain:
 7. `refactor/phase-6-metadata-hardening` <- `refactor/phase-7-language-spikes`
 
 Each PR remains reviewable and mergeable independently.
-

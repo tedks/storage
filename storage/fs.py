@@ -25,6 +25,7 @@ from typing import Dict, Optional, Set, List, Tuple
 
 from .backends.base import Backend
 from .cache import CacheManager
+from .cache_metadata import XATTR_CACHE_METADATA_NAME
 from .file_config import FileConfig, get_inherited_config
 from .models import FileLocation, FileMetadata, SyncStatus
 from .state import StateManager
@@ -61,6 +62,7 @@ class StorageFS(Operations):
 
     CHECKSUM_XATTR = "user.storage.checksums"
     CACHE_STATE_XATTR = "user.storage.cache"
+    CACHE_METADATA_XATTR = XATTR_CACHE_METADATA_NAME
     _STUB_XATTR = "user.storage.stub"
     _PARTIAL_SUFFIX = ".storage.partial"
     _STREAM_STATE_XATTR = "user.storage.stream"
@@ -699,6 +701,12 @@ class StorageFS(Operations):
                 except Exception:
                     pass
 
+                self.cache_manager.sync_cache_metadata(
+                    canonical_path,
+                    metadata,
+                    cache_path=cache_path,
+                )
+
                 return True
 
         # File not in cache or backends - try recomputation
@@ -781,8 +789,16 @@ class StorageFS(Operations):
             if not resolved.backend_name:
                 metadata = self.state_manager.get_file_metadata(resolved.canonical_path)
                 if metadata:
+                    st = os.lstat(str(cache_path))
+                    metadata.size = st.st_size
+                    metadata.last_modified = st.st_mtime
                     metadata.sync_status = SyncStatus.DIRTY
                     self.state_manager.set_file_metadata(metadata)
+                    self.cache_manager.sync_cache_metadata(
+                        resolved.canonical_path,
+                        metadata,
+                        cache_path=cache_path,
+                    )
 
         except OSError as e:
             raise FuseOSError(e.errno)
@@ -895,6 +911,11 @@ class StorageFS(Operations):
                 encryption_key_id=None
             )
             self.state_manager.set_file_metadata(metadata)
+            self.cache_manager.sync_cache_metadata(
+                resolved.canonical_path,
+                metadata,
+                cache_path=cache_path,
+            )
 
             parent_dir = resolved.parent_dir
             self._invalidate_dir_cache_entry(parent_dir)
@@ -957,9 +978,16 @@ class StorageFS(Operations):
                 self.cache_manager.mark_accessed(path)
                 metadata = self.state_manager.get_file_metadata(entry.canonical_path)
                 if metadata:
+                    st = os.lstat(str(entry.cache_path))
+                    metadata.size = st.st_size
+                    metadata.last_modified = st.st_mtime
                     metadata.sync_status = SyncStatus.DIRTY
-                    metadata.last_modified = time.time()
                     self.state_manager.set_file_metadata(metadata)
+                    self.cache_manager.sync_cache_metadata(
+                        entry.canonical_path,
+                        metadata,
+                        cache_path=entry.cache_path,
+                    )
 
             return written
 
@@ -1062,7 +1090,7 @@ class StorageFS(Operations):
 
     def setxattr(self, path, name, value, options, position=0):
         """Set extended attribute"""
-        if name in {self.CHECKSUM_XATTR, self.CACHE_STATE_XATTR}:
+        if name in {self.CHECKSUM_XATTR, self.CACHE_STATE_XATTR, self.CACHE_METADATA_XATTR}:
             # Ignore manual writes for derived attrs.
             return
         cache_path = self.cache_manager.get_cache_path(path)
@@ -1094,7 +1122,7 @@ class StorageFS(Operations):
 
     def removexattr(self, path, name):
         """Remove extended attribute"""
-        if name in {self.CHECKSUM_XATTR, self.CACHE_STATE_XATTR}:
+        if name in {self.CHECKSUM_XATTR, self.CACHE_STATE_XATTR, self.CACHE_METADATA_XATTR}:
             # Derived; ignore removals.
             return
         cache_path = self.cache_manager.get_cache_path(path)

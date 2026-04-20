@@ -72,6 +72,7 @@ class SyncExecutor:
 
         metadata.sync_status = SyncStatus.SYNCING
         self.state_manager.set_file_metadata(metadata)
+        self.cache_manager.sync_cache_metadata(task.virtual_path, metadata, cache_path=cache_path)
 
         config = get_inherited_config(cache_path)
         target_backends = self.replication_manager.select_backends_for_file(
@@ -83,6 +84,7 @@ class SyncExecutor:
             logger.warning("No backends available for %s", task.virtual_path)
             metadata.sync_status = SyncStatus.ERROR
             self.state_manager.set_file_metadata(metadata)
+            self.cache_manager.sync_cache_metadata(task.virtual_path, metadata, cache_path=cache_path)
             self._stats["failed"] += 1
             return True
 
@@ -105,6 +107,7 @@ class SyncExecutor:
                     )
                     metadata.sync_status = SyncStatus.CONFLICT
                     self.state_manager.set_file_metadata(metadata)
+                    self.cache_manager.sync_cache_metadata(task.virtual_path, metadata, cache_path=cache_path)
                     self._stats["conflicts"] += 1
                     return True
 
@@ -158,6 +161,7 @@ class SyncExecutor:
             logger.error("Failed to sync %s to any backend", task.virtual_path)
 
         self.state_manager.set_file_metadata(metadata)
+        self.cache_manager.sync_cache_metadata(task.virtual_path, metadata, cache_path=cache_path)
         return True
 
     def handle_task_failure(
@@ -188,6 +192,12 @@ class SyncExecutor:
             if metadata:
                 metadata.sync_status = SyncStatus.ERROR
                 self.state_manager.set_file_metadata(metadata)
+                cache_path = self.cache_manager.get_cache_path(task.virtual_path)
+                self.cache_manager.sync_cache_metadata(
+                    task.virtual_path,
+                    metadata,
+                    cache_path=cache_path,
+                )
         return True
 
     def process_dir_task(self, task: DirSyncTask) -> bool:

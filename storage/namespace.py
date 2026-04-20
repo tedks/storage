@@ -453,6 +453,10 @@ class NamespaceService:
                 old_resolved.canonical_path,
                 new_resolved.canonical_path,
             )
+            for _, updated in renamed_entries:
+                metadata = self.state_manager.get_file_metadata(updated)
+                if metadata:
+                    self.cache_manager.sync_cache_metadata(updated, metadata)
 
             failures = self._propagate_dir_operation(
                 DirOperation.RENAME,
