@@ -9,6 +9,7 @@ Storage is a meta-filesystem that multiplexes an abstract filesystem over multip
 - **Multiple Backend Types**: Local filesystems, SSH/SFTP remotes (coming soon)
 - **Background Sync**: Writes go to cache first, sync to backends in background
 - **Extended Attribute Configuration**: Control replication, encryption, and recomputation via xattrs
+- **Cache Metadata Xattrs**: Cached files carry `user.storage.metadata` so the local SQLite index can be rebuilt and verified
 - **File Recomputation**: Mark files as recomputable for automatic space reclamation
 - **FUSE-based**: Runs in userspace, no kernel modules required
 - **SQLite State Tracking**: Efficient metadata tracking with optional extended attributes
@@ -151,6 +152,15 @@ Show storage configuration for a path:
 storage info PATH
 ```
 
+### debug
+
+Inspect or repair local cache/index state:
+
+```bash
+storage debug rebuild-index --cache /var/cache/storage --database /var/cache/storage/.storage.db
+storage debug verify-index --cache /var/cache/storage --database /var/cache/storage/.storage.db
+```
+
 ## Configuration System
 
 Storage uses extended attributes to store YAML configuration for files and directories:
@@ -168,12 +178,13 @@ Configuration is hierarchical - child directories inherit from parents, with the
 
 ### Components
 
-1. **StateManager** (`storage/state.py`): SQLite database + xattr metadata tracking
+1. **StateManager** (`storage/state.py`): Rebuildable SQLite operational index
 2. **CacheManager** (`storage/cache.py`): LRU cache management
-3. **ReplicationManager** (`storage/replication.py`): N-way replication across storage members
-4. **Storage Member Adapters** (`storage/backends/`): Local and remote filesystem support behind one capability surface
-5. **StorageFS** (`storage/fs.py`): FUSE filesystem implementation
-6. **CLI** (`storage/cli.py`): Command-line tools
+3. **Cache Metadata** (`storage/cache_metadata.py`): Durable cache-file metadata xattrs and cache/index audit helpers
+4. **ReplicationManager** (`storage/replication.py`): N-way replication across storage members
+5. **Storage Member Adapters** (`storage/backends/`): Local and remote filesystem support behind one capability surface
+6. **StorageFS** (`storage/fs.py`): FUSE filesystem implementation
+7. **CLI** (`storage/cli.py`): Command-line tools
 
 ### How It Works
 
@@ -192,6 +203,12 @@ Configuration is hierarchical - child directories inherit from parents, with the
 2. Evict clean files when space needed
 3. Prefer evicting recomputable files
 4. Never evict dirty (unsynced) files
+
+**Metadata and Recovery:**
+1. File/directory policy remains xattr-defined via `user.storage.config`
+2. Cached files persist cache-local metadata in `user.storage.metadata`
+3. SQLite stores rebuildable acceleration state such as cache locations and LRU ordering
+4. `storage debug rebuild-index` and `storage debug verify-index` repair and audit the cache/index boundary
 
 **Replication:**
 1. Use extended attributes for per-directory configuration

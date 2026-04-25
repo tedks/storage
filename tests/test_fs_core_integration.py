@@ -9,6 +9,7 @@ from pathlib import Path
 from fuse import FuseOSError
 
 from storage.backends.local import LocalBackend
+from storage.cache_metadata import read_cache_metadata
 from storage.fs import StorageFS
 
 
@@ -141,6 +142,19 @@ class TestFSCoreIntegration(unittest.TestCase):
             shutil.rmtree(temp_dir, ignore_errors=True)
 
         self.assertEqual([True], callback_results)
+
+    def test_rename_rewrites_cache_metadata_virtual_path(self):
+        fd = self.fs.create("/old.txt", 0o644)
+        self.fs.write("/old.txt", b"hello", 0, fd)
+        self.fs.release("/old.txt", fd)
+
+        self.fs.rename("/old.txt", "/new.txt")
+
+        cache_path = self.cache_dir / "new.txt"
+        record = read_cache_metadata(cache_path)
+        self.assertIsNotNone(record)
+        self.assertEqual("/new.txt", record.virtual_path)
+        self.assertEqual(5, record.size)
 
 
 if __name__ == '__main__':

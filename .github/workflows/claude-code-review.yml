@@ -31,7 +31,21 @@ jobs:
         with:
           fetch-depth: 1
 
+      - name: Check Claude review prerequisites
+        id: claude-prereqs
+        shell: bash
+        run: |
+          git fetch --no-tags --depth=1 origin "${{ github.base_ref }}"
+          mode="$(git ls-tree "origin/${{ github.base_ref }}" CLAUDE.md | awk '{print $1}')"
+          if [ "$mode" = "120000" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Skipping Claude Code Review because CLAUDE.md on origin/${{ github.base_ref }} is a symlink, which anthropics/claude-code-action cannot restore safely yet."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Run Claude Code Review
+        if: steps.claude-prereqs.outputs.skip != 'true'
         id: claude-review
         uses: anthropics/claude-code-action@v1
         with:
@@ -55,3 +69,7 @@ jobs:
           # or https://code.claude.com/docs/en/cli-reference for available options
           claude_args: '--allowed-tools "Bash(gh issue view:*),Bash(gh search:*),Bash(gh issue list:*),Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*)"'
 
+      - name: Note skipped Claude review
+        if: steps.claude-prereqs.outputs.skip == 'true'
+        run: |
+          echo "Claude Code Review skipped due to base-branch CLAUDE.md symlink incompatibility."

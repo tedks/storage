@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Optional, List, Set
 
 from .backends.base import Backend
+from .cache_metadata import write_cache_metadata
 from .models import FileMetadata, SyncStatus
 from .state import StateManager
 
@@ -185,6 +186,11 @@ class CacheManager:
                         metadata.size = 0
                         metadata.checksum = None
                         self.state_manager.set_file_metadata(metadata)
+                        self.sync_cache_metadata(
+                            metadata.virtual_path,
+                            metadata,
+                            cache_path=cache_path,
+                        )
 
                     except OSError as e:
                         print(f"Warning: Failed to evict recomputable {metadata.virtual_path}: {e}")
@@ -270,6 +276,24 @@ class CacheManager:
     def mark_accessed(self, virtual_path: str):
         """Mark a file as accessed (update LRU)"""
         self.state_manager.update_access_time(virtual_path)
+
+    def sync_cache_metadata(
+        self,
+        virtual_path: str,
+        metadata: FileMetadata,
+        *,
+        cache_path: Optional[Path] = None,
+    ) -> bool:
+        """Mirror file metadata into the cache file xattr when the cache entry exists."""
+        target_path = cache_path or self.get_cache_path(virtual_path)
+        if not target_path.exists() or not target_path.is_file():
+            return False
+
+        try:
+            write_cache_metadata(target_path, metadata, virtual_path=virtual_path)
+            return True
+        except OSError:
+            return False
 
     def flush_file(self, virtual_path: str):
         """Flush a cached file to ensure writes are synced"""

@@ -192,6 +192,38 @@ class StateManager:
             for row in rows
         ]
 
+    def get_all_file_metadata(self) -> List[FileMetadata]:
+        """Return all file metadata rows."""
+        self._flush_access_updates(force=True)
+        with self._db_lock:
+            cursor = self.conn.execute('SELECT * FROM files ORDER BY virtual_path ASC')
+            rows = cursor.fetchall()
+        return [FileMetadata.from_dict(dict(row)) for row in rows]
+
+    def get_all_file_locations(self, is_cached: Optional[bool] = None) -> List[FileLocation]:
+        """Return all file location rows, optionally filtered by cache membership."""
+        query = 'SELECT * FROM file_locations'
+        params: tuple = ()
+        if is_cached is not None:
+            query += ' WHERE is_cached = ?'
+            params = (int(is_cached),)
+        query += ' ORDER BY virtual_path ASC, backend_name ASC'
+
+        with self._db_lock:
+            cursor = self.conn.execute(query, params)
+            rows = cursor.fetchall()
+
+        return [
+            FileLocation(
+                virtual_path=row['virtual_path'],
+                backend_name=row['backend_name'],
+                checksum=row['checksum'],
+                last_synced=row['last_synced'],
+                is_cached=bool(row['is_cached'])
+            )
+            for row in rows
+        ]
+
     def get_location_backends(self, virtual_path: str, recursive: bool = False) -> Set[str]:
         """
         Return backend names that currently hold the path or subtree.
@@ -331,6 +363,63 @@ class StateManager:
         with self._db_lock:
             self.conn.execute('DELETE FROM file_locations WHERE virtual_path = ?', (virtual_path,))
             self.conn.execute('DELETE FROM files WHERE virtual_path = ?', (virtual_path,))
+            self.conn.commit()
+
+    def replace_index(
+        self,
+        metadata_rows: List[FileMetadata],
+        locations: List[FileLocation],
+    ):
+        """Replace the local index contents atomically."""
+        with self._access_lock:
+            self._pending_access_updates.clear()
+            self._recent_access_updates.clear()
+
+        with self._db_lock:
+            self.conn.execute('DELETE FROM file_locations')
+            self.conn.execute('DELETE FROM files')
+            self.conn.executemany(
+                '''
+                INSERT INTO files
+                (virtual_path, size, checksum, last_access, last_modified,
+                 sync_status, replica_count, recomputable, recompute_cmd,
+                 encrypted, encryption_key_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''',
+                [
+                    (
+                        metadata.virtual_path,
+                        metadata.size,
+                        metadata.checksum,
+                        metadata.last_access,
+                        metadata.last_modified,
+                        metadata.sync_status.value,
+                        metadata.replica_count,
+                        int(metadata.recomputable),
+                        metadata.recompute_cmd,
+                        int(metadata.encrypted),
+                        metadata.encryption_key_id,
+                    )
+                    for metadata in metadata_rows
+                ],
+            )
+            self.conn.executemany(
+                '''
+                INSERT INTO file_locations
+                (virtual_path, backend_name, checksum, last_synced, is_cached)
+                VALUES (?, ?, ?, ?, ?)
+                ''',
+                [
+                    (
+                        location.virtual_path,
+                        location.backend_name,
+                        location.checksum,
+                        location.last_synced,
+                        int(location.is_cached),
+                    )
+                    for location in locations
+                ],
+            )
             self.conn.commit()
 
     def get_dirty_files(self) -> List[FileMetadata]:

@@ -285,8 +285,17 @@ class TestResilienceGradient(unittest.TestCase):
                             self.assertEqual(got, payload[:4096])
                             runtime.backend.set_available(False)
                             if state == "uncached":
-                                with self.assertRaises(FuseOSError):
-                                    _ = runtime.fs.read(path, 4096, 96 * 1024, fd)
+                                try:
+                                    got2 = runtime.fs.read(path, 4096, 96 * 1024, fd)
+                                except FuseOSError as exc:
+                                    self.assertIn(exc.errno, {errno.EIO, errno.EHOSTUNREACH})
+                                else:
+                                    # Streaming prefetch may already have filled
+                                    # this later range before the backend drops.
+                                    self.assertEqual(
+                                        got2,
+                                        payload[96 * 1024:96 * 1024 + 4096],
+                                    )
                             else:
                                 got2 = runtime.fs.read(path, 4096, 0, fd)
                                 self.assertEqual(got2, payload[:4096])
