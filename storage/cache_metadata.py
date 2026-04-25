@@ -16,9 +16,13 @@ CACHE_METADATA_VERSION = 1
 _INTERNAL_CACHE_NAMES = frozenset({
     ".storage.rsync-tmp",
     ".storage.control.sock",
+    ".storage.db",
+    ".storage.db-shm",
+    ".storage.db-wal",
 })
 _INTERNAL_CACHE_PREFIXES = (
     ".storage.mount.",
+    ".storage.db-",
 )
 _INTERNAL_CACHE_SUFFIXES = (
     ".storage.partial",

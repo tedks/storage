@@ -12,6 +12,7 @@ from storage.cache_metadata import XATTR_CACHE_METADATA_NAME, write_cache_metada
 from storage.backends.local import LocalBackend
 from storage.cli import main
 from storage.fs import StorageFS
+from storage.index_audit import rebuild_index_from_cache, verify_index_against_cache
 from storage.models import FileLocation, FileMetadata, SyncStatus
 from storage.state import StateManager
 
@@ -221,3 +222,40 @@ class TestDebugIndexCLI(unittest.TestCase):
                 for issue in payload["issues"]
             )
         )
+
+    def test_rebuild_index_rejects_missing_cache_dir_without_mutating_database(self):
+        cache_path = self.cache_dir / "movie.mkv"
+        cache_path.write_bytes(b"payload")
+        seed_metadata = self._metadata("/movie.mkv", cache_path, sync_status=SyncStatus.CLEAN)
+
+        state_manager = StateManager(str(self.db_path))
+        try:
+            state_manager.set_file_metadata(seed_metadata)
+            state_manager.add_file_location(
+                FileLocation(
+                    virtual_path="/movie.mkv",
+                    backend_name="cache",
+                    checksum=seed_metadata.checksum or "",
+                    last_synced=seed_metadata.last_modified,
+                    is_cached=True,
+                )
+            )
+            missing_cache = self.temp_dir / "missing-cache"
+            with self.assertRaises(FileNotFoundError):
+                rebuild_index_from_cache(missing_cache, state_manager)
+
+            metadata = state_manager.get_file_metadata("/movie.mkv")
+            self.assertIsNotNone(metadata)
+            locations = state_manager.get_file_locations("/movie.mkv")
+            self.assertEqual(["cache"], [location.backend_name for location in locations])
+        finally:
+            state_manager.close()
+
+    def test_verify_index_rejects_missing_cache_dir(self):
+        missing_cache = self.temp_dir / "missing-cache"
+        state_manager = StateManager(str(self.db_path))
+        try:
+            with self.assertRaises(FileNotFoundError):
+                verify_index_against_cache(missing_cache, state_manager)
+        finally:
+            state_manager.close()

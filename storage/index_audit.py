@@ -65,8 +65,19 @@ class VerifyIndexReport:
         }
 
 
+def _validate_cache_root(cache_root: Path) -> Path:
+    """Resolve and validate the cache root before auditing or rebuilding."""
+    resolved = cache_root.resolve()
+    if not resolved.exists():
+        raise FileNotFoundError(f"cache directory does not exist: {resolved}")
+    if not resolved.is_dir():
+        raise NotADirectoryError(f"cache path is not a directory: {resolved}")
+    return resolved
+
+
 def rebuild_index_from_cache(cache_root: Path, state_manager: StateManager) -> RebuildIndexReport:
     """Reconstruct cache-backed index rows and normalize cache metadata xattrs."""
+    cache_root = _validate_cache_root(cache_root)
     report = RebuildIndexReport()
     metadata_rows: List[FileMetadata] = []
     cache_locations: List[FileLocation] = []
@@ -145,6 +156,7 @@ def rebuild_index_from_cache(cache_root: Path, state_manager: StateManager) -> R
 
 def verify_index_against_cache(cache_root: Path, state_manager: StateManager) -> VerifyIndexReport:
     """Verify that cache files, cache metadata xattrs, and the SQLite index agree."""
+    cache_root = _validate_cache_root(cache_root)
     report = VerifyIndexReport()
 
     db_metadata: Dict[str, FileMetadata] = {

@@ -75,6 +75,32 @@ class TestCacheMetadata(unittest.TestCase):
         self.assertEqual("/dir/file.txt", cache_path_to_virtual_path(self.cache_root, cache_path))
         self.assertTrue(any(issue.startswith("path_mismatch:") for issue in entries[0].issues))
 
+    def test_scan_skips_internal_database_files(self):
+        (self.cache_root / ".storage.db").write_bytes(b"sqlite")
+        (self.cache_root / ".storage.db-wal").write_bytes(b"wal")
+        (self.cache_root / ".storage.db-shm").write_bytes(b"shm")
+        (self.cache_root / ".storage.db-journal").write_bytes(b"journal")
+
+        cache_path = self.cache_root / "real.bin"
+        cache_path.write_bytes(b"payload")
+        metadata = FileMetadata(
+            virtual_path="/real.bin",
+            size=cache_path.stat().st_size,
+            checksum="sum-2",
+            last_access=0.0,
+            last_modified=cache_path.stat().st_mtime,
+            sync_status=SyncStatus.CLEAN,
+            replica_count=1,
+            recomputable=False,
+            recompute_cmd=None,
+            encrypted=False,
+            encryption_key_id=None,
+        )
+        write_cache_metadata(cache_path, metadata)
+
+        entries = list(scan_cache_entries(self.cache_root))
+        self.assertEqual(["/real.bin"], [entry.virtual_path for entry in entries])
+
 
 if __name__ == "__main__":
     unittest.main()

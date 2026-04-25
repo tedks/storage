@@ -96,7 +96,7 @@ def _with_state_manager(database: Path) -> StateManager:
     "-c",
     "--cache",
     required=True,
-    type=click.Path(file_okay=False, path_type=Path),
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
     help="Cache directory to scan",
 )
 @click.option(
@@ -134,7 +134,7 @@ def debug_rebuild_index(cache: Path, database: Path, json_output: bool):
     "-c",
     "--cache",
     required=True,
-    type=click.Path(file_okay=False, path_type=Path),
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
     help="Cache directory to scan",
 )
 @click.option(
