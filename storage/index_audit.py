@@ -2,10 +2,13 @@
 
 from dataclasses import dataclass, field
 from pathlib import Path
+import stat as stat_module
+import time
 from typing import Dict, List
 
+from .backends.base import Backend
 from .cache_metadata import scan_cache_entries, write_cache_metadata
-from .models import FileLocation, FileMetadata
+from .models import FileLocation, FileMetadata, SyncStatus
 from .state import StateManager
 
 
@@ -65,6 +68,30 @@ class VerifyIndexReport:
         }
 
 
+@dataclass
+class ReprobeLocationsReport:
+    """Result of probing storage members to rebuild non-cache location rows."""
+
+    files_considered: int = 0
+    members_requested: int = 0
+    members_reprobed: int = 0
+    members_unavailable: int = 0
+    remote_locations_found: int = 0
+    issue_count: int = 0
+    issues: List[IndexIssue] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {
+            "files_considered": self.files_considered,
+            "members_requested": self.members_requested,
+            "members_reprobed": self.members_reprobed,
+            "members_unavailable": self.members_unavailable,
+            "remote_locations_found": self.remote_locations_found,
+            "issue_count": self.issue_count,
+            "issues": [issue.to_dict() for issue in self.issues],
+        }
+
+
 def _validate_cache_root(cache_root: Path) -> Path:
     """Resolve and validate the cache root before auditing or rebuilding."""
     resolved = cache_root.resolve()
@@ -73,6 +100,11 @@ def _validate_cache_root(cache_root: Path) -> Path:
     if not resolved.is_dir():
         raise NotADirectoryError(f"cache path is not a directory: {resolved}")
     return resolved
+
+
+def _cache_path_for_metadata(state_manager: StateManager, virtual_path: str) -> Path:
+    """Best-effort cache path lookup for the default cache/.storage.db layout."""
+    return Path(state_manager.db_path).resolve().parent / virtual_path.lstrip("/")
 
 
 def rebuild_index_from_cache(cache_root: Path, state_manager: StateManager) -> RebuildIndexReport:
@@ -244,6 +276,131 @@ def verify_index_against_cache(cache_root: Path, state_manager: StateManager) ->
                 detail="cache location row exists without a cache file",
             )
         )
+
+    report.issue_count = len(report.issues)
+    return report
+
+
+def reprobe_member_locations(
+    state_manager: StateManager,
+    backends: Dict[str, Backend],
+) -> ReprobeLocationsReport:
+    """Probe known file paths against storage members and rebuild non-cache location rows."""
+    report = ReprobeLocationsReport()
+    metadata_rows = state_manager.get_all_file_metadata()
+    known_paths = [metadata.virtual_path for metadata in metadata_rows]
+    report.files_considered = len(metadata_rows)
+    report.members_requested = len(backends)
+
+    for backend_name in sorted(backends):
+        backend = backends[backend_name]
+        found_locations: List[FileLocation] = []
+        member_failed = False
+
+        for metadata in metadata_rows:
+            try:
+                stat_result = backend.stat(metadata.virtual_path)
+            except FileNotFoundError:
+                continue
+            except Exception as exc:
+                issue_kind = "member_unavailable" if not backend.is_available() else "member_probe_error"
+                if issue_kind == "member_unavailable":
+                    report.members_unavailable += 1
+                report.issues.append(
+                    IndexIssue(
+                        kind=issue_kind,
+                        virtual_path=metadata.virtual_path,
+                        detail=f"{backend.name}: {exc}",
+                    )
+                )
+                member_failed = True
+                break
+
+            if stat_module.S_ISDIR(getattr(stat_result, "st_mode", 0)):
+                report.issues.append(
+                    IndexIssue(
+                        kind="member_type_mismatch",
+                        virtual_path=metadata.virtual_path,
+                        detail=f"{backend.name}: expected file but found directory",
+                    )
+                )
+                continue
+
+            checksum_getter = getattr(backend, "get_fast_checksum", None)
+            if callable(checksum_getter):
+                try:
+                    remote_checksum = checksum_getter(metadata.virtual_path)
+                except Exception as exc:
+                    issue_kind = "member_unavailable" if not backend.is_available() else "member_probe_error"
+                    if issue_kind == "member_unavailable":
+                        report.members_unavailable += 1
+                    report.issues.append(
+                        IndexIssue(
+                            kind=issue_kind,
+                            virtual_path=metadata.virtual_path,
+                            detail=f"{backend.name}: checksum probe failed: {exc}",
+                        )
+                    )
+                    member_failed = True
+                    break
+            else:
+                remote_checksum = metadata.checksum or ""
+                report.issues.append(
+                    IndexIssue(
+                        kind="member_checksum_unverified",
+                        virtual_path=metadata.virtual_path,
+                        detail=f"{backend.name}: checksum probe unavailable; using local metadata checksum",
+                    )
+                )
+
+            if metadata.checksum and remote_checksum != metadata.checksum:
+                report.issues.append(
+                    IndexIssue(
+                        kind="member_checksum_mismatch",
+                        virtual_path=metadata.virtual_path,
+                        detail=(
+                            f"{backend.name}: cache={metadata.checksum!r}:"
+                            f"member={remote_checksum!r}"
+                        ),
+                    )
+                )
+                if metadata.sync_status != SyncStatus.CLEAN:
+                    metadata.sync_status = SyncStatus.CONFLICT
+                    state_manager.set_file_metadata(metadata)
+                    cache_path = _cache_path_for_metadata(state_manager, metadata.virtual_path)
+                    if cache_path.exists() and cache_path.is_file():
+                        try:
+                            write_cache_metadata(cache_path, metadata, virtual_path=metadata.virtual_path)
+                        except OSError as exc:
+                            report.issues.append(
+                                IndexIssue(
+                                    kind="cache_metadata_sync_failed",
+                                    virtual_path=metadata.virtual_path,
+                                    detail=f"{backend.name}: {exc}",
+                                )
+                            )
+
+            found_locations.append(
+                FileLocation(
+                    virtual_path=metadata.virtual_path,
+                    backend_name=backend.name,
+                    checksum=remote_checksum,
+                    last_synced=getattr(stat_result, "st_mtime", time.time()),
+                    is_cached=False,
+                )
+            )
+
+        if member_failed:
+            continue
+
+        state_manager.replace_backend_locations_for_paths(
+            backend.name,
+            known_paths,
+            found_locations,
+            is_cached=False,
+        )
+        report.members_reprobed += 1
+        report.remote_locations_found += len(found_locations)
 
     report.issue_count = len(report.issues)
     return report

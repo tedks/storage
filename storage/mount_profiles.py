@@ -41,6 +41,14 @@ class ResolvedMountConfig:
         return self.backing_paths + self.remote
 
 
+@dataclass(frozen=True)
+class ResolvedMemberConfig:
+    member_specs: Tuple[str, ...]
+    key_file: Optional[str]
+    profile_name: Optional[str] = None
+    profile_source: Optional[Path] = None
+
+
 def default_mount_config_paths() -> Tuple[Path, ...]:
     return (
         Path.home() / ".config" / "storage" / DEFAULT_MOUNT_CONFIG_NAME,
@@ -177,7 +185,12 @@ def split_storage_member_specs(member_specs: Sequence[str]) -> Tuple[Tuple[str, 
     return tuple(local_members), tuple(remote_members)
 
 
-def create_storage_members(member_specs: Sequence[str], key_file: Optional[str]):
+def create_storage_members(
+    member_specs: Sequence[str],
+    key_file: Optional[str],
+    *,
+    announce: bool = True,
+):
     backends = {}
     local_specs, remote_specs = split_storage_member_specs(member_specs)
 
@@ -186,7 +199,8 @@ def create_storage_members(member_specs: Sequence[str], key_file: Optional[str])
             name = f"local{i}"
             backend = LocalBackend(name, path, speed_priority=i * 10)
             backends[name] = backend
-            click.echo(f"Added local storage member: {name} -> {path} (priority: {i * 10})")
+            if announce:
+                click.echo(f"Added local storage member: {name} -> {path} (priority: {i * 10})")
         except ValueError as exc:
             raise click.ClickException(str(exc)) from exc
 
@@ -220,10 +234,11 @@ def create_storage_members(member_specs: Sequence[str], key_file: Optional[str])
                     key_filename=key_file,
                     speed_priority=50 + i * 10,
                 )
-                click.echo(
-                    f"Added rsync storage member: {name} -> "
-                    f"{username}@{host}:{remote_path} (priority: {50 + i * 10})"
-                )
+                if announce:
+                    click.echo(
+                        f"Added rsync storage member: {name} -> "
+                        f"{username}@{host}:{remote_path} (priority: {50 + i * 10})"
+                    )
             else:
                 backend = SSHBackend(
                     name=name,
@@ -233,10 +248,11 @@ def create_storage_members(member_specs: Sequence[str], key_file: Optional[str])
                     key_filename=key_file,
                     speed_priority=50 + i * 10,
                 )
-                click.echo(
-                    f"Added SSH storage member: {name} -> "
-                    f"{username}@{host}:{remote_path} (priority: {50 + i * 10})"
-                )
+                if announce:
+                    click.echo(
+                        f"Added SSH storage member: {name} -> "
+                        f"{username}@{host}:{remote_path} (priority: {50 + i * 10})"
+                    )
             backends[name] = backend
         except click.ClickException:
             raise
@@ -257,6 +273,69 @@ def split_backend_specs(backend_specs: Sequence[str]) -> Tuple[Tuple[str, ...], 
 def create_backends(backing_paths: Sequence[str], remote_specs: Sequence[str], key_file: Optional[str]):
     """Compatibility wrapper for older call sites."""
     return create_storage_members(tuple(backing_paths) + tuple(remote_specs), key_file)
+
+
+def resolve_member_configuration(
+    profile_name: Optional[str],
+    config_path: Optional[Path],
+    member_specs: Sequence[str],
+    key_file: Optional[str],
+) -> ResolvedMemberConfig:
+    if profile_name:
+        if member_specs:
+            raise click.ClickException(
+                "Provide either a mount profile or explicit --member options, not both."
+            )
+
+        profile_source = config_path
+        if profile_source is None:
+            available_configs = [candidate for candidate in default_mount_config_paths() if candidate.exists()]
+            if not available_configs:
+                searched = ", ".join(str(path) for path in default_mount_config_paths())
+                raise click.ClickException(
+                    f"No default mount config files found while looking for profile '{profile_name}': {searched}"
+                )
+
+            for candidate in available_configs:
+                try:
+                    settings = _load_mount_profile_settings(candidate, profile_name)
+                    profile_source = candidate
+                    break
+                except click.ClickException as exc:
+                    if f"Mount profile '{profile_name}' not found" in str(exc):
+                        continue
+                    raise
+            else:
+                searched = ", ".join(str(path) for path in available_configs)
+                raise click.ClickException(
+                    f"Mount profile '{profile_name}' not found in default config files: {searched}"
+                )
+        else:
+            settings = _load_mount_profile_settings(profile_source, profile_name)
+
+        resolved_specs = settings["backing_paths"] + settings["remote"]
+        if not resolved_specs:
+            raise click.ClickException(
+                f"Mount profile '{profile_name}' does not define any storage members"
+            )
+
+        return ResolvedMemberConfig(
+            member_specs=resolved_specs,
+            key_file=key_file or settings["key_file"],
+            profile_name=profile_name,
+            profile_source=profile_source,
+        )
+
+    if config_path is not None:
+        raise click.ClickException("Provide the named mount profile when using --config")
+
+    if not member_specs:
+        raise click.ClickException("Provide at least one --member or a mount profile name")
+
+    return ResolvedMemberConfig(
+        member_specs=tuple(member_specs),
+        key_file=key_file,
+    )
 
 
 def _load_mount_profile_settings(config_path: Path, profile_name: str) -> Dict[str, Any]:

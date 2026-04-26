@@ -9,6 +9,7 @@ from storage.mount_profiles import (
     _optional_profile_float,
     _optional_profile_int,
     parse_size,
+    resolve_member_configuration,
     resolve_mount_configuration,
     split_storage_member_specs,
 )
@@ -219,6 +220,55 @@ readdir_ttl = 5.0
             self.assertEqual(2.0, config.readdir_ttl)
         finally:
             Path(config_path).unlink()
+
+
+class TestResolvedMemberConfig(unittest.TestCase):
+    def test_explicit_member_specs_are_used_directly(self):
+        resolved = resolve_member_configuration(
+            profile_name=None,
+            config_path=None,
+            member_specs=["/srv/data", "ssh://user@host:/remote"],
+            key_file="/tmp/key",
+        )
+
+        self.assertEqual(("/srv/data", "ssh://user@host:/remote"), resolved.member_specs)
+        self.assertEqual("/tmp/key", resolved.key_file)
+        self.assertIsNone(resolved.profile_name)
+
+    def test_profile_name_loads_members_from_config(self):
+        toml_content = '''
+[mounts.test]
+mountpoint = "/mnt/test"
+cache = "/tmp/cache"
+backends = ["/srv/data", "ssh://user@host:/remote"]
+key_file = "/tmp/profile-key"
+'''
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.toml', delete=False) as f:
+            f.write(toml_content)
+            config_path = Path(f.name)
+
+        try:
+            resolved = resolve_member_configuration(
+                profile_name="test",
+                config_path=config_path,
+                member_specs=[],
+                key_file=None,
+            )
+            self.assertEqual(("/srv/data", "ssh://user@host:/remote"), resolved.member_specs)
+            self.assertEqual("/tmp/profile-key", resolved.key_file)
+            self.assertEqual("test", resolved.profile_name)
+            self.assertEqual(config_path, resolved.profile_source)
+        finally:
+            config_path.unlink()
+
+    def test_profile_and_explicit_members_conflict(self):
+        with self.assertRaises(click.ClickException):
+            resolve_member_configuration(
+                profile_name="test",
+                config_path=None,
+                member_specs=["/srv/data"],
+                key_file=None,
+            )
 
 
 if __name__ == "__main__":

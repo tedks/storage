@@ -262,6 +262,48 @@ class StateManager:
             int(location.is_cached)
         ))
 
+    def replace_backend_locations_for_paths(
+        self,
+        backend_name: str,
+        virtual_paths: List[str],
+        locations: List[FileLocation],
+        *,
+        is_cached: bool,
+    ):
+        """Replace location rows for one backend, scoped to the provided paths only."""
+        normalized_paths = [self._normalize_virtual_path(path) for path in virtual_paths]
+
+        with self._db_lock:
+            if normalized_paths:
+                self.conn.executemany(
+                    'DELETE FROM file_locations WHERE backend_name = ? AND is_cached = ? AND virtual_path = ?',
+                    [
+                        (backend_name, int(is_cached), path)
+                        for path in normalized_paths
+                    ],
+                )
+
+            if locations:
+                self.conn.executemany(
+                    '''
+                    INSERT INTO file_locations
+                    (virtual_path, backend_name, checksum, last_synced, is_cached)
+                    VALUES (?, ?, ?, ?, ?)
+                    ''',
+                    [
+                        (
+                            location.virtual_path,
+                            location.backend_name,
+                            location.checksum,
+                            location.last_synced,
+                            int(location.is_cached),
+                        )
+                        for location in locations
+                    ],
+                )
+
+            self.conn.commit()
+
     def remove_file_location(self, virtual_path: str, backend_name: str):
         """Remove a file location"""
         self._execute_write(
