@@ -189,11 +189,18 @@ def debug_verify_index(cache: Path, database: Path, json_output: bool):
     help="Load storage members from a named mount profile in a TOML config file.",
 )
 @click.option(
+    "-c",
+    "--cache",
+    "cache_root",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    help="Cache directory used to keep durable cache metadata xattrs in sync.",
+)
+@click.option(
     "-m",
     "--member",
     "member_specs",
     multiple=True,
-    help="Storage member root or URI (local path, ssh://user@host:/path, rsync://user@host:/path).",
+    help="Storage member NAME=SPEC (for example local0=/srv/data or remote1=ssh://user@host:/path).",
 )
 @click.option(
     "-k",
@@ -204,25 +211,41 @@ def debug_verify_index(cache: Path, database: Path, json_output: bool):
     "-d",
     "--database",
     required=True,
-    type=click.Path(path_type=Path),
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
     help="SQLite database path to update",
 )
 @click.option("--json-output", is_flag=True, help="Print raw JSON report")
 def debug_reprobe_locations(
     profile_name: str | None,
     config_path: Path | None,
+    cache_root: Path | None,
     member_specs: tuple[str, ...],
     key_file: str | None,
     database: Path,
     json_output: bool,
 ):
     """Probe storage members to rebuild non-cache location rows for known files."""
-    resolved = resolve_member_configuration(profile_name, config_path, member_specs, key_file)
-    backends = create_storage_members(resolved.member_specs, resolved.key_file, announce=not json_output)
+    resolved = resolve_member_configuration(
+        profile_name,
+        config_path,
+        member_specs,
+        key_file,
+        cache_root,
+    )
+    backends = create_storage_members(
+        resolved.member_specs,
+        resolved.key_file,
+        announce=not json_output,
+        member_names=resolved.member_names,
+    )
 
     state_manager = _with_state_manager(database.resolve())
     try:
-        report = reprobe_member_locations(state_manager, backends)
+        report = reprobe_member_locations(
+            state_manager,
+            backends,
+            cache_root=resolved.cache_root,
+        )
     finally:
         state_manager.close()
         _close_storage_members(backends)

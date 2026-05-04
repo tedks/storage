@@ -158,7 +158,7 @@ Inspect or repair local cache/index state:
 
 ```bash
 storage debug rebuild-index --cache /var/cache/storage --database /var/cache/storage/.storage.db
-storage debug reprobe-locations --database /var/cache/storage/.storage.db --member /srv/raid --member ssh://user@example.com:/srv/archive
+storage debug reprobe-locations --cache /var/cache/storage --database /var/cache/storage/.storage.db --member local0=/srv/raid --member remote0=ssh://user@example.com:/srv/archive
 storage debug verify-index --cache /var/cache/storage --database /var/cache/storage/.storage.db
 ```
 
@@ -210,7 +210,7 @@ Configuration is hierarchical - child directories inherit from parents, with the
 2. Cached files persist cache-local metadata in `user.storage.metadata`
 3. SQLite stores rebuildable acceleration state such as cache locations and LRU ordering
 4. `storage debug rebuild-index` reconstructs cache-backed rows quickly from cache files plus xattrs
-5. `storage debug reprobe-locations` explicitly repopulates non-cache member rows for the rebuilt file set
+5. `storage debug reprobe-locations` explicitly repopulates non-cache member rows for the rebuilt file set using the cache root to keep `user.storage.metadata` authoritative
 6. `storage debug verify-index` audits the cache/index boundary without mutating state
 
 **Replication:**

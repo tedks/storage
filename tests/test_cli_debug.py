@@ -8,6 +8,7 @@ from pathlib import Path
 
 from click.testing import CliRunner
 
+from storage.checksums import fast_checksum_file
 from storage.cache_metadata import XATTR_CACHE_METADATA_NAME, read_cache_metadata, write_cache_metadata
 from storage.backends.base import Backend, BackendType, StorageMemberCapabilities
 from storage.backends.local import LocalBackend
@@ -170,7 +171,7 @@ class TestDebugIndexCLI(unittest.TestCase):
         return FileMetadata(
             virtual_path=virtual_path,
             size=st.st_size,
-            checksum="checksum-1",
+            checksum=fast_checksum_file(cache_path),
             last_access=st.st_atime,
             last_modified=st.st_mtime,
             sync_status=sync_status,
@@ -358,10 +359,12 @@ class TestDebugIndexCLI(unittest.TestCase):
             [
                 "debug",
                 "reprobe-locations",
+                "--cache",
+                str(self.cache_dir),
                 "--database",
                 str(self.db_path),
                 "--member",
-                str(remote_dir),
+                f"local0={remote_dir}",
                 "--json-output",
             ],
         )
@@ -412,6 +415,7 @@ class TestDebugIndexCLI(unittest.TestCase):
             report = reprobe_member_locations(
                 state_manager,
                 {"remote0": FailingProbeBackend("remote0")},
+                cache_root=self.cache_dir,
             )
 
             self.assertEqual(report.members_requested, 1)
@@ -424,10 +428,11 @@ class TestDebugIndexCLI(unittest.TestCase):
         finally:
             state_manager.close()
 
-    def test_reprobe_locations_reports_checksum_mismatch_and_records_remote_checksum(self):
+    def test_reprobe_locations_promotes_clean_mismatch_to_conflict_and_drops_replica_row(self):
         cache_path = self.cache_dir / "movie.mkv"
         cache_path.write_bytes(b"payload")
         metadata = self._metadata("/movie.mkv", cache_path, sync_status=SyncStatus.CLEAN)
+        write_cache_metadata(cache_path, metadata)
 
         state_manager = StateManager(str(self.db_path))
         try:
@@ -453,10 +458,12 @@ class TestDebugIndexCLI(unittest.TestCase):
             [
                 "debug",
                 "reprobe-locations",
+                "--cache",
+                str(self.cache_dir),
                 "--database",
                 str(self.db_path),
                 "--member",
-                str(remote_dir),
+                f"local0={remote_dir}",
                 "--json-output",
             ],
         )
@@ -472,17 +479,20 @@ class TestDebugIndexCLI(unittest.TestCase):
 
         state_manager = StateManager(str(self.db_path))
         try:
-            locations = {
-                location.backend_name: location
-                for location in state_manager.get_file_locations("/movie.mkv")
-            }
-            self.assertIn("local0", locations)
-            self.assertNotEqual(metadata.checksum, locations["local0"].checksum)
+            refreshed = state_manager.get_file_metadata("/movie.mkv")
+            self.assertIsNotNone(refreshed)
+            self.assertEqual(SyncStatus.CONFLICT, refreshed.sync_status)
+            locations = state_manager.get_file_locations("/movie.mkv")
+            self.assertEqual(["cache"], [location.backend_name for location in locations])
         finally:
             state_manager.close()
 
-    def test_reprobe_locations_promotes_dirty_mismatch_to_conflict(self):
-        db_path = self.cache_dir / ".storage.db"
+        record = read_cache_metadata(cache_path)
+        self.assertIsNotNone(record)
+        self.assertEqual(SyncStatus.CONFLICT, record.sync_status)
+
+    def test_reprobe_locations_syncs_conflict_xattr_with_database_outside_cache_root(self):
+        db_path = self.temp_dir / "state.db"
         cache_path = self.cache_dir / "movie.mkv"
         cache_path.write_bytes(b"payload")
         metadata = self._metadata("/movie.mkv", cache_path, sync_status=SyncStatus.DIRTY)
@@ -512,10 +522,12 @@ class TestDebugIndexCLI(unittest.TestCase):
             [
                 "debug",
                 "reprobe-locations",
+                "--cache",
+                str(self.cache_dir),
                 "--database",
                 str(db_path),
                 "--member",
-                str(remote_dir),
+                f"local0={remote_dir}",
                 "--json-output",
             ],
         )
@@ -540,3 +552,25 @@ class TestDebugIndexCLI(unittest.TestCase):
         record = read_cache_metadata(cache_path)
         self.assertIsNotNone(record)
         self.assertEqual(SyncStatus.CONFLICT, record.sync_status)
+
+    def test_reprobe_locations_rejects_missing_database_path(self):
+        remote_dir = self.temp_dir / "remote-missing-db"
+        remote_dir.mkdir()
+        missing_db = self.temp_dir / "missing.db"
+
+        result = self.runner.invoke(
+            main,
+            [
+                "debug",
+                "reprobe-locations",
+                "--cache",
+                str(self.cache_dir),
+                "--database",
+                str(missing_db),
+                "--member",
+                f"local0={remote_dir}",
+            ],
+        )
+
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("does not exist", result.output)

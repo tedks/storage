@@ -102,9 +102,44 @@ def _validate_cache_root(cache_root: Path) -> Path:
     return resolved
 
 
-def _cache_path_for_metadata(state_manager: StateManager, virtual_path: str) -> Path:
-    """Best-effort cache path lookup for the default cache/.storage.db layout."""
-    return Path(state_manager.db_path).resolve().parent / virtual_path.lstrip("/")
+def _cache_path_for_metadata(cache_root: Path, virtual_path: str) -> Path:
+    """Resolve the cache file path for a virtual path."""
+    return cache_root / virtual_path.lstrip("/")
+
+
+def _promote_conflict(
+    cache_root: Path,
+    state_manager: StateManager,
+    metadata: FileMetadata,
+    report: ReprobeLocationsReport,
+    *,
+    backend_name: str,
+):
+    """Mark the cached file conflicted in both SQLite and durable cache xattrs."""
+    metadata.sync_status = SyncStatus.CONFLICT
+    state_manager.set_file_metadata(metadata)
+
+    cache_path = _cache_path_for_metadata(cache_root, metadata.virtual_path)
+    if not cache_path.exists() or not cache_path.is_file():
+        report.issues.append(
+            IndexIssue(
+                kind="missing_cache_file_for_conflict_sync",
+                virtual_path=metadata.virtual_path,
+                detail=f"{backend_name}: expected cache file at {cache_path}",
+            )
+        )
+        return
+
+    try:
+        write_cache_metadata(cache_path, metadata, virtual_path=metadata.virtual_path)
+    except OSError as exc:
+        report.issues.append(
+            IndexIssue(
+                kind="cache_metadata_sync_failed",
+                virtual_path=metadata.virtual_path,
+                detail=f"{backend_name}: {exc}",
+            )
+        )
 
 
 def rebuild_index_from_cache(cache_root: Path, state_manager: StateManager) -> RebuildIndexReport:
@@ -284,8 +319,11 @@ def verify_index_against_cache(cache_root: Path, state_manager: StateManager) ->
 def reprobe_member_locations(
     state_manager: StateManager,
     backends: Dict[str, Backend],
+    *,
+    cache_root: Path,
 ) -> ReprobeLocationsReport:
     """Probe known file paths against storage members and rebuild non-cache location rows."""
+    cache_root = _validate_cache_root(cache_root)
     report = ReprobeLocationsReport()
     metadata_rows = state_manager.get_all_file_metadata()
     known_paths = [metadata.virtual_path for metadata in metadata_rows]
@@ -364,21 +402,14 @@ def reprobe_member_locations(
                         ),
                     )
                 )
-                if metadata.sync_status != SyncStatus.CLEAN:
-                    metadata.sync_status = SyncStatus.CONFLICT
-                    state_manager.set_file_metadata(metadata)
-                    cache_path = _cache_path_for_metadata(state_manager, metadata.virtual_path)
-                    if cache_path.exists() and cache_path.is_file():
-                        try:
-                            write_cache_metadata(cache_path, metadata, virtual_path=metadata.virtual_path)
-                        except OSError as exc:
-                            report.issues.append(
-                                IndexIssue(
-                                    kind="cache_metadata_sync_failed",
-                                    virtual_path=metadata.virtual_path,
-                                    detail=f"{backend.name}: {exc}",
-                                )
-                            )
+                _promote_conflict(
+                    cache_root,
+                    state_manager,
+                    metadata,
+                    report,
+                    backend_name=backend.name,
+                )
+                continue
 
             found_locations.append(
                 FileLocation(

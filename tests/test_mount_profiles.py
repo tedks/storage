@@ -223,16 +223,19 @@ readdir_ttl = 5.0
 
 
 class TestResolvedMemberConfig(unittest.TestCase):
-    def test_explicit_member_specs_are_used_directly(self):
+    def test_explicit_member_specs_require_names_and_cache_root(self):
         resolved = resolve_member_configuration(
             profile_name=None,
             config_path=None,
-            member_specs=["/srv/data", "ssh://user@host:/remote"],
+            member_specs=["local0=/srv/data", "remote0=ssh://user@host:/remote"],
             key_file="/tmp/key",
+            cache_root=Path("/tmp/cache"),
         )
 
         self.assertEqual(("/srv/data", "ssh://user@host:/remote"), resolved.member_specs)
+        self.assertEqual(("local0", "remote0"), resolved.member_names)
         self.assertEqual("/tmp/key", resolved.key_file)
+        self.assertEqual(Path("/tmp/cache"), resolved.cache_root)
         self.assertIsNone(resolved.profile_name)
 
     def test_profile_name_loads_members_from_config(self):
@@ -253,9 +256,12 @@ key_file = "/tmp/profile-key"
                 config_path=config_path,
                 member_specs=[],
                 key_file=None,
+                cache_root=None,
             )
             self.assertEqual(("/srv/data", "ssh://user@host:/remote"), resolved.member_specs)
+            self.assertEqual(("local0", "remote0"), resolved.member_names)
             self.assertEqual("/tmp/profile-key", resolved.key_file)
+            self.assertEqual(Path("/tmp/cache"), resolved.cache_root)
             self.assertEqual("test", resolved.profile_name)
             self.assertEqual(config_path, resolved.profile_source)
         finally:
@@ -266,8 +272,29 @@ key_file = "/tmp/profile-key"
             resolve_member_configuration(
                 profile_name="test",
                 config_path=None,
+                member_specs=["local0=/srv/data"],
+                key_file=None,
+                cache_root=None,
+            )
+
+    def test_explicit_members_require_cache_root(self):
+        with self.assertRaises(click.ClickException):
+            resolve_member_configuration(
+                profile_name=None,
+                config_path=None,
+                member_specs=["local0=/srv/data"],
+                key_file=None,
+                cache_root=None,
+            )
+
+    def test_explicit_members_require_stable_names(self):
+        with self.assertRaises(click.ClickException):
+            resolve_member_configuration(
+                profile_name=None,
+                config_path=None,
                 member_specs=["/srv/data"],
                 key_file=None,
+                cache_root=Path("/tmp/cache"),
             )
 
 

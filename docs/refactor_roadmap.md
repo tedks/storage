@@ -141,7 +141,7 @@ Recovery behavior:
 1. `storage debug rebuild-index` reconstructs `files` rows and cache `file_locations` rows from cache files plus `user.storage.metadata`.
 2. If a cache file is missing `user.storage.metadata` but the current local index still has a row for that path, rebuild backfills the xattr from the existing row and current file stat.
 3. If a cache file is missing `user.storage.metadata` and there is no surviving local row, rebuild skips it rather than guessing and risking indexing derived cache artifacts.
-4. `storage debug reprobe-locations` performs an explicit member probe pass to rebuild non-cache `file_locations` rows for the already-rebuilt file set.
+4. `storage debug reprobe-locations` performs an explicit member probe pass to rebuild non-cache `file_locations` rows for the already-rebuilt file set, using the cache root to keep durable `user.storage.metadata` in sync with any recovered conflict state.
 5. Reprobe only mutates rows for members that complete a full probe successfully; unavailable members are reported and left untouched.
 6. `storage debug verify-index` reports divergence between cache files, cache metadata xattrs, and SQLite rows without mutating state.
 

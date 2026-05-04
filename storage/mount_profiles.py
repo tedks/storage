@@ -2,6 +2,7 @@ import click
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
+import re
 from typing import Any, Dict, Optional, Sequence, Tuple
 
 from .backends.local import LocalBackend
@@ -44,7 +45,9 @@ class ResolvedMountConfig:
 @dataclass(frozen=True)
 class ResolvedMemberConfig:
     member_specs: Tuple[str, ...]
+    member_names: Tuple[str, ...]
     key_file: Optional[str]
+    cache_root: Path
     profile_name: Optional[str] = None
     profile_source: Optional[Path] = None
 
@@ -185,79 +188,124 @@ def split_storage_member_specs(member_specs: Sequence[str]) -> Tuple[Tuple[str, 
     return tuple(local_members), tuple(remote_members)
 
 
+_EXPLICIT_MEMBER_NAME_RE = re.compile(r"^(local|remote)(\d+)$")
+
+
+def _default_member_names(member_specs: Sequence[str]) -> Tuple[str, ...]:
+    local_specs, remote_specs = split_storage_member_specs(member_specs)
+    return tuple(
+        [f"local{i}" for i in range(len(local_specs))]
+        + [f"remote{i}" for i in range(len(remote_specs))]
+    )
+
+
+def _parse_explicit_member_specs(member_specs: Sequence[str]) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
+    names = []
+    specs = []
+    seen_names = set()
+    for raw in member_specs:
+        name, sep, spec = raw.partition("=")
+        if sep != "=" or not name.strip() or not spec.strip():
+            raise click.ClickException(
+                "Explicit --member values must use NAME=SPEC so reprobe preserves stable backend identities."
+            )
+
+        name = name.strip()
+        spec = spec.strip()
+        match = _EXPLICIT_MEMBER_NAME_RE.fullmatch(name)
+        if not match:
+            raise click.ClickException(
+                "Explicit --member names must match the mounted backend names, e.g. local0=/srv/data or remote1=ssh://user@host:/path."
+            )
+
+        expected_prefix = "remote" if spec.startswith(("ssh://", "rsync://")) else "local"
+        if match.group(1) != expected_prefix:
+            raise click.ClickException(
+                f"Explicit member {name!r} does not match {spec!r}; use a {expected_prefix}N name."
+            )
+
+        if name in seen_names:
+            raise click.ClickException(f"Duplicate explicit storage member name: {name}")
+        seen_names.add(name)
+        names.append(name)
+        specs.append(spec)
+
+    return tuple(specs), tuple(names)
+
+
 def create_storage_members(
     member_specs: Sequence[str],
     key_file: Optional[str],
     *,
     announce: bool = True,
+    member_names: Optional[Sequence[str]] = None,
 ):
     backends = {}
-    local_specs, remote_specs = split_storage_member_specs(member_specs)
+    resolved_names = tuple(member_names) if member_names is not None else _default_member_names(member_specs)
+    if len(resolved_names) != len(tuple(member_specs)):
+        raise click.ClickException("member_names must match member_specs length")
 
-    for i, path in enumerate(local_specs):
+    local_index = 0
+    remote_index = 0
+    for name, spec in zip(resolved_names, member_specs):
         try:
-            name = f"local{i}"
-            backend = LocalBackend(name, path, speed_priority=i * 10)
+            is_rsync = spec.startswith("rsync://")
+            is_ssh = spec.startswith("ssh://")
+            if is_ssh or is_rsync:
+                prefix_len = 8 if is_rsync else 6
+                remote_spec = spec[prefix_len:]
+                if "@" not in remote_spec or ":" not in remote_spec:
+                    raise click.ClickException(
+                        f"Invalid remote format. Use {'rsync' if is_rsync else 'ssh'}://user@host:/path"
+                    )
+
+                user_host, remote_path = remote_spec.split(":", 1)
+                username, host = user_host.split("@", 1)
+                priority = 50 + remote_index * 10
+                remote_index += 1
+
+                if is_rsync:
+                    from .backends.rsync import RsyncBackend
+                    backend = RsyncBackend(
+                        name=name,
+                        host=host,
+                        remote_path=remote_path,
+                        username=username,
+                        key_filename=key_file,
+                        speed_priority=priority,
+                    )
+                    if announce:
+                        click.echo(
+                            f"Added rsync storage member: {name} -> "
+                            f"{username}@{host}:{remote_path} (priority: {priority})"
+                        )
+                else:
+                    backend = SSHBackend(
+                        name=name,
+                        host=host,
+                        remote_path=remote_path,
+                        username=username,
+                        key_filename=key_file,
+                        speed_priority=priority,
+                    )
+                    if announce:
+                        click.echo(
+                            f"Added SSH storage member: {name} -> "
+                            f"{username}@{host}:{remote_path} (priority: {priority})"
+                        )
+            else:
+                priority = local_index * 10
+                local_index += 1
+                backend = LocalBackend(name, spec, speed_priority=priority)
+                if announce:
+                    click.echo(f"Added local storage member: {name} -> {spec} (priority: {priority})")
             backends[name] = backend
-            if announce:
-                click.echo(f"Added local storage member: {name} -> {path} (priority: {i * 10})")
         except ValueError as exc:
             raise click.ClickException(str(exc)) from exc
-
-    for i, remote_spec in enumerate(remote_specs):
-        try:
-            name = f"remote{i}"
-            is_rsync = remote_spec.startswith("rsync://")
-            is_ssh = remote_spec.startswith("ssh://")
-            if not is_ssh and not is_rsync:
-                raise click.ClickException(
-                    "Remote backend must start with ssh:// or rsync://"
-                )
-
-            prefix_len = 8 if is_rsync else 6  # len("rsync://") or len("ssh://")
-            spec = remote_spec[prefix_len:]
-            if "@" not in spec or ":" not in spec:
-                raise click.ClickException(
-                    f"Invalid remote format. Use {'rsync' if is_rsync else 'ssh'}://user@host:/path"
-                )
-
-            user_host, remote_path = spec.split(":", 1)
-            username, host = user_host.split("@", 1)
-
-            if is_rsync:
-                from .backends.rsync import RsyncBackend
-                backend = RsyncBackend(
-                    name=name,
-                    host=host,
-                    remote_path=remote_path,
-                    username=username,
-                    key_filename=key_file,
-                    speed_priority=50 + i * 10,
-                )
-                if announce:
-                    click.echo(
-                        f"Added rsync storage member: {name} -> "
-                        f"{username}@{host}:{remote_path} (priority: {50 + i * 10})"
-                    )
-            else:
-                backend = SSHBackend(
-                    name=name,
-                    host=host,
-                    remote_path=remote_path,
-                    username=username,
-                    key_filename=key_file,
-                    speed_priority=50 + i * 10,
-                )
-                if announce:
-                    click.echo(
-                        f"Added SSH storage member: {name} -> "
-                        f"{username}@{host}:{remote_path} (priority: {50 + i * 10})"
-                    )
-            backends[name] = backend
         except click.ClickException:
             raise
         except Exception as exc:
-            raise click.ClickException(f"Error adding remote backend {remote_spec}: {exc}") from exc
+            raise click.ClickException(f"Error adding remote backend {spec}: {exc}") from exc
 
     if not backends:
         raise click.ClickException("No valid storage members provided")
@@ -280,6 +328,7 @@ def resolve_member_configuration(
     config_path: Optional[Path],
     member_specs: Sequence[str],
     key_file: Optional[str],
+    cache_root: Optional[Path],
 ) -> ResolvedMemberConfig:
     if profile_name:
         if member_specs:
@@ -321,7 +370,9 @@ def resolve_member_configuration(
 
         return ResolvedMemberConfig(
             member_specs=resolved_specs,
+            member_names=_default_member_names(resolved_specs),
             key_file=key_file or settings["key_file"],
+            cache_root=(cache_root or Path(settings["cache"])).resolve(),
             profile_name=profile_name,
             profile_source=profile_source,
         )
@@ -332,9 +383,18 @@ def resolve_member_configuration(
     if not member_specs:
         raise click.ClickException("Provide at least one --member or a mount profile name")
 
+    if cache_root is None:
+        raise click.ClickException(
+            "Provide --cache when using explicit --member values so cache metadata xattrs stay authoritative."
+        )
+
+    resolved_specs, resolved_names = _parse_explicit_member_specs(member_specs)
+
     return ResolvedMemberConfig(
-        member_specs=tuple(member_specs),
+        member_specs=resolved_specs,
+        member_names=resolved_names,
         key_file=key_file,
+        cache_root=cache_root.resolve(),
     )
 
 
