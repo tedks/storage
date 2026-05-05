@@ -203,6 +203,8 @@ def _parse_explicit_member_specs(member_specs: Sequence[str]) -> Tuple[Tuple[str
     names = []
     specs = []
     seen_names = set()
+    local_names = []
+    remote_names = []
     for raw in member_specs:
         name, sep, spec = raw.partition("=")
         if sep != "=" or not name.strip() or not spec.strip():
@@ -229,6 +231,18 @@ def _parse_explicit_member_specs(member_specs: Sequence[str]) -> Tuple[Tuple[str
         seen_names.add(name)
         names.append(name)
         specs.append(spec)
+        if expected_prefix == "local":
+            local_names.append(name)
+        else:
+            remote_names.append(name)
+
+    expected_local_names = {f"local{i}" for i in range(len(local_names))}
+    expected_remote_names = {f"remote{i}" for i in range(len(remote_names))}
+    if set(local_names) != expected_local_names or set(remote_names) != expected_remote_names:
+        raise click.ClickException(
+            "Explicit --member names must use the canonical mounted identity set with no gaps, "
+            "for example local0..localN and remote0..remoteM for the supplied members."
+        )
 
     return tuple(specs), tuple(names)
 

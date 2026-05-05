@@ -297,6 +297,16 @@ key_file = "/tmp/profile-key"
                 cache_root=Path("/tmp/cache"),
             )
 
+    def test_explicit_members_reject_noncanonical_name_gaps(self):
+        with self.assertRaises(click.ClickException):
+            resolve_member_configuration(
+                profile_name=None,
+                config_path=None,
+                member_specs=["local1=/srv/data"],
+                key_file=None,
+                cache_root=Path("/tmp/cache"),
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

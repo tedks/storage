@@ -574,3 +574,52 @@ class TestDebugIndexCLI(unittest.TestCase):
 
         self.assertNotEqual(result.exit_code, 0)
         self.assertIn("does not exist", result.output)
+
+    def test_reprobe_locations_rejects_noncanonical_member_name_without_mutating_db(self):
+        cache_path = self.cache_dir / "movie.mkv"
+        cache_path.write_bytes(b"payload")
+        metadata = self._metadata("/movie.mkv", cache_path, sync_status=SyncStatus.CLEAN)
+        write_cache_metadata(cache_path, metadata)
+
+        state_manager = StateManager(str(self.db_path))
+        try:
+            state_manager.set_file_metadata(metadata)
+            state_manager.add_file_location(
+                FileLocation(
+                    virtual_path="/movie.mkv",
+                    backend_name="cache",
+                    checksum=metadata.checksum or "",
+                    last_synced=metadata.last_modified,
+                    is_cached=True,
+                )
+            )
+        finally:
+            state_manager.close()
+
+        remote_dir = self.temp_dir / "remote-phantom-name"
+        remote_dir.mkdir()
+        (remote_dir / "movie.mkv").write_bytes(b"payload")
+
+        result = self.runner.invoke(
+            main,
+            [
+                "debug",
+                "reprobe-locations",
+                "--cache",
+                str(self.cache_dir),
+                "--database",
+                str(self.db_path),
+                "--member",
+                f"local1={remote_dir}",
+            ],
+        )
+
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("canonical mounted identity set", result.output)
+
+        state_manager = StateManager(str(self.db_path))
+        try:
+            locations = state_manager.get_file_locations("/movie.mkv")
+            self.assertEqual(["cache"], [location.backend_name for location in locations])
+        finally:
+            state_manager.close()
