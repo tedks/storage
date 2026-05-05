@@ -304,6 +304,80 @@ class StateManager:
 
             self.conn.commit()
 
+    def apply_reprobe_backend_update(
+        self,
+        *,
+        promoted_metadata: List[FileMetadata],
+        backend_name: str,
+        virtual_paths: List[str],
+        locations: List[FileLocation],
+        is_cached: bool,
+    ):
+        """Atomically apply reprobe metadata promotions and backend location replacement."""
+        normalized_paths = [self._normalize_virtual_path(path) for path in virtual_paths]
+
+        with self._db_lock:
+            try:
+                if promoted_metadata:
+                    self.conn.executemany(
+                        '''
+                        INSERT OR REPLACE INTO files
+                        (virtual_path, size, checksum, last_access, last_modified,
+                         sync_status, replica_count, recomputable, recompute_cmd,
+                         encrypted, encryption_key_id)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ''',
+                        [
+                            (
+                                metadata.virtual_path,
+                                metadata.size,
+                                metadata.checksum,
+                                metadata.last_access,
+                                metadata.last_modified,
+                                metadata.sync_status.value,
+                                metadata.replica_count,
+                                int(metadata.recomputable),
+                                metadata.recompute_cmd,
+                                int(metadata.encrypted),
+                                metadata.encryption_key_id,
+                            )
+                            for metadata in promoted_metadata
+                        ],
+                    )
+
+                if normalized_paths:
+                    self.conn.executemany(
+                        'DELETE FROM file_locations WHERE backend_name = ? AND is_cached = ? AND virtual_path = ?',
+                        [
+                            (backend_name, int(is_cached), path)
+                            for path in normalized_paths
+                        ],
+                    )
+
+                if locations:
+                    self.conn.executemany(
+                        '''
+                        INSERT INTO file_locations
+                        (virtual_path, backend_name, checksum, last_synced, is_cached)
+                        VALUES (?, ?, ?, ?, ?)
+                        ''',
+                        [
+                            (
+                                location.virtual_path,
+                                location.backend_name,
+                                location.checksum,
+                                location.last_synced,
+                                int(location.is_cached),
+                            )
+                            for location in locations
+                        ],
+                    )
+            except Exception:
+                self.conn.rollback()
+                raise
+
+            self.conn.commit()
+
     def remove_file_location(self, virtual_path: str, backend_name: str):
         """Remove a file location"""
         self._execute_write(

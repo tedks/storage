@@ -4,10 +4,13 @@ from pathlib import Path
 
 import click
 
+from storage.backends.local import LocalBackend
+from storage.backends.ssh import SSHBackend
 from storage.mount_profiles import (
     _load_mount_profile_settings,
     _optional_profile_float,
     _optional_profile_int,
+    create_storage_members,
     parse_size,
     resolve_member_configuration,
     resolve_mount_configuration,
@@ -306,6 +309,27 @@ key_file = "/tmp/profile-key"
                 key_file=None,
                 cache_root=Path("/tmp/cache"),
             )
+
+    def test_create_storage_members_handles_interleaved_specs_without_name_mismatch(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            local_a = Path(temp_dir) / "local-a"
+            local_b = Path(temp_dir) / "local-b"
+            local_a.mkdir()
+            local_b.mkdir()
+
+            backends = create_storage_members(
+                [
+                    str(local_a),
+                    "ssh://user@example.com:/remote",
+                    str(local_b),
+                ],
+                key_file=None,
+                announce=False,
+            )
+
+            self.assertIsInstance(backends["local0"], LocalBackend)
+            self.assertIsInstance(backends["remote0"], SSHBackend)
+            self.assertIsInstance(backends["local1"], LocalBackend)
 
 
 if __name__ == "__main__":

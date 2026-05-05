@@ -1,6 +1,6 @@
 """Cache/index rebuild and verification tooling."""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 import stat as stat_module
 import time
@@ -107,18 +107,23 @@ def _cache_path_for_metadata(cache_root: Path, virtual_path: str) -> Path:
     return cache_root / virtual_path.lstrip("/")
 
 
-def _promote_conflict(
+def _promoted_conflict_metadata(metadata: FileMetadata) -> FileMetadata:
+    """Return the conflict-marked metadata record for a virtual path."""
+    return metadata if metadata.sync_status == SyncStatus.CONFLICT else replace(
+        metadata,
+        sync_status=SyncStatus.CONFLICT,
+    )
+
+
+def _write_conflict_xattr(
     cache_root: Path,
-    state_manager: StateManager,
     metadata: FileMetadata,
     report: ReprobeLocationsReport,
     *,
     backend_name: str,
-):
-    """Mark the cached file conflicted in both SQLite and durable cache xattrs."""
-    metadata.sync_status = SyncStatus.CONFLICT
-    state_manager.set_file_metadata(metadata)
-
+) -> tuple[Path, FileMetadata] | None:
+    """Write the conflict xattr for a cache file without mutating SQLite state."""
+    promoted = _promoted_conflict_metadata(metadata)
     cache_path = _cache_path_for_metadata(cache_root, metadata.virtual_path)
     if not cache_path.exists() or not cache_path.is_file():
         report.issues.append(
@@ -128,10 +133,10 @@ def _promote_conflict(
                 detail=f"{backend_name}: expected cache file at {cache_path}",
             )
         )
-        return
+        return None
 
     try:
-        write_cache_metadata(cache_path, metadata, virtual_path=metadata.virtual_path)
+        write_cache_metadata(cache_path, promoted, virtual_path=metadata.virtual_path)
     except OSError as exc:
         report.issues.append(
             IndexIssue(
@@ -140,6 +145,29 @@ def _promote_conflict(
                 detail=f"{backend_name}: {exc}",
             )
         )
+        return None
+
+    return cache_path, promoted
+
+
+def _rollback_conflict_xattrs(
+    written_conflicts: List[tuple[FileMetadata, Path, FileMetadata]],
+    report: ReprobeLocationsReport,
+    *,
+    backend_name: str,
+):
+    """Restore previously written cache xattrs after a failed conflict promotion batch."""
+    for original_metadata, cache_path, promoted_metadata in reversed(written_conflicts):
+        try:
+            write_cache_metadata(cache_path, original_metadata, virtual_path=promoted_metadata.virtual_path)
+        except OSError as exc:
+            report.issues.append(
+                IndexIssue(
+                    kind="cache_metadata_rollback_failed",
+                    virtual_path=promoted_metadata.virtual_path,
+                    detail=f"{backend_name}: {exc}",
+                )
+            )
 
 
 def rebuild_index_from_cache(cache_root: Path, state_manager: StateManager) -> RebuildIndexReport:
@@ -333,12 +361,15 @@ def reprobe_member_locations(
     for backend_name in sorted(backends):
         backend = backends[backend_name]
         found_locations: List[FileLocation] = []
+        pending_conflicts: List[FileMetadata] = []
+        replaceable_paths: List[str] = []
         member_failed = False
 
         for metadata in metadata_rows:
             try:
                 stat_result = backend.stat(metadata.virtual_path)
             except FileNotFoundError:
+                replaceable_paths.append(metadata.virtual_path)
                 continue
             except Exception as exc:
                 issue_kind = "member_unavailable" if not backend.is_available() else "member_probe_error"
@@ -355,6 +386,7 @@ def reprobe_member_locations(
                 break
 
             if stat_module.S_ISDIR(getattr(stat_result, "st_mode", 0)):
+                replaceable_paths.append(metadata.virtual_path)
                 report.issues.append(
                     IndexIssue(
                         kind="member_type_mismatch",
@@ -364,10 +396,9 @@ def reprobe_member_locations(
                 )
                 continue
 
-            checksum_getter = getattr(backend, "get_fast_checksum", None)
-            if callable(checksum_getter):
+            if backend.__class__.get_fast_checksum is not Backend.get_fast_checksum:
                 try:
-                    remote_checksum = checksum_getter(metadata.virtual_path)
+                    remote_checksum = backend.get_fast_checksum(metadata.virtual_path)
                 except Exception as exc:
                     issue_kind = "member_unavailable" if not backend.is_available() else "member_probe_error"
                     if issue_kind == "member_unavailable":
@@ -382,15 +413,19 @@ def reprobe_member_locations(
                     member_failed = True
                     break
             else:
-                remote_checksum = metadata.checksum or ""
                 report.issues.append(
                     IndexIssue(
                         kind="member_checksum_unverified",
                         virtual_path=metadata.virtual_path,
-                        detail=f"{backend.name}: checksum probe unavailable; using local metadata checksum",
+                        detail=(
+                            f"{backend.name}: checksum probe unavailable; "
+                            "preserving any existing location row because checksum verification is unavailable"
+                        ),
                     )
                 )
+                continue
 
+            replaceable_paths.append(metadata.virtual_path)
             if metadata.checksum and remote_checksum != metadata.checksum:
                 report.issues.append(
                     IndexIssue(
@@ -402,13 +437,7 @@ def reprobe_member_locations(
                         ),
                     )
                 )
-                _promote_conflict(
-                    cache_root,
-                    state_manager,
-                    metadata,
-                    report,
-                    backend_name=backend.name,
-                )
+                pending_conflicts.append(metadata)
                 continue
 
             found_locations.append(
@@ -424,12 +453,55 @@ def reprobe_member_locations(
         if member_failed:
             continue
 
-        state_manager.replace_backend_locations_for_paths(
-            backend.name,
-            known_paths,
-            found_locations,
-            is_cached=False,
-        )
+        written_conflicts: List[tuple[FileMetadata, Path, FileMetadata]] = []
+        for metadata in pending_conflicts:
+            original_metadata = replace(metadata)
+            written = _write_conflict_xattr(
+                cache_root,
+                metadata,
+                report,
+                backend_name=backend.name,
+            )
+            if written is None:
+                _rollback_conflict_xattrs(
+                    written_conflicts,
+                    report,
+                    backend_name=backend.name,
+                )
+                member_failed = True
+                break
+            cache_path, promoted = written
+            written_conflicts.append((original_metadata, cache_path, promoted))
+
+        if member_failed:
+            continue
+
+        promoted_metadata = [promoted for _, _, promoted in written_conflicts]
+        try:
+            state_manager.apply_reprobe_backend_update(
+                promoted_metadata=promoted_metadata,
+                backend_name=backend.name,
+                virtual_paths=replaceable_paths,
+                locations=found_locations,
+                is_cached=False,
+            )
+        except Exception as exc:
+            _rollback_conflict_xattrs(
+                written_conflicts,
+                report,
+                backend_name=backend.name,
+            )
+            report.issues.append(
+                IndexIssue(
+                    kind="member_db_update_failed",
+                    virtual_path="",
+                    detail=f"{backend.name}: {exc}",
+                )
+            )
+            continue
+
+        for metadata in pending_conflicts:
+            metadata.sync_status = SyncStatus.CONFLICT
         report.members_reprobed += 1
         report.remote_locations_found += len(found_locations)
 

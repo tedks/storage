@@ -192,11 +192,17 @@ _EXPLICIT_MEMBER_NAME_RE = re.compile(r"^(local|remote)(\d+)$")
 
 
 def _default_member_names(member_specs: Sequence[str]) -> Tuple[str, ...]:
-    local_specs, remote_specs = split_storage_member_specs(member_specs)
-    return tuple(
-        [f"local{i}" for i in range(len(local_specs))]
-        + [f"remote{i}" for i in range(len(remote_specs))]
-    )
+    names = []
+    local_index = 0
+    remote_index = 0
+    for spec in member_specs:
+        if spec.startswith(("ssh://", "rsync://")):
+            names.append(f"remote{remote_index}")
+            remote_index += 1
+        else:
+            names.append(f"local{local_index}")
+            local_index += 1
+    return tuple(names)
 
 
 def _parse_explicit_member_specs(member_specs: Sequence[str]) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
