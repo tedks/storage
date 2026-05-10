@@ -4,7 +4,12 @@ from pathlib import Path
 
 import click
 
-from .index_audit import rebuild_index_from_cache, verify_index_against_cache
+from .index_audit import (
+    rebuild_index_from_cache,
+    reprobe_member_locations,
+    verify_index_against_cache,
+)
+from .mount_profiles import create_storage_members, resolve_member_configuration
 from .state import StateManager
 
 
@@ -91,6 +96,16 @@ def _with_state_manager(database: Path) -> StateManager:
     return StateManager(str(database))
 
 
+def _close_storage_members(backends):
+    for backend in backends.values():
+        close = getattr(backend, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
+
+
 @debug.command("rebuild-index")
 @click.option(
     "-c",
@@ -163,3 +178,89 @@ def debug_verify_index(cache: Path, database: Path, json_output: bool):
 
     if payload["issue_count"] > 0:
         raise click.exceptions.Exit(1)
+
+
+@debug.command("reprobe-locations")
+@click.argument("profile_name", required=False)
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="Load storage members from a named mount profile in a TOML config file.",
+)
+@click.option(
+    "-c",
+    "--cache",
+    "cache_root",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    help="Cache directory used to keep durable cache metadata xattrs in sync.",
+)
+@click.option(
+    "-m",
+    "--member",
+    "member_specs",
+    multiple=True,
+    help="Storage member NAME=SPEC (for example local0=/srv/data or remote1=ssh://user@host:/path).",
+)
+@click.option(
+    "-k",
+    "--key-file",
+    help="SSH private key file used for SSH/rsync storage members.",
+)
+@click.option(
+    "-d",
+    "--database",
+    required=True,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="SQLite database path to update",
+)
+@click.option("--json-output", is_flag=True, help="Print raw JSON report")
+def debug_reprobe_locations(
+    profile_name: str | None,
+    config_path: Path | None,
+    cache_root: Path | None,
+    member_specs: tuple[str, ...],
+    key_file: str | None,
+    database: Path,
+    json_output: bool,
+):
+    """Probe storage members to rebuild non-cache location rows for known files."""
+    resolved = resolve_member_configuration(
+        profile_name,
+        config_path,
+        member_specs,
+        key_file,
+        cache_root,
+    )
+    backends = create_storage_members(
+        resolved.member_specs,
+        resolved.key_file,
+        announce=not json_output,
+        member_names=resolved.member_names,
+    )
+
+    state_manager = _with_state_manager(database.resolve())
+    try:
+        report = reprobe_member_locations(
+            state_manager,
+            backends,
+            cache_root=resolved.cache_root,
+        )
+    finally:
+        state_manager.close()
+        _close_storage_members(backends)
+
+    payload = report.to_dict()
+    if json_output:
+        click.echo(json.dumps(payload, sort_keys=True, indent=2))
+        return
+
+    if resolved.profile_name is not None:
+        click.echo(f"Loaded mount profile: {resolved.profile_name} ({resolved.profile_source})")
+    click.echo(f"Reprobed storage members into {database}:")
+    click.echo(f"  Files considered: {payload['files_considered']}")
+    click.echo(f"  Members requested: {payload['members_requested']}")
+    click.echo(f"  Members reprobed: {payload['members_reprobed']}")
+    click.echo(f"  Members unavailable: {payload['members_unavailable']}")
+    click.echo(f"  Remote locations found: {payload['remote_locations_found']}")
+    click.echo(f"  Issues: {payload['issue_count']}")

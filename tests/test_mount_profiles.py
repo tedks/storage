@@ -4,11 +4,15 @@ from pathlib import Path
 
 import click
 
+from storage.backends.local import LocalBackend
+from storage.backends.ssh import SSHBackend
 from storage.mount_profiles import (
     _load_mount_profile_settings,
     _optional_profile_float,
     _optional_profile_int,
+    create_storage_members,
     parse_size,
+    resolve_member_configuration,
     resolve_mount_configuration,
     split_storage_member_specs,
 )
@@ -219,6 +223,113 @@ readdir_ttl = 5.0
             self.assertEqual(2.0, config.readdir_ttl)
         finally:
             Path(config_path).unlink()
+
+
+class TestResolvedMemberConfig(unittest.TestCase):
+    def test_explicit_member_specs_require_names_and_cache_root(self):
+        resolved = resolve_member_configuration(
+            profile_name=None,
+            config_path=None,
+            member_specs=["local0=/srv/data", "remote0=ssh://user@host:/remote"],
+            key_file="/tmp/key",
+            cache_root=Path("/tmp/cache"),
+        )
+
+        self.assertEqual(("/srv/data", "ssh://user@host:/remote"), resolved.member_specs)
+        self.assertEqual(("local0", "remote0"), resolved.member_names)
+        self.assertEqual("/tmp/key", resolved.key_file)
+        self.assertEqual(Path("/tmp/cache"), resolved.cache_root)
+        self.assertIsNone(resolved.profile_name)
+
+    def test_profile_name_loads_members_from_config(self):
+        toml_content = '''
+[mounts.test]
+mountpoint = "/mnt/test"
+cache = "/tmp/cache"
+backends = ["/srv/data", "ssh://user@host:/remote"]
+key_file = "/tmp/profile-key"
+'''
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.toml', delete=False) as f:
+            f.write(toml_content)
+            config_path = Path(f.name)
+
+        try:
+            resolved = resolve_member_configuration(
+                profile_name="test",
+                config_path=config_path,
+                member_specs=[],
+                key_file=None,
+                cache_root=None,
+            )
+            self.assertEqual(("/srv/data", "ssh://user@host:/remote"), resolved.member_specs)
+            self.assertEqual(("local0", "remote0"), resolved.member_names)
+            self.assertEqual("/tmp/profile-key", resolved.key_file)
+            self.assertEqual(Path("/tmp/cache"), resolved.cache_root)
+            self.assertEqual("test", resolved.profile_name)
+            self.assertEqual(config_path, resolved.profile_source)
+        finally:
+            config_path.unlink()
+
+    def test_profile_and_explicit_members_conflict(self):
+        with self.assertRaises(click.ClickException):
+            resolve_member_configuration(
+                profile_name="test",
+                config_path=None,
+                member_specs=["local0=/srv/data"],
+                key_file=None,
+                cache_root=None,
+            )
+
+    def test_explicit_members_require_cache_root(self):
+        with self.assertRaises(click.ClickException):
+            resolve_member_configuration(
+                profile_name=None,
+                config_path=None,
+                member_specs=["local0=/srv/data"],
+                key_file=None,
+                cache_root=None,
+            )
+
+    def test_explicit_members_require_stable_names(self):
+        with self.assertRaises(click.ClickException):
+            resolve_member_configuration(
+                profile_name=None,
+                config_path=None,
+                member_specs=["/srv/data"],
+                key_file=None,
+                cache_root=Path("/tmp/cache"),
+            )
+
+    def test_explicit_members_reject_noncanonical_name_gaps(self):
+        with self.assertRaises(click.ClickException):
+            resolve_member_configuration(
+                profile_name=None,
+                config_path=None,
+                member_specs=["local1=/srv/data"],
+                key_file=None,
+                cache_root=Path("/tmp/cache"),
+            )
+
+    def test_create_storage_members_handles_interleaved_specs_without_name_mismatch(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            local_a = Path(temp_dir) / "local-a"
+            local_b = Path(temp_dir) / "local-b"
+            local_a.mkdir()
+            local_b.mkdir()
+
+            backends = create_storage_members(
+                [
+                    str(local_a),
+                    "ssh://user@example.com:/remote",
+                    str(local_b),
+                ],
+                key_file=None,
+                announce=False,
+            )
+
+            self.assertIsInstance(backends["local0"], LocalBackend)
+            self.assertIsInstance(backends["remote0"], SSHBackend)
+            self.assertIsInstance(backends["local1"], LocalBackend)
 
 
 if __name__ == "__main__":
