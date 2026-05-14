@@ -950,7 +950,7 @@ class TestDebugIndexCLI(unittest.TestCase):
 
             with mock.patch.object(
                 state_manager,
-                "apply_reprobe_backend_update",
+                "_commit_locked",
                 side_effect=sqlite3.OperationalError("db write failed"),
             ):
                 report = reprobe_member_locations(
@@ -960,6 +960,11 @@ class TestDebugIndexCLI(unittest.TestCase):
                 )
 
             self.assertTrue(any(issue.kind == "member_db_update_failed" for issue in report.issues))
+            other_cache_path = self.cache_dir / "other-after-db-fail.mkv"
+            other_cache_path.write_bytes(b"payload")
+            other_metadata = self._metadata("/other-after-db-fail.mkv", other_cache_path, sync_status=SyncStatus.CLEAN)
+            state_manager.set_file_metadata(other_metadata)
+
             refreshed = state_manager.get_file_metadata("/movie-db-fail.mkv")
             self.assertEqual(SyncStatus.CLEAN, refreshed.sync_status)
             self.assertEqual(
@@ -970,6 +975,61 @@ class TestDebugIndexCLI(unittest.TestCase):
             state_manager.close()
 
         self.assertEqual(SyncStatus.CLEAN, read_cache_metadata(cache_path).sync_status)
+
+    def test_reprobe_locations_does_not_create_remote_row_without_checksum_baseline(self):
+        cache_path = self.cache_dir / "movie-no-checksum.mkv"
+        cache_path.write_bytes(b"payload")
+        st = cache_path.stat()
+        metadata = FileMetadata(
+            virtual_path="/movie-no-checksum.mkv",
+            size=st.st_size,
+            checksum=None,
+            last_access=st.st_atime,
+            last_modified=st.st_mtime,
+            sync_status=SyncStatus.CLEAN,
+            replica_count=1,
+            recomputable=False,
+            recompute_cmd=None,
+            encrypted=False,
+            encryption_key_id=None,
+        )
+        write_cache_metadata(cache_path, metadata)
+
+        state_manager = StateManager(str(self.db_path))
+        try:
+            state_manager.set_file_metadata(metadata)
+            state_manager.add_file_location(
+                FileLocation(
+                    virtual_path="/movie-no-checksum.mkv",
+                    backend_name="cache",
+                    checksum="",
+                    last_synced=metadata.last_modified,
+                    is_cached=True,
+                )
+            )
+        finally:
+            state_manager.close()
+
+        remote_dir = self.temp_dir / "remote-no-checksum"
+        remote_dir.mkdir()
+        (remote_dir / "movie-no-checksum.mkv").write_bytes(b"payload")
+
+        state_manager = StateManager(str(self.db_path))
+        try:
+            report = reprobe_member_locations(
+                state_manager,
+                {"local0": LocalBackend("local0", str(remote_dir))},
+                cache_root=self.cache_dir,
+            )
+
+            self.assertTrue(any(issue.kind == "member_checksum_baseline_missing" for issue in report.issues))
+            self.assertEqual(0, report.remote_locations_found)
+            self.assertEqual(
+                ["cache"],
+                sorted(location.backend_name for location in state_manager.get_file_locations("/movie-no-checksum.mkv")),
+            )
+        finally:
+            state_manager.close()
 
     def test_reprobe_locations_overwrites_invalid_cache_xattr_from_database_state(self):
         cache_path = self.cache_dir / "movie-invalid-xattr.mkv"

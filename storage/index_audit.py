@@ -425,8 +425,22 @@ def reprobe_member_locations(
                 )
                 continue
 
+            if not metadata.checksum:
+                report.issues.append(
+                    IndexIssue(
+                        kind="member_checksum_baseline_missing",
+                        virtual_path=metadata.virtual_path,
+                        detail=(
+                            f"{backend.name}: member checksum {remote_checksum!r} observed, "
+                            "but local metadata has no trusted checksum baseline; "
+                            "preserving any existing location row"
+                        ),
+                    )
+                )
+                continue
+
             replaceable_paths.append(metadata.virtual_path)
-            if metadata.checksum and remote_checksum != metadata.checksum:
+            if remote_checksum != metadata.checksum:
                 report.issues.append(
                     IndexIssue(
                         kind="member_checksum_mismatch",

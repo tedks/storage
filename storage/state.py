@@ -52,6 +52,10 @@ class StateManager:
             self.conn.execute(query, params)
             self.conn.commit()
 
+    def _commit_locked(self):
+        """Commit the current transaction while the caller holds _db_lock."""
+        self.conn.commit()
+
     def _configure_connection(self):
         """Configure SQLite pragmas for lower write amplification."""
         pragmas = (
@@ -372,11 +376,10 @@ class StateManager:
                             for location in locations
                         ],
                     )
+                self._commit_locked()
             except Exception:
                 self.conn.rollback()
                 raise
-
-            self.conn.commit()
 
     def remove_file_location(self, virtual_path: str, backend_name: str):
         """Remove a file location"""
