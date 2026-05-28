@@ -765,6 +765,77 @@ class TestDebugIndexCLI(unittest.TestCase):
         self.assertEqual(SyncStatus.CLEAN, read_cache_metadata(first_cache_path).sync_status)
         self.assertEqual(SyncStatus.CLEAN, read_cache_metadata(second_cache_path).sync_status)
 
+    def test_reprobe_locations_reconciles_database_when_conflict_xattr_rollback_fails(self):
+        first_cache_path = self.cache_dir / "movie-a.mkv"
+        second_cache_path = self.cache_dir / "movie-b.mkv"
+        first_cache_path.write_bytes(b"payload-a")
+        second_cache_path.write_bytes(b"payload-b")
+        first_metadata = self._metadata("/movie-a.mkv", first_cache_path, sync_status=SyncStatus.CLEAN)
+        second_metadata = self._metadata("/movie-b.mkv", second_cache_path, sync_status=SyncStatus.CLEAN)
+        write_cache_metadata(first_cache_path, first_metadata)
+        write_cache_metadata(second_cache_path, second_metadata)
+
+        state_manager = StateManager(str(self.db_path))
+        try:
+            for metadata in (first_metadata, second_metadata):
+                state_manager.set_file_metadata(metadata)
+                state_manager.add_file_location(
+                    FileLocation(
+                        virtual_path=metadata.virtual_path,
+                        backend_name="cache",
+                        checksum=metadata.checksum or "",
+                        last_synced=metadata.last_modified,
+                        is_cached=True,
+                    )
+                )
+                state_manager.add_file_location(
+                    FileLocation(
+                        virtual_path=metadata.virtual_path,
+                        backend_name="local0",
+                        checksum=metadata.checksum or "",
+                        last_synced=metadata.last_modified,
+                        is_cached=False,
+                    )
+                )
+
+            remote_dir = self.temp_dir / "remote-rollback-reconcile"
+            remote_dir.mkdir()
+            (remote_dir / "movie-a.mkv").write_bytes(b"other-a")
+            (remote_dir / "movie-b.mkv").write_bytes(b"other-b")
+
+            original_write_cache_metadata = write_cache_metadata
+            conflict_writes = {"count": 0}
+
+            def flaky_write_cache_metadata(cache_path, metadata, *, virtual_path=None):
+                if metadata.sync_status == SyncStatus.CONFLICT:
+                    conflict_writes["count"] += 1
+                    if conflict_writes["count"] == 2:
+                        raise OSError("second conflict xattr failed")
+                elif virtual_path == "/movie-a.mkv":
+                    raise OSError("rollback failed")
+                return original_write_cache_metadata(cache_path, metadata, virtual_path=virtual_path)
+
+            with mock.patch("storage.index_audit.write_cache_metadata", side_effect=flaky_write_cache_metadata):
+                report = reprobe_member_locations(
+                    state_manager,
+                    {"local0": LocalBackend("local0", str(remote_dir))},
+                    cache_root=self.cache_dir,
+                )
+
+            self.assertEqual(report.members_reprobed, 0)
+            self.assertTrue(any(issue.kind == "cache_metadata_sync_failed" for issue in report.issues))
+            self.assertTrue(any(issue.kind == "cache_metadata_rollback_failed" for issue in report.issues))
+
+            refreshed_first = state_manager.get_file_metadata("/movie-a.mkv")
+            refreshed_second = state_manager.get_file_metadata("/movie-b.mkv")
+            self.assertEqual(SyncStatus.CONFLICT, refreshed_first.sync_status)
+            self.assertEqual(SyncStatus.CLEAN, refreshed_second.sync_status)
+        finally:
+            state_manager.close()
+
+        self.assertEqual(SyncStatus.CONFLICT, read_cache_metadata(first_cache_path).sync_status)
+        self.assertEqual(SyncStatus.CLEAN, read_cache_metadata(second_cache_path).sync_status)
+
     def test_reprobe_locations_promotes_clean_mismatch_to_conflict_and_drops_replica_row(self):
         cache_path = self.cache_dir / "movie.mkv"
         cache_path.write_bytes(b"payload")
@@ -1028,6 +1099,52 @@ class TestDebugIndexCLI(unittest.TestCase):
                 ["cache"],
                 sorted(location.backend_name for location in state_manager.get_file_locations("/movie-no-checksum.mkv")),
             )
+        finally:
+            state_manager.close()
+
+    def test_index_audit_paths_avoid_full_table_loads(self):
+        cache_path = self.cache_dir / "streamed.mkv"
+        cache_path.write_bytes(b"payload")
+        metadata = self._metadata("/streamed.mkv", cache_path, sync_status=SyncStatus.CLEAN)
+        write_cache_metadata(cache_path, metadata)
+
+        remote_dir = self.temp_dir / "remote-streamed"
+        remote_dir.mkdir()
+        (remote_dir / "streamed.mkv").write_bytes(b"payload")
+
+        state_manager = StateManager(str(self.db_path))
+        try:
+            state_manager.set_file_metadata(metadata)
+            state_manager.add_file_location(
+                FileLocation(
+                    virtual_path="/streamed.mkv",
+                    backend_name="cache",
+                    checksum=metadata.checksum or "",
+                    last_synced=metadata.last_modified,
+                    is_cached=True,
+                )
+            )
+
+            with mock.patch.object(
+                state_manager,
+                "get_all_file_metadata",
+                side_effect=AssertionError("full metadata load"),
+            ), mock.patch.object(
+                state_manager,
+                "get_all_file_locations",
+                side_effect=AssertionError("full location load"),
+            ):
+                rebuild_report = rebuild_index_from_cache(self.cache_dir, state_manager)
+                verify_report = verify_index_against_cache(self.cache_dir, state_manager)
+                reprobe_report = reprobe_member_locations(
+                    state_manager,
+                    {"local0": LocalBackend("local0", str(remote_dir))},
+                    cache_root=self.cache_dir,
+                )
+
+            self.assertEqual(1, rebuild_report.rebuilt_files)
+            self.assertEqual(0, verify_report.issue_count)
+            self.assertEqual(1, reprobe_report.remote_locations_found)
         finally:
             state_manager.close()
 

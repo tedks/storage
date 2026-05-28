@@ -9,11 +9,11 @@ This module manages the state of all files in the Storage filesystem, including:
 - Conflict information
 """
 
+import threading
 import sqlite3
 import time
-import threading
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 from .checksums import fast_checksum_file
 from .file_config import (
@@ -33,6 +33,7 @@ class StateManager:
     ACCESS_DEBOUNCE_SECONDS = 0.25
     ACCESS_FLUSH_INTERVAL_SECONDS = 0.5
     ACCESS_FLUSH_BATCH_SIZE = 256
+    WRITE_BATCH_SIZE = 1000
 
     def __init__(self, db_path: str):
         self.db_path = db_path
@@ -204,6 +205,37 @@ class StateManager:
             rows = cursor.fetchall()
         return [FileMetadata.from_dict(dict(row)) for row in rows]
 
+    def iter_file_metadata(self, batch_size: int = WRITE_BATCH_SIZE) -> Iterator[FileMetadata]:
+        """Yield file metadata rows in bounded batches."""
+        self._flush_access_updates(force=True)
+        last_path = ""
+        while True:
+            with self._db_lock:
+                cursor = self.conn.execute(
+                    '''
+                    SELECT * FROM files
+                    WHERE virtual_path > ?
+                    ORDER BY virtual_path ASC
+                    LIMIT ?
+                    ''',
+                    (last_path, batch_size),
+                )
+                rows = cursor.fetchall()
+
+            if not rows:
+                break
+
+            for row in rows:
+                yield FileMetadata.from_dict(dict(row))
+            last_path = rows[-1]['virtual_path']
+
+    def count_file_metadata(self) -> int:
+        """Return the number of file metadata rows."""
+        self._flush_access_updates(force=True)
+        with self._db_lock:
+            cursor = self.conn.execute('SELECT COUNT(*) AS count FROM files')
+            return int(cursor.fetchone()['count'])
+
     def get_all_file_locations(self, is_cached: Optional[bool] = None) -> List[FileLocation]:
         """Return all file location rows, optionally filtered by cache membership."""
         query = 'SELECT * FROM file_locations'
@@ -227,6 +259,54 @@ class StateManager:
             )
             for row in rows
         ]
+
+    def iter_file_locations(
+        self,
+        is_cached: Optional[bool] = None,
+        batch_size: int = WRITE_BATCH_SIZE,
+    ) -> Iterator[FileLocation]:
+        """Yield file location rows in bounded batches."""
+        last_path = ""
+        last_backend = ""
+        while True:
+            params: tuple
+            if is_cached is None:
+                query = '''
+                    SELECT * FROM file_locations
+                    WHERE virtual_path > ?
+                       OR (virtual_path = ? AND backend_name > ?)
+                    ORDER BY virtual_path ASC, backend_name ASC
+                    LIMIT ?
+                '''
+                params = (last_path, last_path, last_backend, batch_size)
+            else:
+                query = '''
+                    SELECT * FROM file_locations
+                    WHERE is_cached = ?
+                      AND (virtual_path > ?
+                           OR (virtual_path = ? AND backend_name > ?))
+                    ORDER BY virtual_path ASC, backend_name ASC
+                    LIMIT ?
+                '''
+                params = (int(is_cached), last_path, last_path, last_backend, batch_size)
+
+            with self._db_lock:
+                cursor = self.conn.execute(query, params)
+                rows = cursor.fetchall()
+
+            if not rows:
+                break
+
+            for row in rows:
+                yield FileLocation(
+                    virtual_path=row['virtual_path'],
+                    backend_name=row['backend_name'],
+                    checksum=row['checksum'],
+                    last_synced=row['last_synced'],
+                    is_cached=bool(row['is_cached'])
+                )
+            last_path = rows[-1]['virtual_path']
+            last_backend = rows[-1]['backend_name']
 
     def get_location_backends(self, virtual_path: str, recursive: bool = False) -> Set[str]:
         """
@@ -265,6 +345,62 @@ class StateManager:
             location.last_synced,
             int(location.is_cached)
         ))
+
+    @staticmethod
+    def _metadata_row(metadata: FileMetadata) -> tuple:
+        return (
+            metadata.virtual_path,
+            metadata.size,
+            metadata.checksum,
+            metadata.last_access,
+            metadata.last_modified,
+            metadata.sync_status.value,
+            metadata.replica_count,
+            int(metadata.recomputable),
+            metadata.recompute_cmd,
+            int(metadata.encrypted),
+            metadata.encryption_key_id,
+        )
+
+    @staticmethod
+    def _location_row(location: FileLocation) -> tuple:
+        return (
+            location.virtual_path,
+            location.backend_name,
+            location.checksum,
+            location.last_synced,
+            int(location.is_cached),
+        )
+
+    def _insert_metadata_rows_locked(self, rows: List[tuple], *, table_name: str = "files"):
+        if not rows:
+            return
+        if table_name not in {"files", "replacement_files"}:
+            raise ValueError(f"unsupported metadata table: {table_name}")
+        self.conn.executemany(
+            f'''
+            INSERT INTO {table_name}
+            (virtual_path, size, checksum, last_access, last_modified,
+             sync_status, replica_count, recomputable, recompute_cmd,
+             encrypted, encryption_key_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''',
+            rows,
+        )
+
+    def _insert_location_rows_locked(self, rows: List[tuple], *, table_name: str = "file_locations"):
+        if not rows:
+            return
+        if table_name not in {"file_locations", "replacement_file_locations"}:
+            raise ValueError(f"unsupported location table: {table_name}")
+        self.conn.executemany(
+            f'''
+            INSERT INTO {table_name}
+            (virtual_path, backend_name, checksum, last_synced, is_cached)
+            VALUES (?, ?, ?, ?, ?)
+            ''',
+            rows,
+        )
 
     def replace_backend_locations_for_paths(
         self,
@@ -486,8 +622,8 @@ class StateManager:
 
     def replace_index(
         self,
-        metadata_rows: List[FileMetadata],
-        locations: List[FileLocation],
+        metadata_rows: Iterable[FileMetadata],
+        locations: Iterable[FileLocation],
     ):
         """Replace the local index contents atomically."""
         with self._access_lock:
@@ -495,51 +631,107 @@ class StateManager:
             self._recent_access_updates.clear()
 
         with self._db_lock:
-            self.conn.execute('DELETE FROM file_locations')
-            self.conn.execute('DELETE FROM files')
-            self.conn.executemany(
-                '''
-                INSERT INTO files
-                (virtual_path, size, checksum, last_access, last_modified,
-                 sync_status, replica_count, recomputable, recompute_cmd,
-                 encrypted, encryption_key_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ''',
-                [
-                    (
-                        metadata.virtual_path,
-                        metadata.size,
-                        metadata.checksum,
-                        metadata.last_access,
-                        metadata.last_modified,
-                        metadata.sync_status.value,
-                        metadata.replica_count,
-                        int(metadata.recomputable),
-                        metadata.recompute_cmd,
-                        int(metadata.encrypted),
-                        metadata.encryption_key_id,
+            try:
+                self.conn.execute('DELETE FROM file_locations')
+                self.conn.execute('DELETE FROM files')
+
+                batch: List[tuple] = []
+                for metadata in metadata_rows:
+                    batch.append(self._metadata_row(metadata))
+                    if len(batch) >= self.WRITE_BATCH_SIZE:
+                        self._insert_metadata_rows_locked(batch)
+                        batch.clear()
+                self._insert_metadata_rows_locked(batch)
+
+                batch = []
+                for location in locations:
+                    batch.append(self._location_row(location))
+                    if len(batch) >= self.WRITE_BATCH_SIZE:
+                        self._insert_location_rows_locked(batch)
+                        batch.clear()
+                self._insert_location_rows_locked(batch)
+
+                self._commit_locked()
+            except Exception:
+                self.conn.rollback()
+                raise
+
+    def replace_index_from_entries(
+        self,
+        entries: Iterable[Tuple[FileMetadata, FileLocation]],
+    ):
+        """Replace the index from a streaming metadata/location entry source."""
+        with self._access_lock:
+            self._pending_access_updates.clear()
+            self._recent_access_updates.clear()
+
+        with self._db_lock:
+            try:
+                self.conn.execute('DROP TABLE IF EXISTS replacement_files')
+                self.conn.execute('DROP TABLE IF EXISTS replacement_file_locations')
+                self.conn.execute(
+                    '''
+                    CREATE TEMP TABLE replacement_files (
+                        virtual_path TEXT PRIMARY KEY,
+                        size INTEGER NOT NULL,
+                        checksum TEXT,
+                        last_access REAL NOT NULL,
+                        last_modified REAL NOT NULL,
+                        sync_status TEXT NOT NULL,
+                        replica_count INTEGER NOT NULL,
+                        recomputable INTEGER NOT NULL,
+                        recompute_cmd TEXT,
+                        encrypted INTEGER NOT NULL,
+                        encryption_key_id TEXT
                     )
-                    for metadata in metadata_rows
-                ],
-            )
-            self.conn.executemany(
-                '''
-                INSERT INTO file_locations
-                (virtual_path, backend_name, checksum, last_synced, is_cached)
-                VALUES (?, ?, ?, ?, ?)
-                ''',
-                [
-                    (
-                        location.virtual_path,
-                        location.backend_name,
-                        location.checksum,
-                        location.last_synced,
-                        int(location.is_cached),
+                    '''
+                )
+                self.conn.execute(
+                    '''
+                    CREATE TEMP TABLE replacement_file_locations (
+                        virtual_path TEXT NOT NULL,
+                        backend_name TEXT NOT NULL,
+                        checksum TEXT NOT NULL,
+                        last_synced REAL NOT NULL,
+                        is_cached INTEGER NOT NULL,
+                        PRIMARY KEY (virtual_path, backend_name)
                     )
-                    for location in locations
-                ],
-            )
-            self.conn.commit()
+                    '''
+                )
+
+                metadata_batch: List[tuple] = []
+                location_batch: List[tuple] = []
+                for metadata, location in entries:
+                    metadata_batch.append(self._metadata_row(metadata))
+                    location_batch.append(self._location_row(location))
+                    if len(metadata_batch) >= self.WRITE_BATCH_SIZE:
+                        self._insert_metadata_rows_locked(metadata_batch, table_name="replacement_files")
+                        self._insert_location_rows_locked(location_batch, table_name="replacement_file_locations")
+                        metadata_batch.clear()
+                        location_batch.clear()
+                self._insert_metadata_rows_locked(metadata_batch, table_name="replacement_files")
+                self._insert_location_rows_locked(location_batch, table_name="replacement_file_locations")
+
+                self.conn.execute('DELETE FROM file_locations')
+                self.conn.execute('DELETE FROM files')
+                self.conn.execute(
+                    '''
+                    INSERT INTO files
+                    SELECT * FROM replacement_files
+                    '''
+                )
+                self.conn.execute(
+                    '''
+                    INSERT INTO file_locations
+                    SELECT * FROM replacement_file_locations
+                    '''
+                )
+                self.conn.execute('DROP TABLE replacement_file_locations')
+                self.conn.execute('DROP TABLE replacement_files')
+                self._commit_locked()
+            except Exception:
+                self.conn.rollback()
+                raise
 
     def get_dirty_files(self) -> List[FileMetadata]:
         """Get all files that need syncing"""

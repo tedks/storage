@@ -2,9 +2,10 @@ import shutil
 import tempfile
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
-from storage.models import FileMetadata, SyncStatus
+from storage.models import FileLocation, FileMetadata, SyncStatus
 from storage.state import StateManager
 
 
@@ -88,6 +89,56 @@ class TestStateAccessUpdates(unittest.TestCase):
         finally:
             reopened.close()
             self.state_manager = StateManager(str(self.db_path))
+
+    def test_replace_index_rolls_back_when_insert_fails(self):
+        old_metadata = self.state_manager.get_file_metadata("/a.txt")
+        self.assertIsNotNone(old_metadata)
+        self.state_manager.add_file_location(
+            FileLocation(
+                virtual_path="/a.txt",
+                backend_name="cache",
+                checksum="old",
+                last_synced=old_metadata.last_modified,
+                is_cached=True,
+            )
+        )
+        new_metadata = FileMetadata(
+            virtual_path="/new.txt",
+            size=1,
+            checksum="new",
+            last_access=time.time(),
+            last_modified=time.time(),
+            sync_status=SyncStatus.CLEAN,
+            replica_count=1,
+            recomputable=False,
+            recompute_cmd=None,
+            encrypted=False,
+            encryption_key_id=None,
+        )
+
+        with mock.patch.object(
+            self.state_manager,
+            "_insert_location_rows_locked",
+            side_effect=RuntimeError("location insert failed"),
+        ):
+            with self.assertRaises(RuntimeError):
+                self.state_manager.replace_index(
+                    [new_metadata],
+                    [
+                        FileLocation(
+                            virtual_path="/new.txt",
+                            backend_name="cache",
+                            checksum="new",
+                            last_synced=new_metadata.last_modified,
+                            is_cached=True,
+                        )
+                    ],
+                )
+
+        self.assertIsNotNone(self.state_manager.get_file_metadata("/a.txt"))
+        self.assertIsNone(self.state_manager.get_file_metadata("/new.txt"))
+        locations = self.state_manager.get_file_locations("/a.txt")
+        self.assertEqual(["cache"], [location.backend_name for location in locations])
 
 
 if __name__ == "__main__":
