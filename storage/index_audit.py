@@ -354,7 +354,6 @@ def reprobe_member_locations(
     cache_root = _validate_cache_root(cache_root)
     report = ReprobeLocationsReport()
     metadata_rows = state_manager.get_all_file_metadata()
-    known_paths = [metadata.virtual_path for metadata in metadata_rows]
     report.files_considered = len(metadata_rows)
     report.members_requested = len(backends)
 
