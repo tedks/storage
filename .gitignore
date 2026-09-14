@@ -52,8 +52,6 @@ Thumbs.db
 # Benchmark artifacts (regenerate with generate_graphs.py)
 tests/benchmarks/graphs/
 
-# Bazel
-bazel-bin
-bazel-out
-bazel-testlogs
-bazel-master
+# Bazel convenience symlinks: bazel-bin, bazel-out, bazel-testlogs and
+# bazel-<workspace dir>, which differs per worktree (master, storage-<branch>)
+/bazel-*
