@@ -1,0 +1,19 @@
+id: gh-91-tmpfile-leak
+title: Remove the conflict-check temp file when the download fails
+desc: 'conflicts.py:82-103: when copy_to_local raises, the NamedTemporaryFile is never
+  unlinked because the unlink at :94 is skipped by the except at :99. Use try/finally
+  or a context manager, and add a regression test for the failure path. See issue
+  #91.'
+type: bugfix
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-09-14T22:53:22-00:00
+references: []
+log_events:
+- time: 2026-09-14T22:53:22-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
