@@ -28,6 +28,11 @@ log_events:
   who: Ted Smith
   what: blocked by gh-17-startup-scan-only
   comment: ""
+- time: 2026-09-14T22:59:44-00:00
+  who: Ted Smith
+  what: blocked by gh-17-retry-buckets
+  comment: ""
 blocked_by:
 - gh-17-queue-on-dirty
 - gh-17-startup-scan-only
+- gh-17-retry-buckets
