@@ -1,0 +1,19 @@
+id: gh-53-drop-stale
+title: Discard a listing whose directory was invalidated mid-flight
+desc: 'Must land with the outside-the-lock change: watcher mode never expires snapshots
+  (fs.py:162), so a stale result would stick.
+
+  From https://github.com/tedks/storage/issues/53.'
+type: bugfix
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-09-14T22:59:58-00:00
+references: []
+log_events:
+- time: 2026-09-14T22:59:58-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
