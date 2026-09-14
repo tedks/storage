@@ -1,0 +1,19 @@
+id: gh-27-reproduce
+title: Reproduce the failures under load
+desc: 'Several members on one host under heavy readdir plus uncached streaming; record
+  which callers fail.
+
+  From https://github.com/tedks/storage/issues/27.'
+type: task
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-09-14T22:59:48-00:00
+references: []
+log_events:
+- time: 2026-09-14T22:59:48-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
