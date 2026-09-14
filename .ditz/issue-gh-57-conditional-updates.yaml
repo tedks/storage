@@ -25,7 +25,12 @@ log_events:
   who: Ted Smith
   what: blocked by gh-57-generation-column
   comment: ""
+- time: 2026-09-14T23:00:03-00:00
+  who: Ted Smith
+  what: blocks gh-57-requeue-on-conflict
+  comment: ""
 blocks:
 - gh-57
+- gh-57-requeue-on-conflict
 blocked_by:
 - gh-57-generation-column
