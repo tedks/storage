@@ -1,0 +1,25 @@
+id: gh-27
+title: 'GH #27: Investigate Paramiko channel-open failures under concurrent streaming
+  and readdir load'
+desc: 'Epic for https://github.com/tedks/storage/issues/27.
+
+  Partly mitigated: per-thread clients (28dfac3), one retry for read_file and exists
+  (ssh.py:323-357,366-403), and a circuit breaker allowing one reconnect at a time
+  (5899054, ssh.py:259-293). Still missing: failures are not classified by channel
+  type or caller, there is no backoff for remote checksum and xattr commands (4 checksum
+  workers at fs.py:173, failures logged at debug level at fs.py:472-473, and a failed
+  remote checksum falls back to a full download at ssh.py:742-754, adding load), and
+  no test covers sustained streaming plus browsing over SSH.'
+type: bugfix
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-09-14T22:59:48-00:00
+references: []
+log_events:
+- time: 2026-09-14T22:59:48-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
