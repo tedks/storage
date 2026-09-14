@@ -1,0 +1,22 @@
+id: gh-23
+title: 'GH #23: Add adaptive prefetch throttling and foreground-priority scheduling'
+desc: 'Epic for https://github.com/tedks/storage/issues/23.
+
+  Keeper of the #23/#72 pair. The only global limit is the session cap (streaming.py:827);
+  there is no shared budget for in-flight fetches or buffered bytes. Each session''s
+  worker sweeps the whole file from last_foreground_offset (streaming.py:742-760)
+  without pausing for a foreground miss (:501-537), so both hit the member at once.
+  Stats count only fetches and bytes (:79-86).'
+type: feature
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-09-14T22:59:45-00:00
+references: []
+log_events:
+- time: 2026-09-14T22:59:45-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
