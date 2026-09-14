@@ -1,0 +1,22 @@
+id: gh-64
+title: 'GH #64: Make _should_sync_path O(1) instead of O(open_fds)'
+desc: 'Epic for https://github.com/tedks/storage/issues/64.
+
+  It scans all of _fd_map under _fd_lock (fs.py:234-244), once per dirty file on every
+  monitor pass (sync.py:216-217) and once per task (sync_executor.py:64), while the
+  same lock is taken by open, create, read, write, release and fsync (fs.py:847,885,931,964,999,1058).
+  _invalidate_file_cache has the same scan (fs.py:288-297), which the issue does not
+  mention. The impact shrinks once #17 removes the monitor pass.'
+type: bugfix
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-09-14T23:00:09-00:00
+references: []
+log_events:
+- time: 2026-09-14T23:00:09-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
