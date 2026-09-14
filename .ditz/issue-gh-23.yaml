@@ -32,7 +32,12 @@ log_events:
   who: Ted Smith
   what: blocked by gh-23-global-budget
   comment: ""
+- time: 2026-09-14T22:59:46-00:00
+  who: Ted Smith
+  what: blocked by gh-23-bounded-readahead
+  comment: ""
 blocked_by:
 - gh-23-metrics
 - gh-23-pause-on-miss
 - gh-23-global-budget
+- gh-23-bounded-readahead
