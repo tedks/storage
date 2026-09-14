@@ -1,0 +1,19 @@
+id: gh-28-policy
+title: Write the hedging policy
+desc: 'Hedge delay, cancellation, and backend scoring that does not quarantine healthy
+  members.
+
+  From https://github.com/tedks/storage/issues/28.'
+type: task
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-09-14T22:59:49-00:00
+references: []
+log_events:
+- time: 2026-09-14T22:59:49-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
