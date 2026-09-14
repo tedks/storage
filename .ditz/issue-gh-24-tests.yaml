@@ -1,0 +1,18 @@
+id: gh-24-tests
+title: Add race regression tests
+desc: 'Cover leaked partial files and leaked fds.
+
+  From https://github.com/tedks/storage/issues/24.'
+type: task
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-09-14T22:59:47-00:00
+references: []
+log_events:
+- time: 2026-09-14T22:59:47-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
