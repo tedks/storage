@@ -1,0 +1,18 @@
+id: gh-28-hedge
+title: Retry or hedge a failed or stalled chunk on the next candidate
+desc: 'Dedupe through in_flight_chunks / _add_available_range.
+
+  From https://github.com/tedks/storage/issues/28.'
+type: feature
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-09-14T22:59:49-00:00
+references: []
+log_events:
+- time: 2026-09-14T22:59:49-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
