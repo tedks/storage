@@ -1,0 +1,19 @@
+id: gh-29-backpressure
+title: Add backpressure and diagnostics
+desc: 'Cap concurrent connects and channel opens per host by waiting rather than failing;
+  report active, reused and reconnected sessions.
+
+  From https://github.com/tedks/storage/issues/29.'
+type: feature
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-09-14T22:59:51-00:00
+references: []
+log_events:
+- time: 2026-09-14T22:59:51-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
