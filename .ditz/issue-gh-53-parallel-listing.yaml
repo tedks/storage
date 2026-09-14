@@ -24,7 +24,12 @@ log_events:
   who: Ted Smith
   what: blocked by gh-53-list-outside-lock
   comment: ""
+- time: 2026-09-14T23:00:00-00:00
+  who: Ted Smith
+  what: blocks gh-53-tests
+  comment: ""
 blocks:
 - gh-53
+- gh-53-tests
 blocked_by:
 - gh-53-list-outside-lock
