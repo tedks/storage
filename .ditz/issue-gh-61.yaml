@@ -1,0 +1,25 @@
+id: gh-61
+title: 'GH #61: Per-directory parallelism: eliminate global lock contention'
+desc: 'Epic for https://github.com/tedks/storage/issues/61.
+
+  Keeper of the #56/#61 pair and the umbrella over #50, #53, #55, #57, #58. The global
+  state is still there: one _dir_cache / _dir_cache_lock / _readdir_snapshot for every
+  directory (fs.py:148-150) and one SQLite connection with an RLock (state.py:39-41).
+  #56''s idea of moving the stat cache out of SQLite is partly moot, since getattr
+  does not touch SQLite (namespace.py:236-296); the real cost is member stats, which
+  is #50. The snapshot design relies on the GIL making dict assignment atomic, which
+  holds on the pinned Python 3.11 (flake.nix:11) and should be written down as an
+  assumption.'
+type: feature
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-09-14T23:00:05-00:00
+references: []
+log_events:
+- time: 2026-09-14T23:00:05-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
