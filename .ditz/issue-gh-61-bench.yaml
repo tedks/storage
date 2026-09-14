@@ -1,0 +1,18 @@
+id: gh-61-bench
+title: Extend tests/benchmarks/test_parallelism_bench.py
+desc: 'Show that listings of /photos and /documents do not block each other.
+
+  From https://github.com/tedks/storage/issues/61.'
+type: task
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-09-14T23:00:06-00:00
+references: []
+log_events:
+- time: 2026-09-14T23:00:06-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
