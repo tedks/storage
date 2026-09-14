@@ -20,5 +20,10 @@ log_events:
   who: Ted Smith
   what: blocks gh-17
   comment: ""
+- time: 2026-09-14T22:59:45-00:00
+  who: Ted Smith
+  what: blocks gh-17-tests
+  comment: ""
 blocks:
 - gh-17
+- gh-17-tests
