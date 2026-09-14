@@ -1,0 +1,19 @@
+id: gh-55-flush-on-release
+title: Persist final size and mtime once, in release()/fsync
+desc: 'release() currently only reads the row (fs.py:1046-1049), so SQLite would otherwise
+  be left stale.
+
+  From https://github.com/tedks/storage/issues/55.'
+type: feature
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-09-14T23:00:00-00:00
+references: []
+log_events:
+- time: 2026-09-14T23:00:00-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
