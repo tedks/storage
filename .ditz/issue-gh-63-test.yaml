@@ -1,0 +1,18 @@
+id: gh-63-test
+title: Test replica fallback
+desc: 'First replica''s copy_to_local raises, second succeeds.
+
+  From https://github.com/tedks/storage/issues/63.'
+type: task
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-09-14T23:00:08-00:00
+references: []
+log_events:
+- time: 2026-09-14T23:00:08-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
