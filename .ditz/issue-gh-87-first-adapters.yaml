@@ -22,7 +22,12 @@ log_events:
   who: Ted Smith
   what: blocked by gh-87-capability-matrix
   comment: ""
+- time: 2026-09-14T01:34:57-00:00
+  who: Ted Smith
+  what: blocks gh-87-language-spikes
+  comment: ""
 blocks:
 - gh-87
+- gh-87-language-spikes
 blocked_by:
 - gh-87-capability-matrix
