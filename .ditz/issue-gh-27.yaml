@@ -31,6 +31,11 @@ log_events:
   who: Ted Smith
   what: blocked by gh-27-reproduce
   comment: ""
+- time: 2026-09-14T22:59:48-00:00
+  who: Ted Smith
+  what: blocked by gh-27-backoff
+  comment: ""
 blocked_by:
 - gh-27-instrument
 - gh-27-reproduce
+- gh-27-backoff
