@@ -1,0 +1,18 @@
+id: gh-31-align
+title: Align the three defaults
+desc: 'StorageFS.__init__, mount_storage and the CLI/profile resolution.
+
+  From https://github.com/tedks/storage/issues/31.'
+type: task
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-09-14T22:59:55-00:00
+references: []
+log_events:
+- time: 2026-09-14T22:59:55-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
