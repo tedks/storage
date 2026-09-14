@@ -1,0 +1,19 @@
+id: gh-30-option
+title: Add a host-key policy option
+desc: 'auto-add | warn | strict, settable from the CLI and mount-profile TOML and
+  passed to SSHBackend and RsyncBackend.
+
+  From https://github.com/tedks/storage/issues/30.'
+type: feature
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-09-14T22:59:53-00:00
+references: []
+log_events:
+- time: 2026-09-14T22:59:53-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
