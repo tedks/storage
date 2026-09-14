@@ -1,0 +1,18 @@
+id: gh-58-download-outside-lock
+title: Download outside the lock
+desc: 'Reserve space under the lock, then re-take it only to reconcile the accounting.
+
+  From https://github.com/tedks/storage/issues/58.'
+type: feature
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-09-14T23:00:04-00:00
+references: []
+log_events:
+- time: 2026-09-14T23:00:04-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
