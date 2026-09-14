@@ -18,3 +18,9 @@ log_events:
   who: Ted Smith
   what: created
   comment: ""
+- time: 2026-09-14T22:59:56-00:00
+  who: Ted Smith
+  what: blocked by gh-50-keep-attrs
+  comment: ""
+blocked_by:
+- gh-50-keep-attrs
