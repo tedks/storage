@@ -2,7 +2,7 @@ import pytest
 
 
 def main() -> int:
-    # Nightly resilience-focused gate.
+    # Resilience-focused gate (run locally; see AGENTS.md "Build and test").
     return pytest.main([
         "tests/test_resilience_gradient.py",
         "tests/test_streaming_system.py",
