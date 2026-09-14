@@ -1,0 +1,18 @@
+id: gh-23-pause-on-miss
+title: Pause background prefetch while a foreground miss is in flight
+desc: 'Per-session gate in _background_prefetch_worker. This is #72''s option 1.
+
+  From https://github.com/tedks/storage/issues/23.'
+type: task
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-09-14T22:59:45-00:00
+references: []
+log_events:
+- time: 2026-09-14T22:59:45-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
