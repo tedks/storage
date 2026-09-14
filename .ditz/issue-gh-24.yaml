@@ -34,7 +34,12 @@ log_events:
   who: Ted Smith
   what: blocked by gh-24-no-resurrect
   comment: ""
+- time: 2026-09-14T22:59:47-00:00
+  who: Ted Smith
+  what: blocked by gh-24-tests
+  comment: ""
 blocked_by:
 - gh-24-semantics
 - gh-24-session-aware
 - gh-24-no-resurrect
+- gh-24-tests
