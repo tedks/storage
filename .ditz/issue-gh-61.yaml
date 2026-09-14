@@ -31,6 +31,11 @@ log_events:
   who: Ted Smith
   what: blocked by gh-61-immutable-snapshots
   comment: ""
+- time: 2026-09-14T23:00:06-00:00
+  who: Ted Smith
+  what: blocked by gh-61-lockless-invalidate
+  comment: ""
 blocked_by:
 - gh-61-land-children
 - gh-61-immutable-snapshots
+- gh-61-lockless-invalidate
