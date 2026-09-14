@@ -1,0 +1,23 @@
+id: gh-53
+title: 'GH #53: Stop readdir holding the global lock across blocking member I/O'
+desc: 'Epic for https://github.com/tedks/storage/issues/53.
+
+  Keeper of the #52/#53 pair. namespace.py:315-339 holds the single dir_cache_lock
+  (fs.py:149) while calling listdir_attrs/listdir on each member in turn (SFTP at
+  ssh.py:543). The same lock blocks invalidation (namespace.py:104-106, used by the
+  watcher and by mkdir/rmdir/unlink/create at fs.py:921-922), snapshot reads (:301-302)
+  and the conflict view (:191-192). The unmerged origin/performance branch (0b7c732,
+  42c1d87) has an async readdir refresh worth reading first.'
+type: bugfix
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-09-14T22:59:57-00:00
+references: []
+log_events:
+- time: 2026-09-14T22:59:57-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
