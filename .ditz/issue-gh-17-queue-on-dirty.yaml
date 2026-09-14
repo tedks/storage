@@ -1,0 +1,19 @@
+id: gh-17-queue-on-dirty
+title: Queue on every transition to DIRTY
+desc: 'Also re-queue when a worker finishes with the row still DIRTY, and when a deferred
+  busy path is released.
+
+  From https://github.com/tedks/storage/issues/17.'
+type: task
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-09-14T22:59:44-00:00
+references: []
+log_events:
+- time: 2026-09-14T22:59:44-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
