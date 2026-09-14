@@ -1,0 +1,19 @@
+id: gh-17-tests
+title: Test convergence without the poll
+desc: 'Deferred, partial and dropped-while-in-flight paths still converge, with no
+  steady-state polling.
+
+  From https://github.com/tedks/storage/issues/17.'
+type: task
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-09-14T22:59:44-00:00
+references: []
+log_events:
+- time: 2026-09-14T22:59:44-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
