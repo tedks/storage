@@ -1,0 +1,33 @@
+id: fuse-test-env
+title: Make the Bazel test gates run without manual libfuse/sandbox flags
+desc: 'The plain gate command (nix develop --command bazel test //:storage_tests_fast_gate
+  //:storage_tests_mounted_system_gate //:storage_tests_resilience_gate) fails on
+  framework0 for environmental reasons (checked at 199889c, 2026-09-13):
+
+  1. The flake does not provide libfuse 2, so every fuse-importing module fails collection
+  with ''OSError: Unable to find libfuse''. The removed GitHub Actions workflow apt-installed
+  libfuse2t64 instead.
+
+  2. Under Bazel''s default linux-sandbox, FUSE mounts fail: ''fusermount: mount failed:
+  Operation not permitted''.
+
+  Workaround in AGENTS.md (PR #89): FUSE_LIBRARY_PATH to nixpkgs fuse^out plus --strategy=TestRunner=local,
+  which makes all three gates pass.
+
+  Make the plain command work: e.g. add pkgs.fuse to the devShell and export FUSE_LIBRARY_PATH
+  from it, plus a checked-in .bazelrc with ''test --test_env=FUSE_LIBRARY_PATH'' and
+  a TestRunner=local strategy (or tag the FUSE tests no-sandbox). Keep the host''s
+  setuid fusermount on PATH. Then simplify the AGENTS.md gate command.'
+type: task
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-09-14T01:47:36-00:00
+references: []
+log_events:
+- time: 2026-09-14T01:47:36-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
