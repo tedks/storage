@@ -1,0 +1,18 @@
+id: gh-30-tests
+title: Test strict and permissive modes
+desc: 'Strict rejects an unknown key; permissive accepts it.
+
+  From https://github.com/tedks/storage/issues/30.'
+type: task
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-09-14T22:59:54-00:00
+references: []
+log_events:
+- time: 2026-09-14T22:59:54-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
