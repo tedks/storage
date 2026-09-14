@@ -1,0 +1,28 @@
+id: gh-57
+title: 'GH #57: Fix the sync-status read-modify-write race between write() and the
+  sync worker'
+desc: 'Epic for https://github.com/tedks/storage/issues/57.
+
+  Keeper for #59 (and see #35, which proposed the generation/compare-and-set approach
+  and is kept open). The worker reads the row once (sync_executor.py:55), writes it
+  whole as SYNCING (:73-74), then writes CLEAN from that stale copy (:142,:163); set_file_metadata
+  replaces the whole row (state.py:154-174) and write() does its own read-then-write
+  (fs.py:979-985), with _db_lock serializing only single statements (state.py:49-53).
+  PR #36''s open-writer check (fs.py:234-244) is check-then-act, and the missed writer''s
+  release() re-queue is dropped as a duplicate (sync.py:240), so the write is lost
+  for good. force=True (sync.py:261, namespace.py:478) allows two in-flight tasks
+  per path, which a status-only compare-and-set cannot detect (ABA). Since PR #83
+  a wrong CLEAN also reaches the xattr mirror and would survive rebuild-index.'
+type: bugfix
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-09-14T23:00:02-00:00
+references: []
+log_events:
+- time: 2026-09-14T23:00:02-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
