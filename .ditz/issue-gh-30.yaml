@@ -1,0 +1,22 @@
+id: gh-30
+title: 'GH #30: Support strict host-key verification'
+desc: 'Epic for https://github.com/tedks/storage/issues/30.
+
+  ssh.py:185 uses AutoAddPolicy and no known_hosts file is ever loaded (no load_system_host_keys),
+  so every key counts as new and even a changed key is accepted. That contradicts
+  the comment at rsync.py:97-98 claiming the paramiko path rejects changed keys; the
+  rsync (rsync.py:99) and watcher (watcher.py:110) paths use accept-new. Member parsing
+  has no host-key option (mount_profiles.py:269-316).'
+type: feature
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-09-14T22:59:53-00:00
+references: []
+log_events:
+- time: 2026-09-14T22:59:53-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
