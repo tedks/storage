@@ -1,0 +1,18 @@
+id: gh-86
+title: 'GH #86: Stabilize rsync temp-file cleanup system test'
+desc: Epic for https://github.com/tedks/storage/issues/86. tests/test_sync_system.py::test_rsync_write_succeeds_and_syncs_final_file
+  intermittently times out waiting for rsync temp files (.<name>.*) to leave cache/backends;
+  a rerun passed.
+type: bugfix
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-09-14T01:34:53-00:00
+references: []
+log_events:
+- time: 2026-09-14T01:34:53-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
