@@ -25,7 +25,12 @@ log_events:
   who: Ted Smith
   what: blocked by gh-30-option
   comment: ""
+- time: 2026-09-14T22:59:54-00:00
+  who: Ted Smith
+  what: blocks gh-30-docs
+  comment: ""
 blocks:
 - gh-30
+- gh-30-docs
 blocked_by:
 - gh-30-option
