@@ -1,0 +1,20 @@
+id: gh-91
+title: 'GH #91: Empty recorded checksum can report a false conflict on first write'
+desc: Epic for https://github.com/tedks/storage/issues/91. Member rows recorded on
+  the remote-read path get checksum='' (fs.py:684, streaming.py:696), which check_conflict
+  reads as a changed remote (conflicts.py:106-112), so the first write after a remote
+  read can be reported as a conflict. Found by backlog triage 2026-09-14; not reproduced
+  at runtime.
+type: bugfix
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-09-14T22:53:22-00:00
+references: []
+log_events:
+- time: 2026-09-14T22:53:22-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
