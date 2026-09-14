@@ -1,0 +1,18 @@
+id: gh-55-benchmark
+title: Benchmark commits for a 100MB sequential write
+desc: 'Establishes the before/after number the issue asks for.
+
+  From https://github.com/tedks/storage/issues/55.'
+type: task
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-09-14T23:00:01-00:00
+references: []
+log_events:
+- time: 2026-09-14T23:00:01-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
