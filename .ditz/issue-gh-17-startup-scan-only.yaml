@@ -1,0 +1,18 @@
+id: gh-17-startup-scan-only
+title: Scan for dirty files only at startup
+desc: 'Remove the steady-state poll once every DIRTY transition enqueues.
+
+  From https://github.com/tedks/storage/issues/17.'
+type: task
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-09-14T22:59:44-00:00
+references: []
+log_events:
+- time: 2026-09-14T22:59:44-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
