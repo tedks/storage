@@ -26,6 +26,11 @@ log_events:
   who: Ted Smith
   what: blocked by gh-91-absent-baseline
   comment: ""
+- time: 2026-09-14T22:53:23-00:00
+  who: Ted Smith
+  what: blocked by gh-91-tmpfile-leak
+  comment: ""
 blocked_by:
 - gh-91-repro
 - gh-91-absent-baseline
+- gh-91-tmpfile-leak
