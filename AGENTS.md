@@ -154,8 +154,11 @@ This repo uses both trackers, at different altitudes:
   member closes.
 
 Not every open GitHub issue has an epic yet. When you open an issue, or
-pick up an existing one and `ditz show gh-N` finds nothing, create the
-epic and at least the first concrete member task. When the last member
+pick up an existing one that has no epic, create the epic and at least the
+first concrete member task. Check for the epic with
+`ditz list --ids-only | grep -qx gh-N`, not `ditz show gh-N`: `show`
+matches id prefixes, so it can display a different issue (or report an
+ambiguous match) when `gh-N` itself does not exist. When the last member
 closes, close the epic and the GitHub issue together. Small,
 self-contained work that needs no design record can be a plain ditz issue
 with no GitHub issue.
