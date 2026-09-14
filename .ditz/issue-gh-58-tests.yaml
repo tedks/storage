@@ -1,0 +1,18 @@
+id: gh-58-tests
+title: Test cache concurrency
+desc: 'A slow download must not block delete, eviction or size queries.
+
+  From https://github.com/tedks/storage/issues/58.'
+type: task
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-09-14T23:00:04-00:00
+references: []
+log_events:
+- time: 2026-09-14T23:00:04-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
