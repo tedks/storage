@@ -59,8 +59,9 @@ the flake:
 - **libfuse 2.** `fusepy` loads `libfuse.so.2`, which the flake does not
   provide. Without it every test module that imports `fuse` fails at
   collection with `OSError: Unable to find libfuse`. Install it on the host
-  (Debian/Ubuntu: `libfuse2t64`) or pass the nixpkgs build through
-  `FUSE_LIBRARY_PATH`, as in the gate command below.
+  (`libfuse2t64` on Ubuntu 24.04+ and Debian trixie, `libfuse2` on older
+  releases) or pass the nixpkgs build through `FUSE_LIBRARY_PATH`, as in
+  the gate command below.
 - **`/dev/fuse` and a setuid `fusermount`** on the host.
 - **No Bazel sandbox for tests.** Under the default `linux-sandbox`
   strategy the mounts fail with
@@ -77,25 +78,27 @@ Test targets:
 
 | Target | Runs |
 |--------|------|
-| `//:storage_tests_fast_gate` | all of `tests/` except the mounted system tests |
+| `//:storage_tests_fast_gate` | `tests/test_*.py` except the mounted system tests |
 | `//:storage_tests_mounted_system_gate` | `test_streaming_system.py`, `test_sync_system.py` (real FUSE mounts) |
 | `//:storage_tests_resilience_gate` | `test_resilience_gradient.py`, `test_streaming_system.py` |
-| `//:storage_tests` | all of `tests/` |
+| `//:storage_tests` | all `tests/test_*.py` |
 
 The quality gate before pushing code changes is all three gates (about
 four minutes on framework0 with a warm Bazel cache, most of it the fast
-gate):
+gate). Run it as one shell command, since it sets a variable:
 
 ```bash
-FUSE2=$(nix build --no-link --print-out-paths 'nixpkgs#fuse^out')
+FUSE2=$(nix build --no-link --print-out-paths --inputs-from . 'nixpkgs#fuse^out') &&
 nix develop --command bazel test \
   //:storage_tests_fast_gate //:storage_tests_mounted_system_gate //:storage_tests_resilience_gate \
   --test_output=errors --strategy=TestRunner=local \
   --test_env=FUSE_LIBRARY_PATH="$FUSE2/lib/libfuse.so.2"
 ```
 
-Drop the `FUSE2` line and the `--test_env` flag if the host has libfuse 2
-installed. A red run whose failures are `Unable to find libfuse` or
+`--inputs-from .` takes nixpkgs from this repo's `flake.lock`. Drop the
+`FUSE2=...` line and the `--test_env` flag if the host has libfuse 2
+installed. The benchmarks in `tests/benchmarks/` are not part of any
+Bazel target. A red run whose failures are `Unable to find libfuse` or
 `fusermount: mount failed: Operation not permitted` is an environment
 problem (see Environment), not a code signal, and it does not count as
 running the gate.
@@ -143,17 +146,19 @@ This repo uses both trackers, at different altitudes:
 
 - **GitHub Issues** hold the bigger things: the problem statement, design
   discussion, and progress notes a human reads.
-- **ditz** holds the tactical breakdown. Each open GitHub issue `#N` has a
-  ditz epic with id `gh-N` whose description links back to the issue.
-  The epic's member tasks (ids `gh-N-<slug>`) each block the epic
+- **ditz** holds the tactical breakdown. A GitHub issue `#N` that is being
+  worked has a ditz epic with id `gh-N` whose description links back to
+  the issue. The epic's member tasks (ids `gh-N-<slug>`) each block the epic
   (`ditz blocks gh-N-<slug> gh-N`), and ordering between members is
   expressed the same way. The epic stays out of `ditz ready` until every
   member closes.
 
-When opening a GitHub issue, create its epic and at least the first
-concrete member task. When the last member closes, close the epic and the
-GitHub issue together. Small, self-contained work that needs no design
-record can be a plain ditz issue with no GitHub issue.
+Not every open GitHub issue has an epic yet. When you open an issue, or
+pick up an existing one and `ditz show gh-N` finds nothing, create the
+epic and at least the first concrete member task. When the last member
+closes, close the epic and the GitHub issue together. Small,
+self-contained work that needs no design record can be a plain ditz issue
+with no GitHub issue.
 
 ## Planning
 
@@ -170,10 +175,14 @@ ExecPlans for non-trivial work follow the format in
   reprobe.
 - `storage debug rebuild-index` and `storage debug reprobe-locations`
   mutate state (SQLite index rows and cache-file xattrs: rebuild normalizes
-  metadata xattrs, reprobe can write conflict xattrs);
-  `storage debug verify-index` is read-only. Do not point the
-  mutating commands, or experimental mounts, at a live cache or at the real
-  mount profiles in `~/.config/storage/storage.toml`.
+  metadata xattrs, reprobe can write conflict xattrs).
+  `storage debug verify-index` does not change an existing index or
+  xattrs, but all three open the database through `StateManager`, which
+  creates an empty one (and its parent directory) at a mistyped `-d` path.
+  Do not point the mutating commands, or experimental mounts, at a live
+  cache or at real mount profiles. A profile name given without `--config`
+  is looked up in `~/.config/storage/storage.toml`, then
+  `/etc/storage/storage.toml`.
 - README.md lags the code (for example, it still lists remote backends
   and background sync as unimplemented); trust the code and
   IMPLEMENTATION_STATUS.md over it.
