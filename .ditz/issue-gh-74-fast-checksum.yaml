@@ -1,0 +1,18 @@
+id: gh-74-fast-checksum
+title: Use backend.get_fast_checksum() in check_conflict
+desc: 'Handle NotImplementedError for members that cannot provide one.
+
+  From https://github.com/tedks/storage/issues/74.'
+type: feature
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-09-14T23:00:11-00:00
+references: []
+log_events:
+- time: 2026-09-14T23:00:11-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
