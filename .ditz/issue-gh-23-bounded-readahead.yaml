@@ -1,0 +1,19 @@
+id: gh-23-bounded-readahead
+title: Bound the read-ahead distance and grow it on sequential reads
+desc: 'Replaces the whole-file sweep (#72 option 2). Test with 8 or more concurrent
+  sessions.
+
+  From https://github.com/tedks/storage/issues/23.'
+type: feature
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-09-14T22:59:46-00:00
+references: []
+log_events:
+- time: 2026-09-14T22:59:46-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
