@@ -1,0 +1,22 @@
+id: gh-17
+title: 'GH #17: Replace the polling sync monitor with an event-driven scheduler'
+desc: 'Epic for https://github.com/tedks/storage/issues/17.
+
+  The monitor re-scans every dirty file every 5s (sync.py:206-222, state.py:541-549,
+  sync_tasks.py:13). release() already queues dirty files (fs.py:1047-1049), but paths
+  deferred as busy (sync_executor.py:64-66), partial syncs left DIRTY (:150-151) and
+  re-queues dropped while in flight (sync.py:240, cleared at :319) only recover through
+  the poll. Retries sleep inside worker threads (sync_executor.py:184). Do after #57.'
+type: feature
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-09-14T22:59:44-00:00
+references: []
+log_events:
+- time: 2026-09-14T22:59:44-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
