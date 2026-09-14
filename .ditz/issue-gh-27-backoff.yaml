@@ -1,0 +1,19 @@
+id: gh-27-backoff
+title: Back off remote checksum and xattr commands on failure
+desc: 'Failure-aware throttling for the scheduling at fs.py:440-473 and ssh.py:714-790,
+  so a failure does not escalate into a full-file download.
+
+  From https://github.com/tedks/storage/issues/27.'
+type: bugfix
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-09-14T22:59:48-00:00
+references: []
+log_events:
+- time: 2026-09-14T22:59:48-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
