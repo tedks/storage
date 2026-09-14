@@ -1,0 +1,19 @@
+id: gh-27-xattr-channel
+title: Close the channel opened by set_xattr
+desc: 'ssh.py:771 discards the channel from its remote command without waiting for
+  completion or closing it, which looks like a channel leak on every xattr write.
+
+  From https://github.com/tedks/storage/issues/27.'
+type: bugfix
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-09-14T22:59:48-00:00
+references: []
+log_events:
+- time: 2026-09-14T22:59:48-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
