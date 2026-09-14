@@ -20,5 +20,11 @@ log_events:
   who: Ted Smith
   what: blocks gh-63
   comment: ""
+- time: 2026-09-14T23:00:09-00:00
+  who: Ted Smith
+  what: blocked by gh-63-candidate-list
+  comment: ""
 blocks:
 - gh-63
+blocked_by:
+- gh-63-candidate-list
