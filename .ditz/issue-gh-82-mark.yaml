@@ -1,0 +1,18 @@
+id: gh-82-mark
+title: Mark derived cache entries so rebuild distinguishes canonical files from conflict-view
+  scratch
+desc: Follow-up item 1 of https://github.com/tedks/storage/issues/82, implemented
+  per the gh-82-decide outcome.
+type: task
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-09-14T01:34:53-00:00
+references: []
+log_events:
+- time: 2026-09-14T01:34:53-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
