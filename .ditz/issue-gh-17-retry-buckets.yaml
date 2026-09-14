@@ -1,0 +1,18 @@
+id: gh-17-retry-buckets
+title: Add retry buckets outside the worker threads
+desc: 'Delayed re-queue instead of sleeping in a worker, with a bound on queue depth.
+
+  From https://github.com/tedks/storage/issues/17.'
+type: task
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-09-14T22:59:44-00:00
+references: []
+log_events:
+- time: 2026-09-14T22:59:44-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
