@@ -1,0 +1,18 @@
+id: gh-82-decide
+title: Decide whether conflict-view caches carry their own metadata xattr or stay
+  fully derived
+desc: Follow-up item 2 of https://github.com/tedks/storage/issues/82. Design decision
+  that gates the marking work.
+type: task
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-09-14T01:34:53-00:00
+references: []
+log_events:
+- time: 2026-09-14T01:34:53-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
