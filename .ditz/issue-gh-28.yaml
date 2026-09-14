@@ -31,7 +31,12 @@ log_events:
   who: Ted Smith
   what: blocked by gh-28-hedge
   comment: ""
+- time: 2026-09-14T22:59:50-00:00
+  who: Ted Smith
+  what: blocked by gh-28-tests
+  comment: ""
 blocked_by:
 - gh-28-policy
 - gh-28-candidates
 - gh-28-hedge
+- gh-28-tests
