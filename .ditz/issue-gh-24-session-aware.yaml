@@ -24,7 +24,12 @@ log_events:
   who: Ted Smith
   what: blocked by gh-24-semantics
   comment: ""
+- time: 2026-09-14T22:59:47-00:00
+  who: Ted Smith
+  what: blocks gh-24-tests
+  comment: ""
 blocks:
 - gh-24
+- gh-24-tests
 blocked_by:
 - gh-24-semantics
