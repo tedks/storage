@@ -1,0 +1,21 @@
+id: gh-55
+title: 'GH #55: Remove redundant SQLite round-trips from write()'
+desc: 'Epic for https://github.com/tedks/storage/issues/55.
+
+  Keeper of the #54/#55 pair. Every write still does a SELECT (fs.py:979), an lstat,
+  and a full-row replace plus commit (:985). Since PR #83 (a5c889f) it also writes
+  an xattr per call (fs.py:986-990, cache.py:280-296). FDEntry has no dirty flag (fs.py:42-52).
+  Do after #57.'
+type: bugfix
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-09-14T23:00:00-00:00
+references: []
+log_events:
+- time: 2026-09-14T23:00:00-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
