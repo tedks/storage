@@ -1,0 +1,18 @@
+id: gh-55-test-write-during-sync
+title: Test that a write during a sync still ends DIRTY
+desc: 'Guards the interaction with #57''s status handling.
+
+  From https://github.com/tedks/storage/issues/55.'
+type: task
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-09-14T23:00:00-00:00
+references: []
+log_events:
+- time: 2026-09-14T23:00:00-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
