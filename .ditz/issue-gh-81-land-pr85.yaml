@@ -1,0 +1,20 @@
+id: gh-81-land-pr85
+title: 'Land draft PR #85 (reprobe fail-closed commits, no rows without checksum baseline)'
+desc: 'PR #85 (branch phase-6-reprobe-followups) makes commit-time SQLite failures
+  in reprobe fail closed and stops recreating non-cache member rows when the local
+  metadata row lacks a trusted checksum baseline. Council-reviewed with fast/mounted-system/resilience
+  gates green as of 2026-05-28. At import the branch was 2 commits behind master:
+  rebase, rerun the three gates, mark ready, merge.'
+type: task
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-09-14T01:34:53-00:00
+references: []
+log_events:
+- time: 2026-09-14T01:34:53-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
