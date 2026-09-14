@@ -1,0 +1,18 @@
+id: gh-31-decide
+title: Decide the default-on policy
+desc: 'Operator decision; #72''s option 3 (make streaming opt-in) feeds into it.
+
+  From https://github.com/tedks/storage/issues/31.'
+type: task
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-09-14T22:59:54-00:00
+references: []
+log_events:
+- time: 2026-09-14T22:59:54-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
