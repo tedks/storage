@@ -1,0 +1,19 @@
+id: gh-63-candidate-list
+title: Build a replica candidate list
+desc: 'All available location members sorted by speed_priority, plus the fallback
+  probe from fs.py:496-517. #28 reuses this.
+
+  From https://github.com/tedks/storage/issues/63.'
+type: feature
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-09-14T23:00:07-00:00
+references: []
+log_events:
+- time: 2026-09-14T23:00:07-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
