@@ -1,0 +1,20 @@
+id: gh-63-clean-partial
+title: Remove the partial cache file before retrying the next replica
+desc: 'SFTP get writes straight to the destination (ssh.py:608) and nothing removes
+  it on failure, which would likely leave a truncated file that is_cached accepts.
+  Not confirmed at runtime.
+
+  From https://github.com/tedks/storage/issues/63.'
+type: bugfix
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-09-14T23:00:08-00:00
+references: []
+log_events:
+- time: 2026-09-14T23:00:08-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
