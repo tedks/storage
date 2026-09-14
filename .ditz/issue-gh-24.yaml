@@ -1,0 +1,24 @@
+id: gh-24
+title: 'GH #24: Harden rename/unlink semantics for files with an active streaming
+  session'
+desc: 'Epic for https://github.com/tedks/storage/issues/24.
+
+  NamespaceService.unlink/rename never consult the active prefetch sessions (namespace.py:408-490).
+  While a file streams, only <cache>.storage.partial exists, so cache_path.unlink()
+  (:413) and old_cache.rename() (:443) fail with ENOENT. On completion the session
+  moves the partial file to the path captured at open (streaming.py:647, captured
+  at :875) and writes metadata and location rows (:662-715), resurrecting the old
+  path. No rename/unlink coverage in tests/test_fs_streaming.py.'
+type: bugfix
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-09-14T22:59:46-00:00
+references: []
+log_events:
+- time: 2026-09-14T22:59:46-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
