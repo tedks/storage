@@ -1,0 +1,19 @@
+id: gh-86-fix
+title: Make the rsync temp-file test fail only on real persistence or backend leaks
+desc: 'Acceptance criteria 2-3 of https://github.com/tedks/storage/issues/86: the
+  test should fail only when temp files can persist indefinitely or leak to backends,
+  while keeping coverage that rsync staging files are not user-visible or synced as
+  final artifacts after rename.'
+type: bugfix
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-09-14T01:34:53-00:00
+references: []
+log_events:
+- time: 2026-09-14T01:34:53-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
