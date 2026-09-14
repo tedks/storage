@@ -21,5 +21,10 @@ log_events:
   who: Ted Smith
   what: blocks gh-28
   comment: ""
+- time: 2026-09-14T22:59:50-00:00
+  who: Ted Smith
+  what: blocks gh-28-candidates
+  comment: ""
 blocks:
 - gh-28
+- gh-28-candidates
