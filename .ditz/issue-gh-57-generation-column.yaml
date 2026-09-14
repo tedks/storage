@@ -1,0 +1,19 @@
+id: gh-57-generation-column
+title: Add a generation column bumped atomically on every transition to DIRTY
+desc: 'Gives the compare-and-set a value that changes even when the status returns
+  to the same state.
+
+  From https://github.com/tedks/storage/issues/57.'
+type: feature
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-09-14T23:00:02-00:00
+references: []
+log_events:
+- time: 2026-09-14T23:00:02-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
