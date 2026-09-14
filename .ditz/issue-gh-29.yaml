@@ -28,6 +28,11 @@ log_events:
   who: Ted Smith
   what: blocked by gh-29-model
   comment: ""
+- time: 2026-09-14T22:59:51-00:00
+  who: Ted Smith
+  what: blocked by gh-29-backpressure
+  comment: ""
 blocked_by:
 - gh-29-benchmark
 - gh-29-model
+- gh-29-backpressure
