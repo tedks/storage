@@ -1,0 +1,18 @@
+id: gh-91-repro
+title: Reproduce the false conflict against a live mount
+desc: 'Read a file from a storage member with no existing index row, write to it,
+  sync, and record whether a conflict is reported. Confirms or kills the static finding
+  before any fix. See issue #91.'
+type: task
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-09-14T22:53:22-00:00
+references: []
+log_events:
+- time: 2026-09-14T22:53:22-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
