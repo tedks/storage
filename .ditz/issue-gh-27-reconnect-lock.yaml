@@ -1,0 +1,21 @@
+id: gh-27-reconnect-lock
+title: Stop the reconnect guard from failing healthy callers
+desc: 'ssh.py:275-278 takes the reconnect lock without waiting even when the backend
+  is healthy, so concurrent threads get ConnectionError; exists() turns that into
+  False (:341-344) and read_file raises without retry (:389-390). Found by reading
+  the code during triage, not reproduced.
+
+  From https://github.com/tedks/storage/issues/27.'
+type: bugfix
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-09-14T22:59:48-00:00
+references: []
+log_events:
+- time: 2026-09-14T22:59:48-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
