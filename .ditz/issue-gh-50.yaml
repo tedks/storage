@@ -30,7 +30,12 @@ log_events:
   who: Ted Smith
   what: blocked by gh-50-invalidate
   comment: ""
+- time: 2026-09-14T22:59:57-00:00
+  who: Ted Smith
+  what: blocked by gh-50-tests
+  comment: ""
 blocked_by:
 - gh-50-keep-attrs
 - gh-50-use-in-getattr
 - gh-50-invalidate
+- gh-50-tests
