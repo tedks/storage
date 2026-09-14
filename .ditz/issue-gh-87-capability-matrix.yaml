@@ -1,0 +1,18 @@
+id: gh-87-capability-matrix
+title: Define the per-platform capability matrix
+desc: 'Step 2 of ''What to do later'' in https://github.com/tedks/storage/issues/87:
+  mount support, xattr support, placeholder support, background execution model, user-visible
+  namespace model, for Linux/macOS/Windows/Android/Apple mobile.'
+type: task
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-09-14T01:34:53-00:00
+references: []
+log_events:
+- time: 2026-09-14T01:34:53-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
