@@ -39,8 +39,13 @@ log_events:
   who: Ted Smith
   what: blocked by gh-27-reconnect-lock
   comment: ""
+- time: 2026-09-14T22:59:49-00:00
+  who: Ted Smith
+  what: blocked by gh-27-xattr-channel
+  comment: ""
 blocked_by:
 - gh-27-instrument
 - gh-27-reproduce
 - gh-27-backoff
 - gh-27-reconnect-lock
+- gh-27-xattr-channel
