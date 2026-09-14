@@ -1,0 +1,18 @@
+id: gh-74-tests
+title: Test the fast-checksum path
+desc: 'No copy_to_local when a fast checksum exists, and conflict outcomes unchanged.
+
+  From https://github.com/tedks/storage/issues/74.'
+type: task
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-09-14T23:00:12-00:00
+references: []
+log_events:
+- time: 2026-09-14T23:00:12-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
