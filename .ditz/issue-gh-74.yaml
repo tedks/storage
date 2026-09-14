@@ -23,5 +23,10 @@ log_events:
   who: Ted Smith
   what: blocked by gh-74-fast-checksum
   comment: ""
+- time: 2026-09-14T23:00:12-00:00
+  who: Ted Smith
+  what: blocked by gh-74-no-hash-policy
+  comment: ""
 blocked_by:
 - gh-74-fast-checksum
+- gh-74-no-hash-policy
