@@ -1,0 +1,20 @@
+id: gh-50
+title: 'GH #50: Stop getattr probing members on every call for uncached files'
+desc: 'Epic for https://github.com/tedks/storage/issues/50.
+
+  Keeper of the #50/#51 pair. readdir discards the attributes listdir_attrs already
+  returned (namespace.py:324), so on a cache miss getattr calls backend.stat on each
+  member in turn (namespace.py:255-290).'
+type: bugfix
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-09-14T22:59:56-00:00
+references: []
+log_events:
+- time: 2026-09-14T22:59:56-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
