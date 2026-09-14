@@ -1,0 +1,18 @@
+id: gh-64-tests
+title: Test that the writer count stays balanced
+desc: 'Across open, create and release, including a close error inside release.
+
+  From https://github.com/tedks/storage/issues/64.'
+type: task
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-09-14T23:00:10-00:00
+references: []
+log_events:
+- time: 2026-09-14T23:00:10-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
