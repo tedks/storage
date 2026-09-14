@@ -16,3 +16,9 @@ log_events:
   who: Ted Smith
   what: created
   comment: ""
+- time: 2026-09-14T01:34:54-00:00
+  who: Ted Smith
+  what: blocked by gh-86-diagnose
+  comment: ""
+blocked_by:
+- gh-86-diagnose
