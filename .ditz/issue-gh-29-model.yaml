@@ -1,0 +1,19 @@
+id: gh-29-model
+title: Pick a reuse model and implement it
+desc: 'Per-thread with idle TTL, a bounded pool, or ControlMaster, with a bounded
+  client lifecycle.
+
+  From https://github.com/tedks/storage/issues/29.'
+type: feature
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-09-14T22:59:51-00:00
+references: []
+log_events:
+- time: 2026-09-14T22:59:51-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
