@@ -1,0 +1,22 @@
+id: gh-81
+title: 'GH #81: Reprobe storage members to rebuild remote file_locations after index
+  loss'
+desc: 'Epic for https://github.com/tedks/storage/issues/81 (the GitHub issue is the
+  design record; this epic holds the tactical breakdown and closes when its blockers
+  do).
+
+  Status at import (2026-09-13): the reprobe command landed in PR #84; the two holes
+  found after #84 are addressed by draft PR #85.'
+type: feature
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-09-14T01:34:53-00:00
+references: []
+log_events:
+- time: 2026-09-14T01:34:53-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
