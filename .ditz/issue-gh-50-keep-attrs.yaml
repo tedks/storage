@@ -1,0 +1,18 @@
+id: gh-50-keep-attrs
+title: Keep the attributes returned by readdir
+desc: 'Store them per directory and per member as an immutable snapshot with a timestamp.
+
+  From https://github.com/tedks/storage/issues/50.'
+type: feature
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-09-14T22:59:56-00:00
+references: []
+log_events:
+- time: 2026-09-14T22:59:56-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
