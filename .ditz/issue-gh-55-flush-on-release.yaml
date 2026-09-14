@@ -21,5 +21,11 @@ log_events:
   who: Ted Smith
   what: blocks gh-55
   comment: ""
+- time: 2026-09-14T23:00:01-00:00
+  who: Ted Smith
+  what: blocked by gh-55-fd-dirty-flag
+  comment: ""
 blocks:
 - gh-55
+blocked_by:
+- gh-55-fd-dirty-flag
