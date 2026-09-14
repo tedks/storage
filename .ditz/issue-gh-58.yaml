@@ -1,0 +1,22 @@
+id: gh-58
+title: 'GH #58: Stop holding the CacheManager lock across member downloads'
+desc: 'Epic for https://github.com/tedks/storage/issues/58.
+
+  Keeper of the #58/#60 pair. cache_file holds self._lock around exists, get_size
+  and copy_to_local (cache.py:243-274). Streaming session setup waits on it through
+  ensure_space -> evict_lru_files (cache.py:124, streaming.py:867), and unlink waits
+  through mark_cache_size_dirty (cache.py:91, namespace.py:414). There is no dedupe
+  and no is-cached recheck, so two opens of the same file download it twice.'
+type: bugfix
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-09-14T23:00:04-00:00
+references: []
+log_events:
+- time: 2026-09-14T23:00:04-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
