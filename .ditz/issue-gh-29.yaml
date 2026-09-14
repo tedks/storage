@@ -1,0 +1,22 @@
+id: gh-29
+title: 'GH #29: Define an SSH connection and session reuse policy for streaming workloads'
+desc: 'Epic for https://github.com/tedks/storage/issues/29.
+
+  Clients owned by dead threads are pruned (d3cc753, ssh.py:89-104, called at :108,296),
+  but client entries carry no timestamps (ssh.py:69), so idle live threads hold connections
+  forever. There is no pool, no ControlMaster, and no metrics for active, reused or
+  reconnected sessions. The only concurrency limit is the fail-fast reconnect lock
+  covered by #27.'
+type: feature
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-09-14T22:59:51-00:00
+references: []
+log_events:
+- time: 2026-09-14T22:59:51-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
