@@ -1,0 +1,21 @@
+id: gh-74
+title: 'GH #74: Stop downloading whole remote files for conflict checksum comparison'
+desc: 'Epic for https://github.com/tedks/storage/issues/74.
+
+  conflicts.py:76-92 still does a full copy_to_local plus a local hash, with a ''See
+  issue #74'' comment in place; PR #75 only added logging. Each sync target is checked
+  (sync_executor.py:95-100). The temp-file leak on the failure path is tracked separately
+  under #91.'
+type: feature
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-09-14T23:00:11-00:00
+references: []
+log_events:
+- time: 2026-09-14T23:00:11-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
