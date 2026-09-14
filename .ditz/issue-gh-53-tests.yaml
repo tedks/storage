@@ -1,0 +1,18 @@
+id: gh-53-tests
+title: Test that a slow member does not block other directories
+desc: 'A slow member on /a must not block readdir of /b or invalidation.
+
+  From https://github.com/tedks/storage/issues/53.'
+type: task
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-09-14T22:59:58-00:00
+references: []
+log_events:
+- time: 2026-09-14T22:59:58-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
