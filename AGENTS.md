@@ -57,24 +57,24 @@ The tests that mount FUSE (in all three gates) run only on Linux and need
 more than the flake:
 
 - **libfuse 2.** `fusepy` loads `libfuse.so.2`. If the host's `ldconfig`
-  cache has one (`libfuse2t64` on Ubuntu 24.04+ and Debian trixie,
-  `libfuse2` on older releases), `fusepy` finds it itself. Otherwise the
-  dev shell sets `FUSE_LIBRARY_PATH` to nixpkgs' build. A non-empty value
-  already in the environment always wins, and the shell banner's
-  `libfuse2:` line shows the choice. The `storage_tests*` targets in
-  `BUILD` pass the variable into the tests (`env_inherit`). nixpkgs' build
-  is loaded into Bazel's Python, which uses the host glibc, so it fails to
-  load on a host whose glibc is older than that build needs (at the
-  current `flake.lock`, `` version `GLIBC_2.38' not found ``, as in this
-  repo's Debian 12 `.devcontainer`). Install libfuse 2 on such a host.
-  Without any libfuse 2, every test module that imports `fuse` fails at
-  collection with `OSError: Unable to find libfuse`.
+  cache has one for the host architecture (`libfuse2t64` on Ubuntu 24.04+
+  and Debian trixie, `libfuse2` on older releases), `fusepy` finds it
+  itself. Otherwise the dev shell sets `FUSE_LIBRARY_PATH` to nixpkgs'
+  build. A non-empty value already in the environment always wins, and the
+  shell banner's `libfuse2:` line shows the choice. The `storage_tests*`
+  targets in `BUILD` pass the variable into the tests (`env_inherit`).
+  nixpkgs' build is loaded into Bazel's Python, which uses the host glibc,
+  so it fails to load on a host whose glibc is older than that build needs
+  (at the current `flake.lock`, `` version `GLIBC_2.38' not found ``, as
+  in this repo's Debian 12 `.devcontainer`). Install libfuse 2 on such a
+  host. Without any libfuse 2, every test module that imports `fuse` fails
+  at collection with `OSError: Unable to find libfuse`.
 - **`/dev/fuse` and a setuid `fusermount`.** libfuse runs its built-in
   `fusermount` path first (`/run/wrappers/bin` for nixpkgs' build, which
-  exists only on NixOS; `/bin` for distro builds), then the first
-  `fusermount` on `PATH`. Whichever it finds must be setuid. The dev shell
-  keeps nixpkgs' non-setuid `fusermount` off `PATH`, so do not put one
-  ahead of `/usr/bin` yourself (for example with
+  exists only on NixOS; `/bin` in Debian and Ubuntu builds), then the
+  first `fusermount` on `PATH`. Whichever it finds must be setuid. The dev
+  shell keeps nixpkgs' non-setuid `fusermount` off `PATH`, so do not put
+  one ahead of `/usr/bin` yourself (for example with
   `nix profile install nixpkgs#fuse`).
 - **No Bazel sandbox.** Mounts fail inside `linux-sandbox` with
   `fusermount: mount failed: Operation not permitted`, so the
