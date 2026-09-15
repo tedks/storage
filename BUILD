@@ -59,9 +59,11 @@ py_binary(
 
 # Tests
 #
-# Each tests/test_*.py module belongs to exactly one py_test below. The
-# gates are test_suites over those py_tests, so `bazel test` on several
-# gates runs each py_test once. Every py_test runs
+# Each tests/test_*.py module belongs to exactly one py_test below, and
+# //:storage_build_srcs_check (in the fast gate) fails if one is unlisted,
+# listed twice, or in a py_test that neither gate runs. The gates are
+# test_suites over those py_tests, so `bazel test` on several gates runs
+# each py_test once. Every py_test runs
 # tests/pytest_main.py with its modules as arguments; each module list is a
 # constant used for both srcs and args.
 #
@@ -194,15 +196,60 @@ py_test(
     tags = MOUNTED_TEST_TAGS,
 )
 
+# What BUILD actually lists: storage_lib and every py_test the fast and
+# mounted gates run, with their srcs, as XML. It queries
+# storage_tests_nonmounting rather than the fast gate because the fast gate
+# contains the check that depends on this query; test_suite membership is a
+# dependency edge, so that would be a cycle.
+genquery(
+    name = "build_srcs",
+    expression = "tests(//:storage_tests_nonmounting) + tests(//:storage_tests_mounted_system_gate) + //:storage_lib",
+    opts = ["--output=xml"],
+    scope = [
+        ":storage_lib",
+        ":storage_tests_mounted_system_gate",
+        ":storage_tests_nonmounting",
+    ],
+)
+
+# Compares :build_srcs with the storage/ and tests/test_*.py files in the
+# source tree. It reads the real tree, not only its declared inputs, so it
+# runs "local" (outside the sandbox) and "external" (never served from the
+# test cache: adding a file changes none of its inputs).
+py_test(
+    name = "storage_build_srcs_check",
+    srcs = ["tests/build_srcs_check.py"],
+    args = ["$(rootpath :build_srcs)"],
+    data = [
+        "MODULE.bazel",
+        ":build_srcs",
+    ],
+    main = "tests/build_srcs_check.py",
+    tags = [
+        "external",
+        "local",
+    ],
+)
+
 # Gates. Leave `tags` unset on these test_suites: on a test_suite, tags
 # filter which member tests run.
 
-# Everything that runs sandboxed.
+# Every module that does not mount, sandboxed. A new sandboxed py_test goes
+# here, not straight into the fast gate, or the srcs check reports its
+# modules as unlisted.
 test_suite(
-    name = "storage_tests_fast_gate",
+    name = "storage_tests_nonmounting",
     tests = [
         ":storage_tests_resilience_gradient",
         ":storage_tests_sandboxed",
+    ],
+)
+
+test_suite(
+    name = "storage_tests_fast_gate",
+    tests = [
+        ":storage_build_srcs_check",
+        ":storage_tests_nonmounting",
     ],
 )
 
