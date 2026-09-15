@@ -180,20 +180,26 @@ def _reconcile_failed_rollback_metadata(
     *,
     backend_name: str,
 ):
-    """Best-effort DB reconciliation when conflict xattr rollback cannot restore old state."""
-    if not promoted_metadata:
-        return
-    try:
-        for metadata in promoted_metadata:
+    """Best-effort DB reconciliation when conflict xattr rollback cannot restore old state.
+
+    The cache xattr for each of these paths is stuck at CONFLICT, so bring SQLite
+    in line with it: record the conflict status and drop this member's location
+    row, which the checksum mismatch already disproved (the failed update would
+    have dropped it too). Paths are reconciled independently, so one failure
+    neither stops the rest nor hides which path is still inconsistent.
+    """
+    for metadata in promoted_metadata:
+        try:
             state_manager.set_file_metadata(metadata)
-    except Exception as exc:
-        report.issues.append(
-            IndexIssue(
-                kind="cache_metadata_rollback_reconcile_failed",
-                virtual_path="",
-                detail=f"{backend_name}: {exc}",
+            state_manager.remove_file_location(metadata.virtual_path, backend_name)
+        except Exception as exc:
+            report.issues.append(
+                IndexIssue(
+                    kind="cache_metadata_rollback_reconcile_failed",
+                    virtual_path=metadata.virtual_path,
+                    detail=f"{backend_name}: {exc}",
+                )
             )
-        )
 
 
 def rebuild_index_from_cache(cache_root: Path, state_manager: StateManager) -> RebuildIndexReport:

@@ -883,11 +883,93 @@ class TestDebugIndexCLI(unittest.TestCase):
             refreshed_second = state_manager.get_file_metadata("/movie-b.mkv")
             self.assertEqual(SyncStatus.CONFLICT, refreshed_first.sync_status)
             self.assertEqual(SyncStatus.CLEAN, refreshed_second.sync_status)
+            # The mismatch disproved movie-a's local0 replica, so reconciliation
+            # drops that row; movie-b was never promoted and keeps its row.
+            self.assertEqual(
+                ["cache"],
+                sorted(location.backend_name for location in state_manager.get_file_locations("/movie-a.mkv")),
+            )
+            self.assertEqual(
+                ["cache", "local0"],
+                sorted(location.backend_name for location in state_manager.get_file_locations("/movie-b.mkv")),
+            )
         finally:
             state_manager.close()
 
         self.assertEqual(SyncStatus.CONFLICT, read_cache_metadata(first_cache_path).sync_status)
         self.assertEqual(SyncStatus.CLEAN, read_cache_metadata(second_cache_path).sync_status)
+
+    def test_reprobe_locations_reconciles_each_path_independently_after_database_update_fails(self):
+        paths = ["/movie-a.mkv", "/movie-b.mkv"]
+        cache_paths = {}
+        state_manager = StateManager(str(self.db_path))
+        try:
+            remote_dir = self.temp_dir / "remote-reconcile-each"
+            remote_dir.mkdir()
+            for virtual_path in paths:
+                cache_path = self.cache_dir / virtual_path.lstrip("/")
+                cache_path.write_bytes(b"payload" + virtual_path.encode())
+                cache_paths[virtual_path] = cache_path
+                metadata = self._metadata(virtual_path, cache_path, sync_status=SyncStatus.CLEAN)
+                write_cache_metadata(cache_path, metadata)
+                state_manager.set_file_metadata(metadata)
+                for backend_name, is_cached in (("cache", True), ("local0", False)):
+                    state_manager.add_file_location(
+                        FileLocation(
+                            virtual_path=virtual_path,
+                            backend_name=backend_name,
+                            checksum=metadata.checksum or "",
+                            last_synced=metadata.last_modified,
+                            is_cached=is_cached,
+                        )
+                    )
+                (remote_dir / virtual_path.lstrip("/")).write_bytes(b"other" + virtual_path.encode())
+
+            original_write_cache_metadata = write_cache_metadata
+
+            def rollback_fails(cache_path, metadata, *, virtual_path=None):
+                # Conflict promotion succeeds; restoring the original xattr fails.
+                if metadata.sync_status != SyncStatus.CONFLICT:
+                    raise OSError("rollback failed")
+                return original_write_cache_metadata(cache_path, metadata, virtual_path=virtual_path)
+
+            original_set_file_metadata = state_manager.set_file_metadata
+
+            def set_fails_for_first(metadata):
+                if metadata.virtual_path == "/movie-a.mkv":
+                    raise sqlite3.OperationalError("reconcile write failed")
+                return original_set_file_metadata(metadata)
+
+            with mock.patch("storage.index_audit.write_cache_metadata", side_effect=rollback_fails), \
+                    mock.patch.object(state_manager, "_commit_locked", side_effect=sqlite3.OperationalError("db write failed")), \
+                    mock.patch.object(state_manager, "set_file_metadata", side_effect=set_fails_for_first):
+                report = reprobe_member_locations(
+                    state_manager,
+                    {"local0": LocalBackend("local0", str(remote_dir))},
+                    cache_root=self.cache_dir,
+                )
+
+            self.assertTrue(any(issue.kind == "member_db_update_failed" for issue in report.issues))
+            reconcile_failures = [
+                issue.virtual_path
+                for issue in report.issues
+                if issue.kind == "cache_metadata_rollback_reconcile_failed"
+            ]
+            self.assertEqual(["/movie-a.mkv"], reconcile_failures)
+
+            # The first path's failure did not stop the second from being reconciled.
+            self.assertEqual(SyncStatus.CONFLICT, state_manager.get_file_metadata("/movie-b.mkv").sync_status)
+            self.assertEqual(
+                ["cache"],
+                sorted(location.backend_name for location in state_manager.get_file_locations("/movie-b.mkv")),
+            )
+            # The failed path is left as it was and is named in the report.
+            self.assertEqual(SyncStatus.CLEAN, state_manager.get_file_metadata("/movie-a.mkv").sync_status)
+        finally:
+            state_manager.close()
+
+        for virtual_path in paths:
+            self.assertEqual(SyncStatus.CONFLICT, read_cache_metadata(cache_paths[virtual_path]).sync_status)
 
     def test_reprobe_locations_promotes_clean_mismatch_to_conflict_and_drops_replica_row(self):
         cache_path = self.cache_dir / "movie.mkv"
