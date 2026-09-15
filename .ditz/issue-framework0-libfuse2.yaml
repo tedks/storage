@@ -20,8 +20,8 @@ type: task
 component: default
 release:
 reporter: Ted Smith <tedks@riseup.net>
-status: unstarted
-disposition:
+status: closed
+disposition: wontfix
 creation_time: 2026-09-15T00:27:16-00:00
 references: []
 log_events:
@@ -37,3 +37,13 @@ log_events:
     FUSE_LIBRARY_PATH it exported, because a non-empty preset value wins. Open a fresh
     shell or run direnv reload. The banner''s libfuse2: line shows which library is
     in use.'
+- time: 2026-09-15T01:37:30-00:00
+  who: Ted Smith
+  what: 'closed: wontfix'
+  comment: 'Operator decision (2026-09-14): keep libfuse 2 in Nix and do not install
+    libfuse2t64 on framework0. Accepted risk: framework0 loads nixpkgs'' libfuse.so.2
+    into Bazel''s host-glibc Python, which needs GLIBC_2.38 at the PR #92 flake.lock
+    (host has 2.39). If a flake.lock bump raises that floor, the gates fail with "version
+    GLIBC_2.xx not found". Fix it inside Nix, not on the host, e.g. take fuse2 from
+    a nixpkgs input whose glibc floor the host meets, or run the tests with a Nix-provided
+    Python.'
