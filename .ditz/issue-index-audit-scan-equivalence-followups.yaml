@@ -1,0 +1,36 @@
+id: index-audit-scan-equivalence-followups
+title: 'Index audit: case-folding limit, per-row syscall cost, reconcile delete scope'
+desc: 'Remaining nits from the PR #85 convergence review (2026-09-14), manual recovery
+  commands only.
+
+  - Case-folding/normalizing filesystems (APFS, ext4 casefold dirs): cache_file_would_be_scanned
+  accepts ''/A.bin'' for on-disk ''a.bin'', so a wrong-case duplicate row is not reported
+  as orphaned. Documented as a limit; exact checking needs directory listings per
+  component. Revisit if a non-case-sensitive cache filesystem becomes supported.
+
+  - Cost: the helper does ~3 syscalls per directory level per row (islink, isdir,
+  access) versus one stat before. Rows arrive in sorted path order, so caching the
+  result for the last parent directory would recover most of it on large caches.
+
+  - _reconcile_failed_rollback_metadata uses remove_file_location, which ignores is_cached
+  and does not normalize the path, while apply_reprobe_backend_update deletes only
+  is_cached=0 rows on normalized paths. Cannot matter today (the CLI accepts only
+  localN/remoteN member names and paths come from the files table), but aligning the
+  two would remove the asymmetry.
+
+  - The two reconcile writes commit separately; if the row removal fails after the
+  status write, the report says which repair failed and re-running reprobe repairs
+  it.'
+type: task
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-09-15T01:52:58-00:00
+references: []
+log_events:
+- time: 2026-09-15T01:52:58-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
