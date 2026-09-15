@@ -61,7 +61,8 @@ py_binary(
 #
 # Each tests/test_*.py module belongs to exactly one py_test below, and
 # //:storage_build_srcs_check (in the fast gate) fails if one is unlisted,
-# listed twice, or in a py_test that neither gate runs. The gates are
+# in a py_test that neither gate runs, listed by two gate-run py_tests, or
+# in a py_test's srcs but not its args. The gates are
 # test_suites over those py_tests, so `bazel test` on several gates runs
 # each py_test once. Every py_test runs
 # tests/pytest_main.py with its modules as arguments; each module list is a
@@ -75,7 +76,7 @@ py_binary(
 # Passing --@rules_python//python/config_settings:precompile=force_enabled
 # overrides the attribute and brings the conflict back.
 #
-# Most modules import fuse, directly or through storage.fs, so every test
+# Most modules import fuse, directly or through storage.fs, so every pytest
 # target needs libfuse 2. fusepy reads FUSE_LIBRARY_PATH to find it before
 # falling back to find_library("fuse"). The flake's dev shell sets it when
 # the host has no libfuse 2; Bazel test actions do not inherit the client
@@ -245,6 +246,8 @@ test_suite(
     ],
 )
 
+# The srcs check cannot see this suite (see :build_srcs), so it cannot
+# notice if storage_tests_nonmounting is dropped from it: keep both entries.
 test_suite(
     name = "storage_tests_fast_gate",
     tests = [
