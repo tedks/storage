@@ -59,29 +59,20 @@ py_binary(
 
 # Tests
 #
-# Each tests/test_*.py module belongs to exactly one py_test below, and
-# //:storage_build_srcs_check (in the fast gate) fails if one is unlisted,
-# in a py_test that neither gate runs, listed by two gate-run py_tests, or
-# in a py_test's srcs but not its args. The gates are
-# test_suites over those py_tests, so `bazel test` on several gates runs
-# each py_test once. Every py_test runs
-# tests/pytest_main.py with its modules as arguments; each module list is a
-# constant used for both srcs and args.
+# Each tests/test_*.py module is in the srcs of exactly one py_test, and the
+# gates are test_suites over those py_tests. Every py_test runs
+# tests/pytest_main.py, which collects the test modules in its runfiles:
+# exactly its srcs. //:storage_build_srcs_check fails when a module on disk
+# is not listed.
 #
-# The py_tests set precompile = "disabled" because they share that main.
-# Bazel copies a target's tags into its actions' execution info
-# (--incompatible_allow_tags_propagation), so a "local" and an untagged
-# target would each emit a different action for the same
-# tests/__pycache__/pytest_main.*.pyc, which Bazel rejects as conflicting.
-# Passing --@rules_python//python/config_settings:precompile=force_enabled
-# overrides the attribute and brings the conflict back.
+# The py_tests set precompile = "disabled" because they share that main:
+# Bazel copies each target's tags into its actions, so a "local" and an
+# untagged target would emit conflicting precompile actions for the same
+# tests/__pycache__/pytest_main.*.pyc.
 #
-# Most modules import fuse, directly or through storage.fs, so every pytest
-# target needs libfuse 2. fusepy reads FUSE_LIBRARY_PATH to find it before
-# falling back to find_library("fuse"). The flake's dev shell sets it when
-# the host has no libfuse 2; Bazel test actions do not inherit the client
-# environment unless asked.
-FUSE_TEST_ENV_INHERIT = ["FUSE_LIBRARY_PATH"]
+# Most modules import fuse, directly or through storage.fs. fusepy finds
+# libfuse 2 through FUSE_LIBRARY_PATH, which the dev shell sets when the host
+# has none; Bazel passes it to a test only through env_inherit.
 
 TEST_DEPS = [
     ":storage_lib",
@@ -89,123 +80,112 @@ TEST_DEPS = [
     "@pypi//pytest_timeout",
 ]
 
-# Modules that never mount a FUSE filesystem run inside Bazel's sandbox.
-# A module that starts mounting fails here with "fusermount: mount failed:
-# Operation not permitted"; move it to its own mounted target.
-SANDBOXED_TEST_MODULES = [
-    "tests/test_allow_other.py",
-    "tests/test_cache.py",
-    "tests/test_cache_metadata.py",
-    "tests/test_cli_debug.py",
-    "tests/test_cli_mount.py",
-    "tests/test_crypto.py",
-    "tests/test_file_config.py",
-    "tests/test_fs_core_integration.py",
-    "tests/test_fs_namespace_integration.py",
-    "tests/test_fs_streaming.py",
-    "tests/test_local_backend.py",
-    "tests/test_member_capabilities.py",
-    "tests/test_models.py",
-    "tests/test_mount_lock.py",
-    "tests/test_mount_profiles.py",
-    "tests/test_namespace.py",
-    "tests/test_pathing.py",
-    "tests/test_recompute.py",
-    "tests/test_replication.py",
-    "tests/test_rsync_backend.py",
-    "tests/test_ssh_backend.py",
-    "tests/test_state.py",
-    "tests/test_state_rename.py",
-    "tests/test_sync_dir_ops.py",
-    "tests/test_sync_executor.py",
-    "tests/test_sync_manager.py",
-    "tests/test_sync_tasks.py",
-    "tests/test_watcher.py",
-]
-
+# Modules that do not mount FUSE run inside Bazel's sandbox. One that starts
+# mounting fails here with "fusermount: mount failed: Operation not
+# permitted"; give it its own mounted py_test.
 py_test(
     name = "storage_tests_sandboxed",
-    srcs = ["tests/pytest_main.py"] + SANDBOXED_TEST_MODULES,
-    args = SANDBOXED_TEST_MODULES,
+    srcs = [
+        "tests/pytest_main.py",
+        "tests/test_allow_other.py",
+        "tests/test_cache.py",
+        "tests/test_cache_metadata.py",
+        "tests/test_cli_debug.py",
+        "tests/test_cli_mount.py",
+        "tests/test_crypto.py",
+        "tests/test_file_config.py",
+        "tests/test_fs_core_integration.py",
+        "tests/test_fs_namespace_integration.py",
+        "tests/test_fs_streaming.py",
+        "tests/test_local_backend.py",
+        "tests/test_member_capabilities.py",
+        "tests/test_models.py",
+        "tests/test_mount_lock.py",
+        "tests/test_mount_profiles.py",
+        "tests/test_namespace.py",
+        "tests/test_pathing.py",
+        "tests/test_recompute.py",
+        "tests/test_replication.py",
+        "tests/test_rsync_backend.py",
+        "tests/test_ssh_backend.py",
+        "tests/test_state.py",
+        "tests/test_state_rename.py",
+        "tests/test_sync_dir_ops.py",
+        "tests/test_sync_executor.py",
+        "tests/test_sync_manager.py",
+        "tests/test_sync_tasks.py",
+        "tests/test_watcher.py",
+    ],
     main = "tests/pytest_main.py",
     precompile = "disabled",
-    # About 200s on framework0; "moderate" (300s) leaves little headroom
-    # on a slower or loaded host.
+    # About 200s on framework0; the default 300s leaves little headroom.
     timeout = "long",
     deps = TEST_DEPS,
-    env_inherit = FUSE_TEST_ENV_INHERIT,
+    env_inherit = ["FUSE_LIBRARY_PATH"],
 )
 
-# Sandboxed too; a separate target so the resilience gate can include it
-# without the rest of the sandboxed modules.
-RESILIENCE_GRADIENT_TEST_MODULES = ["tests/test_resilience_gradient.py"]
-
+# Sandboxed too; its own target so the resilience gate can include it alone.
 py_test(
     name = "storage_tests_resilience_gradient",
-    srcs = ["tests/pytest_main.py"] + RESILIENCE_GRADIENT_TEST_MODULES,
-    args = RESILIENCE_GRADIENT_TEST_MODULES,
+    srcs = [
+        "tests/pytest_main.py",
+        "tests/test_resilience_gradient.py",
+    ],
     main = "tests/pytest_main.py",
     precompile = "disabled",
     deps = TEST_DEPS,
-    env_inherit = FUSE_TEST_ENV_INHERIT,
+    env_inherit = ["FUSE_LIBRARY_PATH"],
 )
 
-# Modules that mount real FUSE filesystems, one target each. Mounting goes
-# through the host's setuid fusermount, which cannot mount inside Bazel's
-# linux-sandbox. "local" runs these tests unsandboxed and keeps them off
-# remote executors and remote caches: they need /dev/fuse and a setuid
-# fusermount on the machine that runs them, and a pass elsewhere says
-# nothing about this host.
-MOUNTED_TEST_TAGS = ["local"]
-
-CONFLICTS_INTEGRATION_TEST_MODULES = ["tests/test_conflicts_integration.py"]
-
+# Modules that mount real FUSE filesystems, one target each. The host's
+# setuid fusermount cannot mount inside linux-sandbox, so these are "local":
+# unsandboxed, and never remotely executed or cached, since they need
+# /dev/fuse and fusermount on the machine that runs them.
 py_test(
     name = "storage_tests_conflicts_integration",
-    srcs = ["tests/pytest_main.py"] + CONFLICTS_INTEGRATION_TEST_MODULES,
-    args = CONFLICTS_INTEGRATION_TEST_MODULES,
+    srcs = [
+        "tests/pytest_main.py",
+        "tests/test_conflicts_integration.py",
+    ],
     main = "tests/pytest_main.py",
     precompile = "disabled",
     deps = TEST_DEPS,
-    env_inherit = FUSE_TEST_ENV_INHERIT,
-    tags = MOUNTED_TEST_TAGS,
+    env_inherit = ["FUSE_LIBRARY_PATH"],
+    tags = ["local"],
 )
-
-STREAMING_SYSTEM_TEST_MODULES = ["tests/test_streaming_system.py"]
 
 py_test(
     name = "storage_tests_streaming_system",
-    srcs = ["tests/pytest_main.py"] + STREAMING_SYSTEM_TEST_MODULES,
-    args = STREAMING_SYSTEM_TEST_MODULES,
+    srcs = [
+        "tests/pytest_main.py",
+        "tests/test_streaming_system.py",
+    ],
     main = "tests/pytest_main.py",
     precompile = "disabled",
     deps = TEST_DEPS,
-    env_inherit = FUSE_TEST_ENV_INHERIT,
-    tags = MOUNTED_TEST_TAGS,
+    env_inherit = ["FUSE_LIBRARY_PATH"],
+    tags = ["local"],
 )
-
-SYNC_SYSTEM_TEST_MODULES = ["tests/test_sync_system.py"]
 
 py_test(
     name = "storage_tests_sync_system",
-    srcs = ["tests/pytest_main.py"] + SYNC_SYSTEM_TEST_MODULES,
-    args = SYNC_SYSTEM_TEST_MODULES,
+    srcs = [
+        "tests/pytest_main.py",
+        "tests/test_sync_system.py",
+    ],
     main = "tests/pytest_main.py",
     precompile = "disabled",
     deps = TEST_DEPS,
-    env_inherit = FUSE_TEST_ENV_INHERIT,
-    tags = MOUNTED_TEST_TAGS,
+    env_inherit = ["FUSE_LIBRARY_PATH"],
+    tags = ["local"],
 )
 
-# What BUILD actually lists: storage_lib and every py_test the fast and
-# mounted gates run, with their srcs, as XML. It queries
-# storage_tests_nonmounting rather than the fast gate because the fast gate
-# contains the check that depends on this query; test_suite membership is a
-# dependency edge, so that would be a cycle.
+# What the gates and storage_lib list, one label per line. It names
+# storage_tests_nonmounting instead of the fast gate: the fast gate contains
+# the check that reads this, and suite membership is a dependency (a cycle).
 genquery(
     name = "build_srcs",
-    expression = "tests(//:storage_tests_nonmounting) + tests(//:storage_tests_mounted_system_gate) + //:storage_lib",
-    opts = ["--output=xml"],
+    expression = "labels(srcs, tests(//:storage_tests_nonmounting) + tests(//:storage_tests_mounted_system_gate) + //:storage_lib)",
     scope = [
         ":storage_lib",
         ":storage_tests_mounted_system_gate",
@@ -213,10 +193,8 @@ genquery(
     ],
 )
 
-# Compares :build_srcs with the storage/ and tests/test_*.py files in the
-# source tree. It reads the real tree, not only its declared inputs, so it
-# runs "local" (outside the sandbox) and "external" (never served from the
-# test cache: adding a file changes none of its inputs).
+# Reads the source tree, not just its inputs: "local" to see it, "external"
+# so a cached pass cannot hide a newly added file.
 py_test(
     name = "storage_build_srcs_check",
     srcs = ["tests/build_srcs_check.py"],
@@ -235,9 +213,6 @@ py_test(
 # Gates. Leave `tags` unset on these test_suites: on a test_suite, tags
 # filter which member tests run.
 
-# Every module that does not mount, sandboxed. A new sandboxed py_test goes
-# here, not straight into the fast gate, or the srcs check reports its
-# modules as unlisted.
 test_suite(
     name = "storage_tests_nonmounting",
     tests = [
@@ -246,8 +221,7 @@ test_suite(
     ],
 )
 
-# The srcs check cannot see this suite (see :build_srcs), so it cannot
-# notice if storage_tests_nonmounting is dropped from it: keep both entries.
+# Keep storage_tests_nonmounting here; the srcs check cannot see this suite.
 test_suite(
     name = "storage_tests_fast_gate",
     tests = [
@@ -256,7 +230,6 @@ test_suite(
     ],
 )
 
-# Everything that mounts FUSE.
 test_suite(
     name = "storage_tests_mounted_system_gate",
     tests = [
@@ -274,7 +247,6 @@ test_suite(
     ],
 )
 
-# The whole suite: the fast and mounted gates together cover every module.
 test_suite(
     name = "storage_tests",
     tests = [
