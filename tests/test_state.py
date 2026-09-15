@@ -174,22 +174,33 @@ class TestStateAccessUpdates(unittest.TestCase):
             keys(is_cached=False),
         )
 
-    def test_iter_file_locations_pages_do_bounded_work_for_a_late_cursor(self):
-        # Each page must seek to its cursor. Choosing idx_cached, sorting in a temp
-        # B-tree, or scanning from the start all cost O(rows) per page and make a
-        # full iteration quadratic. Count SQLite VM steps for one late page rather
-        # than matching EXPLAIN QUERY PLAN text, which is not a stable interface
-        # (and a SCAN in primary-key order would pass a plan-text check).
+    def test_iter_file_locations_pages_do_bounded_work_at_any_cursor(self):
+        # Each page must seek to its cursor and read only LIMIT rows. Choosing
+        # idx_cached, sorting in a temp B-tree, or scanning from the start all cost
+        # O(rows) per page and make a full iteration quadratic. Count SQLite VM
+        # steps per page rather than matching EXPLAIN QUERY PLAN text, which is not
+        # a stable interface (and a SCAN in primary-key order passes a plan check).
         paths = 5000
         rows = [
             (f"/f{index:06d}", backend_name, "c", 1.0, int(backend_name == "cache"))
             for index in range(paths)
             for backend_name in ("cache", "remote1")
         ]
-        late_cursor = (f"/f{paths - 5:06d}", "remote1")
+        # No single cursor position catches every regression: scanning from the
+        # start is cheap for an early page, and seeking then sorting the remaining
+        # suffix is cheap for a late one. A regression is costly at one of these.
+        cursors = {
+            "early": ("", ""),
+            "middle": (f"/f{paths // 2:06d}", "remote1"),
+            "late": (f"/f{paths - 5:06d}", "remote1"),
+        }
         cases = [
-            ("all", StateManager.ITER_LOCATIONS_QUERY, late_cursor + (10,)),
-            ("cached", StateManager.ITER_LOCATIONS_BY_CACHE_QUERY, (1,) + late_cursor + (10,)),
+            (f"{name} {position}", query, prefix + cursor + (10,))
+            for position, cursor in cursors.items()
+            for name, query, prefix in (
+                ("all", StateManager.ITER_LOCATIONS_QUERY, ()),
+                ("cached", StateManager.ITER_LOCATIONS_BY_CACHE_QUERY, (1,)),
+            )
         ]
 
         conn = self.state_manager.conn
@@ -211,9 +222,11 @@ class TestStateAccessUpdates(unittest.TestCase):
                         conn.set_progress_handler(None, 1)
 
                     self.assertTrue(fetched)
-                    # A seek measured about 130-140 steps on SQLite 3.45-3.50; the
-                    # regressions above measured 35,000-60,000 on this table.
+                    # The real queries measured at most 262 steps at any of these
+                    # cursors on SQLite 3.45-3.50; each regression above measured at
+                    # least 45,000 at one or more of them on this table.
                     self.assertLess(steps[0], 2000)
+
 
 if __name__ == "__main__":
     unittest.main()

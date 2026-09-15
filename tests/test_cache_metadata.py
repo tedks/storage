@@ -109,7 +109,7 @@ class TestCacheMetadata(unittest.TestCase):
         self.assertTrue(cache_file_would_be_scanned(root, "/top.bin"))
 
         original_mode = stat.S_IMODE(root.stat().st_mode)
-        # Execute-only: a known name still lstats, but os.walk cannot list the root.
+        # Searchable but not readable: a known name still lstats, but os.walk cannot list the root.
         os.chmod(root, 0o311)
         try:
             try:
@@ -123,6 +123,7 @@ class TestCacheMetadata(unittest.TestCase):
             self.assertFalse(cache_file_would_be_scanned(root, "/top.bin"))
         finally:
             os.chmod(root, original_mode)
+
 
 if __name__ == "__main__":
     unittest.main()

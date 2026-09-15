@@ -39,7 +39,7 @@ class StateManager:
     # the (virtual_path, backend_name) primary key so each page is an index range
     # seek. The unary + on is_cached stops SQLite from choosing idx_cached, which
     # would re-sort all remaining cached rows for every page (quadratic).
-    # tests/test_state.py checks these plans.
+    # tests/test_state.py bounds the work each page does.
     ITER_LOCATIONS_QUERY = """
         SELECT * FROM file_locations
         WHERE (virtual_path, backend_name) > (?, ?)

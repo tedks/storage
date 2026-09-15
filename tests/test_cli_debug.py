@@ -908,7 +908,8 @@ class TestDebugIndexCLI(unittest.TestCase):
         Rollback walks the written conflicts in reverse, so reconciliation visits
         movie-b before movie-a. Failing movie-b, the first path visited, is what
         proves a failure neither stops later paths nor the other repair.
-        Returns the report plus each path's (db status, member backends, xattr status).
+        Returns (failures, outcome, xattrs): the reconcile failures as (path, detail),
+        each path's (db status, sorted backend names), and each path's xattr status.
         """
         paths = ["/movie-a.mkv", "/movie-b.mkv"]
         cache_paths = {}
