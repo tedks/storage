@@ -35,6 +35,25 @@ class StateManager:
     ACCESS_FLUSH_BATCH_SIZE = 256
     WRITE_BATCH_SIZE = 1000
 
+    # Keyset paging over file_locations. The cursor is a row-value comparison on
+    # the (virtual_path, backend_name) primary key so each page is an index range
+    # seek. The unary + on is_cached stops SQLite from choosing idx_cached, which
+    # would re-sort all remaining cached rows for every page (quadratic).
+    # tests/test_state.py checks these plans.
+    ITER_LOCATIONS_QUERY = """
+        SELECT * FROM file_locations
+        WHERE (virtual_path, backend_name) > (?, ?)
+        ORDER BY virtual_path ASC, backend_name ASC
+        LIMIT ?
+    """
+    ITER_LOCATIONS_BY_CACHE_QUERY = """
+        SELECT * FROM file_locations
+        WHERE +is_cached = ?
+          AND (virtual_path, backend_name) > (?, ?)
+        ORDER BY virtual_path ASC, backend_name ASC
+        LIMIT ?
+    """
+
     def __init__(self, db_path: str):
         self.db_path = db_path
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
@@ -265,33 +284,16 @@ class StateManager:
         is_cached: Optional[bool] = None,
         batch_size: int = WRITE_BATCH_SIZE,
     ) -> Iterator[FileLocation]:
-        """Yield file location rows in bounded batches.
-
-        The cursor is a row-value comparison on the (virtual_path, backend_name)
-        primary key so each page is an index range seek. The unary ``+`` on
-        is_cached stops SQLite from choosing idx_cached, which would re-sort all
-        remaining cached rows for every page and make iteration quadratic.
-        """
+        """Yield file location rows in bounded batches (see ITER_LOCATIONS_QUERY)."""
         last_path = ""
         last_backend = ""
         while True:
             params: tuple
             if is_cached is None:
-                query = '''
-                    SELECT * FROM file_locations
-                    WHERE (virtual_path, backend_name) > (?, ?)
-                    ORDER BY virtual_path ASC, backend_name ASC
-                    LIMIT ?
-                '''
+                query = self.ITER_LOCATIONS_QUERY
                 params = (last_path, last_backend, batch_size)
             else:
-                query = '''
-                    SELECT * FROM file_locations
-                    WHERE +is_cached = ?
-                      AND (virtual_path, backend_name) > (?, ?)
-                    ORDER BY virtual_path ASC, backend_name ASC
-                    LIMIT ?
-                '''
+                query = self.ITER_LOCATIONS_BY_CACHE_QUERY
                 params = (int(is_cached), last_path, last_backend, batch_size)
 
             with self._db_lock:

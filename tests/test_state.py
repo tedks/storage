@@ -174,6 +174,24 @@ class TestStateAccessUpdates(unittest.TestCase):
             keys(is_cached=False),
         )
 
+    def test_iter_file_locations_queries_seek_the_primary_key(self):
+        # Guards the paging plan: using idx_cached, or sorting each page in a temp
+        # B-tree, makes a full iteration quadratic in the number of rows.
+        cases = [
+            (StateManager.ITER_LOCATIONS_QUERY, ("", "", 1000)),
+            (StateManager.ITER_LOCATIONS_BY_CACHE_QUERY, (1, "", "", 1000)),
+        ]
+        for query, params in cases:
+            with self.subTest(query=query):
+                with self.state_manager._db_lock:
+                    plan = " | ".join(
+                        row[3]
+                        for row in self.state_manager.conn.execute("EXPLAIN QUERY PLAN " + query, params)
+                    )
+                self.assertIn("sqlite_autoindex_file_locations_1", plan)
+                self.assertNotIn("idx_cached", plan)
+                self.assertNotIn("TEMP B-TREE", plan)
+
 
 if __name__ == "__main__":
     unittest.main()
