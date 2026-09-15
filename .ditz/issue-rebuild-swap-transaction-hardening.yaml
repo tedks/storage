@@ -1,0 +1,44 @@
+id: rebuild-swap-transaction-hardening
+title: Harden the rebuild-index temp-table swap (concurrency, interrupts, tests)
+desc: 'Deferred Important/nit findings on StateManager.replace_index_from_entries
+  from the PR #85 council review (2026-09-14). All are on the manual rebuild-index
+  path.
+
+  - Concurrent writer (Claude seat, measured): the implicit transaction opens at the
+  first temp batch; a later legacy get_file_metadata pins a WAL snapshot; if another
+  connection commits meanwhile (e.g. a live mount''s access flush), DELETE FROM file_locations
+  fails with ''database is locked'' (BUSY_SNAPSHOT, not covered by busy_timeout) after
+  the whole scan. It fails safely (rollback) but is new, and the long snapshot blocks
+  checkpoints. Fix: commit each temp batch, then do the swap in a short BEGIN IMMEDIATE,
+  and document rebuild as offline-only.
+
+  - except Exception misses KeyboardInterrupt (measured): after Ctrl-C inside replace_index
+  the transaction stayed open and a later unrelated commit made the DELETE permanent.
+  The CLI is safe today only because close() does not commit. Use BaseException in
+  replace_index, replace_index_from_entries, apply_reprobe_backend_update.
+
+  - Qualify temp tables: DROP TABLE IF EXISTS replacement_files drops main.replacement_files
+  when no temp table exists (confirmed).
+
+  - Use explicit column lists in INSERT INTO files/file_locations SELECT, instead
+  of relying on the temp DDL''s column order.
+
+  - Drop the temp tables after commit, not inside the swap transaction.
+
+  - Tests: replace_index_from_entries has no failure-path coverage (generator raising
+  after multiple batches, insert failure, commit failure; assert old rows intact and
+  connection usable); nothing exercises WRITE_BATCH_SIZE boundaries. replace_index
+  has no production callers any more: delete it or make it delegate.'
+type: task
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-09-15T01:37:03-00:00
+references: []
+log_events:
+- time: 2026-09-15T01:37:03-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
