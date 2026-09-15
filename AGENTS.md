@@ -66,12 +66,17 @@ more than the flake:
   so it fails to load on a host whose glibc is older than that build needs
   (at the current `flake.lock`, `` version `GLIBC_2.38' not found ``, as
   in this repo's Debian 12 `.devcontainer`). Fix that in `flake.nix`, not
-  by installing a host package: add an older nixpkgs input whose libfuse 2
-  the host can load, and use its package in `libfuse2Hook`. For example,
-  nixos-23.05's `fuse` (2.9.9; `fuse2` did not exist yet) needs only
-  `GLIBC_2.34` and loads on Debian 12. Without any libfuse 2, every test
-  module that imports `fuse` fails at collection with
-  `OSError: Unable to find libfuse`.
+  by installing a host libfuse 2: add an older nixpkgs input whose libfuse
+  2 the host can load, and use its package in place of `pkgs.fuse2.out` in
+  `libfuse2Hook`. The flake cannot see the host glibc, so this changes the
+  fallback on every host without a libfuse 2; an older build still loads
+  on newer glibc. For example, nixos-23.05's `fuse` (2.9.9; `fuse2` did not
+  exist yet) needs only `GLIBC_2.34` and loads on Debian 12 and Ubuntu
+  24.04. Update this paragraph and the flake comments to match, and enter
+  a fresh shell (or `direnv reload`) afterwards, since a
+  `FUSE_LIBRARY_PATH` already set by an older shell wins. Without any
+  libfuse 2, every test module that imports `fuse` fails at collection
+  with `OSError: Unable to find libfuse`.
 - **`/dev/fuse` and a setuid `fusermount`.** libfuse runs its built-in
   `fusermount` path first (`/run/wrappers/bin` for nixpkgs' build, which
   exists only on NixOS; `/bin` in Debian and Ubuntu builds), then the
