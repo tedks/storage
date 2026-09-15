@@ -56,9 +56,8 @@ If using direnv, `.envrc` is `use flake`.
 The tests that mount FUSE (in all three gates) run only on Linux and need
 more than the flake:
 
-- **libfuse 2.** `fusepy` loads `libfuse.so.2`. If the host's `ldconfig`
-  cache has one for the host architecture (`libfuse2t64` on Ubuntu 24.04+
-  and Debian trixie, `libfuse2` on older releases), `fusepy` finds it
+- **libfuse 2.** `fusepy` loads `libfuse.so.2`. If the host already has
+  one in its `ldconfig` cache for the host architecture, `fusepy` finds it
   itself. Otherwise the dev shell sets `FUSE_LIBRARY_PATH` to nixpkgs'
   build. A non-empty value already in the environment always wins, and the
   shell banner's `libfuse2:` line shows the choice. The `storage_tests*`
@@ -66,9 +65,18 @@ more than the flake:
   nixpkgs' build is loaded into Bazel's Python, which uses the host glibc,
   so it fails to load on a host whose glibc is older than that build needs
   (at the current `flake.lock`, `` version `GLIBC_2.38' not found ``, as
-  in this repo's Debian 12 `.devcontainer`). Install libfuse 2 on such a
-  host. Without any libfuse 2, every test module that imports `fuse` fails
-  at collection with `OSError: Unable to find libfuse`.
+  in this repo's Debian 12 `.devcontainer`). Fix that in `flake.nix`, not
+  by installing a host libfuse 2: add an older nixpkgs input whose libfuse
+  2 the host can load, and use its package in place of `pkgs.fuse2.out` in
+  `libfuse2Hook`. The flake cannot see the host glibc, so this changes the
+  fallback on every host without a libfuse 2; an older build still loads
+  on newer glibc. For example, nixos-23.05's `fuse` (2.9.9; `fuse2` did not
+  exist yet) needs only `GLIBC_2.34` and loads on Debian 12 and Ubuntu
+  24.04. Update this paragraph and the flake comments to match, and enter
+  a fresh shell (or `direnv reload`) afterwards, since a
+  `FUSE_LIBRARY_PATH` already set by an older shell wins. Without any
+  libfuse 2, every test module that imports `fuse` fails at collection
+  with `OSError: Unable to find libfuse`.
 - **`/dev/fuse` and a setuid `fusermount`.** libfuse runs its built-in
   `fusermount` path first (`/run/wrappers/bin` for nixpkgs' build, which
   exists only on NixOS; `/bin` in Debian and Ubuntu builds), then the
