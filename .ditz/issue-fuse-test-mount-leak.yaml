@@ -1,0 +1,35 @@
+id: fuse-test-mount-leak
+title: FUSE test mounts and temp dirs leak when Bazel kills a test
+desc: 'Deferred from council round 1 on PR #92 (fuse-test-env); Claude rated it a
+  nit.
+
+
+  The FUSE tests run unsandboxed (tag "local" since PR #92; before that the documented
+  gate used --strategy=TestRunner=local). Bazel''s local runner sets TMPDIR to the
+  client''s TMPDIR or /tmp, and the tests create mount points with tempfile.mkdtemp(),
+  so they land in host /tmp or /tmp/nix-shell.*. If Bazel kills a test (test timeout,
+  Ctrl-C), tearDown never runs. The mount stays behind as a stale "Transport endpoint
+  is not connected" entry, along with its payload directories (~12MB for the streaming
+  tests).
+
+
+  Possible fixes: pass auto_unmount=True (libfuse 2 option, handled by fusermount)
+  to the FUSE(...) calls in the test harnesses; or put mount points under TEST_TMPDIR
+  and add a session-level cleanup that runs `fusermount -u -z` on leftovers.
+
+
+  Why deferred: it changes test harness code, which is outside fuse-test-env''s scope,
+  and the behavior predates PR #92.'
+type: bugfix
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-09-15T00:27:16-00:00
+references: []
+log_events:
+- time: 2026-09-15T00:27:16-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
