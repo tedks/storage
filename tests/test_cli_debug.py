@@ -935,14 +935,17 @@ class TestDebugIndexCLI(unittest.TestCase):
 
             original_set_file_metadata = state_manager.set_file_metadata
 
-            def set_fails_for_first(metadata):
-                if metadata.virtual_path == "/movie-a.mkv":
+            # Rollback walks the written conflicts in reverse, so reconciliation
+            # visits movie-b before movie-a. Failing movie-b, the first path
+            # visited, is what proves a failure does not stop later paths.
+            def set_fails_for_movie_b(metadata):
+                if metadata.virtual_path == "/movie-b.mkv":
                     raise sqlite3.OperationalError("reconcile write failed")
                 return original_set_file_metadata(metadata)
 
             with mock.patch("storage.index_audit.write_cache_metadata", side_effect=rollback_fails), \
                     mock.patch.object(state_manager, "_commit_locked", side_effect=sqlite3.OperationalError("db write failed")), \
-                    mock.patch.object(state_manager, "set_file_metadata", side_effect=set_fails_for_first):
+                    mock.patch.object(state_manager, "set_file_metadata", side_effect=set_fails_for_movie_b):
                 report = reprobe_member_locations(
                     state_manager,
                     {"local0": LocalBackend("local0", str(remote_dir))},
@@ -951,20 +954,27 @@ class TestDebugIndexCLI(unittest.TestCase):
 
             self.assertTrue(any(issue.kind == "member_db_update_failed" for issue in report.issues))
             reconcile_failures = [
-                issue.virtual_path
+                (issue.virtual_path, issue.detail)
                 for issue in report.issues
                 if issue.kind == "cache_metadata_rollback_reconcile_failed"
             ]
-            self.assertEqual(["/movie-a.mkv"], reconcile_failures)
+            self.assertEqual(1, len(reconcile_failures), msg=reconcile_failures)
+            self.assertEqual("/movie-b.mkv", reconcile_failures[0][0])
+            self.assertIn("conflict status", reconcile_failures[0][1])
 
-            # The first path's failure did not stop the second from being reconciled.
-            self.assertEqual(SyncStatus.CONFLICT, state_manager.get_file_metadata("/movie-b.mkv").sync_status)
+            # movie-b's failure did not stop movie-a, visited after it, from being reconciled.
+            self.assertEqual(SyncStatus.CONFLICT, state_manager.get_file_metadata("/movie-a.mkv").sync_status)
+            self.assertEqual(
+                ["cache"],
+                sorted(location.backend_name for location in state_manager.get_file_locations("/movie-a.mkv")),
+            )
+            # For movie-b the status write failed and is reported, but its disproved
+            # local0 row is still removed: the two repairs are independent.
+            self.assertEqual(SyncStatus.CLEAN, state_manager.get_file_metadata("/movie-b.mkv").sync_status)
             self.assertEqual(
                 ["cache"],
                 sorted(location.backend_name for location in state_manager.get_file_locations("/movie-b.mkv")),
             )
-            # The failed path is left as it was and is named in the report.
-            self.assertEqual(SyncStatus.CLEAN, state_manager.get_file_metadata("/movie-a.mkv").sync_status)
         finally:
             state_manager.close()
 

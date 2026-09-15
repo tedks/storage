@@ -185,19 +185,30 @@ def _reconcile_failed_rollback_metadata(
     The cache xattr for each of these paths is stuck at CONFLICT, so bring SQLite
     in line with it: record the conflict status and drop this member's location
     row, which the checksum mismatch already disproved (the failed update would
-    have dropped it too). Paths are reconciled independently, so one failure
-    neither stops the rest nor hides which path is still inconsistent.
+    have dropped it too). Paths are reconciled independently, and so are the
+    two repairs within a path: the member row stays disproved even when the
+    status write fails. Each failure is reported with its path and which
+    repair did not apply.
     """
     for metadata in promoted_metadata:
         try:
             state_manager.set_file_metadata(metadata)
+        except Exception as exc:
+            report.issues.append(
+                IndexIssue(
+                    kind="cache_metadata_rollback_reconcile_failed",
+                    virtual_path=metadata.virtual_path,
+                    detail=f"{backend_name}: could not record conflict status: {exc}",
+                )
+            )
+        try:
             state_manager.remove_file_location(metadata.virtual_path, backend_name)
         except Exception as exc:
             report.issues.append(
                 IndexIssue(
                     kind="cache_metadata_rollback_reconcile_failed",
                     virtual_path=metadata.virtual_path,
-                    detail=f"{backend_name}: {exc}",
+                    detail=f"{backend_name}: could not remove disproved location row: {exc}",
                 )
             )
 
