@@ -54,8 +54,9 @@ nix develop --command <cmd>
 
 If using direnv, `.envrc` is `use flake`.
 
-The tests that mount FUSE (in all three gates) run only on Linux and need
-more than the flake:
+The tests run only on Linux and need more than the flake. Every test
+target needs libfuse 2; the ones that mount (the mounted and resilience
+gates) also need `/dev/fuse` and a setuid `fusermount`:
 
 - **libfuse 2.** `fusepy` loads `libfuse.so.2`. If the host already has
   one in its `ldconfig` cache for the host architecture, `fusepy` finds it
@@ -97,23 +98,29 @@ nix develop --command bazel build //:storage_cli
 ```
 
 `BUILD` lists every source explicitly; there are no globs. Each
-`tests/test_*.py` module belongs to exactly one `py_test`, and a module
-that no target lists does not run. Add a new module to
-`SANDBOXED_TEST_MODULES`; if it mounts FUSE, give it its own `py_test`
-tagged `local` instead (copy `storage_tests_sync_system`) and add that to
-the mounted gate. New `storage/` modules go in `storage_lib`'s `srcs`.
+`tests/test_*.py` module belongs to exactly one `py_test`. Add a new test
+module to `SANDBOXED_TEST_MODULES`; if it mounts FUSE, give it its own
+`py_test` tagged `local` instead (copy `storage_tests_sync_system`) and
+add that to the mounted gate. A new sandboxed `py_test` goes in
+`storage_tests_nonmounting`. New `storage/` modules go in `storage_lib`'s
+`srcs`. `//:storage_build_srcs_check`, part of the fast gate, fails when a
+`storage/` or `tests/test_*.py` module on disk is unlisted, is listed by
+two `py_test`s, or is only in a `py_test` that neither gate runs.
 
 The gates are `test_suite`s over those `py_test`s:
 
 | Target | Runs |
 |--------|------|
-| `//:storage_tests_fast_gate` | `storage_tests_sandboxed`, `storage_tests_resilience_gradient`: every module that does not mount, sandboxed |
+| `//:storage_tests_fast_gate` | `storage_tests_nonmounting` (`storage_tests_sandboxed`, `storage_tests_resilience_gradient`: every module that does not mount, sandboxed) and `storage_build_srcs_check` |
 | `//:storage_tests_mounted_system_gate` | `storage_tests_conflicts_integration`, `storage_tests_streaming_system`, `storage_tests_sync_system`: the modules that mount FUSE, unsandboxed |
 | `//:storage_tests_resilience_gate` | `storage_tests_resilience_gradient`, `storage_tests_streaming_system` |
 | `//:storage_tests` | the fast and mounted gates: every module |
 
-Extra pytest flags reach the modules through `--test_arg`, for example
-`bazel test //:storage_tests_sandboxed --test_arg=-k --test_arg=<expr>`.
+Extra pytest flags reach a target's modules through `--test_arg`, for
+example `bazel test //:storage_tests_sandboxed --test_arg=-k
+--test_arg=rename`. Aim it at a single `py_test`: every target gets the
+same flags, and one where `-k` selects nothing fails (pytest exits 5).
+Bazel's `--test_filter` is ignored.
 
 The quality gate before pushing code changes is all three gates (about
 four minutes on framework0 with a warm Bazel cache, most of it
