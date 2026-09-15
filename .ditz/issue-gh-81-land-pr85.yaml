@@ -9,8 +9,8 @@ type: task
 component: default
 release:
 reporter: Ted Smith <tedks@riseup.net>
-status: in_progress
-disposition:
+status: closed
+disposition: fixed
 creation_time: 2026-09-14T01:34:53-00:00
 references: []
 log_events:
@@ -33,5 +33,12 @@ log_events:
     pagination (68aa29e), orphan check (384ac7d), per-path reconcile + disproved row
     removal (0a2d761). Deferred with rationale: reprobe-checksum-baseline-design,
     rebuild-swap-transaction-hardening, index-audit-report-and-memory-nits.'
+- time: 2026-09-15T02:29:27-00:00
+  who: Ted Smith
+  what: 'closed: fixed'
+  comment: 'PR #85 merged as 956d8f8 after a 5-round council to fixpoint and gates
+    on 1fb879e (284 tests). Deferred findings filed: reprobe-checksum-baseline-design,
+    rebuild-swap-transaction-hardening, index-audit-report-and-memory-nits, index-audit-scan-equivalence-followups,
+    conflict-xattr-path-escape.'
 blocks:
 - gh-81
