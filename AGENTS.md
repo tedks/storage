@@ -28,8 +28,11 @@ agent genuinely needs divergent instructions.
   (`cli*.py`), and storage member adapters in `backends/` (local, SSH,
   rsync)
 - `storage_cli_main.py` - entry point for the `//:storage_cli` Bazel binary
-- `tests/` - pytest suites; `pytest_main*.py` are the entry points for the
-  Bazel test targets; `benchmarks/` holds the benchmark suite
+- `tests/` - pytest suites; `pytest_main.py` is the entry point every
+  pytest target runs (it collects the target's own test modules);
+  `build_srcs_check.py` checks that BUILD lists every top-level
+  `tests/test_*.py` and `storage/` module; `benchmarks/` holds the
+  benchmark suite
 - `BUILD`, `MODULE.bazel`, `WORKSPACE` - Bazel build; PyPI deps are pinned
   in `requirements.lock` (generated from `requirements.txt`)
 - `third_party/` - forked-submodule vendoring workflow (see its README) and
@@ -53,15 +56,16 @@ nix develop --command <cmd>
 
 If using direnv, `.envrc` is `use flake`.
 
-The tests that mount FUSE (in all three gates) run only on Linux and need
-more than the flake:
+The tests run only on Linux and need more than the flake. Every pytest
+target needs libfuse 2; the ones that mount (run by the mounted and
+resilience gates) also need `/dev/fuse` and a setuid `fusermount`:
 
 - **libfuse 2.** `fusepy` loads `libfuse.so.2`. If the host already has
   one in its `ldconfig` cache for the host architecture, `fusepy` finds it
   itself. Otherwise the dev shell sets `FUSE_LIBRARY_PATH` to nixpkgs'
   build. A non-empty value already in the environment always wins, and the
-  shell banner's `libfuse2:` line shows the choice. The `storage_tests*`
-  targets in `BUILD` pass the variable into the tests (`env_inherit`).
+  shell banner's `libfuse2:` line shows the choice. Every pytest `py_test`
+  in `BUILD` passes the variable into the tests (`env_inherit`).
   nixpkgs' build is loaded into Bazel's Python, which uses the host glibc,
   so it fails to load on a host whose glibc is older than that build needs
   (at the current `flake.lock`, `` version `GLIBC_2.38' not found ``, as
@@ -84,11 +88,12 @@ more than the flake:
   shell keeps nixpkgs' non-setuid `fusermount` off `PATH`, so do not put
   one ahead of `/usr/bin` yourself (for example with
   `nix profile install nixpkgs#fuse`).
-- **No Bazel sandbox.** Mounts fail inside `linux-sandbox` with
-  `fusermount: mount failed: Operation not permitted`, so the
-  `storage_tests*` targets are tagged `local`: unsandboxed, and never
-  remotely executed or cached. A new test target that mounts FUSE needs
-  the same `env_inherit` and `tags`.
+- **No Bazel sandbox for mounts.** Mounts fail inside `linux-sandbox` with
+  `fusermount: mount failed: Operation not permitted`, so the `py_test`s
+  for the modules that mount are tagged `local`: unsandboxed, and never
+  remotely executed or cached. Every other pytest target runs in the
+  sandbox. (`storage_build_srcs_check`, which imports no fuse, is also
+  `local` because it reads the source tree.)
 
 ## Build and test
 
@@ -96,18 +101,33 @@ more than the flake:
 nix develop --command bazel build //:storage_cli
 ```
 
-Test targets:
+`BUILD` lists every source explicitly; there are no globs. Add a new test
+module to the `srcs` of `storage_tests_sandboxed`, or, if it mounts FUSE,
+give it its own `py_test` tagged `local` (copy `storage_tests_sync_system`)
+and add that to the mounted gate. New `storage/` modules go in
+`storage_lib`'s `srcs`. `//:storage_build_srcs_check`, part of the fast
+gate, fails when a `tests/test_*.py` or `storage/` module on disk is not
+listed.
+
+The gates are `test_suite`s over those `py_test`s:
 
 | Target | Runs |
 |--------|------|
-| `//:storage_tests_fast_gate` | `tests/test_*.py` except the mounted system tests |
-| `//:storage_tests_mounted_system_gate` | `test_streaming_system.py`, `test_sync_system.py` (real FUSE mounts) |
-| `//:storage_tests_resilience_gate` | `test_resilience_gradient.py`, `test_streaming_system.py` |
-| `//:storage_tests` | all `tests/test_*.py` |
+| `//:storage_tests_fast_gate` | `storage_tests_nonmounting` (`storage_tests_sandboxed`, `storage_tests_resilience_gradient`: every module that does not mount, sandboxed) and `storage_build_srcs_check` |
+| `//:storage_tests_mounted_system_gate` | `storage_tests_conflicts_integration`, `storage_tests_streaming_system`, `storage_tests_sync_system`: the modules that mount FUSE, unsandboxed |
+| `//:storage_tests_resilience_gate` | `storage_tests_resilience_gradient`, `storage_tests_streaming_system` |
+| `//:storage_tests` | the fast and mounted gates: every module |
+
+Extra pytest flags reach a target's modules through `--test_arg`, for
+example `bazel test //:storage_tests_sandboxed --test_arg=-k
+--test_arg=rename`. Aim it at a single `py_test`: every target gets the
+same flags, and one where `-k` selects nothing fails (pytest exits 5).
+Bazel's `--test_filter` is ignored.
 
 The quality gate before pushing code changes is all three gates (about
-four minutes on framework0 with a warm Bazel cache, most of it the fast
-gate):
+four minutes on framework0 with a warm Bazel cache, most of it
+`storage_tests_sandboxed`). Bazel runs each `py_test` once, so the
+resilience gate's overlap costs nothing:
 
 ```bash
 nix develop --command bazel test \
@@ -121,8 +141,9 @@ A red run whose failures are libfuse loading errors
 `fusermount: mount failed: Operation not permitted` usually means an
 environment problem (see Environment), not a code signal, and it does not
 count as running the gate. Rule out a regression in the setup itself
-first: check the shell banner's `libfuse2:` line, and check that the
-targets in `BUILD` still carry `env_inherit` and the `local` tag.
+first: check the shell banner's `libfuse2:` line, and check that every
+pytest `py_test` in `BUILD` still has `env_inherit` and the mounting ones
+are still tagged `local`.
 
 If you cannot run them (for example, no FUSE on the host), say so
 explicitly in the commit or PR rather than implying they passed.
