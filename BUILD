@@ -11,6 +11,12 @@ package(default_visibility = ["//visibility:public"])
 # do not inherit the client environment unless asked.
 FUSE_TEST_ENV_INHERIT = ["FUSE_LIBRARY_PATH"]
 
+# Mounting goes through the host's setuid fusermount, which cannot mount
+# inside Bazel's linux-sandbox ("fusermount: mount failed: Operation not
+# permitted"). Run these tests unsandboxed; they still need /dev/fuse and a
+# setuid fusermount on the machine that runs them.
+FUSE_TEST_TAGS = ["no-sandbox"]
+
 py_library(
     name = "storage_lib",
     srcs = glob([
@@ -44,6 +50,7 @@ py_test(
         "@pypi//pytest_timeout",
     ],
     env_inherit = FUSE_TEST_ENV_INHERIT,
+    tags = FUSE_TEST_TAGS,
 )
 
 
@@ -57,6 +64,7 @@ py_test(
         "@pypi//pytest_timeout",
     ],
     env_inherit = FUSE_TEST_ENV_INHERIT,
+    tags = FUSE_TEST_TAGS,
 )
 
 py_test(
@@ -69,6 +77,7 @@ py_test(
         "@pypi//pytest_timeout",
     ],
     env_inherit = FUSE_TEST_ENV_INHERIT,
+    tags = FUSE_TEST_TAGS,
 )
 
 py_test(
@@ -81,4 +90,5 @@ py_test(
         "@pypi//pytest_timeout",
     ],
     env_inherit = FUSE_TEST_ENV_INHERIT,
+    tags = FUSE_TEST_TAGS,
 )
