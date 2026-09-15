@@ -1,0 +1,31 @@
+id: framework0-libfuse2
+title: Consider installing libfuse2t64 on framework0 so gates do not depend on nixpkgs'
+  glibc floor
+desc: 'Raised in council round 1 on PR #92 (fuse-test-env), Claude seat. This is an
+  operator host decision, so it is filed rather than acted on.
+
+
+  framework0 (Ubuntu 24.04, glibc 2.39) has no host libfuse 2, so the dev shell points
+  fusepy at nixpkgs'' libfuse.so.2. That library is loaded into Bazel''s rules_python
+  interpreter against the host glibc. At the flake.lock in PR #92 it needs GLIBC_2.38,
+  one symbol from the C23 toolchain defaults. A nixpkgs bump that raises the floor
+  above 2.39 would break every FUSE test on framework0 with "version `GLIBC_2.xx''
+  not found", and framework0 is the host the gates must pass on.
+
+
+  Installing libfuse2t64 (apt) on framework0 makes the dev shell prefer the host library
+  automatically (PR #92''s shellHook checks `ldconfig -p`) and removes that dependency.
+  tower0 already has it.'
+type: task
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-09-15T00:27:16-00:00
+references: []
+log_events:
+- time: 2026-09-15T00:27:16-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
