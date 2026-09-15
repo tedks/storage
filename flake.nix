@@ -15,7 +15,10 @@
         # environment is kept; else a host libfuse 2 in the linker cache is
         # left to fusepy's find_library, because it is built for the host
         # glibc that Bazel's Python uses and nixpkgs' build can need a newer
-        # one; else fusepy is pointed at nixpkgs' build.
+        # one; else fusepy is pointed at nixpkgs' build. This runs in
+        # shellHook (nix develop, nix-direnv), so tools that import only the
+        # derivation's variables, e.g. `nix print-dev-env --json`, do not
+        # see it.
         # Only the library output: pkgs.fuse2 in `packages` would put its
         # non-setuid fusermount on PATH ahead of the host's setuid one. This
         # libfuse runs /run/wrappers/bin/fusermount (NixOS), then the first
