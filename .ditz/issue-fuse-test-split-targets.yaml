@@ -54,3 +54,10 @@ log_events:
     srcs; keep storage_tests_fast_gate and storage_tests_mounted_system_gate, depending
     on other targets as needed; keep storage_tests_resilience_gate as a test_suite.
     Work on branch refactor/explicit-test-targets.'
+- time: 2026-09-15T04:58:04-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'PR https://github.com/tedks/storage/pull/94 is ready (not merged; operator
+    decides). Head d9304f5. Council fixpoint CLEAN in round 4 after the operator-requested
+    simplification (no args on py_tests; 38-line srcs check). Forced gate run on f740adc
+    (rebased on master 956d8f8): 6/6, 289 tests.'
