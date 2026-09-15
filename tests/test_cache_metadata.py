@@ -6,6 +6,7 @@ from pathlib import Path
 
 from storage.cache_metadata import (
     XATTR_CACHE_METADATA_NAME,
+    cache_file_would_be_scanned,
     cache_path_to_virtual_path,
     read_cache_metadata,
     scan_cache_entries,
@@ -100,6 +101,20 @@ class TestCacheMetadata(unittest.TestCase):
 
         entries = list(scan_cache_entries(self.cache_root))
         self.assertEqual(["/real.bin"], [entry.virtual_path for entry in entries])
+
+    @unittest.skipIf(os.geteuid() == 0, "root lists unreadable directories anyway")
+    def test_would_be_scanned_matches_scan_when_cache_root_is_unlistable(self):
+        (self.cache_root / "top.bin").write_bytes(b"data")
+        root = self.cache_root.resolve()
+        self.assertTrue(cache_file_would_be_scanned(root, "/top.bin"))
+
+        # Execute-only: a known name still lstats, but os.walk cannot list the root.
+        os.chmod(root, 0o311)
+        try:
+            self.assertEqual([], [entry.virtual_path for entry in scan_cache_entries(root)])
+            self.assertFalse(cache_file_would_be_scanned(root, "/top.bin"))
+        finally:
+            os.chmod(root, 0o755)
 
 
 if __name__ == "__main__":

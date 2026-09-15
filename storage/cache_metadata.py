@@ -233,16 +233,31 @@ def write_cache_metadata(
     return record
 
 
+def _is_listable_dir(path: Path) -> bool:
+    """Whether os.walk could list this directory with the current credentials."""
+    if os.access in os.supports_effective_ids:
+        # os.walk, lstat and isfile run with the effective uid/gid; os.access
+        # checks the real ids unless told otherwise.
+        return os.access(path, os.R_OK | os.X_OK, effective_ids=True)
+    return os.access(path, os.R_OK | os.X_OK)
+
+
 def cache_file_would_be_scanned(cache_root: Path, virtual_path: str) -> bool:
     """Return True when scan_cache_entries(cache_root) would yield virtual_path.
 
     Answers for one path without walking the cache, and must stay in step with
     the scanner below: the path is canonical ("/a/b", with no empty, "." or ".."
     components), no component is an internal cache artifact (the scanner prunes
-    those), every parent is a real, listable directory (os.walk neither follows
-    directory symlinks nor lists unreadable directories), and the leaf lstats
-    and is a regular file once a final symlink is followed. cache_root must
-    already be resolved.
+    those), the root and every parent are real, listable directories (os.walk
+    neither follows directory symlinks nor lists unreadable directories), and
+    the leaf lstats and is a regular file once a final symlink is followed.
+    cache_root must already be resolved.
+
+    Known limit: on a case-folding or Unicode-normalizing filesystem (APFS, ext4
+    casefold directories) a differently spelled path such as "/A.bin" lstats to
+    the real "a.bin" and counts as scanned, although the scanner only ever
+    yields the on-disk spelling. The supported cache filesystems are
+    case-sensitive.
     """
     if not virtual_path.startswith("/"):
         return False
@@ -251,13 +266,15 @@ def cache_file_would_be_scanned(cache_root: Path, virtual_path: str) -> bool:
         return False
     if any(is_internal_cache_artifact(part) for part in parts):
         return False
+    if not _is_listable_dir(cache_root):
+        return False
 
     current = cache_root
     for part in parts[:-1]:
         current = current / part
         if os.path.islink(current) or not os.path.isdir(current):
             return False
-        if not os.access(current, os.R_OK | os.X_OK):
+        if not _is_listable_dir(current):
             return False
 
     leaf = current / parts[-1]

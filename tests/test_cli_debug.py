@@ -429,8 +429,10 @@ class TestDebugIndexCLI(unittest.TestCase):
         (self.temp_dir / "outside.bin").write_bytes(b"outside")
 
         backed = "/a.bin"
-        # Each of these resolves to an existing regular file, but scan_cache_entries
-        # would never produce it, so the row is not backed by a scanned cache file.
+        # scan_cache_entries would never produce any of these paths, so none is backed
+        # by a scanned cache file. Most are aliases that still reach a real file
+        # (non-canonical, traversal, symlinked directory, internal artifact);
+        # "/a.bin/" and "/gone.bin" reach nothing.
         unbacked = [
             "//a.bin",
             "/a.bin/",

@@ -368,7 +368,7 @@ def verify_index_against_cache(cache_root: Path, state_manager: StateManager) ->
             IndexIssue(
                 kind="orphaned_cache_location",
                 virtual_path=location.virtual_path,
-                detail="cache location row exists without a cache file",
+                detail="cache location row has no cache file that the cache scan would find",
             )
         )
 
