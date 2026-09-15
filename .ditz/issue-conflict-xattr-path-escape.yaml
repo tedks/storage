@@ -1,0 +1,28 @@
+id: conflict-xattr-path-escape
+title: Reprobe can write a conflict xattr outside the cache for a corrupt path row
+desc: 'Found in the PR #85 convergence review (Claude seat, by reading; 2026-09-14).
+  Pre-existing, not introduced by #85.
+
+  _write_conflict_xattr (storage/index_audit.py, around line 127) builds the cache
+  path with _cache_path_for_metadata(), which is cache_root / virtual_path.lstrip(''/''),
+  and only checks exists()/is_file(). A corrupt files row such as ''/../x'' or one
+  reaching through a symlinked directory makes reprobe-locations write the user.storage.metadata
+  xattr on a file outside the cache root.
+
+  Fix: resolve and require containment under the cache root (or reuse cache_file_would_be_scanned
+  from storage/cache_metadata.py) before writing, and report the row instead. Add
+  a regression test with a traversal row. Check other _cache_path_for_metadata callers
+  for the same pattern.'
+type: bugfix
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-09-15T01:52:58-00:00
+references: []
+log_events:
+- time: 2026-09-15T01:52:58-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
