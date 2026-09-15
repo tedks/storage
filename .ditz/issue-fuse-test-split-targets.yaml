@@ -46,3 +46,11 @@ log_events:
   who: Ted Smith
   what: started
   comment: ""
+- time: 2026-09-15T02:21:37-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Operator decisions (2026-09-14): split into sandboxed non-mounting and
+    local mounting targets; no globs in any BUILD target (storage_lib included), explicit
+    srcs; keep storage_tests_fast_gate and storage_tests_mounted_system_gate, depending
+    on other targets as needed; keep storage_tests_resilience_gate as a test_suite.
+    Work on branch refactor/explicit-test-targets.'
