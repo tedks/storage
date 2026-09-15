@@ -20,9 +20,17 @@
         # non-setuid fusermount on PATH ahead of the host's setuid one. This
         # libfuse runs /run/wrappers/bin/fusermount (NixOS), then the first
         # fusermount on PATH.
+        # Only a host library for this system's ABI counts (an i386 one on
+        # x86_64 is not loadable), matched by prefix on the ldconfig -p tag,
+        # e.g. "libfuse.so.2 (libc6,x86-64) => ...", as CPython's
+        # find_library matches it on x86_64.
+        ldconfigAbi = {
+          x86_64-linux = "libc6,x86-64";
+          aarch64-linux = "libc6,AArch64";
+        }.${system} or "libc6";
         libfuse2Hook = pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
           case "$(/sbin/ldconfig -p 2>/dev/null)" in
-            *"libfuse.so.2 "*) ;;
+            *"libfuse.so.2 (${ldconfigAbi}"*) ;;
             *) export FUSE_LIBRARY_PATH="''${FUSE_LIBRARY_PATH:-${pkgs.fuse2.out}/lib/libfuse.so.2}" ;;
           esac
           echo "  libfuse2:  ''${FUSE_LIBRARY_PATH:-host, via find_library}"
