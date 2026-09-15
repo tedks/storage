@@ -9,9 +9,27 @@
       let
         pkgs = import nixpkgs { inherit system; };
         python = pkgs.python311;
+
+        # fusepy loads libfuse 2 (libfuse.so.2), which many hosts no longer
+        # install. Precedence: a non-empty FUSE_LIBRARY_PATH already in the
+        # environment is kept; else a host libfuse 2 in the linker cache is
+        # left to fusepy's find_library, because it is built for the host
+        # glibc that Bazel's Python uses and nixpkgs' build can need a newer
+        # one; else fusepy is pointed at nixpkgs' build.
+        # Only the library output: pkgs.fuse2 in `packages` would put its
+        # non-setuid fusermount on PATH ahead of the host's setuid one. This
+        # libfuse runs /run/wrappers/bin/fusermount (NixOS), then the first
+        # fusermount on PATH.
+        libfuse2Hook = pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
+          case "$(/sbin/ldconfig -p 2>/dev/null)" in
+            *"libfuse.so.2 "*) ;;
+            *) export FUSE_LIBRARY_PATH="''${FUSE_LIBRARY_PATH:-${pkgs.fuse2.out}/lib/libfuse.so.2}" ;;
+          esac
+          echo "  libfuse2:  ''${FUSE_LIBRARY_PATH:-host, via find_library}"
+        '';
       in
       {
-        devShells.default = pkgs.mkShell ({
+        devShells.default = pkgs.mkShell {
           packages = [
             pkgs.bazel_7
             pkgs.jdk11
@@ -31,17 +49,9 @@
             echo "  pip:       $(pip --version)"
             echo "  virtualenv $(virtualenv --version)"
             echo "  direnv:    $(direnv version 2>/dev/null || true)"
+            ${libfuse2Hook}
             echo "Hint: run 'direnv allow' after adding the hook to your shell to auto-enter this flake."
           '';
-        } // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
-          # fusepy loads libfuse 2 (libfuse.so.2), which many hosts no longer
-          # install. Point it at the nixpkgs build instead of the host's.
-          # Only the library output: pkgs.fuse in `packages` would put its
-          # non-setuid fusermount on PATH ahead of the host's setuid one.
-          # This libfuse still finds fusermount at /run/wrappers/bin (NixOS)
-          # or on PATH. It is loaded into a host-glibc Python, so it needs a
-          # host glibc new enough for this nixpkgs build.
-          FUSE_LIBRARY_PATH = "${pkgs.fuse.out}/lib/libfuse.so.2";
-        });
+        };
       });
 }
