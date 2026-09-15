@@ -34,3 +34,10 @@ log_events:
   who: Ted Smith
   what: created
   comment: ""
+- time: 2026-09-15T02:02:25-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Also from round 3 (Claude seat): _validate_cache_root accepts an unlistable
+    cache root; verify-index then reports every cache row as orphaned and rebuild-index
+    scans nothing. Now that cache_metadata._is_listable_dir exists, reject such a
+    root up front with a clear error.'
