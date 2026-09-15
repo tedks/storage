@@ -7,7 +7,7 @@ import time
 from typing import Dict, List
 
 from .backends.base import Backend
-from .cache_metadata import scan_cache_entries, write_cache_metadata
+from .cache_metadata import cache_file_would_be_scanned, scan_cache_entries, write_cache_metadata
 from .models import FileLocation, FileMetadata, SyncStatus
 from .state import StateManager
 
@@ -155,17 +155,60 @@ def _rollback_conflict_xattrs(
     report: ReprobeLocationsReport,
     *,
     backend_name: str,
-):
+) -> List[FileMetadata]:
     """Restore previously written cache xattrs after a failed conflict promotion batch."""
+    failed_promotions: List[FileMetadata] = []
     for original_metadata, cache_path, promoted_metadata in reversed(written_conflicts):
         try:
             write_cache_metadata(cache_path, original_metadata, virtual_path=promoted_metadata.virtual_path)
         except OSError as exc:
+            failed_promotions.append(promoted_metadata)
             report.issues.append(
                 IndexIssue(
                     kind="cache_metadata_rollback_failed",
                     virtual_path=promoted_metadata.virtual_path,
                     detail=f"{backend_name}: {exc}",
+                )
+            )
+    return failed_promotions
+
+
+def _reconcile_failed_rollback_metadata(
+    state_manager: StateManager,
+    promoted_metadata: List[FileMetadata],
+    report: ReprobeLocationsReport,
+    *,
+    backend_name: str,
+):
+    """Best-effort DB reconciliation when conflict xattr rollback cannot restore old state.
+
+    The cache xattr for each of these paths is stuck at CONFLICT, so bring SQLite
+    in line with it: record the conflict status and drop this member's location
+    row, which the checksum mismatch already disproved (the failed update would
+    have dropped it too). Paths are reconciled independently, and so are the
+    two repairs within a path: the member row stays disproved even when the
+    status write fails. Each failure is reported with its path and which
+    repair did not apply.
+    """
+    for metadata in promoted_metadata:
+        try:
+            state_manager.set_file_metadata(metadata)
+        except Exception as exc:
+            report.issues.append(
+                IndexIssue(
+                    kind="cache_metadata_rollback_reconcile_failed",
+                    virtual_path=metadata.virtual_path,
+                    detail=f"{backend_name}: could not record conflict status: {exc}",
+                )
+            )
+        try:
+            state_manager.remove_file_location(metadata.virtual_path, backend_name)
+        except Exception as exc:
+            report.issues.append(
+                IndexIssue(
+                    kind="cache_metadata_rollback_reconcile_failed",
+                    virtual_path=metadata.virtual_path,
+                    detail=f"{backend_name}: could not remove disproved location row: {exc}",
                 )
             )
 
@@ -174,77 +217,68 @@ def rebuild_index_from_cache(cache_root: Path, state_manager: StateManager) -> R
     """Reconstruct cache-backed index rows and normalize cache metadata xattrs."""
     cache_root = _validate_cache_root(cache_root)
     report = RebuildIndexReport()
-    metadata_rows: List[FileMetadata] = []
-    cache_locations: List[FileLocation] = []
-    legacy_metadata: Dict[str, FileMetadata] = {
-        metadata.virtual_path: metadata
-        for metadata in state_manager.get_all_file_metadata()
-    }
-
-    for entry in scan_cache_entries(cache_root):
-        report.scanned_files += 1
-        metadata = entry.build_file_metadata()
-        had_missing_xattr = any(issue == "missing_xattr" for issue in entry.issues)
-        if had_missing_xattr:
-            legacy = legacy_metadata.get(entry.virtual_path)
-            if legacy is None:
-                report.skipped_files += 1
-                report.issues.append(
-                    IndexIssue(
-                        kind="missing_xattr_unrecoverable",
-                        virtual_path=entry.virtual_path,
-                        detail=(
-                            "cache file has no metadata xattr and no legacy index row; "
-                            "skipping to avoid indexing derived cache artifacts"
-                        ),
+    def replacement_entries():
+        for entry in scan_cache_entries(cache_root):
+            report.scanned_files += 1
+            metadata = entry.build_file_metadata()
+            had_missing_xattr = any(issue == "missing_xattr" for issue in entry.issues)
+            if had_missing_xattr:
+                legacy = state_manager.get_file_metadata(entry.virtual_path)
+                if legacy is None:
+                    report.skipped_files += 1
+                    report.issues.append(
+                        IndexIssue(
+                            kind="missing_xattr_unrecoverable",
+                            virtual_path=entry.virtual_path,
+                            detail=(
+                                "cache file has no metadata xattr and no legacy index row; "
+                                "skipping to avoid indexing derived cache artifacts"
+                            ),
+                        )
                     )
-                )
-                continue
-            metadata = legacy
-            metadata.size = entry.stat_size
-            metadata.last_access = entry.stat_atime
-            metadata.last_modified = entry.stat_mtime
-            report.inferred_metadata_files += 1
+                    continue
+                metadata = legacy
+                metadata.size = entry.stat_size
+                metadata.last_access = entry.stat_atime
+                metadata.last_modified = entry.stat_mtime
+                report.inferred_metadata_files += 1
 
-        metadata_rows.append(metadata)
-        cache_locations.append(
-            FileLocation(
+            cache_location = FileLocation(
                 virtual_path=metadata.virtual_path,
                 backend_name="cache",
                 checksum=metadata.checksum or "",
                 last_synced=entry.stat_mtime,
                 is_cached=True,
             )
-        )
-        report.rebuilt_files += 1
+            report.rebuilt_files += 1
 
-        if entry.issues:
-            for issue in entry.issues:
-                if issue == "missing_xattr" and had_missing_xattr and entry.virtual_path not in legacy_metadata:
-                    continue
-                kind, _, detail = issue.partition(":")
+            if entry.issues:
+                for issue in entry.issues:
+                    kind, _, detail = issue.partition(":")
+                    report.issues.append(
+                        IndexIssue(
+                            kind=kind,
+                            virtual_path=entry.virtual_path,
+                            detail=detail or issue,
+                        )
+                    )
+
+            try:
+                write_cache_metadata(entry.cache_path, metadata, virtual_path=entry.virtual_path)
+                if had_missing_xattr or entry.issues:
+                    report.normalized_xattrs += 1
+            except OSError as exc:
                 report.issues.append(
                     IndexIssue(
-                        kind=kind,
+                        kind="xattr_write_error",
                         virtual_path=entry.virtual_path,
-                        detail=detail or issue,
+                        detail=str(exc),
                     )
                 )
 
-        try:
-            write_cache_metadata(entry.cache_path, metadata, virtual_path=entry.virtual_path)
-            if had_missing_xattr or entry.issues:
-                report.normalized_xattrs += 1
-        except OSError as exc:
-            report.issues.append(
-                IndexIssue(
-                    kind="xattr_write_error",
-                    virtual_path=entry.virtual_path,
-                    detail=str(exc),
-                )
-            )
+            yield metadata, cache_location
 
-    state_manager.replace_index(metadata_rows, cache_locations)
+    state_manager.replace_index_from_entries(replacement_entries())
     report.issue_count = len(report.issues)
     return report
 
@@ -254,19 +288,8 @@ def verify_index_against_cache(cache_root: Path, state_manager: StateManager) ->
     cache_root = _validate_cache_root(cache_root)
     report = VerifyIndexReport()
 
-    db_metadata: Dict[str, FileMetadata] = {
-        metadata.virtual_path: metadata
-        for metadata in state_manager.get_all_file_metadata()
-    }
-    db_cache_locations = {
-        location.virtual_path: location
-        for location in state_manager.get_all_file_locations(is_cached=True)
-    }
-    seen_paths = set()
-
     for entry in scan_cache_entries(cache_root):
         report.scanned_files += 1
-        seen_paths.add(entry.virtual_path)
 
         for issue in entry.issues:
             kind, _, detail = issue.partition(":")
@@ -278,7 +301,7 @@ def verify_index_against_cache(cache_root: Path, state_manager: StateManager) ->
                 )
             )
 
-        metadata = db_metadata.get(entry.virtual_path)
+        metadata = state_manager.get_file_metadata(entry.virtual_path)
         if metadata is None:
             report.issues.append(
                 IndexIssue(
@@ -320,7 +343,12 @@ def verify_index_against_cache(cache_root: Path, state_manager: StateManager) ->
                     )
                 )
 
-        if entry.virtual_path not in db_cache_locations:
+        cache_locations = [
+            location
+            for location in state_manager.get_file_locations(entry.virtual_path)
+            if location.is_cached
+        ]
+        if not cache_locations:
             report.issues.append(
                 IndexIssue(
                     kind="missing_cache_location",
@@ -329,14 +357,18 @@ def verify_index_against_cache(cache_root: Path, state_manager: StateManager) ->
                 )
             )
 
-    for virtual_path in sorted(db_cache_locations):
-        if virtual_path in seen_paths:
+    # A cache row is backed only if the scan above could have produced its path.
+    # A bare is_file() would also accept non-canonical ("//a", "/./a"),
+    # traversal ("/../x"), symlinked-directory and internal-artifact rows, which
+    # are exactly the corruption this check exists to report.
+    for location in state_manager.iter_file_locations(is_cached=True):
+        if cache_file_would_be_scanned(cache_root, location.virtual_path):
             continue
         report.issues.append(
             IndexIssue(
                 kind="orphaned_cache_location",
-                virtual_path=virtual_path,
-                detail="cache location row exists without a cache file",
+                virtual_path=location.virtual_path,
+                detail="cache location row has no cache file that the cache scan would find",
             )
         )
 
@@ -353,9 +385,7 @@ def reprobe_member_locations(
     """Probe known file paths against storage members and rebuild non-cache location rows."""
     cache_root = _validate_cache_root(cache_root)
     report = ReprobeLocationsReport()
-    metadata_rows = state_manager.get_all_file_metadata()
-    known_paths = [metadata.virtual_path for metadata in metadata_rows]
-    report.files_considered = len(metadata_rows)
+    report.files_considered = state_manager.count_file_metadata()
     report.members_requested = len(backends)
 
     for backend_name in sorted(backends):
@@ -365,7 +395,7 @@ def reprobe_member_locations(
         replaceable_paths: List[str] = []
         member_failed = False
 
-        for metadata in metadata_rows:
+        for metadata in state_manager.iter_file_metadata():
             try:
                 stat_result = backend.stat(metadata.virtual_path)
             except FileNotFoundError:
@@ -425,8 +455,22 @@ def reprobe_member_locations(
                 )
                 continue
 
+            if not metadata.checksum:
+                report.issues.append(
+                    IndexIssue(
+                        kind="member_checksum_baseline_missing",
+                        virtual_path=metadata.virtual_path,
+                        detail=(
+                            f"{backend.name}: member checksum {remote_checksum!r} observed, "
+                            "but local metadata has no trusted checksum baseline; "
+                            "preserving any existing location row"
+                        ),
+                    )
+                )
+                continue
+
             replaceable_paths.append(metadata.virtual_path)
-            if metadata.checksum and remote_checksum != metadata.checksum:
+            if remote_checksum != metadata.checksum:
                 report.issues.append(
                     IndexIssue(
                         kind="member_checksum_mismatch",
@@ -463,8 +507,14 @@ def reprobe_member_locations(
                 backend_name=backend.name,
             )
             if written is None:
-                _rollback_conflict_xattrs(
+                failed_rollbacks = _rollback_conflict_xattrs(
                     written_conflicts,
+                    report,
+                    backend_name=backend.name,
+                )
+                _reconcile_failed_rollback_metadata(
+                    state_manager,
+                    failed_rollbacks,
                     report,
                     backend_name=backend.name,
                 )
@@ -486,8 +536,14 @@ def reprobe_member_locations(
                 is_cached=False,
             )
         except Exception as exc:
-            _rollback_conflict_xattrs(
+            failed_rollbacks = _rollback_conflict_xattrs(
                 written_conflicts,
+                report,
+                backend_name=backend.name,
+            )
+            _reconcile_failed_rollback_metadata(
+                state_manager,
+                failed_rollbacks,
                 report,
                 backend_name=backend.name,
             )

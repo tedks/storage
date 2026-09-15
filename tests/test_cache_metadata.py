@@ -1,11 +1,13 @@
 import os
 import shutil
+import stat
 import tempfile
 import unittest
 from pathlib import Path
 
 from storage.cache_metadata import (
     XATTR_CACHE_METADATA_NAME,
+    cache_file_would_be_scanned,
     cache_path_to_virtual_path,
     read_cache_metadata,
     scan_cache_entries,
@@ -100,6 +102,27 @@ class TestCacheMetadata(unittest.TestCase):
 
         entries = list(scan_cache_entries(self.cache_root))
         self.assertEqual(["/real.bin"], [entry.virtual_path for entry in entries])
+
+    def test_would_be_scanned_matches_scan_when_cache_root_is_unlistable(self):
+        (self.cache_root / "top.bin").write_bytes(b"data")
+        root = self.cache_root.resolve()
+        self.assertTrue(cache_file_would_be_scanned(root, "/top.bin"))
+
+        original_mode = stat.S_IMODE(root.stat().st_mode)
+        # Searchable but not readable: a known name still lstats, but os.walk cannot list the root.
+        os.chmod(root, 0o311)
+        try:
+            try:
+                os.listdir(root)
+            except PermissionError:
+                pass
+            else:
+                # Root, CAP_DAC_READ_SEARCH, or a filesystem that ignores mode bits.
+                self.skipTest("this process can list a directory without read permission")
+            self.assertEqual([], [entry.virtual_path for entry in scan_cache_entries(root)])
+            self.assertFalse(cache_file_would_be_scanned(root, "/top.bin"))
+        finally:
+            os.chmod(root, original_mode)
 
 
 if __name__ == "__main__":
