@@ -265,7 +265,13 @@ class StateManager:
         is_cached: Optional[bool] = None,
         batch_size: int = WRITE_BATCH_SIZE,
     ) -> Iterator[FileLocation]:
-        """Yield file location rows in bounded batches."""
+        """Yield file location rows in bounded batches.
+
+        The cursor is a row-value comparison on the (virtual_path, backend_name)
+        primary key so each page is an index range seek. The unary ``+`` on
+        is_cached stops SQLite from choosing idx_cached, which would re-sort all
+        remaining cached rows for every page and make iteration quadratic.
+        """
         last_path = ""
         last_backend = ""
         while True:
@@ -273,22 +279,20 @@ class StateManager:
             if is_cached is None:
                 query = '''
                     SELECT * FROM file_locations
-                    WHERE virtual_path > ?
-                       OR (virtual_path = ? AND backend_name > ?)
+                    WHERE (virtual_path, backend_name) > (?, ?)
                     ORDER BY virtual_path ASC, backend_name ASC
                     LIMIT ?
                 '''
-                params = (last_path, last_path, last_backend, batch_size)
+                params = (last_path, last_backend, batch_size)
             else:
                 query = '''
                     SELECT * FROM file_locations
-                    WHERE is_cached = ?
-                      AND (virtual_path > ?
-                           OR (virtual_path = ? AND backend_name > ?))
+                    WHERE +is_cached = ?
+                      AND (virtual_path, backend_name) > (?, ?)
                     ORDER BY virtual_path ASC, backend_name ASC
                     LIMIT ?
                 '''
-                params = (int(is_cached), last_path, last_path, last_backend, batch_size)
+                params = (int(is_cached), last_path, last_backend, batch_size)
 
             with self._db_lock:
                 cursor = self.conn.execute(query, params)

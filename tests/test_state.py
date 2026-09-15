@@ -140,6 +140,40 @@ class TestStateAccessUpdates(unittest.TestCase):
         locations = self.state_manager.get_file_locations("/a.txt")
         self.assertEqual(["cache"], [location.backend_name for location in locations])
 
+    def test_iter_file_locations_pages_across_rows_sharing_a_path(self):
+        rows = [
+            ("/a.txt", "cache", True),
+            ("/a.txt", "local0", False),
+            ("/a.txt", "remote1", False),
+            ("/b.txt", "cache", True),
+            ("/b.txt", "remote1", False),
+        ]
+        for virtual_path, backend_name, is_cached in rows:
+            self.state_manager.add_file_location(
+                FileLocation(
+                    virtual_path=virtual_path,
+                    backend_name=backend_name,
+                    checksum="c",
+                    last_synced=1.0,
+                    is_cached=is_cached,
+                )
+            )
+
+        def keys(**kwargs):
+            return [
+                (location.virtual_path, location.backend_name)
+                for location in self.state_manager.iter_file_locations(batch_size=1, **kwargs)
+            ]
+
+        # batch_size=1 puts a page boundary between rows that share a virtual_path,
+        # so the cursor must advance on backend_name as well.
+        self.assertEqual([(path, backend) for path, backend, _ in rows], keys())
+        self.assertEqual([("/a.txt", "cache"), ("/b.txt", "cache")], keys(is_cached=True))
+        self.assertEqual(
+            [("/a.txt", "local0"), ("/a.txt", "remote1"), ("/b.txt", "remote1")],
+            keys(is_cached=False),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
