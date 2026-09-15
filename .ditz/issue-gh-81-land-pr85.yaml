@@ -26,5 +26,12 @@ log_events:
   who: Ted Smith
   what: started
   comment: ""
+- time: 2026-09-15T01:37:03-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Council round on #85 (2026-09-14): 0 Critical. Fixed on the rebased branch:
+    pagination (68aa29e), orphan check (384ac7d), per-path reconcile + disproved row
+    removal (0a2d761). Deferred with rationale: reprobe-checksum-baseline-design,
+    rebuild-swap-transaction-hardening, index-audit-report-and-memory-nits.'
 blocks:
 - gh-81
