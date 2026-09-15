@@ -174,24 +174,46 @@ class TestStateAccessUpdates(unittest.TestCase):
             keys(is_cached=False),
         )
 
-    def test_iter_file_locations_queries_seek_the_primary_key(self):
-        # Guards the paging plan: using idx_cached, or sorting each page in a temp
-        # B-tree, makes a full iteration quadratic in the number of rows.
-        cases = [
-            (StateManager.ITER_LOCATIONS_QUERY, ("", "", 1000)),
-            (StateManager.ITER_LOCATIONS_BY_CACHE_QUERY, (1, "", "", 1000)),
+    def test_iter_file_locations_pages_do_bounded_work_for_a_late_cursor(self):
+        # Each page must seek to its cursor. Choosing idx_cached, sorting in a temp
+        # B-tree, or scanning from the start all cost O(rows) per page and make a
+        # full iteration quadratic. Count SQLite VM steps for one late page rather
+        # than matching EXPLAIN QUERY PLAN text, which is not a stable interface
+        # (and a SCAN in primary-key order would pass a plan-text check).
+        paths = 5000
+        rows = [
+            (f"/f{index:06d}", backend_name, "c", 1.0, int(backend_name == "cache"))
+            for index in range(paths)
+            for backend_name in ("cache", "remote1")
         ]
-        for query, params in cases:
-            with self.subTest(query=query):
-                with self.state_manager._db_lock:
-                    plan = " | ".join(
-                        row[3]
-                        for row in self.state_manager.conn.execute("EXPLAIN QUERY PLAN " + query, params)
-                    )
-                self.assertIn("sqlite_autoindex_file_locations_1", plan)
-                self.assertNotIn("idx_cached", plan)
-                self.assertNotIn("TEMP B-TREE", plan)
+        late_cursor = (f"/f{paths - 5:06d}", "remote1")
+        cases = [
+            ("all", StateManager.ITER_LOCATIONS_QUERY, late_cursor + (10,)),
+            ("cached", StateManager.ITER_LOCATIONS_BY_CACHE_QUERY, (1,) + late_cursor + (10,)),
+        ]
 
+        conn = self.state_manager.conn
+        with self.state_manager._db_lock:
+            conn.executemany("INSERT INTO file_locations VALUES (?, ?, ?, ?, ?)", rows)
+            conn.commit()
+            for label, query, params in cases:
+                with self.subTest(label):
+                    steps = [0]
+
+                    def count_step():
+                        steps[0] += 1
+                        return 0
+
+                    conn.set_progress_handler(count_step, 1)
+                    try:
+                        fetched = conn.execute(query, params).fetchall()
+                    finally:
+                        conn.set_progress_handler(None, 1)
+
+                    self.assertTrue(fetched)
+                    # A seek measured about 130-140 steps on SQLite 3.45-3.50; the
+                    # regressions above measured 35,000-60,000 on this table.
+                    self.assertLess(steps[0], 2000)
 
 if __name__ == "__main__":
     unittest.main()
