@@ -53,28 +53,34 @@ nix develop --command <cmd>
 
 If using direnv, `.envrc` is `use flake`.
 
-The tests that mount FUSE (in all three gates) need more than the flake:
+The tests that mount FUSE (in all three gates) run only on Linux and need
+more than the flake:
 
-- **libfuse 2.** `fusepy` loads `libfuse.so.2`. The dev shell sets
-  `FUSE_LIBRARY_PATH` to nixpkgs' build, and the `storage_tests*` targets
-  in `BUILD` inherit it (`env_inherit`), so the host needs no libfuse 2
-  inside `nix develop`. That library is loaded into Bazel's Python, which
-  uses the host glibc, so it fails to load on a host whose glibc is older
-  than the nixpkgs build needs (at the current `flake.lock`,
-  `` version `GLIBC_2.38' not found `` on Debian 12). On such a host, or
-  outside Nix, install libfuse 2 (`libfuse2t64` on Ubuntu 24.04+ and
-  Debian trixie, `libfuse2` on older releases) and keep `FUSE_LIBRARY_PATH`
-  out of the environment
-  (`nix develop --command env -u FUSE_LIBRARY_PATH bazel test ...`), so
-  `fusepy` falls back to `find_library`. Without any libfuse 2, every test
-  module that imports `fuse` fails at collection with
-  `OSError: Unable to find libfuse`.
-- **`/dev/fuse` and a setuid `fusermount`** on the host. The dev shell
-  deliberately leaves nixpkgs' non-setuid `fusermount` off `PATH`.
+- **libfuse 2.** `fusepy` loads `libfuse.so.2`. If the host's `ldconfig`
+  cache has one (`libfuse2t64` on Ubuntu 24.04+ and Debian trixie,
+  `libfuse2` on older releases), `fusepy` finds it itself. Otherwise the
+  dev shell sets `FUSE_LIBRARY_PATH` to nixpkgs' build. A non-empty value
+  already in the environment always wins, and the shell banner's
+  `libfuse2:` line shows the choice. The `storage_tests*` targets in
+  `BUILD` pass the variable into the tests (`env_inherit`). nixpkgs' build
+  is loaded into Bazel's Python, which uses the host glibc, so it fails to
+  load on a host whose glibc is older than that build needs (at the
+  current `flake.lock`, `` version `GLIBC_2.38' not found ``, as in this
+  repo's Debian 12 `.devcontainer`). Install libfuse 2 on such a host.
+  Without any libfuse 2, every test module that imports `fuse` fails at
+  collection with `OSError: Unable to find libfuse`.
+- **`/dev/fuse` and a setuid `fusermount`.** libfuse runs its built-in
+  `fusermount` path first (`/run/wrappers/bin` for nixpkgs' build, which
+  exists only on NixOS; `/bin` for distro builds), then the first
+  `fusermount` on `PATH`. Whichever it finds must be setuid. The dev shell
+  keeps nixpkgs' non-setuid `fusermount` off `PATH`, so do not put one
+  ahead of `/usr/bin` yourself (for example with
+  `nix profile install nixpkgs#fuse`).
 - **No Bazel sandbox.** Mounts fail inside `linux-sandbox` with
   `fusermount: mount failed: Operation not permitted`, so the
-  `storage_tests*` targets are tagged `no-sandbox`. A new test target that
-  mounts FUSE needs the same `env_inherit` and `tags`.
+  `storage_tests*` targets are tagged `local`: unsandboxed, and never
+  remotely executed or cached. A new test target that mounts FUSE needs
+  the same `env_inherit` and `tags`.
 
 ## Build and test
 
@@ -104,9 +110,11 @@ nix develop --command bazel test \
 The benchmarks in `tests/benchmarks/` are not part of any Bazel target.
 A red run whose failures are libfuse loading errors
 (`Unable to find libfuse`, `GLIBC_... not found`) or
-`fusermount: mount failed: Operation not permitted` is an environment
-problem (see Environment), not a code signal, and it does not count as
-running the gate.
+`fusermount: mount failed: Operation not permitted` usually means an
+environment problem (see Environment), not a code signal, and it does not
+count as running the gate. Rule out a regression in the setup itself
+first: check the shell banner's `libfuse2:` line, and check that the
+targets in `BUILD` still carry `env_inherit` and the `local` tag.
 
 If you cannot run them (for example, no FUSE on the host), say so
 explicitly in the commit or PR rather than implying they passed.
