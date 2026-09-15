@@ -54,16 +54,16 @@ nix develop --command <cmd>
 
 If using direnv, `.envrc` is `use flake`.
 
-The tests run only on Linux and need more than the flake. Every test
-target needs libfuse 2; the ones that mount (the mounted and resilience
-gates) also need `/dev/fuse` and a setuid `fusermount`:
+The tests run only on Linux and need more than the flake. Every pytest
+target needs libfuse 2; the ones that mount (run by the mounted and
+resilience gates) also need `/dev/fuse` and a setuid `fusermount`:
 
 - **libfuse 2.** `fusepy` loads `libfuse.so.2`. If the host already has
   one in its `ldconfig` cache for the host architecture, `fusepy` finds it
   itself. Otherwise the dev shell sets `FUSE_LIBRARY_PATH` to nixpkgs'
   build. A non-empty value already in the environment always wins, and the
-  shell banner's `libfuse2:` line shows the choice. Every `py_test` in
-  `BUILD` passes the variable into the tests (`env_inherit`).
+  shell banner's `libfuse2:` line shows the choice. Every pytest `py_test`
+  in `BUILD` passes the variable into the tests (`env_inherit`).
   nixpkgs' build is loaded into Bazel's Python, which uses the host glibc,
   so it fails to load on a host whose glibc is older than that build needs
   (at the current `flake.lock`, `` version `GLIBC_2.38' not found ``, as
@@ -89,7 +89,9 @@ gates) also need `/dev/fuse` and a setuid `fusermount`:
 - **No Bazel sandbox for mounts.** Mounts fail inside `linux-sandbox` with
   `fusermount: mount failed: Operation not permitted`, so the `py_test`s
   for the modules that mount are tagged `local`: unsandboxed, and never
-  remotely executed or cached. Every other test runs in the sandbox.
+  remotely executed or cached. Every other pytest target runs in the
+  sandbox. (`storage_build_srcs_check`, which imports no fuse, is also
+  `local` because it reads the source tree.)
 
 ## Build and test
 
@@ -97,15 +99,24 @@ gates) also need `/dev/fuse` and a setuid `fusermount`:
 nix develop --command bazel build //:storage_cli
 ```
 
-`BUILD` lists every source explicitly; there are no globs. Each
-`tests/test_*.py` module belongs to exactly one `py_test`. Add a new test
-module to `SANDBOXED_TEST_MODULES`; if it mounts FUSE, give it its own
-`py_test` tagged `local` instead (copy `storage_tests_sync_system`) and
-add that to the mounted gate. A new sandboxed `py_test` goes in
+`BUILD` lists every source explicitly; there are no globs. Each test
+module belongs to exactly one `py_test`. Add a new test module to
+`SANDBOXED_TEST_MODULES`; if it mounts FUSE, give it its own `py_test`
+tagged `local` instead (copy `storage_tests_sync_system`) and add that to
+the mounted gate. A new sandboxed `py_test` goes in
 `storage_tests_nonmounting`. New `storage/` modules go in `storage_lib`'s
-`srcs`. `//:storage_build_srcs_check`, part of the fast gate, fails when a
-`storage/` or `tests/test_*.py` module on disk is unlisted, is listed by
-two `py_test`s, or is only in a `py_test` that neither gate runs.
+`srcs`. `//:storage_build_srcs_check`, part of the fast gate, reads the
+source tree and fails when:
+
+- a `storage/` module is not in `storage_lib`,
+- a test module under `tests/` (`test_*.py` or `*_test.py`, outside
+  `tests/benchmarks/`) is in no `py_test` that the fast or mounted gate
+  runs, or in two of them, or
+- a `py_test` lists a module in `srcs` but not `args` (it would never
+  run), or the reverse.
+
+It cannot see the fast gate itself, so do not drop
+`storage_tests_nonmounting` from it.
 
 The gates are `test_suite`s over those `py_test`s:
 
@@ -120,7 +131,7 @@ Extra pytest flags reach a target's modules through `--test_arg`, for
 example `bazel test //:storage_tests_sandboxed --test_arg=-k
 --test_arg=rename`. Aim it at a single `py_test`: every target gets the
 same flags, and one where `-k` selects nothing fails (pytest exits 5).
-Bazel's `--test_filter` is ignored.
+The srcs check ignores them. Bazel's `--test_filter` is ignored.
 
 The quality gate before pushing code changes is all three gates (about
 four minutes on framework0 with a warm Bazel cache, most of it
@@ -140,8 +151,8 @@ A red run whose failures are libfuse loading errors
 environment problem (see Environment), not a code signal, and it does not
 count as running the gate. Rule out a regression in the setup itself
 first: check the shell banner's `libfuse2:` line, and check that every
-`py_test` in `BUILD` still has `env_inherit` and the mounting ones are
-still tagged `local`.
+pytest `py_test` in `BUILD` still has `env_inherit` and the mounting ones
+are still tagged `local`.
 
 If you cannot run them (for example, no FUSE on the host), say so
 explicitly in the commit or PR rather than implying they passed.
