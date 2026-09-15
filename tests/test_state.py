@@ -174,12 +174,14 @@ class TestStateAccessUpdates(unittest.TestCase):
             keys(is_cached=False),
         )
 
-    def test_iter_file_locations_pages_do_bounded_work_at_any_cursor(self):
-        # Each page must seek to its cursor and read only LIMIT rows. Choosing
+    def test_iter_file_locations_pages_do_bounded_work_at_representative_cursors(self):
+        # Each page must seek to its cursor and do bounded work past it. Choosing
         # idx_cached, sorting in a temp B-tree, or scanning from the start all cost
         # O(rows) per page and make a full iteration quadratic. Count SQLite VM
         # steps per page rather than matching EXPLAIN QUERY PLAN text, which is not
         # a stable interface (and a SCAN in primary-key order passes a plan check).
+        # Blind spots: work against another table (only file_locations is filled
+        # here) and work done inside a single VM step are not counted.
         paths = 5000
         rows = [
             (f"/f{index:06d}", backend_name, "c", 1.0, int(backend_name == "cache"))
@@ -188,7 +190,8 @@ class TestStateAccessUpdates(unittest.TestCase):
         ]
         # No single cursor position catches every regression: scanning from the
         # start is cheap for an early page, and seeking then sorting the remaining
-        # suffix is cheap for a late one. A regression is costly at one of these.
+        # suffix is cheap for a late one. The known regression classes are each
+        # costly at one or more of these representative positions.
         cursors = {
             "early": ("", ""),
             "middle": (f"/f{paths // 2:06d}", "remote1"),
@@ -222,9 +225,9 @@ class TestStateAccessUpdates(unittest.TestCase):
                         conn.set_progress_handler(None, 1)
 
                     self.assertTrue(fetched)
-                    # The real queries measured at most 262 steps at any of these
-                    # cursors on SQLite 3.45-3.50; each regression above measured at
-                    # least 45,000 at one or more of them on this table.
+                    # The real queries measured about 260 steps at most on SQLite
+                    # 3.45-3.50; each regression above measured at least 45,000 at one
+                    # or more of these cursors on this table.
                     self.assertLess(steps[0], 2000)
 
 
