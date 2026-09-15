@@ -2,6 +2,15 @@ load("@rules_python//python:defs.bzl", "py_binary", "py_library", "py_test")
 
 package(default_visibility = ["//visibility:public"])
 
+# Every storage_tests* target collects test modules that import fuse and
+# mount real FUSE filesystems (the fast gate too, e.g.
+# test_conflicts_integration.py).
+#
+# fusepy reads FUSE_LIBRARY_PATH to find libfuse 2 before falling back to
+# find_library("fuse"). The flake's dev shell sets it; Bazel test actions
+# do not inherit the client environment unless asked.
+FUSE_TEST_ENV_INHERIT = ["FUSE_LIBRARY_PATH"]
+
 py_library(
     name = "storage_lib",
     srcs = glob([
@@ -34,6 +43,7 @@ py_test(
         "@pypi//pytest",
         "@pypi//pytest_timeout",
     ],
+    env_inherit = FUSE_TEST_ENV_INHERIT,
 )
 
 
@@ -46,6 +56,7 @@ py_test(
         "@pypi//pytest",
         "@pypi//pytest_timeout",
     ],
+    env_inherit = FUSE_TEST_ENV_INHERIT,
 )
 
 py_test(
@@ -57,6 +68,7 @@ py_test(
         "@pypi//pytest",
         "@pypi//pytest_timeout",
     ],
+    env_inherit = FUSE_TEST_ENV_INHERIT,
 )
 
 py_test(
@@ -68,4 +80,5 @@ py_test(
         "@pypi//pytest",
         "@pypi//pytest_timeout",
     ],
+    env_inherit = FUSE_TEST_ENV_INHERIT,
 )
