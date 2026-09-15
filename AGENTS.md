@@ -53,20 +53,34 @@ nix develop --command <cmd>
 
 If using direnv, `.envrc` is `use flake`.
 
-The tests that mount FUSE (in all three gates) depend on the host, not just
-the flake:
+The tests that mount FUSE (in all three gates) run only on Linux and need
+more than the flake:
 
-- **libfuse 2.** `fusepy` loads `libfuse.so.2`, which the flake does not
-  provide. Without it every test module that imports `fuse` fails at
-  collection with `OSError: Unable to find libfuse`. Install it on the host
-  (`libfuse2t64` on Ubuntu 24.04+ and Debian trixie, `libfuse2` on older
-  releases) or pass the nixpkgs build through `FUSE_LIBRARY_PATH`, as in
-  the gate command below.
-- **`/dev/fuse` and a setuid `fusermount`** on the host.
-- **No Bazel sandbox for tests.** Under the default `linux-sandbox`
-  strategy the mounts fail with
-  `fusermount: mount failed: Operation not permitted`; run tests with
-  `--strategy=TestRunner=local`.
+- **libfuse 2.** `fusepy` loads `libfuse.so.2`. If the host's `ldconfig`
+  cache has one for the host architecture (`libfuse2t64` on Ubuntu 24.04+
+  and Debian trixie, `libfuse2` on older releases), `fusepy` finds it
+  itself. Otherwise the dev shell sets `FUSE_LIBRARY_PATH` to nixpkgs'
+  build. A non-empty value already in the environment always wins, and the
+  shell banner's `libfuse2:` line shows the choice. The `storage_tests*`
+  targets in `BUILD` pass the variable into the tests (`env_inherit`).
+  nixpkgs' build is loaded into Bazel's Python, which uses the host glibc,
+  so it fails to load on a host whose glibc is older than that build needs
+  (at the current `flake.lock`, `` version `GLIBC_2.38' not found ``, as
+  in this repo's Debian 12 `.devcontainer`). Install libfuse 2 on such a
+  host. Without any libfuse 2, every test module that imports `fuse` fails
+  at collection with `OSError: Unable to find libfuse`.
+- **`/dev/fuse` and a setuid `fusermount`.** libfuse runs its built-in
+  `fusermount` path first (`/run/wrappers/bin` for nixpkgs' build, which
+  exists only on NixOS; `/bin` in Debian and Ubuntu builds), then the
+  first `fusermount` on `PATH`. Whichever it finds must be setuid. The dev
+  shell keeps nixpkgs' non-setuid `fusermount` off `PATH`, so do not put
+  one ahead of `/usr/bin` yourself (for example with
+  `nix profile install nixpkgs#fuse`).
+- **No Bazel sandbox.** Mounts fail inside `linux-sandbox` with
+  `fusermount: mount failed: Operation not permitted`, so the
+  `storage_tests*` targets are tagged `local`: unsandboxed, and never
+  remotely executed or cached. A new test target that mounts FUSE needs
+  the same `env_inherit` and `tags`.
 
 ## Build and test
 
@@ -85,23 +99,22 @@ Test targets:
 
 The quality gate before pushing code changes is all three gates (about
 four minutes on framework0 with a warm Bazel cache, most of it the fast
-gate). Run it as one shell command, since it sets a variable:
+gate):
 
 ```bash
-FUSE2=$(nix build --no-link --print-out-paths --inputs-from . 'nixpkgs#fuse^out') &&
 nix develop --command bazel test \
   //:storage_tests_fast_gate //:storage_tests_mounted_system_gate //:storage_tests_resilience_gate \
-  --test_output=errors --strategy=TestRunner=local \
-  --test_env=FUSE_LIBRARY_PATH="$FUSE2/lib/libfuse.so.2"
+  --test_output=errors
 ```
 
-`--inputs-from .` takes nixpkgs from this repo's `flake.lock`. Drop the
-`FUSE2=...` line and the `--test_env` flag if the host has libfuse 2
-installed. The benchmarks in `tests/benchmarks/` are not part of any
-Bazel target. A red run whose failures are `Unable to find libfuse` or
-`fusermount: mount failed: Operation not permitted` is an environment
-problem (see Environment), not a code signal, and it does not count as
-running the gate.
+The benchmarks in `tests/benchmarks/` are not part of any Bazel target.
+A red run whose failures are libfuse loading errors
+(`Unable to find libfuse`, `GLIBC_... not found`) or
+`fusermount: mount failed: Operation not permitted` usually means an
+environment problem (see Environment), not a code signal, and it does not
+count as running the gate. Rule out a regression in the setup itself
+first: check the shell banner's `libfuse2:` line, and check that the
+targets in `BUILD` still carry `env_inherit` and the `local` tag.
 
 If you cannot run them (for example, no FUSE on the host), say so
 explicitly in the commit or PR rather than implying they passed.
