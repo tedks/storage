@@ -7,7 +7,7 @@ import time
 from typing import Dict, List
 
 from .backends.base import Backend
-from .cache_metadata import scan_cache_entries, write_cache_metadata
+from .cache_metadata import cache_file_would_be_scanned, scan_cache_entries, write_cache_metadata
 from .models import FileLocation, FileMetadata, SyncStatus
 from .state import StateManager
 
@@ -340,8 +340,12 @@ def verify_index_against_cache(cache_root: Path, state_manager: StateManager) ->
                 )
             )
 
+    # A cache row is backed only if the scan above could have produced its path.
+    # A bare is_file() would also accept non-canonical ("//a", "/./a"),
+    # traversal ("/../x"), symlinked-directory and internal-artifact rows, which
+    # are exactly the corruption this check exists to report.
     for location in state_manager.iter_file_locations(is_cached=True):
-        if _cache_path_for_metadata(cache_root, location.virtual_path).is_file():
+        if cache_file_would_be_scanned(cache_root, location.virtual_path):
             continue
         report.issues.append(
             IndexIssue(

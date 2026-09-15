@@ -415,6 +415,59 @@ class TestDebugIndexCLI(unittest.TestCase):
         finally:
             state_manager.close()
 
+    def test_verify_index_reports_cache_rows_the_scan_cannot_see_as_orphaned(self):
+        cache_path = self.cache_dir / "a.bin"
+        cache_path.write_bytes(b"payload")
+        metadata = self._metadata("/a.bin", cache_path)
+        write_cache_metadata(cache_path, metadata)
+
+        real_dir = self.cache_dir / "realdir"
+        real_dir.mkdir()
+        (real_dir / "f.bin").write_bytes(b"linked")
+        (self.cache_dir / "link").symlink_to(real_dir, target_is_directory=True)
+        (self.cache_dir / "x.bin.storage.partial").write_bytes(b"partial")
+        (self.temp_dir / "outside.bin").write_bytes(b"outside")
+
+        backed = "/a.bin"
+        # Each of these resolves to an existing regular file, but scan_cache_entries
+        # would never produce it, so the row is not backed by a scanned cache file.
+        unbacked = [
+            "//a.bin",
+            "/a.bin/",
+            "/./a.bin",
+            "/realdir/../a.bin",
+            "/link/f.bin",
+            "/x.bin.storage.partial",
+            "/../outside.bin",
+            "/gone.bin",
+        ]
+
+        state_manager = StateManager(str(self.db_path))
+        try:
+            state_manager.set_file_metadata(metadata)
+            # Insert raw rows: this is what a corrupted index looks like, and the
+            # write helpers would otherwise normalize the paths.
+            with state_manager._db_lock:
+                state_manager.conn.executemany(
+                    "INSERT INTO file_locations VALUES (?, 'cache', ?, ?, 1)",
+                    [
+                        (path, metadata.checksum, metadata.last_modified)
+                        for path in [backed, *unbacked]
+                    ],
+                )
+                state_manager.conn.commit()
+
+            report = verify_index_against_cache(self.cache_dir, state_manager)
+        finally:
+            state_manager.close()
+
+        orphaned = sorted(
+            issue.virtual_path
+            for issue in report.issues
+            if issue.kind == "orphaned_cache_location"
+        )
+        self.assertEqual(sorted(unbacked), orphaned)
+
     def test_reprobe_locations_rebuilds_noncache_member_rows(self):
         cache_path = self.cache_dir / "movie.mkv"
         cache_path.write_bytes(b"payload")

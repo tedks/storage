@@ -233,6 +233,41 @@ def write_cache_metadata(
     return record
 
 
+def cache_file_would_be_scanned(cache_root: Path, virtual_path: str) -> bool:
+    """Return True when scan_cache_entries(cache_root) would yield virtual_path.
+
+    Answers for one path without walking the cache, and must stay in step with
+    the scanner below: the path is canonical ("/a/b", with no empty, "." or ".."
+    components), no component is an internal cache artifact (the scanner prunes
+    those), every parent is a real, listable directory (os.walk neither follows
+    directory symlinks nor lists unreadable directories), and the leaf lstats
+    and is a regular file once a final symlink is followed. cache_root must
+    already be resolved.
+    """
+    if not virtual_path.startswith("/"):
+        return False
+    parts = virtual_path[1:].split("/")
+    if any(part in ("", ".", "..") for part in parts):
+        return False
+    if any(is_internal_cache_artifact(part) for part in parts):
+        return False
+
+    current = cache_root
+    for part in parts[:-1]:
+        current = current / part
+        if os.path.islink(current) or not os.path.isdir(current):
+            return False
+        if not os.access(current, os.R_OK | os.X_OK):
+            return False
+
+    leaf = current / parts[-1]
+    try:
+        os.lstat(str(leaf))
+    except (OSError, ValueError):
+        return False
+    return os.path.isfile(str(leaf))
+
+
 def scan_cache_entries(cache_root: Path) -> Iterator[CacheScanEntry]:
     """Walk cache files, parse metadata xattrs, and surface drift/invariant issues."""
     cache_root = cache_root.resolve()
