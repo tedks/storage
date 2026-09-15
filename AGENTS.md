@@ -28,10 +28,11 @@ agent genuinely needs divergent instructions.
   (`cli*.py`), and storage member adapters in `backends/` (local, SSH,
   rsync)
 - `storage_cli_main.py` - entry point for the `//:storage_cli` Bazel binary
-- `tests/` - pytest suites; `pytest_main.py` is the entry point every Bazel
-  test target runs (it collects the target's own test modules);
-  `build_srcs_check.py` checks that BUILD lists every module;
-  `benchmarks/` holds the benchmark suite
+- `tests/` - pytest suites; `pytest_main.py` is the entry point every
+  pytest target runs (it collects the target's own test modules);
+  `build_srcs_check.py` checks that BUILD lists every top-level
+  `tests/test_*.py` and `storage/` module; `benchmarks/` holds the
+  benchmark suite
 - `BUILD`, `MODULE.bazel`, `WORKSPACE` - Bazel build; PyPI deps are pinned
   in `requirements.lock` (generated from `requirements.txt`)
 - `third_party/` - forked-submodule vendoring workflow (see its README) and
