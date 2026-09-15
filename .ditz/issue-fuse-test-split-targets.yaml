@@ -1,0 +1,44 @@
+id: fuse-test-split-targets
+title: Split FUSE-mounting test modules into their own Bazel targets
+desc: 'Deferred from council round 1 on PR #92 (fuse-test-env); Codex rated it Important,
+  Claude suggested the macro part as a nit.
+
+
+  Each storage_tests* py_test target globs all tests/test_*.py, so one FUSE-mounting
+  module makes the whole target need host FUSE. PR #92 therefore tags all four targets
+  "local" (unsandboxed, no remote exec/cache) and env_inherits FUSE_LIBRARY_PATH.
+  The fast gate''s ~270 tests that do not mount FUSE lose sandbox isolation, and the
+  "fast" gate requires /dev/fuse plus a setuid fusermount (it already did via test_conflicts_integration.py).
+
+
+  Proposal:
+
+  - Move the mounting modules (test_conflicts_integration, test_streaming_system,
+  test_sync_system, test_resilience_gradient, test_fs_*_integration, test_allow_other,
+  test_cli_mount, test_mount_lock, ...; audit which actually mount rather than only
+  import fuse) into dedicated py_test targets.
+
+  - Compose the gates with test_suite.
+
+  - Add a small fuse_py_test macro in a .bzl that applies env_inherit = ["FUSE_LIBRARY_PATH"]
+  and tags = ["local"] by construction, so a new mounting target cannot forget them.
+  AGENTS.md currently asks for that by convention.
+
+
+  Why deferred: it restructures tests and gate targets, which fuse-test-env explicitly
+  excludes ("don''t change test logic beyond what the environment fix needs"). It
+  is also not a regression: before PR #92 the documented gate command already ran
+  every test unsandboxed via --strategy=TestRunner=local.'
+type: task
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-09-15T00:27:16-00:00
+references: []
+log_events:
+- time: 2026-09-15T00:27:16-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
