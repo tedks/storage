@@ -2,20 +2,23 @@ load("@rules_python//python:defs.bzl", "py_binary", "py_library", "py_test")
 
 package(default_visibility = ["//visibility:public"])
 
-# Every storage_tests* target collects test modules that import fuse and
-# mount real FUSE filesystems (the fast gate too, e.g.
-# test_conflicts_integration.py).
+# Each storage_tests* target collects at least one test module that imports
+# fuse and mounts a real FUSE filesystem (the fast gate too, via
+# test_conflicts_integration.py), so the whole target needs the following.
 #
 # fusepy reads FUSE_LIBRARY_PATH to find libfuse 2 before falling back to
-# find_library("fuse"). The flake's dev shell sets it; Bazel test actions
-# do not inherit the client environment unless asked.
+# find_library("fuse"). The flake's dev shell sets it when the host has no
+# libfuse 2; Bazel test actions do not inherit the client environment
+# unless asked.
 FUSE_TEST_ENV_INHERIT = ["FUSE_LIBRARY_PATH"]
 
 # Mounting goes through the host's setuid fusermount, which cannot mount
 # inside Bazel's linux-sandbox ("fusermount: mount failed: Operation not
-# permitted"). Run these tests unsandboxed; they still need /dev/fuse and a
-# setuid fusermount on the machine that runs them.
-FUSE_TEST_TAGS = ["no-sandbox"]
+# permitted"). "local" runs these tests unsandboxed and keeps them off
+# remote executors and remote caches: they need /dev/fuse and a setuid
+# fusermount on the machine that runs them, and a pass elsewhere says
+# nothing about this host.
+FUSE_TEST_TAGS = ["local"]
 
 py_library(
     name = "storage_lib",
