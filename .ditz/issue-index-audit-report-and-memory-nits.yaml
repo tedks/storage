@@ -1,0 +1,35 @@
+id: index-audit-report-and-memory-nits
+title: 'Index audit: clarify report counters, drop dead code, bound memory'
+desc: 'Nits from the PR #85 council review (2026-09-14), manual recovery commands
+  only.
+
+  - Report counters: remote_locations_found now means ''trusted rows accepted'', so
+  ''0 found'' can coexist with preserved rows; members_reprobed increments even when
+  every file was skipped. Add locations_preserved or document the counters.
+
+  - index_audit.py (after the reprobe DB update): setting sync_status on pending_conflicts
+  is a no-op now that each member re-reads rows from the database.
+
+  - _commit_locked''s ''caller holds _db_lock'' invariant is unenforced; assert self._db_lock._is_owned()
+  is cheap. Mocking _commit_locked in tests is justified (sqlite3.Connection.commit
+  cannot be patched).
+
+  - Memory is still unbounded: PRAGMA temp_store=MEMORY keeps staging tables in RAM
+  (300k entries measured +103 MiB peak), and reprobe builds replaceable_paths/found_locations
+  sized to the index.
+
+  - _db_lock is held for the whole rebuild scan including xattr writes: fine for the
+  single-process CLI; note it in the docstring.'
+type: task
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-09-15T01:37:03-00:00
+references: []
+log_events:
+- time: 2026-09-15T01:37:03-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
