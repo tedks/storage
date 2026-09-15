@@ -1,0 +1,53 @@
+id: reprobe-checksum-baseline-design
+title: Decide how reprobe treats files with no local checksum baseline
+desc: 'Parked design question from the PR #85 council review (2026-09-14). Relates
+  to #81; not blocking it.
+
+
+  Files without a local checksum are skipped by reprobe (member_checksum_baseline_missing):
+  files only ever read from a member (fs.py:666), cache entries invalidated after
+  a remote change (fs.py:308), evicted recomputable files (cache.py:187). In the rebuild-index
+  -> reprobe-locations flow, rebuild removes all member rows, so these files end up
+  with no member rows at all.
+
+
+  Consequences found by reading, not yet confirmed at runtime:
+
+  - reads still work via the fallback probe (fs.py:496-517)
+
+  - renaming a cached read-only file propagates only to members with rows (namespace.py:448
+  -> _get_target_backends), so members keep the old name
+
+  - replica counting (replication.py:210, spacemgmt.py:100) under-counts
+
+  Separately, when a member row already exists, #85 keeps it even if its stored checksum
+  differs from the checksum just observed (provably stale).
+
+
+  Options discussed:
+
+  A. keep #85 behavior (fail closed)
+
+  B. A + delete provably stale existing rows
+
+  C. use a CLEAN cached copy as the baseline: hash it, verify members against it,
+  recreate matching rows; only uncached checksum-less files stay unrecovered
+
+  D. adopt the member checksum (pre-#85 behavior; divergent replicas all look valid)
+
+  Lean: C + B. First step: confirm the rename consequence at runtime. Context: the
+  whole feature is manual disaster-recovery tooling; no index-loss incident is on
+  record.'
+type: task
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-09-15T01:37:03-00:00
+references: []
+log_events:
+- time: 2026-09-15T01:37:03-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
