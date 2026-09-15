@@ -60,13 +60,18 @@ py_binary(
 # Tests
 #
 # Each tests/test_*.py module belongs to exactly one py_test below. The
-# gates are test_suites over those py_tests, so `bazel test` on a gate runs
-# each py_test once even when two gates share it. Every py_test runs
-# tests/pytest_main.py with its own modules as arguments, so a module list
-# is written once and used for both srcs and args. They set
-# precompile = "disabled" because they share that main: rules_python would
-# otherwise emit one precompile action per target for the same
+# gates are test_suites over those py_tests, so `bazel test` on several
+# gates runs each py_test once. Every py_test runs
+# tests/pytest_main.py with its modules as arguments; each module list is a
+# constant used for both srcs and args.
+#
+# The py_tests set precompile = "disabled" because they share that main.
+# Bazel copies a target's tags into its actions' execution info
+# (--incompatible_allow_tags_propagation), so a "local" and an untagged
+# target would each emit a different action for the same
 # tests/__pycache__/pytest_main.*.pyc, which Bazel rejects as conflicting.
+# Passing --@rules_python//python/config_settings:precompile=force_enabled
+# overrides the attribute and brings the conflict back.
 #
 # Most modules import fuse, directly or through storage.fs, so every test
 # target needs libfuse 2. fusepy reads FUSE_LIBRARY_PATH to find it before
@@ -121,19 +126,21 @@ py_test(
     args = SANDBOXED_TEST_MODULES,
     main = "tests/pytest_main.py",
     precompile = "disabled",
+    # About 200s on framework0; "moderate" (300s) leaves little headroom
+    # on a slower or loaded host.
+    timeout = "long",
     deps = TEST_DEPS,
     env_inherit = FUSE_TEST_ENV_INHERIT,
 )
 
 # Sandboxed too; a separate target so the resilience gate can include it
 # without the rest of the sandboxed modules.
+RESILIENCE_GRADIENT_TEST_MODULES = ["tests/test_resilience_gradient.py"]
+
 py_test(
     name = "storage_tests_resilience_gradient",
-    srcs = [
-        "tests/pytest_main.py",
-        "tests/test_resilience_gradient.py",
-    ],
-    args = ["tests/test_resilience_gradient.py"],
+    srcs = ["tests/pytest_main.py"] + RESILIENCE_GRADIENT_TEST_MODULES,
+    args = RESILIENCE_GRADIENT_TEST_MODULES,
     main = "tests/pytest_main.py",
     precompile = "disabled",
     deps = TEST_DEPS,
@@ -148,27 +155,25 @@ py_test(
 # nothing about this host.
 MOUNTED_TEST_TAGS = ["local"]
 
+CONFLICTS_INTEGRATION_TEST_MODULES = ["tests/test_conflicts_integration.py"]
+
 py_test(
     name = "storage_tests_conflicts_integration",
-    srcs = [
-        "tests/pytest_main.py",
-        "tests/test_conflicts_integration.py",
-    ],
-    args = ["tests/test_conflicts_integration.py"],
+    srcs = ["tests/pytest_main.py"] + CONFLICTS_INTEGRATION_TEST_MODULES,
+    args = CONFLICTS_INTEGRATION_TEST_MODULES,
     main = "tests/pytest_main.py",
     precompile = "disabled",
     deps = TEST_DEPS,
     env_inherit = FUSE_TEST_ENV_INHERIT,
     tags = MOUNTED_TEST_TAGS,
 )
+
+STREAMING_SYSTEM_TEST_MODULES = ["tests/test_streaming_system.py"]
 
 py_test(
     name = "storage_tests_streaming_system",
-    srcs = [
-        "tests/pytest_main.py",
-        "tests/test_streaming_system.py",
-    ],
-    args = ["tests/test_streaming_system.py"],
+    srcs = ["tests/pytest_main.py"] + STREAMING_SYSTEM_TEST_MODULES,
+    args = STREAMING_SYSTEM_TEST_MODULES,
     main = "tests/pytest_main.py",
     precompile = "disabled",
     deps = TEST_DEPS,
@@ -176,13 +181,12 @@ py_test(
     tags = MOUNTED_TEST_TAGS,
 )
 
+SYNC_SYSTEM_TEST_MODULES = ["tests/test_sync_system.py"]
+
 py_test(
     name = "storage_tests_sync_system",
-    srcs = [
-        "tests/pytest_main.py",
-        "tests/test_sync_system.py",
-    ],
-    args = ["tests/test_sync_system.py"],
+    srcs = ["tests/pytest_main.py"] + SYNC_SYSTEM_TEST_MODULES,
+    args = SYNC_SYSTEM_TEST_MODULES,
     main = "tests/pytest_main.py",
     precompile = "disabled",
     deps = TEST_DEPS,
