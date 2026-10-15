@@ -1,0 +1,21 @@
+id: refused-pass-stale-location-checksum
+title: A refused sync pass leaves a stale checksum in file_locations
+desc: 'Council finding on #97 (Claude seat), pre-existing shape: when a sync pass
+  is refused because a write landed during the copy, add_file_location has already
+  recorded the checksum computed before the write. If copy_from_local read mixed content,
+  the member holds bytes matching neither checksum, and the next pass''s check_conflict
+  can report a false CONFLICT. Consider recording the location only after a successful
+  publish, or recording it as unverified.'
+type: bugfix
+component: sync
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-15T01:24:39-00:00
+references: []
+log_events:
+- time: 2026-10-15T01:24:39-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
