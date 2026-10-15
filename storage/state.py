@@ -825,7 +825,9 @@ class StateManager:
                 self.conn.execute(
                     '''
                     INSERT INTO file_locations
-                    SELECT * FROM replacement_file_locations
+                    (virtual_path, backend_name, checksum, last_synced, is_cached)
+                    SELECT virtual_path, backend_name, checksum, last_synced, is_cached
+                    FROM replacement_file_locations
                     '''
                 )
                 self.conn.execute('DROP TABLE replacement_file_locations')

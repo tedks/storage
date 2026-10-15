@@ -222,6 +222,9 @@ class TestSyncExecutorOverlappingWrite(_ExecutorTestBase):
         self.assertTrue(self.executor.handle_task_failure(task, "boom", queue.PriorityQueue()))
 
         self.assertEqual(self.state_manager.get_file_metadata("/test.txt").sync_status, SyncStatus.DIRTY)
+        self.assertFalse(task.requeue)
+        # Nothing to publish against, but the failure is still a failure.
+        self.assertEqual(self.executor.get_stats()["failed"], 1)
 
 
 class TestSyncExecutorFileTask(_ExecutorTestBase):

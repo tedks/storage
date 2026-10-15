@@ -320,7 +320,9 @@ class SyncManager:
                 # the dedup entry straight to a fresh task, under the lock,
                 # so there is never a moment with the path unregistered or
                 # registered twice. (queue_sync would re-take _queue_lock.)
-                self.task_queue.put(SyncTask(virtual_path=task.virtual_path, priority=100))
+                # Default priority: a file written continuously must not
+                # crowd out everything else by requeueing ahead of it.
+                self.task_queue.put(SyncTask(virtual_path=task.virtual_path))
                 logger.debug("Re-queued sync for %s after an overlapping write", task.virtual_path)
             else:
                 self._queued_tasks.discard(task.virtual_path)

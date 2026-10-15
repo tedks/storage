@@ -228,9 +228,12 @@ class SyncExecutor:
             return False
 
         logger.error("Max retries exceeded for %s: %s", task.virtual_path, error)
-        if isinstance(task, DirSyncTask):
+        if isinstance(task, DirSyncTask) or task.generation is None:
+            # A file task that never read its row (the index itself failed,
+            # say) has no generation to publish against; the row stays DIRTY
+            # for the monitor. The failure still counts.
             self._stats["failed"] += 1
-        elif task.generation is not None:
+        else:
             # The failure belongs to the attempt that read task.generation. A
             # write since then owns the row, and its DIRTY must stand; a
             # failure it refuses is not counted, the file is simply dirty.
