@@ -185,19 +185,25 @@ class SyncExecutor:
         retires this one, and False is returned so the caller stops treating
         this sync as current.
         """
-        if not self.state_manager.publish_sync_status(
-            task.virtual_path, generation, status, checksum=checksum,
-        ):
+        # The publish and its mirror are one critical section, so a writer's
+        # mirror cannot land between them and then be overwritten by ours.
+        with self.state_manager.metadata_lock:
+            published = self.state_manager.publish_sync_status(
+                task.virtual_path, generation, status, checksum=checksum,
+            )
+            if published:
+                metadata = self.state_manager.get_file_metadata(task.virtual_path)
+                if metadata:
+                    self.cache_manager.sync_cache_metadata(
+                        task.virtual_path, metadata, cache_path=cache_path,
+                    )
+        if not published:
             logger.info(
                 "%s was written during sync; leaving it dirty for another pass",
                 task.virtual_path,
             )
             task.requeue = True
             return False
-
-        metadata = self.state_manager.get_file_metadata(task.virtual_path)
-        if metadata:
-            self.cache_manager.sync_cache_metadata(task.virtual_path, metadata, cache_path=cache_path)
         return True
 
     def handle_task_failure(
@@ -222,12 +228,15 @@ class SyncExecutor:
             return False
 
         logger.error("Max retries exceeded for %s: %s", task.virtual_path, error)
-        self._stats["failed"] += 1
-        if isinstance(task, SyncTask) and task.generation is not None:
+        if isinstance(task, DirSyncTask):
+            self._stats["failed"] += 1
+        elif task.generation is not None:
             # The failure belongs to the attempt that read task.generation. A
-            # write since then owns the row, and its DIRTY must stand.
+            # write since then owns the row, and its DIRTY must stand; a
+            # failure it refuses is not counted, the file is simply dirty.
             cache_path = self.cache_manager.get_cache_path(task.virtual_path)
-            self._publish(task, task.generation, SyncStatus.ERROR, cache_path)
+            if self._publish(task, task.generation, SyncStatus.ERROR, cache_path):
+                self._stats["failed"] += 1
         return True
 
     def process_dir_task(self, task: DirSyncTask) -> bool:

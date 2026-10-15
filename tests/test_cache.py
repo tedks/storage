@@ -103,6 +103,6 @@ class TestStoreFileMetadata(unittest.TestCase):
         self.assertEqual(stored.sync_status, SyncStatus.DIRTY)
         self.assertEqual(stored.size, 9)
         record = read_cache_metadata(cache_path)
-        if record is not None:  # None only where the filesystem has no xattrs
-            self.assertEqual(record.sync_status, SyncStatus.DIRTY)
-            self.assertEqual(record.size, 9)
+        self.assertIsNotNone(record)
+        self.assertEqual(record.sync_status, SyncStatus.DIRTY)
+        self.assertEqual(record.size, 9)

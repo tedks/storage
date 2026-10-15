@@ -272,6 +272,25 @@ class CacheManager:
         """Mark a file as accessed (update LRU)"""
         self.state_manager.update_access_time(virtual_path)
 
+    def mark_file_dirty(self, virtual_path: str, cache_path: Path) -> Optional[int]:
+        """Record a modification of a cached file: DIRTY, its size and mtime, a new generation.
+
+        One UPDATE on the index row, so a sync in flight for the old content
+        sees the generation move and does not report it as synced. The stat,
+        the update and the mirror of the row into the cache file's metadata
+        xattr run under the index lock, so concurrent writers record their
+        stats in update order and mirror their rows in the same order.
+        Returns the new generation, or None when the path has no row.
+        """
+        with self.state_manager.metadata_lock:
+            generation = self.state_manager.mark_dirty_from_cache_file(virtual_path, cache_path)
+            if generation is None:
+                return None
+            metadata = self.state_manager.get_file_metadata(virtual_path)
+            if metadata:
+                self.sync_cache_metadata(virtual_path, metadata, cache_path=cache_path)
+        return generation
+
     def store_file_metadata(
         self,
         metadata: FileMetadata,
@@ -282,12 +301,15 @@ class CacheManager:
 
         set_file_metadata keeps content columns a write recorded after the
         snapshot was read, so the xattr is written from a re-read of the row,
-        never from the caller's object. Returns the stored row.
+        never from the caller's object, and the write, re-read and mirror are
+        one critical section under the index lock so no other writer's
+        mirror can land between them. Returns the stored row.
         """
-        self.state_manager.set_file_metadata(metadata)
-        stored = self.state_manager.get_file_metadata(metadata.virtual_path)
-        if stored is not None:
-            self.sync_cache_metadata(metadata.virtual_path, stored, cache_path=cache_path)
+        with self.state_manager.metadata_lock:
+            self.state_manager.set_file_metadata(metadata)
+            stored = self.state_manager.get_file_metadata(metadata.virtual_path)
+            if stored is not None:
+                self.sync_cache_metadata(metadata.virtual_path, stored, cache_path=cache_path)
         return stored
 
     def sync_cache_metadata(

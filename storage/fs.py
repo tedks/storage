@@ -776,20 +776,8 @@ class StorageFS(Operations):
             raise FuseOSError(e.errno)
 
     def _mark_cache_file_dirty(self, canonical_path: str, cache_path: Path) -> None:
-        """Record a modification of a cached file: DIRTY, new size and mtime, new generation.
-
-        One UPDATE on the index row, so a sync that is in flight for the old
-        content sees the generation move and does not report it as synced.
-        The stat is taken under the index lock, so concurrent writers cannot
-        record an older stat over a newer one. The row is then mirrored into
-        the cache file's metadata xattr.
-        """
-        generation = self.state_manager.mark_dirty_from_cache_file(canonical_path, cache_path)
-        if generation is None:
-            return
-        metadata = self.state_manager.get_file_metadata(canonical_path)
-        if metadata:
-            self.cache_manager.sync_cache_metadata(canonical_path, metadata, cache_path=cache_path)
+        """Record a modification of a cached file (see CacheManager.mark_file_dirty)."""
+        self.cache_manager.mark_file_dirty(canonical_path, cache_path)
 
     def truncate(self, path, length, fh=None):
         """Truncate a file"""

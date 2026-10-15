@@ -107,6 +107,17 @@ class StateManager:
         """Commit the current transaction while the caller holds _db_lock."""
         self.conn.commit()
 
+    @property
+    def metadata_lock(self) -> threading.RLock:
+        """The re-entrant lock that orders row writes.
+
+        Hold it across a row write and the mirror of that row into the cache
+        file's metadata xattr, so mirrors land in the same order as the
+        writes they describe. Without it two writers can mirror their rows in
+        the opposite order and leave the xattr describing the older one.
+        """
+        return self._db_lock
+
     def _configure_connection(self):
         """Configure SQLite pragmas for lower write amplification."""
         pragmas = (
