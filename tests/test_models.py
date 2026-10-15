@@ -40,12 +40,31 @@ class TestFileMetadataModel(unittest.TestCase):
             "recompute_cmd": None,
             "encrypted": True,
             "encryption_key_id": "key-1",
+            "dirty_generation": 7,
         }
 
         metadata = FileMetadata.from_dict(payload)
 
         self.assertEqual(metadata.sync_status, SyncStatus.CLEAN)
         self.assertEqual(metadata.to_dict(), payload)
+
+    def test_from_dict_defaults_dirty_generation_for_rows_without_it(self):
+        # Index rows and xattr records written before the column existed.
+        payload = {
+            "virtual_path": "/old.txt",
+            "size": 1,
+            "checksum": None,
+            "last_access": 1.0,
+            "last_modified": 1.0,
+            "sync_status": "dirty",
+            "replica_count": 1,
+            "recomputable": False,
+            "recompute_cmd": None,
+            "encrypted": False,
+            "encryption_key_id": None,
+        }
+
+        self.assertEqual(FileMetadata.from_dict(payload).dirty_generation, 0)
 
 
 class TestFileLocationModel(unittest.TestCase):
