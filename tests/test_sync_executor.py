@@ -7,6 +7,7 @@ Tests cover:
 - Retry and failure handling
 """
 
+import os
 import queue
 import shutil
 import tempfile
@@ -17,6 +18,7 @@ from unittest.mock import MagicMock, patch
 
 from storage.backends.base import Backend
 from storage.cache import CacheManager
+from storage.cache_metadata import read_cache_metadata
 from storage.file_config import FileConfig
 from storage.models import FileLocation, FileMetadata, SyncStatus
 from storage.replication import ReplicationManager
@@ -103,6 +105,47 @@ class _ExecutorTestBase(unittest.TestCase):
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         cache_path.write_bytes(content)
         return cache_path
+
+
+class TestSyncExecutorOverlappingWrite(_ExecutorTestBase):
+    """A write that lands while a sync is in flight must leave the file DIRTY.
+
+    Regression test for #35 / #57: the worker snapshots the metadata row at
+    the start of the task and writes the whole snapshot back as CLEAN at the
+    end, so a write() in between is marked synced without ever being copied,
+    and the row's size reverts to the pre-write value.
+    """
+
+    def test_write_during_copy_is_not_marked_clean(self):
+        meta = _make_metadata(sync_status=SyncStatus.DIRTY, size=2)
+        self.state_manager.set_file_metadata(meta)
+        cache_path = self._create_cache_file(content=b"v1")
+        newer = b"v2 written while the worker was copying v1"
+
+        def write_during_copy(local_path, virtual_path):
+            # The backend has read v1. Now do what fs.py's write() does:
+            # replace the bytes, then record the new size and DIRTY.
+            cache_path.write_bytes(newer)
+            current = self.state_manager.get_file_metadata("/test.txt")
+            st = os.lstat(cache_path)
+            current.size = st.st_size
+            current.last_modified = st.st_mtime
+            current.sync_status = SyncStatus.DIRTY
+            self.state_manager.set_file_metadata(current)
+
+        self.mock_backend.copy_from_local.side_effect = write_during_copy
+
+        with patch.object(self.executor.conflict_detector, "check_conflict", return_value=None):
+            self.executor.process_file_task(SyncTask("/test.txt"))
+
+        updated = self.state_manager.get_file_metadata("/test.txt")
+        self.assertEqual(updated.sync_status, SyncStatus.DIRTY)
+        self.assertEqual(updated.size, len(newer))
+        # The xattr mirror feeds rebuild-index; it must not claim CLEAN either.
+        # (None when the filesystem has no xattr support.)
+        record = read_cache_metadata(cache_path)
+        if record is not None:
+            self.assertNotEqual(record.sync_status, SyncStatus.CLEAN)
 
 
 class TestSyncExecutorFileTask(_ExecutorTestBase):
