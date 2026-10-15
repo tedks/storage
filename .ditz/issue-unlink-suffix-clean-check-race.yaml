@@ -1,0 +1,21 @@
+id: unlink-suffix-clean-check-race
+title: unlink of a conflict-suffixed path can destroy a write that lands after its
+  CLEAN check
+desc: 'Council finding on #97 (Claude seat), pre-existing: fs.py ~300-313 checks the
+  canonical row is CLEAN, then unlinks the cache file. A write between the check and
+  the unlink destroys the new bytes, leaving a DIRTY row with no cache file, which
+  the worker reports as ''Cache file missing'' every monitor tick. Needs the check
+  and the unlink under one lock, or a generation check after the unlink with recovery.'
+type: bugfix
+component: fs
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-15T01:24:39-00:00
+references: []
+log_events:
+- time: 2026-10-15T01:24:39-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
