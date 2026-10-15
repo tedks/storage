@@ -5,8 +5,8 @@ type: task
 component: sync
 release:
 reporter: Ted Smith <tedks@riseup.net>
-status: unstarted
-disposition:
+status: closed
+disposition: reorg
 creation_time: 2026-10-15T01:01:13-00:00
 references: []
 log_events:
@@ -18,5 +18,10 @@ log_events:
   who: Ted Smith
   what: blocks gh-57
   comment: ""
+- time: 2026-10-15T01:01:36-00:00
+  who: Ted Smith
+  what: 'closed: reorg'
+  comment: duplicate of the existing gh-57 member tasks (generation-column, conditional-updates,
+    requeue-on-conflict, test)
 blocks:
 - gh-57
