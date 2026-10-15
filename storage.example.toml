@@ -1,16 +1,18 @@
-[mounts.drynwyn-warez]
-mountpoint = "/home/tedks/Downloads/drynwyn-warez"
-cache = "/home/tedks/Downloads/.drynwyn-chunk0-cache"
+# Example mount profile. Copy to ~/.config/storage/storage.toml (or pass
+# with --config) and replace the host, paths and key with your own.
+[mounts.example-media]
+mountpoint = "/home/user/mnt/media"
+cache = "/home/user/.cache/storage/media"
 cache_size = "50G"
-database = "/home/tedks/Downloads/.drynwyn-chunk0-cache/.storage.db"
+database = "/home/user/.cache/storage/media/.storage.db"
 workers = 2
-key_file = "/home/tedks/.ssh/id_ed25519"
+key_file = "/home/user/.ssh/id_ed25519"
 foreground = true
 streaming_reads = true
 streaming_chunk_size = "1M"
 max_streaming_sessions = 8
 backends = [
-  "ssh://tedks@drynwyn.local:/srv/raid/warez/",
-  "ssh://tedks@drynwyn.local:/srv/chunk0/warez/",
-  "ssh://tedks@drynwyn.local:/srv/chunk1/warez/",
+  "ssh://user@storage-host.example:/srv/raid/media/",
+  "ssh://user@storage-host.example:/srv/chunk0/media/",
+  "ssh://user@storage-host.example:/srv/chunk1/media/",
 ]

@@ -97,10 +97,10 @@ def mount(
           --remote ssh://host2:/path2
 
         # Auto-discovered profile from ~/.config/storage/storage.toml
-        storage mount drynwyn-warez
+        storage mount example-media
 
         # TOML-configured mount
-        storage mount --config ~/.config/storage/storage.toml drynwyn-warez
+        storage mount --config ~/.config/storage/storage.toml example-media
     """
     resolved = resolve_mount_configuration(
         mount_target,

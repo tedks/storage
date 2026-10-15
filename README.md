@@ -95,29 +95,30 @@ storage mount /mnt/storage /srv/raid /srv/chunk0 /srv/chunk1 \
 TOML mount profiles are also supported:
 
 ```toml
-[mounts.drynwyn-warez]
-mountpoint = "/home/tedks/Downloads/drynwyn-warez"
-cache = "/home/tedks/Downloads/.drynwyn-chunk0-cache"
+[mounts.example-media]
+mountpoint = "/home/user/mnt/media"
+cache = "/home/user/.cache/storage/media"
 cache_size = "50G"
-key_file = "/home/tedks/.ssh/id_ed25519"
+key_file = "/home/user/.ssh/id_ed25519"
 foreground = true
 backends = [
-  "ssh://tedks@drynwyn.local:/srv/raid/warez/",
-  "ssh://tedks@drynwyn.local:/srv/chunk0/warez/",
-  "ssh://tedks@drynwyn.local:/srv/chunk1/warez/",
+  "ssh://user@storage-host.example:/srv/raid/media/",
+  "ssh://user@storage-host.example:/srv/chunk0/media/",
+  "ssh://user@storage-host.example:/srv/chunk1/media/",
 ]
 ```
 
 Save that as `~/.config/storage/storage.toml` to auto-load by name:
 
 ```bash
-storage mount drynwyn-warez
+storage mount example-media
 ```
 
-Or mount from an explicit TOML path:
+Or mount from an explicit TOML path (`storage.example.toml` in this repo
+is a fuller version of the same profile):
 
 ```bash
-storage mount --config ./storage.example.toml drynwyn-warez
+storage mount --config ./storage.example.toml example-media
 ```
 
 ### configure
