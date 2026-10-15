@@ -1,0 +1,18 @@
+id: gh-96
+title: 'gh-96: xattr/SQLite crash consistency for dirty state (#96)'
+desc: 'Epic for https://github.com/tedks/storage/issues/96: crash between SQLite and
+  xattr writes turns a dirty file clean after rebuild-index. Xattr becomes last-synced
+  state; dirtiness derived from stat vs xattr. Stacked on gh-57.'
+type: bugfix
+component: sync
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-15T01:01:07-00:00
+references: []
+log_events:
+- time: 2026-10-15T01:01:07-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
