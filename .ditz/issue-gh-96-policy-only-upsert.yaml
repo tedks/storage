@@ -1,0 +1,23 @@
+id: gh-96-policy-only-upsert
+title: 'set_file_metadata: update policy columns only on conflict'
+desc: 'Council finding on #97 (Codex): set_file_metadata''s upsert guards content
+  columns only when the stored generation is greater, so a stale snapshot at the same
+  generation can still overwrite a newer sync-side status or checksum (e.g. re-mark
+  a just-published CLEAN as SYNCING). The data-loss direction is covered because every
+  DIRTY transition bumps the generation; no current caller exhibits the hazard. Proper
+  fix: on conflict, set_file_metadata updates policy columns only; content and status
+  go through mark_dirty / publish_sync_status / the last-synced xattr write. Fits
+  #96''s redefinition of the xattr.'
+type: task
+component: sync
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-15T01:24:38-00:00
+references: []
+log_events:
+- time: 2026-10-15T01:24:38-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
