@@ -5,6 +5,8 @@ from pathlib import Path
 
 from storage.backends.local import LocalBackend
 from storage.cache import CacheManager
+from storage.cache_metadata import read_cache_metadata
+from storage.models import FileMetadata, SyncStatus
 from storage.state import StateManager
 
 
@@ -66,3 +68,41 @@ class TestCacheAccounting(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestStoreFileMetadata(unittest.TestCase):
+    """The xattr mirror follows the row as stored, not the caller's snapshot."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.cache_dir = Path(self.temp_dir) / "cache"
+        self.cache_dir.mkdir()
+        self.state_manager = StateManager(str(Path(self.temp_dir) / "state.db"))
+        self.cache_manager = CacheManager(self.cache_dir, self.state_manager, 1024 * 1024)
+
+    def tearDown(self):
+        self.state_manager.close()
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_stale_clean_snapshot_mirrors_the_stored_dirty_row(self):
+        cache_path = self.cache_dir / "f.txt"
+        cache_path.write_bytes(b"v1")
+        self.state_manager.set_file_metadata(FileMetadata(
+            virtual_path="/f.txt", size=2, checksum=None, last_access=1.0,
+            last_modified=1.0, sync_status=SyncStatus.CLEAN, replica_count=1,
+            recomputable=False, recompute_cmd=None, encrypted=False,
+            encryption_key_id=None,
+        ))
+        snapshot = self.state_manager.get_file_metadata("/f.txt")
+        # A write lands after the snapshot was taken.
+        cache_path.write_bytes(b"v2 longer")
+        self.state_manager.mark_dirty_from_cache_file("/f.txt", cache_path)
+
+        stored = self.cache_manager.store_file_metadata(snapshot, cache_path=cache_path)
+
+        self.assertEqual(stored.sync_status, SyncStatus.DIRTY)
+        self.assertEqual(stored.size, 9)
+        record = read_cache_metadata(cache_path)
+        if record is not None:  # None only where the filesystem has no xattrs
+            self.assertEqual(record.sync_status, SyncStatus.DIRTY)
+            self.assertEqual(record.size, 9)

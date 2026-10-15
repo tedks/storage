@@ -185,12 +185,7 @@ class CacheManager:
                         # Update metadata to show file needs recomputation
                         metadata.size = 0
                         metadata.checksum = None
-                        self.state_manager.set_file_metadata(metadata)
-                        self.sync_cache_metadata(
-                            metadata.virtual_path,
-                            metadata,
-                            cache_path=cache_path,
-                        )
+                        self.store_file_metadata(metadata, cache_path=cache_path)
 
                     except OSError as e:
                         print(f"Warning: Failed to evict recomputable {metadata.virtual_path}: {e}")
@@ -276,6 +271,24 @@ class CacheManager:
     def mark_accessed(self, virtual_path: str):
         """Mark a file as accessed (update LRU)"""
         self.state_manager.update_access_time(virtual_path)
+
+    def store_file_metadata(
+        self,
+        metadata: FileMetadata,
+        *,
+        cache_path: Optional[Path] = None,
+    ) -> Optional[FileMetadata]:
+        """Store a metadata snapshot and mirror the row as stored into the xattr.
+
+        set_file_metadata keeps content columns a write recorded after the
+        snapshot was read, so the xattr is written from a re-read of the row,
+        never from the caller's object. Returns the stored row.
+        """
+        self.state_manager.set_file_metadata(metadata)
+        stored = self.state_manager.get_file_metadata(metadata.virtual_path)
+        if stored is not None:
+            self.sync_cache_metadata(metadata.virtual_path, stored, cache_path=cache_path)
+        return stored
 
     def sync_cache_metadata(
         self,
