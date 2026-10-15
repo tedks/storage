@@ -1,0 +1,22 @@
+id: eviction-truncate-vs-write-race
+title: Eviction can truncate a recomputable file under a concurrent write
+desc: 'Council finding on #97 (Claude seat), pre-existing: CacheManager eviction of
+  recomputable files (cache.py ~181-188) truncates the cache file without coordinating
+  with fs.py writes. A write that lands after get_recomputable_files selected the
+  file is truncated away; the generation-aware upsert keeps that write''s DIRTY and
+  size in the row, so the next sync uploads an empty file. Needs the eviction to re-check
+  the row (status and generation) under the index lock before truncating, or to hold
+  a per-path lock the write path also takes.'
+type: bugfix
+component: cache
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-15T01:35:28-00:00
+references: []
+log_events:
+- time: 2026-10-15T01:35:28-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
