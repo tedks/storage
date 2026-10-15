@@ -4,7 +4,7 @@ Storage is a FUSE meta-filesystem that presents one abstract filesystem
 split across multiple local and remote storage members, with a local LRU
 cache, per-directory N-way replication configured through extended
 attributes, and background sync. See [DESIGN.md](DESIGN.md) for the design
-and [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md) for what is built.
+and the Status section of [README.md](README.md) for what is built.
 
 ## Scope of this file
 
