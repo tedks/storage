@@ -105,7 +105,8 @@ class StateManager:
                 recomputable INTEGER NOT NULL,
                 recompute_cmd TEXT,
                 encrypted INTEGER NOT NULL,
-                encryption_key_id TEXT
+                encryption_key_id TEXT,
+                dirty_generation INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS file_locations (
@@ -123,6 +124,13 @@ class StateManager:
             CREATE INDEX IF NOT EXISTS idx_recomputable ON files(recomputable);
             CREATE INDEX IF NOT EXISTS idx_cached ON file_locations(is_cached);
         ''')
+        # Indexes created before dirty_generation existed get the column
+        # appended, at the same default a fresh schema holds.
+        columns = {row['name'] for row in self.conn.execute('PRAGMA table_info(files)')}
+        if 'dirty_generation' not in columns:
+            self.conn.execute(
+                'ALTER TABLE files ADD COLUMN dirty_generation INTEGER NOT NULL DEFAULT 0'
+            )
         self.conn.commit()
 
     def _flush_access_updates(self, force: bool = False):
@@ -172,17 +180,43 @@ class StateManager:
             recomputable=bool(row['recomputable']),
             recompute_cmd=row['recompute_cmd'],
             encrypted=bool(row['encrypted']),
-            encryption_key_id=row['encryption_key_id']
+            encryption_key_id=row['encryption_key_id'],
+            dirty_generation=row['dirty_generation'],
         )
 
     def set_file_metadata(self, metadata: FileMetadata):
-        """Store or update file metadata"""
+        """Store or update file metadata.
+
+        The content columns (size, checksum, last_modified, sync_status) belong
+        to the row's dirty_generation: when the stored generation is newer than
+        the one in `metadata`, a write() landed after this snapshot was read,
+        and those columns keep the stored values. Policy columns and
+        last_access always take the new values. Use mark_dirty to record a
+        modification and publish_sync_status to report a sync outcome; both
+        are conditioned on the generation instead of overwriting it.
+        """
         self._execute_write('''
-            INSERT OR REPLACE INTO files
+            INSERT INTO files
             (virtual_path, size, checksum, last_access, last_modified,
              sync_status, replica_count, recomputable, recompute_cmd,
-             encrypted, encryption_key_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             encrypted, encryption_key_id, dirty_generation)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(virtual_path) DO UPDATE SET
+                size = CASE WHEN files.dirty_generation > excluded.dirty_generation
+                            THEN files.size ELSE excluded.size END,
+                checksum = CASE WHEN files.dirty_generation > excluded.dirty_generation
+                                THEN files.checksum ELSE excluded.checksum END,
+                last_modified = CASE WHEN files.dirty_generation > excluded.dirty_generation
+                                     THEN files.last_modified ELSE excluded.last_modified END,
+                sync_status = CASE WHEN files.dirty_generation > excluded.dirty_generation
+                                   THEN files.sync_status ELSE excluded.sync_status END,
+                dirty_generation = MAX(files.dirty_generation, excluded.dirty_generation),
+                last_access = excluded.last_access,
+                replica_count = excluded.replica_count,
+                recomputable = excluded.recomputable,
+                recompute_cmd = excluded.recompute_cmd,
+                encrypted = excluded.encrypted,
+                encryption_key_id = excluded.encryption_key_id
         ''', (
             metadata.virtual_path,
             metadata.size,
@@ -194,8 +228,64 @@ class StateManager:
             int(metadata.recomputable),
             metadata.recompute_cmd,
             int(metadata.encrypted),
-            metadata.encryption_key_id
+            metadata.encryption_key_id,
+            metadata.dirty_generation,
         ))
+
+    def mark_dirty(self, virtual_path: str, *, size: int, last_modified: float) -> Optional[int]:
+        """Record a local modification of a file in one statement.
+
+        Sets DIRTY with the new size and mtime and bumps dirty_generation.
+        Every sync-side status change goes through publish_sync_status, which
+        is conditioned on the generation it read, so a write that overlaps an
+        in-flight sync leaves the file DIRTY. Returns the new generation, or
+        None when the path has no row.
+        """
+        with self._db_lock:
+            cursor = self.conn.execute(
+                '''
+                UPDATE files
+                SET sync_status = ?, size = ?, last_modified = ?,
+                    dirty_generation = dirty_generation + 1
+                WHERE virtual_path = ?
+                ''',
+                (SyncStatus.DIRTY.value, size, last_modified, virtual_path),
+            )
+            if cursor.rowcount == 0:
+                self.conn.commit()
+                return None
+            row = self.conn.execute(
+                'SELECT dirty_generation FROM files WHERE virtual_path = ?',
+                (virtual_path,),
+            ).fetchone()
+            self.conn.commit()
+        return int(row['dirty_generation'])
+
+    def publish_sync_status(
+        self,
+        virtual_path: str,
+        generation: int,
+        status: SyncStatus,
+        *,
+        checksum: Optional[str] = None,
+    ) -> bool:
+        """Set a sync-side status if the file has not been written since `generation`.
+
+        Returns False and changes nothing when dirty_generation has moved on:
+        a write() landed after the caller read the row, and the DIRTY it set
+        must stand. A checksum, when given, is recorded with the status.
+        """
+        with self._db_lock:
+            cursor = self.conn.execute(
+                '''
+                UPDATE files
+                SET sync_status = ?, checksum = COALESCE(?, checksum)
+                WHERE virtual_path = ? AND dirty_generation = ?
+                ''',
+                (status.value, checksum, virtual_path, generation),
+            )
+            self.conn.commit()
+            return cursor.rowcount == 1
 
     def get_file_locations(self, virtual_path: str) -> List[FileLocation]:
         """Get all locations where a file is stored"""
@@ -366,6 +456,7 @@ class StateManager:
             metadata.recompute_cmd,
             int(metadata.encrypted),
             metadata.encryption_key_id,
+            metadata.dirty_generation,
         )
 
     @staticmethod
@@ -388,8 +479,8 @@ class StateManager:
             INSERT INTO {table_name}
             (virtual_path, size, checksum, last_access, last_modified,
              sync_status, replica_count, recomputable, recompute_cmd,
-             encrypted, encryption_key_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             encrypted, encryption_key_id, dirty_generation)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''',
             rows,
         )
@@ -688,7 +779,8 @@ class StateManager:
                         recomputable INTEGER NOT NULL,
                         recompute_cmd TEXT,
                         encrypted INTEGER NOT NULL,
-                        encryption_key_id TEXT
+                        encryption_key_id TEXT,
+                        dirty_generation INTEGER NOT NULL DEFAULT 0
                     )
                     '''
                 )

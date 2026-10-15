@@ -218,6 +218,12 @@ ExecPlans for non-trivial work follow the format in
   The SQLite index is rebuildable acceleration state, so do not make it the
   only record of anything that cannot be recovered from xattrs or a member
   reprobe.
+- Sync status is owned by `files.dirty_generation`. Record a modification
+  with `StateManager.mark_dirty` (one UPDATE that bumps the generation) and
+  a sync outcome with `publish_sync_status` (conditioned on the generation
+  the worker read). Never read a row, change `sync_status` and write it
+  back: `set_file_metadata` is for creating rows and changing policy, and it
+  refuses to move the content columns backwards past a newer generation.
 - `storage debug rebuild-index` and `storage debug reprobe-locations`
   mutate state (SQLite index rows and cache-file xattrs: rebuild normalizes
   metadata xattrs, reprobe can write conflict xattrs).
