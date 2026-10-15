@@ -1,0 +1,17 @@
+id: gh-57-repro-test
+title: 'Reproducing test: write() during copy_from_local ends DIRTY with the newer
+  size'
+desc: ""
+type: task
+component: sync
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-15T01:01:08-00:00
+references: []
+log_events:
+- time: 2026-10-15T01:01:08-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
