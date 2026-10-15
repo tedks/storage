@@ -231,7 +231,11 @@ ExecPlans for non-trivial work follow the format in
   xattrs, but all three open the database through `StateManager`, which
   creates an empty one (and its parent directory) at a mistyped `-d` path.
   Do not point the mutating commands, or experimental mounts, at a live
-  cache or at real mount profiles. A profile name given without `--config`
+  cache or at real mount profiles. One concrete reason: the metadata xattr
+  does not carry `dirty_generation`, so a rebuild restarts every row at 0,
+  and a sync worker still holding an older generation could then have a
+  stale CLEAN accepted once the counter climbs back to it (ditz
+  `gh-96-xattr-generation`). A profile name given without `--config`
   is looked up in `~/.config/storage/storage.toml`, then
   `/etc/storage/storage.toml`.
 - README.md lags the code (for example, it still lists remote backends

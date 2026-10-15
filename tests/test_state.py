@@ -376,3 +376,36 @@ class TestDirtyGeneration(unittest.TestCase):
         self.assertEqual(row.sync_status, SyncStatus.DIRTY)
         self.assertEqual(self.state_manager.mark_dirty("/old.txt", size=6, last_modified=2.0), 1)
         self.assertEqual([m.virtual_path for m in self.state_manager.get_dirty_files()], ["/old.txt"])
+
+    def test_mark_dirty_from_cache_file_records_the_file_stat(self):
+        self.state_manager.set_file_metadata(self._metadata())
+        cache_path = self.temp_dir / "f.txt"
+        cache_path.write_bytes(b"twelve bytes")
+
+        self.assertEqual(self.state_manager.mark_dirty_from_cache_file("/f.txt", cache_path), 1)
+
+        row = self.state_manager.get_file_metadata("/f.txt")
+        self.assertEqual(row.sync_status, SyncStatus.DIRTY)
+        self.assertEqual(row.size, 12)
+        self.assertEqual(row.last_modified, cache_path.lstat().st_mtime)
+
+    def test_reprobe_promotion_from_a_stale_snapshot_keeps_newer_content(self):
+        self.state_manager.set_file_metadata(self._metadata())
+        snapshot = self.state_manager.get_file_metadata("/f.txt")
+        self.state_manager.mark_dirty("/f.txt", size=10, last_modified=2.0)
+
+        snapshot.sync_status = SyncStatus.CONFLICT
+        snapshot.replica_count = 2
+        self.state_manager.apply_reprobe_backend_update(
+            promoted_metadata=[snapshot],
+            backend_name="remote0",
+            virtual_paths=[],
+            locations=[],
+            is_cached=False,
+        )
+
+        row = self.state_manager.get_file_metadata("/f.txt")
+        self.assertEqual(row.replica_count, 2)
+        self.assertEqual(row.sync_status, SyncStatus.DIRTY)
+        self.assertEqual(row.size, 10)
+        self.assertEqual(row.dirty_generation, 1)

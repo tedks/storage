@@ -9,6 +9,7 @@ This module manages the state of all files in the Storage filesystem, including:
 - Conflict information
 """
 
+import os
 import threading
 import sqlite3
 import time
@@ -53,6 +54,36 @@ class StateManager:
         ORDER BY virtual_path ASC, backend_name ASC
         LIMIT ?
     """
+
+    # Every whole-row write goes through this upsert. The content columns
+    # (size, checksum, last_modified, sync_status) belong to the row's
+    # dirty_generation: when the stored generation is newer than the one in
+    # the incoming row, a write() landed after that row was read, and those
+    # columns keep the stored values. Policy columns and last_access always
+    # take the new values. Parameters are a _metadata_row tuple.
+    _UPSERT_FILES_SQL = '''
+        INSERT INTO files
+        (virtual_path, size, checksum, last_access, last_modified,
+         sync_status, replica_count, recomputable, recompute_cmd,
+         encrypted, encryption_key_id, dirty_generation)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(virtual_path) DO UPDATE SET
+            size = CASE WHEN files.dirty_generation > excluded.dirty_generation
+                        THEN files.size ELSE excluded.size END,
+            checksum = CASE WHEN files.dirty_generation > excluded.dirty_generation
+                            THEN files.checksum ELSE excluded.checksum END,
+            last_modified = CASE WHEN files.dirty_generation > excluded.dirty_generation
+                                 THEN files.last_modified ELSE excluded.last_modified END,
+            sync_status = CASE WHEN files.dirty_generation > excluded.dirty_generation
+                               THEN files.sync_status ELSE excluded.sync_status END,
+            dirty_generation = MAX(files.dirty_generation, excluded.dirty_generation),
+            last_access = excluded.last_access,
+            replica_count = excluded.replica_count,
+            recomputable = excluded.recomputable,
+            recompute_cmd = excluded.recompute_cmd,
+            encrypted = excluded.encrypted,
+            encryption_key_id = excluded.encryption_key_id
+    '''
 
     def __init__(self, db_path: str):
         self.db_path = db_path
@@ -187,50 +218,14 @@ class StateManager:
     def set_file_metadata(self, metadata: FileMetadata):
         """Store or update file metadata.
 
-        The content columns (size, checksum, last_modified, sync_status) belong
-        to the row's dirty_generation: when the stored generation is newer than
-        the one in `metadata`, a write() landed after this snapshot was read,
-        and those columns keep the stored values. Policy columns and
-        last_access always take the new values. Use mark_dirty to record a
-        modification and publish_sync_status to report a sync outcome; both
-        are conditioned on the generation instead of overwriting it.
+        Content columns from a snapshot older than the stored row do not
+        move it backwards (see _UPSERT_FILES_SQL). Use mark_dirty to record
+        a modification and publish_sync_status to report a sync outcome;
+        both are conditioned on the generation instead of overwriting it.
+        Callers that then mirror the row into the xattr must mirror a
+        re-read of the row, not this snapshot (CacheManager.store_file_metadata).
         """
-        self._execute_write('''
-            INSERT INTO files
-            (virtual_path, size, checksum, last_access, last_modified,
-             sync_status, replica_count, recomputable, recompute_cmd,
-             encrypted, encryption_key_id, dirty_generation)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(virtual_path) DO UPDATE SET
-                size = CASE WHEN files.dirty_generation > excluded.dirty_generation
-                            THEN files.size ELSE excluded.size END,
-                checksum = CASE WHEN files.dirty_generation > excluded.dirty_generation
-                                THEN files.checksum ELSE excluded.checksum END,
-                last_modified = CASE WHEN files.dirty_generation > excluded.dirty_generation
-                                     THEN files.last_modified ELSE excluded.last_modified END,
-                sync_status = CASE WHEN files.dirty_generation > excluded.dirty_generation
-                                   THEN files.sync_status ELSE excluded.sync_status END,
-                dirty_generation = MAX(files.dirty_generation, excluded.dirty_generation),
-                last_access = excluded.last_access,
-                replica_count = excluded.replica_count,
-                recomputable = excluded.recomputable,
-                recompute_cmd = excluded.recompute_cmd,
-                encrypted = excluded.encrypted,
-                encryption_key_id = excluded.encryption_key_id
-        ''', (
-            metadata.virtual_path,
-            metadata.size,
-            metadata.checksum,
-            metadata.last_access,
-            metadata.last_modified,
-            metadata.sync_status.value,
-            metadata.replica_count,
-            int(metadata.recomputable),
-            metadata.recompute_cmd,
-            int(metadata.encrypted),
-            metadata.encryption_key_id,
-            metadata.dirty_generation,
-        ))
+        self._execute_write(self._UPSERT_FILES_SQL, self._metadata_row(metadata))
 
     def mark_dirty(self, virtual_path: str, *, size: int, last_modified: float) -> Optional[int]:
         """Record a local modification of a file in one statement.
@@ -260,6 +255,17 @@ class StateManager:
             ).fetchone()
             self.conn.commit()
         return int(row['dirty_generation'])
+
+    def mark_dirty_from_cache_file(self, virtual_path: str, cache_path: Path) -> Optional[int]:
+        """mark_dirty with the cache file's current size and mtime.
+
+        The stat is taken under the database lock, so concurrent writers
+        record their stats in the order they update the row: the row never
+        ends up holding a stat older than the one it held before.
+        """
+        with self._db_lock:
+            st = os.lstat(str(cache_path))
+            return self.mark_dirty(virtual_path, size=st.st_size, last_modified=st.st_mtime)
 
     def publish_sync_status(
         self,
@@ -556,30 +562,11 @@ class StateManager:
         with self._db_lock:
             try:
                 if promoted_metadata:
+                    # Promotions come from an earlier scan of the index; the
+                    # upsert keeps any content a write recorded since.
                     self.conn.executemany(
-                        '''
-                        INSERT OR REPLACE INTO files
-                        (virtual_path, size, checksum, last_access, last_modified,
-                         sync_status, replica_count, recomputable, recompute_cmd,
-                         encrypted, encryption_key_id)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        ''',
-                        [
-                            (
-                                metadata.virtual_path,
-                                metadata.size,
-                                metadata.checksum,
-                                metadata.last_access,
-                                metadata.last_modified,
-                                metadata.sync_status.value,
-                                metadata.replica_count,
-                                int(metadata.recomputable),
-                                metadata.recompute_cmd,
-                                int(metadata.encrypted),
-                                metadata.encryption_key_id,
-                            )
-                            for metadata in promoted_metadata
-                        ],
+                        self._UPSERT_FILES_SQL,
+                        [self._metadata_row(metadata) for metadata in promoted_metadata],
                     )
 
                 if normalized_paths:
@@ -815,7 +802,13 @@ class StateManager:
                 self.conn.execute(
                     '''
                     INSERT INTO files
-                    SELECT * FROM replacement_files
+                    (virtual_path, size, checksum, last_access, last_modified,
+                     sync_status, replica_count, recomputable, recompute_cmd,
+                     encrypted, encryption_key_id, dirty_generation)
+                    SELECT virtual_path, size, checksum, last_access, last_modified,
+                           sync_status, replica_count, recomputable, recompute_cmd,
+                           encrypted, encryption_key_id, dirty_generation
+                    FROM replacement_files
                     '''
                 )
                 self.conn.execute(

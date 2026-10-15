@@ -780,12 +780,11 @@ class StorageFS(Operations):
 
         One UPDATE on the index row, so a sync that is in flight for the old
         content sees the generation move and does not report it as synced.
-        The row is then mirrored into the cache file's metadata xattr.
+        The stat is taken under the index lock, so concurrent writers cannot
+        record an older stat over a newer one. The row is then mirrored into
+        the cache file's metadata xattr.
         """
-        st = os.lstat(str(cache_path))
-        generation = self.state_manager.mark_dirty(
-            canonical_path, size=st.st_size, last_modified=st.st_mtime,
-        )
+        generation = self.state_manager.mark_dirty_from_cache_file(canonical_path, cache_path)
         if generation is None:
             return
         metadata = self.state_manager.get_file_metadata(canonical_path)
