@@ -25,5 +25,14 @@ log_events:
   who: Ted Smith
   what: blocks gh-96
   comment: ""
+- time: 2026-10-15T01:35:28-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Reachable case from the #97 convergence round (Claude seat): streaming.py''s
+    cache-fill completion turns any status other than DIRTY into CLEAN at the same
+    generation via set_file_metadata. A fill landing on a row that is ERROR or SYNCING
+    at generation N writes CLEAN, and that file is never retried. Unlikely (a locally
+    dirty file is normally already cached) but it is exactly the same-generation overwrite
+    this issue is about.'
 blocks:
 - gh-96
