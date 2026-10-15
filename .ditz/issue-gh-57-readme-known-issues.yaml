@@ -1,0 +1,19 @@
+id: gh-57-readme-known-issues
+title: 'Drop the #35/#57 entry from README Known Issues once the fix and #95 are both
+  merged'
+desc: 'PR #95 adds a README Known Issues entry for #35/#57. Once both #95 and the
+  fix PR are on master, remove that entry. Not done in the fix PR because the two
+  branches are independent of each other.'
+type: task
+component: sync
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-15T01:12:22-00:00
+references: []
+log_events:
+- time: 2026-10-15T01:12:22-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
