@@ -1,0 +1,41 @@
+id: readme-ai-authorship-statement
+title: Should the README say the code is largely AI-assisted before the repo goes
+  public?
+desc: 'Context: 96 of ~254 commits carry a Claude co-author trailer and the first
+  PRs are titled "Claude storage implementation" and "Jules PR", so a reader of the
+  history will see how the code was built whether or not the README says so. PR release/public-hygiene
+  (license, README status, scrubbed hosts) deliberately leaves this out because it
+  is a framing choice, not a hygiene fix.
+
+
+  Options:
+
+  1. Say nothing; let the history speak. Zero work, but a reader may feel it was hidden.
+
+  2. One sentence in the README (e.g. under Status): "Much of this code was written
+  with Claude and Codex, reviewed and run by the maintainer." Honest, low cost.
+
+  3. A fuller note on the process (council review, field testing on one setup).
+
+
+  Recommendation: option 2. It matches what the Status section already does, which
+  is state plainly what has and has not been verified.
+
+
+  Decides: the maintainer (product/framing ruling).
+
+  Blocks: nothing technical; only the decision to flip the repo to public, which the
+  maintainer has said to hold for now.'
+type: task
+component: open-questions
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-15T00:47:09-00:00
+references: []
+log_events:
+- time: 2026-10-15T00:47:09-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
