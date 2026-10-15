@@ -1,0 +1,21 @@
+id: gh-96-xattr-generation
+title: Rebuild-index resets dirty_generation; carry it or make it irrelevant
+desc: 'Council finding on #97 (Claude seat): the metadata xattr does not carry dirty_generation,
+  so rebuild-index restarts every row at 0. If a rebuild ran against a mounted cache,
+  a worker holding generation g could have its stale CLEAN accepted once the counter
+  climbs back to g. AGENTS.md documents that rebuild requires an unmounted cache;
+  #96 should either carry the generation in the xattr or make the derived-dirtiness
+  rule make the counter irrelevant across rebuilds.'
+type: task
+component: sync
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-15T01:24:38-00:00
+references: []
+log_events:
+- time: 2026-10-15T01:24:38-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
