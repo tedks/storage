@@ -66,6 +66,10 @@ log_events:
   who: Ted Smith
   what: blocked by gh-57-xattr-generation
   comment: ""
+- time: 2026-10-15T01:12:22-00:00
+  who: Ted Smith
+  what: blocked by gh-57-readme-known-issues
+  comment: ""
 blocks:
 - gh-96
 blocked_by:
@@ -78,3 +82,4 @@ blocked_by:
 - gh-57-worker-finalize
 - gh-57-write-path
 - gh-57-xattr-generation
+- gh-57-readme-known-issues
