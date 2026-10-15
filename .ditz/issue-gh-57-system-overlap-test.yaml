@@ -1,0 +1,21 @@
+id: gh-57-system-overlap-test
+title: System-level overlapping-write test through SyncManager workers
+desc: 'Council nit on #97: the overlapping-write tests are unit-level (executor, manager
+  and state each driven directly). Add a system-level test that runs SyncManager workers
+  against a real cache directory and local backends, writes a file through CacheManager.mark_file_dirty
+  while a worker is mid-copy (a backend whose copy_from_local blocks on an event),
+  and asserts the file ends CLEAN with the newer content on the member after the requeued
+  pass.'
+type: task
+component: sync
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-15T01:35:28-00:00
+references: []
+log_events:
+- time: 2026-10-15T01:35:28-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
