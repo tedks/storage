@@ -11,6 +11,7 @@ from fuse import FuseOSError
 from storage.backends.local import LocalBackend
 from storage.cache_metadata import read_cache_metadata
 from storage.fs import StorageFS
+from storage.models import SyncStatus
 
 
 class TestFSCoreIntegration(unittest.TestCase):
@@ -142,6 +143,30 @@ class TestFSCoreIntegration(unittest.TestCase):
             shutil.rmtree(temp_dir, ignore_errors=True)
 
         self.assertEqual([True], callback_results)
+
+    def test_create_write_and_truncate_each_bump_the_dirty_generation(self):
+        fd = self.fs.create("/gen.txt", 0o644)
+        created = self.fs.state_manager.get_file_metadata("/gen.txt")
+        self.assertEqual(created.sync_status, SyncStatus.DIRTY)
+        self.assertEqual(created.size, 0)
+
+        self.fs.write("/gen.txt", b"hello", 0, fd)
+        written = self.fs.state_manager.get_file_metadata("/gen.txt")
+        self.assertGreater(written.dirty_generation, created.dirty_generation)
+        self.assertEqual(written.sync_status, SyncStatus.DIRTY)
+        self.assertEqual(written.size, 5)
+        self.fs.release("/gen.txt", fd)
+
+        self.fs.truncate("/gen.txt", 2)
+        truncated = self.fs.state_manager.get_file_metadata("/gen.txt")
+        self.assertGreater(truncated.dirty_generation, written.dirty_generation)
+        self.assertEqual(truncated.sync_status, SyncStatus.DIRTY)
+        self.assertEqual(truncated.size, 2)
+
+        record = read_cache_metadata(self.cache_dir / "gen.txt")
+        if record is not None:
+            self.assertEqual(record.sync_status, SyncStatus.DIRTY)
+            self.assertEqual(record.size, 2)
 
     def test_rename_rewrites_cache_metadata_virtual_path(self):
         fd = self.fs.create("/old.txt", 0o644)

@@ -775,6 +775,23 @@ class StorageFS(Operations):
         except OSError as e:
             raise FuseOSError(e.errno)
 
+    def _mark_cache_file_dirty(self, canonical_path: str, cache_path: Path) -> None:
+        """Record a modification of a cached file: DIRTY, new size and mtime, new generation.
+
+        One UPDATE on the index row, so a sync that is in flight for the old
+        content sees the generation move and does not report it as synced.
+        The row is then mirrored into the cache file's metadata xattr.
+        """
+        st = os.lstat(str(cache_path))
+        generation = self.state_manager.mark_dirty(
+            canonical_path, size=st.st_size, last_modified=st.st_mtime,
+        )
+        if generation is None:
+            return
+        metadata = self.state_manager.get_file_metadata(canonical_path)
+        if metadata:
+            self.cache_manager.sync_cache_metadata(canonical_path, metadata, cache_path=cache_path)
+
     def truncate(self, path, length, fh=None):
         """Truncate a file"""
         resolved = self._resolve_path(path)
@@ -787,18 +804,7 @@ class StorageFS(Operations):
 
             # Mark as dirty
             if not resolved.backend_name:
-                metadata = self.state_manager.get_file_metadata(resolved.canonical_path)
-                if metadata:
-                    st = os.lstat(str(cache_path))
-                    metadata.size = st.st_size
-                    metadata.last_modified = st.st_mtime
-                    metadata.sync_status = SyncStatus.DIRTY
-                    self.state_manager.set_file_metadata(metadata)
-                    self.cache_manager.sync_cache_metadata(
-                        resolved.canonical_path,
-                        metadata,
-                        cache_path=cache_path,
-                    )
+                self._mark_cache_file_dirty(resolved.canonical_path, cache_path)
 
         except OSError as e:
             raise FuseOSError(e.errno)
@@ -911,11 +917,7 @@ class StorageFS(Operations):
                 encryption_key_id=None
             )
             self.state_manager.set_file_metadata(metadata)
-            self.cache_manager.sync_cache_metadata(
-                resolved.canonical_path,
-                metadata,
-                cache_path=cache_path,
-            )
+            self._mark_cache_file_dirty(resolved.canonical_path, cache_path)
 
             parent_dir = resolved.parent_dir
             self._invalidate_dir_cache_entry(parent_dir)
@@ -976,18 +978,7 @@ class StorageFS(Operations):
 
             if entry.backend_name is None:
                 self.cache_manager.mark_accessed(path)
-                metadata = self.state_manager.get_file_metadata(entry.canonical_path)
-                if metadata:
-                    st = os.lstat(str(entry.cache_path))
-                    metadata.size = st.st_size
-                    metadata.last_modified = st.st_mtime
-                    metadata.sync_status = SyncStatus.DIRTY
-                    self.state_manager.set_file_metadata(metadata)
-                    self.cache_manager.sync_cache_metadata(
-                        entry.canonical_path,
-                        metadata,
-                        cache_path=entry.cache_path,
-                    )
+                self._mark_cache_file_dirty(entry.canonical_path, entry.cache_path)
 
             return written
 
