@@ -30,6 +30,10 @@ class FileMetadata:
     recompute_cmd: Optional[str]
     encrypted: bool
     encryption_key_id: Optional[str]
+    # Bumped by every local modification (StateManager.mark_dirty). Sync-side
+    # status changes are conditioned on it, so a write that overlaps an
+    # in-flight sync cannot be reported as synced.
+    dirty_generation: int = 0
 
     def to_dict(self) -> Dict:
         """Convert to a SQLite-friendly dictionary."""

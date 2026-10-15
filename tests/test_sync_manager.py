@@ -435,3 +435,55 @@ class TestDirQueueDedup(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestRequeueOnCompletion(unittest.TestCase):
+    """A task flagged by the executor is replaced under the queue lock."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.cache_dir = Path(self.temp_dir) / "cache"
+        self.backend_dir = Path(self.temp_dir) / "backend"
+        self.cache_dir.mkdir()
+        self.backend_dir.mkdir()
+        self.state_manager = StateManager(str(Path(self.temp_dir) / "state.db"))
+        self.cache_manager = CacheManager(self.cache_dir, self.state_manager, 1024 * 1024)
+        backends = {"backend": LocalBackend("backend", str(self.backend_dir))}
+        self.sync_manager = SyncManager(
+            self.state_manager,
+            self.cache_manager,
+            ReplicationManager(self.state_manager, backends),
+            num_workers=1,
+        )
+        # Not started: the queue and dedup set are driven directly.
+
+    def tearDown(self):
+        self.state_manager.close()
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_flagged_task_hands_its_dedup_entry_to_a_fresh_task(self):
+        self.sync_manager.queue_sync("/a")
+        task = self.sync_manager.task_queue.get_nowait()
+        task.requeue = True
+
+        self.sync_manager._task_complete(task)
+
+        self.assertIn("/a", self.sync_manager._queued_tasks)
+        self.assertEqual(self.sync_manager.task_queue.qsize(), 1)
+        replacement = self.sync_manager.task_queue.get_nowait()
+        self.assertEqual(replacement.virtual_path, "/a")
+        self.assertIsNot(replacement, task)
+        self.assertFalse(replacement.requeue)
+        self.assertIsNone(replacement.generation)
+        # The entry still deduplicates ordinary requests against the fresh task.
+        self.sync_manager.queue_sync("/a")
+        self.assertEqual(self.sync_manager.task_queue.qsize(), 0)
+
+    def test_unflagged_task_releases_its_dedup_entry(self):
+        self.sync_manager.queue_sync("/a")
+        task = self.sync_manager.task_queue.get_nowait()
+
+        self.sync_manager._task_complete(task)
+
+        self.assertNotIn("/a", self.sync_manager._queued_tasks)
+        self.assertEqual(self.sync_manager.task_queue.qsize(), 0)

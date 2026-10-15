@@ -17,6 +17,7 @@ from unittest.mock import MagicMock, patch
 
 from storage.backends.base import Backend
 from storage.cache import CacheManager
+from storage.cache_metadata import read_cache_metadata
 from storage.file_config import FileConfig
 from storage.models import FileLocation, FileMetadata, SyncStatus
 from storage.replication import ReplicationManager
@@ -103,6 +104,127 @@ class _ExecutorTestBase(unittest.TestCase):
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         cache_path.write_bytes(content)
         return cache_path
+
+
+class TestSyncExecutorOverlappingWrite(_ExecutorTestBase):
+    """A write that lands while a sync is in flight must leave the file DIRTY.
+
+    Regression test for #35 / #57: the worker snapshots the metadata row at
+    the start of the task and writes the whole snapshot back as CLEAN at the
+    end, so a write() in between is marked synced without ever being copied,
+    and the row's size reverts to the pre-write value.
+    """
+
+    def test_write_during_copy_is_not_marked_clean(self):
+        meta = _make_metadata(sync_status=SyncStatus.DIRTY, size=2)
+        self.state_manager.set_file_metadata(meta)
+        cache_path = self._create_cache_file(content=b"v1")
+        newer = b"v2 written while the worker was copying v1"
+
+        def write_during_copy(local_path, virtual_path):
+            # The backend has read v1. Now do what fs.py's write() does:
+            # replace the bytes, then record the modification.
+            cache_path.write_bytes(newer)
+            self.cache_manager.mark_file_dirty("/test.txt", cache_path)
+
+        self.mock_backend.copy_from_local.side_effect = write_during_copy
+
+        task = SyncTask("/test.txt")
+        with patch.object(self.executor.conflict_detector, "check_conflict", return_value=None):
+            self.executor.process_file_task(task)
+
+        updated = self.state_manager.get_file_metadata("/test.txt")
+        self.assertEqual(updated.sync_status, SyncStatus.DIRTY)
+        self.assertEqual(updated.size, len(newer))
+        # The xattr mirror feeds rebuild-index; it must not claim CLEAN either.
+        record = read_cache_metadata(cache_path)
+        self.assertIsNotNone(record)
+        self.assertEqual(record.sync_status, SyncStatus.DIRTY)
+        self.assertEqual(record.size, len(newer))
+        # The newer content needs its own pass; the manager queues it when it
+        # retires this task. The copy that was superseded is not a success.
+        self.assertTrue(task.requeue)
+        self.assertEqual(self.executor.get_stats()["synced"], 0)
+
+    def test_sync_without_overlap_marks_clean_and_keeps_generation(self):
+        meta = _make_metadata(sync_status=SyncStatus.DIRTY, checksum=None)
+        self.state_manager.set_file_metadata(meta)
+        cache_path = self._create_cache_file(content=b"steady")
+        before = self.state_manager.get_file_metadata("/test.txt").dirty_generation
+
+        task = SyncTask("/test.txt")
+        with patch.object(self.executor.conflict_detector, "check_conflict", return_value=None):
+            self.executor.process_file_task(task)
+
+        updated = self.state_manager.get_file_metadata("/test.txt")
+        self.assertEqual(updated.sync_status, SyncStatus.CLEAN)
+        self.assertEqual(updated.dirty_generation, before)
+        self.assertEqual(updated.checksum, self.state_manager.compute_checksum(cache_path))
+        self.assertFalse(task.requeue)
+        self.assertEqual(task.generation, before)
+        self.assertEqual(self.executor.get_stats()["synced"], 1)
+
+    def test_error_after_last_retry_respects_a_newer_write(self):
+        """The ERROR after max retries belongs to the attempt that read the row."""
+        self.state_manager.set_file_metadata(_make_metadata(sync_status=SyncStatus.DIRTY))
+        cache_path = self._create_cache_file(content=b"v1")
+        task = SyncTask("/test.txt", retry_count=self.config.max_retries - 1)
+        task.generation = self.state_manager.get_file_metadata("/test.txt").dirty_generation
+        # The attempt raised after a write had landed.
+        cache_path.write_bytes(b"v2")
+        self.cache_manager.mark_file_dirty("/test.txt", cache_path)
+
+        completed = self.executor.handle_task_failure(task, "boom", queue.PriorityQueue())
+
+        self.assertTrue(completed)
+        self.assertEqual(self.state_manager.get_file_metadata("/test.txt").sync_status, SyncStatus.DIRTY)
+        self.assertTrue(task.requeue)
+
+    def test_failing_attempt_records_the_generation_it_read(self):
+        """The same task object carries its generation from the attempt to the failure path."""
+        self.state_manager.set_file_metadata(_make_metadata(sync_status=SyncStatus.DIRTY))
+        cache_path = self._create_cache_file(content=b"v1")
+        task = SyncTask("/test.txt", retry_count=self.config.max_retries - 1)
+
+        def write_then_fail(path):
+            cache_path.write_bytes(b"v2")
+            self.cache_manager.mark_file_dirty("/test.txt", cache_path)
+            raise OSError("checksum failed")
+
+        with patch.object(self.state_manager, "compute_checksum", side_effect=write_then_fail):
+            with self.assertRaises(OSError):
+                self.executor.process_file_task(task)
+        self.assertEqual(task.generation, 0)
+
+        completed = self.executor.handle_task_failure(task, "checksum failed", queue.PriorityQueue())
+
+        self.assertTrue(completed)
+        self.assertEqual(self.state_manager.get_file_metadata("/test.txt").sync_status, SyncStatus.DIRTY)
+        self.assertTrue(task.requeue)
+        self.assertEqual(self.executor.get_stats()["failed"], 0)
+
+    def test_error_after_last_retry_lands_when_nothing_was_written(self):
+        self.state_manager.set_file_metadata(_make_metadata(sync_status=SyncStatus.DIRTY))
+        self._create_cache_file(content=b"v1")
+        task = SyncTask("/test.txt", retry_count=self.config.max_retries - 1)
+        task.generation = self.state_manager.get_file_metadata("/test.txt").dirty_generation
+
+        self.assertTrue(self.executor.handle_task_failure(task, "boom", queue.PriorityQueue()))
+
+        self.assertEqual(self.state_manager.get_file_metadata("/test.txt").sync_status, SyncStatus.ERROR)
+        self.assertFalse(task.requeue)
+        self.assertEqual(self.executor.get_stats()["failed"], 1)
+
+    def test_failure_before_the_row_was_read_leaves_it_alone(self):
+        self.state_manager.set_file_metadata(_make_metadata(sync_status=SyncStatus.DIRTY))
+        task = SyncTask("/test.txt", retry_count=self.config.max_retries - 1)
+
+        self.assertTrue(self.executor.handle_task_failure(task, "boom", queue.PriorityQueue()))
+
+        self.assertEqual(self.state_manager.get_file_metadata("/test.txt").sync_status, SyncStatus.DIRTY)
+        self.assertFalse(task.requeue)
+        # Nothing to publish against, but the failure is still a failure.
+        self.assertEqual(self.executor.get_stats()["failed"], 1)
 
 
 class TestSyncExecutorFileTask(_ExecutorTestBase):
@@ -333,6 +455,8 @@ class TestSyncExecutorRetry(_ExecutorTestBase):
         # handle_task_failure increments retry_count first, so pass max_retries - 1
         # so after increment it becomes 3 which is NOT < 3.
         task = SyncTask("/doomed.txt", priority=50, retry_count=2)
+        # The attempts read the row; the ERROR is published against that read.
+        task.generation = self.state_manager.get_file_metadata("/doomed.txt").dirty_generation
 
         done = self.executor.handle_task_failure(task, "persistent error", task_queue)
 

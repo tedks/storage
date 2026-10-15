@@ -233,3 +233,179 @@ class TestStateAccessUpdates(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestDirtyGeneration(unittest.TestCase):
+    """mark_dirty, publish_sync_status and the generation guard on set_file_metadata."""
+
+    def setUp(self):
+        self.temp_dir = Path(tempfile.mkdtemp())
+        self.db_path = self.temp_dir / "state.db"
+        self.state_manager = StateManager(str(self.db_path))
+
+    def tearDown(self):
+        self.state_manager.close()
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _metadata(self, **overrides):
+        values = dict(
+            virtual_path="/f.txt",
+            size=3,
+            checksum="old",
+            last_access=1.0,
+            last_modified=1.0,
+            sync_status=SyncStatus.CLEAN,
+            replica_count=1,
+            recomputable=False,
+            recompute_cmd=None,
+            encrypted=False,
+            encryption_key_id=None,
+        )
+        values.update(overrides)
+        return FileMetadata(**values)
+
+    def test_mark_dirty_bumps_generation_and_records_stat(self):
+        self.state_manager.set_file_metadata(self._metadata())
+
+        self.assertEqual(self.state_manager.mark_dirty("/f.txt", size=10, last_modified=2.0), 1)
+        self.assertEqual(self.state_manager.mark_dirty("/f.txt", size=11, last_modified=3.0), 2)
+
+        row = self.state_manager.get_file_metadata("/f.txt")
+        self.assertEqual(row.sync_status, SyncStatus.DIRTY)
+        self.assertEqual(row.dirty_generation, 2)
+        self.assertEqual(row.size, 11)
+        self.assertEqual(row.last_modified, 3.0)
+
+    def test_mark_dirty_without_row_returns_none(self):
+        self.assertIsNone(self.state_manager.mark_dirty("/missing", size=1, last_modified=1.0))
+
+    def test_publish_sync_status_refuses_a_stale_generation(self):
+        self.state_manager.set_file_metadata(self._metadata(sync_status=SyncStatus.DIRTY))
+        seen = self.state_manager.get_file_metadata("/f.txt").dirty_generation
+        self.state_manager.mark_dirty("/f.txt", size=10, last_modified=2.0)
+
+        published = self.state_manager.publish_sync_status(
+            "/f.txt", seen, SyncStatus.CLEAN, checksum="new",
+        )
+
+        self.assertFalse(published)
+        row = self.state_manager.get_file_metadata("/f.txt")
+        self.assertEqual(row.sync_status, SyncStatus.DIRTY)
+        self.assertEqual(row.checksum, "old")
+        self.assertEqual(row.size, 10)
+
+    def test_publish_sync_status_at_current_generation_sets_status_and_checksum(self):
+        self.state_manager.set_file_metadata(self._metadata(sync_status=SyncStatus.DIRTY))
+        generation = self.state_manager.mark_dirty("/f.txt", size=10, last_modified=2.0)
+
+        self.assertTrue(self.state_manager.publish_sync_status(
+            "/f.txt", generation, SyncStatus.CLEAN, checksum="new",
+        ))
+        row = self.state_manager.get_file_metadata("/f.txt")
+        self.assertEqual(row.sync_status, SyncStatus.CLEAN)
+        self.assertEqual(row.checksum, "new")
+        self.assertEqual(row.dirty_generation, generation)
+
+        # Without a checksum the stored one is kept.
+        self.assertTrue(self.state_manager.publish_sync_status("/f.txt", generation, SyncStatus.ERROR))
+        self.assertEqual(self.state_manager.get_file_metadata("/f.txt").checksum, "new")
+
+    def test_set_file_metadata_with_stale_snapshot_keeps_newer_content_columns(self):
+        self.state_manager.set_file_metadata(self._metadata())
+        snapshot = self.state_manager.get_file_metadata("/f.txt")
+        self.state_manager.mark_dirty("/f.txt", size=10, last_modified=2.0)
+
+        # A read-modify-write from before the write: policy change plus a
+        # stale CLEAN. The policy lands, the content columns do not move back.
+        snapshot.replica_count = 3
+        snapshot.sync_status = SyncStatus.CLEAN
+        snapshot.size = 3
+        self.state_manager.set_file_metadata(snapshot)
+
+        row = self.state_manager.get_file_metadata("/f.txt")
+        self.assertEqual(row.replica_count, 3)
+        self.assertEqual(row.sync_status, SyncStatus.DIRTY)
+        self.assertEqual(row.size, 10)
+        self.assertEqual(row.last_modified, 2.0)
+        self.assertEqual(row.dirty_generation, 1)
+
+    def test_set_file_metadata_at_current_generation_applies_everything(self):
+        self.state_manager.set_file_metadata(self._metadata())
+        self.state_manager.mark_dirty("/f.txt", size=10, last_modified=2.0)
+        current = self.state_manager.get_file_metadata("/f.txt")
+
+        current.sync_status = SyncStatus.CONFLICT
+        current.checksum = "resolved"
+        self.state_manager.set_file_metadata(current)
+
+        row = self.state_manager.get_file_metadata("/f.txt")
+        self.assertEqual(row.sync_status, SyncStatus.CONFLICT)
+        self.assertEqual(row.checksum, "resolved")
+        self.assertEqual(row.dirty_generation, 1)
+
+    def test_index_without_generation_column_is_migrated(self):
+        self.state_manager.close()
+        self.db_path.unlink()
+        import sqlite3
+
+        conn = sqlite3.connect(str(self.db_path))
+        conn.executescript(
+            '''
+            CREATE TABLE files (
+                virtual_path TEXT PRIMARY KEY,
+                size INTEGER NOT NULL,
+                checksum TEXT,
+                last_access REAL NOT NULL,
+                last_modified REAL NOT NULL,
+                sync_status TEXT NOT NULL,
+                replica_count INTEGER NOT NULL,
+                recomputable INTEGER NOT NULL,
+                recompute_cmd TEXT,
+                encrypted INTEGER NOT NULL,
+                encryption_key_id TEXT
+            );
+            INSERT INTO files VALUES ('/old.txt', 5, NULL, 1.0, 1.0, 'dirty', 1, 0, NULL, 0, NULL);
+            '''
+        )
+        conn.commit()
+        conn.close()
+
+        self.state_manager = StateManager(str(self.db_path))
+        row = self.state_manager.get_file_metadata("/old.txt")
+        self.assertEqual(row.dirty_generation, 0)
+        self.assertEqual(row.sync_status, SyncStatus.DIRTY)
+        self.assertEqual(self.state_manager.mark_dirty("/old.txt", size=6, last_modified=2.0), 1)
+        self.assertEqual([m.virtual_path for m in self.state_manager.get_dirty_files()], ["/old.txt"])
+
+    def test_mark_dirty_from_cache_file_records_the_file_stat(self):
+        self.state_manager.set_file_metadata(self._metadata())
+        cache_path = self.temp_dir / "f.txt"
+        cache_path.write_bytes(b"twelve bytes")
+
+        self.assertEqual(self.state_manager.mark_dirty_from_cache_file("/f.txt", cache_path), 1)
+
+        row = self.state_manager.get_file_metadata("/f.txt")
+        self.assertEqual(row.sync_status, SyncStatus.DIRTY)
+        self.assertEqual(row.size, 12)
+        self.assertEqual(row.last_modified, cache_path.lstat().st_mtime)
+
+    def test_reprobe_promotion_from_a_stale_snapshot_keeps_newer_content(self):
+        self.state_manager.set_file_metadata(self._metadata())
+        snapshot = self.state_manager.get_file_metadata("/f.txt")
+        self.state_manager.mark_dirty("/f.txt", size=10, last_modified=2.0)
+
+        snapshot.sync_status = SyncStatus.CONFLICT
+        snapshot.replica_count = 2
+        self.state_manager.apply_reprobe_backend_update(
+            promoted_metadata=[snapshot],
+            backend_name="remote0",
+            virtual_paths=[],
+            locations=[],
+            is_cached=False,
+        )
+
+        row = self.state_manager.get_file_metadata("/f.txt")
+        self.assertEqual(row.replica_count, 2)
+        self.assertEqual(row.sync_status, SyncStatus.DIRTY)
+        self.assertEqual(row.size, 10)
+        self.assertEqual(row.dirty_generation, 1)

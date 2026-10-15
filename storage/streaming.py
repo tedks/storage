@@ -681,12 +681,9 @@ class StreamingReadManager:
                 metadata.last_modified = st.st_mtime
                 if metadata.sync_status != SyncStatus.DIRTY:
                     metadata.sync_status = SyncStatus.CLEAN
-            self.state_manager.set_file_metadata(metadata)
-            self.cache_manager.sync_cache_metadata(
-                session.canonical_path,
-                metadata,
-                cache_path=session.final_cache_path,
-            )
+            # Mirrors the row as stored: a write during the fill keeps its
+            # DIRTY in SQLite, and the xattr must say the same.
+            self.cache_manager.store_file_metadata(metadata, cache_path=session.final_cache_path)
 
             try:
                 self.state_manager.add_file_location(

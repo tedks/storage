@@ -315,6 +315,15 @@ class SyncManager:
                     task.backend_hint,
                 )
                 self._queued_dir_tasks.discard(key)
+            elif task.requeue:
+                # The file was written while this pass was in flight. Hand
+                # the dedup entry straight to a fresh task, under the lock,
+                # so there is never a moment with the path unregistered or
+                # registered twice. (queue_sync would re-take _queue_lock.)
+                # Default priority: a file written continuously must not
+                # crowd out everything else by requeueing ahead of it.
+                self.task_queue.put(SyncTask(virtual_path=task.virtual_path))
+                logger.debug("Re-queued sync for %s after an overlapping write", task.virtual_path)
             else:
                 self._queued_tasks.discard(task.virtual_path)
             logger.debug("Completed %s task for %s", getattr(task, 'operation', 'file'),
