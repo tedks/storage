@@ -20,5 +20,10 @@ log_events:
   who: Ted Smith
   what: blocked by gh-57
   comment: ""
+- time: 2026-10-15T01:24:38-00:00
+  who: Ted Smith
+  what: blocked by gh-96-policy-only-upsert
+  comment: ""
 blocked_by:
 - gh-57
+- gh-96-policy-only-upsert
