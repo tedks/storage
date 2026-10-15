@@ -24,6 +24,13 @@ class SyncTask:
     priority: int = 0
     retry_count: int = 0
     queued_time: float = field(default_factory=time.time)
+    # The dirty_generation the current attempt read before claiming the row.
+    # Every status it publishes, including the ERROR after the last retry, is
+    # conditioned on it. None until an attempt has read the row.
+    generation: Optional[int] = None
+    # Set when a publish was refused because the file was written during the
+    # attempt. The manager queues another pass when it completes this task.
+    requeue: bool = False
 
     def __lt__(self, other):
         return self.priority > other.priority

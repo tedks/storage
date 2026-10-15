@@ -30,7 +30,6 @@ class SyncExecutor:
         replication_manager: ReplicationManager,
         config: SyncConfig,
         should_sync_path_cb: Optional[Callable[[str], bool]] = None,
-        requeue_cb: Optional[Callable[[str], None]] = None,
     ):
         self.worker_id = worker_id
         self.state_manager = state_manager
@@ -39,9 +38,6 @@ class SyncExecutor:
         self.config = config
         self.conflict_detector = ConflictDetector(state_manager)
         self.should_sync_path_cb = should_sync_path_cb
-        # Called with the path when a sync is abandoned because the file was
-        # written while it was in flight; the manager queues another pass.
-        self.requeue_cb = requeue_cb
         self._stats = {
             "synced": 0,
             "failed": 0,
@@ -79,6 +75,7 @@ class SyncExecutor:
         # write() that lands while the copy is in flight bumps it, so the
         # change is refused and the file stays DIRTY (#35, #57).
         generation = metadata.dirty_generation
+        task.generation = generation
         if not self._publish(task, generation, SyncStatus.SYNCING, cache_path):
             return True
 
@@ -90,8 +87,8 @@ class SyncExecutor:
 
         if not target_backends:
             logger.warning("No backends available for %s", task.virtual_path)
-            self._publish(task, generation, SyncStatus.ERROR, cache_path)
-            self._stats["failed"] += 1
+            if self._publish(task, generation, SyncStatus.ERROR, cache_path):
+                self._stats["failed"] += 1
             return True
 
         checksum = self.state_manager.compute_checksum(cache_path)
@@ -110,8 +107,8 @@ class SyncExecutor:
                         task.virtual_path,
                         backend.name,
                     )
-                    self._publish(task, generation, SyncStatus.CONFLICT, cache_path)
-                    self._stats["conflicts"] += 1
+                    if self._publish(task, generation, SyncStatus.CONFLICT, cache_path):
+                        self._stats["conflicts"] += 1
                     return True
 
                 backend.copy_from_local(cache_path, task.virtual_path)
@@ -143,14 +140,23 @@ class SyncExecutor:
             config.replica_count == -1 and successful_syncs == len(target_backends)
         ):
             status = SyncStatus.CLEAN
+        elif successful_syncs > 0:
+            status = SyncStatus.DIRTY
+        else:
+            status = SyncStatus.ERROR
+
+        # Counted only once the outcome is on record: a refused publish means
+        # the content that was copied is already superseded.
+        if not self._publish(task, generation, status, cache_path, checksum=checksum):
+            return True
+        if status == SyncStatus.CLEAN:
             self._stats["synced"] += 1
             logger.info(
                 "Successfully synced %s to %s backends",
                 task.virtual_path,
                 successful_syncs,
             )
-        elif successful_syncs > 0:
-            status = SyncStatus.DIRTY
+        elif status == SyncStatus.DIRTY:
             logger.warning(
                 "Partial sync for %s: %s/%s",
                 task.virtual_path,
@@ -158,11 +164,8 @@ class SyncExecutor:
                 len(target_backends),
             )
         else:
-            status = SyncStatus.ERROR
             self._stats["failed"] += 1
             logger.error("Failed to sync %s to any backend", task.virtual_path)
-
-        self._publish(task, generation, status, cache_path, checksum=checksum)
         return True
 
     def _publish(
@@ -177,9 +180,10 @@ class SyncExecutor:
         """Record a sync-side status unless the file was written since `generation`.
 
         When the generation has moved, nothing is written: the row already
-        carries the newer write's DIRTY, which must stand. The path is handed
-        to requeue_cb so the newer content gets its own pass, and False is
-        returned so the caller stops treating this sync as current.
+        carries the newer write's DIRTY, which must stand. The task is flagged
+        for requeue so the newer content gets its own pass once the manager
+        retires this one, and False is returned so the caller stops treating
+        this sync as current.
         """
         if not self.state_manager.publish_sync_status(
             task.virtual_path, generation, status, checksum=checksum,
@@ -188,8 +192,7 @@ class SyncExecutor:
                 "%s was written during sync; leaving it dirty for another pass",
                 task.virtual_path,
             )
-            if self.requeue_cb:
-                self.requeue_cb(task.virtual_path)
+            task.requeue = True
             return False
 
         metadata = self.state_manager.get_file_metadata(task.virtual_path)
@@ -220,11 +223,11 @@ class SyncExecutor:
 
         logger.error("Max retries exceeded for %s: %s", task.virtual_path, error)
         self._stats["failed"] += 1
-        if isinstance(task, SyncTask):
-            metadata = self.state_manager.get_file_metadata(task.virtual_path)
-            if metadata:
-                cache_path = self.cache_manager.get_cache_path(task.virtual_path)
-                self._publish(task, metadata.dirty_generation, SyncStatus.ERROR, cache_path)
+        if isinstance(task, SyncTask) and task.generation is not None:
+            # The failure belongs to the attempt that read task.generation. A
+            # write since then owns the row, and its DIRTY must stand.
+            cache_path = self.cache_manager.get_cache_path(task.virtual_path)
+            self._publish(task, task.generation, SyncStatus.ERROR, cache_path)
         return True
 
     def process_dir_task(self, task: DirSyncTask) -> bool:
