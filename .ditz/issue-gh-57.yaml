@@ -42,6 +42,12 @@ log_events:
   who: Ted Smith
   what: blocked by gh-57-test
   comment: ""
+- time: 2026-10-15T01:01:07-00:00
+  who: Ted Smith
+  what: blocks gh-96
+  comment: ""
+blocks:
+- gh-96
 blocked_by:
 - gh-57-generation-column
 - gh-57-conditional-updates
