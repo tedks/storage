@@ -39,7 +39,8 @@ class SyncWorker(threading.Thread):
     def __init__(self, worker_id: int, task_queue: queue.PriorityQueue,
                  state_manager: StateManager, cache_manager: CacheManager,
                  replication_manager: ReplicationManager, config: SyncConfig,
-                 task_complete_cb=None, should_sync_path_cb: Optional[Callable[[str], bool]] = None):
+                 task_complete_cb=None, should_sync_path_cb: Optional[Callable[[str], bool]] = None,
+                 requeue_cb: Optional[Callable[[str], None]] = None):
         super().__init__(daemon=True, name=f"SyncWorker-{worker_id}")
         self.worker_id = worker_id
         self.task_queue = task_queue
@@ -54,6 +55,7 @@ class SyncWorker(threading.Thread):
             replication_manager=replication_manager,
             config=config,
             should_sync_path_cb=should_sync_path_cb,
+            requeue_cb=requeue_cb,
         )
         self._stop_event = threading.Event()
         self._active_task: Optional[str] = None
@@ -168,7 +170,8 @@ class SyncManager:
                 i, self.task_queue, self.state_manager,
                 self.cache_manager, self.replication_manager,
                 self.config, self._task_complete,
-                should_sync_path_cb=self._should_sync_path_cb
+                should_sync_path_cb=self._should_sync_path_cb,
+                requeue_cb=self._requeue_after_write,
             )
             worker.start()
             self.workers.append(worker)
@@ -304,6 +307,15 @@ class SyncManager:
             self.task_queue.put(task)
             self._queued_dir_tasks.add(key)
             logger.debug("Queued dir sync %s for %s", operation.value, virtual_path)
+
+    def _requeue_after_write(self, virtual_path: str):
+        """Queue another pass for a file written while its sync was in flight.
+
+        The abandoned task is still registered in _queued_tasks until the
+        worker reports it complete, so the ordinary dedup would drop this
+        request; force it through.
+        """
+        self.queue_sync(virtual_path, priority=100, force=True)
 
     def _task_complete(self, task: Union[SyncTask, DirSyncTask]):
         with self._queue_lock:

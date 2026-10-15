@@ -3,6 +3,7 @@
 import logging
 import queue
 import time
+from pathlib import Path
 from typing import Callable, Dict, List, Optional, Union
 
 from .backends.base import Backend
@@ -29,6 +30,7 @@ class SyncExecutor:
         replication_manager: ReplicationManager,
         config: SyncConfig,
         should_sync_path_cb: Optional[Callable[[str], bool]] = None,
+        requeue_cb: Optional[Callable[[str], None]] = None,
     ):
         self.worker_id = worker_id
         self.state_manager = state_manager
@@ -37,6 +39,9 @@ class SyncExecutor:
         self.config = config
         self.conflict_detector = ConflictDetector(state_manager)
         self.should_sync_path_cb = should_sync_path_cb
+        # Called with the path when a sync is abandoned because the file was
+        # written while it was in flight; the manager queues another pass.
+        self.requeue_cb = requeue_cb
         self._stats = {
             "synced": 0,
             "failed": 0,
@@ -70,9 +75,12 @@ class SyncExecutor:
             logger.warning("Cache file missing for %s", task.virtual_path)
             return True
 
-        metadata.sync_status = SyncStatus.SYNCING
-        self.state_manager.set_file_metadata(metadata)
-        self.cache_manager.sync_cache_metadata(task.virtual_path, metadata, cache_path=cache_path)
+        # Every status change below is conditioned on this generation. A
+        # write() that lands while the copy is in flight bumps it, so the
+        # change is refused and the file stays DIRTY (#35, #57).
+        generation = metadata.dirty_generation
+        if not self._publish(task, generation, SyncStatus.SYNCING, cache_path):
+            return True
 
         config = get_inherited_config(cache_path)
         target_backends = self.replication_manager.select_backends_for_file(
@@ -82,14 +90,11 @@ class SyncExecutor:
 
         if not target_backends:
             logger.warning("No backends available for %s", task.virtual_path)
-            metadata.sync_status = SyncStatus.ERROR
-            self.state_manager.set_file_metadata(metadata)
-            self.cache_manager.sync_cache_metadata(task.virtual_path, metadata, cache_path=cache_path)
+            self._publish(task, generation, SyncStatus.ERROR, cache_path)
             self._stats["failed"] += 1
             return True
 
         checksum = self.state_manager.compute_checksum(cache_path)
-        metadata.checksum = checksum
 
         sync_results: Dict[str, bool] = {}
         for backend in target_backends:
@@ -105,9 +110,7 @@ class SyncExecutor:
                         task.virtual_path,
                         backend.name,
                     )
-                    metadata.sync_status = SyncStatus.CONFLICT
-                    self.state_manager.set_file_metadata(metadata)
-                    self.cache_manager.sync_cache_metadata(task.virtual_path, metadata, cache_path=cache_path)
+                    self._publish(task, generation, SyncStatus.CONFLICT, cache_path)
                     self._stats["conflicts"] += 1
                     return True
 
@@ -139,8 +142,7 @@ class SyncExecutor:
         if successful_syncs >= config.replica_count or (
             config.replica_count == -1 and successful_syncs == len(target_backends)
         ):
-            metadata.sync_status = SyncStatus.CLEAN
-            metadata.last_modified = time.time()
+            status = SyncStatus.CLEAN
             self._stats["synced"] += 1
             logger.info(
                 "Successfully synced %s to %s backends",
@@ -148,7 +150,7 @@ class SyncExecutor:
                 successful_syncs,
             )
         elif successful_syncs > 0:
-            metadata.sync_status = SyncStatus.DIRTY
+            status = SyncStatus.DIRTY
             logger.warning(
                 "Partial sync for %s: %s/%s",
                 task.virtual_path,
@@ -156,12 +158,43 @@ class SyncExecutor:
                 len(target_backends),
             )
         else:
-            metadata.sync_status = SyncStatus.ERROR
+            status = SyncStatus.ERROR
             self._stats["failed"] += 1
             logger.error("Failed to sync %s to any backend", task.virtual_path)
 
-        self.state_manager.set_file_metadata(metadata)
-        self.cache_manager.sync_cache_metadata(task.virtual_path, metadata, cache_path=cache_path)
+        self._publish(task, generation, status, cache_path, checksum=checksum)
+        return True
+
+    def _publish(
+        self,
+        task: SyncTask,
+        generation: int,
+        status: SyncStatus,
+        cache_path: Path,
+        *,
+        checksum: Optional[str] = None,
+    ) -> bool:
+        """Record a sync-side status unless the file was written since `generation`.
+
+        When the generation has moved, nothing is written: the row already
+        carries the newer write's DIRTY, which must stand. The path is handed
+        to requeue_cb so the newer content gets its own pass, and False is
+        returned so the caller stops treating this sync as current.
+        """
+        if not self.state_manager.publish_sync_status(
+            task.virtual_path, generation, status, checksum=checksum,
+        ):
+            logger.info(
+                "%s was written during sync; leaving it dirty for another pass",
+                task.virtual_path,
+            )
+            if self.requeue_cb:
+                self.requeue_cb(task.virtual_path)
+            return False
+
+        metadata = self.state_manager.get_file_metadata(task.virtual_path)
+        if metadata:
+            self.cache_manager.sync_cache_metadata(task.virtual_path, metadata, cache_path=cache_path)
         return True
 
     def handle_task_failure(
@@ -190,14 +223,8 @@ class SyncExecutor:
         if isinstance(task, SyncTask):
             metadata = self.state_manager.get_file_metadata(task.virtual_path)
             if metadata:
-                metadata.sync_status = SyncStatus.ERROR
-                self.state_manager.set_file_metadata(metadata)
                 cache_path = self.cache_manager.get_cache_path(task.virtual_path)
-                self.cache_manager.sync_cache_metadata(
-                    task.virtual_path,
-                    metadata,
-                    cache_path=cache_path,
-                )
+                self._publish(task, metadata.dirty_generation, SyncStatus.ERROR, cache_path)
         return True
 
     def process_dir_task(self, task: DirSyncTask) -> bool:

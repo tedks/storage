@@ -121,17 +121,17 @@ class TestSyncExecutorOverlappingWrite(_ExecutorTestBase):
         self.state_manager.set_file_metadata(meta)
         cache_path = self._create_cache_file(content=b"v1")
         newer = b"v2 written while the worker was copying v1"
+        requeue = MagicMock()
+        self.executor.requeue_cb = requeue
 
         def write_during_copy(local_path, virtual_path):
             # The backend has read v1. Now do what fs.py's write() does:
             # replace the bytes, then record the new size and DIRTY.
             cache_path.write_bytes(newer)
-            current = self.state_manager.get_file_metadata("/test.txt")
             st = os.lstat(cache_path)
-            current.size = st.st_size
-            current.last_modified = st.st_mtime
-            current.sync_status = SyncStatus.DIRTY
-            self.state_manager.set_file_metadata(current)
+            self.state_manager.mark_dirty(
+                "/test.txt", size=st.st_size, last_modified=st.st_mtime,
+            )
 
         self.mock_backend.copy_from_local.side_effect = write_during_copy
 
@@ -146,6 +146,26 @@ class TestSyncExecutorOverlappingWrite(_ExecutorTestBase):
         record = read_cache_metadata(cache_path)
         if record is not None:
             self.assertNotEqual(record.sync_status, SyncStatus.CLEAN)
+        # The abandoned task is still registered with the manager, so the
+        # newer content needs an explicit second pass.
+        requeue.assert_called_once_with("/test.txt")
+
+    def test_sync_without_overlap_marks_clean_and_keeps_generation(self):
+        meta = _make_metadata(sync_status=SyncStatus.DIRTY, checksum=None)
+        self.state_manager.set_file_metadata(meta)
+        cache_path = self._create_cache_file(content=b"steady")
+        before = self.state_manager.get_file_metadata("/test.txt").dirty_generation
+        requeue = MagicMock()
+        self.executor.requeue_cb = requeue
+
+        with patch.object(self.executor.conflict_detector, "check_conflict", return_value=None):
+            self.executor.process_file_task(SyncTask("/test.txt"))
+
+        updated = self.state_manager.get_file_metadata("/test.txt")
+        self.assertEqual(updated.sync_status, SyncStatus.CLEAN)
+        self.assertEqual(updated.dirty_generation, before)
+        self.assertEqual(updated.checksum, self.state_manager.compute_checksum(cache_path))
+        requeue.assert_not_called()
 
 
 class TestSyncExecutorFileTask(_ExecutorTestBase):
