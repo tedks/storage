@@ -54,6 +54,10 @@ log_events:
   who: Ted Smith
   what: blocked by gh-57-state-cas
   comment: ""
+- time: 2026-10-15T01:01:10-00:00
+  who: Ted Smith
+  what: blocked by gh-57-worker-finalize
+  comment: ""
 blocks:
 - gh-96
 blocked_by:
@@ -63,3 +67,4 @@ blocked_by:
 - gh-57-test
 - gh-57-repro-test
 - gh-57-state-cas
+- gh-57-worker-finalize
