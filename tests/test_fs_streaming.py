@@ -218,18 +218,27 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.assertGreaterEqual(state["downloaded_bytes"], 4096)
 
         self.fs.release('/xattr.bin', vfd)
-        self.assertTrue(self._wait_for(lambda: cache_path.exists(), timeout=8.0))
 
-        try:
-            final_raw = os.getxattr(str(cache_path), self.fs._STREAM_STATE_XATTR)
-        except OSError as exc:
-            if exc.errno in (getattr(errno, "EOPNOTSUPP", -1), getattr(errno, "ENOTSUP", -1), getattr(errno, "ENODATA", -1)):
-                self.skipTest("xattrs unsupported in this environment")
-            raise
+        # The partial is renamed into place before the session is marked
+        # finalized and the "complete" state is written, so wait for the
+        # terminal state itself, not for the final path to exist.
+        def final_state():
+            if not cache_path.exists():
+                return None
+            try:
+                raw = os.getxattr(str(cache_path), self.fs._STREAM_STATE_XATTR)
+            except OSError as exc:
+                if exc.errno in (getattr(errno, "EOPNOTSUPP", -1), getattr(errno, "ENOTSUP", -1)):
+                    self.skipTest("xattrs unsupported in this environment")
+                return None  # ENODATA: renamed, state not yet written
+            return json.loads(raw.decode())
 
-        final_state = json.loads(final_raw.decode())
-        self.assertEqual(final_state["status"], "complete")
-        self.assertTrue(final_state["finalized"])
+        self.assertTrue(self._wait_for(
+            lambda: (final_state() or {}).get("status") == "complete", timeout=8.0,
+        ))
+        state = final_state()
+        self.assertEqual(state["status"], "complete")
+        self.assertTrue(state["finalized"])
 
     def test_streaming_tolerates_backend_short_reads(self):
         self.backend.max_read_bytes = 1024
