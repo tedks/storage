@@ -19,3 +19,13 @@ log_events:
   who: Ted Smith
   what: created
   comment: ""
+- time: 2026-10-16T19:25:27-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Cause confirmed in code: streaming.py renames the partial into place (os.replace,
+    ~line 647) before marking the session finalized and writing the ''complete'' stream-state
+    xattr (~716-720); the test waited for the final path to exist and then read the
+    state. Fix: the test polls for status == complete with the bounded helper. Possible
+    product follow-up, not done: write the complete state before the rename so a crash
+    in between never leaves a final file whose stream xattr says it is still downloading;
+    nothing reads that xattr to decide anything today, so cosmetic.'
