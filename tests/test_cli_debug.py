@@ -1548,15 +1548,23 @@ class TestRebuildDerivesDirtyFromStat(unittest.TestCase):
             state_manager.close()
 
     def test_crash_points(self):
+        """Each case builds the exact records a crash at that point leaves behind.
+
+        mark_file_dirty writes the row and then the xattr; the sync worker
+        publishes CLEAN on the row and then mirrors it. A crash can fall
+        between any two of those. 'expected' is the status rebuild must
+        derive: DIRTY wherever v2 is not on a member, and for a lost final
+        mirror DIRTY as well (a redundant resync, never a lost write).
+        """
         cases = [
-            # name, bytes on member?, row update landed?, xattr mirror landed?
-            ("write landed, crash before the row update", False, False, False),
-            ("write landed, row updated, crash before the xattr", False, True, False),
-            ("write and both records landed", False, True, True),
-            ("synced, crash before the xattr mirrored CLEAN", True, True, False),
-            ("synced, all records landed", True, True, True),
+            # name, v2 on member?, row updated?, DIRTY xattr mirrored?, CLEAN mirrored?, expected
+            ("write landed, crash before the row update", False, False, False, False, SyncStatus.DIRTY),
+            ("write landed, row updated, crash before its xattr", False, True, False, False, SyncStatus.DIRTY),
+            ("write landed, row and xattr both updated", False, True, True, False, SyncStatus.DIRTY),
+            ("synced, crash before the CLEAN mirror", True, True, True, False, SyncStatus.DIRTY),
+            ("synced, all records landed", True, True, True, True, SyncStatus.CLEAN),
         ]
-        for name, on_member, row_landed, xattr_landed in cases:
+        for name, on_member, row_updated, dirty_mirrored, clean_mirrored, expected in cases:
             with self.subTest(name):
                 shutil.rmtree(self.cache_dir); self.cache_dir.mkdir()
                 if self.db_path.exists():
@@ -1569,34 +1577,29 @@ class TestRebuildDerivesDirtyFromStat(unittest.TestCase):
                 state_manager = StateManager(str(self.db_path))
                 try:
                     state_manager.set_file_metadata(clean_v1)
-                    if on_member:
-                        # The sync of v2 completed: row says CLEAN for v2's stat.
-                        cache_path.write_bytes(b"v2 longer")
+                    cache_path.write_bytes(b"v2 longer")
+                    if row_updated:
                         state_manager.mark_dirty_from_cache_file("/f.txt", cache_path)
+                    if dirty_mirrored:
+                        write_cache_metadata(cache_path, state_manager.get_file_metadata("/f.txt"))
+                    if on_member:
                         row = state_manager.get_file_metadata("/f.txt")
                         state_manager.publish_sync_status(
                             "/f.txt", row.dirty_generation, SyncStatus.CLEAN, checksum="v2",
                         )
-                        if xattr_landed:
-                            write_cache_metadata(cache_path, state_manager.get_file_metadata("/f.txt"))
-                    else:
-                        # v2 was written and never synced.
-                        cache_path.write_bytes(b"v2 longer")
-                        if row_landed:
-                            state_manager.mark_dirty_from_cache_file("/f.txt", cache_path)
-                        if xattr_landed:
-                            write_cache_metadata(cache_path, state_manager.get_file_metadata("/f.txt"))
+                    if clean_mirrored:
+                        write_cache_metadata(cache_path, state_manager.get_file_metadata("/f.txt"))
                 finally:
                     state_manager.close()
 
                 row = self._rebuild()
 
-                if on_member:
-                    # Correct, or a redundant resync; never a lost write.
-                    self.assertIn(row.sync_status, (SyncStatus.CLEAN, SyncStatus.DIRTY))
-                else:
-                    self.assertEqual(row.sync_status, SyncStatus.DIRTY, name)
+                self.assertEqual(row.sync_status, expected, name)
                 self.assertEqual(row.size, cache_path.lstat().st_size, name)
+                # The rewritten xattr agrees with the row and the file.
+                record = read_cache_metadata(cache_path)
+                self.assertEqual(record.sync_status, expected, name)
+                self.assertEqual(record.size, cache_path.lstat().st_size, name)
 
     def test_rebuild_rewrites_a_stale_clean_xattr_as_dirty(self):
         cache_path = self.cache_dir / "f.txt"

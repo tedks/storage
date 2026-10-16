@@ -8,7 +8,6 @@ from typing import Dict, List
 
 from .backends.base import Backend
 from .cache_metadata import (
-    MTIME_TOLERANCE,
     cache_file_would_be_scanned,
     scan_cache_entries,
     write_cache_metadata,
@@ -245,11 +244,12 @@ def rebuild_index_from_cache(cache_root: Path, state_manager: StateManager) -> R
                 metadata = legacy
                 # The row's size and mtime are the stat as of the last recorded
                 # write. A live stat that differs means bytes landed after it,
-                # so a CLEAN row cannot be trusted for this content. The
-                # checksum stays: it describes the content last synced.
-                if metadata.sync_status == SyncStatus.CLEAN and (
+                # so whatever status the row recorded describes content that
+                # is gone; the same rule as CacheMetadataRecord.to_file_metadata.
+                # The checksum stays: it describes the content last synced.
+                if (
                     metadata.size != entry.stat_size
-                    or abs(metadata.last_modified - entry.stat_mtime) > MTIME_TOLERANCE
+                    or metadata.last_modified != entry.stat_mtime
                 ):
                     metadata.sync_status = SyncStatus.DIRTY
                 metadata.size = entry.stat_size

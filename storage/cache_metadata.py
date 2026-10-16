@@ -13,8 +13,6 @@ from .models import FileLocation, FileMetadata, SyncStatus
 
 XATTR_CACHE_METADATA_NAME = "user.storage.metadata"
 CACHE_METADATA_VERSION = 1
-# Two mtimes closer than this are the same mtime (float round-trips).
-MTIME_TOLERANCE = 1e-6
 _INTERNAL_CACHE_NAMES = frozenset({
     ".storage.rsync-tmp",
     ".storage.control.sock",
@@ -126,9 +124,13 @@ class CacheMetadataRecord:
 
         The record carries the file's size and mtime as of the setxattr that
         wrote it. A live stat that differs means bytes landed afterwards and
-        the recorded status describes content that is gone.
+        the recorded status describes content that is gone. The comparison
+        is exact: both sides come from stat and round-trip unchanged through
+        JSON and SQLite, and any tolerance could only hide a write. What it
+        cannot see is a same-size write in the same timestamp tick as the
+        record (a few ms on kernels without fine-grained timestamps).
         """
-        return stat_size != self.size or abs(stat_mtime - self.last_modified) > MTIME_TOLERANCE
+        return stat_size != self.size or stat_mtime != self.last_modified
 
     def to_file_metadata(
         self,
@@ -346,7 +348,7 @@ def scan_cache_entries(cache_root: Path) -> Iterator[CacheScanEntry]:
                     issues.append(
                         f"size_mismatch:xattr={metadata.size}:stat={st.st_size}"
                     )
-                if abs(metadata.last_modified - st.st_mtime) > MTIME_TOLERANCE:
+                if metadata.last_modified != st.st_mtime:
                     issues.append(
                         f"mtime_mismatch:xattr={metadata.last_modified}:stat={st.st_mtime}"
                     )
