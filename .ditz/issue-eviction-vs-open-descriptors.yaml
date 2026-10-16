@@ -1,0 +1,22 @@
+id: eviction-vs-open-descriptors
+title: LRU eviction can unlink a file that is open for writing
+desc: 'Council thread on #99: evict_lru_files decides from the index row and unlinks
+  the cache file. It does not consult the FUSE descriptor table, so a file open for
+  writing can be evicted; the open fd keeps the inode alive, the writer''s next write()
+  then fails in mark_file_dirty with ENOENT (the name is gone), and the bytes die
+  with the inode on close. The sync path already defers busy paths through should_sync_path_cb;
+  eviction needs the same check (skip paths with open descriptors), or a per-path
+  lock the write path also takes.'
+type: bugfix
+component: cache
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-16T02:50:39-00:00
+references: []
+log_events:
+- time: 2026-10-16T02:50:39-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
