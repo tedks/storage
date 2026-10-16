@@ -26,8 +26,8 @@ type: task
 component: open-questions
 release:
 reporter: Ted Smith <tedks@riseup.net>
-status: unstarted
-disposition:
+status: closed
+disposition: reorg
 creation_time: 2026-10-16T04:48:55-00:00
 references: []
 log_events:
@@ -35,3 +35,11 @@ log_events:
   who: Ted Smith
   what: created
   comment: ""
+- time: 2026-10-16T05:49:48-00:00
+  who: Ted Smith
+  what: 'closed: reorg'
+  comment: 'Deferred 2026-10-16: #99 covers every crash case without the semantics
+    change; option 2''s remaining value is one fewer setxattr per write and a cleaner
+    invariant, which belongs with the write-path performance work (#55). Revisit there;
+    gh-96-policy-only-upsert and gh-96-xattr-generation stay open under #96 as the
+    concrete items.'
