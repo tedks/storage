@@ -41,3 +41,8 @@ log_events:
     failed deterministically, not occasionally: the rename lands and the xattr write
     follows late enough every time. Verification of the fixed test on splinter1 is
     in progress.'
+- time: 2026-10-16T19:32:17-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Verified on splinter1 at ee2394e: tests/test_fs_streaming.py passes there
+    (14/14) after the fix.'
