@@ -285,6 +285,17 @@ class TestFSCoreIntegration(unittest.TestCase):
             self.fs._run_stale_sweep()
         self.assertTrue(self.fs._sweep_pending)
 
+    def test_open_descriptor_blocks_eviction_until_release(self):
+        self.fs.sync_manager.stop()
+        fd = self.fs.create("/held.txt", 0o644)
+        self.fs.write("/held.txt", b"v1", 0, fd)
+        self.assertTrue(self.fs._has_open_descriptor("/held.txt"))
+        self.assertTrue(self.fs.cache_manager.is_path_open_cb("/held.txt"))
+
+        self.fs.release("/held.txt", fd)
+
+        self.assertFalse(self.fs._has_open_descriptor("/held.txt"))
+
     def test_sweep_marks_files_written_after_their_clean_row(self):
         self.fs.sync_manager.stop()  # the row states below are set by hand
         for name in ("a.txt", "b.txt"):

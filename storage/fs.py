@@ -121,6 +121,7 @@ class StorageFS(Operations):
         """
         self.state_manager = StateManager(str(state_db))
         self.cache_manager = CacheManager(cache_root, self.state_manager, cache_size)
+        self.cache_manager.is_path_open_cb = self._has_open_descriptor
         self.replication_manager = ReplicationManager(self.state_manager, backends)
         self.backends = backends
 
@@ -249,6 +250,19 @@ class StorageFS(Operations):
         """Get configuration for a file"""
         cache_path = self.cache_manager.get_cache_path(virtual_path)
         return get_inherited_config(cache_path)
+
+    def _has_open_descriptor(self, virtual_path: str) -> bool:
+        """Whether any descriptor other than a prefetch session is open on the path.
+
+        Eviction asks this inside its critical section; _fd_lock is never
+        held while the index lock is taken, so the order stays cache lock,
+        index lock, _fd_lock.
+        """
+        with self._fd_lock:
+            return any(
+                entry.canonical_path == virtual_path and entry.prefetch_session is None
+                for entry in self._fd_map.values()
+            )
 
     def _should_sync_path(self, virtual_path: str) -> bool:
         """Only sync paths that do not currently have an open writer."""
