@@ -1,0 +1,36 @@
+id: flip-repo-to-public
+title: 'When does the repo go public, and what is the order with PR #95?'
+desc: 'Context: the repo is PRIVATE. PR #95 (AGPLv3 LICENSE, scrubbed mount profile,
+  truthful README status and Known Issues) is a draft awaiting the maintainer''s read;
+  it is the hygiene gate before flipping visibility. Since it was written, #97 (lost-write
+  race) and #99 (crash consistency) have merged, so its Known Issues line for #35/#57
+  is stale (ditz gh-57-readme-known-issues).
+
+
+  Options:
+
+  1. Review and merge #95, drop the #35/#57 line, then flip visibility (gh repo edit
+  --visibility public).
+
+  2. Merge #95 and keep the repo private until #74/#98 land too.
+
+  3. Hold #95.
+
+
+  Recommendation: option 1; the README''s Status section already says alpha and lists
+  what is open, which is the honest state. Decides: the maintainer (outward act).
+  Blocks: readme-ai-authorship-statement should be answered before the flip, since
+  it changes README text.'
+type: task
+component: open-questions
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-16T04:48:55-00:00
+references: []
+log_events:
+- time: 2026-10-16T04:48:55-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
