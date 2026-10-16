@@ -1,0 +1,38 @@
+id: real-remote-gate-hosts
+title: May drynwyn be a target for the real-remote test gate, or must the gate run
+  against an sshd inside the dev shell only?
+desc: 'Context: WP-REMOTE (org/packages/WP-REMOTE.md) adds a gate that exercises the
+  SSH backend, the inotify watcher and rsync over SSH against a real sshd. Nothing
+  in the suite does this today; the field use that covered it was on drynwyn in early
+  2026.
+
+
+  Options:
+
+  1. Dev-shell sshd on localhost only (preferred default): runs on any Linux host
+  without network; never touches a real host; misses host-specific behavior (older
+  glibc on drynwyn/tower0, real LAN latency).
+
+  2. Opt-in second mode against drynwyn.local under a dedicated test directory (never
+  a live cache or profile), gated by an environment variable: catches what fixtures
+  miss (doctrine: keep one representative real run), but points automated writes at
+  your storage host.
+
+  3. Both: 1 in the gate, 2 run by hand at milestones.
+
+
+  Recommendation: 3. Decides: the CEO (a real host is an outward/resource act). Blocks:
+  WP-REMOTE moving from DRAFT to READY.'
+type: task
+component: open-questions
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-16T05:53:54-00:00
+references: []
+log_events:
+- time: 2026-10-16T05:53:54-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
