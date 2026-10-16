@@ -140,20 +140,8 @@ class CacheManager:
                 # Evict this file
                 cache_path = self.get_cache_path(metadata.virtual_path)
                 if cache_path.exists():
-                    # A CLEAN row older than the file is a write whose row
-                    # update was lost; unlinking it would destroy the only
-                    # copy. Mark it and move on.
-                    if self.heal_stale_clean(metadata.virtual_path, cache_path):
-                        continue
                     try:
-                        file_size = cache_path.stat().st_size
-                        cache_path.unlink()
-                        freed += file_size
-                        self._current_size_bytes = max(0, self._current_size_bytes - file_size)
-
-                        # Remove cache location from state
-                        self.state_manager.remove_file_location(metadata.virtual_path, "cache")
-
+                        freed += self._evict_if_still_clean(metadata.virtual_path, cache_path)
                     except OSError as e:
                         print(f"Warning: Failed to evict {metadata.virtual_path}: {e}")
 
@@ -295,6 +283,30 @@ class CacheManager:
             if metadata:
                 self.sync_cache_metadata(virtual_path, metadata, cache_path=cache_path)
         return generation
+
+    def _evict_if_still_clean(self, virtual_path: str, cache_path: Path) -> int:
+        """Unlink a cached file if its row is still CLEAN and describes the file.
+
+        The LRU list was read earlier; by now a write or the post-crash
+        sweep may have made the row DIRTY, or a write's row update may have
+        been lost (a CLEAN row older than the file). Both mean the file is
+        the only copy of something. The re-check and the unlink are one
+        critical section under the index lock, which every mark_file_dirty
+        also takes, so no write can be recorded between them. A stale CLEAN
+        is marked and kept. Returns the bytes freed, 0 when nothing was.
+        """
+        with self.state_manager.metadata_lock:
+            row = self.state_manager.get_file_metadata(virtual_path)
+            if row is None or row.sync_status != SyncStatus.CLEAN:
+                return 0
+            st = os.lstat(str(cache_path))
+            if st.st_size != row.size or st.st_mtime != row.last_modified:
+                self.mark_file_dirty(virtual_path, cache_path)
+                return 0
+            cache_path.unlink()
+            self._current_size_bytes = max(0, self._current_size_bytes - st.st_size)
+            self.state_manager.remove_file_location(virtual_path, "cache")
+            return st.st_size
 
     def heal_stale_clean(
         self,

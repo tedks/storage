@@ -4,6 +4,7 @@ import os
 import shutil
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 from fuse import FuseOSError
@@ -257,6 +258,32 @@ class TestFSCoreIntegration(unittest.TestCase):
 
         self.assertNotEqual(lock_path.read_text().strip(), "")
         lock_file.close()
+
+    def test_init_runs_a_requested_sweep_and_clears_pending(self):
+        self.fs.sync_manager.stop()
+        fd = self.fs.create("/swept.txt", 0o644)
+        self.fs.write("/swept.txt", b"v1", 0, fd)
+        self.fs.release("/swept.txt", fd)
+        row = self.fs.state_manager.get_file_metadata("/swept.txt")
+        self.fs.state_manager.publish_sync_status(
+            "/swept.txt", row.dirty_generation, SyncStatus.CLEAN, checksum="v1",
+        )
+        (self.cache_dir / "swept.txt").write_bytes(b"v2 is longer")
+        self.fs.request_stale_sweep()
+        self.assertTrue(self.fs._sweep_pending)
+
+        self.fs.init("/")  # post-fork hook: this is where the sweep starts
+        self.fs._sweep_thread.join(timeout=30)
+
+        self.assertFalse(self.fs._sweep_thread.is_alive())
+        self.assertFalse(self.fs._sweep_pending)
+        self.assertEqual(self.fs.state_manager.get_file_metadata("/swept.txt").sync_status, SyncStatus.DIRTY)
+
+    def test_failed_sweep_keeps_pending(self):
+        self.fs.request_stale_sweep()
+        with patch.object(self.fs, "sweep_stale_cache_metadata", side_effect=OSError("index gone")):
+            self.fs._run_stale_sweep()
+        self.assertTrue(self.fs._sweep_pending)
 
     def test_sweep_marks_files_written_after_their_clean_row(self):
         self.fs.sync_manager.stop()  # the row states below are set by hand

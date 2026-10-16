@@ -695,16 +695,28 @@ class StorageFS(Operations):
                         encrypted=config.encrypted,
                         encryption_key_id=None,
                     )
+                    # Writes the row and mirrors it.
+                    self.cache_manager.store_file_metadata(metadata, cache_path=cache_path)
                 else:
                     # A refetch after eviction: the member's copy is what the
                     # row already calls synced, but the transfer does not keep
                     # the mtime, so the row's stat must follow the new file or
-                    # heal_stale_clean would resync unchanged content.
-                    metadata.size = st.st_size
-                    metadata.last_modified = st.st_mtime
-                    metadata.last_access = time.time()
-                # Writes the row and mirrors it (the evicted file lost its xattr).
-                self.cache_manager.store_file_metadata(metadata, cache_path=cache_path)
+                    # heal_stale_clean would resync unchanged content. Only
+                    # the stat columns move, and only at the generation read
+                    # above; a write recorded since keeps its own stat. The
+                    # mirror rewrites the xattr the evicted file lost.
+                    with self.state_manager.metadata_lock:
+                        self.state_manager.record_cached_stat(
+                            canonical_path,
+                            metadata.dirty_generation,
+                            size=st.st_size,
+                            last_modified=st.st_mtime,
+                            last_access=time.time(),
+                        )
+                        metadata = self.state_manager.get_file_metadata(canonical_path) or metadata
+                        self.cache_manager.sync_cache_metadata(
+                            canonical_path, metadata, cache_path=cache_path,
+                        )
 
                 # Record locations
                 try:

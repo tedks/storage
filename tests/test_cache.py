@@ -1,6 +1,7 @@
 import shutil
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 from storage.backends.local import LocalBackend
@@ -144,3 +145,17 @@ class TestEvictionSkipsStaleClean(unittest.TestCase):
         self.assertTrue(stale.exists())
         self.assertEqual(self.state_manager.get_file_metadata("/stale.txt").sync_status, SyncStatus.DIRTY)
         self.assertFalse(fresh.exists())
+
+    def test_file_made_dirty_after_selection_is_kept(self):
+        """The LRU list is a snapshot; the row is re-checked before the unlink."""
+        turned = self._clean_cached("turned.txt", b"v1")
+        snapshot = self.state_manager.get_lru_files(limit=10)
+        # A write lands after the snapshot was taken, through the real path.
+        turned.write_bytes(b"v2")
+        self.cache_manager.mark_file_dirty("/turned.txt", turned)
+
+        with patch.object(self.state_manager, "get_lru_files", return_value=snapshot):
+            self.cache_manager.evict_lru_files(bytes_needed=1)
+
+        self.assertTrue(turned.exists())
+        self.assertEqual(self.state_manager.get_file_metadata("/turned.txt").sync_status, SyncStatus.DIRTY)

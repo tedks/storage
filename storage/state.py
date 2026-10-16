@@ -278,6 +278,35 @@ class StateManager:
             st = os.lstat(str(cache_path))
             return self.mark_dirty(virtual_path, size=st.st_size, last_modified=st.st_mtime)
 
+    def record_cached_stat(
+        self,
+        virtual_path: str,
+        generation: int,
+        *,
+        size: int,
+        last_modified: float,
+        last_access: float,
+    ) -> bool:
+        """Bring a row's recorded stat up to a cache file that holds synced content.
+
+        For a refetch after eviction: the transfer does not keep the mtime,
+        and the row's stat must describe the file on disk or the file looks
+        like a lost write. Touches only size, last_modified and last_access,
+        and only WHERE dirty_generation = `generation`, so a write recorded
+        since the caller read the row is left alone. Returns whether it applied.
+        """
+        with self._db_lock:
+            cursor = self.conn.execute(
+                '''
+                UPDATE files
+                SET size = ?, last_modified = ?, last_access = ?
+                WHERE virtual_path = ? AND dirty_generation = ?
+                ''',
+                (size, last_modified, last_access, virtual_path, generation),
+            )
+            self.conn.commit()
+            return cursor.rowcount == 1
+
     def publish_sync_status(
         self,
         virtual_path: str,
