@@ -13,6 +13,8 @@ from .models import FileLocation, FileMetadata, SyncStatus
 
 XATTR_CACHE_METADATA_NAME = "user.storage.metadata"
 CACHE_METADATA_VERSION = 1
+# Two mtimes closer than this are the same mtime (float round-trips).
+MTIME_TOLERANCE = 1e-6
 _INTERNAL_CACHE_NAMES = frozenset({
     ".storage.rsync-tmp",
     ".storage.control.sock",
@@ -119,6 +121,15 @@ class CacheMetadataRecord:
             encryption_key_id=metadata.encryption_key_id,
         )
 
+    def is_stale_for(self, stat_size: int, stat_mtime: float) -> bool:
+        """Whether the cache file changed after this record was written.
+
+        The record carries the file's size and mtime as of the setxattr that
+        wrote it. A live stat that differs means bytes landed afterwards and
+        the recorded status describes content that is gone.
+        """
+        return stat_size != self.size or abs(stat_mtime - self.last_modified) > MTIME_TOLERANCE
+
     def to_file_metadata(
         self,
         *,
@@ -127,14 +138,22 @@ class CacheMetadataRecord:
         stat_mtime: float,
         last_access: float,
     ) -> FileMetadata:
-        """Build runtime metadata using the live cache path and file stat."""
+        """Build runtime metadata using the live cache path and file stat.
+
+        A record that is stale for the live stat yields DIRTY whatever status
+        it recorded: the file was written after the record, and nothing says
+        those bytes reached a member. Erring this way costs a redundant sync;
+        believing a stale CLEAN loses the write. The checksum is kept: it is
+        the checksum of the content last synced, which the members still hold.
+        """
+        stale = self.is_stale_for(stat_size, stat_mtime)
         return FileMetadata(
             virtual_path=virtual_path,
             size=stat_size,
             checksum=self.checksum,
             last_access=last_access,
             last_modified=stat_mtime,
-            sync_status=self.sync_status,
+            sync_status=SyncStatus.DIRTY if stale else self.sync_status,
             replica_count=self.replica_count,
             recomputable=self.recomputable,
             recompute_cmd=self.recompute_cmd,
@@ -327,9 +346,15 @@ def scan_cache_entries(cache_root: Path) -> Iterator[CacheScanEntry]:
                     issues.append(
                         f"size_mismatch:xattr={metadata.size}:stat={st.st_size}"
                     )
-                if abs(metadata.last_modified - st.st_mtime) > 1e-6:
+                if abs(metadata.last_modified - st.st_mtime) > MTIME_TOLERANCE:
                     issues.append(
                         f"mtime_mismatch:xattr={metadata.last_modified}:stat={st.st_mtime}"
+                    )
+                if metadata.sync_status == SyncStatus.CLEAN and metadata.is_stale_for(
+                    st.st_size, st.st_mtime
+                ):
+                    issues.append(
+                        "stale_clean_xattr:file changed after its xattr said clean; treated as dirty"
                     )
 
             yield CacheScanEntry(
