@@ -1,0 +1,17 @@
+id: gh-96-unclean-sweep
+title: Clear the pid from the mount lock on clean unmount; on mount with a pid present,
+  sweep the cache with the derive rule before the sync monitor starts
+desc: ""
+type: task
+component: sync
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-16T02:26:04-00:00
+references: []
+log_events:
+- time: 2026-10-16T02:26:04-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
