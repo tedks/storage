@@ -1,0 +1,21 @@
+id: sqlite-connection-opened-before-fork
+title: SQLite connection is opened before libfuse's daemonizing fork
+desc: 'Council finding on #99 (Claude seat), pre-existing: mount_storage constructs
+  StorageFS, and with it the StateManager''s SQLite connection, before FUSE() daemonizes
+  by forking in background mode. SQLite documents that a connection must not be carried
+  across fork. The sync workers and now the post-crash sweep are started from init()
+  post-fork, but the connection itself is inherited. Open the index in init() (post-fork)
+  or construct StorageFS lazily there.'
+type: task
+component: fs
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-16T02:47:20-00:00
+references: []
+log_events:
+- time: 2026-10-16T02:47:20-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
