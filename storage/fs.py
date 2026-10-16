@@ -316,12 +316,15 @@ class StorageFS(Operations):
         the canonical path, so we resolve it for the metadata lookup while
         still unlinking the cache at the suffixed path.
 
-        Holds _fd_lock across the open-writer check and the unlink, and
-        nothing else: open() takes the same lock across its os.open and
-        registration, so no writer can get a descriptor between the check
-        and the delete, and the index and cache work happens outside the
-        lock so that eviction, which takes the index lock and then _fd_lock,
-        cannot deadlock with this.
+        The same critical section as eviction (CacheManager._evict_if_still_clean):
+        the index lock is held from the row read through the index writes, so
+        no write can be recorded in between, and inside it _fd_lock is held
+        across the open-writer check, the stat and the unlink, so no writer
+        can get a descriptor in between either (open() takes _fd_lock across
+        its os.open and registration). A CLEAN row older than the file is a
+        write whose row update was lost: it is marked dirty and kept. The
+        cache lock is taken only after the index lock is released, keeping the
+        order cache lock, index lock, _fd_lock.
         """
         cache_path = self.cache_manager.get_cache_path(virtual_path)
         if not (cache_path.exists() and cache_path.is_file()):
@@ -333,34 +336,46 @@ class StorageFS(Operations):
         resolved = self._resolve_path(virtual_path)
         canonical_path = resolved.canonical_path
 
-        # For canonical paths, check metadata directly.
-        # For suffixed paths, check the canonical metadata.
-        meta = self.state_manager.get_file_metadata(canonical_path)
-        if meta and meta.sync_status != SyncStatus.CLEAN:
-            return
-
-        with self._fd_lock:
-            for entry in self._fd_map.values():
-                # Check both the suffixed virtual_path and canonical_path
-                # since open() may use either.
-                if entry.virtual_path != virtual_path and entry.canonical_path != canonical_path:
-                    continue
-                if entry.prefetch_session is not None:
-                    continue
-                if (entry.flags & os.O_ACCMODE) != os.O_RDONLY:
-                    return
-            try:
-                cache_path.unlink()
-            except OSError:
+        with self.state_manager.metadata_lock:
+            # For canonical paths, check metadata directly.
+            # For suffixed paths, check the canonical metadata.
+            meta = self.state_manager.get_file_metadata(canonical_path)
+            if meta and meta.sync_status != SyncStatus.CLEAN:
                 return
 
-        self.state_manager.remove_file_location(virtual_path, "cache")
-        self.cache_manager.mark_cache_size_dirty()
-        if meta:
-            meta.checksum = None
-            meta.size = 0
-            meta.last_modified = 0.0
-            self.state_manager.set_file_metadata(meta)
+            stale = False
+            with self._fd_lock:
+                for entry in self._fd_map.values():
+                    # Check both the suffixed virtual_path and canonical_path
+                    # since open() may use either.
+                    if entry.virtual_path != virtual_path and entry.canonical_path != canonical_path:
+                        continue
+                    if entry.prefetch_session is not None:
+                        continue
+                    if (entry.flags & os.O_ACCMODE) != os.O_RDONLY:
+                        return
+                try:
+                    st = os.lstat(str(cache_path))
+                    if meta and not resolved.backend_name:
+                        stale = st.st_size != meta.size or st.st_mtime != meta.last_modified
+                    if not stale:
+                        cache_path.unlink()
+                except OSError:
+                    return
+
+            if stale:
+                # A write whose row update was lost: keep the file and record
+                # it. The checksum records below still go, the remote changed.
+                self.cache_manager.mark_file_dirty(canonical_path, cache_path)
+            else:
+                self.state_manager.remove_file_location(virtual_path, "cache")
+                if meta:
+                    meta.checksum = None
+                    meta.size = 0
+                    meta.last_modified = 0.0
+                    self.state_manager.set_file_metadata(meta)
+        if not stale:
+            self.cache_manager.mark_cache_size_dirty()
 
         # Clear in-memory checksum records and cancel pending tasks.
         # Records are keyed (canonical_path, backend), so clear both the

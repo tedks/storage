@@ -315,17 +315,27 @@ class TestFSCoreIntegration(unittest.TestCase):
         self.assertEqual(after.size, len(b"v2 longer"))
         self.fs.release("/moved/a.txt", fd)
 
-    def test_invalidation_does_index_and_cache_work_outside_the_descriptor_lock(self):
-        """Eviction takes the index lock and then _fd_lock; invalidation must not nest the other way."""
-        self.fs.sync_manager.stop()
-        fd = self.fs.create("/inv.txt", 0o644)
-        self.fs.write("/inv.txt", b"v1", 0, fd)
-        self.fs.release("/inv.txt", fd)
-        row = self.fs.state_manager.get_file_metadata("/inv.txt")
+    def _clean_file(self, name, content=b"v1"):
+        fd = self.fs.create(f"/{name}", 0o644)
+        self.fs.write(f"/{name}", content, 0, fd)
+        self.fs.release(f"/{name}", fd)
+        row = self.fs.state_manager.get_file_metadata(f"/{name}")
         self.fs.state_manager.publish_sync_status(
-            "/inv.txt", row.dirty_generation, SyncStatus.CLEAN, checksum="v1",
+            f"/{name}", row.dirty_generation, SyncStatus.CLEAN, checksum="c",
         )
+        return self.cache_dir / name
+
+    def test_invalidation_lock_order(self):
+        """Index work under the index lock and never under _fd_lock; the cache lock after both.
+
+        Eviction takes the index lock, then _fd_lock; invalidation must do the
+        same, with the row read, the unlink and the index writes all inside
+        the index lock so no write can be recorded in between.
+        """
+        self.fs.sync_manager.stop()
+        self._clean_file("inv.txt")
         state = self.fs.state_manager
+        index_lock = state.metadata_lock
         seen = []
         originals = {
             name: getattr(state, name)
@@ -334,7 +344,7 @@ class TestFSCoreIntegration(unittest.TestCase):
 
         def spy(name):
             def call(*args, **kwargs):
-                seen.append((name, self.fs._fd_lock.locked()))
+                seen.append((name, index_lock._is_owned(), self.fs._fd_lock.locked()))
                 return originals[name](*args, **kwargs)
             return call
 
@@ -342,12 +352,40 @@ class TestFSCoreIntegration(unittest.TestCase):
              patch.object(state, "remove_file_location", side_effect=spy("remove_file_location")), \
              patch.object(state, "set_file_metadata", side_effect=spy("set_file_metadata")), \
              patch.object(self.fs.cache_manager, "mark_cache_size_dirty",
-                          side_effect=lambda: seen.append(("mark_cache_size_dirty", self.fs._fd_lock.locked()))):
+                          side_effect=lambda: seen.append(("mark_cache_size_dirty", index_lock._is_owned(), self.fs._fd_lock.locked()))):
             self.fs._invalidate_file_cache("/inv.txt")
 
         self.assertFalse((self.cache_dir / "inv.txt").exists())
-        self.assertTrue(seen)
-        self.assertEqual([entry for entry in seen if entry[1]], [])
+        names = [name for name, _, _ in seen]
+        self.assertIn("get_file_metadata", names)
+        self.assertIn("remove_file_location", names)
+        self.assertIn("mark_cache_size_dirty", names)
+        for name, index_owned, fd_held in seen:
+            self.assertFalse(fd_held, name)
+            if name == "mark_cache_size_dirty":
+                self.assertFalse(index_owned, name)
+            else:
+                self.assertTrue(index_owned, name)
+
+    def test_invalidation_keeps_a_file_written_after_its_clean_row(self):
+        self.fs.sync_manager.stop()
+        cache_path = self._clean_file("lost.txt")
+        cache_path.write_bytes(b"v2 is longer")  # row update lost
+
+        self.fs._invalidate_file_cache("/lost.txt")
+
+        self.assertTrue(cache_path.exists())
+        self.assertEqual(self.fs.state_manager.get_file_metadata("/lost.txt").sync_status, SyncStatus.DIRTY)
+
+    def test_invalidation_skips_a_file_open_for_writing(self):
+        self.fs.sync_manager.stop()
+        cache_path = self._clean_file("busy.txt")
+        fd = self.fs.open("/busy.txt", os.O_WRONLY)
+
+        self.fs._invalidate_file_cache("/busy.txt")
+
+        self.assertTrue(cache_path.exists())
+        self.fs.release("/busy.txt", fd)
 
     def test_sweep_marks_files_written_after_their_clean_row(self):
         self.fs.sync_manager.stop()  # the row states below are set by hand
