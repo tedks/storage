@@ -1,0 +1,37 @@
+id: xattr-means-last-synced-state
+title: 'Should user.storage.metadata mean ''state as of the last completed sync''
+  (option 2 on #96)?'
+desc: 'Context: PR #99 (merged) closed the crash-consistency gap by deriving dirtiness
+  from the cache file''s stat without changing what the xattr means. Option 2 on #96
+  goes further: the xattr is written only by the sync worker, rebuild, reprobe and
+  the conflict tooling, never by write(); the write path drops to one transactional
+  record and one fewer setxattr per write; writers that bypass FUSE are caught.
+
+
+  Options:
+
+  1. Keep the xattr as "current status, last mirrored" (today). No further work; #99''s
+  rule covers the crash cases.
+
+  2. Redefine it as "last synced state" (option 2). One medium PR, stacked on nothing
+  now that #99 is in; AGENTS.md''s authority rule, verify-index''s expectations and
+  the conflict tooling''s reading of the xattr change with it. Also the natural home
+  for ditz gh-96-policy-only-upsert and gh-96-xattr-generation.
+
+
+  Recommendation: option 2, but it is a semantics ruling rather than a bugfix, and
+  nothing is at risk while it waits. Decides: the maintainer. Blocks: gh-96-policy-only-upsert
+  and gh-96-xattr-generation are best done inside it.'
+type: task
+component: open-questions
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-16T04:48:55-00:00
+references: []
+log_events:
+- time: 2026-10-16T04:48:55-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
