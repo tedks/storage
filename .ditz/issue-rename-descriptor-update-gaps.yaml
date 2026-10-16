@@ -1,0 +1,23 @@
+id: rename-descriptor-update-gaps
+title: 'rename(): descriptor update is not atomic with the rename and skips suffixed
+  conflict paths'
+desc: 'Council nits on #99 round 5 (Claude seat), pre-existing shape: (1) StorageFS.rename()
+  updates descriptor entries after namespace.rename returns, not atomically with it,
+  so a write through an open descriptor in that gap records against the old path;
+  (2) descriptors opened on backend-suffixed conflict paths (/foo.remote0) are matched
+  by virtual_path only and are not moved when /foo is renamed. Needs the fd-map update
+  under _fd_lock as part of the rename, and matching on canonical_path for suffixed
+  entries.'
+type: bugfix
+component: fs
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-16T03:11:53-00:00
+references: []
+log_events:
+- time: 2026-10-16T03:11:53-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
