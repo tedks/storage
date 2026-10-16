@@ -1,0 +1,17 @@
+id: gh-96-crash-table-test
+title: 'Crash-point table test: abort at each step of write and sync, run rebuild-index
+  and verify-index, assert never CLEAN unless the content is on the replica'
+desc: ""
+type: task
+component: sync
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-16T02:26:05-00:00
+references: []
+log_events:
+- time: 2026-10-16T02:26:05-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
