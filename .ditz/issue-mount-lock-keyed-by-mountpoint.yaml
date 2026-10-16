@@ -1,0 +1,22 @@
+id: mount-lock-keyed-by-mountpoint
+title: Mount lock and unclean-shutdown marker are keyed by mountpoint, not cache root
+desc: 'Council nit on #99 (Claude seat), pre-existing: the mount lock path is cache_root/.storage.mount.<sha256(mountpoint)[:12]>.lock.
+  A crash while mounted at X followed by a mount of the same cache root at Y (or the
+  same path spelled differently) uses a different lock file, so the unclean-shutdown
+  pid is not seen and the post-crash sweep does not run; two concurrent mounts of
+  one cache root at different mountpoints also both get locks. Consider one lock per
+  cache root (or a per-cache-root ''unclean'' marker file independent of the mountpoint)
+  and keying only the duplicate-mount check on the mountpoint.'
+type: task
+component: fs
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-16T02:47:20-00:00
+references: []
+log_events:
+- time: 2026-10-16T02:47:20-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
