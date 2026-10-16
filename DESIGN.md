@@ -6,6 +6,59 @@ Storage is a meta-filesystem that multiplexes an abstract filesystem over a numb
 
 The Storage abstract filesystem is backed by many other normal filesystems. YAML documents stored in extended attributes (synched to the underlying filesystems) control how many (or which) backing filesystems store which directories. Storage uses extended attributes to store all data about files, and can optionally replicate the extended attributes in a SQLite database. Generally, the philosophy of Storage is to try to store as much as possible on the filesystem itself, but the sqlite database can be used to improve performance or to handle situations where the underlying filesystems are exhausted of space or inode capacity. 
 
+# Goals and non-goals
+
+Draft for CEO ratification, 2026-10-16. Until ratified, packages cite the
+Motivations section below as intent. This section is the commander's
+intent in the sense of the org doctrine: every work package names which
+goal it serves, and a worker deviates toward these when an instruction
+conflicts with them.
+
+## Goals
+
+1. **Offline use of remote resources.** Mount remote members over SSH and
+   keep a whole-file LRU cache locally, so files that have been touched
+   remain usable without the network and writes land locally first.
+2. **Per-directory replication, chosen by the user.** Replication counts
+   and member preferences are extended attributes on the tree; critical
+   files are replicated, bulk files are not, and the user can tell which
+   is which from the filesystem itself.
+3. **The filesystem is the record.** File and directory policy lives in
+   xattrs; cached files carry their metadata in xattrs; the SQLite index is
+   rebuildable acceleration state and never the only copy of anything.
+4. **No silent loss.** A write that landed is synced or visibly dirty;
+   every recorded inconsistency errs toward resync, never toward believing
+   a stale clean. Conflicts are surfaced to the user, never auto-resolved.
+5. **Large files stream.** A cold read starts without a full download, with
+   the rest prefetched in the background, so media plays and desktop
+   browsing stays responsive.
+6. **Untrusted members get ciphertext.** Transparent encryption per file,
+   directory or member, for cloud storage of last resort.
+7. **Recomputable files are free space.** Files that a recorded command can
+   recreate may be dropped under pressure and rebuilt on demand.
+
+## Non-goals
+
+- Being a block device or a RAID: whole files, not blocks, are the unit of
+  placement, sync and cache.
+- Byte-range or delta synchronization inside the filesystem (rsync's delta
+  transfer on the wire is fine; the model stays whole-file).
+- Automatic conflict resolution.
+- Multiple writers of one cache root at once: one mount per cache root;
+  coordination across machines is by sync, not by locks.
+- Strong consistency across replicas at every instant; replicas converge.
+- Performance competitive with a native filesystem for small-file
+  metadata-heavy workloads before the correctness goals above hold.
+
+## Sprint-1 schwerpunkt
+
+Correctness of the write and sync path, and verification against a real
+remote, ahead of performance and new features. Concretely: #74 (conflict
+checks must not download), #98 (nothing stays SYNCING forever), and a gate
+that exercises the SSH backend, the watcher and rsync over SSH for real.
+Performance (#50, #61, #55) and architecture (#17, #87) wait for that gate.
+
+
 # Motivations & Goals
 The main use case of Storage is to mount multiple remote filesystems of different types, syncing whole files whenever part of them is accessed and storing the files in a local mirror of the abstract filesystem which is managed like an LRU cache according to the configured size of the Storage local store. This allows for offline usage of remote resources. 
 
