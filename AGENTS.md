@@ -218,6 +218,16 @@ ExecPlans for non-trivial work follow the format in
   The SQLite index is rebuildable acceleration state, so do not make it the
   only record of anything that cannot be recovered from xattrs or a member
   reprobe.
+- A cached file whose live size or mtime differs from the stat recorded in
+  its index row or its metadata xattr is dirty, whatever status the record
+  says: the record predates a write. `CacheMetadataRecord.to_file_metadata`
+  applies this for rebuild-index, `CacheManager.heal_stale_clean` for the
+  open path and the post-crash sweep. The comparison is exact (both sides
+  come from `stat`); what it cannot see is a same-size write in the same
+  timestamp tick as the record, a few ms on kernels without fine-grained
+  timestamps. Anything that changes a cached file's bytes or mtime goes
+  through `CacheManager.mark_file_dirty`, which keeps the records in step;
+  a change that bypasses it looks like a lost write and gets resynced.
 - Sync status is owned by `files.dirty_generation`. Record a modification
   with `StateManager.mark_dirty` (one UPDATE that bumps the generation) and
   a sync outcome with `publish_sync_status` (conditioned on the generation

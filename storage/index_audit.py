@@ -7,7 +7,11 @@ import time
 from typing import Dict, List
 
 from .backends.base import Backend
-from .cache_metadata import cache_file_would_be_scanned, scan_cache_entries, write_cache_metadata
+from .cache_metadata import (
+    cache_file_would_be_scanned,
+    scan_cache_entries,
+    write_cache_metadata,
+)
 from .models import FileLocation, FileMetadata, SyncStatus
 from .state import StateManager
 
@@ -238,6 +242,16 @@ def rebuild_index_from_cache(cache_root: Path, state_manager: StateManager) -> R
                     )
                     continue
                 metadata = legacy
+                # The row's size and mtime are the stat as of the last recorded
+                # write. A live stat that differs means bytes landed after it,
+                # so whatever status the row recorded describes content that
+                # is gone; the same rule as CacheMetadataRecord.to_file_metadata.
+                # The checksum stays: it describes the content last synced.
+                if (
+                    metadata.size != entry.stat_size
+                    or metadata.last_modified != entry.stat_mtime
+                ):
+                    metadata.sync_status = SyncStatus.DIRTY
                 metadata.size = entry.stat_size
                 metadata.last_access = entry.stat_atime
                 metadata.last_modified = entry.stat_mtime

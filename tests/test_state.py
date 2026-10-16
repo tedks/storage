@@ -409,3 +409,30 @@ class TestDirtyGeneration(unittest.TestCase):
         self.assertEqual(row.sync_status, SyncStatus.DIRTY)
         self.assertEqual(row.size, 10)
         self.assertEqual(row.dirty_generation, 1)
+
+    def test_record_cached_stat_moves_only_the_stat_at_the_generation_read(self):
+        self.state_manager.set_file_metadata(self._metadata(checksum="synced"))
+        row = self.state_manager.get_file_metadata("/f.txt")
+
+        self.assertTrue(self.state_manager.record_cached_stat(
+            "/f.txt", row.dirty_generation, size=42, last_modified=7.0, last_access=8.0,
+        ))
+
+        updated = self.state_manager.get_file_metadata("/f.txt")
+        self.assertEqual((updated.size, updated.last_modified, updated.last_access), (42, 7.0, 8.0))
+        self.assertEqual(updated.sync_status, SyncStatus.CLEAN)
+        self.assertEqual(updated.checksum, "synced")
+        self.assertEqual(updated.dirty_generation, row.dirty_generation)
+
+    def test_record_cached_stat_is_refused_after_a_write(self):
+        self.state_manager.set_file_metadata(self._metadata())
+        row = self.state_manager.get_file_metadata("/f.txt")
+        self.state_manager.mark_dirty("/f.txt", size=10, last_modified=2.0)
+
+        self.assertFalse(self.state_manager.record_cached_stat(
+            "/f.txt", row.dirty_generation, size=42, last_modified=7.0, last_access=8.0,
+        ))
+
+        updated = self.state_manager.get_file_metadata("/f.txt")
+        self.assertEqual((updated.size, updated.last_modified), (10, 2.0))
+        self.assertEqual(updated.sync_status, SyncStatus.DIRTY)

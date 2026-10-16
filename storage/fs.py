@@ -10,6 +10,7 @@ Main filesystem layer that provides:
 
 import os
 import errno
+import stat
 import threading
 import logging
 import fcntl
@@ -18,6 +19,7 @@ import hashlib
 import yaml
 import json
 import concurrent.futures
+import contextlib
 from dataclasses import dataclass
 from fuse import FUSE, FuseOSError, Operations
 from pathlib import Path
@@ -25,7 +27,7 @@ from typing import Dict, Optional, Set, List, Tuple
 
 from .backends.base import Backend
 from .cache import CacheManager
-from .cache_metadata import XATTR_CACHE_METADATA_NAME
+from .cache_metadata import XATTR_CACHE_METADATA_NAME, scan_cache_entries
 from .file_config import FileConfig, get_inherited_config
 from .models import FileLocation, FileMetadata, SyncStatus
 from .state import StateManager
@@ -61,6 +63,8 @@ class StorageFS(Operations):
     """
 
     CHECKSUM_XATTR = "user.storage.checksums"
+    # How long destroy() waits for an in-flight post-crash sweep.
+    SWEEP_JOIN_TIMEOUT = 60.0
     CACHE_STATE_XATTR = "user.storage.cache"
     CACHE_METADATA_XATTR = XATTR_CACHE_METADATA_NAME
     _STUB_XATTR = "user.storage.stub"
@@ -118,6 +122,7 @@ class StorageFS(Operations):
         """
         self.state_manager = StateManager(str(state_db))
         self.cache_manager = CacheManager(cache_root, self.state_manager, cache_size)
+        self.cache_manager.descriptor_guard = self._descriptor_guard
         self.replication_manager = ReplicationManager(self.state_manager, backends)
         self.backends = backends
 
@@ -140,6 +145,14 @@ class StorageFS(Operations):
         if start_sync:
             self.sync_manager.start()
             self._sync_started = True
+        # Set by mount_storage. A clean unmount blanks the pid in it; a pid
+        # still there at the next mount means this session did not finish.
+        self.mount_lock_file = None
+        # True from mount until sweep_stale_cache_metadata has completed
+        # after an unclean shutdown. While True the pid stays in the lock
+        # file, so an interrupted sweep is rerun by the next mount.
+        self._sweep_pending = False
+        self._sweep_thread: Optional[threading.Thread] = None
 
         # Recomputation engine
         self.recompute_engine = RecomputeEngine(self.state_manager)
@@ -223,6 +236,14 @@ class StorageFS(Operations):
             self.sync_manager.start()
             self._sync_started = True
 
+        # Threads started before FUSE() do not survive the daemonizing fork
+        # in background mode, so the sweep starts here, like the workers.
+        if self._sweep_pending and self._sweep_thread is None:
+            self._sweep_thread = threading.Thread(
+                target=self._run_stale_sweep, name="stale-cache-sweep", daemon=True,
+            )
+            self._sweep_thread.start()
+
         if self._enable_watchers and not self._watchers:
             self._start_watchers()
 
@@ -230,6 +251,30 @@ class StorageFS(Operations):
         """Get configuration for a file"""
         cache_path = self.cache_manager.get_cache_path(virtual_path)
         return get_inherited_config(cache_path)
+
+    @contextlib.contextmanager
+    def _descriptor_guard(self, virtual_path: str):
+        """Hold _fd_lock and yield whether a non-prefetch descriptor is open on the path.
+
+        Eviction stats and unlinks the cache file inside this, so no open()
+        can slip a descriptor onto the file in between: open() takes
+        _fd_lock across its os.open and registration. Nothing under
+        _fd_lock takes the index or cache lock: every other _fd_lock section
+        touches only the descriptor table and raw fd calls, and
+        _invalidate_file_cache nests its _fd_lock section inside the index
+        lock and takes the cache lock only after releasing both. So the
+        order cache lock, index lock, _fd_lock has no inversion.
+        """
+        with self._fd_lock:
+            yield any(
+                entry.canonical_path == virtual_path and entry.prefetch_session is None
+                for entry in self._fd_map.values()
+            )
+
+    def _has_open_descriptor(self, virtual_path: str) -> bool:
+        """Whether any descriptor other than a prefetch session is open on the path."""
+        with self._descriptor_guard(virtual_path) as is_open:
+            return is_open
 
     def _should_sync_path(self, virtual_path: str) -> bool:
         """Only sync paths that do not currently have an open writer."""
@@ -272,8 +317,15 @@ class StorageFS(Operations):
         the canonical path, so we resolve it for the metadata lookup while
         still unlinking the cache at the suffixed path.
 
-        Holds _fd_lock across the open-writer check and unlink so that
-        no writer can open the file between the check and the delete.
+        The same critical section as eviction (CacheManager._evict_if_still_clean):
+        the index lock is held from the row read through the index writes, so
+        no write can be recorded in between, and inside it _fd_lock is held
+        across the open-writer check, the stat and the unlink, so no writer
+        can get a descriptor in between either (open() takes _fd_lock across
+        its os.open and registration). A CLEAN row older than the file is a
+        write whose row update was lost: it is marked dirty and kept. The
+        cache lock is taken only after the index lock is released, keeping the
+        order cache lock, index lock, _fd_lock.
         """
         cache_path = self.cache_manager.get_cache_path(virtual_path)
         if not (cache_path.exists() and cache_path.is_file()):
@@ -285,34 +337,49 @@ class StorageFS(Operations):
         resolved = self._resolve_path(virtual_path)
         canonical_path = resolved.canonical_path
 
-        with self._fd_lock:
-            for entry in self._fd_map.values():
-                # Check both the suffixed virtual_path and canonical_path
-                # since open() may use either.
-                if entry.virtual_path != virtual_path and entry.canonical_path != canonical_path:
-                    continue
-                if entry.prefetch_session is not None:
-                    continue
-                if (entry.flags & os.O_ACCMODE) != os.O_RDONLY:
-                    return
-
+        with self.state_manager.metadata_lock:
             # For canonical paths, check metadata directly.
             # For suffixed paths, check the canonical metadata.
             meta = self.state_manager.get_file_metadata(canonical_path)
             if meta and meta.sync_status != SyncStatus.CLEAN:
                 return
 
-            try:
-                cache_path.unlink()
+            stale = False
+            with self._fd_lock:
+                for entry in self._fd_map.values():
+                    # Check both the suffixed virtual_path and canonical_path
+                    # since open() may use either.
+                    if entry.virtual_path != virtual_path and entry.canonical_path != canonical_path:
+                        continue
+                    if entry.prefetch_session is not None:
+                        continue
+                    if (entry.flags & os.O_ACCMODE) != os.O_RDONLY:
+                        return
+                try:
+                    st = os.lstat(str(cache_path))
+                    if meta and not resolved.backend_name:
+                        stale = st.st_size != meta.size or st.st_mtime != meta.last_modified
+                    if not stale:
+                        cache_path.unlink()
+                except OSError:
+                    return
+
+            if stale:
+                # A write whose row update was lost: keep the file and record
+                # it. The checksum records below still go, the remote changed.
+                self.cache_manager.mark_file_dirty(canonical_path, cache_path)
+            else:
                 self.state_manager.remove_file_location(virtual_path, "cache")
-                self.cache_manager.mark_cache_size_dirty()
-                if meta:
+                # The canonical row describes the canonical cache file, not a
+                # suffixed conflict copy; zeroing it for /foo.remote0 would
+                # make a still-cached /foo look like a lost write.
+                if meta and not resolved.backend_name:
                     meta.checksum = None
                     meta.size = 0
                     meta.last_modified = 0.0
                     self.state_manager.set_file_metadata(meta)
-            except OSError:
-                pass
+        if not stale:
+            self.cache_manager.mark_cache_size_dirty()
 
         # Clear in-memory checksum records and cancel pending tasks.
         # Records are keyed (canonical_path, backend), so clear both the
@@ -618,6 +685,9 @@ class StorageFS(Operations):
         if self.cache_manager.is_cached(resolved.requested_path):
             if not resolved.backend_name:
                 self.cache_manager.mark_accessed(resolved.requested_path)
+                # A CLEAN row older than the file means a write's row update
+                # was lost; the file is dirty whatever the row says.
+                self.cache_manager.heal_stale_clean(canonical_path, cache_path)
             return True
 
         # If a backend is explicitly requested (conflict suffix), bypass replication manager.
@@ -673,7 +743,28 @@ class StorageFS(Operations):
                         encrypted=config.encrypted,
                         encryption_key_id=None,
                     )
-                    self.state_manager.set_file_metadata(metadata)
+                    # Writes the row and mirrors it.
+                    self.cache_manager.store_file_metadata(metadata, cache_path=cache_path)
+                else:
+                    # A refetch after eviction: the member's copy is what the
+                    # row already calls synced, but the transfer does not keep
+                    # the mtime, so the row's stat must follow the new file or
+                    # heal_stale_clean would resync unchanged content. Only
+                    # the stat columns move, and only at the generation read
+                    # above; a write recorded since keeps its own stat. The
+                    # mirror rewrites the xattr the evicted file lost.
+                    with self.state_manager.metadata_lock:
+                        self.state_manager.record_cached_stat(
+                            canonical_path,
+                            metadata.dirty_generation,
+                            size=st.st_size,
+                            last_modified=st.st_mtime,
+                            last_access=time.time(),
+                        )
+                        metadata = self.state_manager.get_file_metadata(canonical_path) or metadata
+                        self.cache_manager.sync_cache_metadata(
+                            canonical_path, metadata, cache_path=cache_path,
+                        )
 
                 # Record locations
                 try:
@@ -700,12 +791,6 @@ class StorageFS(Operations):
                     )
                 except Exception:
                     pass
-
-                self.cache_manager.sync_cache_metadata(
-                    canonical_path,
-                    metadata,
-                    cache_path=cache_path,
-                )
 
                 return True
 
@@ -756,6 +841,22 @@ class StorageFS(Operations):
     def rename(self, old, new):
         """Rename a file or directory"""
         self.namespace.rename(old, new)
+        # Open descriptors follow the file (or everything under a renamed
+        # directory): write() records against, and eviction and sync look
+        # up, the path they carry.
+        prefix = old.rstrip("/") + "/"
+        with self._fd_lock:
+            for entry in self._fd_map.values():
+                if entry.virtual_path == old:
+                    moved = new
+                elif entry.virtual_path.startswith(prefix):
+                    moved = new.rstrip("/") + "/" + entry.virtual_path[len(prefix):]
+                else:
+                    continue
+                target = self._resolve_path(moved)
+                entry.virtual_path = moved
+                entry.canonical_path = target.canonical_path
+                entry.cache_path = target.cache_path
 
     def chmod(self, path, mode):
         """Change file mode"""
@@ -1135,12 +1236,62 @@ class StorageFS(Operations):
 
     def utimens(self, path, times=None):
         """Update file timestamps"""
-        cache_path = self.cache_manager.get_cache_path(path)
+        resolved = self._resolve_path(path)
+        cache_path = resolved.cache_path
 
         try:
+            before = os.lstat(str(cache_path))
             os.utime(str(cache_path), times)
+            after = os.lstat(str(cache_path))
         except OSError as e:
             raise FuseOSError(e.errno)
+
+        # The index row and the xattr both record a cached file's mtime; a
+        # touch that moves it must be recorded as a modification, or the file
+        # looks like a lost write to heal_stale_clean at the next open. Only
+        # regular files are tracked, and an atime-only change is not a
+        # modification.
+        if (
+            not resolved.backend_name
+            and stat.S_ISREG(after.st_mode)
+            and after.st_mtime != before.st_mtime
+        ):
+            self._mark_cache_file_dirty(resolved.canonical_path, cache_path)
+
+    def sweep_stale_cache_metadata(self) -> int:
+        """Mark DIRTY every cached file written after its row last said CLEAN.
+
+        Run after an unclean shutdown: a write whose bytes landed but whose
+        row update was lost leaves a CLEAN row with an older size or mtime
+        than the file. One lstat, one getxattr and one row read per cached
+        file. Safe alongside FUSE operations and the sync monitor: it only
+        ever records a modification through mark_file_dirty. Returns the
+        number of files marked.
+        """
+        marked = 0
+        for entry in scan_cache_entries(self.cache_manager.cache_root):
+            if self.cache_manager.heal_stale_clean(
+                entry.virtual_path,
+                entry.cache_path,
+                stat_size=entry.stat_size,
+                stat_mtime=entry.stat_mtime,
+            ):
+                marked += 1
+        if marked:
+            self.logger.warning("Marked %d cached files dirty after an unclean shutdown", marked)
+        return marked
+
+    def request_stale_sweep(self) -> None:
+        """Arrange for sweep_stale_cache_metadata to run once FUSE is up."""
+        self._sweep_pending = True
+
+    def _run_stale_sweep(self) -> None:
+        try:
+            self.sweep_stale_cache_metadata()
+        except Exception:
+            self.logger.exception("Stale cache sweep failed; the next mount will rerun it")
+            return
+        self._sweep_pending = False
 
     def destroy(self, path):
         """Cleanup on unmount"""
@@ -1152,12 +1303,46 @@ class StorageFS(Operations):
         except Exception:
             pass
 
+        # The sweep uses the index; give it a bounded chance to finish before
+        # the index closes. If it has not, _sweep_pending stays True, the pid
+        # stays in the lock file, and the next mount sweeps again.
+        if self._sweep_thread is not None and self._sweep_thread.is_alive():
+            self._sweep_thread.join(timeout=self.SWEEP_JOIN_TIMEOUT)
+
         self.sync_manager.stop()
         self.state_manager.close()
+        if not self._sweep_pending:
+            _clear_mount_lock_pid(self.mount_lock_file)
+
+
+def _clear_mount_lock_pid(lock_file) -> None:
+    """Blank the pid in a held lock file to record a clean shutdown."""
+    if lock_file is None or lock_file.closed:
+        return
+    try:
+        lock_file.seek(0)
+        lock_file.truncate()
+        lock_file.flush()
+    except (OSError, ValueError):
+        logging.getLogger(__name__).exception("Could not clear the mount lock pid")
 
 
 def _acquire_mount_lock(lock_path: Path, mountpoint: str):
     """Take an exclusive, non-blocking lock to prevent duplicate mounts."""
+    return _acquire_mount_lock_ex(lock_path, mountpoint)[0]
+
+
+def _acquire_mount_lock_ex(lock_path: Path, mountpoint: str):
+    """Take the mount lock; also report whether the previous session left its pid.
+
+    A clean unmount blanks the pid (_clear_mount_lock_pid). A pid still there
+    once we hold the lock means the last session did not get that far: its
+    in-flight row updates may be lost and the cache needs
+    sweep_stale_cache_metadata. Read under the lock, so a session that takes
+    the lock and crashes between our read and our acquisition is not missed.
+    The first mount after upgrading from a version that never blanked the
+    pid sweeps once. Returns (lock_file, previous_pid_left).
+    """
     lock_file = None
     try:
         fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
@@ -1174,10 +1359,13 @@ def _acquire_mount_lock(lock_path: Path, mountpoint: str):
             )
 
         lock_file.seek(0)
+        previous_pid_left = lock_file.read().strip() != ""
+        lock_file.seek(0)
         lock_file.truncate()
         lock_file.write(str(os.getpid()))
         lock_file.flush()
-        return lock_file
+        os.fsync(lock_file.fileno())
+        return lock_file, previous_pid_left
     except Exception:
         if lock_file:
             lock_file.close()
@@ -1250,7 +1438,7 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
     mount_hash = hashlib.sha256(str(mountpoint).encode('utf-8')).hexdigest()[:12]
     lock_path = cache_root / f'.storage.mount.{mount_hash}.lock'
     try:
-        lock_file = _acquire_mount_lock(lock_path, mountpoint)
+        lock_file, unclean_shutdown = _acquire_mount_lock_ex(lock_path, mountpoint)
         logger.info("Acquired mount lock at %s for %s", lock_path, mountpoint)
     except RuntimeError as e:
         logger.error(str(e))
@@ -1269,10 +1457,18 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
         readdir_ttl=readdir_ttl,
         enable_watchers=enable_watchers,
     )
+    fs.mount_lock_file = lock_file
+    if unclean_shutdown:
+        logger.warning(
+            "Previous session of %s did not shut down cleanly; the cache will be swept", mountpoint,
+        )
+        fs.request_stale_sweep()  # started by init(), after FUSE's fork
     try:
         FUSE(fs, mountpoint, nothreads=True, foreground=foreground, allow_other=allow_other)
     finally:
         try:
+            if not fs._sweep_pending:
+                _clear_mount_lock_pid(lock_file)
             lock_file.close()
         except Exception:
             logger.exception("Exception occurred while closing mount lock file")

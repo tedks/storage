@@ -472,12 +472,14 @@ class TestWatcherInvalidation(TestCase):
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         cache_path.write_bytes(content)
 
+        # A row carries the file's real stat: a CLEAN row whose recorded stat
+        # differs from the file is a lost write, and invalidation keeps it.
         meta = FileMetadata(
             virtual_path=virtual_path,
             size=len(content),
             checksum="abc123",
             last_access=0.0,
-            last_modified=1.0,
+            last_modified=cache_path.lstat().st_mtime,
             sync_status=SyncStatus.CLEAN,
             replica_count=1,
             recomputable=False,

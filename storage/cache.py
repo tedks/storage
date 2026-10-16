@@ -9,7 +9,8 @@ import os
 import time
 import threading
 from pathlib import Path
-from typing import Optional, List, Set
+from contextlib import nullcontext
+from typing import Callable, ContextManager, Optional, List, Set
 
 from .backends.base import Backend
 from .cache_metadata import write_cache_metadata
@@ -35,6 +36,13 @@ class CacheManager:
             max_size_bytes: Maximum cache size in bytes
         """
         self.cache_root = cache_root
+        # Set by StorageFS: a context manager that holds the descriptor
+        # table lock and yields whether the path has an open descriptor.
+        # Eviction stats and unlinks inside it, so no descriptor can be
+        # opened on the file in between, and none open can be missed: bytes
+        # written through one after the stat would die with the inode.
+        # None (no StorageFS attached: tests, CLI tools) means no descriptors.
+        self.descriptor_guard: Optional[Callable[[str], ContextManager[bool]]] = None
         self.state_manager = state_manager
         self.max_size_bytes = max_size_bytes
         self._lock = threading.RLock()
@@ -141,14 +149,7 @@ class CacheManager:
                 cache_path = self.get_cache_path(metadata.virtual_path)
                 if cache_path.exists():
                     try:
-                        file_size = cache_path.stat().st_size
-                        cache_path.unlink()
-                        freed += file_size
-                        self._current_size_bytes = max(0, self._current_size_bytes - file_size)
-
-                        # Remove cache location from state
-                        self.state_manager.remove_file_location(metadata.virtual_path, "cache")
-
+                        freed += self._evict_if_still_clean(metadata.virtual_path, cache_path)
                     except OSError as e:
                         print(f"Warning: Failed to evict {metadata.virtual_path}: {e}")
 
@@ -290,6 +291,77 @@ class CacheManager:
             if metadata:
                 self.sync_cache_metadata(virtual_path, metadata, cache_path=cache_path)
         return generation
+
+    def _evict_if_still_clean(self, virtual_path: str, cache_path: Path) -> int:
+        """Unlink a cached file if its row is still CLEAN and describes the file.
+
+        The LRU list was read earlier; by now a write or the post-crash
+        sweep may have made the row DIRTY, or a write's row update may have
+        been lost (a CLEAN row older than the file). Both mean the file is
+        the only copy of something. The re-check and the unlink are one
+        critical section under the index lock, which every mark_file_dirty
+        also takes, so no write can be recorded between them. The stat and
+        the unlink also sit inside descriptor_guard, which holds the
+        descriptor table lock: a path with an open descriptor is skipped,
+        and none can be opened on the file before the unlink (open() takes
+        the same lock across its os.open and registration), since bytes
+        written through one after the stat would die with the unlinked
+        inode. A stale CLEAN is marked and kept. Lock order: the caller's
+        self._lock, the index lock, then the descriptor lock; nothing under
+        the descriptor lock takes the other two. Returns the bytes freed.
+        """
+        with self.state_manager.metadata_lock:
+            row = self.state_manager.get_file_metadata(virtual_path)
+            if row is None or row.sync_status != SyncStatus.CLEAN:
+                return 0
+            guard = self.descriptor_guard(virtual_path) if self.descriptor_guard else nullcontext(False)
+            with guard as is_open:
+                if is_open:
+                    return 0
+                st = os.lstat(str(cache_path))
+                stale = st.st_size != row.size or st.st_mtime != row.last_modified
+                if not stale:
+                    cache_path.unlink()
+            if stale:
+                self.mark_file_dirty(virtual_path, cache_path)
+                return 0
+            self._current_size_bytes = max(0, self._current_size_bytes - st.st_size)
+            self.state_manager.remove_file_location(virtual_path, "cache")
+            return st.st_size
+
+    def heal_stale_clean(
+        self,
+        virtual_path: str,
+        cache_path: Path,
+        *,
+        stat_size: Optional[int] = None,
+        stat_mtime: Optional[float] = None,
+    ) -> bool:
+        """Mark a CLEAN row DIRTY when the cache file was written after it.
+
+        The row's size and mtime are the stat recorded by the last
+        mark_file_dirty (or the last fetch). A CLEAN row whose stat differs
+        from the file means a write landed and its row update was lost (a
+        crash between the two), or something wrote to the cache directory
+        behind the mount; in that second case a sync may publish CLEAN for
+        a half-written file and the next open heals it again. One row read
+        and one lstat, unless the caller passes a stat it already has. The
+        read and the stat are not under the index lock: a writer racing
+        them bumps the generation, and mark_file_dirty's own bump keeps the
+        row at the newer write. Returns True when the file was marked.
+        """
+        row = self.state_manager.get_file_metadata(virtual_path)
+        if row is None or row.sync_status != SyncStatus.CLEAN:
+            return False
+        if stat_size is None or stat_mtime is None:
+            try:
+                st = os.lstat(str(cache_path))
+            except OSError:
+                return False
+            stat_size, stat_mtime = st.st_size, st.st_mtime
+        if stat_size == row.size and stat_mtime == row.last_modified:
+            return False
+        return self.mark_file_dirty(virtual_path, cache_path) is not None
 
     def store_file_metadata(
         self,

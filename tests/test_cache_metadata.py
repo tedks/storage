@@ -127,3 +127,70 @@ class TestCacheMetadata(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestStaleRecordDerivation(unittest.TestCase):
+    """A record older than the file it describes derives DIRTY."""
+
+    def setUp(self):
+        self.temp_dir = Path(tempfile.mkdtemp())
+        self.cache_path = self.temp_dir / "f.txt"
+        self.cache_path.write_bytes(b"v1")
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _clean_record(self):
+        st = self.cache_path.lstat()
+        return write_cache_metadata(
+            self.cache_path,
+            FileMetadata(
+                virtual_path="/f.txt", size=st.st_size, checksum="c1",
+                last_access=1.0, last_modified=st.st_mtime,
+                sync_status=SyncStatus.CLEAN, replica_count=1, recomputable=False,
+                recompute_cmd=None, encrypted=False, encryption_key_id=None,
+            ),
+        )
+
+    def test_record_matching_the_file_keeps_its_status_and_checksum(self):
+        record = self._clean_record()
+        st = self.cache_path.lstat()
+
+        self.assertFalse(record.is_stale_for(st.st_size, st.st_mtime))
+        derived = record.to_file_metadata(
+            virtual_path="/f.txt", stat_size=st.st_size, stat_mtime=st.st_mtime, last_access=2.0,
+        )
+        self.assertEqual(derived.sync_status, SyncStatus.CLEAN)
+        self.assertEqual(derived.checksum, "c1")
+
+    def test_record_older_than_the_file_derives_dirty_and_keeps_the_synced_checksum(self):
+        record = self._clean_record()
+        # A write lands after the record, and its mirror never happens.
+        self.cache_path.write_bytes(b"v2 is longer")
+        st = self.cache_path.lstat()
+
+        self.assertTrue(record.is_stale_for(st.st_size, st.st_mtime))
+        derived = record.to_file_metadata(
+            virtual_path="/f.txt", stat_size=st.st_size, stat_mtime=st.st_mtime, last_access=2.0,
+        )
+        self.assertEqual(derived.sync_status, SyncStatus.DIRTY)
+        self.assertEqual(derived.checksum, "c1")  # what the members hold
+        self.assertEqual(derived.size, st.st_size)
+
+    def test_same_size_newer_mtime_is_stale(self):
+        record = self._clean_record()
+        os.utime(self.cache_path, (5_000_000, 5_000_000))
+        st = self.cache_path.lstat()
+
+        self.assertTrue(record.is_stale_for(st.st_size, st.st_mtime))
+
+    def test_scan_reports_stale_clean_xattr(self):
+        self._clean_record()
+        self.cache_path.write_bytes(b"v2 is longer")
+
+        [entry] = list(scan_cache_entries(self.temp_dir))
+
+        kinds = {issue.partition(":")[0] for issue in entry.issues}
+        self.assertIn("stale_clean_xattr", kinds)
+        self.assertIn("size_mismatch", kinds)
+        self.assertEqual(entry.build_file_metadata().sync_status, SyncStatus.DIRTY)

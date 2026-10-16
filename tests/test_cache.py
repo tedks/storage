@@ -1,6 +1,8 @@
 import shutil
 import tempfile
 import unittest
+from contextlib import contextmanager
+from unittest.mock import patch
 from pathlib import Path
 
 from storage.backends.local import LocalBackend
@@ -106,3 +108,73 @@ class TestStoreFileMetadata(unittest.TestCase):
         self.assertIsNotNone(record)
         self.assertEqual(record.sync_status, SyncStatus.DIRTY)
         self.assertEqual(record.size, 9)
+
+
+class TestEvictionSkipsStaleClean(unittest.TestCase):
+    """LRU eviction must not unlink a file written after its CLEAN row."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.cache_dir = Path(self.temp_dir) / "cache"
+        self.cache_dir.mkdir()
+        self.state_manager = StateManager(str(Path(self.temp_dir) / "state.db"))
+        self.cache_manager = CacheManager(self.cache_dir, self.state_manager, 1024 * 1024)
+
+    def tearDown(self):
+        self.state_manager.close()
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _clean_cached(self, name, content):
+        cache_path = self.cache_dir / name
+        cache_path.write_bytes(content)
+        st = cache_path.lstat()
+        self.state_manager.set_file_metadata(FileMetadata(
+            virtual_path=f"/{name}", size=st.st_size, checksum="c", last_access=1.0,
+            last_modified=st.st_mtime, sync_status=SyncStatus.CLEAN, replica_count=1,
+            recomputable=False, recompute_cmd=None, encrypted=False,
+            encryption_key_id=None,
+        ))
+        return cache_path
+
+    def test_stale_clean_file_is_marked_dirty_and_kept(self):
+        stale = self._clean_cached("stale.txt", b"v1")
+        fresh = self._clean_cached("fresh.txt", b"v1")
+        stale.write_bytes(b"v2, the only copy")  # row update lost
+
+        self.cache_manager.evict_lru_files(bytes_needed=1)
+
+        self.assertTrue(stale.exists())
+        self.assertEqual(self.state_manager.get_file_metadata("/stale.txt").sync_status, SyncStatus.DIRTY)
+        self.assertFalse(fresh.exists())
+
+    def test_path_with_an_open_descriptor_is_kept(self):
+        held = self._clean_cached("held.txt", b"v1")
+        other = self._clean_cached("other.txt", b"v1")
+        guard_calls = []
+
+        @contextmanager
+        def guard(path):
+            guard_calls.append(path)
+            yield path == "/held.txt"
+
+        self.cache_manager.descriptor_guard = guard
+
+        self.cache_manager.evict_lru_files(bytes_needed=1)
+
+        self.assertTrue(held.exists())
+        self.assertFalse(other.exists())
+        self.assertEqual(sorted(guard_calls), ["/held.txt", "/other.txt"])
+
+    def test_file_made_dirty_after_selection_is_kept(self):
+        """The LRU list is a snapshot; the row is re-checked before the unlink."""
+        turned = self._clean_cached("turned.txt", b"v1")
+        snapshot = self.state_manager.get_lru_files(limit=10)
+        # A write lands after the snapshot was taken, through the real path.
+        turned.write_bytes(b"v2")
+        self.cache_manager.mark_file_dirty("/turned.txt", turned)
+
+        with patch.object(self.state_manager, "get_lru_files", return_value=snapshot):
+            self.cache_manager.evict_lru_files(bytes_needed=1)
+
+        self.assertTrue(turned.exists())
+        self.assertEqual(self.state_manager.get_file_metadata("/turned.txt").sync_status, SyncStatus.DIRTY)
