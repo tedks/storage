@@ -45,8 +45,7 @@ agent genuinely needs divergent instructions.
 - `docs/` - refactor roadmap and feature plans
 - `storage.example.toml` - example mount profile
 - `.planning/PLANS.md` - ExecPlan format guide
-- `org/`, `status/`, `events/` - the org artifacts (roster, work packages,
-  status entries, ledger shards); `org/README.md` is the cold-start map
+- `org/` - the roster and work packages; `org/README.md` is the cold-start map
 - `.claude/skills/` - agent skills vendored from dotfiles
 
 ## Environment
