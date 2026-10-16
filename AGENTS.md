@@ -248,6 +248,7 @@ ExecPlans for non-trivial work follow the format in
   `gh-96-xattr-generation`). A profile name given without `--config`
   is looked up in `~/.config/storage/storage.toml`, then
   `/etc/storage/storage.toml`.
-- README.md's Status and Known Issues sections are the public summary of
-  what is built and what is broken; update them when a feature lands or
-  a listed issue closes. The code is the authority when they disagree.
+- README.md's Status section is the public summary of what is built and
+  what is not; update it when a feature lands. Known problems live in the
+  issue tracker, not in the README. The code is the authority when they
+  disagree.

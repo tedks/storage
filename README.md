@@ -260,18 +260,6 @@ Not implemented:
   describes the intent, not the code.
 - Event-driven sync scheduling ([#17](https://github.com/tedks/storage/issues/17)); the sync monitor polls.
 
-## Known Issues
-
-Open issues a user is likely to hit. The tracker has the rest.
-
-- [#35](https://github.com/tedks/storage/issues/35) / [#57](https://github.com/tedks/storage/issues/57): if a file is written again while a sync of it is in flight, the sync worker can mark it CLEAN when it finishes, and the newer write is never synced. This is the reason for the warning above.
-- [#74](https://github.com/tedks/storage/issues/74): conflict detection downloads the whole remote file to compare checksums. Seen as multi-gigabyte transfers with no process asking for them, and timeouts on large files.
-- [#27](https://github.com/tedks/storage/issues/27) / [#29](https://github.com/tedks/storage/issues/29): Paramiko channel-open failures when streaming reads and directory listings run at the same time.
-- [#23](https://github.com/tedks/storage/issues/23): prefetch competes with foreground reads for bandwidth.
-- [#50](https://github.com/tedks/storage/issues/50): `getattr` probes every member for an uncached file, so browsing a directory in a file manager is slow.
-- [#24](https://github.com/tedks/storage/issues/24): renaming or unlinking a file with an active streaming session is not handled.
-- [#86](https://github.com/tedks/storage/issues/86): the rsync temp-file cleanup system test is flaky.
-
 ## Requirements
 
 - Linux with FUSE (libfuse 2) and extended attribute support
