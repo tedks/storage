@@ -106,3 +106,41 @@ class TestStoreFileMetadata(unittest.TestCase):
         self.assertIsNotNone(record)
         self.assertEqual(record.sync_status, SyncStatus.DIRTY)
         self.assertEqual(record.size, 9)
+
+
+class TestEvictionSkipsStaleClean(unittest.TestCase):
+    """LRU eviction must not unlink a file written after its CLEAN row."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.cache_dir = Path(self.temp_dir) / "cache"
+        self.cache_dir.mkdir()
+        self.state_manager = StateManager(str(Path(self.temp_dir) / "state.db"))
+        self.cache_manager = CacheManager(self.cache_dir, self.state_manager, 1024 * 1024)
+
+    def tearDown(self):
+        self.state_manager.close()
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _clean_cached(self, name, content):
+        cache_path = self.cache_dir / name
+        cache_path.write_bytes(content)
+        st = cache_path.lstat()
+        self.state_manager.set_file_metadata(FileMetadata(
+            virtual_path=f"/{name}", size=st.st_size, checksum="c", last_access=1.0,
+            last_modified=st.st_mtime, sync_status=SyncStatus.CLEAN, replica_count=1,
+            recomputable=False, recompute_cmd=None, encrypted=False,
+            encryption_key_id=None,
+        ))
+        return cache_path
+
+    def test_stale_clean_file_is_marked_dirty_and_kept(self):
+        stale = self._clean_cached("stale.txt", b"v1")
+        fresh = self._clean_cached("fresh.txt", b"v1")
+        stale.write_bytes(b"v2, the only copy")  # row update lost
+
+        self.cache_manager.evict_lru_files(bytes_needed=1)
+
+        self.assertTrue(stale.exists())
+        self.assertEqual(self.state_manager.get_file_metadata("/stale.txt").sync_status, SyncStatus.DIRTY)
+        self.assertFalse(fresh.exists())

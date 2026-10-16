@@ -1,9 +1,10 @@
 import multiprocessing as mp
+import os
 import tempfile
 import unittest
 from pathlib import Path
 
-from storage.fs import _acquire_mount_lock, _clear_mount_lock_pid, _mount_lock_left_pid
+from storage.fs import _acquire_mount_lock, _acquire_mount_lock_ex, _clear_mount_lock_pid
 
 
 def _try_lock(lock_path_str, mountpoint, return_dict):
@@ -67,17 +68,29 @@ if __name__ == '__main__':
 class TestMountLockPidLifecycle(unittest.TestCase):
     """A pid left in the lock file records an unclean shutdown."""
 
-    def test_fresh_lock_has_no_pid_and_clean_close_leaves_none(self):
+    def test_fresh_lock_reports_no_previous_pid(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             lock_path = Path(tmpdir) / 'lock'
-            self.assertFalse(_mount_lock_left_pid(lock_path))
 
+            lock_file, previous = _acquire_mount_lock_ex(lock_path, '/mnt/test')
+
+            self.assertFalse(previous)
+            self.assertEqual(lock_path.read_text().strip(), str(os.getpid()))
+            _clear_mount_lock_pid(lock_file)
+            lock_file.close()
+            self.assertEqual(lock_path.read_text(), "")
+
+    def test_clean_close_then_reacquire_reports_no_previous_pid(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            lock_path = Path(tmpdir) / 'lock'
             lock_file = _acquire_mount_lock(lock_path, '/mnt/test')
-            self.assertTrue(_mount_lock_left_pid(lock_path))
             _clear_mount_lock_pid(lock_file)
             lock_file.close()
 
-            self.assertFalse(_mount_lock_left_pid(lock_path))
+            next_lock, previous = _acquire_mount_lock_ex(lock_path, '/mnt/test')
+
+            self.assertFalse(previous)
+            next_lock.close()
 
     def test_pid_left_by_a_session_that_never_cleared_it(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -85,9 +98,9 @@ class TestMountLockPidLifecycle(unittest.TestCase):
             lock_file = _acquire_mount_lock(lock_path, '/mnt/test')
             lock_file.close()  # a crash: no _clear_mount_lock_pid
 
-            self.assertTrue(_mount_lock_left_pid(lock_path))
-            # The next mount still acquires the lock; the pid is just a record.
-            next_lock = _acquire_mount_lock(lock_path, '/mnt/test')
-            _clear_mount_lock_pid(next_lock)
+            next_lock, previous = _acquire_mount_lock_ex(lock_path, '/mnt/test')
+
+            self.assertTrue(previous)
+            # Our own pid replaced it, so a crash now is detected next time too.
+            self.assertEqual(lock_path.read_text().strip(), str(os.getpid()))
             next_lock.close()
-            self.assertFalse(_mount_lock_left_pid(lock_path))

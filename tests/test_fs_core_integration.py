@@ -10,8 +10,8 @@ from fuse import FuseOSError
 
 from storage.backends.local import LocalBackend
 from storage.cache_metadata import read_cache_metadata
-from storage.fs import StorageFS
-from storage.models import SyncStatus
+from storage.fs import StorageFS, _acquire_mount_lock_ex
+from storage.models import FileMetadata, SyncStatus
 
 
 class TestFSCoreIntegration(unittest.TestCase):
@@ -201,6 +201,62 @@ class TestFSCoreIntegration(unittest.TestCase):
         self.assertEqual(after.last_modified, 5_000_000)
         record = read_cache_metadata(self.cache_dir / "touch.txt")
         self.assertEqual(record.last_modified, 5_000_000)
+
+    def test_utimens_ignores_directories_and_atime_only_changes(self):
+        self.fs.mkdir("/d", 0o755)
+        self.assertIsNone(self.fs.state_manager.get_file_metadata("/d"))
+        self.fs.utimens("/d", (5_000_000, 5_000_000))
+        self.assertIsNone(self.fs.state_manager.get_file_metadata("/d"))
+
+        fd = self.fs.create("/atime.txt", 0o644)
+        self.fs.write("/atime.txt", b"v1", 0, fd)
+        self.fs.release("/atime.txt", fd)
+        before = self.fs.state_manager.get_file_metadata("/atime.txt")
+
+        self.fs.utimens("/atime.txt", (9_000_000, before.last_modified))
+
+        after = self.fs.state_manager.get_file_metadata("/atime.txt")
+        self.assertEqual(after.dirty_generation, before.dirty_generation)
+
+    def test_refetch_after_eviction_updates_the_row_stat_and_xattr(self):
+        self.fs.sync_manager.stop()
+        # A file that exists only on a member, with a CLEAN row from before
+        # it was evicted, whose stat no transfer will reproduce.
+        (self.backend1_dir / "far.txt").write_bytes(b"member copy")
+        self.fs.state_manager.set_file_metadata(FileMetadata(
+            virtual_path="/far.txt", size=11, checksum="c", last_access=1.0,
+            last_modified=1.0, sync_status=SyncStatus.CLEAN, replica_count=1,
+            recomputable=False, recompute_cmd=None, encrypted=False,
+            encryption_key_id=None,
+        ))
+
+        fd = self.fs.open("/far.txt", os.O_RDONLY)
+        self.fs.release("/far.txt", fd)
+
+        cache_path = self.cache_dir / "far.txt"
+        st = cache_path.lstat()
+        row = self.fs.state_manager.get_file_metadata("/far.txt")
+        self.assertEqual(row.sync_status, SyncStatus.CLEAN)
+        self.assertEqual((row.size, row.last_modified), (st.st_size, st.st_mtime))
+        record = read_cache_metadata(cache_path)
+        self.assertIsNotNone(record)
+        self.assertEqual(record.sync_status, SyncStatus.CLEAN)
+        # A second open finds the records in step: nothing to heal.
+        fd = self.fs.open("/far.txt", os.O_RDONLY)
+        self.fs.release("/far.txt", fd)
+        self.assertEqual(self.fs.state_manager.get_file_metadata("/far.txt").dirty_generation,
+                         row.dirty_generation)
+
+    def test_destroy_keeps_the_pid_while_a_sweep_is_pending(self):
+        lock_path = self.temp_dir / "lock"
+        lock_file, _ = _acquire_mount_lock_ex(lock_path, "/mnt/t")
+        self.fs.mount_lock_file = lock_file
+        self.fs.request_stale_sweep()  # never run: init() was not called
+
+        self.fs.destroy("/")
+
+        self.assertNotEqual(lock_path.read_text().strip(), "")
+        lock_file.close()
 
     def test_sweep_marks_files_written_after_their_clean_row(self):
         self.fs.sync_manager.stop()  # the row states below are set by hand
