@@ -19,6 +19,7 @@ import hashlib
 import yaml
 import json
 import concurrent.futures
+import contextlib
 from dataclasses import dataclass
 from fuse import FUSE, FuseOSError, Operations
 from pathlib import Path
@@ -121,7 +122,7 @@ class StorageFS(Operations):
         """
         self.state_manager = StateManager(str(state_db))
         self.cache_manager = CacheManager(cache_root, self.state_manager, cache_size)
-        self.cache_manager.is_path_open_cb = self._has_open_descriptor
+        self.cache_manager.descriptor_guard = self._descriptor_guard
         self.replication_manager = ReplicationManager(self.state_manager, backends)
         self.backends = backends
 
@@ -251,18 +252,28 @@ class StorageFS(Operations):
         cache_path = self.cache_manager.get_cache_path(virtual_path)
         return get_inherited_config(cache_path)
 
-    def _has_open_descriptor(self, virtual_path: str) -> bool:
-        """Whether any descriptor other than a prefetch session is open on the path.
+    @contextlib.contextmanager
+    def _descriptor_guard(self, virtual_path: str):
+        """Hold _fd_lock and yield whether a non-prefetch descriptor is open on the path.
 
-        Eviction asks this inside its critical section; _fd_lock is never
-        held while the index lock is taken, so the order stays cache lock,
-        index lock, _fd_lock.
+        Eviction stats and unlinks the cache file inside this, so no open()
+        can slip a descriptor onto the file in between: open() takes
+        _fd_lock across its os.open and registration. Nothing under
+        _fd_lock takes the index or cache lock (every other _fd_lock section
+        touches only the descriptor table and raw fd calls, and
+        _invalidate_file_cache does its index and cache work outside it),
+        so the order cache lock, index lock, _fd_lock has no inversion.
         """
         with self._fd_lock:
-            return any(
+            yield any(
                 entry.canonical_path == virtual_path and entry.prefetch_session is None
                 for entry in self._fd_map.values()
             )
+
+    def _has_open_descriptor(self, virtual_path: str) -> bool:
+        """Whether any descriptor other than a prefetch session is open on the path."""
+        with self._descriptor_guard(virtual_path) as is_open:
+            return is_open
 
     def _should_sync_path(self, virtual_path: str) -> bool:
         """Only sync paths that do not currently have an open writer."""
@@ -305,8 +316,12 @@ class StorageFS(Operations):
         the canonical path, so we resolve it for the metadata lookup while
         still unlinking the cache at the suffixed path.
 
-        Holds _fd_lock across the open-writer check and unlink so that
-        no writer can open the file between the check and the delete.
+        Holds _fd_lock across the open-writer check and the unlink, and
+        nothing else: open() takes the same lock across its os.open and
+        registration, so no writer can get a descriptor between the check
+        and the delete, and the index and cache work happens outside the
+        lock so that eviction, which takes the index lock and then _fd_lock,
+        cannot deadlock with this.
         """
         cache_path = self.cache_manager.get_cache_path(virtual_path)
         if not (cache_path.exists() and cache_path.is_file()):
@@ -318,6 +333,12 @@ class StorageFS(Operations):
         resolved = self._resolve_path(virtual_path)
         canonical_path = resolved.canonical_path
 
+        # For canonical paths, check metadata directly.
+        # For suffixed paths, check the canonical metadata.
+        meta = self.state_manager.get_file_metadata(canonical_path)
+        if meta and meta.sync_status != SyncStatus.CLEAN:
+            return
+
         with self._fd_lock:
             for entry in self._fd_map.values():
                 # Check both the suffixed virtual_path and canonical_path
@@ -328,24 +349,18 @@ class StorageFS(Operations):
                     continue
                 if (entry.flags & os.O_ACCMODE) != os.O_RDONLY:
                     return
-
-            # For canonical paths, check metadata directly.
-            # For suffixed paths, check the canonical metadata.
-            meta = self.state_manager.get_file_metadata(canonical_path)
-            if meta and meta.sync_status != SyncStatus.CLEAN:
-                return
-
             try:
                 cache_path.unlink()
-                self.state_manager.remove_file_location(virtual_path, "cache")
-                self.cache_manager.mark_cache_size_dirty()
-                if meta:
-                    meta.checksum = None
-                    meta.size = 0
-                    meta.last_modified = 0.0
-                    self.state_manager.set_file_metadata(meta)
             except OSError:
-                pass
+                return
+
+        self.state_manager.remove_file_location(virtual_path, "cache")
+        self.cache_manager.mark_cache_size_dirty()
+        if meta:
+            meta.checksum = None
+            meta.size = 0
+            meta.last_modified = 0.0
+            self.state_manager.set_file_metadata(meta)
 
         # Clear in-memory checksum records and cancel pending tasks.
         # Records are keyed (canonical_path, backend), so clear both the
@@ -807,6 +822,22 @@ class StorageFS(Operations):
     def rename(self, old, new):
         """Rename a file or directory"""
         self.namespace.rename(old, new)
+        # Open descriptors follow the file (or everything under a renamed
+        # directory): write() records against, and eviction and sync look
+        # up, the path they carry.
+        prefix = old.rstrip("/") + "/"
+        with self._fd_lock:
+            for entry in self._fd_map.values():
+                if entry.virtual_path == old:
+                    moved = new
+                elif entry.virtual_path.startswith(prefix):
+                    moved = new.rstrip("/") + "/" + entry.virtual_path[len(prefix):]
+                else:
+                    continue
+                target = self._resolve_path(moved)
+                entry.virtual_path = moved
+                entry.canonical_path = target.canonical_path
+                entry.cache_path = target.cache_path
 
     def chmod(self, path, mode):
         """Change file mode"""

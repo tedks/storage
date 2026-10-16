@@ -1,6 +1,7 @@
 import shutil
 import tempfile
 import unittest
+from contextlib import contextmanager
 from unittest.mock import patch
 from pathlib import Path
 
@@ -149,12 +150,20 @@ class TestEvictionSkipsStaleClean(unittest.TestCase):
     def test_path_with_an_open_descriptor_is_kept(self):
         held = self._clean_cached("held.txt", b"v1")
         other = self._clean_cached("other.txt", b"v1")
-        self.cache_manager.is_path_open_cb = lambda path: path == "/held.txt"
+        guard_calls = []
+
+        @contextmanager
+        def guard(path):
+            guard_calls.append(path)
+            yield path == "/held.txt"
+
+        self.cache_manager.descriptor_guard = guard
 
         self.cache_manager.evict_lru_files(bytes_needed=1)
 
         self.assertTrue(held.exists())
         self.assertFalse(other.exists())
+        self.assertEqual(sorted(guard_calls), ["/held.txt", "/other.txt"])
 
     def test_file_made_dirty_after_selection_is_kept(self):
         """The LRU list is a snapshot; the row is re-checked before the unlink."""

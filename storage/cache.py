@@ -9,7 +9,8 @@ import os
 import time
 import threading
 from pathlib import Path
-from typing import Callable, Optional, List, Set
+from contextlib import nullcontext
+from typing import Callable, ContextManager, Optional, List, Set
 
 from .backends.base import Backend
 from .cache_metadata import write_cache_metadata
@@ -35,10 +36,13 @@ class CacheManager:
             max_size_bytes: Maximum cache size in bytes
         """
         self.cache_root = cache_root
-        # Set by StorageFS: whether a virtual path has an open descriptor.
-        # Eviction must not unlink such a file: bytes written through the
-        # descriptor after eviction's stat would die with the inode.
-        self.is_path_open_cb: Optional[Callable[[str], bool]] = None
+        # Set by StorageFS: a context manager that holds the descriptor
+        # table lock and yields whether the path has an open descriptor.
+        # Eviction stats and unlinks inside it, so no descriptor can be
+        # opened on the file in between, and none open can be missed: bytes
+        # written through one after the stat would die with the inode.
+        # None (no StorageFS attached: tests, CLI tools) means no descriptors.
+        self.descriptor_guard: Optional[Callable[[str], ContextManager[bool]]] = None
         self.state_manager = state_manager
         self.max_size_bytes = max_size_bytes
         self._lock = threading.RLock()
@@ -296,23 +300,31 @@ class CacheManager:
         been lost (a CLEAN row older than the file). Both mean the file is
         the only copy of something. The re-check and the unlink are one
         critical section under the index lock, which every mark_file_dirty
-        also takes, so no write can be recorded between them; a path with
-        an open descriptor is skipped too, since bytes written through it
-        after the stat would otherwise die with the unlinked inode. A stale
-        CLEAN is marked and kept. The caller holds self._lock for the size
-        accounting. Returns the bytes freed, 0 when nothing was.
+        also takes, so no write can be recorded between them. The stat and
+        the unlink also sit inside descriptor_guard, which holds the
+        descriptor table lock: a path with an open descriptor is skipped,
+        and none can be opened on the file before the unlink (open() takes
+        the same lock across its os.open and registration), since bytes
+        written through one after the stat would die with the unlinked
+        inode. A stale CLEAN is marked and kept. Lock order: the caller's
+        self._lock, the index lock, then the descriptor lock; nothing under
+        the descriptor lock takes the other two. Returns the bytes freed.
         """
         with self.state_manager.metadata_lock:
             row = self.state_manager.get_file_metadata(virtual_path)
             if row is None or row.sync_status != SyncStatus.CLEAN:
                 return 0
-            if self.is_path_open_cb is not None and self.is_path_open_cb(virtual_path):
-                return 0
-            st = os.lstat(str(cache_path))
-            if st.st_size != row.size or st.st_mtime != row.last_modified:
+            guard = self.descriptor_guard(virtual_path) if self.descriptor_guard else nullcontext(False)
+            with guard as is_open:
+                if is_open:
+                    return 0
+                st = os.lstat(str(cache_path))
+                stale = st.st_size != row.size or st.st_mtime != row.last_modified
+                if not stale:
+                    cache_path.unlink()
+            if stale:
                 self.mark_file_dirty(virtual_path, cache_path)
                 return 0
-            cache_path.unlink()
             self._current_size_bytes = max(0, self._current_size_bytes - st.st_size)
             self.state_manager.remove_file_location(virtual_path, "cache")
             return st.st_size

@@ -290,11 +290,64 @@ class TestFSCoreIntegration(unittest.TestCase):
         fd = self.fs.create("/held.txt", 0o644)
         self.fs.write("/held.txt", b"v1", 0, fd)
         self.assertTrue(self.fs._has_open_descriptor("/held.txt"))
-        self.assertTrue(self.fs.cache_manager.is_path_open_cb("/held.txt"))
+        with self.fs.cache_manager.descriptor_guard("/held.txt") as is_open:
+            self.assertTrue(is_open)
 
         self.fs.release("/held.txt", fd)
 
         self.assertFalse(self.fs._has_open_descriptor("/held.txt"))
+
+    def test_descriptors_follow_a_rename(self):
+        self.fs.sync_manager.stop()
+        self.fs.mkdir("/dir", 0o755)
+        fd = self.fs.create("/dir/a.txt", 0o644)
+        self.fs.write("/dir/a.txt", b"v1", 0, fd)
+
+        self.fs.rename("/dir", "/moved")
+
+        self.assertFalse(self.fs._has_open_descriptor("/dir/a.txt"))
+        self.assertTrue(self.fs._has_open_descriptor("/moved/a.txt"))
+        # A write through the surviving descriptor records against the new path.
+        before = self.fs.state_manager.get_file_metadata("/moved/a.txt")
+        self.fs.write("/moved/a.txt", b"v2 longer", 0, fd)
+        after = self.fs.state_manager.get_file_metadata("/moved/a.txt")
+        self.assertGreater(after.dirty_generation, before.dirty_generation)
+        self.assertEqual(after.size, len(b"v2 longer"))
+        self.fs.release("/moved/a.txt", fd)
+
+    def test_invalidation_does_index_and_cache_work_outside_the_descriptor_lock(self):
+        """Eviction takes the index lock and then _fd_lock; invalidation must not nest the other way."""
+        self.fs.sync_manager.stop()
+        fd = self.fs.create("/inv.txt", 0o644)
+        self.fs.write("/inv.txt", b"v1", 0, fd)
+        self.fs.release("/inv.txt", fd)
+        row = self.fs.state_manager.get_file_metadata("/inv.txt")
+        self.fs.state_manager.publish_sync_status(
+            "/inv.txt", row.dirty_generation, SyncStatus.CLEAN, checksum="v1",
+        )
+        state = self.fs.state_manager
+        seen = []
+        originals = {
+            name: getattr(state, name)
+            for name in ("get_file_metadata", "remove_file_location", "set_file_metadata")
+        }
+
+        def spy(name):
+            def call(*args, **kwargs):
+                seen.append((name, self.fs._fd_lock.locked()))
+                return originals[name](*args, **kwargs)
+            return call
+
+        with patch.object(state, "get_file_metadata", side_effect=spy("get_file_metadata")), \
+             patch.object(state, "remove_file_location", side_effect=spy("remove_file_location")), \
+             patch.object(state, "set_file_metadata", side_effect=spy("set_file_metadata")), \
+             patch.object(self.fs.cache_manager, "mark_cache_size_dirty",
+                          side_effect=lambda: seen.append(("mark_cache_size_dirty", self.fs._fd_lock.locked()))):
+            self.fs._invalidate_file_cache("/inv.txt")
+
+        self.assertFalse((self.cache_dir / "inv.txt").exists())
+        self.assertTrue(seen)
+        self.assertEqual([entry for entry in seen if entry[1]], [])
 
     def test_sweep_marks_files_written_after_their_clean_row(self):
         self.fs.sync_manager.stop()  # the row states below are set by hand
