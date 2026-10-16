@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Optional, List, Set
 
 from .backends.base import Backend
-from .cache_metadata import write_cache_metadata
+from .cache_metadata import MTIME_TOLERANCE, write_cache_metadata
 from .models import FileMetadata, SyncStatus
 from .state import StateManager
 
@@ -290,6 +290,26 @@ class CacheManager:
             if metadata:
                 self.sync_cache_metadata(virtual_path, metadata, cache_path=cache_path)
         return generation
+
+    def heal_stale_clean(self, virtual_path: str, cache_path: Path) -> bool:
+        """Mark a CLEAN row DIRTY when the cache file was written after it.
+
+        The row's size and mtime are the stat recorded by the last
+        mark_file_dirty. A CLEAN row whose stat differs from the file means a
+        write landed and its row update was lost (a crash between the two),
+        or something wrote to the cache directory behind the mount. One
+        row read and one lstat. Returns True when the file was marked.
+        """
+        row = self.state_manager.get_file_metadata(virtual_path)
+        if row is None or row.sync_status != SyncStatus.CLEAN:
+            return False
+        try:
+            st = os.lstat(str(cache_path))
+        except OSError:
+            return False
+        if st.st_size == row.size and abs(st.st_mtime - row.last_modified) <= MTIME_TOLERANCE:
+            return False
+        return self.mark_file_dirty(virtual_path, cache_path) is not None
 
     def store_file_metadata(
         self,

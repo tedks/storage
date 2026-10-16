@@ -25,7 +25,7 @@ from typing import Dict, Optional, Set, List, Tuple
 
 from .backends.base import Backend
 from .cache import CacheManager
-from .cache_metadata import XATTR_CACHE_METADATA_NAME
+from .cache_metadata import XATTR_CACHE_METADATA_NAME, scan_cache_entries
 from .file_config import FileConfig, get_inherited_config
 from .models import FileLocation, FileMetadata, SyncStatus
 from .state import StateManager
@@ -140,6 +140,9 @@ class StorageFS(Operations):
         if start_sync:
             self.sync_manager.start()
             self._sync_started = True
+        # Set by mount_storage. A clean unmount blanks the pid in it; a pid
+        # still there at the next mount means this session did not finish.
+        self.mount_lock_file = None
 
         # Recomputation engine
         self.recompute_engine = RecomputeEngine(self.state_manager)
@@ -618,6 +621,9 @@ class StorageFS(Operations):
         if self.cache_manager.is_cached(resolved.requested_path):
             if not resolved.backend_name:
                 self.cache_manager.mark_accessed(resolved.requested_path)
+                # A CLEAN row older than the file means a write's row update
+                # was lost; the file is dirty whatever the row says.
+                self.cache_manager.heal_stale_clean(canonical_path, cache_path)
             return True
 
         # If a backend is explicitly requested (conflict suffix), bypass replication manager.
@@ -1135,17 +1141,41 @@ class StorageFS(Operations):
 
     def utimens(self, path, times=None):
         """Update file timestamps"""
-        cache_path = self.cache_manager.get_cache_path(path)
+        resolved = self._resolve_path(path)
+        cache_path = resolved.cache_path
 
         try:
             os.utime(str(cache_path), times)
         except OSError as e:
             raise FuseOSError(e.errno)
 
+        # The index row and the xattr both record the file's mtime; a touch
+        # moves it, so record a modification and let the new mtime reach the
+        # members. Otherwise the file looks like a lost write to heal_stale_clean.
+        if not resolved.backend_name:
+            self._mark_cache_file_dirty(resolved.canonical_path, cache_path)
+
+    def sweep_stale_cache_metadata(self) -> int:
+        """Mark DIRTY every cached file written after its row last said CLEAN.
+
+        Run after an unclean shutdown: a write whose bytes landed but whose
+        row update was lost leaves a CLEAN row with an older size or mtime
+        than the file. One lstat and one row read per cached file. Returns
+        the number of files marked.
+        """
+        marked = 0
+        for entry in scan_cache_entries(self.cache_manager.cache_root):
+            if self.cache_manager.heal_stale_clean(entry.virtual_path, entry.cache_path):
+                marked += 1
+        if marked:
+            self.logger.warning("Marked %d cached files dirty after an unclean shutdown", marked)
+        return marked
+
     def destroy(self, path):
         """Cleanup on unmount"""
         self._streaming_manager.destroy()
         self._stop_watchers()
+        _clear_mount_lock_pid(self.mount_lock_file)
 
         try:
             self._checksum_executor.shutdown(wait=False, cancel_futures=True)
@@ -1154,6 +1184,32 @@ class StorageFS(Operations):
 
         self.sync_manager.stop()
         self.state_manager.close()
+
+
+def _mount_lock_left_pid(lock_path: Path) -> bool:
+    """Whether the previous session's pid is still in the lock file.
+
+    A clean unmount blanks it (_clear_mount_lock_pid). A pid still there at
+    mount time means the last session did not get that far: its in-flight
+    row updates may be lost and the cache needs sweep_stale_cache_metadata.
+    (A live session also leaves its pid, but then the flock below fails.)
+    """
+    try:
+        return lock_path.read_text().strip() != ""
+    except OSError:
+        return False
+
+
+def _clear_mount_lock_pid(lock_file) -> None:
+    """Blank the pid in a held lock file to record a clean shutdown."""
+    if lock_file is None or lock_file.closed:
+        return
+    try:
+        lock_file.seek(0)
+        lock_file.truncate()
+        lock_file.flush()
+    except (OSError, ValueError):
+        logging.getLogger(__name__).exception("Could not clear the mount lock pid")
 
 
 def _acquire_mount_lock(lock_path: Path, mountpoint: str):
@@ -1249,6 +1305,7 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
     # Prevent duplicate mounts on the same cache/mountpoint
     mount_hash = hashlib.sha256(str(mountpoint).encode('utf-8')).hexdigest()[:12]
     lock_path = cache_root / f'.storage.mount.{mount_hash}.lock'
+    unclean_shutdown = _mount_lock_left_pid(lock_path)
     try:
         lock_file = _acquire_mount_lock(lock_path, mountpoint)
         logger.info("Acquired mount lock at %s for %s", lock_path, mountpoint)
@@ -1269,10 +1326,17 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
         readdir_ttl=readdir_ttl,
         enable_watchers=enable_watchers,
     )
+    fs.mount_lock_file = lock_file
+    if unclean_shutdown:
+        logger.warning("Previous session of %s did not shut down cleanly; sweeping the cache", mountpoint)
+        threading.Thread(
+            target=fs.sweep_stale_cache_metadata, name="stale-cache-sweep", daemon=True,
+        ).start()
     try:
         FUSE(fs, mountpoint, nothreads=True, foreground=foreground, allow_other=allow_other)
     finally:
         try:
+            _clear_mount_lock_pid(lock_file)
             lock_file.close()
         except Exception:
             logger.exception("Exception occurred while closing mount lock file")

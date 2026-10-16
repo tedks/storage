@@ -168,6 +168,57 @@ class TestFSCoreIntegration(unittest.TestCase):
             self.assertEqual(record.sync_status, SyncStatus.DIRTY)
             self.assertEqual(record.size, 2)
 
+    def test_open_heals_a_clean_row_older_than_the_file(self):
+        self.fs.sync_manager.stop()  # the row states below are set by hand
+        fd = self.fs.create("/heal.txt", 0o644)
+        self.fs.write("/heal.txt", b"v1", 0, fd)
+        self.fs.release("/heal.txt", fd)
+        row = self.fs.state_manager.get_file_metadata("/heal.txt")
+        self.fs.state_manager.publish_sync_status(
+            "/heal.txt", row.dirty_generation, SyncStatus.CLEAN, checksum="v1",
+        )
+        # Bytes land behind the mount's back (or a write's row update was lost).
+        (self.cache_dir / "heal.txt").write_bytes(b"v2 is longer")
+
+        fd = self.fs.open("/heal.txt", os.O_RDONLY)
+        self.fs.release("/heal.txt", fd)
+
+        healed = self.fs.state_manager.get_file_metadata("/heal.txt")
+        self.assertEqual(healed.sync_status, SyncStatus.DIRTY)
+        self.assertEqual(healed.size, len(b"v2 is longer"))
+        self.assertGreater(healed.dirty_generation, row.dirty_generation)
+
+    def test_utimens_records_a_modification(self):
+        fd = self.fs.create("/touch.txt", 0o644)
+        self.fs.write("/touch.txt", b"v1", 0, fd)
+        self.fs.release("/touch.txt", fd)
+        before = self.fs.state_manager.get_file_metadata("/touch.txt")
+
+        self.fs.utimens("/touch.txt", (5_000_000, 5_000_000))
+
+        after = self.fs.state_manager.get_file_metadata("/touch.txt")
+        self.assertGreater(after.dirty_generation, before.dirty_generation)
+        self.assertEqual(after.last_modified, 5_000_000)
+        record = read_cache_metadata(self.cache_dir / "touch.txt")
+        self.assertEqual(record.last_modified, 5_000_000)
+
+    def test_sweep_marks_files_written_after_their_clean_row(self):
+        self.fs.sync_manager.stop()  # the row states below are set by hand
+        for name in ("a.txt", "b.txt"):
+            fd = self.fs.create(f"/{name}", 0o644)
+            self.fs.write(f"/{name}", b"v1", 0, fd)
+            self.fs.release(f"/{name}", fd)
+            row = self.fs.state_manager.get_file_metadata(f"/{name}")
+            self.fs.state_manager.publish_sync_status(
+                f"/{name}", row.dirty_generation, SyncStatus.CLEAN, checksum="v1",
+            )
+        (self.cache_dir / "a.txt").write_bytes(b"v2 is longer")
+
+        self.assertEqual(self.fs.sweep_stale_cache_metadata(), 1)
+
+        self.assertEqual(self.fs.state_manager.get_file_metadata("/a.txt").sync_status, SyncStatus.DIRTY)
+        self.assertEqual(self.fs.state_manager.get_file_metadata("/b.txt").sync_status, SyncStatus.CLEAN)
+
     def test_rename_rewrites_cache_metadata_virtual_path(self):
         fd = self.fs.create("/old.txt", 0o644)
         self.fs.write("/old.txt", b"hello", 0, fd)
