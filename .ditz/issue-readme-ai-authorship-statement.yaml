@@ -30,8 +30,8 @@ type: task
 component: open-questions
 release:
 reporter: Ted Smith <tedks@riseup.net>
-status: unstarted
-disposition:
+status: closed
+disposition: wontfix
 creation_time: 2026-10-15T00:47:09-00:00
 references: []
 log_events:
@@ -39,3 +39,8 @@ log_events:
   who: Ted Smith
   what: created
   comment: ""
+- time: 2026-10-16T05:49:07-00:00
+  who: Ted Smith
+  what: 'closed: wontfix'
+  comment: 'Maintainer ruling 2026-10-16: no statement; the history already says it,
+    and starting with Jules is a flex.'
