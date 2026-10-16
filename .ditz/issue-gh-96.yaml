@@ -40,6 +40,10 @@ log_events:
   who: Ted Smith
   what: blocked by gh-96-verify-report
   comment: ""
+- time: 2026-10-16T02:26:04-00:00
+  who: Ted Smith
+  what: blocked by gh-96-self-heal
+  comment: ""
 blocked_by:
 - gh-57
 - gh-96-policy-only-upsert
@@ -47,3 +51,4 @@ blocked_by:
 - gh-96-derive-rule
 - gh-96-no-launder
 - gh-96-verify-report
+- gh-96-self-heal
