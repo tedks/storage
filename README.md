@@ -5,14 +5,19 @@ Storage is a meta-filesystem that multiplexes an abstract filesystem over multip
 ## Features
 
 - **Local Cache with LRU**: Local cache mirrors remote files with automatic LRU eviction
+- **Streaming Reads**: Uncached files are read straight from a remote member with background prefetch, so large files start without a full download
 - **N-way Replication**: Configure per-directory replication (1 to N copies, or -1 for all storage members)
-- **Multiple Backend Types**: Local filesystems, SSH/SFTP remotes (coming soon)
-- **Background Sync**: Writes go to cache first, sync to backends in background
+- **Multiple Backend Types**: Local filesystems and SSH remotes (SFTP for reads, rsync for writes)
+- **Background Sync**: Writes go to cache first, sync to backends in background, with conflict detection and a `storage conflicts` command
+- **Remote Change Notification**: inotify watchers on SSH members invalidate the cache when files change behind the mount
+- **Mount Profiles**: Named TOML profiles for mounts
 - **Extended Attribute Configuration**: Control replication, encryption, and recomputation via xattrs
 - **Cache Metadata Xattrs**: Cached files carry `user.storage.metadata` so the local SQLite index can be rebuilt and verified
 - **File Recomputation**: Mark files as recomputable for automatic space reclamation
 - **FUSE-based**: Runs in userspace, no kernel modules required
 - **SQLite State Tracking**: Efficient metadata tracking with optional extended attributes
+
+See [Status](#status) before trusting it with anything.
 
 ## Installation
 
@@ -95,29 +100,30 @@ storage mount /mnt/storage /srv/raid /srv/chunk0 /srv/chunk1 \
 TOML mount profiles are also supported:
 
 ```toml
-[mounts.drynwyn-warez]
-mountpoint = "/home/tedks/Downloads/drynwyn-warez"
-cache = "/home/tedks/Downloads/.drynwyn-chunk0-cache"
+[mounts.example-media]
+mountpoint = "/home/user/mnt/media"
+cache = "/home/user/.cache/storage/media"
 cache_size = "50G"
-key_file = "/home/tedks/.ssh/id_ed25519"
+key_file = "/home/user/.ssh/id_ed25519"
 foreground = true
 backends = [
-  "ssh://tedks@drynwyn.local:/srv/raid/warez/",
-  "ssh://tedks@drynwyn.local:/srv/chunk0/warez/",
-  "ssh://tedks@drynwyn.local:/srv/chunk1/warez/",
+  "ssh://user@storage-host.example:/srv/raid/media/",
+  "ssh://user@storage-host.example:/srv/chunk0/media/",
+  "ssh://user@storage-host.example:/srv/chunk1/media/",
 ]
 ```
 
 Save that as `~/.config/storage/storage.toml` to auto-load by name:
 
 ```bash
-storage mount drynwyn-warez
+storage mount example-media
 ```
 
-Or mount from an explicit TOML path:
+Or mount from an explicit TOML path (`storage.example.toml` in this repo
+is a fuller version of the same profile):
 
 ```bash
-storage mount --config ./storage.example.toml drynwyn-warez
+storage mount --config ./storage.example.toml example-media
 ```
 
 ### configure
@@ -219,40 +225,48 @@ Configuration is hierarchical - child directories inherit from parents, with the
 3. Respect preferred member choices and speed priorities
 4. Propagate via background sync workers with retry/backoff
 
-## Implementation Status
+## Status
 
-✅ **Implemented:**
-- State tracking (SQLite + extended attributes)
-- Local cache with LRU eviction
-- Local filesystem backends
-- N-way replication manager
-- Basic FUSE operations (read, write, create, delete)
-- Configuration via extended attributes
-- CLI tools (mount, configure, info)
+Alpha. Do not point it at data you do not have elsewhere.
 
-⏳ **Not Yet Implemented:**
-- Background sync workers (writes only go to cache currently)
-- Remote backends (SSH/SFTP planned)
-- Recomputation engine
-- Transparent encryption
-- Conflict resolution
-- Advanced space management (defragmentation, over-replication cleanup)
+One person has used it on one setup: a laptop mounting three replicas on a
+single SSH host over a home LAN, for media playback and desktop file
+browsing, mostly in February and March 2026. The bugs found that way are
+fixed, but the code has been refactored substantially since, and those
+paths have not been re-exercised against a real remote. The automated
+suite (about 290 tests, see [AGENTS.md](AGENTS.md) for the Bazel gates)
+mounts real FUSE filesystems and runs real `rsync`, but every remote
+member in it is a local directory flagged as remote: nothing in the suite
+talks to an SSH host, so the SSH backend, the inotify watcher and rsync
+over SSH are covered only by the field use above.
+
+Implemented:
+
+- Local, SSH/SFTP and rsync storage members (SFTP for reads, rsync for writes)
+- Local cache with LRU eviction; streaming cold reads with background prefetch
+- Background sync workers with retry; N-way replication configured per directory through xattrs
+- Conflict detection on sync, and `storage conflicts` to list and resolve conflicts
+- Remote inotify watchers that invalidate the cache when a member changes
+- TOML mount profiles
+- Cache metadata xattrs, with `storage debug rebuild-index`, `reprobe-locations` and `verify-index`
+- File recomputation
+- Transparent encryption (implemented; one test covers `storage/crypto.py`, so treat it as unverified)
+
+Not implemented:
+
+- Space management beyond cache eviction. Over-replication cleanup,
+  defragmentation and hot/cold placement are stubs in
+  `storage/spacemgmt.py`; the escalation chain in [DESIGN.md](DESIGN.md)
+  describes the intent, not the code.
+- Event-driven sync scheduling ([#17](https://github.com/tedks/storage/issues/17)); the sync monitor polls.
 
 ## Requirements
 
-- Python 3.7+
-- FUSE support (libfuse)
-- Extended attribute support in filesystems
+- Linux with FUSE (libfuse 2) and extended attribute support
+- Python 3.11 (the Nix flake pins it; `setup.py` allows 3.7+ but that is not tested)
 - SQLite3
-
-## Limitations (Current Version)
-
-- Files are written to cache but not automatically synced to backends (background sync TODO)
-- Only local backends supported (remote backends TODO)
-- No encryption yet
-- No conflict detection/resolution
-- Basic space management only
+- `rsync` and an SSH server on remote members; `inotifywait` there for change notification
 
 ## License
 
-See LICENSE file for details.
+GNU Affero General Public License v3.0 or later. See [LICENSE](LICENSE).

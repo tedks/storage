@@ -174,31 +174,31 @@ class TestMultiPathWatcher(TestCase):
             backend_name="remote0,remote1",
             ssh_host="host",
             ssh_port=22,
-            remote_paths=["/srv/raid/warez", "/srv/chunk0/warez"],
+            remote_paths=["/srv/raid/media", "/srv/chunk0/media"],
             on_change=lambda p: None,
             username="user",
         )
         cmd = w._build_ssh_command()
         inotify_part = cmd[-1]
-        self.assertIn("/srv/raid/warez", inotify_part)
-        self.assertIn("/srv/chunk0/warez", inotify_part)
+        self.assertIn("/srv/raid/media", inotify_part)
+        self.assertIn("/srv/chunk0/media", inotify_part)
 
     def test_multi_path_parse_matches_correct_root(self):
         w = RemoteWatcher(
             backend_name="multi",
             ssh_host="host",
             ssh_port=22,
-            remote_paths=["/srv/raid/warez", "/srv/chunk0/warez"],
+            remote_paths=["/srv/raid/media", "/srv/chunk0/media"],
             on_change=lambda p: None,
         )
         # Event under first path
         self.assertEqual(
-            w._parse_event_line("CREATE /srv/raid/warez/movies/test.mkv"),
+            w._parse_event_line("CREATE /srv/raid/media/movies/test.mkv"),
             "/movies/test.mkv",
         )
         # Event under second path
         self.assertEqual(
-            w._parse_event_line("MODIFY /srv/chunk0/warez/music/song.flac"),
+            w._parse_event_line("MODIFY /srv/chunk0/media/music/song.flac"),
             "/music/song.flac",
         )
         # Event under neither path
@@ -211,11 +211,11 @@ class TestMultiPathWatcher(TestCase):
             backend_name="multi",
             ssh_host="host",
             ssh_port=22,
-            remote_paths=["/srv/raid/warez", "/srv/chunk0/warez"],
+            remote_paths=["/srv/raid/media", "/srv/chunk0/media"],
             on_change=lambda p: None,
         )
         self.assertEqual(
-            w._parse_event_line("ATTRIB /srv/chunk0/warez"),
+            w._parse_event_line("ATTRIB /srv/chunk0/media"),
             "/",
         )
 
@@ -272,16 +272,16 @@ class TestMultiPathWatcher(TestCase):
             backend_name="r0,r1,r2",
             ssh_host="host",
             ssh_port=22,
-            remote_paths=["/srv/raid/warez", "/srv/chunk0/warez", "/srv/chunk1/warez"],
+            remote_paths=["/srv/raid/media", "/srv/chunk0/media", "/srv/chunk1/media"],
             on_change=lambda p: None,
-            username="tedks",
+            username="user",
         )
         cmd = w._build_ssh_command()
         inotify_part = cmd[-1]
         # All three paths in one inotifywait command
-        self.assertIn("/srv/raid/warez", inotify_part)
-        self.assertIn("/srv/chunk0/warez", inotify_part)
-        self.assertIn("/srv/chunk1/warez", inotify_part)
+        self.assertIn("/srv/raid/media", inotify_part)
+        self.assertIn("/srv/chunk0/media", inotify_part)
+        self.assertIn("/srv/chunk1/media", inotify_part)
         # Only one ssh command (verified by cmd structure)
         self.assertEqual(cmd[0], "ssh")
 

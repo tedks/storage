@@ -4,7 +4,7 @@ Storage is a FUSE meta-filesystem that presents one abstract filesystem
 split across multiple local and remote storage members, with a local LRU
 cache, per-directory N-way replication configured through extended
 attributes, and background sync. See [DESIGN.md](DESIGN.md) for the design
-and [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md) for what is built.
+and the Status section of [README.md](README.md) for what is built.
 
 ## Scope of this file
 
@@ -248,6 +248,7 @@ ExecPlans for non-trivial work follow the format in
   `gh-96-xattr-generation`). A profile name given without `--config`
   is looked up in `~/.config/storage/storage.toml`, then
   `/etc/storage/storage.toml`.
-- README.md lags the code (for example, it still lists remote backends
-  and background sync as unimplemented); trust the code and
-  IMPLEMENTATION_STATUS.md over it.
+- README.md's Status section is the public summary of what is built and
+  what is not; update it when a feature lands. Known problems live in the
+  issue tracker, not in the README. The code is the authority when they
+  disagree.
