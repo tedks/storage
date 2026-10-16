@@ -259,10 +259,11 @@ class StorageFS(Operations):
         Eviction stats and unlinks the cache file inside this, so no open()
         can slip a descriptor onto the file in between: open() takes
         _fd_lock across its os.open and registration. Nothing under
-        _fd_lock takes the index or cache lock (every other _fd_lock section
+        _fd_lock takes the index or cache lock: every other _fd_lock section
         touches only the descriptor table and raw fd calls, and
-        _invalidate_file_cache does its index and cache work outside it),
-        so the order cache lock, index lock, _fd_lock has no inversion.
+        _invalidate_file_cache nests its _fd_lock section inside the index
+        lock and takes the cache lock only after releasing both. So the
+        order cache lock, index lock, _fd_lock has no inversion.
         """
         with self._fd_lock:
             yield any(
@@ -369,7 +370,10 @@ class StorageFS(Operations):
                 self.cache_manager.mark_file_dirty(canonical_path, cache_path)
             else:
                 self.state_manager.remove_file_location(virtual_path, "cache")
-                if meta:
+                # The canonical row describes the canonical cache file, not a
+                # suffixed conflict copy; zeroing it for /foo.remote0 would
+                # make a still-cached /foo look like a lost write.
+                if meta and not resolved.backend_name:
                     meta.checksum = None
                     meta.size = 0
                     meta.last_modified = 0.0
