@@ -46,7 +46,6 @@ agent genuinely needs divergent instructions.
 - `storage.example.toml` - example mount profile
 - `.planning/PLANS.md` - ExecPlan format guide
 - `org/` - the roster and work packages; `org/README.md` is the cold-start map
-- `.claude/skills/` - agent skills vendored from dotfiles
 
 ## Environment
 
