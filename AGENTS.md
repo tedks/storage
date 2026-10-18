@@ -4,7 +4,9 @@ Storage is a FUSE meta-filesystem that presents one abstract filesystem
 split across multiple local and remote storage members, with a local LRU
 cache, per-directory N-way replication configured through extended
 attributes, and background sync. See [DESIGN.md](DESIGN.md) for the design
-and the Status section of [README.md](README.md) for what is built.
+and its Goals and non-goals (the commander's intent), the Status section
+of [README.md](README.md) for what is built, and [org/README.md](org/README.md)
+for how the project is run.
 
 ## Scope of this file
 
@@ -43,6 +45,7 @@ agent genuinely needs divergent instructions.
 - `docs/` - refactor roadmap and feature plans
 - `storage.example.toml` - example mount profile
 - `.planning/PLANS.md` - ExecPlan format guide
+- `org/` - the roster and work packages; `org/README.md` is the cold-start map
 - `.claude/skills/` - agent skills vendored from dotfiles
 
 ## Environment
