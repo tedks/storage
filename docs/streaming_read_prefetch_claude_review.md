@@ -3,7 +3,7 @@
 Query mechanism:
 
 - `~/.codex/skills/ask-agent/scripts/agent-query.sh claude`
-- Working directory: `/home/tedks/Projects/storage/streaming-read-prefetch`
+- Working directory: `<worktree>/streaming-read-prefetch`
 
 ## Successful response: key risks
 
