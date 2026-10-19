@@ -167,13 +167,14 @@ the filesystem:
 nix develop --command bazel test //:storage_tests_remote_gate --test_output=errors
 ```
 
-It needs a Docker daemon on the same host (the user in the `docker` group),
-`ssh`, `ssh-keygen` and `docker` on `PATH`, and what the mounted gate needs
-(libfuse 2, `/dev/fuse`, a setuid `fusermount`; see Environment). Without Docker it fails with a
-message naming Docker; it never skips. The first run builds the image
-(Debian packages from the network); later runs reuse it until anything in
-`tests/remote/` changes, since the tag is a hash of that directory. The
-target inherits `DOCKER_HOST`, `DOCKER_CONTEXT` and `DOCKER_CONFIG`.
+It needs a Docker daemon on the same host (the user in the `docker`
+group), `ssh`, `ssh-keygen` and `docker` on `PATH`, and what the mounted
+gate needs (libfuse 2, `/dev/fuse`, a setuid `fusermount`; see
+Environment). Without Docker it fails with a message naming Docker; it
+never skips. The first run builds the image (Debian packages from the
+network); later runs reuse it until anything in `tests/remote/` changes,
+since the tag is a hash of that directory. The target inherits
+`DOCKER_HOST`, `DOCKER_CONTEXT` and `DOCKER_CONFIG`.
 The members share a network named by the run id; when the host's Docker
 address pools are exhausted (other projects' networks), the fixture warns
 and uses the default bridge instead. Tests connect to the container IPs
