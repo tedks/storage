@@ -116,7 +116,8 @@ The gates are `test_suite`s over those `py_test`s:
 | `//:storage_tests_fast_gate` | `storage_tests_nonmounting` (`storage_tests_sandboxed`, `storage_tests_resilience_gradient`: every module that does not mount, sandboxed) and `storage_build_srcs_check` |
 | `//:storage_tests_mounted_system_gate` | `storage_tests_conflicts_integration`, `storage_tests_streaming_system`, `storage_tests_sync_system`: the modules that mount FUSE, unsandboxed |
 | `//:storage_tests_resilience_gate` | `storage_tests_resilience_gradient`, `storage_tests_streaming_system` |
-| `//:storage_tests` | the fast and mounted gates: every module |
+| `//:storage_tests` | the fast and mounted gates: every module except the remote gate's |
+| `//:storage_tests_remote_gate` | `storage_tests_remote_system`: the SSH backend, rsync over SSH and the remote watcher against sshd in Docker containers; needs Docker (see below) |
 
 Extra pytest flags reach a target's modules through `--test_arg`, for
 example `bazel test //:storage_tests_sandboxed --test_arg=-k
@@ -147,6 +148,62 @@ are still tagged `local`.
 
 If you cannot run them (for example, no FUSE on the host), say so
 explicitly in the commit or PR rather than implying they passed.
+
+### The remote gate
+
+`//:storage_tests_remote_gate` runs `tests/test_remote_system.py` against
+real sshd: two containers built from `tests/remote/`, the only coverage of
+the SSH backend, rsync over SSH and the inotify watcher talking to an
+actual remote. It is not in `//:storage_tests` or the three gates above,
+and its target is tagged `manual`, so `//...` skips it too and hosts
+without Docker are unaffected. Run it, in addition to them,
+before pushing a change to `storage/backends/ssh.py`,
+`storage/backends/rsync.py`, `storage/watcher.py` or the remote paths of
+the filesystem:
+
+```bash
+nix develop --command bazel test //:storage_tests_remote_gate --test_output=errors
+```
+
+It needs a Docker daemon on the same host (the user in the `docker` group) and
+`ssh`, `ssh-keygen` and `docker` on `PATH`. Without Docker it fails with a
+message naming Docker; it never skips. The first run builds the image
+(Debian packages from the network); later runs reuse it until anything in
+`tests/remote/` changes, since the tag is a hash of that directory. The
+target inherits `DOCKER_HOST`, `DOCKER_CONTEXT` and `DOCKER_CONFIG`.
+The members share a network named by the run id; when the host's Docker
+address pools are exhausted (other projects' networks), the fixture warns
+and uses the default bridge instead. Tests connect to the container IPs
+on port 22; on a host that cannot route to Docker's bridge they fall back
+to ports published on 127.0.0.1, and `STORAGE_TEST_REMOTE_PUBLISHED=1`
+forces that fallback.
+
+What the fixtures create, they name `storage-test-*` and remove (the
+containers by id, the rest by exact name): containers
+`storage-test-<pid>-<hex>-remote0`/`-remote1`, a network
+`storage-test-<pid>-<hex>`, and the keys under the test tmp dir. The
+image `storage-test-sshd:<hash>` stays as a cache, and older tags are
+never removed by the fixture (another run may be starting one); remove
+stale `storage-test-sshd` tags with `docker rmi` when no run is active.
+After an interrupted run, check `docker ps -a` and `docker network ls`
+for `storage-test-` leftovers and remove those by name.
+
+The fixture puts an `ssh` shim first on `PATH`. `RsyncBackend` and
+`RemoteWatcher` run the system `ssh` with
+`StrictHostKeyChecking=accept-new` and cannot be given a known-hosts file
+([#107](https://github.com/tedks/storage/issues/107)). Run as they are,
+they would add every throwaway container host key to
+`~/.ssh/known_hosts` and fail when a later run reuses an IP. The shim
+runs the real `ssh` with `-F` and a per-run config whose known_hosts
+holds the generated host keys, and it logs each invocation so tests can
+assert which commands went over ssh. Remove it when #107 lets those call
+sites take a known-hosts file. `SSHBackend` uses paramiko, which never
+loads or writes a known_hosts file here.
+
+`test_watcher_stop_ends_remote_inotifywait` is a strict xfail for
+[#106](https://github.com/tedks/storage/issues/106) (the remote
+`inotifywait` outlives `RemoteWatcher.stop()`). Fixing #106 turns it
+red; then remove the marker.
 
 ## Issue tracking (ditz)
 

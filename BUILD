@@ -180,16 +180,51 @@ py_test(
     tags = ["local"],
 )
 
+# Real remotes: sshd in Docker containers built from tests/remote/. "local"
+# because it talks to the Docker daemon, which the sandbox does not reach.
+# "manual" keeps it out of //... and storage_tests, so hosts without Docker
+# are unaffected; //:storage_tests_remote_gate names it and runs it, and
+# there it fails rather than skips when Docker is unavailable.
+py_test(
+    name = "storage_tests_remote_system",
+    srcs = [
+        "tests/pytest_main.py",
+        "tests/test_remote_system.py",
+    ],
+    data = [
+        "tests/remote/Dockerfile",
+        "tests/remote/entrypoint.sh",
+        "tests/remote/sshd_config",
+    ],
+    main = "tests/pytest_main.py",
+    precompile = "disabled",
+    # The first run builds the image.
+    timeout = "long",
+    deps = TEST_DEPS,
+    env_inherit = [
+        "DOCKER_CONFIG",
+        "DOCKER_CONTEXT",
+        "DOCKER_HOST",
+        "FUSE_LIBRARY_PATH",
+        "STORAGE_TEST_REMOTE_PUBLISHED",
+    ],
+    tags = [
+        "local",
+        "manual",
+    ],
+)
+
 # What the gates and storage_lib list, one label per line. It names
 # storage_tests_nonmounting instead of the fast gate: the fast gate contains
 # the check that reads this, and suite membership is a dependency (a cycle).
 genquery(
     name = "build_srcs",
-    expression = "labels(srcs, tests(//:storage_tests_nonmounting) + tests(//:storage_tests_mounted_system_gate) + //:storage_lib)",
+    expression = "labels(srcs, tests(//:storage_tests_nonmounting) + tests(//:storage_tests_mounted_system_gate) + tests(//:storage_tests_remote_gate) + //:storage_lib)",
     scope = [
         ":storage_lib",
         ":storage_tests_mounted_system_gate",
         ":storage_tests_nonmounting",
+        ":storage_tests_remote_gate",
     ],
 )
 
@@ -244,6 +279,17 @@ test_suite(
     tests = [
         ":storage_tests_resilience_gradient",
         ":storage_tests_streaming_system",
+    ],
+)
+
+# Not in storage_tests: it needs Docker. See AGENTS.md. The one exception to
+# leaving tags unset: "manual" keeps //... from expanding this suite (and so
+# its manual test); it does not filter the suite's own members.
+test_suite(
+    name = "storage_tests_remote_gate",
+    tags = ["manual"],
+    tests = [
+        ":storage_tests_remote_system",
     ],
 )
 
