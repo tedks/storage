@@ -1,0 +1,14 @@
+# Key auth only, for the storage user only. Host keys and authorized_keys are
+# installed from /keys by entrypoint.sh.
+Port 22
+HostKey /etc/ssh/ssh_host_ed25519_key
+PubkeyAuthentication yes
+AuthorizedKeysFile .ssh/authorized_keys
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitRootLogin no
+AllowUsers storage
+UsePAM no
+X11Forwarding no
+PrintMotd no
+Subsystem sftp internal-sftp
