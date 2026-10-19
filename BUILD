@@ -181,9 +181,10 @@ py_test(
 )
 
 # Real remotes: sshd in Docker containers built from tests/remote/. "local"
-# because it mounts FUSE and talks to the Docker daemon, neither of which the
-# sandbox reaches. Its own gate, not part of storage_tests: hosts without
-# Docker are unaffected, and on them this target fails rather than skips.
+# because it talks to the Docker daemon, which the sandbox does not reach.
+# "manual" keeps it out of //... and storage_tests, so hosts without Docker
+# are unaffected; //:storage_tests_remote_gate names it and runs it, and
+# there it fails rather than skips when Docker is unavailable.
 py_test(
     name = "storage_tests_remote_system",
     srcs = [
@@ -207,7 +208,10 @@ py_test(
         "FUSE_LIBRARY_PATH",
         "STORAGE_TEST_REMOTE_PUBLISHED",
     ],
-    tags = ["local"],
+    tags = [
+        "local",
+        "manual",
+    ],
 )
 
 # What the gates and storage_lib list, one label per line. It names

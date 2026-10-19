@@ -155,7 +155,8 @@ explicitly in the commit or PR rather than implying they passed.
 real sshd: two containers built from `tests/remote/`, the only coverage of
 the SSH backend, rsync over SSH and the inotify watcher talking to an
 actual remote. It is not in `//:storage_tests` or the three gates above,
-so hosts without Docker are unaffected. Run it, in addition to them,
+and its target is tagged `manual`, so `//...` skips it too and hosts
+without Docker are unaffected. Run it, in addition to them,
 before pushing a change to `storage/backends/ssh.py`,
 `storage/backends/rsync.py`, `storage/watcher.py` or the remote paths of
 the filesystem:
@@ -164,7 +165,7 @@ the filesystem:
 nix develop --command bazel test //:storage_tests_remote_gate --test_output=errors
 ```
 
-It needs a reachable Docker daemon (the user in the `docker` group) and
+It needs a Docker daemon on the same host (the user in the `docker` group) and
 `ssh`, `ssh-keygen` and `docker` on `PATH`. Without Docker it fails with a
 message naming Docker; it never skips. The first run builds the image
 (Debian packages from the network); later runs reuse it until anything in
@@ -180,8 +181,9 @@ forces that fallback.
 What the fixtures create, they name `storage-test-*` and remove by exact
 name: containers `storage-test-<pid>-<hex>-remote0`/`-remote1`, a network
 `storage-test-<pid>-<hex>`, and the keys under the test tmp dir. The image
-`storage-test-sshd:<hash>` stays as a cache; the fixture removes older
-tags of it when it builds a new one. After an interrupted run, check
+`storage-test-sshd:<hash>` stays as a cache, and older tags are never
+removed by the fixture (another run may be starting one); remove stale
+`storage-test-sshd` tags with `docker rmi` when no run is active. After an interrupted run, check
 `docker ps -a` and `docker network ls` for `storage-test-` leftovers and
 remove those by name.
 
@@ -194,8 +196,8 @@ they would add every throwaway container host key to
 runs the real `ssh` with `-F` and a per-run config whose known_hosts
 holds the generated host keys, and it logs each invocation so tests can
 assert which commands went over ssh. Remove it when #107 lets those call
-sites take a known-hosts file. `SSHBackend` uses paramiko and does not
-read or write `~/.ssh`.
+sites take a known-hosts file. `SSHBackend` uses paramiko, which never
+loads or writes a known_hosts file here.
 
 `test_watcher_stop_ends_remote_inotifywait` is a strict xfail for
 [#106](https://github.com/tedks/storage/issues/106) (the remote

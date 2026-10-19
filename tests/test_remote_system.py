@@ -98,9 +98,14 @@ def _require_docker():
         )
 
 
+def _image_files() -> List[Path]:
+    # Plain files only, so a stray subdirectory cannot break the copy below.
+    return sorted(p for p in IMAGE_DIR.iterdir() if p.is_file())
+
+
 def _image_tag() -> str:
     digest = hashlib.sha256()
-    for path in sorted(IMAGE_DIR.iterdir()):
+    for path in _image_files():
         digest.update(path.name.encode() + b"\0")
         digest.update(path.read_bytes() + b"\0")
     return f"{IMAGE_REPO}:{digest.hexdigest()[:16]}"
@@ -114,19 +119,15 @@ def _ensure_image(build_root: Path) -> str:
     # copy the real files into a context of our own.
     context = build_root / "image-context"
     context.mkdir()
-    for path in IMAGE_DIR.iterdir():
+    for path in _image_files():
         shutil.copyfile(path, context / path.name)
+    # Under Bazel's "long" (900s) test timeout, so a slow build still
+    # reports why it failed.
     result = _docker("build", "--label", "storage-test=1", "-t", tag, str(context),
-                     check=False, timeout=900.0)
+                     check=False, timeout=600.0)
     if result.returncode != 0:
         pytest.fail(f"Building {tag} failed:\n{result.stderr[-4000:]}", pytrace=False)
-    # Drop tags this fixture built from older contents of tests/remote/.
-    # Without -f, Docker refuses to remove one a running container uses.
-    stale = _docker("image", "ls", "--filter", "label=storage-test=1",
-                    "--format", "{{.Repository}}:{{.Tag}}", IMAGE_REPO).stdout.split()
-    for old_tag in stale:
-        if old_tag != tag:
-            _docker("rmi", old_tag, check=False)
+    # Older tags are left alone: another run may be about to start one.
     return tag
 
 
@@ -140,6 +141,7 @@ def _create_network(run_id: str) -> str:
     result = _docker("network", "create", "--label", "storage-test=1", run_id, check=False)
     if result.returncode == 0:
         return run_id
+    # Docker 29.8's wording for pool exhaustion; other wordings hard-fail.
     if "address pools have been fully subnetted" in result.stderr:
         warnings.warn(f"docker network create {run_id}: {result.stderr.strip()}; "
                       "using the default bridge network")
@@ -230,6 +232,10 @@ class RemoteCluster:
         """
         for member in self.members:
             self.exec(member, "pkill -u storage -x inotifywait", check=False)
+            if not _wait_for(lambda member=member: self.exec(
+                    member, "pgrep -u storage -x inotifywait", check=False).returncode != 0,
+                    timeout=10.0, interval=0.1):
+                raise RuntimeError(f"inotifywait in {member.container} survived pkill")
             self.exec(member, f"find {REMOTE_ROOT} -mindepth 1 -delete")
 
 
@@ -287,24 +293,36 @@ def cluster(tmp_path_factory):
             _ssh_keygen(keys / "ssh_host_ed25519_key", f"{run_id}-{name}")
             (keys / "authorized_keys").write_text(client_pub)
             container = f"{run_id}-{name}"
-            created_containers.append(container)
-            _docker("run", "-d", "--name", container, "--network", network,
+            # create fails on a name clash, so only a container this run
+            # made is ever recorded for removal.
+            _docker("create", "--pull=never", "--name", container, "--network", network,
                     "--label", "storage-test=1", "-p", "127.0.0.1::22",
                     "-v", f"{keys}:/keys:ro", image)
+            created_containers.append(container)
+            _docker("start", container)
             ip = _docker("inspect", "-f",
                          "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
                          container).stdout.strip()
             published = _docker("port", container, "22/tcp").stdout.split()[0]
             published_port = int(published.rsplit(":", 1)[1])
-            if not _wait_for(lambda: _ssh_banner("127.0.0.1", published_port, 1.0),
-                             timeout=30.0, interval=0.2):
+            candidates = [("127.0.0.1", published_port)]
+            if not force_published:
+                candidates.insert(0, (ip, 22))
+            answered: List[tuple] = []
+
+            def sshd_answers(candidates=candidates, answered=answered):
+                for candidate in candidates:
+                    if _ssh_banner(*candidate, 1.0):
+                        answered.append(candidate)
+                        return True
+                return False
+
+            if not _wait_for(sshd_answers, timeout=30.0, interval=0.2):
                 logs = _docker("logs", container, check=False)
-                pytest.fail(f"sshd in {container} never answered:\n"
+                pytest.fail(f"sshd in {container} never answered on {candidates} "
+                            "(the Docker daemon must be on this host):\n"
                             f"{logs.stdout}{logs.stderr}", pytrace=False)
-            if not force_published and _ssh_banner(ip, 22, 2.0):
-                host, port = ip, 22
-            else:
-                host, port = "127.0.0.1", published_port
+            host, port = answered[0]
             host_pubkey = (keys / "ssh_host_ed25519_key.pub").read_text().split()
             members.append(Member(name, container, ip, host, port,
                                   " ".join(host_pubkey[:2])))
@@ -320,10 +338,14 @@ def cluster(tmp_path_factory):
         yield RemoteCluster(run_id, members, key_path, ssh_log)
     finally:
         os.environ["PATH"] = old_path
-        for container in created_containers:
-            _docker("rm", "-f", "-v", container, check=False)
+        removals = [("rm", "-f", "-v", c) for c in created_containers]
         if created_network is not None:
-            _docker("network", "rm", created_network, check=False)
+            removals.append(("network", "rm", created_network))
+        for removal in removals:
+            try:
+                _docker(*removal, check=False, timeout=60.0)
+            except subprocess.TimeoutExpired:
+                warnings.warn(f"docker {' '.join(removal)} timed out; remove it by hand")
         shutil.rmtree(work, ignore_errors=True)
 
 
@@ -378,6 +400,16 @@ def test_ssh_backend_operations(remote, ssh_backend, tmp_path):
     download = tmp_path / "download.bin"
     ssh_backend.copy_to_local("/dir/made-remotely.bin", download)
     assert download.read_bytes() == made_remotely
+
+
+def _ssh_to(line: str, member: Member) -> bool:
+    """Whether a shim log line is an ssh invocation aimed at this member."""
+    args = line.split()
+    pairs = list(zip(args, args[1:]))
+    # The watcher passes user@host; rsync passes -l user and the bare host.
+    target = (f"{REMOTE_USER}@{member.host}" in args
+              or (("-l", REMOTE_USER) in pairs and member.host in args))
+    return target and ("-p", str(member.port)) in pairs
 
 
 def _count_downloads(backend, monkeypatch) -> list:
@@ -436,7 +468,7 @@ def test_rsync_write_over_ssh(remote, tmp_path):
         rsync_calls = [line for line in remote.ssh_log_lines()[log_before:]
                        if "rsync --server" in line]
         assert rsync_calls, "the write must go through rsync over the ssh shim"
-        assert all(member.host in line for line in rsync_calls)
+        assert all(_ssh_to(line, member) for line in rsync_calls)
 
         download = tmp_path / "back.bin"
         backend.copy_to_local("/sub/rsynced.bin", download)
@@ -463,11 +495,29 @@ def _remote_inotifywait_running(remote, member) -> bool:
 
 
 def _wait_for_remote_inotifywait(remote, member):
-    assert _wait_for(lambda: _remote_inotifywait_running(remote, member),
-                     timeout=20.0, interval=0.2), \
-        "inotifywait never started in the container"
-    # inotifywait -r sets its watches after it starts; give it a moment.
-    time.sleep(1.0)
+    # RuntimeError, not an assertion: the #106 xfail expects only
+    # AssertionError, and a watcher that never starts must not pass as it.
+    if not _wait_for(lambda: _remote_inotifywait_running(remote, member),
+                     timeout=20.0, interval=0.2):
+        raise RuntimeError(f"inotifywait never started in {member.container}")
+
+
+def _wait_for_watch(remote, member, rel_dir: str, events: List[str]):
+    """Block until a change under rel_dir reaches the watcher.
+
+    inotifywait -r sets its watches after it starts, so a running process
+    is not a ready one: touch probe files until one is reported.
+    """
+    _wait_for_remote_inotifywait(remote, member)
+    deadline = time.monotonic() + 20.0
+    index = 0
+    while time.monotonic() < deadline:
+        probe = f"/{rel_dir}/.probe-{index}"
+        remote.exec(member, f"touch {REMOTE_ROOT}{probe}")
+        if _wait_for(lambda: probe in events, timeout=0.5):
+            return
+        index += 1
+    raise RuntimeError(f"the watcher on {member.container} never reported a probe")
 
 
 def test_watcher_reports_change_made_in_container(remote):
@@ -486,14 +536,14 @@ def test_watcher_reports_change_made_in_container(remote):
     watcher = _watcher_for(remote, member, on_change)
     watcher.start()
     try:
-        _wait_for_remote_inotifywait(remote, member)
+        _wait_for_watch(remote, member, "watched", events)
         assert not seen.is_set()
 
         remote.exec(member, f"echo changed > {REMOTE_ROOT}/watched/new-{token}")
 
         assert seen.wait(15.0), f"no watcher event for the docker exec change; saw {events}"
         assert "/watched" in events
-        assert any("inotifywait" in line and member.host in line
+        assert any("inotifywait" in line and _ssh_to(line, member)
                    for line in remote.ssh_log_lines()[log_before:])
     finally:
         watcher.stop()
