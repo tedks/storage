@@ -643,32 +643,38 @@ def mounted_factory(remote, tmp_path):
         thread = threading.Thread(target=run, daemon=True)
         thread.start()
         handle = Mounted(fs, mount, cache, backends)
-        created.append((handle, thread, errors))
-        if not _wait_for(lambda: os.path.ismount(mount) or bool(errors),
-                         timeout=MOUNT_TIMEOUT, interval=0.1) or errors:
+        came_up = _wait_for(lambda: os.path.ismount(mount) or bool(errors),
+                            timeout=MOUNT_TIMEOUT, interval=0.1) and os.path.ismount(mount)
+        created.append((handle, thread, errors, came_up))
+        if not came_up:
             pytest.fail(f"FUSE mount did not come up: {errors or 'timed out'}", pytrace=False)
         return handle
 
     yield make
 
     problems: List[str] = []
-    for handle, thread, errors in created:
-        mounted = os.path.ismount(handle.mount)
-        if mounted:
-            problems += _fusermount_unmount(handle.mount)
-        # On unmount libfuse calls StorageFS.destroy, which stops the
-        # watchers and sync workers; a hang there leaves this thread alive.
-        thread.join(timeout=30.0)
-        if thread.is_alive():
-            problems.append("the FUSE thread did not finish after unmount "
-                            "(StorageFS.destroy hung?)")
-        elif not mounted:
-            # The mount never came up, so libfuse never ran destroy.
-            handle.fs.destroy("/")
-        if errors:
-            problems.append(f"the FUSE thread raised: {errors}")
-        for backend in handle.backends.values():
-            backend.close()
+    for handle, thread, errors, came_up in created:
+        try:
+            if os.path.ismount(handle.mount):
+                problems += _fusermount_unmount(handle.mount)
+            elif came_up:
+                problems.append("the mount went away before teardown")
+            # On unmount libfuse calls StorageFS.destroy, which stops the
+            # watchers and sync workers; a hang there leaves this thread alive.
+            thread.join(timeout=30.0)
+            if thread.is_alive():
+                problems.append("the FUSE thread did not finish after unmount "
+                                "(StorageFS.destroy hung?)")
+            elif not came_up:
+                # libfuse never ran destroy, so the sync workers still run.
+                handle.fs.destroy("/")
+            if errors:
+                problems.append(f"the FUSE thread raised: {errors}")
+        except Exception as exc:
+            problems.append(f"teardown raised {exc!r}")
+        finally:
+            for backend in handle.backends.values():
+                backend.close()
     if problems:
         pytest.fail("mount teardown: " + "; ".join(problems), pytrace=False)
 
