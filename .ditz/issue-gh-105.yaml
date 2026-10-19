@@ -15,3 +15,9 @@ log_events:
   who: Ted Smith
   what: created
   comment: ""
+- time: 2026-10-19T18:11:38-00:00
+  who: Ted Smith
+  what: blocked by gh-105-lane
+  comment: ""
+blocked_by:
+- gh-105-lane
