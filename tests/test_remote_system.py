@@ -573,3 +573,159 @@ def test_watcher_stop_ends_remote_inotifywait(remote):
     assert _wait_for(lambda: not _remote_inotifywait_running(remote, member),
                      timeout=10.0, interval=0.2), \
         "inotifywait still runs in the container after RemoteWatcher.stop()"
+
+
+# --- Mounted half: a real FUSE mount of StorageFS over two SSH members ----
+
+MOUNT_TIMEOUT = 30.0
+
+
+@dataclass
+class Mounted:
+    fs: object
+    mount: Path
+    cache: Path
+    backends: dict
+
+
+def _fusermount_unmount(mount: Path):
+    for cmd in (["fusermount", "-u", str(mount)], ["fusermount3", "-u", str(mount)]):
+        if shutil.which(cmd[0]) is None:
+            continue
+        if subprocess.run(cmd, capture_output=True, timeout=30.0).returncode == 0:
+            return
+
+
+@pytest.fixture
+def mounted_factory(remote, tmp_path):
+    """Factory mounting StorageFS over remote0 and remote1 (both SSHBackend).
+
+    Unlike the other mounted suites this never skips: a mount that does not
+    come up is a failure.
+    """
+    from fuse import FUSE
+
+    from storage.fs import StorageFS
+
+    created: List[tuple] = []
+
+    def make(**fs_kwargs) -> Mounted:
+        assert not created, "one mount per test"
+        mount = tmp_path / "mount"
+        cache = tmp_path / "cache"
+        mount.mkdir()
+        cache.mkdir()
+        backends = {m.name: SSHBackend(**remote.backend_kwargs(m)) for m in remote.members}
+        fs_kwargs.setdefault("num_sync_workers", 2)
+        fs = StorageFS(cache_root=cache, state_db=tmp_path / "state.db",
+                       backends=backends, cache_size=256 * 1024 * 1024, **fs_kwargs)
+        errors: List[BaseException] = []
+
+        def run():
+            try:
+                FUSE(fs, str(mount), nothreads=True, foreground=True, allow_other=False)
+            except BaseException as exc:  # reported by the failure below
+                errors.append(exc)
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        handle = Mounted(fs, mount, cache, backends)
+        created.append((handle, thread))
+        if not _wait_for(lambda: os.path.ismount(mount) or bool(errors),
+                         timeout=MOUNT_TIMEOUT, interval=0.1) or errors:
+            pytest.fail(f"FUSE mount did not come up: {errors or 'timed out'}", pytrace=False)
+        return handle
+
+    yield make
+
+    for handle, thread in created:
+        _fusermount_unmount(handle.mount)
+        thread.join(timeout=15.0)
+        try:
+            handle.fs.destroy("/")
+        except Exception:
+            pass
+        for backend in handle.backends.values():
+            backend.close()
+
+
+def test_mounted_write_syncs_to_both_members(remote, mounted_factory):
+    from storage.file_config import FileConfig, set_file_config
+
+    m0, m1 = remote.members
+    for member in (m0, m1):
+        assert remote.exec(member, f"ls -A {REMOTE_ROOT}").stdout.strip() == "", \
+            "members must start empty or the replica check proves nothing"
+    mnt = mounted_factory()
+    # Replica count is read from the xattr on the cache path, inherited down.
+    set_file_config(mnt.cache, FileConfig(replica_count=2))
+
+    payload = secrets.token_bytes(300_000)
+    (mnt.mount / "replicated.bin").write_bytes(payload)
+
+    for member in (m0, m1):
+        assert _wait_for(
+            lambda member=member: remote.exec(
+                member, f"cat {REMOTE_ROOT}/replicated.bin 2>/dev/null | wc -c"
+            ).stdout.strip() == str(len(payload)), timeout=30.0), \
+            f"{member.name} never received the replica"
+        assert remote.read_remote(member, "replicated.bin") == payload
+
+
+def test_mounted_watcher_refreshes_listing(remote, mounted_factory):
+    m1 = remote.members[1]
+    log_before = len(remote.ssh_log_lines())
+    mnt = mounted_factory(enable_watchers=True)
+    assert mnt.fs._readdir_snapshot_ttl == float("inf"), \
+        "both SSH members must be watchable, else a TTL would mask the watcher"
+    for member in remote.members:
+        _wait_for_remote_inotifywait(remote, member)
+
+    token = secrets.token_hex(4)
+    name = f"from-container-{token}.txt"
+    body = f"hello {token}\n".encode()
+    assert name not in os.listdir(mnt.mount)  # primes the snapshot
+
+    remote.write_remote(m1, name, body)
+
+    assert _wait_for(lambda: name in os.listdir(mnt.mount), timeout=20.0), \
+        "the container's new file never appeared in the mount listing"
+    assert (mnt.mount / name).read_bytes() == body
+    assert any("inotifywait" in line for line in remote.ssh_log_lines()[log_before:]), \
+        "the mount's watcher must have run inotifywait over ssh"
+
+
+def _streaming_read_case(remote, mounted_factory, streaming: bool):
+    chunk = 64 * 1024
+    member = remote.members[0]
+    payload = secrets.token_bytes(3 * 1024 * 1024)
+    remote.write_remote(member, "stream.bin", payload)
+
+    mnt = mounted_factory(streaming_reads=streaming, streaming_chunk_size=chunk,
+                          num_sync_workers=0, start_sync=False)
+    ranges: List[tuple] = []
+    backend = mnt.backends[member.name]
+    original = backend.read_file
+
+    def recording(virtual_path, offset, size):
+        ranges.append((virtual_path, offset, size))
+        return original(virtual_path, offset, size)
+
+    backend.read_file = recording
+
+    assert "stream.bin" in os.listdir(mnt.mount)
+    assert (mnt.mount / "stream.bin").read_bytes() == payload
+    return ranges, chunk
+
+
+def test_mounted_streaming_range_reads_reach_ssh_member(remote, mounted_factory):
+    ranges, chunk = _streaming_read_case(remote, mounted_factory, streaming=True)
+    assert len(ranges) > 1, f"expected several range reads, saw {ranges}"
+    assert all(size <= chunk for _p, _o, size in ranges), ranges
+    assert len({offset for _p, offset, _s in ranges}) > 1
+
+
+def test_mounted_nonstreaming_read_makes_no_range_reads(remote, mounted_factory):
+    """Twin: without streaming the whole file is downloaded, not ranged."""
+    ranges, chunk = _streaming_read_case(remote, mounted_factory, streaming=False)
+    assert len(ranges) <= 1
