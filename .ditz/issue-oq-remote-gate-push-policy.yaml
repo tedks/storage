@@ -1,0 +1,36 @@
+id: oq-remote-gate-push-policy
+title: When must //:storage_tests_remote_gate run before a push?
+desc: 'Question: should the Docker remote gate (#105, PRs #108/#109) be part of the
+  mandatory pre-push quality gate, or run only for changes to the remote paths?
+
+  Options:
+
+  (1) Only for changes to storage/backends/ssh.py, storage/backends/rsync.py, storage/watcher.py
+  or the filesystem''s remote paths. This is what AGENTS.md says now.
+
+  (2) Always, alongside the three gates (adds about 40 s with a warm image; hosts
+  without Docker cannot satisfy it).
+
+  (3) Always on framework0 only.
+
+  Recommendation: (1). It keeps Docker-less hosts able to push, and the gate''s cost
+  goes where it finds bugs.
+
+  Who decides: CEO (Ted).
+
+  Blocks: nothing; AGENTS.md carries (1) until ruled otherwise.
+
+  Record: gh-105-lane, PR #108 AGENTS.md "The remote gate".'
+type: task
+component: open-questions
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-19T19:05:22-00:00
+references: []
+log_events:
+- time: 2026-10-19T19:05:22-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
