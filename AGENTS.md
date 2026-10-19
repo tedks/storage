@@ -179,13 +179,14 @@ to ports published on 127.0.0.1, and `STORAGE_TEST_REMOTE_PUBLISHED=1`
 forces that fallback.
 
 What the fixtures create, they name `storage-test-*` and remove (the
-containers by id, the rest by exact name): containers `storage-test-<pid>-<hex>-remote0`/`-remote1`, a network
-`storage-test-<pid>-<hex>`, and the keys under the test tmp dir. The image
-`storage-test-sshd:<hash>` stays as a cache, and older tags are never
-removed by the fixture (another run may be starting one); remove stale
-`storage-test-sshd` tags with `docker rmi` when no run is active. After an interrupted run, check
-`docker ps -a` and `docker network ls` for `storage-test-` leftovers and
-remove those by name.
+containers by id, the rest by exact name): containers
+`storage-test-<pid>-<hex>-remote0`/`-remote1`, a network
+`storage-test-<pid>-<hex>`, and the keys under the test tmp dir. The
+image `storage-test-sshd:<hash>` stays as a cache, and older tags are
+never removed by the fixture (another run may be starting one); remove
+stale `storage-test-sshd` tags with `docker rmi` when no run is active.
+After an interrupted run, check `docker ps -a` and `docker network ls`
+for `storage-test-` leftovers and remove those by name.
 
 The fixture puts an `ssh` shim first on `PATH`. `RsyncBackend` and
 `RemoteWatcher` run the system `ssh` with
