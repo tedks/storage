@@ -117,7 +117,7 @@ The gates are `test_suite`s over those `py_test`s:
 | `//:storage_tests_mounted_system_gate` | `storage_tests_conflicts_integration`, `storage_tests_streaming_system`, `storage_tests_sync_system`: the modules that mount FUSE, unsandboxed |
 | `//:storage_tests_resilience_gate` | `storage_tests_resilience_gradient`, `storage_tests_streaming_system` |
 | `//:storage_tests` | the fast and mounted gates: every module except the remote gate's |
-| `//:storage_tests_remote_gate` | `storage_tests_remote_system`: the SSH backend, rsync over SSH and the remote watcher against sshd in Docker containers; needs Docker (see below) |
+| `//:storage_tests_remote_gate` | `storage_tests_remote_system`: the SSH backend, rsync over SSH, the remote watcher and a FUSE mount over two SSH members, against sshd in Docker containers; needs Docker and FUSE (see below) |
 
 Extra pytest flags reach a target's modules through `--test_arg`, for
 example `bazel test //:storage_tests_sandboxed --test_arg=-k
@@ -154,7 +154,9 @@ explicitly in the commit or PR rather than implying they passed.
 `//:storage_tests_remote_gate` runs `tests/test_remote_system.py` against
 real sshd: two containers built from `tests/remote/`, the only coverage of
 the SSH backend, rsync over SSH and the inotify watcher talking to an
-actual remote. It is not in `//:storage_tests` or the three gates above,
+actual remote, and of a FUSE mount whose members are SSH hosts (write and
+replicate to both, a container-side change through the watcher, a
+streaming read). It is not in `//:storage_tests` or the three gates above,
 and its target is tagged `manual`, so `//...` skips it too and hosts
 without Docker are unaffected. Run it, in addition to them,
 before pushing a change to `storage/backends/ssh.py`,
@@ -165,8 +167,9 @@ the filesystem:
 nix develop --command bazel test //:storage_tests_remote_gate --test_output=errors
 ```
 
-It needs a Docker daemon on the same host (the user in the `docker` group) and
-`ssh`, `ssh-keygen` and `docker` on `PATH`. Without Docker it fails with a
+It needs a Docker daemon on the same host (the user in the `docker` group),
+`ssh`, `ssh-keygen` and `docker` on `PATH`, and what the mounted gate needs
+(libfuse 2, `/dev/fuse`, a setuid `fusermount`; see Environment). Without Docker it fails with a
 message naming Docker; it never skips. The first run builds the image
 (Debian packages from the network); later runs reuse it until anything in
 `tests/remote/` changes, since the tag is a hash of that directory. The

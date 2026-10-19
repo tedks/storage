@@ -239,7 +239,8 @@ suite (about 290 tests, see [AGENTS.md](AGENTS.md) for the Bazel gates)
 mounts real FUSE filesystems and runs real `rsync`, but every remote
 member in it is a local directory flagged as remote. A separate gate that
 needs Docker, `//:storage_tests_remote_gate`, runs the SSH backend, rsync
-over SSH and the inotify watcher against sshd in containers. Nothing yet
+over SSH and the inotify watcher against sshd in containers, and mounts
+the filesystem with two of those containers as SSH members. Nothing yet
 has been run against a real host since the field use above.
 
 Implemented:
