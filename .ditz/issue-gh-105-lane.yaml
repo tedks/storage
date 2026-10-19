@@ -45,5 +45,11 @@ log_events:
     6/6 pass on 476b67c. Filed #106 (orphaned remote inotifywait) and #107 (known_hosts
     via accept-new). Mount half delegated to a Sonnet implementer on feat/container-remote-gate-mount
     (stacked).'
+- time: 2026-10-19T18:46:19-00:00
+  who: Ted Smith
+  what: commented
+  comment: '#108 council at fixpoint after 4 rounds (Claude+Codex; agy empty, quota);
+    record posted on #108; gates 7/7 on ff1d4e9. #109 rebased to c98bfd0 (10 passed,
+    1 xfail), marked ready, council round 1 started.'
 blocks:
 - gh-105
