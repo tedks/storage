@@ -1,6 +1,7 @@
 """
 Real-remote system tests: the SSH backend, rsync over SSH and the remote
-watcher against sshd running in Docker containers (issue #105).
+watcher against sshd running in Docker containers, then a real FUSE mount of
+StorageFS with both containers as SSH members (issue #105).
 
 The fixtures build the image in tests/remote/ (tagged by a hash of that
 directory, so an edited Dockerfile is never tested stale), generate a
@@ -588,12 +589,24 @@ class Mounted:
     backends: dict
 
 
-def _fusermount_unmount(mount: Path):
-    for cmd in (["fusermount", "-u", str(mount)], ["fusermount3", "-u", str(mount)]):
-        if shutil.which(cmd[0]) is None:
-            continue
-        if subprocess.run(cmd, capture_output=True, timeout=30.0).returncode == 0:
-            return
+def _fusermount_unmount(mount: Path) -> List[str]:
+    """Unmount; return what went wrong, falling back to a lazy unmount."""
+    problems: List[str] = []
+    for flags in ("-u", "-uz"):
+        for tool in ("fusermount", "fusermount3"):
+            if shutil.which(tool) is None:
+                continue
+            try:
+                result = subprocess.run([tool, flags, str(mount)], capture_output=True,
+                                        text=True, timeout=30.0)
+            except subprocess.TimeoutExpired:
+                problems.append(f"{tool} {flags} timed out")
+                continue
+            if result.returncode == 0:
+                return problems
+            problems.append(f"{tool} {flags}: {result.stderr.strip()}")
+    problems.append(f"{mount} could not be unmounted")
+    return problems
 
 
 @pytest.fixture
@@ -630,7 +643,7 @@ def mounted_factory(remote, tmp_path):
         thread = threading.Thread(target=run, daemon=True)
         thread.start()
         handle = Mounted(fs, mount, cache, backends)
-        created.append((handle, thread))
+        created.append((handle, thread, errors))
         if not _wait_for(lambda: os.path.ismount(mount) or bool(errors),
                          timeout=MOUNT_TIMEOUT, interval=0.1) or errors:
             pytest.fail(f"FUSE mount did not come up: {errors or 'timed out'}", pytrace=False)
@@ -638,15 +651,26 @@ def mounted_factory(remote, tmp_path):
 
     yield make
 
-    for handle, thread in created:
-        _fusermount_unmount(handle.mount)
-        thread.join(timeout=15.0)
-        try:
+    problems: List[str] = []
+    for handle, thread, errors in created:
+        mounted = os.path.ismount(handle.mount)
+        if mounted:
+            problems += _fusermount_unmount(handle.mount)
+        # On unmount libfuse calls StorageFS.destroy, which stops the
+        # watchers and sync workers; a hang there leaves this thread alive.
+        thread.join(timeout=30.0)
+        if thread.is_alive():
+            problems.append("the FUSE thread did not finish after unmount "
+                            "(StorageFS.destroy hung?)")
+        elif not mounted:
+            # The mount never came up, so libfuse never ran destroy.
             handle.fs.destroy("/")
-        except Exception:
-            pass
+        if errors:
+            problems.append(f"the FUSE thread raised: {errors}")
         for backend in handle.backends.values():
             backend.close()
+    if problems:
+        pytest.fail("mount teardown: " + "; ".join(problems), pytrace=False)
 
 
 def test_mounted_write_syncs_to_both_members(remote, mounted_factory):
@@ -692,7 +716,8 @@ def test_mounted_watcher_refreshes_listing(remote, mounted_factory):
             break
         index += 1
         if time.monotonic() >= deadline:
-            raise RuntimeError(f"the mount's watcher on {m1.container} never refreshed the listing")
+            pytest.fail(f"the mount's watcher on {m1.container} never refreshed the listing",
+                        pytrace=False)
 
     token = secrets.token_hex(4)
     name = f"from-container-{token}.txt"
@@ -704,8 +729,9 @@ def test_mounted_watcher_refreshes_listing(remote, mounted_factory):
     assert _wait_for(lambda: name in os.listdir(mnt.mount), timeout=20.0), \
         "the container's new file never appeared in the mount listing"
     assert (mnt.mount / name).read_bytes() == body
-    assert any("inotifywait" in line for line in remote.ssh_log_lines()[log_before:]), \
-        "the mount's watcher must have run inotifywait over ssh"
+    assert any("inotifywait" in line and _ssh_to(line, m1)
+               for line in remote.ssh_log_lines()[log_before:]), \
+        "the mount's watcher must have run inotifywait over ssh to remote1"
 
 
 def _streaming_read_case(remote, mounted_factory, monkeypatch, streaming: bool):
@@ -724,7 +750,7 @@ def _streaming_read_case(remote, mounted_factory, monkeypatch, streaming: bool):
         ranges.append((virtual_path, offset, size))
         return original(virtual_path, offset, size)
 
-    backend.read_file = recording
+    monkeypatch.setattr(backend, "read_file", recording)
     downloads = _count_downloads(backend, monkeypatch)
 
     assert "stream.bin" in os.listdir(mnt.mount)
@@ -733,8 +759,9 @@ def _streaming_read_case(remote, mounted_factory, monkeypatch, streaming: bool):
 
 
 def test_mounted_streaming_range_reads_reach_ssh_member(remote, mounted_factory, monkeypatch):
-    ranges, _downloads, chunk = _streaming_read_case(remote, mounted_factory, monkeypatch,
-                                                     streaming=True)
+    ranges, downloads, chunk = _streaming_read_case(remote, mounted_factory, monkeypatch,
+                                                    streaming=True)
+    assert downloads == [], "a streaming read must not download the whole file"
     assert len(ranges) > 1, f"expected several range reads, saw {ranges}"
     assert all(size <= chunk for _p, _o, size in ranges), ranges
     assert len({offset for _p, offset, _s in ranges}) > 1
@@ -744,5 +771,5 @@ def test_mounted_nonstreaming_read_makes_no_range_reads(remote, mounted_factory,
     """Twin: without streaming the whole file is downloaded, not ranged."""
     ranges, downloads, _chunk = _streaming_read_case(remote, mounted_factory, monkeypatch,
                                                      streaming=False)
-    assert len(ranges) <= 1
+    assert ranges == []
     assert downloads == ["/stream.bin"], "the whole file must be downloaded exactly once"
