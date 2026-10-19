@@ -36,5 +36,14 @@ log_events:
     briefed from a file; reports to coordinator session storage-06 in the fixed forms
     (ASSUMPTIONS, LANDED, BLOCKED, NEEDS RULING, READY, DONE). Coordinator merges
     after READY.'
+- time: 2026-10-19T18:30:43-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'PR #108 head 476b67c: remote gate 6 passed + 1 strict xfail (#106); Docker-down
+    run fails all 7 with ''Docker is unavailable''; 6/6 mutation checks red then restored;
+    bridge fallback verified under pool exhaustion; fast+mounted+resilience gates
+    6/6 pass on 476b67c. Filed #106 (orphaned remote inotifywait) and #107 (known_hosts
+    via accept-new). Mount half delegated to a Sonnet implementer on feat/container-remote-gate-mount
+    (stacked).'
 blocks:
 - gh-105
