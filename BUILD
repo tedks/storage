@@ -180,16 +180,47 @@ py_test(
     tags = ["local"],
 )
 
+# Real remotes: sshd in Docker containers built from tests/remote/. "local"
+# because it mounts FUSE and talks to the Docker daemon, neither of which the
+# sandbox reaches. Its own gate, not part of storage_tests: hosts without
+# Docker are unaffected, and on them this target fails rather than skips.
+py_test(
+    name = "storage_tests_remote_system",
+    srcs = [
+        "tests/pytest_main.py",
+        "tests/test_remote_system.py",
+    ],
+    data = [
+        "tests/remote/Dockerfile",
+        "tests/remote/entrypoint.sh",
+        "tests/remote/sshd_config",
+    ],
+    main = "tests/pytest_main.py",
+    precompile = "disabled",
+    # The first run builds the image.
+    timeout = "long",
+    deps = TEST_DEPS,
+    env_inherit = [
+        "DOCKER_CONFIG",
+        "DOCKER_CONTEXT",
+        "DOCKER_HOST",
+        "FUSE_LIBRARY_PATH",
+        "STORAGE_TEST_REMOTE_PUBLISHED",
+    ],
+    tags = ["local"],
+)
+
 # What the gates and storage_lib list, one label per line. It names
 # storage_tests_nonmounting instead of the fast gate: the fast gate contains
 # the check that reads this, and suite membership is a dependency (a cycle).
 genquery(
     name = "build_srcs",
-    expression = "labels(srcs, tests(//:storage_tests_nonmounting) + tests(//:storage_tests_mounted_system_gate) + //:storage_lib)",
+    expression = "labels(srcs, tests(//:storage_tests_nonmounting) + tests(//:storage_tests_mounted_system_gate) + tests(//:storage_tests_remote_gate) + //:storage_lib)",
     scope = [
         ":storage_lib",
         ":storage_tests_mounted_system_gate",
         ":storage_tests_nonmounting",
+        ":storage_tests_remote_gate",
     ],
 )
 
@@ -244,6 +275,14 @@ test_suite(
     tests = [
         ":storage_tests_resilience_gradient",
         ":storage_tests_streaming_system",
+    ],
+)
+
+# Not in storage_tests: it needs Docker. See AGENTS.md.
+test_suite(
+    name = "storage_tests_remote_gate",
+    tests = [
+        ":storage_tests_remote_system",
     ],
 )
 
