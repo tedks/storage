@@ -5,7 +5,7 @@ type: task
 component: tests
 release:
 reporter: Ted Smith <tedks@riseup.net>
-status: unstarted
+status: in_progress
 disposition:
 creation_time: 2026-10-19T18:11:37-00:00
 references: []
@@ -17,6 +17,10 @@ log_events:
 - time: 2026-10-19T18:11:38-00:00
   who: Ted Smith
   what: blocks gh-105
+  comment: ""
+- time: 2026-10-19T18:13:49-00:00
+  who: Ted Smith
+  what: started
   comment: ""
 blocks:
 - gh-105
