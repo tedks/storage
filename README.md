@@ -44,6 +44,7 @@ The `setup-venv.sh` helper script creates `.venv/`, installs/upgrades `pip`, and
 
 - **Pytest (venv)**: Activate the virtualenv (`source .venv/bin/activate`) and run `pytest`.
 - **Bazel**: From the Nix dev shell, run `bazel test //:storage_tests` (or `bazel test //...` for everything). This uses the hermetic Bazel toolchain and the repo’s pinned Python deps.
+- **Remote gate**: `bazel test //:storage_tests_remote_gate` runs the SSH, rsync and watcher tests against sshd in Docker containers. It needs Docker, and it fails when Docker is unavailable. `//...` includes it. See [AGENTS.md](AGENTS.md).
 
 ## Quick Start
 
@@ -236,9 +237,10 @@ fixed, but the code has been refactored substantially since, and those
 paths have not been re-exercised against a real remote. The automated
 suite (about 290 tests, see [AGENTS.md](AGENTS.md) for the Bazel gates)
 mounts real FUSE filesystems and runs real `rsync`, but every remote
-member in it is a local directory flagged as remote: nothing in the suite
-talks to an SSH host, so the SSH backend, the inotify watcher and rsync
-over SSH are covered only by the field use above.
+member in it is a local directory flagged as remote. A separate gate that
+needs Docker, `//:storage_tests_remote_gate`, runs the SSH backend, rsync
+over SSH and the inotify watcher against sshd in containers. Nothing yet
+has been run against a real host since the field use above.
 
 Implemented:
 
