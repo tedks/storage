@@ -178,8 +178,8 @@ on port 22; on a host that cannot route to Docker's bridge they fall back
 to ports published on 127.0.0.1, and `STORAGE_TEST_REMOTE_PUBLISHED=1`
 forces that fallback.
 
-What the fixtures create, they name `storage-test-*` and remove by exact
-name: containers `storage-test-<pid>-<hex>-remote0`/`-remote1`, a network
+What the fixtures create, they name `storage-test-*` and remove (the
+containers by id, the rest by exact name): containers `storage-test-<pid>-<hex>-remote0`/`-remote1`, a network
 `storage-test-<pid>-<hex>`, and the keys under the test tmp dir. The image
 `storage-test-sshd:<hash>` stays as a cache, and older tags are never
 removed by the fixture (another run may be starting one); remove stale

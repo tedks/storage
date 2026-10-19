@@ -6,8 +6,9 @@ The fixtures build the image in tests/remote/ (tagged by a hash of that
 directory, so an edited Dockerfile is never tested stale), generate a
 test-only ed25519 client key and one host key per member under the test's
 tmp dir, and start two members on a user-defined Docker network. Everything
-they create in Docker is named ``storage-test-<run id>-*`` and removed by
-exact name at teardown.
+they create in Docker is named ``storage-test-<run id>-*`` and removed at
+teardown: containers by the id ``docker create`` returned, the network by
+its exact name.
 
 RsyncBackend and RemoteWatcher run the system ``ssh`` with
 ``StrictHostKeyChecking=accept-new`` and no way to pass a config or
@@ -539,14 +540,14 @@ def test_watcher_reports_change_made_in_container(remote):
     try:
         _wait_for_watch(remote, member, "watched", events)
         assert not seen.is_set()
-        probe_events = len(events)
 
         remote.exec(member, f"echo changed > {REMOTE_ROOT}/watched/new-{token}")
 
         assert seen.wait(15.0), f"no watcher event for the docker exec change; saw {events}"
-        # The parent directory is invalidated too; the probes also did that,
-        # so look only at what came after them.
-        assert _wait_for(lambda: "/watched" in events[probe_events:], timeout=5.0), events
+        # The parent directory is invalidated too. The probes also did that,
+        # so look only after the change's own first event.
+        first = events.index(f"/watched/new-{token}")
+        assert _wait_for(lambda: "/watched" in events[first + 1:], timeout=5.0), events
         assert any("inotifywait" in line and _ssh_to(line, member)
                    for line in remote.ssh_log_lines()[log_before:])
     finally:
