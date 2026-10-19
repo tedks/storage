@@ -678,13 +678,26 @@ def test_mounted_watcher_refreshes_listing(remote, mounted_factory):
     mnt = mounted_factory(enable_watchers=True)
     assert mnt.fs._readdir_snapshot_ttl == float("inf"), \
         "both SSH members must be watchable, else a TTL would mask the watcher"
-    for member in remote.members:
-        _wait_for_remote_inotifywait(remote, member)
+    os.listdir(mnt.mount)  # primes the snapshot; only the watcher can refresh it
+
+    # A running inotifywait is not a ready one (its watches are set after it
+    # starts): create probe files in the member until one shows up in the
+    # mount's listing. Not dot-named, so no listing filter can hide them.
+    deadline = time.monotonic() + 20.0
+    index = 0
+    while True:
+        probe = f"probe-{index}"
+        remote.write_remote(m1, probe, b"")
+        if _wait_for(lambda: probe in os.listdir(mnt.mount), timeout=0.5):
+            break
+        index += 1
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f"the mount's watcher on {m1.container} never refreshed the listing")
 
     token = secrets.token_hex(4)
     name = f"from-container-{token}.txt"
     body = f"hello {token}\n".encode()
-    assert name not in os.listdir(mnt.mount)  # primes the snapshot
+    assert name not in os.listdir(mnt.mount)
 
     remote.write_remote(m1, name, body)
 
@@ -695,7 +708,7 @@ def test_mounted_watcher_refreshes_listing(remote, mounted_factory):
         "the mount's watcher must have run inotifywait over ssh"
 
 
-def _streaming_read_case(remote, mounted_factory, streaming: bool):
+def _streaming_read_case(remote, mounted_factory, monkeypatch, streaming: bool):
     chunk = 64 * 1024
     member = remote.members[0]
     payload = secrets.token_bytes(3 * 1024 * 1024)
@@ -712,20 +725,24 @@ def _streaming_read_case(remote, mounted_factory, streaming: bool):
         return original(virtual_path, offset, size)
 
     backend.read_file = recording
+    downloads = _count_downloads(backend, monkeypatch)
 
     assert "stream.bin" in os.listdir(mnt.mount)
     assert (mnt.mount / "stream.bin").read_bytes() == payload
-    return ranges, chunk
+    return ranges, downloads, chunk
 
 
-def test_mounted_streaming_range_reads_reach_ssh_member(remote, mounted_factory):
-    ranges, chunk = _streaming_read_case(remote, mounted_factory, streaming=True)
+def test_mounted_streaming_range_reads_reach_ssh_member(remote, mounted_factory, monkeypatch):
+    ranges, _downloads, chunk = _streaming_read_case(remote, mounted_factory, monkeypatch,
+                                                     streaming=True)
     assert len(ranges) > 1, f"expected several range reads, saw {ranges}"
     assert all(size <= chunk for _p, _o, size in ranges), ranges
     assert len({offset for _p, offset, _s in ranges}) > 1
 
 
-def test_mounted_nonstreaming_read_makes_no_range_reads(remote, mounted_factory):
+def test_mounted_nonstreaming_read_makes_no_range_reads(remote, mounted_factory, monkeypatch):
     """Twin: without streaming the whole file is downloaded, not ranged."""
-    ranges, chunk = _streaming_read_case(remote, mounted_factory, streaming=False)
+    ranges, downloads, _chunk = _streaming_read_case(remote, mounted_factory, monkeypatch,
+                                                     streaming=False)
     assert len(ranges) <= 1
+    assert downloads == ["/stream.bin"], "the whole file must be downloaded exactly once"
