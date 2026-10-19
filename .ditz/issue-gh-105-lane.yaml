@@ -51,5 +51,12 @@ log_events:
   comment: '#108 council at fixpoint after 4 rounds (Claude+Codex; agy empty, quota);
     record posted on #108; gates 7/7 on ff1d4e9. #109 rebased to c98bfd0 (10 passed,
     1 xfail), marked ready, council round 1 started.'
+- time: 2026-10-19T19:05:39-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Council fixpoint: #108 ff1d4e9 (4 rounds), #109 6062a63 (4 rounds); agy
+    empty all rounds (quota). Lead acceptance audit (fresh Opus): ACCEPT; follow-ups
+    closed or filed (gh-105-teardown-rm-silent). Open questions filed: oq-remote-gate-push-policy,
+    oq-ssh-known-hosts-surface. Reporting READY.'
 blocks:
 - gh-105
