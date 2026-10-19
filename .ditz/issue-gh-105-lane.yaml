@@ -58,5 +58,10 @@ log_events:
     empty all rounds (quota). Lead acceptance audit (fresh Opus): ACCEPT; follow-ups
     closed or filed (gh-105-teardown-rm-silent). Open questions filed: oq-remote-gate-push-policy,
     oq-ssh-known-hosts-surface. Reporting READY.'
+- time: 2026-10-19T19:06:31-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'DONE: shard pushed to off-duty origin/master 9b06000 (waiting/2026-10-19-62084c27-storage-gh105-remote-gate.md).
+    Merge pending with coordinator.'
 blocks:
 - gh-105
