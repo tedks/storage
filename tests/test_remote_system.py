@@ -31,6 +31,7 @@ import socket
 import subprocess
 import threading
 import time
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List
@@ -54,14 +55,28 @@ FORCE_PUBLISHED_ENV = "STORAGE_TEST_REMOTE_PUBLISHED"
 
 
 def _docker(*args, check=True, timeout=120.0, input=None):
-    return subprocess.run(
+    result = subprocess.run(
         ["docker", *args],
         capture_output=True,
         text=True,
-        check=check,
         timeout=timeout,
         input=input,
     )
+    if check and result.returncode != 0:
+        raise RuntimeError(
+            f"docker {' '.join(args)} exited {result.returncode}: {result.stderr.strip()}"
+        )
+    return result
+
+
+def _docker_bytes(*args, input: bytes = None) -> bytes:
+    """Like _docker, for commands whose stdin or stdout is binary."""
+    result = subprocess.run(["docker", *args], input=input, capture_output=True,
+                            timeout=60.0)
+    if result.returncode != 0:
+        raise RuntimeError(f"docker {' '.join(args[:4])} ... exited {result.returncode}: "
+                           f"{result.stderr.decode(errors='replace').strip()}")
+    return result.stdout
 
 
 def _require_docker():
@@ -115,6 +130,23 @@ def _ensure_image(build_root: Path) -> str:
     return tag
 
 
+def _create_network(run_id: str) -> str:
+    """Create the run's network, or fall back to Docker's default bridge.
+
+    A host whose other projects hold most of Docker's predefined address
+    pools can refuse a new network; the tests need only host-to-container
+    traffic, which the default bridge also carries.
+    """
+    result = _docker("network", "create", "--label", "storage-test=1", run_id, check=False)
+    if result.returncode == 0:
+        return run_id
+    if "address pools have been fully subnetted" in result.stderr:
+        warnings.warn(f"docker network create {run_id}: {result.stderr.strip()}; "
+                      "using the default bridge network")
+        return "bridge"
+    raise RuntimeError(f"docker network create {run_id} failed: {result.stderr.strip()}")
+
+
 def _ssh_keygen(path: Path, comment: str):
     subprocess.run(
         ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", comment, "-f", str(path)],
@@ -166,20 +198,14 @@ class RemoteCluster:
                        check=check, timeout=60.0, input=input)
 
     def read_remote(self, member: Member, rel_path: str) -> bytes:
-        result = subprocess.run(
-            ["docker", "exec", "-u", REMOTE_USER, member.container,
-             "cat", f"{REMOTE_ROOT}/{rel_path.lstrip('/')}"],
-            capture_output=True, check=True, timeout=60.0,
-        )
-        return result.stdout
+        return _docker_bytes("exec", "-u", REMOTE_USER, member.container,
+                             "cat", f"{REMOTE_ROOT}/{rel_path.lstrip('/')}")
 
     def write_remote(self, member: Member, rel_path: str, data: bytes):
         path = f"{REMOTE_ROOT}/{rel_path.lstrip('/')}"
-        subprocess.run(
-            ["docker", "exec", "-i", "-u", REMOTE_USER, member.container, "sh", "-c",
-             f"mkdir -p \"$(dirname {shlex.quote(path)})\" && cat > {shlex.quote(path)}"],
-            input=data, capture_output=True, check=True, timeout=60.0,
-        )
+        _docker_bytes("exec", "-i", "-u", REMOTE_USER, member.container, "sh", "-c",
+                      f"mkdir -p \"$(dirname {shlex.quote(path)})\" && cat > {shlex.quote(path)}",
+                      input=data)
 
     def ssh_log_lines(self) -> List[str]:
         if not self.ssh_log.exists():
@@ -248,8 +274,9 @@ def cluster(tmp_path_factory):
         _ssh_keygen(key_path, f"{run_id}-client")
         client_pub = (work / "client_ed25519.pub").read_text()
 
-        _docker("network", "create", "--label", "storage-test=1", run_id)
-        created_network = run_id
+        network = _create_network(run_id)
+        if network != "bridge":
+            created_network = network
 
         force_published = os.environ.get(FORCE_PUBLISHED_ENV) == "1"
         members: List[Member] = []
@@ -261,7 +288,7 @@ def cluster(tmp_path_factory):
             (keys / "authorized_keys").write_text(client_pub)
             container = f"{run_id}-{name}"
             created_containers.append(container)
-            _docker("run", "-d", "--name", container, "--network", run_id,
+            _docker("run", "-d", "--name", container, "--network", network,
                     "--label", "storage-test=1", "-p", "127.0.0.1::22",
                     "-v", f"{keys}:/keys:ro", image)
             ip = _docker("inspect", "-f",
@@ -474,8 +501,10 @@ def test_watcher_reports_change_made_in_container(remote):
 
 # Known failure, #106: stop() kills only the local ssh; without a pty the
 # remote inotifywait is reparented to init and lives until its next event.
-# strict, so the fix turns this red and the marker comes off.
-@pytest.mark.xfail(strict=True, reason="#106: remote inotifywait outlives RemoteWatcher.stop()")
+# strict, so the fix turns this red and the marker comes off; raises, so a
+# setup error (no Docker) is still an error and not an expected failure.
+@pytest.mark.xfail(strict=True, raises=AssertionError,
+                   reason="#106: remote inotifywait outlives RemoteWatcher.stop()")
 def test_watcher_stop_ends_remote_inotifywait(remote):
     member = remote.members[1]
     watcher = _watcher_for(remote, member, lambda _path: None)
