@@ -1,6 +1,7 @@
 """
 Real-remote system tests: the SSH backend, rsync over SSH and the remote
-watcher against sshd running in Docker containers (issue #105).
+watcher against sshd running in Docker containers, then a real FUSE mount of
+StorageFS with both containers as SSH members (issue #105).
 
 The fixtures build the image in tests/remote/ (tagged by a hash of that
 directory, so an edited Dockerfile is never tested stale), generate a
@@ -573,3 +574,220 @@ def test_watcher_stop_ends_remote_inotifywait(remote):
     assert _wait_for(lambda: not _remote_inotifywait_running(remote, member),
                      timeout=10.0, interval=0.2), \
         "inotifywait still runs in the container after RemoteWatcher.stop()"
+
+
+# --- Mounted half: a real FUSE mount of StorageFS over two SSH members ----
+
+MOUNT_TIMEOUT = 30.0
+
+
+@dataclass
+class Mounted:
+    fs: object
+    mount: Path
+    cache: Path
+    backends: dict
+
+
+def _fusermount_unmount(mount: Path) -> List[str]:
+    """Unmount; return what went wrong, falling back to a lazy unmount."""
+    problems: List[str] = []
+    for flags in ("-u", "-uz"):
+        for tool in ("fusermount", "fusermount3"):
+            if shutil.which(tool) is None:
+                continue
+            try:
+                result = subprocess.run([tool, flags, str(mount)], capture_output=True,
+                                        text=True, timeout=30.0)
+            except subprocess.TimeoutExpired:
+                problems.append(f"{tool} {flags} timed out")
+                continue
+            if result.returncode == 0:
+                return problems
+            problems.append(f"{tool} {flags}: {result.stderr.strip()}")
+    problems.append(f"{mount} could not be unmounted")
+    return problems
+
+
+@pytest.fixture
+def mounted_factory(remote, tmp_path):
+    """Factory mounting StorageFS over remote0 and remote1 (both SSHBackend).
+
+    Unlike the other mounted suites this never skips: a mount that does not
+    come up is a failure.
+    """
+    from fuse import FUSE
+
+    from storage.fs import StorageFS
+
+    created: List[tuple] = []
+
+    def make(**fs_kwargs) -> Mounted:
+        assert not created, "one mount per test"
+        mount = tmp_path / "mount"
+        cache = tmp_path / "cache"
+        mount.mkdir()
+        cache.mkdir()
+        backends = {m.name: SSHBackend(**remote.backend_kwargs(m)) for m in remote.members}
+        fs_kwargs.setdefault("num_sync_workers", 2)
+        fs = StorageFS(cache_root=cache, state_db=tmp_path / "state.db",
+                       backends=backends, cache_size=256 * 1024 * 1024, **fs_kwargs)
+        errors: List[BaseException] = []
+        # libfuse calls destroy on unmount; record it, so teardown runs it
+        # itself exactly when libfuse never did.
+        destroy_called = threading.Event()
+        libfuse_destroy = fs.destroy
+
+        def tracked_destroy(path):
+            destroy_called.set()
+            return libfuse_destroy(path)
+
+        fs.destroy = tracked_destroy
+
+        def run():
+            try:
+                FUSE(fs, str(mount), nothreads=True, foreground=True, allow_other=False)
+            except BaseException as exc:  # reported by the failure below
+                errors.append(exc)
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        handle = Mounted(fs, mount, cache, backends)
+        came_up = _wait_for(lambda: os.path.ismount(mount) or bool(errors),
+                            timeout=MOUNT_TIMEOUT, interval=0.1) and os.path.ismount(mount)
+        created.append((handle, thread, errors, came_up, destroy_called))
+        if not came_up:
+            pytest.fail(f"FUSE mount did not come up: {errors or 'timed out'}", pytrace=False)
+        return handle
+
+    yield make
+
+    problems: List[str] = []
+    for handle, thread, errors, came_up, destroy_called in created:
+        try:
+            if os.path.ismount(handle.mount):
+                problems += _fusermount_unmount(handle.mount)
+            elif came_up:
+                problems.append("the mount went away before teardown")
+            # On unmount libfuse calls StorageFS.destroy, which stops the
+            # watchers and sync workers; a hang there leaves this thread alive.
+            thread.join(timeout=30.0)
+            if thread.is_alive():
+                problems.append("the FUSE thread did not finish after unmount "
+                                "(StorageFS.destroy hung?)")
+            elif not destroy_called.is_set():
+                if came_up:
+                    problems.append("libfuse unmounted without calling destroy")
+                # Either way the sync workers still run; stop them.
+                handle.fs.destroy("/")
+            if errors:
+                problems.append(f"the FUSE thread raised: {errors}")
+        except Exception as exc:
+            problems.append(f"teardown raised {exc!r}")
+        finally:
+            for backend in handle.backends.values():
+                backend.close()
+    if problems:
+        pytest.fail("mount teardown: " + "; ".join(problems), pytrace=False)
+
+
+def test_mounted_write_syncs_to_both_members(remote, mounted_factory):
+    from storage.file_config import FileConfig, set_file_config
+
+    m0, m1 = remote.members
+    for member in (m0, m1):
+        assert remote.exec(member, f"ls -A {REMOTE_ROOT}").stdout.strip() == "", \
+            "members must start empty or the replica check proves nothing"
+    mnt = mounted_factory()
+    # Replica count is read from the xattr on the cache path, inherited down.
+    set_file_config(mnt.cache, FileConfig(replica_count=2))
+
+    payload = secrets.token_bytes(300_000)
+    (mnt.mount / "replicated.bin").write_bytes(payload)
+
+    for member in (m0, m1):
+        assert _wait_for(
+            lambda member=member: remote.exec(
+                member, f"cat {REMOTE_ROOT}/replicated.bin 2>/dev/null | wc -c"
+            ).stdout.strip() == str(len(payload)), timeout=30.0), \
+            f"{member.name} never received the replica"
+        assert remote.read_remote(member, "replicated.bin") == payload
+
+
+def test_mounted_watcher_refreshes_listing(remote, mounted_factory):
+    m1 = remote.members[1]
+    log_before = len(remote.ssh_log_lines())
+    mnt = mounted_factory(enable_watchers=True)
+    assert mnt.fs._readdir_snapshot_ttl == float("inf"), \
+        "both SSH members must be watchable, else a TTL would mask the watcher"
+    os.listdir(mnt.mount)  # primes the snapshot; only the watcher can refresh it
+
+    # A running inotifywait is not a ready one (its watches are set after it
+    # starts): create probe files in the member until one shows up in the
+    # mount's listing. Not dot-named, so no listing filter can hide them.
+    deadline = time.monotonic() + 20.0
+    index = 0
+    while True:
+        probe = f"probe-{index}"
+        remote.write_remote(m1, probe, b"")
+        if _wait_for(lambda: probe in os.listdir(mnt.mount), timeout=0.5):
+            break
+        index += 1
+        if time.monotonic() >= deadline:
+            pytest.fail(f"the mount's watcher on {m1.container} never refreshed the listing",
+                        pytrace=False)
+
+    token = secrets.token_hex(4)
+    name = f"from-container-{token}.txt"
+    body = f"hello {token}\n".encode()
+    assert name not in os.listdir(mnt.mount)
+
+    remote.write_remote(m1, name, body)
+
+    assert _wait_for(lambda: name in os.listdir(mnt.mount), timeout=20.0), \
+        "the container's new file never appeared in the mount listing"
+    assert (mnt.mount / name).read_bytes() == body
+    assert any("inotifywait" in line and _ssh_to(line, m1)
+               for line in remote.ssh_log_lines()[log_before:]), \
+        "the mount's watcher must have run inotifywait over ssh to remote1"
+
+
+def _streaming_read_case(remote, mounted_factory, monkeypatch, streaming: bool):
+    chunk = 64 * 1024
+    member = remote.members[0]
+    payload = secrets.token_bytes(3 * 1024 * 1024)
+    remote.write_remote(member, "stream.bin", payload)
+
+    mnt = mounted_factory(streaming_reads=streaming, streaming_chunk_size=chunk,
+                          num_sync_workers=0, start_sync=False)
+    ranges: List[tuple] = []
+    backend = mnt.backends[member.name]
+    original = backend.read_file
+
+    def recording(virtual_path, offset, size):
+        ranges.append((virtual_path, offset, size))
+        return original(virtual_path, offset, size)
+
+    monkeypatch.setattr(backend, "read_file", recording)
+    downloads = _count_downloads(backend, monkeypatch)
+
+    assert "stream.bin" in os.listdir(mnt.mount)
+    assert (mnt.mount / "stream.bin").read_bytes() == payload
+    return ranges, downloads, chunk
+
+
+def test_mounted_streaming_range_reads_reach_ssh_member(remote, mounted_factory, monkeypatch):
+    ranges, downloads, chunk = _streaming_read_case(remote, mounted_factory, monkeypatch,
+                                                    streaming=True)
+    assert downloads == [], "a streaming read must not download the whole file"
+    assert len(ranges) > 1, f"expected several range reads, saw {ranges}"
+    assert all(size <= chunk for _p, _o, size in ranges), ranges
+    assert len({offset for _p, offset, _s in ranges}) > 1
+
+
+def test_mounted_nonstreaming_read_makes_no_range_reads(remote, mounted_factory, monkeypatch):
+    """Twin: without streaming the whole file is downloaded, not ranged."""
+    ranges, downloads, _chunk = _streaming_read_case(remote, mounted_factory, monkeypatch,
+                                                     streaming=False)
+    assert ranges == []
+    assert downloads == ["/stream.bin"], "the whole file must be downloaded exactly once"

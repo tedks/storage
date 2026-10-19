@@ -181,7 +181,8 @@ py_test(
 )
 
 # Real remotes: sshd in Docker containers built from tests/remote/. "local"
-# because it talks to the Docker daemon, which the sandbox does not reach.
+# because it talks to the Docker daemon, which the sandbox does not reach, and
+# its mounted tests need FUSE mounts, which fail inside linux-sandbox.
 # "manual" keeps it out of //... and storage_tests, so hosts without Docker
 # are unaffected; //:storage_tests_remote_gate names it and runs it, and
 # there it fails rather than skips when Docker is unavailable.
