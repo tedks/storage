@@ -5,8 +5,8 @@ type: task
 component: tests
 release:
 reporter: Ted Smith <tedks@riseup.net>
-status: in_progress
-disposition:
+status: closed
+disposition: fixed
 creation_time: 2026-10-19T18:11:37-00:00
 references: []
 log_events:
@@ -76,5 +76,10 @@ log_events:
   comment: '#109 rebased onto master 322412e -> 0531b2e (tree identical to 6062a63),
     retargeted to master; 7/7 gates pass uncached on 0531b2e; record posted. Reporting
     READY #109 0531b2e.'
+- time: 2026-10-19T19:13:48-00:00
+  who: Ted Smith
+  what: 'closed: fixed'
+  comment: 'Delivered: PRs #108 and #109 merged (322412e, 80625c2). Lane retired;
+    shard off-duty 9b06000.'
 blocks:
 - gh-105
