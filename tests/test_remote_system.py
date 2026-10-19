@@ -633,6 +633,16 @@ def mounted_factory(remote, tmp_path):
         fs = StorageFS(cache_root=cache, state_db=tmp_path / "state.db",
                        backends=backends, cache_size=256 * 1024 * 1024, **fs_kwargs)
         errors: List[BaseException] = []
+        # libfuse calls destroy on unmount; record it, so teardown runs it
+        # itself exactly when libfuse never did.
+        destroy_called = threading.Event()
+        libfuse_destroy = fs.destroy
+
+        def tracked_destroy(path):
+            destroy_called.set()
+            return libfuse_destroy(path)
+
+        fs.destroy = tracked_destroy
 
         def run():
             try:
@@ -645,7 +655,7 @@ def mounted_factory(remote, tmp_path):
         handle = Mounted(fs, mount, cache, backends)
         came_up = _wait_for(lambda: os.path.ismount(mount) or bool(errors),
                             timeout=MOUNT_TIMEOUT, interval=0.1) and os.path.ismount(mount)
-        created.append((handle, thread, errors, came_up))
+        created.append((handle, thread, errors, came_up, destroy_called))
         if not came_up:
             pytest.fail(f"FUSE mount did not come up: {errors or 'timed out'}", pytrace=False)
         return handle
@@ -653,7 +663,7 @@ def mounted_factory(remote, tmp_path):
     yield make
 
     problems: List[str] = []
-    for handle, thread, errors, came_up in created:
+    for handle, thread, errors, came_up, destroy_called in created:
         try:
             if os.path.ismount(handle.mount):
                 problems += _fusermount_unmount(handle.mount)
@@ -665,8 +675,10 @@ def mounted_factory(remote, tmp_path):
             if thread.is_alive():
                 problems.append("the FUSE thread did not finish after unmount "
                                 "(StorageFS.destroy hung?)")
-            elif not came_up:
-                # libfuse never ran destroy, so the sync workers still run.
+            elif not destroy_called.is_set():
+                if came_up:
+                    problems.append("libfuse unmounted without calling destroy")
+                # Either way the sync workers still run; stop them.
                 handle.fs.destroy("/")
             if errors:
                 problems.append(f"the FUSE thread raised: {errors}")
