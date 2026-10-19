@@ -293,12 +293,13 @@ def cluster(tmp_path_factory):
             _ssh_keygen(keys / "ssh_host_ed25519_key", f"{run_id}-{name}")
             (keys / "authorized_keys").write_text(client_pub)
             container = f"{run_id}-{name}"
-            # create fails on a name clash, so only a container this run
-            # made is ever recorded for removal.
-            _docker("create", "--pull=never", "--name", container, "--network", network,
-                    "--label", "storage-test=1", "-p", "127.0.0.1::22",
-                    "-v", f"{keys}:/keys:ro", image)
-            created_containers.append(container)
+            # create fails on a name clash, and teardown removes by the id it
+            # returns, so only a container this run made is ever removed.
+            container_id = _docker(
+                "create", "--pull=never", "--name", container, "--network", network,
+                "--label", "storage-test=1", "-p", "127.0.0.1::22",
+                "-v", f"{keys}:/keys:ro", image).stdout.strip()
+            created_containers.append(container_id)
             _docker("start", container)
             ip = _docker("inspect", "-f",
                          "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
@@ -512,7 +513,7 @@ def _wait_for_watch(remote, member, rel_dir: str, events: List[str]):
     deadline = time.monotonic() + 20.0
     index = 0
     while time.monotonic() < deadline:
-        probe = f"/{rel_dir}/.probe-{index}"
+        probe = "/" + "/".join(part for part in (rel_dir, f".probe-{index}") if part)
         remote.exec(member, f"touch {REMOTE_ROOT}{probe}")
         if _wait_for(lambda: probe in events, timeout=0.5):
             return
@@ -538,11 +539,14 @@ def test_watcher_reports_change_made_in_container(remote):
     try:
         _wait_for_watch(remote, member, "watched", events)
         assert not seen.is_set()
+        probe_events = len(events)
 
         remote.exec(member, f"echo changed > {REMOTE_ROOT}/watched/new-{token}")
 
         assert seen.wait(15.0), f"no watcher event for the docker exec change; saw {events}"
-        assert "/watched" in events
+        # The parent directory is invalidated too; the probes also did that,
+        # so look only at what came after them.
+        assert _wait_for(lambda: "/watched" in events[probe_events:], timeout=5.0), events
         assert any("inotifywait" in line and _ssh_to(line, member)
                    for line in remote.ssh_log_lines()[log_before:])
     finally:
@@ -557,10 +561,12 @@ def test_watcher_reports_change_made_in_container(remote):
                    reason="#106: remote inotifywait outlives RemoteWatcher.stop()")
 def test_watcher_stop_ends_remote_inotifywait(remote):
     member = remote.members[1]
-    watcher = _watcher_for(remote, member, lambda _path: None)
+    events: List[str] = []
+    watcher = _watcher_for(remote, member, events.append)
     watcher.start()
     try:
-        _wait_for_remote_inotifywait(remote, member)
+        # Stop a fully established watch, not one still setting up.
+        _wait_for_watch(remote, member, "", events)
     finally:
         watcher.stop()
     assert _wait_for(lambda: not _remote_inotifywait_running(remote, member),

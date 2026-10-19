@@ -43,7 +43,7 @@ The `setup-venv.sh` helper script creates `.venv/`, installs/upgrades `pip`, and
 ## Testing
 
 - **Pytest (venv)**: Activate the virtualenv (`source .venv/bin/activate`) and run `pytest`.
-- **Bazel**: From the Nix dev shell, run `bazel test //:storage_tests` (or `bazel test //...` for everything). This uses the hermetic Bazel toolchain and the repo’s pinned Python deps.
+- **Bazel**: From the Nix dev shell, run `bazel test //:storage_tests` (or `bazel test //...` for every target not tagged `manual`). This uses the hermetic Bazel toolchain and the repo’s pinned Python deps.
 - **Remote gate**: `bazel test //:storage_tests_remote_gate` runs the SSH, rsync and watcher tests against sshd in Docker containers. It needs Docker, and it fails when Docker is unavailable. It is tagged `manual`, so `//...` does not run it. See [AGENTS.md](AGENTS.md).
 
 ## Quick Start

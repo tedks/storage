@@ -282,9 +282,12 @@ test_suite(
     ],
 )
 
-# Not in storage_tests: it needs Docker. See AGENTS.md.
+# Not in storage_tests: it needs Docker. See AGENTS.md. The one exception to
+# leaving tags unset: "manual" keeps //... from expanding this suite (and so
+# its manual test); it does not filter the suite's own members.
 test_suite(
     name = "storage_tests_remote_gate",
+    tags = ["manual"],
     tests = [
         ":storage_tests_remote_system",
     ],
