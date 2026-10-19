@@ -1,0 +1,16 @@
+id: gh-105-lane
+title: Implement the container remote gate (lane mission)
+desc: Lead-tier lane briefed from the issue; owns the PR, its council rounds and gates.
+type: task
+component: tests
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-19T18:11:37-00:00
+references: []
+log_events:
+- time: 2026-10-19T18:11:37-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
