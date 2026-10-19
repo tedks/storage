@@ -1,0 +1,41 @@
+id: oq-ssh-known-hosts-surface
+title: 'Configuration surface for SSH host-key policy across paramiko, rsync and the
+  watcher (#107, #30)'
+desc: 'Question: what should the member configuration offer for host-key verification,
+  now that the container gate (#105) showed RsyncBackend and RemoteWatcher silently
+  write to ~/.ssh/known_hosts via accept-new, and break when an address''s key changes
+  (#107)? SSHBackend (paramiko) auto-adds keys in memory (#30).
+
+  Options:
+
+  (1) A per-member `known_hosts` path, with a policy in {accept-new, strict}. It is
+  threaded into paramiko (load_host_keys plus RejectPolicy or AutoAdd) and into both
+  ssh command builders (-o UserKnownHostsFile, -o StrictHostKeyChecking).
+
+  (2) A per-member `ssh_config` path passed as -F to the shelled-out ssh, with paramiko
+  reading the same file through SSHConfig.
+
+  (3) Keep the current behavior, documented.
+
+  Recommendation: (1). It is the smallest surface that makes all three call sites
+  agree. It also lets the gate drop its PATH shim, and strict is the safe production
+  default.
+
+  Who decides: CEO (Ted); it is a product and config-schema ruling.
+
+  Blocks: the fix for #107 and the strict mode in #30. It does not block #105.
+
+  Record: gh-105-lane, issue #107.'
+type: task
+component: open-questions
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-19T19:05:22-00:00
+references: []
+log_events:
+- time: 2026-10-19T19:05:22-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
