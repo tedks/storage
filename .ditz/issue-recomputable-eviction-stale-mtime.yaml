@@ -1,0 +1,35 @@
+id: recomputable-eviction-stale-mtime
+title: evict_recomputable_files keeps the old mtime in the row; the next open may
+  sync an empty file to members
+desc: 'Found by the Claude council seat on PR #115 (pre-existing, outside that PR''s
+  diff). Not yet reproduced.
+
+
+  storage/cache.py evict_recomputable_files truncates the cached file to 0 bytes,
+  which changes its mtime. It then stores the row with size=0 and checksum=None but
+  keeps the old last_modified.
+
+
+  Suspected consequence: on the next open, is_cached is true (the empty file exists).
+  heal_stale_clean sees size 0 == 0 but a different mtime, marks the row DIRTY, and
+  sync uploads the 0-byte file over the members. The reviewer found no recomputable
+  check in sync.py or sync_executor.py. The open would also serve an empty file instead
+  of recomputing.
+
+
+  Next step: a test that evicts a recomputable file and then opens it, asserting that
+  no DIRTY row and no member write result. Then record the truncated file''s stat
+  in the row, or exclude recomputable rows from the heal.'
+type: bugfix
+component: cache
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-24T21:14:19-00:00
+references: []
+log_events:
+- time: 2026-10-24T21:14:19-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
