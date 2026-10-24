@@ -202,6 +202,7 @@ class StorageFS(Operations):
             checksum_records=self._checksum_records,
             checksum_lock=self._checksum_lock,
         )
+        self.cache_manager.forget_listed_attrs = self.namespace.forget_listed_attrs
 
         self._streaming_manager = StreamingReadManager(
             cache_manager=self.cache_manager,
@@ -322,7 +323,8 @@ class StorageFS(Operations):
         no write can be recorded in between, and inside it _fd_lock is held
         across the open-writer check, the stat and the unlink, so no writer
         can get a descriptor in between either (open() takes _fd_lock across
-        its os.open and registration). A CLEAN row older than the file is a
+        its os.open and registration). The path's listing attributes are
+        forgotten before the unlink. A CLEAN row older than the file is a
         write whose row update was lost: it is marked dirty and kept. The
         cache lock is taken only after the index lock is released, keeping the
         order cache lock, index lock, _fd_lock.
@@ -360,6 +362,9 @@ class StorageFS(Operations):
                     if meta and not resolved.backend_name:
                         stale = st.st_size != meta.size or st.st_mtime != meta.last_modified
                     if not stale:
+                        # Before the unlink: no getattr may find the copy
+                        # gone and its name still in the parent's listing.
+                        self.namespace.forget_listed_attrs(virtual_path)
                         cache_path.unlink()
                 except OSError:
                     return

@@ -14,6 +14,7 @@ from fuse import FuseOSError
 
 from storage.backends.local import LocalBackend
 from storage.fs import StorageFS
+from storage.models import FileMetadata, SyncStatus
 from storage.sync import DirOperation
 
 
@@ -374,6 +375,155 @@ class TestFSNamespaceIntegration(unittest.TestCase):
             list(self.fs.readdir('/', None))
 
         schedule_task.assert_not_called()
+
+    OLD = b"old"
+    NEW = b"newer bytes"
+
+    def _cache_clean(self, name, content):
+        """A cached copy of /name with a CLEAN row describing it."""
+        cache_path = self.cache_dir / name
+        cache_path.write_bytes(content)
+        st = cache_path.lstat()
+        self.fs.state_manager.set_file_metadata(FileMetadata(
+            virtual_path=f"/{name}", size=st.st_size, checksum="c", last_access=1.0,
+            last_modified=st.st_mtime, sync_status=SyncStatus.CLEAN, replica_count=1,
+            recomputable=False, recompute_cmd=None, encrypted=False,
+            encryption_key_id=None,
+        ))
+        return cache_path
+
+    def _listed_then_synced(self, name):
+        """List /name at OLD, then a local write of NEW that has synced.
+
+        The watcher's echo of the sync is lost (nothing invalidates the
+        listing), and the readdir TTL is unbounded, as with watchers on.
+        """
+        self.fs.sync_manager.stop()
+        self.fs.namespace.readdir_snapshot_ttl = float('inf')
+        (self.backend1_dir / name).write_bytes(self.OLD)
+        list(self.fs.readdir('/', None))
+        cache_path = self._cache_clean(name, self.NEW)
+        (self.backend1_dir / name).write_bytes(self.NEW)
+        return cache_path
+
+    def test_eviction_forgets_listing_attrs(self):
+        cache_path = self._listed_then_synced("evicted.txt")
+
+        self.assertTrue(self.fs.cache_manager.evict_lru_files(bytes_needed=1))
+
+        self.assertFalse(cache_path.exists())
+        self.assertEqual(self.fs.getattr('/evicted.txt')['st_size'], len(self.NEW))
+
+    def test_eviction_keeps_a_racing_listing_unpublished(self):
+        # A listing that read the member before the sync and publishes after
+        # the eviction must not put the old attributes back.
+        self.fs.sync_manager.stop()
+        self.fs.namespace.readdir_snapshot_ttl = float('inf')
+        (self.backend1_dir / "raced.txt").write_bytes(self.OLD)
+        cache_path = self._cache_clean("raced.txt", self.NEW)
+        namespace = self.fs.namespace
+        real = namespace._schedule_directory_checksums
+
+        def schedule_then_sync_and_evict(*args, **kwargs):
+            real(*args, **kwargs)
+            (self.backend1_dir / "raced.txt").write_bytes(self.NEW)
+            self.assertTrue(self.fs.cache_manager.evict_lru_files(bytes_needed=1))
+
+        with patch.object(namespace, "_schedule_directory_checksums", side_effect=schedule_then_sync_and_evict):
+            list(self.fs.readdir('/', None))
+
+        self.assertFalse(cache_path.exists())
+        self.assertNotIn('/', namespace.entry_attrs)
+        self.assertEqual(self.fs.getattr('/raced.txt')['st_size'], len(self.NEW))
+
+    def test_invalidation_forgets_listing_attrs(self):
+        # _invalidate_file_cache alone, without the watcher's directory
+        # invalidation that _on_remote_change also makes.
+        cache_path = self._listed_then_synced("invalidated.txt")
+
+        self.fs._invalidate_file_cache('/invalidated.txt')
+
+        self.assertFalse(cache_path.exists())
+        self.assertEqual(self.fs.getattr('/invalidated.txt')['st_size'], len(self.NEW))
+
+    def test_conflict_copy_invalidation_forgets_canonical_listing(self):
+        (self.backend1_dir / "dup.txt").write_bytes(b"one")
+        (self.backend2_dir / "dup.txt").write_bytes(self.OLD)
+        self.fs.sync_manager.stop()
+        self.fs.namespace.readdir_snapshot_ttl = float('inf')
+        list(self.fs.readdir('/', None))
+        cache_path = self.cache_dir / "dup.txt.backend2"
+        cache_path.write_bytes(self.NEW)
+        (self.backend2_dir / "dup.txt").write_bytes(self.NEW)
+
+        self.fs._invalidate_file_cache('/dup.txt.backend2')
+
+        self.assertFalse(cache_path.exists())
+        self.assertEqual(self.fs.getattr('/dup.txt.backend2')['st_size'], len(self.NEW))
+
+    def test_local_write_forgets_listing_attrs(self):
+        self.fs.sync_manager.stop()
+        (self.backend1_dir / "written.txt").write_bytes(self.OLD)
+        (self.backend2_dir / "written.txt").write_bytes(self.OLD)
+        list(self.fs.readdir('/', None))
+        fd = self.fs.open('/written.txt', os.O_RDWR)
+        listing = self.fs.namespace.entry_attrs['/'][1]
+        self.assertIn("written.txt", listing["backend1"])
+
+        self.fs.write('/written.txt', self.NEW, 0, fd)
+        self.fs.release('/written.txt', fd)
+
+        self.assertNotIn("written.txt", listing["backend1"])
+        self.assertNotIn("written.txt", listing["backend2"])
+        # The copy is the only record of the write; getattr reads it.
+        self.assertEqual(self.fs.getattr('/written.txt')['st_size'], len(self.NEW))
+
+    def test_write_during_a_listing_does_not_discard_it(self):
+        # Writes come at write rate; a listing must not be thrown away for
+        # each one, or a directory with an active writer is never listed
+        # for long enough to answer getattr. The written copy exists, so the
+        # listing is not consulted for it.
+        self.fs.sync_manager.stop()
+        (self.backend1_dir / "appended.txt").write_bytes(self.OLD)
+        fd = self.fs.open('/appended.txt', os.O_RDWR)
+        namespace = self.fs.namespace
+        real = namespace._schedule_directory_checksums
+
+        def schedule_then_write(*args, **kwargs):
+            real(*args, **kwargs)
+            self.fs.write('/appended.txt', self.NEW, 0, fd)
+
+        with patch.object(namespace, "_schedule_directory_checksums", side_effect=schedule_then_write):
+            list(self.fs.readdir('/', None))
+        self.fs.release('/appended.txt', fd)
+
+        self.assertIn('/', namespace.entry_attrs)
+        self.assertEqual(self.fs.getattr('/appended.txt')['st_size'], len(self.NEW))
+
+    def test_forgetting_listing_attrs_does_not_wait_for_a_listing(self):
+        # A listing holds dir_cache_lock across its member round trips;
+        # eviction and invalidation run under the index and descriptor
+        # locks and must not wait for it.
+        evicted = self._listed_then_synced("evicted.txt")
+        invalidated = self._cache_clean("invalidated.txt", self.NEW)
+        written = self._cache_clean("written.txt", self.NEW)
+        finished = threading.Event()
+
+        def evict_and_invalidate():
+            written.write_bytes(self.NEW + self.NEW)
+            self.fs.cache_manager.mark_file_dirty('/written.txt', written)
+            self.fs._invalidate_file_cache('/invalidated.txt')
+            self.fs.cache_manager.evict_lru_files(bytes_needed=1)
+            finished.set()
+
+        worker = threading.Thread(target=evict_and_invalidate, daemon=True)
+        with self.fs._dir_cache_lock:
+            worker.start()
+            self.assertTrue(finished.wait(5.0))
+        worker.join()
+        self.assertFalse(evicted.exists())
+        self.assertFalse(invalidated.exists())
+        self.assertTrue(written.exists())
 
     def test_dir_cache_scoped_per_instance(self):
         # Populate cache in first instance
