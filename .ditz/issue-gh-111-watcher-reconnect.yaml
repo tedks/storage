@@ -55,5 +55,14 @@ log_events:
   who: Ted Smith
   what: blocks gh-111
   comment: ""
+- time: 2026-10-24T21:34:19-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'From #116 (checksum skip): once #116 lands, checksum records outlive listings.
+    Whatever a watcher reconnect revalidates (oq-watcher-outage-cache-policy), it
+    should also drop the checksum records of the reconnecting watcher''s members,
+    under StorageFS._checksum_lock (keys are (canonical_path, member)). That is cheap
+    and closes the outage gap for conflict detection. The next listing re-hashes duplicated
+    files once.'
 blocks:
 - gh-111
