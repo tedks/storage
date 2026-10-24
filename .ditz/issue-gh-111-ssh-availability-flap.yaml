@@ -1,0 +1,35 @@
+id: gh-111-ssh-availability-flap
+title: 'SSH: one thread''s connect failure marks a healthy member unavailable'
+desc: 'From council round 2 on PR #117 (Claude seat, nits 1 and 2). This predates
+  #117; the parallel connects that 3b8d646 allows on an available member widen the
+  window a little.
+
+
+  1. Availability is one flag on SSHBackend, set by whichever thread finished last,
+  and only _connect sets it back to available. With parallel connects, one thread''s
+  late failure (a banner timeout, or sshd MaxStartups dropping part of a burst; three
+  members on one host make a burst likelier) can land after other threads'' successes
+  and mark a live member unavailable. Threads that hold live clients never check or
+  restore the flag, so getattr / _listed_attrs skip the member until the failing thread
+  next touches it and reconnects through the gate, which can be minutes for a sync
+  or checksum worker. Suggested fix: record _last_connect_ok_at, and in _connect''s
+  failure path skip _mark_unavailable() when another thread connected successfully
+  after this attempt started.
+
+  2. _connect sets no timeout on open_sftp(). Under the old gate only the probing
+  thread could hang there; now any thread connecting at outage onset can, including
+  the single FUSE thread, if a peer black-holes after authentication. Bound open_sftp,
+  e.g. with the transport''s channel timeout.'
+type: bugfix
+component: performance
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-24T21:50:10-00:00
+references: []
+log_events:
+- time: 2026-10-24T21:50:10-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
