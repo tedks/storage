@@ -1,0 +1,47 @@
+id: gh-111-fuse-attr-timeouts
+title: Raise the kernel's FUSE entry/attr timeouts above libfuse's 1 s default?
+desc: "Product ruling needed (coherence for every client of a mount). Linked to gh-111
+  / GitHub #111; raised by the parallel-listing lane (gh-111-parallel-listing), not
+  changed in its PR.\n\nWhat: mount_storage calls FUSE(fs, mountpoint, nothreads=True,
+  ...) with no entry_timeout / attr_timeout, so libfuse 2 uses 1.0 s for both (negative_timeout
+  0). `ls -la` stats each entry, then returns for each entry's getxattr calls (security.selinux,
+  the POSIX ACL); when the pass over a large directory takes over 1 s the dentries
+  have expired and the kernel looks every entry up again: 3 lookups per entry (latency-report-2026-10-24.md,
+  \"Mechanism\").\n\nWhy it matters less after #113: each of those lookups is now
+  answered from the listing's attributes in memory (no member round trip) while the
+  listing is younger than min(readdir_ttl, 5 s). The extra lookups cost a FUSE round
+  trip each, not a VPN round trip. They only reach the members again when the listing
+  itself has expired (a directory whose `ls -la` takes longer than the cap, or a second
+  `ls` after it).\n\nWhat raising it costs: fusepy's high-level API has no kernel
+  invalidation (no fuse_lowlevel_notify_inval_*), so watcher pushes and readdir invalidations
+  never reach the kernel's cache. With attr_timeout T, every process on the host sees
+  a file's size/mtime/mode up to T stale after a change made outside this kernel:
+  a remote member change, a sync worker replacing a cached file, a conflict resolving.
+  Changes made through this mount stay coherent (the kernel updates its own inode
+  on write/truncate). entry_timeout T also keeps a deleted-elsewhere name resolvable
+  for up to T.\n\nOptions:\n A. Keep the 1 s default (status quo). Cost: up to 3 lookups
+  per entry, now in-memory.\n B. Set entry_timeout and attr_timeout to the listing
+  cap, min(readdir_ttl, 5 s), keep negative_timeout 0. Staleness becomes \"up to the
+  cap\", which getattr of uncached files already has since #113, but now for cached
+  files too and invisible to watchers.\n C. Add a profile option (e.g. `attr_timeout`,
+  default 1.0) passed to FUSE() as both timeouts, so a high-latency profile like warez
+  can opt in to B while the default stays coherent.\n\nRecommendation: A now, C if
+  gates-lane timing on #113 + parallel listing still shows lookup cost worth having.
+  B changes coherence for cached files on every mount, which the watcher design (push
+  invalidation) was meant to avoid; it should be opt-in. Measure first: count FUSE
+  lookups/getattrs per `ls -la Videos/Movies` on the stack (the guarded harness can
+  log them) before deciding.\n\nWho decides: Ted (product ruling: mount-wide coherence).\nBlocks:
+  nothing in flight. A follow-up implementation task only if B or C is chosen."
+type: task
+component: open-questions
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-24T21:04:17-00:00
+references: []
+log_events:
+- time: 2026-10-24T21:04:17-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
