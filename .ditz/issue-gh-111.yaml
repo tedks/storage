@@ -28,7 +28,12 @@ log_events:
   who: Ted Smith
   what: blocked by gh-111-eviction-drops-listing
   comment: ""
+- time: 2026-10-24T19:52:18-00:00
+  who: Ted Smith
+  what: blocked by gh-111-review-nits
+  comment: ""
 blocked_by:
 - gh-111-listing-attrs
 - gh-111-parallel-listing
 - gh-111-eviction-drops-listing
+- gh-111-review-nits
