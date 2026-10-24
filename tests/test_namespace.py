@@ -69,7 +69,7 @@ def _make_namespace_service(
         sync_manager=sync_manager,
         logger=logging.getLogger("test"),
         resolve_path=_resolve,
-        schedule_checksum_task=lambda backend, vpath: None,
+        schedule_checksum_task=lambda backend, vpath, basis=None: None,
         partial_suffix=".storage.partial",
         is_hidden_entry=StorageFS._is_hidden_entry,
         dir_cache=dir_cache,

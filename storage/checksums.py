@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional, Tuple
 
 import xxhash
 
@@ -38,7 +39,13 @@ def fast_checksum_bytes(data: bytes) -> str:
 
 @dataclass(frozen=True)
 class ChecksumRecord:
-    """Checksum value plus the time it was produced."""
+    """Checksum value plus the time it was produced.
+
+    basis is the member's (st_size, st_mtime) from the listing that
+    scheduled the hash, or None when it was not known. A listing that
+    reports the same basis does not hash the file again.
+    """
 
     checksum: str
     timestamp: float
+    basis: Optional[Tuple[int, float]] = None

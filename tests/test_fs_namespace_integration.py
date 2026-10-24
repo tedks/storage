@@ -525,6 +525,170 @@ class TestFSNamespaceIntegration(unittest.TestCase):
         self.assertFalse(invalidated.exists())
         self.assertTrue(written.exists())
 
+    def _hashes(self):
+        """Wrap every member's get_fast_checksum; return the list of
+        (member, path) it is called with."""
+        calls = []
+        for name, backend in self.backends.items():
+            real = backend.get_fast_checksum
+
+            def counted(path, _name=name, _real=real):
+                calls.append((_name, path))
+                return _real(path)
+
+            patcher = patch.object(backend, "get_fast_checksum", side_effect=counted)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        return calls
+
+    def _list_and_settle(self, path='/'):
+        """List path past the snapshot and wait for its checksum tasks."""
+        self.fs.namespace.readdir_snapshot_ttl = 0
+        entries = set(self.fs.readdir(path, None))
+        self.assertTrue(self._wait_for(lambda: not self.fs._checksum_tasks))
+        return entries
+
+    def test_repeated_readdir_hashes_recorded_checksum_once(self):
+        (self.backend1_dir / "dup.txt").write_text("same")
+        (self.backend2_dir / "dup.txt").write_text("same")
+        hashes = self._hashes()
+
+        for _ in range(3):
+            self.assertIn("dup.txt", self._list_and_settle())
+
+        self.assertEqual(sorted(hashes), [("backend1", "/dup.txt"), ("backend2", "/dup.txt")])
+        self.assertEqual(
+            self.fs._checksum_records[("/dup.txt", "backend2")].basis,
+            (4, (self.backend2_dir / "dup.txt").stat().st_mtime),
+        )
+
+    def test_readdir_rehashes_member_whose_size_changed(self):
+        (self.backend1_dir / "dup.txt").write_text("same")
+        (self.backend2_dir / "dup.txt").write_text("same")
+        hashes = self._hashes()
+        self._list_and_settle()
+        hashes.clear()
+
+        (self.backend2_dir / "dup.txt").write_text("different")
+        self._list_and_settle()
+
+        self.assertEqual(hashes, [("backend2", "/dup.txt")])
+        # The view follows once the new hash is in, from the next listing.
+        self.assertIn("dup.txt.backend2", self._list_and_settle())
+        self.assertEqual(len(hashes), 1)
+
+    def test_readdir_rehashes_member_whose_mtime_changed(self):
+        (self.backend1_dir / "dup.txt").write_text("same")
+        (self.backend2_dir / "dup.txt").write_text("same")
+        hashes = self._hashes()
+        self._list_and_settle()
+        hashes.clear()
+
+        # Same size, different bytes: only the mtime shows the change.
+        target = self.backend2_dir / "dup.txt"
+        before = target.stat().st_mtime
+        target.write_text("diff")
+        os.utime(target, (before + 10, before + 10))
+        self._list_and_settle()
+
+        self.assertEqual(hashes, [("backend2", "/dup.txt")])
+        entries = self._list_and_settle()
+        self.assertIn("dup.txt.backend1", entries)
+        self.assertIn("dup.txt.backend2", entries)
+
+    def test_watcher_invalidation_of_uncached_file_rehashes_it(self):
+        (self.backend1_dir / "dup.txt").write_text("same")
+        (self.backend2_dir / "dup.txt").write_text("same")
+        hashes = self._hashes()
+        self._list_and_settle()
+        hashes.clear()
+
+        self.assertFalse((self.cache_dir / "dup.txt").exists())
+        self.fs._on_remote_change('/dup.txt')
+        self.assertNotIn(("/dup.txt", "backend1"), self.fs._checksum_records)
+        self._list_and_settle()
+
+        self.assertEqual(sorted(hashes), [("backend1", "/dup.txt"), ("backend2", "/dup.txt")])
+
+    def test_invalidation_while_hashing_drops_the_result(self):
+        (self.backend1_dir / "dup.txt").write_text("same")
+        (self.backend2_dir / "dup.txt").write_text("same")
+        started, release = threading.Event(), threading.Event()
+        member = self.backends["backend2"]
+        real = member.get_fast_checksum
+
+        def slow(path):
+            started.set()
+            release.wait(5)
+            return real(path)
+
+        self.fs.namespace.readdir_snapshot_ttl = 0
+        with patch.object(member, "get_fast_checksum", side_effect=slow):
+            list(self.fs.readdir('/', None))
+            self.assertTrue(started.wait(5))
+            running = self.fs._checksum_tasks[("/dup.txt", "backend2")]
+            self.fs._invalidate_file_cache('/dup.txt')
+            release.set()
+            self.assertIsNotNone(running.result(timeout=5))
+            # The done callback runs on the worker after the result is set.
+            time.sleep(0.1)
+
+        self.assertNotIn(("/dup.txt", "backend2"), self.fs._checksum_records)
+
+    def test_rename_and_unlink_forget_recorded_checksums(self):
+        (self.backend1_dir / "sub").mkdir()
+        (self.backend2_dir / "sub").mkdir()
+        for member_dir in (self.backend1_dir, self.backend2_dir):
+            (member_dir / "sub" / "dup.txt").write_text("same")
+            (member_dir / "gone.txt").write_text("same")
+        (self.cache_dir / "sub").mkdir()
+        self._list_and_settle('/sub')
+        self._list_and_settle('/')
+        self.assertIn(("/sub/dup.txt", "backend1"), self.fs._checksum_records)
+        self.assertIn(("/gone.txt", "backend1"), self.fs._checksum_records)
+
+        self.fs.rename('/sub', '/moved')
+        (self.cache_dir / "gone.txt").write_text("same")
+        self.fs.unlink('/gone.txt')
+
+        self.assertEqual(
+            {k for k in self.fs._checksum_records if k[0] in ("/sub/dup.txt", "/gone.txt")},
+            set(),
+        )
+
+    def test_readdir_rehashes_symlinks_every_listing(self):
+        # A symlink's listed attributes are the link's, which do not change
+        # when its target does, so they cannot vouch for a recorded checksum.
+        for member_dir in (self.backend1_dir, self.backend2_dir):
+            (member_dir / "target.txt").write_text("same")
+            (member_dir / "link.txt").symlink_to("target.txt")
+        hashes = self._hashes()
+
+        self._list_and_settle()
+        self._list_and_settle()
+
+        self.assertEqual(sum(1 for h in hashes if h[1] == "/link.txt"), 4)
+        self.assertEqual(sum(1 for h in hashes if h[1] == "/target.txt"), 2)
+
+    def test_conflict_view_survives_skipped_rehash_and_clears_on_change(self):
+        (self.backend1_dir / "dup.txt").write_text("one")
+        (self.backend2_dir / "dup.txt").write_text("two!")
+        hashes = self._hashes()
+
+        self._list_and_settle()
+        for _ in range(2):
+            entries = self._list_and_settle()
+            self.assertIn("dup.txt.backend1", entries)
+            self.assertIn("dup.txt.backend2", entries)
+            self.assertNotIn("dup.txt", entries)
+        self.assertEqual(len(hashes), 2)
+
+        (self.backend2_dir / "dup.txt").write_text("one")
+        self._list_and_settle()
+        entries = self._list_and_settle()
+        self.assertIn("dup.txt", entries)
+        self.assertNotIn("dup.txt.backend2", entries)
+
     def test_dir_cache_scoped_per_instance(self):
         # Populate cache in first instance
         (self.backend1_dir / "onlyfirst.txt").write_text("one")
