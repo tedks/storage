@@ -545,7 +545,14 @@ class TestFSNamespaceIntegration(unittest.TestCase):
         """List path past the snapshot and wait for its checksum tasks."""
         self.fs.namespace.readdir_snapshot_ttl = 0
         entries = set(self.fs.readdir(path, None))
-        self.assertTrue(self._wait_for(lambda: not self.fs._checksum_tasks))
+
+        def settled():
+            # A done callback drops its task and records its result under
+            # the lock; reading outside it could land in between.
+            with self.fs._checksum_lock:
+                return not self.fs._checksum_tasks
+
+        self.assertTrue(self._wait_for(settled))
         return entries
 
     def test_repeated_readdir_hashes_recorded_checksum_once(self):
@@ -557,10 +564,53 @@ class TestFSNamespaceIntegration(unittest.TestCase):
             self.assertIn("dup.txt", self._list_and_settle())
 
         self.assertEqual(sorted(hashes), [("backend1", "/dup.txt"), ("backend2", "/dup.txt")])
+        st = (self.backend2_dir / "dup.txt").stat()
         self.assertEqual(
             self.fs._checksum_records[("/dup.txt", "backend2")].basis,
-            (4, (self.backend2_dir / "dup.txt").stat().st_mtime),
+            (4, st.st_mtime, st.st_ctime),
         )
+
+    def test_readdir_rehashes_member_rewritten_with_same_size_and_mtime(self):
+        # A tagger that preserves mtime: only ctime shows the change, and a
+        # local member's listing carries it.
+        (self.backend1_dir / "dup.txt").write_text("same")
+        (self.backend2_dir / "dup.txt").write_text("same")
+        hashes = self._hashes()
+        self._list_and_settle()
+        hashes.clear()
+
+        target = self.backend2_dir / "dup.txt"
+        before = target.stat()
+        time.sleep(0.02)
+        target.write_text("diff")
+        os.utime(target, ns=(before.st_atime_ns, before.st_mtime_ns))
+        self.assertNotEqual(target.stat().st_ctime, before.st_ctime)
+        self._list_and_settle()
+
+        self.assertEqual(hashes, [("backend2", "/dup.txt")])
+        self.assertIn("dup.txt.backend2", self._list_and_settle())
+
+    def test_hashing_writes_nothing_the_watcher_would_see(self):
+        # Watched members report xattr writes as ATTRIB, and the watcher's
+        # invalidation drops the checksum records. A hash that wrote to the
+        # member would undo itself, and every listing would hash again.
+        (self.backend1_dir / "dup.txt").write_text("same")
+        (self.backend2_dir / "dup.txt").write_text("same")
+        hashes = self._hashes()
+        for name, backend in self.backends.items():
+            for method in ("set_xattr", "write_file", "copy_from_local", "truncate_file"):
+                if hasattr(backend, method):
+                    patcher = patch.object(
+                        backend, method,
+                        side_effect=lambda path, *a, **kw: self.fs._on_remote_change(path),
+                    )
+                    patcher.start()
+                    self.addCleanup(patcher.stop)
+
+        self._list_and_settle()
+        self._list_and_settle()
+
+        self.assertEqual(sorted(hashes), [("backend1", "/dup.txt"), ("backend2", "/dup.txt")])
 
     def test_readdir_rehashes_member_whose_size_changed(self):
         (self.backend1_dir / "dup.txt").write_text("same")
@@ -628,10 +678,13 @@ class TestFSNamespaceIntegration(unittest.TestCase):
             self.assertTrue(started.wait(5))
             running = self.fs._checksum_tasks[("/dup.txt", "backend2")]
             self.fs._invalidate_file_cache('/dup.txt')
+            # Callbacks run in the order added, so this one runs after the
+            # fs's own has decided whether to record.
+            callbacks_done = threading.Event()
+            running.add_done_callback(lambda _: callbacks_done.set())
             release.set()
-            self.assertIsNotNone(running.result(timeout=5))
-            # The done callback runs on the worker after the result is set.
-            time.sleep(0.1)
+            self.assertTrue(callbacks_done.wait(5))
+            self.assertIsNotNone(running.result())
 
         self.assertNotIn(("/dup.txt", "backend2"), self.fs._checksum_records)
 

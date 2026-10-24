@@ -501,7 +501,7 @@ class StorageFS(Operations):
         )
 
     def _record_checksum(self, canonical_path: str, backend_name: str, checksum: str, timestamp: float,
-                         basis: Optional[Tuple[int, float]] = None):
+                         basis: Optional[tuple] = None):
         """Record a checksum for (path, backend) and keep only the latest.
 
         A task still hashing the same key started before this result, so its
@@ -531,10 +531,11 @@ class StorageFS(Operations):
         self.namespace._schedule_directory_checksums(dir_path, backend_entries)
 
     def _schedule_checksum_task(self, backend: Backend, canonical_path: str,
-                                basis: Optional[Tuple[int, float]] = None):
+                                basis: Optional[tuple] = None):
         """Hash canonical_path on backend in the background.
 
-        basis is the member's (st_size, st_mtime) from the listing. A record
+        basis is the member's (st_size, st_mtime, st_ctime) from the listing,
+        st_ctime None where the member does not report it (SFTP). A record
         made from the same basis is still current, so nothing is scheduled;
         without a basis (no listed attributes, or a symlink) the file is
         always hashed again.
@@ -567,24 +568,17 @@ class StorageFS(Operations):
             future.add_done_callback(_record)
 
     def _compute_and_store_checksum(self, backend: Backend, canonical_path: str):
-        """Compute checksum on backend side and store it in the member's xattr.
+        """Compute a checksum on the member side.
 
         Returns (checksum, timestamp), or None when the hash failed; the
-        caller records it in memory.
+        caller records it in memory. Nothing is written to the member: an
+        xattr write raises the watcher's ATTRIB event, whose invalidation
+        would drop the record this hash made, and nothing reads it back
+        (getxattr answers user.storage.checksums from memory).
         """
         try:
             checksum = backend.get_fast_checksum(canonical_path)
-            ts = time.time()
-            # Write to backend xattr (best effort)
-            try:
-                yaml_blob = yaml.dump(
-                    [f"{backend.name}:{checksum}:{ts}"], default_flow_style=False
-                ).encode()
-                backend.set_xattr(canonical_path, self.CHECKSUM_XATTR, yaml_blob)
-            except Exception:
-                pass
-
-            return checksum, ts
+            return checksum, time.time()
         except Exception as exc:
             self.logger.debug("checksum for %s on %s failed: %s", canonical_path, backend.name, exc)
             return None
@@ -1172,13 +1166,6 @@ class StorageFS(Operations):
                         checksum = backend.get_fast_checksum(entry.canonical_path)
                         ts = time.time()
                         self._record_checksum(entry.canonical_path, entry.backend_name, checksum, ts)
-                        try:
-                            yaml_blob = yaml.dump(
-                                [f"{entry.backend_name}:{checksum}:{ts}"], default_flow_style=False
-                            ).encode()
-                            backend.set_xattr(entry.canonical_path, self.CHECKSUM_XATTR, yaml_blob)
-                        except Exception:
-                            pass
                     except Exception as exc:
                         self.logger.error(
                             "direct sync failed for %s on %s: %s",

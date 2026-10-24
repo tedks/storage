@@ -29,7 +29,7 @@ class NamespaceService:
         sync_manager,
         logger,
         resolve_path: Callable[[str], ResolvedPath],
-        schedule_checksum_task: Callable[[Backend, str, Optional[Tuple[int, float]]], None],
+        schedule_checksum_task: Callable[[Backend, str, Optional[tuple]], None],
         partial_suffix: str,
         is_hidden_entry: Callable[[str], bool],
         dir_cache: Dict[str, Dict[str, Set[str]]],
@@ -261,7 +261,8 @@ class NamespaceService:
 
         A directory is skipped by the mode its listing reported; a member is
         asked with isdir only when its listing carried no attributes. A
-        regular file's listed size and mtime go with the task as its basis,
+        regular file's listed size, mtime and ctime (None where the member
+        does not report it) go with the task as its basis,
         so a checksum already recorded from the same basis is not recomputed.
         """
         owners: Dict[str, Set[str]] = {}
@@ -285,7 +286,7 @@ class NamespaceService:
                         continue
                     size, mtime = attrs.get("st_size"), attrs.get("st_mtime")
                     if stat.S_ISREG(mode) and size is not None and mtime is not None:
-                        basis = (size, mtime)
+                        basis = (size, mtime, attrs.get("st_ctime"))
                 else:
                     # No listed mode, or a symlink, which isdir follows. A
                     # symlink's listed attributes are the link's, which do not

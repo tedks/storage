@@ -41,11 +41,12 @@ def fast_checksum_bytes(data: bytes) -> str:
 class ChecksumRecord:
     """Checksum value plus the time it was produced.
 
-    basis is the member's (st_size, st_mtime) from the listing that
-    scheduled the hash, or None when it was not known. A listing that
-    reports the same basis does not hash the file again.
+    basis is the member's (st_size, st_mtime, st_ctime) from the listing
+    that scheduled the hash, or None when it was not known; st_ctime is None
+    where the member does not report it (SFTP). A listing that reports the
+    same basis does not hash the file again.
     """
 
     checksum: str
     timestamp: float
-    basis: Optional[Tuple[int, float]] = None
+    basis: Optional[Tuple[int, float, Optional[float]]] = None
