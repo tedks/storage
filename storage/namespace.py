@@ -1,3 +1,4 @@
+import concurrent.futures
 import errno
 import os
 import stat
@@ -55,8 +56,8 @@ class NamespaceService:
         self.checksum_records = checksum_records
         self.checksum_lock = checksum_lock
         # The listing state below (entry_attrs, readdir_snapshot and the
-        # listings in flight) is guarded by listing_lock, not dir_cache_lock:
-        # a listing holds dir_cache_lock across its member round trips, and
+        # listings in flight) is guarded by listing_lock, not dir_cache_lock,
+        # and where both are taken listing_lock nests inside dir_cache_lock:
         # forget_listed_attrs runs under the cache, index and descriptor
         # locks (eviction and invalidation) or the index lock (a write).
         # listing_lock is a leaf: it is held only for dictionary
@@ -79,6 +80,14 @@ class NamespaceService:
         # Both hold only directories with a listing in flight.
         self._listings_in_flight: Dict[str, int] = {}
         self._listing_generation: Dict[str, int] = {}
+        # One single-thread executor per member lists it concurrently with
+        # the others. A dedicated thread per member keeps one extra member
+        # connection each (SSH clients are per thread) and never has two
+        # listing threads reconnecting the same member. Created on first use,
+        # after FUSE's daemonizing fork, and shut down by shutdown().
+        self._listing_executors: Dict[str, concurrent.futures.ThreadPoolExecutor] = {}
+        self._listing_executors_lock = Lock()
+        self._listing_shut_down = False
 
     @property
     def listing_attrs_ttl(self) -> float:
@@ -298,15 +307,22 @@ class NamespaceService:
                         pass
                 self.schedule_checksum_task(backend, virtual_child, basis)
 
-    def _apply_conflict_view(self, dir_path: str, base_entries: Set[str]) -> Set[str]:
+    def _apply_conflict_view(
+        self,
+        dir_path: str,
+        base_entries: Set[str],
+        backend_entries: Optional[Dict[str, Set[str]]] = None,
+    ) -> Set[str]:
         """
         Convert raw directory entries into conflict-aware view.
 
         If multiple backends contain the same name with differing checksums,
         present them as <name>.<backend>. Otherwise present the plain name.
+        backend_entries defaults to the directory's cached member names.
         """
-        with self.dir_cache_lock:
-            backend_entries = self.dir_cache.get(dir_path, {})
+        if backend_entries is None:
+            with self.dir_cache_lock:
+                backend_entries = dict(self.dir_cache.get(dir_path, {}))
 
         aggregated: Dict[str, Set[str]] = {}
         for backend_name, names in backend_entries.items():
@@ -497,53 +513,140 @@ class NamespaceService:
                     del self._listings_in_flight[path]
                     del self._listing_generation[path]
 
+    def shutdown(self):
+        """Stop the member listing threads; later listings run inline.
+
+        Called from StorageFS.destroy. With nothreads FUSE, destroy runs on
+        the thread that calls readdir, so no listing is in flight then; a
+        worker still blocked in member I/O (a hung member) is not
+        interrupted and ends at its SFTP timeout, as the checksum
+        executor's workers do.
+        """
+        with self._listing_executors_lock:
+            self._listing_shut_down = True
+            executors = list(self._listing_executors.values())
+            self._listing_executors.clear()
+        for executor in executors:
+            executor.shutdown(wait=False, cancel_futures=True)
+
+    def _listing_executor(self, backend_name: str) -> Optional[concurrent.futures.ThreadPoolExecutor]:
+        with self._listing_executors_lock:
+            if self._listing_shut_down:
+                return None
+            executor = self._listing_executors.get(backend_name)
+            if executor is None:
+                executor = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix=f"readdir-{backend_name}",
+                )
+                self._listing_executors[backend_name] = executor
+            return executor
+
+    def _list_member(self, backend: Backend, path: str):
+        """(names, attrs by name or None) for one member, or the exception it raised."""
+        try:
+            attrs = backend.listdir_attrs(path)
+            listed = None
+            if attrs is None:
+                names = set(backend.listdir(path))
+            else:
+                listed = {
+                    name: attr for name, attr in attrs
+                    if not self.is_hidden_entry(name)
+                }
+                names = set(listed)
+            return {e for e in names if not self.is_hidden_entry(e)}, listed
+        except Exception as exc:
+            return exc
+
+    def _submit_member_listings(self, path: str) -> Dict[str, Optional[concurrent.futures.Future]]:
+        """Start listing every member; None means list it inline."""
+        futures: Dict[str, Optional[concurrent.futures.Future]] = {}
+        if len(self.backends) <= 1:
+            return {name: None for name in self.backends}
+        for backend_name, backend in self.backends.items():
+            executor = self._listing_executor(backend_name)
+            future = None
+            if executor is not None:
+                try:
+                    future = executor.submit(self._list_member, backend, path)
+                except RuntimeError:
+                    # shutdown() raced the submit.
+                    future = None
+            futures[backend_name] = future
+        return futures
+
     def _list_members(self, path: str, generation: int) -> List[str]:
         """List the cache and every member, and publish the result unless an
-        invalidation of the directory or a child raced it."""
+        invalidation of the directory or a child raced it.
 
-        cache_path = self.cache_manager.get_cache_path(path)
+        The members are listed concurrently and outside dir_cache_lock; their
+        results are merged under it.
+        """
+
+        futures = self._submit_member_listings(path)
+
         entries: Set[str] = {".", ".."}
+        try:
+            cache_path = self.cache_manager.get_cache_path(path)
+            if cache_path.exists() and cache_path.is_dir():
+                entries.update(
+                    entry for entry in os.listdir(str(cache_path))
+                    if not self.is_hidden_entry(entry)
+                )
+        except BaseException:
+            # No member listing outlives the readdir that started it, so
+            # nothing is in flight once FUSE moves on (shutdown() relies on it).
+            concurrent.futures.wait([f for f in futures.values() if f is not None])
+            raise
 
-        if cache_path.exists() and cache_path.is_dir():
-            entries.update(
-                entry for entry in os.listdir(str(cache_path))
-                if not self.is_hidden_entry(entry)
-            )
+        outcomes = {}
+        for backend_name, future in futures.items():
+            if future is None:
+                outcomes[backend_name] = self._list_member(self.backends[backend_name], path)
+                continue
+            try:
+                outcomes[backend_name] = future.result()
+            except Exception as exc:
+                # Cancelled by shutdown().
+                outcomes[backend_name] = exc
 
         backend_attrs: Dict[str, Dict[str, dict]] = {}
+        member_entries: Dict[str, Set[str]] = {}
         with self.dir_cache_lock:
-            dir_cache = self.dir_cache.setdefault(path, {})
-
-            for backend_name, backend in self.backends.items():
-                try:
-                    attrs = backend.listdir_attrs(path)
-                    if attrs is None:
-                        backend_entries = set(backend.listdir(path))
-                    else:
-                        listed = {
-                            name: attr for name, attr in attrs
-                            if not self.is_hidden_entry(name)
-                        }
-                        backend_entries = set(listed)
-                        backend_attrs[backend_name] = listed
-                    backend_entries = {
-                        e for e in backend_entries if not self.is_hidden_entry(e)
-                    }
-                    entries.update(backend_entries)
-                    dir_cache[backend_name] = backend_entries
-                except Exception as exc:
-                    cached = dir_cache.get(backend_name, set())
-                    if cached:
-                        entries.update(cached)
+            previous = self.dir_cache.get(path, {})
+            for backend_name, outcome in outcomes.items():
+                if isinstance(outcome, Exception):
+                    cached = previous.get(backend_name)
+                    if cached is not None:
+                        # Shared with the previous map: these sets are only
+                        # ever replaced, never mutated in place.
+                        member_entries[backend_name] = cached
                     self.logger.debug(
                         "readdir fallback for %s on backend %s due to %s",
                         path,
                         backend_name,
-                        exc,
+                        outcome,
                     )
+                    continue
+                names, listed = outcome
+                member_entries[backend_name] = names
+                if listed is not None:
+                    backend_attrs[backend_name] = listed
+            # A raced invalidation of the directory dropped its names, and one
+            # of a child changed what this listing saw; either way the result
+            # may predate the change, so it is not stored. A child-only
+            # invalidation leaves the older names in place, which the next
+            # listing replaces.
+            # Checked and stored under listing_lock, so forget_listed_attrs
+            # (which takes only listing_lock) cannot bump in between.
+            with self.listing_lock:
+                if self._listing_generation[path] == generation:
+                    self.dir_cache[path] = member_entries
+        for names in member_entries.values():
+            entries.update(names)
 
-        self._schedule_directory_checksums(path, dir_cache, backend_attrs)
-        visible_entries = self._apply_conflict_view(path, entries)
+        self._schedule_directory_checksums(path, member_entries, backend_attrs)
+        visible_entries = self._apply_conflict_view(path, entries, member_entries)
         ordered_entries = sorted(visible_entries)
 
         with self.listing_lock:

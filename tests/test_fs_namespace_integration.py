@@ -43,6 +43,7 @@ class TestFSNamespaceIntegration(unittest.TestCase):
         )
 
     def tearDown(self):
+        self.fs.namespace.shutdown()
         self.fs.sync_manager.stop()
         self.fs.state_manager.close()
         shutil.rmtree(self.temp_dir, ignore_errors=True)
@@ -318,6 +319,198 @@ class TestFSNamespaceIntegration(unittest.TestCase):
 
         self.assertEqual(namespace._listings_in_flight, {})
         self.assertEqual(namespace._listing_generation, {})
+
+    def _wrap_listdir_attrs(self, backend_name, before=None, after=None):
+        backend = self.backends[backend_name]
+        real = backend.listdir_attrs
+
+        def wrapped(path):
+            if before:
+                before(path)
+            result = real(path)
+            if after:
+                after(path)
+            return result
+
+        return patch.object(backend, "listdir_attrs", side_effect=wrapped)
+
+    def test_readdir_lists_members_concurrently(self):
+        # Each member's listing waits for the other's to start; listed one
+        # after the other, the barrier breaks and both fall back to nothing.
+        (self.backend1_dir / "one.txt").write_text("1")
+        (self.backend2_dir / "two.txt").write_text("2")
+        barrier = threading.Barrier(2, timeout=2)
+        wait = lambda _path: barrier.wait()
+
+        with self._wrap_listdir_attrs("backend1", before=wait), \
+                self._wrap_listdir_attrs("backend2", before=wait):
+            entries = set(self.fs.readdir('/', None))
+
+        self.assertIn("one.txt", entries)
+        self.assertIn("two.txt", entries)
+        self.assertIn("/", self.fs.namespace.entry_attrs)
+        self.assertEqual(set(self.fs.namespace.entry_attrs["/"][1]), {"backend1", "backend2"})
+
+    def test_readdir_lists_members_outside_dir_cache_lock(self):
+        (self.backend1_dir / "one.txt").write_text("1")
+        held = []
+
+        def probe_lock(_path):
+            # Give the caller time to start waiting for this listing; a
+            # caller holding the lock meanwhile never releases it in time.
+            time.sleep(0.2)
+            free = self.fs._dir_cache_lock.acquire(timeout=1)
+            if free:
+                self.fs._dir_cache_lock.release()
+            held.append(not free)
+
+        with self._wrap_listdir_attrs("backend1", before=probe_lock), \
+                self._wrap_listdir_attrs("backend2", before=probe_lock):
+            list(self.fs.readdir('/', None))
+
+        self.assertEqual(held, [False, False])
+
+    def test_readdir_concurrent_member_failure_falls_back_to_last_known(self):
+        (self.backend1_dir / "primed.txt").write_text("1")
+        (self.backend2_dir / "other.txt").write_text("2")
+        list(self.fs.readdir('/', None))
+        # Expire the snapshot and attributes, keeping dir_cache's last names.
+        self.fs._readdir_snapshot.clear()
+        self.fs.namespace.entry_attrs.clear()
+        (self.backend2_dir / "newer.txt").write_text("3")
+
+        with patch.object(self.backends["backend1"], "listdir_attrs", side_effect=RuntimeError("offline")):
+            entries = set(self.fs.readdir('/', None))
+
+        self.assertIn("primed.txt", entries)
+        self.assertIn("newer.txt", entries)
+        # The failed member keeps its last names and contributes no attributes.
+        self.assertEqual(self.fs._dir_cache["/"]["backend1"], {"primed.txt"})
+        self.assertNotIn("backend1", self.fs.namespace.entry_attrs["/"][1])
+        self.assertIn("backend2", self.fs.namespace.entry_attrs["/"][1])
+
+    def test_readdir_does_not_publish_listing_raced_during_member_io(self):
+        # Members are listed outside dir_cache_lock, so an invalidation can
+        # land while one is being listed. Neither the listing nor its names
+        # in dir_cache may outlive it.
+        (self.backend1_dir / "raced.txt").write_text("old")
+
+        def change(_path):
+            (self.backend1_dir / "raced.txt").write_text("newer bytes")
+            self.fs._invalidate_dir_cache_entry('/')
+
+        with self._wrap_listdir_attrs("backend1", after=change):
+            entries = set(self.fs.readdir('/', None))
+
+        self.assertIn("raced.txt", entries)
+        namespace = self.fs.namespace
+        self.assertNotIn('/', namespace.entry_attrs)
+        self.assertNotIn('/', self.fs._readdir_snapshot)
+        self.assertNotIn('/', self.fs._dir_cache)
+        self.assertEqual(namespace._listings_in_flight, {})
+        self.assertEqual(self.fs.getattr('/raced.txt')['st_size'], len("newer bytes"))
+
+    def test_readdir_does_not_store_listing_raced_by_child_invalidation(self):
+        # A watcher event for a child (_on_remote_change) during member I/O
+        # bumps the parent's generation without popping the parent's names.
+        (self.backend1_dir / "kept.txt").write_text("1")
+        list(self.fs.readdir('/', None))
+        previous = self.fs._dir_cache['/']
+        self.fs._readdir_snapshot.clear()
+        self.fs.namespace.entry_attrs.clear()
+        (self.backend1_dir / "child.txt").write_text("new")
+
+        def change(_path):
+            self.fs._invalidate_dir_cache_entry('/child.txt')
+
+        with self._wrap_listdir_attrs("backend1", after=change):
+            entries = set(self.fs.readdir('/', None))
+
+        self.assertIn("child.txt", entries)
+        namespace = self.fs.namespace
+        self.assertNotIn('/', namespace.entry_attrs)
+        self.assertNotIn('/', self.fs._readdir_snapshot)
+        self.assertIs(self.fs._dir_cache['/'], previous)
+        self.assertEqual(namespace._listings_in_flight, {})
+
+    def test_readdir_waits_for_member_listings_when_cache_listing_fails(self):
+        finished = threading.Event()
+
+        def slow(_path):
+            time.sleep(0.3)
+
+        with self._wrap_listdir_attrs("backend1", after=lambda _p: (slow(_p), finished.set())), \
+                patch.object(self.fs.namespace.cache_manager, "get_cache_path",
+                             side_effect=OSError(errno.EIO, "cache unreadable")):
+            with self.assertRaises(OSError):
+                self.fs.namespace.readdir('/')
+            self.assertTrue(finished.is_set())
+
+        self.assertEqual(self.fs.namespace._listings_in_flight, {})
+
+    def test_readdir_does_not_store_listing_raced_by_child_eviction(self):
+        # Evicting or invalidating a cached child (forget_listed_attrs with
+        # removing=True) during member I/O keeps the listing from being
+        # stored; a write (removing=False) must not, or an active writer
+        # would starve listings of its directory.
+        for removing, stored in ((True, False), (False, True)):
+            with self.subTest(removing=removing):
+                (self.backend1_dir / "kept.txt").write_text("1")
+                self.fs._readdir_snapshot.clear()
+                self.fs.namespace.entry_attrs.clear()
+                list(self.fs.readdir('/', None))
+                previous = self.fs._dir_cache['/']
+                self.fs._readdir_snapshot.clear()
+                self.fs.namespace.entry_attrs.clear()
+
+                def evict(_path):
+                    self.fs.namespace.forget_listed_attrs('/kept.txt', removing=removing)
+
+                with self._wrap_listdir_attrs("backend1", after=evict):
+                    list(self.fs.readdir('/', None))
+
+                namespace = self.fs.namespace
+                self.assertEqual('/' in namespace.entry_attrs, stored)
+                self.assertEqual('/' in self.fs._readdir_snapshot, stored)
+                self.assertEqual(self.fs._dir_cache['/'] is previous, not stored)
+
+    def test_readdir_reuses_one_thread_per_member(self):
+        threads = {"backend1": set(), "backend2": set()}
+
+        def record(name):
+            return lambda _path: threads[name].add(threading.current_thread())
+
+        with self._wrap_listdir_attrs("backend1", before=record("backend1")), \
+                self._wrap_listdir_attrs("backend2", before=record("backend2")):
+            for _ in range(3):
+                self.fs._readdir_snapshot.clear()
+                list(self.fs.readdir('/', None))
+
+        self.assertEqual(len(threads["backend1"]), 1)
+        self.assertEqual(len(threads["backend2"]), 1)
+        self.assertNotEqual(threads["backend1"], threads["backend2"])
+        self.assertNotIn(threading.current_thread(), threads["backend1"] | threads["backend2"])
+
+    def test_readdir_lists_inline_after_shutdown(self):
+        (self.backend1_dir / "one.txt").write_text("1")
+        list(self.fs.readdir('/', None))
+        listing_threads = [
+            t for t in threading.enumerate() if t.name.startswith("readdir-backend")
+        ]
+        self.assertTrue(listing_threads)
+
+        self.fs.namespace.shutdown()
+        for thread in listing_threads:
+            thread.join(timeout=5)
+            self.assertFalse(thread.is_alive())
+
+        self.fs._readdir_snapshot.clear()
+        seen = []
+        with self._wrap_listdir_attrs("backend1", before=lambda _p: seen.append(threading.current_thread())):
+            entries = set(self.fs.readdir('/', None))
+        self.assertIn("one.txt", entries)
+        self.assertEqual(seen, [threading.current_thread()])
+        self.assertEqual(self.fs.namespace._listing_executors, {})
 
     def test_conflict_view_invalidation_drops_canonical_listing(self):
         (self.backend1_dir / "dup.txt").write_text("one")

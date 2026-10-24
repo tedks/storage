@@ -1353,6 +1353,7 @@ class StorageFS(Operations):
             self._checksum_executor.shutdown(wait=False, cancel_futures=True)
         except Exception:
             pass
+        self.namespace.shutdown()
 
         # The sweep uses the index; give it a bounded chance to finish before
         # the index closes. If it has not, _sweep_pending stays True, the pid
