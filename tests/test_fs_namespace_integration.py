@@ -410,6 +410,29 @@ class TestFSNamespaceIntegration(unittest.TestCase):
         self.assertEqual(namespace._listings_in_flight, {})
         self.assertEqual(self.fs.getattr('/raced.txt')['st_size'], len("newer bytes"))
 
+    def test_readdir_does_not_store_listing_raced_by_child_invalidation(self):
+        # A watcher event for a child (_on_remote_change) during member I/O
+        # bumps the parent's generation without popping the parent's names.
+        (self.backend1_dir / "kept.txt").write_text("1")
+        list(self.fs.readdir('/', None))
+        previous = self.fs._dir_cache['/']
+        self.fs._readdir_snapshot.clear()
+        self.fs.namespace.entry_attrs.clear()
+        (self.backend1_dir / "child.txt").write_text("new")
+
+        def change(_path):
+            self.fs._invalidate_dir_cache_entry('/child.txt')
+
+        with self._wrap_listdir_attrs("backend1", after=change):
+            entries = set(self.fs.readdir('/', None))
+
+        self.assertIn("child.txt", entries)
+        namespace = self.fs.namespace
+        self.assertNotIn('/', namespace.entry_attrs)
+        self.assertNotIn('/', self.fs._readdir_snapshot)
+        self.assertIs(self.fs._dir_cache['/'], previous)
+        self.assertEqual(namespace._listings_in_flight, {})
+
     def test_readdir_reuses_one_thread_per_member(self):
         threads = {"backend1": set(), "backend2": set()}
 

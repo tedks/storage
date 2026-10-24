@@ -514,7 +514,14 @@ class NamespaceService:
                     del self._listing_generation[path]
 
     def shutdown(self):
-        """Stop the member listing threads; later listings run inline."""
+        """Stop the member listing threads; later listings run inline.
+
+        Called from StorageFS.destroy. With nothreads FUSE, destroy runs on
+        the thread that calls readdir, so no listing is in flight then; a
+        worker still blocked in member I/O (a hung member) is not
+        interrupted and ends at its SFTP timeout, as the checksum
+        executor's workers do.
+        """
         with self._listing_executors_lock:
             self._listing_shut_down = True
             executors = list(self._listing_executors.values())
@@ -606,6 +613,8 @@ class NamespaceService:
                 if isinstance(outcome, Exception):
                     cached = previous.get(backend_name)
                     if cached is not None:
+                        # Shared with the previous map: these sets are only
+                        # ever replaced, never mutated in place.
                         member_entries[backend_name] = cached
                     self.logger.debug(
                         "readdir fallback for %s on backend %s due to %s",
@@ -618,8 +627,11 @@ class NamespaceService:
                 member_entries[backend_name] = names
                 if listed is not None:
                     backend_attrs[backend_name] = listed
-            # An invalidation that raced the listing dropped this directory's
-            # names; storing them again would reinstate what it removed.
+            # A raced invalidation of the directory dropped its names, and one
+            # of a child changed what this listing saw; either way the result
+            # may predate the change, so it is not stored. A child-only
+            # invalidation leaves the older names in place, which the next
+            # listing replaces.
             if self._listing_generation[path] == generation:
                 self.dir_cache[path] = member_entries
         for names in member_entries.values():
