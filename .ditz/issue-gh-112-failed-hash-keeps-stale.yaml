@@ -1,0 +1,24 @@
+id: gh-112-failed-hash-keeps-stale
+title: A failed re-hash leaves the known-stale record in the conflict view
+desc: 'From the #116 council (Claude seat, round 1, nit). This predates #116. When
+  a listing reschedules because the basis changed and the hash then fails, the old
+  record stays, and the conflict view keeps its old split or merge until a hash succeeds.
+  The scheduler now knows the record is stale (basis mismatch), so it could drop it
+  at scheduling time. With no record, _apply_conflict_view shows the plain name.
+
+
+  That is the open choice: when a member''s content is unknown, show the stale split,
+  or the merged name? Both are guesses. Left as is.'
+type: task
+component: performance
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-24T21:34:11-00:00
+references: []
+log_events:
+- time: 2026-10-24T21:34:11-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
