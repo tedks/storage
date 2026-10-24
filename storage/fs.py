@@ -35,7 +35,7 @@ from .replication import ReplicationManager
 from .sync import SyncManager
 from .sync_tasks import DirOperation
 from .recompute import RecomputeEngine
-from .checksums import ChecksumRecord
+from .checksums import ChecksumBasis, ChecksumRecord
 from .pathing import ResolvedPath, resolve_path
 from .namespace import NamespaceService
 from .streaming import PrefetchSession, StreamingReadManager
@@ -192,7 +192,9 @@ class StorageFS(Operations):
             sync_manager=self.sync_manager,
             logger=self.logger,
             resolve_path=lambda path: self._resolve_path(path),
-            schedule_checksum_task=lambda backend, path: self._schedule_checksum_task(backend, path),
+            schedule_checksum_task=lambda backend, path, basis=None: self._schedule_checksum_task(
+                backend, path, basis
+            ),
             partial_suffix=self._PARTIAL_SUFFIX,
             is_hidden_entry=self._is_hidden_entry,
             dir_cache=self._dir_cache,
@@ -328,16 +330,24 @@ class StorageFS(Operations):
         write whose row update was lost: it is marked dirty and kept. The
         cache lock is taken only after the index lock is released, keeping the
         order cache lock, index lock, _fd_lock.
-        """
-        cache_path = self.cache_manager.get_cache_path(virtual_path)
-        if not (cache_path.exists() and cache_path.is_file()):
-            return
 
+        The checksum records for the path go whether or not it is cached, is
+        dirty or has a writer open: they describe the members, which changed.
+        """
         # Resolve canonical path for metadata lookup.  Suffixed conflict
         # paths (e.g. /foo.remote0) store metadata under the canonical
         # path (/foo), so we need to resolve it.
         resolved = self._resolve_path(virtual_path)
         canonical_path = resolved.canonical_path
+        # Records are keyed (canonical_path, backend), so clear both the
+        # virtual_path (which may be suffixed) and the canonical_path to
+        # cover conflict-view caches like /foo.remote0 whose checksums
+        # are stored under /foo.
+        self._forget_checksums({virtual_path, canonical_path})
+
+        cache_path = self.cache_manager.get_cache_path(virtual_path)
+        if not (cache_path.exists() and cache_path.is_file()):
+            return
 
         with self.state_manager.metadata_lock:
             # For canonical paths, check metadata directly.
@@ -371,7 +381,7 @@ class StorageFS(Operations):
 
             if stale:
                 # A write whose row update was lost: keep the file and record
-                # it. The checksum records below still go, the remote changed.
+                # it.
                 self.cache_manager.mark_file_dirty(canonical_path, cache_path)
             else:
                 self.state_manager.remove_file_location(virtual_path, "cache")
@@ -386,23 +396,23 @@ class StorageFS(Operations):
         if not stale:
             self.cache_manager.mark_cache_size_dirty()
 
-        # Clear in-memory checksum records and cancel pending tasks.
-        # Records are keyed (canonical_path, backend), so clear both the
-        # virtual_path (which may be suffixed) and the canonical_path to
-        # cover conflict-view caches like /foo.remote0 whose checksums
-        # are stored under /foo.
-        invalidate_paths = {virtual_path, canonical_path}
+    def _forget_checksums(self, paths: Set[str], subtree: bool = False):
+        """Drop the checksum records and tasks for paths (and, with subtree,
+        everything under them).
+
+        A task that is already running cannot be cancelled; dropping it from
+        _checksum_tasks is what keeps its result from being recorded.
+        """
+        prefixes = tuple(p.rstrip("/") + "/" for p in paths) if subtree else ()
+
+        def matches(path: str) -> bool:
+            return path in paths or (bool(prefixes) and path.startswith(prefixes))
+
         with self._checksum_lock:
-            stale_keys = [k for k in self._checksum_records if k[0] in invalidate_paths]
-            for k in stale_keys:
-                self._checksum_records.pop(k, None)
-            # Cancel pending checksum tasks so they don't re-insert
-            # stale results after we just cleared them.
-            stale_tasks = [k for k in self._checksum_tasks if k[0] in invalidate_paths]
-            for k in stale_tasks:
-                future = self._checksum_tasks.pop(k, None)
-                if future is not None:
-                    future.cancel()
+            for k in [k for k in self._checksum_records if matches(k[0])]:
+                del self._checksum_records[k]
+            for k in [k for k in self._checksum_tasks if matches(k[0])]:
+                self._checksum_tasks.pop(k).cancel()
 
     def _on_remote_change(self, virtual_path: str):
         """
@@ -490,11 +500,21 @@ class StorageFS(Operations):
             backend_names=backend_names,
         )
 
-    def _record_checksum(self, canonical_path: str, backend_name: str, checksum: str, timestamp: float):
-        """Record a checksum for (path, backend) and keep only the latest."""
+    def _record_checksum(self, canonical_path: str, backend_name: str, checksum: str, timestamp: float,
+                         basis: Optional[ChecksumBasis] = None):
+        """Record a checksum for (path, backend) and keep only the latest.
+
+        A task still hashing the same key started before this result, so its
+        result is dropped rather than allowed to replace this one.
+        """
         key = (canonical_path, backend_name)
         with self._checksum_lock:
-            self._checksum_records[key] = ChecksumRecord(checksum=checksum, timestamp=timestamp)
+            superseded = self._checksum_tasks.pop(key, None)
+            if superseded is not None:
+                superseded.cancel()
+            self._checksum_records[key] = ChecksumRecord(
+                checksum=checksum, timestamp=timestamp, basis=basis,
+            )
 
     def _aggregate_checksums_yaml(self, canonical_path: str) -> bytes:
         """Return YAML list of '<backend>:<checksum>:<timestamp>' entries."""
@@ -510,40 +530,58 @@ class StorageFS(Operations):
         """Queue checksum computations for backend collisions in the directory."""
         self.namespace._schedule_directory_checksums(dir_path, backend_entries)
 
-    def _schedule_checksum_task(self, backend: Backend, canonical_path: str):
+    def _schedule_checksum_task(self, backend: Backend, canonical_path: str,
+                                basis: Optional[ChecksumBasis] = None):
+        """Hash canonical_path on backend in the background.
+
+        basis is the member's (st_size, st_mtime, st_ctime) from the listing,
+        st_ctime None where the member does not report it (SFTP). A record
+        made from the same basis is still current, so nothing is scheduled;
+        without a basis (no listed attributes, or a symlink) the file is
+        always hashed again.
+        """
         key = (canonical_path, backend.name)
         with self._checksum_lock:
             if key in self._checksum_tasks:
                 return
+            record = self._checksum_records.get(key)
+            if basis is not None and record is not None and record.basis == basis:
+                return
 
             future = self._checksum_executor.submit(
-                self._compute_and_store_checksum, backend, canonical_path
+                self._compute_checksum, backend, canonical_path
             )
             self._checksum_tasks[key] = future
 
-            def _cleanup(_):
+            def _record(done):
                 with self._checksum_lock:
-                    self._checksum_tasks.pop(key, None)
+                    # Gone or replaced: the path was invalidated while this
+                    # ran, so its result may describe the old file.
+                    if self._checksum_tasks.get(key) is not done:
+                        return
+                    del self._checksum_tasks[key]
+                    result = None if done.cancelled() else done.result()
+                    if result is not None:
+                        checksum, ts = result
+                        self._record_checksum(canonical_path, backend.name, checksum, ts, basis)
 
-            future.add_done_callback(_cleanup)
+            future.add_done_callback(_record)
 
-    def _compute_and_store_checksum(self, backend: Backend, canonical_path: str):
-        """Compute checksum on backend side and store in xattr + memory."""
+    def _compute_checksum(self, backend: Backend, canonical_path: str):
+        """Compute a checksum on the member side.
+
+        Returns (checksum, timestamp), or None when the hash failed; the
+        caller records it in memory. Nothing is written to the member: an
+        xattr write raises the watcher's ATTRIB event, whose invalidation
+        would drop the record this hash made, and nothing reads it back
+        (getxattr answers user.storage.checksums from memory).
+        """
         try:
             checksum = backend.get_fast_checksum(canonical_path)
-            ts = time.time()
-            # Write to backend xattr (best effort)
-            try:
-                yaml_blob = yaml.dump(
-                    [f"{backend.name}:{checksum}:{ts}"], default_flow_style=False
-                ).encode()
-                backend.set_xattr(canonical_path, self.CHECKSUM_XATTR, yaml_blob)
-            except Exception:
-                pass
-
-            self._record_checksum(canonical_path, backend.name, checksum, ts)
+            return checksum, time.time()
         except Exception as exc:
             self.logger.debug("checksum for %s on %s failed: %s", canonical_path, backend.name, exc)
+            return None
 
     def _apply_conflict_view(self, dir_path: str, base_entries: Set[str]) -> Set[str]:
         """
@@ -837,15 +875,30 @@ class StorageFS(Operations):
 
     def rmdir(self, path):
         """Remove a directory"""
-        self.namespace.rmdir(path)
+        try:
+            self.namespace.rmdir(path)
+        finally:
+            self._forget_checksums({self._resolve_path(path).canonical_path}, subtree=True)
 
     def unlink(self, path):
         """Remove a file"""
-        self.namespace.unlink(path)
+        try:
+            self.namespace.unlink(path)
+        finally:
+            self._forget_checksums({self._resolve_path(path).canonical_path})
 
     def rename(self, old, new):
         """Rename a file or directory"""
-        self.namespace.rename(old, new)
+        try:
+            self.namespace.rename(old, new)
+        finally:
+            # Records are keyed by path, so neither name's records (nor, for a
+            # directory, its children's) describe what is there now. Dropping
+            # them is always safe, so a failed rename drops them too.
+            self._forget_checksums(
+                {self._resolve_path(old).canonical_path, self._resolve_path(new).canonical_path},
+                subtree=True,
+            )
         # Open descriptors follow the file (or everything under a renamed
         # directory): write() records against, and eviction and sync look
         # up, the path they carry.
@@ -1113,13 +1166,6 @@ class StorageFS(Operations):
                         checksum = backend.get_fast_checksum(entry.canonical_path)
                         ts = time.time()
                         self._record_checksum(entry.canonical_path, entry.backend_name, checksum, ts)
-                        try:
-                            yaml_blob = yaml.dump(
-                                [f"{entry.backend_name}:{checksum}:{ts}"], default_flow_style=False
-                            ).encode()
-                            backend.set_xattr(entry.canonical_path, self.CHECKSUM_XATTR, yaml_blob)
-                        except Exception:
-                            pass
                     except Exception as exc:
                         self.logger.error(
                             "direct sync failed for %s on %s: %s",

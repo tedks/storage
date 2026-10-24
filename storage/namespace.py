@@ -9,7 +9,7 @@ from typing import Callable, Dict, List, Optional, Set, Tuple
 from fuse import FuseOSError
 
 from .backends.base import Backend
-from .checksums import ChecksumRecord
+from .checksums import ChecksumBasis, ChecksumRecord
 from .models import SyncStatus
 from .pathing import ResolvedPath, canonicalize_virtual_path
 from .sync_tasks import DirOperation
@@ -29,7 +29,7 @@ class NamespaceService:
         sync_manager,
         logger,
         resolve_path: Callable[[str], ResolvedPath],
-        schedule_checksum_task: Callable[[Backend, str], None],
+        schedule_checksum_task: Callable[[Backend, str, Optional[ChecksumBasis]], None],
         partial_suffix: str,
         is_hidden_entry: Callable[[str], bool],
         dir_cache: Dict[str, Dict[str, Set[str]]],
@@ -260,7 +260,10 @@ class NamespaceService:
         """Queue checksum computations for backend collisions in the directory.
 
         A directory is skipped by the mode its listing reported; a member is
-        asked with isdir only when its listing carried no attributes.
+        asked with isdir only when its listing carried no attributes. A
+        regular file's listed size, mtime and ctime (None where the member
+        does not report it) go with the task as its basis,
+        so a checksum already recorded from the same basis is not recomputed.
         """
         owners: Dict[str, Set[str]] = {}
         for backend_name, names in backend_entries.items():
@@ -275,18 +278,25 @@ class NamespaceService:
                 if len(owners.get(name, set())) <= 1:
                     continue
                 virtual_child = str(Path(dir_path) / name)
-                mode = ((backend_attrs or {}).get(backend_name, {}).get(name) or {}).get("st_mode")
+                attrs = (backend_attrs or {}).get(backend_name, {}).get(name) or {}
+                mode = attrs.get("st_mode")
+                basis = None
                 if mode is not None and not stat.S_ISLNK(mode):
                     if stat.S_ISDIR(mode):
                         continue
+                    size, mtime = attrs.get("st_size"), attrs.get("st_mtime")
+                    if stat.S_ISREG(mode) and size is not None and mtime is not None:
+                        basis = (size, mtime, attrs.get("st_ctime"))
                 else:
-                    # No listed mode, or a symlink, which isdir follows.
+                    # No listed mode, or a symlink, which isdir follows. A
+                    # symlink's listed attributes are the link's, which do not
+                    # change with its target, so it gets no basis.
                     try:
                         if backend.isdir(virtual_child):
                             continue
                     except Exception:
                         pass
-                self.schedule_checksum_task(backend, virtual_child)
+                self.schedule_checksum_task(backend, virtual_child, basis)
 
     def _apply_conflict_view(self, dir_path: str, base_entries: Set[str]) -> Set[str]:
         """
