@@ -556,6 +556,7 @@ class SSHBackend(Backend):
                     'st_mode': getattr(attr, 'st_mode', None),
                     'st_size': getattr(attr, 'st_size', 0),
                     'st_mtime': getattr(attr, 'st_mtime', time.time()),
+                    'st_atime': getattr(attr, 'st_atime', None) or getattr(attr, 'st_mtime', time.time()),
                     'st_gid': getattr(attr, 'st_gid', os.getgid()),
                     'st_uid': getattr(attr, 'st_uid', os.getuid()),
                     'st_nlink': getattr(attr, 'st_nlink', 1),

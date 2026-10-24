@@ -11,7 +11,7 @@ from fuse import FuseOSError
 from .backends.base import Backend
 from .checksums import ChecksumRecord
 from .models import SyncStatus
-from .pathing import ResolvedPath
+from .pathing import ResolvedPath, canonicalize_virtual_path
 from .sync_tasks import DirOperation
 
 
@@ -52,6 +52,12 @@ class NamespaceService:
         self.readdir_snapshot_ttl = readdir_snapshot_ttl
         self.checksum_records = checksum_records
         self.checksum_lock = checksum_lock
+        # Per-directory member attributes from the last listing, guarded by
+        # dir_cache_lock: {dir: (monotonic time, {backend: {name: attrs}})}.
+        # getattr answers from it while the listing is within the readdir
+        # TTL, so `ls -l` costs no member round trip per entry. Only hits
+        # are trusted: a name missing from it is still probed.
+        self.entry_attrs: Dict[str, Tuple[float, Dict[str, Dict[str, dict]]]] = {}
 
     def backend_availability(self) -> Tuple[List[str], List[str]]:
         """Return backend names split by current availability."""
@@ -104,6 +110,11 @@ class NamespaceService:
         with self.dir_cache_lock:
             self.dir_cache.pop(path, None)
             self.readdir_snapshot.pop(path, None)
+            self.entry_attrs.pop(path, None)
+            # The path's own attributes live in its parent's listing.
+            parent = canonicalize_virtual_path(str(Path(path).parent))
+            if parent != path:
+                self.entry_attrs.pop(parent, None)
 
     def _get_target_backends(
         self,
@@ -159,8 +170,13 @@ class NamespaceService:
         self,
         dir_path: str,
         backend_entries: Dict[str, Set[str]],
+        backend_attrs: Optional[Dict[str, Dict[str, dict]]] = None,
     ):
-        """Queue checksum computations for backend collisions in the directory."""
+        """Queue checksum computations for backend collisions in the directory.
+
+        A directory is skipped by the mode its listing reported; a member is
+        asked with isdir only when its listing carried no attributes.
+        """
         owners: Dict[str, Set[str]] = {}
         for backend_name, names in backend_entries.items():
             for name in names:
@@ -174,11 +190,16 @@ class NamespaceService:
                 if len(owners.get(name, set())) <= 1:
                     continue
                 virtual_child = str(Path(dir_path) / name)
-                try:
-                    if backend.isdir(virtual_child):
+                mode = ((backend_attrs or {}).get(backend_name, {}).get(name) or {}).get("st_mode")
+                if mode is not None:
+                    if stat.S_ISDIR(mode):
                         continue
-                except Exception:
-                    pass
+                else:
+                    try:
+                        if backend.isdir(virtual_child):
+                            continue
+                    except Exception:
+                        pass
                 self.schedule_checksum_task(backend, virtual_child)
 
     def _apply_conflict_view(self, dir_path: str, base_entries: Set[str]) -> Set[str]:
@@ -258,6 +279,20 @@ class NamespaceService:
             else:
                 backend_iter = list(self.backends.items())
 
+            listed = self._listed_attrs(resolved, backend_iter)
+            if listed is not None:
+                now = time.time()
+                return {
+                    "st_atime": listed.get("st_atime", now),
+                    "st_ctime": listed.get("st_ctime", listed.get("st_mtime", now)),
+                    "st_gid": listed.get("st_gid", os.getgid()),
+                    "st_mode": listed["st_mode"],
+                    "st_mtime": listed.get("st_mtime", now),
+                    "st_nlink": listed.get("st_nlink", 1),
+                    "st_size": listed.get("st_size", 0),
+                    "st_uid": listed.get("st_uid", os.getuid()),
+                }
+
             for backend_name, backend in backend_iter:
                 if not backend:
                     continue
@@ -295,6 +330,31 @@ class NamespaceService:
 
             raise FuseOSError(exc.errno)
 
+    def _listed_attrs(self, resolved: ResolvedPath, backend_iter) -> Optional[dict]:
+        """Attributes of a path from its parent's recent listing, if any.
+
+        Returns the attributes of the first available member, in the order
+        getattr probes them, whose listing (within the readdir TTL) has the
+        name with a known mode; None when no listing does, and the caller
+        probes the members. A member marked unavailable is skipped, as
+        getattr would skip it. Listings come from lstat, so a symlink is
+        left to the members' stat, which follows it.
+        """
+        parent = resolved.parent_dir
+        name = Path(resolved.canonical_path).name
+        with self.dir_cache_lock:
+            listing = self.entry_attrs.get(parent)
+        if not listing or (time.monotonic() - listing[0]) > self.readdir_snapshot_ttl:
+            return None
+        for backend_name, backend in backend_iter:
+            if not backend or not backend.is_available():
+                continue
+            attrs = listing[1].get(backend_name, {}).get(name)
+            mode = attrs.get("st_mode") if attrs else None
+            if mode is not None and not stat.S_ISLNK(mode):
+                return attrs
+        return None
+
     def readdir(self, path: str):
         """Read directory contents."""
         now = time.monotonic()
@@ -312,6 +372,7 @@ class NamespaceService:
                 if not self.is_hidden_entry(entry)
             )
 
+        backend_attrs: Dict[str, Dict[str, dict]] = {}
         with self.dir_cache_lock:
             dir_cache = self.dir_cache.setdefault(path, {})
 
@@ -322,6 +383,10 @@ class NamespaceService:
                         backend_entries = set(backend.listdir(path))
                     else:
                         backend_entries = {name for name, _ in attrs}
+                        backend_attrs[backend_name] = {
+                            name: attr for name, attr in attrs
+                            if not self.is_hidden_entry(name)
+                        }
                     backend_entries = {
                         e for e in backend_entries if not self.is_hidden_entry(e)
                     }
@@ -338,12 +403,14 @@ class NamespaceService:
                         exc,
                     )
 
-        self._schedule_directory_checksums(path, dir_cache)
+        self._schedule_directory_checksums(path, dir_cache, backend_attrs)
         visible_entries = self._apply_conflict_view(path, entries)
         ordered_entries = sorted(visible_entries)
 
         with self.dir_cache_lock:
-            self.readdir_snapshot[path] = (time.monotonic(), ordered_entries)
+            listed_at = time.monotonic()
+            self.readdir_snapshot[path] = (listed_at, ordered_entries)
+            self.entry_attrs[path] = (listed_at, backend_attrs)
 
         return ordered_entries
 

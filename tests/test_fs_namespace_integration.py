@@ -172,6 +172,82 @@ class TestFSNamespaceIntegration(unittest.TestCase):
             list(self.fs.readdir('/', None))
         self.assertEqual(schedule_task.call_count, 2)
 
+    def test_getattr_after_readdir_uses_listing_attrs(self):
+        (self.backend1_dir / "listed.txt").write_text("listed")
+        (self.backend2_dir / "listeddir").mkdir()
+        list(self.fs.readdir('/', None))
+
+        with patch.object(self.backends["backend1"], "stat", side_effect=AssertionError("listed entry was probed")), \
+                patch.object(self.backends["backend2"], "stat", side_effect=AssertionError("listed entry was probed")):
+            file_attrs = self.fs.getattr('/listed.txt')
+            dir_attrs = self.fs.getattr('/listeddir')
+
+        self.assertTrue(stat.S_ISREG(file_attrs['st_mode']))
+        self.assertEqual(file_attrs['st_size'], len("listed"))
+        self.assertEqual(file_attrs['st_mtime'], (self.backend1_dir / "listed.txt").stat().st_mtime)
+        self.assertTrue(stat.S_ISDIR(dir_attrs['st_mode']))
+
+    def test_getattr_listing_attrs_follow_member_order(self):
+        (self.backend1_dir / "both.txt").write_text("one")
+        (self.backend2_dir / "both.txt").write_text("second member")
+        list(self.fs.readdir('/', None))
+
+        self.assertEqual(self.fs.getattr('/both.txt')['st_size'], len("one"))
+        self.assertEqual(self.fs.getattr('/both.txt.backend2')['st_size'], len("second member"))
+
+        self.backends["backend1"].set_available(False)
+        self.assertEqual(self.fs.getattr('/both.txt')['st_size'], len("second member"))
+
+    def test_getattr_probes_members_after_listing_expires(self):
+        self.fs.namespace.readdir_snapshot_ttl = 0.05
+        (self.backend1_dir / "aging.txt").write_text("old")
+        list(self.fs.readdir('/', None))
+        (self.backend1_dir / "aging.txt").write_text("newer bytes")
+        time.sleep(0.1)
+
+        self.assertEqual(self.fs.getattr('/aging.txt')['st_size'], len("newer bytes"))
+
+    def test_getattr_probes_members_after_invalidation(self):
+        (self.backend1_dir / "sub").mkdir()
+        (self.backend1_dir / "sub" / "f.txt").write_text("old")
+        list(self.fs.readdir('/sub', None))
+        (self.backend1_dir / "sub" / "f.txt").write_text("newer bytes")
+
+        self.fs._invalidate_dir_cache_entry('/sub/f.txt')
+        self.assertEqual(self.fs.getattr('/sub/f.txt')['st_size'], len("newer bytes"))
+
+    def test_getattr_probes_unlisted_name(self):
+        list(self.fs.readdir('/', None))
+        (self.backend2_dir / "late.txt").write_text("late")
+
+        self.assertEqual(self.fs.getattr('/late.txt')['st_size'], len("late"))
+
+    def test_getattr_leaves_member_symlink_to_member_stat(self):
+        # Listings are lstat; whether a symlink is followed is the member's
+        # stat's call (SSH follows it), so getattr still asks the member.
+        (self.backend1_dir / "target.txt").write_text("target")
+        (self.backend1_dir / "link.txt").symlink_to("target.txt")
+        list(self.fs.readdir('/', None))
+
+        member = self.backends["backend1"]
+        with patch.object(member, "stat", wraps=member.stat) as member_stat:
+            self.fs.getattr('/link.txt')
+        member_stat.assert_called_once_with('/link.txt')
+
+    def test_readdir_checksum_scheduling_skips_directories_without_isdir(self):
+        (self.backend1_dir / "shared").mkdir()
+        (self.backend2_dir / "shared").mkdir()
+        (self.backend1_dir / "dup.txt").write_text("a")
+        (self.backend2_dir / "dup.txt").write_text("b")
+
+        with patch.object(self.fs, "_schedule_checksum_task") as schedule_task, \
+                patch.object(self.backends["backend1"], "isdir", side_effect=AssertionError("isdir probed")), \
+                patch.object(self.backends["backend2"], "isdir", side_effect=AssertionError("isdir probed")):
+            list(self.fs.readdir('/', None))
+
+        scheduled = sorted((call.args[0].name, call.args[1]) for call in schedule_task.call_args_list)
+        self.assertEqual(scheduled, [("backend1", "/dup.txt"), ("backend2", "/dup.txt")])
+
     def test_dir_cache_scoped_per_instance(self):
         # Populate cache in first instance
         (self.backend1_dir / "onlyfirst.txt").write_text("one")
