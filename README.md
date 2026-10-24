@@ -21,6 +21,17 @@ See [Status](#status) before trusting it with anything.
 
 ## Installation
 
+The flake's default package is the `storage` CLI, with its Python
+dependencies and libfuse 2. Mounting also needs `/dev/fuse` and a setuid
+`fusermount` from the host on `PATH`.
+
+```bash
+nix profile install github:tedks/storage   # or a Home Manager flake input
+storage mount example-media
+```
+
+For development:
+
 ```bash
 # Set up local virtualenv (recommended)
 ./setup-venv.sh
