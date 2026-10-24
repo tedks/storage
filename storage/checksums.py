@@ -13,6 +13,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple
 
+# A member's (st_size, st_mtime, st_ctime) from a listing; st_ctime is None
+# where the member does not report it (SFTP).
+ChecksumBasis = Tuple[int, float, Optional[float]]
+
 import xxhash
 
 # Read buffer: 1 MB chunks for streaming large files.
@@ -49,4 +53,4 @@ class ChecksumRecord:
 
     checksum: str
     timestamp: float
-    basis: Optional[Tuple[int, float, Optional[float]]] = None
+    basis: Optional[ChecksumBasis] = None

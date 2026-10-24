@@ -9,7 +9,7 @@ from typing import Callable, Dict, List, Optional, Set, Tuple
 from fuse import FuseOSError
 
 from .backends.base import Backend
-from .checksums import ChecksumRecord
+from .checksums import ChecksumBasis, ChecksumRecord
 from .models import SyncStatus
 from .pathing import ResolvedPath, canonicalize_virtual_path
 from .sync_tasks import DirOperation
@@ -29,7 +29,7 @@ class NamespaceService:
         sync_manager,
         logger,
         resolve_path: Callable[[str], ResolvedPath],
-        schedule_checksum_task: Callable[[Backend, str, Optional[tuple]], None],
+        schedule_checksum_task: Callable[[Backend, str, Optional[ChecksumBasis]], None],
         partial_suffix: str,
         is_hidden_entry: Callable[[str], bool],
         dir_cache: Dict[str, Dict[str, Set[str]]],

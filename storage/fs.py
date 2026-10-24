@@ -35,7 +35,7 @@ from .replication import ReplicationManager
 from .sync import SyncManager
 from .sync_tasks import DirOperation
 from .recompute import RecomputeEngine
-from .checksums import ChecksumRecord
+from .checksums import ChecksumBasis, ChecksumRecord
 from .pathing import ResolvedPath, resolve_path
 from .namespace import NamespaceService
 from .streaming import PrefetchSession, StreamingReadManager
@@ -501,7 +501,7 @@ class StorageFS(Operations):
         )
 
     def _record_checksum(self, canonical_path: str, backend_name: str, checksum: str, timestamp: float,
-                         basis: Optional[tuple] = None):
+                         basis: Optional[ChecksumBasis] = None):
         """Record a checksum for (path, backend) and keep only the latest.
 
         A task still hashing the same key started before this result, so its
@@ -531,7 +531,7 @@ class StorageFS(Operations):
         self.namespace._schedule_directory_checksums(dir_path, backend_entries)
 
     def _schedule_checksum_task(self, backend: Backend, canonical_path: str,
-                                basis: Optional[tuple] = None):
+                                basis: Optional[ChecksumBasis] = None):
         """Hash canonical_path on backend in the background.
 
         basis is the member's (st_size, st_mtime, st_ctime) from the listing,
@@ -549,7 +549,7 @@ class StorageFS(Operations):
                 return
 
             future = self._checksum_executor.submit(
-                self._compute_and_store_checksum, backend, canonical_path
+                self._compute_checksum, backend, canonical_path
             )
             self._checksum_tasks[key] = future
 
@@ -567,7 +567,7 @@ class StorageFS(Operations):
 
             future.add_done_callback(_record)
 
-    def _compute_and_store_checksum(self, backend: Backend, canonical_path: str):
+    def _compute_checksum(self, backend: Backend, canonical_path: str):
         """Compute a checksum on the member side.
 
         Returns (checksum, timestamp), or None when the hash failed; the
