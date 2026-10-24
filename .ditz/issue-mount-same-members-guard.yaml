@@ -1,0 +1,22 @@
+id: mount-same-members-guard
+title: Refuse a second mount over the same members from another profile
+desc: 'dotfiles ships drynwyn-warez (LAN) and drynwyn-warez-vpn (WireGuard): the same
+  three SSH members reached by different addresses, each with its own cache and index.
+  The mount lock is per cache, so both can be mounted at once and two uncoordinated
+  writers sync to one set of members. The profile file now says to mount one at a
+  time. A guard could key a lock on the members'' identity (e.g. a marker file or
+  host key + path on each member) rather than the cache. Council finding on dotfiles#205,
+  deferred as a feature.'
+type: feature
+component: fs
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-24T17:38:57-00:00
+references: []
+log_events:
+- time: 2026-10-24T17:38:57-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
