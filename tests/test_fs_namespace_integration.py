@@ -288,6 +288,34 @@ class TestFSNamespaceIntegration(unittest.TestCase):
         self.assertNotIn('/', self.fs._readdir_snapshot)
         self.assertEqual(self.fs.getattr('/raced.txt')['st_size'], len("newer bytes"))
 
+    def test_readdir_publishes_listing_despite_unrelated_invalidation(self):
+        (self.backend1_dir / "kept.txt").write_text("kept")
+        (self.backend1_dir / "elsewhere").mkdir()
+        namespace = self.fs.namespace
+        real = namespace._schedule_directory_checksums
+
+        def schedule_then_unrelated_change(*args, **kwargs):
+            real(*args, **kwargs)
+            self.fs._invalidate_dir_cache_entry('/elsewhere/other.txt')
+
+        with patch.object(namespace, "_schedule_directory_checksums", side_effect=schedule_then_unrelated_change):
+            list(self.fs.readdir('/', None))
+
+        self.assertIn('/', namespace.entry_attrs)
+        self.assertIn('/', self.fs._readdir_snapshot)
+        self.assertEqual(namespace._listings_in_flight, {})
+        self.assertEqual(namespace._listing_generation, {})
+
+    def test_conflict_view_invalidation_drops_canonical_listing(self):
+        (self.backend1_dir / "dup.txt").write_text("one")
+        (self.backend2_dir / "dup.txt").write_text("two")
+        list(self.fs.readdir('/', None))
+        (self.backend2_dir / "dup.txt").write_text("changed on two")
+
+        self.fs._invalidate_dir_cache_entry('/dup.txt.backend2')
+
+        self.assertEqual(self.fs.getattr('/dup.txt.backend2')['st_size'], len("changed on two"))
+
     def test_child_invalidation_keeps_sibling_attrs(self):
         (self.backend1_dir / "changed.txt").write_text("old")
         (self.backend1_dir / "sibling.txt").write_text("sibling")

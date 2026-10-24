@@ -56,15 +56,20 @@ class NamespaceService:
         self.checksum_lock = checksum_lock
         # Per-directory member attributes from the last listing, guarded by
         # dir_cache_lock: {dir: (monotonic time, {backend: {name: attrs}})}.
-        # getattr answers from it while the listing is younger than
-        # listing_attrs_ttl, so `ls -l` costs no member round trip per entry.
+        # getattr answers from it until listing_attrs_ttl after the listing
+        # was published, so `ls -l` costs no member round trip per entry.
         # The age is capped even when the readdir TTL is unbounded
         # (watchers): a change that reaches no invalidation (eviction after
-        # a local write, a dropped watcher event) is visible within the cap.
+        # a local write, a dropped watcher event) is visible within the cap
+        # plus the listing's own duration.
         self.entry_attrs: Dict[str, Tuple[float, Dict[str, Dict[str, dict]]]] = {}
-        # Bumped by every invalidation; a listing that raced one is not
-        # published, so it cannot reinstate what the invalidation removed.
-        self._invalidation_generation = 0
+        # Directories being listed, and a generation per such directory that
+        # an invalidation of the directory or of a child bumps. A listing
+        # that raced one is not published, so it cannot reinstate what the
+        # invalidation removed; invalidations elsewhere do not affect it.
+        # Both hold only directories with a listing in flight.
+        self._listings_in_flight: Dict[str, int] = {}
+        self._listing_generation: Dict[str, int] = {}
 
     @property
     def listing_attrs_ttl(self) -> float:
@@ -119,18 +124,24 @@ class NamespaceService:
             path = "/"
         if not path.startswith("/"):
             path = "/" + path
+        # A conflict view's path (/foo.member) is listed under its
+        # canonical name (foo).
+        canonical = self.resolve_path(path).canonical_path
+        parent = canonicalize_virtual_path(str(Path(canonical).parent))
         with self.dir_cache_lock:
-            self._invalidation_generation += 1
+            for listed_dir in {path, parent}:
+                if listed_dir in self._listings_in_flight:
+                    self._listing_generation[listed_dir] += 1
             self.dir_cache.pop(path, None)
             self.readdir_snapshot.pop(path, None)
             self.entry_attrs.pop(path, None)
             # The path's own attributes live in its parent's listing.
-            parent = canonicalize_virtual_path(str(Path(path).parent))
             listing = self.entry_attrs.get(parent) if parent != path else None
             if listing:
-                name = Path(path).name
+                names_to_drop = {Path(path).name, Path(canonical).name}
                 for names in listing[1].values():
-                    names.pop(name, None)
+                    for name in names_to_drop:
+                        names.pop(name, None)
 
     def _get_target_backends(
         self,
@@ -394,7 +405,6 @@ class NamespaceService:
         with self.dir_cache_lock:
             snapshot = self.readdir_snapshot.get(path)
             listing = self.entry_attrs.get(path)
-            generation = self._invalidation_generation
         # A snapshot is reused only while its listing's attributes are also
         # fresh, so the `ls -l` that follows a readdir never probes per entry.
         if (
@@ -404,6 +414,24 @@ class NamespaceService:
             and (now - listing[0]) <= self.listing_attrs_ttl
         ):
             return list(snapshot[1])
+
+        with self.dir_cache_lock:
+            self._listings_in_flight[path] = self._listings_in_flight.get(path, 0) + 1
+            generation = self._listing_generation.setdefault(path, 0)
+        try:
+            return self._list_members(path, generation)
+        finally:
+            with self.dir_cache_lock:
+                remaining = self._listings_in_flight[path] - 1
+                if remaining:
+                    self._listings_in_flight[path] = remaining
+                else:
+                    del self._listings_in_flight[path]
+                    del self._listing_generation[path]
+
+    def _list_members(self, path: str, generation: int) -> List[str]:
+        """List the cache and every member, and publish the result unless an
+        invalidation of the directory or a child raced it."""
 
         cache_path = self.cache_manager.get_cache_path(path)
         entries: Set[str] = {".", ".."}
@@ -451,10 +479,11 @@ class NamespaceService:
         ordered_entries = sorted(visible_entries)
 
         with self.dir_cache_lock:
-            if self._invalidation_generation == generation:
+            if self._listing_generation[path] == generation:
                 listed_at = time.monotonic()
                 self.readdir_snapshot[path] = (listed_at, ordered_entries)
                 self.entry_attrs[path] = (listed_at, backend_attrs)
+            # A snapshot is not reused once its listing has expired, so both go.
             now = time.monotonic()
             expired = [
                 dir_path for dir_path, (at, _) in self.entry_attrs.items()
@@ -462,6 +491,7 @@ class NamespaceService:
             ]
             for dir_path in expired:
                 del self.entry_attrs[dir_path]
+                self.readdir_snapshot.pop(dir_path, None)
 
         return ordered_entries
 
