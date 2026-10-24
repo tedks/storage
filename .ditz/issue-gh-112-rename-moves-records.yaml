@@ -1,0 +1,21 @@
+id: gh-112-rename-moves-records
+title: Move checksum records on rename through the mount instead of dropping them
+desc: 'From the #116 council (Claude seat, round 1, nit). fs.rename now drops the
+  records for both paths and their subtrees, so renaming Videos/Movies re-hashes every
+  duplicated file in it. Moving the records to the new keys would be safe: the basis
+  still checks each record against the next listing (a member whose rename failed,
+  or that has a different file at the new path, shows a different size, mtime or ctime
+  and is re-hashed). Low priority: renames of large duplicated trees are rare.'
+type: task
+component: performance
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-24T21:34:11-00:00
+references: []
+log_events:
+- time: 2026-10-24T21:34:11-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
