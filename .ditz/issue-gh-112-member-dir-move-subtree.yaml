@@ -1,0 +1,32 @@
+id: gh-112-member-dir-move-subtree
+title: A directory moved on a member drops only its own checksum key, not its children's
+desc: 'From the #116 council (Claude seat, round 1, Important; deferred with rationale).
+  inotify reports MOVED_FROM/MOVED_TO for the directory alone. _on_remote_change then
+  forgets only that exact path''s records. So after `mv Photos Photos.old && mv Photos.new
+  Photos` on one member, the /Photos/* records survive.
+
+
+  A surviving record is trusted only when the new file at that path has the same basis:
+  same size, mtime and (local members) ctime. ctime changes on a rename, so local
+  members are safe. On SSH members it needs the same size and the same whole-second
+  mtime, which in practice means the same file, copied with its mtime preserved.
+
+
+  Not fixed in #116, because the obvious fix is wrong: the watcher calls on_change
+  for the parent of every event, so a subtree forget on every call would drop a whole
+  directory''s records on any change inside it, which is the cost #112 removes. A
+  real fix needs the event type (or "is a directory") passed from RemoteWatcher to
+  the callback, then a subtree forget for directory moves and deletes only.'
+type: bugfix
+component: performance
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-24T21:34:11-00:00
+references: []
+log_events:
+- time: 2026-10-24T21:34:11-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
