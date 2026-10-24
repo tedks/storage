@@ -306,6 +306,18 @@ class TestFSNamespaceIntegration(unittest.TestCase):
         self.assertEqual(namespace._listings_in_flight, {})
         self.assertEqual(namespace._listing_generation, {})
 
+    def test_readdir_failure_clears_in_flight_bookkeeping(self):
+        # The in-flight maps are cleaned in a `finally`; a listing that
+        # raises must not leave its directory marked in flight forever.
+        namespace = self.fs.namespace
+
+        with patch.object(namespace, "_list_members", side_effect=RuntimeError("listing failed")):
+            with self.assertRaisesRegex(RuntimeError, "listing failed"):
+                namespace.readdir('/')
+
+        self.assertEqual(namespace._listings_in_flight, {})
+        self.assertEqual(namespace._listing_generation, {})
+
     def test_conflict_view_invalidation_drops_canonical_listing(self):
         (self.backend1_dir / "dup.txt").write_text("one")
         (self.backend2_dir / "dup.txt").write_text("two")
