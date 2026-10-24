@@ -478,6 +478,28 @@ class TestFSNamespaceIntegration(unittest.TestCase):
         # The copy is the only record of the write; getattr reads it.
         self.assertEqual(self.fs.getattr('/written.txt')['st_size'], len(self.NEW))
 
+    def test_write_during_a_listing_does_not_discard_it(self):
+        # Writes come at write rate; a listing must not be thrown away for
+        # each one, or a directory with an active writer is never listed
+        # for long enough to answer getattr. The written copy exists, so the
+        # listing is not consulted for it.
+        self.fs.sync_manager.stop()
+        (self.backend1_dir / "appended.txt").write_bytes(self.OLD)
+        fd = self.fs.open('/appended.txt', os.O_RDWR)
+        namespace = self.fs.namespace
+        real = namespace._schedule_directory_checksums
+
+        def schedule_then_write(*args, **kwargs):
+            real(*args, **kwargs)
+            self.fs.write('/appended.txt', self.NEW, 0, fd)
+
+        with patch.object(namespace, "_schedule_directory_checksums", side_effect=schedule_then_write):
+            list(self.fs.readdir('/', None))
+        self.fs.release('/appended.txt', fd)
+
+        self.assertIn('/', namespace.entry_attrs)
+        self.assertEqual(self.fs.getattr('/appended.txt')['st_size'], len(self.NEW))
+
     def test_forgetting_listing_attrs_does_not_wait_for_a_listing(self):
         # A listing holds dir_cache_lock across its member round trips;
         # eviction and invalidation run under the index and descriptor

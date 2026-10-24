@@ -43,11 +43,12 @@ class CacheManager:
         # written through one after the stat would die with the inode.
         # None (no StorageFS attached: tests, CLI tools) means no descriptors.
         self.descriptor_guard: Optional[Callable[[str], ContextManager[bool]]] = None
-        # Set by StorageFS: NamespaceService.forget_listed_attrs. Called
-        # before a cached file is evicted and when one is recorded dirty, so
-        # getattr never answers for a vanished copy from a directory listing
-        # that may predate its last write. It takes only a leaf lock and is
-        # safe under every lock here. None (no StorageFS) means no listings.
+        # Set by StorageFS: NamespaceService.forget_listed_attrs, which
+        # StorageFS._invalidate_file_cache also calls. Called before a cached
+        # file is evicted and when one is recorded dirty, so getattr never
+        # answers for a vanished copy from a directory listing that may
+        # predate its last write. It takes only a leaf lock and is safe
+        # under every lock here. None (no StorageFS) means no listings.
         self.forget_listed_attrs: Optional[Callable[[str], None]] = None
         self.state_manager = state_manager
         self.max_size_bytes = max_size_bytes
@@ -293,7 +294,7 @@ class CacheManager:
         """
         with self.state_manager.metadata_lock:
             if self.forget_listed_attrs:
-                self.forget_listed_attrs(virtual_path)
+                self.forget_listed_attrs(virtual_path, removing=False)
             generation = self.state_manager.mark_dirty_from_cache_file(virtual_path, cache_path)
             if generation is None:
                 return None

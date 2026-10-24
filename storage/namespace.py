@@ -58,7 +58,8 @@ class NamespaceService:
         # listings in flight) is guarded by listing_lock, not dir_cache_lock:
         # a listing holds dir_cache_lock across its member round trips, and
         # forget_listed_attrs runs under the cache, index and descriptor
-        # locks. listing_lock is a leaf: it is held only for dictionary
+        # locks (eviction and invalidation) or the index lock (a write).
+        # listing_lock is a leaf: it is held only for dictionary
         # updates, never across I/O or while taking another lock.
         self.listing_lock = Lock()
         # Per-directory member attributes from the last listing:
@@ -146,18 +147,28 @@ class NamespaceService:
                 if parent != path:
                     self._forget_listed_name_locked(path, canonical, parent)
 
-    def forget_listed_attrs(self, path: str):
+    def forget_listed_attrs(self, path: str, *, removing: bool = True):
         """Stop answering getattr for a path from its parent's listing.
 
         For a cached copy about to be removed (eviction, watcher
-        invalidation) or just recorded dirty: the listing's attributes may
-        predate a local write, and once the copy is gone getattr would
-        serve them. Drops the canonical name for every member and keeps a
-        listing of the parent in flight from being published, so a listing
-        read before the write was synced cannot put it back. Takes only
-        listing_lock, so it is safe under the cache, index and descriptor
-        locks; callers that remove the copy call it before the unlink, so
-        no getattr sees the copy gone and the name still listed.
+        invalidation; removing=True) or just recorded dirty (removing=False):
+        the listing's attributes may predate a local write, and once the
+        copy is gone getattr would serve them. Drops the canonical name for
+        every member: a conflict copy's invalidation also forgets the plain
+        name and the other members' copies, which costs them a probe and is
+        never wrong.
+
+        When removing, a listing of the parent in flight is also kept from
+        being published, so a listing read before the write was synced
+        cannot put the name back. A write does not do that: it would starve
+        listings of a directory with an active writer, and while the file
+        is dirty its copy exists and getattr never reads the listing; a
+        listing published meanwhile is cleaned up by the removal's forget.
+
+        Takes only listing_lock, so it is safe under the cache, index and
+        descriptor locks. Callers that remove the copy call it before the
+        unlink, so a getattr whose lstat finds the copy gone finds the name
+        gone too (one already past its lstat may still answer from either).
         """
         if not path:
             path = "/"
@@ -168,11 +179,14 @@ class NamespaceService:
         if parent == path:
             return
         with self.listing_lock:
-            self._forget_listed_name_locked(path, canonical, parent)
+            self._forget_listed_name_locked(path, canonical, parent, bump=removing)
 
-    def _forget_listed_name_locked(self, path: str, canonical: str, parent: str):
-        """Drop a path's names from its parent's listing; listing_lock held."""
-        if parent in self._listings_in_flight:
+    def _forget_listed_name_locked(self, path: str, canonical: str, parent: str, *, bump: bool = True):
+        """Drop a path's names from its parent's listing; listing_lock held.
+
+        With bump, a listing of the parent in flight is not published.
+        """
+        if bump and parent in self._listings_in_flight:
             self._listing_generation[parent] += 1
         # The path's own attributes live in its parent's listing, under the
         # canonical name (a conflict view's /foo.member is listed as foo).
