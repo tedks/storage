@@ -16,3 +16,9 @@ log_events:
   who: Ted Smith
   what: created
   comment: ""
+- time: 2026-10-24T19:18:39-00:00
+  who: Ted Smith
+  what: blocked by gh-111-listing-attrs
+  comment: ""
+blocked_by:
+- gh-111-listing-attrs
