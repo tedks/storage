@@ -43,6 +43,7 @@ class TestFSNamespaceIntegration(unittest.TestCase):
         )
 
     def tearDown(self):
+        self.fs.namespace.shutdown()
         self.fs.sync_manager.stop()
         self.fs.state_manager.close()
         shutil.rmtree(self.temp_dir, ignore_errors=True)
@@ -318,6 +319,131 @@ class TestFSNamespaceIntegration(unittest.TestCase):
 
         self.assertEqual(namespace._listings_in_flight, {})
         self.assertEqual(namespace._listing_generation, {})
+
+    def _wrap_listdir_attrs(self, backend_name, before=None, after=None):
+        backend = self.backends[backend_name]
+        real = backend.listdir_attrs
+
+        def wrapped(path):
+            if before:
+                before(path)
+            result = real(path)
+            if after:
+                after(path)
+            return result
+
+        return patch.object(backend, "listdir_attrs", side_effect=wrapped)
+
+    def test_readdir_lists_members_concurrently(self):
+        # Each member's listing waits for the other's to start; listed one
+        # after the other, the barrier breaks and both fall back to nothing.
+        (self.backend1_dir / "one.txt").write_text("1")
+        (self.backend2_dir / "two.txt").write_text("2")
+        barrier = threading.Barrier(2, timeout=2)
+        wait = lambda _path: barrier.wait()
+
+        with self._wrap_listdir_attrs("backend1", before=wait), \
+                self._wrap_listdir_attrs("backend2", before=wait):
+            entries = set(self.fs.readdir('/', None))
+
+        self.assertIn("one.txt", entries)
+        self.assertIn("two.txt", entries)
+        self.assertIn("/", self.fs.namespace.entry_attrs)
+        self.assertEqual(set(self.fs.namespace.entry_attrs["/"][1]), {"backend1", "backend2"})
+
+    def test_readdir_lists_members_outside_dir_cache_lock(self):
+        (self.backend1_dir / "one.txt").write_text("1")
+        held = []
+
+        def probe_lock(_path):
+            free = self.fs._dir_cache_lock.acquire(blocking=False)
+            if free:
+                self.fs._dir_cache_lock.release()
+            held.append(not free)
+
+        with self._wrap_listdir_attrs("backend1", before=probe_lock), \
+                self._wrap_listdir_attrs("backend2", before=probe_lock):
+            list(self.fs.readdir('/', None))
+
+        self.assertEqual(held, [False, False])
+
+    def test_readdir_concurrent_member_failure_falls_back_to_last_known(self):
+        (self.backend1_dir / "primed.txt").write_text("1")
+        (self.backend2_dir / "other.txt").write_text("2")
+        list(self.fs.readdir('/', None))
+        # Expire the snapshot and attributes, keeping dir_cache's last names.
+        self.fs._readdir_snapshot.clear()
+        self.fs.namespace.entry_attrs.clear()
+        (self.backend2_dir / "newer.txt").write_text("3")
+
+        with patch.object(self.backends["backend1"], "listdir_attrs", side_effect=RuntimeError("offline")):
+            entries = set(self.fs.readdir('/', None))
+
+        self.assertIn("primed.txt", entries)
+        self.assertIn("newer.txt", entries)
+        # The failed member keeps its last names and contributes no attributes.
+        self.assertEqual(self.fs._dir_cache["/"]["backend1"], {"primed.txt"})
+        self.assertNotIn("backend1", self.fs.namespace.entry_attrs["/"][1])
+        self.assertIn("backend2", self.fs.namespace.entry_attrs["/"][1])
+
+    def test_readdir_does_not_publish_listing_raced_during_member_io(self):
+        # Members are listed outside dir_cache_lock, so an invalidation can
+        # land while one is being listed. Neither the listing nor its names
+        # in dir_cache may outlive it.
+        (self.backend1_dir / "raced.txt").write_text("old")
+
+        def change(_path):
+            (self.backend1_dir / "raced.txt").write_text("newer bytes")
+            self.fs._invalidate_dir_cache_entry('/')
+
+        with self._wrap_listdir_attrs("backend1", after=change):
+            entries = set(self.fs.readdir('/', None))
+
+        self.assertIn("raced.txt", entries)
+        namespace = self.fs.namespace
+        self.assertNotIn('/', namespace.entry_attrs)
+        self.assertNotIn('/', self.fs._readdir_snapshot)
+        self.assertNotIn('/', self.fs._dir_cache)
+        self.assertEqual(namespace._listings_in_flight, {})
+        self.assertEqual(self.fs.getattr('/raced.txt')['st_size'], len("newer bytes"))
+
+    def test_readdir_reuses_one_thread_per_member(self):
+        threads = {"backend1": set(), "backend2": set()}
+
+        def record(name):
+            return lambda _path: threads[name].add(threading.current_thread())
+
+        with self._wrap_listdir_attrs("backend1", before=record("backend1")), \
+                self._wrap_listdir_attrs("backend2", before=record("backend2")):
+            for _ in range(3):
+                self.fs._readdir_snapshot.clear()
+                list(self.fs.readdir('/', None))
+
+        self.assertEqual(len(threads["backend1"]), 1)
+        self.assertEqual(len(threads["backend2"]), 1)
+        self.assertNotEqual(threads["backend1"], threads["backend2"])
+        self.assertNotIn(threading.current_thread(), threads["backend1"] | threads["backend2"])
+
+    def test_readdir_lists_inline_after_shutdown(self):
+        (self.backend1_dir / "one.txt").write_text("1")
+        list(self.fs.readdir('/', None))
+        listing_threads = [
+            t for t in threading.enumerate() if t.name.startswith("readdir-backend")
+        ]
+        self.assertTrue(listing_threads)
+
+        self.fs.namespace.shutdown()
+        for thread in listing_threads:
+            thread.join(timeout=5)
+            self.assertFalse(thread.is_alive())
+
+        self.fs._readdir_snapshot.clear()
+        seen = []
+        with self._wrap_listdir_attrs("backend1", before=lambda _p: seen.append(threading.current_thread())):
+            entries = set(self.fs.readdir('/', None))
+        self.assertIn("one.txt", entries)
+        self.assertEqual(seen, [threading.current_thread()])
+        self.assertEqual(self.fs.namespace._listing_executors, {})
 
     def test_conflict_view_invalidation_drops_canonical_listing(self):
         (self.backend1_dir / "dup.txt").write_text("one")
