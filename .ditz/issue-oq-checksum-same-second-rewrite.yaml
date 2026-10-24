@@ -47,3 +47,12 @@ log_events:
   who: Ted Smith
   what: created
   comment: ""
+- time: 2026-10-24T21:35:41-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Council round 2 (Claude seat) caveat: SSHBackend''s put sets the member
+    mtime to the upload time, but RsyncBackend runs rsync -a, which copies the cache
+    file''s mtime. On rsync members (SFTP listings, so no ctime), a write through
+    the mount whose mtime was set back with utimens (cp -p, touch -r) can match the
+    old size and mtime. That widens option 3''s case beyond the same-second window
+    for those members. See gh-112-rsync-quickcheck for the related upload bug.'
