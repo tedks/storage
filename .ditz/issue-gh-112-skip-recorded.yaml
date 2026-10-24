@@ -1,0 +1,18 @@
+id: gh-112-skip-recorded
+title: Do not recompute a recorded checksum on every listing
+desc: Skip scheduling a checksum when _checksum_records already holds one for (path,
+  member) whose size/mtime still match the listing; invalidate on watcher events and
+  writes.
+type: bugfix
+component: performance
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-24T19:18:48-00:00
+references: []
+log_events:
+- time: 2026-10-24T19:18:48-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
