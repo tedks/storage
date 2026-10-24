@@ -1,6 +1,7 @@
 import io
 import socket
 import threading
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -354,6 +355,78 @@ class TestSSHBackendThreadedClients(unittest.TestCase):
         self.assertEqual(len(first.sftp_client.open_calls), 0)
         self.assertEqual(len(second.sftp_client.open_calls), 1)
         backend.close()
+
+    def _blocking_first_connect(self, mock_ssh_client_cls):
+        """Make the first client's connect block until the returned event is set."""
+        release = threading.Event()
+        connecting = threading.Event()
+        created = []
+
+        def _factory():
+            client = _FakeSSHClient(_FakeSFTPClient(payload=b""))
+            if not created:
+                def _slow_connect(**_kwargs):
+                    connecting.set()
+                    release.wait(timeout=5)
+                client.connect = _slow_connect
+            created.append(client)
+            return client
+
+        mock_ssh_client_cls.side_effect = _factory
+        return release, connecting, created
+
+    @patch("storage.backends.ssh.paramiko.AutoAddPolicy")
+    @patch("storage.backends.ssh.paramiko.SSHClient")
+    def test_connect_waits_for_another_threads_probe_while_available(self, mock_ssh_client_cls, mock_auto_add_policy):
+        # Two threads connecting an available member at once (a readdir
+        # listing thread and a sync worker) must both get a client: the
+        # second waits for the first's probe instead of failing.
+        _ = mock_auto_add_policy
+        release, connecting, created = self._blocking_first_connect(mock_ssh_client_cls)
+        backend = self._new_backend()
+
+        first = threading.Thread(target=backend._current_clients)
+        first.start()
+        self.assertTrue(connecting.wait(timeout=5))
+        threading.Timer(0.2, release.set).start()
+
+        ssh_client, sftp_client = backend._current_clients()
+
+        first.join(timeout=5)
+        self.assertIsNotNone(ssh_client)
+        self.assertIsNotNone(sftp_client)
+        self.assertEqual(len(created), 2)
+        self.assertTrue(backend.is_available())
+        backend.close()
+
+    @patch("storage.backends.ssh.paramiko.AutoAddPolicy")
+    @patch("storage.backends.ssh.paramiko.SSHClient")
+    def test_connect_fails_fast_during_probe_after_disconnect(self, mock_ssh_client_cls, mock_auto_add_policy):
+        _ = mock_auto_add_policy
+        release, connecting, created = self._blocking_first_connect(mock_ssh_client_cls)
+        backend = SSHBackend(
+            name="ssh0",
+            host="example.local",
+            remote_path="/data",
+            username="test",
+            key_filename="/tmp/id_test",
+            connect_timeout=30.0,
+        )
+        backend.set_available(False)  # retry window already open
+
+        first = threading.Thread(target=backend._current_clients)
+        first.start()
+        try:
+            self.assertTrue(connecting.wait(timeout=5))
+            started = time.monotonic()
+            with self.assertRaises(ConnectionError):
+                backend._current_clients()
+            self.assertLess(time.monotonic() - started, 5.0)
+            self.assertEqual(len(created), 1)
+        finally:
+            release.set()
+            first.join(timeout=5)
+            backend.close()
 
 
 if __name__ == "__main__":

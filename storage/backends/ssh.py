@@ -271,8 +271,14 @@ class SSHBackend(Backend):
                 f"SSH backend {self.name} is temporarily unavailable after a disconnect"
             )
 
-        # Single-probe reconnect gate: one thread probes; others fail fast.
-        if not self._probe_lock.acquire(blocking=False):
+        # Single-probe reconnect gate: one thread probes at a time. After a
+        # disconnect the others fail fast. While the member is believed up,
+        # a probe in progress is most likely another thread's own first
+        # connect (clients are per thread), so wait for it, bounded by the
+        # connect timeout, rather than report the member failed.
+        if not self._probe_lock.acquire(blocking=False) and not (
+            is_available and self._probe_lock.acquire(timeout=self.connect_timeout)
+        ):
             raise ConnectionError(
                 f"SSH backend {self.name} reconnect probe already in progress"
             )
