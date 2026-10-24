@@ -1,0 +1,20 @@
+id: flake-package-version
+title: Flake package version is hard-coded in flake.nix and setup.py
+desc: 'flake.nix packages.storage has version = "0.1.0" and setup.py has version=''0.1.0'';
+  they will drift, and every nightly bump of the storage input in home-manager-config
+  installs a build still called 0.1.0. Option: read the version from setup.py (or
+  a VERSION file) and append self.shortRev or lastModifiedDate. Council nit on #110,
+  deferred: cosmetic, no behaviour depends on it.'
+type: task
+component: packaging
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-24T17:38:57-00:00
+references: []
+log_events:
+- time: 2026-10-24T17:38:57-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
