@@ -1,0 +1,28 @@
+id: gh-112-rsync-quickcheck
+title: rsync -a upload can skip a changed file whose size and mtime match the member's
+desc: 'Found in the #116 council (Claude seat, round 2); this predates #116. RsyncBackend.copy_from_local
+  runs `rsync -a`, and rsync''s quick check compares only size and mtime. A file written
+  through the mount and given an old mtime (`cp -p` or `touch -r` into the mount,
+  both of which call utimens), whose size matches the member''s current copy, is not
+  transferred: the member keeps its old bytes while sync records success. The same
+  blind spot also makes #116''s checksum basis miss the change on rsync members, which
+  list over SFTP and carry no ctime (see oq-checksum-same-second-rewrite).
+
+
+  Fix options: `--checksum` (costly: a full read on both ends), `--ignore-times` (always
+  transfers), or comparing the checksum after the upload. Recommendation: `--ignore-times`
+  for single-file uploads. The mount has already decided the file changed, so rsync''s
+  quick check adds nothing.'
+type: bugfix
+component: sync
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-24T21:35:41-00:00
+references: []
+log_events:
+- time: 2026-10-24T21:35:41-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
