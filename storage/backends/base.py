@@ -170,7 +170,9 @@ class Backend(ABC):
         List directory contents with stat-like attributes in one call.
 
         Returns an iterable of (name, attr_dict) where attr_dict contains
-        st_mode, st_size, st_mtime, st_gid, st_uid, st_nlink.
+        st_mode, st_size, st_mtime, st_gid, st_uid, st_nlink, and st_atime
+        and st_ctime where the member reports them. getattr answers from
+        these while the listing is within the readdir TTL.
 
         Returns None to fall back to listdir + per-entry stat calls.
         Backends should override this to avoid N+1 round trips.

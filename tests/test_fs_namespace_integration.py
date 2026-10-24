@@ -172,6 +172,197 @@ class TestFSNamespaceIntegration(unittest.TestCase):
             list(self.fs.readdir('/', None))
         self.assertEqual(schedule_task.call_count, 2)
 
+    def test_getattr_after_readdir_uses_listing_attrs(self):
+        (self.backend1_dir / "listed.txt").write_text("listed")
+        (self.backend2_dir / "listeddir").mkdir()
+        list(self.fs.readdir('/', None))
+
+        with patch.object(self.backends["backend1"], "stat", side_effect=AssertionError("listed entry was probed")), \
+                patch.object(self.backends["backend2"], "stat", side_effect=AssertionError("listed entry was probed")):
+            file_attrs = self.fs.getattr('/listed.txt')
+            dir_attrs = self.fs.getattr('/listeddir')
+
+        self.assertTrue(stat.S_ISREG(file_attrs['st_mode']))
+        self.assertEqual(file_attrs['st_size'], len("listed"))
+        self.assertEqual(file_attrs['st_mtime'], (self.backend1_dir / "listed.txt").stat().st_mtime)
+        self.assertTrue(stat.S_ISDIR(dir_attrs['st_mode']))
+
+    def test_getattr_listing_attrs_follow_member_order(self):
+        (self.backend1_dir / "both.txt").write_text("one")
+        (self.backend2_dir / "both.txt").write_text("second member")
+        list(self.fs.readdir('/', None))
+
+        self.assertEqual(self.fs.getattr('/both.txt')['st_size'], len("one"))
+        self.assertEqual(self.fs.getattr('/both.txt.backend2')['st_size'], len("second member"))
+
+        self.backends["backend1"].set_available(False)
+        self.assertEqual(self.fs.getattr('/both.txt')['st_size'], len("second member"))
+
+    def test_getattr_probes_members_after_listing_expires(self):
+        self.fs.namespace.readdir_snapshot_ttl = 0.05
+        (self.backend1_dir / "aging.txt").write_text("old")
+        list(self.fs.readdir('/', None))
+        (self.backend1_dir / "aging.txt").write_text("newer bytes")
+        time.sleep(0.1)
+
+        self.assertEqual(self.fs.getattr('/aging.txt')['st_size'], len("newer bytes"))
+
+    def test_getattr_probes_members_after_invalidation(self):
+        (self.backend1_dir / "sub").mkdir()
+        (self.backend1_dir / "sub" / "f.txt").write_text("old")
+        list(self.fs.readdir('/sub', None))
+        (self.backend1_dir / "sub" / "f.txt").write_text("newer bytes")
+
+        self.fs._invalidate_dir_cache_entry('/sub/f.txt')
+        self.assertEqual(self.fs.getattr('/sub/f.txt')['st_size'], len("newer bytes"))
+
+    def test_getattr_probes_unlisted_name(self):
+        list(self.fs.readdir('/', None))
+        (self.backend2_dir / "late.txt").write_text("late")
+
+        self.assertEqual(self.fs.getattr('/late.txt')['st_size'], len("late"))
+
+    def test_getattr_leaves_member_symlink_to_member_stat(self):
+        # Listings are lstat; whether a symlink is followed is the member's
+        # stat's call (SSH follows it), so getattr still asks the member.
+        (self.backend1_dir / "target.txt").write_text("target")
+        (self.backend1_dir / "link.txt").symlink_to("target.txt")
+        list(self.fs.readdir('/', None))
+
+        member = self.backends["backend1"]
+        with patch.object(member, "stat", wraps=member.stat) as member_stat:
+            self.fs.getattr('/link.txt')
+        member_stat.assert_called_once_with('/link.txt')
+
+    def test_readdir_checksum_scheduling_skips_directories_without_isdir(self):
+        (self.backend1_dir / "shared").mkdir()
+        (self.backend2_dir / "shared").mkdir()
+        (self.backend1_dir / "dup.txt").write_text("a")
+        (self.backend2_dir / "dup.txt").write_text("b")
+
+        with patch.object(self.fs, "_schedule_checksum_task") as schedule_task, \
+                patch.object(self.backends["backend1"], "isdir", side_effect=AssertionError("isdir probed")), \
+                patch.object(self.backends["backend2"], "isdir", side_effect=AssertionError("isdir probed")):
+            list(self.fs.readdir('/', None))
+
+        scheduled = sorted((call.args[0].name, call.args[1]) for call in schedule_task.call_args_list)
+        self.assertEqual(scheduled, [("backend1", "/dup.txt"), ("backend2", "/dup.txt")])
+
+    def test_getattr_probes_first_member_listed_without_attrs(self):
+        # The first member decides: a listing without attributes for it means
+        # its stat, not the next member's listing, answers.
+        (self.backend1_dir / "both.txt").write_text("first")
+        (self.backend2_dir / "both.txt").write_text("second member")
+        with patch.object(self.backends["backend1"], "listdir_attrs", return_value=None):
+            list(self.fs.readdir('/', None))
+
+        self.assertEqual(self.fs.getattr('/both.txt')['st_size'], len("first"))
+
+    def test_getattr_probes_listing_with_missing_fields(self):
+        (self.backend1_dir / "partial.txt").write_text("partial")
+        listing = [("partial.txt", {"st_mode": 0o100644, "st_size": None, "st_mtime": None})]
+        with patch.object(self.backends["backend1"], "listdir_attrs", return_value=listing):
+            list(self.fs.readdir('/', None))
+
+        attrs = self.fs.getattr('/partial.txt')
+        self.assertEqual(attrs['st_size'], len("partial"))
+        self.assertIsNotNone(attrs['st_mtime'])
+
+    def test_readdir_does_not_publish_listing_that_raced_invalidation(self):
+        # Members are listed under dir_cache_lock; an invalidation (a watcher
+        # callback) can land between that and publication, while checksums
+        # are scheduled. The listing it raced must not be published.
+        (self.backend1_dir / "raced.txt").write_text("old")
+        namespace = self.fs.namespace
+        real = namespace._schedule_directory_checksums
+
+        def schedule_then_change(*args, **kwargs):
+            real(*args, **kwargs)
+            (self.backend1_dir / "raced.txt").write_text("newer bytes")
+            self.fs._invalidate_dir_cache_entry('/')
+
+        with patch.object(namespace, "_schedule_directory_checksums", side_effect=schedule_then_change):
+            list(self.fs.readdir('/', None))
+
+        self.assertNotIn('/', namespace.entry_attrs)
+        self.assertNotIn('/', self.fs._readdir_snapshot)
+        self.assertEqual(self.fs.getattr('/raced.txt')['st_size'], len("newer bytes"))
+
+    def test_readdir_publishes_listing_despite_unrelated_invalidation(self):
+        (self.backend1_dir / "kept.txt").write_text("kept")
+        (self.backend1_dir / "elsewhere").mkdir()
+        namespace = self.fs.namespace
+        real = namespace._schedule_directory_checksums
+
+        def schedule_then_unrelated_change(*args, **kwargs):
+            real(*args, **kwargs)
+            self.fs._invalidate_dir_cache_entry('/elsewhere/other.txt')
+
+        with patch.object(namespace, "_schedule_directory_checksums", side_effect=schedule_then_unrelated_change):
+            list(self.fs.readdir('/', None))
+
+        self.assertIn('/', namespace.entry_attrs)
+        self.assertIn('/', self.fs._readdir_snapshot)
+        self.assertEqual(namespace._listings_in_flight, {})
+        self.assertEqual(namespace._listing_generation, {})
+
+    def test_conflict_view_invalidation_drops_canonical_listing(self):
+        (self.backend1_dir / "dup.txt").write_text("one")
+        (self.backend2_dir / "dup.txt").write_text("two")
+        list(self.fs.readdir('/', None))
+        (self.backend2_dir / "dup.txt").write_text("changed on two")
+
+        self.fs._invalidate_dir_cache_entry('/dup.txt.backend2')
+
+        self.assertEqual(self.fs.getattr('/dup.txt.backend2')['st_size'], len("changed on two"))
+
+    def test_child_invalidation_keeps_sibling_attrs(self):
+        (self.backend1_dir / "changed.txt").write_text("old")
+        (self.backend1_dir / "sibling.txt").write_text("sibling")
+        list(self.fs.readdir('/', None))
+
+        self.fs._invalidate_dir_cache_entry('/changed.txt')
+        (self.backend1_dir / "changed.txt").write_text("newer bytes")
+
+        with patch.object(self.backends["backend1"], "stat", wraps=self.backends["backend1"].stat) as member_stat:
+            self.assertEqual(self.fs.getattr('/sibling.txt')['st_size'], len("sibling"))
+            self.assertEqual(self.fs.getattr('/changed.txt')['st_size'], len("newer bytes"))
+        member_stat.assert_called_once_with('/changed.txt')
+
+    def test_listing_attrs_age_is_capped_with_unbounded_ttl(self):
+        self.fs.namespace.readdir_snapshot_ttl = float('inf')
+        (self.backend1_dir / "capped.txt").write_text("old")
+        with patch.object(type(self.fs.namespace), "LISTING_ATTRS_MAX_AGE", 0.05):
+            list(self.fs.readdir('/', None))
+            (self.backend1_dir / "capped.txt").write_text("newer bytes")
+            (self.backend1_dir / "appeared.txt").write_text("new")
+            time.sleep(0.1)
+
+            self.assertEqual(self.fs.getattr('/capped.txt')['st_size'], len("newer bytes"))
+            # The snapshot is not reused past the cap either: readdir relists.
+            self.assertIn("appeared.txt", set(self.fs.readdir('/', None)))
+
+    def test_readdir_prunes_expired_listing_attrs(self):
+        (self.backend1_dir / "a").mkdir()
+        (self.backend1_dir / "b").mkdir()
+        self.fs.namespace.readdir_snapshot_ttl = 0.05
+        list(self.fs.readdir('/a', None))
+        time.sleep(0.1)
+        list(self.fs.readdir('/b', None))
+
+        self.assertEqual(set(self.fs.namespace.entry_attrs), {'/b'})
+
+    def test_readdir_checksum_scheduling_follows_symlinked_directories(self):
+        (self.backend1_dir / "real").mkdir()
+        (self.backend2_dir / "real").mkdir()
+        (self.backend1_dir / "linked").symlink_to("real")
+        (self.backend2_dir / "linked").symlink_to("real")
+
+        with patch.object(self.fs, "_schedule_checksum_task") as schedule_task:
+            list(self.fs.readdir('/', None))
+
+        schedule_task.assert_not_called()
+
     def test_dir_cache_scoped_per_instance(self):
         # Populate cache in first instance
         (self.backend1_dir / "onlyfirst.txt").write_text("one")
