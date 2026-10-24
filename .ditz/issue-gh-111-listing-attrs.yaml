@@ -1,0 +1,17 @@
+id: gh-111-listing-attrs
+title: getattr from listing attributes; no isdir per duplicate
+desc: Answer getattr from readdir's listdir_attrs while the snapshot is valid; take
+  duplicated names' mode from the listing instead of isdir. Branch perf/readdir-latency.
+type: bugfix
+component: performance
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-24T19:18:34-00:00
+references: []
+log_events:
+- time: 2026-10-24T19:18:34-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
