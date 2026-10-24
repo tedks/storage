@@ -35,9 +35,14 @@ log_events:
   who: Ted Smith
   what: blocked by gh-112-failed-hash-keeps-stale
   comment: ""
+- time: 2026-10-24T21:35:42-00:00
+  who: Ted Smith
+  what: blocked by gh-112-rsync-quickcheck
+  comment: ""
 blocked_by:
 - gh-112-skip-recorded
 - gh-112-remote-hash-outlives-timeout
 - gh-112-member-dir-move-subtree
 - gh-112-rename-moves-records
 - gh-112-failed-hash-keeps-stale
+- gh-112-rsync-quickcheck
