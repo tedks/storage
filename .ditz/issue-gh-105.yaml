@@ -1,0 +1,27 @@
+id: gh-105
+title: 'gh-105: container-backed real-remote test gate'
+desc: 'Epic for https://github.com/tedks/storage/issues/105: real-remote gate against
+  sshd in Docker containers.'
+type: feature
+component: tests
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: closed
+disposition: fixed
+creation_time: 2026-10-19T18:11:37-00:00
+references: []
+log_events:
+- time: 2026-10-19T18:11:37-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
+- time: 2026-10-19T18:11:38-00:00
+  who: Ted Smith
+  what: blocked by gh-105-lane
+  comment: ""
+- time: 2026-10-19T19:13:49-00:00
+  who: Ted Smith
+  what: 'closed: fixed'
+  comment: 'Container-backed real-remote gate merged in #108 and #109.'
+blocked_by:
+- gh-105-lane

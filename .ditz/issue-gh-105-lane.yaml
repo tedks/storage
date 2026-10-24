@@ -1,0 +1,91 @@
+id: gh-105-lane
+title: Implement the container remote gate (lane mission)
+desc: Lead-tier lane briefed from the issue; owns the PR, its council rounds and gates.
+type: task
+component: tests
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: closed
+disposition: fixed
+creation_time: 2026-10-19T18:11:37-00:00
+references: []
+log_events:
+- time: 2026-10-19T18:11:37-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
+- time: 2026-10-19T18:11:38-00:00
+  who: Ted Smith
+  what: blocks gh-105
+  comment: ""
+- time: 2026-10-19T18:13:49-00:00
+  who: Ted Smith
+  what: started
+  comment: ""
+- time: 2026-10-19T18:13:50-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Lead lane claimed: Claude Code, model claude-opus-5-5 (Lead tier), session
+    62084c27-955f-44e2-833c-839903a28681, worktree storage-feat-container-remote-gate,
+    branch feat/container-remote-gate at e863871.'
+- time: 2026-10-19T18:13:54-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Lane spawned 2026-10-19: Claude Code, Opus 5.5, tmux storage:remote-gate-opus-20261019
+    (pane %786), worktree storage-feat-container-remote-gate on feat/container-remote-gate,
+    briefed from a file; reports to coordinator session storage-06 in the fixed forms
+    (ASSUMPTIONS, LANDED, BLOCKED, NEEDS RULING, READY, DONE). Coordinator merges
+    after READY.'
+- time: 2026-10-19T18:30:43-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'PR #108 head 476b67c: remote gate 6 passed + 1 strict xfail (#106); Docker-down
+    run fails all 7 with ''Docker is unavailable''; 6/6 mutation checks red then restored;
+    bridge fallback verified under pool exhaustion; fast+mounted+resilience gates
+    6/6 pass on 476b67c. Filed #106 (orphaned remote inotifywait) and #107 (known_hosts
+    via accept-new). Mount half delegated to a Sonnet implementer on feat/container-remote-gate-mount
+    (stacked).'
+- time: 2026-10-19T18:46:19-00:00
+  who: Ted Smith
+  what: commented
+  comment: '#108 council at fixpoint after 4 rounds (Claude+Codex; agy empty, quota);
+    record posted on #108; gates 7/7 on ff1d4e9. #109 rebased to c98bfd0 (10 passed,
+    1 xfail), marked ready, council round 1 started.'
+- time: 2026-10-19T19:05:39-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Council fixpoint: #108 ff1d4e9 (4 rounds), #109 6062a63 (4 rounds); agy
+    empty all rounds (quota). Lead acceptance audit (fresh Opus): ACCEPT; follow-ups
+    closed or filed (gh-105-teardown-rm-silent). Open questions filed: oq-remote-gate-push-policy,
+    oq-ssh-known-hosts-surface. Reporting READY.'
+- time: 2026-10-19T19:06:31-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'DONE: shard pushed to off-duty origin/master 9b06000 (waiting/2026-10-19-62084c27-storage-gh105-remote-gate.md).
+    Merge pending with coordinator.'
+- time: 2026-10-19T19:06:58-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'storage-06 acked DONE and assigned one more bounded action: after it reports
+    ''MERGED #108'', rebase #109 onto origin/master, retarget to master, rerun 4 gates,
+    post the record, report READY #109. Waiting for MERGED #108; not rebasing before
+    then.'
+- time: 2026-10-19T19:12:15-00:00
+  who: Ted Smith
+  what: commented
+  comment: '#109 rebased onto master 322412e -> 0531b2e (tree identical to 6062a63),
+    retargeted to master; 7/7 gates pass uncached on 0531b2e; record posted. Reporting
+    READY #109 0531b2e.'
+- time: 2026-10-19T19:13:48-00:00
+  who: Ted Smith
+  what: 'closed: fixed'
+  comment: 'Delivered: PRs #108 and #109 merged (322412e, 80625c2). Lane retired;
+    shard off-duty 9b06000.'
+- time: 2026-10-19T19:15:44-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'RETIRED 2026-10-19: thanked; shard off-duty 9b06000 verified pushed; /exit
+    typed into the empty composer; pane %786 observed gone. Worktrees and branches
+    of the merged stack queued for an enumerated prune.'
+blocks:
+- gh-105

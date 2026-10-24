@@ -25,8 +25,8 @@ type: task
 component: open-questions
 release:
 reporter: Ted Smith <tedks@riseup.net>
-status: unstarted
-disposition:
+status: closed
+disposition: fixed
 creation_time: 2026-10-16T04:48:55-00:00
 references: []
 log_events:
@@ -34,3 +34,16 @@ log_events:
   who: Ted Smith
   what: created
   comment: ""
+- time: 2026-10-18T23:31:55-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Ready to flip as of master 92c02f9 (2026-10-18): #95 (license, scrubbed
+    profile, Status-only README), #100 (intent section and org artifacts), #102 (last
+    home path), #103 (skills out of tree, CONTRIBUTING.md) merged; repo description
+    and topics set; Actions disabled. The CEO accepted that history carries the old
+    profile and the commit email. Remaining: the visibility flip itself, the CEO''s
+    act.'
+- time: 2026-10-18T23:40:34-00:00
+  who: Ted Smith
+  what: 'closed: fixed'
+  comment: Flipped to public 2026-10-18 at master 92c02f9 on the CEO's word.

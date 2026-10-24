@@ -1,0 +1,22 @@
+id: gh-105-teardown-rm-silent
+title: 'Remote gate teardown: warn when docker rm or network rm exits nonzero'
+desc: 'From the lead acceptance audit of #108/#109 (6062a63): the cluster fixture''s
+  teardown (tests/test_remote_system.py, removals loop) runs `docker rm -f -v <id>`
+  and `docker network rm <name>` with check=False. It warns only on a timeout. A nonzero
+  exit (daemon error, a network still in use) is silent, so a leaked storage-test-*
+  object goes unreported. Fix: warnings.warn (or collect and fail at session end)
+  on a nonzero returncode, with Docker''s stderr. Not acceptance-blocking. Small;
+  any lane touching the gate can take it.'
+type: task
+component: tests
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-19T19:05:22-00:00
+references: []
+log_events:
+- time: 2026-10-19T19:05:22-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
