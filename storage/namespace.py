@@ -138,6 +138,9 @@ class NamespaceService:
             # The path's own attributes live in its parent's listing.
             listing = self.entry_attrs.get(parent) if parent != path else None
             if listing:
+                # A real name that itself ends in ".<member>" also drops its
+                # stripped name from the listing. That costs one extra member
+                # stat on the next getattr: conservative, not a bug.
                 names_to_drop = {Path(path).name, Path(canonical).name}
                 for names in listing[1].values():
                     for name in names_to_drop:
