@@ -45,6 +45,10 @@ log_events:
   who: Ted Smith
   what: blocked by gh-111-eviction-nits
   comment: ""
+- time: 2026-10-24T21:48:09-00:00
+  who: Ted Smith
+  what: blocked by gh-111-child-invalidation-churn
+  comment: ""
 blocked_by:
 - gh-111-listing-attrs
 - gh-111-parallel-listing
@@ -52,3 +56,4 @@ blocked_by:
 - gh-111-review-nits
 - gh-111-watcher-reconnect
 - gh-111-eviction-nits
+- gh-111-child-invalidation-churn
