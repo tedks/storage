@@ -49,7 +49,12 @@
           pname = "storage";
           version = "0.1.0";
           pyproject = true;
-          src = self;
+          # Only what setup.py packages, so a docs or tests commit on master
+          # does not rebuild every host's storage.
+          src = pkgs.lib.fileset.toSource {
+            root = ./.;
+            fileset = pkgs.lib.fileset.unions [ ./setup.py ./storage ];
+          };
           build-system = [ python.pkgs.setuptools ];
           dependencies = with python.pkgs; [
             click

@@ -23,10 +23,13 @@ See [Status](#status) before trusting it with anything.
 
 The flake's default package is the `storage` CLI, with its Python
 dependencies and libfuse 2. Mounting also needs `/dev/fuse` and a setuid
-`fusermount` from the host on `PATH`.
+`fusermount` from the host on `PATH`, and the rsync backend and remote
+watcher run the host's `ssh`, `rsync` and (on the member) `inotifywait`.
 
 ```bash
 nix profile install github:tedks/storage   # or a Home Manager flake input
+# Named profiles come from ~/.config/storage/storage.toml; copy
+# storage.example.toml there and edit it first.
 storage mount example-media
 ```
 

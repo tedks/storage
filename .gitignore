@@ -58,3 +58,7 @@ tests/benchmarks/graphs/
 
 # Agent skills live in the dotfiles repo and the global skill directory, not here.
 .claude/skills/
+
+# nix build output links
+/result
+/result-*
