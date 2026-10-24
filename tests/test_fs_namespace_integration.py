@@ -356,7 +356,10 @@ class TestFSNamespaceIntegration(unittest.TestCase):
         held = []
 
         def probe_lock(_path):
-            free = self.fs._dir_cache_lock.acquire(blocking=False)
+            # Give the caller time to start waiting for this listing; a
+            # caller holding the lock meanwhile never releases it in time.
+            time.sleep(0.2)
+            free = self.fs._dir_cache_lock.acquire(timeout=1)
             if free:
                 self.fs._dir_cache_lock.release()
             held.append(not free)
