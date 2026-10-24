@@ -1,0 +1,18 @@
+id: gh-111
+title: Directory listings over SSH members cost a round trip per entry (#111)
+desc: 'Epic for https://github.com/tedks/storage/issues/111: directory listings over
+  SSH members cost a member round trip per entry, three times per ls -la. Report:
+  ~/Projects/storage/latency-report-2026-10-24.md (splinter1).'
+type: bugfix
+component: performance
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-24T19:18:32-00:00
+references: []
+log_events:
+- time: 2026-10-24T19:18:32-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
