@@ -38,8 +38,47 @@
           esac
           echo "  libfuse2:  ''${FUSE_LIBRARY_PATH:-host, via find_library}"
         '';
+
+        # The `storage` CLI, for installing with nix profile or Home Manager.
+        # The same Python as the dev shell and Bazel, which the tests cover.
+        # nixpkgs' fusepy loads nixpkgs' libfuse 2 (FUSE_LIBRARY_PATH still
+        # overrides it), and this Python uses nixpkgs' glibc, so it loads on
+        # any host. Mounting still needs a setuid fusermount from the host on
+        # PATH, as under Environment in AGENTS.md.
+        storage = python.pkgs.buildPythonApplication {
+          pname = "storage";
+          version = "0.1.0";
+          pyproject = true;
+          # Only what setup.py packages, so a docs or tests commit on master
+          # does not rebuild every host's storage.
+          src = pkgs.lib.fileset.toSource {
+            root = ./.;
+            fileset = pkgs.lib.fileset.unions [ ./setup.py ./storage ];
+          };
+          build-system = [ python.pkgs.setuptools ];
+          dependencies = with python.pkgs; [
+            click
+            cryptography
+            fusepy
+            paramiko
+            pyyaml
+            xxhash
+          ];
+          # The suites need FUSE mounts and run under Bazel; see AGENTS.md.
+          doCheck = false;
+          pythonImportsCheck = [ "storage.cli" "storage.fs" "storage.backends.ssh" ];
+          meta = {
+            description = "FUSE meta-filesystem over local and remote storage members";
+            license = pkgs.lib.licenses.agpl3Plus;
+            mainProgram = "storage";
+            platforms = pkgs.lib.platforms.linux;
+          };
+        };
       in
       {
+        packages.default = storage;
+        packages.storage = storage;
+
         devShells.default = pkgs.mkShell {
           packages = [
             pkgs.bazel_7
