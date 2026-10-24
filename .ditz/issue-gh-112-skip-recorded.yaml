@@ -32,5 +32,10 @@ log_events:
     the remote gate. Count run on drynwyn: 0 xxh128sum per listing once all 110 keys
     were recorded, and no key hashed twice. Waiting on #115 to merge, then rebase
     onto master per CTO-LAND-116. In progress until merge.'
+- time: 2026-10-24T22:53:31-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Rebased onto master e34ba83; head 673a77a; gates 7/7 uncached; PR #116
+    marked ready. Waiting for the CTO to merge.'
 blocks:
 - gh-112
