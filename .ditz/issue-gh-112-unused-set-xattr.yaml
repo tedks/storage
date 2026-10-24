@@ -1,0 +1,22 @@
+id: gh-112-unused-set-xattr
+title: Remove or fence Backend.set_xattr now that nothing writes member file xattrs
+desc: 'From the #116 council (Claude seat, round 2, nit). After #116, Backend.set_xattr
+  (base.py, local.py, ssh.py) has no callers in storage/; file_config writes the directory
+  policy xattr through its own path. A member write of an xattr on a file raises the
+  watcher''s ATTRIB event, and that event''s invalidation drops checksum records (the
+  round-1 Critical on #116). Removing the method, or documenting that trap on it,
+  keeps someone from re-adding that write without knowing it. Not done in #116, to
+  keep the backend interface change out of a performance PR.'
+type: task
+component: performance
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-24T21:35:41-00:00
+references: []
+log_events:
+- time: 2026-10-24T21:35:41-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
