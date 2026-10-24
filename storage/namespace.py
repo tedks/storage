@@ -54,14 +54,22 @@ class NamespaceService:
         self.readdir_snapshot_ttl = readdir_snapshot_ttl
         self.checksum_records = checksum_records
         self.checksum_lock = checksum_lock
-        # Per-directory member attributes from the last listing, guarded by
-        # dir_cache_lock: {dir: (monotonic time, {backend: {name: attrs}})}.
+        # The listing state below (entry_attrs, readdir_snapshot and the
+        # listings in flight) is guarded by listing_lock, not dir_cache_lock:
+        # a listing holds dir_cache_lock across its member round trips, and
+        # forget_listed_attrs runs under the cache, index and descriptor
+        # locks. listing_lock is a leaf: it is held only for dictionary
+        # updates, never across I/O or while taking another lock.
+        self.listing_lock = Lock()
+        # Per-directory member attributes from the last listing:
+        # {dir: (monotonic time, {backend: {name: attrs}})}.
         # getattr answers from it until listing_attrs_ttl after the listing
         # was published, so `ls -l` costs no member round trip per entry.
         # The age is capped even when the readdir TTL is unbounded
-        # (watchers): a change that reaches no invalidation (eviction after
-        # a local write, a dropped watcher event) is visible within the cap
-        # plus the listing's own duration.
+        # (watchers): a change that reaches no invalidation (a dropped
+        # watcher event) is visible within the cap plus the listing's own
+        # duration. A cached copy that is evicted, invalidated or written
+        # drops its name at once (forget_listed_attrs).
         self.entry_attrs: Dict[str, Tuple[float, Dict[str, Dict[str, dict]]]] = {}
         # Directories being listed, and a generation per such directory that
         # an invalidation of the directory or of a child bumps. A listing
@@ -129,23 +137,55 @@ class NamespaceService:
         canonical = self.resolve_path(path).canonical_path
         parent = canonicalize_virtual_path(str(Path(canonical).parent))
         with self.dir_cache_lock:
-            for listed_dir in {path, parent}:
-                if listed_dir in self._listings_in_flight:
-                    self._listing_generation[listed_dir] += 1
             self.dir_cache.pop(path, None)
-            self.readdir_snapshot.pop(path, None)
-            self.entry_attrs.pop(path, None)
-            # The path's own attributes live in its parent's listing.
-            listing = self.entry_attrs.get(parent) if parent != path else None
-            if listing:
-                # A real name that itself ends in ".<member>" also drops its
-                # stripped name from the listing. That costs extra member stats
-                # on getattr until the listing refreshes: conservative, not a
-                # bug.
-                names_to_drop = {Path(path).name, Path(canonical).name}
-                for names in listing[1].values():
-                    for name in names_to_drop:
-                        names.pop(name, None)
+            with self.listing_lock:
+                if path in self._listings_in_flight:
+                    self._listing_generation[path] += 1
+                self.readdir_snapshot.pop(path, None)
+                self.entry_attrs.pop(path, None)
+                if parent != path:
+                    self._forget_listed_name_locked(path, canonical, parent)
+
+    def forget_listed_attrs(self, path: str):
+        """Stop answering getattr for a path from its parent's listing.
+
+        For a cached copy about to be removed (eviction, watcher
+        invalidation) or just recorded dirty: the listing's attributes may
+        predate a local write, and once the copy is gone getattr would
+        serve them. Drops the canonical name for every member and keeps a
+        listing of the parent in flight from being published, so a listing
+        read before the write was synced cannot put it back. Takes only
+        listing_lock, so it is safe under the cache, index and descriptor
+        locks; callers that remove the copy call it before the unlink, so
+        no getattr sees the copy gone and the name still listed.
+        """
+        if not path:
+            path = "/"
+        if not path.startswith("/"):
+            path = "/" + path
+        canonical = self.resolve_path(path).canonical_path
+        parent = canonicalize_virtual_path(str(Path(canonical).parent))
+        if parent == path:
+            return
+        with self.listing_lock:
+            self._forget_listed_name_locked(path, canonical, parent)
+
+    def _forget_listed_name_locked(self, path: str, canonical: str, parent: str):
+        """Drop a path's names from its parent's listing; listing_lock held."""
+        if parent in self._listings_in_flight:
+            self._listing_generation[parent] += 1
+        # The path's own attributes live in its parent's listing, under the
+        # canonical name (a conflict view's /foo.member is listed as foo).
+        listing = self.entry_attrs.get(parent)
+        if listing:
+            # A real name that itself ends in ".<member>" also drops its
+            # stripped name from the listing. That costs extra member stats
+            # on getattr until the listing refreshes: conservative, not a
+            # bug.
+            names_to_drop = {Path(path).name, Path(canonical).name}
+            for names in listing[1].values():
+                for name in names_to_drop:
+                    names.pop(name, None)
 
     def _get_target_backends(
         self,
@@ -379,7 +419,7 @@ class NamespaceService:
         """
         parent = resolved.parent_dir
         name = Path(resolved.canonical_path).name
-        with self.dir_cache_lock:
+        with self.listing_lock:
             listing = self.entry_attrs.get(parent)
         if not listing or (time.monotonic() - listing[0]) > self.listing_attrs_ttl:
             return None
@@ -406,7 +446,7 @@ class NamespaceService:
     def readdir(self, path: str):
         """Read directory contents."""
         now = time.monotonic()
-        with self.dir_cache_lock:
+        with self.listing_lock:
             snapshot = self.readdir_snapshot.get(path)
             listing = self.entry_attrs.get(path)
         # A snapshot is reused only while its listing's attributes are also
@@ -419,13 +459,13 @@ class NamespaceService:
         ):
             return list(snapshot[1])
 
-        with self.dir_cache_lock:
+        with self.listing_lock:
             self._listings_in_flight[path] = self._listings_in_flight.get(path, 0) + 1
             generation = self._listing_generation.setdefault(path, 0)
         try:
             return self._list_members(path, generation)
         finally:
-            with self.dir_cache_lock:
+            with self.listing_lock:
                 remaining = self._listings_in_flight[path] - 1
                 if remaining:
                     self._listings_in_flight[path] = remaining
@@ -482,7 +522,7 @@ class NamespaceService:
         visible_entries = self._apply_conflict_view(path, entries)
         ordered_entries = sorted(visible_entries)
 
-        with self.dir_cache_lock:
+        with self.listing_lock:
             if self._listing_generation[path] == generation:
                 listed_at = time.monotonic()
                 self.readdir_snapshot[path] = (listed_at, ordered_entries)
