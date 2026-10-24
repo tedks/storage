@@ -1,0 +1,21 @@
+id: flake-nixpkgs-bump
+title: Bump the storage flake's nixpkgs lock (2025-11-30)
+desc: 'flake.lock pins nixpkgs 2d293cb (2025-11-30). Since #110 the packaged CLI is
+  built from it on every Home Manager host, which carries a second, year-old nixpkgs
+  closure (python311, glibc) next to home-manager-config''s. Bump it, rerun all three
+  gates (the dev shell''s Bazel/JDK/Python also come from it) and the libfuse loading
+  notes in AGENTS.md (the GLIBC_2.38 example names the current lock). Council nit
+  on #110.'
+type: task
+component: packaging
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-24T17:38:57-00:00
+references: []
+log_events:
+- time: 2026-10-24T17:38:57-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
