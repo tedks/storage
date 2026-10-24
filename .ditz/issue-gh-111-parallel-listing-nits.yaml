@@ -35,5 +35,14 @@ log_events:
   who: Ted Smith
   what: blocks gh-111
   comment: ""
+- time: 2026-10-24T23:05:53-00:00
+  who: Ted Smith
+  what: commented
+  comment: '3. (Claude seat, rebase-resolution round) Eviction churn: when evictions
+    under cache pressure keep bumping a directory''s listing generation, every listing
+    of it is raced; if the directory has no earlier dir_cache entry, nothing is stored
+    and a later member failure has no names to fall back on. A corner of #115''s ''raced
+    listing is not published'' rule, not a correctness bug. See also gh-111-child-invalidation-churn,
+    whose per-name fix would cover it.'
 blocks:
 - gh-111
