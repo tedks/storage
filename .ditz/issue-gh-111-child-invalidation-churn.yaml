@@ -1,0 +1,32 @@
+id: gh-111-child-invalidation-churn
+title: 'readdir: a child''s watcher churn discards every listing of its parent'
+desc: 'From council round 1 on PR #117 (Claude seat, nit 1). Deferred: close to #113''s
+  behaviour, not a regression of #117.
+
+
+  MODIFY is in the watcher''s _CHANGE_EVENTS (storage/watcher.py), so a file being
+  written remotely in directory D invalidates D/child on every event, which bumps
+  D''s listing generation. Every listing of D that overlaps an event then publishes
+  no snapshot, no entry_attrs and (since #117) no dir_cache update, so `ls -l` of
+  D falls back to per-entry member stats for as long as the write lasts. Under #113
+  the invalidation queued behind dir_cache_lock and usually bumped the generation
+  before publish anyway.
+
+
+  Possible fix: record the invalidated child names per in-flight directory and drop
+  just those from the listing (and its attrs) at publish, instead of refusing the
+  whole listing; refuse only when D itself was invalidated. Needs a test with watcher-style
+  churn.'
+type: task
+component: performance
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-24T21:48:08-00:00
+references: []
+log_events:
+- time: 2026-10-24T21:48:08-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
