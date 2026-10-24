@@ -28,5 +28,12 @@ log_events:
   who: Ted Smith
   what: blocks gh-111
   comment: ""
+- time: 2026-10-24T21:22:17-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Round 2 (Claude seat), optional: an end-to-end test of listing in flight,
+    then write, publish, sync and evict, asserting that getattr returns the new size.
+    It would pin the exact interleaving behind removing=False. test_eviction_forgets_listing_attrs
+    covers the eviction half.'
 blocks:
 - gh-111
