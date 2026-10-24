@@ -49,7 +49,7 @@ class CacheManager:
         # answers for a vanished copy from a directory listing that may
         # predate its last write. It takes only a leaf lock and is safe
         # under every lock here. None (no StorageFS) means no listings.
-        self.forget_listed_attrs: Optional[Callable[[str], None]] = None
+        self.forget_listed_attrs: Optional[Callable[..., None]] = None
         self.state_manager = state_manager
         self.max_size_bytes = max_size_bytes
         self._lock = threading.RLock()
@@ -289,7 +289,9 @@ class CacheManager:
         xattr run under the index lock, so concurrent writers record their
         stats in update order and mirror their rows in the same order.
         The path's listing attributes are forgotten first: they describe the
-        member copy, which no longer matches. Returns the new generation, or
+        member copy, which no longer matches. A listing in flight is still
+        published (removing=False; see NamespaceService.forget_listed_attrs).
+        Returns the new generation, or
         None when the path has no row.
         """
         with self.state_manager.metadata_lock:
