@@ -1,0 +1,49 @@
+id: gh-112-remote-hash-outlives-timeout
+title: Remote xxh128sum outlives its caller; checksum wait is unbounded and its fallback
+  downloads the file
+desc: 'Second point of #112 (https://github.com/tedks/storage/issues/112), out of
+  scope for gh-112-skip-recorded.
+
+
+  SSHBackend.get_fast_checksum (storage/backends/ssh.py) runs `xxh128sum` with exec_command(timeout=sftp_operation_timeout).
+  Two things, found reading it on 2026-10-24 (checksum-rehash lane):
+
+
+  1. The timeout bounds only channel reads. `stdout.channel.recv_exit_status()` waits
+  for the exit status without any timeout, so the call can block a checksum executor
+  worker (4 workers) for as long as the remote hash runs. When the channel does fail
+  or close, the remote xxh128sum keeps running on the member, like the remote inotifywait
+  in #106.
+
+  2. Any exception in that path (a timeout, a channel error) falls through to the
+  download-and-hash fallback: copy_to_local of the whole file into a temp file, then
+  a local hash. For multi-GB files over the VPN that is a full download per failed
+  hash, and the guarded harness does not block it (it is a read).
+
+
+  Options: (a) bound the wait (poll exit_status_ready with a deadline), close the
+  channel and kill the remote process (run it under `timeout` on the remote, or record
+  its pid), and give up instead of downloading; (b) keep the fallback only for members
+  without xxh128sum (rc 127), never for a timeout. Recommendation: both, with a per-file
+  give-up so a file that keeps timing out is not retried every listing (gh-112-skip-recorded
+  skips only recorded checksums; a failed hash records nothing and is retried on the
+  next listing).'
+type: bugfix
+component: performance
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-24T21:17:16-00:00
+references: []
+log_events:
+- time: 2026-10-24T21:17:16-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
+- time: 2026-10-24T21:17:17-00:00
+  who: Ted Smith
+  what: blocks gh-112
+  comment: ""
+blocks:
+- gh-112

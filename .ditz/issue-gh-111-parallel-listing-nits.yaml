@@ -1,0 +1,39 @@
+id: gh-111-parallel-listing-nits
+title: 'PR #117 council nits (parallel listing)'
+desc: 'Remaining nits from the PR #117 council (fixpoint reached in round 3; nothing
+  Critical or Important remains).
+
+
+  1. (Claude seat, round 3) storage/namespace.py, the member result loop in _list_members:
+  future.result() catches only Exception, so a BaseException such as KeyboardInterrupt
+  reaching the FUSE thread there leaves the remaining member futures in flight. The
+  comment added in 01ca533 ("No member listing outlives the readdir that started it")
+  is therefore exact only for the cache-listing path. Either wrap the cache listing,
+  the result loop and the merge in one try/except BaseException that waits for every
+  outstanding future, or narrow the comment. Very unlikely in a daemonized nothreads
+  mount, so it was deferred rather than rerunning the gates for a comment.
+
+  2. (Codex seat, round 2) test_readdir_does_not_store_listing_raced_by_child_invalidation
+  runs the invalidation in the listing worker''s hook rather than in an independent
+  watcher thread. It proves the generation check for that ordering only; the lock
+  behaviour is covered separately by test_readdir_lists_members_outside_dir_cache_lock.
+  A watcher-thread variant would strengthen it.'
+type: task
+component: performance
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-24T21:56:23-00:00
+references: []
+log_events:
+- time: 2026-10-24T21:56:23-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
+- time: 2026-10-24T21:56:23-00:00
+  who: Ted Smith
+  what: blocks gh-111
+  comment: ""
+blocks:
+- gh-111

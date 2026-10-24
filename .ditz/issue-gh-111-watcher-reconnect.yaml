@@ -1,0 +1,68 @@
+id: gh-111-watcher-reconnect
+title: Revalidate listing state (and cached files) after a watcher outage
+desc: 'Evaluated in lane listing-eviction (gh-111-eviction-drops-listing) and deferred:
+  not clean enough to do there.
+
+
+  With watchers on, the readdir TTL is unbounded and remote changes reach the mount
+  only as inotify events. RemoteWatcher._watch_loop restarts inotifywait after it
+  exits, with backoff up to 300 s, and every event in that gap is lost. Events are
+  also lost while the new inotifywait is still setting up its recursive watches.
+
+
+  Clearing entry_attrs and readdir_snapshot on reconnect would gain little. Since
+  #113, a snapshot is reused only while its listing is under LISTING_ATTRS_MAX_AGE
+  (5 s) old, so an outage already leaves names and attributes stale for at most 5
+  s plus a listing''s duration.
+
+
+  What the outage really leaves stale is unbounded. dir_cache (the listing fallback
+  when a member errors) stays stale, and so do the CLEAN cached files a lost event
+  would have invalidated (_invalidate_file_cache), until the next event for that path,
+  if one ever comes.
+
+
+  A correct hook needs:
+
+  - a reconnect signal raised once inotifywait reports "Watches established", not
+  when the process starts. Its stderr is a PIPE that is read only at exit today, so
+  a watch loop that long would also have to drain it;
+
+  - a decision on what to revalidate, which is a product and design call: drop every
+  CLEAN cached file under the watched roots (expensive refetches), compare cached
+  rows against member stats (a listing walk), or clear the listing state only (a cheap
+  but small gain).
+
+
+  Recommendation: an on_resync callback from RemoteWatcher, fired when the watches
+  are established after any restart other than the first. StorageFS clears dir_cache,
+  readdir_snapshot and entry_attrs on it, and the cached-file policy is decided separately.
+  Any watcher.py change needs the remote gate.'
+type: task
+component: performance
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-24T21:01:16-00:00
+references: []
+log_events:
+- time: 2026-10-24T21:01:16-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
+- time: 2026-10-24T21:01:16-00:00
+  who: Ted Smith
+  what: blocks gh-111
+  comment: ""
+- time: 2026-10-24T21:34:19-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'From #116 (checksum skip): once #116 lands, checksum records outlive listings.
+    Whatever a watcher reconnect revalidates (oq-watcher-outage-cache-policy), it
+    should also drop the checksum records of the reconnecting watcher''s members,
+    under StorageFS._checksum_lock (keys are (canonical_path, member)). That is cheap
+    and closes the outage gap for conflict detection. The next listing re-hashes duplicated
+    files once.'
+blocks:
+- gh-111

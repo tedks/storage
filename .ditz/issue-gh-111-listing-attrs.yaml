@@ -34,6 +34,16 @@ log_events:
     fixpoint in round 3. Gates (fast, mounted, resilience) pass on 8edacc5. Remote
     gate not run (no Docker on splinter1); required before merge. Left in_progress
     pending merge.'
+- time: 2026-10-24T20:52:43-00:00
+  who: Ted Smith
+  what: started
+  comment: ""
+- time: 2026-10-24T21:30:05-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'gates-113 (framework0): 8edacc5 fast/mounted/resilience 6/6 pass, remote
+    gate pass. LAN measurement (0.35 ms RTT): ls -la Videos/Movies 0.21 s -> 0.04
+    s, SFTP stat 742 -> 2-3. Posted: https://github.com/tedks/storage/pull/113#issuecomment-6389771381'
 - time: 2026-10-24T22:23:56-00:00
   who: Ted Smith
   what: 'closed: fixed'

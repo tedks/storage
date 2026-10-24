@@ -1,0 +1,40 @@
+id: oq-watcher-outage-cache-policy
+title: What should a watcher reconnect revalidate in the cache?
+desc: 'Context: gh-111-watcher-reconnect. With watchers on, remote changes made while
+  inotifywait is down (up to 300 s of backoff) are lost. A CLEAN cached file whose
+  remote copy changed in that gap stays stale until another event for the same path
+  arrives.
+
+
+  Options:
+
+  1. Clear the listing state only (dir_cache, readdir_snapshot, entry_attrs). Cheap,
+  and it leaves stale cached files stale.
+
+  2. Additionally, stat every CLEAN cached file under the watched roots against its
+  members, and invalidate the ones that differ. Each reconnect then costs one member
+  stat per cached file, or a listing walk.
+
+  3. Additionally, drop every CLEAN cached file under the watched roots. This is simple
+  and correct, but every reconnect refetches the working set.
+
+
+  Recommendation: 2, done in the background after the watches are established, with
+  1 at once.
+
+  Who decides: Ted (cache-consistency policy).
+
+  Blocks: gh-111-watcher-reconnect beyond option 1. Does not block gh-111-eviction-drops-listing.'
+type: task
+component: open-questions
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-24T21:01:26-00:00
+references: []
+log_events:
+- time: 2026-10-24T21:01:26-00:00
+  who: Ted Smith
+  what: created
+  comment: ""

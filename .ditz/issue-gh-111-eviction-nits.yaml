@@ -1,0 +1,39 @@
+id: gh-111-eviction-nits
+title: 'Listing-eviction review nits (PR #115)'
+desc: "Nits from the PR #115 council (round 1), deferred with rationale:\n\n1. namespace.unlink
+  and namespace.rename remove or rename the cache entry before invalidate_dir_cache_entry.
+  rename propagates to members first, over SSH. In that gap, getattr(old) can answer
+  from the listing. This is not a regression: the members still hold the name until
+  the propagation, so a member probe would answer the same. For consistency with \"forget
+  before unlink\", invalidate before touching the cache copy.\n2. Tests:\n   - test_eviction_keeps_a_racing_listing_unpublished
+  evicts after the member loop (from _schedule_directory_checksums), not during it.\n
+  \  - The lock test holds _dir_cache_lock on the test thread instead of inside a
+  real listing.\n   A two-thread barrier test would give stronger evidence (Codex),
+  and the lock test could also assert that a listing which started before the eviction
+  ends up unpublished (Claude)."
+type: task
+component: performance
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-24T21:14:19-00:00
+references: []
+log_events:
+- time: 2026-10-24T21:14:19-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
+- time: 2026-10-24T21:14:19-00:00
+  who: Ted Smith
+  what: blocks gh-111
+  comment: ""
+- time: 2026-10-24T21:22:17-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Round 2 (Claude seat), optional: an end-to-end test of listing in flight,
+    then write, publish, sync and evict, asserting that getattr returns the new size.
+    It would pin the exact interleaving behind removing=False. test_eviction_forgets_listing_attrs
+    covers the eviction half.'
+blocks:
+- gh-111

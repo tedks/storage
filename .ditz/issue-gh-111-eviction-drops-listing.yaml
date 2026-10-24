@@ -10,7 +10,7 @@ type: bugfix
 component: performance
 release:
 reporter: Ted Smith <tedks@riseup.net>
-status: unstarted
+status: in_progress
 disposition:
 creation_time: 2026-10-24T19:52:10-00:00
 references: []
@@ -23,5 +23,16 @@ log_events:
   who: Ted Smith
   what: blocks gh-111
   comment: ""
+- time: 2026-10-24T20:53:53-00:00
+  who: Ted Smith
+  what: started
+  comment: ""
+- time: 2026-10-24T21:29:01-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'PR #115 (draft, base perf/readdir-latency), head d044941. Council at fixpoint:
+    round 2 CLEAN (Claude + Codex; agy seat empty, quota). All four gates are green
+    on d044941, including the remote gate. Watcher reconnect deferred to gh-111-watcher-reconnect.
+    Left in_progress until merge.'
 blocks:
 - gh-111

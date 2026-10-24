@@ -1,0 +1,53 @@
+id: gh-112-checksum-probe-gate
+title: Checksum tasks fail fast on the SSH single-probe connect gate, so a fresh mount
+  takes many listings to hash
+desc: 'Measured with the guarded harness on 2026-10-24 (checksum-rehash lane, framework0
+  to drynwyn.local, 3 SSH members, Videos/Movies: 110 duplicated (member, file) keys).
+
+
+  SSHBackend keeps one SSH/SFTP client pair per thread. _ensure_connected lets one
+  thread connect at a time and fails every other thread at once with "ConnectionError:
+  SSH backend <name> reconnect probe already in progress" (_probe_lock, non-blocking).
+  The checksum executor''s 4 threads each need their own connection to each member.
+  So on the first listing of a fresh mount, 107 of 110 hash tasks failed within milliseconds
+  and only 3 ran. A failed hash records nothing and is retried on the next listing,
+  where more fail the same way, and so on.
+
+
+  This predates #116, and it explains the earlier "5 to 47 hashes per ls" (#112):
+  most attempts never reached the member. With #116, recorded hashes are not repeated;
+  the failures are retried until each key succeeds once.
+
+
+  Options:
+
+  (a) Let a thread whose member is already available and connected through another
+  thread wait for the probe (blocking acquire with a timeout) instead of failing.
+  The fail-fast gate was meant for unavailable members.
+
+  (b) Share one SSH transport per member for exec_command, opening a channel per call
+  (paramiko transports multiplex channels), instead of per-thread clients for checksums.
+
+  (c) Give a failed checksum a short backoff instead of retrying on every listing.
+
+  Recommendation: (a), which is small and keeps the gate''s intent for real outages;
+  (c) as well, to bound retries.'
+type: bugfix
+component: performance
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-24T21:54:03-00:00
+references: []
+log_events:
+- time: 2026-10-24T21:54:03-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
+- time: 2026-10-24T21:54:04-00:00
+  who: Ted Smith
+  what: blocks gh-112
+  comment: ""
+blocks:
+- gh-112
