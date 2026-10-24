@@ -18,6 +18,8 @@ from .sync_tasks import DirOperation
 class NamespaceService:
     """Namespace and directory-view operations extracted from StorageFS."""
 
+    LISTING_ATTRS_MAX_AGE = 5.0
+
     def __init__(
         self,
         *,
@@ -54,10 +56,20 @@ class NamespaceService:
         self.checksum_lock = checksum_lock
         # Per-directory member attributes from the last listing, guarded by
         # dir_cache_lock: {dir: (monotonic time, {backend: {name: attrs}})}.
-        # getattr answers from it while the listing is within the readdir
-        # TTL, so `ls -l` costs no member round trip per entry. Only hits
-        # are trusted: a name missing from it is still probed.
+        # getattr answers from it while the listing is younger than
+        # listing_attrs_ttl, so `ls -l` costs no member round trip per entry.
+        # The age is capped even when the readdir TTL is unbounded
+        # (watchers): a change that reaches no invalidation (eviction after
+        # a local write, a dropped watcher event) is visible within the cap.
         self.entry_attrs: Dict[str, Tuple[float, Dict[str, Dict[str, dict]]]] = {}
+        # Bumped by every invalidation; a listing that raced one is not
+        # published, so it cannot reinstate what the invalidation removed.
+        self._invalidation_generation = 0
+
+    @property
+    def listing_attrs_ttl(self) -> float:
+        """How long a listing's attributes answer getattr (and keep its snapshot)."""
+        return min(self.readdir_snapshot_ttl, self.LISTING_ATTRS_MAX_AGE)
 
     def backend_availability(self) -> Tuple[List[str], List[str]]:
         """Return backend names split by current availability."""
@@ -108,13 +120,17 @@ class NamespaceService:
         if not path.startswith("/"):
             path = "/" + path
         with self.dir_cache_lock:
+            self._invalidation_generation += 1
             self.dir_cache.pop(path, None)
             self.readdir_snapshot.pop(path, None)
             self.entry_attrs.pop(path, None)
             # The path's own attributes live in its parent's listing.
             parent = canonicalize_virtual_path(str(Path(path).parent))
-            if parent != path:
-                self.entry_attrs.pop(parent, None)
+            listing = self.entry_attrs.get(parent) if parent != path else None
+            if listing:
+                name = Path(path).name
+                for names in listing[1].values():
+                    names.pop(name, None)
 
     def _get_target_backends(
         self,
@@ -191,10 +207,11 @@ class NamespaceService:
                     continue
                 virtual_child = str(Path(dir_path) / name)
                 mode = ((backend_attrs or {}).get(backend_name, {}).get(name) or {}).get("st_mode")
-                if mode is not None:
+                if mode is not None and not stat.S_ISLNK(mode):
                     if stat.S_ISDIR(mode):
                         continue
                 else:
+                    # No listed mode, or a symlink, which isdir follows.
                     try:
                         if backend.isdir(virtual_child):
                             continue
@@ -281,16 +298,19 @@ class NamespaceService:
 
             listed = self._listed_attrs(resolved, backend_iter)
             if listed is not None:
-                now = time.time()
+                def field(key, default):
+                    value = listed.get(key)
+                    return default if value is None else value
+
                 return {
-                    "st_atime": listed.get("st_atime", now),
-                    "st_ctime": listed.get("st_ctime", listed.get("st_mtime", now)),
-                    "st_gid": listed.get("st_gid", os.getgid()),
+                    "st_atime": field("st_atime", listed["st_mtime"]),
+                    "st_ctime": field("st_ctime", listed["st_mtime"]),
+                    "st_gid": field("st_gid", os.getgid()),
                     "st_mode": listed["st_mode"],
-                    "st_mtime": listed.get("st_mtime", now),
-                    "st_nlink": listed.get("st_nlink", 1),
-                    "st_size": listed.get("st_size", 0),
-                    "st_uid": listed.get("st_uid", os.getuid()),
+                    "st_mtime": listed["st_mtime"],
+                    "st_nlink": field("st_nlink", 1),
+                    "st_size": listed["st_size"],
+                    "st_uid": field("st_uid", os.getuid()),
                 }
 
             for backend_name, backend in backend_iter:
@@ -333,26 +353,39 @@ class NamespaceService:
     def _listed_attrs(self, resolved: ResolvedPath, backend_iter) -> Optional[dict]:
         """Attributes of a path from its parent's recent listing, if any.
 
-        Returns the attributes of the first available member, in the order
-        getattr probes them, whose listing (within the readdir TTL) has the
-        name with a known mode; None when no listing does, and the caller
-        probes the members. A member marked unavailable is skipped, as
-        getattr would skip it. Listings come from lstat, so a symlink is
-        left to the members' stat, which follows it.
+        Walks the members in the order getattr probes them, skipping the
+        unavailable ones as getattr does. The first available member decides:
+        its listed attributes are returned when complete, and None (probe the
+        members) is returned when its listing is missing, failed, carried no
+        attributes, or lists the name as a symlink (listings are lstat; the
+        member's stat decides whether to follow it) or without mode, size or
+        mtime. Only a member that listed successfully without the name is
+        passed over, as its stat would have failed.
         """
         parent = resolved.parent_dir
         name = Path(resolved.canonical_path).name
         with self.dir_cache_lock:
             listing = self.entry_attrs.get(parent)
-        if not listing or (time.monotonic() - listing[0]) > self.readdir_snapshot_ttl:
+        if not listing or (time.monotonic() - listing[0]) > self.listing_attrs_ttl:
             return None
         for backend_name, backend in backend_iter:
             if not backend or not backend.is_available():
                 continue
-            attrs = listing[1].get(backend_name, {}).get(name)
-            mode = attrs.get("st_mode") if attrs else None
-            if mode is not None and not stat.S_ISLNK(mode):
-                return attrs
+            member_attrs = listing[1].get(backend_name)
+            if member_attrs is None:
+                return None
+            attrs = member_attrs.get(name)
+            if attrs is None:
+                continue
+            mode = attrs.get("st_mode")
+            if (
+                mode is None
+                or stat.S_ISLNK(mode)
+                or attrs.get("st_size") is None
+                or attrs.get("st_mtime") is None
+            ):
+                return None
+            return attrs
         return None
 
     def readdir(self, path: str):
@@ -360,7 +393,16 @@ class NamespaceService:
         now = time.monotonic()
         with self.dir_cache_lock:
             snapshot = self.readdir_snapshot.get(path)
-        if snapshot and (now - snapshot[0]) <= self.readdir_snapshot_ttl:
+            listing = self.entry_attrs.get(path)
+            generation = self._invalidation_generation
+        # A snapshot is reused only while its listing's attributes are also
+        # fresh, so the `ls -l` that follows a readdir never probes per entry.
+        if (
+            snapshot
+            and (now - snapshot[0]) <= self.readdir_snapshot_ttl
+            and listing
+            and (now - listing[0]) <= self.listing_attrs_ttl
+        ):
             return list(snapshot[1])
 
         cache_path = self.cache_manager.get_cache_path(path)
@@ -382,11 +424,12 @@ class NamespaceService:
                     if attrs is None:
                         backend_entries = set(backend.listdir(path))
                     else:
-                        backend_entries = {name for name, _ in attrs}
-                        backend_attrs[backend_name] = {
+                        listed = {
                             name: attr for name, attr in attrs
                             if not self.is_hidden_entry(name)
                         }
+                        backend_entries = set(listed)
+                        backend_attrs[backend_name] = listed
                     backend_entries = {
                         e for e in backend_entries if not self.is_hidden_entry(e)
                     }
@@ -408,9 +451,17 @@ class NamespaceService:
         ordered_entries = sorted(visible_entries)
 
         with self.dir_cache_lock:
-            listed_at = time.monotonic()
-            self.readdir_snapshot[path] = (listed_at, ordered_entries)
-            self.entry_attrs[path] = (listed_at, backend_attrs)
+            if self._invalidation_generation == generation:
+                listed_at = time.monotonic()
+                self.readdir_snapshot[path] = (listed_at, ordered_entries)
+                self.entry_attrs[path] = (listed_at, backend_attrs)
+            now = time.monotonic()
+            expired = [
+                dir_path for dir_path, (at, _) in self.entry_attrs.items()
+                if now - at > self.listing_attrs_ttl
+            ]
+            for dir_path in expired:
+                del self.entry_attrs[dir_path]
 
         return ordered_entries
 

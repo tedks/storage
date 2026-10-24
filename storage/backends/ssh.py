@@ -552,14 +552,22 @@ class SSHBackend(Backend):
                 name = attr.filename
                 if isinstance(name, bytes):
                     name = name.decode()
+                # SFTPAttributes holds None for a field the server omitted.
+                # Mode, size and mtime stay None so getattr probes the member
+                # instead of answering from an incomplete listing.
+                mtime = getattr(attr, 'st_mtime', None)
+                atime = getattr(attr, 'st_atime', None)
+                gid = getattr(attr, 'st_gid', None)
+                uid = getattr(attr, 'st_uid', None)
+                nlink = getattr(attr, 'st_nlink', None)
                 result.append((name, {
                     'st_mode': getattr(attr, 'st_mode', None),
-                    'st_size': getattr(attr, 'st_size', 0),
-                    'st_mtime': getattr(attr, 'st_mtime', time.time()),
-                    'st_atime': getattr(attr, 'st_atime', None) or getattr(attr, 'st_mtime', time.time()),
-                    'st_gid': getattr(attr, 'st_gid', os.getgid()),
-                    'st_uid': getattr(attr, 'st_uid', os.getuid()),
-                    'st_nlink': getattr(attr, 'st_nlink', 1),
+                    'st_size': getattr(attr, 'st_size', None),
+                    'st_mtime': mtime,
+                    'st_atime': atime if atime is not None else mtime,
+                    'st_gid': gid if gid is not None else os.getgid(),
+                    'st_uid': uid if uid is not None else os.getuid(),
+                    'st_nlink': nlink if nlink is not None else 1,
                 }))
             return result
         except (socket.timeout, EOFError, paramiko.SSHException) as exc:
