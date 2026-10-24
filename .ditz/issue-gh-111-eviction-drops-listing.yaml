@@ -1,0 +1,21 @@
+id: gh-111-eviction-drops-listing
+title: Drop listing attributes on eviction and local writes
+desc: 'Council follow-up on #113 (Claude seat, rounds 1-3): when a cached file is
+  evicted, removed by _invalidate_file_cache, or marked dirty, drop its name from
+  the parent''s NamespaceService.entry_attrs so the listing''s attributes are never
+  served for a file whose cache copy vanished after a local write. Today the 5 s listing
+  cap (plus the listing''s duration) bounds this; a hook closes it. Also consider
+  clearing entry_attrs and readdir_snapshot on watcher reconnect.'
+type: bugfix
+component: performance
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-24T19:52:10-00:00
+references: []
+log_events:
+- time: 2026-10-24T19:52:10-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
