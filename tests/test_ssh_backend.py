@@ -419,7 +419,7 @@ class TestSSHBackendThreadedClients(unittest.TestCase):
 
     @patch("storage.backends.ssh.paramiko.AutoAddPolicy")
     @patch("storage.backends.ssh.paramiko.SSHClient")
-    def test_connect_failure_while_available_sends_later_threads_to_the_gate(self, mock_ssh_client_cls, mock_auto_add_policy):
+    def test_connect_failure_while_available_fails_fast_in_retry_window(self, mock_ssh_client_cls, mock_auto_add_policy):
         _ = mock_auto_add_policy
 
         def _factory():

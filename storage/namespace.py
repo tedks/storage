@@ -585,14 +585,19 @@ class NamespaceService:
 
         futures = self._submit_member_listings(path)
 
-        cache_path = self.cache_manager.get_cache_path(path)
         entries: Set[str] = {".", ".."}
-
-        if cache_path.exists() and cache_path.is_dir():
-            entries.update(
-                entry for entry in os.listdir(str(cache_path))
-                if not self.is_hidden_entry(entry)
-            )
+        try:
+            cache_path = self.cache_manager.get_cache_path(path)
+            if cache_path.exists() and cache_path.is_dir():
+                entries.update(
+                    entry for entry in os.listdir(str(cache_path))
+                    if not self.is_hidden_entry(entry)
+                )
+        except BaseException:
+            # No member listing outlives the readdir that started it, so
+            # nothing is in flight once FUSE moves on (shutdown() relies on it).
+            concurrent.futures.wait([f for f in futures.values() if f is not None])
+            raise
 
         outcomes = {}
         for backend_name, future in futures.items():

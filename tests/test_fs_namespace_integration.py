@@ -433,6 +433,21 @@ class TestFSNamespaceIntegration(unittest.TestCase):
         self.assertIs(self.fs._dir_cache['/'], previous)
         self.assertEqual(namespace._listings_in_flight, {})
 
+    def test_readdir_waits_for_member_listings_when_cache_listing_fails(self):
+        finished = threading.Event()
+
+        def slow(_path):
+            time.sleep(0.3)
+
+        with self._wrap_listdir_attrs("backend1", after=lambda _p: (slow(_p), finished.set())), \
+                patch.object(self.fs.namespace.cache_manager, "get_cache_path",
+                             side_effect=OSError(errno.EIO, "cache unreadable")):
+            with self.assertRaises(OSError):
+                self.fs.namespace.readdir('/')
+            self.assertTrue(finished.is_set())
+
+        self.assertEqual(self.fs.namespace._listings_in_flight, {})
+
     def test_readdir_reuses_one_thread_per_member(self):
         threads = {"backend1": set(), "backend2": set()}
 
