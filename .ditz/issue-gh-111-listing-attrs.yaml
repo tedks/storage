@@ -6,8 +6,8 @@ type: bugfix
 component: performance
 release:
 reporter: Ted Smith <tedks@riseup.net>
-status: in_progress
-disposition:
+status: closed
+disposition: fixed
 creation_time: 2026-10-24T19:18:34-00:00
 references: []
 log_events:
@@ -44,6 +44,10 @@ log_events:
   comment: 'gates-113 (framework0): 8edacc5 fast/mounted/resilience 6/6 pass, remote
     gate pass. LAN measurement (0.35 ms RTT): ls -la Videos/Movies 0.21 s -> 0.04
     s, SFTP stat 742 -> 2-3. Posted: https://github.com/tedks/storage/pull/113#issuecomment-6389771381'
+- time: 2026-10-24T22:23:56-00:00
+  who: Ted Smith
+  what: 'closed: fixed'
+  comment: 'Landed: PR #113 merged as d8b7366 (gated 1a73423, 7/7 incl. remote)'
 blocks:
 - gh-111
 - gh-111-parallel-listing
