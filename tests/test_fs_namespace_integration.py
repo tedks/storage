@@ -448,6 +448,32 @@ class TestFSNamespaceIntegration(unittest.TestCase):
 
         self.assertEqual(self.fs.namespace._listings_in_flight, {})
 
+    def test_readdir_does_not_store_listing_raced_by_child_eviction(self):
+        # Evicting or invalidating a cached child (forget_listed_attrs with
+        # removing=True) during member I/O keeps the listing from being
+        # stored; a write (removing=False) must not, or an active writer
+        # would starve listings of its directory.
+        for removing, stored in ((True, False), (False, True)):
+            with self.subTest(removing=removing):
+                (self.backend1_dir / "kept.txt").write_text("1")
+                self.fs._readdir_snapshot.clear()
+                self.fs.namespace.entry_attrs.clear()
+                list(self.fs.readdir('/', None))
+                previous = self.fs._dir_cache['/']
+                self.fs._readdir_snapshot.clear()
+                self.fs.namespace.entry_attrs.clear()
+
+                def evict(_path):
+                    self.fs.namespace.forget_listed_attrs('/kept.txt', removing=removing)
+
+                with self._wrap_listdir_attrs("backend1", after=evict):
+                    list(self.fs.readdir('/', None))
+
+                namespace = self.fs.namespace
+                self.assertEqual('/' in namespace.entry_attrs, stored)
+                self.assertEqual('/' in self.fs._readdir_snapshot, stored)
+                self.assertEqual(self.fs._dir_cache['/'] is previous, not stored)
+
     def test_readdir_reuses_one_thread_per_member(self):
         threads = {"backend1": set(), "backend2": set()}
 

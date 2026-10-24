@@ -56,7 +56,8 @@ class NamespaceService:
         self.checksum_records = checksum_records
         self.checksum_lock = checksum_lock
         # The listing state below (entry_attrs, readdir_snapshot and the
-        # listings in flight) is guarded by listing_lock, not dir_cache_lock:
+        # listings in flight) is guarded by listing_lock, not dir_cache_lock,
+        # and where both are taken listing_lock nests inside dir_cache_lock:
         # forget_listed_attrs runs under the cache, index and descriptor
         # locks (eviction and invalidation) or the index lock (a write).
         # listing_lock is a leaf: it is held only for dictionary
@@ -636,10 +637,11 @@ class NamespaceService:
             # may predate the change, so it is not stored. A child-only
             # invalidation leaves the older names in place, which the next
             # listing replaces.
+            # Checked and stored under listing_lock, so forget_listed_attrs
+            # (which takes only listing_lock) cannot bump in between.
             with self.listing_lock:
-                raced = self._listing_generation[path] != generation
-            if not raced:
-                self.dir_cache[path] = member_entries
+                if self._listing_generation[path] == generation:
+                    self.dir_cache[path] = member_entries
         for names in member_entries.values():
             entries.update(names)
 
