@@ -1,0 +1,49 @@
+id: oq-checksum-same-second-rewrite
+title: Should recorded checksums be re-verified periodically, given SFTP's whole-second
+  mtimes?
+desc: 'Context: PR #116 (gh-112-skip-recorded). A member''s checksum is now recomputed
+  only when its listed (size, mtime, ctime) changes or the path is invalidated: a
+  watcher event, or an unlink, rename or rmdir through the mount. SFTP listings carry
+  only whole-second mtimes and no ctime. So on an SSH member, a rewrite that keeps
+  the size and lands in the same second as the listing that scheduled the recorded
+  hash is not seen until an invalidation. Without watchers, or in a watcher outage
+  (see oq-watcher-outage-cache-policy), the conflict view can then be wrong for the
+  life of the mount: replicas that differ shown as one name, or a resolved conflict
+  still split. Example: sync uploads v1, a listing hashes it, sync uploads v2 of the
+  same size within the same second.
+
+
+  Options:
+
+  1. Accept and document (current PR). The window is under a second per write, and
+  needs a same-size rewrite.
+
+  2. Re-verify records older than an interval (for example 1 h) on the next listing.
+  Bounds the stale view, but brings back periodic whole-file hashes of every duplicated
+  file in each listed directory: for Videos/Movies, tens of multi-GB remote hashes
+  per interval.
+
+  3. Drop the member''s records whenever this mount writes to that member (sync upload,
+  re-replication, release). Closes the mount''s own writes, but needs a callback through
+  SyncManager, SyncExecutor and ReplicationManager. External writers stay uncovered.
+
+
+  Recommendation: 1 now, with 3 as a follow-up if the mount''s own writes turn out
+  to matter. 2 trades the cost #112 was filed for against a narrow window.
+
+  Who decides: Ted (conflict-detection consistency policy).
+
+  Blocks: nothing in #116; only whether a follow-up member is needed under gh-112.'
+type: task
+component: open-questions
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-24T21:34:11-00:00
+references: []
+log_events:
+- time: 2026-10-24T21:34:11-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
