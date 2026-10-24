@@ -43,6 +43,12 @@ class CacheManager:
         # written through one after the stat would die with the inode.
         # None (no StorageFS attached: tests, CLI tools) means no descriptors.
         self.descriptor_guard: Optional[Callable[[str], ContextManager[bool]]] = None
+        # Set by StorageFS: NamespaceService.forget_listed_attrs. Called
+        # before a cached file is evicted and when one is recorded dirty, so
+        # getattr never answers for a vanished copy from a directory listing
+        # that may predate its last write. It takes only a leaf lock and is
+        # safe under every lock here. None (no StorageFS) means no listings.
+        self.forget_listed_attrs: Optional[Callable[[str], None]] = None
         self.state_manager = state_manager
         self.max_size_bytes = max_size_bytes
         self._lock = threading.RLock()
@@ -281,9 +287,13 @@ class CacheManager:
         the update and the mirror of the row into the cache file's metadata
         xattr run under the index lock, so concurrent writers record their
         stats in update order and mirror their rows in the same order.
-        Returns the new generation, or None when the path has no row.
+        The path's listing attributes are forgotten first: they describe the
+        member copy, which no longer matches. Returns the new generation, or
+        None when the path has no row.
         """
         with self.state_manager.metadata_lock:
+            if self.forget_listed_attrs:
+                self.forget_listed_attrs(virtual_path)
             generation = self.state_manager.mark_dirty_from_cache_file(virtual_path, cache_path)
             if generation is None:
                 return None
@@ -306,7 +316,9 @@ class CacheManager:
         and none can be opened on the file before the unlink (open() takes
         the same lock across its os.open and registration), since bytes
         written through one after the stat would die with the unlinked
-        inode. A stale CLEAN is marked and kept. Lock order: the caller's
+        inode. A stale CLEAN is marked and kept. The listing attributes for
+        the path are forgotten before the unlink (forget_listed_attrs). Lock
+        order: the caller's
         self._lock, the index lock, then the descriptor lock; nothing under
         the descriptor lock takes the other two. Returns the bytes freed.
         """
@@ -321,6 +333,8 @@ class CacheManager:
                 st = os.lstat(str(cache_path))
                 stale = st.st_size != row.size or st.st_mtime != row.last_modified
                 if not stale:
+                    if self.forget_listed_attrs:
+                        self.forget_listed_attrs(virtual_path)
                     cache_path.unlink()
             if stale:
                 self.mark_file_dirty(virtual_path, cache_path)
