@@ -37,6 +37,11 @@ log_events:
     of quota). Gates 7/7 including the remote gate on 01ca533. Follow-ups: gh-111-child-invalidation-churn,
     gh-111-ssh-availability-flap, gh-111-parallel-listing-nits. Open question: gh-111-fuse-attr-timeouts.
     Left in_progress until merge.'
+- time: 2026-10-24T23:14:17-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Rebased on master 6552d3c, head 45b37bf; resolution council at fixpoint;
+    gates 7/7; PR #117 marked ready. Awaiting CTO merge.'
 - time: 2026-10-24T23:15:04-00:00
   who: Ted Smith
   what: 'closed: fixed'
