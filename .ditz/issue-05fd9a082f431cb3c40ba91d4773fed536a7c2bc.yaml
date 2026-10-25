@@ -1,0 +1,25 @@
+id: 05fd9a082f431cb3c40ba91d4773fed536a7c2bc
+title: 'ls prints an errno-less ''ls: <path>'' stderr line per uncached entry (getxattr
+  path)'
+desc: ""
+type: bugfix
+component: gh-111
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-24T23:19:25-00:00
+references: []
+log_events:
+- time: 2026-10-24T23:19:25-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
+- time: 2026-10-24T23:19:29-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Observed on framework0 (coreutils 9.4) on master 80625c2 and 8edacc5 alike:
+    ls -la on the mount prints ''ls: <path>'' with no strerror for every entry, stdout
+    fine. Likely FUSE getxattr (security.selinux/ACL) returning an errno for uncached
+    entries that libacl/ls does not map. Not caused by #113; unverified root cause.
+    Repro: mount, ls -la a remote-only dir, read stderr.'

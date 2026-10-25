@@ -46,6 +46,11 @@ log_events:
   who: Ted Smith
   what: 'closed: fixed'
   comment: 'Landed: PR #117 merged (gated 45b37bf, 7/7 incl. remote)'
+- time: 2026-10-24T23:21:49-00:00
+  who: Ted Smith
+  what: 'closed: fixed'
+  comment: 'Merged in PR #117 (merge 47392ef; head 45b37bf). Follow-ups: gh-111-child-invalidation-churn,
+    gh-111-ssh-availability-flap, gh-111-parallel-listing-nits. Open question: gh-111-fuse-attr-timeouts.'
 blocks:
 - gh-111
 blocked_by:
