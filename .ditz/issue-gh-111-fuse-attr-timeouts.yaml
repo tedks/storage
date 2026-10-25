@@ -45,3 +45,10 @@ log_events:
   who: Ted Smith
   what: created
   comment: ""
+- time: 2026-10-25T02:02:54-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Ruling (Ted, 2026-10-24): option A, keep libfuse''s 1 s entry/attr timeouts.
+    Option C (opt-in per-profile attr_timeout) only if a later measurement of FUSE
+    lookups per ls -la shows the in-memory lookups cost enough to matter. No implementation
+    task now.'
