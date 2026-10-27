@@ -1,0 +1,25 @@
+id: cache-revalidate-on-open
+title: Revalidate a cached CLEAN file against its member on open when last checked
+  >60 s ago
+desc: 'Ruling on oq-watcher-outage-cache-policy (2026-10-27). Today a CLEAN cached
+  file is opened without any member check (fs.py _ensure_file_in_cache), so with watchers
+  off (the default, and drynwyn-warez-vpn) a remotely changed file stays stale until
+  eviction. On open of a cached CLEAN file whose last verification is older than a
+  configurable age (default 60 s), stat the member that holds it; if size/mtime differ,
+  invalidate and refetch. DIRTY files are never discarded. Applies with watchers on
+  or off. Record the verification time in memory (not the SQLite index as the only
+  record). Acceptance: tests for unchanged/changed/member-unavailable/dirty cases;
+  three gates + remote gate.'
+type: feature
+component: cache
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-27T19:13:15-00:00
+references: []
+log_events:
+- time: 2026-10-27T19:13:15-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
