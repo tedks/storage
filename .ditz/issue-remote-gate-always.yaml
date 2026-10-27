@@ -1,0 +1,21 @@
+id: remote-gate-always
+title: 'Make the remote gate mandatory: all-gates suite, scripts/run-gates.sh with
+  framework0 fallback, AGENTS.md'
+desc: Ruling on oq-remote-gate-push-policy (2026-10-27). Add a manual test_suite covering
+  fast, mounted, resilience and remote gates; scripts/run-gates.sh runs it locally
+  when Docker is usable, otherwise ssh framework0, check out the exact SHA (pushed
+  branch) in a scratch worktree, run the remote gate there and clean up. Update AGENTS.md
+  'Build and test' and 'The remote gate'.
+type: task
+component: build
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-27T19:13:26-00:00
+references: []
+log_events:
+- time: 2026-10-27T19:13:26-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
