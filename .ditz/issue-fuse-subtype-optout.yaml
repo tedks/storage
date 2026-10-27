@@ -1,0 +1,25 @@
+id: fuse-subtype-optout
+title: Opt-out for fuse.sshfs typing of mixed mounts
+desc: ""
+type: task
+component: open-questions
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-27T19:51:15-00:00
+references: []
+log_events:
+- time: 2026-10-27T19:51:15-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
+- time: 2026-10-27T19:51:20-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Question: should a mount with any remote member always be typed fuse.sshfs
+    (current, PR #118), or should a profile key force it on/off? Case: an SSH member
+    that is only a replica while reads come from local members loses thumbnails/indexing.
+    Options: (a) always remote if any member remote [current]; (b) profile key subtype
+    = auto|remote|local; (c) remote only if all/primary members are remote. Recommendation:
+    (a) until a real complaint. Decides: Ted. Blocks: nothing (PR #118 ships (a)).'

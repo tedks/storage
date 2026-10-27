@@ -1,0 +1,79 @@
+id: oq-streaming-continue-after-close
+title: Should streaming prefetch stop when the last reader closes after only a small
+  read?
+desc: 'Question: when the last reader of an unfinished streaming session closes, should
+  the background prefetch keep running to completion after any read (today''s behaviour),
+  or only when the readers showed real consumption?
+
+
+  Why it needs a ruling: today''s behaviour is stated as intended in two places.
+
+  - tests/test_fs_streaming.py test_streaming_prefetch_continues_after_last_reader_release:
+  reads 4 KiB of a 2 MiB file, closes, and asserts the whole file lands in the cache.
+
+  - docs/streaming_read_prefetch_plan.md Phase 4: "if no readers and prefetch running:
+  allow continuation (configurable)".
+
+  The field report behind ditz streaming-small-read-fetches-whole-file (Nautilus sniffing
+  ~450 files on drynwyn-warez, each streamed to completion) argues the other way.
+
+
+  Options:
+
+  A. Keep continuation after any read (status quo). Every content sniff/thumbnail
+  of an uncached file is a full download.
+
+  B. Continue after close only if the readers consumed the file: the longest contiguous
+  span the readers asked for reaches min(4 chunks, half the file) (4 MiB at the default
+  1 MiB chunk). Otherwise stop through the cancel path; the partial is discarded,
+  nothing marked cached. Constant, not a config option.
+
+  C. B with the threshold as a mount option (streaming_keep_after_close_bytes or similar).
+
+
+  Recommendation: B. It serves the stated goal (a sniff leaves no full download; a
+  copy or a player that has played a few MiB keeps read-ahead), and the plan''s "configurable"
+  was never built, so C can follow if B''s constant proves wrong.
+
+
+  Who decides: Ted.
+
+  Blocks: the threshold half of ditz streaming-small-read-fetches-whole-file (stacked
+  PR, held as draft). Does not block the race fix in the existing cancel path (separate
+  PR).'
+type: task
+component: open-questions
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: closed
+disposition: fixed
+creation_time: 2026-10-27T19:39:54-00:00
+references: []
+log_events:
+- time: 2026-10-27T19:39:54-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
+- time: 2026-10-27T19:40:00-00:00
+  who: Ted Smith
+  what: blocks streaming-small-read-fetches-whole-file
+  comment: ""
+- time: 2026-10-27T19:44:45-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Ruling (Ted, 2026-10-27): option C. The keep-after-close threshold is
+    a mount option; its default is B (contiguous read span >= min(4 chunks, half the
+    file)). Relayed to the streaming-partial lane by the CTO.'
+- time: 2026-10-27T19:44:46-00:00
+  who: Ted Smith
+  what: 'closed: fixed'
+  comment: 'Ruled: C (mount option, default = B rule).'
+- time: 2026-10-27T19:45:06-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Ruling addendum (Ted, 2026-10-27): the option accepts a byte size (e.g.
+    4M) or a percentage of the file (e.g. 50%), and the default must still be the
+    B rule: continue when the contiguous read span reaches 4 chunks or half the file,
+    whichever is smaller.'
+blocks:
+- streaming-small-read-fetches-whole-file
