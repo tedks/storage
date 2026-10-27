@@ -25,8 +25,8 @@ type: task
 component: open-questions
 release:
 reporter: Ted Smith <tedks@riseup.net>
-status: unstarted
-disposition:
+status: closed
+disposition: fixed
 creation_time: 2026-10-19T19:05:22-00:00
 references: []
 log_events:
@@ -40,3 +40,7 @@ log_events:
   comment: 'Ruling (Ted, 2026-10-27): always run the remote gate before a push; a
     host without Docker runs it on framework0 at the same SHA. Lanes on other hosts
     may SSH to framework0 and use its Docker. Implementation: remote-gate-always.'
+- time: 2026-10-27T19:13:26-00:00
+  who: Ted Smith
+  what: 'closed: fixed'
+  comment: 'Ruled: always, via framework0 when local Docker is absent.'
