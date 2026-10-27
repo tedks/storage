@@ -137,10 +137,11 @@ Edge handling:
    - decref session
    - if no readers and prefetch failed: cleanup partial file + registry
    - if no readers and prefetch running: continue only if the readers
-     consumed the file (a contiguous span read of at least
-     min(4 chunks, half the file), `STREAMING_KEEP_AFTER_CLOSE_CHUNKS` in
-     `storage/streaming.py`); otherwise cancel and discard the partial, so
-     a content sniff or thumbnail never becomes a full download
+     consumed the file, meaning the longest contiguous span they read
+     reached the mount's `streaming_keep_after_close` (default 4 chunks or
+     50% of the file, whichever is reached first; `0` continues after any
+     read); otherwise cancel and discard the partial, so a content sniff or
+     thumbnail never becomes a full download
 
 ### Phase 5: Cache Accounting and Eviction Compatibility
 

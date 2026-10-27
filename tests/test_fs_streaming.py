@@ -13,6 +13,7 @@ from fuse import FuseOSError
 
 from storage.backends.local import LocalBackend
 from storage.fs import StorageFS
+from storage.mount_profiles import parse_keep_after_close
 
 
 class SlowRangeLocalBackend(LocalBackend):
@@ -58,7 +59,10 @@ class TestFSStreamingIntegration(unittest.TestCase):
             copy_delay=0.35,
         )
 
-        self.fs = StorageFS(
+        self.fs = self._make_fs()
+
+    def _make_fs(self, keep_after_close=None):
+        return StorageFS(
             cache_root=self.cache_dir,
             state_db=self.db_path,
             backends={"backend": self.backend},
@@ -68,7 +72,14 @@ class TestFSStreamingIntegration(unittest.TestCase):
             streaming_reads=True,
             streaming_chunk_size=32 * 1024,
             max_streaming_sessions=2,
+            streaming_keep_after_close=(
+                parse_keep_after_close(keep_after_close) if keep_after_close is not None else None
+            ),
         )
+
+    def _remake_fs(self, keep_after_close):
+        self.fs.destroy('/')
+        self.fs = self._make_fs(keep_after_close)
 
     def tearDown(self):
         try:
@@ -331,6 +342,82 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.fs.release('/shared.bin', vfd_b)
 
 
+
+    def test_streaming_prefetch_continues_after_last_reader_release(self):
+        # streaming_keep_after_close = "0" restores the behaviour before the
+        # threshold: any read keeps read-ahead going after the last close.
+        self._remake_fs("0")
+        self.backend.range_delay = 0.03
+        payload = os.urandom(2 * 1024 * 1024)
+        (self.backend_dir / "orphan.bin").write_bytes(payload)
+
+        vfd = self.fs.open('/orphan.bin', os.O_RDONLY)
+        _ = self.fs.read('/orphan.bin', 4096, 0, vfd)
+        self.fs.release('/orphan.bin', vfd)
+
+        self.assertTrue(
+            self._wait_for(
+                lambda: '/orphan.bin' not in self.fs._prefetch_sessions,
+                timeout=8.0,
+            )
+        )
+
+        cache_path = self.cache_dir / "orphan.bin"
+        partial_path = self.cache_dir / "orphan.bin.storage.partial"
+        self.assertTrue(cache_path.exists())
+        self.assertFalse(partial_path.exists())
+        self.assertEqual(cache_path.read_bytes(), payload)
+
+    def test_streaming_keep_after_close_zero_still_cancels_without_a_read(self):
+        self._remake_fs("0")
+        (self.backend_dir / "unread.bin").write_bytes(os.urandom(256 * 1024))
+
+        vfd = self.fs.open('/unread.bin', os.O_RDONLY)
+        session = self._session_for(vfd)
+        self.fs.release('/unread.bin', vfd)
+
+        self.assertTrue(session.detached)
+        self._assert_not_cached("unread.bin")
+
+    def test_streaming_keep_after_close_bytes_and_percent(self):
+        # "64K,90%" on a 2 MiB file: 64 KiB is reached first.
+        self._remake_fs("64K,90%")
+        self.backend.range_delay = 0.03
+        payload = os.urandom(2 * 1024 * 1024)
+        (self.backend_dir / "custom.bin").write_bytes(payload)
+
+        vfd = self.fs.open('/custom.bin', os.O_RDONLY)
+        session = self._session_for(vfd)
+        self.fs.read('/custom.bin', 60 * 1024, 0, vfd)
+        with session.lock:
+            self.assertFalse(session.readers_consumed)
+        self.fs.read('/custom.bin', 4 * 1024, 60 * 1024, vfd)
+        with session.lock:
+            self.assertTrue(session.readers_consumed)
+        self.fs.release('/custom.bin', vfd)
+
+        cache_path = self.cache_dir / "custom.bin"
+        self.assertTrue(self._wait_for(cache_path.exists, timeout=8.0))
+        self.assertEqual(cache_path.read_bytes(), payload)
+
+    def test_streaming_keep_after_close_full_percent_cancels_partial_reader(self):
+        # "100%": only a reader of the whole file qualifies, and by then every
+        # byte has arrived, so a close with anything missing cancels.
+        self._remake_fs("100%")
+        self.backend.range_delay = 0.03
+        # 4 MiB so the worker, running alongside the 768 KiB read, cannot
+        # finish the file before the close.
+        payload = os.urandom(4 * 1024 * 1024)
+        (self.backend_dir / "most.bin").write_bytes(payload)
+
+        vfd = self.fs.open('/most.bin', os.O_RDONLY)
+        session = self._session_for(vfd)
+        self.fs.read('/most.bin', 768 * 1024, 0, vfd)
+        self.fs.release('/most.bin', vfd)
+
+        self.assertTrue(session.detached)
+        self.assertTrue(self._wait_for(lambda: session.io_fd == -1, timeout=3.0))
+        self._assert_not_cached("most.bin")
 
     def test_streaming_prefetch_continues_after_consuming_reader_release(self):
         # 4 chunks of 32 KiB read sequentially reach the keep-after-close

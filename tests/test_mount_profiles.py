@@ -1,16 +1,19 @@
 import tempfile
 import unittest
+from fractions import Fraction
 from pathlib import Path
 
 import click
 
 from storage.backends.local import LocalBackend
 from storage.backends.ssh import SSHBackend
+from storage.models import StreamingKeepAfterClose
 from storage.mount_profiles import (
     _load_mount_profile_settings,
     _optional_profile_float,
     _optional_profile_int,
     create_storage_members,
+    parse_keep_after_close,
     parse_size,
     resolve_member_configuration,
     resolve_mount_configuration,
@@ -164,6 +167,51 @@ enable_watchers = true
             config_path.unlink()
 
 
+class TestParseKeepAfterClose(unittest.TestCase):
+    def test_bytes_and_percent_list(self):
+        spec = parse_keep_after_close("4M,50%")
+        self.assertEqual((4 * 1024 ** 2,), spec.byte_thresholds)
+        self.assertEqual((Fraction(50),), spec.percent_thresholds)
+
+    def test_whitespace_and_decimals(self):
+        spec = parse_keep_after_close(" 512k , 12.5% ,1024 ")
+        self.assertEqual((512 * 1024, 1024), spec.byte_thresholds)
+        self.assertEqual((Fraction(25, 2),), spec.percent_thresholds)
+
+    def test_threshold_is_whichever_is_reached_first(self):
+        spec = parse_keep_after_close("4M,50%")
+        self.assertEqual(4 * 1024 ** 2, spec.threshold(100 * 1024 ** 2))
+        self.assertEqual(1024 ** 2, spec.threshold(2 * 1024 ** 2))
+        # Percentages round down.
+        self.assertEqual(1, spec.threshold(3))
+
+    def test_zero_means_any_read(self):
+        self.assertEqual(0, parse_keep_after_close("0").threshold(10 * 1024 ** 3))
+        self.assertEqual(0, parse_keep_after_close("0%").threshold(10 * 1024 ** 3))
+
+    def test_full_percent_is_whole_file(self):
+        self.assertEqual(12345, parse_keep_after_close("100%").threshold(12345))
+
+    def test_percent_of_empty_file_is_zero(self):
+        self.assertEqual(0, parse_keep_after_close("50%").threshold(0))
+        self.assertEqual(0, parse_keep_after_close("4M,50%").threshold(0))
+
+    def test_bad_values_rejected(self):
+        for value in ("", " ", ",", "4M,", ",50%", "-1M", "-5%", "101%", "100.5%",
+                      "abc", "4X", "1/2%", "infM", "nan%", "50 %", "4M;50%", "0x10"):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    parse_keep_after_close(value)
+
+    def test_model_rejects_empty_and_out_of_range(self):
+        with self.assertRaises(ValueError):
+            StreamingKeepAfterClose()
+        with self.assertRaises(ValueError):
+            StreamingKeepAfterClose(byte_thresholds=(-1,))
+        with self.assertRaises(ValueError):
+            StreamingKeepAfterClose(percent_thresholds=(Fraction(101),))
+
+
 class TestResolvedMountConfig(unittest.TestCase):
     def _resolve(self, **overrides):
         """Helper to call resolve_mount_configuration with sensible defaults."""
@@ -200,6 +248,34 @@ class TestResolvedMountConfig(unittest.TestCase):
     def test_member_specs_merge_local_and_remote_inputs(self):
         config = self._resolve(remote=["ssh://user@host:/remote"])
         self.assertEqual(("/srv/data", "ssh://user@host:/remote"), config.member_specs)
+
+    def test_streaming_keep_after_close_defaults_to_none(self):
+        self.assertIsNone(self._resolve().streaming_keep_after_close)
+
+    def test_streaming_keep_after_close_from_cli_overrides_profile(self):
+        toml_content = '''
+[mounts.prof]
+mountpoint = "/mnt/test"
+cache = "/tmp/cache"
+backends = ["/srv/data"]
+streaming_keep_after_close = "8M,25%"
+'''
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.toml', delete=False) as f:
+            f.write(toml_content)
+            config_path = Path(f.name)
+
+        try:
+            from_profile = self._resolve(
+                mount_target="prof", backing_paths=[], config_path=config_path,
+            )
+            self.assertEqual("8M,25%", from_profile.streaming_keep_after_close)
+            from_cli = self._resolve(
+                mount_target="prof", backing_paths=[], config_path=config_path,
+                streaming_keep_after_close="0",
+            )
+            self.assertEqual("0", from_cli.streaming_keep_after_close)
+        finally:
+            config_path.unlink()
 
     def test_readdir_ttl_from_cli_overrides_profile(self):
         toml_content = '''

@@ -5,24 +5,27 @@ import socket
 import threading
 import time
 from dataclasses import dataclass, field
+from fractions import Fraction
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
 from fuse import FuseOSError
 
 from .backends.base import Backend
-from .models import FileLocation, FileMetadata, SyncStatus
+from .models import FileLocation, FileMetadata, StreamingKeepAfterClose, SyncStatus
 
 # Read-ahead outlives the last close only for readers that consumed the file.
 # The evidence is the longest contiguous span the readers asked for (not what
 # was fetched: foreground reads round up to whole chunks and the worker runs
-# ahead), which must reach this many chunks (4 MiB at the default 1 MiB
-# chunk) or half the file, whichever is smaller. A content-type sniff or a
-# thumbnailer reads a few KiB to a few MiB at scattered offsets and stays
-# under it; a copy or a player that has played a few seconds crosses it. A
-# span anywhere counts, so a player resuming mid-file qualifies too. Below
-# the threshold the close cancels the session and the partial is discarded.
+# ahead), checked against the mount's streaming_keep_after_close. Its
+# default is this many chunks (4 MiB at the default 1 MiB chunk) or half the
+# file, whichever is smaller. A content-type sniff or a thumbnailer reads a
+# few KiB to a few MiB at scattered offsets and stays under it; a copy or a
+# player that has played a few seconds crosses it. A span anywhere counts,
+# so a player resuming mid-file qualifies too. Below the threshold the close
+# cancels the session and the partial is discarded.
 STREAMING_KEEP_AFTER_CLOSE_CHUNKS = 4
+STREAMING_KEEP_AFTER_CLOSE_PERCENT = Fraction(50)
 # Bound on the spans tracked per session before the threshold is reached;
 # past it the shortest span is dropped. Only a reader making that many
 # scattered reads gets here, and losing a short span can only delay the
@@ -90,6 +93,7 @@ class StreamingReadManager:
         max_streaming_sessions: int,
         partial_suffix: str,
         stream_state_xattr: str,
+        keep_after_close: Optional[StreamingKeepAfterClose] = None,
     ):
         self.cache_manager = cache_manager
         self.state_manager = state_manager
@@ -99,6 +103,12 @@ class StreamingReadManager:
         self.streaming_reads = streaming_reads
         self.chunk_size = max(4096, int(streaming_chunk_size))
         self.max_streaming_sessions = max(1, int(max_streaming_sessions))
+        if keep_after_close is None:
+            keep_after_close = StreamingKeepAfterClose(
+                byte_thresholds=(STREAMING_KEEP_AFTER_CLOSE_CHUNKS * self.chunk_size,),
+                percent_thresholds=(STREAMING_KEEP_AFTER_CLOSE_PERCENT,),
+            )
+        self.keep_after_close = keep_after_close
         self.partial_suffix = partial_suffix
         self.stream_state_xattr = stream_state_xattr
 
@@ -534,12 +544,8 @@ class StreamingReadManager:
         self._update_streaming_state_xattr(session, "prefetching")
         return fetched_end
 
-    @staticmethod
-    def _keep_after_close_threshold(session: PrefetchSession) -> int:
-        return min(
-            STREAMING_KEEP_AFTER_CLOSE_CHUNKS * session.chunk_size,
-            max(session.chunk_size, session.file_size // 2),
-        )
+    def _keep_after_close_threshold(self, session: PrefetchSession) -> int:
+        return self.keep_after_close.threshold(session.file_size)
 
     def _record_foreground_read(self, session: PrefetchSession, start: int, end: int):
         """Track the spans readers asked for. Caller holds session.lock."""

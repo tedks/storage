@@ -29,7 +29,7 @@ from .backends.base import Backend
 from .cache import CacheManager
 from .cache_metadata import XATTR_CACHE_METADATA_NAME, scan_cache_entries
 from .file_config import FileConfig, get_inherited_config
-from .models import FileLocation, FileMetadata, SyncStatus
+from .models import FileLocation, FileMetadata, StreamingKeepAfterClose, SyncStatus
 from .state import StateManager
 from .replication import ReplicationManager
 from .sync import SyncManager
@@ -98,7 +98,8 @@ class StorageFS(Operations):
                  streaming_reads: bool = False, streaming_chunk_size: int = 1024 * 1024,
                  max_streaming_sessions: int = 8,
                  readdir_ttl: float = 1.0,
-                 enable_watchers: bool = False):
+                 enable_watchers: bool = False,
+                 streaming_keep_after_close: Optional[StreamingKeepAfterClose] = None):
         """
         Initialize Storage filesystem
 
@@ -111,6 +112,9 @@ class StorageFS(Operations):
             streaming_reads: Enable uncached range streaming + background prefetch
             streaming_chunk_size: Range size used for foreground/background remote reads
             max_streaming_sessions: Maximum concurrent streaming sessions
+            streaming_keep_after_close: When read-ahead outlives the last
+                close of a streaming session; None for the default, 4 chunks
+                or 50% of the file
             readdir_ttl: Seconds to cache readdir results before re-querying
                          backends (pull-based invalidation). Ignored when
                          enable_watchers is True.
@@ -215,6 +219,7 @@ class StorageFS(Operations):
             streaming_reads=streaming_reads,
             streaming_chunk_size=streaming_chunk_size,
             max_streaming_sessions=max_streaming_sessions,
+            keep_after_close=streaming_keep_after_close,
             partial_suffix=self._PARTIAL_SUFFIX,
             stream_state_xattr=self._STREAM_STATE_XATTR,
         )
@@ -1453,7 +1458,8 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
                  streaming_chunk_size: int = 1024 * 1024,
                  max_streaming_sessions: int = 8,
                  readdir_ttl: float = 1.0,
-                 enable_watchers: bool = False):
+                 enable_watchers: bool = False,
+                 streaming_keep_after_close: Optional[StreamingKeepAfterClose] = None):
     """
     Mount a Storage filesystem
 
@@ -1471,6 +1477,8 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
         streaming_reads: Enable uncached range streaming + background prefetch
         streaming_chunk_size: Chunk size used for remote range reads
         max_streaming_sessions: Maximum concurrent streaming prefetch sessions
+        streaming_keep_after_close: When read-ahead outlives the last close;
+            None for the default
 
     Raises:
         PermissionError: If allow_other=True but not running as root and user_allow_other not set
@@ -1528,6 +1536,7 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
         max_streaming_sessions=max_streaming_sessions,
         readdir_ttl=readdir_ttl,
         enable_watchers=enable_watchers,
+        streaming_keep_after_close=streaming_keep_after_close,
     )
     fs.mount_lock_file = lock_file
     if unclean_shutdown:
