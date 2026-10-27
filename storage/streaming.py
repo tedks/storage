@@ -35,6 +35,12 @@ class PrefetchSession:
     error: Optional[Exception] = None
     worker: Optional[threading.Thread] = None
     has_foreground_read: bool = False
+    # Set with stop_requested when the last reader's close stops the session.
+    # A detached session is out of the registry and its partial file is
+    # already unlinked, so it no longer owns the partial path: a new session
+    # for the same file may be using it. Nothing of a detached session may
+    # touch that path again; its worker only closes its own descriptor.
+    detached: bool = False
     last_logged_status: str = ""
     last_logged_downloaded_bytes: int = 0
     last_foreground_offset: int = 0
@@ -304,6 +310,8 @@ class StreamingReadManager:
         self._log_streaming_state_change(session, payload)
 
         with session.lock:
+            if session.detached:
+                return
             target_path = session.final_cache_path if session.finalized else session.partial_cache_path
             final_path = session.final_cache_path
 
@@ -574,6 +582,9 @@ class StreamingReadManager:
 
     def _discard_unregistered_prefetch_session(self, session: PrefetchSession):
         self._close_streaming_session_resources(session)
+        with session.lock:
+            if session.detached:
+                return
         try:
             session.partial_cache_path.unlink(missing_ok=True)
         except OSError:
@@ -587,6 +598,8 @@ class StreamingReadManager:
 
     def _promote_failed_session_cache_prefix(self, session: PrefetchSession) -> bool:
         with session.lock:
+            if session.detached:
+                return False
             ranges = list(session.available_ranges)
             contiguous_bytes = self._contiguous_available_prefix(ranges, session.file_size)
             partial_path = session.partial_cache_path
@@ -632,7 +645,7 @@ class StreamingReadManager:
 
     def _finalize_streaming_session(self, session: PrefetchSession):
         with session.lock:
-            if session.finalized or session.error is not None:
+            if session.finalized or session.error is not None or session.detached:
                 return
             if not self._is_range_available(session.available_ranges, 0, session.file_size):
                 return
@@ -945,37 +958,74 @@ class StreamingReadManager:
 
         return session
 
+    def _should_stop_on_last_close(self, session: PrefetchSession) -> bool:
+        """Whether the last reader's close stops an unfinished session.
+
+        Caller holds session.lock. A session whose bytes have all arrived is
+        never stopped, even if the worker has not renamed it yet: the stop
+        and finalize decisions are both made under session.lock, so either
+        this sees prefetch_complete and the session finalizes, or the stop
+        lands first and finalize sees detached.
+        """
+        return (
+            session.refcount == 0
+            and not session.finalized
+            and not session.prefetch_complete
+            and session.error is None
+            and not session.has_foreground_read
+        )
+
+    def _stop_and_detach_session(self, session: PrefetchSession) -> bool:
+        """Drop the last reader's ref; stop and detach the session if it is unfinished.
+
+        Runs under prefetch_sessions_lock so the decision, the removal from the
+        registry and the unlink of the partial file are one step against
+        _create_or_attach_prefetch_session: an open either attached before
+        this (refcount is then above zero and nothing stops) or finds no
+        session and creates a fresh one, never the stopped one. The unlink is
+        inside the lock because a fresh session prepares its partial file at
+        the same path once the registry no longer holds this one.
+        """
+        with self.prefetch_sessions_lock:
+            with session.lock:
+                if session.refcount > 0:
+                    session.refcount -= 1
+                if not self._should_stop_on_last_close(session):
+                    return False
+                session.stop_requested = True
+                session.detached = True
+                session.condition.notify_all()
+            if self.prefetch_sessions.get(session.canonical_path) is session:
+                self.prefetch_sessions.pop(session.canonical_path, None)
+            try:
+                session.partial_cache_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+        self._log_streaming_state_change(session, self._snapshot_streaming_state(session, "cancelled"))
+        self.cache_manager.mark_cache_size_dirty()
+        return True
+
     def _release_prefetch_session(self, session: PrefetchSession):
+        stopped = self._stop_and_detach_session(session)
+        worker = session.worker
+
+        if stopped:
+            # The worker may be mid-chunk. It writes only to its own
+            # descriptor, now on an unlinked inode, and closes it on exit
+            # (_background_prefetch_worker's cancelled cleanup). The join only
+            # makes the close prompt when the worker is idle; nothing depends
+            # on it finishing.
+            if worker and worker.is_alive():
+                worker.join(timeout=2.0)
+            if worker is None or not worker.is_alive():
+                self._close_streaming_session_resources(session)
+            return
+
         with session.lock:
-            if session.refcount > 0:
-                session.refcount -= 1
             has_error = session.error is not None
             finalized = session.finalized
             no_readers = session.refcount == 0
-            had_foreground_read = session.has_foreground_read
-
-        worker = session.worker
-
-        if no_readers and not finalized and not has_error and not had_foreground_read:
-            with session.lock:
-                session.stop_requested = True
-                session.condition.notify_all()
-
-            if worker and worker.is_alive():
-                worker.join(timeout=2.0)
-            if worker and worker.is_alive():
-                return
-
-            with self.prefetch_sessions_lock:
-                still_registered = self.prefetch_sessions.get(session.canonical_path) is session
-
-            if still_registered:
-                with session.lock:
-                    finalized = session.finalized
-                    has_error = session.error is not None
-                if not finalized and not has_error:
-                    self._cleanup_cancelled_session(session)
-            return
 
         if has_error and no_readers:
             if worker and worker.is_alive():

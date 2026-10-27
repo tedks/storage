@@ -442,6 +442,95 @@ class TestFSStreamingIntegration(unittest.TestCase):
                 self.assertEqual(failed_cleanup.call_count, 0)
 
 
+    def _session_for(self, vfd):
+        with self.fs._fd_lock:
+            session = self.fs._fd_map[vfd].prefetch_session
+        self.assertIsNotNone(session)
+        return session
+
+    def test_streaming_open_during_last_close_stop_gets_fresh_session(self):
+        # An open that lands while the last close is stopping the session
+        # (here: while release waits on the worker) must not attach to the
+        # stopped session, whose descriptor the stop then closes.
+        payload = os.urandom(128 * 1024)
+        (self.backend_dir / "reopen.bin").write_bytes(payload)
+
+        vfd_a = self.fs.open('/reopen.bin', os.O_RDONLY)
+        session_a = self._session_for(vfd_a)
+        real_worker = session_a.worker
+        reopened = {}
+
+        class JoinHook:
+            def is_alive(hook):
+                return real_worker.is_alive()
+
+            def join(hook, timeout=None):
+                if "vfd" not in reopened:
+                    reopened["vfd"] = self.fs.open('/reopen.bin', os.O_RDONLY)
+                real_worker.join(timeout)
+
+        session_a.worker = JoinHook()
+        self.fs.release('/reopen.bin', vfd_a)
+
+        self.assertIn("vfd", reopened)
+        vfd_b = reopened["vfd"]
+        session_b = self._session_for(vfd_b)
+        self.assertIsNot(session_b, session_a)
+        for offset in range(0, len(payload), 32 * 1024):
+            self.assertEqual(
+                self.fs.read('/reopen.bin', 32 * 1024, offset, vfd_b),
+                payload[offset:offset + 32 * 1024],
+            )
+        self.fs.release('/reopen.bin', vfd_b)
+
+        self.assertTrue(self._wait_for(lambda: session_a.io_fd == -1, timeout=3.0))
+        cache_path = self.cache_dir / "reopen.bin"
+        self.assertTrue(self._wait_for(cache_path.exists, timeout=8.0))
+        self.assertEqual(cache_path.read_bytes(), payload)
+
+    def test_streaming_stopped_session_leaves_successor_partial_alone(self):
+        # Once stopped, a session no longer owns the partial path: its late
+        # cleanup, failure promotion and state xattr updates must not touch
+        # the file a new session for the same path created there.
+        payload = os.urandom(128 * 1024)
+        (self.backend_dir / "successor.bin").write_bytes(payload)
+        partial_path = self.cache_dir / "successor.bin.storage.partial"
+        cache_path = self.cache_dir / "successor.bin"
+        manager = self.fs._streaming_manager
+
+        vfd_a = self.fs.open('/successor.bin', os.O_RDONLY)
+        session_a = self._session_for(vfd_a)
+        self.fs.release('/successor.bin', vfd_a)
+        self.assertTrue(session_a.detached)
+        self.assertFalse(partial_path.exists())
+
+        # Hold the successor's worker before its first fetch: no read yet.
+        vfd_b = self.fs.open('/successor.bin', os.O_RDONLY)
+        session_b = self._session_for(vfd_b)
+        self.assertIsNot(session_b, session_a)
+        self.assertTrue(partial_path.exists())
+        partial_inode = partial_path.stat().st_ino
+        state_before = os.getxattr(str(partial_path), self.fs._STREAM_STATE_XATTR)
+
+        with session_a.lock:
+            session_a.error = OSError(errno.EIO, "late failure")
+            session_a.available_ranges = [(0, 4096)]
+        manager._update_streaming_state_xattr(session_a, "error")
+        manager._cleanup_failed_session(session_a)
+        manager._cleanup_cancelled_session(session_a)
+        manager._finalize_streaming_session(session_a)
+
+        self.assertTrue(partial_path.exists())
+        self.assertEqual(partial_path.stat().st_ino, partial_inode)
+        self.assertFalse(cache_path.exists())
+        self.assertEqual(os.getxattr(str(partial_path), self.fs._STREAM_STATE_XATTR), state_before)
+        with self.fs._prefetch_sessions_lock:
+            self.assertIs(self.fs._prefetch_sessions.get('/successor.bin'), session_b)
+
+        self.assertEqual(self.fs.read('/successor.bin', 4096, 0, vfd_b), payload[:4096])
+        self.fs.release('/successor.bin', vfd_b)
+
+
 
 if __name__ == '__main__':
     unittest.main()
