@@ -30,8 +30,8 @@ type: task
 component: open-questions
 release:
 reporter: Ted Smith <tedks@riseup.net>
-status: unstarted
-disposition:
+status: closed
+disposition: fixed
 creation_time: 2026-10-19T19:05:22-00:00
 references: []
 log_events:
@@ -45,3 +45,7 @@ log_events:
   comment: 'Ruling (Ted, 2026-10-27): keep current behaviour and document it (paramiko
     AutoAddPolicy, in-memory; rsync and watcher accept-new into ~/.ssh/known_hosts;
     the split failure on a changed key). No config surface now. Task: ssh-host-key-docs.'
+- time: 2026-10-27T19:13:30-00:00
+  who: Ted Smith
+  what: 'closed: fixed'
+  comment: 'Ruled: keep current behaviour, document it.'
