@@ -1433,7 +1433,11 @@ def fuse_subtype_options(backends: Dict[str, Backend]) -> Dict[str, str]:
     makes thumbnails, and LocalSearch crawls, through it as if reads were
     cheap. A mount with any SSH or rsync-over-SSH member therefore asks for
     subtype "sshfs"; a mount of only local members keeps the plain type.
-    The fsname is unchanged.
+    The fsname is unchanged. Typing the mount as sshfs is deliberate: other
+    tools that key on fuse.sshfs (systemd network ordering, updatedb's
+    PRUNEFS) will see this mount the same way, which suits a mount that is
+    backed by remote hosts. Any remote member makes the whole mount remote;
+    there is no opt-out (ditz open-questions).
     """
     if any(backend.transport_is_remote for backend in backends.values()):
         return {"subtype": "sshfs"}
