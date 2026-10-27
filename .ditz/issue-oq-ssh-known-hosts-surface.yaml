@@ -39,3 +39,9 @@ log_events:
   who: Ted Smith
   what: created
   comment: ""
+- time: 2026-10-27T19:13:28-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Ruling (Ted, 2026-10-27): keep current behaviour and document it (paramiko
+    AutoAddPolicy, in-memory; rsync and watcher accept-new into ~/.ssh/known_hosts;
+    the split failure on a changed key). No config surface now. Task: ssh-host-key-docs.'
