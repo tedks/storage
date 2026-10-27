@@ -141,6 +141,12 @@ is a fuller version of the same profile):
 storage mount --config ./storage.example.toml example-media
 ```
 
+A mount with at least one SSH or rsync-over-SSH member appears in the mount
+table as type `fuse.sshfs` (a mount of only local members stays plain
+`fuse`), so desktop tools that follow GLib's notion of remote (Nautilus,
+LocalSearch) can treat it as a remote filesystem rather than a local disk and avoid thumbnails, item counts
+and crawling through it.
+
 ### configure
 
 Configure storage settings for files/directories:

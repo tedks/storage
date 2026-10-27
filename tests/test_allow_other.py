@@ -10,6 +10,7 @@ from unittest.mock import patch, mock_open, MagicMock
 
 from storage.fs import mount_storage
 from storage.backends.local import LocalBackend
+from storage.backends.ssh import SSHBackend
 
 
 class TestAllowOther(unittest.TestCase):
@@ -206,6 +207,26 @@ class TestAllowOther(unittest.TestCase):
         mock_fuse.assert_called_once()
         args, kwargs = mock_fuse.call_args
         self.assertFalse(kwargs['allow_other'])
+
+    def _mount_with(self, backends, mock_fuse):
+        mount_storage(
+            str(self.mount_point), self.cache_root, self.state_db, backends,
+            1024 * 1024 * 100, foreground=True, allow_other=False,
+        )
+        mock_fuse.assert_called_once()
+        return mock_fuse.call_args.kwargs
+
+    @patch('storage.fs.FUSE')
+    @patch('os.geteuid', return_value=1000)
+    def test_remote_member_mount_requests_sshfs_subtype(self, mock_geteuid, mock_fuse):
+        backends = dict(self.backends)
+        backends['ssh0'] = SSHBackend('ssh0', 'host.invalid', '/srv', 'user')
+        self.assertEqual(self._mount_with(backends, mock_fuse).get('subtype'), 'sshfs')
+
+    @patch('storage.fs.FUSE')
+    @patch('os.geteuid', return_value=1000)
+    def test_local_only_mount_requests_no_subtype(self, mock_geteuid, mock_fuse):
+        self.assertNotIn('subtype', self._mount_with(self.backends, mock_fuse))
 
 
 if __name__ == '__main__':
