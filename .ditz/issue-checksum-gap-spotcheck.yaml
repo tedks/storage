@@ -1,0 +1,19 @@
+id: checksum-gap-spotcheck
+title: 'Spot-check the same-second checksum gap: snapshot now, re-check in a week'
+desc: 'Feeds oq-checksum-same-second-rewrite. Read-only on drynwyn: sample files present
+  on more than one warez member, record (size, mtime, xxh128) per copy; re-run the
+  same sample about a week later and count copies whose size+mtime are unchanged but
+  hash changed. Script and snapshot: splinter1 ~/Projects/storage/checksum-spotcheck-2026-10-27/.'
+type: task
+component: open-questions
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-27T19:13:20-00:00
+references: []
+log_events:
+- time: 2026-10-27T19:13:20-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
