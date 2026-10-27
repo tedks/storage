@@ -1,0 +1,25 @@
+id: nix-package-mdns-resolution
+title: Flake-packaged storage cannot resolve mDNS .local hosts on non-NixOS
+desc: 'Found 2026-10-27 relaunching drynwyn-warez on splinter1 (Ubuntu). The flake''s
+  storage (47392ef, python3.11 from nixpkgs) fails every member connect with ''[Errno
+  -3] Temporary failure in name resolution'' for drynwyn.local, while getent, ssh
+  and /usr/bin/python3 resolve it (192.168.1.195) through nsswitch ''mdns4_minimal''.
+  Nix glibc cannot load the host''s libnss_mdns, and no nscd is running to proxy it.
+  The mount still comes up, with every member unreachable. Workaround in use: a scratch
+  profile with the IP. Options: wrap the binary to prefer the host''s NSS (e.g. ship
+  nssmdns in LD_LIBRARY_PATH for the wrapper), resolve via avahi/getent fallback in
+  SSHBackend, or document ''use IPs or run nscd''. Note ssh (rsync, watcher) already
+  resolves, so only paramiko is affected.'
+type: bugfix
+component: build
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-27T19:15:37-00:00
+references: []
+log_events:
+- time: 2026-10-27T19:15:37-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
