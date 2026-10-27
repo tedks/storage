@@ -58,5 +58,11 @@ log_events:
   who: Ted Smith
   what: blocks streaming-small-read-fetches-whole-file
   comment: ""
+- time: 2026-10-27T19:44:45-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Ruling (Ted, 2026-10-27): option C. The keep-after-close threshold is
+    a mount option; its default is B (contiguous read span >= min(4 chunks, half the
+    file)). Relayed to the streaming-partial lane by the CTO.'
 blocks:
 - streaming-small-read-fetches-whole-file
