@@ -35,11 +35,14 @@ class PrefetchSession:
     error: Optional[Exception] = None
     worker: Optional[threading.Thread] = None
     has_foreground_read: bool = False
-    # Set with stop_requested when the last reader's close stops the session.
-    # A detached session is out of the registry and its partial file is
-    # already unlinked, so it no longer owns the partial path: a new session
-    # for the same file may be using it. Nothing of a detached session may
-    # touch that path again; its worker only closes its own descriptor.
+    # Set, under prefetch_sessions_lock, when the session leaves the registry
+    # for good: stopped by the last reader's close, or cleaned up after a
+    # failure or cancel. Its partial file is already unlinked or promoted, so
+    # it no longer owns the partial path: a new session for the same file may
+    # be using it. Cleanup, promotion and finalize skip the path once this is
+    # set, and its worker only closes its own descriptor. State-xattr writes
+    # check it too, but not atomically with the write (see
+    # _update_streaming_state_xattr).
     detached: bool = False
     last_logged_status: str = ""
     last_logged_downloaded_bytes: int = 0
@@ -309,6 +312,10 @@ class StreamingReadManager:
         payload = self._snapshot_streaming_state(session, status)
         self._log_streaming_state_change(session, payload)
 
+        # The detached check is not atomic with the setxattr below: a session
+        # detached in between could write one stale state onto a successor's
+        # partial. The successor would have to finish a remote get_size in
+        # that gap, and the xattr is informational, so it is not locked out.
         with session.lock:
             if session.detached:
                 return
@@ -590,10 +597,38 @@ class StreamingReadManager:
         except OSError:
             pass
 
+    def _detach_locked(self, session: PrefetchSession) -> bool:
+        """Detach the session: drop it from the registry and unlink its partial.
+
+        Caller holds prefetch_sessions_lock, which is what keeps a fresh
+        session from preparing a partial at the same path until the unlink is
+        done. Returns False if it was already detached. A session that is not
+        in the registry and not detached was dropped by destroy() (unmount),
+        so no successor can own the path and the unlink is still ours.
+        """
+        with session.lock:
+            if session.detached:
+                return False
+            session.detached = True
+        if self.prefetch_sessions.get(session.canonical_path) is session:
+            self.prefetch_sessions.pop(session.canonical_path, None)
+        try:
+            session.partial_cache_path.unlink(missing_ok=True)
+        except OSError as exc:
+            # The next session for this path unlinks it again before
+            # creating its own; a mount restart sweeps it otherwise.
+            self.logger.warning(
+                "streaming could not remove partial %s: %r", session.partial_cache_path, exc,
+            )
+        return True
+
     def _cleanup_prefetch_session(self, session: PrefetchSession, status: str):
+        # Single-shot: release and the worker's tail can both reach cleanup
+        # for one failed session, and only the first may touch the path.
         self._update_streaming_state_xattr(session, status)
-        self._remove_prefetch_session(session)
-        self._discard_unregistered_prefetch_session(session)
+        with self.prefetch_sessions_lock:
+            self._detach_locked(session)
+        self._close_streaming_session_resources(session)
         self.cache_manager.mark_cache_size_dirty()
 
     def _promote_failed_session_cache_prefix(self, session: PrefetchSession) -> bool:
@@ -993,14 +1028,9 @@ class StreamingReadManager:
                 if not self._should_stop_on_last_close(session):
                     return False
                 session.stop_requested = True
-                session.detached = True
                 session.condition.notify_all()
-            if self.prefetch_sessions.get(session.canonical_path) is session:
-                self.prefetch_sessions.pop(session.canonical_path, None)
-            try:
-                session.partial_cache_path.unlink(missing_ok=True)
-            except OSError:
-                pass
+            if not self._detach_locked(session):
+                return False
 
         self._log_streaming_state_change(session, self._snapshot_streaming_state(session, "cancelled"))
         self.cache_manager.mark_cache_size_dirty()
@@ -1011,13 +1041,11 @@ class StreamingReadManager:
         worker = session.worker
 
         if stopped:
-            # The worker may be mid-chunk. It writes only to its own
-            # descriptor, now on an unlinked inode, and closes it on exit
-            # (_background_prefetch_worker's cancelled cleanup). The join only
-            # makes the close prompt when the worker is idle; nothing depends
-            # on it finishing.
-            if worker and worker.is_alive():
-                worker.join(timeout=2.0)
+            # No join: the mount runs FUSE single-threaded (nothreads=True),
+            # so waiting here on a worker mid-chunk would stall every other
+            # operation on the mount for the length of a remote fetch. The
+            # worker writes only to its own descriptor, now on an unlinked
+            # inode, and closes it on exit (its cancelled cleanup).
             if worker is None or not worker.is_alive():
                 self._close_streaming_session_resources(session)
             return

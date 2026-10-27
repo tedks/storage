@@ -448,32 +448,32 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.assertIsNotNone(session)
         return session
 
-    def test_streaming_open_during_last_close_stop_gets_fresh_session(self):
-        # An open that lands while the last close is stopping the session
-        # (here: while release waits on the worker) must not attach to the
-        # stopped session, whose descriptor the stop then closes.
+    def test_streaming_reopen_while_stopped_worker_alive_gets_fresh_session(self):
+        # The mount is single-threaded, so the next open follows the close.
+        # If the stopped session's worker is still running then (here a stub
+        # reports it alive and returns from join at once, as a worker stuck
+        # in a remote fetch past a join timeout would), the open must not
+        # attach to the stopped session: nothing would ever finish or remove
+        # it, and it would hold a max_streaming_sessions slot for good.
         payload = os.urandom(128 * 1024)
         (self.backend_dir / "reopen.bin").write_bytes(payload)
 
         vfd_a = self.fs.open('/reopen.bin', os.O_RDONLY)
         session_a = self._session_for(vfd_a)
         real_worker = session_a.worker
-        reopened = {}
 
-        class JoinHook:
-            def is_alive(hook):
-                return real_worker.is_alive()
+        class StuckWorker:
+            def is_alive(stub):
+                return True
 
-            def join(hook, timeout=None):
-                if "vfd" not in reopened:
-                    reopened["vfd"] = self.fs.open('/reopen.bin', os.O_RDONLY)
-                real_worker.join(timeout)
+            def join(stub, timeout=None):
+                return None
 
-        session_a.worker = JoinHook()
+        session_a.worker = StuckWorker()
         self.fs.release('/reopen.bin', vfd_a)
+        self.assertTrue(session_a.detached)
 
-        self.assertIn("vfd", reopened)
-        vfd_b = reopened["vfd"]
+        vfd_b = self.fs.open('/reopen.bin', os.O_RDONLY)
         session_b = self._session_for(vfd_b)
         self.assertIsNot(session_b, session_a)
         for offset in range(0, len(payload), 32 * 1024):
@@ -483,10 +483,49 @@ class TestFSStreamingIntegration(unittest.TestCase):
             )
         self.fs.release('/reopen.bin', vfd_b)
 
-        self.assertTrue(self._wait_for(lambda: session_a.io_fd == -1, timeout=3.0))
+        # The real worker (never read, so idle) exits on the stop and its
+        # cancelled cleanup closes the descriptor.
+        self.assertTrue(self._wait_for(lambda: not real_worker.is_alive(), timeout=3.0))
+        self.assertEqual(session_a.io_fd, -1)
         cache_path = self.cache_dir / "reopen.bin"
         self.assertTrue(self._wait_for(cache_path.exists, timeout=8.0))
         self.assertEqual(cache_path.read_bytes(), payload)
+
+    def test_streaming_failed_session_cleanup_is_single_shot(self):
+        # The worker's tail and release can both clean up one failed session.
+        # A successor created after the first cleanup must survive the second.
+        payload = os.urandom(128 * 1024)
+        (self.backend_dir / "twice.bin").write_bytes(payload)
+        partial_path = self.cache_dir / "twice.bin.storage.partial"
+        manager = self.fs._streaming_manager
+
+        vfd_a = self.fs.open('/twice.bin', os.O_RDONLY)
+        session_a = self._session_for(vfd_a)
+        with session_a.lock:
+            session_a.error = OSError(errno.EIO, "simulated failure")
+            session_a.condition.notify_all()
+        self.assertTrue(self._wait_for(lambda: not session_a.worker.is_alive(), timeout=3.0))
+
+        # First cleanup, as the worker's tail runs it once no reader is left.
+        manager._cleanup_failed_session(session_a)
+        self.assertFalse(partial_path.exists())
+
+        # A successor session takes the path (it is open by two handles here
+        # only because the test keeps vfd_a to release it afterwards).
+        vfd_b = self.fs.open('/twice.bin', os.O_RDONLY)
+        session_b = self._session_for(vfd_b)
+        self.assertIsNot(session_b, session_a)
+        partial_inode = partial_path.stat().st_ino
+
+        # Second cleanup, through release of the failed session's reader.
+        self.fs.release('/twice.bin', vfd_a)
+
+        self.assertTrue(partial_path.exists())
+        self.assertEqual(partial_path.stat().st_ino, partial_inode)
+        with self.fs._prefetch_sessions_lock:
+            self.assertIs(self.fs._prefetch_sessions.get('/twice.bin'), session_b)
+        self.assertEqual(self.fs.read('/twice.bin', 4096, 0, vfd_b), payload[:4096])
+        self.fs.release('/twice.bin', vfd_b)
 
     def test_streaming_stopped_session_leaves_successor_partial_alone(self):
         # Once stopped, a session no longer owns the partial path: its late
@@ -504,7 +543,8 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.assertTrue(session_a.detached)
         self.assertFalse(partial_path.exists())
 
-        # Hold the successor's worker before its first fetch: no read yet.
+        # The successor's worker cannot fetch or finish: it waits for a
+        # first read, and none happens until the checks below are done.
         vfd_b = self.fs.open('/successor.bin', os.O_RDONLY)
         session_b = self._session_for(vfd_b)
         self.assertIsNot(session_b, session_a)
