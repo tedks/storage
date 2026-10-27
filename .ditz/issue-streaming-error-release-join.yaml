@@ -1,0 +1,24 @@
+id: streaming-error-release-join
+title: Release of a failed streaming session can stall the mount for up to 2 s
+desc: 'The error branch of StreamingReadManager._release_prefetch_session still calls
+  worker.join(timeout=2.0). The mount runs FUSE nothreads=True, so when a foreground
+  fetch sets the error while the background worker is mid remote fetch, release stalls
+  the whole mount for up to 2 s (council round 2 on #119/#120, Claude seat N1; same
+  argument as the stop-branch join removed in #119). Removing it is not a one-liner:
+  the join also covers the window where the worker tail checked refcount before release
+  dropped it, so without it neither side would clean up. Fix sketch: decide cleanup
+  ownership under session.lock (whoever sees refcount==0 and worker-exited last),
+  e.g. a worker_exited flag set in the tail under the lock.'
+type: task
+component: fs
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-27T20:14:04-00:00
+references: []
+log_events:
+- time: 2026-10-27T20:14:04-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
