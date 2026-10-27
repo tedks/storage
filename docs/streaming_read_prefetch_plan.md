@@ -136,7 +136,11 @@ Edge handling:
 4. Release path behavior:
    - decref session
    - if no readers and prefetch failed: cleanup partial file + registry
-   - if no readers and prefetch running: allow continuation (configurable)
+   - if no readers and prefetch running: continue only if the readers
+     consumed the file (a contiguous span read of at least
+     min(4 chunks, half the file), `STREAMING_KEEP_AFTER_CLOSE_CHUNKS` in
+     `storage/streaming.py`); otherwise cancel and discard the partial, so
+     a content sniff or thumbnail never becomes a full download
 
 ### Phase 5: Cache Accounting and Eviction Compatibility
 

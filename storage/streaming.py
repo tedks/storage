@@ -13,6 +13,22 @@ from fuse import FuseOSError
 from .backends.base import Backend
 from .models import FileLocation, FileMetadata, SyncStatus
 
+# Read-ahead outlives the last close only for readers that consumed the file.
+# The evidence is the longest contiguous span the readers asked for (not what
+# was fetched: foreground reads round up to whole chunks and the worker runs
+# ahead), which must reach this many chunks (4 MiB at the default 1 MiB
+# chunk) or half the file, whichever is smaller. A content-type sniff or a
+# thumbnailer reads a few KiB to a few MiB at scattered offsets and stays
+# under it; a copy or a player that has played a few seconds crosses it. A
+# span anywhere counts, so a player resuming mid-file qualifies too. Below
+# the threshold the close cancels the session and the partial is discarded.
+STREAMING_KEEP_AFTER_CLOSE_CHUNKS = 4
+# Bound on the spans tracked per session before the threshold is reached;
+# past it the shortest span is dropped. Only a reader making that many
+# scattered reads gets here, and losing a short span can only delay the
+# threshold, never fake it.
+STREAMING_MAX_TRACKED_READ_SPANS = 64
+
 
 @dataclass
 class PrefetchSession:
@@ -45,6 +61,9 @@ class PrefetchSession:
     # check it too, but not atomically with the write (see
     # _update_streaming_state_xattr).
     detached: bool = False
+    # Merged spans the readers asked for, until readers_consumed is set.
+    foreground_read_spans: List[Tuple[int, int]] = field(default_factory=list)
+    readers_consumed: bool = False
     last_logged_status: str = ""
     last_logged_downloaded_bytes: int = 0
     last_foreground_offset: int = 0
@@ -249,6 +268,7 @@ class StreamingReadManager:
                 "finalized": bool(session.finalized),
                 "active_readers": session.refcount,
                 "has_foreground_read": bool(session.has_foreground_read),
+                "readers_consumed": bool(session.readers_consumed),
                 "updated_at": time.time(),
             }
             if session.error is not None:
@@ -514,9 +534,32 @@ class StreamingReadManager:
         self._update_streaming_state_xattr(session, "prefetching")
         return fetched_end
 
+    @staticmethod
+    def _keep_after_close_threshold(session: PrefetchSession) -> int:
+        return min(
+            STREAMING_KEEP_AFTER_CLOSE_CHUNKS * session.chunk_size,
+            max(session.chunk_size, session.file_size // 2),
+        )
+
+    def _record_foreground_read(self, session: PrefetchSession, start: int, end: int):
+        """Track the spans readers asked for. Caller holds session.lock."""
+        if session.readers_consumed:
+            return
+        spans = session.foreground_read_spans
+        self._add_available_range(spans, start, end)
+        threshold = self._keep_after_close_threshold(session)
+        if any(span_end - span_start >= threshold for span_start, span_end in spans):
+            session.readers_consumed = True
+            spans.clear()
+        elif len(spans) > STREAMING_MAX_TRACKED_READ_SPANS:
+            spans.remove(min(spans, key=lambda span: span[1] - span[0]))
+
     def _ensure_streaming_range(self, session: PrefetchSession, start: int, end: int):
         if start >= end:
             return
+
+        with session.lock:
+            self._record_foreground_read(session, start, end)
 
         while True:
             with session.lock:
@@ -1014,7 +1057,8 @@ class StreamingReadManager:
     def _should_stop_on_last_close(self, session: PrefetchSession) -> bool:
         """Whether the last reader's close stops an unfinished session.
 
-        Caller holds session.lock. A session whose bytes have all arrived is
+        Caller holds session.lock. The session keeps prefetching only if the
+        readers consumed it (see STREAMING_KEEP_AFTER_CLOSE_CHUNKS). A session whose bytes have all arrived is
         never stopped, even if the worker has not renamed it yet: the stop
         and finalize decisions are both made under session.lock, so either
         this sees prefetch_complete and the session finalizes, or the stop
@@ -1025,7 +1069,7 @@ class StreamingReadManager:
             and not session.finalized
             and not session.prefetch_complete
             and session.error is None
-            and not session.has_foreground_read
+            and not session.readers_consumed
         )
 
     def _stop_and_detach_session(self, session: PrefetchSession) -> bool:
