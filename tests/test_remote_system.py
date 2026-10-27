@@ -26,6 +26,7 @@ a message naming Docker. It never skips.
 
 import hashlib
 import os
+import re
 import secrets
 import shlex
 import shutil
@@ -698,7 +699,11 @@ def _mount_table_type(mount: Path) -> str:
     for line in Path("/proc/self/mountinfo").read_text().splitlines():
         left, _, right = line.partition(" - ")
         fields = left.split()
-        if len(fields) > 4 and fields[4] == target:
+        if len(fields) < 5:
+            continue
+        # mountinfo writes space, tab, newline and backslash as \NNN octal
+        mount_point = re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), fields[4])
+        if mount_point == target:
             return right.split()[0]
     raise AssertionError(f"{target} is not in /proc/self/mountinfo")
 
