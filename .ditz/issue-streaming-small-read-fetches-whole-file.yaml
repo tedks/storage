@@ -42,5 +42,14 @@ log_events:
   who: Ted Smith
   what: blocked by oq-streaming-continue-after-close
   comment: ""
+- time: 2026-10-27T20:55:36-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'PRs: https://github.com/tedks/storage/pull/119 (race fix: atomic stop/detach,
+    no join in release, single-shot cleanup) and https://github.com/tedks/storage/pull/120
+    (stacked; keep-after-close threshold as mount option streaming_keep_after_close
+    per ruling oq-streaming-continue-after-close option C). Council to fixpoint (agy
+    seat empty: quota); four gates pass at 5e9dbc3 / abcdad6. Follow-ups: streaming-bound-readahead-while-open,
+    streaming-concurrent-first-open-partial-race, streaming-error-release-join.'
 blocked_by:
 - oq-streaming-continue-after-close
