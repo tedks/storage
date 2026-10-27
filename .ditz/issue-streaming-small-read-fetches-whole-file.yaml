@@ -20,3 +20,17 @@ log_events:
   who: Ted Smith
   what: created
   comment: ""
+- time: 2026-10-27T19:32:41-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Mechanism (storage/streaming.py _release_prefetch_session ~948): on the
+    last close, prefetch is stopped only if the session never had a foreground read
+    (has_foreground_read False). Any read at all, even GIO''s few-KB content sniff,
+    sets it, so the background prefetch runs to completion after close and the whole
+    file lands in the cache (LRU, 50G on drynwyn-warez). Observed 2026-10-27: ~450
+    PNG/OGG opens by Nautilus, each to ''streaming complete''. Exposure: GIO sniffs
+    content only when the name-based type is uncertain (.ogg yes; .mkv/.mp4 usually
+    not), plus thumbnailers and LocalSearch (now off/excluded on splinter1). Fix direction:
+    after the last reader closes, keep prefetching only if reads covered a meaningful
+    sequential prefix (e.g. >= N chunks or a fraction of the file); otherwise stop
+    and keep what was fetched as a partial, or discard.'
