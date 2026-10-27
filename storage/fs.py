@@ -1424,6 +1424,22 @@ def _acquire_mount_lock_ex(lock_path: Path, mountpoint: str):
         raise
 
 
+def fuse_subtype_options(backends: Dict[str, Backend]) -> Dict[str, str]:
+    """Extra FUSE() keyword arguments that mark a mount with remote members.
+
+    GLib decides whether a mount is remote from the mount-table type, and
+    lists only nfs4, cifs, smb2, ncpfs, fuse.sshfs and fuse.portal as remote.
+    A plain "fuse" mount reads as a local disk, so Nautilus counts items and
+    makes thumbnails, and LocalSearch crawls, through it as if reads were
+    cheap. A mount with any SSH or rsync-over-SSH member therefore asks for
+    subtype "sshfs"; a mount of only local members keeps the plain type.
+    The fsname is unchanged.
+    """
+    if any(backend.transport_is_remote for backend in backends.values()):
+        return {"subtype": "sshfs"}
+    return {}
+
+
 def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
                  backends: Dict[str, Backend], cache_size: int,
                  foreground: bool = False, num_sync_workers: int = 2,
@@ -1516,7 +1532,8 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
         )
         fs.request_stale_sweep()  # started by init(), after FUSE's fork
     try:
-        FUSE(fs, mountpoint, nothreads=True, foreground=foreground, allow_other=allow_other)
+        FUSE(fs, mountpoint, nothreads=True, foreground=foreground, allow_other=allow_other,
+             **fuse_subtype_options(backends))
     finally:
         try:
             if not fs._sweep_pending:

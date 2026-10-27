@@ -618,7 +618,7 @@ def mounted_factory(remote, tmp_path):
     """
     from fuse import FUSE
 
-    from storage.fs import StorageFS
+    from storage.fs import StorageFS, fuse_subtype_options
 
     created: List[tuple] = []
 
@@ -646,7 +646,8 @@ def mounted_factory(remote, tmp_path):
 
         def run():
             try:
-                FUSE(fs, str(mount), nothreads=True, foreground=True, allow_other=False)
+                FUSE(fs, str(mount), nothreads=True, foreground=True, allow_other=False,
+                     **fuse_subtype_options(backends))
             except BaseException as exc:  # reported by the failure below
                 errors.append(exc)
 
@@ -689,6 +690,23 @@ def mounted_factory(remote, tmp_path):
                 backend.close()
     if problems:
         pytest.fail("mount teardown: " + "; ".join(problems), pytrace=False)
+
+
+def _mount_table_type(mount: Path) -> str:
+    """The filesystem type /proc/self/mountinfo records for the mount point."""
+    target = str(mount.resolve())
+    for line in Path("/proc/self/mountinfo").read_text().splitlines():
+        left, _, right = line.partition(" - ")
+        fields = left.split()
+        if len(fields) > 4 and fields[4] == target:
+            return right.split()[0]
+    raise AssertionError(f"{target} is not in /proc/self/mountinfo")
+
+
+def test_mount_over_ssh_members_is_typed_fuse_sshfs(remote, mounted_factory):
+    """GLib treats only fuse.sshfs (not plain fuse) as a remote filesystem."""
+    mnt = mounted_factory()
+    assert _mount_table_type(mnt.mount) == "fuse.sshfs"
 
 
 def test_mounted_write_syncs_to_both_members(remote, mounted_factory):

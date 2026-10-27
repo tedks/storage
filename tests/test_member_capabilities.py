@@ -3,6 +3,9 @@ import unittest
 
 from storage.backends.base import WatcherSpec
 from storage.backends.local import LocalBackend
+from storage.backends.rsync import RsyncBackend
+from storage.backends.ssh import SSHBackend
+from storage.fs import fuse_subtype_options
 
 
 class WatchableLoopbackMember(LocalBackend):
@@ -49,3 +52,34 @@ class TestStorageMemberCapabilities(unittest.TestCase):
             self.assertIsNone(backend.push_invalidation_spec())
             self.assertIsNone(backend.watcher_spec())
             self.assertFalse(backend.capabilities.push_invalidation)
+
+
+class TestFuseSubtypeOptions(unittest.TestCase):
+    """GLib calls a mount remote only for some types; fuse.sshfs is the FUSE one."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.local = LocalBackend("local0", self._tmp.name)
+        self.ssh = SSHBackend("ssh0", "host.invalid", "/srv", "user")
+        self.rsync = RsyncBackend("rsync0", "host.invalid", "/srv", "user")
+
+    def test_ssh_member_gets_sshfs_subtype(self):
+        self.assertEqual(fuse_subtype_options({"ssh0": self.ssh}), {"subtype": "sshfs"})
+
+    def test_rsync_member_gets_sshfs_subtype(self):
+        self.assertEqual(fuse_subtype_options({"rsync0": self.rsync}), {"subtype": "sshfs"})
+
+    def test_local_only_mount_keeps_plain_fuse_type(self):
+        self.assertEqual(fuse_subtype_options({"local0": self.local}), {})
+
+    def test_no_members_keeps_plain_fuse_type(self):
+        self.assertEqual(fuse_subtype_options({}), {})
+
+    def test_mixed_mount_is_remote(self):
+        members = {"local0": self.local, "ssh0": self.ssh}
+        self.assertEqual(fuse_subtype_options(members), {"subtype": "sshfs"})
+
+    def test_reconnect_probe_flag_on_local_member_does_not_count(self):
+        self.local.is_remote = True
+        self.assertEqual(fuse_subtype_options({"local0": self.local}), {})
