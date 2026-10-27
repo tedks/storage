@@ -38,3 +38,11 @@ log_events:
   who: Ted Smith
   what: created
   comment: ""
+- time: 2026-10-27T19:13:12-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Ruling (Ted, 2026-10-27): stopgap is revalidate-on-open with a ~60 s age,
+    in both watcher and TTL modes; a watcher reconnect does option 1 only (clear listing
+    state). inotifywait is headed for deprecation: drynwyn''s warez members hold ~304k
+    directories (raid 9,251 / chunk0 132,514 / chunk1 162,462) against max_user_watches
+    524,288. Implementation: cache-revalidate-on-open.'
