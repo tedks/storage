@@ -1,0 +1,26 @@
+id: fuse-subtype-remote
+title: Mount with a FUSE subtype so GIO/Nautilus/LocalSearch treat remote-backed mounts
+  as remote
+desc: '2026-10-27 on splinter1: gio info on the mount reports filesystem::type fuse,
+  filesystem::remote FALSE (/proc/mounts: ''StorageFS ... fuse''), so Nautilus ''local-only''
+  options (directory item counts, thumbnails) apply and browse the whole remote tree.
+  GLib 2.88''s remote list is nfs4, cifs, smb2, ncpfs, fuse.sshfs, fuse.portal, matched
+  on the mount-table type. mount_storage calls FUSE(fs, mountpoint, nothreads=True,
+  ...) with no fsname/subtype (fs.py:1519). Options: pass subtype=sshfs when any member
+  is SSH (truthful about transport, makes GLib say remote), or a profile option fuse_subtype.
+  Workaround applied on splinter1: Nautilus show-directory-item-counts/show-image-thumbnails
+  = never, thumbnailers disable-all, LocalSearch ignored-directories += both drynwyn
+  mountpoints.'
+type: feature
+component: fs
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-27T19:26:41-00:00
+references: []
+log_events:
+- time: 2026-10-27T19:26:41-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
