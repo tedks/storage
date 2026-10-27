@@ -597,19 +597,29 @@ class StreamingReadManager:
         except OSError:
             pass
 
-    def _detach_locked(self, session: PrefetchSession) -> bool:
-        """Detach the session: drop it from the registry and unlink its partial.
+    @staticmethod
+    def _claim_detach(session: PrefetchSession) -> bool:
+        """Mark the session detached; False if it already was. Caller holds session.lock.
+
+        Callers that also decide something about the session (the stop on
+        last close) claim in the same session.lock section as the decision,
+        so finalize, which checks detached under session.lock, either runs
+        to the rename before the claim or never starts it.
+        """
+        if session.detached:
+            return False
+        session.detached = True
+        return True
+
+    def _unregister_and_unlink(self, session: PrefetchSession):
+        """Drop a just-claimed session from the registry and unlink its partial.
 
         Caller holds prefetch_sessions_lock, which is what keeps a fresh
         session from preparing a partial at the same path until the unlink is
-        done. Returns False if it was already detached. A session that is not
-        in the registry and not detached was dropped by destroy() (unmount),
-        so no successor can own the path and the unlink is still ours.
+        done. A session that is not in the registry was dropped by destroy()
+        (unmount), so no successor can own the path and the unlink is still
+        ours.
         """
-        with session.lock:
-            if session.detached:
-                return False
-            session.detached = True
         if self.prefetch_sessions.get(session.canonical_path) is session:
             self.prefetch_sessions.pop(session.canonical_path, None)
         try:
@@ -620,14 +630,16 @@ class StreamingReadManager:
             self.logger.warning(
                 "streaming could not remove partial %s: %r", session.partial_cache_path, exc,
             )
-        return True
 
     def _cleanup_prefetch_session(self, session: PrefetchSession, status: str):
         # Single-shot: release and the worker's tail can both reach cleanup
         # for one failed session, and only the first may touch the path.
         self._update_streaming_state_xattr(session, status)
         with self.prefetch_sessions_lock:
-            self._detach_locked(session)
+            with session.lock:
+                claimed = self._claim_detach(session)
+            if claimed:
+                self._unregister_and_unlink(session)
         self._close_streaming_session_resources(session)
         self.cache_manager.mark_cache_size_dirty()
 
@@ -1027,10 +1039,12 @@ class StreamingReadManager:
                     session.refcount -= 1
                 if not self._should_stop_on_last_close(session):
                     return False
+                # One section with the decision: see _claim_detach.
+                if not self._claim_detach(session):
+                    return False
                 session.stop_requested = True
                 session.condition.notify_all()
-            if not self._detach_locked(session):
-                return False
+            self._unregister_and_unlink(session)
 
         self._log_streaming_state_change(session, self._snapshot_streaming_state(session, "cancelled"))
         self.cache_manager.mark_cache_size_dirty()

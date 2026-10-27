@@ -3,6 +3,7 @@ import json
 import os
 import shutil
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -490,6 +491,65 @@ class TestFSStreamingIntegration(unittest.TestCase):
         cache_path = self.cache_dir / "reopen.bin"
         self.assertTrue(self._wait_for(cache_path.exists, timeout=8.0))
         self.assertEqual(cache_path.read_bytes(), payload)
+
+    def test_streaming_stop_and_finalize_cannot_both_proceed(self):
+        # The stop decision and the detach must be one session.lock section.
+        # Right after release's stop section exits, run what a worker
+        # finishing the last chunk would do: complete the ranges and
+        # finalize. Finalize must see the session detached and not rename the
+        # partial (which a successor may already own) into the cache as CLEAN.
+        payload = os.urandom(128 * 1024)
+        (self.backend_dir / "gap.bin").write_bytes(payload)
+        manager = self.fs._streaming_manager
+
+        vfd = self.fs.open('/gap.bin', os.O_RDONLY)
+        session = self._session_for(vfd)
+        real_lock = session.lock
+        test_thread = threading.get_ident()
+        state = {"depth": 0, "fired": False}
+
+        def worker_finishes_last_chunk():
+            with real_lock:
+                session.available_ranges = [(0, session.file_size)]
+                session.prefetch_complete = True
+            manager._finalize_streaming_session(session)
+
+        class GapLock:
+            def __enter__(proxy):
+                real_lock.acquire()
+                if threading.get_ident() == test_thread:
+                    state["depth"] += 1
+                return proxy
+
+            def __exit__(proxy, *exc):
+                fire = False
+                if threading.get_ident() == test_thread:
+                    state["depth"] -= 1
+                    fire = state["depth"] == 0 and session.stop_requested and not state["fired"]
+                real_lock.release()
+                if fire:
+                    state["fired"] = True
+                    worker_finishes_last_chunk()
+                return False
+
+            def acquire(proxy, *args, **kwargs):
+                return real_lock.acquire(*args, **kwargs)
+
+            def release(proxy):
+                real_lock.release()
+
+        session.lock = GapLock()
+        try:
+            self.fs.release('/gap.bin', vfd)
+        finally:
+            session.lock = real_lock
+
+        self.assertTrue(state["fired"])
+        self.assertTrue(session.detached)
+        self.assertFalse(session.finalized)
+        self.assertFalse((self.cache_dir / "gap.bin").exists())
+        self.assertFalse(self.fs.cache_manager.is_cached("/gap.bin"))
+        self.assertIsNone(self.fs.state_manager.get_file_metadata("/gap.bin"))
 
     def test_streaming_failed_session_cleanup_is_single_shot(self):
         # The worker's tail and release can both clean up one failed session.
