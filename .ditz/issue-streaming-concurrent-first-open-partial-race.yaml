@@ -1,0 +1,25 @@
+id: streaming-concurrent-first-open-partial-race
+title: Concurrent first opens of one uncached file clobber each other's partial
+desc: 'Two opens of the same uncached file that both miss the registry prepare a partial
+  file at the same path outside prefetch_sessions_lock (_create_or_attach_prefetch_session:
+  unlink + O_CREAT|O_TRUNC + ftruncate). The second preparation unlinks the first''s
+  file. When the first registers and the second attaches, the second''s discard unlinks
+  the path again, so the registered session''s partial no longer exists: the attaching
+  reader''s os.open(partial) fails with ENOENT and the session''s finalize os.replace
+  fails, putting it in error. Found while reviewing #119; pre-existing, not changed
+  there. Fix sketch: reserve the path in the registry (a placeholder or a per-path
+  creating set under prefetch_sessions_lock) before preparing, and have a racing opener
+  wait for it, or prepare under a unique name and rename into place at registration.'
+type: bugfix
+component: fs
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-27T20:01:11-00:00
+references: []
+log_events:
+- time: 2026-10-27T20:01:11-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
