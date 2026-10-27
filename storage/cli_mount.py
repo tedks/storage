@@ -56,7 +56,8 @@ from .mount_profiles import (
     help=(
         "Keep prefetching after the last close once readers have read a contiguous "
         "span this long: comma-separated sizes or percentages of the file, whichever "
-        "is reached first (default: 4 chunks or 50%; 0 = after any read)."
+        "is reached first (default: 4 chunks or 50%; 0 = after any read). Spans include "
+        "kernel readahead, so sizes up to about 128K act like 0."
     ),
 )
 @click.option(

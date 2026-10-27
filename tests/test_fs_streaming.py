@@ -751,8 +751,8 @@ class TestFSStreamingIntegration(unittest.TestCase):
 
         with self.fs._prefetch_sessions_lock:
             self.assertNotIn('/sniff.bin', self.fs._prefetch_sessions)
-        self.assertTrue(self._wait_for(lambda: session.io_fd == -1, timeout=3.0))
-        self.assertFalse(session.worker.is_alive())
+        self.assertTrue(self._wait_for(lambda: not session.worker.is_alive(), timeout=3.0))
+        self.assertEqual(session.io_fd, -1)
         with session.lock:
             fetched = sum(end - start for start, end in session.available_ranges)
         self.assertLess(fetched, len(payload))
@@ -784,11 +784,11 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self._assert_not_cached("thumb.bin")
 
     def test_streaming_reopen_after_stop_while_worker_mid_chunk(self):
-        # The stop lands while the worker is mid-chunk. A reopen in that
-        # window (here: while release waits on the worker) gets a fresh
+        # The stop lands while the worker is mid-chunk, and release returns
+        # without waiting for it. The reopen right after gets a fresh
         # session on a fresh partial file; the old worker's late write goes
         # to its own unlinked inode, and the new session caches correct bytes.
-        self.backend.range_delay = 0.15
+        self.backend.range_delay = 0.3
         payload = os.urandom(512 * 1024)
         (self.backend_dir / "midchunk.bin").write_bytes(payload)
 
@@ -797,23 +797,11 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.assertEqual(self.fs.read('/midchunk.bin', 4096, 0, vfd_a), payload[:4096])
         self.assertTrue(self._wait_for(lambda: bool(session_a.in_flight_chunks), timeout=2.0))
 
-        real_worker = session_a.worker
-        reopened = {}
-
-        class JoinHook:
-            def is_alive(hook):
-                return real_worker.is_alive()
-
-            def join(hook, timeout=None):
-                if "vfd" not in reopened:
-                    reopened["vfd"] = self.fs.open('/midchunk.bin', os.O_RDONLY)
-                real_worker.join(timeout)
-
-        session_a.worker = JoinHook()
         self.fs.release('/midchunk.bin', vfd_a)
         self.assertTrue(session_a.detached)
+        self.assertTrue(session_a.worker.is_alive())
 
-        vfd_b = reopened["vfd"]
+        vfd_b = self.fs.open('/midchunk.bin', os.O_RDONLY)
         session_b = self._session_for(vfd_b)
         self.assertIsNot(session_b, session_a)
         for offset in range(0, len(payload), 64 * 1024):
@@ -827,6 +815,26 @@ class TestFSStreamingIntegration(unittest.TestCase):
         cache_path = self.cache_dir / "midchunk.bin"
         self.assertTrue(self._wait_for(cache_path.exists, timeout=8.0))
         self.assertEqual(cache_path.read_bytes(), payload)
+
+    def test_streaming_stopping_release_does_not_wait_for_the_worker(self):
+        # The mount is single-threaded: a release that waited for a worker
+        # mid-chunk would stall every other operation for the fetch.
+        self.backend.range_delay = 1.5
+        payload = os.urandom(512 * 1024)
+        (self.backend_dir / "slow.bin").write_bytes(payload)
+
+        vfd = self.fs.open('/slow.bin', os.O_RDONLY)
+        session = self._session_for(vfd)
+        self.fs.read('/slow.bin', 4096, 0, vfd)
+        self.assertTrue(self._wait_for(lambda: bool(session.in_flight_chunks), timeout=3.0))
+
+        started = time.monotonic()
+        self.fs.release('/slow.bin', vfd)
+        self.assertLess(time.monotonic() - started, 0.5)
+        self.assertTrue(session.detached)
+        self.assertTrue(self._wait_for(lambda: not session.worker.is_alive(), timeout=5.0))
+        self.assertEqual(session.io_fd, -1)
+        self._assert_not_cached("slow.bin")
 
     def test_streaming_reopen_after_stop_restarts_cleanly(self):
         self.backend.range_delay = 0.03

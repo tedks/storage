@@ -1064,7 +1064,7 @@ class StreamingReadManager:
         """Whether the last reader's close stops an unfinished session.
 
         Caller holds session.lock. The session keeps prefetching only if the
-        readers consumed it (see STREAMING_KEEP_AFTER_CLOSE_CHUNKS). A session whose bytes have all arrived is
+        readers consumed it (see StreamingKeepAfterClose). A session whose bytes have all arrived is
         never stopped, even if the worker has not renamed it yet: the stop
         and finalize decisions are both made under session.lock, so either
         this sees prefetch_complete and the session finalizes, or the stop

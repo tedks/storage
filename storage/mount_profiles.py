@@ -88,8 +88,8 @@ def parse_size(size_str: str) -> int:
         raise ValueError(f"Invalid size format: {size_str}") from exc
 
 
-_KEEP_AFTER_CLOSE_SIZE = re.compile(r"\d+(\.\d+)?[KMGT]?", re.IGNORECASE)
-_KEEP_AFTER_CLOSE_PERCENT = re.compile(r"(\d+(\.\d+)?)%")
+_KEEP_AFTER_CLOSE_SIZE = re.compile(r"\d+(\.\d+)?[KMGT]?", re.IGNORECASE | re.ASCII)
+_KEEP_AFTER_CLOSE_PERCENT = re.compile(r"(\d+(\.\d+)?)%", re.ASCII)
 
 
 def parse_keep_after_close(text: str) -> StreamingKeepAfterClose:

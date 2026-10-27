@@ -198,7 +198,8 @@ class TestParseKeepAfterClose(unittest.TestCase):
 
     def test_bad_values_rejected(self):
         for value in ("", " ", ",", "4M,", ",50%", "-1M", "-5%", "101%", "100.5%",
-                      "abc", "4X", "1/2%", "infM", "nan%", "50 %", "4M;50%", "0x10"):
+                      "abc", "4X", "1/2%", "infM", "nan%", "50 %", "4M;50%", "0x10",
+                      "\uff14M", "\u0665\u0660%"):
             with self.subTest(value=value):
                 with self.assertRaises(ValueError):
                     parse_keep_after_close(value)
