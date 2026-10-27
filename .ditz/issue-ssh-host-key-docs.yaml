@@ -1,0 +1,21 @@
+id: ssh-host-key-docs
+title: Document SSH host-key behaviour of the SSH, rsync and watcher paths
+desc: 'Ruling on oq-ssh-known-hosts-surface (2026-10-27). Document in README/storage.example.toml:
+  SSHBackend trusts any host key (paramiko AutoAddPolicy, not persisted); RsyncBackend
+  and RemoteWatcher use StrictHostKeyChecking=accept-new and write ~/.ssh/known_hosts;
+  on a changed key SFTP keeps working while rsync/watcher fail with REMOTE HOST IDENTIFICATION
+  HAS CHANGED (#107), and the fix is ssh-keygen -R <host>. Note the ruling on #107
+  and #30.'
+type: task
+component: docs
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-27T19:13:30-00:00
+references: []
+log_events:
+- time: 2026-10-27T19:13:30-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
