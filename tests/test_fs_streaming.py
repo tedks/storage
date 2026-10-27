@@ -501,6 +501,8 @@ class TestFSStreamingIntegration(unittest.TestCase):
         payload = os.urandom(128 * 1024)
         (self.backend_dir / "gap.bin").write_bytes(payload)
         manager = self.fs._streaming_manager
+        # The real worker cannot finish the file first: nothing is read, so
+        # it waits for a first read until the stop wakes it.
 
         vfd = self.fs.open('/gap.bin', os.O_RDONLY)
         session = self._session_for(vfd)
@@ -548,6 +550,7 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.assertTrue(session.detached)
         self.assertFalse(session.finalized)
         self.assertFalse((self.cache_dir / "gap.bin").exists())
+        self.assertFalse((self.cache_dir / "gap.bin.storage.partial").exists())
         self.assertFalse(self.fs.cache_manager.is_cached("/gap.bin"))
         self.assertIsNone(self.fs.state_manager.get_file_metadata("/gap.bin"))
 

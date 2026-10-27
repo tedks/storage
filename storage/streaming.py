@@ -35,7 +35,8 @@ class PrefetchSession:
     error: Optional[Exception] = None
     worker: Optional[threading.Thread] = None
     has_foreground_read: bool = False
-    # Set, under prefetch_sessions_lock, when the session leaves the registry
+    # Set (claimed under session.lock, inside prefetch_sessions_lock; see
+    # _claim_detach) when the session leaves the registry
     # for good: stopped by the last reader's close, or cleaned up after a
     # failure or cancel. Its partial file is already unlinked or promoted, so
     # it no longer owns the partial path: a new session for the same file may
@@ -602,9 +603,14 @@ class StreamingReadManager:
         """Mark the session detached; False if it already was. Caller holds session.lock.
 
         Callers that also decide something about the session (the stop on
-        last close) claim in the same session.lock section as the decision,
-        so finalize, which checks detached under session.lock, either runs
-        to the rename before the claim or never starts it.
+        last close) claim in the same session.lock section as the decision.
+        Finalize checks detached and range completeness under session.lock
+        and renames after dropping it, so the stop alone does not exclude a
+        rename already past that check. What does is that the stop also
+        requires prefetch_complete to be unset, and _fetch_range_into_session
+        sets it in the same section that completes the ranges: a finalize
+        past its check implies prefetch_complete, so no stop. Keep both, the
+        predicate and where prefetch_complete is set, or this breaks.
         """
         if session.detached:
             return False
