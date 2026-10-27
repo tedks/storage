@@ -56,3 +56,8 @@ log_events:
     the mount whose mtime was set back with utimens (cp -p, touch -r) can match the
     old size and mtime. That widens option 3''s case beyond the same-second window
     for those members. See gh-112-rsync-quickcheck for the related upload bug.'
+- time: 2026-10-27T19:13:20-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Ruling (Ted, 2026-10-27): decision deferred. Take one read-only snapshot
+    by hand now and re-check in about a week; decide from the result. Task: checksum-gap-spotcheck.'
