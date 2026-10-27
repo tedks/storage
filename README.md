@@ -158,7 +158,7 @@ does not pull whole files. The value is a comma-separated list of sizes
 (`4M`, `512K`, plain bytes) and percentages of the file (`50%`, `12.5%`,
 rounded down to bytes), whichever is reached first. Spans count the
 read requests the kernel sends, which include its own readahead (up to
-128K by default), so a size at or below that acts like `0`. Unset, it is 4
+128K by default), so a size at or below that can act like `0`. Unset, it is 4
 chunks or 50% (`4M,50%` at the default 1M `streaming_chunk_size`). `0`
 keeps prefetching after any read, the behaviour before this option.
 `100%` effectively never keeps prefetching after a close. Empty terms,

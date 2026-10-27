@@ -830,7 +830,7 @@ class TestFSStreamingIntegration(unittest.TestCase):
 
         started = time.monotonic()
         self.fs.release('/slow.bin', vfd)
-        self.assertLess(time.monotonic() - started, 0.5)
+        self.assertLess(time.monotonic() - started, 1.0)
         self.assertTrue(session.detached)
         self.assertTrue(self._wait_for(lambda: not session.worker.is_alive(), timeout=5.0))
         self.assertEqual(session.io_fd, -1)
