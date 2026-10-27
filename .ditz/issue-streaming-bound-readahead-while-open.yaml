@@ -1,0 +1,23 @@
+id: streaming-bound-readahead-while-open
+title: Bound streaming read-ahead while the reader has not shown consumption
+desc: 'While a streaming session is open, the background worker prefetches unboundedly
+  from the reader''s offset as soon as the first read lands. PR #120 stops it at the
+  last close unless readers consumed the file, but a reader that holds a file open
+  while reading only its head (a long-lived sniffer, a paused player) still pulls
+  the whole file. The original issue (streaming-small-read-fetches-whole-file) suggested
+  a read-ahead window that grows with contiguous reads. Recommendation: cap the worker''s
+  lead over the readers'' furthest contiguous span until readers_consumed is set,
+  then lift the cap. Not done in #120 to keep that PR to the close decision.'
+type: feature
+component: fs
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-27T20:01:11-00:00
+references: []
+log_events:
+- time: 2026-10-27T20:01:11-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
