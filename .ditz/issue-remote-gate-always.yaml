@@ -19,3 +19,13 @@ log_events:
   who: Ted Smith
   what: created
   comment: ""
+- time: 2026-10-27T19:20:23-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Scope note (2026-10-27): the repo is public and contributors have no framework0.
+    The rule in AGENTS.md/CONTRIBUTING.md must be host-neutral: run the remote gate
+    before every push; it needs Docker; if your host has none, run it on a host that
+    does at the same SHA. run-gates.sh takes that host from an env var (e.g. STORAGE_REMOTE_GATE_HOST),
+    unset by default, so framework0 appears only in the maintainer''s own environment,
+    not in the tree. Contributors without Docker say so in the PR and the maintainer
+    runs the gate before merging.'
