@@ -1,0 +1,22 @@
+id: streaming-small-read-fetches-whole-file
+title: A small read of an uncached file streams the whole file
+desc: '2026-10-27: Nautilus browsing a folder on the drynwyn-warez mount (content-type
+  sniffing / thumbnailing) opened ~450 files; each open of an uncached file started
+  a streaming session that prefetched to ''streaming complete'' (full size), though
+  the reader needed a few KB. On a folder of multi-GB videos one browse would pull
+  GBs. Consider bounding prefetch until the reader proves sequential (read-ahead window
+  grows with contiguous reads), and dropping the session when the last reader closes
+  early.'
+type: bugfix
+component: fs
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-27T19:26:42-00:00
+references: []
+log_events:
+- time: 2026-10-27T19:26:42-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
