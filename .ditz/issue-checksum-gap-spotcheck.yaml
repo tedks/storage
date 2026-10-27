@@ -17,3 +17,9 @@ log_events:
   who: Ted Smith
   what: created
   comment: ""
+- time: 2026-10-27T19:13:23-00:00
+  who: Ted Smith
+  what: blocks oq-checksum-same-second-rewrite
+  comment: ""
+blocks:
+- oq-checksum-same-second-rewrite
