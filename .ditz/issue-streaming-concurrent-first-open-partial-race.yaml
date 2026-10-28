@@ -14,8 +14,8 @@ type: bugfix
 component: fs
 release:
 reporter: Ted Smith <tedks@riseup.net>
-status: in_progress
-disposition:
+status: closed
+disposition: fixed
 creation_time: 2026-10-27T20:01:11-00:00
 references: []
 log_events:
@@ -27,3 +27,8 @@ log_events:
   who: Ted Smith
   what: started
   comment: ""
+- time: 2026-10-28T21:55:52-00:00
+  who: Ted Smith
+  what: 'closed: fixed'
+  comment: 'Merged in #125 as be0cad0 (head 58e1450): partial prepared under a unique
+    staging name, renamed onto the shared path at registration under prefetch_sessions_lock.'
