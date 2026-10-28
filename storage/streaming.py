@@ -64,6 +64,11 @@ class PrefetchSession:
     # check it too, but not atomically with the write (see
     # _update_streaming_state_xattr).
     detached: bool = False
+    # Set by the worker's tail, in the same session.lock section where it
+    # reads refcount to decide whether it cleans up a failed session. A
+    # release that drops the last ref of a failed session cleans up only if
+    # this is set; otherwise the worker's tail will see refcount == 0.
+    worker_exited: bool = False
     # Merged spans the readers asked for, until readers_consumed is set.
     foreground_read_spans: List[Tuple[int, int]] = field(default_factory=list)
     readers_consumed: bool = False
@@ -908,6 +913,7 @@ class StreamingReadManager:
         self._finalize_streaming_session(session)
 
         with session.lock:
+            session.worker_exited = True
             has_error = session.error is not None
             no_readers = session.refcount == 0
             stopped = session.stop_requested
@@ -1124,14 +1130,17 @@ class StreamingReadManager:
             has_error = session.error is not None
             finalized = session.finalized
             no_readers = session.refcount == 0
+            worker_exited = session.worker_exited
 
         if has_error and no_readers:
-            if worker and worker.is_alive():
-                worker.join(timeout=2.0)
-            if worker and worker.is_alive():
+            # No join here either (see above). Cleanup of a failed session
+            # belongs to whichever side comes second under session.lock: the
+            # worker's tail sets worker_exited and reads refcount in one
+            # section, so if it has not exited yet it will see no readers and
+            # clean up itself, and if it has, it saw a reader and left the
+            # cleanup to us. Cleanup is single-shot, so both running is safe.
+            if not worker_exited:
                 return
-            with session.lock:
-                finalized = session.finalized
             if not finalized:
                 self._cleanup_failed_session(session)
                 return
