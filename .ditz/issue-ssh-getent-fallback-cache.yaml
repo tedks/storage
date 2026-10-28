@@ -1,0 +1,24 @@
+id: ssh-getent-fallback-cache
+title: 'SSH getent fallback: cache resolved addresses per host briefly'
+desc: 'Follow-up from the council on PR #124 (nix-package-mdns-resolution), Claude
+  seat nit 3. With the getent fallback, every per-thread SSH connect to an affected
+  .local member first fails getaddrinfo and then runs one getent process (about 25
+  ms with a warm avahi cache). While a member is available each FUSE worker thread
+  connects on its own, so a mount with many threads runs that many getents at startup
+  and after each reconnect. Not a problem at current thread counts; a short per-host
+  cache (a few seconds, keyed by host) would remove it if it shows up in profiles.
+  Deferred because it adds staleness questions (DHCP address change) for no measured
+  cost.'
+type: task
+component: build
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-28T21:31:08-00:00
+references: []
+log_events:
+- time: 2026-10-28T21:31:08-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
