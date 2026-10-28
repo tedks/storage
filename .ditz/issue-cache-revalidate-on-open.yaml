@@ -27,3 +27,11 @@ log_events:
   who: Ted Smith
   what: started
   comment: ""
+- time: 2026-10-28T22:19:05-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'PR #127 open; blocked on oq-revalidate-council-round4 (three council rounds
+    without convergence, per the lane brief''s stop condition). Head 4d77d8b has fixes
+    for round 3, not yet reviewed. Follow-ups filed: revalidate-stat-timeout, revalidate-listing-attrs,
+    revalidate-streamed-baseline, revalidate-unavailable-negative-cache, revalidate-double-stat,
+    revalidate-post-sync-stat-failure, revalidate-streaming-bail-pin, local-backend-internal-xattrs.'
