@@ -7,6 +7,13 @@ cache_size = "50G"
 database = "/home/user/.cache/storage/media/.storage.db"
 workers = 2
 key_file = "/home/user/.ssh/id_ed25519"
+# Host keys are not configurable yet (#107, #30). SFTP (paramiko) trusts any
+# key and remembers none. rsync uploads and the remote watcher (when
+# enabled) use ssh's StrictHostKeyChecking=accept-new and write your
+# known_hosts (normally ~/.ssh/known_hosts); after a member's key changes they fail with "REMOTE
+# HOST IDENTIFICATION HAS CHANGED" while SFTP keeps working. Verify the new
+# key's fingerprint, then `ssh-keygen -R <host>`. See "SSH host keys" in
+# README.md.
 foreground = true
 streaming_reads = true
 streaming_chunk_size = "1M"

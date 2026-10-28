@@ -94,8 +94,8 @@ class RsyncBackend(SSHBackend):
         if self.key_filename:
             parts.append(f"-i {shlex.quote(self.key_filename)}")
         parts.append("-o BatchMode=yes")
-        # Match paramiko's AutoAddPolicy: accept new host keys automatically
-        # but reject changed keys (MITM protection).
+        # Accept unseen host keys (like paramiko's AutoAddPolicy) but refuse
+        # a changed one; unlike paramiko this records them in known_hosts.
         parts.append("-o StrictHostKeyChecking=accept-new")
         parts.append(f"-o ConnectTimeout={int(self.connect_timeout)}")
         return " ".join(parts)
