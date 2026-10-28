@@ -546,7 +546,9 @@ class TestFSStreamingIntegration(unittest.TestCase):
                 self.fs.release('/cancelled.bin', vfd)
 
                 self.assertTrue(self._wait_for(lambda: len(self.fs._prefetch_sessions) == 0, timeout=3.0))
-                self.assertGreaterEqual(cancelled_cleanup.call_count, 1)
+                # The stop unregisters at once; the worker's tail, which runs
+                # the cancelled cleanup, follows on its own thread.
+                self.assertTrue(self._wait_for(lambda: cancelled_cleanup.call_count >= 1, timeout=3.0))
                 self.assertEqual(failed_cleanup.call_count, 0)
 
 
