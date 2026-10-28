@@ -1,0 +1,25 @@
+id: streaming-destroy-concurrent-open
+title: destroy() drops sessions without detaching them, so an open racing unmount
+  could lose its partial
+desc: 'Council round 1 on #125 (Codex Critical, Claude nit). StreamingReadManager.destroy()
+  clears the registry, then stops sessions and unlinks each partial, without claiming
+  detach. An open that registered a new session for the same path in between could
+  have its partial unlinked by destroy, renamed by the old session''s finalize, or
+  removed by its cancelled cleanup. FUSE runs destroy as the unmount hook on the single
+  FUSE thread (nothreads), after which no open is served, so this needs a multithreaded
+  StorageFS caller; pre-existing, not changed by #125. Fix sketch: claim detach for
+  each session inside prefetch_sessions_lock in destroy, and refuse new sessions once
+  destroy has started.'
+type: bugfix
+component: fs
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-28T21:42:41-00:00
+references: []
+log_events:
+- time: 2026-10-28T21:42:41-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
