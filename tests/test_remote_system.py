@@ -814,3 +814,38 @@ def test_mounted_nonstreaming_read_makes_no_range_reads(remote, mounted_factory,
                                                      streaming=False)
     assert ranges == []
     assert downloads == ["/stream.bin"], "the whole file must be downloaded exactly once"
+
+
+def test_mounted_revalidate_sees_container_change_after_age(remote, mounted_factory):
+    """With watchers off, a changed member copy is refetched once the check ages.
+
+    The file is fetched over SFTP, whose download stamps the fetch time, so
+    the first check runs without a member baseline (size, or a member mtime
+    later than the cache file's); the second runs against the baseline the
+    first recorded.
+    """
+    m0 = remote.members[0]
+    age = 2.0
+    remote.write_remote(m0, "reval.txt", b"first version\n")
+    mnt = mounted_factory(revalidate_after=age, readdir_ttl=0.5)
+    assert not mnt.fs._watchers
+    path = mnt.mount / "reval.txt"
+    assert path.read_bytes() == b"first version\n"
+
+    # Different size; inside the age the cached copy is still served.
+    remote.write_remote(m0, "reval.txt", b"second, longer version\n")
+    assert path.read_bytes() == b"first version\n"
+    assert _wait_for(lambda: path.read_bytes() == b"second, longer version\n",
+                     timeout=age * 5, interval=0.5), \
+        "the container's change was never seen after the revalidation age"
+    # That stale open recorded the member's stat; let the age pass once more
+    # so the next one compares against it.
+    time.sleep(age + 0.5)
+    assert path.read_bytes() == b"second, longer version\n"
+
+    # Same size, later mtime (SFTP reports whole seconds, so step past one).
+    time.sleep(1.1)
+    remote.write_remote(m0, "reval.txt", b"SECOND, LONGER VERSION\n")
+    assert _wait_for(lambda: path.read_bytes() == b"SECOND, LONGER VERSION\n",
+                     timeout=age * 5, interval=0.5), \
+        "a same-size change was never seen after the revalidation age"

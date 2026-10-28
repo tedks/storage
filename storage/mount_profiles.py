@@ -2,6 +2,7 @@ import click
 import tomllib
 from dataclasses import dataclass
 from fractions import Fraction
+import math
 from pathlib import Path
 import re
 from typing import Any, Dict, Optional, Sequence, Tuple
@@ -15,6 +16,7 @@ DEFAULT_CACHE_SIZE = "10G"
 DEFAULT_SYNC_WORKERS = 2
 DEFAULT_STREAMING_CHUNK_SIZE = "1M"
 DEFAULT_MAX_STREAMING_SESSIONS = 8
+DEFAULT_REVALIDATE_AFTER = 60.0
 DEFAULT_MOUNT_CONFIG_NAME = "storage.toml"
 
 
@@ -40,6 +42,8 @@ class ResolvedMountConfig:
     profile_source: Optional[Path] = None
     # None: the default, 4 chunks or 50% (see storage/streaming.py).
     streaming_keep_after_close: Optional[str] = None
+    # Seconds after which opening a CLEAN cached file checks its member.
+    revalidate_after: float = DEFAULT_REVALIDATE_AFTER
 
     @property
     def member_specs(self) -> Tuple[str, ...]:
@@ -170,6 +174,15 @@ def _optional_profile_string(profile: Dict[str, Any], key: str, profile_name: st
             f"Mount profile '{profile_name}' must define '{key}' as a non-empty string when present"
         )
     return value
+
+
+def _validated_revalidate_after(value: float) -> float:
+    """revalidate_after is seconds, 0 or more (0: check at every open)."""
+    if math.isnan(value) or value < 0:
+        raise click.ClickException(
+            f"revalidate_after must be a number of seconds, 0 or more (got {value})"
+        )
+    return float(value)
 
 
 def _optional_profile_float(profile: Dict[str, Any], key: str, profile_name: str) -> Optional[float]:
@@ -484,6 +497,7 @@ def _load_mount_profile_settings(config_path: Path, profile_name: str) -> Dict[s
         ),
         "readdir_ttl": _optional_profile_float(config_profile, "readdir_ttl", profile_name),
         "enable_watchers": _optional_profile_bool(config_profile, "enable_watchers", profile_name),
+        "revalidate_after": _optional_profile_float(config_profile, "revalidate_after", profile_name),
         "backing_paths": config_backing_paths,
         "remote": config_remote,
     }
@@ -515,6 +529,7 @@ def _can_auto_load_mount_profile(
     readdir_ttl: Optional[float],
     enable_watchers: Optional[bool],
     streaming_keep_after_close: Optional[str] = None,
+    revalidate_after: Optional[float] = None,
 ) -> bool:
     if not _target_looks_like_profile_name(mount_target):
         return False
@@ -535,6 +550,7 @@ def _can_auto_load_mount_profile(
         readdir_ttl is not None,
         enable_watchers is not None,
         streaming_keep_after_close is not None,
+        revalidate_after is not None,
     ))
 
 
@@ -557,6 +573,7 @@ def resolve_mount_configuration(
     readdir_ttl: Optional[float],
     enable_watchers: Optional[bool],
     streaming_keep_after_close: Optional[str] = None,
+    revalidate_after: Optional[float] = None,
 ) -> ResolvedMountConfig:
     config_values = {
         "mountpoint": None,
@@ -574,6 +591,7 @@ def resolve_mount_configuration(
         "streaming_keep_after_close": None,
         "readdir_ttl": None,
         "enable_watchers": None,
+        "revalidate_after": None,
         "backing_paths": (),
         "remote": (),
     }
@@ -602,6 +620,7 @@ def resolve_mount_configuration(
         readdir_ttl,
         enable_watchers,
         streaming_keep_after_close,
+        revalidate_after,
     ):
         available_configs = [candidate for candidate in default_mount_config_paths() if candidate.exists()]
         if available_configs:
@@ -674,5 +693,12 @@ def resolve_mount_configuration(
             streaming_keep_after_close
             if streaming_keep_after_close is not None
             else config_values["streaming_keep_after_close"]
+        ),
+        revalidate_after=_validated_revalidate_after(
+            revalidate_after if revalidate_after is not None else (
+                config_values["revalidate_after"]
+                if config_values["revalidate_after"] is not None
+                else DEFAULT_REVALIDATE_AFTER
+            )
         ),
     )

@@ -301,6 +301,39 @@ readdir_ttl = 5.0
         finally:
             Path(config_path).unlink()
 
+    def test_revalidate_after_defaults_to_60(self):
+        self.assertEqual(60.0, self._resolve().revalidate_after)
+
+    def test_revalidate_after_from_profile_and_cli_override(self):
+        toml_content = '''
+[mounts.prof]
+mountpoint = "/mnt/test"
+cache = "/tmp/cache"
+backends = ["/srv/data"]
+revalidate_after = 300
+'''
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.toml', delete=False) as f:
+            f.write(toml_content)
+            config_path = Path(f.name)
+
+        try:
+            from_profile = self._resolve(
+                mount_target="prof", backing_paths=[], config_path=config_path,
+            )
+            self.assertEqual(300.0, from_profile.revalidate_after)
+            from_cli = self._resolve(
+                mount_target="prof", backing_paths=[], config_path=config_path,
+                revalidate_after=0.0,
+            )
+            self.assertEqual(0.0, from_cli.revalidate_after)
+        finally:
+            config_path.unlink()
+
+    def test_revalidate_after_rejects_negative_and_nan(self):
+        for bad in (-1.0, float("nan")):
+            with self.assertRaises(click.ClickException):
+                self._resolve(revalidate_after=bad)
+
 
 class TestResolvedMemberConfig(unittest.TestCase):
     def test_explicit_member_specs_require_names_and_cache_root(self):
