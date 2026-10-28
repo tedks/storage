@@ -1,0 +1,24 @@
+id: revalidate-streamed-baseline
+title: Streamed fetches record no revalidation check or member baseline
+desc: 'From council round 1 on #127 (Claude seat). _finalize_streaming_session (storage/streaming.py)
+  records no member check, so the first open of a streamed file stats the member at
+  once regardless of revalidate_after, and the check runs without a baseline (size,
+  or member mtime later than the cache file''s). That misses a same-size change with
+  an older mtime made between the stream and the first check, and refetches once when
+  the member''s clock is ahead. Fix: take the member stat at session start (the session
+  already calls backend.get_size; a stat gives size and mtime) and hand it to StorageFS
+  on finalize (a callback like member_written_cb). Touches streaming.py; left out
+  of #127 because the streaming lane owns that file in this wave.'
+type: task
+component: cache
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-28T22:02:52-00:00
+references: []
+log_events:
+- time: 2026-10-28T22:02:52-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
