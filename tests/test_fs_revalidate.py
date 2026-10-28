@@ -246,11 +246,26 @@ class TestRevalidateOnOpen(RevalidateTestBase):
     def test_persisted_baseline_ignored_after_cache_file_changes(self):
         cache_file = self.cache_dir / "f.txt"
         os.utime(cache_file, (1_650_000_000, 1_650_000_000))
+        recorded = self.fs._member_checks["/f.txt"].cache_identity
+        self.assertEqual({"member": (8, 1_700_000_000.0)},
+                         self.fs._load_persisted_members(cache_file, recorded))
         st = os.lstat(cache_file)
         identity = (st.st_ino, st.st_size, st.st_mtime_ns)
-        self.assertEqual({}, self.fs._load_persisted_members("/f.txt", cache_file, identity))
-        self.assertEqual({}, self.fs._load_persisted_members("/g.txt", cache_file,
-                                                             self.fs._member_checks["/f.txt"].cache_identity))
+        self.assertNotEqual(recorded, identity)
+        self.assertEqual({}, self.fs._load_persisted_members(cache_file, identity))
+
+    def test_baselines_merge_across_members(self):
+        cache_file = self.cache_dir / "f.txt"
+        identity = self.fs._member_checks["/f.txt"].cache_identity
+        self.fs._store_member_check("/f.txt", cache_file, identity, {"other": (8, 1.0)})
+        expected = {"member": (8, 1_700_000_000.0), "other": (8, 1.0)}
+        self.assertEqual(expected, self.fs._member_checks["/f.txt"].members)
+        # And on disk, so a restart sees both.
+        self.assertEqual(expected, self.fs._load_persisted_members(cache_file, identity))
+        # Not in memory (restart): the merge starts from the xattr.
+        self.fs._forget_member_check("/f.txt")
+        self.fs._store_member_check("/f.txt", cache_file, identity, {"third": (8, 2.0)})
+        self.assertEqual(dict(expected, third=(8, 2.0)), self.fs._member_checks["/f.txt"].members)
 
     def test_member_stat_xattr_is_read_only_through_the_mount(self):
         before = os.getxattr(self.cache_dir / "f.txt", StorageFS.MEMBER_STAT_XATTR)
@@ -277,14 +292,22 @@ class TestRevalidateOnOpen(RevalidateTestBase):
             self.fs.release("/f.txt", fd)
         stat.assert_not_called()
 
-    def test_unlink_and_rename_forget_checks(self):
-        self.read_through("/f.txt")
+    def test_rename_keeps_baseline_and_unlink_forgets(self):
         self.fs.rename("/f.txt", "/g.txt")
         self.assertNotIn("/f.txt", self.fs._member_checks)
-        self.assertNotIn("/g.txt", self.fs._member_checks)
-        self.read_through("/g.txt")
+        self.assertEqual({"member": (8, 1_700_000_000.0)}, self.fs._member_checks["/g.txt"].members)
+        # Same size, older mtime at the new name: only the moved baseline sees it.
+        self.rewrite_member("g.txt", b"ORIGINAL", mtime=1_600_000_000)
+        self.age_checks()
+        self.assertEqual(b"ORIGINAL", self.read_through("/g.txt"))
         self.fs.unlink("/g.txt")
         self.assertNotIn("/g.txt", self.fs._member_checks)
+
+    def test_rename_keeps_persisted_baseline_after_restart(self):
+        self.fs.rename("/f.txt", "/g.txt")
+        self.restart()
+        self.rewrite_member("g.txt", b"ORIGINAL", mtime=1_600_000_000)
+        self.assertEqual(b"ORIGINAL", self.read_through("/g.txt"))
 
     def test_eviction_forgets_the_check(self):
         self.assertIn("/f.txt", self.fs._member_checks)
@@ -371,11 +394,35 @@ class TestRevalidateTwoMembers(RevalidateTestBase):
         self.fs.state_manager.add_file_location(FileLocation(
             virtual_path="/f.txt", backend_name="fast", checksum="",
             last_synced=time.time(), is_cached=False))
+        self.fast, self.slow, self.fast_dir = fast, slow, fast_dir
         (fast_dir / "f.txt").write_bytes(b"changed on fast")
         self.age_checks()
         with patch.object(slow, "stat", wraps=slow.stat) as slow_stat:
             self.assertEqual(b"changed on fast", self.read_through("/f.txt"))
         slow_stat.assert_not_called()
+
+    def test_refetch_from_another_member_rechecks_the_changed_one(self):
+        self.test_checks_the_member_a_refetch_reads()
+        fast, fast_dir = self.fast, self.fast_dir
+        (fast_dir / "f.txt").write_bytes(b"changed again on fast")
+        self.age_checks()
+        real_stat = fast.stat
+
+        def stat_then_drop(path):
+            # The checked member goes away between its stat and the refetch.
+            result = real_stat(path)
+            fast.set_available(False)
+            return result
+
+        with patch.object(fast, "stat", side_effect=stat_then_drop):
+            # The slower member supplies its (older) bytes; the open works.
+            self.assertEqual(b"original", self.read_through("/f.txt"))
+        self.assertEqual({"fast"}, self.fs._recheck["/f.txt"])
+        fast.set_available(True)
+        self.age_checks()
+        # Its baseline now matches nothing it supplied: the recheck refetches.
+        self.assertEqual(b"changed again on fast", self.read_through("/f.txt"))
+        self.assertNotIn("/f.txt", self.fs._recheck)
 
 
 if __name__ == "__main__":

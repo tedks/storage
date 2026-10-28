@@ -170,6 +170,13 @@ class StorageFS(Operations):
         # Members whose failed revalidation has been logged; cleared by the
         # member's next successful stat, so an outage is logged once.
         self._revalidate_outages: Set[str] = set()
+        # A check that found a change pins the refetch to the member it
+        # checked (consumed by _select_backend_for_read). If that member is
+        # gone by then and another supplies the bytes, its name is kept in
+        # _recheck so its next check refetches again instead of adopting the
+        # change as a baseline. Both under _member_checks_lock.
+        self._refetch_pins: Dict[str, Backend] = {}
+        self._recheck: Dict[str, Set[str]] = {}
 
         # Background sync manager
         self.sync_manager = SyncManager(
@@ -644,7 +651,22 @@ class StorageFS(Operations):
         return self._streaming_manager._partial_cache_path(cache_path)
 
     def _select_backend_for_read(self, canonical_path: str) -> Optional[Backend]:
-        """Pick a readable backend, preferring existing replication metadata."""
+        """Pick a readable backend, preferring existing replication metadata.
+
+        A refetch after revalidation reads from the member that was checked
+        (see _revalidate_cached_file) while it is available.
+        """
+        with self._member_checks_lock:
+            pinned = self._refetch_pins.pop(canonical_path, None)
+        if pinned is not None and pinned.is_available():
+            return pinned
+        backend = self._select_unpinned_backend_for_read(canonical_path)
+        if pinned is not None and backend is not pinned:
+            with self._member_checks_lock:
+                self._recheck.setdefault(canonical_path, set()).add(pinned.name)
+        return backend
+
+    def _select_unpinned_backend_for_read(self, canonical_path: str) -> Optional[Backend]:
         backend = self.replication_manager.get_backend_for_read(canonical_path)
         if backend:
             return backend
@@ -673,15 +695,44 @@ class StorageFS(Operations):
     def _cache_identity(st: os.stat_result) -> Tuple[int, int, int]:
         return (st.st_ino, st.st_size, st.st_mtime_ns)
 
-    def _forget_member_check(self, virtual_path: str, subtree: bool = False):
+    def _forget_member_check(self, virtual_path: str, subtree: bool = False,
+                             path_gone: bool = False):
         """Drop the in-memory check (a persisted baseline dies with its file,
-        or is ignored once the file's identity or path no longer matches)."""
+        or is ignored once the file's identity no longer matches).
+
+        With path_gone (unlink, a failed rename) the refetch pin and recheck
+        marks go too; a cached copy that is only being dropped or rewritten
+        keeps them, since they are about the members, not the copy.
+        """
         prefix = virtual_path.rstrip("/") + "/"
+        tables = [self._member_checks]
+        if path_gone:
+            tables += [self._refetch_pins, self._recheck]
         with self._member_checks_lock:
-            self._member_checks.pop(virtual_path, None)
-            if subtree:
-                for key in [k for k in self._member_checks if k.startswith(prefix)]:
-                    del self._member_checks[key]
+            for table in tables:
+                table.pop(virtual_path, None)
+                if subtree:
+                    for key in [k for k in table if k.startswith(prefix)]:
+                        del table[key]
+
+    def _move_member_checks(self, old: str, new: str):
+        """A rename succeeded: the checks (and recheck marks) follow the files.
+
+        The cache files keep their identity across a rename, and the members
+        are renamed too, so the baselines still hold. Whatever was recorded
+        under the new name (a file replaced by the rename) goes.
+        """
+        old_prefix = old.rstrip("/") + "/"
+        new_prefix = new.rstrip("/") + "/"
+        with self._member_checks_lock:
+            for table in (self._member_checks, self._refetch_pins, self._recheck):
+                for key in [k for k in table if k == new or k.startswith(new_prefix)]:
+                    del table[key]
+                moved = {}
+                for key in [k for k in table if k == old or k.startswith(old_prefix)]:
+                    target = new if key == old else new_prefix + key[len(old_prefix):]
+                    moved[target] = table.pop(key)
+                table.update(moved)
 
     def _forget_cached_copy_attrs(self, virtual_path: str, *, removing: bool = True):
         """Forget what was known about a cached copy that is going or changing.
@@ -693,12 +744,18 @@ class StorageFS(Operations):
         self.namespace.forget_listed_attrs(virtual_path, removing=removing)
         self._forget_member_check(virtual_path)
 
-    def _load_persisted_members(self, canonical_path: str, cache_path: Path,
+    def _load_persisted_members(self, cache_path: Path,
                                 identity: Tuple[int, int, int]) -> Dict[str, Tuple[int, float]]:
-        """Member baselines from the cache file's xattr, if it still describes this file."""
+        """Member baselines from the cache file's xattr, if it still describes this file.
+
+        Matched on the cache file's (ino, size, mtime_ns) alone: a rename
+        keeps both the file and its baselines valid, and a copy of the xattr
+        onto another file (copy2 to a local member and back) has another
+        inode.
+        """
         try:
             payload = json.loads(os.getxattr(str(cache_path), self.MEMBER_STAT_XATTR))
-            if payload.get("path") != canonical_path or tuple(payload.get("cache")) != identity:
+            if tuple(payload.get("cache")) != identity:
                 return {}
             return {
                 str(name): (int(size), float(mtime))
@@ -709,23 +766,34 @@ class StorageFS(Operations):
 
     def _store_member_check(self, canonical_path: str, cache_path: Path,
                             identity: Tuple[int, int, int],
-                            members: Dict[str, Tuple[int, float]]):
-        """Record a check now, in memory, and persist its baselines on the cache file.
+                            updates: Dict[str, Tuple[int, float]], *, replace: bool = False):
+        """Record a check now, merging member baselines, in memory and on the cache file.
 
-        The xattr lets the first check after a restart compare against a
-        baseline instead of guessing; it carries the path and the cache file's
-        identity, so a renamed, rewritten or refetched file ignores it. Under
-        _member_checks_lock (a leaf: setxattr takes no other lock) so the sync
-        workers and the FUSE thread cannot interleave memory and xattr.
+        The baselines already known for this cache file (in memory, else from
+        its xattr) are kept and updates applied on top; replace=True starts
+        from nothing (a fetch: the old copy's baselines describe other bytes).
+        The read, merge and both writes are one critical section under
+        _member_checks_lock (a leaf: getxattr and setxattr take no other
+        lock), so a sync worker and the FUSE thread cannot drop each other's
+        baselines. The xattr carries the cache file's identity, so a
+        rewritten or refetched file ignores it; it lets the first check after
+        a restart compare against a baseline instead of guessing.
         """
-        check = MemberCheck(cache_identity=identity, verified_at=time.monotonic(),
-                            members=dict(members))
         with self._member_checks_lock:
             previous = self._member_checks.get(canonical_path)
+            if replace:
+                members = {}
+            elif previous is not None and previous.cache_identity == identity:
+                members = dict(previous.members)
+            else:
+                members = self._load_persisted_members(cache_path, identity)
+            members.update(updates)
+            check = MemberCheck(cache_identity=identity, verified_at=time.monotonic(),
+                                members=members)
             self._member_checks[canonical_path] = check
             if members and (previous is None or previous.cache_identity != identity
-                            or previous.members != check.members):
-                payload = {"path": canonical_path, "cache": list(identity),
+                            or previous.members != members):
+                payload = {"cache": list(identity),
                            "members": {name: list(stat) for name, stat in members.items()}}
                 try:
                     os.setxattr(str(cache_path), self.MEMBER_STAT_XATTR,
@@ -750,7 +818,7 @@ class StorageFS(Operations):
         members = {}
         if member_stat is not None:
             members[backend.name] = (member_stat.st_size, member_stat.st_mtime)
-        self._store_member_check(canonical_path, cache_path, identity, members)
+        self._store_member_check(canonical_path, cache_path, identity, members, replace=True)
 
     def _record_member_written(self, virtual_path: str, backend: Backend, cache_path: Path):
         """Sync callback: backend now holds the cache file's content.
@@ -767,15 +835,8 @@ class StorageFS(Operations):
         except Exception as exc:
             self.logger.debug("post-sync stat on %s failed: %r", backend.name, exc)
             return
-        with self._member_checks_lock:
-            previous = self._member_checks.get(virtual_path)
-        members = {}
-        if previous is not None and previous.cache_identity == identity:
-            members.update(previous.members)
-        else:
-            members.update(self._load_persisted_members(virtual_path, cache_path, identity))
-        members[backend.name] = (member_stat.st_size, member_stat.st_mtime)
-        self._store_member_check(virtual_path, cache_path, identity, members)
+        self._store_member_check(virtual_path, cache_path, identity,
+                                 {backend.name: (member_stat.st_size, member_stat.st_mtime)})
 
     def _member_for_revalidation(self, canonical_path: str) -> Tuple[Optional[Backend], List[str]]:
         """Pick the member to stat, from the index alone (no remote call).
@@ -826,7 +887,11 @@ class StorageFS(Operations):
 
         A changed copy goes through _invalidate_file_cache, which keeps a
         file that became DIRTY or has a writer open; whatever is no longer
-        cached is then fetched by the caller as usual. An unavailable member,
+        cached is then fetched by the caller as usual, pinned to the member
+        that was checked (_select_backend_for_read). If that member is gone
+        by then, another supplies the bytes and the checked member is marked
+        for a forced refetch at its next check (_recheck), so the change is
+        never adopted as a baseline unseen. An unavailable member,
         a failed stat or a member that no longer has the file keeps the
         cached copy and its baselines: the open never fails here. Failures
         are logged once per member until it answers again.
@@ -834,6 +899,8 @@ class StorageFS(Operations):
         canonical_path = resolved.canonical_path
         cache_path = resolved.cache_path
         with self._member_checks_lock:
+            # A pin no fetch consumed (the open attached to a running stream).
+            self._refetch_pins.pop(canonical_path, None)
             check = self._member_checks.get(canonical_path)
         if check is not None and time.monotonic() - check.verified_at < self._revalidate_after:
             return
@@ -849,7 +916,7 @@ class StorageFS(Operations):
         if check is not None and check.cache_identity == identity:
             members = dict(check.members)
         else:
-            members = self._load_persisted_members(canonical_path, cache_path, identity)
+            members = self._load_persisted_members(cache_path, identity)
 
         backend, unavailable = self._member_for_revalidation(canonical_path)
         if backend is None:
@@ -866,13 +933,13 @@ class StorageFS(Operations):
             # may be the only one left, so it stays.
             self.logger.info("revalidate: %s no longer has %s; keeping the cached copy",
                              backend.name, canonical_path)
-            self._store_member_check(canonical_path, cache_path, identity, members)
+            self._store_member_check(canonical_path, cache_path, identity, {})
             return
         except Exception as exc:
             # Counts as a check, so a member that fails without being marked
             # unavailable is not stat'd at every open.
             self._note_revalidation_outage(backend.name, f"stat failed: {exc!r}")
-            self._store_member_check(canonical_path, cache_path, identity, members)
+            self._store_member_check(canonical_path, cache_path, identity, {})
             return
         if backend.name in self._revalidate_outages:
             self._revalidate_outages.discard(backend.name)
@@ -880,17 +947,29 @@ class StorageFS(Operations):
 
         observed = (member_stat.st_size, member_stat.st_mtime)
         baseline = members.get(backend.name)
-        if baseline is not None:
+        with self._member_checks_lock:
+            # The last refetch for a change here came from another member.
+            must_refetch = backend.name in self._recheck.get(canonical_path, ())
+        if must_refetch:
+            changed = True
+        elif baseline is not None:
             changed = observed != baseline
         else:
             changed = (member_stat.st_size != cache_stat.st_size
                        or member_stat.st_mtime > cache_stat.st_mtime)
         if not changed:
-            members[backend.name] = observed
-            self._store_member_check(canonical_path, cache_path, identity, members)
+            self._store_member_check(canonical_path, cache_path, identity,
+                                     {backend.name: observed})
             return
 
         self.logger.info("revalidate: %s changed on %s; refetching", canonical_path, backend.name)
+        with self._member_checks_lock:
+            self._refetch_pins[canonical_path] = backend
+            marks = self._recheck.get(canonical_path)
+            if marks is not None:
+                marks.discard(backend.name)
+                if not marks:
+                    del self._recheck[canonical_path]
         self._invalidate_file_cache(resolved.requested_path)
         if self.cache_manager.is_cached(resolved.requested_path):
             # Kept (a writer is open, or it turned out to be a lost write):
@@ -900,10 +979,13 @@ class StorageFS(Operations):
                 kept_identity = self._cache_identity(os.lstat(str(cache_path)))
             except OSError:
                 return
+            with self._member_checks_lock:
+                self._refetch_pins.pop(canonical_path, None)
             if kept_identity == identity:
-                self._store_member_check(canonical_path, cache_path, identity, members)
+                self._store_member_check(canonical_path, cache_path, identity, {})
         else:
-            self._forget_member_check(canonical_path)
+            with self._member_checks_lock:
+                self._member_checks.pop(canonical_path, None)
 
     @staticmethod
     def _is_range_available(ranges: List[Tuple[int, int]], start: int, end: int) -> bool:
@@ -1176,22 +1258,26 @@ class StorageFS(Operations):
         finally:
             canonical_path = self._resolve_path(path).canonical_path
             self._forget_checksums({canonical_path})
-            self._forget_member_check(canonical_path)
+            self._forget_member_check(canonical_path, path_gone=True)
 
     def rename(self, old, new):
         """Rename a file or directory"""
+        old_canonical = self._resolve_path(old).canonical_path
+        new_canonical = self._resolve_path(new).canonical_path
         try:
             self.namespace.rename(old, new)
+        except BaseException:
+            # Where the files ended up is unknown; a forgotten check only
+            # costs a stat at the next open.
+            self._forget_member_check(old_canonical, subtree=True, path_gone=True)
+            self._forget_member_check(new_canonical, subtree=True, path_gone=True)
+            raise
         finally:
             # Records are keyed by path, so neither name's records (nor, for a
             # directory, its children's) describe what is there now. Dropping
             # them is always safe, so a failed rename drops them too.
-            renamed = {self._resolve_path(old).canonical_path, self._resolve_path(new).canonical_path}
-            self._forget_checksums(renamed, subtree=True)
-            # Persisted baselines carry their path, so the moved files'
-            # xattrs no longer apply either.
-            for renamed_path in renamed:
-                self._forget_member_check(renamed_path, subtree=True)
+            self._forget_checksums({old_canonical, new_canonical}, subtree=True)
+        self._move_member_checks(old_canonical, new_canonical)
         # Open descriptors follow the file (or everything under a renamed
         # directory): write() records against, and eviction and sync look
         # up, the path they carry.
