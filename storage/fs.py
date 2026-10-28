@@ -161,9 +161,12 @@ class StorageFS(Operations):
         self._fd_lock = threading.Lock()
 
         # Revalidation on open, keyed by canonical path (see
-        # _revalidate_cached_file). In memory only: after a restart every
-        # cached file is checked at its first open. _member_checks_lock is a
-        # leaf: nothing is taken under it.
+        # _revalidate_cached_file). Check times are in memory only: after a
+        # restart every cached file is checked at its first open; baselines
+        # also live in a cache-file xattr. _member_checks_lock is a leaf:
+        # nothing is taken under it, though it is held across local
+        # getxattr/setxattr calls, and eviction takes it while holding the
+        # cache, index and descriptor locks.
         self._revalidate_after = max(0.0, float(revalidate_after))
         self._member_checks: Dict[str, MemberCheck] = {}
         self._member_checks_lock = threading.Lock()
@@ -659,12 +662,22 @@ class StorageFS(Operations):
         with self._member_checks_lock:
             pinned = self._refetch_pins.pop(canonical_path, None)
         if pinned is not None and pinned.is_available():
+            self._clear_recheck(canonical_path, pinned.name)
             return pinned
         backend = self._select_unpinned_backend_for_read(canonical_path)
         if pinned is not None and backend is not pinned:
             with self._member_checks_lock:
                 self._recheck.setdefault(canonical_path, set()).add(pinned.name)
         return backend
+
+    def _clear_recheck(self, canonical_path: str, backend_name: str):
+        """backend_name is supplying the file's bytes now: no forced refetch is owed to it."""
+        with self._member_checks_lock:
+            marks = self._recheck.get(canonical_path)
+            if marks is not None:
+                marks.discard(backend_name)
+                if not marks:
+                    del self._recheck[canonical_path]
 
     def _select_unpinned_backend_for_read(self, canonical_path: str) -> Optional[Backend]:
         backend = self.replication_manager.get_backend_for_read(canonical_path)
@@ -715,6 +728,24 @@ class StorageFS(Operations):
                     for key in [k for k in table if k.startswith(prefix)]:
                         del table[key]
 
+    def _drop_persisted_baselines(self, virtual_path: str):
+        """Remove the member-baseline xattr from a cached file or every file under a directory.
+
+        For a rename that failed part way: the cache files may have moved
+        while the members did not, and a baseline matched on identity alone
+        would then describe a member file at another path.
+        """
+        root = self.cache_manager.get_cache_path(virtual_path)
+        if root.is_dir() and not root.is_symlink():
+            files = (Path(d) / name for d, _dirs, names in os.walk(root) for name in names)
+        else:
+            files = iter([root])
+        for path in files:
+            try:
+                os.removexattr(str(path), self.MEMBER_STAT_XATTR, follow_symlinks=False)
+            except OSError:
+                pass
+
     def _move_member_checks(self, old: str, new: str):
         """A rename succeeded: the checks (and recheck marks) follow the files.
 
@@ -722,6 +753,8 @@ class StorageFS(Operations):
         are renamed too, so the baselines still hold. Whatever was recorded
         under the new name (a file replaced by the rename) goes.
         """
+        if old == new:
+            return
         old_prefix = old.rstrip("/") + "/"
         new_prefix = new.rstrip("/") + "/"
         with self._member_checks_lock:
@@ -819,6 +852,7 @@ class StorageFS(Operations):
         if member_stat is not None:
             members[backend.name] = (member_stat.st_size, member_stat.st_mtime)
         self._store_member_check(canonical_path, cache_path, identity, members, replace=True)
+        self._clear_recheck(canonical_path, backend.name)
 
     def _record_member_written(self, virtual_path: str, backend: Backend, cache_path: Path):
         """Sync callback: backend now holds the cache file's content.
@@ -964,12 +998,9 @@ class StorageFS(Operations):
 
         self.logger.info("revalidate: %s changed on %s; refetching", canonical_path, backend.name)
         with self._member_checks_lock:
+            # A recheck mark stays until this member supplies the bytes
+            # (_clear_recheck): the invalidation below may be refused.
             self._refetch_pins[canonical_path] = backend
-            marks = self._recheck.get(canonical_path)
-            if marks is not None:
-                marks.discard(backend.name)
-                if not marks:
-                    del self._recheck[canonical_path]
         self._invalidate_file_cache(resolved.requested_path)
         if self.cache_manager.is_cached(resolved.requested_path):
             # Kept (a writer is open, or it turned out to be a lost write):
@@ -1271,6 +1302,8 @@ class StorageFS(Operations):
             # costs a stat at the next open.
             self._forget_member_check(old_canonical, subtree=True, path_gone=True)
             self._forget_member_check(new_canonical, subtree=True, path_gone=True)
+            for renamed_path in (old_canonical, new_canonical):
+                self._drop_persisted_baselines(renamed_path)
             raise
         finally:
             # Records are keyed by path, so neither name's records (nor, for a

@@ -303,6 +303,18 @@ class TestRevalidateOnOpen(RevalidateTestBase):
         self.fs.unlink("/g.txt")
         self.assertNotIn("/g.txt", self.fs._member_checks)
 
+    def test_failed_rename_drops_persisted_baselines(self):
+        with patch.object(self.fs.namespace, "rename", side_effect=OSError(5, "I/O error")):
+            with self.assertRaises(OSError):
+                self.fs.rename("/f.txt", "/g.txt")
+        with self.assertRaises(OSError):
+            os.getxattr(self.cache_dir / "f.txt", StorageFS.MEMBER_STAT_XATTR)
+        self.assertNotIn("/f.txt", self.fs._member_checks)
+
+    def test_rename_to_itself_keeps_check(self):
+        self.fs._move_member_checks("/f.txt", "/f.txt")
+        self.assertIn("/f.txt", self.fs._member_checks)
+
     def test_rename_keeps_persisted_baseline_after_restart(self):
         self.fs.rename("/f.txt", "/g.txt")
         self.restart()
@@ -422,6 +434,25 @@ class TestRevalidateTwoMembers(RevalidateTestBase):
         self.age_checks()
         # Its baseline now matches nothing it supplied: the recheck refetches.
         self.assertEqual(b"changed again on fast", self.read_through("/f.txt"))
+        self.assertNotIn("/f.txt", self.fs._recheck)
+
+    def test_recheck_mark_survives_a_refused_invalidation(self):
+        self.test_checks_the_member_a_refetch_reads()
+        fast, fast_dir = self.fast, self.fast_dir
+        with self.fs._member_checks_lock:
+            self.fs._recheck["/f.txt"] = {"fast"}
+        writer = self.fs.open("/f.txt", os.O_RDWR)
+        try:
+            self.age_checks()
+            # The forced refetch is refused (a writer is open): the copy and
+            # the mark both stay.
+            self.assertEqual(b"changed on fast", self.read_through("/f.txt"))
+            self.assertEqual({"fast"}, self.fs._recheck["/f.txt"])
+        finally:
+            self.fs.release("/f.txt", writer)
+        (fast_dir / "f.txt").write_bytes(b"CHANGED ON FAST")
+        self.age_checks()
+        self.assertEqual(b"CHANGED ON FAST", self.read_through("/f.txt"))
         self.assertNotIn("/f.txt", self.fs._recheck)
 
 
