@@ -1129,6 +1129,94 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.assertEqual(self.fs.read('/orphan-partial.bin', 4096, 0, vfd), payload[:4096])
         self.fs.release('/orphan-partial.bin', vfd)
 
+    def _wait_until_fetching_stops(self, session, quiet=0.5, timeout=10.0):
+        """Wait until the session's fetched bytes stop changing for `quiet` s."""
+        def fetched():
+            with session.lock:
+                return sum(end - start for start, end in session.available_ranges)
+
+        deadline = time.monotonic() + timeout
+        last = fetched()
+        last_change = time.monotonic()
+        while time.monotonic() < deadline:
+            time.sleep(0.05)
+            now = fetched()
+            if now != last:
+                last, last_change = now, time.monotonic()
+            elif time.monotonic() - last_change >= quiet:
+                return now
+        self.fail("fetching did not settle")
+
+    def test_streaming_open_sniffer_does_not_pull_whole_file(self):
+        # A reader reads the head and holds the file open. Until the readers
+        # show consumption, read-ahead stays within the keep-after-close
+        # threshold (here 4 chunks: 128 KiB) past what they read.
+        self.backend.range_delay = 0.005
+        payload = os.urandom(2 * 1024 * 1024)
+        (self.backend_dir / "held.bin").write_bytes(payload)
+        chunk = 32 * 1024
+        threshold = 4 * chunk
+
+        vfd = self.fs.open('/held.bin', os.O_RDONLY)
+        session = self._session_for(vfd)
+        self.assertEqual(self.fs.read('/held.bin', 4096, 0, vfd), payload[:4096])
+        fetched = self._wait_until_fetching_stops(session)
+        # Chunks up to the one holding 4 KiB + threshold.
+        self.assertEqual(fetched, ((4096 + threshold) // chunk + 1) * chunk)
+        with session.lock:
+            self.assertFalse(session.prefetch_complete)
+            self.assertFalse(session.readers_consumed)
+
+        # The bound follows the reader to a new offset.
+        offset = 1024 * 1024
+        self.assertEqual(self.fs.read('/held.bin', 4096, offset, vfd), payload[offset:offset + 4096])
+        self._wait_until_fetching_stops(session)
+        with session.lock:
+            ranges = list(session.available_ranges)
+            self.assertFalse(session.prefetch_complete)
+        self.assertTrue(self.fs._is_range_available(ranges, offset, offset + threshold))
+        self.assertFalse(self.fs._is_range_available(ranges, offset + threshold + chunk, offset + threshold + 2 * chunk))
+
+        self.fs.release('/held.bin', vfd)
+        self.assertTrue(session.detached)
+        self._assert_not_cached("held.bin")
+
+    def test_streaming_consuming_reader_lifts_read_ahead_bound(self):
+        # Once a contiguous span reaches the threshold, read-ahead runs to the
+        # end of the file while the reader still holds it open.
+        self.backend.range_delay = 0.005
+        payload = os.urandom(2 * 1024 * 1024)
+        (self.backend_dir / "lift.bin").write_bytes(payload)
+
+        vfd = self.fs.open('/lift.bin', os.O_RDONLY)
+        session = self._session_for(vfd)
+        for offset in range(0, 4 * 32 * 1024, 16 * 1024):
+            self.assertEqual(
+                self.fs.read('/lift.bin', 16 * 1024, offset, vfd),
+                payload[offset:offset + 16 * 1024],
+            )
+        with session.lock:
+            self.assertTrue(session.readers_consumed)
+        cache_path = self.cache_dir / "lift.bin"
+        self.assertTrue(self._wait_for(cache_path.exists, timeout=8.0))
+        self.assertEqual(cache_path.read_bytes(), payload)
+        self.fs.release('/lift.bin', vfd)
+
+    def test_streaming_keep_after_close_zero_leaves_read_ahead_unbounded(self):
+        # "0" restores the old behaviour while open too: any read counts as
+        # consumption, so the worker prefetches the whole file.
+        self._remake_fs("0")
+        self.backend.range_delay = 0.005
+        payload = os.urandom(1024 * 1024)
+        (self.backend_dir / "zero.bin").write_bytes(payload)
+
+        vfd = self.fs.open('/zero.bin', os.O_RDONLY)
+        self.assertEqual(self.fs.read('/zero.bin', 4096, 0, vfd), payload[:4096])
+        cache_path = self.cache_dir / "zero.bin"
+        self.assertTrue(self._wait_for(cache_path.exists, timeout=8.0))
+        self.assertEqual(cache_path.read_bytes(), payload)
+        self.fs.release('/zero.bin', vfd)
+
 
 if __name__ == '__main__':
     unittest.main()
