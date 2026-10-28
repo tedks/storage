@@ -12,8 +12,8 @@ type: feature
 component: fs
 release:
 reporter: Ted Smith <tedks@riseup.net>
-status: in_progress
-disposition:
+status: closed
+disposition: fixed
 creation_time: 2026-10-27T20:01:11-00:00
 references: []
 log_events:
@@ -25,3 +25,9 @@ log_events:
   who: Ted Smith
   what: started
   comment: ""
+- time: 2026-10-28T22:15:43-00:00
+  who: Ted Smith
+  what: 'closed: fixed'
+  comment: 'Merged in #126 as 642f0bc (head a0bea7d): read-ahead bounded by the keep-after-close
+    threshold past the latest read span until readers consume. Open question oq-streaming-read-ahead-window
+    filed (non-blocking).'
