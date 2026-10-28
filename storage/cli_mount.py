@@ -7,7 +7,12 @@ import click
 
 from .file_config import FileConfig, get_file_config, get_inherited_config, set_file_config
 from .fs import mount_storage
-from .mount_profiles import create_storage_members, parse_size, resolve_mount_configuration
+from .mount_profiles import (
+    create_storage_members,
+    parse_keep_after_close,
+    parse_size,
+    resolve_mount_configuration,
+)
 
 
 @click.command()
@@ -47,6 +52,15 @@ from .mount_profiles import create_storage_members, parse_size, resolve_mount_co
     help="Maximum number of concurrent streaming prefetch sessions.",
 )
 @click.option(
+    "--streaming-keep-after-close",
+    help=(
+        "Keep prefetching after the last close once readers have read a contiguous "
+        "span this long: comma-separated sizes or percentages of the file, whichever "
+        "is reached first (default: 4 chunks or 50%; 0 = after any read). Spans include "
+        "kernel readahead, so sizes up to about 128K can act like 0."
+    ),
+)
+@click.option(
     "--readdir-ttl",
     type=float,
     help="Seconds to cache directory listings (default 1.0). Higher = less backend load.",
@@ -72,6 +86,7 @@ def mount(
     streaming_reads,
     streaming_chunk_size,
     max_streaming_sessions,
+    streaming_keep_after_close,
     readdir_ttl,
     enable_watchers,
 ):
@@ -120,6 +135,7 @@ def mount(
         max_streaming_sessions,
         readdir_ttl,
         enable_watchers,
+        streaming_keep_after_close=streaming_keep_after_close,
     )
 
     try:
@@ -131,6 +147,13 @@ def mount(
         streaming_chunk_bytes = parse_size(resolved.streaming_chunk_size)
     except ValueError as exc:
         raise click.ClickException(f"Invalid streaming chunk size: {exc}") from exc
+
+    keep_after_close = None
+    if resolved.streaming_keep_after_close is not None:
+        try:
+            keep_after_close = parse_keep_after_close(resolved.streaming_keep_after_close)
+        except ValueError as exc:
+            raise click.ClickException(f"Invalid streaming keep-after-close: {exc}") from exc
 
     cache_root = Path(resolved.cache).resolve()
     cache_root.mkdir(parents=True, exist_ok=True)
@@ -159,6 +182,10 @@ def mount(
         f"  Streaming chunk: {resolved.streaming_chunk_size} ({streaming_chunk_bytes:,} bytes)"
     )
     click.echo(f"  Max streaming sessions: {resolved.max_streaming_sessions}")
+    click.echo(
+        "  Streaming keep after close: "
+        f"{resolved.streaming_keep_after_close if keep_after_close else 'default (4 chunks or 50%)'}"
+    )
     if resolved.enable_watchers:
         non_watchable = [n for n, b in backends.items() if not b.supports_push_invalidation()]
         if non_watchable:
@@ -188,6 +215,7 @@ def mount(
             streaming_reads=resolved.streaming_reads,
             streaming_chunk_size=streaming_chunk_bytes,
             max_streaming_sessions=resolved.max_streaming_sessions,
+            streaming_keep_after_close=keep_after_close,
             readdir_ttl=resolved.readdir_ttl,
             enable_watchers=resolved.enable_watchers,
         )

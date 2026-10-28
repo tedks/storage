@@ -1,12 +1,14 @@
 import click
 import tomllib
 from dataclasses import dataclass
+from fractions import Fraction
 from pathlib import Path
 import re
 from typing import Any, Dict, Optional, Sequence, Tuple
 
 from .backends.local import LocalBackend
 from .backends.ssh import SSHBackend
+from .models import StreamingKeepAfterClose
 
 
 DEFAULT_CACHE_SIZE = "10G"
@@ -36,6 +38,8 @@ class ResolvedMountConfig:
     enable_watchers: bool
     profile_name: Optional[str] = None
     profile_source: Optional[Path] = None
+    # None: the default, 4 chunks or 50% (see storage/streaming.py).
+    streaming_keep_after_close: Optional[str] = None
 
     @property
     def member_specs(self) -> Tuple[str, ...]:
@@ -82,6 +86,41 @@ def parse_size(size_str: str) -> int:
         return int(size_str)
     except ValueError as exc:
         raise ValueError(f"Invalid size format: {size_str}") from exc
+
+
+_KEEP_AFTER_CLOSE_SIZE = re.compile(r"\d+(\.\d+)?[KMGT]?", re.IGNORECASE | re.ASCII)
+_KEEP_AFTER_CLOSE_PERCENT = re.compile(r"(\d+(\.\d+)?)%", re.ASCII)
+
+
+def parse_keep_after_close(text: str) -> StreamingKeepAfterClose:
+    """Parse a streaming_keep_after_close value: comma-separated terms.
+
+    Each term is a size in parse_size's form ("4M", "512K", "4194304") or a
+    percentage of the file from 0 to 100 ("50%", "12.5%"). Read-ahead
+    continues after the last close once the readers' longest contiguous
+    span reaches any term. Raises ValueError on an empty value or term, a
+    negative or non-numeric size, an unknown suffix, or a percentage above
+    100.
+    """
+    terms = [term.strip() for term in text.split(",")]
+    if not any(terms) or not all(terms):
+        raise ValueError(f"expected comma-separated sizes or percentages, got {text!r}")
+
+    byte_thresholds = []
+    percent_thresholds = []
+    for term in terms:
+        percent = _KEEP_AFTER_CLOSE_PERCENT.fullmatch(term)
+        if percent:
+            value = Fraction(percent.group(1))
+            if value > 100:
+                raise ValueError(f"percentage above 100%: {term!r}")
+            percent_thresholds.append(value)
+        elif _KEEP_AFTER_CLOSE_SIZE.fullmatch(term):
+            byte_thresholds.append(parse_size(term))
+        else:
+            raise ValueError(f"not a size or percentage: {term!r}")
+
+    return StreamingKeepAfterClose(tuple(byte_thresholds), tuple(percent_thresholds))
 
 
 def _load_mount_profile(config_path: Path, profile_name: str) -> Dict[str, Any]:
@@ -440,6 +479,9 @@ def _load_mount_profile_settings(config_path: Path, profile_name: str) -> Dict[s
         "max_streaming_sessions": _optional_profile_int(
             config_profile, "max_streaming_sessions", profile_name
         ),
+        "streaming_keep_after_close": _optional_profile_string(
+            config_profile, "streaming_keep_after_close", profile_name
+        ),
         "readdir_ttl": _optional_profile_float(config_profile, "readdir_ttl", profile_name),
         "enable_watchers": _optional_profile_bool(config_profile, "enable_watchers", profile_name),
         "backing_paths": config_backing_paths,
@@ -472,6 +514,7 @@ def _can_auto_load_mount_profile(
     max_streaming_sessions: Optional[int],
     readdir_ttl: Optional[float],
     enable_watchers: Optional[bool],
+    streaming_keep_after_close: Optional[str] = None,
 ) -> bool:
     if not _target_looks_like_profile_name(mount_target):
         return False
@@ -491,6 +534,7 @@ def _can_auto_load_mount_profile(
         max_streaming_sessions is not None,
         readdir_ttl is not None,
         enable_watchers is not None,
+        streaming_keep_after_close is not None,
     ))
 
 
@@ -512,6 +556,7 @@ def resolve_mount_configuration(
     max_streaming_sessions: Optional[int],
     readdir_ttl: Optional[float],
     enable_watchers: Optional[bool],
+    streaming_keep_after_close: Optional[str] = None,
 ) -> ResolvedMountConfig:
     config_values = {
         "mountpoint": None,
@@ -526,6 +571,7 @@ def resolve_mount_configuration(
         "streaming_reads": None,
         "streaming_chunk_size": None,
         "max_streaming_sessions": None,
+        "streaming_keep_after_close": None,
         "readdir_ttl": None,
         "enable_watchers": None,
         "backing_paths": (),
@@ -555,6 +601,7 @@ def resolve_mount_configuration(
         max_streaming_sessions,
         readdir_ttl,
         enable_watchers,
+        streaming_keep_after_close,
     ):
         available_configs = [candidate for candidate in default_mount_config_paths() if candidate.exists()]
         if available_configs:
@@ -623,4 +670,9 @@ def resolve_mount_configuration(
         ),
         profile_name=profile_name,
         profile_source=config_path,
+        streaming_keep_after_close=(
+            streaming_keep_after_close
+            if streaming_keep_after_close is not None
+            else config_values["streaming_keep_after_close"]
+        ),
     )

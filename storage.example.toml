@@ -11,6 +11,12 @@ foreground = true
 streaming_reads = true
 streaming_chunk_size = "1M"
 max_streaming_sessions = 8
+# Keep prefetching after the last reader closes once readers have read a
+# contiguous span this long: comma-separated sizes or percentages of the
+# file, whichever is reached first. Unset means 4 chunks or 50% ("4M,50%"
+# at the 1M chunk above); "0" keeps prefetching after any read; "100%"
+# effectively never keeps prefetching after a close.
+streaming_keep_after_close = "4M,50%"
 backends = [
   "ssh://user@storage-host.example:/srv/raid/media/",
   "ssh://user@storage-host.example:/srv/chunk0/media/",

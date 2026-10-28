@@ -136,7 +136,12 @@ Edge handling:
 4. Release path behavior:
    - decref session
    - if no readers and prefetch failed: cleanup partial file + registry
-   - if no readers and prefetch running: allow continuation (configurable)
+   - if no readers and prefetch running: continue only if the readers
+     consumed the file, meaning the longest contiguous span they read
+     reached the mount's `streaming_keep_after_close` (default 4 chunks or
+     50% of the file, whichever is reached first; `0` continues after any
+     read); otherwise cancel and discard the partial, so a content sniff or
+     thumbnail never becomes a full download
 
 ### Phase 5: Cache Accounting and Eviction Compatibility
 

@@ -163,3 +163,69 @@ backends = ["ssh://user@storage-host.example:/srv/other/"]
 
         self.assertNotEqual(result.exit_code, 0)
         self.assertIn("Mount profile 'missing-profile' not found", result.output)
+
+
+class TestMountStreamingKeepAfterClose(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = Path(tempfile.mkdtemp())
+        self.runner = CliRunner()
+        self.config_path = self.temp_dir / "storage.toml"
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _mount(self, profile_line="", extra_args=()):
+        self.config_path.write_text(
+            f"""
+[mounts.keep]
+mountpoint = "{self.temp_dir / 'mnt'}"
+cache = "{self.temp_dir / 'cache'}"
+{profile_line}
+backends = [
+  "ssh://user@storage-host.example:/srv/raid/media/",
+]
+""".strip()
+        )
+        with patch("storage.cli_mount.mount_storage") as mock_mount:
+            result = self.runner.invoke(
+                main,
+                ["mount", "--config", str(self.config_path), *extra_args, "keep"],
+            )
+        return result, mock_mount
+
+    def test_unset_passes_none_for_the_default(self):
+        result, mock_mount = self._mount()
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        self.assertIsNone(mock_mount.call_args.kwargs["streaming_keep_after_close"])
+        self.assertIn("Streaming keep after close: default (4 chunks or 50%)", result.output)
+
+    def test_profile_value_is_parsed(self):
+        result, mock_mount = self._mount('streaming_keep_after_close = "8M,25%"')
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        spec = mock_mount.call_args.kwargs["streaming_keep_after_close"]
+        self.assertEqual((8 * 1024 ** 2,), spec.byte_thresholds)
+        self.assertEqual(2 * 1024 ** 2, spec.threshold(8 * 1024 ** 2))
+        self.assertIn("Streaming keep after close: 8M,25%", result.output)
+
+    def test_flag_overrides_profile(self):
+        result, mock_mount = self._mount(
+            'streaming_keep_after_close = "8M"',
+            ["--streaming-keep-after-close", "0"],
+        )
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        spec = mock_mount.call_args.kwargs["streaming_keep_after_close"]
+        self.assertEqual(0, spec.threshold(10 * 1024 ** 3))
+
+    def test_bad_values_rejected_before_mounting(self):
+        for profile_line, args in (
+            ('streaming_keep_after_close = "150%"', ()),
+            ('streaming_keep_after_close = "lots"', ()),
+            ('streaming_keep_after_close = 0', ()),
+            ("", ["--streaming-keep-after-close", ""]),
+            ("", ["--streaming-keep-after-close", "4M,"]),
+        ):
+            with self.subTest(profile_line=profile_line, args=args):
+                result, mock_mount = self._mount(profile_line, args)
+                self.assertNotEqual(result.exit_code, 0, msg=result.output)
+                self.assertRegex(result.output, "keep.after.close")
+                mock_mount.assert_not_called()

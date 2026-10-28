@@ -2,7 +2,8 @@
 
 from dataclasses import asdict, dataclass
 from enum import Enum
-from typing import Dict, Optional
+from fractions import Fraction
+from typing import Dict, Optional, Tuple
 
 
 class SyncStatus(Enum):
@@ -58,3 +59,31 @@ class FileLocation:
     checksum: str
     last_synced: float
     is_cached: bool
+
+
+@dataclass(frozen=True)
+class StreamingKeepAfterClose:
+    """When read-ahead outlives the last close of a streaming session.
+
+    Read-ahead continues once the longest contiguous span the readers asked
+    for reaches any of the thresholds: a byte count, or a percentage of the
+    file rounded down. 0 (bytes or percent) means any read qualifies.
+    """
+
+    byte_thresholds: Tuple[int, ...] = ()
+    percent_thresholds: Tuple[Fraction, ...] = ()
+
+    def __post_init__(self):
+        if not self.byte_thresholds and not self.percent_thresholds:
+            raise ValueError("at least one threshold is required")
+        if any(value < 0 for value in self.byte_thresholds):
+            raise ValueError("byte thresholds must not be negative")
+        if any(not 0 <= value <= 100 for value in self.percent_thresholds):
+            raise ValueError("percent thresholds must be between 0 and 100")
+
+    def threshold(self, file_size: int) -> int:
+        """The span in bytes a reader must reach on a file of file_size bytes."""
+        return min(
+            list(self.byte_thresholds)
+            + [int(file_size * percent // 100) for percent in self.percent_thresholds]
+        )

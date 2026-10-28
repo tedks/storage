@@ -147,6 +147,24 @@ table as type `fuse.sshfs` (a mount of only local members stays plain
 LocalSearch) can treat it as a remote filesystem rather than a local disk and avoid thumbnails, item counts
 and crawling through it.
 
+Streaming reads (`streaming_reads`, on by default) serve an uncached file
+by range reads while a background worker prefetches the rest into the
+cache. When the last reader closes before the file is complete, the
+prefetch continues only if the readers consumed the file: the longest
+contiguous span they read reached `streaming_keep_after_close`
+(`--streaming-keep-after-close`). Otherwise the partial download is
+discarded, so a file manager sniffing content types or making thumbnails
+does not pull whole files. The value is a comma-separated list of sizes
+(`4M`, `512K`, plain bytes) and percentages of the file (`50%`, `12.5%`,
+rounded down to bytes), whichever is reached first. Spans count the
+read requests the kernel sends, which include its own readahead (up to
+128K by default), so a size at or below that can act like `0`. Unset, it is 4
+chunks or 50% (`4M,50%` at the default 1M `streaming_chunk_size`). `0`
+keeps prefetching after any read, the behaviour before this option.
+`100%` effectively never keeps prefetching after a close. Empty terms,
+negative sizes, unknown suffixes and percentages above 100 are rejected
+when the mount configuration loads.
+
 ### configure
 
 Configure storage settings for files/directories:
@@ -266,7 +284,7 @@ has been run against a real host since the field use above.
 Implemented:
 
 - Local, SSH/SFTP and rsync storage members (SFTP for reads, rsync for writes)
-- Local cache with LRU eviction; streaming cold reads with background prefetch
+- Local cache with LRU eviction; streaming cold reads with background prefetch that stops when readers close early (`streaming_keep_after_close`)
 - Background sync workers with retry; N-way replication configured per directory through xattrs
 - Conflict detection on sync, and `storage conflicts` to list and resolve conflicts
 - Remote inotify watchers that invalidate the cache when a member changes
