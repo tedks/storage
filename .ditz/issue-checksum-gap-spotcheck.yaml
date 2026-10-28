@@ -21,5 +21,19 @@ log_events:
   who: Ted Smith
   what: blocks oq-checksum-same-second-rewrite
   comment: ""
+- time: 2026-10-28T15:45:50-00:00
+  who: Ted Smith
+  what: commented
+  comment: '2026-10-28, on Ted''s request to schedule it: the 2026-10-27 hand snapshot
+    from splinter1 failed (ssh reset during the silent walk; 0 rows) and was removed.
+    It now runs on framework0 as a systemd user timer: storage-checksum-spotcheck.timer
+    (Sun 04:00 + up to 1 h, Persistent) -> .service -> ~/Projects/storage/checksum-spotcheck/run.sh.
+    The first run takes the baseline (seeded sample of 100 files present on more than
+    one member, 1 MiB..256 MiB; size, mtime_ns, xxh128 per copy). Each later run re-probes
+    them and appends counts to summary.log: compared, unchanged, changed_stat, gap
+    (same size+mtime, different hash), missing, hash_err. Read-only on drynwyn. Files
+    under that directory contain file names: report counts only. Decide oq-checksum-same-second-rewrite
+    from a few weeks of gap counts, then remove: systemctl --user disable --now storage-checksum-spotcheck.timer;
+    delete the two unit files and the directory.'
 blocks:
 - oq-checksum-same-second-rewrite
