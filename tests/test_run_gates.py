@@ -64,7 +64,7 @@ def env(tmp_path):
     # checked out where it ran.
     (bin_dir / "nix").write_text(
         FAKE_LOGGER
-        + 'printf "  at %s\\n" "$(git rev-parse HEAD 2>/dev/null)" >> "$FAKE_LOG"\n'
+        + 'printf "  at %s\\n  in %s\\n" "$(git rev-parse HEAD 2>/dev/null)" "$(pwd)" >> "$FAKE_LOG"\n'
         + 'case "$*" in *"${FAKE_NIX_FAIL:-@@none@@}"*) exit 1;; esac\n'
     )
     (bin_dir / "nix").chmod(0o755)
@@ -267,7 +267,13 @@ def test_failing_local_gates_never_reach_ssh(env, tmp_path):
 def test_relative_tmpdir_still_cleans_up(env, tmp_path):
     repo, log, environ, scratch_parent = _remote_env(env, tmp_path)
     environ["TMPDIR"] = "."
-    before = set(Path("/tmp").glob("storage-remote-gate.*"))
     result = _run(repo, environ)
     assert result.returncode == 0, result.stderr
-    assert set(Path("/tmp").glob("storage-remote-gate.*")) == before
+    where = [
+        line.split("  in ", 1)[1]
+        for line in log.read_text().splitlines()
+        if line.startswith("  in ") and "storage-remote-gate." in line
+    ]
+    assert len(set(where)) == 1  # the test run and the cleanup's bazel clean
+    assert where[0].startswith("/tmp/storage-remote-gate.")
+    assert not Path(where[0]).exists()

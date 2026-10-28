@@ -126,8 +126,8 @@ example `bazel test //:storage_tests_sandboxed --test_arg=-k
 same flags, and one where `-k` selects nothing fails (pytest exits 5).
 Bazel's `--test_filter` is ignored.
 
-The quality gate before every push is all four gates, the remote gate
-included. Run it with the script:
+The quality gate before merging is all four gates, the remote gate
+included, on the exact commit. Run it with the script:
 
 ```bash
 scripts/run-gates.sh
@@ -139,7 +139,9 @@ Bazel cache, most of it `storage_tests_sandboxed`, plus the remote gate).
 Bazel runs each `py_test` once, so the resilience gate's overlap costs
 nothing. On a host without Docker it runs the other three gates here and
 the remote gate on another host; see The remote gate. With no Docker and no
-such host it fails, naming both: a skipped gate must be a decision.
+such host it fails, naming both: a skipped gate must be a decision. On
+the Docker path the script tests the working tree and says so when it is
+dirty; commit and rerun to attest a commit.
 
 The three local gates by hand (everything but the remote gate), for
 iterating:

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run every quality gate (fast, mounted, resilience and remote) before a push.
+# Run every quality gate (fast, mounted, resilience and remote) before merging.
 #
 #   scripts/run-gates.sh [extra bazel test flags]
 #
@@ -65,7 +65,8 @@ cleanup() {
   esac
 }
 trap cleanup EXIT
-# A dropped ssh connection arrives as HUP or PIPE: leave through the EXIT trap.
+# A dropped ssh connection usually shows up as PIPE on the next write: leave
+# through the EXIT trap.
 trap 'exit 1' HUP INT TERM PIPE
 cd "$scratch"
 git init -q . </dev/null
@@ -99,7 +100,8 @@ run_remote_gate() {
   url=${STORAGE_REMOTE_GATE_URL:-$(git remote get-url origin)}
   echo "run-gates: remote gate on $host at $sha"
   # ssh joins its arguments into one remote shell command line: quote them
-  # (bash %q; the remote login shell must be sh-compatible).
+  # (bash %q; the remote login shell must accept its quoting, including $'...'
+  # for control characters).
   cmd=$(printf 'bash -l -s -- %q %q' "$url" "$sha")
   for arg in "$@"; do cmd+=$(printf ' %q' "$arg"); done
   remote_script | ssh -o BatchMode=yes -- "$host" "$cmd"
@@ -110,6 +112,9 @@ if docker_usable; then
   [ -z "$(git status --porcelain)" ] ||
     echo "run-gates: warning: uncommitted changes are included in this run" >&2
   bazel_test //:storage_tests_all_gates "$@"
+  if [ -n "$(git status --porcelain)" ]; then
+    echo "run-gates: gates passed on HEAD $(git rev-parse HEAD) plus uncommitted changes; rerun after committing to attest the commit" >&2
+  fi
 elif [ -n "${STORAGE_REMOTE_GATE_HOST:-}" ]; then
   case $STORAGE_REMOTE_GATE_HOST in
     -*) die "STORAGE_REMOTE_GATE_HOST must be an ssh destination, not an option" ;;
