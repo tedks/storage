@@ -165,6 +165,42 @@ keeps prefetching after any read, the behaviour before this option.
 negative sizes, unknown suffixes and percentages above 100 are rejected
 when the mount configuration loads.
 
+#### SSH host keys
+
+There is no host-key setting yet; the three SSH code paths behave as
+follows, by design for now:
+
+- **SFTP reads and metadata (`SSHBackend`, paramiko)** trust any host key.
+  It uses `AutoAddPolicy` without loading any known-hosts file, and nothing
+  is persisted, so every connection accepts whatever key the far end
+  presents. A man-in-the-middle on the path is not detected. Use an SSH
+  profile only on a network you trust (the home LAN, a VPN).
+- **rsync writes (`RsyncBackend`) and the remote change watcher
+  (`RemoteWatcher`)** run the system `ssh` with
+  `StrictHostKeyChecking=accept-new`. An unseen host is added to
+  `~/.ssh/known_hosts` of the user running the mount, silently; a host
+  whose recorded key differs is refused.
+- **A changed host key splits the two.** After a member is re-provisioned,
+  or its address is reused by another host, SFTP keeps working while rsync
+  and the watcher fail with `REMOTE HOST IDENTIFICATION HAS CHANGED`. The
+  mount then lists and reads, but writes do not replicate and remote
+  changes stop invalidating the cache. If the new key is expected, remove
+  the old one and the next connection records the new one:
+
+  ```bash
+  ssh-keygen -R storage-host.example
+  ```
+
+  (Use the name or address the profile uses; a mount with `:port` members
+  may need `ssh-keygen -R '[storage-host.example]:2222'`.) If it is not
+  expected, treat it as a possible impersonation and do not remove it.
+
+The rsync and watcher commands cannot be given a known-hosts file or a
+strict policy. Making host-key verification configurable across all three
+paths is tracked in [#107](https://github.com/tedks/storage/issues/107) and
+[#30](https://github.com/tedks/storage/issues/30); the decision for now is
+to keep this behaviour and document it.
+
 ### configure
 
 Configure storage settings for files/directories:
