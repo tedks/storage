@@ -1,6 +1,7 @@
 import errno
 import json
 import os
+import secrets
 import socket
 import threading
 import time
@@ -1005,20 +1006,31 @@ class StreamingReadManager:
         final_cache_path = self.cache_manager.get_cache_path(virtual_path)
         partial_cache_path = self._partial_cache_path(final_cache_path)
         final_cache_path.parent.mkdir(parents=True, exist_ok=True)
+        # Prepared under a name of its own and renamed onto the partial path
+        # at registration, inside prefetch_sessions_lock: another open that
+        # also missed the registry prepares its own file meanwhile, and only
+        # the one that registers takes the shared path. The name keeps the
+        # partial suffix so listings hide it and a restart sweeps it.
+        staging_path = self._partial_cache_path(
+            Path(f"{final_cache_path}.{secrets.token_hex(8)}")
+        )
 
         io_fd = -1
         try:
-            partial_cache_path.unlink(missing_ok=True)
-            io_fd = os.open(str(partial_cache_path), os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o644)
+            io_fd = os.open(str(staging_path), os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o644)
             os.ftruncate(io_fd, file_size)
         except OSError as exc:
             self.logger.debug(
                 "streaming session unavailable: failed to prepare partial cache file %s: %s",
-                partial_cache_path,
+                staging_path,
                 exc,
             )
             if io_fd >= 0:
                 os.close(io_fd)
+                try:
+                    staging_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
             return None
 
         session = PrefetchSession(
@@ -1027,7 +1039,7 @@ class StreamingReadManager:
             backend=backend,
             file_size=file_size,
             final_cache_path=final_cache_path,
-            partial_cache_path=partial_cache_path,
+            partial_cache_path=staging_path,
             chunk_size=self.chunk_size,
             io_fd=io_fd,
             refcount=1,
@@ -1054,6 +1066,20 @@ class StreamingReadManager:
                 )
                 self._discard_unregistered_prefetch_session(session)
                 return None
+            # Replaces any partial a detached session failed to unlink. No
+            # registered session owns the path: detaching unlinks it inside
+            # this lock, and a registered one would have been attached above.
+            try:
+                os.replace(staging_path, partial_cache_path)
+            except OSError as exc:
+                self.logger.debug(
+                    "streaming session unavailable: failed to install partial cache file %s: %s",
+                    partial_cache_path,
+                    exc,
+                )
+                self._discard_unregistered_prefetch_session(session)
+                return None
+            session.partial_cache_path = partial_cache_path
             self.prefetch_sessions[canonical_path] = session
 
         self.cache_manager.mark_cache_size_dirty()
