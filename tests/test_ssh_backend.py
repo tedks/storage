@@ -482,6 +482,7 @@ _GETENT_AHOSTS = (
     "192.0.2.7       RAW    \n"
     "2001:db8::7     STREAM \n"
     "2001:db8::7     DGRAM  \n"
+    "fe80::7%eth0    STREAM \n"
 )
 
 
@@ -507,7 +508,7 @@ class TestHostResolverFallback(unittest.TestCase):
         mock_run.return_value = _getent_result(_GETENT_AHOSTS)
         self.assertEqual(
             ssh_module._host_resolver_addresses("nas.local", 5.0),
-            ["192.0.2.7", "2001:db8::7"],
+            ["192.0.2.7", "2001:db8::7", "fe80::7%eth0"],
         )
         args, kwargs = mock_run.call_args
         self.assertEqual(args[0], ["/usr/bin/getent", "ahosts", "--", "nas.local"])
@@ -551,16 +552,67 @@ class TestHostResolverFallback(unittest.TestCase):
             [c.args[0] for c in mock_create.call_args_list],
             [("192.0.2.7", 2222), ("2001:db8::7", 2222)],
         )
-        self.assertEqual(mock_create.call_args.kwargs["timeout"], 4.0)
+        # The remainder of the shared 4s deadline.
+        self.assertTrue(0 < mock_create.call_args.kwargs["timeout"] <= 4.0)
 
     @patch("storage.backends.ssh.socket.create_connection")
     @patch("storage.backends.ssh.subprocess.run")
     def test_connect_raises_the_last_connect_error_when_none_answers(self, mock_run, mock_create):
         mock_run.return_value = _getent_result(_GETENT_AHOSTS)
-        mock_create.side_effect = [OSError("first"), ConnectionRefusedError("second")]
+        mock_create.side_effect = [
+            OSError("first"), OSError("second"), ConnectionRefusedError("third")]
         with self.assertRaises(ConnectionRefusedError):
             ssh_module._connect_via_host_resolver(
                 "nas.local", 22, 4.0, socket.gaierror(-3, "lookup"))
+
+    @patch("storage.backends.ssh.socket.create_connection")
+    @patch("storage.backends.ssh.subprocess.run")
+    def test_getent_and_connects_share_one_deadline(self, mock_run, mock_create):
+        mock_run.return_value = _getent_result(_GETENT_AHOSTS)
+        clock = SimpleNamespace(now=100.0)
+        fake_time = SimpleNamespace(monotonic=lambda: clock.now)
+
+        def _getent(*_args, **_kwargs):
+            clock.now += 1.0
+            return _getent_result(_GETENT_AHOSTS)
+
+        def _timed_out(_address, timeout):
+            clock.now += timeout
+            raise socket.timeout("timed out")
+
+        mock_run.side_effect = _getent
+        mock_create.side_effect = _timed_out
+        with patch.object(ssh_module, "time", fake_time):
+            with self.assertRaises(socket.timeout):
+                ssh_module._connect_via_host_resolver(
+                    "nas.local", 22, 4.0, socket.gaierror(-3, "lookup"))
+        # getent took 1s of 4; the first address timed out with the other 3;
+        # nothing was left for the rest.
+        self.assertEqual([c.kwargs["timeout"] for c in mock_create.call_args_list], [3.0])
+        self.assertEqual(clock.now, 104.0)
+
+    @patch("storage.backends.ssh.socket.create_connection")
+    @patch("storage.backends.ssh.subprocess.run")
+    def test_getent_using_the_whole_deadline_raises_timeout(self, mock_run, mock_create):
+        clock = SimpleNamespace(now=0.0)
+
+        def _slow_getent(*_args, **_kwargs):
+            clock.now += 4.0
+            return _getent_result(_GETENT_AHOSTS)
+
+        mock_run.side_effect = _slow_getent
+        with patch.object(ssh_module, "time", SimpleNamespace(monotonic=lambda: clock.now)):
+            with self.assertRaises(socket.timeout):
+                ssh_module._connect_via_host_resolver(
+                    "nas.local", 22, 4.0, socket.gaierror(-3, "lookup"))
+        mock_create.assert_not_called()
+
+    @patch("storage.backends.ssh.subprocess.run")
+    def test_undecodable_getent_output_still_parses_addresses(self, mock_run):
+        # subprocess decodes with errors="replace"; a replaced name is harmless.
+        mock_run.return_value = _getent_result("192.0.2.9 STREAM caf\ufffd.local\n")
+        self.assertEqual(ssh_module._host_resolver_addresses("nas.local", 5.0), ["192.0.2.9"])
+        self.assertEqual(mock_run.call_args.kwargs["errors"], "replace")
 
     @patch("storage.backends.ssh.socket.create_connection")
     @patch("storage.backends.ssh.subprocess.run")
@@ -638,8 +690,14 @@ class TestSSHBackendHostResolverConnect(unittest.TestCase):
     def test_handshake_failure_over_fallback_socket_closes_it(self, mock_ssh_client_cls, _policy, mock_fallback):
         calls = []
         handshake_error = ssh_module.paramiko.SSHException("banner")
-        mock_ssh_client_cls.side_effect = lambda: self._client_failing_lookup_without_sock(
-            calls, fail_with_sock=handshake_error)
+        clients = []
+
+        def _factory():
+            clients.append(self._client_failing_lookup_without_sock(
+                calls, fail_with_sock=handshake_error))
+            return clients[-1]
+
+        mock_ssh_client_cls.side_effect = _factory
         sock = _FakeTCPSocket()
         mock_fallback.return_value = sock
         backend = self._new_backend()
@@ -647,6 +705,7 @@ class TestSSHBackendHostResolverConnect(unittest.TestCase):
         with self.assertRaises(ssh_module.paramiko.SSHException):
             backend._current_clients()
         self.assertTrue(sock.closed)
+        self.assertTrue(clients[0].closed)
         self.assertFalse(backend.is_available())
         backend.close()
 

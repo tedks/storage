@@ -39,10 +39,10 @@ def _host_resolver_addresses(host: str, timeout: float) -> List[str]:
     address; the caller then keeps its original lookup error.
     """
     getent = next(
-        (candidate for candidate in (*_GETENT_CANDIDATES, shutil.which("getent"))
-         if candidate and os.access(candidate, os.X_OK)),
+        (candidate for candidate in _GETENT_CANDIDATES
+         if os.access(candidate, os.X_OK)),
         None,
-    )
+    ) or shutil.which("getent")
     if getent is None:
         return []
     try:
@@ -52,6 +52,9 @@ def _host_resolver_addresses(host: str, timeout: float) -> List[str]:
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
+            # Only the address field is parsed; a stray byte in a name from
+            # /etc/hosts must not replace the caller's lookup error.
+            errors="replace",
             timeout=timeout,
             check=False,
         )
@@ -78,19 +81,27 @@ def _connect_via_host_resolver(host: str, port: int, timeout: float,
                                lookup_error: socket.gaierror) -> socket.socket:
     """Open a TCP connection to host:port through the host's NSS.
 
-    Tries each getent address in order, as getaddrinfo callers do. Raises
-    lookup_error when getent finds no address, else the last connect error.
+    getent and the connects share one deadline of timeout seconds; each
+    getent address is tried in order with what remains, as getaddrinfo
+    callers do. Raises lookup_error when getent finds no address, else the
+    last connect error, or socket.timeout when getent used up the deadline.
     """
+    deadline = time.monotonic() + timeout
     addresses = _host_resolver_addresses(host, timeout)
     if not addresses:
         raise lookup_error
     last_error: Optional[OSError] = None
     for address in addresses:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
         try:
-            return socket.create_connection((address, port), timeout=timeout)
+            return socket.create_connection((address, port), timeout=remaining)
         except OSError as exc:
             last_error = exc
-    assert last_error is not None
+    if last_error is None:
+        raise socket.timeout(
+            f"timed out connecting to {host}:{port} after resolving it with getent")
     raise last_error
 
 
@@ -148,6 +159,9 @@ class SSHBackend(Backend):
         self._probe_lock = threading.Lock()
         self._reconnect_probe_interval = max(1.0, min(5.0, float(connect_timeout) / 2.0))
         self._next_connect_retry_at = 0.0
+        # Log the first getent fallback at info, later ones at debug: every
+        # thread's connect to an affected host takes it.
+        self._host_resolver_logged = False
 
     @staticmethod
     def _close_client_pair(ssh_client: Optional[paramiko.SSHClient], sftp_client: Optional[paramiko.SFTPClient]):
@@ -286,12 +300,17 @@ class SSHBackend(Backend):
                 # in connect_kwargs: paramiko names the host key by it.
                 sock = _connect_via_host_resolver(
                     self.host, self.port, self.connect_timeout, lookup_error)
-                self.logger.info(
+                self.logger.log(
+                    logging.DEBUG if self._host_resolver_logged else logging.INFO,
                     "Resolved %s through the host's getent after: %s",
                     self.host, lookup_error)
+                self._host_resolver_logged = True
                 try:
                     ssh_client.connect(sock=sock, **connect_kwargs)
                 except BaseException:
+                    # A failure after the handshake leaves paramiko's
+                    # transport thread on the socket; close both.
+                    ssh_client.close()
                     sock.close()
                     raise
             sftp_client = ssh_client.open_sftp()
