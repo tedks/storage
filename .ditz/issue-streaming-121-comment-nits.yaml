@@ -1,0 +1,23 @@
+id: streaming-121-comment-nits
+title: 'Comment nits from #121 council: single-shot test and claim-before-promote'
+desc: 'Claude seat, council round 2 on #121 (both nits, not blocking): (1) tests/test_fs_streaming.py
+  test_streaming_failed_session_cleanup_is_single_shot: its second cleanup now stops
+  at failed_cleanup_claimed, so it no longer exercises the detached guard in promote/claim
+  (test_streaming_stopped_session_leaves_successor_partial_alone still covers that
+  guard); reword its comment. (2) streaming.py _cleanup_failed_session takes failed_cleanup_claimed
+  before promote and cleanup; if either raised a non-OSError, no later release could
+  retry and the session would stay registered. Theoretical (OSErrors are caught);
+  add a comment saying so.'
+type: task
+component: fs
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-28T21:44:52-00:00
+references: []
+log_events:
+- time: 2026-10-28T21:44:52-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
