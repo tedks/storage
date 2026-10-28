@@ -1,0 +1,20 @@
+id: revalidate-unavailable-negative-cache
+title: Revalidation re-queries the index at every open while no holder is available
+desc: 'From council round 1 on #127 (Claude seat, nit). With every holder unavailable,
+  _revalidate_cached_file records nothing, so each open repeats get_file_metadata,
+  an lstat and get_file_locations (local SQLite and a syscall; no remote call). Deliberate,
+  so the first open after a member returns revalidates, but unbounded during a long
+  outage. A short negative entry (a few seconds) would bound it. Low priority.'
+type: task
+component: cache
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-28T22:02:52-00:00
+references: []
+log_events:
+- time: 2026-10-28T22:02:52-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
