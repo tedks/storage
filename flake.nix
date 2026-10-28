@@ -44,7 +44,12 @@
         # nixpkgs' fusepy loads nixpkgs' libfuse 2 (FUSE_LIBRARY_PATH still
         # overrides it), and this Python uses nixpkgs' glibc, so it loads on
         # any host. Mounting still needs a setuid fusermount from the host on
-        # PATH, as under Environment in AGENTS.md.
+        # PATH, as under Environment in AGENTS.md. On a non-NixOS host that
+        # glibc cannot load the host's NSS modules (e.g. nss-mdns for .local
+        # names) and there is usually no nscd to ask, so the SSH member falls
+        # back to the host's getent when a lookup fails (storage/backends/
+        # ssh.py). Wrapping this with the host's or nixpkgs' NSS modules on
+        # LD_LIBRARY_PATH would leak into the host ssh and rsync it runs.
         storage = python.pkgs.buildPythonApplication {
           pname = "storage";
           version = "0.1.0";

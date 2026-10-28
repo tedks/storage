@@ -3,9 +3,12 @@ SSH/SFTP backend implementation for remote filesystems
 """
 
 import errno
+import ipaddress
 import os
 import shlex
+import shutil
 import socket
+import subprocess
 import stat as stat_module
 import logging
 import threading
@@ -16,6 +19,93 @@ from pathlib import Path, PurePosixPath
 from typing import Dict, List, Optional, Tuple
 
 from .base import Backend, BackendType, StorageMemberCapabilities, WatcherSpec
+
+
+# The flake-packaged storage runs on nixpkgs' glibc, which on a non-NixOS host
+# cannot load the host's NSS modules (nss-mdns for .local names, or any other
+# the host's nsswitch.conf names) and has no nscd to ask, so getaddrinfo fails
+# for names the host resolves. getent is the host's own NSS front end, so SSH
+# connects fall back to it on a lookup failure. /usr/bin first: a nixpkgs
+# getent earlier on PATH has the same blind spot.
+_GETENT_CANDIDATES = ("/usr/bin/getent", "/bin/getent")
+
+
+def _host_resolver_addresses(host: str, timeout: float) -> List[str]:
+    """Return the host's NSS addresses for host, in getent's order.
+
+    Runs the first executable getent among _GETENT_CANDIDATES and PATH (one
+    process: a second getent would consult the same nsswitch.conf). Returns
+    [] when there is no getent, it fails or times out, or it prints no
+    address; the caller then keeps its original lookup error.
+    """
+    getent = next(
+        (candidate for candidate in _GETENT_CANDIDATES
+         if os.access(candidate, os.X_OK)),
+        None,
+    ) or shutil.which("getent")
+    if getent is None:
+        return []
+    try:
+        # "--" so a host starting with "-" is not read as an option.
+        result = subprocess.run(
+            [getent, "ahosts", "--", host],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            # Only the address field is parsed; a stray byte in a name from
+            # /etc/hosts must not replace the caller's lookup error.
+            errors="replace",
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if result.returncode != 0:
+        return []
+    # Lines are "ADDRESS SOCKTYPE [NAME]", one per address and socket type.
+    addresses: List[str] = []
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) < 2 or fields[1] != "STREAM":
+            continue
+        try:
+            address = str(ipaddress.ip_address(fields[0]))
+        except ValueError:
+            continue
+        if address not in addresses:
+            addresses.append(address)
+    return addresses
+
+
+def _connect_via_host_resolver(host: str, port: int, timeout: float,
+                               lookup_error: socket.gaierror) -> socket.socket:
+    """Open a TCP connection to host:port through the host's NSS.
+
+    getent and the connects share one deadline of timeout seconds; each
+    getent address is tried in order with what remains, as getaddrinfo
+    callers do. Raises lookup_error when getent finds no address (including
+    when getent itself times out), the last connect error when every address
+    was tried, and socket.timeout when the deadline passes with addresses
+    left untried.
+    """
+    deadline = time.monotonic() + timeout
+    addresses = _host_resolver_addresses(host, timeout)
+    if not addresses:
+        raise lookup_error
+    last_error: Optional[OSError] = None
+    for address in addresses:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise socket.timeout(
+                f"timed out connecting to {host}:{port} after resolving it "
+                f"with getent") from (last_error or lookup_error)
+        try:
+            return socket.create_connection((address, port), timeout=remaining)
+        except OSError as exc:
+            last_error = exc
+    if last_error is None:  # unreachable: addresses is non-empty
+        raise lookup_error
+    raise last_error
 
 
 class SSHBackend(Backend):
@@ -72,6 +162,9 @@ class SSHBackend(Backend):
         self._probe_lock = threading.Lock()
         self._reconnect_probe_interval = max(1.0, min(5.0, float(connect_timeout) / 2.0))
         self._next_connect_retry_at = 0.0
+        # Log the first getent fallback at info, later ones at debug: every
+        # thread's connect to an affected host takes it.
+        self._host_resolver_logged = False
 
     @staticmethod
     def _close_client_pair(ssh_client: Optional[paramiko.SSHClient], sftp_client: Optional[paramiko.SFTPClient]):
@@ -202,7 +295,31 @@ class SSHBackend(Backend):
                 connect_kwargs['allow_agent'] = False
                 connect_kwargs['look_for_keys'] = False
 
-            ssh_client.connect(**connect_kwargs)
+            try:
+                ssh_client.connect(**connect_kwargs)
+            except socket.gaierror as lookup_error:
+                # paramiko raises this from its getaddrinfo, before it opens
+                # a socket, so the client is still unused. The hostname stays
+                # in connect_kwargs: paramiko names the host key by it.
+                sock = _connect_via_host_resolver(
+                    self.host, self.port, self.connect_timeout, lookup_error)
+                self.logger.log(
+                    logging.DEBUG if self._host_resolver_logged else logging.INFO,
+                    "Resolved %s through the host's getent after: %s",
+                    self.host, lookup_error)
+                self._host_resolver_logged = True
+                try:
+                    ssh_client.connect(sock=sock, **connect_kwargs)
+                except BaseException:
+                    # A failure after the handshake leaves paramiko's
+                    # transport thread on the socket; close both, and let
+                    # neither close hide the connect error.
+                    for close in (ssh_client.close, sock.close):
+                        try:
+                            close()
+                        except Exception:
+                            pass
+                    raise
             sftp_client = ssh_client.open_sftp()
 
             # Keep SFTP socket/channel timeouts above connect timeout to tolerate
