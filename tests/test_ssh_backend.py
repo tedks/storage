@@ -593,6 +593,25 @@ class TestHostResolverFallback(unittest.TestCase):
 
     @patch("storage.backends.ssh.socket.create_connection")
     @patch("storage.backends.ssh.subprocess.run")
+    def test_deadline_with_addresses_untried_raises_timeout_not_the_last_error(self, mock_run, mock_create):
+        mock_run.return_value = _getent_result(_GETENT_AHOSTS)
+        clock = SimpleNamespace(now=0.0)
+
+        def _refused_at_deadline(_address, timeout):
+            clock.now += timeout
+            raise ConnectionRefusedError("refused")
+
+        mock_create.side_effect = _refused_at_deadline
+        with patch.object(ssh_module, "time", SimpleNamespace(monotonic=lambda: clock.now)):
+            with self.assertRaises(socket.timeout) as caught:
+                ssh_module._connect_via_host_resolver(
+                    "nas.local", 22, 4.0, socket.gaierror(-3, "lookup"))
+        # A refusal from one address must not read as "every address refused".
+        self.assertIsInstance(caught.exception.__cause__, ConnectionRefusedError)
+        self.assertEqual(mock_create.call_count, 1)
+
+    @patch("storage.backends.ssh.socket.create_connection")
+    @patch("storage.backends.ssh.subprocess.run")
     def test_getent_using_the_whole_deadline_raises_timeout(self, mock_run, mock_create):
         clock = SimpleNamespace(now=0.0)
 
@@ -708,6 +727,32 @@ class TestSSHBackendHostResolverConnect(unittest.TestCase):
         self.assertTrue(clients[0].closed)
         self.assertFalse(backend.is_available())
         backend.close()
+
+    @patch("storage.backends.ssh._connect_via_host_resolver")
+    @patch("storage.backends.ssh.paramiko.AutoAddPolicy")
+    @patch("storage.backends.ssh.paramiko.SSHClient")
+    def test_client_close_error_does_not_hide_handshake_error_or_leak_socket(self, mock_ssh_client_cls, _policy, mock_fallback):
+        calls = []
+        handshake_error = ssh_module.paramiko.SSHException("banner")
+
+        def _factory():
+            client = self._client_failing_lookup_without_sock(calls, fail_with_sock=handshake_error)
+
+            def _close_fails():
+                raise RuntimeError("close failed")
+
+            client.close = _close_fails
+            return client
+
+        mock_ssh_client_cls.side_effect = _factory
+        sock = _FakeTCPSocket()
+        mock_fallback.return_value = sock
+        backend = self._new_backend()
+
+        with self.assertRaises(ssh_module.paramiko.SSHException) as caught:
+            backend._current_clients()
+        self.assertIs(caught.exception, handshake_error)
+        self.assertTrue(sock.closed)
 
     @patch("storage.backends.ssh._connect_via_host_resolver")
     @patch("storage.backends.ssh.paramiko.AutoAddPolicy")

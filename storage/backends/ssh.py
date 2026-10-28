@@ -83,8 +83,10 @@ def _connect_via_host_resolver(host: str, port: int, timeout: float,
 
     getent and the connects share one deadline of timeout seconds; each
     getent address is tried in order with what remains, as getaddrinfo
-    callers do. Raises lookup_error when getent finds no address, else the
-    last connect error, or socket.timeout when getent used up the deadline.
+    callers do. Raises lookup_error when getent finds no address (including
+    when getent itself times out), the last connect error when every address
+    was tried, and socket.timeout when the deadline passes with addresses
+    left untried.
     """
     deadline = time.monotonic() + timeout
     addresses = _host_resolver_addresses(host, timeout)
@@ -94,14 +96,15 @@ def _connect_via_host_resolver(host: str, port: int, timeout: float,
     for address in addresses:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            break
+            raise socket.timeout(
+                f"timed out connecting to {host}:{port} after resolving it "
+                f"with getent") from last_error
         try:
             return socket.create_connection((address, port), timeout=remaining)
         except OSError as exc:
             last_error = exc
-    if last_error is None:
-        raise socket.timeout(
-            f"timed out connecting to {host}:{port} after resolving it with getent")
+    if last_error is None:  # unreachable: addresses is non-empty
+        raise lookup_error
     raise last_error
 
 
@@ -309,9 +312,14 @@ class SSHBackend(Backend):
                     ssh_client.connect(sock=sock, **connect_kwargs)
                 except BaseException:
                     # A failure after the handshake leaves paramiko's
-                    # transport thread on the socket; close both.
-                    ssh_client.close()
-                    sock.close()
+                    # transport thread on the socket; close both, and let
+                    # neither close hide the connect error.
+                    try:
+                        ssh_client.close()
+                    except Exception:
+                        pass
+                    finally:
+                        sock.close()
                     raise
             sftp_client = ssh_client.open_sftp()
 
