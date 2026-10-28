@@ -1,0 +1,22 @@
+id: streaming-125-staging-nits
+title: 'Staging partial nits from #125 council'
+desc: 'Claude seat, council round 2 on #125 (non-blocking): (1) the staging name .<16hex>.storage.partial
+  no longer names its source; add final_cache_path to the debug log line where preparing
+  the staging file fails. (2) A virtual file literally named .<16hex> in the same
+  directory has a partial named like a staging file, so its registration replace could
+  clobber a concurrent staging file with the same token; needs a 64-bit random match,
+  negligible, noted only. A distinct prefix (e.g. .storage-staging-<hex>) would remove
+  even that.'
+type: task
+component: fs
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-28T21:46:59-00:00
+references: []
+log_events:
+- time: 2026-10-28T21:46:59-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
