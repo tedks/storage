@@ -54,6 +54,24 @@ class FDEntry:
     prefetch_session: Optional[PrefetchSession] = None
 
 
+@dataclass(frozen=True)
+class MemberCheck:
+    """When a cached file was last known to match its member, and against what.
+
+    cache_identity is the cache file's (st_ino, st_size, st_mtime_ns) when the
+    check was recorded; a check whose identity no longer matches the file
+    describes some earlier copy and gives no baseline. backend_name,
+    member_size and member_mtime are the member's stat at that time, or None
+    when only the time is known (a fetch, or a stat that failed).
+    """
+
+    cache_identity: Tuple[int, int, int]
+    verified_at: float
+    backend_name: Optional[str] = None
+    member_size: Optional[int] = None
+    member_mtime: Optional[float] = None
+
+
 class StorageFS(Operations):
     """
     Storage FUSE filesystem
@@ -99,7 +117,8 @@ class StorageFS(Operations):
                  max_streaming_sessions: int = 8,
                  readdir_ttl: float = 1.0,
                  enable_watchers: bool = False,
-                 streaming_keep_after_close: Optional[StreamingKeepAfterClose] = None):
+                 streaming_keep_after_close: Optional[StreamingKeepAfterClose] = None,
+                 revalidate_after: float = 60.0):
         """
         Initialize Storage filesystem
 
@@ -123,6 +142,9 @@ class StorageFS(Operations):
                              readdir_ttl is ignored and directory listings are
                              only invalidated by remote change events. Requires
                              inotify-tools on the remote host.
+            revalidate_after: Seconds after which opening a CLEAN cached
+                file stats the member holding it, and refetches it if the
+                member's copy changed (0: every open)
         """
         self.state_manager = StateManager(str(state_db))
         self.cache_manager = CacheManager(cache_root, self.state_manager, cache_size)
@@ -137,6 +159,17 @@ class StorageFS(Operations):
         self._fd_map: Dict[int, FDEntry] = {}
         self._fd_lock = threading.Lock()
 
+        # Revalidation on open, keyed by canonical path (see
+        # _revalidate_cached_file). In memory only: after a restart every
+        # cached file is checked at its first open. _member_checks_lock is a
+        # leaf: nothing is taken under it.
+        self._revalidate_after = max(0.0, float(revalidate_after))
+        self._member_checks: Dict[str, MemberCheck] = {}
+        self._member_checks_lock = threading.Lock()
+        # Members whose failed revalidation has been logged; cleared by the
+        # member's next successful stat, so an outage is logged once.
+        self._revalidate_outages: Set[str] = set()
+
         # Background sync manager
         self.sync_manager = SyncManager(
             self.state_manager,
@@ -144,6 +177,7 @@ class StorageFS(Operations):
             self.replication_manager,
             num_workers=num_sync_workers,
             should_sync_path_cb=self._should_sync_path,
+            member_written_cb=self._record_member_written,
         )
         self._sync_started = False
         if start_sync:
@@ -208,7 +242,7 @@ class StorageFS(Operations):
             checksum_records=self._checksum_records,
             checksum_lock=self._checksum_lock,
         )
-        self.cache_manager.forget_listed_attrs = self.namespace.forget_listed_attrs
+        self.cache_manager.forget_listed_attrs = self._forget_cached_copy_attrs
 
         self._streaming_manager = StreamingReadManager(
             cache_manager=self.cache_manager,
@@ -379,7 +413,7 @@ class StorageFS(Operations):
                     if not stale:
                         # Before the unlink: no getattr may find the copy
                         # gone and its name still in the parent's listing.
-                        self.namespace.forget_listed_attrs(virtual_path)
+                        self._forget_cached_copy_attrs(virtual_path)
                         cache_path.unlink()
                 except OSError:
                     return
@@ -631,6 +665,180 @@ class StorageFS(Operations):
                 continue
         return None
 
+    # ------------------------------------------------------------------ #
+    # Revalidation of cached files on open
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _cache_identity(st: os.stat_result) -> Tuple[int, int, int]:
+        return (st.st_ino, st.st_size, st.st_mtime_ns)
+
+    def _forget_member_check(self, virtual_path: str):
+        with self._member_checks_lock:
+            self._member_checks.pop(virtual_path, None)
+
+    def _forget_cached_copy_attrs(self, virtual_path: str, *, removing: bool = True):
+        """Forget what was known about a cached copy that is going or changing.
+
+        Installed as CacheManager.forget_listed_attrs, which eviction calls
+        before an unlink and mark_file_dirty before recording a write: in both
+        the member check no longer describes the cache file.
+        """
+        self.namespace.forget_listed_attrs(virtual_path, removing=removing)
+        self._forget_member_check(virtual_path)
+
+    def _record_member_check(self, canonical_path: str, cache_path: Path,
+                             backend: Optional[Backend] = None,
+                             member_stat: Optional[os.stat_result] = None):
+        """Record that the cache file matches its member as of now."""
+        try:
+            identity = self._cache_identity(os.lstat(str(cache_path)))
+        except OSError:
+            self._forget_member_check(canonical_path)
+            return
+        check = MemberCheck(cache_identity=identity, verified_at=time.monotonic())
+        if backend is not None and member_stat is not None:
+            check = MemberCheck(
+                cache_identity=identity,
+                verified_at=check.verified_at,
+                backend_name=backend.name,
+                member_size=member_stat.st_size,
+                member_mtime=member_stat.st_mtime,
+            )
+        with self._member_checks_lock:
+            self._member_checks[canonical_path] = check
+
+    def _record_member_written(self, virtual_path: str, backend: Backend, cache_path: Path):
+        """Sync callback: backend now holds the cache file's content.
+
+        Runs in a sync worker, so the stat costs the FUSE loop nothing. The
+        member's stat after an upload is the baseline for later checks:
+        without it, an upload that does not keep the mtime (SFTP) would look
+        like a change on the member at the next stale open.
+        """
+        try:
+            member_stat = backend.stat(virtual_path)
+        except Exception as exc:
+            self.logger.debug("post-sync stat on %s failed: %r", backend.name, exc)
+            self._forget_member_check(virtual_path)
+            return
+        self._record_member_check(virtual_path, cache_path, backend, member_stat)
+
+    def _member_for_revalidation(self, canonical_path: str,
+                                 preferred: Optional[str]) -> Tuple[Optional[Backend], List[str]]:
+        """Pick the member to stat, from the index alone (no remote call).
+
+        Returns the member (the preferred one if it holds the file and is
+        available, else the fastest available holder) and the names of the
+        holders that are unavailable.
+        """
+        holders = []
+        for location in self.state_manager.get_file_locations(canonical_path):
+            backend = self.backends.get(location.backend_name)
+            if backend is not None and backend not in holders:
+                holders.append(backend)
+        available = [b for b in holders if b.is_available()]
+        unavailable = [b.name for b in holders if not b.is_available()]
+        for backend in available:
+            if backend.name == preferred:
+                return backend, unavailable
+        available.sort(key=lambda b: b.speed_priority)
+        return (available[0] if available else None), unavailable
+
+    def _note_revalidation_outage(self, backend_name: str, reason: str):
+        if backend_name in self._revalidate_outages:
+            return
+        self._revalidate_outages.add(backend_name)
+        self.logger.warning(
+            "Cannot revalidate cached files against %s (%s); serving cached copies",
+            backend_name, reason,
+        )
+
+    def _revalidate_cached_file(self, resolved: ResolvedPath):
+        """Refetch a CLEAN cached file whose member copy changed.
+
+        Called by open() for a canonical path. Within revalidate_after of the
+        last check this is a dict lookup. Past it, and only for a CLEAN row,
+        it costs one stat of one member (FUSE runs nothreads, so this blocks
+        every other operation): a member chosen from the index, never a
+        listing or an exists() probe. The member's copy changed when:
+
+        - with a baseline (the member's stat at the last check, for the same
+          member and the same cache file): size or mtime differ from it;
+        - without one (first check since a fetch or a restart): the size
+          differs from the cache file's, or the member's mtime is later than
+          the cache file's. A fetch keeps the member's mtime (local, rsync)
+          or stamps the fetch time (SFTP), so an unchanged member is never
+          later; a member clock ahead of ours can cause one needless
+          refetch, after which there is a baseline.
+
+        A changed copy goes through _invalidate_file_cache, which keeps a
+        file that became DIRTY or has a writer open; whatever is no longer
+        cached is then fetched by the caller as usual. An unavailable member,
+        a failed stat or a member that no longer has the file keeps the
+        cached copy: the open never fails here. Failures are logged once per
+        member until it answers again.
+        """
+        canonical_path = resolved.canonical_path
+        now = time.monotonic()
+        with self._member_checks_lock:
+            check = self._member_checks.get(canonical_path)
+        if check is not None and now - check.verified_at < self._revalidate_after:
+            return
+
+        metadata = self.state_manager.get_file_metadata(canonical_path)
+        if metadata is None or metadata.sync_status != SyncStatus.CLEAN:
+            return
+        try:
+            cache_stat = os.lstat(str(resolved.cache_path))
+        except OSError:
+            return
+        if check is not None and (
+            check.backend_name is None
+            or check.cache_identity != self._cache_identity(cache_stat)
+        ):
+            check = None
+
+        backend, unavailable = self._member_for_revalidation(
+            canonical_path, check.backend_name if check else None,
+        )
+        if backend is None:
+            # Nothing is recorded as checked, so the next open looks again;
+            # with no available holder that costs no remote call.
+            for name in unavailable:
+                self._note_revalidation_outage(name, "unavailable")
+            return
+
+        try:
+            member_stat = backend.stat(canonical_path)
+        except FileNotFoundError:
+            # The member may have lost the file or its disk; the cached copy
+            # may be the only one left, so it stays.
+            self.logger.info("revalidate: %s no longer has %s; keeping the cached copy",
+                             backend.name, canonical_path)
+            self._record_member_check(canonical_path, resolved.cache_path)
+            return
+        except Exception as exc:
+            self._note_revalidation_outage(backend.name, f"stat failed: {exc!r}")
+            self._record_member_check(canonical_path, resolved.cache_path)
+            return
+        if backend.name in self._revalidate_outages:
+            self._revalidate_outages.discard(backend.name)
+            self.logger.info("Revalidating cached files against %s again", backend.name)
+
+        if check is not None and check.backend_name == backend.name:
+            changed = (member_stat.st_size != check.member_size
+                       or member_stat.st_mtime != check.member_mtime)
+        else:
+            changed = (member_stat.st_size != cache_stat.st_size
+                       or member_stat.st_mtime > cache_stat.st_mtime)
+        if not changed:
+            self._record_member_check(canonical_path, resolved.cache_path, backend, member_stat)
+            return
+
+        self.logger.info("revalidate: %s changed on %s; refetching", canonical_path, backend.name)
+        self._invalidate_file_cache(resolved.requested_path)
+        self._forget_member_check(canonical_path)
+
     @staticmethod
     def _is_range_available(ranges: List[Tuple[int, int]], start: int, end: int) -> bool:
         return StreamingReadManager._is_range_available(ranges, start, end)
@@ -769,6 +977,8 @@ class StorageFS(Operations):
                 backend,
                 source_virtual_path=canonical_path,
             ):
+                # Fresh from the member: no check needed until revalidate_after.
+                self._record_member_check(canonical_path, cache_path)
                 # Populate state metadata and locations if missing
                 try:
                     st = os.lstat(str(cache_path))
@@ -967,6 +1177,11 @@ class StorageFS(Operations):
         resolved = self._resolve_path(path)
         cache_path = resolved.cache_path
         prefetch_session: Optional[PrefetchSession] = None
+
+        # Before the streaming decision: a copy dropped here is refetched
+        # like any uncached file, streamed if streaming is on.
+        if resolved.backend_name is None and self.cache_manager.is_cached(resolved.requested_path):
+            self._revalidate_cached_file(resolved)
 
         # Streaming mode applies only to canonical read-only opens of uncached files.
         if (
@@ -1459,7 +1674,8 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
                  max_streaming_sessions: int = 8,
                  readdir_ttl: float = 1.0,
                  enable_watchers: bool = False,
-                 streaming_keep_after_close: Optional[StreamingKeepAfterClose] = None):
+                 streaming_keep_after_close: Optional[StreamingKeepAfterClose] = None,
+                 revalidate_after: float = 60.0):
     """
     Mount a Storage filesystem
 
@@ -1479,6 +1695,8 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
         max_streaming_sessions: Maximum concurrent streaming prefetch sessions
         streaming_keep_after_close: When read-ahead outlives the last close;
             None for the default
+        revalidate_after: Seconds after which opening a CLEAN cached file
+            stats its member (see StorageFS._revalidate_cached_file)
 
     Raises:
         PermissionError: If allow_other=True but not running as root and user_allow_other not set
@@ -1537,6 +1755,7 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
         readdir_ttl=readdir_ttl,
         enable_watchers=enable_watchers,
         streaming_keep_after_close=streaming_keep_after_close,
+        revalidate_after=revalidate_after,
     )
     fs.mount_lock_file = lock_file
     if unclean_shutdown:

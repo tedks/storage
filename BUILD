@@ -96,6 +96,7 @@ py_test(
         "tests/test_file_config.py",
         "tests/test_fs_core_integration.py",
         "tests/test_fs_namespace_integration.py",
+        "tests/test_fs_revalidate.py",
         "tests/test_fs_streaming.py",
         "tests/test_local_backend.py",
         "tests/test_member_capabilities.py",
