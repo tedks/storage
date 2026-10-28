@@ -174,17 +174,21 @@ streaming read). It is not in `//:storage_tests` or the three gates above,
 and its target is tagged `manual`, so `//...` skips it too and hosts
 without Docker are unaffected.
 
-Run it before every push, not only for changes to the SSH, rsync, watcher
-or remote filesystem paths: `scripts/run-gates.sh` does, together with the
-other gates. It needs Docker. If your host has none, run it on a host that
-does, at the same commit: set `STORAGE_REMOTE_GATE_HOST` to that host's ssh
-destination (unset by default; the host needs Docker and the dev shell, and
-must be able to fetch your commit from `origin`, or from
-`STORAGE_REMOTE_GATE_URL`). With the variable set and no local Docker, the
-script runs the other three gates here, then the remote gate over ssh on
-that host against the pushed commit, in a scratch checkout it removes
-afterwards (and a cold Bazel output base, so expect a slower run). It
-refuses to run the remote gate for an unpushed commit or a dirty tree. A
+Run it for every change before it merges, not only for changes to the SSH,
+rsync, watcher or remote filesystem paths: `scripts/run-gates.sh` does,
+together with the other gates, on the exact commit. It needs Docker. If your
+host has none, run it on a host that does, at the same commit: set
+`STORAGE_REMOTE_GATE_HOST` to that host's ssh destination (unset by
+default). That host needs Docker, FUSE (see Environment), the dev shell with
+flakes enabled, a login `bash` that puts `nix` on `PATH`, and the ability to
+fetch your commit from `origin` (or `STORAGE_REMOTE_GATE_URL`). The host
+fetches the commit, so push your branch first (a branch push is not a
+merge). With the variable set and no local Docker, the script runs the other
+three gates here, then the remote gate over ssh on that host against the
+pushed commit, in a scratch checkout it removes afterwards (and a cold Bazel
+output base, so expect a slower run; an interrupted run can leave one under
+the host's `~/.cache/bazel`). It refuses to run the remote gate for an
+unpushed commit or a dirty tree. A
 contributor with no Docker host says so in the PR, and the maintainer runs
 the gate before merging. To run just the remote gate where Docker is:
 
