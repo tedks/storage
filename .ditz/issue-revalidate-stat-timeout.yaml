@@ -1,0 +1,25 @@
+id: revalidate-stat-timeout
+title: Revalidation stat can stall the mount up to the SFTP operation timeout
+desc: 'From council round 1 on #127 (Claude seat, Codex seat). _revalidate_cached_file
+  stats one member on the FUSE thread (nothreads). When a member''s link goes quiet
+  but is not yet marked unavailable, the first stale open waits for SSHBackend.sftp_operation_timeout
+  (max(60, 6 x connect_timeout)) before the stat fails and the member is marked unavailable;
+  every FUSE op on the mount waits with it. Once per outage, and the same exposure
+  every other remote op on the loop already has, so not a merge blocker. Options:
+  a short per-call timeout for the revalidation stat (a dedicated SFTP channel with
+  a few seconds'' timeout), or stale-while-revalidate (serve cached, check in a worker;
+  changes the ruling''s on-open semantics, so Ted''s call). Recommendation: short-timeout
+  channel.'
+type: task
+component: cache
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-28T22:02:52-00:00
+references: []
+log_events:
+- time: 2026-10-28T22:02:52-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
