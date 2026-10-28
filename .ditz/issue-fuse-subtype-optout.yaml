@@ -5,8 +5,8 @@ type: task
 component: open-questions
 release:
 reporter: Ted Smith <tedks@riseup.net>
-status: unstarted
-disposition:
+status: closed
+disposition: fixed
 creation_time: 2026-10-27T19:51:15-00:00
 references: []
 log_events:
@@ -23,3 +23,13 @@ log_events:
     Options: (a) always remote if any member remote [current]; (b) profile key subtype
     = auto|remote|local; (c) remote only if all/primary members are remote. Recommendation:
     (a) until a real complaint. Decides: Ted. Blocks: nothing (PR #118 ships (a)).'
+- time: 2026-10-28T15:44:32-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Ruling (Ted, 2026-10-28): optimize for the conservative case, option (a).
+    Any remote member makes the whole mount remote (fuse.sshfs), as #118 ships. No
+    opt-out key.'
+- time: 2026-10-28T15:44:35-00:00
+  who: Ted Smith
+  what: 'closed: fixed'
+  comment: 'Ruled: (a) always remote if any member is remote; no change needed.'
