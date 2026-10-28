@@ -14,8 +14,8 @@ type: bugfix
 component: build
 release:
 reporter: Ted Smith <tedks@riseup.net>
-status: in_progress
-disposition:
+status: closed
+disposition: fixed
 creation_time: 2026-10-27T19:15:37-00:00
 references: []
 log_events:
@@ -27,3 +27,9 @@ log_events:
   who: Ted Smith
   what: started
   comment: ""
+- time: 2026-10-28T22:30:56-00:00
+  who: Ted Smith
+  what: 'closed: fixed'
+  comment: 'PR #124 merged as 82be79f (head ac01c4c): SSHBackend falls back to the
+    host''s getent when paramiko''s getaddrinfo fails. Council CLEAN at round 4; run-gates
+    7/7 on ac01c4c. Needs a flake input bump to deploy.'
