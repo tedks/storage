@@ -1,0 +1,17 @@
+id: ded6d1578f6a1a798c68fa58c2a67173b614fe3f
+title: 'Flaky remote gate teardown: FUSE thread did not finish after unmount (StorageFS.destroy
+  hung?)'
+desc: ""
+type: bugfix
+component: streaming
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-28T21:56:17-00:00
+references: []
+log_events:
+- time: 2026-10-28T21:56:17-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
