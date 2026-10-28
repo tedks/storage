@@ -1,0 +1,22 @@
+id: revalidate-post-sync-stat-failure
+title: A failed post-sync stat leaves the member's old baseline in place
+desc: 'From council round 2 on #127 (Claude seat, nit). _record_member_written returns
+  without touching the baselines when the member stat after an upload fails. If the
+  upload re-sent unchanged content (a retry after a partial sync) and the member stamped
+  a new mtime (SFTP put), the old baseline no longer matches and the next check refetches
+  once. Safe (never a missed change); dropping just that member''s baseline on failure
+  would turn it into the comparison without a baseline instead, which for SFTP refetches
+  too. Low value; noted for completeness.'
+type: task
+component: cache
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-28T22:09:19-00:00
+references: []
+log_events:
+- time: 2026-10-28T22:09:19-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
