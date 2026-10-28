@@ -1,0 +1,22 @@
+id: revalidate-streaming-bail-pin
+title: A refetch pin consumed by a streaming session that then falls back is lost
+desc: 'From council round 3 on #127 (Claude seat, nit 2). The pin set by _revalidate_cached_file
+  is consumed when the streaming manager selects a backend; if streaming then bails
+  (no range reads, get_size failing, no cache space) the full-file fallback selects
+  again without the pin and adds no recheck mark if it picks another member. Mostly
+  harmless (the pinned member was the fastest available holder, and get_backend_for_read
+  orders the same way). Fix: restore the pin on those returns, or make selection idempotent
+  within one open().'
+type: task
+component: cache
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-28T22:18:45-00:00
+references: []
+log_events:
+- time: 2026-10-28T22:18:45-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
