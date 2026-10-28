@@ -26,10 +26,18 @@ class SlowRangeLocalBackend(LocalBackend):
         self.copy_delay = copy_delay
         self.fail_after_offset = fail_after_offset
         self.max_read_bytes = max_read_bytes
+        # When set, a background worker's range read signals worker_in_read
+        # and blocks until worker_gate is set; foreground reads pass through.
+        self.worker_gate = None
+        self.worker_in_read = threading.Event()
 
     def read_file(self, virtual_path: str, offset: int, size: int) -> bytes:
         if self.fail_after_offset is not None and offset >= self.fail_after_offset:
             raise OSError(errno.EIO, "simulated backend range read failure")
+        gate = self.worker_gate
+        if gate is not None and threading.current_thread().name.startswith("storage-prefetch-"):
+            self.worker_in_read.set()
+            gate.wait(timeout=10.0)
         if self.range_delay:
             time.sleep(self.range_delay)
         data = super().read_file(virtual_path, offset, size)
@@ -82,6 +90,8 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.fs = self._make_fs(keep_after_close)
 
     def tearDown(self):
+        if self.backend.worker_gate is not None:
+            self.backend.worker_gate.set()
         try:
             self.fs.destroy('/')
         except Exception:
@@ -886,6 +896,84 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.assertTrue(self._wait_for(cache_path.exists, timeout=5.0))
         self.assertEqual(cache_path.read_bytes(), payload)
 
+
+    def _release_in_thread(self, path, vfd):
+        releaser = threading.Thread(target=self.fs.release, args=(path, vfd), daemon=True)
+        releaser.start()
+        return releaser
+
+    def test_streaming_failed_release_does_not_wait_for_worker_mid_fetch(self):
+        # A foreground fetch fails while the worker is blocked in a remote
+        # read. The mount is single-threaded, so the last release must return
+        # without waiting for that read; the worker cleans up when it ends.
+        self.backend.worker_gate = threading.Event()
+        payload = os.urandom(256 * 1024)
+        (self.backend_dir / "errjoin.bin").write_bytes(payload)
+        partial_path = self.cache_dir / "errjoin.bin.storage.partial"
+
+        vfd = self.fs.open('/errjoin.bin', os.O_RDONLY)
+        session = self._session_for(vfd)
+        self.assertEqual(self.fs.read('/errjoin.bin', 4096, 0, vfd), payload[:4096])
+        self.assertTrue(self.backend.worker_in_read.wait(timeout=3.0))
+
+        self.backend.fail_after_offset = 128 * 1024
+        with self.assertRaises(FuseOSError):
+            self.fs.read('/errjoin.bin', 4096, 192 * 1024, vfd)
+
+        releaser = self._release_in_thread('/errjoin.bin', vfd)
+        releaser.join(timeout=1.0)
+        self.assertFalse(releaser.is_alive(), "release waited for the worker's remote read")
+        self.assertTrue(session.worker.is_alive())
+        self.assertTrue(partial_path.exists())
+
+        self.backend.worker_gate.set()
+        self.assertTrue(self._wait_for(lambda: not session.worker.is_alive(), timeout=3.0))
+        self.assertEqual(session.io_fd, -1)
+        self.assertTrue(session.detached)
+        self.assertFalse(partial_path.exists())
+        with self.fs._prefetch_sessions_lock:
+            self.assertNotIn('/errjoin.bin', self.fs._prefetch_sessions)
+
+    def test_streaming_failed_release_after_worker_tail_cleans_up(self):
+        # The worker's tail ran while a reader still held the failed session,
+        # so it left cleanup to the release. The thread has not ended yet
+        # (here held after its tail; in practice, just scheduled out) when
+        # the last release comes: release must clean up now, without waiting
+        # for the thread, or nothing ever removes the session.
+        manager = self.fs._streaming_manager
+        real_worker = manager._background_prefetch_worker
+        tail_done = threading.Event()
+        hold = threading.Event()
+        self.addCleanup(hold.set)
+
+        def held_worker(session):
+            real_worker(session)
+            tail_done.set()
+            hold.wait(timeout=10.0)
+
+        payload = os.urandom(128 * 1024)
+        (self.backend_dir / "tail.bin").write_bytes(payload)
+        partial_path = self.cache_dir / "tail.bin.storage.partial"
+
+        with patch.object(manager, "_background_prefetch_worker", side_effect=held_worker):
+            vfd = self.fs.open('/tail.bin', os.O_RDONLY)
+        session = self._session_for(vfd)
+        with session.lock:
+            session.error = OSError(errno.EIO, "simulated failure")
+            session.condition.notify_all()
+        self.assertTrue(tail_done.wait(timeout=3.0))
+        self.assertTrue(session.worker.is_alive())
+        self.assertTrue(partial_path.exists())
+
+        releaser = self._release_in_thread('/tail.bin', vfd)
+        releaser.join(timeout=1.0)
+        self.assertFalse(releaser.is_alive(), "release waited for the worker thread")
+        self.assertTrue(session.worker.is_alive())
+        self.assertEqual(session.io_fd, -1)
+        self.assertTrue(session.detached)
+        self.assertFalse(partial_path.exists())
+        with self.fs._prefetch_sessions_lock:
+            self.assertNotIn('/tail.bin', self.fs._prefetch_sessions)
 
 
 if __name__ == '__main__':
