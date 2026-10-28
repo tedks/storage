@@ -546,7 +546,9 @@ class TestFSStreamingIntegration(unittest.TestCase):
                 self.fs.release('/cancelled.bin', vfd)
 
                 self.assertTrue(self._wait_for(lambda: len(self.fs._prefetch_sessions) == 0, timeout=3.0))
-                self.assertGreaterEqual(cancelled_cleanup.call_count, 1)
+                # The stop unregisters at once; the worker's tail, which runs
+                # the cancelled cleanup, follows on its own thread.
+                self.assertTrue(self._wait_for(lambda: cancelled_cleanup.call_count >= 1, timeout=3.0))
                 self.assertEqual(failed_cleanup.call_count, 0)
 
 
@@ -1028,6 +1030,104 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.assertTrue(cleanups[0].startswith("storage-prefetch-"), cleanups)
         self.assertEqual(session.io_fd, -1)
         self.assertTrue(session.detached)
+
+    def test_streaming_concurrent_first_opens_share_one_partial(self):
+        # Two opens of one uncached file both miss the registry and prepare a
+        # partial before either registers. The loser attaches to the winner;
+        # neither preparation may remove or replace the file the registered
+        # session writes, and both readers must see the file's bytes.
+        payload = os.urandom(128 * 1024)
+        (self.backend_dir / "race.bin").write_bytes(payload)
+        partial_path = self.cache_dir / "race.bin.storage.partial"
+        import storage.streaming as streaming_module
+        real_session_cls = streaming_module.PrefetchSession
+        first_prepared = threading.Event()
+        second_prepared = threading.Event()
+        go_first = threading.Event()
+        go_second = threading.Event()
+        self.addCleanup(go_first.set)
+        self.addCleanup(go_second.set)
+        calls = []
+        calls_lock = threading.Lock()
+
+        def paused_session(**kwargs):
+            # Runs after the partial is prepared, before registration.
+            with calls_lock:
+                calls.append(threading.current_thread().name)
+                first = len(calls) == 1
+            if first:
+                first_prepared.set()
+                go_first.wait(timeout=5.0)
+            else:
+                second_prepared.set()
+                go_second.wait(timeout=5.0)
+            return real_session_cls(**kwargs)
+
+        results = {}
+
+        def opener(name):
+            try:
+                results[name] = self.fs.open('/race.bin', os.O_RDONLY)
+            except Exception as exc:
+                results[name] = exc
+
+        with patch.object(streaming_module, "PrefetchSession", side_effect=paused_session):
+            first = threading.Thread(target=opener, args=("first",), name="opener-first")
+            second = threading.Thread(target=opener, args=("second",), name="opener-second")
+            first.start()
+            self.assertTrue(first_prepared.wait(timeout=3.0))
+            second.start()
+            self.assertTrue(second_prepared.wait(timeout=3.0))
+            go_first.set()
+            first.join(timeout=5.0)
+            go_second.set()
+            second.join(timeout=5.0)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertIsInstance(results["first"], int, results["first"])
+        self.assertIsInstance(results["second"], int, results["second"])
+        session = self._session_for(results["first"])
+        self.assertIs(self._session_for(results["second"]), session)
+        self.assertTrue(partial_path.exists())
+        self.assertEqual(os.fstat(session.io_fd).st_ino, partial_path.stat().st_ino)
+        self.assertEqual(
+            [p.name for p in self.cache_dir.iterdir() if p.name.endswith(".storage.partial")],
+            ["race.bin.storage.partial"],
+        )
+
+        for vfd in (results["first"], results["second"]):
+            for offset in range(0, len(payload), 32 * 1024):
+                self.assertEqual(
+                    self.fs.read('/race.bin', 32 * 1024, offset, vfd),
+                    payload[offset:offset + 32 * 1024],
+                )
+        self.fs.release('/race.bin', results["first"])
+        self.fs.release('/race.bin', results["second"])
+        cache_path = self.cache_dir / "race.bin"
+        self.assertTrue(self._wait_for(cache_path.exists, timeout=5.0))
+        self.assertEqual(cache_path.read_bytes(), payload)
+
+    def test_streaming_first_open_replaces_orphan_partial(self):
+        # A partial a detached session failed to unlink is left at the path.
+        # The next session's registration renames its own file over it.
+        payload = os.urandom(64 * 1024)
+        (self.backend_dir / "orphan-partial.bin").write_bytes(payload)
+        partial_path = self.cache_dir / "orphan-partial.bin.storage.partial"
+        partial_path.write_bytes(b"stale" * 100)
+        orphan_inode = partial_path.stat().st_ino
+
+        vfd = self.fs.open('/orphan-partial.bin', os.O_RDONLY)
+        session = self._session_for(vfd)
+        self.assertNotEqual(partial_path.stat().st_ino, orphan_inode)
+        self.assertEqual(os.fstat(session.io_fd).st_ino, partial_path.stat().st_ino)
+        self.assertEqual(partial_path.stat().st_size, len(payload))
+        self.assertEqual(
+            [p.name for p in self.cache_dir.iterdir() if p.name.endswith(".storage.partial")],
+            ["orphan-partial.bin.storage.partial"],
+        )
+        self.assertEqual(self.fs.read('/orphan-partial.bin', 4096, 0, vfd), payload[:4096])
+        self.fs.release('/orphan-partial.bin', vfd)
 
 
 if __name__ == '__main__':
