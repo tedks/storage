@@ -15,3 +15,12 @@ log_events:
   who: Ted Smith
   what: created
   comment: ""
+- time: 2026-10-28T21:56:25-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Seen once in 3 runs of //:storage_tests_remote_gate on master fb1eb76
+    plus the run-gates PR (no storage/ changes): ERROR at teardown of test_mounted_nonstreaming_read_makes_no_range_reads,
+    ''mount teardown: the FUSE thread did not finish after unmount (StorageFS.destroy
+    hung?)''. 11 passed, 1 xfailed, 1 error. Two immediate reruns (cache off) passed.
+    Run was right after #121 (streaming-error-release) merged; not bisected. Possibly
+    related to streaming-destroy-concurrent-open. Needs the streaming lane or CTO.'
