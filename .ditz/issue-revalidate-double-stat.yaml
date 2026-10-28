@@ -1,0 +1,22 @@
+id: revalidate-double-stat
+title: Revalidation refetch stats the same member twice
+desc: 'From council round 2 on #127 (Claude seat, nit). When _revalidate_cached_file
+  finds a change, the refetch in _ensure_file_in_cache stats the same member again
+  for its baseline (stat before copy): two round trips back to back on the FUSE thread.
+  Every cold non-streamed fetch also pays one extra stat for the baseline. Pass the
+  observed stat through to the fetch when the read backend is the pinned one, or have
+  copy_to_local return the stat it already takes (paramiko get stats the remote file).
+  Safe as is; a latency cost only.'
+type: task
+component: cache
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-28T22:09:19-00:00
+references: []
+log_events:
+- time: 2026-10-28T22:09:19-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
