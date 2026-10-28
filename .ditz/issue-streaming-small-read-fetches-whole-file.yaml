@@ -11,8 +11,8 @@ type: bugfix
 component: fs
 release:
 reporter: Ted Smith <tedks@riseup.net>
-status: in_progress
-disposition:
+status: closed
+disposition: fixed
 creation_time: 2026-10-27T19:26:42-00:00
 references: []
 log_events:
@@ -51,5 +51,11 @@ log_events:
     per ruling oq-streaming-continue-after-close option C). Council to fixpoint (agy
     seat empty: quota); four gates pass at 5e9dbc3 / abcdad6. Follow-ups: streaming-bound-readahead-while-open,
     streaming-concurrent-first-open-partial-race, streaming-error-release-join.'
+- time: 2026-10-28T15:15:08-00:00
+  who: Ted Smith
+  what: 'closed: fixed'
+  comment: 'Merged #119 (11db5c6, race-free stop/detach on last close) and #120 (5f31a04,
+    streaming_keep_after_close: default 4 chunks or 50%, ''0'' = old behaviour) per
+    Ted''s ruling C.'
 blocked_by:
 - oq-streaming-continue-after-close
