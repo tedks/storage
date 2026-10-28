@@ -107,6 +107,7 @@ py_test(
         "tests/test_recompute.py",
         "tests/test_replication.py",
         "tests/test_rsync_backend.py",
+        "tests/test_run_gates.py",
         "tests/test_ssh_backend.py",
         "tests/test_state.py",
         "tests/test_state_rename.py",
@@ -116,9 +117,10 @@ py_test(
         "tests/test_sync_tasks.py",
         "tests/test_watcher.py",
     ],
+    data = ["scripts/run-gates.sh"],
     main = "tests/pytest_main.py",
     precompile = "disabled",
-    # About 200s on framework0; the default 300s leaves little headroom.
+    # About 200s on a fast host; the default 300s leaves little headroom.
     timeout = "long",
     deps = TEST_DEPS,
     env_inherit = ["FUSE_LIBRARY_PATH"],
@@ -291,6 +293,19 @@ test_suite(
     tags = ["manual"],
     tests = [
         ":storage_tests_remote_system",
+    ],
+)
+
+# Every gate, including the remote one: what scripts/run-gates.sh runs on a
+# host with Docker. "manual" for the same reason as the remote gate above.
+test_suite(
+    name = "storage_tests_all_gates",
+    tags = ["manual"],
+    tests = [
+        ":storage_tests_fast_gate",
+        ":storage_tests_mounted_system_gate",
+        ":storage_tests_remote_gate",
+        ":storage_tests_resilience_gate",
     ],
 )
 

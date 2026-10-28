@@ -39,7 +39,7 @@ agent genuinely needs divergent instructions.
 - `third_party/` - forked-submodule vendoring workflow (see its README) and
   `update.sh`
 - `flake.nix`, `.envrc`, `.devcontainer/` - development environment
-- `scripts/` - manual mount/unmount helpers and `ensure-nix-shell.sh`
+- `scripts/` - `run-gates.sh` (every quality gate), manual mount/unmount helpers and `ensure-nix-shell.sh`
 - `setup.py`, `setup-venv.sh` - non-Bazel pip/virtualenv install path
 - `docs/` - refactor roadmap and feature plans
 - `storage.example.toml` - example mount profile
@@ -118,6 +118,7 @@ The gates are `test_suite`s over those `py_test`s:
 | `//:storage_tests_resilience_gate` | `storage_tests_resilience_gradient`, `storage_tests_streaming_system` |
 | `//:storage_tests` | the fast and mounted gates: every module except the remote gate's |
 | `//:storage_tests_remote_gate` | `storage_tests_remote_system`: the SSH backend, rsync over SSH, the remote watcher and a FUSE mount over two SSH members, against sshd in Docker containers; needs Docker and FUSE (see below) |
+| `//:storage_tests_all_gates` | the fast, mounted, resilience and remote gates together; `manual`, so `//...` skips it. `scripts/run-gates.sh` runs it |
 
 Extra pytest flags reach a target's modules through `--test_arg`, for
 example `bazel test //:storage_tests_sandboxed --test_arg=-k
@@ -125,10 +126,25 @@ example `bazel test //:storage_tests_sandboxed --test_arg=-k
 same flags, and one where `-k` selects nothing fails (pytest exits 5).
 Bazel's `--test_filter` is ignored.
 
-The quality gate before pushing code changes is all three gates (about
-four minutes on framework0 with a warm Bazel cache, most of it
-`storage_tests_sandboxed`). Bazel runs each `py_test` once, so the
-resilience gate's overlap costs nothing:
+The quality gate before merging is all four gates, the remote gate
+included, on the exact commit. Run it with the script:
+
+```bash
+scripts/run-gates.sh
+```
+
+On a host with a usable Docker daemon it runs
+`//:storage_tests_all_gates` (about four minutes of local gates with a warm
+Bazel cache, most of it `storage_tests_sandboxed`, plus the remote gate).
+Bazel runs each `py_test` once, so the resilience gate's overlap costs
+nothing. On a host without Docker it runs the other three gates here and
+the remote gate on another host; see The remote gate. With no Docker and no
+such host it fails, naming both: a skipped gate must be a decision. On
+the Docker path the script tests the working tree and says so when it is
+dirty; commit and rerun to attest a commit.
+
+The three local gates by hand (everything but the remote gate), for
+iterating:
 
 ```bash
 nix develop --command bazel test \
@@ -158,10 +174,25 @@ actual remote, and of a FUSE mount whose members are SSH hosts (write and
 replicate to both, a container-side change through the watcher, a
 streaming read). It is not in `//:storage_tests` or the three gates above,
 and its target is tagged `manual`, so `//...` skips it too and hosts
-without Docker are unaffected. Run it, in addition to them,
-before pushing a change to `storage/backends/ssh.py`,
-`storage/backends/rsync.py`, `storage/watcher.py` or the remote paths of
-the filesystem:
+without Docker are unaffected.
+
+Run it for every change before it merges, not only for changes to the SSH,
+rsync, watcher or remote filesystem paths: `scripts/run-gates.sh` does,
+together with the other gates, on the exact commit. It needs Docker. If your
+host has none, run it on a host that does, at the same commit: set
+`STORAGE_REMOTE_GATE_HOST` to that host's ssh destination (unset by
+default). That host needs Docker, FUSE (see Environment), the dev shell with
+flakes enabled, a login `bash` that puts `nix` on `PATH`, and the ability to
+fetch your commit from `origin` (or `STORAGE_REMOTE_GATE_URL`). The host
+fetches the commit, so push your branch first (a branch push is not a
+merge). With the variable set and no local Docker, the script runs the other
+three gates here, then the remote gate over ssh on that host against the
+pushed commit, in a scratch checkout it removes afterwards (and a cold Bazel
+output base, so expect a slower run; an interrupted run can leave one under
+the host's `~/.cache/bazel`). It refuses to run the remote gate for an
+unpushed commit or a dirty tree. A
+contributor with no Docker host says so in the PR, and the maintainer runs
+the gate before merging. To run just the remote gate where Docker is:
 
 ```bash
 nix develop --command bazel test //:storage_tests_remote_gate --test_output=errors
