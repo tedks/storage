@@ -177,10 +177,10 @@ def _optional_profile_string(profile: Dict[str, Any], key: str, profile_name: st
 
 
 def _validated_revalidate_after(value: float) -> float:
-    """revalidate_after is seconds, 0 or more (0: check at every open)."""
-    if math.isnan(value) or value < 0:
+    """revalidate_after is a finite number of seconds, 0 or more (0: check at every open)."""
+    if not math.isfinite(value) or value < 0:
         raise click.ClickException(
-            f"revalidate_after must be a number of seconds, 0 or more (got {value})"
+            f"revalidate_after must be a finite number of seconds, 0 or more (got {value})"
         )
     return float(value)
 

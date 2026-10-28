@@ -12,6 +12,7 @@ import logging
 import os
 import shutil
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -21,8 +22,22 @@ from storage.fs import StorageFS
 from storage.models import SyncStatus
 
 
+class NoMtimeBackend(LocalBackend):
+    """A local member whose transfers stamp the current time, as SFTP get/put do."""
+
+    def copy_to_local(self, virtual_path, local_path):
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(self._resolve_path(virtual_path), local_path)
+
+    def copy_from_local(self, local_path, virtual_path):
+        real_path = self._resolve_path(virtual_path)
+        real_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(local_path, real_path)
+
+
 class RevalidateTestBase(unittest.TestCase):
     revalidate_after = 60.0
+    backend_class = LocalBackend
 
     def setUp(self):
         self.temp_dir = Path(tempfile.mkdtemp())
@@ -31,7 +46,7 @@ class RevalidateTestBase(unittest.TestCase):
         self.member_dir = self.temp_dir / "member"
         self.member_dir.mkdir()
         self.db_path = self.temp_dir / "state.db"
-        self.member = LocalBackend("member", str(self.member_dir))
+        self.member = self.backend_class("member", str(self.member_dir))
         self.fs = self._make_fs()
 
     def _make_fs(self, start_sync=False):
@@ -80,6 +95,15 @@ class RevalidateTestBase(unittest.TestCase):
     def count_stats(self):
         return patch.object(self.member, "stat", wraps=self.member.stat)
 
+    def count_fetches(self):
+        return patch.object(self.member, "copy_to_local", wraps=self.member.copy_to_local)
+
+    def restart(self, start_sync=False):
+        self.fs.sync_manager.stop()
+        self.fs.state_manager.close()
+        self.fs = self._make_fs(start_sync=start_sync)
+        self.assertEqual({}, self.fs._member_checks)
+
 
 class TestRevalidateOnOpen(RevalidateTestBase):
     def setUp(self):
@@ -110,25 +134,25 @@ class TestRevalidateOnOpen(RevalidateTestBase):
         self.age_checks()
         with self.count_stats() as stat:
             self.assertEqual(b"changed-and-longer", self.read_through("/f.txt"))
-        self.assertEqual(1, stat.call_count)
+        # The check, then the refetch's baseline.
+        self.assertEqual(2, stat.call_count)
         self.assertEqual(b"changed-and-longer", (self.cache_dir / "f.txt").read_bytes())
         meta = self.fs.state_manager.get_file_metadata("/f.txt")
         self.assertEqual(SyncStatus.CLEAN, meta.sync_status)
         self.assertEqual(len(b"changed-and-longer"), meta.size)
 
+    def test_fetch_records_member_baseline(self):
+        check = self.fs._member_checks["/f.txt"]
+        self.assertEqual({"member": (8, 1_700_000_000.0)}, check.members)
+
     def test_mtime_only_change_refetches(self):
-        # Same size, later mtime: no baseline yet, so the heuristic applies.
         self.rewrite_member("f.txt", b"ORIGINAL", mtime=1_700_000_100)
         self.age_checks()
         self.assertEqual(b"ORIGINAL", self.read_through("/f.txt"))
 
-    def test_mtime_only_change_against_baseline_refetches(self):
-        # First stale open records the member's stat as the baseline.
-        self.age_checks()
-        self.assertEqual(b"original", self.read_through("/f.txt"))
-        check = self.fs._member_checks["/f.txt"]
-        self.assertEqual("member", check.backend_name)
-        # Same size, mtime moved backwards: only the baseline can see this.
+    def test_older_mtime_change_before_first_check_refetches(self):
+        # Same size, mtime moved backwards (rsync -a, cp -p, a restore):
+        # only the baseline taken at the fetch can see this.
         self.rewrite_member("f.txt", b"ORIGINAL", mtime=1_600_000_000)
         self.age_checks()
         self.assertEqual(b"ORIGINAL", self.read_through("/f.txt"))
@@ -208,12 +232,59 @@ class TestRevalidateOnOpen(RevalidateTestBase):
             self.fs.release("/f.txt", reader)
 
     def test_restart_checks_at_first_open(self):
-        self.fs.sync_manager.stop()
-        self.fs.state_manager.close()
+        self.restart()
         self.rewrite_member("f.txt", b"changed-and-longer")
-        self.fs = self._make_fs()
-        self.assertEqual({}, self.fs._member_checks)
         self.assertEqual(b"changed-and-longer", self.read_through("/f.txt"))
+
+    def test_restart_keeps_baseline_in_xattr(self):
+        # Changed while unmounted, same size, older mtime: seen only through
+        # the baseline persisted on the cache file.
+        self.restart()
+        self.rewrite_member("f.txt", b"ORIGINAL", mtime=1_600_000_000)
+        self.assertEqual(b"ORIGINAL", self.read_through("/f.txt"))
+
+    def test_persisted_baseline_ignored_after_cache_file_changes(self):
+        cache_file = self.cache_dir / "f.txt"
+        os.utime(cache_file, (1_650_000_000, 1_650_000_000))
+        st = os.lstat(cache_file)
+        identity = (st.st_ino, st.st_size, st.st_mtime_ns)
+        self.assertEqual({}, self.fs._load_persisted_members("/f.txt", cache_file, identity))
+        self.assertEqual({}, self.fs._load_persisted_members("/g.txt", cache_file,
+                                                             self.fs._member_checks["/f.txt"].cache_identity))
+
+    def test_member_stat_xattr_is_read_only_through_the_mount(self):
+        before = os.getxattr(self.cache_dir / "f.txt", StorageFS.MEMBER_STAT_XATTR)
+        self.fs.setxattr("/f.txt", StorageFS.MEMBER_STAT_XATTR, b"{}", 0)
+        self.fs.removexattr("/f.txt", StorageFS.MEMBER_STAT_XATTR)
+        self.assertEqual(before, os.getxattr(self.cache_dir / "f.txt", StorageFS.MEMBER_STAT_XATTR))
+
+    def test_failed_stat_keeps_baseline(self):
+        baseline = self.fs._member_checks["/f.txt"].members
+        self.age_checks()
+        with patch.object(self.member, "stat", side_effect=OSError(5, "I/O error")), \
+                self.assertLogs("storage.fs", logging.WARNING):
+            self.read_through("/f.txt")
+        self.assertEqual(baseline, self.fs._member_checks["/f.txt"].members)
+        # Same size, older mtime: still caught against the kept baseline.
+        self.rewrite_member("f.txt", b"ORIGINAL", mtime=1_600_000_000)
+        self.age_checks()
+        self.assertEqual(b"ORIGINAL", self.read_through("/f.txt"))
+
+    def test_truncating_open_makes_no_stat(self):
+        self.age_checks()
+        with self.count_stats() as stat:
+            fd = self.fs.open("/f.txt", os.O_WRONLY | os.O_TRUNC)
+            self.fs.release("/f.txt", fd)
+        stat.assert_not_called()
+
+    def test_unlink_and_rename_forget_checks(self):
+        self.read_through("/f.txt")
+        self.fs.rename("/f.txt", "/g.txt")
+        self.assertNotIn("/f.txt", self.fs._member_checks)
+        self.assertNotIn("/g.txt", self.fs._member_checks)
+        self.read_through("/g.txt")
+        self.fs.unlink("/g.txt")
+        self.assertNotIn("/g.txt", self.fs._member_checks)
 
     def test_eviction_forgets_the_check(self):
         self.assertIn("/f.txt", self.fs._member_checks)
@@ -232,19 +303,79 @@ class TestRevalidateAfterSync(RevalidateTestBase):
         self.fs.release("/new.txt", fd)
         self.assertTrue(self.fs.sync_manager.sync_now("/new.txt", timeout=10))
         check = self.fs._member_checks["/new.txt"]
-        self.assertEqual("member", check.backend_name)
-        self.assertEqual(len(b"written here"), check.member_size)
-        # Stamp the member with a later mtime, as an upload that does not
-        # keep it (SFTP) would, and the baseline to match: the next stale
-        # open must not mistake the upload for a change on the member.
-        later = os.lstat(self.member_dir / "new.txt").st_mtime + 100
-        os.utime(self.member_dir / "new.txt", (later, later))
-        with self.fs._member_checks_lock:
-            self.fs._member_checks["/new.txt"] = dataclasses.replace(check, member_mtime=later)
+        self.assertEqual(len(b"written here"), check.members["member"][0])
         inode = self.cache_inode("new.txt")
         self.age_checks()
         self.assertEqual(b"written here", self.read_through("/new.txt"))
         self.assertEqual(inode, self.cache_inode("new.txt"))
+
+
+class TestRevalidateSftpLikeMember(RevalidateTestBase):
+    """Transfers stamp the current time, so member and cache mtimes differ."""
+
+    backend_class = NoMtimeBackend
+
+    def test_future_member_mtime_refetches_at_most_once(self):
+        # A member clock ahead of ours (or touch -d tomorrow): the baseline
+        # taken at the fetch means no check ever refetches.
+        future = time.time() + 3600
+        self.rewrite_member("f.txt", b"original", mtime=future)
+        with self.count_fetches() as fetch:
+            for _ in range(4):
+                self.assertEqual(b"original", self.read_through("/f.txt"))
+                self.age_checks()
+        self.assertEqual(1, fetch.call_count)
+
+    def test_upload_then_restart_does_not_refetch(self):
+        self.restart(start_sync=True)
+        fd = self.fs.create("/new.txt", 0o644)
+        self.fs.write("/new.txt", b"written here", 0, fd)
+        self.fs.release("/new.txt", fd)
+        # Put the write seconds before the upload, whose mtime is "now":
+        # without a baseline the member would look changed.
+        earlier = time.time() - 5
+        os.utime(self.cache_dir / "new.txt", (earlier, earlier))
+        self.fs._mark_cache_file_dirty("/new.txt", self.cache_dir / "new.txt")
+        self.assertTrue(self.fs.sync_manager.sync_now("/new.txt", timeout=10))
+        self.restart()
+        with self.count_fetches() as fetch:
+            self.assertEqual(b"written here", self.read_through("/new.txt"))
+        fetch.assert_not_called()
+
+
+class TestRevalidateTwoMembers(RevalidateTestBase):
+    def test_checks_the_member_a_refetch_reads(self):
+        fast_dir = self.temp_dir / "fast"
+        fast_dir.mkdir()
+        fast = LocalBackend("fast", str(fast_dir))
+        slow = self.member
+        slow.speed_priority = 50
+        fast.speed_priority = 0
+        self.fs.sync_manager.stop()
+        self.fs.state_manager.close()
+        self.fs = StorageFS(
+            cache_root=self.cache_dir, state_db=self.db_path,
+            backends={"member": slow, "fast": fast}, cache_size=10 * 1024 * 1024,
+            num_sync_workers=1, start_sync=False, revalidate_after=self.revalidate_after,
+        )
+        for d in (fast_dir, self.member_dir):
+            (d / "f.txt").write_bytes(b"original")
+            os.utime(d / "f.txt", (1_700_000_000, 1_700_000_000))
+        self.assertEqual(b"original", self.read_through("/f.txt"))
+        # Both members are recorded as holders, and slow holds the baseline
+        # (as the last upload would leave it).
+        from storage.models import FileLocation
+        self.fs.state_manager.add_file_location(FileLocation(
+            virtual_path="/f.txt", backend_name="member", checksum="",
+            last_synced=time.time(), is_cached=False))
+        self.fs.state_manager.add_file_location(FileLocation(
+            virtual_path="/f.txt", backend_name="fast", checksum="",
+            last_synced=time.time(), is_cached=False))
+        (fast_dir / "f.txt").write_bytes(b"changed on fast")
+        self.age_checks()
+        with patch.object(slow, "stat", wraps=slow.stat) as slow_stat:
+            self.assertEqual(b"changed on fast", self.read_through("/f.txt"))
+        slow_stat.assert_not_called()
 
 
 if __name__ == "__main__":

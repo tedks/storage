@@ -182,8 +182,15 @@ with unsynced writes is never dropped, and a file open for writing keeps
 its copy. If the member cannot be reached, the cached copy is served and
 the outage is logged once. This applies with watchers on or off, so a file
 changed behind the mount is seen within about a minute of being opened
-again. Check times are kept in memory, so after a restart each cached file
-is checked at its first open.
+again. The member's size and mtime are recorded when the file is fetched or
+synced, and each check compares against them; they are also kept in a
+read-only `user.storage.member_stat` xattr on the cached file. Check times
+are kept in memory, so after a restart each cached file is checked at its
+first open. Each check is a remote round trip on the single FUSE thread:
+the first open after a member silently drops off can wait for the SSH
+operation timeout (60 s by default) before the member is marked
+unavailable, and walking a large cached tree after the age costs one
+round trip per file.
 
 #### SSH host keys
 

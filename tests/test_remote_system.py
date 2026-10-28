@@ -819,10 +819,9 @@ def test_mounted_nonstreaming_read_makes_no_range_reads(remote, mounted_factory,
 def test_mounted_revalidate_sees_container_change_after_age(remote, mounted_factory):
     """With watchers off, a changed member copy is refetched once the check ages.
 
-    The file is fetched over SFTP, whose download stamps the fetch time, so
-    the first check runs without a member baseline (size, or a member mtime
-    later than the cache file's); the second runs against the baseline the
-    first recorded.
+    Each fetch records the member's stat as a baseline, and a check compares
+    the member against it: first a size change, then a same-size change
+    (SFTP reports whole seconds, so the test steps past one).
     """
     m0 = remote.members[0]
     age = 2.0
@@ -838,10 +837,8 @@ def test_mounted_revalidate_sees_container_change_after_age(remote, mounted_fact
     assert _wait_for(lambda: path.read_bytes() == b"second, longer version\n",
                      timeout=age * 5, interval=0.5), \
         "the container's change was never seen after the revalidation age"
-    # That stale open recorded the member's stat; let the age pass once more
-    # so the next one compares against it.
-    time.sleep(age + 0.5)
-    assert path.read_bytes() == b"second, longer version\n"
+    # The refetch recorded the member's stat as the baseline; the same-size
+    # change below is found by comparing against it.
 
     # Same size, later mtime (SFTP reports whole seconds, so step past one).
     time.sleep(1.1)

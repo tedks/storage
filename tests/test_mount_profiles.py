@@ -329,8 +329,8 @@ revalidate_after = 300
         finally:
             config_path.unlink()
 
-    def test_revalidate_after_rejects_negative_and_nan(self):
-        for bad in (-1.0, float("nan")):
+    def test_revalidate_after_rejects_negative_nan_and_infinity(self):
+        for bad in (-1.0, float("nan"), float("inf")):
             with self.assertRaises(click.ClickException):
                 self._resolve(revalidate_after=bad)
 
