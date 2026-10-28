@@ -1,0 +1,22 @@
+id: local-backend-internal-xattrs
+title: LocalBackend copy2 copies internal user.storage.* xattrs onto member files
+desc: 'From council round 2 on #127 (Claude seat, nit). LocalBackend.copy_from_local
+  and copy_to_local use shutil.copy2, which copies xattrs: user.storage.metadata (before
+  #127) and now user.storage.member_stat land on local members'' files and come back
+  on fetch. Harmless for correctness (member_stat is matched on the cache file''s
+  inode, so a copied payload is ignored), but internal state leaks into members and
+  their backups. Option: copy data and times without user.storage.* xattrs (shutil.copyfile
+  + copystat with a filter, or strip after copy).'
+type: task
+component: backends
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-28T22:09:19-00:00
+references: []
+log_events:
+- time: 2026-10-28T22:09:19-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
