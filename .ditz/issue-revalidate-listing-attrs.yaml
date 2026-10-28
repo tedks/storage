@@ -1,0 +1,22 @@
+id: revalidate-listing-attrs
+title: 'Revalidation: use fresh listing attrs instead of a stat per file'
+desc: 'From council round 1 on #127 (Claude seat). After revalidate_after (default
+  60 s), or after a restart, walking a cached tree (grep -r, a build) costs one serial
+  remote stat per file on the FUSE thread: 10k files at 50-100 ms RTT is 8-17 minutes.
+  NamespaceService already holds member attrs from listings (entry_attrs, per member).
+  When a listing of the parent from the chosen member is newer than the check age,
+  its (size, mtime) can stand in for the stat. Care: the listing attrs must be from
+  the same member as the baseline and must not predate the fetch.'
+type: task
+component: cache
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-28T22:02:52-00:00
+references: []
+log_events:
+- time: 2026-10-28T22:02:52-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
