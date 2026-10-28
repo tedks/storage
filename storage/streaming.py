@@ -574,7 +574,13 @@ class StreamingReadManager:
             session.readers_consumed = True
             spans.clear()
         elif len(spans) > STREAMING_MAX_TRACKED_READ_SPANS:
-            spans.remove(min(spans, key=lambda span: span[1] - span[0]))
+            # Never the span this read just joined: the read-ahead bound is
+            # measured from it, and short sequential reads must be able to
+            # grow it to the threshold.
+            spans.remove(min(
+                (span for span in spans if not span[0] <= start < span[1]),
+                key=lambda span: span[1] - span[0],
+            ))
 
     def _unbounded_read_ahead_chunk(
         self,
@@ -592,25 +598,26 @@ class StreamingReadManager:
         if not wrapped:
             desired_start = (session.last_foreground_offset // session.chunk_size) * session.chunk_size
             cursor = max(cursor, desired_start)
-        while True:
-            if cursor >= session.file_size:
-                missing = self._first_missing_range(session.available_ranges, 0, session.file_size)
-                if missing is None:
-                    return None, wrapped
-                cursor = (missing[0] // session.chunk_size) * session.chunk_size
-                wrapped = True
-                continue
-            chunk_end = min(cursor + session.chunk_size, session.file_size)
-            if not self._is_range_available(session.available_ranges, cursor, chunk_end):
-                return cursor, wrapped
-            cursor = chunk_end
+        # The chunk-sized steps from cursor (which a short fetch can leave
+        # unaligned) to the first one holding a missing byte, found from the
+        # range list rather than by testing each chunk under the lock.
+        if cursor < session.file_size:
+            missing = self._first_missing_range(session.available_ranges, cursor, session.file_size)
+            if missing is not None:
+                steps = (missing[0] - cursor) // session.chunk_size
+                return cursor + steps * session.chunk_size, wrapped
+        missing = self._first_missing_range(session.available_ranges, 0, session.file_size)
+        if missing is None:
+            return None, wrapped
+        return (missing[0] // session.chunk_size) * session.chunk_size, True
 
     def _bounded_read_ahead_chunk(self, session: PrefetchSession) -> Optional[int]:
         """The next chunk the worker may fetch before readers_consumed is set.
 
         Caller holds session.lock. Until the readers have consumed the file,
         the worker stays within the keep-after-close threshold past the end
-        of the span the latest read belongs to, so a reader that sniffs the
+        of the span the latest read belongs to (rounded up to whole chunks),
+        fetching forward from that read only, so a reader that sniffs the
         head and holds the file open pulls at most that much, not the whole
         file. A reader reading on reaches the threshold inside that window
         and lifts the bound. None means nothing is due until the readers
@@ -633,15 +640,19 @@ class StreamingReadManager:
         if start >= end:
             return
 
-        with session.lock:
-            self._record_foreground_read(session, start, end)
-            # Wakes a worker held at its read-ahead bound (see
-            # _bounded_read_ahead_chunk): the bound moves with the reader.
-            session.last_foreground_offset = start
-            session.condition.notify_all()
-
+        recorded = False
         while True:
             with session.lock:
+                if not recorded:
+                    # In the section that claims the reader's chunk below,
+                    # so a worker woken here cannot claim it first.
+                    self._record_foreground_read(session, start, end)
+                    # Wakes a worker held at its read-ahead bound (see
+                    # _bounded_read_ahead_chunk): the bound moves with the
+                    # reader.
+                    session.last_foreground_offset = start
+                    session.condition.notify_all()
+                    recorded = True
                 if not session.has_foreground_read:
                     session.has_foreground_read = True
                     session.condition.notify_all()

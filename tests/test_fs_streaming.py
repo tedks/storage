@@ -1135,10 +1135,18 @@ class TestFSStreamingIntegration(unittest.TestCase):
 
     def _wait_until_fetching_stops(self, session, quiet=0.5, timeout=10.0):
         """Wait until the session's fetched bytes stop changing for `quiet` s."""
+
+    def _wait_until_fetching_stops(self, session, at_least, quiet=0.5, timeout=10.0):
+        """Wait for at_least bytes fetched, then for no change for `quiet` s.
+
+        The first wait makes a slow worker harmless; the quiet period only
+        has to show that nothing more arrives.
+        """
         def fetched():
             with session.lock:
                 return sum(end - start for start, end in session.available_ranges)
 
+        self.assertTrue(self._wait_for(lambda: fetched() >= at_least, timeout=timeout))
         deadline = time.monotonic() + timeout
         last = fetched()
         last_change = time.monotonic()
@@ -1164,9 +1172,10 @@ class TestFSStreamingIntegration(unittest.TestCase):
         vfd = self.fs.open('/held.bin', os.O_RDONLY)
         session = self._session_for(vfd)
         self.assertEqual(self.fs.read('/held.bin', 4096, 0, vfd), payload[:4096])
-        fetched = self._wait_until_fetching_stops(session)
         # Chunks up to the one holding 4 KiB + threshold.
-        self.assertEqual(fetched, ((4096 + threshold) // chunk + 1) * chunk)
+        expected = ((4096 + threshold) // chunk + 1) * chunk
+        fetched = self._wait_until_fetching_stops(session, expected)
+        self.assertEqual(fetched, expected)
         with session.lock:
             self.assertFalse(session.prefetch_complete)
             self.assertFalse(session.readers_consumed)
@@ -1174,7 +1183,7 @@ class TestFSStreamingIntegration(unittest.TestCase):
         # The bound follows the reader to a new offset.
         offset = 1024 * 1024
         self.assertEqual(self.fs.read('/held.bin', 4096, offset, vfd), payload[offset:offset + 4096])
-        self._wait_until_fetching_stops(session)
+        self._wait_until_fetching_stops(session, expected + threshold)
         with session.lock:
             ranges = list(session.available_ranges)
             self.assertFalse(session.prefetch_complete)
@@ -1220,6 +1229,25 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.assertTrue(self._wait_for(cache_path.exists, timeout=8.0))
         self.assertEqual(cache_path.read_bytes(), payload)
         self.fs.release('/zero.bin', vfd)
+
+    def test_streaming_span_trim_keeps_the_latest_read(self):
+        # Past the tracked-span bound the shortest span is dropped, but never
+        # the one the latest read joined: the read-ahead bound is measured
+        # from it, and sequential short reads must be able to grow it.
+        payload = os.urandom(4 * 1024 * 1024)
+        (self.backend_dir / "spans.bin").write_bytes(payload)
+        manager = self.fs._streaming_manager
+        vfd = self.fs.open('/spans.bin', os.O_RDONLY)
+        session = self._session_for(vfd)
+        with session.lock:
+            for index in range(64):
+                manager._record_foreground_read(session, index * 64 * 1024, index * 64 * 1024 + 2048)
+            manager._record_foreground_read(session, 4096 * 1024 - 1024, 4096 * 1024 - 512)
+            spans = list(session.foreground_read_spans)
+            self.assertFalse(session.readers_consumed)
+        self.assertEqual(len(spans), 64)
+        self.assertIn((4096 * 1024 - 1024, 4096 * 1024 - 512), spans)
+        self.fs.release('/spans.bin', vfd)
 
 
 if __name__ == '__main__':
