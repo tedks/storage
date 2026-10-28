@@ -620,11 +620,12 @@ class TestHostResolverFallback(unittest.TestCase):
             return _getent_result(_GETENT_AHOSTS)
 
         mock_run.side_effect = _slow_getent
+        lookup_error = socket.gaierror(-3, "lookup")
         with patch.object(ssh_module, "time", SimpleNamespace(monotonic=lambda: clock.now)):
-            with self.assertRaises(socket.timeout):
-                ssh_module._connect_via_host_resolver(
-                    "nas.local", 22, 4.0, socket.gaierror(-3, "lookup"))
+            with self.assertRaises(socket.timeout) as caught:
+                ssh_module._connect_via_host_resolver("nas.local", 22, 4.0, lookup_error)
         mock_create.assert_not_called()
+        self.assertIs(caught.exception.__cause__, lookup_error)
 
     @patch("storage.backends.ssh.subprocess.run")
     def test_undecodable_getent_output_still_parses_addresses(self, mock_run):
@@ -753,6 +754,36 @@ class TestSSHBackendHostResolverConnect(unittest.TestCase):
             backend._current_clients()
         self.assertIs(caught.exception, handshake_error)
         self.assertTrue(sock.closed)
+        backend.close()
+
+    @patch("storage.backends.ssh._connect_via_host_resolver")
+    @patch("storage.backends.ssh.paramiko.AutoAddPolicy")
+    @patch("storage.backends.ssh.paramiko.SSHClient")
+    def test_socket_close_error_does_not_hide_handshake_error(self, mock_ssh_client_cls, _policy, mock_fallback):
+        calls = []
+        handshake_error = ssh_module.paramiko.SSHException("banner")
+        clients = []
+
+        def _factory():
+            clients.append(self._client_failing_lookup_without_sock(
+                calls, fail_with_sock=handshake_error))
+            return clients[-1]
+
+        mock_ssh_client_cls.side_effect = _factory
+        sock = _FakeTCPSocket()
+
+        def _close_fails():
+            raise OSError("close failed")
+
+        sock.close = _close_fails
+        mock_fallback.return_value = sock
+        backend = self._new_backend()
+
+        with self.assertRaises(ssh_module.paramiko.SSHException) as caught:
+            backend._current_clients()
+        self.assertIs(caught.exception, handshake_error)
+        self.assertTrue(clients[0].closed)
+        backend.close()
 
     @patch("storage.backends.ssh._connect_via_host_resolver")
     @patch("storage.backends.ssh.paramiko.AutoAddPolicy")

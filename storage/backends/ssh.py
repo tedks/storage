@@ -98,7 +98,7 @@ def _connect_via_host_resolver(host: str, port: int, timeout: float,
         if remaining <= 0:
             raise socket.timeout(
                 f"timed out connecting to {host}:{port} after resolving it "
-                f"with getent") from last_error
+                f"with getent") from (last_error or lookup_error)
         try:
             return socket.create_connection((address, port), timeout=remaining)
         except OSError as exc:
@@ -314,12 +314,11 @@ class SSHBackend(Backend):
                     # A failure after the handshake leaves paramiko's
                     # transport thread on the socket; close both, and let
                     # neither close hide the connect error.
-                    try:
-                        ssh_client.close()
-                    except Exception:
-                        pass
-                    finally:
-                        sock.close()
+                    for close in (ssh_client.close, sock.close):
+                        try:
+                            close()
+                        except Exception:
+                            pass
                     raise
             sftp_client = ssh_client.open_sftp()
 
