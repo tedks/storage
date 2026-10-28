@@ -175,10 +175,10 @@ keep this and document it). Which ones a mount uses depends on its members:
   metadata and writes. It uses `AutoAddPolicy` without loading any
   known-hosts file and persists nothing, so every connection accepts
   whatever key the far end presents. An impersonator is not detected, on a
-  LAN or a VPN as much as anywhere. Key-only authentication stops it from
-  relaying to the real host, but it can receive every file replicated to the
-  member and serve forged listings and file contents to the mount. Weigh
-  that before pointing a profile at a host over a path you do not control.
+  LAN or a VPN as much as anywhere, and can receive every file replicated
+  to the member and serve forged listings and file contents to the mount.
+  Weigh that before pointing a profile at a host over a path you do not
+  control.
 - **`rsync://` members** use paramiko the same way for reads, metadata and
   directory operations, and the system `ssh` (through `rsync -e`, with
   `StrictHostKeyChecking=accept-new`) for uploads.
@@ -199,21 +199,26 @@ while the system-`ssh` ones fail with
 `rsync failed`, and by the watcher as `inotifywait exited with code 255`,
 which is ssh failing). For an `rsync://` member that means reads and listings
 work but uploads do not replicate; with watchers on, a failed watcher stops
-invalidating the cache, so listings can go stale until it reconnects (it
-retries with backoff of up to 5 minutes, so a fix takes effect without a
-remount). An `ssh://` member with no watchers never notices.
+invalidating the cache, so listings can go stale. It retries with
+backoff of up to 5 minutes, so a fix takes effect without a remount, but
+changes made while it was down are not replayed; remount, or wait for the
+affected cache entries to be refetched, to be sure. An `ssh://` member with no watchers never notices.
 
 If the new key is expected, first check its fingerprint through a channel
-you trust (for example `ssh-keygen -lf` on the member's
-`/etc/ssh/ssh_host_*_key.pub`): a re-provisioned host does not make whatever
-key answers genuine. Then remove the old entry; the next connection records
-the key it is then offered, so make sure that is the verified one:
+you trust (for example `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`
+on the member), and compare it with what the host offers now
+(`ssh-keyscan -t ed25519 storage-host.example | ssh-keygen -lf -`): a
+re-provisioned host does not make whatever key answers genuine. Then remove
+the old entry; the next connection records the key it is then offered, so
+make sure that is the verified one:
 
 ```bash
 ssh-keygen -R storage-host.example
 ```
 
-Use the name or address the profile uses. If the change is not expected,
+Use the name or address the profile uses; if your ssh config sets
+`HostKeyAlias` or `UserKnownHostsFile` for it, pass that alias and file
+instead (`ssh-keygen -R <alias> -f <file>`). If the change is not expected,
 treat it as a possible impersonation and do not remove the entry. Storage's
 rsync and watcher call sites do not expose a known-hosts file or a strict
 policy; making host-key verification configurable across all three paths is
