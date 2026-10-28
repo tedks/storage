@@ -123,6 +123,10 @@ class TestFSStreamingIntegration(unittest.TestCase):
 
         first = self.fs.read('/large.bin', 4096, 0, vfd)
         self.assertEqual(first, payload[:4096])
+        # Reading on past the keep-after-close threshold (128 KiB here) lifts
+        # the read-ahead bound, so the worker fetches the rest while open.
+        rest = self.fs.read('/large.bin', 128 * 1024, 4096, vfd)
+        self.assertEqual(rest, payload[4096:4096 + 128 * 1024])
 
         self.assertTrue(self._wait_for(lambda: cache_path.exists() and not partial_path.exists(), timeout=8.0))
         self.assertEqual(cache_path.read_bytes(), payload)

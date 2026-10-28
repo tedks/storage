@@ -154,14 +154,20 @@ prefetch continues only if the readers consumed the file: the longest
 contiguous span they read reached `streaming_keep_after_close`
 (`--streaming-keep-after-close`). Otherwise the partial download is
 discarded, so a file manager sniffing content types or making thumbnails
-does not pull whole files. The value is a comma-separated list of sizes
+does not pull whole files. The same threshold bounds read-ahead while the
+file is open: until the readers have consumed it, the worker fetches at
+most that far past the span the latest read belongs to, so a reader that
+reads the head and holds the file open does not pull the whole file
+either. The value is a comma-separated list of sizes
 (`4M`, `512K`, plain bytes) and percentages of the file (`50%`, `12.5%`,
 rounded down to bytes), whichever is reached first. Spans count the
 read requests the kernel sends, which include its own readahead (up to
 128K by default), so a size at or below that can act like `0`. Unset, it is 4
 chunks or 50% (`4M,50%` at the default 1M `streaming_chunk_size`). `0`
-keeps prefetching after any read, the behaviour before this option.
-`100%` effectively never keeps prefetching after a close. Empty terms,
+keeps prefetching after any read, the behaviour before this option, and
+leaves read-ahead unbounded while open. `100%` effectively never keeps
+prefetching after a close, and bounds read-ahead while open only by the
+file's size. Empty terms,
 negative sizes, unknown suffixes and percentages above 100 are rejected
 when the mount configuration loads.
 
