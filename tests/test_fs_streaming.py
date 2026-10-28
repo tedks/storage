@@ -123,6 +123,10 @@ class TestFSStreamingIntegration(unittest.TestCase):
 
         first = self.fs.read('/large.bin', 4096, 0, vfd)
         self.assertEqual(first, payload[:4096])
+        # Reading on past the keep-after-close threshold (128 KiB here) lifts
+        # the read-ahead bound, so the worker fetches the rest while open.
+        rest = self.fs.read('/large.bin', 128 * 1024, 4096, vfd)
+        self.assertEqual(rest, payload[4096:4096 + 128 * 1024])
 
         self.assertTrue(self._wait_for(lambda: cache_path.exists() and not partial_path.exists(), timeout=8.0))
         self.assertEqual(cache_path.read_bytes(), payload)
@@ -1128,6 +1132,128 @@ class TestFSStreamingIntegration(unittest.TestCase):
         )
         self.assertEqual(self.fs.read('/orphan-partial.bin', 4096, 0, vfd), payload[:4096])
         self.fs.release('/orphan-partial.bin', vfd)
+
+    def test_streaming_open_sniffer_does_not_pull_whole_file(self):
+        # A reader reads the head and holds the file open. Until the readers
+        # show consumption, read-ahead stays within the keep-after-close
+        # threshold (here 4 chunks: 128 KiB) past what they read, rounded up
+        # to whole chunks, and follows the reader when it moves.
+        self.backend.range_delay = 0.005
+        payload = os.urandom(2 * 1024 * 1024)
+        (self.backend_dir / "held.bin").write_bytes(payload)
+        chunk = 32 * 1024
+        threshold = 4 * chunk
+        manager = self.fs._streaming_manager
+        # create=True so that, without the bound, the test fails on the
+        # forbidden fetch below rather than on a missing attribute.
+        real_bounded = getattr(manager, "_bounded_read_ahead_chunk", None)
+        real_read_file = self.backend.read_file
+        parked_at = []
+        background_reads = []
+
+        def spy_bounded(session):
+            # The worker asks this under session.lock; None means it is
+            # parked at the bound for the reader's current offset.
+            result = real_bounded(session)
+            if result is None:
+                parked_at.append(session.last_foreground_offset)
+            return result
+
+        def spy_read_file(virtual_path, offset, size):
+            if threading.current_thread().name.startswith("storage-prefetch-"):
+                background_reads.append((offset, size))
+            return real_read_file(virtual_path, offset, size)
+
+        def fetched(session):
+            with session.lock:
+                return list(session.available_ranges)
+
+        with patch.object(manager, "_bounded_read_ahead_chunk", side_effect=spy_bounded, create=True), \
+                patch.object(self.backend, "read_file", side_effect=spy_read_file):
+            vfd = self.fs.open('/held.bin', os.O_RDONLY)
+            session = self._session_for(vfd)
+            self.assertEqual(self.fs.read('/held.bin', 4096, 0, vfd), payload[:4096])
+            # Chunks up to the one holding 4 KiB + threshold, and no further.
+            first_end = ((4096 + threshold) // chunk + 1) * chunk
+            self.assertTrue(self._wait_for(
+                lambda: 0 in parked_at or any(start >= first_end for start, _ in background_reads),
+                timeout=5.0,
+            ))
+            self.assertEqual(fetched(session), [(0, first_end)])
+            self.assertTrue(all(start < first_end for start, _ in background_reads), background_reads)
+
+            # The bound follows the reader to a new offset, forward only.
+            offset = 1024 * 1024
+            self.assertEqual(self.fs.read('/held.bin', 4096, offset, vfd), payload[offset:offset + 4096])
+            self.assertTrue(self._wait_for(lambda: offset in parked_at, timeout=5.0))
+            second_end = ((offset + 4096 + threshold) // chunk + 1) * chunk
+            self.assertEqual(fetched(session), [(0, first_end), (offset, second_end)])
+            self.assertTrue(
+                all(start < first_end or offset <= start < second_end for start, _ in background_reads),
+                background_reads,
+            )
+            with session.lock:
+                self.assertFalse(session.prefetch_complete)
+                self.assertFalse(session.readers_consumed)
+
+            self.fs.release('/held.bin', vfd)
+        self.assertTrue(session.detached)
+        self._assert_not_cached("held.bin")
+
+    def test_streaming_consuming_reader_lifts_read_ahead_bound(self):
+        # Once a contiguous span reaches the threshold, read-ahead runs to the
+        # end of the file while the reader still holds it open.
+        self.backend.range_delay = 0.005
+        payload = os.urandom(2 * 1024 * 1024)
+        (self.backend_dir / "lift.bin").write_bytes(payload)
+
+        vfd = self.fs.open('/lift.bin', os.O_RDONLY)
+        session = self._session_for(vfd)
+        for offset in range(0, 4 * 32 * 1024, 16 * 1024):
+            self.assertEqual(
+                self.fs.read('/lift.bin', 16 * 1024, offset, vfd),
+                payload[offset:offset + 16 * 1024],
+            )
+        with session.lock:
+            self.assertTrue(session.readers_consumed)
+        cache_path = self.cache_dir / "lift.bin"
+        self.assertTrue(self._wait_for(cache_path.exists, timeout=8.0))
+        self.assertEqual(cache_path.read_bytes(), payload)
+        self.fs.release('/lift.bin', vfd)
+
+    def test_streaming_keep_after_close_zero_leaves_read_ahead_unbounded(self):
+        # "0" restores the old behaviour while open too: any read counts as
+        # consumption, so the worker prefetches the whole file.
+        self._remake_fs("0")
+        self.backend.range_delay = 0.005
+        payload = os.urandom(1024 * 1024)
+        (self.backend_dir / "zero.bin").write_bytes(payload)
+
+        vfd = self.fs.open('/zero.bin', os.O_RDONLY)
+        self.assertEqual(self.fs.read('/zero.bin', 4096, 0, vfd), payload[:4096])
+        cache_path = self.cache_dir / "zero.bin"
+        self.assertTrue(self._wait_for(cache_path.exists, timeout=8.0))
+        self.assertEqual(cache_path.read_bytes(), payload)
+        self.fs.release('/zero.bin', vfd)
+
+    def test_streaming_span_trim_keeps_the_latest_read(self):
+        # Past the tracked-span bound the shortest span is dropped, but never
+        # the one the latest read joined: the read-ahead bound is measured
+        # from it, and sequential short reads must be able to grow it.
+        payload = os.urandom(4 * 1024 * 1024)
+        (self.backend_dir / "spans.bin").write_bytes(payload)
+        manager = self.fs._streaming_manager
+        vfd = self.fs.open('/spans.bin', os.O_RDONLY)
+        session = self._session_for(vfd)
+        with session.lock:
+            for index in range(64):
+                manager._record_foreground_read(session, index * 64 * 1024, index * 64 * 1024 + 2048)
+            manager._record_foreground_read(session, 4096 * 1024 - 1024, 4096 * 1024 - 512)
+            spans = list(session.foreground_read_spans)
+            self.assertFalse(session.readers_consumed)
+        self.assertEqual(len(spans), 64)
+        self.assertIn((4096 * 1024 - 1024, 4096 * 1024 - 512), spans)
+        self.fs.release('/spans.bin', vfd)
 
 
 if __name__ == '__main__':

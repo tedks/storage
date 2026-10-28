@@ -22,7 +22,9 @@ max_streaming_sessions = 8
 # contiguous span this long: comma-separated sizes or percentages of the
 # file, whichever is reached first. Unset means 4 chunks or 50% ("4M,50%"
 # at the 1M chunk above); "0" keeps prefetching after any read; "100%"
-# effectively never keeps prefetching after a close.
+# effectively never keeps prefetching after a close. Until readers reach it,
+# read-ahead while the file is open also stays within this far past what
+# they read.
 streaming_keep_after_close = "4M,50%"
 backends = [
   "ssh://user@storage-host.example:/srv/raid/media/",
