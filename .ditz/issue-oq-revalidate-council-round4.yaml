@@ -1,0 +1,57 @@
+id: oq-revalidate-council-round4
+title: 'PR #127 (revalidate on open): authorize a fourth council round, then merge?'
+desc: 'Context: the lane brief''s stop condition is three council rounds without convergence
+  on one PR, and it tripped on #127 (cache-revalidate-on-open).
+
+  - Round 1, on 4757cdd: Claude and Codex seats; the agy seat was empty (quota). Findings:
+  baselines missing at fetch, a different-replica refetch, failures dropping baselines,
+  stalls. Fixed in 8c06e26; the stall and walk cost were filed as follow-ups.
+
+  - Round 2, on 4757cdd..8c06e26: the Claude seat was CLEAN. Codex found three issues:
+  a pin was needed for the refetch, rename dropped baselines, and the merge was not
+  atomic. Fixed in b165ed2.
+
+  - Round 3, on 8c06e26..b165ed2: the Claude seat was CLEAN, with a nit that Codex
+  rated Critical (a recheck mark was cleared before a refusable invalidation). Codex
+  also found an Important issue: a failed rename could leave identity-matched xattrs.
+  Both are fixed in 4d77d8b, which has not been reviewed.
+
+  Each round''s findings were narrower than the last, about rarer interleavings in
+  the new pin/recheck machinery; no data-loss path was found in any round. Gates:
+  all three gates and the remote gate green at b165ed2; at 4d77d8b, see PR #127 comments.
+
+
+  Options:
+
+  1. Authorize round 4 on 4d77d8b''s delta (b165ed2..4d77d8b) and merge if CLEAN (the
+  lane or a resumed CTO).
+
+  2. Merge 4d77d8b as is, on the strength of the gates and round-3 fixes for the stated
+  findings.
+
+  3. Simplify before merging: drop the pin/recheck machinery (round 2''s first fix)
+  and accept the narrow different-replica case as a documented limit. Less code to
+  get wrong, but it reopens a Codex Critical.
+
+  4. Hold.
+
+
+  Recommendation: 1. The fixes are small and targeted, and the review loop is converging.
+
+  Who decides: Ted.
+
+  Blocks: merge of #127 and closing cache-revalidate-on-open. Ted''s flake bump and
+  deploy wait on that.'
+type: task
+component: open-questions
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-28T22:19:04-00:00
+references: []
+log_events:
+- time: 2026-10-28T22:19:04-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
