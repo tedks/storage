@@ -52,7 +52,7 @@ Target behavior:
 Use a **partial local cache file + range-availability map**:
 
 1. For uncached opens, create or attach to `PrefetchSession`.
-2. Session creates `cache_path + ".storage.partial"`, pre-sizes/truncates to full remote size. It prepares the file under a unique `cache_path + ".<random>.storage.partial"` and renames it onto the shared name when it registers, so two opens that both miss the registry cannot clobber each other's file; the one that loses attaches and removes its own.
+2. Session creates `cache_path + ".storage.partial"`, pre-sizes/truncates to full remote size. It prepares the file under a unique `.<random>.storage.partial` in the same directory and renames it onto the shared name when it registers, so two opens that both miss the registry cannot clobber each other's file; the one that loses attaches and removes its own.
 3. Background prefetch thread streams chunks sequentially (e.g., 1 MiB).
 4. Foreground `read()` ensures requested range exists:
    - if already available: read locally

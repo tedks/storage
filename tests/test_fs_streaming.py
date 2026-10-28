@@ -1108,6 +1108,27 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.assertTrue(self._wait_for(cache_path.exists, timeout=5.0))
         self.assertEqual(cache_path.read_bytes(), payload)
 
+    def test_streaming_first_open_replaces_orphan_partial(self):
+        # A partial a detached session failed to unlink is left at the path.
+        # The next session's registration renames its own file over it.
+        payload = os.urandom(64 * 1024)
+        (self.backend_dir / "orphan-partial.bin").write_bytes(payload)
+        partial_path = self.cache_dir / "orphan-partial.bin.storage.partial"
+        partial_path.write_bytes(b"stale" * 100)
+        orphan_inode = partial_path.stat().st_ino
+
+        vfd = self.fs.open('/orphan-partial.bin', os.O_RDONLY)
+        session = self._session_for(vfd)
+        self.assertNotEqual(partial_path.stat().st_ino, orphan_inode)
+        self.assertEqual(os.fstat(session.io_fd).st_ino, partial_path.stat().st_ino)
+        self.assertEqual(partial_path.stat().st_size, len(payload))
+        self.assertEqual(
+            [p.name for p in self.cache_dir.iterdir() if p.name.endswith(".storage.partial")],
+            ["orphan-partial.bin.storage.partial"],
+        )
+        self.assertEqual(self.fs.read('/orphan-partial.bin', 4096, 0, vfd), payload[:4096])
+        self.fs.release('/orphan-partial.bin', vfd)
+
 
 if __name__ == '__main__':
     unittest.main()

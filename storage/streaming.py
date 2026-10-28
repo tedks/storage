@@ -178,7 +178,12 @@ class StreamingReadManager:
             self.cache_manager.mark_cache_size_dirty()
 
     def cleanup_stale_partials(self):
-        """Delete stale partial-cache files left by prior crashes."""
+        """Delete stale partial-cache files left by prior crashes.
+
+        Startup only (StorageFS.__init__, before the mount serves anything):
+        it removes every name ending in the partial suffix, including a live
+        session's partial or staging file.
+        """
         removed = 0
         for partial_path in self.cache_manager.cache_root.rglob(f"*{self.partial_suffix}"):
             try:
@@ -657,6 +662,7 @@ class StreamingReadManager:
             session.partial_cache_path.unlink(missing_ok=True)
         except OSError:
             pass
+        self.cache_manager.mark_cache_size_dirty()
 
     @staticmethod
     def _claim_detach(session: PrefetchSession) -> bool:
@@ -681,9 +687,10 @@ class StreamingReadManager:
         """Drop a just-claimed session from the registry and unlink its partial.
 
         Caller holds prefetch_sessions_lock, which is what keeps a fresh
-        session from preparing a partial at the same path until the unlink is
-        done. A session that is not in the registry was dropped by destroy()
-        (unmount), so no successor can own the path and the unlink is still
+        session from installing its partial at the same path (the rename at
+        registration) until the unlink is done. A session that is not in the
+        registry was dropped by destroy() (unmount), after which no open is
+        served, so no successor can own the path and the unlink is still
         ours.
         """
         if self.prefetch_sessions.get(session.canonical_path) is session:
@@ -691,8 +698,8 @@ class StreamingReadManager:
         try:
             session.partial_cache_path.unlink(missing_ok=True)
         except OSError as exc:
-            # The next session for this path unlinks it again before
-            # creating its own; a mount restart sweeps it otherwise.
+            # The next session for this path renames its own file over it
+            # at registration; a mount restart sweeps it otherwise.
             self.logger.warning(
                 "streaming could not remove partial %s: %r", session.partial_cache_path, exc,
             )
@@ -1009,11 +1016,10 @@ class StreamingReadManager:
         # Prepared under a name of its own and renamed onto the partial path
         # at registration, inside prefetch_sessions_lock: another open that
         # also missed the registry prepares its own file meanwhile, and only
-        # the one that registers takes the shared path. The name keeps the
-        # partial suffix so listings hide it and a restart sweeps it.
-        staging_path = self._partial_cache_path(
-            Path(f"{final_cache_path}.{secrets.token_hex(8)}")
-        )
+        # the one that registers takes the shared path. The name is short
+        # (a file name near the length limit must not fail here) and keeps
+        # the partial suffix so listings hide it and a restart sweeps it.
+        staging_path = final_cache_path.parent / f".{secrets.token_hex(8)}{self.partial_suffix}"
 
         io_fd = -1
         try:
