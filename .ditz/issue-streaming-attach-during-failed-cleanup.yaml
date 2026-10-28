@@ -1,0 +1,31 @@
+id: streaming-attach-during-failed-cleanup
+title: Open can attach to a failed session between the worker tail's no-readers decision
+  and its cleanup
+desc: 'Found by the Codex seat, council round 1 on #121 (rated Critical there; triaged
+  as pre-existing and not data-corrupting). The worker''s tail decides to clean up
+  a failed session when it sees refcount == 0 under session.lock, then promotes the
+  contiguous prefix (ftruncate, rename partial -> final) and only afterwards claims
+  detach and unregisters under prefetch_sessions_lock. An open on the FUSE thread
+  in that window still finds the session registered and attaches. Its os.open falls
+  back to the promoted final file; reads inside the session''s available ranges but
+  past the contiguous prefix return short (EOF) because the file was truncated, and
+  other reads get EIO as on any failed session. The cached prefix itself is not corrupted,
+  and #121''s single-shot claim keeps the attacher''s later release from running a
+  second cleanup. Master had the identical window. Fix sketch: refuse attach to a
+  session whose cleanup is claimed (failed_cleanup_claimed, checked under prefetch_sessions_lock,
+  with the claim taken inside that lock) and have the opener fall back to the full-file
+  path only after the promotion finished, or unregister at claim time while reserving
+  the partial path until the promotion is done.'
+type: bugfix
+component: fs
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-28T21:35:12-00:00
+references: []
+log_events:
+- time: 2026-10-28T21:35:12-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
