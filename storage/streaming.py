@@ -64,11 +64,16 @@ class PrefetchSession:
     # check it too, but not atomically with the write (see
     # _update_streaming_state_xattr).
     detached: bool = False
-    # Set by the worker's tail, in the same session.lock section where it
-    # reads refcount to decide whether it cleans up a failed session. A
-    # release that drops the last ref of a failed session cleans up only if
-    # this is set; otherwise the worker's tail will see refcount == 0.
-    worker_exited: bool = False
+    # Set by the worker's tail once it no longer writes the partial, in the
+    # same session.lock section where it reads refcount to decide whether it
+    # cleans up a failed session. A release decides in the section where it
+    # drops its ref: it cleans up a failed session only if this is already
+    # set, and otherwise leaves it to the tail, which will then see no
+    # readers. Exactly one of the two sees both conditions.
+    worker_done: bool = False
+    # Claimed by the first _cleanup_failed_session, which alone promotes and
+    # removes the session; any later call returns at once.
+    failed_cleanup_claimed: bool = False
     # Merged spans the readers asked for, until readers_consumed is set.
     foreground_read_spans: List[Tuple[int, int]] = field(default_factory=list)
     readers_consumed: bool = False
@@ -742,6 +747,13 @@ class StreamingReadManager:
             return False
 
     def _cleanup_failed_session(self, session: PrefetchSession):
+        # Promotion checks detached and then renames outside session.lock, so
+        # two cleanups in flight could both pass the check; the claim keeps
+        # the second out entirely.
+        with session.lock:
+            if session.failed_cleanup_claimed:
+                return
+            session.failed_cleanup_claimed = True
         if self._promote_failed_session_cache_prefix(session):
             self._cleanup_prefetch_session(session, "partial-cache")
             return
@@ -913,7 +925,7 @@ class StreamingReadManager:
         self._finalize_streaming_session(session)
 
         with session.lock:
-            session.worker_exited = True
+            session.worker_done = True
             has_error = session.error is not None
             no_readers = session.refcount == 0
             stopped = session.stop_requested
@@ -1084,8 +1096,13 @@ class StreamingReadManager:
             and not session.readers_consumed
         )
 
-    def _stop_and_detach_session(self, session: PrefetchSession) -> bool:
-        """Drop the last reader's ref; stop and detach the session if it is unfinished.
+    def _stop_and_detach_session(self, session: PrefetchSession) -> str:
+        """Drop a reader's ref and decide what its release does.
+
+        Returns "stopped" if this was the last ref of an unfinished session,
+        now stopped and detached; "cleanup-failed" if it was the last ref of
+        a failed session whose worker is done (see worker_done); "close" if
+        it was the last ref of a finalized session; otherwise "".
 
         Runs under prefetch_sessions_lock so the decision, the removal from the
         registry and the unlink of the partial file are one step against
@@ -1100,23 +1117,30 @@ class StreamingReadManager:
                 if session.refcount > 0:
                     session.refcount -= 1
                 if not self._should_stop_on_last_close(session):
-                    return False
+                    if session.refcount > 0:
+                        return ""
+                    if session.finalized:
+                        return "close"
+                    # Decided with the decrement, not after it: see worker_done.
+                    if session.error is not None and session.worker_done:
+                        return "cleanup-failed"
+                    return ""
                 # One section with the decision: see _claim_detach.
                 if not self._claim_detach(session):
-                    return False
+                    return ""
                 session.stop_requested = True
                 session.condition.notify_all()
             self._unregister_and_unlink(session)
 
         self._log_streaming_state_change(session, self._snapshot_streaming_state(session, "cancelled"))
         self.cache_manager.mark_cache_size_dirty()
-        return True
+        return "stopped"
 
     def _release_prefetch_session(self, session: PrefetchSession):
-        stopped = self._stop_and_detach_session(session)
+        action = self._stop_and_detach_session(session)
         worker = session.worker
 
-        if stopped:
+        if action == "stopped":
             # No join: the mount runs FUSE single-threaded (nothreads=True),
             # so waiting here on a worker mid-chunk would stall every other
             # operation on the mount for the length of a remote fetch. The
@@ -1124,26 +1148,9 @@ class StreamingReadManager:
             # inode, and closes it on exit (its cancelled cleanup).
             if worker is None or not worker.is_alive():
                 self._close_streaming_session_resources(session)
-            return
-
-        with session.lock:
-            has_error = session.error is not None
-            finalized = session.finalized
-            no_readers = session.refcount == 0
-            worker_exited = session.worker_exited
-
-        if has_error and no_readers:
-            # No join here either (see above). Cleanup of a failed session
-            # belongs to whichever side comes second under session.lock: the
-            # worker's tail sets worker_exited and reads refcount in one
-            # section, so if it has not exited yet it will see no readers and
-            # clean up itself, and if it has, it saw a reader and left the
-            # cleanup to us. Cleanup is single-shot, so both running is safe.
-            if not worker_exited:
-                return
-            if not finalized:
-                self._cleanup_failed_session(session)
-                return
-
-        if finalized and no_readers:
+        elif action == "cleanup-failed":
+            # No join here either: a failed session whose worker is not done
+            # yet is cleaned up by the worker's tail.
+            self._cleanup_failed_session(session)
+        elif action == "close":
             self._close_streaming_session_resources(session)

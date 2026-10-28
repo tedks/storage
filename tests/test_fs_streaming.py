@@ -933,6 +933,10 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.assertFalse(partial_path.exists())
         with self.fs._prefetch_sessions_lock:
             self.assertNotIn('/errjoin.bin', self.fs._prefetch_sessions)
+        # The worker's tail promoted the contiguous prefix it had.
+        cached = (self.cache_dir / "errjoin.bin").read_bytes()
+        self.assertGreater(len(cached), 0)
+        self.assertEqual(cached, payload[:len(cached)])
 
     def test_streaming_failed_release_after_worker_tail_cleans_up(self):
         # The worker's tail ran while a reader still held the failed session,
@@ -974,6 +978,56 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.assertFalse(partial_path.exists())
         with self.fs._prefetch_sessions_lock:
             self.assertNotIn('/tail.bin', self.fs._prefetch_sessions)
+
+    def test_streaming_failed_session_cleaned_by_exactly_one_side(self):
+        # Release drops the last ref of a failed session while the worker is
+        # just short of its tail; the tail then runs before release goes on.
+        # Who cleans up must be decided with the decrement: the tail sees no
+        # readers and cleans up, and release must not clean up as well (two
+        # cleanups in flight can both pass promotion's detached check).
+        manager = self.fs._streaming_manager
+        real_finalize = manager._finalize_streaming_session
+        real_stop = manager._stop_and_detach_session
+        real_cleanup = manager._cleanup_failed_session
+        at_tail = threading.Event()
+        go_tail = threading.Event()
+        self.addCleanup(go_tail.set)
+        cleanups = []
+
+        def held_finalize(session):
+            at_tail.set()
+            go_tail.wait(timeout=5.0)
+            real_finalize(session)
+
+        def stop_then_tail(session):
+            result = real_stop(session)
+            go_tail.set()
+            session.worker.join(timeout=5.0)
+            return result
+
+        def counted_cleanup(session):
+            cleanups.append(threading.current_thread().name)
+            real_cleanup(session)
+
+        payload = os.urandom(128 * 1024)
+        (self.backend_dir / "once.bin").write_bytes(payload)
+
+        with patch.object(manager, "_finalize_streaming_session", side_effect=held_finalize), \
+                patch.object(manager, "_stop_and_detach_session", side_effect=stop_then_tail), \
+                patch.object(manager, "_cleanup_failed_session", side_effect=counted_cleanup):
+            vfd = self.fs.open('/once.bin', os.O_RDONLY)
+            session = self._session_for(vfd)
+            with session.lock:
+                session.error = OSError(errno.EIO, "simulated failure")
+                session.condition.notify_all()
+            self.assertTrue(at_tail.wait(timeout=3.0))
+            self.fs.release('/once.bin', vfd)
+
+        self.assertFalse(session.worker.is_alive())
+        self.assertEqual(len(cleanups), 1, cleanups)
+        self.assertTrue(cleanups[0].startswith("storage-prefetch-"), cleanups)
+        self.assertEqual(session.io_fd, -1)
+        self.assertTrue(session.detached)
 
 
 if __name__ == '__main__':
