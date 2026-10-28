@@ -1133,64 +1133,70 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.assertEqual(self.fs.read('/orphan-partial.bin', 4096, 0, vfd), payload[:4096])
         self.fs.release('/orphan-partial.bin', vfd)
 
-    def _wait_until_fetching_stops(self, session, quiet=0.5, timeout=10.0):
-        """Wait until the session's fetched bytes stop changing for `quiet` s."""
-
-    def _wait_until_fetching_stops(self, session, at_least, quiet=0.5, timeout=10.0):
-        """Wait for at_least bytes fetched, then for no change for `quiet` s.
-
-        The first wait makes a slow worker harmless; the quiet period only
-        has to show that nothing more arrives.
-        """
-        def fetched():
-            with session.lock:
-                return sum(end - start for start, end in session.available_ranges)
-
-        self.assertTrue(self._wait_for(lambda: fetched() >= at_least, timeout=timeout))
-        deadline = time.monotonic() + timeout
-        last = fetched()
-        last_change = time.monotonic()
-        while time.monotonic() < deadline:
-            time.sleep(0.05)
-            now = fetched()
-            if now != last:
-                last, last_change = now, time.monotonic()
-            elif time.monotonic() - last_change >= quiet:
-                return now
-        self.fail("fetching did not settle")
-
     def test_streaming_open_sniffer_does_not_pull_whole_file(self):
         # A reader reads the head and holds the file open. Until the readers
         # show consumption, read-ahead stays within the keep-after-close
-        # threshold (here 4 chunks: 128 KiB) past what they read.
+        # threshold (here 4 chunks: 128 KiB) past what they read, rounded up
+        # to whole chunks, and follows the reader when it moves.
         self.backend.range_delay = 0.005
         payload = os.urandom(2 * 1024 * 1024)
         (self.backend_dir / "held.bin").write_bytes(payload)
         chunk = 32 * 1024
         threshold = 4 * chunk
+        manager = self.fs._streaming_manager
+        # create=True so that, without the bound, the test fails on the
+        # forbidden fetch below rather than on a missing attribute.
+        real_bounded = getattr(manager, "_bounded_read_ahead_chunk", None)
+        real_read_file = self.backend.read_file
+        parked_at = []
+        background_reads = []
 
-        vfd = self.fs.open('/held.bin', os.O_RDONLY)
-        session = self._session_for(vfd)
-        self.assertEqual(self.fs.read('/held.bin', 4096, 0, vfd), payload[:4096])
-        # Chunks up to the one holding 4 KiB + threshold.
-        expected = ((4096 + threshold) // chunk + 1) * chunk
-        fetched = self._wait_until_fetching_stops(session, expected)
-        self.assertEqual(fetched, expected)
-        with session.lock:
-            self.assertFalse(session.prefetch_complete)
-            self.assertFalse(session.readers_consumed)
+        def spy_bounded(session):
+            # The worker asks this under session.lock; None means it is
+            # parked at the bound for the reader's current offset.
+            result = real_bounded(session)
+            if result is None:
+                parked_at.append(session.last_foreground_offset)
+            return result
 
-        # The bound follows the reader to a new offset.
-        offset = 1024 * 1024
-        self.assertEqual(self.fs.read('/held.bin', 4096, offset, vfd), payload[offset:offset + 4096])
-        self._wait_until_fetching_stops(session, expected + threshold)
-        with session.lock:
-            ranges = list(session.available_ranges)
-            self.assertFalse(session.prefetch_complete)
-        self.assertTrue(self.fs._is_range_available(ranges, offset, offset + threshold))
-        self.assertFalse(self.fs._is_range_available(ranges, offset + threshold + chunk, offset + threshold + 2 * chunk))
+        def spy_read_file(virtual_path, offset, size):
+            if threading.current_thread().name.startswith("storage-prefetch-"):
+                background_reads.append((offset, size))
+            return real_read_file(virtual_path, offset, size)
 
-        self.fs.release('/held.bin', vfd)
+        def fetched(session):
+            with session.lock:
+                return list(session.available_ranges)
+
+        with patch.object(manager, "_bounded_read_ahead_chunk", side_effect=spy_bounded, create=True), \
+                patch.object(self.backend, "read_file", side_effect=spy_read_file):
+            vfd = self.fs.open('/held.bin', os.O_RDONLY)
+            session = self._session_for(vfd)
+            self.assertEqual(self.fs.read('/held.bin', 4096, 0, vfd), payload[:4096])
+            # Chunks up to the one holding 4 KiB + threshold, and no further.
+            first_end = ((4096 + threshold) // chunk + 1) * chunk
+            self.assertTrue(self._wait_for(
+                lambda: 0 in parked_at or any(start >= first_end for start, _ in background_reads),
+                timeout=5.0,
+            ))
+            self.assertEqual(fetched(session), [(0, first_end)])
+            self.assertTrue(all(start < first_end for start, _ in background_reads), background_reads)
+
+            # The bound follows the reader to a new offset, forward only.
+            offset = 1024 * 1024
+            self.assertEqual(self.fs.read('/held.bin', 4096, offset, vfd), payload[offset:offset + 4096])
+            self.assertTrue(self._wait_for(lambda: offset in parked_at, timeout=5.0))
+            second_end = ((offset + 4096 + threshold) // chunk + 1) * chunk
+            self.assertEqual(fetched(session), [(0, first_end), (offset, second_end)])
+            self.assertTrue(
+                all(start < first_end or offset <= start < second_end for start, _ in background_reads),
+                background_reads,
+            )
+            with session.lock:
+                self.assertFalse(session.prefetch_complete)
+                self.assertFalse(session.readers_consumed)
+
+            self.fs.release('/held.bin', vfd)
         self.assertTrue(session.detached)
         self._assert_not_cached("held.bin")
 
