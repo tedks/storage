@@ -1,11 +1,13 @@
 import io
 import socket
+import subprocess
 import threading
 import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from storage.backends import ssh as ssh_module
 from storage.backends.ssh import SSHBackend
 
 
@@ -472,6 +474,199 @@ class TestSSHBackendThreadedClients(unittest.TestCase):
             release.set()
             first.join(timeout=5)
             backend.close()
+
+
+_GETENT_AHOSTS = (
+    "192.0.2.7       STREAM nas.local\n"
+    "192.0.2.7       DGRAM  \n"
+    "192.0.2.7       RAW    \n"
+    "2001:db8::7     STREAM \n"
+    "2001:db8::7     DGRAM  \n"
+)
+
+
+def _getent_result(stdout="", returncode=0):
+    return subprocess.CompletedProcess(args=[], returncode=returncode, stdout=stdout, stderr="")
+
+
+class TestHostResolverFallback(unittest.TestCase):
+    """Lookups through the host's getent when this Python's glibc cannot resolve."""
+
+    def setUp(self):
+        # Only /usr/bin/getent "exists", so the tests do not depend on the host.
+        access = patch("storage.backends.ssh.os.access",
+                       side_effect=lambda path, _mode: path == "/usr/bin/getent")
+        which = patch("storage.backends.ssh.shutil.which", return_value=None)
+        access.start()
+        which.start()
+        self.addCleanup(access.stop)
+        self.addCleanup(which.stop)
+
+    @patch("storage.backends.ssh.subprocess.run")
+    def test_addresses_are_stream_lines_in_order_without_duplicates(self, mock_run):
+        mock_run.return_value = _getent_result(_GETENT_AHOSTS)
+        self.assertEqual(
+            ssh_module._host_resolver_addresses("nas.local", 5.0),
+            ["192.0.2.7", "2001:db8::7"],
+        )
+        args, kwargs = mock_run.call_args
+        self.assertEqual(args[0], ["/usr/bin/getent", "ahosts", "--", "nas.local"])
+        self.assertEqual(kwargs["timeout"], 5.0)
+
+    @patch("storage.backends.ssh.subprocess.run")
+    def test_unparseable_lines_are_skipped(self, mock_run):
+        mock_run.return_value = _getent_result("not-an-ip STREAM x\n\n192.0.2.8 STREAM\n")
+        self.assertEqual(ssh_module._host_resolver_addresses("nas.local", 5.0), ["192.0.2.8"])
+
+    @patch("storage.backends.ssh.subprocess.run")
+    def test_no_addresses_when_getent_fails_or_times_out(self, mock_run):
+        for outcome in (
+            _getent_result("", returncode=2),
+            subprocess.TimeoutExpired(cmd="getent", timeout=5.0),
+            FileNotFoundError("getent"),
+        ):
+            with self.subTest(outcome=outcome):
+                if isinstance(outcome, BaseException):
+                    mock_run.side_effect = outcome
+                else:
+                    mock_run.side_effect = None
+                    mock_run.return_value = outcome
+                self.assertEqual(ssh_module._host_resolver_addresses("nas.local", 5.0), [])
+
+    @patch("storage.backends.ssh.subprocess.run")
+    def test_no_getent_means_no_addresses(self, mock_run):
+        with patch("storage.backends.ssh.os.access", return_value=False):
+            self.assertEqual(ssh_module._host_resolver_addresses("nas.local", 5.0), [])
+        mock_run.assert_not_called()
+
+    @patch("storage.backends.ssh.socket.create_connection")
+    @patch("storage.backends.ssh.subprocess.run")
+    def test_connect_tries_each_address_until_one_answers(self, mock_run, mock_create):
+        mock_run.return_value = _getent_result(_GETENT_AHOSTS)
+        sock = object()
+        mock_create.side_effect = [OSError("unreachable"), sock]
+        lookup_error = socket.gaierror(-3, "Temporary failure in name resolution")
+        self.assertIs(ssh_module._connect_via_host_resolver("nas.local", 2222, 4.0, lookup_error), sock)
+        self.assertEqual(
+            [c.args[0] for c in mock_create.call_args_list],
+            [("192.0.2.7", 2222), ("2001:db8::7", 2222)],
+        )
+        self.assertEqual(mock_create.call_args.kwargs["timeout"], 4.0)
+
+    @patch("storage.backends.ssh.socket.create_connection")
+    @patch("storage.backends.ssh.subprocess.run")
+    def test_connect_raises_the_last_connect_error_when_none_answers(self, mock_run, mock_create):
+        mock_run.return_value = _getent_result(_GETENT_AHOSTS)
+        mock_create.side_effect = [OSError("first"), ConnectionRefusedError("second")]
+        with self.assertRaises(ConnectionRefusedError):
+            ssh_module._connect_via_host_resolver(
+                "nas.local", 22, 4.0, socket.gaierror(-3, "lookup"))
+
+    @patch("storage.backends.ssh.socket.create_connection")
+    @patch("storage.backends.ssh.subprocess.run")
+    def test_connect_keeps_the_lookup_error_when_getent_finds_nothing(self, mock_run, mock_create):
+        mock_run.return_value = _getent_result("", returncode=2)
+        lookup_error = socket.gaierror(-2, "Name or service not known")
+        with self.assertRaises(socket.gaierror) as caught:
+            ssh_module._connect_via_host_resolver("typo.local", 22, 4.0, lookup_error)
+        self.assertIs(caught.exception, lookup_error)
+        mock_create.assert_not_called()
+
+
+class _FakeTCPSocket:
+    def __init__(self):
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+class TestSSHBackendHostResolverConnect(unittest.TestCase):
+    def _new_backend(self):
+        return SSHBackend(
+            name="ssh0",
+            host="nas.local",
+            remote_path="/data",
+            username="test",
+            key_filename="/tmp/id_test",
+            port=2222,
+            connect_timeout=3.0,
+        )
+
+    @staticmethod
+    def _client_failing_lookup_without_sock(calls, fail_with_sock=None):
+        client = _FakeSSHClient(_FakeSFTPClient(payload=b""))
+
+        def _connect(**kwargs):
+            calls.append(kwargs)
+            if "sock" not in kwargs:
+                raise socket.gaierror(-3, "Temporary failure in name resolution")
+            if fail_with_sock is not None:
+                raise fail_with_sock
+
+        client.connect = _connect
+        return client
+
+    @patch("storage.backends.ssh._connect_via_host_resolver")
+    @patch("storage.backends.ssh.paramiko.AutoAddPolicy")
+    @patch("storage.backends.ssh.paramiko.SSHClient")
+    def test_lookup_failure_connects_over_host_resolver_socket(self, mock_ssh_client_cls, _policy, mock_fallback):
+        calls = []
+        mock_ssh_client_cls.side_effect = lambda: self._client_failing_lookup_without_sock(calls)
+        sock = _FakeTCPSocket()
+        mock_fallback.return_value = sock
+        backend = self._new_backend()
+
+        backend._current_clients()
+
+        self.assertTrue(backend.is_available())
+        self.assertEqual(mock_ssh_client_cls.call_count, 1)
+        host, port, timeout, lookup_error = mock_fallback.call_args.args
+        self.assertEqual((host, port, timeout), ("nas.local", 2222, 3.0))
+        self.assertIsInstance(lookup_error, socket.gaierror)
+        self.assertEqual(len(calls), 2)
+        # Same hostname (it names the host key) and settings, plus the socket.
+        self.assertIs(calls[1].pop("sock"), sock)
+        self.assertEqual(calls[1], calls[0])
+        self.assertEqual(calls[1]["hostname"], "nas.local")
+        self.assertFalse(sock.closed)
+        backend.close()
+
+    @patch("storage.backends.ssh._connect_via_host_resolver")
+    @patch("storage.backends.ssh.paramiko.AutoAddPolicy")
+    @patch("storage.backends.ssh.paramiko.SSHClient")
+    def test_handshake_failure_over_fallback_socket_closes_it(self, mock_ssh_client_cls, _policy, mock_fallback):
+        calls = []
+        handshake_error = ssh_module.paramiko.SSHException("banner")
+        mock_ssh_client_cls.side_effect = lambda: self._client_failing_lookup_without_sock(
+            calls, fail_with_sock=handshake_error)
+        sock = _FakeTCPSocket()
+        mock_fallback.return_value = sock
+        backend = self._new_backend()
+
+        with self.assertRaises(ssh_module.paramiko.SSHException):
+            backend._current_clients()
+        self.assertTrue(sock.closed)
+        self.assertFalse(backend.is_available())
+        backend.close()
+
+    @patch("storage.backends.ssh._connect_via_host_resolver")
+    @patch("storage.backends.ssh.paramiko.AutoAddPolicy")
+    @patch("storage.backends.ssh.paramiko.SSHClient")
+    def test_unresolvable_host_keeps_lookup_error_and_marks_unavailable(self, mock_ssh_client_cls, _policy, mock_fallback):
+        calls = []
+        mock_ssh_client_cls.side_effect = lambda: self._client_failing_lookup_without_sock(calls)
+        def _no_address(_host, _port, _timeout, lookup_error):
+            raise lookup_error
+
+        mock_fallback.side_effect = _no_address
+        backend = self._new_backend()
+
+        with self.assertRaises(socket.gaierror):
+            backend._current_clients()
+        self.assertFalse(backend.is_available())
+        self.assertEqual(len(calls), 1)
+        backend.close()
 
 
 if __name__ == "__main__":
