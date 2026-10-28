@@ -174,6 +174,8 @@ class TestResilienceGradient(unittest.TestCase):
         with self.assertRaises(FuseOSError):
             self.rt.fs.read("/survive.bin", 4096, 96 * 1024, fd)
         self.rt.fs.release("/survive.bin", fd)
+        # Release does not wait for the worker; its tail promotes the prefix.
+        self.assertTrue(self._wait_for(lambda: len(self._cached_file_prefix("/survive.bin")) > 0))
 
         self.rt.backend.set_available(False)
         retry_fd = self.rt.fs.open("/survive.bin", os.O_RDONLY)
