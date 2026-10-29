@@ -1,0 +1,21 @@
+id: streaming-worker-poll-claimed-chunk
+title: Streaming worker polls at 50 ms when its chunk's missing bytes are all claimed
+  by a reader
+desc: 'From council round 1 on PR #128 (nit, pre-existing, more likely with sub-chunk
+  reader claims): _background_prefetch_worker waits with timeout 0.05 when every missing
+  byte of its chosen chunk is in flight, instead of moving to the next missing chunk.
+  Costs speed only, not correctness; fetch completion notifies, so the wait is usually
+  short. Fix if profiling shows read-ahead stalls behind reader fetches.'
+type: task
+component: fs
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-29T22:28:53-00:00
+references: []
+log_events:
+- time: 2026-10-29T22:28:53-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
