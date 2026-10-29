@@ -42,3 +42,12 @@ log_events:
   who: Ted Smith
   what: created
   comment: ""
+- time: 2026-10-29T21:43:24-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Ruling (Ted, 2026-10-29): A now and B as the fix. Ted also asked that
+    the defaults give a good first-time experience without profile tuning, so the
+    B lane may change the defaults (chunk size, keep-after-close, read-ahead start)
+    when its measurements support it, and must record the measurements in the PR and
+    README. Profiles drynwyn-warez and -vpn tuned to 256K chunks and keep-after-close
+    512K,50% via dotfiles meanwhile.'
