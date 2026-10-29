@@ -1,0 +1,46 @@
+id: oq-listing-cache-lifetime
+title: 'Listing cache lifetime: 1 s readdir TTL and 5 s attribute age force per-member
+  stats during ordinary browsing; align with the 60 s revalidate policy?'
+desc: 'Context: with watchers off (the SSH profiles), a directory listing is reused
+  for readdir_ttl (default 1.0 s) and its attributes answer getattr for at most LISTING_ATTRS_MAX_AGE
+  (5 s, namespace.py). Past that, every getattr for a file without a cache copy falls
+  back to a stat on each member that may hold it (up to one SFTP round trip per member,
+  serialized in the single-threaded FUSE loop), and the next readdir re-lists every
+  member. File managers re-query file info continuously (monitors, selection, sorting,
+  neighbour previews), so after the first second a directory view costs one round
+  trip per file per member at network latency, which a native sftp mount never pays:
+  its READDIR carries attributes and it issues no per-file stat. The 2026-10-27 ruling
+  (oq-watcher-outage-cache-policy) accepted about 60 s of staleness for file content
+  on open; the listing policy is 60 times stricter than the content policy.
+
+  Options:
+
+  A. Default readdir_ttl and LISTING_ATTRS_MAX_AGE to revalidate_after (60 s) when
+  watchers are off; a listing is refreshed once a minute per directory, getattr never
+  stats members for an entry the listing knew. Writes through the mount already invalidate
+  listing state (#115), so the mount''s own changes stay visible at once; a change
+  made directly on a member shows within a minute, like file content.
+
+  B. A, plus stale-while-revalidate: past the age, answer from the stale listing and
+  re-list in the background, so no request ever waits on a listing.
+
+  C. Keep 1 s / 5 s and document that browsing over SSH without watchers costs a stat
+  per file per member per second.
+
+  Recommendation: A now (a defaults change, one PR, no new machinery), B when the
+  listing executor can be reused for it. Who decides: Ted (coherence policy for directories,
+  same scope as the 2026-10-27 ruling). Blocks: nothing merged; it decides the next
+  browsing-latency lane after streaming-sniff.'
+type: task
+component: open-questions
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-29T22:01:44-00:00
+references: []
+log_events:
+- time: 2026-10-29T22:01:44-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
