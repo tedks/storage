@@ -8,17 +8,30 @@ import time
 from dataclasses import dataclass, field
 from fractions import Fraction
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Set, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from fuse import FuseOSError
 
 from .backends.base import Backend
 from .models import FileLocation, FileMetadata, StreamingKeepAfterClose, SyncStatus
 
+# A foreground read fetches only the bytes the reader asked for that are not
+# already there or being fetched; streaming_chunk_size is the unit of the
+# background worker's read-ahead. The worker starts only once the readers have
+# shown they are consuming the file: a contiguous span of this many chunks,
+# or the keep-after-close threshold below if that is smaller (so a file the
+# threshold calls consumed always gets read-ahead). A content-type sniff
+# reads a few KiB (the kernel turns that into at most its readahead, 128K by
+# default) and so costs about what it reads, as on a plain sftp mount, with
+# nothing speculative; a copy or a player crosses one chunk in its first
+# second. Read-ahead, once started, follows the readers for the rest of the
+# session.
+STREAMING_READ_AHEAD_START_CHUNKS = 1
+
 # Read-ahead outlives the last close only for readers that consumed the file.
 # The evidence is the longest contiguous span the readers asked for (not what
-# was fetched: foreground reads round up to whole chunks and the worker runs
-# ahead), checked against the mount's streaming_keep_after_close. Its
+# was fetched: the worker runs ahead of the readers), checked against the
+# mount's streaming_keep_after_close. Its
 # default is this many chunks (4 MiB at the default 1 MiB chunk) or half the
 # file, whichever is smaller. A content-type sniff or a thumbnailer reads a
 # few KiB to a few MiB at scattered offsets and stays under it; a copy or a
@@ -47,7 +60,10 @@ class PrefetchSession:
     chunk_size: int
     io_fd: int
     available_ranges: List[Tuple[int, int]] = field(default_factory=list)
-    in_flight_chunks: Set[int] = field(default_factory=set)
+    # Byte ranges claimed by a fetch in progress, foreground or background.
+    # A range is claimed only where it is missing and not already claimed,
+    # so no byte is requested from the member twice.
+    in_flight_ranges: List[Tuple[int, int]] = field(default_factory=list)
     refcount: int = 0
     prefetch_complete: bool = False
     finalized: bool = False
@@ -77,6 +93,9 @@ class PrefetchSession:
     failed_cleanup_claimed: bool = False
     # Merged spans the readers asked for, until readers_consumed is set.
     foreground_read_spans: List[Tuple[int, int]] = field(default_factory=list)
+    # Set once a span reaches the read-ahead start (see
+    # STREAMING_READ_AHEAD_START_CHUNKS); the worker fetches nothing before.
+    read_ahead_started: bool = False
     readers_consumed: bool = False
     last_logged_status: str = ""
     last_logged_downloaded_bytes: int = 0
@@ -570,14 +589,22 @@ class StreamingReadManager:
     def _keep_after_close_threshold(self, session: PrefetchSession) -> int:
         return self.keep_after_close.threshold(session.file_size)
 
+    def _read_ahead_start_threshold(self, session: PrefetchSession) -> int:
+        return min(
+            STREAMING_READ_AHEAD_START_CHUNKS * session.chunk_size,
+            self._keep_after_close_threshold(session),
+        )
+
     def _record_foreground_read(self, session: PrefetchSession, start: int, end: int):
         """Track the spans readers asked for. Caller holds session.lock."""
         if session.readers_consumed:
             return
         spans = session.foreground_read_spans
         self._add_available_range(spans, start, end)
-        threshold = self._keep_after_close_threshold(session)
-        if any(span_end - span_start >= threshold for span_start, span_end in spans):
+        longest = max(span_end - span_start for span_start, span_end in spans)
+        if longest >= self._read_ahead_start_threshold(session):
+            session.read_ahead_started = True
+        if longest >= self._keep_after_close_threshold(session):
             session.readers_consumed = True
             spans.clear()
         elif len(spans) > STREAMING_MAX_TRACKED_READ_SPANS:
@@ -643,6 +670,19 @@ class StreamingReadManager:
             return None
         return (missing[0] // session.chunk_size) * session.chunk_size
 
+    @staticmethod
+    def _first_unclaimed_missing_range(
+        session: PrefetchSession,
+        start: int,
+        end: int,
+    ) -> Optional[Tuple[int, int]]:
+        """The first range in [start, end) neither available nor in flight.
+
+        Caller holds session.lock.
+        """
+        covered = sorted(session.available_ranges + session.in_flight_ranges)
+        return StreamingReadManager._first_missing_range(covered, start, end)
+
     def _ensure_streaming_range(self, session: PrefetchSession, start: int, end: int):
         if start >= end:
             return
@@ -670,33 +710,30 @@ class StreamingReadManager:
                 if session.error is not None:
                     raise FuseOSError(errno.EIO)
 
-                missing = self._first_missing_range(session.available_ranges, start, end)
-                if missing is None:
-                    return
-
-                chunk_start = (missing[0] // session.chunk_size) * session.chunk_size
-                chunk_end = min(chunk_start + session.chunk_size, session.file_size)
-
-                if chunk_start in session.in_flight_chunks:
+                # Only what the reader asked for: not rounded up to a chunk,
+                # which is what made a 4 KiB sniff cost a whole chunk.
+                fetch = self._first_unclaimed_missing_range(session, start, end)
+                if fetch is None:
+                    # The rest is in flight; its fetch notifies when done.
                     session.condition.wait(timeout=0.05)
                     continue
 
-                session.in_flight_chunks.add(chunk_start)
+                session.in_flight_ranges.append(fetch)
 
             try:
                 _ = self._fetch_range_into_session(
                     session,
-                    chunk_start,
-                    chunk_end,
+                    fetch[0],
+                    fetch[1],
                     source="foreground",
                 )
             except Exception as exc:
                 self.logger.warning(
-                    "streaming foreground fetch failed path=%s backend=%s chunk=[%d,%d): %r",
+                    "streaming foreground fetch failed path=%s backend=%s range=[%d,%d): %r",
                     session.canonical_path,
                     session.backend.name,
-                    chunk_start,
-                    chunk_end,
+                    fetch[0],
+                    fetch[1],
                     exc,
                 )
                 with session.lock:
@@ -707,7 +744,7 @@ class StreamingReadManager:
                 raise FuseOSError(errno.EIO)
             finally:
                 with session.lock:
-                    session.in_flight_chunks.discard(chunk_start)
+                    session.in_flight_ranges.remove(fetch)
                     session.condition.notify_all()
 
     def _close_streaming_session_resources(self, session: PrefetchSession):
@@ -952,8 +989,12 @@ class StreamingReadManager:
                 if session.stop_requested or session.error is not None:
                     break
 
-                if not session.has_foreground_read:
-                    session.condition.wait(timeout=0.05)
+                # Readers that fetched every byte themselves still need the
+                # worker to finalize, hence prefetch_complete.
+                if not session.read_ahead_started and not session.prefetch_complete:
+                    # Reads, fetches and stop notify; the timeout is only a
+                    # backstop.
+                    session.condition.wait(timeout=1.0)
                     continue
 
                 if session.readers_consumed:
@@ -971,28 +1012,30 @@ class StreamingReadManager:
                         continue
                 cursor = chunk_start
                 chunk_end = min(chunk_start + session.chunk_size, session.file_size)
-
-                if chunk_start in session.in_flight_chunks:
+                # The chunk's missing bytes that no reader is fetching: the
+                # readers' own fetches leave holes of any size in it.
+                fetch = self._first_unclaimed_missing_range(session, chunk_start, chunk_end)
+                if fetch is None:
                     session.condition.wait(timeout=0.05)
                     continue
 
-                session.in_flight_chunks.add(chunk_start)
+                session.in_flight_ranges.append(fetch)
 
             try:
                 fetched_end = self._fetch_range_into_session(
                     session,
-                    chunk_start,
-                    chunk_end,
+                    fetch[0],
+                    fetch[1],
                     source="background",
                 )
-                cursor = max(fetched_end, chunk_start + 1)
+                cursor = max(fetched_end, fetch[0] + 1)
             except Exception as exc:
                 self.logger.warning(
-                    "streaming background fetch failed path=%s backend=%s chunk=[%d,%d): %r",
+                    "streaming background fetch failed path=%s backend=%s range=[%d,%d): %r",
                     session.canonical_path,
                     session.backend.name,
-                    chunk_start,
-                    chunk_end,
+                    fetch[0],
+                    fetch[1],
                     exc,
                 )
                 with session.lock:
@@ -1003,7 +1046,7 @@ class StreamingReadManager:
                 break
             finally:
                 with session.lock:
-                    session.in_flight_chunks.discard(chunk_start)
+                    session.in_flight_ranges.remove(fetch)
                     session.condition.notify_all()
 
         self._finalize_streaming_session(session)
