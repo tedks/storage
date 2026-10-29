@@ -1,0 +1,31 @@
+id: streaming-sniff-read-cost
+title: A sniff-sized read of an uncached file costs a whole chunk plus read-ahead,
+  far more than a native sftp mount
+desc: 'Measured on splinter1 2026-10-29 against drynwyn over SSH, storage at 5f31a04,
+  profile drynwyn-warez (streaming_reads on, 1M chunks, default keep-after-close):
+  open, read 4 KiB, close on an uncached 5.7 MiB file took 0.99 s and moved 2.2 MiB
+  over the network in the following 8 s; the partial was then discarded (#120), so
+  the bytes are spent and nothing is kept. For files at or below one chunk (median
+  0.70 MiB in that tree) the first range read completes the file, so a sniff keeps
+  a whole copy: 717 of 717 indexed files had whole cache copies while Nautilus and
+  Loupe browsed. A native gvfs sftp mount reads a few KiB for the same content-type
+  sniff. Cause: the foreground range read is rounded up to streaming_chunk_size, and
+  read-ahead starts at the first read; #126 only bounds it to the keep-after-close
+  threshold (4M,50%), so a sniff still costs at least one chunk and up to the bound.
+  A stat-only listing (readdir + getattr of 64 files) fetched nothing, so listing
+  itself is not the cost. Mitigation without code: a smaller streaming_chunk_size
+  (128K-256K) and an explicit keep-after-close above the kernel''s 128K readahead.
+  Fix options are in oq-streaming-sniff-policy.'
+type: bugfix
+component: fs
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-29T21:36:38-00:00
+references: []
+log_events:
+- time: 2026-10-29T21:36:38-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
