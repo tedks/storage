@@ -1,0 +1,25 @@
+id: streaming-promoted-prefix-false-conflict
+title: A failed streamed refetch after an invalidation shows a false CONFLICT
+desc: 'From council round 4 on #127 (Claude seat). Pre-existing, but revalidation
+  on open makes it routine. After _invalidate_file_cache the row is CLEAN with size
+  0 and last_modified 0, and the location checksums are empty. If the refetch is streamed
+  and fails, the session promotes a byte prefix to the final cache path and makes
+  no row update. The next open (heal_stale_clean, or revalidation) treats the prefix
+  as a lost write and marks it DIRTY. The sync''s conflict check then compares against
+  the empty checksum and reports CONFLICT on a file the user never wrote, and the
+  open serves the truncated copy. The member is not overwritten. Before #127 only
+  watcher invalidations led here; with #127 every detected change can. Fix: record
+  the row stat on prefix promotion, or do not promote a prefix whose row was invalidated.'
+type: bugfix
+component: cache
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-29T18:36:33-00:00
+references: []
+log_events:
+- time: 2026-10-29T18:36:33-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
