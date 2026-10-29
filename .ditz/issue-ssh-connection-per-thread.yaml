@@ -1,0 +1,28 @@
+id: ssh-connection-per-thread
+title: SSH backend opens one connection per thread per member; share one transport
+  per member
+desc: 'ssh.py keeps its SSH and SFTP clients in threading.local, so every thread that
+  touches a member (the FUSE loop, each member''s listing thread, prefetch workers,
+  the checksum executor, sync workers) performs its own SSH handshake and holds its
+  own session: 22 connections to one host were counted on a live mount with three
+  members on that host (2026-10-29). Each new thread''s first use pays a full handshake
+  (several round trips, plus name resolution, which on the packaged build fails in
+  getaddrinfo before the getent fallback runs) inside whatever request it serves.
+  A native sftp mount holds one connection per host and multiplexes requests. Proposed:
+  one paramiko Transport per member with SFTP channels opened per thread (channels
+  are cheap, handshakes are not), or a small bounded pool; resolve the member name
+  once per transport. Measure handshake count and first-request latency in the remote
+  gate before and after. Not blocking; a lane candidate after streaming-sniff.'
+type: task
+component: fs
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-29T22:01:44-00:00
+references: []
+log_events:
+- time: 2026-10-29T22:01:44-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
