@@ -55,3 +55,8 @@ log_events:
   who: Ted Smith
   what: created
   comment: ""
+- time: 2026-10-29T18:33:52-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Ruling (Ted, 2026-10-29): ''do it'' on the recommendation, option 1. Run
+    round 4 on b165ed2..4d77d8b, then merge if CLEAN. The lane resumes.'
