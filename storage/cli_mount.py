@@ -44,7 +44,10 @@ from .mount_profiles import (
 )
 @click.option(
     "--streaming-chunk-size",
-    help="Chunk size for streaming range reads (e.g., 256K, 1M).",
+    help=(
+        "Unit of streaming read-ahead (e.g., 256K, 1M); read-ahead starts once readers "
+        "have read one chunk. Reads fetch only what they ask for."
+    ),
 )
 @click.option(
     "--max-streaming-sessions",
