@@ -1,0 +1,28 @@
+id: streaming-finalize-over-writer
+title: Streaming finalize replaces the final cache path under a concurrent writer
+desc: 'From the 2026-10-29 threading audit (read-only, origin/master 033d8ac). streaming.py
+  finalize (around line 925) does os.replace(partial, final) unconditionally. A write-open
+  of the same path during a stream takes the full-fetch path into the final cache
+  path; when the stream finishes, finalize replaces that file under the writer, so
+  the writer''s bytes land on an unlinked inode and are lost from the cache (the index
+  row still describes them). Probably reachable today with one FUSE thread plus the
+  prefetch worker; certainly reachable once the FUSE loop is multithreaded. Needs
+  a deterministic test (Event-gated backend double, pattern in tests/test_fs_streaming.py
+  near line 1050): write-open during a stream, finalize, then read back through the
+  mount. Fix candidates: finalize only when no writer holds the path (check the fd
+  table under _fd_lock) and otherwise discard the partial; or route write-open through
+  the streaming session so it waits for or cancels the stream. Related: streaming-destroy-concurrent-open,
+  streaming-attach-during-failed-cleanup.'
+type: bugfix
+component: fs
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-29T23:49:43-00:00
+references: []
+log_events:
+- time: 2026-10-29T23:49:43-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
