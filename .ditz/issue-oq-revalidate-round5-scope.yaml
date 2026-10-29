@@ -1,0 +1,31 @@
+id: oq-revalidate-round5-scope
+title: 'PR #127 round 4 not clean: close the no-baseline class, merge with limits,
+  or simplify?'
+desc: "Round 4 on #127 was not CLEAN.\n- Both seats: the recheck mark is cleared when
+  the pinned member is selected, not when its bytes arrive.\n- Codex (Critical): a
+  rename that fails before moving anything drops valid baselines.\nPattern: every
+  finding since round 2 is a new way into the 'no baseline' state. There the fallback
+  (size differs, or member mtime later than the cache file's) misses a same-size change
+  whose mtime went backwards. Each case needs a member to flap at the wrong moment,
+  or a rename to fail. All gates pass at 16133fd.\nOptions:\n1. Close the class at
+  the root, then run round 5:\n   - streamed fetches record a member baseline and
+  clear the mark on finalize (touches streaming.py; the streaming lane is DONE);\n
+  \  - marks clear only when bytes arrive;\n   - a failed rename keeps the baselines
+  of files that did not move.\n   About one more fix commit plus a review round.\n2.
+  Merge 16133fd now, documenting the no-baseline blind spot and filing the two round-4
+  findings.\n3. Simplify: drop the pin/recheck machinery, document the limit, then
+  do a light review and merge.\nRecommendation: 1.\nWho decides: Ted.\nBlocks: merge
+  of #127."
+type: task
+component: open-questions
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-29T18:43:19-00:00
+references: []
+log_events:
+- time: 2026-10-29T18:43:19-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
