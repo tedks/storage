@@ -38,3 +38,9 @@ log_events:
   who: Ted Smith
   what: 'closed: fixed'
   comment: 'Ruled: A (keep the coupling)'
+- time: 2026-10-29T22:33:20-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'PR #128 (merged 033d8ac): the coupling is not moot. Read-ahead now starts
+    only after one chunk of contiguous reads; between that start and consumption it
+    is still bounded by the keep-after-close threshold, as ruled (A).'
