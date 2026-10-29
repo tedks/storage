@@ -1,0 +1,33 @@
+id: revalidate-round5-nits
+title: 'Revalidation: round-5 council nits (tests and comments)'
+desc: 'From council round 5 on #127 (Claude seat), none blocking:
+
+  (1) No test that a recheck mark survives a stream that bails out after selection
+  or is cancelled; only the finished-stream and failed-full-transfer cases are covered.
+
+  (2) LocalBackend.stat is os.lstat, but get_size follows symlinks. The stream session
+  now sizes from stat, so streaming a symlink path on a local member would size by
+  the link text. That is unreachable today (getattr uses lstat, so the kernel never
+  opens a symlink through FUSE); add an S_ISREG check that falls back to get_size,
+  or a comment.
+
+  (3) A failed rename from a never-cached source onto a cached target drops the target''s
+  valid baselines (the old path is absent and the new one exists). One needless refetch,
+  on a failure path only.
+
+  (4) A stream''s on_finalized can land after the FUSE thread''s own refetch and install
+  the older stream-start baseline. That is conservative: at most one refetch. Add
+  a comment in _record_fetched about callers off the FUSE thread.'
+type: task
+component: cache
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-29T21:45:10-00:00
+references: []
+log_events:
+- time: 2026-10-29T21:45:10-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
