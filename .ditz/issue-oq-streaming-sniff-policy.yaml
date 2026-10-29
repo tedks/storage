@@ -1,0 +1,44 @@
+id: oq-streaming-sniff-policy
+title: 'Streaming: should sniff-sized reads of uncached files cost sniff-sized transfers?'
+desc: 'Context: ditz streaming-sniff-read-cost. Nautilus content-type sniffs and similar
+  small head reads of uncached files each cost one streaming chunk (1M default) plus
+  read-ahead up to the keep-after-close bound, then the partial is discarded; files
+  under one chunk are fetched whole. Ted observes storage reading far more than a
+  native Nautilus sftp mount for the same browsing.
+
+  Options:
+
+  A. Tune only: set streaming_chunk_size to 128K-256K and streaming_keep_after_close
+  explicitly (above the kernel''s 128K readahead) in the profile. No code; sniffs
+  cost a few hundred KiB; large sequential reads make more SFTP requests, throughput
+  effect unmeasured.
+
+  B. Decouple the foreground range size from the prefetch chunk: serve the reader''s
+  actual request (the kernel sends at most 128K) and start read-ahead only after the
+  readers have consumed a configurable amount (for example one chunk), so a sniff
+  costs what it reads. Keeps 1M prefetch chunks for consuming readers. Code in streaming.py,
+  Lead lane, council to fixpoint.
+
+  C. Accept and document.
+
+  Recommendation: A now as a mitigation Ted can try on the live profile (no deploy);
+  B as the fix, since read-ahead for a reader that has read 4 KiB is speculation the
+  native mount does not make.
+
+  Who decides: Ted (read policy and the profile).
+
+  Blocks: nothing merged; it decides whether a streaming lane is opened after #127
+  settles.'
+type: task
+component: open-questions
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-29T21:36:38-00:00
+references: []
+log_events:
+- time: 2026-10-29T21:36:38-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
