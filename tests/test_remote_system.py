@@ -804,7 +804,9 @@ def test_mounted_streaming_range_reads_reach_ssh_member(remote, mounted_factory,
                                                     streaming=True)
     assert downloads == [], "a streaming read must not download the whole file"
     assert len(ranges) > 1, f"expected several range reads, saw {ranges}"
-    assert all(size <= chunk for _p, _o, size in ranges), ranges
+    # Foreground reads are the kernel's request (up to its 128 KiB
+    # readahead), read-ahead is chunk-sized: neither is the whole file.
+    assert all(size <= max(chunk, 128 * 1024) for _p, _o, size in ranges), ranges
     assert len({offset for _p, offset, _s in ranges}) > 1
 
 
