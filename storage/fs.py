@@ -130,7 +130,9 @@ class StorageFS(Operations):
             cache_size: Maximum cache size in bytes
             num_sync_workers: Number of background sync worker threads
             streaming_reads: Enable uncached range streaming + background prefetch
-            streaming_chunk_size: Range size used for foreground/background remote reads
+            streaming_chunk_size: Unit of background read-ahead (foreground
+                reads fetch only what the reader asked for); read-ahead
+                starts once readers have read one chunk
             max_streaming_sessions: Maximum concurrent streaming sessions
             streaming_keep_after_close: When read-ahead outlives the last
                 close of a streaming session; None for the default, 4 chunks

@@ -816,6 +816,54 @@ def test_mounted_nonstreaming_read_makes_no_range_reads(remote, mounted_factory,
     assert downloads == ["/stream.bin"], "the whole file must be downloaded exactly once"
 
 
+def _record_range_reads(mnt, monkeypatch) -> List[tuple]:
+    """Log (offset, size, background) for every range read on any member."""
+    reads: List[tuple] = []
+    for backend in mnt.backends.values():
+        original = backend.read_file
+
+        def recording(virtual_path, offset, size, original=original):
+            background = threading.current_thread().name.startswith("storage-prefetch-")
+            reads.append((offset, size, background))
+            return original(virtual_path, offset, size)
+
+        monkeypatch.setattr(backend, "read_file", recording)
+    return reads
+
+
+def test_mounted_sniff_of_uncached_file_costs_what_it_reads(remote, mounted_factory,
+                                                           monkeypatch):
+    """A content-type sniff through the kernel, at the mount's default chunk.
+
+    Open, read 4 KiB, close an uncached multi-MiB file: the member is asked
+    for no more than the kernel requested (its readahead, at most 128 KiB),
+    nothing is prefetched, and nothing is kept.
+    """
+    from storage.mount_profiles import DEFAULT_STREAMING_CHUNK_SIZE, parse_size
+
+    member = remote.members[0]
+    payload = secrets.token_bytes(6 * 1024 * 1024)
+    remote.write_remote(member, "sniff.bin", payload)
+    mnt = mounted_factory(streaming_reads=True,
+                          streaming_chunk_size=parse_size(DEFAULT_STREAMING_CHUNK_SIZE),
+                          num_sync_workers=0, start_sync=False)
+    reads = _record_range_reads(mnt, monkeypatch)
+
+    with open(mnt.mount / "sniff.bin", "rb", buffering=0) as handle:
+        assert handle.read(4096) == payload[:4096]
+        with mnt.fs._prefetch_sessions_lock:
+            session = mnt.fs._prefetch_sessions["/sniff.bin"]
+    # The kernel sends the release after close() returns.
+    assert _wait_for(lambda: session.detached, timeout=10.0), "the close never stopped the session"
+    session.worker.join(timeout=10.0)
+    assert not session.worker.is_alive()
+
+    assert reads, "the read never reached the member"
+    assert not any(background for _o, _s, background in reads), reads
+    assert sum(size for _o, size, _b in reads) <= 128 * 1024, reads
+    assert not (mnt.cache / "sniff.bin").exists()
+
+
 def test_mounted_revalidate_sees_container_change_after_age(remote, mounted_factory):
     """With watchers off, a changed member copy is refetched once the check ages.
 
