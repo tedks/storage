@@ -24,3 +24,9 @@ log_events:
     an opt-out env var (e.g. STORAGE_REMOTE_GATE_SKIP=1) that runs the local three
     and prints a loud ''remote gate NOT run'' would be the deliberate path. Needs
     a product call, so not done in the PR.'
+- time: 2026-10-29T21:51:43-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Ruling (Ted, 2026-10-29): contributors can be required to run Docker;
+    no opt-out. CONTRIBUTING.md already says the remote gate needs Docker and that
+    a host without it must run the gates elsewhere (a remote host via scripts/run-gates.sh).'
