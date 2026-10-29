@@ -29,3 +29,8 @@ log_events:
   who: Ted Smith
   what: created
   comment: ""
+- time: 2026-10-29T21:33:42-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Ruling (Ted, 2026-10-29): option 1. Fix the root, run round 5, merge if
+    CLEAN.'
