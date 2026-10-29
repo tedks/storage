@@ -33,8 +33,8 @@ type: task
 component: open-questions
 release:
 reporter: Ted Smith <tedks@riseup.net>
-status: unstarted
-disposition:
+status: closed
+disposition: fixed
 creation_time: 2026-10-29T21:36:38-00:00
 references: []
 log_events:
@@ -51,3 +51,7 @@ log_events:
     when its measurements support it, and must record the measurements in the PR and
     README. Profiles drynwyn-warez and -vpn tuned to 256K chunks and keep-after-close
     512K,50% via dotfiles meanwhile.'
+- time: 2026-10-29T21:44:07-00:00
+  who: Ted Smith
+  what: 'closed: fixed'
+  comment: 'Ruled: A now, B as a lane with authority over defaults'
