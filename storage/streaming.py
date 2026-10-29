@@ -8,7 +8,7 @@ import time
 from dataclasses import dataclass, field
 from fractions import Fraction
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from fuse import FuseOSError
 
@@ -81,6 +81,9 @@ class PrefetchSession:
     last_logged_status: str = ""
     last_logged_downloaded_bytes: int = 0
     last_foreground_offset: int = 0
+    # The member's stat at session start (None when the member has no
+    # stat); handed to on_finalized as the revalidation baseline.
+    member_stat: Optional[object] = None
 
     def __post_init__(self):
         self.lock = threading.RLock()
@@ -105,8 +108,12 @@ class StreamingReadManager:
         partial_suffix: str,
         stream_state_xattr: str,
         keep_after_close: Optional[StreamingKeepAfterClose] = None,
+        on_finalized: Optional[Callable[["PrefetchSession"], None]] = None,
     ):
         self.cache_manager = cache_manager
+        # Called once the complete file is in the cache (StorageFS records
+        # the member baseline for revalidation on open).
+        self.on_finalized = on_finalized
         self.state_manager = state_manager
         self.logger = logger
         self.get_config = get_config
@@ -924,6 +931,12 @@ class StreamingReadManager:
             should_close = session.refcount == 0
             session.condition.notify_all()
 
+        if self.on_finalized is not None:
+            try:
+                self.on_finalized(session)
+            except Exception:
+                self.logger.exception("on_finalized failed for %s", session.canonical_path)
+
         self._update_streaming_state_xattr(session, "complete")
         self._remove_prefetch_session(session)
 
@@ -1046,8 +1059,14 @@ class StreamingReadManager:
             )
             return None
 
+        member_stat = None
         try:
-            file_size = backend.get_size(canonical_path)
+            # One round trip either way: get_size is a stat on every member.
+            try:
+                member_stat = backend.stat(canonical_path)
+                file_size = member_stat.st_size
+            except NotImplementedError:
+                file_size = backend.get_size(canonical_path)
         except Exception as exc:
             self.logger.debug(
                 "streaming session unavailable: failed to stat %s on %s: %s",
@@ -1112,6 +1131,7 @@ class StreamingReadManager:
             chunk_size=self.chunk_size,
             io_fd=io_fd,
             refcount=1,
+            member_stat=member_stat,
         )
 
         with self.prefetch_sessions_lock:

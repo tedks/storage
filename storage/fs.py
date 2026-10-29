@@ -265,6 +265,10 @@ class StorageFS(Operations):
             streaming_chunk_size=streaming_chunk_size,
             max_streaming_sessions=max_streaming_sessions,
             keep_after_close=streaming_keep_after_close,
+            on_finalized=lambda session: self._record_fetched(
+                session.canonical_path, session.final_cache_path,
+                session.backend, session.member_stat,
+            ),
             partial_suffix=self._PARTIAL_SUFFIX,
             stream_state_xattr=self._STREAM_STATE_XATTR,
         )
@@ -662,7 +666,9 @@ class StorageFS(Operations):
         with self._member_checks_lock:
             pinned = self._refetch_pins.pop(canonical_path, None)
         if pinned is not None and pinned.is_available():
-            self._clear_recheck(canonical_path, pinned.name)
+            # The recheck mark stays until the bytes arrive (_record_fetched,
+            # for a full fetch or a finished stream); a transfer that fails
+            # after this leaves it owed.
             return pinned
         backend = self._select_unpinned_backend_for_read(canonical_path)
         if pinned is not None and backend is not pinned:
@@ -908,11 +914,11 @@ class StorageFS(Operations):
         never a listing or an exists() probe. The member's copy changed when:
 
         - with a baseline for that member (its stat when the cache file was
-          last known to match it: at the fetch, after a sync, or at the last
+          last known to match it: at a full or streamed fetch, after a sync, or at the last
           check; kept in memory and in the cache file's xattr): size or
           mtime differ from it;
-        - without one (a streamed fetch, a member never checked, an xattr
-          that could not be written): the size differs from the cache
+        - without one (a member never checked, a stat that failed before a
+          fetch, an xattr that could not be written): the size differs from the cache
           file's, or the member's mtime is later than the cache file's. A
           fetch keeps the member mtime (local, rsync) or stamps the fetch
           time (SFTP), so an unchanged member is not later unless its clock
@@ -1298,12 +1304,16 @@ class StorageFS(Operations):
         try:
             self.namespace.rename(old, new)
         except BaseException:
-            # Where the files ended up is unknown; a forgotten check only
-            # costs a stat at the next open.
-            self._forget_member_check(old_canonical, subtree=True, path_gone=True)
-            self._forget_member_check(new_canonical, subtree=True, path_gone=True)
-            for renamed_path in (old_canonical, new_canonical):
-                self._drop_persisted_baselines(renamed_path)
+            # If the cached copy moved but the rename failed after (or
+            # before) the members', its baselines, matched on identity alone,
+            # may describe a member file at the other path: drop them. If it
+            # did not move, they still describe this path and stay.
+            old_cache = self.cache_manager.get_cache_path(old_canonical)
+            new_cache = self.cache_manager.get_cache_path(new_canonical)
+            if not os.path.lexists(old_cache) and os.path.lexists(new_cache):
+                self._forget_member_check(old_canonical, subtree=True, path_gone=True)
+                self._forget_member_check(new_canonical, subtree=True, path_gone=True)
+                self._drop_persisted_baselines(new_canonical)
             raise
         finally:
             # Records are keyed by path, so neither name's records (nor, for a

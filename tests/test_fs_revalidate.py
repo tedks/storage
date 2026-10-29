@@ -303,13 +303,29 @@ class TestRevalidateOnOpen(RevalidateTestBase):
         self.fs.unlink("/g.txt")
         self.assertNotIn("/g.txt", self.fs._member_checks)
 
-    def test_failed_rename_drops_persisted_baselines(self):
+    def test_rename_failing_before_any_move_keeps_baselines(self):
         with patch.object(self.fs.namespace, "rename", side_effect=OSError(5, "I/O error")):
             with self.assertRaises(OSError):
                 self.fs.rename("/f.txt", "/g.txt")
+        self.assertEqual({"member": (8, 1_700_000_000.0)}, self.fs._member_checks["/f.txt"].members)
+        os.getxattr(self.cache_dir / "f.txt", StorageFS.MEMBER_STAT_XATTR)
+        # The kept baseline still catches a same-size change with an older mtime.
+        self.rewrite_member("f.txt", b"ORIGINAL", mtime=1_600_000_000)
+        self.age_checks()
+        self.assertEqual(b"ORIGINAL", self.read_through("/f.txt"))
+
+    def test_rename_failing_after_the_cache_moved_drops_baselines(self):
+        def move_cache_then_fail(old, new):
+            os.rename(self.cache_dir / "f.txt", self.cache_dir / "g.txt")
+            raise OSError(5, "I/O error")
+
+        with patch.object(self.fs.namespace, "rename", side_effect=move_cache_then_fail):
+            with self.assertRaises(OSError):
+                self.fs.rename("/f.txt", "/g.txt")
         with self.assertRaises(OSError):
-            os.getxattr(self.cache_dir / "f.txt", StorageFS.MEMBER_STAT_XATTR)
+            os.getxattr(self.cache_dir / "g.txt", StorageFS.MEMBER_STAT_XATTR)
         self.assertNotIn("/f.txt", self.fs._member_checks)
+        self.assertNotIn("/g.txt", self.fs._member_checks)
 
     def test_rename_to_itself_keeps_check(self):
         self.fs._move_member_checks("/f.txt", "/f.txt")
@@ -436,6 +452,21 @@ class TestRevalidateTwoMembers(RevalidateTestBase):
         self.assertEqual(b"changed again on fast", self.read_through("/f.txt"))
         self.assertNotIn("/f.txt", self.fs._recheck)
 
+    def test_recheck_mark_survives_a_failed_pinned_transfer(self):
+        self.test_checks_the_member_a_refetch_reads()
+        fast, fast_dir = self.fast, self.fast_dir
+        with self.fs._member_checks_lock:
+            self.fs._recheck["/f.txt"] = {"fast"}
+        self.age_checks()
+        with patch.object(fast, "copy_to_local", side_effect=OSError(5, "I/O error")):
+            with self.assertRaises(Exception):
+                self.read_through("/f.txt")
+        # Selected but never delivered: the forced refetch is still owed.
+        self.assertEqual({"fast"}, self.fs._recheck["/f.txt"])
+        (fast_dir / "f.txt").write_bytes(b"CHANGED ON FAST")
+        self.assertEqual(b"CHANGED ON FAST", self.read_through("/f.txt"))
+        self.assertNotIn("/f.txt", self.fs._recheck)
+
     def test_recheck_mark_survives_a_refused_invalidation(self):
         self.test_checks_the_member_a_refetch_reads()
         fast, fast_dir = self.fast, self.fast_dir
@@ -458,3 +489,40 @@ class TestRevalidateTwoMembers(RevalidateTestBase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRevalidateStreamedFetch(RevalidateTestBase):
+    def _make_fs(self, start_sync=False):
+        return StorageFS(
+            cache_root=self.cache_dir,
+            state_db=self.db_path,
+            backends={"member": self.member},
+            cache_size=10 * 1024 * 1024,
+            num_sync_workers=1,
+            start_sync=start_sync,
+            streaming_reads=True,
+            streaming_chunk_size=4096,
+            revalidate_after=self.revalidate_after,
+        )
+
+    def tearDown(self):
+        self.fs.destroy("/")
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_finished_stream_records_member_baseline(self):
+        payload = os.urandom(3 * 4096 + 17)
+        self.rewrite_member("s.bin", payload, mtime=1_700_000_000)
+        self.assertEqual(payload, self.read_through("/s.bin"))
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            check = self.fs._member_checks.get("/s.bin")
+            if check is not None and check.members:
+                break
+            time.sleep(0.05)
+        self.assertEqual({"member": (len(payload), 1_700_000_000.0)},
+                         self.fs._member_checks["/s.bin"].members)
+        # Same size, older mtime: caught against the streamed baseline.
+        changed = os.urandom(len(payload))
+        self.rewrite_member("s.bin", changed, mtime=1_600_000_000)
+        self.age_checks()
+        self.assertEqual(changed, self.read_through("/s.bin"))
