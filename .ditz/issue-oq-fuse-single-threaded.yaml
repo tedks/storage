@@ -1,0 +1,47 @@
+id: oq-fuse-single-threaded
+title: Should the mount stay single-threaded (FUSE nothreads), given that any slow
+  request stalls every other process on the mount?
+desc: 'Context: fs.py mounts with nothreads=True, so the FUSE loop handles one request
+  at a time. Any request that waits on a member blocks every other request: a 1 s
+  first-chunk fetch for one application''s sniff read stalls another application''s
+  readdir and getattr for that second (Ted''s slow listings on 2026-10-29 while Nautilus
+  sniffed files one by one). Several filed stalls are symptoms of the same choice:
+  streaming-error-release-join (fixed), revalidate-stat-timeout, gh-28-hedge.
+
+  Options:
+
+  A. Stay single-threaded and keep shrinking each request''s worst case: streaming-sniff-read-cost
+  (in a lane), a bounded stat timeout for revalidation, hedged chunk fetches. Simple,
+  no locking audit; a slow member still stalls the mount for one request''s worst
+  case.
+
+  B. Run the FUSE loop multithreaded. Many paths already take leaf locks (dir_cache_lock,
+  listing_lock, session.lock, checksum_lock), but the open and refetch paths assume
+  serialization (PR #127 and the streaming lanes note nothreads-only invariants, e.g.
+  streaming-destroy-concurrent-open). Needs a locking audit of fs.py, cache.py, state.py
+  and streaming.py, a concurrency test suite, and the remote gate under load. A Lead
+  mission of its own.
+
+  C. B for read-only requests only (getattr, readdir, read) while writes stay serialized.
+  Smaller audit, most of the benefit for browsing.
+
+  Recommendation: A now; decide between B and C after the streaming-sniff lane lands
+  and the sniff cost is measured again, since that removes the common case of the
+  stall.
+
+  Who decides: Ted (architecture).
+
+  Blocks: nothing merged; whether a threading mission is opened.'
+type: task
+component: open-questions
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-29T21:52:15-00:00
+references: []
+log_events:
+- time: 2026-10-29T21:52:15-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
