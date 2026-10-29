@@ -70,6 +70,14 @@ from .mount_profiles import (
     default=None,
     help="Run inotifywait on SSH backends for push-based cache invalidation.",
 )
+@click.option(
+    "--revalidate-after",
+    type=float,
+    help=(
+        "Seconds after which opening a cached, synced file stats its member and "
+        "refetches it if the member's copy changed (default 60; 0 = every open)."
+    ),
+)
 def mount(
     mount_target,
     backing_paths,
@@ -89,6 +97,7 @@ def mount(
     streaming_keep_after_close,
     readdir_ttl,
     enable_watchers,
+    revalidate_after,
 ):
     """
     Mount a Storage filesystem
@@ -136,6 +145,7 @@ def mount(
         readdir_ttl,
         enable_watchers,
         streaming_keep_after_close=streaming_keep_after_close,
+        revalidate_after=revalidate_after,
     )
 
     try:
@@ -197,6 +207,7 @@ def mount(
             click.echo("  Invalidation: push (inotifywait)")
     else:
         click.echo(f"  Invalidation: pull (TTL={resolved.readdir_ttl}s)")
+    click.echo(f"  Revalidate cached files after: {resolved.revalidate_after}s")
     click.echo("\nPress Ctrl+C to unmount\n")
 
     logging.getLogger("paramiko").setLevel(logging.DEBUG if resolved.debug else logging.WARNING)
@@ -218,6 +229,7 @@ def mount(
             streaming_keep_after_close=keep_after_close,
             readdir_ttl=resolved.readdir_ttl,
             enable_watchers=resolved.enable_watchers,
+            revalidate_after=resolved.revalidate_after,
         )
     except PermissionError as exc:
         click.echo(f"Permission error: {exc}", err=True)

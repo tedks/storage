@@ -20,7 +20,7 @@ import yaml
 import json
 import concurrent.futures
 import contextlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from fuse import FUSE, FuseOSError, Operations
 from pathlib import Path
 from typing import Dict, Optional, Set, List, Tuple
@@ -54,6 +54,23 @@ class FDEntry:
     prefetch_session: Optional[PrefetchSession] = None
 
 
+@dataclass(frozen=True)
+class MemberCheck:
+    """What is known about a cached file's members, and since when.
+
+    cache_identity is the cache file's (st_ino, st_size, st_mtime_ns) when the
+    check was recorded; a check whose identity no longer matches the file
+    describes some earlier copy. members maps a member name to its
+    (st_size, st_mtime) when the cache file was known to match it: the
+    baseline a later check compares against. verified_at is time.monotonic()
+    of the last check (or fetch).
+    """
+
+    cache_identity: Tuple[int, int, int]
+    verified_at: float
+    members: Dict[str, Tuple[int, float]] = field(default_factory=dict)
+
+
 class StorageFS(Operations):
     """
     Storage FUSE filesystem
@@ -70,6 +87,8 @@ class StorageFS(Operations):
     _STUB_XATTR = "user.storage.stub"
     _PARTIAL_SUFFIX = ".storage.partial"
     _STREAM_STATE_XATTR = "user.storage.stream"
+    # Member baselines for revalidation on open (see _store_member_check).
+    MEMBER_STAT_XATTR = "user.storage.member_stat"
     # Internal artifacts that should be hidden from readdir listings.
     # Entries matching these exactly are filtered, plus anything ending
     # with _PARTIAL_SUFFIX.
@@ -99,7 +118,8 @@ class StorageFS(Operations):
                  max_streaming_sessions: int = 8,
                  readdir_ttl: float = 1.0,
                  enable_watchers: bool = False,
-                 streaming_keep_after_close: Optional[StreamingKeepAfterClose] = None):
+                 streaming_keep_after_close: Optional[StreamingKeepAfterClose] = None,
+                 revalidate_after: float = 60.0):
         """
         Initialize Storage filesystem
 
@@ -123,6 +143,9 @@ class StorageFS(Operations):
                              readdir_ttl is ignored and directory listings are
                              only invalidated by remote change events. Requires
                              inotify-tools on the remote host.
+            revalidate_after: Seconds after which opening a CLEAN cached
+                file stats the member holding it, and refetches it if the
+                member's copy changed (0: every open)
         """
         self.state_manager = StateManager(str(state_db))
         self.cache_manager = CacheManager(cache_root, self.state_manager, cache_size)
@@ -137,6 +160,27 @@ class StorageFS(Operations):
         self._fd_map: Dict[int, FDEntry] = {}
         self._fd_lock = threading.Lock()
 
+        # Revalidation on open, keyed by canonical path (see
+        # _revalidate_cached_file). Check times are in memory only: after a
+        # restart every cached file is checked at its first open; baselines
+        # also live in a cache-file xattr. _member_checks_lock is a leaf:
+        # nothing is taken under it, though it is held across local
+        # getxattr/setxattr calls, and eviction takes it while holding the
+        # cache, index and descriptor locks.
+        self._revalidate_after = max(0.0, float(revalidate_after))
+        self._member_checks: Dict[str, MemberCheck] = {}
+        self._member_checks_lock = threading.Lock()
+        # Members whose failed revalidation has been logged; cleared by the
+        # member's next successful stat, so an outage is logged once.
+        self._revalidate_outages: Set[str] = set()
+        # A check that found a change pins the refetch to the member it
+        # checked (consumed by _select_backend_for_read). If that member is
+        # gone by then and another supplies the bytes, its name is kept in
+        # _recheck so its next check refetches again instead of adopting the
+        # change as a baseline. Both under _member_checks_lock.
+        self._refetch_pins: Dict[str, Backend] = {}
+        self._recheck: Dict[str, Set[str]] = {}
+
         # Background sync manager
         self.sync_manager = SyncManager(
             self.state_manager,
@@ -144,6 +188,7 @@ class StorageFS(Operations):
             self.replication_manager,
             num_workers=num_sync_workers,
             should_sync_path_cb=self._should_sync_path,
+            member_written_cb=self._record_member_written,
         )
         self._sync_started = False
         if start_sync:
@@ -208,7 +253,7 @@ class StorageFS(Operations):
             checksum_records=self._checksum_records,
             checksum_lock=self._checksum_lock,
         )
-        self.cache_manager.forget_listed_attrs = self.namespace.forget_listed_attrs
+        self.cache_manager.forget_listed_attrs = self._forget_cached_copy_attrs
 
         self._streaming_manager = StreamingReadManager(
             cache_manager=self.cache_manager,
@@ -220,6 +265,10 @@ class StorageFS(Operations):
             streaming_chunk_size=streaming_chunk_size,
             max_streaming_sessions=max_streaming_sessions,
             keep_after_close=streaming_keep_after_close,
+            on_finalized=lambda session: self._record_fetched(
+                session.canonical_path, session.final_cache_path,
+                session.backend, session.member_stat,
+            ),
             partial_suffix=self._PARTIAL_SUFFIX,
             stream_state_xattr=self._STREAM_STATE_XATTR,
         )
@@ -379,7 +428,7 @@ class StorageFS(Operations):
                     if not stale:
                         # Before the unlink: no getattr may find the copy
                         # gone and its name still in the parent's listing.
-                        self.namespace.forget_listed_attrs(virtual_path)
+                        self._forget_cached_copy_attrs(virtual_path)
                         cache_path.unlink()
                 except OSError:
                     return
@@ -609,7 +658,34 @@ class StorageFS(Operations):
         return self._streaming_manager._partial_cache_path(cache_path)
 
     def _select_backend_for_read(self, canonical_path: str) -> Optional[Backend]:
-        """Pick a readable backend, preferring existing replication metadata."""
+        """Pick a readable backend, preferring existing replication metadata.
+
+        A refetch after revalidation reads from the member that was checked
+        (see _revalidate_cached_file) while it is available.
+        """
+        with self._member_checks_lock:
+            pinned = self._refetch_pins.pop(canonical_path, None)
+        if pinned is not None and pinned.is_available():
+            # The recheck mark stays until the bytes arrive (_record_fetched,
+            # for a full fetch or a finished stream); a transfer that fails
+            # after this leaves it owed.
+            return pinned
+        backend = self._select_unpinned_backend_for_read(canonical_path)
+        if pinned is not None and backend is not pinned:
+            with self._member_checks_lock:
+                self._recheck.setdefault(canonical_path, set()).add(pinned.name)
+        return backend
+
+    def _clear_recheck(self, canonical_path: str, backend_name: str):
+        """backend_name is supplying the file's bytes now: no forced refetch is owed to it."""
+        with self._member_checks_lock:
+            marks = self._recheck.get(canonical_path)
+            if marks is not None:
+                marks.discard(backend_name)
+                if not marks:
+                    del self._recheck[canonical_path]
+
+    def _select_unpinned_backend_for_read(self, canonical_path: str) -> Optional[Backend]:
         backend = self.replication_manager.get_backend_for_read(canonical_path)
         if backend:
             return backend
@@ -630,6 +706,323 @@ class StorageFS(Operations):
             except Exception:
                 continue
         return None
+
+    # ------------------------------------------------------------------ #
+    # Revalidation of cached files on open
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _cache_identity(st: os.stat_result) -> Tuple[int, int, int]:
+        return (st.st_ino, st.st_size, st.st_mtime_ns)
+
+    def _forget_member_check(self, virtual_path: str, subtree: bool = False,
+                             path_gone: bool = False):
+        """Drop the in-memory check (a persisted baseline dies with its file,
+        or is ignored once the file's identity no longer matches).
+
+        With path_gone (unlink, a failed rename) the refetch pin and recheck
+        marks go too; a cached copy that is only being dropped or rewritten
+        keeps them, since they are about the members, not the copy.
+        """
+        prefix = virtual_path.rstrip("/") + "/"
+        tables = [self._member_checks]
+        if path_gone:
+            tables += [self._refetch_pins, self._recheck]
+        with self._member_checks_lock:
+            for table in tables:
+                table.pop(virtual_path, None)
+                if subtree:
+                    for key in [k for k in table if k.startswith(prefix)]:
+                        del table[key]
+
+    def _drop_persisted_baselines(self, virtual_path: str):
+        """Remove the member-baseline xattr from a cached file or every file under a directory.
+
+        For a rename that failed part way: the cache files may have moved
+        while the members did not, and a baseline matched on identity alone
+        would then describe a member file at another path.
+        """
+        root = self.cache_manager.get_cache_path(virtual_path)
+        if root.is_dir() and not root.is_symlink():
+            files = (Path(d) / name for d, _dirs, names in os.walk(root) for name in names)
+        else:
+            files = iter([root])
+        for path in files:
+            try:
+                os.removexattr(str(path), self.MEMBER_STAT_XATTR, follow_symlinks=False)
+            except OSError:
+                pass
+
+    def _move_member_checks(self, old: str, new: str):
+        """A rename succeeded: the checks (and recheck marks) follow the files.
+
+        The cache files keep their identity across a rename, and the members
+        are renamed too, so the baselines still hold. Whatever was recorded
+        under the new name (a file replaced by the rename) goes.
+        """
+        if old == new:
+            return
+        old_prefix = old.rstrip("/") + "/"
+        new_prefix = new.rstrip("/") + "/"
+        with self._member_checks_lock:
+            for table in (self._member_checks, self._refetch_pins, self._recheck):
+                for key in [k for k in table if k == new or k.startswith(new_prefix)]:
+                    del table[key]
+                moved = {}
+                for key in [k for k in table if k == old or k.startswith(old_prefix)]:
+                    target = new if key == old else new_prefix + key[len(old_prefix):]
+                    moved[target] = table.pop(key)
+                table.update(moved)
+
+    def _forget_cached_copy_attrs(self, virtual_path: str, *, removing: bool = True):
+        """Forget what was known about a cached copy that is going or changing.
+
+        Installed as CacheManager.forget_listed_attrs, which eviction calls
+        before an unlink and mark_file_dirty before recording a write: in both
+        the member check no longer describes the cache file.
+        """
+        self.namespace.forget_listed_attrs(virtual_path, removing=removing)
+        self._forget_member_check(virtual_path)
+
+    def _load_persisted_members(self, cache_path: Path,
+                                identity: Tuple[int, int, int]) -> Dict[str, Tuple[int, float]]:
+        """Member baselines from the cache file's xattr, if it still describes this file.
+
+        Matched on the cache file's (ino, size, mtime_ns) alone: a rename
+        keeps both the file and its baselines valid, and a copy of the xattr
+        onto another file (copy2 to a local member and back) has another
+        inode.
+        """
+        try:
+            payload = json.loads(os.getxattr(str(cache_path), self.MEMBER_STAT_XATTR))
+            if tuple(payload.get("cache")) != identity:
+                return {}
+            return {
+                str(name): (int(size), float(mtime))
+                for name, (size, mtime) in payload.get("members", {}).items()
+            }
+        except (OSError, ValueError, TypeError, AttributeError):
+            return {}
+
+    def _store_member_check(self, canonical_path: str, cache_path: Path,
+                            identity: Tuple[int, int, int],
+                            updates: Dict[str, Tuple[int, float]], *, replace: bool = False):
+        """Record a check now, merging member baselines, in memory and on the cache file.
+
+        The baselines already known for this cache file (in memory, else from
+        its xattr) are kept and updates applied on top; replace=True starts
+        from nothing (a fetch: the old copy's baselines describe other bytes).
+        The read, merge and both writes are one critical section under
+        _member_checks_lock (a leaf: getxattr and setxattr take no other
+        lock), so a sync worker and the FUSE thread cannot drop each other's
+        baselines. The xattr carries the cache file's identity, so a
+        rewritten or refetched file ignores it; it lets the first check after
+        a restart compare against a baseline instead of guessing.
+        """
+        with self._member_checks_lock:
+            previous = self._member_checks.get(canonical_path)
+            if replace:
+                members = {}
+            elif previous is not None and previous.cache_identity == identity:
+                members = dict(previous.members)
+            else:
+                members = self._load_persisted_members(cache_path, identity)
+            members.update(updates)
+            check = MemberCheck(cache_identity=identity, verified_at=time.monotonic(),
+                                members=members)
+            self._member_checks[canonical_path] = check
+            if members and (previous is None or previous.cache_identity != identity
+                            or previous.members != members):
+                payload = {"cache": list(identity),
+                           "members": {name: list(stat) for name, stat in members.items()}}
+                try:
+                    os.setxattr(str(cache_path), self.MEMBER_STAT_XATTR,
+                                json.dumps(payload, sort_keys=True).encode("utf-8"))
+                except OSError as exc:
+                    self.logger.debug("could not persist member baseline: %r", exc)
+
+    def _record_fetched(self, canonical_path: str, cache_path: Path, backend: Backend,
+                        member_stat: Optional[os.stat_result]):
+        """A full fetch from backend just finished; member_stat was taken before it.
+
+        Stat before copy: a change landing in between leaves a baseline older
+        than the copy, which costs one needless refetch at the next check;
+        the other order could pair a new baseline with old bytes and never
+        see the change.
+        """
+        try:
+            identity = self._cache_identity(os.lstat(str(cache_path)))
+        except OSError:
+            self._forget_member_check(canonical_path)
+            return
+        members = {}
+        if member_stat is not None:
+            members[backend.name] = (member_stat.st_size, member_stat.st_mtime)
+        self._store_member_check(canonical_path, cache_path, identity, members, replace=True)
+        self._clear_recheck(canonical_path, backend.name)
+
+    def _record_member_written(self, virtual_path: str, backend: Backend, cache_path: Path):
+        """Sync callback: backend now holds the cache file's content.
+
+        Runs in a sync worker, so the stat costs the FUSE loop nothing. The
+        member's stat after an upload is its baseline for later checks:
+        without it, an upload that does not keep the mtime (SFTP) would look
+        like a change on the member at the next stale open. Baselines for
+        the other members are kept while the cache file is the same one.
+        """
+        try:
+            member_stat = backend.stat(virtual_path)
+            identity = self._cache_identity(os.lstat(str(cache_path)))
+        except Exception as exc:
+            self.logger.debug("post-sync stat on %s failed: %r", backend.name, exc)
+            return
+        self._store_member_check(virtual_path, cache_path, identity,
+                                 {backend.name: (member_stat.st_size, member_stat.st_mtime)})
+
+    def _member_for_revalidation(self, canonical_path: str) -> Tuple[Optional[Backend], List[str]]:
+        """Pick the member to stat, from the index alone (no remote call).
+
+        The fastest available holder, the member a refetch would read from
+        (ReplicationManager.get_backend_for_read orders the same way), so a
+        change found there is what the refetch brings in. Returns it and the
+        names of the holders that are unavailable.
+        """
+        holders = []
+        for location in self.state_manager.get_file_locations(canonical_path):
+            backend = self.backends.get(location.backend_name)
+            if backend is not None and backend not in holders:
+                holders.append(backend)
+        available = sorted((b for b in holders if b.is_available()), key=lambda b: b.speed_priority)
+        unavailable = [b.name for b in holders if not b.is_available()]
+        return (available[0] if available else None), unavailable
+
+    def _note_revalidation_outage(self, backend_name: str, reason: str):
+        if backend_name in self._revalidate_outages:
+            return
+        self._revalidate_outages.add(backend_name)
+        self.logger.warning(
+            "Cannot revalidate cached files against %s (%s); serving cached copies",
+            backend_name, reason,
+        )
+
+    def _revalidate_cached_file(self, resolved: ResolvedPath):
+        """Refetch a CLEAN cached file whose member copy changed.
+
+        Called by open() for a canonical path. Within revalidate_after of the
+        last check this is a dict lookup. Past it, and only for a CLEAN row,
+        it costs one stat of one member (FUSE runs nothreads, so this blocks
+        every other operation): the fastest available holder in the index,
+        never a listing or an exists() probe. The member's copy changed when:
+
+        - with a baseline for that member (its stat when the cache file was
+          last known to match it: at a full or streamed fetch, after a sync, or at the last
+          check; kept in memory and in the cache file's xattr): size or
+          mtime differ from it;
+        - without one (a member never checked, a stat that failed before a
+          fetch, an xattr that could not be written): the size differs from the cache
+          file's, or the member's mtime is later than the cache file's. A
+          fetch keeps the member mtime (local, rsync) or stamps the fetch
+          time (SFTP), so an unchanged member is not later unless its clock
+          is ahead; the refetch then records a baseline, so that costs one
+          refetch, not one per check.
+
+        A changed copy goes through _invalidate_file_cache, which keeps a
+        file that became DIRTY or has a writer open; whatever is no longer
+        cached is then fetched by the caller as usual, pinned to the member
+        that was checked (_select_backend_for_read). If that member is gone
+        by then, another supplies the bytes and the checked member is marked
+        for a forced refetch at its next check (_recheck), so the change is
+        never adopted as a baseline unseen. An unavailable member,
+        a failed stat or a member that no longer has the file keeps the
+        cached copy and its baselines: the open never fails here. Failures
+        are logged once per member until it answers again.
+        """
+        canonical_path = resolved.canonical_path
+        cache_path = resolved.cache_path
+        with self._member_checks_lock:
+            # A pin no fetch consumed (the open attached to a running stream).
+            self._refetch_pins.pop(canonical_path, None)
+            check = self._member_checks.get(canonical_path)
+        if check is not None and time.monotonic() - check.verified_at < self._revalidate_after:
+            return
+
+        metadata = self.state_manager.get_file_metadata(canonical_path)
+        if metadata is None or metadata.sync_status != SyncStatus.CLEAN:
+            return
+        try:
+            cache_stat = os.lstat(str(cache_path))
+        except OSError:
+            return
+        identity = self._cache_identity(cache_stat)
+        if check is not None and check.cache_identity == identity:
+            members = dict(check.members)
+        else:
+            members = self._load_persisted_members(cache_path, identity)
+
+        backend, unavailable = self._member_for_revalidation(canonical_path)
+        if backend is None:
+            # Nothing is recorded as checked, so the next open looks again;
+            # with no available holder that costs no remote call.
+            for name in unavailable:
+                self._note_revalidation_outage(name, "unavailable")
+            return
+
+        try:
+            member_stat = backend.stat(canonical_path)
+        except FileNotFoundError:
+            # The member may have lost the file or its disk; the cached copy
+            # may be the only one left, so it stays.
+            self.logger.info("revalidate: %s no longer has %s; keeping the cached copy",
+                             backend.name, canonical_path)
+            self._store_member_check(canonical_path, cache_path, identity, {})
+            return
+        except Exception as exc:
+            # Counts as a check, so a member that fails without being marked
+            # unavailable is not stat'd at every open.
+            self._note_revalidation_outage(backend.name, f"stat failed: {exc!r}")
+            self._store_member_check(canonical_path, cache_path, identity, {})
+            return
+        if backend.name in self._revalidate_outages:
+            self._revalidate_outages.discard(backend.name)
+            self.logger.info("Revalidating cached files against %s again", backend.name)
+
+        observed = (member_stat.st_size, member_stat.st_mtime)
+        baseline = members.get(backend.name)
+        with self._member_checks_lock:
+            # The last refetch for a change here came from another member.
+            must_refetch = backend.name in self._recheck.get(canonical_path, ())
+        if must_refetch:
+            changed = True
+        elif baseline is not None:
+            changed = observed != baseline
+        else:
+            changed = (member_stat.st_size != cache_stat.st_size
+                       or member_stat.st_mtime > cache_stat.st_mtime)
+        if not changed:
+            self._store_member_check(canonical_path, cache_path, identity,
+                                     {backend.name: observed})
+            return
+
+        self.logger.info("revalidate: %s changed on %s; refetching", canonical_path, backend.name)
+        with self._member_checks_lock:
+            # A recheck mark stays until this member supplies the bytes
+            # (_clear_recheck): the invalidation below may be refused.
+            self._refetch_pins[canonical_path] = backend
+        self._invalidate_file_cache(resolved.requested_path)
+        if self.cache_manager.is_cached(resolved.requested_path):
+            # Kept (a writer is open, or it turned out to be a lost write):
+            # do not stat again before the age passes; the baselines stay,
+            # so the next check still sees the change.
+            try:
+                kept_identity = self._cache_identity(os.lstat(str(cache_path)))
+            except OSError:
+                return
+            with self._member_checks_lock:
+                self._refetch_pins.pop(canonical_path, None)
+            if kept_identity == identity:
+                self._store_member_check(canonical_path, cache_path, identity, {})
+        else:
+            with self._member_checks_lock:
+                self._member_checks.pop(canonical_path, None)
 
     @staticmethod
     def _is_range_available(ranges: List[Tuple[int, int]], start: int, end: int) -> bool:
@@ -763,12 +1156,22 @@ class StorageFS(Operations):
         backend = self._select_backend_for_read(canonical_path)
 
         if backend:
+            # The member's stat before the copy is the baseline for
+            # revalidation (see _record_fetched); without it the fetch
+            # still works, and the first check falls back to comparing the
+            # member against the cache file.
+            try:
+                member_stat = backend.stat(canonical_path)
+            except Exception:
+                member_stat = None
             # Download to cache
             if self.cache_manager.cache_file(
                 resolved.requested_path,
                 backend,
                 source_virtual_path=canonical_path,
             ):
+                # Fresh from the member: no check needed until revalidate_after.
+                self._record_fetched(canonical_path, cache_path, backend, member_stat)
                 # Populate state metadata and locations if missing
                 try:
                     st = os.lstat(str(cache_path))
@@ -890,20 +1293,34 @@ class StorageFS(Operations):
         try:
             self.namespace.unlink(path)
         finally:
-            self._forget_checksums({self._resolve_path(path).canonical_path})
+            canonical_path = self._resolve_path(path).canonical_path
+            self._forget_checksums({canonical_path})
+            self._forget_member_check(canonical_path, path_gone=True)
 
     def rename(self, old, new):
         """Rename a file or directory"""
+        old_canonical = self._resolve_path(old).canonical_path
+        new_canonical = self._resolve_path(new).canonical_path
         try:
             self.namespace.rename(old, new)
+        except BaseException:
+            # If the cached copy moved but the rename failed after (or
+            # before) the members', its baselines, matched on identity alone,
+            # may describe a member file at the other path: drop them. If it
+            # did not move, they still describe this path and stay.
+            old_cache = self.cache_manager.get_cache_path(old_canonical)
+            new_cache = self.cache_manager.get_cache_path(new_canonical)
+            if not os.path.lexists(old_cache) and os.path.lexists(new_cache):
+                self._forget_member_check(old_canonical, subtree=True, path_gone=True)
+                self._forget_member_check(new_canonical, subtree=True, path_gone=True)
+                self._drop_persisted_baselines(new_canonical)
+            raise
         finally:
             # Records are keyed by path, so neither name's records (nor, for a
             # directory, its children's) describe what is there now. Dropping
             # them is always safe, so a failed rename drops them too.
-            self._forget_checksums(
-                {self._resolve_path(old).canonical_path, self._resolve_path(new).canonical_path},
-                subtree=True,
-            )
+            self._forget_checksums({old_canonical, new_canonical}, subtree=True)
+        self._move_member_checks(old_canonical, new_canonical)
         # Open descriptors follow the file (or everything under a renamed
         # directory): write() records against, and eviction and sync look
         # up, the path they carry.
@@ -967,6 +1384,16 @@ class StorageFS(Operations):
         resolved = self._resolve_path(path)
         cache_path = resolved.cache_path
         prefetch_session: Optional[PrefetchSession] = None
+
+        # Before the streaming decision: a copy dropped here is refetched
+        # like any uncached file, streamed if streaming is on.
+        # An O_TRUNC open discards the bytes, so their freshness does not matter.
+        if (
+            resolved.backend_name is None
+            and not flags & os.O_TRUNC
+            and self.cache_manager.is_cached(resolved.requested_path)
+        ):
+            self._revalidate_cached_file(resolved)
 
         # Streaming mode applies only to canonical read-only opens of uncached files.
         if (
@@ -1225,7 +1652,8 @@ class StorageFS(Operations):
 
     def setxattr(self, path, name, value, options, position=0):
         """Set extended attribute"""
-        if name in {self.CHECKSUM_XATTR, self.CACHE_STATE_XATTR, self.CACHE_METADATA_XATTR}:
+        if name in {self.CHECKSUM_XATTR, self.CACHE_STATE_XATTR, self.CACHE_METADATA_XATTR,
+                    self.MEMBER_STAT_XATTR}:
             # Ignore manual writes for derived attrs.
             return
         cache_path = self.cache_manager.get_cache_path(path)
@@ -1257,7 +1685,8 @@ class StorageFS(Operations):
 
     def removexattr(self, path, name):
         """Remove extended attribute"""
-        if name in {self.CHECKSUM_XATTR, self.CACHE_STATE_XATTR, self.CACHE_METADATA_XATTR}:
+        if name in {self.CHECKSUM_XATTR, self.CACHE_STATE_XATTR, self.CACHE_METADATA_XATTR,
+                    self.MEMBER_STAT_XATTR}:
             # Derived; ignore removals.
             return
         cache_path = self.cache_manager.get_cache_path(path)
@@ -1459,7 +1888,8 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
                  max_streaming_sessions: int = 8,
                  readdir_ttl: float = 1.0,
                  enable_watchers: bool = False,
-                 streaming_keep_after_close: Optional[StreamingKeepAfterClose] = None):
+                 streaming_keep_after_close: Optional[StreamingKeepAfterClose] = None,
+                 revalidate_after: float = 60.0):
     """
     Mount a Storage filesystem
 
@@ -1479,6 +1909,8 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
         max_streaming_sessions: Maximum concurrent streaming prefetch sessions
         streaming_keep_after_close: When read-ahead outlives the last close;
             None for the default
+        revalidate_after: Seconds after which opening a CLEAN cached file
+            stats its member (see StorageFS._revalidate_cached_file)
 
     Raises:
         PermissionError: If allow_other=True but not running as root and user_allow_other not set
@@ -1537,6 +1969,7 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
         readdir_ttl=readdir_ttl,
         enable_watchers=enable_watchers,
         streaming_keep_after_close=streaming_keep_after_close,
+        revalidate_after=revalidate_after,
     )
     fs.mount_lock_file = lock_file
     if unclean_shutdown:

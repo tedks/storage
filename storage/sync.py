@@ -9,8 +9,10 @@ import time
 import threading
 import queue
 import logging
+from pathlib import Path
 from typing import Callable, Optional, Set, Union, Tuple
 
+from .backends.base import Backend
 from .cache import CacheManager
 from .models import SyncStatus
 from .replication import ReplicationManager
@@ -39,7 +41,8 @@ class SyncWorker(threading.Thread):
     def __init__(self, worker_id: int, task_queue: queue.PriorityQueue,
                  state_manager: StateManager, cache_manager: CacheManager,
                  replication_manager: ReplicationManager, config: SyncConfig,
-                 task_complete_cb=None, should_sync_path_cb: Optional[Callable[[str], bool]] = None):
+                 task_complete_cb=None, should_sync_path_cb: Optional[Callable[[str], bool]] = None,
+                 member_written_cb: Optional[Callable[[str, Backend, Path], None]] = None):
         super().__init__(daemon=True, name=f"SyncWorker-{worker_id}")
         self.worker_id = worker_id
         self.task_queue = task_queue
@@ -54,6 +57,7 @@ class SyncWorker(threading.Thread):
             replication_manager=replication_manager,
             config=config,
             should_sync_path_cb=should_sync_path_cb,
+            member_written_cb=member_written_cb,
         )
         self._stop_event = threading.Event()
         self._active_task: Optional[str] = None
@@ -125,7 +129,8 @@ class SyncManager:
     def __init__(self, state_manager: StateManager, cache_manager: CacheManager,
                  replication_manager: ReplicationManager, num_workers: int = 2,
                  config: Optional[SyncConfig] = None,
-                 should_sync_path_cb: Optional[Callable[[str], bool]] = None):
+                 should_sync_path_cb: Optional[Callable[[str], bool]] = None,
+                 member_written_cb: Optional[Callable[[str, Backend, Path], None]] = None):
         """
         Initialize sync manager
 
@@ -135,6 +140,9 @@ class SyncManager:
             replication_manager: Replication manager instance
             num_workers: Number of sync worker threads
             config: Sync configuration (uses defaults if None)
+            should_sync_path_cb: Whether a path may sync now (no open writer)
+            member_written_cb: Called (virtual_path, member, cache_path)
+                after each upload to a member
         """
         self.state_manager = state_manager
         self.cache_manager = cache_manager
@@ -142,6 +150,7 @@ class SyncManager:
         self.num_workers = num_workers
         self.config = config or SyncConfig()
         self._should_sync_path_cb = should_sync_path_cb
+        self._member_written_cb = member_written_cb
 
         # Task queue (priority queue)
         self.task_queue = queue.PriorityQueue()
@@ -168,7 +177,8 @@ class SyncManager:
                 i, self.task_queue, self.state_manager,
                 self.cache_manager, self.replication_manager,
                 self.config, self._task_complete,
-                should_sync_path_cb=self._should_sync_path_cb
+                should_sync_path_cb=self._should_sync_path_cb,
+                member_written_cb=self._member_written_cb,
             )
             worker.start()
             self.workers.append(worker)

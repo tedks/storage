@@ -26,6 +26,10 @@ max_streaming_sessions = 8
 # read-ahead while the file is open also stays within this far past what
 # they read.
 streaming_keep_after_close = "4M,50%"
+# Seconds after which opening a cached, synced file stats the member that
+# holds it and refetches the file if the member's copy changed. 0 checks at
+# every open.
+revalidate_after = 60
 backends = [
   "ssh://user@storage-host.example:/srv/raid/media/",
   "ssh://user@storage-host.example:/srv/chunk0/media/",

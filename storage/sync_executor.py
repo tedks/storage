@@ -30,6 +30,7 @@ class SyncExecutor:
         replication_manager: ReplicationManager,
         config: SyncConfig,
         should_sync_path_cb: Optional[Callable[[str], bool]] = None,
+        member_written_cb: Optional[Callable[[str, Backend, Path], None]] = None,
     ):
         self.worker_id = worker_id
         self.state_manager = state_manager
@@ -38,6 +39,9 @@ class SyncExecutor:
         self.config = config
         self.conflict_detector = ConflictDetector(state_manager)
         self.should_sync_path_cb = should_sync_path_cb
+        # Told (virtual_path, member, cache_path) after each upload, so the
+        # filesystem can record the member's new stat (StorageFS revalidation).
+        self.member_written_cb = member_written_cb
         self._stats = {
             "synced": 0,
             "failed": 0,
@@ -113,6 +117,11 @@ class SyncExecutor:
 
                 backend.copy_from_local(cache_path, task.virtual_path)
                 backend.sync()
+                if self.member_written_cb:
+                    try:
+                        self.member_written_cb(task.virtual_path, backend, cache_path)
+                    except Exception:
+                        logger.exception("member_written_cb failed for %s", task.virtual_path)
 
                 location = FileLocation(
                     virtual_path=task.virtual_path,

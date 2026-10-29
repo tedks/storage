@@ -173,6 +173,25 @@ latest read to the end of the file. Empty terms,
 negative sizes, unknown suffixes and percentages above 100 are rejected
 when the mount configuration loads.
 
+A cached file that has been synced is checked against its member when it
+is opened and was last checked more than `revalidate_after` seconds ago
+(`--revalidate-after`, default 60; `0` checks at every open). The check is
+one stat of one member that holds the file. If the member's size or mtime
+changed, the cached copy is dropped and the file is fetched again. A file
+with unsynced writes is never dropped, and a file open for writing keeps
+its copy. If the member cannot be reached, the cached copy is served and
+the outage is logged once. This applies with watchers on or off, so a file
+changed behind the mount is seen within about a minute of being opened
+again. The member's size and mtime are recorded when the file is fetched or
+synced, and each check compares against them; they are also kept in a
+read-only `user.storage.member_stat` xattr on the cached file. Check times
+are kept in memory, so after a restart each cached file is checked at its
+first open. Each check is a remote round trip on the single FUSE thread:
+the first open after a member silently drops off can wait for the SSH
+operation timeout (60 s by default) before the member is marked
+unavailable, and walking a large cached tree after the age costs one
+round trip per file.
+
 #### SSH host keys
 
 There is no host-key setting yet: host-key verification is not configurable,
@@ -352,7 +371,7 @@ has been run against a real host since the field use above.
 Implemented:
 
 - Local, SSH/SFTP and rsync storage members (SFTP for reads, rsync for writes)
-- Local cache with LRU eviction; streaming cold reads with background prefetch that stops when readers close early (`streaming_keep_after_close`)
+- Local cache with LRU eviction, revalidated against the member on open (`revalidate_after`); streaming cold reads with background prefetch that stops when readers close early (`streaming_keep_after_close`)
 - Background sync workers with retry; N-way replication configured per directory through xattrs
 - Conflict detection on sync, and `storage conflicts` to list and resolve conflicts
 - Remote inotify watchers that invalidate the cache when a member changes
