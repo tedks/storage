@@ -1,0 +1,24 @@
+id: streaming-fragment-fallback-nits
+title: 'Streaming fragment-fallback: tighten tests, share one sorted list'
+desc: 'Council round 2 nits on PR #128 (none blocking): (1) in fallback mode _ensure_streaming_range
+  sorts available+in-flight three times per read under session.lock; compute one sorted
+  covered list and pass it. (2) test_streaming_scattered_reader_falls_back_to_chunk_fetches
+  bounds ranges by limit+1+chunks (1153) while the real peak is ~1025; assert instead
+  that every fetch after the limit ends on a chunk boundary or EOF, and pin the first
+  fallback fetch [2097153, 2129920) to check the backward reach to the run start.
+  (3) test_mounted_sniff_of_uncached_file_costs_what_it_reads falls back to 128 KiB
+  when the bdi read_ahead_kb file is missing. (4) README could say that once a session
+  is fragmented even a small read costs up to one chunk.'
+type: task
+component: fs
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-29T22:30:18-00:00
+references: []
+log_events:
+- time: 2026-10-29T22:30:18-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
