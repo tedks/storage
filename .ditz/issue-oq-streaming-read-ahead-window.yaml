@@ -29,3 +29,8 @@ log_events:
   who: Ted Smith
   what: created
   comment: ""
+- time: 2026-10-29T21:43:23-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Ruling (Ted, 2026-10-29): A, keep read-ahead while open coupled to streaming_keep_after_close.
+    Superseded in practice by oq-streaming-sniff-policy if its option B lands.'
