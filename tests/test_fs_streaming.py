@@ -1345,11 +1345,47 @@ class TestFSStreamingIntegration(unittest.TestCase):
             self.assertTrue(background_read.wait(timeout=5.0))
             self.fs.release('/consume.bin', vfd)
             session.worker.join(timeout=5.0)
+            self.assertFalse(session.worker.is_alive())
         background = [(offset, size) for offset, size, is_bg in reads if is_bg]
         # Read-ahead starts past what the reader already fetched.
         self.assertGreaterEqual(background[0][0], chunk)
         foreground = [(offset, size) for offset, size, is_bg in reads if not is_bg]
         self.assertEqual(foreground, [(offset, 8 * 1024) for offset in range(0, chunk, 8 * 1024)])
+
+    def test_streaming_scattered_reader_falls_back_to_chunk_fetches(self):
+        # A reader making many tiny scattered reads would leave one range per
+        # read. Past the fragment limit its reads fetch the missing run out
+        # to the chunk boundary, so the range list stays bounded.
+        from storage.streaming import STREAMING_MAX_FOREGROUND_FRAGMENTS as limit
+
+        self.backend.range_delay = 0
+        chunk = 32 * 1024
+        stride = 2048
+        payload = os.urandom(4 * 1024 * 1024)
+        (self.backend_dir / "scatter.bin").write_bytes(payload)
+        reads, spy = self._record_member_reads()
+        with spy:
+            vfd = self.fs.open('/scatter.bin', os.O_RDONLY)
+            session = self._session_for(vfd)
+            for offset in range(0, len(payload), stride):
+                self.assertEqual(
+                    self.fs.read('/scatter.bin', 1, offset, vfd),
+                    payload[offset:offset + 1],
+                )
+                with session.lock:
+                    self.assertLessEqual(
+                        len(session.available_ranges), limit + 1 + len(payload) // chunk,
+                    )
+            self.fs.release('/scatter.bin', vfd)
+            session.worker.join(timeout=5.0)
+            self.assertFalse(session.worker.is_alive())
+        self.assertFalse(any(background for _o, _s, background in reads))
+        # The first reads cost one byte each; past the limit a read's fetch
+        # runs to the end of its chunk.
+        self.assertEqual(reads[:limit], [(offset, 1, False) for offset in range(0, limit * stride, stride)])
+        offset, size, _bg = reads[-1]
+        self.assertEqual(offset + size, len(payload))
+        self.assertGreater(size, 1)
 
 if __name__ == '__main__':
     unittest.main()

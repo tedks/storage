@@ -152,23 +152,31 @@ by range reads while a background worker prefetches the rest into the
 cache. A read fetches only the bytes it asks for (the kernel asks for at
 most its readahead, 128K by default), and the worker starts only once the
 readers have read a contiguous span of one `streaming_chunk_size` (1M by
-default; the keep-after-close threshold below if that is smaller), in
-chunks of that size. So a file manager sniffing a content type costs what
-it reads, as on a plain sftp mount. Measured in the remote gate (SSH
-members in local containers, one run each), open, read 4 KiB, close of an
-uncached file moved 16 KiB (the kernel's first readahead) where it moved
-2 MiB of a 6 MiB file before, and a 700 KiB file was no longer fetched
-whole and kept; a 64 MiB sequential read ran at the same speed (5.3 MiB/s
-at the default 1M chunk, 5.0 before; paramiko's SFTP, not the chunk size,
-is the limit there), and 1M needs 71 member requests for it where 128K
-needs 512, which matters on a link with real latency. When the last reader closes before the file is complete, the
+default; the keep-after-close threshold below if that is smaller), then
+prefetches in chunks of that size. So a file manager sniffing a content
+type costs about what it reads, as on a plain sftp mount. A reader making
+more than 1024 scattered reads of one file (a database, an archive index)
+gets whole-chunk fetches again.
+
+Measured in the remote gate (SSH members in local containers, one run
+each), before and after this behaviour, at the default 1M chunk:
+
+- open, read 4 KiB, close of an uncached 6 MiB file: 2 MiB from the
+  member before, 16 KiB (the kernel's first readahead) now;
+- the same for a 700 KiB file: fetched whole and kept before, 16 KiB and
+  not kept now;
+- a 64 MiB sequential read: 5.0 MiB/s before, 5.3 MiB/s now, in 71 member
+  requests (512 at a 128K chunk, which matters on a link with real
+  latency; paramiko's SFTP, not the chunk size, limits the speed here).
+
+When the last reader closes before the file is complete, the
 prefetch continues only if the readers consumed the file: the longest
 contiguous span they read reached `streaming_keep_after_close`
 (`--streaming-keep-after-close`). Otherwise the partial download is
 discarded, so a file manager sniffing content types or making thumbnails
 does not pull whole files. The same threshold bounds read-ahead while the
-file is open: once it has started and until the readers have consumed it, the worker fetches
-forward from the latest read to at most that far past the span it belongs
+file is open: once it has started and until the readers have consumed it,
+the worker fetches forward from the latest read to at most that far past the span it belongs
 to (rounded up to a whole chunk), so a reader that reads the head and
 holds the file open does not pull the whole file either. A percentage
 threshold therefore also widens that window: `50%` lets a reader that

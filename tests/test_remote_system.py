@@ -836,7 +836,7 @@ def test_mounted_sniff_of_uncached_file_costs_what_it_reads(remote, mounted_fact
     """A content-type sniff through the kernel, at the mount's default chunk.
 
     Open, read 4 KiB, close an uncached multi-MiB file: the member is asked
-    for no more than the kernel requested (its readahead, at most 128 KiB),
+    for no more than the kernel requested (at most its readahead),
     nothing is prefetched, and nothing is kept.
     """
     from storage.mount_profiles import DEFAULT_STREAMING_CHUNK_SIZE, parse_size
@@ -858,9 +858,15 @@ def test_mounted_sniff_of_uncached_file_costs_what_it_reads(remote, mounted_fact
     session.worker.join(timeout=10.0)
     assert not session.worker.is_alive()
 
+    # The kernel's readahead for this mount (128 KiB unless the host raised
+    # it), read from its backing device info.
+    st_dev = os.stat(mnt.mount).st_dev
+    bdi = Path(f"/sys/class/bdi/{os.major(st_dev)}:{os.minor(st_dev)}/read_ahead_kb")
+    readahead = int(bdi.read_text()) * 1024 if bdi.exists() else 128 * 1024
+
     assert reads, "the read never reached the member"
     assert not any(background for _o, _s, background in reads), reads
-    assert sum(size for _o, size, _b in reads) <= 128 * 1024, reads
+    assert sum(size for _o, size, _b in reads) <= max(readahead, 4096), reads
     assert not (mnt.cache / "sniff.bin").exists()
 
 

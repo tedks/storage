@@ -27,6 +27,13 @@ from .models import FileLocation, FileMetadata, StreamingKeepAfterClose, SyncSta
 # second. Read-ahead, once started, follows the readers for the rest of the
 # session.
 STREAMING_READ_AHEAD_START_CHUNKS = 1
+# Past this many disjoint ranges in a session, foreground reads go back to
+# fetching the whole chunk around them. A sniff or a thumbnailer makes a
+# handful of reads; a reader making this many scattered ones (a database, an
+# archive index) gets chunk locality again, and the range list, which every
+# read walks under the session lock, stays near this plus one per chunk
+# instead of growing with every read.
+STREAMING_MAX_FOREGROUND_FRAGMENTS = 1024
 
 # Read-ahead outlives the last close only for readers that consumed the file.
 # The evidence is the longest contiguous span the readers asked for (not what
@@ -601,7 +608,7 @@ class StreamingReadManager:
             return
         spans = session.foreground_read_spans
         self._add_available_range(spans, start, end)
-        longest = max(span_end - span_start for span_start, span_end in spans)
+        longest = max((span_end - span_start for span_start, span_end in spans), default=0)
         if longest >= self._read_ahead_start_threshold(session):
             session.read_ahead_started = True
         if longest >= self._keep_after_close_threshold(session):
@@ -671,6 +678,19 @@ class StreamingReadManager:
         return (missing[0] // session.chunk_size) * session.chunk_size
 
     @staticmethod
+    def _missing_run_start(session: PrefetchSession, offset: int) -> int:
+        """Where the run of unfetched, unclaimed bytes holding offset begins.
+
+        Caller holds session.lock.
+        """
+        run_start = 0
+        for range_start, range_end in sorted(session.available_ranges + session.in_flight_ranges):
+            if range_start > offset:
+                break
+            run_start = max(run_start, range_end)
+        return run_start
+
+    @staticmethod
     def _first_unclaimed_missing_range(
         session: PrefetchSession,
         start: int,
@@ -691,7 +711,7 @@ class StreamingReadManager:
         while True:
             with session.lock:
                 if not recorded:
-                    # In the section that claims the reader's chunk below,
+                    # In the section that claims the reader's range below,
                     # so a worker woken here cannot claim it first.
                     self._record_foreground_read(session, start, end)
                     # Wakes a worker held at its read-ahead bound (see
@@ -700,9 +720,9 @@ class StreamingReadManager:
                     session.last_foreground_offset = start
                     session.condition.notify_all()
                     recorded = True
-                if not session.has_foreground_read:
-                    session.has_foreground_read = True
-                    session.condition.notify_all()
+                # Reported in the state xattr only; the worker waits on
+                # read_ahead_started.
+                session.has_foreground_read = True
 
                 if self._is_range_available(session.available_ranges, start, end):
                     return
@@ -717,6 +737,13 @@ class StreamingReadManager:
                     # The rest is in flight; its fetch notifies when done.
                     session.condition.wait(timeout=0.05)
                     continue
+                if len(session.available_ranges) > STREAMING_MAX_FOREGROUND_FRAGMENTS:
+                    # The missing run around the read, out to its chunk.
+                    chunk_start = (fetch[0] // session.chunk_size) * session.chunk_size
+                    chunk_end = min(chunk_start + session.chunk_size, session.file_size)
+                    fetch = self._first_unclaimed_missing_range(
+                        session, max(chunk_start, self._missing_run_start(session, fetch[0])), chunk_end,
+                    )
 
                 session.in_flight_ranges.append(fetch)
 
