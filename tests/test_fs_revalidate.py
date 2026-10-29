@@ -487,9 +487,6 @@ class TestRevalidateTwoMembers(RevalidateTestBase):
         self.assertNotIn("/f.txt", self.fs._recheck)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class TestRevalidateStreamedFetch(RevalidateTestBase):
     def _make_fs(self, start_sync=False):
@@ -526,3 +523,42 @@ class TestRevalidateStreamedFetch(RevalidateTestBase):
         self.rewrite_member("s.bin", changed, mtime=1_600_000_000)
         self.age_checks()
         self.assertEqual(changed, self.read_through("/s.bin"))
+
+    def _wait_for_baseline(self, path):
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            check = self.fs._member_checks.get(path)
+            if check is not None and check.members:
+                return check
+            time.sleep(0.05)
+        self.fail(f"no baseline recorded for {path}")
+
+    def test_member_change_mid_stream_is_refetched(self):
+        # The baseline is the stat taken when the stream started, so bytes
+        # that mix the old and new versions never match it.
+        old = os.urandom(3 * 4096 + 17)
+        new = os.urandom(len(old))
+        self.rewrite_member("m.bin", old, mtime=1_700_000_000)
+        real_read = self.member.read_file
+        state = {"changed": False}
+
+        def read_then_change(path, offset, size):
+            data = real_read(path, offset, size)
+            if not state["changed"]:
+                state["changed"] = True
+                self.rewrite_member("m.bin", new, mtime=1_600_000_000)
+            return data
+
+        with patch.object(self.member, "read_file", side_effect=read_then_change):
+            # Read it all, so the stream finishes (keep-after-close).
+            mixed = self.read_through("/m.bin")
+            check = self._wait_for_baseline("/m.bin")
+        # The first range came from the old version, the rest from the new.
+        self.assertNotEqual(new, mixed)
+        self.assertEqual({"member": (len(old), 1_700_000_000.0)}, check.members)
+        self.age_checks()
+        self.assertEqual(new, self.read_through("/m.bin"))
+
+
+if __name__ == "__main__":
+    unittest.main()
