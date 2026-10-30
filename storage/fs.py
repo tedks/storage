@@ -2137,8 +2137,8 @@ def fuse_mount_options(backends: Dict[str, Backend], *, enable_watchers: bool,
     follows every open rather than leaving it implied.
 
     Writes through the mount stay visible at once: create, mkdir, unlink,
-    rmdir and rename (and symlink, refused for now) update the kernel's
-    entries themselves.
+    rmdir and rename update the kernel's entries themselves. (symlink is
+    refused for now and creates nothing.)
 
     The override arguments replace the defaults (per profile); each, and
     fresh_window, must be finite and 0 or more.
