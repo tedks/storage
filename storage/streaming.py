@@ -1551,9 +1551,9 @@ class StreamingReadManager:
         worker = session.worker
 
         if action == "stopped":
-            # No join: the mount runs FUSE single-threaded (nothreads=True),
-            # so waiting here on a worker mid-chunk would stall every other
-            # operation on the mount for the length of a remote fetch. The
+            # No join: waiting here on a worker mid-chunk would hold this
+            # release (and, with the FUSE loop single-threaded, every other
+            # operation on the mount) for the length of a remote fetch. The
             # worker writes only to its own descriptor, now on an unlinked
             # inode, and closes it on exit (its cancelled cleanup).
             if worker is None or not worker.is_alive():

@@ -292,3 +292,47 @@ backends = [
         self.assertNotEqual(result.exit_code, 0)
         self.assertIn("negative_timeout", result.output)
         mock_mount.assert_not_called()
+
+
+class TestMountFuseThreads(unittest.TestCase):
+    """fuse_threads: profile key and --fuse-threads/--no-fuse-threads, default off."""
+
+    def setUp(self):
+        self.temp_dir = Path(tempfile.mkdtemp())
+        self.runner = CliRunner()
+        self.config_path = self.temp_dir / "storage.toml"
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _mount(self, profile_line="", extra_args=()):
+        self.config_path.write_text(
+            f"""
+[mounts.threads]
+mountpoint = "{self.temp_dir / 'mnt'}"
+cache = "{self.temp_dir / 'cache'}"
+{profile_line}
+backends = ["{self.temp_dir}"]
+""".strip()
+        )
+        with patch("storage.cli_mount.mount_storage") as mock_mount:
+            result = self.runner.invoke(
+                main,
+                ["mount", "--config", str(self.config_path), *extra_args, "threads"],
+            )
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        return result, mock_mount.call_args.kwargs["fuse_threads"]
+
+    def test_off_by_default(self):
+        result, fuse_threads = self._mount()
+        self.assertIs(False, fuse_threads)
+        self.assertIn("FUSE loop: single-threaded", result.output)
+
+    def test_profile_turns_it_on(self):
+        result, fuse_threads = self._mount("fuse_threads = true")
+        self.assertIs(True, fuse_threads)
+        self.assertIn("FUSE loop: multithreaded", result.output)
+
+    def test_flags_override_the_profile(self):
+        self.assertIs(False, self._mount("fuse_threads = true", ["--no-fuse-threads"])[1])
+        self.assertIs(True, self._mount("", ["--fuse-threads"])[1])

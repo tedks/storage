@@ -50,6 +50,9 @@ class ResolvedMountConfig:
     # revalidate_after and enable_watchers (see storage.fs.fuse_mount_options).
     entry_timeout: Optional[float] = None
     negative_timeout: Optional[float] = None
+    # Run the FUSE loop multithreaded (storage.fs.mount_storage). Off by
+    # default until the field test (docs/browsing_latency_plan.md D6).
+    fuse_threads: bool = False
 
     @property
     def member_specs(self) -> Tuple[str, ...]:
@@ -519,6 +522,7 @@ def _load_mount_profile_settings(config_path: Path, profile_name: str) -> Dict[s
             key: _validated_kernel_timeout(key, _optional_profile_float(config_profile, key, profile_name))
             for key in KERNEL_TIMEOUT_KEYS
         },
+        "fuse_threads": _optional_profile_bool(config_profile, "fuse_threads", profile_name),
         "backing_paths": config_backing_paths,
         "remote": config_remote,
     }
@@ -551,6 +555,7 @@ def _can_auto_load_mount_profile(
     enable_watchers: Optional[bool],
     streaming_keep_after_close: Optional[str] = None,
     revalidate_after: Optional[float] = None,
+    fuse_threads: Optional[bool] = None,
 ) -> bool:
     if not _target_looks_like_profile_name(mount_target):
         return False
@@ -572,6 +577,7 @@ def _can_auto_load_mount_profile(
         enable_watchers is not None,
         streaming_keep_after_close is not None,
         revalidate_after is not None,
+        fuse_threads is not None,
     ))
 
 
@@ -595,6 +601,7 @@ def resolve_mount_configuration(
     enable_watchers: Optional[bool],
     streaming_keep_after_close: Optional[str] = None,
     revalidate_after: Optional[float] = None,
+    fuse_threads: Optional[bool] = None,
 ) -> ResolvedMountConfig:
     config_values = {
         "mountpoint": None,
@@ -614,6 +621,7 @@ def resolve_mount_configuration(
         "enable_watchers": None,
         "revalidate_after": None,
         **{key: None for key in KERNEL_TIMEOUT_KEYS},
+        "fuse_threads": None,
         "backing_paths": (),
         "remote": (),
     }
@@ -643,6 +651,7 @@ def resolve_mount_configuration(
         enable_watchers,
         streaming_keep_after_close,
         revalidate_after,
+        fuse_threads,
     ):
         available_configs = [candidate for candidate in default_mount_config_paths() if candidate.exists()]
         if available_configs:
@@ -725,4 +734,9 @@ def resolve_mount_configuration(
         ),
         entry_timeout=config_values["entry_timeout"],
         negative_timeout=config_values["negative_timeout"],
+        fuse_threads=fuse_threads if fuse_threads is not None else (
+            config_values["fuse_threads"]
+            if config_values["fuse_threads"] is not None
+            else False
+        ),
     )

@@ -81,6 +81,14 @@ from .mount_profiles import (
         "refetches it if the member's copy changed (default 60; 0 = every open)."
     ),
 )
+@click.option(
+    "--fuse-threads/--no-fuse-threads",
+    default=None,
+    help=(
+        "Serve FUSE requests on several threads, so one slow member call does not "
+        "hold up requests for other files (default off)."
+    ),
+)
 def mount(
     mount_target,
     backing_paths,
@@ -101,6 +109,7 @@ def mount(
     readdir_ttl,
     enable_watchers,
     revalidate_after,
+    fuse_threads,
 ):
     """
     Mount a Storage filesystem
@@ -149,6 +158,7 @@ def mount(
         enable_watchers,
         streaming_keep_after_close=streaming_keep_after_close,
         revalidate_after=revalidate_after,
+        fuse_threads=fuse_threads,
     )
 
     try:
@@ -222,6 +232,7 @@ def mount(
         f"  Kernel cache: names {kernel['entry_timeout']}s, missing names {kernel['negative_timeout']}s, "
         f"attributes {kernel['attr_timeout']}s, pages kept while unchanged"
     )
+    click.echo(f"  FUSE loop: {'multithreaded' if resolved.fuse_threads else 'single-threaded'}")
     click.echo("\nPress Ctrl+C to unmount\n")
 
     logging.getLogger("paramiko").setLevel(logging.DEBUG if resolved.debug else logging.WARNING)
@@ -246,6 +257,7 @@ def mount(
             revalidate_after=resolved.revalidate_after,
             entry_timeout=resolved.entry_timeout,
             negative_timeout=resolved.negative_timeout,
+            fuse_threads=resolved.fuse_threads,
         )
     except PermissionError as exc:
         click.echo(f"Permission error: {exc}", err=True)

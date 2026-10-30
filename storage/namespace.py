@@ -517,8 +517,9 @@ class NamespaceService:
     def shutdown(self):
         """Stop the member listing threads; later listings run inline.
 
-        Called from StorageFS.destroy. With nothreads FUSE, destroy runs on
-        the thread that calls readdir, so no listing is in flight then; a
+        Called from StorageFS.destroy. libfuse runs destroy only after its
+        loop has returned (the multithreaded loop joins every worker first),
+        so no listing started by a FUSE request is in flight then; a
         worker still blocked in member I/O (a hung member) is not
         interrupted and ends at its SFTP timeout, as the checksum
         executor's workers do.
