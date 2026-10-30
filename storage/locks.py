@@ -19,7 +19,8 @@ Two outer locks order the handlers that change what a path names
    persisted member hashes have their own connection, so _checksum_lock,
    which readdir takes, never waits on the index lock; besides it, only
    MemberHashQueues' condition is taken under _checksum_lock), prefetch_sessions_lock then session.lock,
-   _access_lock then _db_lock.
+   _access_lock then _db_lock. (An index on ":memory:" shares one
+   connection, so there _checksum_db_lock is the index lock; tests only.)
 
 Eviction runs under the cache lock, against the order, so it only
 try-acquires (NamespaceLock.try_shared, PathLocks.try_hold) and skips a

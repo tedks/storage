@@ -1810,6 +1810,33 @@ class TestFSNamespaceIntegration(unittest.TestCase):
         self.assertEqual(json.loads(self.fs.getxattr('/a', StorageFS.VERIFY_XATTR)),
                          {"known": 1, "pending": 0, "verified": 1, "unverified": 0})
 
+    def test_refused_retry_runs_before_a_write_under_it(self):
+        (self.backend1_dir / "d").mkdir()
+        (self.backend2_dir / "d").mkdir()
+        (self.backend1_dir / "d" / "dup.txt").write_text("same")
+        (self.backend2_dir / "d" / "dup.txt").write_text("same")
+        self._list_and_settle('/d')
+        state = self.fs.state_manager
+        with patch.object(state, "delete_member_checksums", side_effect=sqlite3.OperationalError("locked")):
+            self.fs._forget_checksums({"/d"}, subtree=True)
+        self._upload("/d/dup.txt", b"same")
+        self.assertIsNotNone(state.get_member_checksum("/d/dup.txt", "backend2"))
+        self.assertEqual(self.fs._persisted_refused, set())
+
+    def test_settled_verify_results_are_dropped_first(self):
+        self.fs.VERIFY_RESULTS_KEPT = 2
+        for d in ("a", "b", "c"):
+            (self.backend1_dir / d).mkdir()
+            (self.backend2_dir / d).mkdir()
+            (self.backend1_dir / d / "dup.txt").write_text("same")
+            (self.backend2_dir / d / "dup.txt").write_text("same")
+        for d in ("/a", "/b", "/c"):
+            self.fs.setxattr(d, StorageFS.VERIFY_XATTR, b"1", 0)
+            self.assertTrue(self._wait_for(lambda: not self.fs._checksum_tasks))
+        known = {d: json.loads(self.fs.getxattr(d, StorageFS.VERIFY_XATTR))["known"]
+                 for d in ("/a", "/b", "/c")}
+        self.assertEqual(known, {"/a": 0, "/b": 1, "/c": 1})
+
     def test_reverify_thread_runs_from_init_and_stops_at_destroy(self):
         self.fs._checksum_reverify_interval = 0.05
         ticks = threading.Event()

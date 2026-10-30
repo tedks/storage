@@ -103,7 +103,8 @@ def _verify_directory(directory: Path, poll_interval: float = 0.5) -> dict:
             raise click.ClickException(f"Lost track of the verification of {directory}: {exc}") from exc
         if not status.get("known"):
             raise click.ClickException(
-                f"The mount no longer holds the verification of {directory}; run it again")
+                f"The mount no longer holds the verification of {directory} (many other "
+                "directories were verified since); run it again")
         if not status.get("pending"):
             return status
         time.sleep(poll_interval)

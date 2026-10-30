@@ -576,19 +576,28 @@ class StorageFS(Operations):
             self.logger.warning("could not drop persisted checksums: %r", exc)
             for path in paths:
                 self._persisted_refused.add((path, backend_name, subtree))
+            return
+        if self._persisted_refused:
+            self._retry_refused_deletes()
 
     def _retry_refused_deletes(self):
         """Delete the rows failed writes left, so a refusal outlives the
-        mount; the caller holds _checksum_lock. Called after a write
-        succeeds (the index is back) and at destroy."""
-        for entry in list(self._persisted_refused):
-            path, backend_name, subtree = entry
+        mount; the caller holds _checksum_lock. Called once the index
+        answers again (a delete succeeded, or before a write) and at
+        destroy. One statement batch per (member, subtree) group. A row
+        written under a refused path since the failure goes too: that
+        costs a hash after a remount, never trusts a stale row."""
+        groups: Dict[Tuple[Optional[str], bool], List[str]] = {}
+        for path, backend_name, subtree in self._persisted_refused:
+            groups.setdefault((backend_name, subtree), []).append(path)
+        for (backend_name, subtree), paths in groups.items():
             try:
-                self.state_manager.delete_member_checksums([path], subtree=subtree,
+                self.state_manager.delete_member_checksums(paths, subtree=subtree,
                                                            backend_name=backend_name)
             except Exception:
                 return
-            self._persisted_refused.discard(entry)
+            for path in paths:
+                self._persisted_refused.discard((path, backend_name, subtree))
 
     def _persisted_row_refused(self, key: tuple) -> bool:
         """Whether a failed write covered key; the caller holds _checksum_lock."""
@@ -722,6 +731,10 @@ class StorageFS(Operations):
         if record is None or record.checksum is None or record.basis is None:
             self._drop_persisted_checksums({canonical_path}, backend_name=backend_name)
             return
+        if self._persisted_refused:
+            # Before the write, so a refused subtree or member-wide delete
+            # does not remove the row written now.
+            self._retry_refused_deletes()
         try:
             self.state_manager.put_member_checksum(canonical_path, backend_name, record)
         except Exception as exc:
@@ -729,10 +742,7 @@ class StorageFS(Operations):
             self.logger.warning("could not persist a checksum: %r", exc)
             self._persisted_refused.add((canonical_path, backend_name, False))
             return
-        if self._persisted_refused:
-            # This row is the record now; then retry the rest.
-            self._persisted_refused.discard((canonical_path, backend_name, False))
-            self._retry_refused_deletes()
+        self._persisted_refused.discard((canonical_path, backend_name, False))
 
     def _load_persisted_checksum(self, key: tuple, basis: ChecksumBasis) -> bool:
         """Install the persisted record for key if it was taken from basis;
@@ -866,6 +876,8 @@ class StorageFS(Operations):
         with self._checksum_lock:
             self._verify_results.pop(dir_path, None)
             self._verify_results[dir_path] = queued
+            # Pending directories are never dropped, so with many verified
+            # at once this holds more; each is bounded by its directory.
             for old in list(self._verify_results):
                 if len(self._verify_results) <= self.VERIFY_RESULTS_KEPT:
                     break
