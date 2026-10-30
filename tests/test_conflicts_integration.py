@@ -137,7 +137,7 @@ class TestLocalConflictMount(BaseConflictMountTest):
             # Wait until the holder has really moved into its own mount
             # namespace and sees the mount; /proc/<pid> exists from fork on.
             mine = os.readlink("/proc/self/ns/mnt")
-            needle = f" {self.mount_dir} "
+            needle = f" {os.path.realpath(self.mount_dir)} "
             deadline = time.monotonic() + 10
             while True:
                 try:

@@ -93,7 +93,6 @@ def _noop_signal(*_):
     """SIGUSR2 only has to interrupt a blocked read."""
 
 
-
 def release_orphaned_loop(fs: StorageFS, thread: threading.Thread,
                           wait: float = 10.0) -> str:
     """End a FUSE loop that outlived its unmount; "" if the thread finished,
@@ -149,13 +148,16 @@ def release_orphaned_loop(fs: StorageFS, thread: threading.Thread,
     deadline = time.monotonic() + wait
     failed = 0
     first_errno = 0
-    while thread.is_alive() and time.monotonic() < deadline:
+    while thread.is_alive() and time.monotonic() < deadline and not fs.destroy_entered.is_set():
         for tid in readers:
             if libc.syscall(ctypes.c_long(tgkill), ctypes.c_long(os.getpid()),
                             ctypes.c_long(tid), ctypes.c_long(int(signal.SIGUSR2))) != 0:
                 failed += 1
                 first_errno = first_errno or ctypes.get_errno()
         thread.join(timeout=0.2)
+    thread.join(timeout=max(0.0, deadline - time.monotonic()))  # destroy is running; let it
+    if not thread.is_alive():
+        return ""  # reader tids that exited first make later tgkills fail with ESRCH
     if failed:
         return f"{failed} tgkill calls failed (first errno {first_errno})"
     return "" if not thread.is_alive() else f"readers {readers} did not leave after fuse_exit and SIGUSR2"
@@ -247,7 +249,7 @@ def native_thread_state(thread: threading.Thread, mount: Union[str, Path]) -> st
 def _other_holders(mount: Union[str, Path]) -> str:
     """Processes whose mount namespace still lists the mount, or that hold a
     descriptor or working directory under it (command names and counts only)."""
-    needle = str(mount)
+    needle = os.path.realpath(mount)
     mine = os.readlink("/proc/self/ns/mnt")
     listing, holders = [], []
     for proc in Path("/proc").iterdir():
