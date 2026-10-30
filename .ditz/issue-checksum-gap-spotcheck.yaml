@@ -35,5 +35,12 @@ log_events:
     under that directory contain file names: report counts only. Decide oq-checksum-same-second-rewrite
     from a few weeks of gap counts, then remove: systemctl --user disable --now storage-checksum-spotcheck.timer;
     delete the two unit files and the directory.'
+- time: 2026-10-30T16:19:40-00:00
+  who: Ted Smith
+  what: commented
+  comment: '2026-10-30T1218 recheck run by hand from the desktop (Ted asked): compared=262
+    unchanged=262 changed_stat=0 gap=0 missing=0 hash_err=0 against the 2026-10-28
+    baseline. Two days of data, no same-size same-mtime hash change. The Sunday 2026-11-01
+    timer run adds a third point; the timer stays.'
 blocks:
 - oq-checksum-same-second-rewrite
