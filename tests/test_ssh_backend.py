@@ -804,6 +804,48 @@ class TestMemberConnectionPool(unittest.TestCase):
         self.assertEqual(pool.snapshot()["stalls"], 0)
         pool.close()
 
+    def test_one_channel_left_says_once_that_the_interactive_reserve_is_gone(self):
+        server = _FakeServer(max_sessions=2)
+        pool = _pool(server)
+
+        def work(_index):
+            with pool.sftp(1.0) as sftp:
+                sftp.stat("/data/x")
+                time.sleep(0.05)
+
+        with self.assertLogs(ssh_pool.__name__, level="WARNING") as logs:
+            self.assertEqual(_run_threads(4, work), [])
+            self.assertEqual(pool.snapshot()["sftp_cap"], 1)
+        lost = [r for r in logs.records if "interactive" in r.getMessage()]
+        self.assertEqual(len(lost), 1, [r.getMessage() for r in logs.records])
+        pool.close()
+
+    def test_a_pool_that_keeps_its_reserve_does_not_warn(self):
+        server = _FakeServer(max_sessions=3)
+        pool = _pool(server)
+        holders = [_Holder(pool) for _ in range(2)]
+        for holder in holders:
+            holder.release()
+        self.assertGreaterEqual(pool.snapshot()["sftp_cap"], 2)
+        pool.close()
+
+    def test_a_request_sent_after_the_last_counted_stall_counts_though_its_lease_is_older(self):
+        server = _FakeServer()
+        pool = _pool(server, stall_limit=5)
+        # A long operation takes its lease first and keeps it.
+        long_op = _Holder(pool)
+        long_op.lease.client.get_channel().settimeout(0.2)
+        # A request on another lease times out and is counted.
+        quick = _Holder(pool)
+        quick.release(socket.timeout("timed out"))
+        self.assertEqual(pool.snapshot()["stalls"], 1)
+        # Later the long operation's own request, sent after that, times out
+        # too: a second stall, not part of the first burst.
+        time.sleep(0.5)
+        long_op.release(socket.timeout("timed out"))
+        self.assertEqual(pool.snapshot()["stalls"], 2)
+        pool.close()
+
     def test_nested_call_on_a_lost_transport_fails_plainly(self):
         server = _FakeServer()
         pool = _pool(server)
@@ -1087,6 +1129,83 @@ class TestMemberConnectionPool(unittest.TestCase):
         self.assertTrue(inside)
         self.assertFalse(outside)
         self.assertFalse(is_interactive_request())
+
+
+# --------------------------------------------------------------------------- #
+# The watchdog behind run_bounded
+# --------------------------------------------------------------------------- #
+
+class TestBoundedRequestWatchdog(unittest.TestCase):
+
+    @staticmethod
+    def _watchdog_threads():
+        return [t for t in threading.enumerate() if t.name == "ssh-pool-watchdog"]
+
+    def test_a_reply_that_never_comes_closes_the_channel_and_times_out(self):
+        chan = _FakeChannel(_FakeTransport(_FakeServer()))
+        started = time.monotonic()
+
+        def wait_for_reply():
+            while not chan.closed:
+                time.sleep(0.01)
+            raise EOFError("channel closed")
+
+        with self.assertRaises(socket.timeout):
+            ssh_pool.run_bounded(chan, 0.1, wait_for_reply)
+        self.assertTrue(chan.closed)
+        self.assertLess(time.monotonic() - started, 5)
+
+    def test_a_reply_in_time_leaves_the_channel_open(self):
+        chan = _FakeChannel(_FakeTransport(_FakeServer()))
+        self.assertEqual(ssh_pool.run_bounded(chan, 5.0, lambda: "ok"), "ok")
+        time.sleep(0.05)
+        self.assertFalse(chan.closed)
+
+    def test_many_requests_share_one_thread(self):
+        chan = _FakeChannel(_FakeTransport(_FakeServer()))
+        before = len(self._watchdog_threads())
+        with patch.object(ssh_pool, "_watchdog", ssh_pool._Watchdog()):
+            for _ in range(300):
+                ssh_pool.run_bounded(chan, 5.0, lambda: None)
+            self.assertEqual(len(self._watchdog_threads()), before + 1)
+        self.assertFalse(chan.closed)
+
+    def test_cancelled_deadlines_do_not_pile_up(self):
+        watchdog = ssh_pool._Watchdog()
+        for _ in range(1000):
+            watchdog.cancel(watchdog.arm(3600.0, lambda: None))
+        self.assertLess(len(watchdog._heap), 200)
+
+    def test_a_close_that_blocks_does_not_delay_another_deadline(self):
+        stuck, released = threading.Event(), threading.Event()
+        fired_at = {}
+        started = time.monotonic()
+        watchdog = ssh_pool._Watchdog()
+
+        def blocked_close():
+            stuck.set()
+            released.wait(10)
+
+        def second():
+            fired_at["second"] = time.monotonic() - started
+
+        watchdog.arm(0.05, blocked_close)
+        watchdog.arm(0.3, second)
+        try:
+            self.assertTrue(stuck.wait(5))
+            deadline = time.monotonic() + 5
+            while "second" not in fired_at and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertIn("second", fired_at)
+            self.assertLess(fired_at["second"], 2.0)
+        finally:
+            released.set()
+
+    def test_a_cancelled_deadline_never_fires(self):
+        fired = threading.Event()
+        watchdog = ssh_pool._Watchdog()
+        watchdog.cancel(watchdog.arm(0.05, fired.set))
+        self.assertFalse(fired.wait(0.3))
 
 
 # --------------------------------------------------------------------------- #
