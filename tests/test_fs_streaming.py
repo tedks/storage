@@ -13,6 +13,7 @@ from fuse import FuseOSError
 
 from storage.backends.local import LocalBackend
 from storage.fs import StorageFS
+from storage.models import SyncStatus
 from storage.mount_profiles import parse_keep_after_close
 
 
@@ -682,7 +683,10 @@ class TestFSStreamingIntegration(unittest.TestCase):
             session_a.condition.notify_all()
         self.assertTrue(self._wait_for(lambda: not session_a.worker.is_alive(), timeout=3.0))
 
-        # First cleanup, as the worker's tail runs it once no reader is left.
+        # First cleanup, as the worker's tail runs it once no reader is left:
+        # claimed, then run.
+        with session_a.lock:
+            self.assertTrue(manager._claim_failed_cleanup(session_a))
         manager._cleanup_failed_session(session_a)
         self.assertFalse(partial_path.exists())
 
@@ -731,6 +735,7 @@ class TestFSStreamingIntegration(unittest.TestCase):
         with session_a.lock:
             session_a.error = OSError(errno.EIO, "late failure")
             session_a.available_ranges = [(0, 4096)]
+            self.assertTrue(manager._claim_failed_cleanup(session_a))
         manager._update_streaming_state_xattr(session_a, "error")
         manager._cleanup_failed_session(session_a)
         manager._cleanup_cancelled_session(session_a)
@@ -1386,6 +1391,362 @@ class TestFSStreamingIntegration(unittest.TestCase):
         offset, size, _bg = reads[-1]
         self.assertEqual(offset + size, len(payload))
         self.assertGreater(size, 1)
+
+    # Concurrent writers, destroy and failed cleanup. Each test parks one
+    # side at an Event (no sleeps) and runs the other side in between.
+
+    def _hold_finalize(self):
+        """Patch the worker's finalize to wait; returns (patcher, at_finalize, go)."""
+        manager = self.fs._streaming_manager
+        real_finalize = manager._finalize_streaming_session
+        at_finalize = threading.Event()
+        go = threading.Event()
+        self.addCleanup(go.set)
+
+        def held_finalize(session):
+            at_finalize.set()
+            go.wait(timeout=10.0)
+            real_finalize(session)
+
+        return patch.object(manager, "_finalize_streaming_session", side_effect=held_finalize), at_finalize, go
+
+    def _stream_whole_file(self, name, payload):
+        vfd = self.fs.open('/' + name, os.O_RDONLY)
+        session = self._session_for(vfd)
+        for offset in range(0, len(payload), 32 * 1024):
+            self.assertEqual(
+                self.fs.read('/' + name, 32 * 1024, offset, vfd),
+                payload[offset:offset + 32 * 1024],
+            )
+        return vfd, session
+
+    def _read_through_fs(self, name, size):
+        vfd = self.fs.open('/' + name, os.O_RDONLY)
+        try:
+            with self.fs._fd_lock:
+                self.assertIsNone(self.fs._fd_map[vfd].prefetch_session)
+            return self.fs.read('/' + name, size, 0, vfd)
+        finally:
+            self.fs.release('/' + name, vfd)
+
+    def _assert_cache_holds(self, name, expected, dirty=True):
+        cache_path = self.cache_dir / name
+        self.assertEqual(cache_path.read_bytes(), expected)
+        st = cache_path.stat()
+        meta = self.fs.state_manager.get_file_metadata('/' + name)
+        self.assertIsNotNone(meta)
+        self.assertEqual(meta.size, st.st_size)
+        self.assertEqual(meta.last_modified, st.st_mtime)
+        if dirty:
+            self.assertEqual(meta.sync_status, SyncStatus.DIRTY)
+        self.assertEqual(
+            [p.name for p in self.cache_dir.iterdir() if p.name.endswith(".storage.partial")], [],
+        )
+        with self.fs._prefetch_sessions_lock:
+            self.assertNotIn('/' + name, self.fs._prefetch_sessions)
+
+    def _write_open_and_edit(self, name, edit):
+        vfd = self.fs.open('/' + name, os.O_RDWR)
+        with self.fs._fd_lock:
+            self.assertIsNone(self.fs._fd_map[vfd].prefetch_session)
+        self.assertEqual(self.fs.write('/' + name, edit, 0, vfd), len(edit))
+        return vfd
+
+    def test_streaming_finalize_keeps_an_open_writers_file(self):
+        # A write-open during a stream fetches the whole file into the cache
+        # path and writes to it. The stream's finalize must not replace that
+        # file: the writer's bytes would be on an unlinked inode and the
+        # index row would describe bytes the cache no longer holds.
+        self.backend.copy_delay = 0
+        payload = os.urandom(64 * 1024)
+        (self.backend_dir / "writer.bin").write_bytes(payload)
+        edit = b"W" * 4096
+        expected = edit + payload[len(edit):]
+
+        hold, at_finalize, go = self._hold_finalize()
+        with hold:
+            rvfd, session = self._stream_whole_file("writer.bin", payload)
+            self.assertTrue(at_finalize.wait(timeout=3.0))
+            wvfd = self._write_open_and_edit("writer.bin", edit)
+            go.set()
+            session.worker.join(timeout=5.0)
+        self.assertFalse(session.worker.is_alive())
+
+        with self.fs._fd_lock:
+            writer_fd = self.fs._fd_map[wvfd].real_fd
+        self.assertEqual(os.fstat(writer_fd).st_ino, (self.cache_dir / "writer.bin").stat().st_ino)
+        self.assertEqual(self._read_through_fs("writer.bin", len(payload)), expected)
+        self._assert_cache_holds("writer.bin", expected)
+        self.assertTrue(session.detached)
+        # The streaming reader keeps the bytes it opened.
+        self.assertEqual(self.fs.read('/writer.bin', 4096, 0, rvfd), payload[:4096])
+        self.fs.release('/writer.bin', rvfd)
+        self.assertEqual(session.io_fd, -1)
+        self.fs.release('/writer.bin', wvfd)
+        self._assert_cache_holds("writer.bin", expected)
+
+    def test_streaming_finalize_keeps_a_closed_writers_file(self):
+        # As above, but the writer has closed before the stream finishes: no
+        # descriptor names the path any more, and its bytes still win.
+        self.backend.copy_delay = 0
+        payload = os.urandom(64 * 1024)
+        (self.backend_dir / "closed.bin").write_bytes(payload)
+        edit = b"C" * 4096
+        expected = edit + payload[len(edit):]
+
+        hold, at_finalize, go = self._hold_finalize()
+        with hold:
+            rvfd, session = self._stream_whole_file("closed.bin", payload)
+            self.assertTrue(at_finalize.wait(timeout=3.0))
+            wvfd = self._write_open_and_edit("closed.bin", edit)
+            self.fs.release('/closed.bin', wvfd)
+            go.set()
+            session.worker.join(timeout=5.0)
+        self.assertFalse(session.worker.is_alive())
+
+        self.assertEqual(self._read_through_fs("closed.bin", len(payload)), expected)
+        self._assert_cache_holds("closed.bin", expected)
+        self.fs.release('/closed.bin', rvfd)
+
+    def test_streaming_session_does_not_start_over_a_writers_file(self):
+        # The mirror case: a read-open found the file uncached, and a
+        # write-open fetched it and wrote to it before the read-open
+        # registered its session. The reader must get the writer's file, not
+        # a stream of the member's older bytes that would later replace it.
+        self.backend.copy_delay = 0
+        manager = self.fs._streaming_manager
+        real_select = manager.select_backend_for_read
+        in_setup = threading.Event()
+        go = threading.Event()
+        self.addCleanup(go.set)
+
+        def paused_select(canonical_path):
+            if threading.current_thread().name == "late-reader":
+                in_setup.set()
+                go.wait(timeout=10.0)
+            return real_select(canonical_path)
+
+        payload = os.urandom(64 * 1024)
+        (self.backend_dir / "mirror.bin").write_bytes(payload)
+        edit = b"M" * 4096
+        expected = edit + payload[len(edit):]
+        results = {}
+
+        def reader():
+            try:
+                results["reader"] = self.fs.open('/mirror.bin', os.O_RDONLY)
+            except Exception as exc:
+                results["reader"] = exc
+
+        with patch.object(manager, "select_backend_for_read", side_effect=paused_select):
+            late = threading.Thread(target=reader, name="late-reader")
+            late.start()
+            self.assertTrue(in_setup.wait(timeout=3.0))
+            wvfd = self._write_open_and_edit("mirror.bin", edit)
+            go.set()
+            late.join(timeout=5.0)
+        self.assertFalse(late.is_alive())
+
+        rvfd = results["reader"]
+        self.assertIsInstance(rvfd, int, rvfd)
+        with self.fs._fd_lock:
+            self.assertIsNone(self.fs._fd_map[rvfd].prefetch_session)
+        self.assertEqual(self.fs.read('/mirror.bin', len(payload), 0, rvfd), expected)
+        self.fs.release('/mirror.bin', rvfd)
+        self.fs.release('/mirror.bin', wvfd)
+        self._assert_cache_holds("mirror.bin", expected)
+
+    def test_streaming_open_racing_destroy_registers_no_session(self):
+        # An open misses the registry and prepares its partial; destroy runs
+        # to the end before the open registers. The open must not register
+        # a session (nothing would ever stop it): it takes the full-file path.
+        self.backend.copy_delay = 0
+        manager = self.fs._streaming_manager
+        import storage.streaming as streaming_module
+        real_session_cls = streaming_module.PrefetchSession
+        prepared = threading.Event()
+        go = threading.Event()
+        self.addCleanup(go.set)
+
+        def paused_session(**kwargs):
+            prepared.set()
+            go.wait(timeout=10.0)
+            return real_session_cls(**kwargs)
+
+        payload = os.urandom(64 * 1024)
+        (self.backend_dir / "unmount.bin").write_bytes(payload)
+        results = {}
+
+        def opener():
+            try:
+                results["open"] = self.fs.open('/unmount.bin', os.O_RDONLY)
+            except Exception as exc:
+                results["open"] = exc
+
+        with patch.object(streaming_module, "PrefetchSession", side_effect=paused_session):
+            thread = threading.Thread(target=opener, name="racing-open")
+            thread.start()
+            self.assertTrue(prepared.wait(timeout=3.0))
+            manager.destroy()
+            go.set()
+            thread.join(timeout=5.0)
+        self.assertFalse(thread.is_alive())
+
+        vfd = results["open"]
+        self.assertIsInstance(vfd, int, vfd)
+        with self.fs._fd_lock:
+            self.assertIsNone(self.fs._fd_map[vfd].prefetch_session)
+        self.assertEqual(self.fs.read('/unmount.bin', len(payload), 0, vfd), payload)
+        self.fs.release('/unmount.bin', vfd)
+        self._assert_cache_holds("unmount.bin", payload, dirty=False)
+
+    def test_streaming_destroy_leaves_an_open_during_destroy_alone(self):
+        # destroy has taken the sessions and is waiting for a worker when an
+        # open of the same file comes in. The open must not register a new
+        # session at the partial path destroy is about to unlink.
+        self.backend.copy_delay = 0
+        manager = self.fs._streaming_manager
+        payload = os.urandom(128 * 1024)
+        (self.backend_dir / "during.bin").write_bytes(payload)
+        in_join = threading.Event()
+        go = threading.Event()
+        self.addCleanup(go.set)
+
+        vfd_a = self.fs.open('/during.bin', os.O_RDONLY)
+        session_a = self._session_for(vfd_a)
+        real_worker = session_a.worker
+
+        class JoinSpy:
+            # Alive until joined, so destroy always waits here, however fast
+            # the stopped worker really exits.
+            def is_alive(self):
+                return not in_join.is_set() or real_worker.is_alive()
+
+            def join(self, timeout=None):
+                in_join.set()
+                go.wait(timeout=10.0)
+                real_worker.join(timeout)
+
+        session_a.worker = JoinSpy()
+        destroyer = threading.Thread(target=manager.destroy, name="destroyer")
+        destroyer.start()
+        self.assertTrue(in_join.wait(timeout=3.0))
+        vfd_b = self.fs.open('/during.bin', os.O_RDONLY)
+        go.set()
+        destroyer.join(timeout=5.0)
+        self.assertFalse(destroyer.is_alive())
+
+        with self.fs._fd_lock:
+            self.assertIsNone(self.fs._fd_map[vfd_b].prefetch_session)
+        self.assertTrue(session_a.detached)
+        self.assertEqual(self.fs.read('/during.bin', len(payload), 0, vfd_b), payload)
+        self.fs.release('/during.bin', vfd_a)
+        self.fs.release('/during.bin', vfd_b)
+        self._assert_cache_holds("during.bin", payload, dirty=False)
+
+    def test_streaming_open_does_not_attach_to_a_session_being_cleaned_up(self):
+        # The worker's tail has decided to clean up a failed session (no
+        # readers) and is promoting its prefix when an open comes in. The
+        # open must not attach: promotion truncates the partial to its
+        # contiguous prefix, so reads past it would come back short.
+        self.backend.copy_delay = 0
+        manager = self.fs._streaming_manager
+        real_promote = manager._promote_failed_session_cache_prefix
+        in_promote = threading.Event()
+        go_promote = threading.Event()
+        self.addCleanup(go_promote.set)
+
+        def held_promote(session):
+            in_promote.set()
+            go_promote.wait(timeout=10.0)
+            return real_promote(session)
+
+        payload = os.urandom(192 * 1024)
+        (self.backend_dir / "cleanup.bin").write_bytes(payload)
+        hold, at_finalize, go_tail = self._hold_finalize()
+        with hold, patch.object(manager, "_promote_failed_session_cache_prefix", side_effect=held_promote):
+            vfd_a = self.fs.open('/cleanup.bin', os.O_RDONLY)
+            session = self._session_for(vfd_a)
+            # Available: [0, 4K) and [16K, 20K); the contiguous prefix is 4K.
+            self.assertEqual(self.fs.read('/cleanup.bin', 4096, 0, vfd_a), payload[:4096])
+            self.assertEqual(
+                self.fs.read('/cleanup.bin', 4096, 16 * 1024, vfd_a), payload[16 * 1024:20 * 1024],
+            )
+            with session.lock:
+                session.error = OSError(errno.EIO, "simulated failure")
+                session.condition.notify_all()
+            self.assertTrue(at_finalize.wait(timeout=3.0))
+            # The worker is short of its tail, so this release leaves cleanup to it.
+            self.fs.release('/cleanup.bin', vfd_a)
+            go_tail.set()
+            self.assertTrue(in_promote.wait(timeout=3.0))
+
+            vfd_b = self.fs.open('/cleanup.bin', os.O_RDONLY)
+            go_promote.set()
+            session.worker.join(timeout=5.0)
+        self.assertFalse(session.worker.is_alive())
+        self.assertTrue(session.detached)
+
+        with self.fs._fd_lock:
+            self.assertIsNone(self.fs._fd_map[vfd_b].prefetch_session)
+        self.assertEqual(
+            self.fs.read('/cleanup.bin', 4096, 16 * 1024, vfd_b), payload[16 * 1024:20 * 1024],
+        )
+        self.fs.release('/cleanup.bin', vfd_b)
+        # The full fetch filled the path first; the promotion left it alone.
+        self._assert_cache_holds("cleanup.bin", payload, dirty=False)
+
+    def _install_case(self, name, final_bytes=None):
+        from types import SimpleNamespace
+        partial = self.cache_dir / (name + ".storage.partial")
+        final = self.cache_dir / name
+        partial.write_bytes(b"streamed")
+        if final_bytes is not None:
+            final.write_bytes(final_bytes)
+        session = SimpleNamespace(
+            partial_cache_path=partial, final_cache_path=final, canonical_path='/' + name,
+        )
+        return session, partial, final
+
+    def _no_hard_links(self):
+        real_link = os.link
+
+        def link(src, dst, *args, **kwargs):
+            if str(src).startswith(str(self.cache_dir)):
+                raise OSError(errno.EPERM, "no hard links here")
+            return real_link(src, dst, *args, **kwargs)
+
+        return patch("os.link", side_effect=link)
+
+    def test_streaming_install_without_hard_links_does_not_replace(self):
+        manager = self.fs._streaming_manager
+        session, partial, final = self._install_case("nolink-taken.bin", final_bytes=b"writer")
+        with self._no_hard_links():
+            outcome = manager._install_partial(session)
+        if outcome == "unsupported":
+            self.skipTest("the test filesystem has no RENAME_NOREPLACE")
+        self.assertEqual(outcome, "taken")
+        self.assertEqual(final.read_bytes(), b"writer")
+        self.assertTrue(partial.exists())
+
+        session, partial, final = self._install_case("nolink-free.bin")
+        with self._no_hard_links():
+            self.assertEqual(manager._install_partial(session), "installed")
+        self.assertEqual(final.read_bytes(), b"streamed")
+        self.assertFalse(partial.exists())
+
+    def test_streaming_install_without_any_no_replace_declines(self):
+        # Neither link() nor RENAME_NOREPLACE: a check and a rename would
+        # race a writer, so the partial is not installed at all.
+        import storage.streaming as streaming_module
+        manager = self.fs._streaming_manager
+        session, partial, final = self._install_case("noreplace.bin")
+        unsupported = OSError(errno.ENOSYS, "no renameat2")
+        with self._no_hard_links(), \
+                patch.object(streaming_module, "_rename_noreplace", side_effect=unsupported):
+            self.assertEqual(manager._install_partial(session), "unsupported")
+        self.assertFalse(os.path.lexists(final))
+        self.assertTrue(partial.exists())
 
 if __name__ == '__main__':
     unittest.main()
