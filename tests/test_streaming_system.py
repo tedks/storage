@@ -18,7 +18,8 @@ import unittest
 from pathlib import Path
 
 from storage.backends.local import LocalBackend
-from storage.fs import StorageFS, fuse_mount_options
+from storage.fs import StorageFS
+from tests.fuse_mount import run_fuse
 
 
 class SlowRemoteLoopbackBackend(LocalBackend):
@@ -35,22 +36,11 @@ class SlowRemoteLoopbackBackend(LocalBackend):
         return super().read_file(virtual_path, offset, size)
 
 
-def _mount_fs(fs: StorageFS, mount_dir: Path):
-    """Mount the filesystem in foreground mode (run in a daemon thread)."""
-    from fuse import FUSE
-
-    FUSE(
-        fs,
-        str(mount_dir),
-        nothreads=True,
-        foreground=True,
-        allow_other=False,
-        **fuse_mount_options(fs.backends, enable_watchers=fs._enable_watchers, fresh_window=fs._revalidate_after),
-    )
-
-
 class TestStreamingSystemRegression(unittest.TestCase):
     """Mounted-FUSE streaming regression checks."""
+
+    # Also run with the multithreaded loop (subclass below).
+    fuse_threads = False
 
     def setUp(self):
         self.temp_dir = tempfile.mkdtemp()
@@ -81,7 +71,10 @@ class TestStreamingSystemRegression(unittest.TestCase):
             max_streaming_sessions=4,
         )
 
-        self.mount_thread = threading.Thread(target=_mount_fs, args=(self.fs, self.mount_dir), daemon=True)
+        self.mount_thread = threading.Thread(
+            target=run_fuse, args=(self.fs, self.mount_dir),
+            kwargs={"fuse_threads": self.fuse_threads}, daemon=True,
+        )
         self.mount_thread.start()
         time.sleep(1.0)
 
@@ -190,6 +183,9 @@ class TestStreamingSystemRegression(unittest.TestCase):
         if stream_state is not None:
             self.assertNotIn(stream_state.get("status"), {"error", "failed"})
 
+
+class TestStreamingSystemRegressionThreaded(TestStreamingSystemRegression):
+    fuse_threads = True
 
 if __name__ == "__main__":
     unittest.main()

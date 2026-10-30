@@ -14,8 +14,9 @@ import threading
 import shutil
 from pathlib import Path
 
-from storage.fs import StorageFS, fuse_mount_options
+from storage.fs import StorageFS
 from storage.backends.local import LocalBackend
+from tests.fuse_mount import run_fuse
 
 
 class _MountedCase(unittest.TestCase):
@@ -27,6 +28,8 @@ class _MountedCase(unittest.TestCase):
     START_SYNC = True
     FS_KWARGS: dict = {}
     KERNEL_OPTIONS: dict = {}
+    # Every suite also runs with the multithreaded loop (subclasses below).
+    fuse_threads = False
 
     def setUp(self):
         """Set up test environment with actual mount"""
@@ -81,20 +84,8 @@ class _MountedCase(unittest.TestCase):
     def _mount_fs(self):
         """Mount filesystem (runs in separate thread)"""
         try:
-            from fuse import FUSE
-            FUSE(
-                self.fs,
-                str(self.mount_dir),
-                nothreads=True,
-                foreground=True,
-                allow_other=False,
-                **fuse_mount_options(
-                    self.fs.backends,
-                    enable_watchers=self.fs._enable_watchers,
-                    fresh_window=self.fs._revalidate_after,
-                    **self.KERNEL_OPTIONS,
-                ),
-            )
+            run_fuse(self.fs, self.mount_dir, fuse_threads=self.fuse_threads,
+                     **self.KERNEL_OPTIONS)
         except Exception as e:
             print(f"Mount error: {e}")
 
@@ -448,3 +439,15 @@ class TestKernelCacheRefetch(_MountedCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestSyncSystemIntegrationThreaded(TestSyncSystemIntegration):
+    fuse_threads = True
+
+
+class TestKernelCacheVisibilityThreaded(TestKernelCacheVisibility):
+    fuse_threads = True
+
+
+class TestKernelCacheRefetchThreaded(TestKernelCacheRefetch):
+    fuse_threads = True
