@@ -18,3 +18,9 @@ log_events:
   who: Ted Smith
   what: started
   comment: ""
+- time: 2026-10-30T16:30:50-00:00
+  who: Ted Smith
+  what: blocks conflicts-persisted-records
+  comment: ""
+blocks:
+- conflicts-persisted-records
