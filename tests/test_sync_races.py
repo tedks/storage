@@ -10,6 +10,7 @@ import time
 from unittest.mock import patch
 
 from storage.models import SyncStatus
+from storage.sync_executor import SyncExecutor
 from storage.sync_tasks import DirOperation
 from tests.test_fs_threading import BLOCKED, WAIT, ThreadingTestBase, Worker
 
@@ -259,23 +260,44 @@ class TestDirectoryRetries(SyncRaceTestBase):
 
         self.start_sync()
         self.wait_idle()
+        # The member keeps an empty /d: what a chain of missed operations
+        # leaves is ditz sync-member-reconcile. It must not gain /e.
         self.assertNotIn("e", self.member_names())
+
+    def test_rename_retry_for_an_evicted_file_still_applies(self):
+        self.write_file("/a.txt")
+        self.start_sync()
+        self.wait_synced("/a.txt")
+        self.wait_idle()
+        self.fs.sync_manager.stop()
+        self.fail_member_once("rename")
+        self.fs.rename("/a.txt", "/b.txt")
+        cache_path = self.fs.cache_manager.get_cache_path("/b.txt")
+        self.assertGreater(self.fs.cache_manager._evict_if_still_clean("/b.txt", cache_path), 0)
+
+        self.start_sync()
+        self.wait_idle()
+        self.assertEqual(["b.txt"], self.member_names())
 
     def test_retry_for_a_member_known_down_is_not_tried_under_the_guard(self):
         self.fail_member_once("mkdir")
         self.fs.mkdir("/d", 0o755)
         self.member.set_available(False)
-        executor_guard = []
+        guarded = []
+
+        def recording_guard(*paths):
+            guarded.append(paths)
+            return self.fs._path_locked(*paths)
+
         task = [t for t in self.fs.sync_manager.task_queue.queue if hasattr(t, "operation")][0]
-        from storage.sync_executor import SyncExecutor
         executor = SyncExecutor(
             worker_id=9, state_manager=self.fs.state_manager, cache_manager=self.fs.cache_manager,
             replication_manager=self.fs.replication_manager, config=self.fs.sync_manager.config,
-            path_guard=lambda *paths: executor_guard.append(paths) or self.fs._path_locked(*paths),
+            path_guard=recording_guard,
         )
         with self.assertRaises(RuntimeError):
             executor.process_dir_task(task)
-        self.assertEqual([], executor_guard)
+        self.assertEqual([], guarded)
         self.member.set_available(True)
         self.assertTrue(executor.process_dir_task(task))
         self.assertEqual(["d"], self.member_names())
