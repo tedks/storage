@@ -31,5 +31,13 @@ log_events:
   who: Ted Smith
   what: blocks gh-111
   comment: ""
+- time: 2026-10-30T03:07:29-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'PR #135 round 3 (Claude nit): under fuse_threads there is no single flight
+    for foreground listings: N threads on one expired directory each submit a full
+    member listing, run one after another on the per-member executors. Later readdirs
+    could wait on the listing already in flight. Also no test runs the listing paths
+    with fuse_threads on.'
 blocks:
 - gh-111
