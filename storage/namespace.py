@@ -17,10 +17,15 @@ from .pathing import ResolvedPath, canonicalize_virtual_path
 from .sync_tasks import DirOperation
 
 
+# _listed_attrs: the name is absent from a fresh listing of every available
+# member, so it does not exist (ruling oq-listing-negative-lookup A).
+LISTED_MISSING = object()
+
+DEFAULT_LISTING_MAX_STALE = 3600.0
+
+
 class NamespaceService:
     """Namespace and directory-view operations extracted from StorageFS."""
-
-    LISTING_ATTRS_MAX_AGE = 5.0
 
     def __init__(
         self,
@@ -40,6 +45,8 @@ class NamespaceService:
         readdir_snapshot_ttl: float,
         checksum_records: Dict[tuple, ChecksumRecord],
         checksum_lock,
+        listing_max_stale: float = DEFAULT_LISTING_MAX_STALE,
+        negative_window: Optional[float] = None,
     ):
         self.backends = backends
         self.cache_manager = cache_manager
@@ -53,7 +60,21 @@ class NamespaceService:
         self.dir_cache = dir_cache
         self.dir_cache_lock = dir_cache_lock
         self.readdir_snapshot = readdir_snapshot
+        # A listing is fresh for readdir_snapshot_ttl (infinite with
+        # watchers on every member) and is then served stale, while one
+        # background refresh per directory runs, until listing_max_stale.
         self.readdir_snapshot_ttl = readdir_snapshot_ttl
+        self.listing_max_stale = listing_max_stale
+        # A listing answers ENOENT for a name it lacks only while it is
+        # fresh and at most this old (None: the fresh window). Finite even
+        # when watchers make the fresh window infinite: a watcher that
+        # drops events (a reconnect, an overflow) must not hide a file for
+        # the life of the listing.
+        self.negative_window = negative_window
+        # Each published snapshot's merge inputs, (cache and member names,
+        # member names by member), so serving it recomputes the conflict
+        # view from the checksums recorded since; dropped with it.
+        self._view_inputs: Dict[str, Tuple[Set[str], Dict[str, Set[str]]]] = {}
         self.checksum_records = checksum_records
         self.checksum_lock = checksum_lock
         # The listing state below (entry_attrs, readdir_snapshot and the
@@ -65,35 +86,75 @@ class NamespaceService:
         # updates, never across I/O or while taking another lock.
         self.listing_lock = Lock()
         # Per-directory member attributes from the last listing:
-        # {dir: (monotonic time, {backend: {name: attrs}})}.
-        # getattr answers from it until listing_attrs_ttl after the listing
-        # was published, so `ls -l` costs no member round trip per entry.
-        # The age is capped even when the readdir TTL is unbounded
-        # (watchers): a change that reaches no invalidation (a dropped
-        # watcher event) is visible within the cap plus the listing's own
-        # duration. A cached copy that is evicted, invalidated or written
-        # drops its name at once (forget_listed_attrs).
-        self.entry_attrs: Dict[str, Tuple[float, Dict[str, Dict[str, dict]]]] = {}
+        # {dir: (monotonic time, {backend: {name: attrs}}, unknown names)}.
+        # getattr answers from it while the listing is fresh or stale (see
+        # listing_state), so `ls -l` and path walks cost no member round
+        # trip per entry, and while it is fresh a name no available member
+        # listed is ENOENT without a stat. A cached copy that is evicted,
+        # invalidated or written drops its name at once and adds it to the
+        # unknown names, which getattr stats again (forget_listed_attrs):
+        # a dropped name is not known to be absent, and a file synced after
+        # the listing was taken is on a member the listing did not see.
+        # With watchers, a change that reaches no invalidation (a dropped
+        # watcher event) stays unseen until the directory is invalidated.
+        self.entry_attrs: Dict[str, Tuple[float, Dict[str, Dict[str, dict]], Set[str]]] = {}
         # Directories being listed, and a generation per such directory that
         # an invalidation of the directory or of a child bumps. A listing
         # that raced one is not published, so it cannot reinstate what the
         # invalidation removed; invalidations elsewhere do not affect it.
-        # Both hold only directories with a listing in flight.
+        # Both hold only directories with a listing in flight, foreground
+        # or background, from the moment a background refresh is queued
+        # until it ends or is cancelled.
         self._listings_in_flight: Dict[str, int] = {}
         self._listing_generation: Dict[str, int] = {}
+        # Directories with a background refresh queued or running: one each.
+        self._background_refreshes: Set[str] = set()
+        # When the member reads behind each directory's published listing
+        # began (monotonic). A background refresh and a foreground listing
+        # of one directory share a generation, so a listing that began
+        # before the published one is not published over it: the slower,
+        # older read must not replace the newer. Dropped with the
+        # directory's dir_cache entry on invalidation.
+        self._listing_as_of: Dict[str, float] = {}
         # One single-thread executor per member lists it concurrently with
         # the others. A dedicated thread per member keeps one extra member
         # connection each (SSH clients are per thread) and never has two
         # listing threads reconnecting the same member. Created on first use,
         # after FUSE's daemonizing fork, and shut down by shutdown().
         self._listing_executors: Dict[str, concurrent.futures.ThreadPoolExecutor] = {}
+        # Background refreshes run one at a time on their own thread, which
+        # hands each member's listing to that member's executor and waits,
+        # as the FUSE thread does for a foreground listing. One at a time
+        # keeps at most one refresh's listings queued ahead of a foreground
+        # listing on each member's executor.
+        self._refresh_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
         self._listing_executors_lock = Lock()
         self._listing_shut_down = False
 
     @property
-    def listing_attrs_ttl(self) -> float:
-        """How long a listing's attributes answer getattr (and keep its snapshot)."""
-        return min(self.readdir_snapshot_ttl, self.LISTING_ATTRS_MAX_AGE)
+    def listing_stale_limit(self) -> float:
+        """Age past which a listing is neither served nor refreshed, only replaced.
+
+        A fresh window of 0 asks for a listing at every access, so it has
+        no stale phase either.
+        """
+        if self.readdir_snapshot_ttl <= 0:
+            return 0.0
+        return max(self.readdir_snapshot_ttl, self.listing_max_stale)
+
+    def _answers_missing(self, listed_at: float, now: float) -> bool:
+        window = self.readdir_snapshot_ttl if self.negative_window is None else self.negative_window
+        age = now - listed_at
+        return age <= self.readdir_snapshot_ttl and age <= window
+
+    def listing_state(self, listed_at: float, now: float) -> str:
+        """'fresh', 'stale' (serve it and refresh in the background) or 'expired'."""
+        age = now - listed_at
+        if age <= self.readdir_snapshot_ttl:
+            return "fresh"
+        if age <= self.listing_stale_limit:
+            return "stale"
+        return "expired"
 
     def backend_availability(self) -> Tuple[List[str], List[str]]:
         """Return backend names split by current availability."""
@@ -150,12 +211,41 @@ class NamespaceService:
         with self.dir_cache_lock:
             self.dir_cache.pop(path, None)
             with self.listing_lock:
+                self._listing_as_of.pop(path, None)
                 if path in self._listings_in_flight:
                     self._listing_generation[path] += 1
                 self.readdir_snapshot.pop(path, None)
+                self._view_inputs.pop(path, None)
                 self.entry_attrs.pop(path, None)
                 if parent != path:
                     self._forget_listed_name_locked(path, canonical, parent)
+
+    def invalidate_listing_subtree(self, path: str):
+        """Drop every listing at or below a directory (rename, rmdir).
+
+        invalidate_dir_cache_entry drops one directory's listing; a renamed
+        or removed directory's subdirectories have listings too, which
+        would otherwise answer under the old name (or ENOENT under the new
+        one) for their whole window. Listings in flight there are kept
+        from being published.
+        """
+        canonical = self.resolve_path(path).canonical_path
+        prefix = canonical.rstrip("/") + "/"
+
+        def under(key: str) -> bool:
+            return key == canonical or key.startswith(prefix)
+
+        with self.dir_cache_lock:
+            for key in [k for k in self.dir_cache if under(k)]:
+                del self.dir_cache[key]
+            with self.listing_lock:
+                for key in self._listings_in_flight:
+                    if under(key):
+                        self._listing_generation[key] += 1
+                for table in (self.readdir_snapshot, self._view_inputs,
+                              self.entry_attrs, self._listing_as_of):
+                    for key in [k for k in table if under(k)]:
+                        del table[key]
 
     def forget_listed_attrs(self, path: str, *, removing: bool = True):
         """Stop answering getattr for a path from its parent's listing.
@@ -205,11 +295,14 @@ class NamespaceService:
             # A real name that itself ends in ".<member>" also drops its
             # stripped name from the listing. That costs extra member stats
             # on getattr until the listing refreshes: conservative, not a
-            # bug.
+            # bug. The names become unknown, not absent: getattr stats them
+            # rather than answering ENOENT (the name may be on a member the
+            # listing never saw it on, e.g. a file synced after it).
             names_to_drop = {Path(path).name, Path(canonical).name}
             for names in listing[1].values():
                 for name in names_to_drop:
                     names.pop(name, None)
+            listing[2].update(names_to_drop)
 
     def _get_target_backends(
         self,
@@ -393,6 +486,8 @@ class NamespaceService:
                 backend_iter = list(self.backends.items())
 
             listed = self._listed_attrs(resolved, backend_iter)
+            if listed is LISTED_MISSING:
+                raise FuseOSError(errno.ENOENT)
             if listed is not None:
                 def field(key, default):
                     value = listed.get(key)
@@ -446,27 +541,55 @@ class NamespaceService:
 
             raise FuseOSError(exc.errno)
 
-    def _listed_attrs(self, resolved: ResolvedPath, backend_iter) -> Optional[dict]:
-        """Attributes of a path from its parent's recent listing, if any.
+    def _listed_attrs(self, resolved: ResolvedPath, backend_iter):
+        """Attributes of a path from its parent's listing, if any.
 
         Walks the members in the order getattr probes them, skipping the
-        unavailable ones as getattr does. The first available member decides:
-        its listed attributes are returned when complete, and None (probe the
-        members) is returned when its listing is missing, failed, carried no
-        attributes, or lists the name as a symlink (listings are lstat; the
-        member's stat decides whether to follow it) or without mode, size or
-        mtime. Only a member that listed successfully without the name is
-        passed over, as its stat would have failed.
+        unavailable ones as getattr does. The first available member that
+        lists the name decides: its listed attributes are returned when
+        complete, and None (probe the members) when it lists the name as a
+        symlink (listings are lstat; the member's stat decides whether to
+        follow it) or without mode, size or mtime. None is also returned
+        when there is no listing, it has expired, the name is unknown (see
+        entry_attrs), or a member walked before the name was found has no
+        attributes in it (its listing failed or carried none). A member
+        that listed successfully without the name is passed over, as its
+        stat would have failed.
+
+        LISTED_MISSING: the listing is fresh, no older than negative_window,
+        and every available member listed without the name, so getattr
+        answers ENOENT without a stat. A stale listing never answers that;
+        its misses are probed.
+
+        A stale listing schedules a background refresh of the parent.
         """
         parent = resolved.parent_dir
         name = Path(resolved.canonical_path).name
+        # Availability first: is_available() may do more than read a flag,
+        # and the walk below runs under listing_lock, which is a leaf.
+        available = [
+            backend_name for backend_name, backend in backend_iter
+            if backend and backend.is_available()
+        ]
+        now = time.monotonic()
+        result = None
         with self.listing_lock:
+            # Under the lock throughout: forget_listed_attrs edits these
+            # dictionaries in place (pops the name, then marks it unknown),
+            # and a walk between the two would read the name as absent.
             listing = self.entry_attrs.get(parent)
-        if not listing or (time.monotonic() - listing[0]) > self.listing_attrs_ttl:
-            return None
-        for backend_name, backend in backend_iter:
-            if not backend or not backend.is_available():
-                continue
+            state = self.listing_state(listing[0], now) if listing else "expired"
+            if state != "expired" and name not in listing[2]:
+                result = self._walk_listing_locked(listing, name, available)
+                if result is LISTED_MISSING and not self._answers_missing(listing[0], now):
+                    result = None
+        if state == "stale":
+            self._schedule_refresh(parent)
+        return result
+
+    @staticmethod
+    def _walk_listing_locked(listing, name: str, available: List[str]):
+        for backend_name in available:
             member_attrs = listing[1].get(backend_name)
             if member_attrs is None:
                 return None
@@ -482,52 +605,138 @@ class NamespaceService:
             ):
                 return None
             return attrs
-        return None
+        return LISTED_MISSING if available else None
 
     def readdir(self, path: str):
-        """Read directory contents."""
-        now = time.monotonic()
+        """Read directory contents.
+
+        A fresh listing is served as is. A stale one is served too, and a
+        background refresh of the directory is scheduled; an expired one
+        (or none) is replaced by listing every member now.
+        """
         with self.listing_lock:
             snapshot = self.readdir_snapshot.get(path)
             listing = self.entry_attrs.get(path)
-        # A snapshot is reused only while its listing's attributes are also
-        # fresh, so the `ls -l` that follows a readdir never probes per entry.
-        if (
-            snapshot
-            and (now - snapshot[0]) <= self.readdir_snapshot_ttl
-            and listing
-            and (now - listing[0]) <= self.listing_attrs_ttl
-        ):
-            return list(snapshot[1])
+        # The snapshot and the attributes are published, dropped and pruned
+        # together; a snapshot is served only with its attributes, so the
+        # `ls -l` that follows a readdir never probes per entry.
+        if snapshot and listing:
+            state = self.listing_state(snapshot[0], time.monotonic())
+            if state == "stale":
+                self._schedule_refresh(path)
+            if state != "expired":
+                return self._served_snapshot(path, snapshot)
 
-        with self.listing_lock:
-            self._listings_in_flight[path] = self._listings_in_flight.get(path, 0) + 1
-            generation = self._listing_generation.setdefault(path, 0)
+        generation = self._begin_listing(path)
         try:
             return self._list_members(path, generation)
         finally:
-            with self.listing_lock:
-                remaining = self._listings_in_flight[path] - 1
-                if remaining:
-                    self._listings_in_flight[path] = remaining
-                else:
-                    del self._listings_in_flight[path]
-                    del self._listing_generation[path]
+            self._end_listing(path)
+
+    def _served_snapshot(self, path: str, snapshot) -> List[str]:
+        """A snapshot's entries, with the conflict view recomputed.
+
+        Checksums finish after the listing that scheduled them; a name whose
+        copies turned out to differ splits into name.member at the next
+        readdir rather than at the next listing. In memory only, linear in
+        the directory's size per readdir.
+        """
+        with self.listing_lock:
+            inputs = self._view_inputs.get(path)
+        if inputs is None:
+            return list(snapshot[1])
+        entries, member_entries = inputs
+        return sorted(self._apply_conflict_view(path, entries, member_entries))
+
+    def _begin_listing(self, path: str) -> int:
+        """Mark a listing of path in flight; return the generation it must match."""
+        with self.listing_lock:
+            self._listings_in_flight[path] = self._listings_in_flight.get(path, 0) + 1
+            return self._listing_generation.setdefault(path, 0)
+
+    def _end_listing(self, path: str, *, background: bool = False):
+        with self.listing_lock:
+            remaining = self._listings_in_flight[path] - 1
+            if remaining:
+                self._listings_in_flight[path] = remaining
+            else:
+                del self._listings_in_flight[path]
+                del self._listing_generation[path]
+            if background:
+                self._background_refreshes.discard(path)
+
+    def _schedule_refresh(self, path: str):
+        """Queue one background refresh of path unless one is queued or running.
+
+        The refresh counts as a listing in flight from now, so an
+        invalidation while it waits or runs keeps its result unpublished.
+        Takes listing_lock and then _listing_executors_lock, never nested.
+        """
+        with self.listing_lock:
+            if path in self._background_refreshes:
+                return
+            self._background_refreshes.add(path)
+        generation = self._begin_listing(path)
+        executor = self._background_executor()
+        future = None
+        if executor is not None:
+            try:
+                future = executor.submit(self._run_refresh, path, generation)
+            except RuntimeError:
+                # shutdown() raced the submit.
+                future = None
+        if future is None:
+            self._end_listing(path, background=True)
+            return
+        # A refresh cancelled by shutdown() never runs, so its bookkeeping
+        # is released here instead.
+        future.add_done_callback(
+            lambda f: self._end_listing(path, background=True) if f.cancelled() else None
+        )
+
+    def _run_refresh(self, path: str, generation: int):
+        try:
+            if not self._listing_shut_down:
+                self._list_members(path, generation, background=True)
+        except Exception as exc:
+            # The stale listing stays in place; the next access past it
+            # schedules another refresh, or lists in the foreground once
+            # it expires.
+            self.logger.debug("background refresh of %s failed: %s", path, exc)
+        finally:
+            self._end_listing(path, background=True)
+
+    def _background_executor(self) -> Optional[concurrent.futures.ThreadPoolExecutor]:
+        with self._listing_executors_lock:
+            if self._listing_shut_down:
+                return None
+            if self._refresh_executor is None:
+                self._refresh_executor = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix="readdir-refresh",
+                )
+            return self._refresh_executor
 
     def shutdown(self):
-        """Stop the member listing threads; later listings run inline.
+        """Stop the listing threads; later foreground listings run inline.
 
         Called from StorageFS.destroy. libfuse runs destroy only after its
         loop has returned (the multithreaded loop joins every worker first),
-        so no listing started by a FUSE request is in flight then; a
-        worker still blocked in member I/O (a hung member) is not
-        interrupted and ends at its SFTP timeout, as the checksum
-        executor's workers do.
+        so no foreground listing is in flight then. A background refresh
+        may be: queued ones are cancelled (their bookkeeping released by
+        the done callback). One already running finds its queued member
+        listings cancelled and lists no member inline, so it falls back to
+        the names it had; it may still publish that into the in-memory
+        maps, which nothing reads after destroy. A worker
+        still blocked in member I/O (a hung member) is not interrupted and
+        ends at its SFTP timeout, as the checksum executor's workers do.
         """
         with self._listing_executors_lock:
             self._listing_shut_down = True
             executors = list(self._listing_executors.values())
             self._listing_executors.clear()
+            if self._refresh_executor is not None:
+                executors.append(self._refresh_executor)
+                self._refresh_executor = None
         for executor in executors:
             executor.shutdown(wait=False, cancel_futures=True)
 
@@ -580,14 +789,19 @@ class NamespaceService:
             futures[backend_name] = future
         return futures
 
-    def _list_members(self, path: str, generation: int) -> List[str]:
+    def _list_members(self, path: str, generation: int, *, background: bool = False) -> List[str]:
         """List the cache and every member, and publish the result unless an
-        invalidation of the directory or a child raced it.
+        invalidation of the directory or a child raced it, or a listing that
+        began later was published first.
 
         The members are listed concurrently and outside dir_cache_lock; their
-        results are merged under it.
+        results are merged under it. The listing's time is when its reads
+        began, so its freshness never outlasts what it read. A background
+        refresh does no member I/O after shutdown(): a member it would list
+        inline counts as failed.
         """
 
+        started_at = time.monotonic()
         futures = self._submit_member_listings(path)
 
         entries: Set[str] = {".", ".."}
@@ -607,6 +821,9 @@ class NamespaceService:
         outcomes = {}
         for backend_name, future in futures.items():
             if future is None:
+                if background and self._listing_shut_down:
+                    outcomes[backend_name] = RuntimeError("listing shut down")
+                    continue
                 outcomes[backend_name] = self._list_member(self.backends[backend_name], path)
                 continue
             try:
@@ -637,16 +854,6 @@ class NamespaceService:
                 member_entries[backend_name] = names
                 if listed is not None:
                     backend_attrs[backend_name] = listed
-            # A raced invalidation of the directory dropped its names, and one
-            # of a child changed what this listing saw; either way the result
-            # may predate the change, so it is not stored. A child-only
-            # invalidation leaves the older names in place, which the next
-            # listing replaces.
-            # Checked and stored under listing_lock, so forget_listed_attrs
-            # (which takes only listing_lock) cannot bump in between.
-            with self.listing_lock:
-                if self._listing_generation[path] == generation:
-                    self.dir_cache[path] = member_entries
         for names in member_entries.values():
             entries.update(names)
 
@@ -654,21 +861,51 @@ class NamespaceService:
         visible_entries = self._apply_conflict_view(path, entries, member_entries)
         ordered_entries = sorted(visible_entries)
 
-        with self.listing_lock:
-            if self._listing_generation[path] == generation:
-                listed_at = time.monotonic()
-                self.readdir_snapshot[path] = (listed_at, ordered_entries)
-                self.entry_attrs[path] = (listed_at, backend_attrs)
-            # A snapshot is not reused once its listing has expired, so both go.
-            now = time.monotonic()
-            expired = [
-                dir_path for dir_path, (at, _) in self.entry_attrs.items()
-                if now - at > self.listing_attrs_ttl
-            ]
-            for dir_path in expired:
-                del self.entry_attrs[dir_path]
-                self.readdir_snapshot.pop(dir_path, None)
+        # Published in one step: member names, time, snapshot, view inputs
+        # and attributes, under dir_cache_lock and then listing_lock (their
+        # order), so no other listing ever sees half of one published.
+        # Not published when an invalidation of the directory or a child
+        # raced it (the result may predate the change; a child-only
+        # invalidation leaves the older names, which the next listing
+        # replaces), or when a listing that began later was published
+        # first. Checked and stored under listing_lock, so
+        # forget_listed_attrs (which takes only listing_lock) cannot bump
+        # in between.
+        with self.dir_cache_lock:
+            with self.listing_lock:
+                if (
+                    self._listing_generation[path] == generation
+                    and started_at >= self._listing_as_of.get(path, float("-inf"))
+                ):
+                    self.dir_cache[path] = member_entries
+                    self._listing_as_of[path] = started_at
+                    self.readdir_snapshot[path] = (started_at, ordered_entries)
+                    self._view_inputs[path] = (entries, member_entries)
+                    self.entry_attrs[path] = (started_at, backend_attrs, set())
+                # A listing that began later was published while this one
+                # ran: answer with it, so a readdir never shows names older
+                # than what getattr now answers from.
+                newer = self._listing_as_of.get(path, float("-inf")) > started_at
+                newer_snapshot = self.readdir_snapshot.get(path) if newer else None
+                # A snapshot is not served once its listing has expired, so
+                # both go; the time goes only with the listing it stamps (a
+                # guard: they are always set and dropped together). Linear
+                # in the listed directories, under both locks, once per
+                # listing.
+                now = time.monotonic()
+                expired = [
+                    dir_path for dir_path, (at, _, _) in self.entry_attrs.items()
+                    if self.listing_state(at, now) == "expired"
+                ]
+                for dir_path in expired:
+                    at = self.entry_attrs.pop(dir_path)[0]
+                    self.readdir_snapshot.pop(dir_path, None)
+                    self._view_inputs.pop(dir_path, None)
+                    if self._listing_as_of.get(dir_path) == at:
+                        del self._listing_as_of[dir_path]
 
+        if newer_snapshot is not None:
+            return self._served_snapshot(path, newer_snapshot)
         return ordered_entries
 
     def mkdir(self, path: str, mode: int):
@@ -717,6 +954,7 @@ class NamespaceService:
 
             self.invalidate_dir_cache_entry(resolved.parent_dir)
             self.invalidate_dir_cache_entry(resolved.canonical_path)
+            self.invalidate_listing_subtree(resolved.canonical_path)
 
             for failed_backend in failures:
                 self.sync_manager.queue_dir_sync(
@@ -805,6 +1043,8 @@ class NamespaceService:
             self.invalidate_dir_cache_entry(new_resolved.parent_dir)
             self.invalidate_dir_cache_entry(old_resolved.canonical_path)
             self.invalidate_dir_cache_entry(new_resolved.canonical_path)
+            self.invalidate_listing_subtree(old_resolved.canonical_path)
+            self.invalidate_listing_subtree(new_resolved.canonical_path)
 
             if renamed_entries:
                 for _, updated in renamed_entries:

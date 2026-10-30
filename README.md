@@ -215,21 +215,53 @@ time out (a hung remote disk) costs the request and a probe each time,
 and is marked unavailable after two such timeouts in a row. Walking a large cached tree after the age costs one
 round trip per file.
 
+Directory listings follow the same policy. With watchers off, a listing
+is fresh for `readdir_ttl` seconds (default: `revalidate_after`, so 60):
+it answers `ls`, the `stat` of every entry in it, and a lookup of a name
+it lacks (`ENOENT`, without asking any member), so a browse costs one
+listing per member per directory per minute and nothing per entry. Past
+that it is still served, and one listing per member runs in the
+background to replace it, until it is `listing_max_stale` seconds old
+(profile only, default 3600); an older listing is replaced before the
+answer. A name is still asked of the members when a member's listing
+failed or carried no attributes, or when the listing is past its fresh
+window. A fresh window of 0 has no stale phase: every access lists. With
+watchers on every member, listings stay until a watcher invalidates them,
+so a change whose watcher event was lost (a watcher reconnect) stays out
+of `ls` until the directory is invalidated; a lookup of a name missing
+from a listing is still answered from it only for `readdir_ttl` (else
+`revalidate_after`) seconds, and stat'd after that. Changes made through the mount (create, write, rename,
+unlink, mkdir, rmdir, symlink) drop the affected listings at once; a file
+added or changed directly on a member shows within the fresh window, plus
+one more listing while a stale one is served.
+
+Member requests for a browse of one directory, 2 SSH members, 20 entries,
+a 6 s window (the remote gate's `test_mounted_browse_request_budget`):
+
+| Step | Before (10c5cc8) | Now |
+|---|---|---|
+| list | 2 listings | 2 listings |
+| stat every entry | 0 | 0 |
+| probe a missing name | 2 stats | 0 |
+| list and stat again 2 s later | 2 listings, 1 stat | 0 |
+| list after the window | 2 listings, 2 stats | 2 background listings (and 2 of the parent) |
+| stat every entry after the next window, no list | 61 stats | 2 background listings (and 2 of the parent) |
+
 The kernel keeps its own cache in front of the mount. With watchers off,
-it remembers names for `revalidate_after` seconds, so a path walk inside
+it remembers names for the listing's fresh window, so a path walk inside
 that window does not reach the mount at all; with watchers on it keeps
 them for 1 s, because the mount cannot evict the kernel's entries when a
 watcher reports a change. A name that does not exist is remembered as
 missing for 10 s. Attributes are not kept: each `stat` reaches the mount,
-which answers it from the cached file or from a listing of the parent
-directory made in the last 5 s, and otherwise asks a member. (Kept
+which answers it from the cached file or from the parent's listing, and
+asks a member only when neither knows the name. (Kept
 attributes would hold a file's old size past a refetch, and reads would
 stop there.) A file's pages stay in the page cache across opens while
 its size and mtime are unchanged and are dropped when they change, so a
 refetched file is read fresh. Changes made through the mount are visible
 at once. A file added directly on a member can stay hidden for up to
 10 s after a lookup missed it, and a name removed on a member can still
-be walked through for up to `revalidate_after`. The profile keys
+be walked through for up to the fresh window. The profile keys
 `entry_timeout` and `negative_timeout` (seconds) override the first two
 timeouts; attributes have no override.
 
@@ -412,6 +444,7 @@ has been run against a real host since the field use above.
 Implemented:
 
 - Local, SSH/SFTP and rsync storage members (SFTP for reads, rsync for writes); one SSH connection per member, its requests multiplexed over a small pool of SFTP channels
+- Directory listings fresh for `revalidate_after` and refreshed in the background after it, answering `stat` and missing names without a member round trip
 - Local cache with LRU eviction, revalidated against the member on open (`revalidate_after`); streaming cold reads with background prefetch that stops when readers close early (`streaming_keep_after_close`)
 - Background sync workers with retry; N-way replication configured per directory through xattrs
 - Conflict detection on sync, and `storage conflicts` to list and resolve conflicts

@@ -1161,3 +1161,110 @@ def test_session_killed_mid_transfer_is_retried_on_a_new_connection(remote, ssh_
     assert target.read_bytes() == payload
     assert ssh_backend._pool.connects == 2
     assert ssh_backend.is_available()
+
+
+_MEMBER_IO = ("exists", "read_file", "get_size", "listdir", "listdir_attrs", "isdir",
+              "copy_to_local", "stat", "get_fast_checksum", "get_xattr")
+
+
+def _count_member_requests(backends):
+    """Record (member, method, path) for every member request from now on."""
+    calls: List[tuple] = []
+    lock = threading.Lock()
+    for name, backend in backends.items():
+        for method in _MEMBER_IO:
+            real = getattr(backend, method)
+
+            def counted(path, *args, _real=real, _name=name, _method=method, **kwargs):
+                with lock:
+                    calls.append((_name, _method, path))
+                return _real(path, *args, **kwargs)
+
+            setattr(backend, method, counted)
+    return calls
+
+
+def test_mounted_browse_request_budget(remote, mounted_factory):
+    """A browse costs one listing per member per fresh window, nothing per entry.
+
+    docs/browsing_latency_plan.md section 2: list a directory, stat every
+    entry, list it again inside the window, probe a missing name, then list
+    and stat again after the window, and stat every entry after the next
+    window without listing. Prints the counts per step (run with
+    --test_arg=-s to see them).
+    """
+    m0, m1 = remote.members
+    names = {m0.name: [f"a{i:02d}.bin" for i in range(10)],
+             m1.name: [f"b{i:02d}.bin" for i in range(10)]}
+    for member in (m0, m1):
+        writes = " && ".join(f"printf x > {REMOTE_ROOT}/browse/{n}" for n in names[member.name])
+        remote.exec(member, f"mkdir -p {REMOTE_ROOT}/browse && {writes}")
+    window = 6.0
+    mnt = mounted_factory(revalidate_after=window, start_sync=False)
+    browse = mnt.mount / "browse"
+    os.listdir(mnt.mount)
+    os.stat(browse)
+    calls = _count_member_requests(mnt.backends)
+    steps = {}
+
+    def step(label, action):
+        start = len(calls)
+        action()
+        steps[label] = list(calls[start:])
+
+    every = sorted(names[m0.name] + names[m1.name])
+    step("list", lambda: os.listdir(browse))
+    step("stat every entry", lambda: [os.stat(browse / n) for n in every])
+    step("list inside window", lambda: os.listdir(browse))
+    step("missing name", lambda: os.path.exists(browse / "missing.bin"))
+    time.sleep(2.0)  # still inside the window, past libfuse's 1 s and the old 1 s listing TTL
+
+    def list_and_stat():
+        os.listdir(browse)
+        for n in every:
+            os.stat(browse / n)
+    step("list and stat 2 s later", list_and_stat)
+    time.sleep(window - 1.5)
+
+    def list_after_window():
+        os.listdir(browse)
+        assert _wait_for(lambda: not mnt.fs.namespace._background_refreshes, timeout=10.0)
+    step("list after window", list_after_window)
+    step("stat after window", lambda: [os.stat(browse / n) for n in every])
+    time.sleep(window + 0.5)
+
+    def stat_without_listing():
+        for n in every:
+            os.stat(browse / n)
+        assert _wait_for(lambda: not mnt.fs.namespace._background_refreshes, timeout=10.0)
+    step("stat every entry after the next window, no list", stat_without_listing)
+
+    def summary(recorded):
+        out: dict = {}
+        for _, method, path in recorded:
+            shown = "/browse/*" if path.startswith("/browse/") else path
+            key = f"{method}({shown})"
+            out[key] = out.get(key, 0) + 1
+        return out
+
+    report = {label: summary(recorded) for label, recorded in steps.items()}
+    print("\nbrowse request budget (2 members, 20 entries):")
+    for label, counts in report.items():
+        print(f"  {label}: {sum(counts.values())} {counts}")
+
+    on_browse = {label: [c for c in recorded if c[2].startswith("/browse")]
+                 for label, recorded in steps.items()}
+    assert sorted(m for _, m, _ in on_browse["list"]) == ["listdir_attrs"] * 2, report
+    assert on_browse["stat every entry"] == [], report
+    assert on_browse["list inside window"] == [], report
+    assert on_browse["missing name"] == [], report
+    assert on_browse["list and stat 2 s later"] == [], report
+    assert sorted(m for _, m, _ in on_browse["list after window"]) == ["listdir_attrs"] * 2, report
+    assert on_browse["stat after window"] == [], report
+    # Served from the stale listing; its refresh is the only request.
+    assert sorted(m for _, m, _ in on_browse["stat every entry after the next window, no list"]) \
+        == ["listdir_attrs"] * 2, report
+    # Requests outside /browse: at most the root's own background refresh.
+    for label, recorded in steps.items():
+        others = [c for c in recorded if not c[2].startswith("/browse")]
+        assert all(m == "listdir_attrs" and p == "/" for _, m, p in others), report

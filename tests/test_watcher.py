@@ -299,7 +299,8 @@ class TestConfigurableTTL(TestCase):
                 cache_root=cache, state_db=db, backends={},
                 cache_size=1024 * 1024, num_sync_workers=0, start_sync=False,
             )
-            self.assertEqual(fs._readdir_snapshot_ttl, 1.0)
+            # The fresh window follows revalidate_after (60 s by default).
+            self.assertEqual(fs._readdir_snapshot_ttl, 60.0)
             fs.state_manager.close()
 
     def test_custom_ttl(self):

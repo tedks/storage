@@ -238,9 +238,24 @@ class TestResolvedMountConfig(unittest.TestCase):
         defaults.update(overrides)
         return resolve_mount_configuration(**defaults)
 
-    def test_readdir_ttl_defaults_to_1(self):
+    def test_readdir_ttl_defaults_to_none_following_revalidate_after(self):
         config = self._resolve()
-        self.assertEqual(1.0, config.readdir_ttl)
+        self.assertIsNone(config.readdir_ttl)
+        self.assertEqual(3600.0, config.listing_max_stale)
+
+    def test_listing_max_stale_from_profile_and_validated(self):
+        config_path = self._profile("listing_max_stale = 600\n")
+        config = self._resolve(mount_target="prof", backing_paths=[], config_path=config_path)
+        self.assertEqual(600.0, config.listing_max_stale)
+        for bad in ("-1", "nan", "inf", '"1h"'):
+            config_path = self._profile(f"listing_max_stale = {bad}\n")
+            with self.subTest(value=bad), self.assertRaises(click.ClickException):
+                self._resolve(mount_target="prof", backing_paths=[], config_path=config_path)
+
+    def test_readdir_ttl_rejects_negative_nan_and_infinity(self):
+        for bad in (-1.0, float("nan"), float("inf")):
+            with self.subTest(value=bad), self.assertRaises(click.ClickException):
+                self._resolve(readdir_ttl=bad)
 
     def test_enable_watchers_defaults_to_false(self):
         config = self._resolve()
