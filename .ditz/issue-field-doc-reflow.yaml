@@ -1,0 +1,20 @@
+id: field-doc-reflow
+title: 'Reflow three long lines in browsing_latency_plan.md sections 4.5 and 6 (PR
+  #145 nit)'
+desc: 'Council convergence nit on PR #145: three edited lines in docs/browsing_latency_plan.md
+  were not reflowed (section 4.5''s added parenthesis, section 6''s ''includes the
+  session''s own reads'' and ''with threads off, about 5.5 ms'' lines). Cosmetic;
+  left to batch with the next edit of the file.'
+type: task
+component: docs
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-30T17:12:08-00:00
+references: []
+log_events:
+- time: 2026-10-30T17:12:08-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
