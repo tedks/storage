@@ -253,10 +253,10 @@ def run_bounded(chan, timeout: float, fn):
     (invoke_subsystem, exec_command). Closing the channel wakes that wait;
     the call then raises socket.timeout.
 
-    Expiry and completion are decided once, under one lock: a deadline that
-    comes due after fn has returned never closes the channel, and one that
-    came due first makes the call raise socket.timeout even if fn then
-    returned.
+    Expiry and completion are decided once, under one lock, as soon as fn
+    returns or raises: a deadline that comes due after that never closes the
+    channel, and one that came due first makes the call raise socket.timeout
+    even if fn then returned.
     """
     decision = threading.Lock()
     state = ["pending"]  # -> "done" or "expired", once
@@ -278,17 +278,18 @@ def run_bounded(chan, timeout: float, fn):
     watchdog = _current_watchdog()
     deadline = watchdog.arm(timeout, expire)
     try:
-        result = fn()
-    except Exception as exc:
+        try:
+            result = fn()
+        except Exception as exc:
+            if settle():
+                raise socket.timeout(
+                    f"no reply to a channel request within {timeout}s") from exc
+            raise
         if settle():
-            raise socket.timeout(
-                f"no reply to a channel request within {timeout}s") from exc
-        raise
+            raise socket.timeout(f"no reply to a channel request within {timeout}s")
+        return result
     finally:
         watchdog.cancel(deadline)
-    if settle():
-        raise socket.timeout(f"no reply to a channel request within {timeout}s")
-    return result
 
 
 def _is_open_timeout(exc: BaseException) -> bool:

@@ -828,7 +828,9 @@ class TestMemberConnectionPool(unittest.TestCase):
             # A fourth channel is refused by the server: the cap shrinks to 2,
             # one of them still kept for interactive requests.
             fourth = _InThread(lambda: pool.acquire_sftp(1.0), interactive=True)
-            time.sleep(0.2)
+            deadline = time.monotonic() + 10
+            while pool.snapshot()["sftp_cap"] != 2 and time.monotonic() < deadline:
+                time.sleep(0.01)
             for holder in holders:
                 holder.release()
             self.assertTrue(fourth.join())
@@ -1276,21 +1278,23 @@ class TestBoundedRequestWatchdog(unittest.TestCase):
     def test_a_dead_watchdog_thread_is_replaced_on_the_next_arm(self):
         watchdog = ssh_pool._Watchdog()
         fired = threading.Event()
-        watchdog.arm(3600.0, lambda: None)
-        watchdog._thread = threading.Thread(target=lambda: None)  # a finished thread
+        # No live watchdog thread: only a finished one on record.
+        watchdog._thread = threading.Thread(target=lambda: None)
         watchdog._thread.start()
         watchdog._thread.join()
         watchdog.arm(0.05, fired.set)
-        self.assertTrue(fired.wait(5))
+        self.assertTrue(fired.wait(5), "a dead watchdog thread was not replaced")
 
     def test_a_forked_child_gets_a_fresh_watchdog(self):
         before = ssh_pool._current_watchdog()
-        self.assertIs(ssh_pool._current_watchdog(), before)
-        with patch.object(ssh_pool.os, "getpid", return_value=before.pid + 1):
-            after = ssh_pool._current_watchdog()
-        self.assertIsNot(after, before)
-        self.assertEqual(after.pid, before.pid + 1)
-        ssh_pool._watchdog = before  # the real process goes on with its own
+        try:
+            self.assertIs(ssh_pool._current_watchdog(), before)
+            with patch.object(ssh_pool.os, "getpid", return_value=before.pid + 1):
+                after = ssh_pool._current_watchdog()
+            self.assertIsNot(after, before)
+            self.assertEqual(after.pid, before.pid + 1)
+        finally:
+            ssh_pool._watchdog = before  # the real process goes on with its own
 
     def test_a_cancelled_deadline_never_fires(self):
         fired = threading.Event()
