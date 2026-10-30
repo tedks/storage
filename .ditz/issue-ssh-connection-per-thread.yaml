@@ -26,3 +26,9 @@ log_events:
   who: Ted Smith
   what: created
   comment: ""
+- time: 2026-10-30T00:33:17-00:00
+  who: Ted Smith
+  what: blocks gh-111-fuse-threads-option
+  comment: ""
+blocks:
+- gh-111-fuse-threads-option
