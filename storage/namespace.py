@@ -890,6 +890,9 @@ class NamespaceService:
             futures[backend_name] = future
         return futures
 
+    # Directories whose last verify_listing is kept for verified_names.
+    VERIFY_RESULTS_KEPT = 64
+
     def verify_listing(self, path: str):
         """List path, hashing every copy of its names on several members
         again (storage conflicts --verify), and keep which names on which
@@ -1006,7 +1009,11 @@ class NamespaceService:
         )
         if verify:
             with self.listing_lock:
+                # The latest last; only the most recent few are kept.
+                self._verify_queued.pop(path, None)
                 self._verify_queued[path] = {n: m for n, m in queued.items() if len(m) > 1}
+                while len(self._verify_queued) > self.VERIFY_RESULTS_KEPT:
+                    del self._verify_queued[next(iter(self._verify_queued))]
         visible_entries = self._apply_conflict_view(path, entries, member_entries, size_splits)
         ordered_entries = sorted(visible_entries)
 

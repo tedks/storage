@@ -47,6 +47,19 @@ class TestMemberHashQueues(unittest.TestCase):
         self.assertEqual((live.result(timeout=5), newest.result(timeout=5)), (1, 2))
         blocker.result(timeout=5)
 
+    def test_pinned_items_are_never_dropped_or_counted(self):
+        release, blocker = self._block("m")
+        pinned = [self.queues.submit("m", lambda i=i: i, pinned=True) for i in range(5)]
+        a = self.queues.submit("m", lambda: "a")
+        b = self.queues.submit("m", lambda: "b")
+        c = self.queues.submit("m", lambda: "c")  # limit 2: drops a, not a pinned one
+        self.assertTrue(a.cancelled())
+        self.assertFalse(any(f.cancelled() for f in pinned))
+        release.set()
+        self.assertEqual([f.result(timeout=5) for f in pinned], list(range(5)))
+        self.assertEqual((b.result(timeout=5), c.result(timeout=5)), ("b", "c"))
+        blocker.result(timeout=5)
+
     def test_idle_while_nothing_waits_or_runs(self):
         self.assertTrue(self.queues.idle("m"))
         release, blocker = self._block("m")

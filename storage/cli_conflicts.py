@@ -97,14 +97,17 @@ def _verify_directory(directory: Path, poll_interval: float = 0.5) -> dict:
     except OSError as exc:
         raise click.ClickException(f"Could not verify {directory}: {exc}") from exc
     while True:
-        status = json.loads(os.getxattr(path, VERIFY_XATTR))
+        try:
+            status = json.loads(os.getxattr(path, VERIFY_XATTR))
+        except (OSError, ValueError) as exc:
+            raise click.ClickException(f"Lost track of the verification of {directory}: {exc}") from exc
         if not status.get("pending"):
             return status
         time.sleep(poll_interval)
 
 
 @click.command("conflicts")
-@click.argument("directory", type=click.Path(exists=True))
+@click.argument("directory", type=click.Path(exists=True, file_okay=False))
 @click.option(
     "-f",
     "--file",

@@ -493,12 +493,16 @@ class TestMemberChecksums(unittest.TestCase):
         self.assertIsNotNone(self.state.get_member_checksum("/a%", "m1"))
 
     def test_oldest_and_mark_verified(self):
-        self.state.put_member_checksum("/old", "m0", self._record(ts=10.0))
-        self.state.put_member_checksum("/new", "m0", self._record(ts=50.0))
-        self.state.put_member_checksum("/other", "m1", self._record(ts=1.0))
+        for member in ("m0", "m1"):
+            self.state.put_member_checksum("/old", member, self._record(ts=10.0))
+            self.state.put_member_checksum("/new", member, self._record(ts=50.0))
+        self.state.put_member_checksum("/single", "m0", self._record(ts=1.0))
         path, record, verified_at = self.state.oldest_member_checksum("m0", verified_before=60.0)
+        # /single is on one member only: the view never compares it.
         self.assertEqual((path, verified_at), ("/old", 10.0))
         self.assertIsNone(self.state.oldest_member_checksum("m0", verified_before=10.0))
+        self.assertEqual(self.state.oldest_member_checksum("m0", 60.0, exclude={"/old"})[0], "/new")
+        self.assertIsNone(self.state.oldest_member_checksum("m0", 60.0, exclude={"/old", "/new"}))
         # Verified again with the same digest: it goes to the back.
         self.assertTrue(self.state.mark_member_checksum_verified("/old", "m0", "a" * 32, 70.0))
         self.assertEqual(self.state.oldest_member_checksum("m0", verified_before=100.0)[0], "/new")
@@ -508,6 +512,13 @@ class TestMemberChecksums(unittest.TestCase):
         # Never moved backwards.
         self.state.mark_member_checksum_verified("/old", "m0", "a" * 32, 5.0)
         self.assertEqual(self.state.oldest_member_checksum("m0", verified_before=100.0)[0], "/new")
+
+    def test_oldest_pages_past_excluded_rows(self):
+        for i in range(150):
+            for member in ("m0", "m1"):
+                self.state.put_member_checksum(f"/f{i:03}", member, self._record(ts=float(i)))
+        exclude = {f"/f{i:03}" for i in range(140)}
+        self.assertEqual(self.state.oldest_member_checksum("m0", 1000.0, exclude)[0], "/f140")
 
     def test_older_index_gains_the_table(self):
         self.state.close()

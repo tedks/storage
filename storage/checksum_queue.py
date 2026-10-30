@@ -35,7 +35,9 @@ DEFAULT_QUEUE_LIMIT = 256
 # idle member each (storage.fs.StorageFS._reverify_tick); 0 turns them off.
 DEFAULT_CHECKSUM_REVERIFY_INTERVAL = 60.0
 
-_Item = Tuple[concurrent.futures.Future, Callable[[], object]]
+# (future, fn, pinned): a pinned item is never dropped and does not count
+# against the limit.
+_Item = Tuple[concurrent.futures.Future, Callable[[], object], bool]
 
 
 class MemberHashQueues:
@@ -51,11 +53,14 @@ class MemberHashQueues:
         self._pid = os.getpid()
         self._shut_down = False
 
-    def submit(self, member: str, fn: Callable[[], object]) -> concurrent.futures.Future:
+    def submit(self, member: str, fn: Callable[[], object],
+               pinned: bool = False) -> concurrent.futures.Future:
         """Queue fn on member's worker; RuntimeError after shutdown().
 
-        The future of the oldest waiting item is cancelled when the queue
-        overflows. Its done callbacks run in this thread, outside the
+        The future of the oldest waiting unpinned item is cancelled when
+        the unpinned items overflow the limit. pinned: never dropped (work
+        nothing else would schedule again, such as an explicit verify),
+        and not counted. Its done callbacks run in this thread, outside the
         queue's lock, so they may take the caller's locks only if the
         caller does not hold them in an order the callback would invert.
         """
@@ -75,16 +80,18 @@ class MemberHashQueues:
                 self._queues.clear()
                 self._running.clear()
             queue = self._queues.setdefault(member, collections.deque())
-            queue.append((future, fn))
-            if len(queue) > self.limit:
+            queue.append((future, fn, pinned))
+            if sum(1 for item in queue if not item[2]) > self.limit:
                 # Items cancelled while waiting (invalidated, superseded)
                 # go first; only then is a live one dropped.
                 live = [item for item in queue if not item[0].cancelled()]
                 if len(live) != len(queue):
                     queue.clear()
                     queue.extend(live)
-            if len(queue) > self.limit:
-                dropped = queue.popleft()[0]
+            if sum(1 for item in queue if not item[2]) > self.limit:
+                oldest = next(item for item in queue if not item[2])
+                queue.remove(oldest)
+                dropped = oldest[0]
             if member not in self._workers:
                 worker = threading.Thread(
                     target=self._run, args=(member,), name=f"checksum-{member}", daemon=True,
@@ -140,7 +147,7 @@ class MemberHashQueues:
                     self._cond.wait()
                 if self._shut_down:
                     return
-                future, fn = self._queues[member].pop()
+                future, fn, _ = self._queues[member].pop()
                 if not future.set_running_or_notify_cancel():
                     continue
                 self._running[member] = future
