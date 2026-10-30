@@ -1,0 +1,28 @@
+id: sync-namespace-orphans
+title: Uploads racing a rename or unlink through the mount leave the old name on members
+desc: 'Found by lane listing (PR A mounted test). With sync workers running, a file
+  written through the mount and renamed or unlinked while its upload is in flight
+  leaves the old name on the member, and the mount then lists it again (the namespace
+  merges member listings). Repro on a two-local-member mount (tests/test_sync_system.py
+  harness with sync on): write a.txt, rename a.txt -> b.txt at once: a member keeps
+  a.txt, listdir shows [a.txt, b.txt], persisting after 3 s. Likewise sub/new.txt
+  created, renamed to sub/moved.txt and unlinked leaves sub/new.txt on a member, so
+  rmdir sub fails on that member (ENOTEMPTY, logged by sync_executor) and sub stays
+  listed; b.txt unlinked shortly after a rename stayed on its member. Waiting for
+  get_location_backends(''/a.txt'') before the rename avoids the first case, so it
+  is the rename/unlink racing an upload whose location is not yet recorded (namespace.rename
+  uses get_location_backends to pick members). Related: gh-24 semantics, rename-descriptor-update-gaps;
+  the threading lane''s path locks (D6 stage 2) are the natural home.'
+type: bugfix
+component: sync
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-30T00:45:06-00:00
+references: []
+log_events:
+- time: 2026-10-30T00:45:06-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
