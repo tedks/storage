@@ -19,3 +19,13 @@ log_events:
   who: Ted Smith
   what: created
   comment: ""
+- time: 2026-10-30T01:13:29-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'From PR #134 council round 2 (Claude seat): StorageFS.rename classifies
+    a name the cache does not hold with getattr and rechecks only the cache under
+    the path locks. While this bug makes such renames fail, a member-only directory
+    misclassified as a file (stale listing, getattr error) is harmless. Whoever fixes
+    this must reclassify under the locks (or take the namespace lock exclusive whenever
+    the members may hold a directory), or a directory rename could run under path
+    locks only.'
