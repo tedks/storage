@@ -1835,10 +1835,8 @@ class TestFSNamespaceIntegration(unittest.TestCase):
             with patch.object(state, "put_member_checksum") as put:
                 self._upload("/d/dup.txt", b"diff")
             put.assert_not_called()
-        # In memory the upload's record stands; the old row stays refused.
-        self.assertEqual(self.fs._checksum_records.get(("/d/dup.txt", "backend2"), None) is None
-                         or self.fs._checksum_records[("/d/dup.txt", "backend2")].checksum
-                         == fast_checksum_bytes(b"diff"), True)
+        # The key itself is refused too: its old row is never loaded.
+        self.assertIn(("/d/dup.txt", "backend2", False), self.fs._persisted_refused)
         # Once deletes work again, a successful delete clears the backlog.
         self.fs._forget_checksums({"/elsewhere"})
         self.assertEqual(self.fs._persisted_refused, set())

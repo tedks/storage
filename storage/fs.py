@@ -584,9 +584,9 @@ class StorageFS(Operations):
         """Delete the rows failed writes left, so a refusal outlives the
         mount; the caller holds _checksum_lock. Called once the index
         answers again (a delete succeeded, or before a write) and at
-        destroy. One statement batch per (member, subtree) group. A row
-        written under a refused path since the failure goes too: that
-        costs a hash after a remount, never trusts a stale row."""
+        destroy. One statement batch per (member, subtree) group. A write
+        still covered by a refusal is skipped (_persist_checksum), so a
+        retry removes only rows from before the failure."""
         groups: Dict[Tuple[Optional[str], bool], List[str]] = {}
         for path, backend_name, subtree in self._persisted_refused:
             groups.setdefault((backend_name, subtree), []).append(path)
@@ -741,8 +741,7 @@ class StorageFS(Operations):
             # Before the write, so a refused subtree or member-wide delete
             # does not remove the row written now.
             self._retry_refused_deletes()
-            if self._persisted_refused - {own} and self._persisted_row_refused(
-                    (canonical_path, backend_name), ignore=own):
+            if self._persisted_row_refused((canonical_path, backend_name), ignore=own):
                 # Still refused: the index is not answering, a row written
                 # now would be deleted by a later retry and is not loaded
                 # meanwhile, so it is not written; the old row stays refused.
