@@ -1869,12 +1869,21 @@ class StorageFS(Operations):
         except OSError as e:
             raise FuseOSError(e.errno)
 
-    def symlink(self, target, source):
-        """Create symbolic link: `ln -s source target`.
+    # Symlinks are refused until they replicate (ruling
+    # oq-symlink-through-mount B; ditz symlink-replication): a link kept
+    # only in the cache would vanish with it.
+    _SYMLINKS_ENABLED = False
 
-        fusepy passes the new link's path first and its contents second.
-        The link lives in the cache only; nothing syncs it to a member.
+    def symlink(self, target, source):
+        """Create symbolic link: `ln -s source target`; refused with EPERM.
+
+        symlink(2) documents EPERM for a filesystem that does not support
+        symbolic links. fusepy passes the new link's path first and its
+        contents second; _symlink keeps that order for when links
+        replicate.
         """
+        if not self._SYMLINKS_ENABLED:
+            raise FuseOSError(errno.EPERM)
         resolved = self._resolve_path(target)
         with self._path_locked(resolved.canonical_path):
             return self._symlink(resolved, source)
@@ -2127,8 +2136,9 @@ def fuse_mount_options(backends: Dict[str, Backend], *, enable_watchers: bool,
     defaults to attr_timeout; ac_attr_timeout=0 states that a getattr
     follows every open rather than leaving it implied.
 
-    Writes through the mount stay visible at once: create, mkdir, symlink,
-    unlink, rmdir and rename update the kernel's entries themselves.
+    Writes through the mount stay visible at once: create, mkdir, unlink,
+    rmdir and rename update the kernel's entries themselves. (symlink is
+    refused for now and creates nothing.)
 
     The override arguments replace the defaults (per profile); each, and
     fresh_window, must be finite and 0 or more.

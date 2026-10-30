@@ -5,6 +5,7 @@ These tests mount an actual FUSE filesystem and verify sync behavior
 end-to-end.
 """
 
+import errno
 import unittest
 import tempfile
 import time
@@ -318,7 +319,7 @@ class TestKernelCacheVisibility(_MountedCase):
         # for every name about to appear.
         self.assertEqual(["a.txt"], sorted(os.listdir(m)))
         os.stat(m / "a.txt")
-        for name in ("b.txt", "c.txt", "link", "sub", "new.txt"):
+        for name in ("b.txt", "c.txt", "sub", "new.txt"):
             self.assertFalse(os.path.lexists(m / name))
 
         os.rename(m / "a.txt", m / "b.txt")
@@ -327,13 +328,14 @@ class TestKernelCacheVisibility(_MountedCase):
         self.assertEqual(3, os.stat(m / "b.txt").st_size)
 
         (m / "c.txt").write_text("three")
-        os.symlink("b.txt", m / "link")
+        # Symlinks are refused until they replicate (oq-symlink-through-mount B).
+        with self.assertRaises(PermissionError) as refused:
+            os.symlink("b.txt", m / "link")
+        self.assertEqual(errno.EPERM, refused.exception.errno)
+        self.assertFalse(os.path.lexists(m / "link"))
         os.mkdir(m / "sub")
-        self.assertEqual(["b.txt", "c.txt", "link", "sub"], sorted(os.listdir(m)))
+        self.assertEqual(["b.txt", "c.txt", "sub"], sorted(os.listdir(m)))
         self.assertEqual(5, os.stat(m / "c.txt").st_size)
-        self.assertTrue(os.path.islink(m / "link"))
-        self.assertEqual("b.txt", os.readlink(m / "link"))
-        self.assertEqual("one", (m / "link").read_text())
         self.assertTrue(os.path.isdir(m / "sub"))
 
         # A write that changes the size is seen by stat at once.
@@ -359,12 +361,11 @@ class TestKernelCacheVisibility(_MountedCase):
         self.assertTrue(os.path.exists(m / "new.txt"))
 
         os.unlink(m / "b.txt")
-        os.unlink(m / "link")
         os.rename(m / "sub" / "new.txt", m / "sub" / "moved.txt")
         os.unlink(m / "sub" / "moved.txt")
         os.rmdir(m / "sub")
         self.assertEqual(["c.txt", "new.txt"], sorted(os.listdir(m)))
-        for name in ("b.txt", "link", "sub"):
+        for name in ("b.txt", "sub"):
             self.assertFalse(os.path.lexists(m / name))
 
     def test_kernel_keeps_names_and_misses_but_not_attributes(self):

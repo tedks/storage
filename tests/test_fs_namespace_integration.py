@@ -276,6 +276,24 @@ class TestFSNamespaceIntegration(unittest.TestCase):
 
         self.assertEqual(self.fs.getattr('/synced.txt')['st_size'], len("synced"))
 
+    def test_symlink_is_refused_with_eperm(self):
+        list(self.fs.readdir('/', None))
+        with self.assertRaises(FuseOSError) as raised:
+            self.fs.symlink('/link', 'target.txt')
+        self.assertEqual(raised.exception.errno, errno.EPERM)
+        self.assertFalse(os.path.lexists(self.cache_dir / "link"))
+        self.assertFalse(os.path.lexists(self.cache_dir / "target.txt"))
+        self.assertIn('/', self.fs.namespace.entry_attrs)
+
+    def test_enabled_symlink_creates_the_link_path_and_drops_the_listing(self):
+        # Kept for when links replicate: fusepy passes the link path first.
+        list(self.fs.readdir('/', None))
+        with patch.object(type(self.fs), "_SYMLINKS_ENABLED", True):
+            self.fs.symlink('/link', 'target.txt')
+        self.assertEqual(os.readlink(self.cache_dir / "link"), "target.txt")
+        self.assertFalse(os.path.lexists(self.cache_dir / "target.txt"))
+        self.assertNotIn('/', self.fs.namespace.entry_attrs)
+
     def test_getattr_leaves_member_symlink_to_member_stat(self):
         # Listings are lstat; whether a symlink is followed is the member's
         # stat's call (SSH follows it), so getattr still asks the member.

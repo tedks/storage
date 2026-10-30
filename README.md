@@ -231,7 +231,7 @@ so a change whose watcher event was lost (a watcher reconnect) stays out
 of `ls` until the directory is invalidated; a lookup of a name missing
 from a listing is still answered from it only for `readdir_ttl` (else
 `revalidate_after`) seconds, and stat'd after that. Changes made through the mount (create, write, rename,
-unlink, mkdir, rmdir, symlink) drop the affected listings at once; a file
+unlink, mkdir, rmdir) drop the affected listings at once; a file
 added or changed directly on a member shows within the fresh window, plus
 one more listing while a stale one is served.
 
@@ -270,6 +270,15 @@ mount prints a warning on stderr naming them. Members are grouped by the
 host as written in the profile (case aside) and the port; nothing is
 resolved, so members that reach one machine by different names or by
 its address are not grouped and get no warning.
+
+Symbolic links cannot be created through the mount: `ln -s` fails with
+`EPERM` ("Operation not permitted"), because a link would live only in the
+local cache and vanish with it, so `cp -a`, `rsync -l` or `tar x` into the
+mount fail for each link. Links that already exist on a member are not
+supported either: an SSH member reports the link's target, so the name
+shows as a regular file or directory (a dangling link is listed but
+cannot be stat'ed); a local member reports the link itself, which the
+mount lists but cannot follow or read (`readlink` fails with `ENOENT`).
 
 #### SSH host keys
 
