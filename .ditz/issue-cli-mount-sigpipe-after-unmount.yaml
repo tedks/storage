@@ -1,0 +1,26 @@
+id: cli-mount-sigpipe-after-unmount
+title: libfuse 2 resets SIGPIPE to default on unmount; restore SIG_IGN after FUSE()
+  returns
+desc: 'Found while landing PR #132 (tests/test_fuse_thread_state.py::test_unmount_resets_sigpipe_to_its_default
+  records it). Python starts with SIGPIPE ignored; libfuse 2''s fuse_remove_signal_handlers
+  resets a SIGPIPE disposition it finds ignored to SIG_DFL, behind Python''s back
+  (signal.getsignal still says SIG_IGN). After an in-process mount ends, a write to
+  a dead socket kills the process with exit 141 instead of raising BrokenPipeError.
+  The remote gate''s mount fixture now restores SIG_IGN after unmounting. In the CLI
+  mount, anything that writes to a socket after FUSE() returns (closing an SSH transport
+  whose peer is gone during shutdown) could end the process with 141 rather than a
+  clean exit. Fix: signal.signal(SIGPIPE, SIG_IGN) right after FUSE() returns in cli_mount.py
+  (lane listing owns that file this wave). Low impact: shutdown only.'
+type: bugfix
+component: fs
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-30T01:15:24-00:00
+references: []
+log_events:
+- time: 2026-10-30T01:15:24-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
