@@ -272,6 +272,7 @@ class TestDirectoryRetries(SyncRaceTestBase):
         self.fs.sync_manager.stop()
         self.fail_member_once("rename")
         self.fs.rename("/a.txt", "/b.txt")
+        # Stands in for cache pressure evicting the renamed, CLEAN file.
         cache_path = self.fs.cache_manager.get_cache_path("/b.txt")
         self.assertGreater(self.fs.cache_manager._evict_if_still_clean("/b.txt", cache_path), 0)
 
