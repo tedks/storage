@@ -548,7 +548,10 @@ class SSHBackend(Backend):
         def rename(sftp):
             self._ensure_parent(sftp, new_remote)
             try:
-                sftp.rename(old_remote, new_remote)
+                # posix-rename@openssh.com replaces an existing target, as
+                # rename(2) and the local member do; plain SFTP rename fails
+                # on OpenSSH when the target exists (an editor's save).
+                sftp.posix_rename(old_remote, new_remote)
             except FileNotFoundError:
                 # Nothing to rename; best-effort
                 pass

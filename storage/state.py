@@ -659,43 +659,63 @@ class StateManager:
             path = path.rstrip('/')
         return path
 
+    @staticmethod
+    def _at_or_under(path: str, root: str) -> bool:
+        return root == '/' or path == root or path.startswith(root + '/')
+
+    def _paths_at_or_under(self, table: str, root: str) -> List[str]:
+        """Rows of table at root or below it.
+
+        LIKE treats '_' and '%' in names as wildcards, so it only narrows
+        the scan and the prefix test decides.
+        """
+        cursor = self.conn.execute(
+            f'SELECT DISTINCT virtual_path FROM {table} WHERE virtual_path = ? OR virtual_path LIKE ?',
+            (root, f"{root.rstrip('/')}/%"),
+        )
+        return [row['virtual_path'] for row in cursor.fetchall()
+                if self._at_or_under(row['virtual_path'], root)]
+
     def rename_path(self, old_virtual_path: str, new_virtual_path: str) -> List[Tuple[str, str]]:
-        """Rename metadata entries from old path (and descendants) to new path."""
+        """Rename metadata entries from old path (and descendants) to new path.
+
+        Like rename(2), the move replaces what was at the new path: a file,
+        or an empty directory whose children's rows are gone already. The
+        destination's rows (files and locations) are dropped first, in the
+        same transaction, so the old ones cannot collide with the moved
+        ones. Returns (old, new) for every files row moved.
+        """
         old_path = self._normalize_virtual_path(old_virtual_path)
         new_path = self._normalize_virtual_path(new_virtual_path)
 
         if old_path == new_path:
             return []
 
-        like_pattern = f"{old_path}/%"
         rename_map: List[Tuple[str, str]] = []
         with self._db_lock:
-            cursor = self.conn.execute(
-                'SELECT virtual_path FROM files WHERE virtual_path = ? OR virtual_path LIKE ?',
-                (old_path, like_pattern)
-            )
+            try:
+                for table in ('files', 'file_locations'):
+                    for path in self._paths_at_or_under(table, new_path):
+                        if not self._at_or_under(path, old_path):
+                            self.conn.execute(f'DELETE FROM {table} WHERE virtual_path = ?', (path,))
 
-            for row in cursor.fetchall():
-                current_path = row['virtual_path']
-                if old_path == '/':
-                    suffix = current_path
-                else:
-                    suffix = current_path[len(old_path):]
-                new_entry = new_path + suffix
-                rename_map.append((current_path, new_entry))
+                for current_path in self._paths_at_or_under('files', old_path):
+                    suffix = current_path if old_path == '/' else current_path[len(old_path):]
+                    rename_map.append((current_path, new_path + suffix))
 
-            for original, updated in rename_map:
-                self.conn.execute(
-                    'UPDATE files SET virtual_path = ? WHERE virtual_path = ?',
-                    (updated, original)
-                )
-                self.conn.execute(
-                    'UPDATE file_locations SET virtual_path = ? WHERE virtual_path = ?',
-                    (updated, original)
-                )
-
-            if rename_map:
+                for original, updated in rename_map:
+                    self.conn.execute(
+                        'UPDATE files SET virtual_path = ? WHERE virtual_path = ?',
+                        (updated, original)
+                    )
+                    self.conn.execute(
+                        'UPDATE file_locations SET virtual_path = ? WHERE virtual_path = ?',
+                        (updated, original)
+                    )
                 self.conn.commit()
+            except BaseException:
+                self.conn.rollback()
+                raise
 
         return rename_map
 

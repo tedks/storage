@@ -234,6 +234,9 @@ class _FakeSFTPClient:
     def rename(self, old_path, new_path):
         self._request("rename", old_path)
 
+    def posix_rename(self, old_path, new_path):
+        self._request("posix_rename", old_path)
+
 
 class _FakeServer:
     """One fake sshd: the transports it accepted and the SFTP clients on them."""
@@ -1137,6 +1140,12 @@ class TestSSHBackendOnThePool(_BackendTestCase):
         self.assertEqual(self.server.connect_calls, 1)
         self.assertLessEqual(self.server.transport.max_open_seen, 4)
         self.assertEqual(self.server.concurrent_use, [])
+
+    def test_rename_uses_posix_rename(self):
+        """posix-rename replaces an existing target (ditz rename-over-existing-file)."""
+        self._new_backend().rename("/a", "/b")
+        self.assertIn("posix_rename", [name for name, *_ in self.server.requests])
+        self.assertNotIn("rename", [name for name, *_ in self.server.requests])
 
     def test_no_socket_timeout_override(self):
         backend = self._new_backend()
