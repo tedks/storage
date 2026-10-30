@@ -178,9 +178,11 @@ class RsyncBackend(SSHBackend):
         remote = self._remote_spec(virtual_path)
         try:
             self._run_rsync(str(local_path), remote)
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as exc:
             self.logger.warning("rsync copy_from_local timed out for %s", virtual_path)
-            self._mark_unavailable()
+            # rsync runs over its own ssh; probe the member's transport rather
+            # than drop it under the other operations sharing it.
+            self._pool.check(exc)
             raise
         except RuntimeError:
             raise

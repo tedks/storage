@@ -422,6 +422,17 @@ class MemberConnection:
         self.logger.debug("SSH member %s: transport answered a probe after %r",
                           self.name, exc)
 
+    def check(self, reason: BaseException) -> None:
+        """Probe the current transport; close it if it does not answer.
+
+        For failures seen outside the pool (an rsync over its own ssh timing
+        out): the member's transport is judged by its own reply, not marked
+        down on another connection's account.
+        """
+        with self._cond:
+            generation = self._generation
+        self._probe(generation, reason)
+
     def _after_error(self, generation: int, verdict: _Verdict, exc: BaseException) -> None:
         if verdict is _Verdict.TRANSPORT:
             self._fail_transport(generation, exc)

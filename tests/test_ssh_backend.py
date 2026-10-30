@@ -562,6 +562,23 @@ class TestMemberConnectionPool(unittest.TestCase):
         self.assertEqual(server.connect_calls, 2)
         pool.close()
 
+    def test_check_keeps_a_live_transport_and_drops_a_dead_one(self):
+        server = _FakeServer()
+        pool = _pool(server)
+        with pool.sftp(1.0):
+            pass
+        pool.check(RuntimeError("outside failure"))
+        self.assertFalse(server.ssh_clients[0].closed)
+
+        def no_reply(_timeout):
+            raise ssh_module.paramiko.SSHException("Timeout opening channel.")
+
+        server.transport.open_hook = no_reply
+        pool.check(RuntimeError("outside failure"))
+        self.assertTrue(server.ssh_clients[0].closed)
+        self.assertTrue(pool.available())
+        pool.close()
+
     def test_path_errors_keep_the_channel(self):
         server = _FakeServer()
         pool = _pool(server)
@@ -991,6 +1008,22 @@ class TestSSHBackendOnThePool(_BackendTestCase):
 
         self.assertTrue(_Probe()("getattr", "/"))
         self.assertFalse(is_interactive_request())
+
+    def test_rsync_timeout_probes_the_transport_instead_of_dropping_it(self):
+        from storage.backends.rsync import RsyncBackend
+
+        backend = RsyncBackend(name="r0", host="example.local", remote_path="/data",
+                               username="test", key_filename="/tmp/id_test",
+                               connect_timeout=2.0)
+        self.addCleanup(backend.close)
+        timeout = subprocess.TimeoutExpired(cmd="rsync", timeout=300)
+        with patch.object(backend, "_run_rsync", side_effect=timeout):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                backend.copy_from_local(SimpleNamespace(), "/f.bin")
+        self.assertTrue(backend.is_available())
+        self.assertFalse(self.server.ssh_clients[0].closed)
+        backend.stat("/f.bin")
+        self.assertEqual(self.server.connect_calls, 1)
 
     def test_rsync_mkdir_goes_through_the_pool(self):
         from storage.backends.rsync import RsyncBackend

@@ -182,9 +182,6 @@ class SSHBackend(Backend):
         else:
             self._pool.mark_down()
 
-    def _mark_unavailable(self):
-        self._pool.mark_down()
-
     @staticmethod
     def _is_transient_oserror(exc: OSError) -> bool:
         """Return True when an OSError likely indicates connection loss."""

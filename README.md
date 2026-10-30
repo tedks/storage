@@ -208,7 +208,8 @@ read-only `user.storage.member_stat` xattr on the cached file. Check times
 are kept in memory, so after a restart each cached file is checked at its
 first open. Each check is a remote round trip on the single FUSE thread:
 the first open after a member silently drops off can wait for the SSH
-operation timeout (60 s by default) before the member is marked
+connect timeout (10 s by default) three times over (the request, a probe
+of the connection, and a reconnect) before the member is marked
 unavailable, and walking a large cached tree after the age costs one
 round trip per file.
 
@@ -390,7 +391,7 @@ has been run against a real host since the field use above.
 
 Implemented:
 
-- Local, SSH/SFTP and rsync storage members (SFTP for reads, rsync for writes)
+- Local, SSH/SFTP and rsync storage members (SFTP for reads, rsync for writes); one SSH connection per member, its requests multiplexed over a small pool of SFTP channels
 - Local cache with LRU eviction, revalidated against the member on open (`revalidate_after`); streaming cold reads with background prefetch that stops when readers close early (`streaming_keep_after_close`)
 - Background sync workers with retry; N-way replication configured per directory through xattrs
 - Conflict detection on sync, and `storage conflicts` to list and resolve conflicts
