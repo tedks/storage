@@ -166,23 +166,50 @@ class TestFetchThroughTempFile(unittest.TestCase):
         self.assertEqual(self.cache_manager.get_total_cache_size(), 0)
         self.assertEqual(self.cache_manager.get_free_space_needed(1024 * 1024), 0)
 
-    def test_second_fetch_does_not_truncate_an_open_reader(self):
-        old = b"old copy " * 100
-        self.cache_path.write_bytes(old)
-        self.cache_manager.mark_cache_size_dirty()
-        reader = os.open(self.cache_path, os.O_RDONLY)
+    def test_late_fetch_keeps_a_file_installed_and_written_meanwhile(self):
+        worker = self._start_fetch()
         try:
-            worker = self._start_fetch()
-            # The reader's file is untouched while the new copy streams in.
-            self.assertEqual(os.pread(reader, len(old) + 1, 0), old)
+            # While this fetch is gated, another installs the path and a
+            # writer changes it (and its xattrs) through an open descriptor.
+            written = b"written through the mount"
+            self.cache_path.write_bytes(written)
+            os.setxattr(self.cache_path, "user.storage.test", b"kept")
+            self.cache_manager.mark_cache_size_dirty()
+            writer = os.open(self.cache_path, os.O_RDWR)
+        finally:
             self.backend.gate.set()
             worker.join(10)
+        try:
+            # The late fetch still reports the path cached, but did not
+            # replace the inode the writer holds.
             self.assertEqual(self.results, [True])
-            self.assertEqual(os.pread(reader, len(old) + 1, 0), old)
+            os.pwrite(writer, b"W", 0)
         finally:
-            os.close(reader)
-        self.assertEqual(self.cache_path.read_bytes(), self.payload)
-        self.assertEqual(self.cache_manager.get_total_cache_size(), len(self.payload))
+            os.close(writer)
+        self.assertEqual(self.cache_path.read_bytes(), b"W" + written[1:])
+        self.assertEqual(os.getxattr(self.cache_path, "user.storage.test"), b"kept")
+        self.assertEqual(self._partials(), [])
+        self.assertEqual(self.cache_manager.get_total_cache_size(), len(written))
+
+    def test_fetch_onto_a_directory_fails(self):
+        self.cache_path.mkdir()
+        worker = self._start_fetch()
+        self.backend.gate.set()
+        worker.join(10)
+        self.assertEqual(self.results, [False])
+        self.assertEqual(self._partials(), [])
+
+    def test_failed_transfer_after_rescan_is_not_counted(self):
+        self.backend.fail = True
+        worker = self._start_fetch()
+        try:
+            self.cache_manager.mark_cache_size_dirty()
+            self.assertEqual(self.cache_manager.get_total_cache_size(), len(self.payload) // 2)
+        finally:
+            self.backend.gate.set()
+            worker.join(10)
+        self.assertEqual(self.results, [False])
+        self.assertEqual(self.cache_manager.get_total_cache_size(), 0)
 
     def test_rescan_during_transfer_is_not_double_counted(self):
         worker = self._start_fetch()

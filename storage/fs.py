@@ -1137,10 +1137,12 @@ class StorageFS(Operations):
         if resolved.backend_name:
             backend = self.backends.get(resolved.backend_name)
 
-            if backend and backend.exists(canonical_path):
+            if backend:
                 try:
-                    self.cache_manager.fetch_into_cache(backend, canonical_path, cache_path)
-                    return True
+                    if self.cache_manager.cache_file(
+                        resolved.requested_path, backend, source_virtual_path=canonical_path,
+                    ):
+                        return True
                 except Exception:
                     pass
 
