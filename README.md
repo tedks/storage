@@ -299,6 +299,14 @@ keep this and document it). Which ones a mount uses depends on its members:
   `StrictHostKeyChecking=accept-new`) for uploads.
 - **Remote watchers** (`enable_watchers`, off by default) run the system
   `ssh` with `StrictHostKeyChecking=accept-new` for every remote member.
+- Those system `ssh` runs share one OpenSSH connection per host and user
+  (`ControlMaster=auto`, bounded by `ControlPersist=60`), so an upload does
+  not handshake again and a watcher rides the same connection. The sockets
+  live in a private directory made for the mount (under `XDG_RUNTIME_DIR`
+  when set) and are removed at unmount; the shared connection is one more
+  TCP connection to the member, apart from the SFTP transport's, and an
+  rsync that times out or loses its connection ends it so the next upload
+  starts fresh. `STORAGE_SSH_MUX=0` turns sharing off.
 
 `accept-new` adds an unseen host to `~/.ssh/known_hosts` of the user running
 the mount without asking and without showing anything (the output is only
