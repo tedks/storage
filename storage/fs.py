@@ -21,6 +21,7 @@ import yaml
 import json
 import concurrent.futures
 import contextlib
+import signal
 from dataclasses import dataclass, field
 from fuse import FUSE, FuseOSError, Operations
 from pathlib import Path
@@ -2177,6 +2178,39 @@ def fuse_mount_options(backends: Dict[str, Backend], *, enable_watchers: bool,
     return options
 
 
+def _discard_sigpipe(signum, frame) -> None:
+    """A SIGPIPE handler that does nothing: the failed write raises EPIPE."""
+
+
+@contextlib.contextmanager
+def _sigpipe_survives_fuse():
+    """Keep a write to a dead socket an EPIPE error through FUSE()'s teardown.
+
+    Python starts with SIGPIPE ignored. libfuse 2's teardown
+    (fuse_remove_signal_handlers) resets a SIGPIPE disposition it finds
+    ignored to the default, behind Python's back (signal.getsignal() still
+    says SIG_IGN), and it does so before it runs the filesystem's destroy():
+    closing an SSH transport or streaming socket whose peer is gone, there
+    or afterwards, would end the process with exit 141 instead of raising
+    BrokenPipeError. libfuse leaves a handler alone, so install a no-op one
+    for the duration of the mount and ignore it again afterwards.
+
+    Only an ignored SIGPIPE is at risk; a handler or the default the caller
+    chose is left in place for the whole mount. signal.signal() works only
+    on the main thread (the CLI's); a mount run from another thread cannot
+    be guarded and leaves SIGPIPE to the caller.
+    """
+    if (threading.current_thread() is not threading.main_thread()
+            or signal.getsignal(signal.SIGPIPE) != signal.SIG_IGN):
+        yield
+        return
+    signal.signal(signal.SIGPIPE, _discard_sigpipe)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+
+
 def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
                  backends: Dict[str, Backend], cache_size: int,
                  foreground: bool = False, num_sync_workers: int = 2,
@@ -2303,8 +2337,9 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
         )
         fs.request_stale_sweep()  # started by init(), after FUSE's fork
     try:
-        FUSE(fs, mountpoint, nothreads=not fuse_threads, foreground=foreground, allow_other=allow_other,
-             **fuse_options)
+        with _sigpipe_survives_fuse():
+            FUSE(fs, mountpoint, nothreads=not fuse_threads, foreground=foreground, allow_other=allow_other,
+                 **fuse_options)
     finally:
         try:
             if not fs._sweep_pending:
