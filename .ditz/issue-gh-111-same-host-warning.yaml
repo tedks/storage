@@ -1,0 +1,18 @@
+id: gh-111-same-host-warning
+title: Warn when several members share one SSH host
+desc: 'Lane listing PR C (docs/browsing_latency_plan.md D5 warning): after create_storage_members,
+  group SSH members by literal (host, port) and warn on stderr that they share one
+  host. Aliases are not grouped.'
+type: feature
+component: listing
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-30T00:32:08-00:00
+references: []
+log_events:
+- time: 2026-10-30T00:32:08-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
