@@ -1856,19 +1856,27 @@ class StorageFS(Operations):
             raise FuseOSError(e.errno)
 
     def symlink(self, target, source):
-        """Create symbolic link"""
-        with self._path_locked(self._resolve_path(source).canonical_path):
-            return self._symlink(target, source)
+        """Create symbolic link: `ln -s source target`.
 
-    def _symlink(self, target, source):
-        """Create symbolic link"""
-        cache_path = self.cache_manager.get_cache_path(source)
+        fusepy passes the new link's path first and its contents second.
+        The link lives in the cache only; nothing syncs it to a member.
+        """
+        resolved = self._resolve_path(target)
+        with self._path_locked(resolved.canonical_path):
+            return self._symlink(resolved, source)
+
+    def _symlink(self, resolved: ResolvedPath, source):
+        cache_path = resolved.cache_path
 
         try:
             cache_path.parent.mkdir(parents=True, exist_ok=True)
-            os.symlink(target, str(cache_path))
+            os.symlink(source, str(cache_path))
         except OSError as e:
             raise FuseOSError(e.errno)
+
+        # Like create: a listing taken before the link would miss it.
+        self._invalidate_dir_cache_entry(resolved.parent_dir)
+        self._invalidate_dir_cache_entry(resolved.canonical_path)
 
     # Time operations
 
