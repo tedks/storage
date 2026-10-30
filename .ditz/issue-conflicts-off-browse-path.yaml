@@ -5,8 +5,8 @@ type: task
 component: fs
 release:
 reporter: Ted Smith <tedks@riseup.net>
-status: in_progress
-disposition:
+status: closed
+disposition: fixed
 creation_time: 2026-10-30T15:59:28-00:00
 references: []
 log_events:
@@ -29,5 +29,10 @@ log_events:
     hashes costs ~5 GiB for a mount that only listed, ~11-19 GiB per test session,
     and keeps the daemon running minutes after unmount. Filed with counts as field-listing-downloads-to-hash
     and field-daemon-outlives-unmount.'
+- time: 2026-10-30T18:08:00-00:00
+  who: Ted Smith
+  what: 'closed: fixed'
+  comment: 'PR #140 merged f2e9213 (head a517d96); council fixpoint after 6 rounds;
+    all gates green on a517d96'
 blocks:
 - conflicts-persisted-records
