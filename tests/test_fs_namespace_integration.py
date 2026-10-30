@@ -831,6 +831,49 @@ class TestFSNamespaceIntegration(unittest.TestCase):
             entries = set(self.fs.readdir('/', None))
         self.assertIn("new.txt", entries)
 
+    def test_listings_publish_whole_while_another_is_between_steps(self):
+        # A later listing (on another thread) pauses after its member reads
+        # while an earlier one finishes. Publication is one step, so the
+        # earlier one never sees half of the later one: it publishes its own
+        # read, and the later one replaces it when it resumes.
+        (self.backend1_dir / "old.txt").write_text("o")
+        namespace = self.fs.namespace
+        real = namespace._schedule_directory_checksums
+        inner_paused, inner_go = threading.Event(), threading.Event()
+        inner_done = threading.Event()
+        state = {"started": False}
+
+        def inner():
+            generation = namespace._begin_listing('/')
+            try:
+                namespace._list_members('/', generation)
+            finally:
+                namespace._end_listing('/')
+                inner_done.set()
+
+        def hook(*args, **kwargs):
+            real(*args, **kwargs)
+            if threading.current_thread().name == "inner-listing":
+                inner_paused.set()
+                inner_go.wait(5)
+            elif not state["started"]:
+                state["started"] = True
+                (self.backend2_dir / "new.txt").write_text("n")
+                threading.Thread(target=inner, name="inner-listing", daemon=True).start()
+                self.assertTrue(inner_paused.wait(5))
+
+        with patch.object(namespace, "_schedule_directory_checksums", side_effect=hook):
+            outer = set(self.fs.readdir('/', None))
+            self.assertNotIn("new.txt", outer)  # its own read; nothing newer published yet
+            with namespace.listing_lock:
+                self.assertEqual(namespace._listing_as_of['/'], namespace.readdir_snapshot['/'][0])
+            inner_go.set()
+            self.assertTrue(inner_done.wait(5))
+
+        with namespace.listing_lock:
+            self.assertEqual(namespace._listing_as_of['/'], namespace.readdir_snapshot['/'][0])
+        self.assertIn("new.txt", set(self.fs.readdir('/', None)))
+
     def test_background_refresh_lists_no_member_inline_after_shutdown(self):
         namespace = self.fs.namespace
         self._make_stale()

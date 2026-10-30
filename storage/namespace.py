@@ -854,21 +854,6 @@ class NamespaceService:
                 member_entries[backend_name] = names
                 if listed is not None:
                     backend_attrs[backend_name] = listed
-            # A raced invalidation of the directory dropped its names, and one
-            # of a child changed what this listing saw; either way the result
-            # may predate the change, so it is not stored. A child-only
-            # invalidation leaves the older names in place, which the next
-            # listing replaces.
-            # Checked and stored under listing_lock, so forget_listed_attrs
-            # (which takes only listing_lock) cannot bump in between.
-            with self.listing_lock:
-                publish = (
-                    self._listing_generation[path] == generation
-                    and started_at >= self._listing_as_of.get(path, float("-inf"))
-                )
-                if publish:
-                    self.dir_cache[path] = member_entries
-                    self._listing_as_of[path] = started_at
         for names in member_entries.values():
             entries.update(names)
 
@@ -876,33 +861,45 @@ class NamespaceService:
         visible_entries = self._apply_conflict_view(path, entries, member_entries)
         ordered_entries = sorted(visible_entries)
 
-        with self.listing_lock:
-            # Published only together with its member names above, and only
-            # while no later listing has been published since.
-            if (
-                publish
-                and self._listing_generation[path] == generation
-                and self._listing_as_of.get(path) == started_at
-            ):
-                self.readdir_snapshot[path] = (started_at, ordered_entries)
-                self._view_inputs[path] = (entries, member_entries)
-                self.entry_attrs[path] = (started_at, backend_attrs, set())
-            # A listing that began later was published while this one ran:
-            # answer with it, so a readdir never shows names older than what
-            # getattr now answers from.
-            newer = self._listing_as_of.get(path, float("-inf")) > started_at
-            newer_snapshot = self.readdir_snapshot.get(path) if newer else None
-            # A snapshot is not served once its listing has expired, so both go.
-            now = time.monotonic()
-            expired = [
-                dir_path for dir_path, (at, _, _) in self.entry_attrs.items()
-                if self.listing_state(at, now) == "expired"
-            ]
-            for dir_path in expired:
-                del self.entry_attrs[dir_path]
-                self.readdir_snapshot.pop(dir_path, None)
-                self._view_inputs.pop(dir_path, None)
-                self._listing_as_of.pop(dir_path, None)
+        # Published in one step: member names, time, snapshot, view inputs
+        # and attributes, under dir_cache_lock and then listing_lock (their
+        # order), so no other listing ever sees half of one published.
+        # Not published when an invalidation of the directory or a child
+        # raced it (the result may predate the change; a child-only
+        # invalidation leaves the older names, which the next listing
+        # replaces), or when a listing that began later was published
+        # first. Checked and stored under listing_lock, so
+        # forget_listed_attrs (which takes only listing_lock) cannot bump
+        # in between.
+        with self.dir_cache_lock:
+            with self.listing_lock:
+                if (
+                    self._listing_generation[path] == generation
+                    and started_at >= self._listing_as_of.get(path, float("-inf"))
+                ):
+                    self.dir_cache[path] = member_entries
+                    self._listing_as_of[path] = started_at
+                    self.readdir_snapshot[path] = (started_at, ordered_entries)
+                    self._view_inputs[path] = (entries, member_entries)
+                    self.entry_attrs[path] = (started_at, backend_attrs, set())
+                # A listing that began later was published while this one
+                # ran: answer with it, so a readdir never shows names older
+                # than what getattr now answers from.
+                newer = self._listing_as_of.get(path, float("-inf")) > started_at
+                newer_snapshot = self.readdir_snapshot.get(path) if newer else None
+                # A snapshot is not served once its listing has expired, so
+                # both go; the time goes only with the listing it stamps.
+                now = time.monotonic()
+                expired = [
+                    dir_path for dir_path, (at, _, _) in self.entry_attrs.items()
+                    if self.listing_state(at, now) == "expired"
+                ]
+                for dir_path in expired:
+                    at = self.entry_attrs.pop(dir_path)[0]
+                    self.readdir_snapshot.pop(dir_path, None)
+                    self._view_inputs.pop(dir_path, None)
+                    if self._listing_as_of.get(dir_path) == at:
+                        del self._listing_as_of[dir_path]
 
         if newer_snapshot is not None:
             return self._served_snapshot(path, newer_snapshot)
