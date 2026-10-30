@@ -11,7 +11,7 @@ type: task
 component: performance
 release:
 reporter: Ted Smith <tedks@riseup.net>
-status: unstarted
+status: in_progress
 disposition:
 creation_time: 2026-10-30T00:33:13-00:00
 references: []
@@ -44,6 +44,10 @@ log_events:
     up and skip _record_fetched. Also from round 1: a watcher push during a fetch
     is a no-op (cache path absent until install); the watcher acquiring the path lock
     blocking closes it.'
+- time: 2026-10-30T01:02:25-00:00
+  who: Ted Smith
+  what: started
+  comment: ""
 blocks:
 - gh-111
 - gh-111-fuse-threads-option
