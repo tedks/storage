@@ -230,7 +230,6 @@ class Backend(ABC):
         """Rename or move a path on this backend."""
         pass
 
-    @abstractmethod
     def filesystem_identity(self) -> Optional[Tuple[str, int, int]]:
         """(host, port, device id) of the filesystem holding this member's root.
 
@@ -241,6 +240,7 @@ class Backend(ABC):
         """
         return None
 
+    @abstractmethod
     def get_free_space(self) -> Optional[int]:
         """Get free space in bytes, None if unknown"""
         pass
