@@ -1,0 +1,21 @@
+id: rename-uncached-file-enoent
+title: Renaming a file the cache does not hold fails with ENOENT
+desc: 'NamespaceService.rename renames the cache copy first (old_cache.rename(new_cache))
+  and turns its FileNotFoundError into ENOENT, so mv of a file that is only on the
+  members (never opened, or evicted) fails through the mount. Found by lane threading
+  while testing rename locking (tests/test_fs_threading.py test_uncached_file_rename_does_not_wait_for_other_paths
+  pins the current behaviour). Pre-existing on master 051627d. Fix: skip the cache
+  move when there is no cache copy and rename on the members and in the index.'
+type: bugfix
+component: fs
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-30T01:09:54-00:00
+references: []
+log_events:
+- time: 2026-10-30T01:09:54-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
