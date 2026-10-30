@@ -1,0 +1,25 @@
+id: oq-listing-negative-lookup
+title: Answer not-found from a fresh complete listing instead of stat-ing every member?
+desc: 'Context: docs/browsing_latency_plan.md decision D3. A lookup of a name that
+  no listing has (file managers probe one per directory, e.g. a hidden-files marker)
+  stats every member today, even when every available member listed the directory
+  moments ago without that name (namespace.py _listed_attrs returns None; test_fs_namespace_integration.py:221
+  pins it). Options: (A) answer ENOENT from a fresh listing in which every available
+  member listed without the name, re-stat only when a member''s listing failed or
+  was attr-less; (B) keep the stats. Consequence of A: a file added directly on a
+  member and opened by its typed name is invisible until the listing refreshes (the
+  fresh window, 60 s by default). Recommendation: A, consistent with the 2026-10-27
+  content ruling. Who decides: Ted. Blocks: lane listing PR B.'
+type: task
+component: open-questions
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-30T00:29:03-00:00
+references: []
+log_events:
+- time: 2026-10-30T00:29:03-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
