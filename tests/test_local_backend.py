@@ -1,4 +1,6 @@
+import os
 import shutil
+import stat
 import tempfile
 import unittest
 from pathlib import Path
@@ -42,3 +44,55 @@ class TestBackendRename(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestCopyKeepsInternalXattrsOut(unittest.TestCase):
+    """The mount's own user.storage.* state stays on cache files (ditz
+    local-backend-internal-xattrs); user xattrs and the user.storage.config
+    policy travel, as do the mode and times."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        self.member_dir = self.root / "member"
+        self.member_dir.mkdir()
+        self.backend = LocalBackend("member", str(self.member_dir))
+
+    def make_source(self, path):
+        path.write_bytes(b"payload")
+        os.chmod(path, 0o640)
+        for name, value in (
+            ("user.storage.metadata", b"{}"),
+            ("user.storage.member_stat", b"{}"),
+            ("user.storage.stream", b"{}"),
+            ("user.storage.config", b"replica_count: 2"),
+            ("user.tag", b"kept"),
+        ):
+            os.setxattr(path, name, value)
+        os.utime(path, ns=(1_000_000_000_000_000_000, 1_000_000_000_123_456_789))
+        return path
+
+    def assert_copied(self, dst):
+        self.assertEqual(b"payload", dst.read_bytes())
+        self.assertEqual(0o640, stat.S_IMODE(os.stat(dst).st_mode))
+        self.assertEqual(1_000_000_000_123_456_789, os.stat(dst).st_mtime_ns)
+        self.assertEqual(["user.storage.config", "user.tag"], sorted(os.listxattr(dst)))
+
+    def test_upload_leaves_internal_xattrs_behind(self):
+        src = self.make_source(self.root / "cache-file")
+        self.backend.copy_from_local(src, "/d/f")
+        self.assert_copied(self.member_dir / "d" / "f")
+
+    def test_upload_over_a_leaked_copy_removes_its_internal_xattrs(self):
+        dst = self.member_dir / "f"
+        dst.write_bytes(b"old")
+        os.setxattr(dst, "user.storage.metadata", b"stale")
+        src = self.make_source(self.root / "cache-file")
+        self.backend.copy_from_local(src, "/f")
+        self.assert_copied(dst)
+
+    def test_fetch_ignores_internal_xattrs_on_the_member(self):
+        self.make_source(self.member_dir / "f")
+        local = self.root / "cache" / "f"
+        self.backend.copy_to_local("/f", local)
+        self.assert_copied(local)
