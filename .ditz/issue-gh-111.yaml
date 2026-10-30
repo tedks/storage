@@ -89,6 +89,10 @@ log_events:
   who: Ted Smith
   what: blocked by threading-fuse-worker-cap
   comment: ""
+- time: 2026-10-30T02:21:56-00:00
+  who: Ted Smith
+  what: blocked by threading-cold-open-pool-share
+  comment: ""
 blocked_by:
 - gh-111-listing-attrs
 - gh-111-parallel-listing
@@ -107,3 +111,4 @@ blocked_by:
 - gh-111-fuse-threads-option
 - gh-111-kernel-cache-nits
 - threading-fuse-worker-cap
+- threading-cold-open-pool-share
