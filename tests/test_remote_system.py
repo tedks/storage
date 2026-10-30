@@ -190,9 +190,13 @@ class Member:
 class RemoteCluster:
     """The running members and the client-side files the tests connect with."""
 
-    def __init__(self, run_id: str, members: List[Member], key_path: Path, ssh_log: Path):
+    def __init__(self, run_id: str, members: List[Member], key_path: Path, ssh_log: Path,
+                 limited: Member):
         self.run_id = run_id
+        # The members a mount uses; limited is a separate container whose
+        # sshd allows only three session channels per connection.
         self.members = members
+        self.limited = limited
         self.key_path = key_path
         self.ssh_log = ssh_log
 
@@ -233,7 +237,7 @@ class RemoteCluster:
         A stopped watcher's remote inotifywait outlives it (#106); without
         this, the next test's check that one is running would pass early.
         """
-        for member in self.members:
+        for member in [*self.members, self.limited]:
             self.exec(member, "pkill -u storage -x inotifywait", check=False)
             if not _wait_for(lambda member=member: self.exec(
                     member, "pgrep -u storage -x inotifywait", check=False).returncode != 0,
@@ -288,9 +292,8 @@ def cluster(tmp_path_factory):
             created_network = network
 
         force_published = os.environ.get(FORCE_PUBLISHED_ENV) == "1"
-        members: List[Member] = []
-        for index in range(MEMBER_COUNT):
-            name = f"remote{index}"
+
+        def start_member(name: str, sshd_args=()) -> Member:
             keys = work / f"keys-{name}"
             keys.mkdir()
             _ssh_keygen(keys / "ssh_host_ed25519_key", f"{run_id}-{name}")
@@ -301,7 +304,7 @@ def cluster(tmp_path_factory):
             container_id = _docker(
                 "create", "--pull=never", "--name", container, "--network", network,
                 "--label", "storage-test=1", "-p", "127.0.0.1::22",
-                "-v", f"{keys}:/keys:ro", image).stdout.strip()
+                "-v", f"{keys}:/keys:ro", image, *sshd_args).stdout.strip()
             created_containers.append(container_id)
             _docker("start", container)
             ip = _docker("inspect", "-f",
@@ -328,18 +331,22 @@ def cluster(tmp_path_factory):
                             f"{logs.stdout}{logs.stderr}", pytrace=False)
             host, port = answered[0]
             host_pubkey = (keys / "ssh_host_ed25519_key.pub").read_text().split()
-            members.append(Member(name, container, ip, host, port,
-                                  " ".join(host_pubkey[:2])))
+            return Member(name, container, ip, host, port, " ".join(host_pubkey[:2]))
+
+        members = [start_member(f"remote{index}") for index in range(MEMBER_COUNT)]
+        # Same image; sshd allows three session channels per connection
+        # instead of ten, so the SSH channel pool meets refusals.
+        limited = start_member("limited", ("-o", "MaxSessions=3"))
 
         known_hosts = work / "known_hosts"
         known_hosts.write_text("".join(
             f"{m.host if m.port == 22 else f'[{m.host}]:{m.port}'} {m.host_pubkey}\n"
-            for m in members
+            for m in [*members, limited]
         ))
         shim_dir, ssh_log = _install_ssh_shim(work, known_hosts)
         os.environ["PATH"] = f"{shim_dir}{os.pathsep}{old_path}"
 
-        yield RemoteCluster(run_id, members, key_path, ssh_log)
+        yield RemoteCluster(run_id, members, key_path, ssh_log, limited)
     finally:
         os.environ["PATH"] = old_path
         removals = [("rm", "-f", "-v", c) for c in created_containers]
@@ -623,13 +630,17 @@ def mounted_factory(remote, tmp_path):
 
     created: List[tuple] = []
 
-    def make(**fs_kwargs) -> Mounted:
+    def make(backend_kwargs=None, **fs_kwargs) -> Mounted:
+        """backend_kwargs: SSHBackend arguments per member name, in place of
+        one member per container."""
         assert not created, "one mount per test"
         mount = tmp_path / "mount"
         cache = tmp_path / "cache"
         mount.mkdir()
         cache.mkdir()
-        backends = {m.name: SSHBackend(**remote.backend_kwargs(m)) for m in remote.members}
+        if backend_kwargs is None:
+            backend_kwargs = {m.name: remote.backend_kwargs(m) for m in remote.members}
+        backends = {name: SSHBackend(**kwargs) for name, kwargs in backend_kwargs.items()}
         fs_kwargs.setdefault("num_sync_workers", 2)
         fs = StorageFS(cache_root=cache, state_db=tmp_path / "state.db",
                        backends=backends, cache_size=256 * 1024 * 1024, **fs_kwargs)
@@ -902,3 +913,144 @@ def test_mounted_revalidate_sees_container_change_after_age(remote, mounted_fact
     assert _wait_for(lambda: path.read_bytes() == b"SECOND, LONGER VERSION\n",
                      timeout=age * 5, interval=0.5), \
         "a same-size change was never seen after the revalidation age"
+
+
+# --------------------------------------------------------------------------- #
+# Connections: one SSH transport per member (ditz ssh-connection-per-thread)
+# --------------------------------------------------------------------------- #
+
+def _established_ssh_connections(remote, member) -> int:
+    """Established TCP connections to the container's sshd, from its /proc.
+
+    The image has no ss; /proc/net/tcp{,6} lists every socket in the
+    container's network namespace, local port 22 is 0016, and state 01 is
+    ESTABLISHED.
+    """
+    out = remote.exec(member, "cat /proc/net/tcp /proc/net/tcp6", user="root").stdout
+    count = 0
+    for line in out.splitlines():
+        fields = line.split()
+        if len(fields) > 3 and fields[1].endswith(":0016") and fields[3] == "01":
+            count += 1
+    return count
+
+
+def test_mount_holds_one_connection_per_member(remote, mounted_factory, tmp_path):
+    """Three members on one host: three transports and the watcher's ssh, under
+    parallel listing, reading and writing (the per-thread design held one per
+    thread per member)."""
+    member = remote.members[0]
+    names = ("a", "b", "c")
+    for name in names:
+        remote.exec(member, f"mkdir -p {REMOTE_ROOT}/{name}")
+        for index in range(4):
+            remote.write_remote(member, f"{name}/seed-{index}.bin", secrets.token_bytes(300_000))
+    base = remote.backend_kwargs(member)
+    kwargs = {f"m{name}": dict(base, name=f"m{name}", remote_path=f"{REMOTE_ROOT}/{name}")
+              for name in names}
+    assert _established_ssh_connections(remote, member) == 0
+    mnt = mounted_factory(backend_kwargs=kwargs, enable_watchers=True)
+
+    peak = [0]
+    stop = threading.Event()
+
+    def sample():
+        while not stop.is_set():
+            peak[0] = max(peak[0], _established_ssh_connections(remote, member))
+            time.sleep(0.05)
+
+    def work(index):
+        for round_ in range(5):
+            os.listdir(mnt.mount)
+            for seed in os.listdir(mnt.mount):
+                if seed.startswith("seed-"):
+                    (mnt.mount / seed).read_bytes()
+            (mnt.mount / f"new-{index}-{round_}.bin").write_bytes(secrets.token_bytes(50_000))
+
+    sampler = threading.Thread(target=sample, daemon=True)
+    sampler.start()
+    errors: List[BaseException] = []
+
+    def guarded(index):
+        try:
+            work(index)
+        except BaseException as exc:
+            errors.append(exc)
+
+    workers = [threading.Thread(target=guarded, args=(i,)) for i in range(6)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=120)
+    # Let the sync workers upload what was written.
+    assert _wait_for(lambda: mnt.fs.sync_manager.get_queue_size() == 0, timeout=60.0)
+    time.sleep(1.0)
+    stop.set()
+    sampler.join(timeout=10)
+
+    assert errors == []
+    for backend in mnt.backends.values():
+        assert backend._pool.connects == 1, backend._pool.snapshot()
+        assert backend.is_available()
+    # Three transports plus the one watcher for the shared host; nothing
+    # else here runs system ssh.
+    assert peak[0] <= 4, peak[0]
+    assert _established_ssh_connections(remote, member) <= 4
+
+
+def test_maxsessions_3_refusals_shrink_the_pool_without_errors(remote, tmp_path):
+    member = remote.limited
+    backend = SSHBackend(**remote.backend_kwargs(member))
+    try:
+        backend.mkdir("/dir")
+        payload = secrets.token_bytes(200_000)
+        remote.write_remote(member, "dir/file.bin", payload)
+        errors: List[BaseException] = []
+        unavailable = []
+
+        def work(index):
+            try:
+                for _ in range(10):
+                    assert backend.stat("/dir/file.bin").st_size == len(payload)
+                    assert backend.read_file("/dir/file.bin", 1000, 64) == payload[1000:1064]
+                    assert "file.bin" in backend.listdir("/dir")
+                    backend.write_file(f"/dir/out-{index}.bin", b"x" * 100, 0)
+                    assert backend.get_fast_checksum("/dir/file.bin") == \
+                        fast_checksum_bytes(payload)
+                    if not backend.is_available():
+                        unavailable.append(index)
+            except BaseException as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=work, args=(i,)) for i in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=180)
+        assert errors == []
+        assert unavailable == []
+        snapshot = backend._pool.snapshot()
+        assert snapshot["connects"] == 1, snapshot
+        assert snapshot["sftp_cap"] + snapshot["exec_cap"] <= 3, snapshot
+        assert _established_ssh_connections(remote, member) == 1
+    finally:
+        backend.close()
+
+
+def test_killed_ssh_session_reconnects_within_the_retry_interval(remote, ssh_backend):
+    member = remote.members[0]
+    remote.write_remote(member, "file.bin", b"hello")
+    assert ssh_backend.read_file("/file.bin", 0, 5) == b"hello"
+    assert ssh_backend._pool.connects == 1
+
+    # The per-connection sshd runs as the storage user; killing it drops the
+    # connection (the watcher is not running in this test).
+    remote.exec(member, "pkill -u storage -x sshd")
+    assert _wait_for(lambda: _established_ssh_connections(remote, member) == 0, timeout=10.0)
+
+    started = time.monotonic()
+    assert ssh_backend.read_file("/file.bin", 0, 5) == b"hello"
+    elapsed = time.monotonic() - started
+    assert ssh_backend._pool.connects == 2
+    assert ssh_backend.is_available()
+    assert elapsed < ssh_backend._reconnect_probe_interval, elapsed
