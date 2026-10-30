@@ -1,10 +1,12 @@
 import logging
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Dict, List, Optional, Tuple
 
 import click
 
+from .backends.base import Backend
+from .backends.ssh import SSHBackend
 from .file_config import FileConfig, get_file_config, get_inherited_config, set_file_config
 from .fs import fuse_mount_options, listing_fresh_window, mount_storage
 from .mount_profiles import (
@@ -13,6 +15,20 @@ from .mount_profiles import (
     parse_size,
     resolve_mount_configuration,
 )
+
+
+def shared_ssh_hosts(backends: Dict[str, Backend]) -> List[Tuple[str, int, List[str]]]:
+    """(host, port, member names) for each SSH host that two or more members use.
+
+    Grouped by the host as written (case aside) and the port, with no name
+    resolution: members that reach one machine by different names or
+    addresses (an alias, its IP) are not grouped.
+    """
+    groups: Dict[Tuple[str, int], List[str]] = {}
+    for name, backend in backends.items():
+        if isinstance(backend, SSHBackend):
+            groups.setdefault((backend.host.lower(), backend.port), []).append(name)
+    return [(host, port, names) for (host, port), names in groups.items() if len(names) > 1]
 
 
 @click.command()
@@ -194,6 +210,12 @@ def mount(
     mountpoint_path.mkdir(parents=True, exist_ok=True)
 
     backends = create_storage_members(resolved.member_specs, resolved.key_file)
+    for host, port, names in shared_ssh_hosts(backends):
+        click.echo(
+            f"Warning: members {', '.join(names)} share the SSH host {host}:{port}; they "
+            "compete for its network link and disks.",
+            err=True,
+        )
 
     if resolved.profile_name is not None:
         click.echo(f"Loaded mount profile: {resolved.profile_name} ({resolved.profile_source})")
