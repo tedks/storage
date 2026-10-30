@@ -24,3 +24,10 @@ log_events:
   who: Ted Smith
   what: created
   comment: ""
+- time: 2026-10-30T17:03:47-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Council round 1 on #141 (Claude seat): the bad case is an unreachable
+    SSH member: the upload holds the upload lock for the SFTP timeout, once per target
+    member, and with the single-threaded loop a rename or unlink of a freshly written
+    file stalls the whole mount that long. Include it in the measurement.'
