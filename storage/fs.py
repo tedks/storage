@@ -2178,20 +2178,34 @@ def fuse_mount_options(backends: Dict[str, Backend], *, enable_watchers: bool,
     return options
 
 
-def _restore_sigpipe_ignored() -> None:
-    """Put SIGPIPE back to ignored after FUSE() returns.
+def _discard_sigpipe(signum, frame) -> None:
+    """A SIGPIPE handler that does nothing: the failed write raises EPIPE."""
+
+
+@contextlib.contextmanager
+def _sigpipe_survives_fuse():
+    """Keep a write to a dead socket an EPIPE error through FUSE()'s teardown.
 
     Python starts with SIGPIPE ignored. libfuse 2's teardown
     (fuse_remove_signal_handlers) resets a SIGPIPE disposition it finds
-    ignored to the default, behind Python's back: signal.getsignal() still
-    says SIG_IGN. Without this, a write to a dead socket during shutdown
-    (closing an SSH transport whose peer is gone) ends the process with
-    exit 141 instead of raising BrokenPipeError. signal.signal() works only
-    on the main thread; a mount run from another thread leaves it to the
-    caller.
+    ignored to the default, behind Python's back (signal.getsignal() still
+    says SIG_IGN), and it does so before it runs the filesystem's destroy():
+    closing an SSH transport or streaming socket whose peer is gone, there
+    or afterwards, would end the process with exit 141 instead of raising
+    BrokenPipeError. libfuse leaves a handler alone, so install a no-op one
+    for the duration of the mount and put back what the caller had.
+
+    signal.signal() works only on the main thread (the CLI's); a mount run
+    from another thread cannot be guarded and leaves SIGPIPE to the caller.
     """
-    if threading.current_thread() is threading.main_thread():
-        signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    previous = signal.signal(signal.SIGPIPE, _discard_sigpipe)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGPIPE, previous if previous is not None else signal.SIG_DFL)
 
 
 def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
@@ -2320,9 +2334,9 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
         )
         fs.request_stale_sweep()  # started by init(), after FUSE's fork
     try:
-        FUSE(fs, mountpoint, nothreads=not fuse_threads, foreground=foreground, allow_other=allow_other,
-             **fuse_options)
-        _restore_sigpipe_ignored()
+        with _sigpipe_survives_fuse():
+            FUSE(fs, mountpoint, nothreads=not fuse_threads, foreground=foreground, allow_other=allow_other,
+                 **fuse_options)
     finally:
         try:
             if not fs._sweep_pending:

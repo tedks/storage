@@ -58,6 +58,11 @@ class _ProbeOperations(Operations):
     def readdir(self, path, fh):
         return [".", ".."]
 
+    def destroy(self, path):
+        # libfuse removes its signal handlers before it calls this.
+        self.sigpipe_in_destroy = (
+            TestFuseThreadState._sigpipe_bit("SigIgn"), TestFuseThreadState._sigpipe_bit("SigCgt"))
+
 
 class TestFuseThreadState(unittest.TestCase):
 
@@ -113,12 +118,16 @@ class TestFuseThreadState(unittest.TestCase):
         self.assertTrue(all(c["local_survived"] for c in calls[1:]))
 
     @staticmethod
-    def _sigpipe_ignored() -> bool:
+    def _sigpipe_bit(field: str) -> bool:
         """The kernel's view; signal.getsignal() only reports Python's cache."""
         for line in Path("/proc/self/status").read_text().splitlines():
-            if line.startswith("SigIgn:"):
+            if line.startswith(field + ":"):
                 return bool(int(line.split()[1], 16) & (1 << (signal.SIGPIPE - 1)))
-        raise AssertionError("no SigIgn line in /proc/self/status")
+        raise AssertionError(f"no {field} line in /proc/self/status")
+
+    @classmethod
+    def _sigpipe_ignored(cls) -> bool:
+        return cls._sigpipe_bit("SigIgn")
 
     def test_unmount_resets_sigpipe_to_its_default(self):
         # Python starts with SIGPIPE ignored. libfuse 2's teardown resets a
@@ -138,6 +147,26 @@ class TestFuseThreadState(unittest.TestCase):
         finally:
             signal.signal(signal.SIGPIPE, signal.SIG_IGN)
         self.assertTrue(self._sigpipe_ignored())
+
+    def test_unmount_leaves_a_sigpipe_handler_alone(self):
+        # What mount_storage relies on: a no-op handler installed before
+        # FUSE() survives libfuse's teardown, including at destroy(), where
+        # an ignored SIGPIPE is already back at its default.
+        signal.signal(signal.SIGPIPE, lambda signum, frame: None)
+        self._mount(nothreads=True)
+        self._stat_sequentially(1)
+        subprocess.run(["fusermount", "-u", str(self.mount_dir)], check=True, timeout=10)
+        self.mount_thread.join(timeout=10)
+        self.assertEqual(self.ops.sigpipe_in_destroy, (False, True))
+        self.assertTrue(self._sigpipe_bit("SigCgt"))
+
+    def test_unmount_reaches_destroy_with_sigpipe_at_its_default(self):
+        signal.signal(signal.SIGPIPE, signal.SIG_IGN)  # as Python starts
+        self._mount(nothreads=True)
+        self._stat_sequentially(1)
+        subprocess.run(["fusermount", "-u", str(self.mount_dir)], check=True, timeout=10)
+        self.mount_thread.join(timeout=10)
+        self.assertEqual(self.ops.sigpipe_in_destroy, (False, False))
 
     def test_threaded_loop_loses_thread_locals_between_callbacks(self):
         self._mount(nothreads=False)
