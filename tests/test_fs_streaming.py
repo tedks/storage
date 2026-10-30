@@ -1722,13 +1722,16 @@ class TestFSStreamingIntegration(unittest.TestCase):
         manager = self.fs._streaming_manager
         session, partial, final = self._install_case("nolink-taken.bin", final_bytes=b"writer")
         with self._no_hard_links():
-            self.assertFalse(manager._install_partial(session))
+            outcome = manager._install_partial(session)
+        if outcome == "unsupported":
+            self.skipTest("the test filesystem has no RENAME_NOREPLACE")
+        self.assertEqual(outcome, "taken")
         self.assertEqual(final.read_bytes(), b"writer")
         self.assertTrue(partial.exists())
 
         session, partial, final = self._install_case("nolink-free.bin")
         with self._no_hard_links():
-            self.assertTrue(manager._install_partial(session))
+            self.assertEqual(manager._install_partial(session), "installed")
         self.assertEqual(final.read_bytes(), b"streamed")
         self.assertFalse(partial.exists())
 
@@ -1741,7 +1744,7 @@ class TestFSStreamingIntegration(unittest.TestCase):
         unsupported = OSError(errno.ENOSYS, "no renameat2")
         with self._no_hard_links(), \
                 patch.object(streaming_module, "_rename_noreplace", side_effect=unsupported):
-            self.assertFalse(manager._install_partial(session))
+            self.assertEqual(manager._install_partial(session), "unsupported")
         self.assertFalse(os.path.lexists(final))
         self.assertTrue(partial.exists())
 

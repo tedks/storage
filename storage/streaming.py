@@ -54,12 +54,26 @@ STREAMING_KEEP_AFTER_CLOSE_PERCENT = Fraction(50)
 # threshold, never fake it.
 STREAMING_MAX_TRACKED_READ_SPANS = 64
 
-# link() errors meaning the cache filesystem has no hard links (see
-# _install_partial); renameat2 errors meaning it has no RENAME_NOREPLACE.
-_LINK_UNSUPPORTED = (errno.EPERM, errno.EOPNOTSUPP, errno.ENOTSUP, errno.ENOSYS)
+# link() errors after which _install_partial tries RENAME_NOREPLACE: no
+# hard links on the cache filesystem (EMLINK cannot happen on a fresh
+# partial, but the rename would work there too); renameat2 errors meaning
+# it has no RENAME_NOREPLACE either.
+_LINK_UNSUPPORTED = (errno.EPERM, errno.EOPNOTSUPP, errno.ENOTSUP, errno.ENOSYS, errno.EMLINK)
 _NOREPLACE_UNSUPPORTED = (errno.EINVAL, errno.ENOSYS, errno.EOPNOTSUPP, errno.ENOTSUP)
 _AT_FDCWD = -100
 _RENAME_NOREPLACE = 1
+
+
+def _load_renameat2():
+    try:
+        renameat2 = ctypes.CDLL(None, use_errno=True).renameat2
+    except (AttributeError, OSError):
+        return None
+    renameat2.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint)
+    return renameat2
+
+
+_RENAMEAT2 = _load_renameat2()
 
 
 def _rename_noreplace(src, dst) -> bool:
@@ -67,11 +81,9 @@ def _rename_noreplace(src, dst) -> bool:
 
     Raises OSError, with ENOSYS where libc has no renameat2.
     """
-    try:
-        renameat2 = ctypes.CDLL(None, use_errno=True).renameat2
-    except AttributeError:
-        raise OSError(errno.ENOSYS, "renameat2 unavailable") from None
-    renameat2.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint)
+    renameat2 = _RENAMEAT2
+    if renameat2 is None:
+        raise OSError(errno.ENOSYS, "renameat2 unavailable")
     if renameat2(_AT_FDCWD, os.fsencode(src), _AT_FDCWD, os.fsencode(dst), _RENAME_NOREPLACE) == 0:
         return True
     err = ctypes.get_errno()
@@ -190,6 +202,7 @@ class StreamingReadManager:
         # Set under prefetch_sessions_lock when destroy() starts; no session
         # registers or is attached to after that.
         self._destroying = False
+        self._warned_no_noreplace = False
         self._streaming_stats_lock = threading.Lock()
         self._streaming_stats = {
             "streaming_sessions_started": 0,
@@ -917,11 +930,11 @@ class StreamingReadManager:
         self._close_streaming_session_resources(session)
         self.cache_manager.mark_cache_size_dirty()
 
-    def _install_partial(self, session: PrefetchSession) -> bool:
+    def _install_partial(self, session: PrefetchSession) -> str:
         """Move the session's partial to the final cache path unless that path is taken.
 
-        Returns False, leaving the partial where it is, if the final path
-        already exists. A session starts only for a file that is not cached,
+        Returns "installed"; or "taken", leaving the partial where it is, if
+        the final path already exists. A session starts only for a file that is not cached,
         so anything at the final path now was put there since: a full-file
         fetch (a write-open, or an open that found no streaming slot),
         create(), or a rename onto the path. That file is at least as new as
@@ -929,31 +942,32 @@ class StreamingReadManager:
         so the session's bytes never replace it. The no-replace is atomic:
         link() fails if the name exists. Where the cache filesystem has no
         hard links, renameat2(RENAME_NOREPLACE) does the same; where it has
-        neither, the partial is not installed at all (returns False): a
+        neither, the partial is not installed at all ("unsupported"): a
         check followed by a rename would lose a fill in between. The
         readers keep their bytes, and the file is not cached by this
-        session. Raises OSError otherwise.
+        session (warned once per mount). Raises OSError otherwise.
         """
         partial_path = session.partial_cache_path
         final_path = session.final_cache_path
         try:
             os.link(partial_path, final_path)
         except FileExistsError:
-            return False
+            return "taken"
         except OSError as exc:
             if exc.errno not in _LINK_UNSUPPORTED:
                 raise
             try:
-                return _rename_noreplace(partial_path, final_path)
+                return "installed" if _rename_noreplace(partial_path, final_path) else "taken"
             except OSError as rename_exc:
                 if rename_exc.errno not in _NOREPLACE_UNSUPPORTED:
                     raise
-            self.logger.warning(
-                "streaming cannot install %s without replacing: the cache filesystem has neither "
-                "hard links nor RENAME_NOREPLACE; not caching it",
-                session.canonical_path,
-            )
-            return False
+            if not self._warned_no_noreplace:
+                self._warned_no_noreplace = True
+                self.logger.warning(
+                    "streaming cannot install files in the cache without replacing: its filesystem "
+                    "has neither hard links nor RENAME_NOREPLACE; streamed files are not cached",
+                )
+            return "unsupported"
         try:
             os.unlink(partial_path)
         except FileNotFoundError:
@@ -964,10 +978,12 @@ class StreamingReadManager:
             self.logger.warning(
                 "streaming could not remove partial %s after install: %r", partial_path, exc,
             )
-        return True
+        return "installed"
 
-    def _discard_superseded_session(self, session: PrefetchSession):
-        """Finish a complete session whose final path was filled by something else.
+    def _discard_superseded_session(self, session: PrefetchSession, outcome: str):
+        """Finish a complete session whose partial was not installed (outcome, see _install_partial).
+
+        Mostly "taken": the final path was filled by something else.
 
         The partial is dropped (see _install_partial) and the session leaves
         the registry, so later opens use the cached file. Readers still
@@ -977,9 +993,10 @@ class StreamingReadManager:
         not run, since the cache holds the other file.
         """
         self.logger.info(
-            "streaming superseded path=%s backend=%s: the cache path was filled while streaming; partial discarded",
+            "streaming not installed path=%s backend=%s reason=%s; partial discarded",
             session.canonical_path,
             session.backend.name,
+            "cache-path-filled" if outcome == "taken" else outcome,
         )
         with self.prefetch_sessions_lock:
             with session.lock:
@@ -1015,11 +1032,13 @@ class StreamingReadManager:
                     os.fsync(io_fd)
 
             final_path.parent.mkdir(parents=True, exist_ok=True)
-            if not self._install_partial(session):
+            outcome = self._install_partial(session)
+            if outcome != "installed":
                 self.logger.info(
-                    "streaming partial-cache skipped path=%s backend=%s: the cache path was filled meanwhile",
+                    "streaming partial-cache skipped path=%s backend=%s reason=%s",
                     session.canonical_path,
                     session.backend.name,
+                    "cache-path-filled" if outcome == "taken" else outcome,
                 )
                 return False
             self.logger.info(
@@ -1082,15 +1101,15 @@ class StreamingReadManager:
         try:
             os.fsync(io_fd)
             session.final_cache_path.parent.mkdir(parents=True, exist_ok=True)
-            installed = self._install_partial(session)
+            outcome = self._install_partial(session)
         except OSError as exc:
             with session.lock:
                 session.error = exc
                 session.condition.notify_all()
             return
 
-        if not installed:
-            self._discard_superseded_session(session)
+        if outcome != "installed":
+            self._discard_superseded_session(session, outcome)
             return
 
         self.cache_manager.mark_cache_size_dirty()
