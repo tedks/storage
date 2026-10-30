@@ -336,3 +336,74 @@ backends = ["{self.temp_dir}"]
     def test_flags_override_the_profile(self):
         self.assertIs(False, self._mount("fuse_threads = true", ["--no-fuse-threads"])[1])
         self.assertIs(True, self._mount("", ["--fuse-threads"])[1])
+
+
+class TestSharedSSHHostWarning(unittest.TestCase):
+    """Members on one SSH host compete for it; the mount says so on stderr."""
+
+    def setUp(self):
+        self.temp_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.temp_dir, True)
+        self.config_path = self.temp_dir / "storage.toml"
+
+    def _mount(self, backends):
+        lines = ",\n".join(f'  "{b}"' for b in backends)
+        self.config_path.write_text(
+            f"""
+[mounts.sh]
+mountpoint = "{self.temp_dir / 'mnt'}"
+cache = "{self.temp_dir / 'cache'}"
+backends = [
+{lines}
+]
+""".strip()
+        )
+        runner = CliRunner()
+        with patch("storage.cli_mount.mount_storage"):
+            result = runner.invoke(main, ["mount", "--config", str(self.config_path), "sh"])
+        self.assertEqual(result.exit_code, 0, msg=result.output + result.stderr)
+        return result
+
+    def test_members_on_one_host_warn_once_on_stderr(self):
+        result = self._mount([
+            "ssh://user@storage-host.example:/srv/raid/",
+            "ssh://user@storage-host.example:/srv/chunk0/",
+            "rsync://other@Storage-Host.example:/srv/chunk1/",
+            "ssh://user@elsewhere.example:/srv/",
+            str(self.temp_dir),
+        ])
+        warnings = [l for l in result.stderr.splitlines() if l.startswith("Warning:")]
+        self.assertEqual(
+            ["Warning: members remote0, remote1, remote2 share the SSH host "
+             "storage-host.example:22; they compete for its network link and disks."],
+            warnings,
+        )
+        self.assertNotIn("Warning:", result.stdout)
+
+    def test_distinct_hosts_do_not_warn(self):
+        result = self._mount([
+            "ssh://user@host-a.example:/srv/",
+            "ssh://user@host-b.example:/srv/",
+        ])
+        self.assertNotIn("Warning:", result.stderr)
+
+    def test_aliases_are_not_grouped(self):
+        # No name resolution: a name and an address for one machine look different.
+        result = self._mount([
+            "ssh://user@storage-host.example:/srv/a/",
+            "ssh://user@192.0.2.10:/srv/b/",
+        ])
+        self.assertNotIn("Warning:", result.stderr)
+
+
+class TestSharedSSHHosts(unittest.TestCase):
+    def test_groups_by_host_and_port(self):
+        from storage.backends.ssh import SSHBackend
+        from storage.cli_mount import shared_ssh_hosts
+
+        backends = {
+            "a": SSHBackend("a", "h.example", "/x", "u", port=22),
+            "b": SSHBackend("b", "h.example", "/y", "u", port=2222),
+            "c": SSHBackend("c", "h.example", "/z", "u", port=2222),
+        }
+        self.assertEqual([("h.example", 2222, ["b", "c"])], shared_ssh_hosts(backends))

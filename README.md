@@ -265,6 +265,12 @@ be walked through for up to the fresh window. The profile keys
 `entry_timeout` and `negative_timeout` (seconds) override the first two
 timeouts; attributes have no override.
 
+Members on one SSH host compete for its network link and disks, so the
+mount prints a warning on stderr naming them. Members are grouped by the
+host as written in the profile (case aside) and the port; nothing is
+resolved, so members that reach one machine by different names or by
+its address are not grouped and get no warning.
+
 #### SSH host keys
 
 There is no host-key setting yet: host-key verification is not configurable,
