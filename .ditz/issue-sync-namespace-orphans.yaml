@@ -17,8 +17,8 @@ type: bugfix
 component: sync
 release:
 reporter: Ted Smith <tedks@riseup.net>
-status: in_progress
-disposition:
+status: closed
+disposition: fixed
 creation_time: 2026-10-30T00:45:06-00:00
 references: []
 log_events:
@@ -30,3 +30,9 @@ log_events:
   who: Ted Smith
   what: started
   comment: ""
+- time: 2026-10-30T17:18:28-00:00
+  who: Ted Smith
+  what: 'closed: fixed'
+  comment: 'Rename and upload races fixed by PR #141, merge 26e2d82 (UploadLocks;
+    settled failures; guarded directory retries). The unlink half (member copies never
+    deleted) is open question oq-unlink-member-copies.'
