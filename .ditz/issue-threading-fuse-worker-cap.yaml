@@ -1,0 +1,26 @@
+id: threading-fuse-worker-cap
+title: Decide a cap on concurrent FUSE handlers before fuse_threads defaults on
+desc: 'From PR #137 council round 1 (Codex). libfuse 2.9.9''s multithreaded loop starts
+  a worker whenever none is idle and has no upper cap (idle workers above 10 exit).
+  The per-member SFTP channel pool (#132) bounds what reaches the members, but a burst
+  (a file manager opening a directory of thumbnails, a find over the mount) can start
+  one thread per pending request, each waiting on a path lock or a pooled channel.
+  Options: (a) no cap, observe thread counts in the field test; (b) a semaphore at
+  the FUSE entry (StorageFS.__call__) sized to a few times the pool, with getattr/readdir
+  exempt so browsing never queues behind transfers; (c) a per-member semaphore on
+  member I/O only. Recommendation: (a) for the field test with thread count logged,
+  then (b) if bursts show. Who decides: the lead of stage 4 (default on), with Ted''s
+  field-test result. Blocks: stage 4 only.'
+type: task
+component: performance
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-30T02:19:17-00:00
+references: []
+log_events:
+- time: 2026-10-30T02:19:17-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
