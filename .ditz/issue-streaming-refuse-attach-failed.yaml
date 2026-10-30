@@ -1,0 +1,21 @@
+id: streaming-refuse-attach-failed
+title: 'Streaming: refuse attach to a failed session and fall back to the full-file
+  path'
+desc: 'Council round 1 on #130 (Claude seat, nit, out of scope). An open that attaches
+  to a session with error set but cleanup not yet claimed gets EIO on missing ranges.
+  Refusing attach when session.error is set (under session.lock, like the failed_cleanup_claimed
+  refusal) would give that opener the full-file path. Trade-off: if the member is
+  down the full fetch fails too, so the reader gets ENOENT instead of the cached ranges.'
+type: feature
+component: fs
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-30T01:00:25-00:00
+references: []
+log_events:
+- time: 2026-10-30T01:00:25-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
