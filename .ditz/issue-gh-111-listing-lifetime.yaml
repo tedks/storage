@@ -1,0 +1,20 @@
+id: gh-111-listing-lifetime
+title: 'Listing lifetime: fresh window, background refresh, not-found from listing'
+desc: 'Lane listing PR B (docs/browsing_latency_plan.md D1, D3): listing fresh for
+  revalidate_after with watchers off, stale-while-revalidate up to max-stale with
+  one background refresh per directory, no attr cap with watchers on, symlink() invalidates
+  the parent listing, ENOENT from a fresh complete listing (ruling oq-listing-negative-lookup
+  A).'
+type: feature
+component: listing
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-30T00:32:08-00:00
+references: []
+log_events:
+- time: 2026-10-30T00:32:08-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
