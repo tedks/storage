@@ -445,6 +445,7 @@ class TestSyncExecutorDirTask(_ExecutorTestBase):
 
     def test_rename_calls_backend(self):
         """DirSyncTask with RENAME and new_path -> backend.rename called."""
+        self.cache_manager.get_cache_path("/newname").mkdir()  # renamed through the mount
         task = DirSyncTask(
             virtual_path="/oldname",
             operation=DirOperation.RENAME,
@@ -456,8 +457,9 @@ class TestSyncExecutorDirTask(_ExecutorTestBase):
         self.mock_backend.rename.assert_called_once_with("/oldname", "/newname")
 
     def test_dir_retries_the_namespace_moved_past_are_dropped(self):
-        """A mkdir retry whose directory is gone from the cache, and an rmdir or
-        rename-away retry whose name is back, are dropped without a member call."""
+        """A mkdir retry whose directory is gone from the cache, an rmdir retry
+        whose name is back, and a rename retry whose destination is gone, are
+        dropped without a member call."""
         self.cache_manager.get_cache_path("/back").mkdir()
         for task in (
             DirSyncTask(virtual_path="/gone", operation=DirOperation.MKDIR),

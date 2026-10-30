@@ -105,6 +105,9 @@ class SyncExecutor:
 
     def _process_file_task(self, task: SyncTask) -> bool:
         logger.debug("Worker %s syncing %s", self.worker_id, task.virtual_path)
+        # A retry's generation is its own: one left from the previous
+        # attempt, read under a guard since released, must not be settled.
+        task.generation = None
 
         metadata = self.state_manager.get_file_metadata(task.virtual_path)
         if not metadata:
@@ -282,6 +285,9 @@ class SyncExecutor:
                 self.config.max_retries,
             )
             time.sleep(self.config.retry_delay * task.retry_count)
+            # The retry reads the row afresh; a refused publish of this
+            # attempt needs no extra pass after it.
+            task.requeue = False
             task_queue.put(task)
             return False
 
@@ -314,8 +320,16 @@ class SyncExecutor:
         sync-namespace-orphans). The cache holds every directory made, and
         drops every directory removed or renamed, through the mount, so it
         says whether the operation still applies; the check and the member
-        call run under the path guard.
+        call run under the path guard. The guard includes the namespace
+        lock, which a directory rename waits for, so a member known to be
+        down is not tried under it: the task fails and is retried later.
         """
+        down = [backend.name for backend in self._select_dir_backends(task.backend_hint)
+                if backend and not backend.is_available()]
+        if down:
+            raise RuntimeError(
+                f"Dir op {task.operation.value} for {task.virtual_path} waits for {', '.join(down)}"
+            )
         paths = [task.virtual_path] + ([task.new_path] if task.new_path else [])
         guard = self.path_guard(*paths) if self.path_guard else contextlib.nullcontext()
         with guard:
@@ -332,8 +346,16 @@ class SyncExecutor:
         cache_path = self.cache_manager.get_cache_path(task.virtual_path)
         if task.operation == DirOperation.MKDIR:
             return cache_path.is_dir()
-        # RMDIR, or RENAME away from the path: only while the name stays gone.
-        return not os.path.lexists(cache_path)
+        if task.operation == DirOperation.RMDIR:
+            return not os.path.lexists(cache_path)
+        # RENAME: while the destination exists. The old name may be in use
+        # again (a new file or directory there): the member still holds the
+        # renamed copy under it, and only the rename moves it. A destination
+        # gone since (renamed on, which queues its own retry, or removed)
+        # must not be created on the member. What the member holds after a
+        # chain of failed operations is not fully settled by single retries
+        # (ditz sync-member-reconcile).
+        return os.path.lexists(self.cache_manager.get_cache_path(task.new_path))
 
     def _process_dir_task(self, task: DirSyncTask) -> bool:
         logger.debug(

@@ -166,8 +166,9 @@ class TestFailedAttemptRacingRename(SyncRaceTestBase):
                 raise OSError("checksum read failed")
             return real_checksum(path)
 
-        patch.object(self.fs.state_manager, "compute_checksum", side_effect=failing_once).start()
-        self.addCleanup(patch.stopall)
+        patcher = patch.object(self.fs.state_manager, "compute_checksum", side_effect=failing_once)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.fs.sync_manager.config.retry_delay = 0
         self.start_sync()
         executor = self.fs.sync_manager.workers[0].executor
@@ -214,6 +215,8 @@ class TestDirectoryRetries(SyncRaceTestBase):
 
         self.start_sync()
         self.wait_idle()
+        # Only the old name is checked: the rename found no /d on the member
+        # to move, so /e is not there either (its mkdir was the retry).
         self.assertNotIn("d", self.member_names())
 
     def test_mkdir_retry_still_applies_while_the_directory_exists(self):
@@ -232,4 +235,47 @@ class TestDirectoryRetries(SyncRaceTestBase):
 
         self.start_sync()
         self.wait_idle()
+        self.assertEqual(["d"], self.member_names())
+
+    def test_rename_retry_applies_while_the_old_name_is_in_use_again(self):
+        """The member still holds the renamed directory under the old name;
+        only the rename moves it, even though /d exists again."""
+        self.fs.mkdir("/d", 0o755)
+        (self.member_dir / "d" / "kept.txt").write_text("k")
+        self.fail_member_once("rename")
+        self.fs.rename("/d", "/e")
+        self.assertEqual([(DirOperation.RENAME, "/d")], self.queued_dir_ops())
+        self.fs.mkdir("/d", 0o755)
+
+        self.start_sync()
+        self.wait_idle()
+        self.assertEqual(["kept.txt"], self.member_names("e"))
+
+    def test_rename_retry_whose_destination_is_gone_is_dropped(self):
+        self.fs.mkdir("/d", 0o755)
+        self.fail_member_once("rename")
+        self.fs.rename("/d", "/e")
+        self.fs.rmdir("/e")
+
+        self.start_sync()
+        self.wait_idle()
+        self.assertNotIn("e", self.member_names())
+
+    def test_retry_for_a_member_known_down_is_not_tried_under_the_guard(self):
+        self.fail_member_once("mkdir")
+        self.fs.mkdir("/d", 0o755)
+        self.member.set_available(False)
+        executor_guard = []
+        task = [t for t in self.fs.sync_manager.task_queue.queue if hasattr(t, "operation")][0]
+        from storage.sync_executor import SyncExecutor
+        executor = SyncExecutor(
+            worker_id=9, state_manager=self.fs.state_manager, cache_manager=self.fs.cache_manager,
+            replication_manager=self.fs.replication_manager, config=self.fs.sync_manager.config,
+            path_guard=lambda *paths: executor_guard.append(paths) or self.fs._path_locked(*paths),
+        )
+        with self.assertRaises(RuntimeError):
+            executor.process_dir_task(task)
+        self.assertEqual([], executor_guard)
+        self.member.set_available(True)
+        self.assertTrue(executor.process_dir_task(task))
         self.assertEqual(["d"], self.member_names())
