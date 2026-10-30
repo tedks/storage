@@ -1,0 +1,21 @@
+id: conflicts-eof-sent-check
+title: 'run_command: tighten the lost-transport test to status -1 and not eof_sent;
+  pin the signal-killed path'
+desc: 'PR #140 round 6 (Claude nits): a transport dying after the server''s EOF but
+  before exit-status still returns (-1, data) in a ms window; ''not chan.eof_sent''
+  closes it (server CLOSE goes through _close_internal, which sends our EOF; teardown
+  does not). Add a test that status -1 with EOF received returns (-1, data). Note:
+  a non-OpenSSH server closing without EOF now costs a reconnect per command.'
+type: task
+component: fs
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-30T18:07:21-00:00
+references: []
+log_events:
+- time: 2026-10-30T18:07:21-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
