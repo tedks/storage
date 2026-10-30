@@ -139,10 +139,13 @@ class MemberHashQueues:
                 outcome = (future.set_exception, exc)
             else:
                 outcome = (future.set_result, result)
-            with self._cond:
-                if self._running.get(member) is future:
-                    del self._running[member]
+            # Finished before it is untracked, outside the lock (its done
+            # callbacks take the caller's locks): a fork in between leaves
+            # the child a tracked future it finds already done.
             try:
                 outcome[0](outcome[1])
             except concurrent.futures.InvalidStateError:
-                pass  # finished by a fork reset; cannot happen in this process
+                pass  # already finished by a fork reset
+            with self._cond:
+                if self._running.get(member) is future:
+                    del self._running[member]

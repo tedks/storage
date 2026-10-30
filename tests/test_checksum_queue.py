@@ -57,7 +57,9 @@ class TestMemberHashQueues(unittest.TestCase):
     def test_submit_after_fork_finishes_the_parents_items(self):
         release, blocker = self._block("m")
         waiting = self.queues.submit("m", lambda: 1)
-        self.queues._pid = -1  # as if forked: the worker holding blocker is gone
+        # As if forked: the worker holding blocker is gone. (It is not, in
+        # this process; both serve "m" until teardown, so assert no order.)
+        self.queues._pid = -1
         self.assertEqual(self.queues.submit("m", lambda: 2).result(timeout=5), 2)
         self.assertTrue(waiting.cancelled())
         self.assertIsNone(blocker.result(timeout=0))

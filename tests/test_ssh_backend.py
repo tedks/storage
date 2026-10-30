@@ -1560,6 +1560,35 @@ class TestSSHBackendOnThePool(_BackendTestCase):
                 backend._pool.run_command("xxh128sum /data/movie.bin", 5.0)
         self.assertNotIsInstance(raised.exception, CommandTimeout)
 
+    def test_run_command_timeout_on_a_half_open_transport_is_not_the_commands(self):
+        backend = self._new_backend()
+        backend._pool.run_command("true", 5.0)  # connected
+
+        def stalled(chan, size):
+            # The transport still says active, but the probe that follows
+            # gets no channel: the connection was half open.
+            self.server.transport.open_hook = lambda _timeout: (_ for _ in ()).throw(
+                socket.timeout("probe"))
+            raise socket.timeout("timed out")
+
+        with patch.object(_FakeChannel, "recv", stalled):
+            with self.assertRaises(socket.timeout) as raised:
+                backend._pool.run_command("xxh128sum /data/movie.bin", 5.0)
+        self.assertNotIsInstance(raised.exception, CommandTimeout)
+
+    def test_run_command_on_a_transport_that_died_is_not_an_answer(self):
+        backend = self._new_backend()
+
+        def died(chan, size):
+            chan.transport.active = False
+            return b""
+
+        with patch.object(_FakeChannel, "recv", died):
+            with self.assertRaises(EOFError):
+                backend._pool.run_command("xxh128sum /data/movie.bin", 5.0)
+            with self.assertRaises(EOFError):
+                backend.get_fast_checksum("/movie.bin", allow_download=False)
+
     def test_remote_checksum_and_xattrs_close_their_exec_channels(self):
         digest = "0123456789abcdef0123456789abcdef"
 

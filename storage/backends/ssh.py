@@ -606,7 +606,8 @@ class SSHBackend(Backend):
         allow_download False it raises instead (the conflict view's hashes,
         which must not move whole files over the link to decide how a
         directory looks): the pool's own error when the member could not be
-        asked, ChecksumUnavailable otherwise (no digest, a timeout).
+        asked, ChecksumUnavailable otherwise (no digest, or a command that
+        started and did not finish).
         """
         remote_path = str(self._resolve_path(virtual_path))
 
