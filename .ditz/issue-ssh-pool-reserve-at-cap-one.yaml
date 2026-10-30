@@ -11,8 +11,8 @@ type: task
 component: fs
 release:
 reporter: Ted Smith <tedks@riseup.net>
-status: in_progress
-disposition:
+status: closed
+disposition: fixed
 creation_time: 2026-10-30T01:15:24-00:00
 references: []
 log_events:
@@ -24,3 +24,9 @@ log_events:
   who: Ted Smith
   what: started
   comment: ""
+- time: 2026-10-30T17:52:04-00:00
+  who: Ted Smith
+  what: 'closed: fixed'
+  comment: 'PR #150, merged 356cbb8: option (a), a warning once per transport when
+    no channel can be kept. Option (b), refusing bulk leases while an interactive
+    request waits at cap 1, waits for a field host that shows it.'
