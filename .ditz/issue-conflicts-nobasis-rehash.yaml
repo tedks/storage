@@ -1,0 +1,21 @@
+id: conflicts-nobasis-rehash
+title: Symlinked or attribute-less duplicates are re-queued (isdir + hash) at every
+  listing
+desc: 'PR #140 rounds 1 and 2 (Claude nits): check_dir items carry no basis, so each
+  listing queues them again; on a member without xxh128sum that is one isdir plus
+  one exec per listing, and a transient failure drops a valid record each time. Bounded
+  by the single worker; consider remembering the last outcome per (path, member, link
+  target).'
+type: task
+component: fs
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-30T18:07:22-00:00
+references: []
+log_events:
+- time: 2026-10-30T18:07:22-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
