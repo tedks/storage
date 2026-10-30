@@ -1,0 +1,20 @@
+id: conflicts-exec-refused-churn
+title: A member that refuses exec requests re-queues view hashes and probes at every
+  listing
+desc: 'PR #140 round 4 (Claude nit): exec_command raising SSHException gets the PROBE
+  verdict, so is_connection_error is True and the copy is never marked unverified;
+  each listing re-queues and probes. Cheap churn; mark unverified after N consecutive
+  refusals if exec-less members are in scope.'
+type: task
+component: fs
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-30T18:07:22-00:00
+references: []
+log_events:
+- time: 2026-10-30T18:07:22-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
