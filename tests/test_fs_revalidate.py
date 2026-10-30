@@ -416,16 +416,34 @@ class TestRevalidateAfterSync(RevalidateTestBase):
         # sync publishes CLEAN only after this callback, so in use a check
         # rarely can; this tests _store_member_check's guard.) It records
         # the same values as the old baseline, as an unchanged member does.
+        def observed(size, mtime):
+            return (size, mtime)  # a new tuple, as a real stat gives
+
         for fresh in ((12, 5.0), (12, 1.0)):
-            self.fs._store_member_check("/new.txt", cache_path, identity, {"member": (12, 1.0)})
+            self.fs._store_member_check("/new.txt", cache_path, identity,
+                                        {"member": observed(12, 1.0)})
 
             def check_then_fail(path, fresh=fresh):
-                self.fs._store_member_check("/new.txt", cache_path, identity, {"member": fresh})
+                self.fs._store_member_check("/new.txt", cache_path, identity,
+                                            {"member": observed(*fresh)})
                 raise OSError("connection reset")
 
             with patch.object(self.member, "stat", side_effect=check_then_fail):
                 self.fs._record_member_written("/new.txt", self.member, cache_path)
             self.assertEqual({"member": fresh}, self.fs._member_checks["/new.txt"].members)
+
+    def test_failed_post_sync_stat_drops_despite_a_check_of_another_member(self):
+        cache_path, identity = self._written_file()
+        self.fs._store_member_check("/new.txt", cache_path, identity,
+                                    {"member": (12, 1.0), "other": (12, 2.0)})
+
+        def other_checked_then_fail(path):
+            self.fs._store_member_check("/new.txt", cache_path, identity, {"other": (12, 3.0)})
+            raise OSError("connection reset")
+
+        with patch.object(self.member, "stat", side_effect=other_checked_then_fail):
+            self.fs._record_member_written("/new.txt", self.member, cache_path)
+        self.assertEqual({"other": (12, 3.0)}, self.fs._member_checks["/new.txt"].members)
 
 
 class TestRevalidateSftpLikeMember(RevalidateTestBase):

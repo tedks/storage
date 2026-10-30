@@ -867,16 +867,21 @@ class StorageFS(Operations):
     def _store_member_check(self, canonical_path: str, cache_path: Path,
                             identity: Tuple[int, int, int],
                             updates: Dict[str, Tuple[int, float]], *, replace: bool = False,
-                            drop: Tuple[str, ...] = (), drop_unless_checked_since=None):
+                            drop: Tuple[str, ...] = (),
+                            drop_unless_checked_since: Optional[MemberCheck] = None):
         """Record a check now, merging member baselines, in memory and on the cache file.
 
         The baselines already known for this cache file (in memory, else from
         its xattr) are kept and updates applied on top; replace=True starts
         from nothing (a fetch: the old copy's baselines describe other bytes),
-        and the members in drop lose theirs, unless a check was recorded for
-        the path since drop_unless_checked_since (the MemberCheck the caller
-        read before, or None): every record is a new object, so a baseline
-        recorded meanwhile, even with the same values, is newer and stays.
+        and the members in drop lose theirs unless that member's baseline was
+        recorded since drop_unless_checked_since (the MemberCheck the caller
+        read before, or None). Compared by object: a record merges the
+        other members' baseline tuples unchanged and stores a new tuple for
+        each member it observed, so a baseline recorded meanwhile, even with
+        the same values, is newer and stays, while a record for another
+        member does not hold the drop back. A baseline that came from the
+        xattr has no object to compare once a record is made, and stays.
         Updates and drops name different members.
         The read, merge and both writes are one critical section under
         _member_checks_lock (a leaf: getxattr and setxattr take no other
@@ -895,11 +900,16 @@ class StorageFS(Operations):
                 members = self._load_persisted_members(cache_path, identity)
             members.update(updates)
             dropped = []
-            if drop and previous is drop_unless_checked_since:
-                for name in drop:
-                    if name in members:
-                        del members[name]
-                        dropped.append(name)
+            token = drop_unless_checked_since
+            for name in drop:
+                if name not in members:
+                    continue
+                if previous is not token:
+                    read = token.members.get(name) if token is not None else None
+                    if read is None or previous is None or previous.members.get(name) is not read:
+                        continue
+                del members[name]
+                dropped.append(name)
             check = MemberCheck(cache_identity=identity, verified_at=time.monotonic(),
                                 members=members)
             self._member_checks[canonical_path] = check
