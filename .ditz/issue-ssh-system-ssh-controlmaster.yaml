@@ -22,8 +22,8 @@ type: task
 component: fs
 release:
 reporter: Ted Smith <tedks@riseup.net>
-status: in_progress
-disposition:
+status: closed
+disposition: fixed
 creation_time: 2026-10-30T00:48:31-00:00
 references: []
 log_events:
@@ -35,3 +35,8 @@ log_events:
   who: Ted Smith
   what: started
   comment: ""
+- time: 2026-10-30T18:11:19-00:00
+  who: Ted Smith
+  what: 'closed: fixed'
+  comment: 'Fixed in PR #151, merged e4f9144. Remote gate: 5 uploads + a watcher =
+    7 sshd logins unshared, 2 shared.'
