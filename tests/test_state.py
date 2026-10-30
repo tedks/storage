@@ -544,3 +544,11 @@ class TestMemberChecksums(unittest.TestCase):
         self.assertIsNone(self.state.get_member_checksum("/f", "m0"))
         self.state.put_member_checksum("/f", "m0", self._record())
         self.assertIsNotNone(self.state.get_member_checksum("/f", "m0"))
+
+    def test_in_memory_index_keeps_one_database(self):
+        state = StateManager(":memory:")
+        try:
+            state.put_member_checksum("/f", "m0", self._record())
+            self.assertIsNotNone(state.get_member_checksum("/f", "m0"))
+        finally:
+            state.close()

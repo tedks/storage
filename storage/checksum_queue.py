@@ -52,6 +52,9 @@ class MemberHashQueues:
         self._running: Dict[str, concurrent.futures.Future] = {}
         self._pid = os.getpid()
         self._shut_down = False
+        # Unpinned items waiting per member, so a submit does not count a
+        # queue that pinned items may make long.
+        self._unpinned: Dict[str, int] = {}
 
     def submit(self, member: str, fn: Callable[[], object],
                pinned: bool = False) -> concurrent.futures.Future:
@@ -79,18 +82,23 @@ class MemberHashQueues:
                 started = list(self._running.values())
                 self._queues.clear()
                 self._running.clear()
+                self._unpinned.clear()
             queue = self._queues.setdefault(member, collections.deque())
             queue.append((future, fn, pinned))
-            if sum(1 for item in queue if not item[2]) > self.limit:
+            if not pinned:
+                self._unpinned[member] = self._unpinned.get(member, 0) + 1
+            if self._unpinned.get(member, 0) > self.limit:
                 # Items cancelled while waiting (invalidated, superseded)
                 # go first; only then is a live one dropped.
                 live = [item for item in queue if not item[0].cancelled()]
                 if len(live) != len(queue):
                     queue.clear()
                     queue.extend(live)
-            if sum(1 for item in queue if not item[2]) > self.limit:
+                    self._unpinned[member] = sum(1 for item in live if not item[2])
+            if self._unpinned.get(member, 0) > self.limit:
                 oldest = next(item for item in queue if not item[2])
                 queue.remove(oldest)
+                self._unpinned[member] -= 1
                 dropped = oldest[0]
             if member not in self._workers:
                 worker = threading.Thread(
@@ -136,6 +144,7 @@ class MemberHashQueues:
             self._shut_down = True
             waiting = [item[0] for queue in self._queues.values() for item in queue]
             self._queues.clear()
+            self._unpinned.clear()
             self._cond.notify_all()
         for future in waiting:
             future.cancel()
@@ -147,7 +156,9 @@ class MemberHashQueues:
                     self._cond.wait()
                 if self._shut_down:
                     return
-                future, fn, _ = self._queues[member].pop()
+                future, fn, pinned = self._queues[member].pop()
+                if not pinned:
+                    self._unpinned[member] -= 1
                 if not future.set_running_or_notify_cancel():
                     continue
                 self._running[member] = future

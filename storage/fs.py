@@ -287,6 +287,9 @@ class StorageFS(Operations):
         # have left describing an older file; never loaded this mount.
         # Under _checksum_lock.
         self._persisted_refused: Set[Tuple[str, Optional[str], bool]] = set()
+        # {dir: {name: members}} queued by the dir's last forced
+        # verification (_force_verify). Under _checksum_lock.
+        self._verify_results: Dict[str, Dict[str, List[str]]] = {}
         self._reverify_stop = threading.Event()
         self._reverify_thread: Optional[threading.Thread] = None
 
@@ -566,12 +569,26 @@ class StorageFS(Operations):
         upload), so it is refused for the rest of this mount
         (_persisted_refused) rather than trusted on its basis.
         """
+        paths = list(paths)
         try:
             self.state_manager.delete_member_checksums(paths, subtree=subtree, backend_name=backend_name)
         except Exception as exc:
             self.logger.warning("could not drop persisted checksums: %r", exc)
             for path in paths:
                 self._persisted_refused.add((path, backend_name, subtree))
+
+    def _retry_refused_deletes(self):
+        """Delete the rows failed writes left, so a refusal outlives the
+        mount; the caller holds _checksum_lock. Called after a write
+        succeeds (the index is back) and at destroy."""
+        for entry in list(self._persisted_refused):
+            path, backend_name, subtree = entry
+            try:
+                self.state_manager.delete_member_checksums([path], subtree=subtree,
+                                                           backend_name=backend_name)
+            except Exception:
+                return
+            self._persisted_refused.discard(entry)
 
     def _persisted_row_refused(self, key: tuple) -> bool:
         """Whether a failed write covered key; the caller holds _checksum_lock."""
@@ -712,7 +729,10 @@ class StorageFS(Operations):
             self.logger.warning("could not persist a checksum: %r", exc)
             self._persisted_refused.add((canonical_path, backend_name, False))
             return
-        self._persisted_refused.discard((canonical_path, backend_name, False))
+        if self._persisted_refused:
+            # This row is the record now; then retry the rest.
+            self._persisted_refused.discard((canonical_path, backend_name, False))
+            self._retry_refused_deletes()
 
     def _load_persisted_checksum(self, key: tuple, basis: ChecksumBasis) -> bool:
         """Install the persisted record for key if it was taken from basis;
@@ -839,26 +859,46 @@ class StorageFS(Operations):
         """List the directory and hash again every copy of its names on
         several members that the listing does not split by size, whatever
         is recorded (storage conflicts --verify). The hashes are queued;
-        the listing itself calls the members, as a readdir would."""
-        self.namespace.verify_listing(dir_path)
+        the listing itself calls the members, as a readdir would. Which
+        names it queued is kept for _verify_status, for the last
+        VERIFY_RESULTS_KEPT directories, never dropping one still pending."""
+        queued = self.namespace.verify_listing(dir_path)
+        with self._checksum_lock:
+            self._verify_results.pop(dir_path, None)
+            self._verify_results[dir_path] = queued
+            for old in list(self._verify_results):
+                if len(self._verify_results) <= self.VERIFY_RESULTS_KEPT:
+                    break
+                if old != dir_path and not self._verify_counts(old)["pending"]:
+                    del self._verify_results[old]
+
+    # Directories whose last forced verification _verify_status reports.
+    VERIFY_RESULTS_KEPT = 64
 
     def _verify_status(self, dir_path: str) -> Dict[str, int]:
         """Of the names the directory's last forced verification hashed
         again (regular files of one size on several members): how many
         have a hash still pending, how many are verified on every member,
-        and how many are not (a member could not hash its copy, or the hash
-        was dropped). All zero before any."""
-        status = {"pending": 0, "verified": 0, "unverified": 0}
-        queued = self.namespace.verified_names(dir_path) or {}
+        and how many are not (a member could not hash its copy, or the
+        copy changed and its record was forgotten). known is 0 when no
+        verification of the directory is on record (none yet, or one
+        settled and since dropped), and the counts are then zero."""
         with self._checksum_lock:
-            for name, members in queued.items():
-                keys = [(str(Path(dir_path) / name), m) for m in members]
-                if any(key in self._checksum_tasks for key in keys):
-                    status["pending"] += 1
-                elif all(getattr(self._checksum_records.get(key), "checksum", None) for key in keys):
-                    status["verified"] += 1
-                else:
-                    status["unverified"] += 1
+            if dir_path not in self._verify_results:
+                return {"known": 0, "pending": 0, "verified": 0, "unverified": 0}
+            return dict(self._verify_counts(dir_path), known=1)
+
+    def _verify_counts(self, dir_path: str) -> Dict[str, int]:
+        """_verify_status's counts; the caller holds _checksum_lock."""
+        status = {"pending": 0, "verified": 0, "unverified": 0}
+        for name, members in self._verify_results.get(dir_path, {}).items():
+            keys = [(str(Path(dir_path) / name), m) for m in members]
+            if any(key in self._checksum_tasks for key in keys):
+                status["pending"] += 1
+            elif all(getattr(self._checksum_records.get(key), "checksum", None) for key in keys):
+                status["verified"] += 1
+            else:
+                status["unverified"] += 1
         return status
 
     _IS_DIRECTORY = object()
@@ -921,6 +961,14 @@ class StorageFS(Operations):
         key = (canonical_path, backend.name)
         with self._checksum_lock:
             if key in self._checksum_tasks:
+                return
+            # Read again under the lock: a record written since the pass
+            # read the row replaced it, and this re-verification would
+            # judge the new row by the old one.
+            try:
+                if self.state_manager.get_member_checksum(*key) != persisted:
+                    return
+            except Exception:
                 return
             try:
                 future = self._checksum_queues.submit(
@@ -2445,6 +2493,9 @@ class StorageFS(Operations):
         self._stop_watchers()
 
         self._reverify_stop.set()
+        with self._checksum_lock:
+            if self._persisted_refused:
+                self._retry_refused_deletes()
         try:
             self._checksum_queues.shutdown()
         except Exception:

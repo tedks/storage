@@ -102,10 +102,15 @@ class StateManager:
         # (held by eviction across file deletions). A leaf: nothing is
         # taken under it. WAL lets the two connections read concurrently;
         # SQLite's busy timeout orders their writes.
-        self._checksum_conn = sqlite3.connect(db_path, check_same_thread=False)
-        self._checksum_conn.row_factory = sqlite3.Row
-        self._checksum_db_lock = threading.Lock()
-        self._configure_connection(self._checksum_conn)
+        if db_path == ":memory:":
+            # A second connection would open another, empty database.
+            self._checksum_conn = self.conn
+            self._checksum_db_lock = self._db_lock
+        else:
+            self._checksum_conn = sqlite3.connect(db_path, check_same_thread=False)
+            self._checksum_conn.row_factory = sqlite3.Row
+            self._checksum_db_lock = threading.Lock()
+            self._configure_connection(self._checksum_conn)
 
     def _execute_write(self, query: str, params: tuple = ()):
         """Execute a single write statement and commit it atomically."""
@@ -1050,5 +1055,6 @@ class StateManager:
         self._flush_access_updates(force=True)
         with self._db_lock:
             self.conn.close()
-        with self._checksum_db_lock:
-            self._checksum_conn.close()
+        if self._checksum_conn is not self.conn:
+            with self._checksum_db_lock:
+                self._checksum_conn.close()

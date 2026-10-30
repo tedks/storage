@@ -17,8 +17,8 @@ Two outer locks order the handlers that change what a path names
 5. Leaves, unchanged: _member_checks_lock, dir_cache_lock then
    listing_lock, _checksum_lock then StateManager._checksum_db_lock (the
    persisted member hashes have their own connection, so _checksum_lock,
-   which readdir takes, never waits on the index lock; nothing else is
-   taken under either), prefetch_sessions_lock then session.lock,
+   which readdir takes, never waits on the index lock; besides it, only
+   MemberHashQueues' condition is taken under _checksum_lock), prefetch_sessions_lock then session.lock,
    _access_lock then _db_lock.
 
 Eviction runs under the cache lock, against the order, so it only

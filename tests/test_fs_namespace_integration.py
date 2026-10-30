@@ -1752,6 +1752,64 @@ class TestFSNamespaceIntegration(unittest.TestCase):
         with self.fs._checksum_lock:
             self.assertFalse(self.fs._persisted_row_refused(("/dup.txt", "backend2")))
 
+    def test_refused_rows_are_deleted_once_the_index_is_back(self):
+        (self.backend1_dir / "dup.txt").write_text("same")
+        (self.backend2_dir / "dup.txt").write_text("same")
+        (self.backend1_dir / "other.txt").write_text("same")
+        (self.backend2_dir / "other.txt").write_text("same")
+        self._list_and_settle()
+        state = self.fs.state_manager
+        with patch.object(state, "delete_member_checksums", side_effect=sqlite3.OperationalError("locked")):
+            self.fs._on_remote_change('/dup.txt')
+        self.assertIsNotNone(state.get_member_checksum("/dup.txt", "backend2"))
+        # The next successful write retries the delete, so the next mount
+        # does not load the row either.
+        self._upload("/other.txt", b"same")
+        self.assertIsNone(state.get_member_checksum("/dup.txt", "backend2"))
+        self.assertEqual(self.fs._persisted_refused, set())
+
+    def test_reverify_of_a_row_replaced_since_it_was_read_does_nothing(self):
+        (self.backend1_dir / "dup.txt").write_text("same")
+        (self.backend2_dir / "dup.txt").write_text("same")
+        self._list_and_settle()
+        member = self.backends["backend2"]
+        stale = self.fs.state_manager.get_member_checksum("/dup.txt", "backend2")
+        self._upload("/dup.txt", b"diff")
+        hashes = self._hashes()
+        self.fs._schedule_reverify(member, "/dup.txt", stale)
+        self.assertNotIn(("/dup.txt", "backend2"), self.fs._checksum_tasks)
+        self.assertEqual(hashes, [])
+        self.assertEqual(self.fs.state_manager.get_member_checksum("/dup.txt", "backend2").checksum,
+                         fast_checksum_bytes(b"diff"))
+
+    def test_verify_results_keep_pending_directories(self):
+        self.fs.VERIFY_RESULTS_KEPT = 2
+        for d in ("a", "b", "c"):
+            (self.backend1_dir / d).mkdir()
+            (self.backend2_dir / d).mkdir()
+            (self.backend1_dir / d / "dup.txt").write_text("same")
+            (self.backend2_dir / d / "dup.txt").write_text("same")
+        member = self.backends["backend1"]
+        started, release = threading.Event(), threading.Event()
+        real = member.get_fast_checksum
+
+        def hold_a(path, *args, **kwargs):
+            if path == "/a/dup.txt":
+                started.set()
+                release.wait(5)
+            return real(path, *args, **kwargs)
+        with patch.object(member, "get_fast_checksum", side_effect=hold_a):
+            self.fs.setxattr('/a', StorageFS.VERIFY_XATTR, b"1", 0)
+            self.assertTrue(started.wait(5))
+            self.fs.setxattr('/b', StorageFS.VERIFY_XATTR, b"1", 0)
+            self.fs.setxattr('/c', StorageFS.VERIFY_XATTR, b"1", 0)
+            # /a is still pending: /b, settled or not, would go first.
+            self.assertEqual(json.loads(self.fs.getxattr('/a', StorageFS.VERIFY_XATTR))["known"], 1)
+            release.set()
+            self.assertTrue(self._wait_for(lambda: not self.fs._checksum_tasks))
+        self.assertEqual(json.loads(self.fs.getxattr('/a', StorageFS.VERIFY_XATTR)),
+                         {"known": 1, "pending": 0, "verified": 1, "unverified": 0})
+
     def test_reverify_thread_runs_from_init_and_stops_at_destroy(self):
         self.fs._checksum_reverify_interval = 0.05
         ticks = threading.Event()
@@ -1791,7 +1849,7 @@ class TestFSNamespaceIntegration(unittest.TestCase):
         self.assertEqual(row.checksum, fast_checksum_bytes(b"newer"))
 
     def test_forced_verify_rehashes_and_counts(self):
-        zero = {"pending": 0, "verified": 0, "unverified": 0}
+        zero = {"known": 0, "pending": 0, "verified": 0, "unverified": 0}
         self.assertEqual(json.loads(self.fs.getxattr('/', StorageFS.VERIFY_XATTR)), zero)
         (self.backend1_dir / "ok.txt").write_text("same")
         (self.backend2_dir / "ok.txt").write_text("same")
@@ -1819,7 +1877,7 @@ class TestFSNamespaceIntegration(unittest.TestCase):
             ("backend2", "/nohash.txt"), ("backend2", "/ok.txt"),
         ])
         self.assertEqual(json.loads(self.fs.getxattr('/', StorageFS.VERIFY_XATTR)),
-                         {"pending": 0, "verified": 1, "unverified": 1})
+                         {"known": 1, "pending": 0, "verified": 1, "unverified": 1})
         self.assertNotIn(StorageFS.VERIFY_XATTR, self.fs.listxattr('/'))
 
     def test_readdir_rehashes_member_rewritten_with_same_size_and_mtime(self):

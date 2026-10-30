@@ -81,9 +81,6 @@ class NamespaceService:
         ] = {}
         self.checksum_records = checksum_records
         self.checksum_lock = checksum_lock
-        # {dir: {name: members}} hashed again by the dir's last
-        # verify_listing (storage conflicts --verify); under listing_lock.
-        self._verify_queued: Dict[str, Dict[str, List[str]]] = {}
         # The listing state below (entry_attrs, readdir_snapshot and the
         # listings in flight) is guarded by listing_lock, not dir_cache_lock,
         # and where both are taken listing_lock nests inside dir_cache_lock:
@@ -890,32 +887,24 @@ class NamespaceService:
             futures[backend_name] = future
         return futures
 
-    # Directories whose last verify_listing is kept for verified_names.
-    VERIFY_RESULTS_KEPT = 64
-
-    def verify_listing(self, path: str):
+    def verify_listing(self, path: str) -> Dict[str, List[str]]:
         """List path, hashing every copy of its names on several members
-        again (storage conflicts --verify), and keep which names on which
-        members that queued, for verified_names. Calls the members, like a
-        readdir that finds no fresh listing."""
+        again (storage conflicts --verify); return {name: members} for the
+        names that queued on more than one member. Calls the members, like
+        a readdir that finds no fresh listing."""
+        queued: Dict[str, List[str]] = {}
         generation = self._begin_listing(path)
         try:
-            self._list_members(path, generation, verify=True)
+            self._list_members(path, generation, verify_out=queued)
         finally:
             self._end_listing(path)
-
-    def verified_names(self, path: str) -> Optional[Dict[str, List[str]]]:
-        """{name: members} queued by the last verify_listing of path, or
-        None if there was none."""
-        with self.listing_lock:
-            names = self._verify_queued.get(path)
-            return None if names is None else {n: list(m) for n, m in names.items()}
+        return queued
 
     def _list_members(self, path: str, generation: int, *, background: bool = False,
-                      verify: bool = False) -> List[str]:
+                      verify_out: Optional[Dict[str, List[str]]] = None) -> List[str]:
         """List the cache and every member, and publish the result unless an
         invalidation of the directory or a child raced it, or a listing that
-        began later was published first. verify: see verify_listing.
+        began later was published first. verify_out: see verify_listing.
 
         The members are listed concurrently and outside dir_cache_lock; their
         results are merged under it. The listing's time is when its reads
@@ -1005,15 +994,10 @@ class NamespaceService:
             {name: names for name, names in member_entries.items() if name not in failed},
             backend_attrs,
             size_splits,
-            replace=verify,
+            replace=verify_out is not None,
         )
-        if verify:
-            with self.listing_lock:
-                # The latest last; only the most recent few are kept.
-                self._verify_queued.pop(path, None)
-                self._verify_queued[path] = {n: m for n, m in queued.items() if len(m) > 1}
-                while len(self._verify_queued) > self.VERIFY_RESULTS_KEPT:
-                    del self._verify_queued[next(iter(self._verify_queued))]
+        if verify_out is not None:
+            verify_out.update({n: m for n, m in queued.items() if len(m) > 1})
         visible_entries = self._apply_conflict_view(path, entries, member_entries, size_splits)
         ordered_entries = sorted(visible_entries)
 
