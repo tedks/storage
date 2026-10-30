@@ -1,0 +1,19 @@
+id: conflicts-forget-commit-volume
+title: Avoid empty DELETE commits in _forget_checksums
+desc: 'Follow-up from PR #152 council: every _forget_checksums now commits a DELETE
+  on member_checksums even when nothing matches; a watcher event issues 1+N (suffixed
+  variants). Cheap under WAL/synchronous=NORMAL, but a guard (skip when no row can
+  exist, or batch per event) would avoid most commits.'
+type: task
+component: fs
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-30T18:41:47-00:00
+references: []
+log_events:
+- time: 2026-10-30T18:41:47-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
