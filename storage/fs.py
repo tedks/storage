@@ -27,6 +27,7 @@ from typing import Dict, Optional, Set, List, Tuple
 
 from .backends.base import Backend
 from .cache import PARTIAL_SUFFIX, CacheManager
+from .locks import NamespaceLock, PathLocks
 from .cache_metadata import XATTR_CACHE_METADATA_NAME, scan_cache_entries
 from .file_config import FileConfig, get_inherited_config
 from .models import FileLocation, FileMetadata, StreamingKeepAfterClose, SyncStatus
@@ -162,6 +163,11 @@ class StorageFS(Operations):
         self._fd_map: Dict[int, FDEntry] = {}
         self._fd_lock = threading.Lock()
 
+        # The outer locks for a multithreaded FUSE loop; storage/locks.py
+        # has the full lock order. Under nothreads they are never contended.
+        self._namespace_lock = NamespaceLock()
+        self._path_locks = PathLocks()
+
         # Revalidation on open, keyed by canonical path (see
         # _revalidate_cached_file). Check times are in memory only: after a
         # restart every cached file is checked at its first open; baselines
@@ -256,6 +262,7 @@ class StorageFS(Operations):
             checksum_lock=self._checksum_lock,
         )
         self.cache_manager.forget_listed_attrs = self._forget_cached_copy_attrs
+        self.cache_manager.path_guard = self._try_path_locked
 
         self._streaming_manager = StreamingReadManager(
             cache_manager=self.cache_manager,
@@ -310,6 +317,26 @@ class StorageFS(Operations):
         """Get configuration for a file"""
         cache_path = self.cache_manager.get_cache_path(virtual_path)
         return get_inherited_config(cache_path)
+
+    @contextlib.contextmanager
+    def _path_locked(self, *paths: str):
+        """Hold the namespace lock shared and the given canonical paths' locks."""
+        with self._namespace_lock.shared(), self._path_locks.hold(*paths):
+            yield
+
+    @contextlib.contextmanager
+    def _try_path_locked(self, canonical_path: str):
+        """Yield whether both outer locks were taken for the path without waiting.
+
+        For eviction, which runs under the cache lock (inside the outer
+        locks' order) and so must skip a busy path rather than wait.
+        """
+        with self._namespace_lock.try_shared() as shared:
+            if not shared:
+                yield False
+                return
+            with self._path_locks.try_hold(canonical_path) as held:
+                yield held
 
     @contextlib.contextmanager
     def _descriptor_guard(self, virtual_path: str):
@@ -477,7 +504,15 @@ class StorageFS(Operations):
         Invalidates the canonical path AND any backend-suffixed conflict
         variants (e.g. /foo.remote0, /foo.remote1) so that cached
         conflict views are also refreshed.
+
+        Runs on the watcher's thread holding nothing; it waits for the
+        path's lock, so an open's fetch, a rename or an upload of the path
+        finishes before the invalidation looks at the cache file.
         """
+        with self._path_locked(self._resolve_path(virtual_path).canonical_path):
+            self._on_remote_change_locked(virtual_path)
+
+    def _on_remote_change_locked(self, virtual_path: str):
         self._invalidate_dir_cache_entry(virtual_path)
         self._invalidate_file_cache(virtual_path)
         # Also invalidate backend-suffixed conflict caches.
@@ -1284,16 +1319,33 @@ class StorageFS(Operations):
 
     def mkdir(self, path, mode):
         """Create a directory"""
+        with self._path_locked(self._resolve_path(path).canonical_path):
+            return self._mkdir(path, mode)
+
+    def _mkdir(self, path, mode):
+        """Create a directory"""
         self.namespace.mkdir(path, mode)
 
     def rmdir(self, path):
-        """Remove a directory"""
+        """Remove a directory
+
+        Exclusive: every path under it is affected at once.
+        """
+        with self._namespace_lock.exclusive():
+            self._rmdir(path)
+
+    def _rmdir(self, path):
         try:
             self.namespace.rmdir(path)
         finally:
             self._forget_checksums({self._resolve_path(path).canonical_path}, subtree=True)
 
     def unlink(self, path):
+        """Remove a file"""
+        with self._path_locked(self._resolve_path(path).canonical_path):
+            return self._unlink(path)
+
+    def _unlink(self, path):
         """Remove a file"""
         try:
             self.namespace.unlink(path)
@@ -1303,11 +1355,45 @@ class StorageFS(Operations):
             self._forget_member_check(canonical_path, path_gone=True)
 
     def rename(self, old, new):
-        """Rename a file or directory"""
+        """Rename a file or directory
+
+        A file rename holds both paths' locks (sorted) across the cache move
+        and the member renames, so an open of either name waits for the
+        members to agree with the cache and cannot fetch a stale copy under
+        the old name. A directory rename changes every path under it, so it
+        holds the namespace lock exclusive, which waits for every in-flight
+        path-locked handler (ditz threading-hierarchical-namespace-lock).
+        A name the cache does not hold is classified by getattr (served
+        from the listing when it is fresh); one that does not exist is
+        renamed as a file, which fails as before. A directory appearing in
+        the cache meanwhile (a fetch beneath it) is caught by the recheck
+        under the path locks.
+        """
+        old_resolved = self._resolve_path(old)
+        new_canonical = self._resolve_path(new).canonical_path
+        cache_path = old_resolved.canonical_cache_path
+        while True:
+            if os.path.isdir(cache_path):
+                is_dir = True
+            elif os.path.lexists(cache_path):
+                is_dir = False
+            else:
+                try:
+                    is_dir = stat.S_ISDIR(self.getattr(old)["st_mode"])
+                except FuseOSError:
+                    is_dir = False
+            if is_dir:
+                with self._namespace_lock.exclusive():
+                    return self._rename(old, new)
+            with self._path_locked(old_resolved.canonical_path, new_canonical):
+                if not os.path.isdir(cache_path):
+                    return self._rename(old, new)
+
+    def _rename(self, old, new):
         old_canonical = self._resolve_path(old).canonical_path
         new_canonical = self._resolve_path(new).canonical_path
         try:
-            self.namespace.rename(old, new)
+            self.namespace.rename(old, new, on_local_moved=lambda: self._repoint_descriptors(old, new))
         except BaseException:
             # If the cached copy moved but the rename failed after (or
             # before) the members', its baselines, matched on identity alone,
@@ -1326,9 +1412,14 @@ class StorageFS(Operations):
             # them is always safe, so a failed rename drops them too.
             self._forget_checksums({old_canonical, new_canonical}, subtree=True)
         self._move_member_checks(old_canonical, new_canonical)
-        # Open descriptors follow the file (or everything under a renamed
-        # directory): write() records against, and eviction and sync look
-        # up, the path they carry.
+
+    def _repoint_descriptors(self, old, new):
+        """Open descriptors follow the file (or everything under a renamed directory).
+
+        write() records against, and eviction and sync look up, the path
+        they carry. Called by NamespaceService.rename under the index lock,
+        right after the cache move and the index rewrite.
+        """
         prefix = old.rstrip("/") + "/"
         with self._fd_lock:
             for entry in self._fd_map.values():
@@ -1367,6 +1458,11 @@ class StorageFS(Operations):
 
     def truncate(self, path, length, fh=None):
         """Truncate a file"""
+        with self._path_locked(self._resolve_path(path).canonical_path):
+            return self._truncate(path, length, fh)
+
+    def _truncate(self, path, length, fh=None):
+        """Truncate a file"""
         resolved = self._resolve_path(path)
         cache_path = resolved.cache_path
 
@@ -1385,6 +1481,11 @@ class StorageFS(Operations):
     # File operations
 
     def open(self, path, flags):
+        """Open a file"""
+        with self._path_locked(self._resolve_path(path).canonical_path):
+            return self._open(path, flags)
+
+    def _open(self, path, flags):
         """Open a file"""
         resolved = self._resolve_path(path)
         cache_path = resolved.cache_path
@@ -1466,6 +1567,11 @@ class StorageFS(Operations):
             raise FuseOSError(e.errno)
 
     def create(self, path, mode, fi=None):
+        """Create a file"""
+        with self._path_locked(self._resolve_path(path).canonical_path):
+            return self._create(path, mode, fi)
+
+    def _create(self, path, mode, fi=None):
         """Create a file"""
         resolved = self._resolve_path(path)
         cache_path = self.cache_manager.create_cached_file(resolved.requested_path)
@@ -1562,7 +1668,14 @@ class StorageFS(Operations):
 
             if entry.backend_name is None:
                 self.cache_manager.mark_accessed(path)
-                self._mark_cache_file_dirty(entry.canonical_path, entry.cache_path)
+                # The path is read under the index lock, which a rename
+                # holds from the cache move until it has re-pointed the
+                # descriptors: the mark lands on the row that describes
+                # this file now, never on a path whose row has moved.
+                with self.state_manager.metadata_lock:
+                    with self._fd_lock:
+                        canonical_path, cache_path = entry.canonical_path, entry.cache_path
+                    self._mark_cache_file_dirty(canonical_path, cache_path)
 
             return written
 
@@ -1570,7 +1683,30 @@ class StorageFS(Operations):
             raise FuseOSError(e.errno)
 
     def release(self, path, fh):
-        """Release (close) a file"""
+        """Release (close) a file
+
+        Holds the path's lock (the descriptor's current path, read again
+        once the lock is held, since a rename re-points it): closing a
+        member copy (a conflict-suffixed path) uploads it, and no rename,
+        unlink, refetch or watcher invalidation may run under the upload; a
+        canonical close reads the path's row and queues its sync, which a
+        rename must not move in between. A streaming descriptor takes no
+        lock: its close only releases the session.
+        """
+        while True:
+            with self._fd_lock:
+                entry = self._fd_map.get(fh)
+            if entry is None or entry.prefetch_session is not None:
+                return self._release(path, fh)
+            locked_path = entry.canonical_path
+            with self._path_locked(locked_path):
+                with self._fd_lock:
+                    current = self._fd_map.get(fh)
+                    moved = current is not None and current.canonical_path != locked_path
+                if not moved:
+                    return self._release(path, fh)
+
+    def _release(self, path, fh):
         with self._fd_lock:
             entry = self._fd_map.pop(fh, None)
 
@@ -1593,7 +1729,7 @@ class StorageFS(Operations):
             raise FuseOSError(close_error.errno)
 
         try:
-            self.cache_manager.flush_file(path)
+            self.cache_manager.flush_file(entry.virtual_path)
 
             if entry.backend_name:
                 backend = self.backends.get(entry.backend_name)
@@ -1715,6 +1851,11 @@ class StorageFS(Operations):
 
     def symlink(self, target, source):
         """Create symbolic link"""
+        with self._path_locked(self._resolve_path(source).canonical_path):
+            return self._symlink(target, source)
+
+    def _symlink(self, target, source):
+        """Create symbolic link"""
         cache_path = self.cache_manager.get_cache_path(source)
 
         try:
@@ -1726,6 +1867,11 @@ class StorageFS(Operations):
     # Time operations
 
     def utimens(self, path, times=None):
+        """Update file timestamps"""
+        with self._path_locked(self._resolve_path(path).canonical_path):
+            return self._utimens(path, times)
+
+    def _utimens(self, path, times=None):
         """Update file timestamps"""
         resolved = self._resolve_path(path)
         cache_path = resolved.cache_path

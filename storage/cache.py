@@ -51,6 +51,14 @@ class CacheManager:
         # predate its last write. It takes only a leaf lock and is safe
         # under every lock here. None (no StorageFS) means no listings.
         self.forget_listed_attrs: Optional[Callable[..., None]] = None
+        # Set by StorageFS: a context manager that try-acquires the outer
+        # locks of a canonical path (storage/locks.py) and yields whether it
+        # got them. Eviction runs under self._lock, inside those locks'
+        # order, so it never waits for one: a path another thread's open,
+        # rename or upload holds is skipped (the locks are reentrant, so a
+        # path the evicting thread holds itself is not). None (no
+        # StorageFS) means no contention.
+        self.path_guard: Optional[Callable[[str], ContextManager[bool]]] = None
         self.state_manager = state_manager
         self.max_size_bytes = max_size_bytes
         self._lock = threading.RLock()
@@ -131,6 +139,9 @@ class CacheManager:
 
         return required_bytes - available
 
+    def _path_guard(self, virtual_path: str) -> ContextManager[bool]:
+        return self.path_guard(virtual_path) if self.path_guard else nullcontext(True)
+
     def evict_lru_files(self, bytes_needed: int) -> bool:
         """
         Evict least recently used files to free space
@@ -163,7 +174,9 @@ class CacheManager:
 
                 # Evict this file
                 cache_path = self.get_cache_path(metadata.virtual_path)
-                if cache_path.exists():
+                with self._path_guard(metadata.virtual_path) as free:
+                    if not free or not cache_path.exists():
+                        continue
                     try:
                         freed += self._evict_if_still_clean(metadata.virtual_path, cache_path)
                     except OSError as e:
@@ -190,7 +203,9 @@ class CacheManager:
                     break
 
                 cache_path = self.get_cache_path(metadata.virtual_path)
-                if cache_path.exists():
+                with self._path_guard(metadata.virtual_path) as free:
+                    if not free or not cache_path.exists():
+                        continue
                     try:
                         file_size = cache_path.stat().st_size
                         # Truncate to preserve xattrs
