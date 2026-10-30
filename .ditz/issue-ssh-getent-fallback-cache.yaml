@@ -13,8 +13,8 @@ type: task
 component: build
 release:
 reporter: Ted Smith <tedks@riseup.net>
-status: in_progress
-disposition:
+status: closed
+disposition: wontfix
 creation_time: 2026-10-28T21:31:08-00:00
 references: []
 log_events:
@@ -26,3 +26,11 @@ log_events:
   who: Ted Smith
   what: started
   comment: ""
+- time: 2026-10-30T17:35:46-00:00
+  who: Ted Smith
+  what: 'closed: wontfix'
+  comment: 'A member holds one transport (PR #132), so getent runs once per connect
+    or retry window, not per FUSE thread; the cost premise is gone. A cache would
+    be stalest exactly when a reconnect follows an address change, which the #124
+    ruling not to cache already guards against. Reason recorded in storage/backends/ssh.py
+    beside the fallback.'
