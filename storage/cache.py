@@ -6,6 +6,7 @@ Files are cached on first access and evicted using LRU when space is needed.
 """
 
 import os
+import secrets
 import time
 import threading
 from pathlib import Path
@@ -16,6 +17,10 @@ from .backends.base import Backend
 from .cache_metadata import write_cache_metadata
 from .models import FileMetadata, SyncStatus
 from .state import StateManager
+
+# Names ending in this are cache-internal scratch: hidden from listings and
+# removed by the startup sweep (StreamingReadManager.cleanup_stale_partials).
+PARTIAL_SUFFIX = ".storage.partial"
 
 
 class CacheManager:
@@ -53,6 +58,13 @@ class CacheManager:
         self.state_manager = state_manager
         self.max_size_bytes = max_size_bytes
         self._lock = threading.RLock()
+        # Bytes promised to fetches in flight (cache_file): counted against
+        # max_size_bytes so concurrent fetches cannot each see the same free
+        # space. Under _lock.
+        self._reserved_bytes = 0
+        # Bumped by every rescan; a fetch that sees it move knows the scan
+        # may have counted its temp file (see _replace_into_cache).
+        self._scan_count = 0
 
         # Ensure cache root exists
         self.cache_root.mkdir(parents=True, exist_ok=True)
@@ -76,6 +88,7 @@ class CacheManager:
         if self._size_dirty:
             self._current_size_bytes = self._scan_total_cache_size()
             self._size_dirty = False
+            self._scan_count += 1
 
     def get_cache_path(self, virtual_path: str) -> Path:
         """Get the local cache path for a virtual file"""
@@ -115,7 +128,7 @@ class CacheManager:
         """
         with self._lock:
             self._ensure_size_current_locked()
-            available = self.max_size_bytes - self._current_size_bytes
+            available = self.max_size_bytes - self._current_size_bytes - self._reserved_bytes
 
         if available >= required_bytes:
             return 0
@@ -234,6 +247,13 @@ class CacheManager:
         """
         Download a file from backend into cache
 
+        The cache lock is not held across member I/O: space is reserved
+        under it, the bytes land in a temp file beside the cache path
+        (fetch_into_cache), and only the rename and the accounting take it
+        again. Until the rename the cache path does not exist (or still
+        holds the previous copy), so nothing sees a half-fetched file as
+        cached, and a reader with the cache path open keeps its inode.
+
         Args:
             virtual_path: Virtual path of file
             backend: Backend to download from
@@ -243,38 +263,65 @@ class CacheManager:
             True if successfully cached, False otherwise
         """
         source_virtual_path = source_virtual_path or virtual_path
-        with self._lock:
-            cache_path = self.get_cache_path(virtual_path)
-            existing_size = cache_path.stat().st_size if cache_path.exists() else 0
-
-            # Check if backend has the file
+        try:
             if not backend.exists(source_virtual_path):
                 return False
-
-            # Get file size to ensure we have space
             file_size = backend.get_size(source_virtual_path)
+        except Exception as e:
+            print(f"Error caching {virtual_path} from {backend.name}: {e}")
+            return False
 
-            # Ensure we have space
+        with self._lock:
             if not self.ensure_space(file_size):
                 print(f"Warning: Insufficient cache space for {virtual_path}")
                 return False
+            self._reserved_bytes += file_size
+        try:
+            self.fetch_into_cache(backend, source_virtual_path, self.get_cache_path(virtual_path))
+        except Exception as e:
+            print(f"Error caching {virtual_path} from {backend.name}: {e}")
+            return False
+        finally:
+            with self._lock:
+                self._reserved_bytes -= file_size
+        self.state_manager.update_access_time(virtual_path)
+        return True
 
-            # Download file
+    def fetch_into_cache(self, backend: Backend, source_virtual_path: str, cache_path: Path) -> None:
+        """Copy a member file to cache_path through a temp file beside it.
+
+        The copy runs without the cache lock into a fresh name that ends in
+        PARTIAL_SUFFIX, so listings hide it and the startup sweep removes
+        it after a crash; then the rename and the size accounting run under
+        the lock. The rename replaces any file at cache_path: a descriptor
+        already open on it keeps the old inode. No space is reserved here
+        (cache_file does that). Raises what the copy or the rename raised,
+        with the temp file removed.
+        """
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = cache_path.parent / f".{secrets.token_hex(8)}{PARTIAL_SUFFIX}"
+        with self._lock:
+            scans = self._scan_count
+        try:
+            backend.copy_to_local(source_virtual_path, temp_path)
+            with self._lock:
+                try:
+                    existing_size = os.lstat(cache_path).st_size
+                except FileNotFoundError:
+                    existing_size = 0
+                os.replace(temp_path, cache_path)
+                self._current_size_bytes += os.lstat(cache_path).st_size - existing_size
+                if self._scan_count != scans:
+                    # A rescan during the copy may have counted the temp
+                    # file, so the sum above may count it twice.
+                    self._size_dirty = True
+        except BaseException:
             try:
-                backend.copy_to_local(source_virtual_path, cache_path)
-                new_size = cache_path.stat().st_size if cache_path.exists() else 0
-                self._current_size_bytes += (new_size - existing_size)
-                self._size_dirty = False
-
-                # Update access time in state
-                self.state_manager.update_access_time(virtual_path)
-
-                return True
-
-            except Exception as e:
-                self._size_dirty = True
-                print(f"Error caching {virtual_path} from {backend.name}: {e}")
-                return False
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                with self._lock:
+                    self._size_dirty = True
+            raise
 
     def mark_accessed(self, virtual_path: str):
         """Mark a file as accessed (update LRU)"""
