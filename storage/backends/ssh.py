@@ -626,6 +626,11 @@ class SSHBackend(Backend):
                     # the child.
                     if transport is not None:
                         transport.join(self.connect_timeout)
+                        if transport.is_alive():
+                            # Nothing safe to do about it here; say so.
+                            self.logger.warning(
+                                "member %s: probe connection's transport thread "
+                                "did not stop in %ss", self.name, self.connect_timeout)
                 except Exception:
                     pass
 
