@@ -30,7 +30,7 @@ from typing import Dict, Optional, Set, List, Tuple
 from .backends.base import Backend, interactive_request
 from .cache import PARTIAL_SUFFIX, CacheManager
 from .locks import NamespaceLock, PathLocks, UploadLocks
-from .cache_metadata import XATTR_CACHE_METADATA_NAME, scan_cache_entries
+from .cache_metadata import PREFIX_XATTR, XATTR_CACHE_METADATA_NAME, scan_cache_entries
 from .file_config import FileConfig, get_inherited_config
 from .models import FileLocation, FileMetadata, StreamingKeepAfterClose, SyncStatus
 from .state import StateManager
@@ -1174,6 +1174,41 @@ class StorageFS(Operations):
     def _release_prefetch_session(self, session: PrefetchSession):
         self._streaming_manager._release_prefetch_session(session)
 
+    def _is_unindexed_prefix(self, canonical_path: str, cache_path: Path) -> bool:
+        """Whether the cached file is a failed stream's prefix the index does not describe."""
+        if self.state_manager.get_file_metadata(canonical_path) is not None:
+            return False
+        try:
+            os.getxattr(str(cache_path), PREFIX_XATTR)
+        except OSError:
+            return False
+        return True
+
+    def _drop_unindexed_prefix(self, canonical_path: str, cache_path: Path) -> bool:
+        """Remove a promoted prefix from the cache path; True if one was removed.
+
+        A full fetch's link fails when a failed streaming session promoted
+        its prefix there first, and indexing what is at the path would take
+        the prefix for the whole file. It is removed unless a descriptor
+        has it open (the bytes stay for that reader; nothing is indexed).
+        Under the index lock, which the promotion takes for its check and
+        install, then _fd_lock.
+        """
+        removed = False
+        with self.state_manager.metadata_lock:
+            if not self._is_unindexed_prefix(canonical_path, cache_path):
+                return False
+            with self._descriptor_guard(canonical_path) as is_open:
+                if not is_open:
+                    try:
+                        cache_path.unlink()
+                    except FileNotFoundError:
+                        pass  # gone already (an invalidation): fetch again all the same
+                    removed = True
+        if removed:
+            self.cache_manager.mark_cache_size_dirty()
+        return removed
+
     def _ensure_file_in_cache(self, resolved: ResolvedPath) -> bool:
         """
         Ensure a file is in the cache, downloading or recomputing if necessary
@@ -1230,11 +1265,26 @@ class StorageFS(Operations):
             except Exception:
                 member_stat = None
             # Download to cache
-            if self.cache_manager.cache_file(
+            cached = self.cache_manager.cache_file(
                 resolved.requested_path,
                 backend,
                 source_virtual_path=canonical_path,
-            ):
+            )
+            if cached and self._drop_unindexed_prefix(canonical_path, cache_path):
+                # A failed stream's prefix was installed before this copy
+                # (whose link then found it): once more, for the whole file.
+                cached = self.cache_manager.cache_file(
+                    resolved.requested_path,
+                    backend,
+                    source_virtual_path=canonical_path,
+                )
+            if cached and self._is_unindexed_prefix(canonical_path, cache_path):
+                # Still a prefix (open elsewhere, or another one won again):
+                # serve it unindexed, as any open after a failed session's
+                # cleanup does. (If the second fetch fails instead, the open
+                # fails: the dropped prefix is not served.)
+                return True
+            if cached:
                 # Fresh from the member: no check needed until revalidate_after.
                 self._record_fetched(canonical_path, cache_path, backend, member_stat)
                 # Populate state metadata and locations if missing
@@ -1243,25 +1293,40 @@ class StorageFS(Operations):
                 except OSError:
                     return True
 
-                metadata = self.state_manager.get_file_metadata(canonical_path)
-                if not metadata:
+                # Read before the lock (xattrs up the parents), and only
+                # for a path without a row, as before.
+                config = None
+                if self.state_manager.get_file_metadata(canonical_path) is None:
                     config = self._get_config(canonical_path)
-                    metadata = FileMetadata(
-                        virtual_path=canonical_path,
-                        size=st.st_size,
-                        checksum=None,
-                        last_access=time.time(),
-                        last_modified=st.st_mtime,
-                        sync_status=SyncStatus.CLEAN,
-                        replica_count=config.replica_count,
-                        recomputable=config.recomputable,
-                        recompute_cmd=config.recompute_cmd,
-                        encrypted=config.encrypted,
-                        encryption_key_id=None,
-                    )
-                    # Writes the row and mirrors it.
-                    self.cache_manager.store_file_metadata(metadata, cache_path=cache_path)
-                else:
+                with self.state_manager.metadata_lock:
+                    # The check and the new row are one step under the lock
+                    # the promotion takes: a prefix installed meanwhile is
+                    # never indexed.
+                    if self._is_unindexed_prefix(canonical_path, cache_path):
+                        return True
+                    metadata = self.state_manager.get_file_metadata(canonical_path)
+                    if not metadata:
+                        if config is None:  # the row went meanwhile
+                            config = self._get_config(canonical_path)
+                        metadata = FileMetadata(
+                            virtual_path=canonical_path,
+                            size=st.st_size,
+                            checksum=None,
+                            last_access=time.time(),
+                            last_modified=st.st_mtime,
+                            sync_status=SyncStatus.CLEAN,
+                            replica_count=config.replica_count,
+                            recomputable=config.recomputable,
+                            recompute_cmd=config.recompute_cmd,
+                            encrypted=config.encrypted,
+                            encryption_key_id=None,
+                        )
+                        # Writes the row and mirrors it.
+                        self.cache_manager.store_file_metadata(metadata, cache_path=cache_path)
+                        created = True
+                    else:
+                        created = False
+                if not created:
                     # A refetch after eviction: the member's copy is what the
                     # row already calls synced, but the transfer does not keep
                     # the mtime, so the row's stat must follow the new file or

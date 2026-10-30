@@ -28,6 +28,11 @@ _INTERNAL_CACHE_PREFIXES = (
 # streaming partials): hidden from listings, never indexed, and removed by
 # the startup sweep (StreamingReadManager.cleanup_stale_partials).
 PARTIAL_SUFFIX = ".storage.partial"
+# On the inode of a failed streaming session's prefix kept in the cache:
+# the bytes are a prefix of the member's file, never to be indexed as the
+# whole file. A whole-file fetch clears it from its copy (a member file may
+# carry it from an older copy that kept xattrs).
+PREFIX_XATTR = "user.storage.prefix"
 _INTERNAL_CACHE_SUFFIXES = (
     PARTIAL_SUFFIX,
 )

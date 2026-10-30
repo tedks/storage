@@ -334,6 +334,221 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.assertEqual(retry_head, payload[:4096])
         self.assertEqual(retry_tail, payload[max(0, cached_size - 4096):cached_size])
 
+    def _sync_now(self, path):
+        from storage.sync_executor import SyncExecutor
+        from storage.sync_tasks import SyncTask
+        executor = SyncExecutor(
+            worker_id=0, state_manager=self.fs.state_manager, cache_manager=self.fs.cache_manager,
+            replication_manager=self.fs.replication_manager, config=self.fs.sync_manager.config,
+        )
+        executor.process(SyncTask(path))
+
+    def _read_whole(self, path, size):
+        vfd = self.fs.open(path, os.O_RDONLY)
+        try:
+            data = b""
+            while len(data) < size:
+                chunk = self.fs.read(path, 32 * 1024, len(data), vfd)
+                if not chunk:
+                    break
+                data += chunk
+            return data
+        finally:
+            self.fs.release(path, vfd)
+
+    def _fail_streamed_refetch(self, path, payload):
+        """Open and read past fail_after_offset, so the session fails after a prefix."""
+        vfd = self.fs.open(path, os.O_RDONLY)
+        try:
+            self.assertIsNotNone(self._session_for(vfd))
+            self.assertEqual(self.fs.read(path, 4096, 0, vfd), payload[:4096])
+            with self.assertRaises(FuseOSError):
+                self.fs.read(path, 4096, 96 * 1024, vfd)
+        finally:
+            self.fs.release(path, vfd)
+        partial = self.cache_dir / (path.lstrip('/') + ".storage.partial")
+        self.assertTrue(self._wait_for(lambda: not partial.exists(), timeout=5.0))
+
+    def test_failed_refetch_of_an_evicted_file_never_reaches_the_member(self):
+        # ditz streaming-promoted-prefix-false-conflict, worse case: an
+        # evicted file keeps its CLEAN row and location checksums. A failed
+        # streamed refetch promoted its prefix, the next open saw a lost
+        # write (the row's stat is the whole file's) and marked it DIRTY,
+        # and the sync, finding the member unchanged, uploaded the prefix
+        # over it.
+        self.backend.copy_delay = 0
+        payload = os.urandom(192 * 1024)
+        fh = self.fs.create('/evicted.bin', 0o644)
+        self.fs.write('/evicted.bin', payload, 0, fh)
+        self.fs.release('/evicted.bin', fh)
+        self._sync_now('/evicted.bin')
+        self.assertEqual(payload, (self.backend_dir / "evicted.bin").read_bytes())
+        cache_path = self.cache_dir / "evicted.bin"
+        self.assertGreater(self.fs.cache_manager._evict_if_still_clean('/evicted.bin', cache_path), 0)
+
+        self.backend.fail_after_offset = 64 * 1024
+        self._fail_streamed_refetch('/evicted.bin', payload)
+        self.assertFalse(cache_path.exists(), "a prefix was promoted for an indexed file")
+
+        self.backend.fail_after_offset = None
+        self.assertEqual(self._read_whole('/evicted.bin', len(payload)), payload)
+        self.assertEqual(SyncStatus.CLEAN, self.fs.state_manager.get_file_metadata('/evicted.bin').sync_status)
+        self._sync_now('/evicted.bin')
+        self.assertEqual(payload, (self.backend_dir / "evicted.bin").read_bytes())
+
+    def test_failed_refetch_after_invalidation_is_no_conflict(self):
+        # The issue's case: after _invalidate_file_cache the row is CLEAN with
+        # size 0 and no checksum; a promoted prefix then looked like a write,
+        # and the sync reported CONFLICT on a file nobody wrote.
+        self.backend.copy_delay = 0
+        payload = os.urandom(192 * 1024)
+        (self.backend_dir / "changed.bin").write_bytes(payload)
+        self.assertEqual(self._read_whole('/changed.bin', len(payload)), payload)
+        self.assertTrue(self._wait_for(lambda: (self.cache_dir / "changed.bin").exists(), timeout=5.0))
+        self.assertIsNotNone(self.fs.state_manager.get_file_metadata('/changed.bin'))
+
+        changed = os.urandom(192 * 1024)
+        (self.backend_dir / "changed.bin").write_bytes(changed)
+        self.fs._invalidate_file_cache('/changed.bin')
+        self.backend.fail_after_offset = 64 * 1024
+        self._fail_streamed_refetch('/changed.bin', changed)
+        self.assertFalse((self.cache_dir / "changed.bin").exists())
+
+        self.backend.fail_after_offset = None
+        self.assertEqual(self._read_whole('/changed.bin', len(changed)), changed)
+        self.assertTrue(self._wait_for(lambda: (self.cache_dir / "changed.bin").exists(), timeout=5.0))
+        row = self.fs.state_manager.get_file_metadata('/changed.bin')
+        self.assertEqual(SyncStatus.CLEAN, row.sync_status)
+        self.assertEqual(len(changed), row.size)
+
+    def test_full_fetch_losing_to_a_promoted_prefix_does_not_index_it(self):
+        # Council round 1 on #146: a full fetch (a write-open) copies the
+        # whole file while a streaming session for the same never-cached
+        # path fails and promotes its prefix; the fetch's link then finds
+        # the prefix at the path and used to index it as the whole file
+        # (CLEAN, prefix size), so it was served truncated and, once
+        # written, synced over the member.
+        self.backend.copy_delay = 0
+        payload = os.urandom(192 * 1024)
+        (self.backend_dir / "raced.bin").write_bytes(payload)
+
+        real_copy = self.backend.copy_to_local
+        in_copy = threading.Event()
+        go = threading.Event()
+        self.addCleanup(go.set)
+        copies = []
+
+        def held_copy(virtual_path, local_path):
+            copies.append(virtual_path)
+            if len(copies) == 1:
+                in_copy.set()
+                self.assertTrue(go.wait(timeout=10.0))
+            return real_copy(virtual_path, local_path)
+
+        # The read-ahead worker waits at its first read until the failure is
+        # set up, so it can neither finish the file nor pass 64 KiB first.
+        self.backend.worker_gate = threading.Event()
+        rvfd = self.fs.open('/raced.bin', os.O_RDONLY)
+        self.assertIsNotNone(self._session_for(rvfd))
+        self.assertEqual(self.fs.read('/raced.bin', 4096, 0, rvfd), payload[:4096])
+
+        outcome = {}
+
+        def write_open():
+            try:
+                outcome["vfd"] = self.fs.open('/raced.bin', os.O_RDWR)
+            except BaseException as exc:  # noqa: BLE001 - reported below
+                outcome["error"] = exc
+
+        with patch.object(self.backend, "copy_to_local", side_effect=held_copy):
+            writer = threading.Thread(target=write_open, daemon=True)
+            writer.start()
+            self.assertTrue(in_copy.wait(timeout=5.0))
+            self.backend.fail_after_offset = 64 * 1024
+            with self.assertRaises(FuseOSError):
+                self.fs.read('/raced.bin', 4096, 96 * 1024, rvfd)
+            self.fs.release('/raced.bin', rvfd)
+            self.backend.worker_gate.set()
+            cache_path = self.cache_dir / "raced.bin"
+            self.assertTrue(self._wait_for(lambda: cache_path.exists(), timeout=5.0))
+            self.assertLess(cache_path.stat().st_size, len(payload))  # the prefix won
+            go.set()
+            writer.join(timeout=5.0)
+        self.assertFalse(writer.is_alive())
+        self.assertNotIn("error", outcome)
+        self.fs.release('/raced.bin', outcome["vfd"])
+
+        self.assertEqual(payload, cache_path.read_bytes())
+        row = self.fs.state_manager.get_file_metadata('/raced.bin')
+        self.assertEqual(len(payload), row.size)
+        self.assertEqual(SyncStatus.CLEAN, row.sync_status)
+
+    def test_a_member_file_carrying_the_prefix_marker_is_fetched_whole_and_indexed(self):
+        # Council round 2 on #146: a member file may carry the marker (an
+        # older local member copy kept xattrs). A whole-file fetch clears it,
+        # or the file would be served unindexed for ever.
+        from storage.cache_metadata import PREFIX_XATTR
+        member_file = self.backend_dir / "marked.bin"
+        member_file.write_bytes(b"whole file")
+        os.setxattr(str(member_file), PREFIX_XATTR, b"1")
+        # Read-only, as the local member's copy keeps it: removing a user
+        # xattr needs write permission (council round 3, Codex).
+        os.chmod(member_file, 0o444)
+        # The whole-file fetch path (a write-open's; a read-only open streams).
+        self.assertTrue(self.fs._ensure_file_in_cache(self.fs._resolve_path('/marked.bin')))
+        cache_path = self.cache_dir / "marked.bin"
+        self.assertNotIn(PREFIX_XATTR, os.listxattr(str(cache_path)))
+        self.assertIsNotNone(self.fs.state_manager.get_file_metadata('/marked.bin'))
+
+    def test_an_owner_unreadable_marked_copy_is_cleared(self):
+        # Council round 5 on #146: getxattr needs read permission, and the
+        # copy keeps the member file's mode (write-only here).
+        from storage.cache import _remove_prefix_marker
+        from storage.cache_metadata import PREFIX_XATTR
+        for mode, marked in ((0o200, True), (0o200, False), (0o000, True)):
+            path = self.cache_dir / f"wo-{mode:o}-{marked}"
+            path.write_bytes(b"x")
+            if marked:
+                os.setxattr(str(path), PREFIX_XATTR, b"1")
+            os.chmod(path, mode)
+            _remove_prefix_marker(path)
+            self.assertEqual(mode, os.stat(path).st_mode & 0o777)
+            os.chmod(path, 0o600)
+            self.assertNotIn(PREFIX_XATTR, os.listxattr(str(path)))
+
+    def test_a_read_only_member_file_without_the_marker_is_fetched(self):
+        # Council round 4 on #146: on a read-only copy the kernel answers
+        # EACCES before ENODATA, so removing an absent marker failed the
+        # fetch of every read-only file.
+        member_file = self.backend_dir / "plain-ro.bin"
+        member_file.write_bytes(b"whole file")
+        os.chmod(member_file, 0o444)
+        self.assertTrue(self.fs._ensure_file_in_cache(self.fs._resolve_path('/plain-ro.bin')))
+        cache_path = self.cache_dir / "plain-ro.bin"
+        self.assertEqual(b"whole file", cache_path.read_bytes())
+        self.assertEqual(0o444, os.stat(cache_path).st_mode & 0o777)
+        self.assertIsNotNone(self.fs.state_manager.get_file_metadata('/plain-ro.bin'))
+
+    def test_unindexed_prefix_is_dropped_only_when_unopened_and_unindexed(self):
+        from storage.cache_metadata import PREFIX_XATTR
+        cache_path = self.cache_dir / "p.bin"
+        cache_path.write_bytes(b"prefix")
+        os.setxattr(str(cache_path), PREFIX_XATTR, b"1")
+        vfd = self.fs.open('/p.bin', os.O_RDONLY)
+        self.assertFalse(self.fs._drop_unindexed_prefix('/p.bin', cache_path))
+        self.assertTrue(cache_path.exists())
+        self.fs.release('/p.bin', vfd)
+        self.assertTrue(self.fs._drop_unindexed_prefix('/p.bin', cache_path))
+        self.assertFalse(cache_path.exists())
+
+        # An indexed file is never a droppable prefix, marker or not.
+        fh = self.fs.create('/q.bin', 0o644)
+        self.fs.release('/q.bin', fh)
+        q_path = self.cache_dir / "q.bin"
+        os.setxattr(str(q_path), PREFIX_XATTR, b"1")
+        self.assertFalse(self.fs._drop_unindexed_prefix('/q.bin', q_path))
+        self.assertTrue(q_path.exists())
+
     def test_streaming_session_is_shared_across_readers(self):
         payload = os.urandom(512 * 1024)
         (self.backend_dir / "shared.bin").write_bytes(payload)

@@ -14,6 +14,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 from fuse import FuseOSError
 
 from .backends.base import Backend
+from .cache_metadata import PREFIX_XATTR
 from .models import FileLocation, FileMetadata, StreamingKeepAfterClose, SyncStatus
 
 # A foreground read fetches only the bytes the reader asked for that are not
@@ -61,6 +62,7 @@ STREAMING_MAX_TRACKED_READ_SPANS = 64
 _LINK_UNSUPPORTED = (errno.EPERM, errno.EOPNOTSUPP, errno.ENOTSUP, errno.ENOSYS, errno.EMLINK)
 _NOREPLACE_UNSUPPORTED = (errno.EINVAL, errno.ENOSYS, errno.EOPNOTSUPP, errno.ENOTSUP)
 _AT_FDCWD = -100
+
 _RENAME_NOREPLACE = 1
 
 
@@ -1029,10 +1031,32 @@ class StreamingReadManager:
             if io_fd >= 0:
                 with session.io_lock:
                     os.ftruncate(io_fd, contiguous_bytes)
+                    # A full fetch that loses the install race to this
+                    # prefix must not index it (StorageFS._ensure_file_in_cache);
+                    # an unmarked prefix is not kept.
+                    os.setxattr(io_fd, PREFIX_XATTR, b"1")
                     os.fsync(io_fd)
+            else:
+                os.setxattr(str(session.partial_cache_path), PREFIX_XATTR, b"1")
 
             final_path.parent.mkdir(parents=True, exist_ok=True)
-            outcome = self._install_partial(session)
+            # A prefix is kept only for a file the index does not describe
+            # (never cached): served offline, never synced, never evicted.
+            # A path with a row (evicted, or invalidated by a member change)
+            # would take the prefix for the file: the next open would see a
+            # lost write and mark it DIRTY, and the sync would upload the
+            # prefix over the member, or report a false CONFLICT after an
+            # invalidation (ditz streaming-promoted-prefix-false-conflict).
+            # The check and the install are one step under the index lock.
+            # A create makes its file before its row, which the no-replace
+            # install refuses; a full fetch that loses the race to this
+            # install finds the marker and fetches again instead of indexing
+            # the prefix.
+            with self.state_manager.metadata_lock:
+                if self.state_manager.get_file_metadata(session.canonical_path) is not None:
+                    outcome = "indexed"
+                else:
+                    outcome = self._install_partial(session)
             if outcome != "installed":
                 self.logger.info(
                     "streaming partial-cache skipped path=%s backend=%s reason=%s",
