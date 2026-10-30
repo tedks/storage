@@ -11,7 +11,7 @@ type: task
 component: performance
 release:
 reporter: Ted Smith <tedks@riseup.net>
-status: unstarted
+status: in_progress
 disposition:
 creation_time: 2026-10-30T00:33:13-00:00
 references: []
@@ -31,6 +31,10 @@ log_events:
 - time: 2026-10-30T00:33:17-00:00
   who: Ted Smith
   what: blocked by ssh-connection-per-thread
+  comment: ""
+- time: 2026-10-30T01:55:17-00:00
+  who: Ted Smith
+  what: started
   comment: ""
 blocks:
 - gh-111
