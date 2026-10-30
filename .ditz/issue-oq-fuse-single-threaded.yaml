@@ -45,3 +45,11 @@ log_events:
   who: Ted Smith
   what: created
   comment: ""
+- time: 2026-10-30T00:29:07-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Ruling (Ted, 2026-10-29): B, full multithreaded loop, landed as a staged
+    stack behind a fuse_threads mount option that defaults off; default on only after
+    Ted''s field test. Locking design and stages in docs/browsing_latency_plan.md
+    D6 and 4.4. Lane threading; the stage that turns threads on waits for lane connections
+    (per-member transport pool) to land.'
