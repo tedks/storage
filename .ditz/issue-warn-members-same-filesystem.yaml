@@ -1,0 +1,29 @@
+id: warn-members-same-filesystem
+title: Warn when member paths sit on the same filesystem on a host, not when they
+  share an SSH host
+desc: 'Ruling (Ted, 2026-10-30): members sharing an SSH host is fine and should simply
+  mean more multiplexing; do not warn for it (replaces the warning #136 added). Warn
+  instead when two or more member roots resolve to the same filesystem on the same
+  host, because replicas there share one disk and give no redundancy. Detection: for
+  SSH and rsync members run one exec per member root on the host, e.g. stat -f -c
+  ''%i'' and stat -c ''%d'' (or df --output=source), and group by (host, device id
+  or filesystem id); for local members use os.stat(root).st_dev. Compare the literal
+  host string, no DNS. Warn on stderr at mount time naming the members (profile member
+  names, never data paths), and keep mounting. Tests: unit with fakes for the exec
+  output and st_dev; a CLI test; a remote-gate case with two members in one container
+  on one filesystem (warns) and a bind-mounted second filesystem if the fixture allows
+  (does not warn), else document. Remove the same-host warning and its test from #136;
+  keep connection_identity() if the pool uses it.'
+type: feature
+component: cli
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-30T16:17:05-00:00
+references: []
+log_events:
+- time: 2026-10-30T16:17:05-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
