@@ -32,6 +32,18 @@ log_events:
   who: Ted Smith
   what: blocks gh-111-fuse-threads-option
   comment: ""
+- time: 2026-10-30T00:52:05-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'From PR #131 council round 2 (Claude seat nit): cache_file returns True
+    when fetch_into_cache discarded its copy because a file was already installed;
+    _ensure_file_in_cache then runs _record_fetched pairing this fetch''s pre-copy
+    member stat with another inode. Unreachable under nothreads (open checks is_cached
+    first). Under threads the per-path lock held across open''s ensure makes it unreachable
+    for opens; if any caller can still reach the discard, pass the installed flag
+    up and skip _record_fetched. Also from round 1: a watcher push during a fetch
+    is a no-op (cache path absent until install); the watcher acquiring the path lock
+    blocking closes it.'
 blocks:
 - gh-111
 - gh-111-fuse-threads-option
