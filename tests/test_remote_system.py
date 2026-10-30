@@ -30,6 +30,7 @@ import re
 import secrets
 import shlex
 import shutil
+import signal
 import socket
 import subprocess
 import threading
@@ -700,6 +701,10 @@ def mounted_factory(remote, tmp_path):
         finally:
             for backend in handle.backends.values():
                 backend.close()
+    # libfuse 2's teardown resets SIGPIPE to its default behind Python's back
+    # (tests/test_fuse_thread_state.py); without this, a later test writing to
+    # a socket whose far end was killed ends the whole run with exit 141.
+    signal.signal(signal.SIGPIPE, signal.SIG_IGN)
     if problems:
         pytest.fail("mount teardown: " + "; ".join(problems), pytrace=False)
 
@@ -982,6 +987,7 @@ def test_mount_holds_one_connection_per_member(remote, mounted_factory, tmp_path
         worker.start()
     for worker in workers:
         worker.join(timeout=120)
+    assert not any(worker.is_alive() for worker in workers), "a worker never finished"
     # Let the sync workers upload what was written.
     assert _wait_for(lambda: mnt.fs.sync_manager.get_queue_size() == 0, timeout=60.0)
     time.sleep(1.0)
@@ -1027,6 +1033,7 @@ def test_maxsessions_3_refusals_shrink_the_pool_without_errors(remote, tmp_path)
             thread.start()
         for thread in threads:
             thread.join(timeout=180)
+        assert not any(thread.is_alive() for thread in threads), "a worker never finished"
         assert errors == []
         assert unavailable == []
         snapshot = backend._pool.snapshot()
@@ -1054,3 +1061,33 @@ def test_killed_ssh_session_reconnects_within_the_retry_interval(remote, ssh_bac
     assert ssh_backend._pool.connects == 2
     assert ssh_backend.is_available()
     assert elapsed < ssh_backend._reconnect_probe_interval, elapsed
+
+
+def test_session_killed_mid_transfer_is_retried_on_a_new_connection(remote, ssh_backend, tmp_path):
+    """The connection dies under a running download: paramiko reports it as
+    an SSHException, the probe finds the transport gone, and the download is
+    retried once on a new connection."""
+    member = remote.members[0]
+    payload = secrets.token_bytes(64 * 1024 * 1024)
+    remote.write_remote(member, "big.bin", payload)
+    ssh_backend.stat("/big.bin")
+    assert ssh_backend._pool.connects == 1
+    target = tmp_path / "big.bin"
+    outcome = {}
+
+    def download():
+        try:
+            ssh_backend.copy_to_local("/big.bin", target)
+        except BaseException as exc:
+            outcome["error"] = exc
+
+    worker = threading.Thread(target=download, daemon=True)
+    worker.start()
+    assert _wait_for(lambda: target.exists() and target.stat().st_size > 0, timeout=30.0)
+    remote.exec(member, "pkill -u storage -x sshd")
+    worker.join(timeout=120)
+    assert not worker.is_alive()
+    assert "error" not in outcome, outcome
+    assert target.read_bytes() == payload
+    assert ssh_backend._pool.connects == 2
+    assert ssh_backend.is_available()
