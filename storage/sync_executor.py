@@ -1,10 +1,11 @@
 """Execution policy for background sync workers."""
 
+import contextlib
 import logging
 import queue
 import time
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Union
+from typing import Callable, ContextManager, Dict, List, Optional, Union
 
 from .backends.base import Backend
 from .cache import CacheManager
@@ -31,6 +32,7 @@ class SyncExecutor:
         config: SyncConfig,
         should_sync_path_cb: Optional[Callable[[str], bool]] = None,
         member_written_cb: Optional[Callable[[str, Backend, Path], None]] = None,
+        upload_guard: Optional[Callable[[str], ContextManager]] = None,
     ):
         self.worker_id = worker_id
         self.state_manager = state_manager
@@ -42,6 +44,11 @@ class SyncExecutor:
         # Told (virtual_path, member, cache_path) after each upload, so the
         # filesystem can record the member's new stat (StorageFS revalidation).
         self.member_written_cb = member_written_cb
+        # Held across a file task, from reading its row to publishing the
+        # outcome: a rename or unlink of the path waits for it, so the
+        # member never gets the bytes under a name the namespace has just
+        # given up (StorageFS: UploadLocks.hold_for_upload).
+        self.upload_guard = upload_guard
         self._stats = {
             "synced": 0,
             "failed": 0,
@@ -54,7 +61,12 @@ class SyncExecutor:
         return self.process_file_task(task)
 
     def process_file_task(self, task: SyncTask) -> bool:
-        """Process a single file sync task."""
+        """Process a single file sync task under the path's upload guard."""
+        guard = self.upload_guard(task.virtual_path) if self.upload_guard else contextlib.nullcontext()
+        with guard:
+            return self._process_file_task(task)
+
+    def _process_file_task(self, task: SyncTask) -> bool:
         logger.debug("Worker %s syncing %s", self.worker_id, task.virtual_path)
 
         metadata = self.state_manager.get_file_metadata(task.virtual_path)
@@ -246,9 +258,13 @@ class SyncExecutor:
             # The failure belongs to the attempt that read task.generation. A
             # write since then owns the row, and its DIRTY must stand; a
             # failure it refuses is not counted, the file is simply dirty.
-            cache_path = self.cache_manager.get_cache_path(task.virtual_path)
-            if self._publish(task, task.generation, SyncStatus.ERROR, cache_path):
-                self._stats["failed"] += 1
+            # Under the guard, so no rename moves another file's row (with
+            # the same generation count) onto the path in between.
+            guard = self.upload_guard(task.virtual_path) if self.upload_guard else contextlib.nullcontext()
+            with guard:
+                cache_path = self.cache_manager.get_cache_path(task.virtual_path)
+                if self._publish(task, task.generation, SyncStatus.ERROR, cache_path):
+                    self._stats["failed"] += 1
         return True
 
     def process_dir_task(self, task: DirSyncTask) -> bool:

@@ -11,7 +11,7 @@ import threading
 import queue
 import logging
 from pathlib import Path
-from typing import Callable, Optional, Set, Union, Tuple
+from typing import Callable, ContextManager, Optional, Set, Union, Tuple
 
 from .backends.base import Backend
 from .cache import CacheManager
@@ -48,7 +48,8 @@ class SyncWorker(threading.Thread):
                  state_manager: StateManager, cache_manager: CacheManager,
                  replication_manager: ReplicationManager, config: SyncConfig,
                  task_complete_cb=None, should_sync_path_cb: Optional[Callable[[str], bool]] = None,
-                 member_written_cb: Optional[Callable[[str, Backend, Path], None]] = None):
+                 member_written_cb: Optional[Callable[[str, Backend, Path], None]] = None,
+                 upload_guard: Optional[Callable[[str], ContextManager]] = None):
         super().__init__(daemon=True, name=f"SyncWorker-{worker_id}")
         self.worker_id = worker_id
         self.task_queue = task_queue
@@ -64,6 +65,7 @@ class SyncWorker(threading.Thread):
             config=config,
             should_sync_path_cb=should_sync_path_cb,
             member_written_cb=member_written_cb,
+            upload_guard=upload_guard,
         )
         self._stop_event = threading.Event()
         self._active_task: Optional[str] = None
@@ -141,7 +143,8 @@ class SyncManager:
                  replication_manager: ReplicationManager, num_workers: int = 2,
                  config: Optional[SyncConfig] = None,
                  should_sync_path_cb: Optional[Callable[[str], bool]] = None,
-                 member_written_cb: Optional[Callable[[str, Backend, Path], None]] = None):
+                 member_written_cb: Optional[Callable[[str, Backend, Path], None]] = None,
+                 upload_guard: Optional[Callable[[str], ContextManager]] = None):
         """
         Initialize sync manager
 
@@ -154,6 +157,8 @@ class SyncManager:
             should_sync_path_cb: Whether a path may sync now (no open writer)
             member_written_cb: Called (virtual_path, member, cache_path)
                 after each upload to a member
+            upload_guard: Context manager factory held across each file
+                task (StorageFS's upload lock for the path)
         """
         self.state_manager = state_manager
         self.cache_manager = cache_manager
@@ -162,6 +167,7 @@ class SyncManager:
         self.config = config or SyncConfig()
         self._should_sync_path_cb = should_sync_path_cb
         self._member_written_cb = member_written_cb
+        self._upload_guard = upload_guard
 
         # Task queue (priority queue)
         self.task_queue = queue.PriorityQueue()
@@ -194,6 +200,7 @@ class SyncManager:
                 self.config, self._task_complete,
                 should_sync_path_cb=self._should_sync_path_cb,
                 member_written_cb=self._member_written_cb,
+                upload_guard=self._upload_guard,
             )
             worker.start()
             self.workers.append(worker)

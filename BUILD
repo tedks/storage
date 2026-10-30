@@ -119,6 +119,7 @@ py_test(
         "tests/test_sync_dir_ops.py",
         "tests/test_sync_executor.py",
         "tests/test_sync_manager.py",
+        "tests/test_sync_races.py",
         "tests/test_sync_tasks.py",
         "tests/test_watcher.py",
     ],
