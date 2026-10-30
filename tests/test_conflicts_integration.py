@@ -21,7 +21,7 @@ import yaml
 from storage.fs import StorageFS
 from storage.backends.local import LocalBackend
 from storage.checksums import fast_checksum_bytes
-from tests.fuse_mount import run_fuse, stop_fuse
+from tests.fuse_mount import ORPHAN_RELEASE_SUPPORTED, run_fuse, stop_fuse
 
 
 class BaseConflictMountTest(unittest.TestCase):
@@ -79,7 +79,7 @@ class BaseConflictMountTest(unittest.TestCase):
         time.sleep(1.0)
 
     def tearDown(self):
-        problems = stop_fuse(self.mount_dir, self.mount_thread)
+        problems = stop_fuse(self.mount_dir, self.mount_thread, fs=self.fs)
         if os.path.ismount(self.mount_dir) or self.mount_thread.is_alive():
             # Still serving (a lazy unmount leaves it running): removing the
             # cache or destroying under it would race its requests.
@@ -114,6 +114,50 @@ class BaseConflictMountTest(unittest.TestCase):
 
 class TestLocalConflictMount(BaseConflictMountTest):
     """Conflicts on two local backends"""
+
+    maxDiff = None
+
+    def test_unmount_ends_the_loop_while_another_namespace_holds_the_mount(self):
+        """A process in a copied mount namespace must not hang the teardown.
+
+        A Bazel linux-sandbox or a container started while the mount is up
+        copies it; the kernel then keeps the filesystem alive after our umount
+        and never wakes the loop's read of /dev/fuse.
+        """
+        if not ORPHAN_RELEASE_SUPPORTED:
+            self.skipTest("no tgkill number for this architecture")
+        os.listdir(self.mount_dir)
+        try:
+            subprocess.run(["unshare", "-Urm", "true"], check=True, timeout=10,
+                           capture_output=True)
+        except (OSError, subprocess.SubprocessError) as exc:
+            self.skipTest(f"cannot create a mount namespace here: {exc}")
+        holder = subprocess.Popen(["unshare", "-Urm", "sleep", "120"])
+        try:
+            # Wait until the holder has really moved into its own mount
+            # namespace and sees the mount; /proc/<pid> exists from fork on.
+            mine = os.readlink("/proc/self/ns/mnt")
+            needle = f" {os.path.realpath(self.mount_dir)} "
+            deadline = time.monotonic() + 10
+            while True:
+                try:
+                    ready = (os.readlink(f"/proc/{holder.pid}/ns/mnt") != mine
+                             and needle in Path(f"/proc/{holder.pid}/mountinfo").read_text())
+                except OSError:
+                    ready = False
+                if ready:
+                    break
+                self.assertLess(time.monotonic(), deadline, "the holder never copied the mount")
+                time.sleep(0.05)
+            started = time.monotonic()
+            problems = stop_fuse(self.mount_dir, self.mount_thread, fs=self.fs)
+            self.assertEqual(problems, [])
+            self.assertIsNone(holder.poll(), "the holder must have outlived the unmount")
+            self.assertTrue(self.fs.destroy_entered.is_set(), "libfuse should have run destroy")
+            self.assertLess(time.monotonic() - started, 25.0)
+        finally:
+            holder.kill()
+            holder.wait(timeout=10)
 
     def test_conflict_detection_and_take(self):
         # First read primes directory cache and kicks off checksum workers

@@ -48,7 +48,10 @@ from storage.backends.ssh import SSHBackend
 from storage.backends.ssh_mux import ControlSockets
 from storage.checksums import fast_checksum_bytes
 from storage.watcher import RemoteWatcher
-from tests.fuse_mount import FUSE_THREAD_MODES, fuse_mode_id, run_fuse, unmount_fuse
+from tests.fuse_mount import (
+    FUSE_THREAD_MODES, ORPHAN_GRACE, _thread_stacks, fuse_mode_id, native_thread_state,
+    release_orphaned_loop, run_fuse, unmount_fuse,
+)
 
 IMAGE_DIR = Path(__file__).resolve().parent / "remote"
 IMAGE_REPO = "storage-test-sshd"
@@ -678,11 +681,22 @@ def mounted_factory(remote, tmp_path, request):
             join_timeout = 30.0
             if handle.fuse_threads:
                 join_timeout += 2 * max(b.sftp_operation_timeout for b in handle.backends.values())
-            thread.join(timeout=join_timeout)
+            orphan_note = ""
+            join_deadline = time.monotonic() + join_timeout
+            thread.join(timeout=min(join_timeout, ORPHAN_GRACE))
+            if thread.is_alive() and not os.path.ismount(handle.mount):
+                orphan_note = release_orphaned_loop(
+                    handle.fs, thread,
+                    wait=max(0.0, min(10.0, join_deadline - time.monotonic())))
+            thread.join(timeout=max(0.0, join_deadline - time.monotonic()))
             if thread.is_alive():
                 problems.append("the FUSE thread did not finish after unmount "
                                 "(a request still in a member call, StorageFS.destroy "
-                                "hung, or a lazy unmount still held open)")
+                                "hung, or a lazy unmount still held open); "
+                                f"destroy entered: {destroy_called.is_set()}; "
+                                f"orphan release: {orphan_note or 'not tried'}\n"
+                                + native_thread_state(thread, handle.mount) + "\n"
+                                + _thread_stacks())
             elif not destroy_called.is_set():
                 if came_up:
                     problems.append("libfuse unmounted without calling destroy")

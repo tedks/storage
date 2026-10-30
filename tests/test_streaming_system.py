@@ -85,7 +85,7 @@ class TestStreamingSystemRegression(unittest.TestCase):
     def tearDown(self):
         # After the FUSE thread has finished, so this destroy never runs
         # beside libfuse's own (or a request still in flight).
-        problems = stop_fuse(self.mount_dir, self.mount_thread)
+        problems = stop_fuse(self.mount_dir, self.mount_thread, fs=self.fs)
         if os.path.ismount(self.mount_dir) or self.mount_thread.is_alive():
             # Still serving (a lazy unmount leaves it running): removing the
             # cache or destroying under it would race its requests.
