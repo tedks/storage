@@ -28,3 +28,13 @@ log_events:
   who: Ted Smith
   what: started
   comment: ""
+- time: 2026-10-30T17:24:28-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Lane sync-correctness, 2026-10-30, under host load avg 18-70 (other projects''
+    builds): seen in sync_system (test_multiple_file_sync, test_read_from_backend
+    [threads]), conflicts_integration, streaming_system and remote_system (test_mounted_browse_request_budget[threads],
+    test_mounted_revalidate_sees_container_change_after_age[threads]) on PR #141''s
+    round-1 head and PR #144 5e7d2b3; each failing test passed 4/4 when rerun alone,
+    and the full gates passed on #141 9353004 at lower load. Looks load-sensitive
+    (join_timeout 30 s vs destroy''s joins), not tied to those PRs'' changes.'
