@@ -47,6 +47,23 @@ class TestMemberHashQueues(unittest.TestCase):
         self.assertEqual((live.result(timeout=5), newest.result(timeout=5)), (1, 2))
         blocker.result(timeout=5)
 
+    def test_idle_while_nothing_waits_or_runs(self):
+        self.assertTrue(self.queues.idle("m"))
+        release, blocker = self._block("m")
+        self.assertFalse(self.queues.idle("m"))
+        self.assertTrue(self.queues.idle("other"))
+        waiting = self.queues.submit("m", lambda: 0)
+        waiting.cancel()
+        release.set()
+        blocker.result(timeout=5)
+        deadline = threading.Event()
+        for _ in range(100):
+            if self.queues.idle("m"):
+                break
+            deadline.wait(0.05)
+        # Only a cancelled item is left (or none): idle.
+        self.assertTrue(self.queues.idle("m"))
+
     def test_submit_after_fork_starts_fresh_workers(self):
         self.queues.submit("m", lambda: None).result(timeout=5)
         parent_worker = self.queues._workers["m"]

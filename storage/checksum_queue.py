@@ -31,6 +31,9 @@ import threading
 from typing import Callable, Deque, Dict, Tuple
 
 DEFAULT_QUEUE_LIMIT = 256
+# Seconds between re-verifications of persisted member hashes, one file per
+# idle member each (storage.fs.StorageFS._reverify_tick); 0 turns them off.
+DEFAULT_CHECKSUM_REVERIFY_INTERVAL = 60.0
 
 _Item = Tuple[concurrent.futures.Future, Callable[[], object]]
 
@@ -107,6 +110,14 @@ class MemberHashQueues:
     def pending(self, member: str) -> int:
         with self._cond:
             return len(self._queues.get(member, ()))
+
+    def idle(self, member: str) -> bool:
+        """Nothing waiting for member's worker (cancelled items aside) and
+        nothing running on it."""
+        with self._cond:
+            if member in self._running:
+                return False
+            return all(item[0].cancelled() for item in self._queues.get(member, ()))
 
     def shutdown(self):
         """Cancel every waiting item; workers exit after the item they run.

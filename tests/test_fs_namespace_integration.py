@@ -1583,6 +1583,125 @@ class TestFSNamespaceIntegration(unittest.TestCase):
                 "/dup.txt", self.backends["backend2"], cache_path, fast_checksum_bytes(b"same"))
         self.assertIsNone(self.fs.state_manager.get_member_checksum("/dup.txt", "backend2"))
 
+    def _age_rows(self, seconds):
+        """Make every persisted row look checked `seconds` ago."""
+        state = self.fs.state_manager
+        with state.metadata_lock:
+            state.conn.execute(
+                "UPDATE member_checksums SET verified_at = verified_at - ?", (seconds,))
+            state.conn.commit()
+
+    def _reverify_and_settle(self):
+        self.fs._reverify_tick()
+
+        def settled():
+            with self.fs._checksum_lock:
+                return not self.fs._checksum_tasks
+        self.assertTrue(self._wait_for(settled))
+
+    def test_reverify_finds_a_rewrite_the_basis_hides(self):
+        (self.backend1_dir / "dup.txt").write_text("same")
+        (self.backend2_dir / "dup.txt").write_text("same")
+        self.assertIn("dup.txt", self._list_and_settle())
+        self._age_rows(2 * StorageFS.CHECKSUM_REVERIFY_MIN_AGE)
+        old_basis = self.fs._checksum_records[("/dup.txt", "backend2")].basis
+        (self.backend2_dir / "dup.txt").write_text("diff")
+        # What a member without ctime reports after a same-second rewrite:
+        # the basis the record was made from.
+        real_stat = self.backends["backend2"].stat
+
+        def same_basis(path):
+            st = real_stat(path)
+            return os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink, st.st_uid,
+                                   st.st_gid, old_basis[0], st.st_atime, old_basis[1],
+                                   old_basis[2]))
+        hashes = self._hashes()
+        with patch.object(self.backends["backend2"], "stat", side_effect=same_basis):
+            self._reverify_and_settle()
+        # One file per member per pass: backend1's row and backend2's.
+        self.assertEqual(sorted(hashes), [("backend1", "/dup.txt"), ("backend2", "/dup.txt")])
+        record = self.fs._checksum_records[("/dup.txt", "backend2")]
+        self.assertEqual(record.checksum, fast_checksum_bytes(b"diff"))
+        self.assertEqual(record.basis, old_basis)
+        self.assertEqual(self.fs.state_manager.get_member_checksum("/dup.txt", "backend2").checksum,
+                         fast_checksum_bytes(b"diff"))
+        self.fs.namespace.readdir_snapshot_ttl = float('inf')
+        self.assertIn("dup.txt.backend2", set(self.fs.readdir('/', None)))
+
+    def test_reverify_takes_only_old_rows_and_moves_them_back(self):
+        for name in ("a.txt", "b.txt"):
+            (self.backend1_dir / name).write_text("same")
+            (self.backend2_dir / name).write_text("same")
+        self._list_and_settle()
+        hashes = self._hashes()
+        self._reverify_and_settle()
+        self.assertEqual(hashes, [])  # checked within the hour
+        self._age_rows(2 * StorageFS.CHECKSUM_REVERIFY_MIN_AGE)
+        self._reverify_and_settle()
+        self._reverify_and_settle()
+        # Each pass took the member's oldest row; the second, the other one.
+        self.assertEqual(sorted(p for m, p in hashes if m == "backend2"), ["/a.txt", "/b.txt"])
+        self._reverify_and_settle()
+        self.assertEqual(len(hashes), 4)  # both rows checked again: nothing old is left
+
+    def test_reverify_skips_a_busy_member_and_drops_vanished_files(self):
+        (self.backend1_dir / "dup.txt").write_text("same")
+        (self.backend2_dir / "dup.txt").write_text("same")
+        self._list_and_settle()
+        self._age_rows(2 * StorageFS.CHECKSUM_REVERIFY_MIN_AGE)
+        hashes = self._hashes()
+        with patch.object(self.fs._checksum_queues, "idle", return_value=False):
+            self._reverify_and_settle()
+        self.assertEqual(hashes, [])
+        (self.backend2_dir / "dup.txt").unlink()
+        self._reverify_and_settle()
+        self.assertIsNone(self.fs.state_manager.get_member_checksum("/dup.txt", "backend2"))
+        self.assertNotIn(("/dup.txt", "backend2"), self.fs._checksum_records)
+        self.assertIsNotNone(self.fs.state_manager.get_member_checksum("/dup.txt", "backend1"))
+
+    def test_reverify_that_cannot_hash_keeps_the_row_and_moves_on(self):
+        (self.backend1_dir / "dup.txt").write_text("same")
+        (self.backend2_dir / "dup.txt").write_text("same")
+        self._list_and_settle()
+        self._age_rows(2 * StorageFS.CHECKSUM_REVERIFY_MIN_AGE)
+        state = self.fs.state_manager
+        before = state.oldest_member_checksum("backend2", time.time())[2]
+        member = self.backends["backend2"]
+        with patch.object(member, "get_fast_checksum",
+                          side_effect=ChecksumUnavailable(errno.EIO, "no remote hash")):
+            self._reverify_and_settle()
+        row = state.oldest_member_checksum("backend2", time.time())
+        self.assertGreater(row[2], before)
+        self.assertEqual(row[1].checksum, fast_checksum_bytes(b"same"))
+        # Could not be asked: the row stays first in line, unchanged.
+        self._age_rows(2 * StorageFS.CHECKSUM_REVERIFY_MIN_AGE)
+        before = state.oldest_member_checksum("backend2", time.time())[2]
+        with patch.object(member, "get_fast_checksum", side_effect=ConnectionResetError("dropped")):
+            self._reverify_and_settle()
+        self.assertEqual(state.oldest_member_checksum("backend2", time.time())[2], before)
+
+    def test_reverify_superseded_by_an_upload_records_nothing(self):
+        (self.backend1_dir / "dup.txt").write_text("same")
+        (self.backend2_dir / "dup.txt").write_text("same")
+        self._list_and_settle()
+        self._age_rows(2 * StorageFS.CHECKSUM_REVERIFY_MIN_AGE)
+        member = self.backends["backend2"]
+        started, release = threading.Event(), threading.Event()
+
+        def slow(path, *args, **kwargs):
+            started.set()
+            release.wait(5)
+            return "0" * 32
+
+        with patch.object(member, "get_fast_checksum", side_effect=slow):
+            self.fs._reverify_tick()
+            self.assertTrue(started.wait(5))
+            self._upload("/dup.txt", b"newer")
+            release.set()
+            self.assertTrue(self._wait_for(lambda: not self.fs._checksum_tasks))
+        row = self.fs.state_manager.get_member_checksum("/dup.txt", "backend2")
+        self.assertEqual(row.checksum, fast_checksum_bytes(b"newer"))
+
     def test_readdir_rehashes_member_rewritten_with_same_size_and_mtime(self):
         # A tagger that preserves mtime: only ctime shows the change, and a
         # local member's listing carries it.

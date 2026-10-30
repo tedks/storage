@@ -10,6 +10,7 @@ from typing import Any, Dict, Optional, Sequence, Tuple
 from .backends.local import LocalBackend
 from .backends.ssh import SSHBackend
 from .models import StreamingKeepAfterClose
+from .checksum_queue import DEFAULT_CHECKSUM_REVERIFY_INTERVAL
 from .namespace import DEFAULT_LISTING_MAX_STALE
 
 
@@ -58,6 +59,8 @@ class ResolvedMountConfig:
     # Seconds a listing past its fresh window is still served while a
     # background refresh runs (profile only).
     listing_max_stale: float = DEFAULT_LISTING_MAX_STALE
+    # Seconds between re-verifications of persisted member hashes; 0: off.
+    checksum_reverify_interval: float = DEFAULT_CHECKSUM_REVERIFY_INTERVAL
 
     @property
     def member_specs(self) -> Tuple[str, ...]:
@@ -531,6 +534,9 @@ def _load_mount_profile_settings(config_path: Path, profile_name: str) -> Dict[s
             for key in KERNEL_TIMEOUT_KEYS
         },
         "fuse_threads": _optional_profile_bool(config_profile, "fuse_threads", profile_name),
+        "checksum_reverify_interval": _optional_profile_float(
+            config_profile, "checksum_reverify_interval", profile_name
+        ),
         "backing_paths": config_backing_paths,
         "remote": config_remote,
     }
@@ -564,6 +570,7 @@ def _can_auto_load_mount_profile(
     streaming_keep_after_close: Optional[str] = None,
     revalidate_after: Optional[float] = None,
     fuse_threads: Optional[bool] = None,
+    checksum_reverify_interval: Optional[float] = None,
 ) -> bool:
     if not _target_looks_like_profile_name(mount_target):
         return False
@@ -586,6 +593,7 @@ def _can_auto_load_mount_profile(
         streaming_keep_after_close is not None,
         revalidate_after is not None,
         fuse_threads is not None,
+        checksum_reverify_interval is not None,
     ))
 
 
@@ -610,6 +618,7 @@ def resolve_mount_configuration(
     streaming_keep_after_close: Optional[str] = None,
     revalidate_after: Optional[float] = None,
     fuse_threads: Optional[bool] = None,
+    checksum_reverify_interval: Optional[float] = None,
 ) -> ResolvedMountConfig:
     config_values = {
         "mountpoint": None,
@@ -631,6 +640,7 @@ def resolve_mount_configuration(
         "listing_max_stale": None,
         **{key: None for key in KERNEL_TIMEOUT_KEYS},
         "fuse_threads": None,
+        "checksum_reverify_interval": None,
         "backing_paths": (),
         "remote": (),
     }
@@ -661,6 +671,7 @@ def resolve_mount_configuration(
         streaming_keep_after_close,
         revalidate_after,
         fuse_threads,
+        checksum_reverify_interval,
     ):
         available_configs = [candidate for candidate in default_mount_config_paths() if candidate.exists()]
         if available_configs:
@@ -750,4 +761,12 @@ def resolve_mount_configuration(
         listing_max_stale=_validated_seconds(
             "listing_max_stale", config_values["listing_max_stale"]
         ) if config_values["listing_max_stale"] is not None else DEFAULT_LISTING_MAX_STALE,
+        checksum_reverify_interval=_validated_seconds(
+            "checksum_reverify_interval",
+            checksum_reverify_interval if checksum_reverify_interval is not None else (
+                config_values["checksum_reverify_interval"]
+                if config_values["checksum_reverify_interval"] is not None
+                else DEFAULT_CHECKSUM_REVERIFY_INTERVAL
+            ),
+        ),
     )
