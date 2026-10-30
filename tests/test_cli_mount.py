@@ -342,25 +342,57 @@ backends = ["{self.temp_dir}"]
         self.assertIs(True, self._mount("", ["--fuse-threads"])[1])
 
 
-class _FakeMember(SSHBackend):
-    """An SSH member whose filesystem probe answers from a table, no network."""
+class _FakeChannel:
+    def __init__(self, rc):
+        self.rc = rc
 
-    def __init__(self, name, host, port=22, fs_output=b"1\n", rc=0, fail=False):
-        super().__init__(name, host, "/srv/root", "u", port=port)
-        self._fs = (rc, fs_output, fail)
-        self.probes = 0
+    def settimeout(self, _t):
+        pass
 
-    def _run(self, cmd, timeout):
-        self.probes += 1
-        rc, out, fail = self._fs
+    def recv_exit_status(self):
+        return self.rc
+
+
+class _FakeStdout:
+    def __init__(self, out, rc):
+        self._out = out
+        self.channel = _FakeChannel(rc)
+
+    def read(self, _n):
+        return self._out
+
+
+class _FakeClient:
+    """Stands in for the paramiko client the probe opens and must close."""
+
+    def __init__(self, member):
+        self.member = member
+        self.closed = False
+
+    def exec_command(self, cmd, timeout=None):
+        self.member.commands.append(cmd)
+        rc, out = self.member.fs
+        return None, _FakeStdout(out, rc), None
+
+    def close(self):
+        self.closed = True
+
+
+def _fake(name, host, port=22, fs_output=b"1\n", rc=0, fail=False):
+    member = SSHBackend(name, host, "/srv/root", "u", port=port)
+    member.fs = (rc, fs_output)
+    member.commands = []
+    member.clients = []
+
+    def open_client():
+        member.probes += 1
         if fail:
             raise OSError("down")
-        return rc, out
+        member.clients.append(_FakeClient(member))
+        return member.clients[-1]
 
-
-def _fake(name, host, **kw):
-    member = _FakeMember(name, host, **kw)
-    member._pool.run_command = member._run
+    member.probes = 0
+    member._open_client = open_client
     return member
 
 
@@ -395,14 +427,29 @@ class TestSharedFilesystems(unittest.TestCase):
         self.assertEqual((0, 0), (a.probes, b.probes))
 
     def test_failed_probes_are_skipped(self):
-        backends = {
-            "a": _fake("a", "h.example", fail=True),
-            "b": _fake("b", "h.example", rc=1, fs_output=b""),
-            "c": _fake("c", "h.example", fs_output=b"not a number\n"),
-            "d": _fake("d", "h.example", fs_output=b"7\n"),
-            "e": _fake("e", "h.example", fs_output=b"7\n"),
-        }
-        self.assertEqual([["d", "e"]], shared_filesystems(backends))
+        for kwargs in (dict(fail=True), dict(rc=1, fs_output=b""),
+                       dict(fs_output=b"not a number\n")):
+            with self.subTest(kwargs=kwargs):
+                backends = {
+                    "bad": _fake("bad", "h.example", **kwargs),
+                    "d": _fake("d", "h.example", fs_output=b"7\n"),
+                    "e": _fake("e", "h.example", fs_output=b"7\n"),
+                    "f": _fake("f", "g.example", fs_output=b"7\n"),
+                    "g": _fake("g", "g.example", fs_output=b"7\n"),
+                }
+                # The failing host's other members are not probed; others are.
+                self.assertEqual([["f", "g"]], shared_filesystems(backends))
+                self.assertEqual(0, backends["d"].probes)
+
+    def test_probe_uses_its_own_connection_and_closes_it(self):
+        member = _fake("a", "h.example", fs_output=b"7\n")
+        other = _fake("b", "h.example", fs_output=b"7\n")
+        with patch.object(member._pool, "run_command") as run_command:
+            self.assertEqual([["a", "b"]], shared_filesystems({"a": member, "b": other}))
+            run_command.assert_not_called()
+        # Nothing left open before the mount forks, and the root is quoted.
+        self.assertTrue(all(c.closed for c in member.clients + other.clients))
+        self.assertEqual(["stat -L -c %d -- /srv/root"], member.commands)
 
     def test_local_members_group_by_st_dev(self):
         root = Path(tempfile.mkdtemp())
@@ -412,8 +459,9 @@ class TestSharedFilesystems(unittest.TestCase):
         backends = {"x": LocalBackend("x", str(root / "x")),
                     "y": LocalBackend("y", str(root / "y"))}
         self.assertEqual([["x", "y"]], shared_filesystems(backends))
-        with patch("storage.backends.local.os.stat") as stat:
-            stat.side_effect = [SimpleNamespace(st_dev=1), SimpleNamespace(st_dev=2)]
+        devs = {str(root / "x"): 1, str(root / "y"): 2}
+        with patch("storage.backends.local.os.stat",
+                   side_effect=lambda p: SimpleNamespace(st_dev=devs[str(p)])):
             self.assertEqual([], shared_filesystems(backends))
         with patch("storage.backends.local.os.stat", side_effect=OSError("gone")):
             self.assertEqual([], shared_filesystems(backends))
@@ -447,13 +495,15 @@ backends = ["{self.temp_dir / 'a'}", "{self.temp_dir / 'b'}"]
         warnings = [l for l in result.stderr.splitlines() if l.startswith("Warning:")]
         self.assertEqual(
             ["Warning: members local0, local1 store on the same filesystem; "
-             "their replicas share one disk and give no redundancy."],
+             "replicas on it add no redundancy beyond the filesystem's own."],
             warnings,
         )
         self.assertNotIn(str(self.temp_dir), "\n".join(warnings))
         self.assertNotIn("Warning:", result.stdout)
 
     def test_distinct_filesystems_do_not_warn(self):
-        with patch("storage.cli_mount.shared_filesystems", return_value=[]):
+        devs = {str((self.temp_dir / "a").resolve()): 1, str((self.temp_dir / "b").resolve()): 2}
+        with patch.object(LocalBackend, "filesystem_identity", autospec=True,
+                          side_effect=lambda member: ("", 0, devs[str(member.root_path)])):
             result = self._mount()
         self.assertNotIn("Warning:", result.stderr)

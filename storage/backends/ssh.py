@@ -588,17 +588,33 @@ class SSHBackend(Backend):
     # Optional capabilities used by conflict detection
     # ------------------------------------------------------------------ #
     def filesystem_identity(self):
-        """The device id of the remote root (`stat -c %d`), on this host and port."""
+        """The device id of the remote root (`stat -c %d`), on this host and port.
+
+        Runs on a connection of its own, closed before returning: this is
+        called before FUSE's daemonizing fork, and a pooled transport opened
+        here would reach the forked child with its reader thread gone. A
+        failure here also leaves the member's pool state untouched.
+        """
+        client = None
         try:
-            cmd = f"stat -L -c %d -- {self._shell_quote(str(self.remote_path))} 2>/dev/null"
-            rc, stdout = self._pool.run_command(cmd, self.connect_timeout)
-            text = stdout.decode(errors="replace").strip()
+            client = self._open_client()
+            cmd = f"stat -L -c %d -- {self._shell_quote(str(self.remote_path))}"
+            _stdin, stdout, _stderr = client.exec_command(cmd, timeout=self.connect_timeout)
+            stdout.channel.settimeout(self.connect_timeout)
+            text = stdout.read(64).decode(errors="replace").strip()
+            rc = stdout.channel.recv_exit_status()
             if rc != 0 or not text.isdigit():
                 raise ValueError(f"unusable stat output (exit {rc})")
             return (self.host, self.port, int(text))
         except Exception as exc:
             self.logger.debug("member %s: filesystem probe failed: %s", self.name, exc)
             return None
+        finally:
+            if client is not None:
+                try:
+                    client.close()
+                except Exception:
+                    pass
 
     def _shell_quote(self, value: str) -> str:
         return shlex.quote(value)

@@ -21,10 +21,12 @@ def shared_filesystems(backends: Dict[str, Backend]) -> List[List[str]]:
     """Member names, in groups of two or more, whose roots sit on one filesystem.
 
     Members are grouped by Backend.filesystem_identity(): the host string
-    as configured (never resolved) and the device id of the root there. A
-    member on a host of its own cannot share with anyone, so it is not
-    probed (no connection is opened for it). A member whose probe fails
-    drops out of the grouping.
+    as configured (never resolved) and the device id of the root there.
+    An SSH member alone on its host cannot share with anyone, so it is not
+    probed (no connection is opened for it); local members are always
+    checked, which is a stat. A member whose probe fails drops out of the
+    grouping, and the host's remaining members are not probed, so an
+    unreachable host costs one connect timeout, not one per member.
     """
     on_host: Dict[Tuple[str, int], int] = {}
     for backend in backends.values():
@@ -32,12 +34,18 @@ def shared_filesystems(backends: Dict[str, Backend]) -> List[List[str]]:
             key = (backend.host, backend.port)
             on_host[key] = on_host.get(key, 0) + 1
     groups: Dict[Tuple[str, int, int], List[str]] = {}
+    failed_hosts = set()
     for name, backend in backends.items():
-        if isinstance(backend, SSHBackend) and on_host[(backend.host, backend.port)] < 2:
-            continue
+        if isinstance(backend, SSHBackend):
+            host = (backend.host, backend.port)
+            if on_host[host] < 2 or host in failed_hosts:
+                continue
         identity = backend.filesystem_identity()
-        if identity is not None:
-            groups.setdefault(identity, []).append(name)
+        if identity is None:
+            if isinstance(backend, SSHBackend):
+                failed_hosts.add((backend.host, backend.port))
+            continue
+        groups.setdefault(identity, []).append(name)
     return [names for names in groups.values() if len(names) > 1]
 
 
@@ -223,7 +231,7 @@ def mount(
     for names in shared_filesystems(backends):
         click.echo(
             f"Warning: members {', '.join(names)} store on the same filesystem; "
-            "their replicas share one disk and give no redundancy.",
+            "replicas on it add no redundancy beyond the filesystem's own.",
             err=True,
         )
 
