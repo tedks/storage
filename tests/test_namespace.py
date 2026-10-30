@@ -7,6 +7,7 @@ and directory operation propagation to backends.
 
 import logging
 import os
+import stat
 import tempfile
 import threading
 import time
@@ -70,7 +71,7 @@ def _make_namespace_service(
         sync_manager=sync_manager,
         logger=logging.getLogger("test"),
         resolve_path=_resolve,
-        schedule_checksum_task=lambda backend, vpath, basis=None: None,
+        schedule_checksum_task=lambda backend, vpath, basis=None, **kw: None,
         partial_suffix=".storage.partial",
         is_hidden_entry=StorageFS._is_hidden_entry,
         dir_cache=dir_cache,
@@ -268,6 +269,94 @@ class TestConflictView(unittest.TestCase):
         result = ns._apply_conflict_view("/solo", {".", "..", "unique.txt"})
         self.assertIn("unique.txt", result)
         self.assertNotIn("unique.txt.backend0", result)
+        self._cleanup_ns()
+
+    # Size-first: the listing's attributes decide before any hash does.
+
+    @staticmethod
+    def _file(size, mode=stat.S_IFREG | 0o644):
+        return {"st_mode": mode, "st_size": size, "st_mtime": 1.0}
+
+    def _view(self, attrs, records=None):
+        ns = self._make_ns(checksum_records=records)
+        entries = {name: set(names) for name, names in
+                   ((member, members.keys()) for member, members in attrs.items())}
+        splits = ns._size_splits(entries, attrs)
+        scheduled = []
+        ns.schedule_checksum_task = lambda backend, path, basis=None, **kw: scheduled.append(
+            (backend.name, path, basis, kw.get("check_dir", False)))
+        ns._schedule_directory_checksums("/d", entries, attrs, splits)
+        view = ns._apply_conflict_view(
+            "/d", {".", ".."} | set().union(*entries.values()), entries, splits)
+        self._cleanup_ns()
+        return view, splits, sorted(scheduled)
+
+    def test_different_sizes_split_without_hashing(self):
+        view, splits, scheduled = self._view({
+            "backend0": {"a.bin": self._file(10)},
+            "backend1": {"a.bin": self._file(11)},
+        })
+        self.assertEqual(splits, {"a.bin": {"backend0": 10, "backend1": 11}})
+        self.assertIn("a.bin.backend0", view)
+        self.assertIn("a.bin.backend1", view)
+        self.assertNotIn("a.bin", view)
+        self.assertEqual(scheduled, [])
+
+    def test_equal_sizes_show_plain_name_and_hash(self):
+        view, splits, scheduled = self._view({
+            "backend0": {"a.bin": self._file(10)},
+            "backend1": {"a.bin": self._file(10)},
+        })
+        self.assertEqual(splits, {})
+        self.assertIn("a.bin", view)
+        self.assertNotIn("a.bin.backend0", view)
+        self.assertEqual([s[:2] for s in scheduled],
+                         [("backend0", "/d/a.bin"), ("backend1", "/d/a.bin")])
+
+    def test_equal_mtime_is_not_identity(self):
+        # Same size and mtime, different hashes: still a conflict.
+        now = time.time()
+        records = {("/d/a.bin", "backend0"): ChecksumRecord(checksum="aa", timestamp=now),
+                   ("/d/a.bin", "backend1"): ChecksumRecord(checksum="bb", timestamp=now)}
+        view, _, _ = self._view({
+            "backend0": {"a.bin": self._file(10)},
+            "backend1": {"a.bin": self._file(10)},
+        }, records)
+        self.assertIn("a.bin.backend0", view)
+        self.assertIn("a.bin.backend1", view)
+
+    def test_unverified_copy_shows_plain_name(self):
+        now = time.time()
+        records = {("/d/a.bin", "backend0"): ChecksumRecord(checksum="aa", timestamp=now),
+                   ("/d/a.bin", "backend1"): ChecksumRecord(checksum=None, timestamp=now)}
+        view, _, _ = self._view({
+            "backend0": {"a.bin": self._file(10)},
+            "backend1": {"a.bin": self._file(10)},
+        }, records)
+        self.assertIn("a.bin", view)
+        self.assertNotIn("a.bin.backend0", view)
+
+    def test_directory_or_symlink_copy_is_never_a_size_split(self):
+        for other in (self._file(4096, stat.S_IFDIR | 0o755),
+                      self._file(3, stat.S_IFLNK | 0o777),
+                      {}):
+            with self.subTest(other=other):
+                view, splits, _ = self._view({
+                    "backend0": {"a": self._file(10)},
+                    "backend1": {"a": other},
+                })
+                self.assertEqual(splits, {})
+                self.assertIn("a", view)
+
+    def test_unlisted_mode_and_symlinks_defer_the_directory_test(self):
+        # No member call while scheduling: the hash worker asks isdir.
+        self.backend0.isdir = self.backend1.isdir = lambda path: self.fail("isdir on the caller")
+        _, _, scheduled = self._view({
+            "backend0": {"a": self._file(3, stat.S_IFLNK | 0o777)},
+            "backend1": {"a": {}},
+        })
+        self.assertEqual(scheduled, [("backend0", "/d/a", None, True),
+                                     ("backend1", "/d/a", None, True)])
         self._cleanup_ns()
 
 

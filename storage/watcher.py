@@ -16,10 +16,13 @@ from __future__ import annotations
 import logging
 import os
 import shlex
+import tempfile
 import threading
 import time
 from pathlib import PurePosixPath
 from typing import Callable, Dict, List, Optional, Tuple
+
+from .backends.ssh_mux import ControlSockets
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +73,7 @@ class RemoteWatcher:
         key_filename: Optional[str] = None,
         *,
         remote_paths: Optional[List[str]] = None,
+        control_sockets: Optional[ControlSockets] = None,
     ):
         self.backend_name = backend_name
         self.ssh_host = ssh_host
@@ -77,6 +81,7 @@ class RemoteWatcher:
         self.on_change = on_change
         self.username = username
         self.key_filename = key_filename
+        self._control_sockets = control_sockets
 
         # Accept either remote_paths (list) or remote_path (single string).
         if not remote_paths and remote_path:
@@ -111,6 +116,9 @@ class RemoteWatcher:
                    "-o", "ServerAliveInterval=30",
                    "-o", "ServerAliveCountMax=3",
                    "-p", str(self.ssh_port)]
+        if self._control_sockets is not None:
+            ssh_cmd += self._control_sockets.options(
+                self.username, self.ssh_host, self.ssh_port, self.key_filename)
         if self.key_filename:
             ssh_cmd += ["-i", self.key_filename]
         target = f"{self.username}@{self.ssh_host}" if self.username else self.ssh_host
@@ -175,11 +183,17 @@ class RemoteWatcher:
         backoff = self._INITIAL_BACKOFF
 
         while not self._stop_event.is_set():
+            stderr_file = None
             try:
+                # stderr goes to a file, not a pipe: a shared ssh master
+                # forked from this ssh may keep its descriptors (older
+                # OpenSSH releases keep stderr), and reading a pipe would
+                # wait for it to exit.
+                stderr_file = tempfile.TemporaryFile("w+", errors="replace")
                 self._process = subprocess.Popen(
                     cmd,
                     stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
+                    stderr=stderr_file,
                     text=True,
                     start_new_session=True,
                 )
@@ -206,9 +220,15 @@ class RemoteWatcher:
                 if rc != 0:
                     stderr_text = ""
                     try:
-                        stderr_text = self._process.stderr.read().strip()
+                        stderr_file.seek(0)
+                        stderr_text = stderr_file.read().strip()
                     except Exception:
                         pass
+                    if rc == 255 and self._control_sockets is not None:
+                        # ssh itself failed: a shared master behind it may be
+                        # gone or hung; the next ssh starts a fresh one.
+                        self._control_sockets.reset(
+                            self.username, self.ssh_host, self.ssh_port, self.key_filename)
                     if stderr_text:
                         logger.warning(
                             "inotifywait exited with code %d for %s: %s",
@@ -224,6 +244,9 @@ class RemoteWatcher:
 
             except Exception:
                 logger.exception("Watcher error for %s", self.backend_name)
+            finally:
+                if stderr_file is not None:
+                    stderr_file.close()
 
             if not self._stop_event.is_set():
                 logger.info(

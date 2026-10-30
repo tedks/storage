@@ -2,6 +2,7 @@
 SSH/SFTP backend implementation for remote filesystems
 """
 
+import errno
 import ipaddress
 import os
 import shlex
@@ -15,8 +16,10 @@ import paramiko
 from pathlib import Path, PurePosixPath
 from typing import Callable, List, Optional, TypeVar
 
-from .base import Backend, BackendType, StorageMemberCapabilities, WatcherSpec
-from .ssh_pool import MemberConnection, SFTPLease, is_connection_error, is_transient_oserror
+from .base import Backend, BackendType, ChecksumUnavailable, StorageMemberCapabilities, WatcherSpec
+from .ssh_pool import (
+    CommandTimeout, MemberConnection, SFTPLease, is_connection_error, is_transient_oserror,
+)
 
 _T = TypeVar("_T")
 
@@ -26,7 +29,10 @@ _T = TypeVar("_T")
 # the host's nsswitch.conf names) and has no nscd to ask, so getaddrinfo fails
 # for names the host resolves. getent is the host's own NSS front end, so SSH
 # connects fall back to it on a lookup failure. /usr/bin first: a nixpkgs
-# getent earlier on PATH has the same blind spot.
+# getent earlier on PATH has the same blind spot. A member holds one
+# transport, so this runs once per connect or retry window, not per thread;
+# the result is not cached, because the connect that follows an address
+# change is the one that must resolve afresh.
 _GETENT_CANDIDATES = ("/usr/bin/getent", "/bin/getent")
 
 
@@ -590,13 +596,18 @@ class SSHBackend(Backend):
     def _shell_quote(self, value: str) -> str:
         return shlex.quote(value)
 
-    def get_fast_checksum(self, virtual_path: str) -> str:
+    def get_fast_checksum(self, virtual_path: str, allow_download: bool = True) -> str:
         """
         Compute checksum without downloading the full file.
 
         Tries xxh128sum on the remote (matches local xxh3_128).
         Falls back to downloading a temp copy and checksumming locally
-        so the result is always consistent with local checksums.
+        so the result is always consistent with local checksums; with
+        allow_download False it raises instead (the conflict view's hashes,
+        which must not move whole files over the link to decide how a
+        directory looks): the pool's own error when the member could not be
+        asked, ChecksumUnavailable otherwise (no digest, or a command that
+        started and did not finish).
         """
         remote_path = str(self._resolve_path(virtual_path))
 
@@ -605,6 +616,7 @@ class SSHBackend(Backend):
         # large files can take much longer than a connection handshake.
         # Any failure (no xxh128sum, a refused or timed-out channel) falls
         # through to the download-and-hash fallback.
+        remote_error = None
         try:
             cmd = f"xxh128sum {self._shell_quote(remote_path)} 2>/dev/null"
             rc, stdout = self._pool.run_command(cmd, self.sftp_operation_timeout)
@@ -614,8 +626,27 @@ class SSHBackend(Backend):
                 # xxh128sum outputs a 32-char hex digest; validate format.
                 if len(token) == 32 and all(c in "0123456789abcdef" for c in token):
                     return token
-        except Exception:
-            pass
+        except Exception as exc:
+            remote_error = exc
+
+        if not allow_download:
+            # An error that kept the member from being asked (a connect or
+            # channel open that failed or timed out, the transport dropped,
+            # no exec channel free or the server refused one) may pass and
+            # costs nothing to retry, so it is raised as is. A command that
+            # started and did not finish (CommandTimeout) is not: the hash
+            # runs too long for this file, or the member runs exec but never
+            # answers (ForceCommand internal-sftp), and would every time.
+            # That, and a command that ran without a digest, is
+            # ChecksumUnavailable.
+            if (
+                remote_error is not None
+                and not isinstance(remote_error, CommandTimeout)
+                and is_connection_error(remote_error)
+            ):
+                raise remote_error
+            raise ChecksumUnavailable(
+                errno.EIO, f"no remote hash for {virtual_path} on {self.name}") from remote_error
 
         # Fallback: download to temp file and compute locally.
         import tempfile

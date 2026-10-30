@@ -1513,6 +1513,86 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self._assert_cache_holds("closed.bin", expected)
         self.fs.release('/closed.bin', rvfd)
 
+    def test_streaming_finalize_records_a_write_landing_before_the_row(self):
+        # ditz streaming-finalize-row-window: once the partial is installed a
+        # write-open finds the file cached. Its write must be recorded even
+        # though the never-cached file had no index row yet: finalize stores
+        # the row under the index lock it holds from the install, so the
+        # write's mark_dirty lands on that row instead of finding none (and
+        # finalize then storing CLEAN from its pre-write stat).
+        self.backend.copy_delay = 0
+        payload = os.urandom(64 * 1024)
+        (self.backend_dir / "window.bin").write_bytes(payload)
+        edit = b"E" * 4096
+        expected = edit + payload[len(edit):]
+
+        # The index lock, traced: finalize is let go only once the writer
+        # has either finished inside the window (the old code) or found the
+        # lock held and is waiting for it (the fix), never on a timer.
+        writer_settled = threading.Event()
+        real_lock = self.fs.state_manager._db_lock
+
+        class TracedLock:
+            def acquire(self, blocking=True, timeout=-1):
+                if threading.current_thread().name == "window-writer":
+                    if real_lock.acquire(blocking=False):
+                        return True
+                    writer_settled.set()
+                return real_lock.acquire(blocking, timeout)
+
+            def release(self):
+                real_lock.release()
+
+            __enter__ = acquire
+
+            def __exit__(self, *exc):
+                real_lock.release()
+
+        self.fs.state_manager._db_lock = TracedLock()
+        self.addCleanup(setattr, self.fs.state_manager, "_db_lock", real_lock)
+
+        cache = self.fs.cache_manager
+        real_store = cache.store_file_metadata
+        at_store = threading.Event()
+        go = threading.Event()
+        self.addCleanup(go.set)
+
+        def held_store(metadata, **kwargs):
+            if threading.current_thread().name.startswith("storage-prefetch-"):
+                at_store.set()
+                self.assertTrue(go.wait(timeout=10.0))
+            return real_store(metadata, **kwargs)
+
+        outcome = {}
+
+        def write_through_mount():
+            try:
+                vfd = self._write_open_and_edit("window.bin", edit)
+                self.fs.release('/window.bin', vfd)
+                outcome["done"] = True
+            except BaseException as exc:  # noqa: BLE001 - reported below
+                outcome["error"] = exc
+            finally:
+                writer_settled.set()
+
+        with patch.object(cache, "store_file_metadata", side_effect=held_store):
+            rvfd, session = self._stream_whole_file("window.bin", payload)
+            self.assertTrue(at_store.wait(timeout=3.0))
+            self.assertTrue((self.cache_dir / "window.bin").exists())
+            writer = threading.Thread(target=write_through_mount, name="window-writer", daemon=True)
+            writer.start()
+            self.assertTrue(writer_settled.wait(timeout=3.0))
+            go.set()
+            writer.join(timeout=5.0)
+            session.worker.join(timeout=5.0)
+        self.assertFalse(writer.is_alive())
+        self.assertNotIn("error", outcome)
+        self.assertFalse(session.worker.is_alive())
+
+        self._assert_cache_holds("window.bin", expected)
+        self.assertIn("/window.bin", self.fs.sync_manager._queued_tasks)
+        self.fs.release('/window.bin', rvfd)
+
     def test_streaming_session_does_not_start_over_a_writers_file(self):
         # The mirror case: a read-open found the file uncached, and a
         # write-open fetched it and wrote to it before the read-open

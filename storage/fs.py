@@ -21,14 +21,16 @@ import yaml
 import json
 import concurrent.futures
 import contextlib
+import signal
 from dataclasses import dataclass, field
 from fuse import FUSE, FuseOSError, Operations
 from pathlib import Path
 from typing import Dict, Optional, Set, List, Tuple
 
-from .backends.base import Backend, interactive_request
+from .backends.base import Backend, ChecksumUnavailable, interactive_request
+from .backends.ssh_mux import close_shared_control_sockets
 from .cache import PARTIAL_SUFFIX, CacheManager
-from .locks import NamespaceLock, PathLocks
+from .locks import NamespaceLock, PathLocks, UploadLocks
 from .cache_metadata import XATTR_CACHE_METADATA_NAME, scan_cache_entries
 from .file_config import FileConfig, get_inherited_config
 from .models import FileLocation, FileMetadata, StreamingKeepAfterClose, SyncStatus
@@ -37,6 +39,7 @@ from .replication import ReplicationManager
 from .sync import SyncManager
 from .sync_tasks import DirOperation
 from .recompute import RecomputeEngine
+from .checksum_queue import MemberHashQueues
 from .checksums import ChecksumBasis, ChecksumRecord
 from .pathing import ResolvedPath, resolve_path
 from .namespace import DEFAULT_LISTING_MAX_STALE, NamespaceService
@@ -181,6 +184,8 @@ class StorageFS(Operations):
         # has the full lock order. Under nothreads they are never contended.
         self._namespace_lock = NamespaceLock()
         self._path_locks = PathLocks()
+        # Held by a sync upload; rename and unlink wait for it (locks.py).
+        self._upload_locks = UploadLocks()
 
         # Revalidation on open, keyed by canonical path (see
         # _revalidate_cached_file). Check times are in memory only: after a
@@ -213,6 +218,8 @@ class StorageFS(Operations):
             num_workers=num_sync_workers,
             should_sync_path_cb=self._should_sync_path,
             member_written_cb=self._record_member_written,
+            upload_guard=self._upload_locks.hold_for_upload,
+            path_guard=self._path_locked,
         )
         self._sync_started = False
         if start_sync:
@@ -255,7 +262,9 @@ class StorageFS(Operations):
         self._checksum_lock = threading.RLock()
         self._checksum_records: Dict[tuple, ChecksumRecord] = {}
         self._checksum_tasks: Dict[tuple, concurrent.futures.Future] = {}
-        self._checksum_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+        # One low-priority worker per member, newest first, bounded (see
+        # checksum_queue); threads start on first use, after the fork.
+        self._checksum_queues = MemberHashQueues(logger=self.logger)
 
         self.namespace = NamespaceService(
             backends=self.backends,
@@ -264,8 +273,8 @@ class StorageFS(Operations):
             sync_manager=self.sync_manager,
             logger=self.logger,
             resolve_path=lambda path: self._resolve_path(path),
-            schedule_checksum_task=lambda backend, path, basis=None: self._schedule_checksum_task(
-                backend, path, basis
+            schedule_checksum_task=lambda backend, path, basis=None, **kw: self._schedule_checksum_task(
+                backend, path, basis, **kw
             ),
             partial_suffix=self._PARTIAL_SUFFIX,
             is_hidden_entry=self._is_hidden_entry,
@@ -546,6 +555,7 @@ class StorageFS(Operations):
     def _start_watchers(self):
         """Start push-invalidation watchers, coalescing members by watch scope."""
         from .watcher import RemoteWatcher
+        from .backends.ssh_mux import shared_control_sockets
 
         # Group watch-capable members by connection identity so members on the
         # same host share a single SSH+inotifywait process.
@@ -578,6 +588,7 @@ class StorageFS(Operations):
                 on_change=self._on_remote_change,
                 username=meta["username"],
                 key_filename=meta["key_filename"],
+                control_sockets=shared_control_sockets(),
             )
             watcher.start()
             self._watchers.append(watcher)
@@ -610,7 +621,7 @@ class StorageFS(Operations):
             backend_names=backend_names,
         )
 
-    def _record_checksum(self, canonical_path: str, backend_name: str, checksum: str, timestamp: float,
+    def _record_checksum(self, canonical_path: str, backend_name: str, checksum: Optional[str], timestamp: float,
                          basis: Optional[ChecksumBasis] = None):
         """Record a checksum for (path, backend) and keep only the latest.
 
@@ -627,10 +638,22 @@ class StorageFS(Operations):
             )
 
     def _aggregate_checksums_yaml(self, canonical_path: str) -> bytes:
-        """Return YAML list of '<backend>:<checksum>:<timestamp>' entries."""
+        """Return a YAML list of '<backend>:<value>:<timestamp>' entries.
+
+        value is the member's hash, or 'unverified' when the member ran its
+        hash and gave no digest (the view never downloads to hash). A name
+        the published listing split by size lists 'size=<bytes>' for every
+        copy instead, timestamped with that listing, as the view does: a
+        hash recorded before the sizes diverged describes an older file.
+        """
+        sizes, listed_at = self.namespace.size_split_markers(canonical_path)
+        if sizes:
+            entries = [f"{backend}:size={size}:{listed_at}"
+                       for backend, size in sorted(sizes.items())]
+            return yaml.dump(entries, default_flow_style=False).encode()
         with self._checksum_lock:
             entries = [
-                f"{backend}:{record.checksum}:{record.timestamp}"
+                f"{backend}:{record.checksum or 'unverified'}:{record.timestamp}"
                 for (path, backend), record in self._checksum_records.items()
                 if path == canonical_path
             ]
@@ -641,26 +664,48 @@ class StorageFS(Operations):
         self.namespace._schedule_directory_checksums(dir_path, backend_entries)
 
     def _schedule_checksum_task(self, backend: Backend, canonical_path: str,
-                                basis: Optional[ChecksumBasis] = None):
+                                basis: Optional[ChecksumBasis] = None, *,
+                                check_dir: bool = False, replace: bool = False):
         """Hash canonical_path on backend in the background.
 
         basis is the member's (st_size, st_mtime, st_ctime) from the listing,
         st_ctime None where the member does not report it (SFTP). A record
-        made from the same basis is still current, so nothing is scheduled;
+        made from the same basis is still current (an unverified one too:
+        a hash that gave no digest or timed out is not run again until the
+        file changes or its records are forgotten), so nothing is
+        scheduled;
         without a basis (no listed attributes, or a symlink) the file is
-        always hashed again.
+        always hashed again. check_dir: the worker first asks the member
+        whether the path is a directory and records nothing if so.
+        replace: the member's copy just changed (a release uploaded it), so
+        a task already queued or running for it is superseded rather than
+        reused; the old record stays until the new hash replaces it.
+
+        Only queues, under _checksum_lock; the member is called on its own
+        hash worker, never on the calling (FUSE) thread.
         """
         key = (canonical_path, backend.name)
         with self._checksum_lock:
-            if key in self._checksum_tasks:
-                return
-            record = self._checksum_records.get(key)
-            if basis is not None and record is not None and record.basis == basis:
-                return
+            previous = self._checksum_tasks.get(key)
+            if previous is not None:
+                if not replace:
+                    return
+                # Popped first: its done callback then finds itself gone
+                # and records nothing.
+                del self._checksum_tasks[key]
+                previous.cancel()
+            elif not replace:
+                record = self._checksum_records.get(key)
+                if basis is not None and record is not None and record.basis == basis:
+                    return
 
-            future = self._checksum_executor.submit(
-                self._compute_checksum, backend, canonical_path
-            )
+            try:
+                future = self._checksum_queues.submit(
+                    backend.name,
+                    lambda: self._compute_checksum(backend, canonical_path, check_dir),
+                )
+            except RuntimeError:
+                return  # destroy() shut the queues down
             self._checksum_tasks[key] = future
 
             def _record(done):
@@ -670,25 +715,51 @@ class StorageFS(Operations):
                     if self._checksum_tasks.get(key) is not done:
                         return
                     del self._checksum_tasks[key]
-                    result = None if done.cancelled() else done.result()
-                    if result is not None:
+                    if done.cancelled():
+                        # Still registered, so dropped by the member's
+                        # full queue, not superseded or invalidated: a
+                        # record left from before would outlive the change
+                        # that scheduled this hash (an upload, a new basis).
+                        self._checksum_records.pop(key, None)
+                        return
+                    result = done.result()
+                    if result is None:
+                        # Could not be asked: whatever was recorded before
+                        # predates the change that scheduled this hash.
+                        self._checksum_records.pop(key, None)
+                    elif result is not self._IS_DIRECTORY:
                         checksum, ts = result
                         self._record_checksum(canonical_path, backend.name, checksum, ts, basis)
 
             future.add_done_callback(_record)
 
-    def _compute_checksum(self, backend: Backend, canonical_path: str):
-        """Compute a checksum on the member side.
+    _IS_DIRECTORY = object()
 
-        Returns (checksum, timestamp), or None when the hash failed; the
-        caller records it in memory. Nothing is written to the member: an
-        xattr write raises the watcher's ATTRIB event, whose invalidation
-        would drop the record this hash made, and nothing reads it back
-        (getxattr answers user.storage.checksums from memory).
+    def _compute_checksum(self, backend: Backend, canonical_path: str, check_dir: bool = False):
+        """Compute a checksum on the member side, on its hash worker.
+
+        Returns (checksum, timestamp), with checksum None when the member's
+        hash gave no digest or did not finish (ChecksumUnavailable:
+        unverified, no download fallback here); None when the member could
+        not be asked (connection lost, no channel) or a local read failed,
+        which drops any older record and lets the next listing retry; or
+        _IS_DIRECTORY when check_dir found a directory. The caller records
+        it in memory. Nothing is written to the member: an xattr write
+        raises the watcher's ATTRIB event, whose invalidation would drop the
+        record this hash made, and nothing reads it back (getxattr answers
+        user.storage.checksums from memory).
         """
         try:
-            checksum = backend.get_fast_checksum(canonical_path)
+            if check_dir and backend.isdir(canonical_path):
+                return self._IS_DIRECTORY
+        except Exception as exc:
+            self.logger.debug("isdir for %s on %s failed: %s", canonical_path, backend.name, exc)
+        try:
+            checksum = backend.get_fast_checksum(canonical_path, allow_download=False)
             return checksum, time.time()
+        except ChecksumUnavailable as exc:
+            self.logger.debug("checksum for %s on %s unavailable: %s", canonical_path, backend.name, exc)
+            return None, time.time()
         except Exception as exc:
             self.logger.debug("checksum for %s on %s failed: %s", canonical_path, backend.name, exc)
             return None
@@ -861,12 +932,23 @@ class StorageFS(Operations):
 
     def _store_member_check(self, canonical_path: str, cache_path: Path,
                             identity: Tuple[int, int, int],
-                            updates: Dict[str, Tuple[int, float]], *, replace: bool = False):
+                            updates: Dict[str, Tuple[int, float]], *, replace: bool = False,
+                            drop: Tuple[str, ...] = (),
+                            drop_unless_checked_since: Optional[MemberCheck] = None):
         """Record a check now, merging member baselines, in memory and on the cache file.
 
         The baselines already known for this cache file (in memory, else from
         its xattr) are kept and updates applied on top; replace=True starts
-        from nothing (a fetch: the old copy's baselines describe other bytes).
+        from nothing (a fetch: the old copy's baselines describe other bytes),
+        and the members in drop lose theirs unless that member's baseline was
+        recorded since drop_unless_checked_since (the MemberCheck the caller
+        read before, or None). Compared by object: a record merges the
+        other members' baseline tuples unchanged and stores a new tuple for
+        each member it observed, so a baseline recorded meanwhile, even with
+        the same values, is newer and stays, while a record for another
+        member does not hold the drop back. A baseline that came from the
+        xattr has no object to compare once a record is made, and stays.
+        Updates and drops name different members.
         The read, merge and both writes are one critical section under
         _member_checks_lock (a leaf: getxattr and setxattr take no other
         lock), so a sync worker and the FUSE thread cannot drop each other's
@@ -883,11 +965,27 @@ class StorageFS(Operations):
             else:
                 members = self._load_persisted_members(cache_path, identity)
             members.update(updates)
+            dropped = []
+            token = drop_unless_checked_since
+            for name in drop:
+                if name not in members:
+                    continue
+                if previous is not token:
+                    # Compared by object: the merge above must carry each
+                    # member's tuple unchanged, and every observation must
+                    # store a fresh one (never rebuilt, cached or reused).
+                    read = token.members.get(name) if token is not None else None
+                    recorded_since = (read is None or previous is None
+                                      or previous.members.get(name) is not read)
+                    if recorded_since:
+                        continue
+                del members[name]
+                dropped.append(name)
             check = MemberCheck(cache_identity=identity, verified_at=time.monotonic(),
                                 members=members)
             self._member_checks[canonical_path] = check
-            if members and (previous is None or previous.cache_identity != identity
-                            or previous.members != members):
+            if (members or dropped) and (previous is None or previous.cache_identity != identity
+                                         or previous.members != members):
                 payload = {"cache": list(identity),
                            "members": {name: list(stat) for name, stat in members.items()}}
                 try:
@@ -923,13 +1021,29 @@ class StorageFS(Operations):
         member's stat after an upload is its baseline for later checks:
         without it, an upload that does not keep the mtime (SFTP) would look
         like a change on the member at the next stale open. Baselines for
-        the other members are kept while the cache file is the same one.
+        the other members are kept while the cache file is the same one. If
+        the member cannot be stat'd, its old baseline no longer describes
+        it (the upload replaced the file) and is dropped: its next check
+        uses the rule for a member without one.
         """
         try:
-            member_stat = backend.stat(virtual_path)
             identity = self._cache_identity(os.lstat(str(cache_path)))
+        except OSError as exc:
+            self.logger.debug("post-sync stat of the cache file failed: %r", exc)
+            return
+        with self._member_checks_lock:
+            check = self._member_checks.get(virtual_path)
+            if check is not None and check.cache_identity == identity:
+                had_baseline = backend.name in check.members
+            else:
+                had_baseline = backend.name in self._load_persisted_members(cache_path, identity)
+        try:
+            member_stat = backend.stat(virtual_path)
         except Exception as exc:
             self.logger.debug("post-sync stat on %s failed: %r", backend.name, exc)
+            if had_baseline:
+                self._store_member_check(virtual_path, cache_path, identity, {},
+                                         drop=(backend.name,), drop_unless_checked_since=check)
             return
         self._store_member_check(virtual_path, cache_path, identity,
                                  {backend.name: (member_stat.st_size, member_stat.st_mtime)})
@@ -1361,8 +1475,13 @@ class StorageFS(Operations):
             self._forget_checksums({self._resolve_path(path).canonical_path}, subtree=True)
 
     def unlink(self, path):
-        """Remove a file"""
-        with self._path_locked(self._resolve_path(path).canonical_path):
+        """Remove a file
+
+        Waits for an upload of the path in flight, so its location row is
+        not recorded after the file's row is gone.
+        """
+        canonical_path = self._resolve_path(path).canonical_path
+        with self._path_locked(canonical_path), self._upload_locks.hold(canonical_path):
             return self._unlink(path)
 
     def _unlink(self, path):
@@ -1388,6 +1507,14 @@ class StorageFS(Operations):
         renamed as a file, which fails as before. A directory appearing in
         the cache meanwhile (a fetch beneath it) is caught by the recheck
         under the path locks.
+
+        Either kind waits for sync uploads of the paths it moves (ditz
+        sync-namespace-orphans): an upload finishing after the rename would
+        put the file back on its member under the old name, a name the
+        member rename skipped because the upload had not recorded its
+        location yet. A file rename takes both upload locks under its path
+        locks; a directory rename drains both subtrees before it takes the
+        namespace lock, so it does not stall other paths while it waits.
         """
         old_resolved = self._resolve_path(old)
         new_canonical = self._resolve_path(new).canonical_path
@@ -1403,11 +1530,13 @@ class StorageFS(Operations):
                 except FuseOSError:
                     is_dir = False
             if is_dir:
-                with self._namespace_lock.exclusive():
-                    return self._rename(old, new)
+                with self._upload_locks.drain(old_resolved.canonical_path, new_canonical):
+                    with self._namespace_lock.exclusive():
+                        return self._rename(old, new)
             with self._path_locked(old_resolved.canonical_path, new_canonical):
-                if not os.path.isdir(cache_path):
-                    return self._rename(old, new)
+                with self._upload_locks.hold(old_resolved.canonical_path, new_canonical):
+                    if not os.path.isdir(cache_path):
+                        return self._rename(old, new)
 
     def _rename(self, old, new):
         old_canonical = self._resolve_path(old).canonical_path
@@ -1757,9 +1886,12 @@ class StorageFS(Operations):
                     try:
                         backend.copy_from_local(entry.cache_path, entry.canonical_path)
                         backend.sync()
-                        checksum = backend.get_fast_checksum(entry.canonical_path)
-                        ts = time.time()
-                        self._record_checksum(entry.canonical_path, entry.backend_name, checksum, ts)
+                        # Hashed on the member's worker, not this thread.
+                        self._schedule_checksum_task(backend, entry.canonical_path, replace=True)
+                        # The member's listed size and mtime are now old;
+                        # a size split on the name drops the parent's
+                        # listing (see NamespaceService.forget_listed_attrs).
+                        self.namespace.forget_listed_attrs(entry.virtual_path)
                     except Exception as exc:
                         self.logger.error(
                             "direct sync failed for %s on %s: %s",
@@ -1839,7 +1971,7 @@ class StorageFS(Operations):
             has_checksum = any(
                 key[0] == resolved.canonical_path for key in self._checksum_records.keys()
             )
-        if has_checksum:
+        if has_checksum or self.namespace.size_split_markers(resolved.canonical_path)[0]:
             attrs.add(self.CHECKSUM_XATTR)
 
         attrs.add(self.CACHE_STATE_XATTR)
@@ -1974,7 +2106,7 @@ class StorageFS(Operations):
         self._stop_watchers()
 
         try:
-            self._checksum_executor.shutdown(wait=False, cancel_futures=True)
+            self._checksum_queues.shutdown()
         except Exception:
             pass
         self.namespace.shutdown()
@@ -1986,6 +2118,8 @@ class StorageFS(Operations):
             self._sweep_thread.join(timeout=self.SWEEP_JOIN_TIMEOUT)
 
         self.sync_manager.stop()
+        # After the last rsync upload and the watchers: they share the masters.
+        close_shared_control_sockets()
         self.state_manager.close()
         if not self._sweep_pending:
             _clear_mount_lock_pid(self.mount_lock_file)
@@ -2158,6 +2292,39 @@ def fuse_mount_options(backends: Dict[str, Backend], *, enable_watchers: bool,
     return options
 
 
+def _discard_sigpipe(signum, frame) -> None:
+    """A SIGPIPE handler that does nothing: the failed write raises EPIPE."""
+
+
+@contextlib.contextmanager
+def _sigpipe_survives_fuse():
+    """Keep a write to a dead socket an EPIPE error through FUSE()'s teardown.
+
+    Python starts with SIGPIPE ignored. libfuse 2's teardown
+    (fuse_remove_signal_handlers) resets a SIGPIPE disposition it finds
+    ignored to the default, behind Python's back (signal.getsignal() still
+    says SIG_IGN), and it does so before it runs the filesystem's destroy():
+    closing an SSH transport or streaming socket whose peer is gone, there
+    or afterwards, would end the process with exit 141 instead of raising
+    BrokenPipeError. libfuse leaves a handler alone, so install a no-op one
+    for the duration of the mount and ignore it again afterwards.
+
+    Only an ignored SIGPIPE is at risk; a handler or the default the caller
+    chose is left in place for the whole mount. signal.signal() works only
+    on the main thread (the CLI's); a mount run from another thread cannot
+    be guarded and leaves SIGPIPE to the caller.
+    """
+    if (threading.current_thread() is not threading.main_thread()
+            or signal.getsignal(signal.SIGPIPE) != signal.SIG_IGN):
+        yield
+        return
+    signal.signal(signal.SIGPIPE, _discard_sigpipe)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+
+
 def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
                  backends: Dict[str, Backend], cache_size: int,
                  foreground: bool = False, num_sync_workers: int = 2,
@@ -2284,8 +2451,9 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
         )
         fs.request_stale_sweep()  # started by init(), after FUSE's fork
     try:
-        FUSE(fs, mountpoint, nothreads=not fuse_threads, foreground=foreground, allow_other=allow_other,
-             **fuse_options)
+        with _sigpipe_survives_fuse():
+            FUSE(fs, mountpoint, nothreads=not fuse_threads, foreground=foreground, allow_other=allow_other,
+                 **fuse_options)
     finally:
         try:
             if not fs._sweep_pending:

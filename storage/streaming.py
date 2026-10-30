@@ -1098,10 +1098,27 @@ class StreamingReadManager:
         if io_fd < 0:
             return
 
+        # From the install until the rows are stored, under the index lock:
+        # once the file is at its final path a write-open finds it cached
+        # and creates no row, so a write's mark_dirty (which takes this
+        # lock) must find the row this stores, not none. Otherwise finalize
+        # stores CLEAN from a stat taken before the write and the release
+        # queues no sync (ditz streaming-finalize-row-window). The location
+        # rows go in the same section, so an eviction or rename cannot run
+        # between the row and them. Only local file calls run under it (no
+        # fsync); the cache lock is taken after. Only the install and the
+        # calls before it raise OSError here: the row and location stores
+        # catch their own.
+        metadata = None
         try:
             os.fsync(io_fd)
             session.final_cache_path.parent.mkdir(parents=True, exist_ok=True)
-            outcome = self._install_partial(session)
+            with self.state_manager.metadata_lock:
+                outcome = self._install_partial(session)
+                if outcome == "installed":
+                    metadata = self._store_finalized_row(session)
+                    if metadata is not None:
+                        self._add_finalized_locations(session, metadata)
         except OSError as exc:
             with session.lock:
                 session.error = exc
@@ -1113,64 +1130,6 @@ class StreamingReadManager:
             return
 
         self.cache_manager.mark_cache_size_dirty()
-
-        try:
-            st = os.lstat(str(session.final_cache_path))
-        except OSError:
-            st = None
-
-        if st is not None:
-            metadata = self.state_manager.get_file_metadata(session.canonical_path)
-            if not metadata:
-                config = self.get_config(session.canonical_path)
-                metadata = FileMetadata(
-                    virtual_path=session.canonical_path,
-                    size=st.st_size,
-                    checksum=None,
-                    last_access=time.time(),
-                    last_modified=st.st_mtime,
-                    sync_status=SyncStatus.CLEAN,
-                    replica_count=config.replica_count,
-                    recomputable=config.recomputable,
-                    recompute_cmd=config.recompute_cmd,
-                    encrypted=config.encrypted,
-                    encryption_key_id=None,
-                )
-            else:
-                metadata.size = st.st_size
-                metadata.last_access = time.time()
-                metadata.last_modified = st.st_mtime
-                if metadata.sync_status != SyncStatus.DIRTY:
-                    metadata.sync_status = SyncStatus.CLEAN
-            # Mirrors the row as stored: a write during the fill keeps its
-            # DIRTY in SQLite, and the xattr must say the same.
-            self.cache_manager.store_file_metadata(metadata, cache_path=session.final_cache_path)
-
-            try:
-                self.state_manager.add_file_location(
-                    FileLocation(
-                        virtual_path=session.canonical_path,
-                        backend_name=session.backend.name,
-                        checksum=metadata.checksum or "",
-                        last_synced=time.time(),
-                        is_cached=False,
-                    )
-                )
-            except Exception:
-                pass
-
-            try:
-                self.state_manager.add_file_location(
-                    FileLocation(
-                        virtual_path=session.canonical_path,
-                        backend_name="cache",
-                        checksum=metadata.checksum or "",
-                        last_synced=time.time(),
-                        is_cached=True,
-                    )
-                )
-            except Exception:
-                pass
 
         with session.lock:
             session.prefetch_complete = True
@@ -1189,6 +1148,57 @@ class StreamingReadManager:
 
         if should_close:
             self._close_streaming_session_resources(session)
+
+    def _store_finalized_row(self, session: PrefetchSession) -> Optional[FileMetadata]:
+        """Store the row for a just-installed file; caller holds the index lock.
+
+        Returns the stored row, or None when the file is already gone.
+        """
+        try:
+            st = os.lstat(str(session.final_cache_path))
+        except OSError:
+            return None
+        metadata = self.state_manager.get_file_metadata(session.canonical_path)
+        if not metadata:
+            config = self.get_config(session.canonical_path)
+            metadata = FileMetadata(
+                virtual_path=session.canonical_path,
+                size=st.st_size,
+                checksum=None,
+                last_access=time.time(),
+                last_modified=st.st_mtime,
+                sync_status=SyncStatus.CLEAN,
+                replica_count=config.replica_count,
+                recomputable=config.recomputable,
+                recompute_cmd=config.recompute_cmd,
+                encrypted=config.encrypted,
+                encryption_key_id=None,
+            )
+        else:
+            metadata.size = st.st_size
+            metadata.last_access = time.time()
+            metadata.last_modified = st.st_mtime
+            if metadata.sync_status != SyncStatus.DIRTY:
+                metadata.sync_status = SyncStatus.CLEAN
+        # Mirrors the row as stored: a write during the fill keeps its
+        # DIRTY in SQLite, and the xattr must say the same.
+        return self.cache_manager.store_file_metadata(metadata, cache_path=session.final_cache_path)
+
+    def _add_finalized_locations(self, session: PrefetchSession, metadata: FileMetadata):
+        """Record the member and the cache as holding the file; caller holds the index lock."""
+        for backend_name, is_cached in ((session.backend.name, False), ("cache", True)):
+            try:
+                self.state_manager.add_file_location(
+                    FileLocation(
+                        virtual_path=session.canonical_path,
+                        backend_name=backend_name,
+                        checksum=metadata.checksum or "",
+                        last_synced=time.time(),
+                        is_cached=is_cached,
+                    )
+                )
+            except Exception:
+                pass
 
     def _background_prefetch_worker(self, session: PrefetchSession):
         cursor = 0

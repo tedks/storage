@@ -1,12 +1,71 @@
 """Local filesystem storage-member implementation."""
 
+import errno
 import os
 import shutil
+import stat
 from pathlib import Path
 from typing import List, Optional
 
 from .base import Backend, BackendType, StorageMemberCapabilities
 from ..checksums import fast_checksum_file
+from ..file_config import XATTR_CONFIG_NAME
+
+# The mount's own state on a cache file (metadata, member baselines, stream
+# state): never copied to a member, nor back from one. The config policy
+# is the user's and travels with the file.
+_INTERNAL_XATTR_PREFIX = "user.storage."
+
+
+def _is_internal_xattr(name: str) -> bool:
+    return name.startswith(_INTERNAL_XATTR_PREFIX) and name != XATTR_CONFIG_NAME
+
+
+# Errors copy2 ignores per xattr: the name cannot be read or written here.
+_XATTR_SKIP_ERRNOS = (errno.EPERM, errno.ENOTSUP, errno.ENODATA, errno.EINVAL)
+
+
+def _listxattr(path) -> List[str]:
+    try:
+        return os.listxattr(path)
+    except OSError as exc:
+        if exc.errno in (errno.ENOTSUP, errno.ENODATA, errno.EINVAL):
+            return []
+        raise
+
+
+def _copy_file(src: Path, dst: Path):
+    """shutil.copy2 without the mount's internal xattrs.
+
+    Bytes, xattrs, mode and times, in copy2's order: the xattrs go before
+    the chmod, since changing a user xattr on a file needs write permission
+    on it. Internal user.storage.* names are never copied. An existing
+    destination keeps its inode, and so its xattrs: its user.storage.*
+    names are made to match the source's (internal ones an older copy2
+    left, and a config policy since removed). Every other name is only
+    copied over, as copy2 does: xattrs other software set on a member file
+    stay, and so do ACL entries the source no longer has. Errors copy2
+    ignores per name are ignored; others raise, leaving the new bytes with
+    partly updated metadata, as copy2 would.
+    """
+    shutil.copyfile(src, dst)
+    st = os.stat(src)
+    keep = {name for name in _listxattr(src) if not _is_internal_xattr(name)}
+    for name in _listxattr(dst):
+        if name.startswith(_INTERNAL_XATTR_PREFIX) and name not in keep:
+            try:
+                os.removexattr(dst, name)
+            except OSError as exc:
+                if exc.errno not in _XATTR_SKIP_ERRNOS:
+                    raise
+    for name in sorted(keep):
+        try:
+            os.setxattr(dst, name, os.getxattr(src, name))
+        except OSError as exc:
+            if exc.errno not in _XATTR_SKIP_ERRNOS:
+                raise
+    os.chmod(dst, stat.S_IMODE(st.st_mode))
+    os.utime(dst, ns=(st.st_atime_ns, st.st_mtime_ns))
 
 
 class LocalBackend(Backend):
@@ -145,13 +204,13 @@ class LocalBackend(Backend):
         """Copy a file from backend to local path"""
         real_path = self._resolve_path(virtual_path)
         local_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(real_path, local_path)
+        _copy_file(real_path, local_path)
 
     def copy_from_local(self, local_path: Path, virtual_path: str):
         """Copy a local file to backend"""
         real_path = self._resolve_path(virtual_path)
         real_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(local_path, real_path)
+        _copy_file(local_path, real_path)
 
     def rename(self, old_virtual_path: str, new_virtual_path: str):
         """Rename a file or directory on the backend."""
@@ -189,8 +248,11 @@ class LocalBackend(Backend):
     # ------------------------------------------------------------------ #
     # Optional capabilities used by conflict detection
     # ------------------------------------------------------------------ #
-    def get_fast_checksum(self, virtual_path: str) -> str:
-        """Compute checksum directly from the real file without caching."""
+    def get_fast_checksum(self, virtual_path: str, allow_download: bool = True) -> str:
+        """Compute checksum directly from the real file without caching.
+
+        A local read is not a download, so allow_download changes nothing.
+        """
         real_path = self._resolve_path(virtual_path)
         return fast_checksum_file(real_path)
 

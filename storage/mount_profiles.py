@@ -363,6 +363,7 @@ def create_storage_members(
 
                 if is_rsync:
                     from .backends.rsync import RsyncBackend
+                    from .backends.ssh_mux import shared_control_sockets
                     backend = RsyncBackend(
                         name=name,
                         host=host,
@@ -370,6 +371,7 @@ def create_storage_members(
                         username=username,
                         key_filename=key_file,
                         speed_priority=priority,
+                        control_sockets=shared_control_sockets(),
                     )
                     if announce:
                         click.echo(

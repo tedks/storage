@@ -32,7 +32,10 @@ pool of one.
 
 import enum
 import errno
+import heapq
+import itertools
 import logging
+import os
 import socket
 import threading
 import time
@@ -42,6 +45,13 @@ from typing import Callable, Dict, Iterator, List, Optional, Tuple
 import paramiko
 
 from .base import is_interactive_request
+
+
+class CommandTimeout(socket.timeout):
+    """run_command's command started on a live transport and did not finish
+    within its timeout, and the transport answered the probe that followed:
+    the member was asked and has not answered. A socket.timeout, so the
+    pool treats it as any other timeout."""
 
 
 class MemberUnavailable(ConnectionError):
@@ -131,34 +141,162 @@ def _close_quietly(obj) -> None:
         pass
 
 
+class _Deadline:
+    """One armed timer in the watchdog: fire() runs unless cancelled first."""
+
+    __slots__ = ("fire", "cancelled")
+
+    def __init__(self, fire: Callable[[], None]):
+        self.fire = fire
+        self.cancelled = False
+
+
+class _Watchdog:
+    """One thread that runs callbacks at deadlines, in place of a
+    threading.Timer (a thread each) per bounded channel request.
+
+    A callback runs on a short-lived thread of its own, started only when a
+    deadline passes: closing a channel on a hung connection can itself block
+    (paramiko's close writes to the transport), and that must not hold up
+    the deadlines of other members. Deadlines that pass are the failure
+    path, not the rate of requests. If no thread can be started for one, the
+    callback runs on the watchdog thread itself: a late deadline beats a
+    lost one, and a lost one would leave every later request unbounded.
+    """
+
+    # Cancelled entries stay in the heap until their deadline or a compaction;
+    # compact once they outnumber the live ones by this much.
+    _COMPACT_AT = 64
+
+    def __init__(self, logger: Optional[logging.Logger] = None):
+        self.pid = os.getpid()
+        self._logger = logger or logging.getLogger(__name__)
+        self._cond = threading.Condition()
+        self._heap: List[Tuple[float, int, _Deadline]] = []
+        self._order = itertools.count()
+        self._cancelled = 0
+        self._thread: Optional[threading.Thread] = None
+
+    def arm(self, timeout: float, fire: Callable[[], None]) -> _Deadline:
+        """Run fire in timeout seconds unless cancelled. Raises RuntimeError
+        when the watchdog thread cannot be started, as Timer.start would."""
+        entry = _Deadline(fire)
+        with self._cond:
+            if self._thread is None or not self._thread.is_alive():
+                thread = threading.Thread(
+                    target=self._run, name="ssh-pool-watchdog", daemon=True)
+                thread.start()
+                self._thread = thread
+            heapq.heappush(self._heap,
+                           (time.monotonic() + timeout, next(self._order), entry))
+            self._cond.notify()
+        return entry
+
+    def cancel(self, entry: _Deadline) -> None:
+        with self._cond:
+            if entry.cancelled:
+                return
+            entry.cancelled = True
+            self._cancelled += 1
+            if (self._cancelled >= self._COMPACT_AT
+                    and self._cancelled * 2 >= len(self._heap)):
+                self._heap = [item for item in self._heap if not item[2].cancelled]
+                heapq.heapify(self._heap)
+                self._cancelled = 0
+
+    def _run(self) -> None:
+        while True:
+            with self._cond:
+                while True:
+                    while self._heap and self._heap[0][2].cancelled:
+                        heapq.heappop(self._heap)
+                        self._cancelled -= 1
+                    if not self._heap:
+                        self._cond.wait()
+                        continue
+                    wait = self._heap[0][0] - time.monotonic()
+                    if wait <= 0:
+                        entry = heapq.heappop(self._heap)[2]
+                        entry.cancelled = True  # a late cancel() finds it spent
+                        break
+                    self._cond.wait(wait)
+            self._expire(entry)
+
+    def _expire(self, entry: _Deadline) -> None:
+        try:
+            threading.Thread(target=entry.fire, name="ssh-pool-expire",
+                             daemon=True).start()
+        except Exception:
+            self._logger.warning(
+                "no thread for an expired SSH request deadline; running it on the watchdog",
+                exc_info=True)
+            try:
+                entry.fire()
+            except Exception:
+                self._logger.exception("an SSH request deadline callback failed")
+
+
+_watchdog = _Watchdog()
+
+
+def _current_watchdog() -> _Watchdog:
+    """The process's watchdog, replaced after a fork.
+
+    A forked child (libfuse daemonizing forks in C, which Python's own fork
+    hooks do not see) has only the forking thread: the watchdog thread is
+    gone and its lock may be held. Start afresh; the thread starts on the
+    first request that needs it.
+    """
+    global _watchdog
+    if _watchdog.pid != os.getpid():
+        _watchdog = _Watchdog()
+    return _watchdog
+
+
 def run_bounded(chan, timeout: float, fn):
     """Run fn, closing chan if it has not returned after timeout seconds.
 
     paramiko waits without a bound for the reply to a channel request
     (invoke_subsystem, exec_command). Closing the channel wakes that wait;
     the call then raises socket.timeout.
+
+    Expiry and completion are decided once, under one lock, as soon as fn
+    returns or raises: a deadline that comes due after that never closes the
+    channel, and one that came due first makes the call raise socket.timeout
+    even if fn then returned.
     """
-    fired = threading.Event()
+    decision = threading.Lock()
+    state = ["pending"]  # -> "done" or "expired", once
 
     def expire():
-        fired.set()
+        with decision:
+            if state[0] != "pending":
+                return
+            state[0] = "expired"
         _close_quietly(chan)
 
-    timer = threading.Timer(timeout, expire)
-    timer.daemon = True
-    timer.start()
+    def settle() -> bool:
+        """Mark fn finished; True if the deadline got there first."""
+        with decision:
+            if state[0] == "pending":
+                state[0] = "done"
+            return state[0] == "expired"
+
+    watchdog = _current_watchdog()
+    deadline = watchdog.arm(timeout, expire)
     try:
-        result = fn()
-    except Exception as exc:
-        if fired.is_set():
-            raise socket.timeout(
-                f"no reply to a channel request within {timeout}s") from exc
-        raise
+        try:
+            result = fn()
+        except Exception as exc:
+            if settle():
+                raise socket.timeout(
+                    f"no reply to a channel request within {timeout}s") from exc
+            raise
+        if settle():
+            raise socket.timeout(f"no reply to a channel request within {timeout}s")
+        return result
     finally:
-        timer.cancel()
-    if fired.is_set():
-        raise socket.timeout(f"no reply to a channel request within {timeout}s")
-    return result
+        watchdog.cancel(deadline)
 
 
 def _is_open_timeout(exc: BaseException) -> bool:
@@ -178,7 +316,7 @@ class SFTPLease:
     """One SFTP channel, held by one operation (and its nested calls)."""
 
     __slots__ = ("client", "generation", "interactive", "owner", "depth",
-                 "verdict", "error", "acquired_at", "_timeouts")
+                 "verdict", "error", "stalled_since", "acquired_at", "_timeouts")
 
     def __init__(self, client, generation: int, interactive: bool, owner: int):
         self.client = client
@@ -190,6 +328,8 @@ class SFTPLease:
         # The first connection error a call on this lease raised, kept so the
         # outermost release acts on it even if an outer caller swallowed it.
         self.error: Optional[BaseException] = None
+        # When the request that timed out was sent, if error is a timeout.
+        self.stalled_since: Optional[float] = None
         self.acquired_at = time.monotonic()
         self._timeouts: List[Optional[float]] = []
 
@@ -197,6 +337,22 @@ class SFTPLease:
         chan = self.client.get_channel()
         self._timeouts.append(chan.gettimeout())
         chan.settimeout(timeout)
+
+    def _request_start(self) -> float:
+        """When the request that just timed out was sent, approximately.
+
+        Called as the lease is released with the timeout: the channel gave up
+        after its timeout without a reply, so the request went out about one
+        timeout ago. An operation that closes a file after a timed-out read
+        sends one more request, a timeout later, and that is the one dated.
+        Never earlier than the lease, whose first request cannot predate it.
+        """
+        try:
+            timeout = self.client.get_channel().gettimeout()
+        except Exception:
+            timeout = None
+        started = time.monotonic() - (timeout or 0.0)
+        return max(started, self.acquired_at)
 
     def _restore_timeout(self) -> None:
         previous = self._timeouts.pop() if self._timeouts else None
@@ -277,13 +433,21 @@ class MemberConnection:
         self._next_retry_at = 0.0
         # SFTP requests that timed out on the current transport while it went
         # on answering probes, since the last request that succeeded; and
-        # when the last one was counted (a stall counts only if its lease
-        # began after that, so a burst of concurrent timeouts is one).
+        # when the last one was counted (a stall counts only if its request
+        # was sent after that, so a burst of concurrent timeouts is one).
         self._stalls = 0
         self._last_stall_at = float("-inf")
+        # The transport generation the lost-reserve warning was last logged
+        # for, so it is said once per transport, not per refused channel.
+        self._reserve_warned_generation = -1
 
         self._sftp_channels = sftp_channels
         self._exec_channels = exec_channels
+        if self._reserve_lost(sftp_channels):
+            self.logger.warning(
+                "SSH member %s: %d SFTP channel(s) configured, so none can be kept "
+                "for interactive requests; a background transfer in progress "
+                "delays them", name, sftp_channels)
         # Caps shrink when the server refuses a channel, and are reset for
         # each new transport.
         self._sftp_cap = sftp_channels
@@ -493,8 +657,8 @@ class MemberConnection:
                stalled_since: Optional[float] = None) -> None:
         """Decide whether a timeout or channel error means the transport is dead.
 
-        stalled_since, for an SFTP request that timed out, is when its lease
-        was taken: if the transport answers, the request counts as a stall,
+        stalled_since, for an SFTP request that timed out, is when that
+        request was sent: if the transport answers, the request counts as a stall,
         and enough of them in a row mark the member down.
         """
         with self._cond:
@@ -573,6 +737,16 @@ class MemberConnection:
             self.name, kind, allowed, sftp_cap, exec_cap)
         self._sftp_cap = sftp_cap
         self._exec_cap = exec_cap
+        if (self._reserve_lost(sftp_cap)
+                and self._reserve_warned_generation != generation):
+            # _bulk_limit never goes below one, so background transfers can
+            # hold the only channel and an interactive request waits for it.
+            self._reserve_warned_generation = generation
+            self.logger.warning(
+                "SSH member %s: the server's session limit leaves %d SFTP "
+                "channel(s), so none can be kept for interactive requests; "
+                "a background transfer in progress delays them",
+                self.name, sftp_cap)
 
     def _trim_idle_locked(self) -> list:
         """Close idle SFTP channels above the cap; return them to close."""
@@ -587,6 +761,11 @@ class MemberConnection:
     # ------------------------------------------------------------------ #
     def _bulk_limit(self) -> int:
         return max(1, self._sftp_cap - self._interactive_reserve)
+
+    def _reserve_lost(self, cap: int) -> bool:
+        """Whether, with cap SFTP channels, background transfers can hold them
+        all: the bulk limit never goes below one."""
+        return self._interactive_reserve > 0 and max(1, cap - self._interactive_reserve) >= cap
 
     def _start_sftp(self, chan):
         """Start the SFTP subsystem on an open channel."""
@@ -717,6 +896,7 @@ class MemberConnection:
         lease.owner = owner
         lease.verdict = _Verdict.HEALTHY
         lease.error = None
+        lease.stalled_since = None
         lease.acquired_at = time.monotonic()
         if not interactive:
             self._bulk_leased += 1
@@ -737,6 +917,8 @@ class MemberConnection:
                 lease.verdict = verdict
             if verdict >= _Verdict.PROBE and lease.error is None:
                 lease.error = exc
+                if isinstance(exc, socket.timeout):
+                    lease.stalled_since = lease._request_start()
             lease.depth -= 1
             lease._restore_timeout()
             if lease.depth > 0:
@@ -760,9 +942,8 @@ class MemberConnection:
             self._cond.notify_all()
         self._close_all(closables)
         if final_verdict >= _Verdict.PROBE and final_error is not None:
-            stalled_since = (lease.acquired_at
-                             if isinstance(final_error, socket.timeout) else None)
-            self._after_error(lease.generation, final_verdict, final_error, stalled_since)
+            self._after_error(lease.generation, final_verdict, final_error,
+                              lease.stalled_since)
 
     @contextmanager
     def sftp(self, timeout: float) -> Iterator[paramiko.SFTPClient]:
@@ -848,10 +1029,34 @@ class MemberConnection:
                 raise socket.timeout(f"command did not finish within {timeout}s")
             return left
 
-        with self.exec_channel(timeout) as chan:
-            run_bounded(chan, remaining(), lambda: chan.exec_command(command))
-            chunks = []
-            size = 0
+        transport = None
+        try:
+            with self.exec_channel(timeout) as chan:
+                transport = chan.get_transport()
+                return self._run_started(chan, command, remaining)
+        except CommandTimeout as exc:
+            # exec_channel probed the transport on the way out; one the probe
+            # dropped (a half-open connection) was the cause, not the command.
+            if not self._is_current_transport(transport):
+                raise socket.timeout(str(exc)) from exc
+            raise
+
+    def _is_current_transport(self, transport) -> bool:
+        with self._cond:
+            return (
+                transport is not None
+                and self._state is _State.CONNECTED
+                and self._transport is transport
+            )
+
+    @staticmethod
+    def _run_started(chan, command: str, remaining) -> Tuple[Optional[int], bytes]:
+        """run_command's body on an open exec channel."""
+        run_bounded(chan, remaining(), lambda: chan.exec_command(command))
+        transport = chan.get_transport()
+        chunks = []
+        size = 0
+        try:
             while True:
                 chan.settimeout(remaining())
                 data = chan.recv(32768)
@@ -863,7 +1068,26 @@ class MemberConnection:
                         f"command output exceeds {MAX_COMMAND_OUTPUT} bytes")
                 chunks.append(data)
             status = chan.exit_status if chan.status_event.wait(remaining()) else None
-            return status, b"".join(chunks)
+        except socket.timeout as exc:
+            # The command was started; a timeout from here on is the
+            # command's unless the transport is gone (a connect or channel
+            # open that timed out never gets this far; run_command rechecks
+            # after the pool's probe, for a transport that only looked alive).
+            if transport is not None and transport.is_active():
+                raise CommandTimeout(str(exc)) from exc
+            raise
+        if (transport is not None and not transport.is_active()) or (
+            status == -1 and not getattr(chan, "eof_received", True)
+        ):
+            # paramiko closes the channels of a transport that died: recv
+            # returns b"" and the status event fires with no exit status.
+            # It does so before it marks the transport inactive, so a reader
+            # woken in between sees it active; a server that closed the
+            # channel itself sent EOF first. Not an answer from the member.
+            # (A transport that dies just after a command finished turns
+            # its answer into this error too: a retry, the safe direction.)
+            raise EOFError("the transport closed during the command")
+        return status, b"".join(chunks)
 
     # ------------------------------------------------------------------ #
     # Introspection for tests and diagnostics

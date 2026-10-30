@@ -45,6 +45,7 @@ import pytest
 
 from storage.backends.rsync import RsyncBackend
 from storage.backends.ssh import SSHBackend
+from storage.backends.ssh_mux import ControlSockets
 from storage.checksums import fast_checksum_bytes
 from storage.watcher import RemoteWatcher
 from tests.fuse_mount import (
@@ -987,6 +988,107 @@ def test_mounted_revalidate_sees_container_change_after_age(remote, mounted_fact
 # Connections: one SSH transport per member (ditz ssh-connection-per-thread)
 # --------------------------------------------------------------------------- #
 
+def _accepted_logins(remote, member) -> int:
+    """Public-key logins the member's sshd has accepted, from its log (-e
+    sends it to stderr): one per TCP connection that authenticated."""
+    result = _docker("logs", member.container, check=False)
+    return sum(1 for line in (result.stdout + result.stderr).splitlines()
+               if "Accepted publickey" in line)
+
+
+UPLOADS = 5
+
+
+@pytest.mark.parametrize("shared", [True, False], ids=["shared", "own-connections"])
+def test_rsync_uploads_and_the_watcher_share_one_ssh_connection(remote, tmp_path, shared):
+    """ditz ssh-system-ssh-controlmaster: with sharing, five uploads and a
+    watcher add one connection (the master) to the transport's; without it,
+    each upload and the watcher handshake for themselves."""
+    member = remote.members[1]
+    sockets = ControlSockets() if shared else None
+    backend = RsyncBackend(**remote.backend_kwargs(member), control_sockets=sockets)
+    events: List[str] = []
+    watcher = RemoteWatcher(
+        backend_name=member.name, ssh_host=member.host, ssh_port=member.port,
+        remote_path=REMOTE_ROOT, on_change=events.append, username=REMOTE_USER,
+        key_filename=str(remote.key_path), control_sockets=sockets)
+    logins_before = _accepted_logins(remote, member)
+    payloads = {}
+
+    def upload(index):
+        payloads[index] = secrets.token_bytes(50_000)
+        source = tmp_path / f"mux-{index}.bin"
+        source.write_bytes(payloads[index])
+        backend.copy_from_local(source, f"/mux/{index}.bin")
+
+    try:
+        # The first upload starts the master. One that kept this rsync's
+        # pipes open would hold it until ControlPersist ended the master.
+        started = time.monotonic()
+        upload(0)
+        assert time.monotonic() - started < 30
+        watcher.start()
+        _wait_for_watch(remote, member, "", events)
+        started = time.monotonic()
+        for index in range(1, UPLOADS):
+            upload(index)
+        assert time.monotonic() - started < 30
+        for index, payload in payloads.items():
+            assert remote.read_remote(member, f"mux/{index}.bin") == payload
+        logins = _accepted_logins(remote, member) - logins_before
+    finally:
+        watcher.stop()
+        backend.close()
+        if sockets is not None:
+            socket_dir = next(iter(sockets._keys), None)
+            socket_dir = socket_dir.parent if socket_dir else None
+            sockets.close()
+    # paramiko's transport and the watcher are one connection each; every
+    # upload is one more unless they share.
+    if shared:
+        assert logins == 2, logins  # the transport, and the shared master
+        assert socket_dir is not None and not socket_dir.exists()
+        assert _wait_for(lambda: _established_ssh_connections(remote, member) == 0,
+                         timeout=10.0), "a master outlived close()"
+    else:
+        assert logins == 2 + UPLOADS, logins
+
+
+def test_a_killed_ssh_master_does_not_wedge_the_next_upload(remote, tmp_path):
+    member = remote.members[1]
+    sockets = ControlSockets()
+    backend = RsyncBackend(**remote.backend_kwargs(member), control_sockets=sockets)
+    try:
+        first = tmp_path / "first.bin"
+        first.write_bytes(secrets.token_bytes(10_000))
+        started = time.monotonic()
+        backend.copy_from_local(first, "/stale/first.bin")
+        assert time.monotonic() - started < 30  # not held by the master's pipes
+        control_path = next(iter(sockets._keys))
+        check = subprocess.run(
+            ["ssh", "-o", f"ControlPath={control_path}", "-O", "check",
+             "-p", str(member.port), f"{REMOTE_USER}@{member.host}"],
+            capture_output=True, text=True, timeout=20)
+        found = re.search(r"pid=(\d+)", check.stderr + check.stdout)
+        assert found, f"no master to kill: {check.stderr!r}"
+        master_pid = int(found.group(1))
+        os.kill(master_pid, signal.SIGKILL)
+        assert _wait_for(lambda: not Path(f"/proc/{master_pid}").exists(), timeout=10.0)
+        assert control_path.exists(), "a killed master leaves its socket behind"
+
+        second_payload = secrets.token_bytes(10_000)
+        second = tmp_path / "second.bin"
+        second.write_bytes(second_payload)
+        started = time.monotonic()
+        backend.copy_from_local(second, "/stale/second.bin")
+
+        assert time.monotonic() - started < 30
+        assert remote.read_remote(member, "stale/second.bin") == second_payload
+    finally:
+        backend.close()
+        sockets.close()
+
+
 def _established_ssh_connections(remote, member) -> int:
     """Established TCP connections to the container's sshd, from its /proc.
 
@@ -1279,3 +1381,102 @@ def test_mounted_browse_request_budget(remote, mounted_factory):
     for label, recorded in steps.items():
         others = [c for c in recorded if not c[2].startswith("/browse")]
         assert all(m == "listdir_attrs" and p == "/" for _, m, p in others), report
+
+
+def test_mounted_conflict_view_hash_budget(remote, mounted_factory):
+    """What listing a directory of duplicates costs the members.
+
+    docs/browsing_latency_plan.md D4: copies of different sizes split from
+    the listing without a hash; copies of the same size are hashed once per
+    member, one at a time, in the background, never by downloading. Counts
+    the member exec calls (xxh128sum), the bytes they hash and any download,
+    and prints them (run with --test_arg=-s to see them).
+    """
+    m0, m1 = remote.members
+    size = 256 * 1024
+    same, same_diverged, different = 4, 2, 4
+    for i in range(same):
+        # The last same_diverged hold different bytes of the same size.
+        remote.write_remote(m0, f"dups/same{i}.bin", b"a" * size)
+        remote.write_remote(m1, f"dups/same{i}.bin",
+                            (b"b" if i >= same - same_diverged else b"a") * size)
+    for i in range(different):
+        remote.write_remote(m0, f"dups/diff{i}.bin", b"a" * size)
+        remote.write_remote(m1, f"dups/diff{i}.bin", b"a" * (size + 1 + i))
+    mnt = mounted_factory(start_sync=False)
+    os.listdir(mnt.mount)
+
+    lock = threading.Lock()
+    commands: List[tuple] = []
+    downloads: List[tuple] = []
+    running = {name: 0 for name in mnt.backends}
+    peak = {name: 0 for name in mnt.backends}
+    for name, backend in mnt.backends.items():
+        real_run, real_copy = backend._pool.run_command, backend.copy_to_local
+
+        def run_command(command, timeout, _name=name, _real=real_run):
+            with lock:
+                commands.append((_name, command))
+                running[_name] += 1
+                peak[_name] = max(peak[_name], running[_name])
+            try:
+                return _real(command, timeout)
+            finally:
+                with lock:
+                    running[_name] -= 1
+
+        def copy_to_local(path, *args, _name=name, _real=real_copy, **kwargs):
+            with lock:
+                downloads.append((_name, path))
+            return _real(path, *args, **kwargs)
+
+        backend._pool.run_command = run_command
+        backend.copy_to_local = copy_to_local
+
+    def settled():
+        with mnt.fs._checksum_lock:
+            return not mnt.fs._checksum_tasks
+
+    started = time.monotonic()
+    first = set(os.listdir(mnt.mount / "dups"))
+    listed_in = time.monotonic() - started
+    assert _wait_for(settled, timeout=60.0)
+
+    hashed = [(n, c) for n, c in commands if c.startswith("xxh128sum")]
+    hashed_bytes = 0
+    for member, command in hashed:
+        name = shlex.split(command)[1].rsplit("/", 1)[1]
+        if name.startswith("diff") and member == m1.name:
+            hashed_bytes += size + 1 + int(name[len("diff"):-len(".bin")])
+        else:
+            hashed_bytes += size
+    print(f"\nconflict view hash budget ({same} same-size and {different} different-size "
+          f"duplicates of {size} bytes, 2 members): listing {listed_in * 1000:.0f} ms, "
+          f"{len(hashed)} member hashes, {hashed_bytes} bytes hashed on the members, "
+          f"{len(downloads)} downloads, peak hashes per member {peak}")
+
+    # Different sizes split at the first listing, from the listing alone.
+    for i in range(different):
+        assert {f"diff{i}.bin.{m0.name}", f"diff{i}.bin.{m1.name}"} <= first, first
+        assert f"diff{i}.bin" not in first
+    # Identical same-size copies show the plain name. (A diverged pair may
+    # already be split here if both hashes finished before the view was
+    # applied: the workers start while the listing is still being merged.)
+    for i in range(same - same_diverged):
+        assert f"same{i}.bin" in first
+    assert sorted(hashed) == sorted(
+        (m.name, f"xxh128sum {shlex.quote(f'{REMOTE_ROOT}/dups/same{i}.bin')} 2>/dev/null")
+        for m in (m0, m1) for i in range(same)), hashed
+    assert hashed_bytes == 2 * same * size
+    assert downloads == []
+    assert all(v <= 1 for v in peak.values()), peak
+
+    # The next readdir serves the snapshot with the hashes applied; nothing
+    # is hashed again.
+    commands.clear()
+    second = set(os.listdir(mnt.mount / "dups"))
+    for i in range(same):
+        diverged = i >= same - same_diverged
+        assert (f"same{i}.bin" in second) != diverged, second
+        assert (f"same{i}.bin.{m1.name}" in second) == diverged, second
+    assert [c for c in commands if c[1].startswith("xxh128sum")] == []

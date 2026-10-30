@@ -361,6 +361,91 @@ class TestRevalidateAfterSync(RevalidateTestBase):
         self.assertEqual(inode, self.cache_inode("new.txt"))
 
 
+    def test_failed_post_sync_stat_drops_that_members_baseline(self):
+        """After an upload the member's old stat no longer describes it; if
+        the stat that would replace it fails, the baseline goes (the next
+        check uses the rule for a member without one) and the others stay."""
+        fd = self.fs.create("/new.txt", 0o644)
+        self.fs.write("/new.txt", b"written here", 0, fd)
+        self.fs.release("/new.txt", fd)
+        cache_path = self.cache_dir / "new.txt"
+        identity = self.fs._cache_identity(os.lstat(cache_path))
+        self.fs._store_member_check("/new.txt", cache_path, identity,
+                                    {"member": (12, 1.0), "other": (12, 2.0)})
+
+        with patch.object(self.member, "stat", side_effect=OSError("connection reset")):
+            self.fs._record_member_written("/new.txt", self.member, cache_path)
+
+        self.assertEqual({"other": (12, 2.0)}, self.fs._member_checks["/new.txt"].members)
+        self.assertEqual({"other": (12, 2.0)},
+                         self.fs._load_persisted_members(cache_path, identity))
+
+
+    def _written_file(self):
+        fd = self.fs.create("/new.txt", 0o644)
+        self.fs.write("/new.txt", b"written here", 0, fd)
+        self.fs.release("/new.txt", fd)
+        cache_path = self.cache_dir / "new.txt"
+        return cache_path, self.fs._cache_identity(os.lstat(cache_path))
+
+    def test_failed_post_sync_stat_drops_a_sole_baseline_everywhere(self):
+        cache_path, identity = self._written_file()
+        self.fs._store_member_check("/new.txt", cache_path, identity, {"member": (12, 1.0)})
+        with patch.object(self.member, "stat", side_effect=OSError("connection reset")):
+            self.fs._record_member_written("/new.txt", self.member, cache_path)
+        self.assertEqual({}, self.fs._member_checks["/new.txt"].members)
+        self.assertEqual({}, self.fs._load_persisted_members(cache_path, identity))
+        # After a restart, the next check uses the rule without a baseline:
+        # same size, member mtime not later than the cache file's.
+        # (The sync itself is not run: the member gets the bytes by hand.)
+        self.rewrite_member("new.txt", b"written here", mtime=1.0)
+        self.fs.state_manager.publish_sync_status(
+            "/new.txt", self.fs.state_manager.get_file_metadata("/new.txt").dirty_generation,
+            SyncStatus.CLEAN)
+        self.restart()
+        inode = self.cache_inode("new.txt")
+        with self.count_fetches() as fetch:
+            self.assertEqual(b"written here", self.read_through("/new.txt"))
+        fetch.assert_not_called()
+        self.assertEqual(inode, self.cache_inode("new.txt"))
+
+    def test_failed_post_sync_stat_keeps_a_baseline_a_check_recorded_meanwhile(self):
+        cache_path, identity = self._written_file()
+
+        # A FUSE thread's check lands while this stat is in flight. (The
+        # sync publishes CLEAN only after this callback, so in use a check
+        # rarely can; this tests _store_member_check's guard.) It records
+        # the same values as the old baseline, as an unchanged member does.
+        def observed(size, mtime):
+            return (size, mtime)  # a new tuple, as a real stat gives
+
+        for fresh in ((12, 5.0), (12, 1.0)):
+            self.fs._store_member_check("/new.txt", cache_path, identity,
+                                        {"member": observed(12, 1.0)})
+
+            def check_then_fail(path, fresh=fresh):
+                self.fs._store_member_check("/new.txt", cache_path, identity,
+                                            {"member": observed(*fresh)})
+                raise OSError("connection reset")
+
+            with patch.object(self.member, "stat", side_effect=check_then_fail):
+                self.fs._record_member_written("/new.txt", self.member, cache_path)
+            self.assertEqual({"member": fresh}, self.fs._member_checks["/new.txt"].members)
+
+    def test_failed_post_sync_stat_drops_despite_a_check_of_another_member(self):
+        cache_path, identity = self._written_file()
+        self.fs._store_member_check("/new.txt", cache_path, identity,
+                                    {"member": (12, 1.0), "other": (12, 2.0)})
+
+        def other_checked_then_fail(path):
+            self.fs._store_member_check("/new.txt", cache_path, identity, {"other": (12, 3.0)})
+            raise OSError("connection reset")
+
+        with patch.object(self.member, "stat", side_effect=other_checked_then_fail):
+            self.fs._record_member_written("/new.txt", self.member, cache_path)
+        self.assertEqual({"other": (12, 3.0)}, self.fs._member_checks["/new.txt"].members)
+
+
 class TestRevalidateSftpLikeMember(RevalidateTestBase):
     """Transfers stamp the current time, so member and cache mtimes differ."""
 

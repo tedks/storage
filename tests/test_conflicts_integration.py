@@ -20,6 +20,7 @@ import yaml
 
 from storage.fs import StorageFS
 from storage.backends.local import LocalBackend
+from storage.checksums import fast_checksum_bytes
 from tests.fuse_mount import run_fuse, stop_fuse
 
 
@@ -30,6 +31,9 @@ class BaseConflictMountTest(unittest.TestCase):
     backend1_name = "local1"
     # Each suite also runs with the multithreaded loop (subclasses below).
     fuse_threads = False
+    # Different sizes: split from the listing alone, nothing hashed.
+    content0 = "alpha\n"
+    content1 = "beta\n"
 
     def setUp(self):
         self.temp_dir = tempfile.mkdtemp()
@@ -48,8 +52,8 @@ class BaseConflictMountTest(unittest.TestCase):
             path.mkdir(parents=True, exist_ok=True)
 
         # Seed conflicting files directly on backends
-        (self.backend0_dir / "report.txt").write_text("alpha\n")
-        (self.backend1_dir / "report.txt").write_text("beta\n")
+        (self.backend0_dir / "report.txt").write_text(self.content0)
+        (self.backend1_dir / "report.txt").write_text(self.content1)
 
         backends = {
             self.backend0_name: LocalBackend(self.backend0_name, str(self.backend0_dir)),
@@ -167,10 +171,11 @@ class TestLocalConflictMount(BaseConflictMountTest):
         )
 
         checksum_list = self._read_xattr_yaml(self.mount_dir / conflict0, "user.storage.checksums")
-        backend_tags = {entry.split(":")[0] for entry in checksum_list}
+        values = {entry.split(":")[0]: entry.split(":")[1] for entry in checksum_list}
         self.assertSetEqual(
-            backend_tags, {self.backend0_name, self.backend1_name}, "All backends should be recorded"
+            set(values), {self.backend0_name, self.backend1_name}, "All backends should be recorded"
         )
+        self.assertEqual(values, self.expected_checksum_values())
 
         # Resolve by taking backend0's version
         result = subprocess.run(
@@ -198,8 +203,24 @@ class TestLocalConflictMount(BaseConflictMountTest):
         self.assertNotIn(conflict1, final_entries)
 
         # Both backend files should now match backend0 content
-        self.assertEqual((self.backend0_dir / "report.txt").read_text(), "alpha\n")
-        self.assertEqual((self.backend1_dir / "report.txt").read_text(), "alpha\n")
+        self.assertEqual((self.backend0_dir / "report.txt").read_text(), self.content0)
+        self.assertEqual((self.backend1_dir / "report.txt").read_text(), self.content0)
+
+    def expected_checksum_values(self):
+        # A size split hashes nothing: each copy carries its listed size.
+        return {self.backend0_name: f"size={len(self.content0)}",
+                self.backend1_name: f"size={len(self.content1)}"}
+
+
+class TestLocalConflictMountEqualSize(TestLocalConflictMount):
+    """Same size, different bytes: plain name until both hashes land."""
+
+    content0 = "alpha\n"
+    content1 = "gamma\n"
+
+    def expected_checksum_values(self):
+        return {self.backend0_name: fast_checksum_bytes(self.content0.encode()),
+                self.backend1_name: fast_checksum_bytes(self.content1.encode())}
 
 
 class TestConflictMerge(BaseConflictMountTest):
@@ -294,6 +315,10 @@ class TestLocalConflictMountThreaded(TestLocalConflictMount):
 
 
 class TestConflictMergeThreaded(TestConflictMerge):
+    fuse_threads = True
+
+
+class TestLocalConflictMountEqualSizeThreaded(TestLocalConflictMountEqualSize):
     fuse_threads = True
 
 
