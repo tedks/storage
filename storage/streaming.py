@@ -1032,7 +1032,21 @@ class StreamingReadManager:
                     os.fsync(io_fd)
 
             final_path.parent.mkdir(parents=True, exist_ok=True)
-            outcome = self._install_partial(session)
+            # A prefix is kept only for a file the index does not describe
+            # (never cached): served offline, never synced, never evicted.
+            # A path with a row (evicted, or invalidated by a member change)
+            # would take the prefix for the file: the next open would see a
+            # lost write and mark it DIRTY, and the sync would upload the
+            # prefix over the member, or report a false CONFLICT after an
+            # invalidation (ditz streaming-promoted-prefix-false-conflict).
+            # The check and the install are one step under the index lock;
+            # a row made outside it comes with a file at the final path
+            # (create, a full fetch), which the no-replace install refuses.
+            with self.state_manager.metadata_lock:
+                if self.state_manager.get_file_metadata(session.canonical_path) is not None:
+                    outcome = "indexed"
+                else:
+                    outcome = self._install_partial(session)
             if outcome != "installed":
                 self.logger.info(
                     "streaming partial-cache skipped path=%s backend=%s reason=%s",
