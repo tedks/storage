@@ -30,3 +30,11 @@ log_events:
   who: Ted Smith
   what: created
   comment: ""
+- time: 2026-10-30T02:25:42-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Ruling (Ted, 2026-10-29): B now, refuse symlink() through the mount with
+    a clear error until links replicate; lane listing takes the one-line refusal.
+    C is specified as ditz symlink-replication (a link follows its target: placed
+    on the members that hold the target, absolute and escaping and dangling targets
+    refused, placement fixed at creation).'
