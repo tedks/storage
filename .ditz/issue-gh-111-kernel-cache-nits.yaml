@@ -12,8 +12,8 @@ type: task
 component: listing
 release:
 reporter: Ted Smith <tedks@riseup.net>
-status: unstarted
-disposition:
+status: closed
+disposition: fixed
 creation_time: 2026-10-30T01:23:51-00:00
 references: []
 log_events:
@@ -25,5 +25,10 @@ log_events:
   who: Ted Smith
   what: blocks gh-111
   comment: ""
+- time: 2026-10-30T01:45:24-00:00
+  who: Ted Smith
+  what: 'closed: fixed'
+  comment: 'Folded into PR B (feat/listing-lifetime): README, D2 note and test docstring
+    wording; the leftover attr_timeout key is not rejected (never reached master).'
 blocks:
 - gh-111
