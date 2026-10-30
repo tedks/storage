@@ -426,7 +426,7 @@ class _FakeClient:
 
     def get_transport(self):
         self.member.joined = []
-        return SimpleNamespace(join=self.member.joined.append)
+        return SimpleNamespace(join=self.member.joined.append, is_alive=lambda: False)
 
     def close(self):
         self.closed = True
