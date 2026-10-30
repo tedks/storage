@@ -1,0 +1,25 @@
+id: streaming-finalize-row-window
+title: 'Streaming finalize: no index row between install and store_file_metadata'
+desc: 'Council round 1 on #130 (Claude seat, Important, pre-existing). After finalize
+  installs the partial at the final path, a never-cached file has no index row until
+  store_file_metadata runs. A write-open in that window sees is_cached true (no row
+  created), its write''s mark_dirty finds no row and records nothing, finalize then
+  stores a CLEAN row from its pre-write lstat, and release sees CLEAN and queues no
+  sync. Not lost: heal_stale_clean / the stale sweep mark it dirty on the stat mismatch
+  and eviction refuses it, but sync is delayed, and a same-tick write is invisible.
+  os.replace had the same window; the multithreaded FUSE loop widens it. Fix sketch:
+  create the row (or store metadata) before the install, under the index lock, or
+  have finalize compare its stat to the live file after storing.'
+type: bugfix
+component: fs
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-30T01:00:25-00:00
+references: []
+log_events:
+- time: 2026-10-30T01:00:25-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
