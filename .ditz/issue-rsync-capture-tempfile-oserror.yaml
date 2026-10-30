@@ -1,0 +1,21 @@
+id: rsync-capture-tempfile-oserror
+title: 'RsyncBackend._run_rsync: a failing TemporaryFile (full /tmp) raises a bare
+  OSError'
+desc: 'PR #151 council nit (Claude seat). _run_rsync now captures rsync''s output
+  through TemporaryFile instead of pipes; if /tmp is full, TemporaryFile raises OSError,
+  which escapes copy_from_local''s handlers and skips the connection-reset logic.
+  Low impact if the sync worker catches Exception; wrap it in RsyncError (or fall
+  back to pipes) if it shows up.'
+type: task
+component: fs
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-30T18:05:32-00:00
+references: []
+log_events:
+- time: 2026-10-30T18:05:32-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
