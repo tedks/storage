@@ -746,8 +746,16 @@ class NamespaceService:
         except OSError as exc:
             raise FuseOSError(exc.errno)
 
-    def rename(self, old: str, new: str):
-        """Rename a file or directory."""
+    def rename(self, old: str, new: str, on_local_moved: Optional[Callable[[], None]] = None):
+        """Rename a file or directory.
+
+        The local move (the cache rename, the index rewrite and the metadata
+        xattrs) is one critical section under the index lock, and
+        on_local_moved runs at its end, before the members are renamed:
+        StorageFS re-points open descriptors there, so a write recording
+        itself (under the same lock) sees either the old row at the old path
+        or the moved row at the new one, never a path whose row is gone.
+        """
         old_resolved = self.resolve_path(old)
         new_resolved = self.resolve_path(new)
 
@@ -758,24 +766,27 @@ class NamespaceService:
         new_cache = new_resolved.canonical_cache_path
 
         try:
-            new_cache.parent.mkdir(parents=True, exist_ok=True)
-            old_cache.rename(new_cache)
+            with self.state_manager.metadata_lock:
+                new_cache.parent.mkdir(parents=True, exist_ok=True)
+                old_cache.rename(new_cache)
 
-            if new_cache.is_dir():
-                rename_backend_names = set(self.backends.keys())
-            else:
-                rename_backend_names = self.state_manager.get_location_backends(
-                    old_resolved.canonical_path
+                if new_cache.is_dir():
+                    rename_backend_names = set(self.backends.keys())
+                else:
+                    rename_backend_names = self.state_manager.get_location_backends(
+                        old_resolved.canonical_path
+                    )
+
+                renamed_entries = self.state_manager.rename_path(
+                    old_resolved.canonical_path,
+                    new_resolved.canonical_path,
                 )
-
-            renamed_entries = self.state_manager.rename_path(
-                old_resolved.canonical_path,
-                new_resolved.canonical_path,
-            )
-            for _, updated in renamed_entries:
-                metadata = self.state_manager.get_file_metadata(updated)
-                if metadata:
-                    self.cache_manager.sync_cache_metadata(updated, metadata)
+                for _, updated in renamed_entries:
+                    metadata = self.state_manager.get_file_metadata(updated)
+                    if metadata:
+                        self.cache_manager.sync_cache_metadata(updated, metadata)
+                if on_local_moved is not None:
+                    on_local_moved()
 
             failures = self._propagate_dir_operation(
                 DirOperation.RENAME,

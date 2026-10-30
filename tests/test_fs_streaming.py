@@ -1079,7 +1079,10 @@ class TestFSStreamingIntegration(unittest.TestCase):
 
         def opener(name):
             try:
-                results[name] = self.fs.open('/race.bin', os.O_RDONLY)
+                # The unlocked body: StorageFS.open holds the path's lock, so
+                # two opens of one path never reach the registry together
+                # through it; this drives the streaming manager's own guard.
+                results[name] = self.fs._open('/race.bin', os.O_RDONLY)
             except Exception as exc:
                 results[name] = exc
 
