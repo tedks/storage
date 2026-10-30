@@ -823,10 +823,27 @@ class TestMemberConnectionPool(unittest.TestCase):
     def test_a_pool_that_keeps_its_reserve_does_not_warn(self):
         server = _FakeServer(max_sessions=3)
         pool = _pool(server)
-        holders = [_Holder(pool) for _ in range(2)]
-        for holder in holders:
-            holder.release()
-        self.assertGreaterEqual(pool.snapshot()["sftp_cap"], 2)
+        with self.assertLogs(ssh_pool.__name__, level="WARNING") as logs:
+            holders = [_Holder(pool) for _ in range(3)]
+            # A fourth channel is refused by the server: the cap shrinks to 2,
+            # one of them still kept for interactive requests.
+            fourth = _InThread(lambda: pool.acquire_sftp(1.0), interactive=True)
+            time.sleep(0.2)
+            for holder in holders:
+                holder.release()
+            self.assertTrue(fourth.join())
+        self.assertEqual(pool.snapshot()["sftp_cap"], 2)
+        # The refusal is logged; the lost reserve is not.
+        self.assertEqual(len(logs.records), 1)
+        self.assertNotIn("interactive", logs.records[0].getMessage())
+        pool.release(fourth.result)
+        pool.close()
+
+    def test_configuring_one_channel_says_so_when_the_pool_is_built(self):
+        with self.assertLogs(ssh_pool.__name__, level="WARNING") as logs:
+            pool = _pool(_FakeServer(), sftp_channels=1)
+        self.assertEqual(len(logs.records), 1)
+        self.assertIn("interactive", logs.records[0].getMessage())
         pool.close()
 
     def test_a_request_sent_after_the_last_counted_stall_counts_though_its_lease_is_older(self):
@@ -1200,6 +1217,80 @@ class TestBoundedRequestWatchdog(unittest.TestCase):
             self.assertLess(fired_at["second"], 2.0)
         finally:
             released.set()
+
+    class _SpyWatchdog:
+        """Arms nothing; the test fires the deadline by hand, where it wants."""
+
+        def __init__(self):
+            self.fire = None
+
+        def arm(self, timeout, fire):
+            self.fire = fire
+            return object()
+
+        def cancel(self, entry):
+            pass
+
+    def test_a_deadline_due_after_the_call_returned_leaves_the_channel_alone(self):
+        chan = _FakeChannel(_FakeTransport(_FakeServer()))
+        spy = self._SpyWatchdog()
+        with patch.object(ssh_pool, "_watchdog", spy), \
+                patch.object(ssh_pool, "_current_watchdog", return_value=spy):
+            self.assertEqual(ssh_pool.run_bounded(chan, 1.0, lambda: "ok"), "ok")
+            spy.fire()  # the expiry thread getting there late
+        self.assertFalse(chan.closed)
+
+    def test_a_deadline_that_came_due_first_wins_even_if_the_call_returns(self):
+        chan = _FakeChannel(_FakeTransport(_FakeServer()))
+        spy = self._SpyWatchdog()
+
+        def fire_then_return():
+            spy.fire()
+            return "ok"
+
+        with patch.object(ssh_pool, "_current_watchdog", return_value=spy):
+            with self.assertRaises(socket.timeout):
+                ssh_pool.run_bounded(chan, 1.0, fire_then_return)
+        self.assertTrue(chan.closed)
+
+    def test_a_failed_thread_start_does_not_lose_the_deadline_or_the_watchdog(self):
+        watchdog = ssh_pool._Watchdog()
+        first, later = threading.Event(), threading.Event()
+        real_thread = threading.Thread
+        failures = []
+
+        def flaky_thread(*args, **kwargs):
+            thread = real_thread(*args, **kwargs)
+            if kwargs.get("name") == "ssh-pool-expire" and not failures:
+                failures.append(1)
+                thread.start = lambda: (_ for _ in ()).throw(
+                    RuntimeError("can't start new thread"))
+            return thread
+
+        with patch.object(ssh_pool.threading, "Thread", flaky_thread):
+            watchdog.arm(0.05, first.set)
+            self.assertTrue(first.wait(5), "the deadline was lost")
+            watchdog.arm(0.05, later.set)
+            self.assertTrue(later.wait(5), "the watchdog stopped working")
+
+    def test_a_dead_watchdog_thread_is_replaced_on_the_next_arm(self):
+        watchdog = ssh_pool._Watchdog()
+        fired = threading.Event()
+        watchdog.arm(3600.0, lambda: None)
+        watchdog._thread = threading.Thread(target=lambda: None)  # a finished thread
+        watchdog._thread.start()
+        watchdog._thread.join()
+        watchdog.arm(0.05, fired.set)
+        self.assertTrue(fired.wait(5))
+
+    def test_a_forked_child_gets_a_fresh_watchdog(self):
+        before = ssh_pool._current_watchdog()
+        self.assertIs(ssh_pool._current_watchdog(), before)
+        with patch.object(ssh_pool.os, "getpid", return_value=before.pid + 1):
+            after = ssh_pool._current_watchdog()
+        self.assertIsNot(after, before)
+        self.assertEqual(after.pid, before.pid + 1)
+        ssh_pool._watchdog = before  # the real process goes on with its own
 
     def test_a_cancelled_deadline_never_fires(self):
         fired = threading.Event()
