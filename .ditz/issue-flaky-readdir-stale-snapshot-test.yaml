@@ -1,0 +1,23 @@
+id: flaky-readdir-stale-snapshot-test
+title: test_readdir_serves_stale_snapshot_then_the_refresh is timing-sensitive under
+  load
+desc: 'tests/test_namespace.py::TestReaddirSnapshotTTL::test_readdir_serves_stale_snapshot_then_the_refresh
+  uses a 0.15 s fresh window and a 0.25 s sleep, then expects the stale listing to
+  be served while a background refresh runs. At host load average ~70 it fails about
+  1 run in 5 on origin/master too (the refresh lands before the stale read, so beta.txt
+  is already listed). Seen by lane sync-correctness in a gate run of PR #141. Fix:
+  gate the background refresh on an Event (hold _run_refresh until the stale read
+  is done) instead of timing.'
+type: bugfix
+component: listing
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-30T17:16:34-00:00
+references: []
+log_events:
+- time: 2026-10-30T17:16:34-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
