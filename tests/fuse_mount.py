@@ -93,8 +93,6 @@ def _noop_signal(*_):
     """SIGUSR2 only has to interrupt a blocked read."""
 
 
-_handler_installed = False
-
 
 def release_orphaned_loop(fs: StorageFS, thread: threading.Thread,
                           wait: float = 10.0) -> str:
@@ -141,10 +139,8 @@ def release_orphaned_loop(fs: StorageFS, thread: threading.Thread,
     # returns (a reader that had it blocked, or a thread id reused) would meet
     # the default disposition, which ends the whole test process. Nothing else
     # here uses SIGUSR2.
-    global _handler_installed
-    if not _handler_installed:
+    if signal.getsignal(signal.SIGUSR2) is not _noop_signal:
         signal.signal(signal.SIGUSR2, _noop_signal)
-        _handler_installed = True
     # Known gap: the holder can exit between the check above and this call,
     # letting libfuse tear the session down first; fuse_exit then writes freed
     # memory. Only a process in another namespace exiting in that window
@@ -152,14 +148,16 @@ def release_orphaned_loop(fs: StorageFS, thread: threading.Thread,
     fuse._libfuse.fuse_exit(handle)
     deadline = time.monotonic() + wait
     failed = 0
+    first_errno = 0
     while thread.is_alive() and time.monotonic() < deadline:
         for tid in readers:
             if libc.syscall(ctypes.c_long(tgkill), ctypes.c_long(os.getpid()),
                             ctypes.c_long(tid), ctypes.c_long(int(signal.SIGUSR2))) != 0:
                 failed += 1
+                first_errno = first_errno or ctypes.get_errno()
         thread.join(timeout=0.2)
     if failed:
-        return f"{failed} tgkill calls failed (errno {ctypes.get_errno()})"
+        return f"{failed} tgkill calls failed (first errno {first_errno})"
     return "" if not thread.is_alive() else f"readers {readers} did not leave after fuse_exit and SIGUSR2"
 
 
