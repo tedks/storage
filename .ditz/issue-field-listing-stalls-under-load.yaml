@@ -1,0 +1,25 @@
+id: field-listing-stalls-under-load
+title: 'Threads-on mixed load: 6 of 2157 listings took over 10 s (max 105 s)'
+desc: 'Field test 2026-10-30, master 39e4b79, fuse_threads on, 3 members on one host.
+  10 minutes of mixed load from 3 client threads (listings 50%, 4 KiB sniffs 40%,
+  stats 10%): 2157 listings (median 5 ms), 1791 sniffs (median 100 ms, max 2.6 s),
+  428 stats (median 1.6 ms, max 1.6 s); no errors, no hung client threads; but 6 listings
+  took over 10 s and the slowest 105 s. During the run the mount was downloading whole
+  files for checksums in the background (field-listing-downloads-to-hash, ~19 GiB
+  in the session), which hold SFTP channels from the per-member pool; that is the
+  likely cause but it was not isolated (no per-request timeline without names). Retest
+  after conflicts-off-browse-path lands; if stalls remain, instrument channel-lease
+  wait time per request class.'
+type: bugfix
+component: performance
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-30T17:06:43-00:00
+references: []
+log_events:
+- time: 2026-10-30T17:06:43-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
