@@ -5,6 +5,7 @@ Handles asynchronous synchronization of files from cache to backing filesystems.
 Monitors dirty files and syncs them according to their replication configuration.
 """
 
+import sys
 import time
 import threading
 import queue
@@ -21,6 +22,10 @@ from .sync_executor import SyncExecutor
 from .sync_tasks import DirOperation, DirSyncTask, SyncConfig, SyncTask, dir_task_key
 
 logger = logging.getLogger(__name__)
+
+# Posted to the task queue by SyncManager.stop() so idle workers wake at once
+# instead of at the end of their poll. Sorts ahead of every real task.
+_WAKE = SyncTask(virtual_path="", priority=sys.maxsize)
 
 __all__ = [
     "DirOperation",
@@ -73,6 +78,11 @@ class SyncWorker(threading.Thread):
                 try:
                     task = self.task_queue.get(timeout=1.0)
                 except queue.Empty:
+                    continue
+
+                if task is _WAKE:
+                    # stop() posted this to end the idle wait; nothing to run.
+                    self.task_queue.task_done()
                     continue
 
                 self._active_task = task.virtual_path
@@ -158,6 +168,8 @@ class SyncManager:
         # Workers
         self.workers = []
         self._running = False
+        # Set by stop() to end the monitor's sleep between scans.
+        self._monitor_stop = threading.Event()
         self._monitor_thread = None
         self._queued_tasks: Set[str] = set()
         self._queued_dir_tasks: Set[Tuple[str, str, Optional[str]]] = set()
@@ -185,6 +197,7 @@ class SyncManager:
 
         # Start monitor thread
         self._running = True
+        self._monitor_stop.clear()
         self._monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
         self._monitor_thread.start()
 
@@ -197,10 +210,12 @@ class SyncManager:
 
         logger.info("Stopping sync manager")
         self._running = False
+        self._monitor_stop.set()
 
-        # Stop workers
+        # Stop workers; one wake task each ends an idle worker's queue wait
         for worker in self.workers:
             worker.stop()
+            self.task_queue.put(_WAKE)
 
         # Wait for workers to finish
         for worker in self.workers:
@@ -229,7 +244,7 @@ class SyncManager:
                     self.queue_sync(metadata.virtual_path, priority=50)
 
                 # Sleep before next check
-                time.sleep(self.config.monitor_interval)
+                self._monitor_stop.wait(self.config.monitor_interval)
 
             except Exception as e:
                 logger.error(f"Monitor loop error: {e}")
