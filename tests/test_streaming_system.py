@@ -86,8 +86,10 @@ class TestStreamingSystemRegression(unittest.TestCase):
         # After the FUSE thread has finished, so this destroy never runs
         # beside libfuse's own (or a request still in flight).
         problems = stop_fuse(self.mount_dir, self.mount_thread)
-        if os.path.ismount(self.mount_dir):
-            self.fail(f"mount teardown: {problems}")
+        if os.path.ismount(self.mount_dir) or self.mount_thread.is_alive():
+            # Still serving (a lazy unmount leaves it running): removing the
+            # cache or destroying under it would race its requests.
+            self.fail(f"mount teardown, {self.temp_dir} left in place: {problems}")
         try:
             self.fs.destroy("/")
         except Exception:
