@@ -1435,6 +1435,94 @@ class TestFSNamespaceIntegration(unittest.TestCase):
             (4, st.st_mtime, st.st_ctime),
         )
 
+    def _remount(self):
+        """A fresh StorageFS on the same index, as after an unmount."""
+        self.fs.namespace.shutdown()
+        self.fs._checksum_queues.shutdown()
+        self.fs.sync_manager.stop()
+        self.fs.state_manager.close()
+        self.fs = StorageFS(
+            cache_root=self.cache_dir,
+            state_db=self.db_path,
+            backends=self.backends,
+            cache_size=10 * 1024 * 1024,
+            num_sync_workers=1,
+        )
+
+    def test_persisted_hashes_split_the_first_listing_after_a_remount(self):
+        (self.backend1_dir / "dup.txt").write_text("aaaa")
+        (self.backend2_dir / "dup.txt").write_text("bbbb")
+        self._list_and_settle()
+        self.assertIn("dup.txt.backend2", self._list_and_settle())
+        self._remount()
+        hashes = self._hashes()
+        self.assertIn("dup.txt.backend2", self._list_and_settle())
+        self.assertEqual(hashes, [])
+        record = self.fs._checksum_records[("/dup.txt", "backend2")]
+        self.assertEqual(record.checksum, fast_checksum_bytes(b"bbbb"))
+
+    def test_persisted_hash_from_another_basis_is_not_used(self):
+        (self.backend1_dir / "dup.txt").write_text("same")
+        (self.backend2_dir / "dup.txt").write_text("same")
+        self._list_and_settle()
+        self._remount()
+        target = self.backend2_dir / "dup.txt"
+        before = target.stat()
+        time.sleep(0.02)
+        target.write_text("diff")
+        os.utime(target, ns=(before.st_atime_ns, before.st_mtime_ns))  # only ctime moved
+        hashes = self._hashes()
+        self._list_and_settle()
+        self.assertEqual(hashes, [("backend2", "/dup.txt")])
+        self.assertIn("dup.txt.backend2", self._list_and_settle())
+        row = self.fs.state_manager.get_member_checksum("/dup.txt", "backend2")
+        self.assertEqual(row.checksum, fast_checksum_bytes(b"diff"))
+
+    def test_forgotten_hashes_leave_the_index_too(self):
+        (self.backend1_dir / "d").mkdir()
+        (self.backend2_dir / "d").mkdir()
+        for name in ("d/dup.txt", "dup.txt"):
+            (self.backend1_dir / name).write_text("same")
+            (self.backend2_dir / name).write_text("same")
+        self._list_and_settle('/d')
+        self._list_and_settle('/')
+        state = self.fs.state_manager
+        self.assertIsNotNone(state.get_member_checksum("/dup.txt", "backend1"))
+        # A watcher event: the member changed, even if its stat did not.
+        self.fs._on_remote_change('/dup.txt')
+        self.assertIsNone(state.get_member_checksum("/dup.txt", "backend1"))
+        self.assertIsNone(state.get_member_checksum("/dup.txt", "backend2"))
+        self.fs._forget_checksums({"/d"}, subtree=True)
+        self.assertIsNone(state.get_member_checksum("/d/dup.txt", "backend2"))
+
+    def test_unverified_and_failed_hashes_are_not_persisted(self):
+        (self.backend1_dir / "dup.txt").write_text("same")
+        (self.backend2_dir / "dup.txt").write_text("same")
+        self._list_and_settle()
+        state = self.fs.state_manager
+        self.assertIsNotNone(state.get_member_checksum("/dup.txt", "backend2"))
+        member = self.backends["backend2"]
+        with patch.object(member, "get_fast_checksum",
+                          side_effect=ChecksumUnavailable(errno.EIO, "no remote hash")):
+            self.fs._schedule_checksum_task(member, "/dup.txt", replace=True)
+            self.assertTrue(self._wait_for(
+                lambda: self.fs._checksum_records[("/dup.txt", "backend2")].checksum is None))
+        self.assertIsNone(state.get_member_checksum("/dup.txt", "backend2"))
+        # Without a basis a digest is kept in memory only.
+        self.fs._schedule_checksum_task(member, "/dup.txt", replace=True)
+        self.assertTrue(self._wait_for(
+            lambda: self.fs._checksum_records[("/dup.txt", "backend2")].checksum is not None))
+        self.assertIsNone(state.get_member_checksum("/dup.txt", "backend2"))
+        st = (self.backend2_dir / "dup.txt").stat()
+        basis = (st.st_size, st.st_mtime, st.st_ctime)
+        self.fs._schedule_checksum_task(member, "/dup.txt", basis, replace=True)
+        self.assertTrue(self._wait_for(
+            lambda: state.get_member_checksum("/dup.txt", "backend2") is not None))
+        with patch.object(member, "get_fast_checksum", side_effect=ConnectionResetError("dropped")):
+            self.fs._schedule_checksum_task(member, "/dup.txt", basis, replace=True)
+            self.assertTrue(self._wait_for(
+                lambda: state.get_member_checksum("/dup.txt", "backend2") is None))
+
     def test_readdir_rehashes_member_rewritten_with_same_size_and_mtime(self):
         # A tagger that preserves mtime: only ctime shows the change, and a
         # local member's listing carries it.

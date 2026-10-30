@@ -509,10 +509,12 @@ class StorageFS(Operations):
 
     def _forget_checksums(self, paths: Set[str], subtree: bool = False):
         """Drop the checksum records and tasks for paths (and, with subtree,
-        everything under them).
+        everything under them), persisted records included.
 
         A task that is already running cannot be cancelled; dropping it from
-        _checksum_tasks is what keeps its result from being recorded.
+        _checksum_tasks is what keeps its result from being recorded. The
+        rows go under _checksum_lock, which every record write holds, so no
+        result recorded before the forget lands after it.
         """
         prefixes = tuple(p.rstrip("/") + "/" for p in paths) if subtree else ()
 
@@ -524,6 +526,16 @@ class StorageFS(Operations):
                 del self._checksum_records[k]
             for k in [k for k in self._checksum_tasks if matches(k[0])]:
                 self._checksum_tasks.pop(k).cancel()
+            self._drop_persisted_checksums(paths, subtree=subtree)
+
+    def _drop_persisted_checksums(self, paths, *, subtree: bool = False, backend_name: Optional[str] = None):
+        """Delete persisted hashes; the caller holds _checksum_lock. A
+        database error is logged: a row left behind is only used while its
+        basis still matches the member."""
+        try:
+            self.state_manager.delete_member_checksums(paths, subtree=subtree, backend_name=backend_name)
+        except Exception as exc:
+            self.logger.warning("could not drop persisted checksums: %r", exc)
 
     def _on_remote_change(self, virtual_path: str):
         """
@@ -626,16 +638,43 @@ class StorageFS(Operations):
         """Record a checksum for (path, backend) and keep only the latest.
 
         A task still hashing the same key started before this result, so its
-        result is dropped rather than allowed to replace this one.
+        result is dropped rather than allowed to replace this one. A digest
+        with a basis is persisted too, so the next mount does not hash the
+        file again while the member reports the same basis; any other
+        result replaces the persisted one by none.
         """
         key = (canonical_path, backend_name)
+        record = ChecksumRecord(checksum=checksum, timestamp=timestamp, basis=basis)
         with self._checksum_lock:
             superseded = self._checksum_tasks.pop(key, None)
             if superseded is not None:
                 superseded.cancel()
-            self._checksum_records[key] = ChecksumRecord(
-                checksum=checksum, timestamp=timestamp, basis=basis,
-            )
+            self._checksum_records[key] = record
+            self._persist_checksum(canonical_path, backend_name, record)
+
+    def _persist_checksum(self, canonical_path: str, backend_name: str, record: Optional[ChecksumRecord]):
+        """Write (or, for None or a record not worth keeping, delete) the
+        persisted hash; the caller holds _checksum_lock."""
+        if record is None or record.checksum is None or record.basis is None:
+            self._drop_persisted_checksums({canonical_path}, backend_name=backend_name)
+            return
+        try:
+            self.state_manager.put_member_checksum(canonical_path, backend_name, record)
+        except Exception as exc:
+            self.logger.warning("could not persist a checksum: %r", exc)
+
+    def _load_persisted_checksum(self, key: tuple, basis: ChecksumBasis) -> bool:
+        """Install the persisted record for key if it was taken from basis;
+        the caller holds _checksum_lock. Returns whether it did."""
+        try:
+            record = self.state_manager.get_member_checksum(*key)
+        except Exception as exc:
+            self.logger.debug("could not read a persisted checksum: %r", exc)
+            return False
+        if record is None or record.basis != basis:
+            return False
+        self._checksum_records[key] = record
+        return True
 
     def _aggregate_checksums_yaml(self, canonical_path: str) -> bytes:
         """Return a YAML list of '<backend>:<value>:<timestamp>' entries.
@@ -675,7 +714,9 @@ class StorageFS(Operations):
         file changes or its records are forgotten), so nothing is
         scheduled;
         without a basis (no listed attributes, or a symlink) the file is
-        always hashed again. check_dir: the worker first asks the member
+        always hashed again. A record persisted by an earlier mount (or
+        by sync, for what it uploaded) counts as made from its basis: one
+        that matches is loaded instead of hashing. check_dir: the worker first asks the member
         whether the path is a directory and records nothing if so.
         replace: the member's copy just changed (a release uploaded it), so
         a task already queued or running for it is superseded rather than
@@ -694,9 +735,12 @@ class StorageFS(Operations):
                 # and records nothing.
                 del self._checksum_tasks[key]
                 previous.cancel()
-            elif not replace:
+            elif not replace and basis is not None:
                 record = self._checksum_records.get(key)
-                if basis is not None and record is not None and record.basis == basis:
+                if record is not None and record.basis == basis:
+                    return
+                # Sync may have persisted a hash of what it uploaded.
+                if self._load_persisted_checksum(key, basis):
                     return
 
             try:
@@ -721,12 +765,14 @@ class StorageFS(Operations):
                         # record left from before would outlive the change
                         # that scheduled this hash (an upload, a new basis).
                         self._checksum_records.pop(key, None)
+                        self._persist_checksum(canonical_path, backend.name, None)
                         return
                     result = done.result()
                     if result is None:
                         # Could not be asked: whatever was recorded before
                         # predates the change that scheduled this hash.
                         self._checksum_records.pop(key, None)
+                        self._persist_checksum(canonical_path, backend.name, None)
                     elif result is not self._IS_DIRECTORY:
                         checksum, ts = result
                         self._record_checksum(canonical_path, backend.name, checksum, ts, basis)
