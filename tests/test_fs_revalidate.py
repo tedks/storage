@@ -381,6 +381,48 @@ class TestRevalidateAfterSync(RevalidateTestBase):
                          self.fs._load_persisted_members(cache_path, identity))
 
 
+    def _written_file(self):
+        fd = self.fs.create("/new.txt", 0o644)
+        self.fs.write("/new.txt", b"written here", 0, fd)
+        self.fs.release("/new.txt", fd)
+        cache_path = self.cache_dir / "new.txt"
+        return cache_path, self.fs._cache_identity(os.lstat(cache_path))
+
+    def test_failed_post_sync_stat_drops_a_sole_baseline_everywhere(self):
+        cache_path, identity = self._written_file()
+        self.fs._store_member_check("/new.txt", cache_path, identity, {"member": (12, 1.0)})
+        with patch.object(self.member, "stat", side_effect=OSError("connection reset")):
+            self.fs._record_member_written("/new.txt", self.member, cache_path)
+        self.assertEqual({}, self.fs._member_checks["/new.txt"].members)
+        self.assertEqual({}, self.fs._load_persisted_members(cache_path, identity))
+        # After a restart, the next check uses the rule without a baseline:
+        # same size, member mtime not later than the cache file's.
+        # (The sync itself is not run: the member gets the bytes by hand.)
+        self.rewrite_member("new.txt", b"written here", mtime=1.0)
+        self.fs.state_manager.publish_sync_status(
+            "/new.txt", self.fs.state_manager.get_file_metadata("/new.txt").dirty_generation,
+            SyncStatus.CLEAN)
+        self.restart()
+        inode = self.cache_inode("new.txt")
+        with self.count_fetches() as fetch:
+            self.assertEqual(b"written here", self.read_through("/new.txt"))
+        fetch.assert_not_called()
+        self.assertEqual(inode, self.cache_inode("new.txt"))
+
+    def test_failed_post_sync_stat_keeps_a_baseline_a_check_recorded_meanwhile(self):
+        cache_path, identity = self._written_file()
+        self.fs._store_member_check("/new.txt", cache_path, identity, {"member": (12, 1.0)})
+
+        def check_then_fail(path):
+            # A FUSE thread's check lands while this stat is in flight.
+            self.fs._store_member_check("/new.txt", cache_path, identity, {"member": (12, 5.0)})
+            raise OSError("connection reset")
+
+        with patch.object(self.member, "stat", side_effect=check_then_fail):
+            self.fs._record_member_written("/new.txt", self.member, cache_path)
+        self.assertEqual({"member": (12, 5.0)}, self.fs._member_checks["/new.txt"].members)
+
+
 class TestRevalidateSftpLikeMember(RevalidateTestBase):
     """Transfers stamp the current time, so member and cache mtimes differ."""
 

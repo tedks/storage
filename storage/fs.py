@@ -867,13 +867,14 @@ class StorageFS(Operations):
     def _store_member_check(self, canonical_path: str, cache_path: Path,
                             identity: Tuple[int, int, int],
                             updates: Dict[str, Tuple[int, float]], *, replace: bool = False,
-                            drop: Tuple[str, ...] = ()):
+                            drop: Optional[Dict[str, Tuple[int, float]]] = None):
         """Record a check now, merging member baselines, in memory and on the cache file.
 
         The baselines already known for this cache file (in memory, else from
         its xattr) are kept and updates applied on top; replace=True starts
         from nothing (a fetch: the old copy's baselines describe other bytes),
-        and the members named in drop lose theirs.
+        and each member in drop loses its baseline if it is still the one
+        given (one recorded meanwhile by a check is newer, and stays).
         The read, merge and both writes are one critical section under
         _member_checks_lock (a leaf: getxattr and setxattr take no other
         lock), so a sync worker and the FUSE thread cannot drop each other's
@@ -890,7 +891,8 @@ class StorageFS(Operations):
             else:
                 members = self._load_persisted_members(cache_path, identity)
             members.update(updates)
-            dropped = [name for name in drop if members.pop(name, None) is not None]
+            dropped = [name for name, expected in (drop or {}).items()
+                       if members.get(name) == expected and members.pop(name)]
             check = MemberCheck(cache_identity=identity, verified_at=time.monotonic(),
                                 members=members)
             self._member_checks[canonical_path] = check
@@ -941,11 +943,19 @@ class StorageFS(Operations):
         except OSError as exc:
             self.logger.debug("post-sync stat of the cache file failed: %r", exc)
             return
+        with self._member_checks_lock:
+            check = self._member_checks.get(virtual_path)
+            if check is not None and check.cache_identity == identity:
+                before = check.members.get(backend.name)
+            else:
+                before = self._load_persisted_members(cache_path, identity).get(backend.name)
         try:
             member_stat = backend.stat(virtual_path)
         except Exception as exc:
             self.logger.debug("post-sync stat on %s failed: %r", backend.name, exc)
-            self._store_member_check(virtual_path, cache_path, identity, {}, drop=(backend.name,))
+            if before is not None:
+                self._store_member_check(virtual_path, cache_path, identity, {},
+                                         drop={backend.name: before})
             return
         self._store_member_check(virtual_path, cache_path, identity,
                                  {backend.name: (member_stat.st_size, member_stat.st_mtime)})
