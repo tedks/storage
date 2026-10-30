@@ -31,6 +31,9 @@ class SyncTask:
     # Set when a publish was refused because the file was written during the
     # attempt. The manager queues another pass when it completes this task.
     requeue: bool = False
+    # Whether the failed last attempt's ERROR was published, set by the
+    # attempt itself under its upload guard; None until then.
+    final_error: Optional[bool] = None
 
     def __lt__(self, other):
         return self.priority > other.priority

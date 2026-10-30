@@ -28,7 +28,7 @@ from typing import Dict, Optional, Set, List, Tuple
 
 from .backends.base import Backend, interactive_request
 from .cache import PARTIAL_SUFFIX, CacheManager
-from .locks import NamespaceLock, PathLocks
+from .locks import NamespaceLock, PathLocks, UploadLocks
 from .cache_metadata import XATTR_CACHE_METADATA_NAME, scan_cache_entries
 from .file_config import FileConfig, get_inherited_config
 from .models import FileLocation, FileMetadata, StreamingKeepAfterClose, SyncStatus
@@ -181,6 +181,8 @@ class StorageFS(Operations):
         # has the full lock order. Under nothreads they are never contended.
         self._namespace_lock = NamespaceLock()
         self._path_locks = PathLocks()
+        # Held by a sync upload; rename and unlink wait for it (locks.py).
+        self._upload_locks = UploadLocks()
 
         # Revalidation on open, keyed by canonical path (see
         # _revalidate_cached_file). Check times are in memory only: after a
@@ -213,6 +215,8 @@ class StorageFS(Operations):
             num_workers=num_sync_workers,
             should_sync_path_cb=self._should_sync_path,
             member_written_cb=self._record_member_written,
+            upload_guard=self._upload_locks.hold_for_upload,
+            path_guard=self._path_locked,
         )
         self._sync_started = False
         if start_sync:
@@ -1361,8 +1365,13 @@ class StorageFS(Operations):
             self._forget_checksums({self._resolve_path(path).canonical_path}, subtree=True)
 
     def unlink(self, path):
-        """Remove a file"""
-        with self._path_locked(self._resolve_path(path).canonical_path):
+        """Remove a file
+
+        Waits for an upload of the path in flight, so its location row is
+        not recorded after the file's row is gone.
+        """
+        canonical_path = self._resolve_path(path).canonical_path
+        with self._path_locked(canonical_path), self._upload_locks.hold(canonical_path):
             return self._unlink(path)
 
     def _unlink(self, path):
@@ -1388,6 +1397,14 @@ class StorageFS(Operations):
         renamed as a file, which fails as before. A directory appearing in
         the cache meanwhile (a fetch beneath it) is caught by the recheck
         under the path locks.
+
+        Either kind waits for sync uploads of the paths it moves (ditz
+        sync-namespace-orphans): an upload finishing after the rename would
+        put the file back on its member under the old name, a name the
+        member rename skipped because the upload had not recorded its
+        location yet. A file rename takes both upload locks under its path
+        locks; a directory rename drains both subtrees before it takes the
+        namespace lock, so it does not stall other paths while it waits.
         """
         old_resolved = self._resolve_path(old)
         new_canonical = self._resolve_path(new).canonical_path
@@ -1403,11 +1420,13 @@ class StorageFS(Operations):
                 except FuseOSError:
                     is_dir = False
             if is_dir:
-                with self._namespace_lock.exclusive():
-                    return self._rename(old, new)
+                with self._upload_locks.drain(old_resolved.canonical_path, new_canonical):
+                    with self._namespace_lock.exclusive():
+                        return self._rename(old, new)
             with self._path_locked(old_resolved.canonical_path, new_canonical):
-                if not os.path.isdir(cache_path):
-                    return self._rename(old, new)
+                with self._upload_locks.hold(old_resolved.canonical_path, new_canonical):
+                    if not os.path.isdir(cache_path):
+                        return self._rename(old, new)
 
     def _rename(self, old, new):
         old_canonical = self._resolve_path(old).canonical_path

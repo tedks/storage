@@ -53,6 +53,7 @@ class TestDirSyncOperations(unittest.TestCase):
     def test_mkdir_sync(self):
         self.sync_manager.start()
         test_dir = "/queued"
+        self.cache_manager.get_cache_path(test_dir).mkdir()  # made through the mount
         self.sync_manager.queue_dir_sync(test_dir, DirOperation.MKDIR, priority=100)
         self.assertTrue(self._wait_for(lambda: (self.backend1_dir / 'queued').is_dir()))
         self.assertTrue(self._wait_for(lambda: (self.backend2_dir / 'queued').is_dir()))
