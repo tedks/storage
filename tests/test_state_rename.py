@@ -149,3 +149,45 @@ class TestHierarchicalRename(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestRenameOntoAndAround(unittest.TestCase):
+    """rename_path over an existing destination, and names with LIKE wildcards
+    (ditz rename-over-existing-file)."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.state_manager = StateManager(str(Path(self.temp_dir) / "state.db"))
+
+    def tearDown(self):
+        self.state_manager.close()
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def add(self, path, size, backend="m"):
+        self.state_manager.set_file_metadata(FileMetadata(
+            virtual_path=path, size=size, checksum=f"c{size}", last_access=time.time(),
+            last_modified=time.time(), sync_status=SyncStatus.CLEAN, replica_count=1,
+            recomputable=False, recompute_cmd=None, encrypted=False, encryption_key_id=None,
+        ))
+        self.state_manager.add_file_location(FileLocation(
+            virtual_path=path, backend_name=backend, checksum=f"c{size}",
+            last_synced=time.time(), is_cached=False,
+        ))
+
+    def test_rename_replaces_the_destination_rows(self):
+        self.add("/src", 1, backend="a")
+        self.add("/dst", 2, backend="b")
+        self.assertEqual([("/src", "/dst")], self.state_manager.rename_path("/src", "/dst"))
+        self.assertIsNone(self.state_manager.get_file_metadata("/src"))
+        self.assertEqual(1, self.state_manager.get_file_metadata("/dst").size)
+        self.assertEqual(["a"], [l.backend_name for l in self.state_manager.get_file_locations("/dst")])
+
+    def test_like_wildcards_in_names_match_only_themselves(self):
+        self.add("/a_b/f", 1)
+        self.add("/axb/f", 2)
+        self.add("/a%/g", 3)
+        self.add("/aZ/g", 4)
+        self.assertEqual([("/a_b/f", "/c/f")], self.state_manager.rename_path("/a_b", "/c"))
+        self.assertEqual(2, self.state_manager.get_file_metadata("/axb/f").size)
+        self.assertEqual([("/a%/g", "/d/g")], self.state_manager.rename_path("/a%", "/d"))
+        self.assertEqual(4, self.state_manager.get_file_metadata("/aZ/g").size)
