@@ -197,6 +197,8 @@ class _FakeSFTPClient:
         if "r" in mode and not exists:
             raise FileNotFoundError(errno.ENOENT, "No such file")
         if "x" in mode:
+            if path in self.server.create_errors:
+                raise self.server.create_errors[path]
             if exists:
                 raise OSError("Failure")  # SFTP_FAILURE carries no errno
             self.server.missing.discard(path)
@@ -246,6 +248,7 @@ class _FakeServer:
         self.requests = []
         self.concurrent_use = []
         self.opens = []
+        self.create_errors = {}
         self.transports = []
         self.ssh_clients = []
         self.connect_calls = 0
@@ -375,6 +378,7 @@ class _Holder:
         self._acquired = threading.Event()
         self.lease = None
         self.error = None
+        self._release_error = None
 
         def target():
             try:
@@ -389,7 +393,7 @@ class _Holder:
                 return
             self._acquired.set()
             self._release.wait(timeout=20)
-            pool.release(self.lease)
+            pool.release(self.lease, self._release_error)
             self._released.set()
 
         threading.Thread(target=target, daemon=True).start()
@@ -398,7 +402,9 @@ class _Holder:
         if self.error is not None:
             raise self.error
 
-    def release(self):
+    def release(self, error=None):
+        """Release from the holding thread, as an operation that raised error."""
+        self._release_error = error
         self._release.set()
         if not self._released.wait(timeout=10):
             raise AssertionError("holder did not release")
@@ -739,6 +745,95 @@ class TestMemberConnectionPool(unittest.TestCase):
             with self.assertRaises(socket.timeout):
                 pool.run_command("trickle", 0.5)
             self.assertLess(time.monotonic() - started, 2.0)
+        pool.close()
+
+    def test_exec_and_non_timeout_errors_do_not_count_as_stalls(self):
+        server = _FakeServer()
+        pool = _pool(server, stall_limit=2)
+        original_recv = _FakeChannel.recv
+
+        def slow_recv(chan, size):
+            time.sleep(0.3)
+            return original_recv(chan, size) or b"."
+
+        with patch.object(_FakeChannel, "recv", slow_recv):
+            for _ in range(2):
+                with self.assertRaises(socket.timeout):
+                    pool.run_command("xxh128sum big", 0.2)
+        for _ in range(2):
+            lease = pool.acquire_sftp(1.0)
+            pool.release(lease, ssh_module.paramiko.SSHException("Channel closed."))
+        self.assertTrue(pool.available())
+        self.assertEqual(pool.snapshot()["stalls"], 0)
+        pool.close()
+
+    def test_a_burst_of_concurrent_timeouts_counts_as_one_stall(self):
+        server = _FakeServer()
+        pool = _pool(server, stall_limit=2)
+        holders = [_Holder(pool) for _ in range(3)]
+        for holder in holders:
+            holder.release(socket.timeout("timed out"))
+        self.assertEqual(pool.snapshot()["stalls"], 1)
+        self.assertTrue(pool.available())
+        pool.close()
+
+    def test_a_stall_on_a_replaced_transport_is_not_counted(self):
+        server = _FakeServer()
+        pool = _pool(server, stall_limit=1)
+        lease = pool.acquire_sftp(1.0)
+
+        def replaced_meanwhile(_timeout):
+            server.transport.open_hook = None
+            with pool._cond:
+                pool._generation += 1  # another thread installed a new transport
+
+        server.transport.open_hook = replaced_meanwhile
+        pool.release(lease, socket.timeout("timed out"))
+        self.assertEqual(pool.snapshot()["stalls"], 0)
+        self.assertTrue(pool.available())
+
+    def test_stalls_reset_with_a_new_transport(self):
+        server = _FakeServer()
+        pool = _pool(server, stall_limit=2)
+        lease = pool.acquire_sftp(1.0)
+        pool.release(lease, socket.timeout("timed out"))
+        self.assertEqual(pool.snapshot()["stalls"], 1)
+        server.transport.close()
+        with pool.sftp(1.0):
+            pass
+        self.assertEqual(pool.snapshot()["stalls"], 0)
+        pool.close()
+
+    def test_nested_call_on_a_lost_transport_fails_plainly(self):
+        server = _FakeServer()
+        pool = _pool(server)
+        with self.assertRaises(MemberUnavailable):
+            with pool.sftp(1.0):
+                server.transport.close()
+                other = _InThread(lambda: pool.acquire_sftp(1.0))  # reconnects
+                self.assertTrue(other.join())
+                pool.release(other.result)
+                with pool.sftp(1.0):
+                    pass
+        self.assertEqual(server.connect_calls, 2)
+        pool.close()
+
+    def test_subsystem_failure_that_finds_the_transport_dead_reconnects(self):
+        server = _FakeServer()
+        pool = _pool(server)
+        with pool.sftp(1.0):
+            pass
+        held = _Holder(pool)  # takes the idle channel
+
+        def die(chan):
+            chan.transport.close()
+            raise socket.timeout("no reply")
+
+        server.transport.subsystem_hook = die
+        with pool.sftp(1.0) as sftp:
+            sftp.stat("/data/x")
+        self.assertEqual(server.connect_calls, 2)
+        held.release()
         pool.close()
 
     def test_path_errors_keep_the_channel(self):
@@ -1163,6 +1258,13 @@ class TestSSHBackendOnThePool(_BackendTestCase):
         modes = [mode for path, mode in self.server.opens if path == "/data/raced.bin"]
         self.assertEqual(modes, ["r+b", "x+b", "r+b"])
         self.assertNotIn("wb", modes)
+
+    def test_write_file_keeps_the_create_error_when_the_file_is_still_absent(self):
+        backend = self._new_backend()
+        self.server.missing.add("/data/locked.bin")
+        self.server.create_errors["/data/locked.bin"] = PermissionError(errno.EACCES, "denied")
+        with self.assertRaises(PermissionError):
+            backend.write_file("/locked.bin", b"abc", 0)
 
     def test_write_file_never_truncates_after_a_connection_error(self):
         backend = self._new_backend()

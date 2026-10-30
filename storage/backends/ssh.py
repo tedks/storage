@@ -369,10 +369,16 @@ class SSHBackend(Backend):
                 try:
                     # 'x' alone sets no write flag in paramiko; '+' does.
                     f = sftp.open(remote_path, 'x+b')
-                except OSError as exc:
-                    if is_connection_error(exc):
+                except OSError as create_error:
+                    if is_connection_error(create_error):
                         raise
-                    f = sftp.open(remote_path, 'r+b')
+                    # Lost a race to another writer, or the create itself
+                    # failed (permissions, quota): only the first is
+                    # recovered by opening what is now there.
+                    try:
+                        f = sftp.open(remote_path, 'r+b')
+                    except FileNotFoundError:
+                        raise create_error from None
             with f:
                 f.seek(offset)
                 f.write(data)

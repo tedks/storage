@@ -40,6 +40,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List
 
+import paramiko
 import pytest
 
 from storage.backends.rsync import RsyncBackend
@@ -1063,7 +1064,8 @@ def test_killed_ssh_session_reconnects_within_the_retry_interval(remote, ssh_bac
     assert elapsed < ssh_backend._reconnect_probe_interval, elapsed
 
 
-def test_session_killed_mid_transfer_is_retried_on_a_new_connection(remote, ssh_backend, tmp_path):
+def test_session_killed_mid_transfer_is_retried_on_a_new_connection(remote, ssh_backend, tmp_path,
+                                                                   monkeypatch):
     """The connection dies under a running download: paramiko reports it as
     an SSHException, the probe finds the transport gone, and the download is
     retried once on a new connection."""
@@ -1074,6 +1076,21 @@ def test_session_killed_mid_transfer_is_retried_on_a_new_connection(remote, ssh_
     assert ssh_backend._pool.connects == 1
     target = tmp_path / "big.bin"
     outcome = {}
+    started, killed = threading.Event(), threading.Event()
+    real_get = paramiko.SFTPClient.get
+
+    def paused_get(self, remotepath, localpath, callback=None, **kwargs):
+        # The first download stops after its first chunk until sshd is
+        # killed, so the kill always lands mid-transfer.
+        def progress(done, total):
+            if not started.is_set():
+                started.set()
+                killed.wait(timeout=60)
+            if callback is not None:
+                callback(done, total)
+        return real_get(self, remotepath, localpath, callback=progress, **kwargs)
+
+    monkeypatch.setattr(paramiko.SFTPClient, "get", paused_get)
 
     def download():
         try:
@@ -1083,8 +1100,10 @@ def test_session_killed_mid_transfer_is_retried_on_a_new_connection(remote, ssh_
 
     worker = threading.Thread(target=download, daemon=True)
     worker.start()
-    assert _wait_for(lambda: target.exists() and target.stat().st_size > 0, timeout=30.0)
+    assert started.wait(timeout=30.0)
     remote.exec(member, "pkill -u storage -x sshd")
+    assert _wait_for(lambda: _established_ssh_connections(remote, member) == 0, timeout=10.0)
+    killed.set()
     worker.join(timeout=120)
     assert not worker.is_alive()
     assert "error" not in outcome, outcome

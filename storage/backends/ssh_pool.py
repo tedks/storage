@@ -18,9 +18,9 @@ the pool and never marks the member down. A broken transport (EOF, an
 inactive transport, a connection-level OSError) is closed, which wakes every
 operation still running on it; the next lease reconnects. A timed-out
 request is ambiguous, so the transport is probed with a channel open before
-deciding; a transport that answers probes while its requests keep timing
-out (a hung remote filesystem) is marked down after a few such stalls in a
-row.
+deciding; a transport that answers probes while its SFTP requests keep
+timing out (a hung remote filesystem) is marked down after a few such
+stalls in a row.
 
 Leases do not depend on which thread holds them beyond one call: libfuse's
 worker threads give Python a fresh thread state per callback
@@ -178,7 +178,7 @@ class SFTPLease:
     """One SFTP channel, held by one operation (and its nested calls)."""
 
     __slots__ = ("client", "generation", "interactive", "owner", "depth",
-                 "verdict", "error", "_timeouts")
+                 "verdict", "error", "acquired_at", "_timeouts")
 
     def __init__(self, client, generation: int, interactive: bool, owner: int):
         self.client = client
@@ -190,6 +190,7 @@ class SFTPLease:
         # The first connection error a call on this lease raised, kept so the
         # outermost release acts on it even if an outer caller swallowed it.
         self.error: Optional[BaseException] = None
+        self.acquired_at = time.monotonic()
         self._timeouts: List[Optional[float]] = []
 
     def _set_timeout(self, timeout: float) -> None:
@@ -240,8 +241,10 @@ class MemberConnection:
             bulk_wait: how long a background request waits for a channel
                 (connect_timeout by default). Nobody is waiting on these, and
                 a channel can stay busy for a whole transfer.
-            stall_limit: consecutive timed-out requests on a transport that
-                still answers probes before the member is marked down.
+            stall_limit: consecutive timed-out SFTP requests on one transport
+                that still answers probes before the member is marked down.
+                Exec commands do not count: a checksum of a large file may
+                simply take longer than its timeout.
         """
         if sftp_channels < 1 or exec_channels < 1:
             raise ValueError("a member needs at least one SFTP and one exec channel")
@@ -272,9 +275,12 @@ class MemberConnection:
         # discarded rather than installed over them.
         self._epoch = 0
         self._next_retry_at = 0.0
-        # Requests that timed out on a transport that then answered a probe,
-        # since the last request that succeeded.
+        # SFTP requests that timed out on the current transport while it went
+        # on answering probes, since the last request that succeeded; and
+        # when the last one was counted (a stall counts only if its lease
+        # began after that, so a burst of concurrent timeouts is one).
         self._stalls = 0
+        self._last_stall_at = float("-inf")
 
         self._sftp_channels = sftp_channels
         self._exec_channels = exec_channels
@@ -459,6 +465,8 @@ class MemberConnection:
                 self._idle = []
                 self._sftp_cap = self._sftp_channels
                 self._exec_cap = self._exec_channels
+                self._stalls = 0
+                self._last_stall_at = float("-inf")
                 self._state = _State.CONNECTED
                 self._probing = False
                 self._next_retry_at = 0.0
@@ -481,11 +489,13 @@ class MemberConnection:
                             self.name, exc)
         self._close_all(closables)
 
-    def _probe(self, generation: int, exc: BaseException, stall: bool = True) -> None:
+    def _probe(self, generation: int, exc: BaseException,
+               stalled_since: Optional[float] = None) -> None:
         """Decide whether a timeout or channel error means the transport is dead.
 
-        With stall, a transport that answers counts the request as a stall;
-        enough of them in a row mark the member down.
+        stalled_since, for an SFTP request that timed out, is when its lease
+        was taken: if the transport answers, the request counts as a stall,
+        and enough of them in a row mark the member down.
         """
         with self._cond:
             if generation != self._generation or self._state is not _State.CONNECTED:
@@ -499,19 +509,33 @@ class MemberConnection:
             self._fail_transport(generation, probe_exc)
             return
         _close_quietly(chan)
-        if not stall:
+        if stalled_since is None:
             return
+        closables = None
         with self._cond:
+            # The transport may have been replaced while the probe ran; a
+            # stall on the old one says nothing about the new one.
+            if generation != self._generation or self._state is not _State.CONNECTED:
+                return
+            if stalled_since <= self._last_stall_at:
+                return  # part of a burst already counted
             self._stalls += 1
+            self._last_stall_at = time.monotonic()
             stalls = self._stalls
-        if stalls >= self._stall_limit:
-            self.logger.warning(
-                "SSH member %s: %d requests in a row timed out while the connection "
-                "answered (last: %r); marking it unavailable", self.name, stalls, exc)
-            self.mark_down()
-        else:
+            if stalls >= self._stall_limit:
+                self._epoch += 1
+                closables = self._drop_locked()
+                self._set_down_locked()
+                self._cond.notify_all()
+        if closables is None:
             self.logger.debug("SSH member %s: transport answered a probe after %r",
                               self.name, exc)
+            return
+        self.logger.warning(
+            "SSH member %s: %d requests in a row timed out while the connection "
+            "answered (last: %r); marking it unavailable", self.name, stalls, exc)
+        self._close_all(closables)
+        self._notify_availability(False)
 
     def check(self, reason: BaseException) -> None:
         """Probe the current transport; close it if it does not answer.
@@ -522,13 +546,14 @@ class MemberConnection:
         """
         with self._cond:
             generation = self._generation
-        self._probe(generation, reason, stall=False)
+        self._probe(generation, reason)
 
-    def _after_error(self, generation: int, verdict: _Verdict, exc: BaseException) -> None:
+    def _after_error(self, generation: int, verdict: _Verdict, exc: BaseException,
+                     stalled_since: Optional[float] = None) -> None:
         if verdict is _Verdict.TRANSPORT:
             self._fail_transport(generation, exc)
         elif verdict is _Verdict.PROBE:
-            self._probe(generation, exc)
+            self._probe(generation, exc, stalled_since)
 
     def _shrink_locked(self, generation: int, kind: str, pending: int = 0) -> None:
         """A channel was refused: cap the pool at what the server allowed.
@@ -580,6 +605,12 @@ class MemberConnection:
         with self._cond:
             held = self._held.get(owner)
             if held is not None:
+                if held.generation != self._generation:
+                    # The caller's channel went with its transport; so would
+                    # this call. Fail it plainly; the outer call decides.
+                    raise MemberUnavailable(
+                        f"SSH member {self.name}: the connection under this "
+                        f"operation was lost")
                 held.depth += 1
                 held._set_timeout(timeout)
                 return held
@@ -651,10 +682,14 @@ class MemberConnection:
                     raise
                 if chan is not None:
                     # The channel opened, so the transport answered just now;
-                    # a stalled subsystem start is settled by a probe.
-                    if is_connection_error(exc):
-                        self._probe(generation, exc)
-                    raise
+                    # a stalled subsystem start is settled by a probe, and
+                    # only a transport the probe dropped is worth a reconnect.
+                    if not is_connection_error(exc):
+                        raise
+                    self._probe(generation, exc)
+                    if self.is_current(generation):
+                        raise
+                    continue
                 if transport.is_active() and not _is_open_timeout(exc):
                     raise  # the transport is fine; the open was rejected
                 # The open got no reply in time, or found the transport gone.
@@ -682,6 +717,7 @@ class MemberConnection:
         lease.owner = owner
         lease.verdict = _Verdict.HEALTHY
         lease.error = None
+        lease.acquired_at = time.monotonic()
         if not interactive:
             self._bulk_leased += 1
         self._held[owner] = lease
@@ -724,7 +760,9 @@ class MemberConnection:
             self._cond.notify_all()
         self._close_all(closables)
         if final_verdict >= _Verdict.PROBE and final_error is not None:
-            self._after_error(lease.generation, final_verdict, final_error)
+            stalled_since = (lease.acquired_at
+                             if isinstance(final_error, socket.timeout) else None)
+            self._after_error(lease.generation, final_verdict, final_error, stalled_since)
 
     @contextmanager
     def sftp(self, timeout: float) -> Iterator[paramiko.SFTPClient]:
