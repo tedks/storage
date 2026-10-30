@@ -187,6 +187,8 @@ class StorageFS(Operations):
         self._member_checks_lock = threading.Lock()
         # Members whose failed revalidation has been logged; cleared by the
         # member's next successful stat, so an outage is logged once.
+        # Deliberately unlocked: with fuse_threads a race costs at most a
+        # duplicate or missed log line.
         self._revalidate_outages: Set[str] = set()
         # A check that found a change pins the refetch to the member it
         # checked (consumed by _select_backend_for_read). If that member is
@@ -2171,10 +2173,12 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
         fuse_threads: Run libfuse's multithreaded loop instead of nothreads.
             The handlers lock as storage/locks.py describes. libfuse 2 has no
             thread cap (a worker is started whenever none is idle, and idle
-            workers above 10 exit); the member transport pools bound what
-            reaches the members. On unmount libfuse joins every worker
-            before destroy, so an unmount waits for the slowest member call
-            in flight.
+            workers above 10 exit), so a burst of requests can start as many
+            threads, each waiting on a path lock or a member channel; the
+            member transport pools bound only what reaches the members
+            (ditz threading-fuse-worker-cap). On unmount libfuse joins every
+            worker before destroy, so an unmount waits for the slowest member
+            call in flight.
 
     Raises:
         PermissionError: If allow_other=True but not running as root and user_allow_other not set

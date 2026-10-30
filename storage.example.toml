@@ -37,9 +37,9 @@ revalidate_after = 60
 # entry_timeout = 60
 # negative_timeout = 10
 # Serve FUSE requests on several threads, so a slow member call for one file
-# does not hold up listings and reads of others. Off by default until it has
-# been field-tested.
-fuse_threads = false
+# does not hold up listings, stats and reads of others. Off by default until
+# it has been field-tested.
+# fuse_threads = true
 backends = [
   "ssh://user@storage-host.example:/srv/raid/media/",
   "ssh://user@storage-host.example:/srv/chunk0/media/",

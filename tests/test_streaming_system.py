@@ -10,7 +10,6 @@ import errno
 import json
 import os
 import shutil
-import subprocess
 import tempfile
 import threading
 import time
@@ -19,7 +18,7 @@ from pathlib import Path
 
 from storage.backends.local import LocalBackend
 from storage.fs import StorageFS
-from tests.fuse_mount import run_fuse
+from tests.fuse_mount import run_fuse, stop_fuse
 
 
 class SlowRemoteLoopbackBackend(LocalBackend):
@@ -84,21 +83,19 @@ class TestStreamingSystemRegression(unittest.TestCase):
             self.skipTest(f"Mount unavailable in this environment: {exc}")
 
     def tearDown(self):
-        for cmd in (
-            ["fusermount", "-u", str(self.mount_dir)],
-            ["umount", str(self.mount_dir)],
-        ):
-            try:
-                subprocess.run(cmd, check=False, timeout=5)
-            except Exception:
-                pass
-
+        # After the FUSE thread has finished, so this destroy never runs
+        # beside libfuse's own (or a request still in flight).
+        problems = stop_fuse(self.mount_dir, self.mount_thread)
+        if os.path.ismount(self.mount_dir):
+            self.fail(f"mount teardown: {problems}")
         try:
             self.fs.destroy("/")
         except Exception:
             pass
 
         shutil.rmtree(self.temp_dir, ignore_errors=True)
+        if problems:
+            self.fail(f"mount teardown: {problems}")
 
     def _wait_for(self, predicate, timeout: float = 8.0) -> bool:
         deadline = time.time() + timeout
@@ -186,6 +183,7 @@ class TestStreamingSystemRegression(unittest.TestCase):
 
 class TestStreamingSystemRegressionThreaded(TestStreamingSystemRegression):
     fuse_threads = True
+
 
 if __name__ == "__main__":
     unittest.main()

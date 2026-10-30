@@ -33,7 +33,7 @@ Target behavior:
 
 ## Constraints and Assumptions
 
-1. FUSE callbacks currently run with `nothreads=True`; this means streaming implementation must use internal threads safely without expecting parallel FUSE calls.
+1. FUSE callbacks ran with `nothreads=True` when this was written; with the `fuse_threads` option (default off) they can run in parallel, so streaming must also be safe under parallel FUSE calls (it is: registration and attach take `prefetch_sessions_lock`, and handlers hold the path locks in `storage/locks.py`).
 2. Existing backend API already exposes range reads via `Backend.read_file(path, offset, size)`.
 3. Cache size limits must still be respected before streaming starts.
 4. Integrity/conflict machinery should continue to work with final cached files.

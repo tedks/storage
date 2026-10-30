@@ -20,7 +20,7 @@ import yaml
 
 from storage.fs import StorageFS
 from storage.backends.local import LocalBackend
-from tests.fuse_mount import run_fuse
+from tests.fuse_mount import run_fuse, stop_fuse
 
 
 class BaseConflictMountTest(unittest.TestCase):
@@ -75,20 +75,15 @@ class BaseConflictMountTest(unittest.TestCase):
         time.sleep(1.0)
 
     def tearDown(self):
-        try:
-            subprocess.run(
-                ["fusermount", "-u", str(self.mount_dir)],
-                check=False,
-                timeout=5,
-            )
-        except Exception:
-            pass
-
-        time.sleep(0.5)
+        problems = stop_fuse(self.mount_dir, self.mount_thread)
+        if os.path.ismount(self.mount_dir):
+            self.fail(f"mount teardown: {problems}")
 
         import shutil
 
         shutil.rmtree(self.temp_dir, ignore_errors=True)
+        if problems:
+            self.fail(f"mount teardown: {problems}")
 
     # Utility helpers -----------------------------------------------------
 
@@ -273,6 +268,7 @@ class TestConflictMergeThreaded(TestConflictMerge):
 
 class TestRemoteConflictMountThreaded(TestRemoteConflictMount):
     fuse_threads = True
+
 
 if __name__ == "__main__":
     unittest.main()

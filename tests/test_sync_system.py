@@ -16,7 +16,7 @@ from pathlib import Path
 
 from storage.fs import StorageFS
 from storage.backends.local import LocalBackend
-from tests.fuse_mount import run_fuse
+from tests.fuse_mount import run_fuse, stop_fuse
 
 
 class _MountedCase(unittest.TestCase):
@@ -91,18 +91,14 @@ class _MountedCase(unittest.TestCase):
 
     def tearDown(self):
         """Clean up and unmount"""
-        # Unmount
-        try:
-            subprocess.run(['fusermount', '-u', str(self.mount_dir)],
-                          timeout=5.0, check=False)
-        except Exception:
-            pass
-
-        # Wait a bit for unmount
-        time.sleep(0.5)
+        problems = stop_fuse(self.mount_dir, self.mount_thread)
+        if os.path.ismount(self.mount_dir):
+            self.fail(f"mount teardown: {problems}")
 
         # Clean up temp directory
         shutil.rmtree(self.temp_dir, ignore_errors=True)
+        if problems:
+            self.fail(f"mount teardown: {problems}")
 
     def _wait_for(self, predicate, timeout=5.0):
         deadline = time.time() + timeout
@@ -437,10 +433,6 @@ class TestKernelCacheRefetch(_MountedCase):
         self._read_after_revalidation("shrink.bin", b"a" * 200, b"d" * 50)
 
 
-if __name__ == '__main__':
-    unittest.main()
-
-
 class TestSyncSystemIntegrationThreaded(TestSyncSystemIntegration):
     fuse_threads = True
 
@@ -451,3 +443,7 @@ class TestKernelCacheVisibilityThreaded(TestKernelCacheVisibility):
 
 class TestKernelCacheRefetchThreaded(TestKernelCacheRefetch):
     fuse_threads = True
+
+
+if __name__ == '__main__':
+    unittest.main()

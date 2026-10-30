@@ -86,7 +86,7 @@ from .mount_profiles import (
     default=None,
     help=(
         "Serve FUSE requests on several threads, so one slow member call does not "
-        "hold up requests for other files (default off)."
+        "hold up listings, stats and reads of other files (default off)."
     ),
 )
 def mount(

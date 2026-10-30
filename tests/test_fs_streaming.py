@@ -564,7 +564,7 @@ class TestFSStreamingIntegration(unittest.TestCase):
         return session
 
     def test_streaming_reopen_while_stopped_worker_alive_gets_fresh_session(self):
-        # The mount is single-threaded, so the next open follows the close.
+        # Driven from one thread, so the next open follows the close.
         # If the stopped session's worker is still running then (here a stub
         # reports it alive and returns from join at once, as a worker stuck
         # in a remote fetch past a join timeout would), the open must not
@@ -839,8 +839,9 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.assertEqual(cache_path.read_bytes(), payload)
 
     def test_streaming_stopping_release_does_not_wait_for_the_worker(self):
-        # The mount is single-threaded: a release that waited for a worker
-        # mid-chunk would stall every other operation for the fetch.
+        # A release that waited for a worker mid-chunk would hold the release
+        # (and, with the single-threaded loop, every other operation) for the
+        # fetch.
         self.backend.range_delay = 1.5
         payload = os.urandom(512 * 1024)
         (self.backend_dir / "slow.bin").write_bytes(payload)
@@ -917,8 +918,9 @@ class TestFSStreamingIntegration(unittest.TestCase):
 
     def test_streaming_failed_release_does_not_wait_for_worker_mid_fetch(self):
         # A foreground fetch fails while the worker is blocked in a remote
-        # read. The mount is single-threaded, so the last release must return
-        # without waiting for that read; the worker cleans up when it ends.
+        # read. The last release must return without waiting for that read
+        # (with the single-threaded loop it would stall the mount); the
+        # worker cleans up when it ends.
         self.backend.worker_gate = threading.Event()
         payload = os.urandom(256 * 1024)
         (self.backend_dir / "errjoin.bin").write_bytes(payload)
