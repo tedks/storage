@@ -1,0 +1,19 @@
+id: conflicts-inflight-replication-split
+title: Size-first split shows a file mid-replication as a conflict at the first listing
+desc: 'PR #140 round 1 (Claude nit): copy_from_local writes in place, so a listing
+  taken between replica uploads of a size-changing edit splits at once (master split
+  one readdir later, after hashes). Consider skipping names whose index row is not
+  CLEAN or that have a pending sync task.'
+type: task
+component: fs
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-30T18:07:22-00:00
+references: []
+log_events:
+- time: 2026-10-30T18:07:22-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
