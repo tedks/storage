@@ -1,0 +1,31 @@
+id: field-listing-downloads-to-hash
+title: Listings download whole files to hash equal-size copies when the member has
+  no xxh128sum
+desc: 'Field test 2026-10-30 (lane field-test, read-only mount of a 3-member SSH profile,
+  all members on one host, master 39e4b79). A listing that sees a name on several
+  members with equal size schedules a checksum per member; get_fast_checksum runs
+  xxh128sum over exec and, when that fails, downloads the whole file to a temp file
+  under /tmp with sftp.get and hashes it locally. Measured by counting paramiko rekeys
+  (one per ~512 MiB received per transport) and exec channel opens: a discovery mount
+  that only listed (about 2600 member requests, no file opened) received ~5 GiB, all
+  after unmount; the threads-off session ~11.5 GiB with 1110 exec channels; the threads-on
+  session ~19 GiB beyond the 1.8 GiB the harness read, with 1243 exec channels. One
+  temp file reached 8.5 GB. The member host''s sshd is OpenSSH 7.6, consistent with
+  an xxhash too old for xxh128sum (not verified on the host: the lane may not touch
+  it). Spec D4 (conflicts-off-browse-path, PR 1) removes the download fallback for
+  view hashes; this issue records the field cost and should close with it. Also: the
+  temp file goes to the system temp dir, not the cache, so it is outside cache_size
+  accounting.'
+type: bugfix
+component: performance
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-30T17:06:43-00:00
+references: []
+log_events:
+- time: 2026-10-30T17:06:43-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
