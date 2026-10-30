@@ -1,0 +1,22 @@
+id: prefix-marker-owner-unreadable-copy
+title: A whole-file fetch of an owner-unreadable member file fails at the prefix-marker
+  check
+desc: 'Council round 5 on #146 (Claude, nit, exotic). _remove_prefix_marker reads
+  the marker with getxattr, which needs read permission; a local member file owned
+  by another user and readable to us only through group/other bits (0044) keeps that
+  mode in copy2, so the temp copy we own is owner-unreadable, getxattr gives EACCES,
+  and the fetch fails (it used to succeed). Fix: on EACCES, add S_IRUSR|S_IWUSR for
+  the check and removal, then restore.'
+type: bugfix
+component: cache
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-30T17:37:16-00:00
+references: []
+log_events:
+- time: 2026-10-30T17:37:16-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
