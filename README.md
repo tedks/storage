@@ -418,6 +418,7 @@ Configuration is hierarchical - child directories inherit from parents, with the
 1. Write to local cache first (ensure at least one copy)
 2. Mark file as dirty in state database
 3. Background sync to configured replicas (directory operations run best-effort synchronously and queue member-specific retries when any replica is offline)
+4. A rename or unlink of a file waits for its upload if one is in flight, and a directory rename for the uploads under it, so a member never receives a file under a name it no longer has
 
 **Cache Management:**
 1. Track file access times for LRU
@@ -476,6 +477,7 @@ Not implemented:
   defragmentation and hot/cold placement are stubs in
   `storage/spacemgmt.py`; the escalation chain in [DESIGN.md](DESIGN.md)
   describes the intent, not the code.
+- Deleting member copies: an unlink through the mount removes the cached copy and the index row, but a file that has synced stays on its members and is listed again.
 - Event-driven sync scheduling ([#17](https://github.com/tedks/storage/issues/17)); the sync monitor polls.
 
 ## Requirements
