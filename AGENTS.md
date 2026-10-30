@@ -114,7 +114,7 @@ The gates are `test_suite`s over those `py_test`s:
 | Target | Runs |
 |--------|------|
 | `//:storage_tests_fast_gate` | `storage_tests_nonmounting` (`storage_tests_sandboxed`, `storage_tests_resilience_gradient`: every module that does not mount, sandboxed) and `storage_build_srcs_check` |
-| `//:storage_tests_mounted_system_gate` | `storage_tests_conflicts_integration`, `storage_tests_streaming_system`, `storage_tests_sync_system`: the modules that mount FUSE, unsandboxed |
+| `//:storage_tests_mounted_system_gate` | `storage_tests_conflicts_integration`, `storage_tests_fuse_thread_state`, `storage_tests_streaming_system`, `storage_tests_sync_system`: the modules that mount FUSE, unsandboxed |
 | `//:storage_tests_resilience_gate` | `storage_tests_resilience_gradient`, `storage_tests_streaming_system` |
 | `//:storage_tests` | the fast and mounted gates: every module except the remote gate's |
 | `//:storage_tests_remote_gate` | `storage_tests_remote_system`: the SSH backend, rsync over SSH, the remote watcher and a FUSE mount over two SSH members, against sshd in Docker containers; needs Docker and FUSE (see below) |

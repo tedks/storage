@@ -1,4 +1,5 @@
 import concurrent.futures
+import contextvars
 import errno
 import os
 import stat
@@ -568,7 +569,10 @@ class NamespaceService:
             future = None
             if executor is not None:
                 try:
-                    future = executor.submit(self._list_member, backend, path)
+                    # In the caller's context, so a listing for a FUSE
+                    # request stays interactive on the member's pool.
+                    future = executor.submit(
+                        contextvars.copy_context().run, self._list_member, backend, path)
                 except RuntimeError:
                     # shutdown() raced the submit.
                     future = None

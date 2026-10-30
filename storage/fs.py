@@ -25,7 +25,7 @@ from fuse import FUSE, FuseOSError, Operations
 from pathlib import Path
 from typing import Dict, Optional, Set, List, Tuple
 
-from .backends.base import Backend
+from .backends.base import Backend, interactive_request
 from .cache import PARTIAL_SUFFIX, CacheManager
 from .locks import NamespaceLock, PathLocks
 from .cache_metadata import XATTR_CACHE_METADATA_NAME, scan_cache_entries
@@ -112,6 +112,12 @@ class StorageFS(Operations):
             if name.startswith(prefix):
                 return True
         return False
+
+    def __call__(self, op, *args):
+        # Every FUSE operation has a caller waiting on it: members with a
+        # connection pool serve it from the channel kept for that.
+        with interactive_request():
+            return super().__call__(op, *args)
 
     def __init__(self, cache_root: Path, state_db: Path, backends: Dict[str, Backend],
                  cache_size: int, num_sync_workers: int = 2, start_sync: bool = True,

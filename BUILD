@@ -14,6 +14,7 @@ py_library(
         "storage/backends/local.py",
         "storage/backends/rsync.py",
         "storage/backends/ssh.py",
+        "storage/backends/ssh_pool.py",
         "storage/cache.py",
         "storage/locks.py",
         "storage/cache_metadata.py",
@@ -160,6 +161,21 @@ py_test(
     tags = ["local"],
 )
 
+# Records what Python thread state survives between libfuse callbacks, with
+# and without libfuse's worker threads.
+py_test(
+    name = "storage_tests_fuse_thread_state",
+    srcs = [
+        "tests/pytest_main.py",
+        "tests/test_fuse_thread_state.py",
+    ],
+    main = "tests/pytest_main.py",
+    precompile = "disabled",
+    deps = TEST_DEPS,
+    env_inherit = ["FUSE_LIBRARY_PATH"],
+    tags = ["local"],
+)
+
 py_test(
     name = "storage_tests_streaming_system",
     srcs = [
@@ -276,6 +292,7 @@ test_suite(
     name = "storage_tests_mounted_system_gate",
     tests = [
         ":storage_tests_conflicts_integration",
+        ":storage_tests_fuse_thread_state",
         ":storage_tests_streaming_system",
         ":storage_tests_sync_system",
     ],
