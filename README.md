@@ -273,8 +273,12 @@ its address are not grouped and get no warning.
 
 Symbolic links cannot be created through the mount: `ln -s` fails with
 `EPERM` ("Operation not permitted"), because a link would live only in the
-local cache and vanish with it. Links that already exist on a member are
-listed and followed as the member reports them.
+local cache and vanish with it, so `cp -a`, `rsync -l` or `tar x` into the
+mount fail for each link. Links that already exist on a member are not
+supported either: an SSH member reports the link's target, so the name
+shows as a regular file or directory; a local member reports the link
+itself, which the mount lists but cannot read until the file is fetched,
+and then caches as a regular file.
 
 #### SSH host keys
 

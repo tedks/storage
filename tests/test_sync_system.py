@@ -5,6 +5,7 @@ These tests mount an actual FUSE filesystem and verify sync behavior
 end-to-end.
 """
 
+import errno
 import unittest
 import tempfile
 import time
@@ -328,8 +329,9 @@ class TestKernelCacheVisibility(_MountedCase):
 
         (m / "c.txt").write_text("three")
         # Symlinks are refused until they replicate (oq-symlink-through-mount B).
-        with self.assertRaises(PermissionError):
+        with self.assertRaises(PermissionError) as refused:
             os.symlink("b.txt", m / "link")
+        self.assertEqual(errno.EPERM, refused.exception.errno)
         self.assertFalse(os.path.lexists(m / "link"))
         os.mkdir(m / "sub")
         self.assertEqual(["b.txt", "c.txt", "sub"], sorted(os.listdir(m)))

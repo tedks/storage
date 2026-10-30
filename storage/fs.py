@@ -2136,8 +2136,9 @@ def fuse_mount_options(backends: Dict[str, Backend], *, enable_watchers: bool,
     defaults to attr_timeout; ac_attr_timeout=0 states that a getattr
     follows every open rather than leaving it implied.
 
-    Writes through the mount stay visible at once: create, mkdir, symlink,
-    unlink, rmdir and rename update the kernel's entries themselves.
+    Writes through the mount stay visible at once: create, mkdir, unlink,
+    rmdir and rename (and symlink, refused for now) update the kernel's
+    entries themselves.
 
     The override arguments replace the defaults (per profile); each, and
     fresh_window, must be finite and 0 or more.
