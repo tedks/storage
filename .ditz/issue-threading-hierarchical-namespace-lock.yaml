@@ -1,0 +1,23 @@
+id: threading-hierarchical-namespace-lock
+title: Hierarchical namespace locking so a directory rename or rmdir waits only for
+  its subtree
+desc: 'From PR #134 council round 1 (Claude seat). Directory rename and rmdir take
+  the namespace lock exclusive, which waits for every in-flight path-locked handler
+  on the mount (a multi-GB fetch, a member-copy upload), and the writer preference
+  queues every new open behind it. Under fuse_threads an mv of a directory therefore
+  stalls the mount for the slowest transfer, like nothreads does for every request
+  today. Option: intent locks (ancestors shared, subtree exclusive) keyed on canonical
+  path. Not blocking stage 3; measure in the field test first.'
+type: task
+component: performance
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-30T01:10:39-00:00
+references: []
+log_events:
+- time: 2026-10-30T01:10:39-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
