@@ -1,0 +1,22 @@
+id: ssh-pool-watchdog-thread
+title: 'ssh_pool: one watchdog thread instead of a Timer per bounded channel request'
+desc: 'Council round 1 on PR #132 (Claude seat nit). run_bounded starts a threading.Timer
+  per channel open and per exec command, to close the channel if paramiko''s unbounded
+  wait for a reply (invoke_subsystem, exec_command) does not return. At current rates
+  (a channel open when the pool grows, an exec per remote checksum or xattr) the thread
+  churn is negligible. Once FUSE goes multithreaded (D6) and conflict checks hash
+  many files, a single watchdog thread with a deadline heap would avoid it. Deferred:
+  no measured cost.'
+type: task
+component: fs
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-30T01:15:24-00:00
+references: []
+log_events:
+- time: 2026-10-30T01:15:24-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
