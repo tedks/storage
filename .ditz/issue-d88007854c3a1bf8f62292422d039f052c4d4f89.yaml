@@ -15,3 +15,19 @@ log_events:
   who: Ted Smith
   what: created
   comment: ""
+- time: 2026-10-30T19:32:43-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Found while fixing ded6d15 (PR #153, tests only). If a process in another
+    mount namespace (a container, a sandbox such as Bazel linux-sandbox, a systemd
+    unit with its own namespace) copies a live mount, fusermount -u succeeds and the
+    mount disappears from the original namespace, but the kernel keeps the filesystem
+    alive and never aborts the FUSE connection, so the daemon''s loop stays in its
+    read of /dev/fuse and StorageFS.destroy never runs (workers, watchers and the
+    mount lock stay held) until that other process exits. PR #153 works around it
+    in test teardown only (fuse_exit on a handle from the first request plus tgkill
+    SIGUSR2 to the reading threads). Product options: have ''storage umount'' detect
+    a still-running daemon after a successful unmount and ask it to exit through the
+    control socket; or give the daemon a signal-based exit path. Not decided; needs
+    a ruling on whether the daemon should self-exit when its mountpoint leaves its
+    own namespace.'
