@@ -1537,7 +1537,10 @@ class TestFSStreamingIntegration(unittest.TestCase):
 
         def reader():
             try:
-                results["reader"] = self.fs.open('/mirror.bin', os.O_RDONLY)
+                # The unlocked body: StorageFS.open holds the path's lock, so
+                # the write-open below could not run inside this open through
+                # it; this drives the streaming manager's own refusal.
+                results["reader"] = self.fs._open('/mirror.bin', os.O_RDONLY)
             except Exception as exc:
                 results["reader"] = exc
 
