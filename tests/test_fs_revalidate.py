@@ -361,6 +361,26 @@ class TestRevalidateAfterSync(RevalidateTestBase):
         self.assertEqual(inode, self.cache_inode("new.txt"))
 
 
+    def test_failed_post_sync_stat_drops_that_members_baseline(self):
+        """After an upload the member's old stat no longer describes it; if
+        the stat that would replace it fails, the baseline goes (the next
+        check uses the rule for a member without one) and the others stay."""
+        fd = self.fs.create("/new.txt", 0o644)
+        self.fs.write("/new.txt", b"written here", 0, fd)
+        self.fs.release("/new.txt", fd)
+        cache_path = self.cache_dir / "new.txt"
+        identity = self.fs._cache_identity(os.lstat(cache_path))
+        self.fs._store_member_check("/new.txt", cache_path, identity,
+                                    {"member": (12, 1.0), "other": (12, 2.0)})
+
+        with patch.object(self.member, "stat", side_effect=OSError("connection reset")):
+            self.fs._record_member_written("/new.txt", self.member, cache_path)
+
+        self.assertEqual({"other": (12, 2.0)}, self.fs._member_checks["/new.txt"].members)
+        self.assertEqual({"other": (12, 2.0)},
+                         self.fs._load_persisted_members(cache_path, identity))
+
+
 class TestRevalidateSftpLikeMember(RevalidateTestBase):
     """Transfers stamp the current time, so member and cache mtimes differ."""
 
