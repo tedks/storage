@@ -587,6 +587,19 @@ class SSHBackend(Backend):
     # ------------------------------------------------------------------ #
     # Optional capabilities used by conflict detection
     # ------------------------------------------------------------------ #
+    def filesystem_identity(self):
+        """The device id of the remote root (`stat -c %d`), on this host and port."""
+        try:
+            cmd = f"stat -L -c %d -- {self._shell_quote(str(self.remote_path))} 2>/dev/null"
+            rc, stdout = self._pool.run_command(cmd, self.connect_timeout)
+            text = stdout.decode(errors="replace").strip()
+            if rc != 0 or not text.isdigit():
+                raise ValueError(f"unusable stat output (exit {rc})")
+            return (self.host, self.port, int(text))
+        except Exception as exc:
+            self.logger.debug("member %s: filesystem probe failed: %s", self.name, exc)
+            return None
+
     def _shell_quote(self, value: str) -> str:
         return shlex.quote(value)
 

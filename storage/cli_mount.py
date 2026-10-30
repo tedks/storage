@@ -17,18 +17,28 @@ from .mount_profiles import (
 )
 
 
-def shared_ssh_hosts(backends: Dict[str, Backend]) -> List[Tuple[str, int, List[str]]]:
-    """(host, port, member names) for each SSH host that two or more members use.
+def shared_filesystems(backends: Dict[str, Backend]) -> List[List[str]]:
+    """Member names, in groups of two or more, whose roots sit on one filesystem.
 
-    Grouped by the host as written (case aside) and the port, with no name
-    resolution: members that reach one machine by different names or
-    addresses (an alias, its IP) are not grouped.
+    Members are grouped by Backend.filesystem_identity(): the host string
+    as configured (never resolved) and the device id of the root there. A
+    member on a host of its own cannot share with anyone, so it is not
+    probed (no connection is opened for it). A member whose probe fails
+    drops out of the grouping.
     """
-    groups: Dict[Tuple[str, int], List[str]] = {}
-    for name, backend in backends.items():
+    on_host: Dict[Tuple[str, int], int] = {}
+    for backend in backends.values():
         if isinstance(backend, SSHBackend):
-            groups.setdefault((backend.host.lower(), backend.port), []).append(name)
-    return [(host, port, names) for (host, port), names in groups.items() if len(names) > 1]
+            key = (backend.host, backend.port)
+            on_host[key] = on_host.get(key, 0) + 1
+    groups: Dict[Tuple[str, int, int], List[str]] = {}
+    for name, backend in backends.items():
+        if isinstance(backend, SSHBackend) and on_host[(backend.host, backend.port)] < 2:
+            continue
+        identity = backend.filesystem_identity()
+        if identity is not None:
+            groups.setdefault(identity, []).append(name)
+    return [names for names in groups.values() if len(names) > 1]
 
 
 @click.command()
@@ -210,10 +220,10 @@ def mount(
     mountpoint_path.mkdir(parents=True, exist_ok=True)
 
     backends = create_storage_members(resolved.member_specs, resolved.key_file)
-    for host, port, names in shared_ssh_hosts(backends):
+    for names in shared_filesystems(backends):
         click.echo(
-            f"Warning: members {', '.join(names)} share the SSH host {host}:{port}; they "
-            "compete for its network link and disks.",
+            f"Warning: members {', '.join(names)} store on the same filesystem; "
+            "their replicas share one disk and give no redundancy.",
             err=True,
         )
 

@@ -1,5 +1,6 @@
 """Local filesystem storage-member implementation."""
 
+import logging
 import os
 import shutil
 from pathlib import Path
@@ -182,6 +183,14 @@ class LocalBackend(Backend):
             os.close(fd)
         except Exception:
             pass
+
+    def filesystem_identity(self):
+        try:
+            return ("", 0, os.stat(self.root_path).st_dev)
+        except OSError as exc:
+            logging.getLogger(__name__).debug(
+                "member %s: filesystem probe failed: %s", self.name, exc)
+            return None
 
     def __repr__(self):
         return f"LocalBackend(name={self.name}, root={self.root_path})"

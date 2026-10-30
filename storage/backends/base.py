@@ -231,6 +231,16 @@ class Backend(ABC):
         pass
 
     @abstractmethod
+    def filesystem_identity(self) -> Optional[Tuple[str, int, int]]:
+        """(host, port, device id) of the filesystem holding this member's root.
+
+        Two members with equal identities store on one disk. The host is
+        the literal string the member was configured with ("" for a local
+        member), never resolved. None when unknown or the probe failed;
+        callers treat that as "no information", not an error.
+        """
+        return None
+
     def get_free_space(self) -> Optional[int]:
         """Get free space in bytes, None if unknown"""
         pass

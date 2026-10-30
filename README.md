@@ -265,11 +265,18 @@ be walked through for up to the fresh window. The profile keys
 `entry_timeout` and `negative_timeout` (seconds) override the first two
 timeouts; attributes have no override.
 
-Members on one SSH host compete for its network link and disks, so the
-mount prints a warning on stderr naming them. Members are grouped by the
-host as written in the profile (case aside) and the port; nothing is
-resolved, so members that reach one machine by different names or by
-its address are not grouped and get no warning.
+Members may share an SSH host; that only means more connections to it.
+What the mount warns about, on stderr, is two or more member roots on one
+filesystem of one host: their replicas share a disk and give no
+redundancy. The warning names the members by their profile names and the
+mount goes on. For SSH and rsync members the mount runs `stat -c %d` on
+each root of a host that has two or more members and compares the device
+ids, grouped by the host as written in the profile (nothing is resolved,
+so one machine under two names is not grouped) and the port; local
+members are compared by `st_dev`. A member whose probe fails is left out
+of the check. Device ids tell mounts apart, not disks: two btrfs
+subvolumes or two partitions of one drive look different and get no
+warning.
 
 Symbolic links cannot be created through the mount: `ln -s` fails with
 `EPERM` ("Operation not permitted"), because a link would live only in the
