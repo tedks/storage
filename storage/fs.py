@@ -1293,29 +1293,33 @@ class StorageFS(Operations):
                     return True
 
                 with self.state_manager.metadata_lock:
-                    # Under the lock the promotion takes: a prefix installed
-                    # after the checks above is still not indexed.
+                    # The check and the new row are one step under the lock
+                    # the promotion takes: a prefix installed meanwhile is
+                    # never indexed.
                     if self._is_unindexed_prefix(canonical_path, cache_path):
                         return True
                     metadata = self.state_manager.get_file_metadata(canonical_path)
-                if not metadata:
-                    config = self._get_config(canonical_path)
-                    metadata = FileMetadata(
-                        virtual_path=canonical_path,
-                        size=st.st_size,
-                        checksum=None,
-                        last_access=time.time(),
-                        last_modified=st.st_mtime,
-                        sync_status=SyncStatus.CLEAN,
-                        replica_count=config.replica_count,
-                        recomputable=config.recomputable,
-                        recompute_cmd=config.recompute_cmd,
-                        encrypted=config.encrypted,
-                        encryption_key_id=None,
-                    )
-                    # Writes the row and mirrors it.
-                    self.cache_manager.store_file_metadata(metadata, cache_path=cache_path)
-                else:
+                    if not metadata:
+                        config = self._get_config(canonical_path)
+                        metadata = FileMetadata(
+                            virtual_path=canonical_path,
+                            size=st.st_size,
+                            checksum=None,
+                            last_access=time.time(),
+                            last_modified=st.st_mtime,
+                            sync_status=SyncStatus.CLEAN,
+                            replica_count=config.replica_count,
+                            recomputable=config.recomputable,
+                            recompute_cmd=config.recompute_cmd,
+                            encrypted=config.encrypted,
+                            encryption_key_id=None,
+                        )
+                        # Writes the row and mirrors it.
+                        self.cache_manager.store_file_metadata(metadata, cache_path=cache_path)
+                        created = True
+                    else:
+                        created = False
+                if not created:
                     # A refetch after eviction: the member's copy is what the
                     # row already calls synced, but the transfer does not keep
                     # the mtime, so the row's stat must follow the new file or

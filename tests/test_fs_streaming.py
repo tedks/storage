@@ -491,8 +491,11 @@ class TestFSStreamingIntegration(unittest.TestCase):
         member_file = self.backend_dir / "marked.bin"
         member_file.write_bytes(b"whole file")
         os.setxattr(str(member_file), PREFIX_XATTR, b"1")
-        vfd = self.fs.open('/marked.bin', os.O_RDWR)
-        self.fs.release('/marked.bin', vfd)
+        # Read-only, as the local member's copy keeps it: removing a user
+        # xattr needs write permission (council round 3, Codex).
+        os.chmod(member_file, 0o444)
+        # The whole-file fetch path (a write-open's; a read-only open streams).
+        self.assertTrue(self.fs._ensure_file_in_cache(self.fs._resolve_path('/marked.bin')))
         cache_path = self.cache_dir / "marked.bin"
         self.assertNotIn(PREFIX_XATTR, os.listxattr(str(cache_path)))
         self.assertIsNotNone(self.fs.state_manager.get_file_metadata('/marked.bin'))

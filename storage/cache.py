@@ -5,7 +5,9 @@ Manages the local cache of files from remote backing filesystems.
 Files are cached on first access and evicted using LRU when space is needed.
 """
 
+import errno
 import os
+import stat as stat_module
 import secrets
 import time
 import threading
@@ -17,6 +19,31 @@ from .backends.base import Backend
 from .cache_metadata import PARTIAL_SUFFIX, PREFIX_XATTR, write_cache_metadata
 from .models import FileMetadata, SyncStatus
 from .state import StateManager
+
+
+def _remove_prefix_marker(path: Path):
+    """Remove the streaming-prefix marker from a whole-file copy.
+
+    Changing a user xattr needs write permission on the file, owner or not,
+    so a read-only copy (a member file's mode is kept) gets owner write for
+    the removal. Absent, or no xattrs on this filesystem: nothing to do. Any
+    other failure raises: a copy that keeps the marker would be served
+    unindexed for good.
+    """
+    try:
+        os.removexattr(path, PREFIX_XATTR)
+        return
+    except OSError as exc:
+        if exc.errno in (errno.ENODATA, errno.ENOTSUP, errno.EOPNOTSUPP):
+            return
+        if exc.errno not in (errno.EACCES, errno.EPERM):
+            raise
+    mode = stat_module.S_IMODE(os.stat(path).st_mode)
+    os.chmod(path, mode | stat_module.S_IWUSR)
+    try:
+        os.removexattr(path, PREFIX_XATTR)
+    finally:
+        os.chmod(path, mode)
 
 
 class CacheManager:
@@ -321,10 +348,7 @@ class CacheManager:
             backend.copy_to_local(source_virtual_path, temp_path)
             # A whole file is never a streaming prefix, whatever xattrs the
             # member's copy came with.
-            try:
-                os.removexattr(temp_path, PREFIX_XATTR)
-            except OSError:
-                pass
+            _remove_prefix_marker(temp_path)
             size = os.lstat(temp_path).st_size
             with self._lock:
                 try:
