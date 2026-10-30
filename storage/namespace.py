@@ -36,7 +36,7 @@ class NamespaceService:
         sync_manager,
         logger,
         resolve_path: Callable[[str], ResolvedPath],
-        schedule_checksum_task: Callable[[Backend, str, Optional[ChecksumBasis]], None],
+        schedule_checksum_task: Callable[..., None],
         partial_suffix: str,
         is_hidden_entry: Callable[[str], bool],
         dir_cache: Dict[str, Dict[str, Set[str]]],
@@ -72,9 +72,13 @@ class NamespaceService:
         # the life of the listing.
         self.negative_window = negative_window
         # Each published snapshot's merge inputs, (cache and member names,
-        # member names by member), so serving it recomputes the conflict
-        # view from the checksums recorded since; dropped with it.
-        self._view_inputs: Dict[str, Tuple[Set[str], Dict[str, Set[str]]]] = {}
+        # member names by member, size splits, wall time of the listing), so
+        # serving it recomputes the conflict view from the checksums
+        # recorded since; dropped with it. Size splits are the listing's
+        # (see _size_splits): they change only with the next listing.
+        self._view_inputs: Dict[
+            str, Tuple[Set[str], Dict[str, Set[str]], Dict[str, Dict[str, int]], float]
+        ] = {}
         self.checksum_records = checksum_records
         self.checksum_lock = checksum_lock
         # The listing state below (entry_attrs, readdir_snapshot and the
@@ -285,7 +289,28 @@ class NamespaceService:
         """Drop a path's names from its parent's listing; listing_lock held.
 
         With bump, a listing of the parent in flight is not published.
+
+        With bump (a member's copy changed: watcher event, release upload,
+        eviction), a name the parent's published listing split by size
+        drops that listing instead (snapshot, view inputs, attributes; the
+        member names stay in dir_cache, which needs dir_cache_lock), so the
+        next readdir lists again: the split came from sizes that just
+        changed, and with watchers the listing would otherwise never
+        refresh. A local write (no bump) changes no member's size, so it
+        does not, and keeps from starving listings of a directory with an
+        active writer.
         """
+        inputs = self._view_inputs.get(parent)
+        if bump and inputs is not None and (
+            Path(path).name in inputs[2] or Path(canonical).name in inputs[2]
+        ):
+            if parent in self._listings_in_flight:
+                self._listing_generation[parent] += 1
+            self.readdir_snapshot.pop(parent, None)
+            self._view_inputs.pop(parent, None)
+            self.entry_attrs.pop(parent, None)
+            self._listing_as_of.pop(parent, None)
+            return
         if bump and parent in self._listings_in_flight:
             self._listing_generation[parent] += 1
         # The path's own attributes live in its parent's listing, under the
@@ -354,20 +379,62 @@ class NamespaceService:
                 )
         return failures
 
+    @staticmethod
+    def _size_splits(
+        backend_entries: Dict[str, Set[str]],
+        backend_attrs: Optional[Dict[str, Dict[str, dict]]],
+    ) -> Dict[str, Dict[str, int]]:
+        """Names on several members whose copies differ in size: {name: {member: size}}.
+
+        Only names whose every copy was listed as a regular file with a size
+        qualify; copies of different sizes cannot hold the same bytes, so
+        the name is a conflict without hashing anything. A directory,
+        symlink or copy listed without attributes leaves the name to the
+        hashes. Equal sizes prove nothing, and neither do equal mtimes: an
+        SSH upload stamps the upload time, while rsync and local copies keep
+        the source's, which is where a divergence would hide.
+        """
+        owners: Dict[str, List[str]] = {}
+        for backend_name, names in backend_entries.items():
+            for name in names:
+                owners.setdefault(name, []).append(backend_name)
+        splits: Dict[str, Dict[str, int]] = {}
+        for name, members in owners.items():
+            if len(members) <= 1:
+                continue
+            sizes: Dict[str, int] = {}
+            for backend_name in members:
+                attrs = (backend_attrs or {}).get(backend_name, {}).get(name) or {}
+                mode, size = attrs.get("st_mode"), attrs.get("st_size")
+                if mode is None or not stat.S_ISREG(mode) or size is None:
+                    break
+                sizes[backend_name] = size
+            else:
+                if len(set(sizes.values())) > 1:
+                    splits[name] = sizes
+        return splits
+
     def _schedule_directory_checksums(
         self,
         dir_path: str,
         backend_entries: Dict[str, Set[str]],
         backend_attrs: Optional[Dict[str, Dict[str, dict]]] = None,
+        size_splits: Optional[Dict[str, Dict[str, int]]] = None,
     ):
         """Queue checksum computations for backend collisions in the directory.
 
-        A directory is skipped by the mode its listing reported; a member is
-        asked with isdir only when its listing carried no attributes. A
-        regular file's listed size, mtime and ctime (None where the member
-        does not report it) go with the task as its basis,
-        so a checksum already recorded from the same basis is not recomputed.
+        Names in size_splits (computed from the listing when not given) are
+        already known to conflict and are not hashed. A directory is skipped
+        by the mode its listing reported. A copy listed without a mode, or
+        as a symlink, is queued with check_dir: the worker asks the member
+        whether it is a directory before hashing, so the FUSE thread never
+        does. A regular file's listed size, mtime and ctime (None where the
+        member does not report it) go with the task as its basis, so a
+        checksum already recorded from the same basis is not recomputed.
+        Only queues; never calls a member.
         """
+        if size_splits is None:
+            size_splits = self._size_splits(backend_entries, backend_attrs)
         owners: Dict[str, Set[str]] = {}
         for backend_name, names in backend_entries.items():
             for name in names:
@@ -378,12 +445,13 @@ class NamespaceService:
             if not backend:
                 continue
             for name in names:
-                if len(owners.get(name, set())) <= 1:
+                if len(owners.get(name, set())) <= 1 or name in size_splits:
                     continue
                 virtual_child = str(Path(dir_path) / name)
                 attrs = (backend_attrs or {}).get(backend_name, {}).get(name) or {}
                 mode = attrs.get("st_mode")
                 basis = None
+                check_dir = False
                 if mode is not None and not stat.S_ISLNK(mode):
                     if stat.S_ISDIR(mode):
                         continue
@@ -394,29 +462,30 @@ class NamespaceService:
                     # No listed mode, or a symlink, which isdir follows. A
                     # symlink's listed attributes are the link's, which do not
                     # change with its target, so it gets no basis.
-                    try:
-                        if backend.isdir(virtual_child):
-                            continue
-                    except Exception:
-                        pass
-                self.schedule_checksum_task(backend, virtual_child, basis)
+                    check_dir = True
+                self.schedule_checksum_task(backend, virtual_child, basis, check_dir=check_dir)
 
     def _apply_conflict_view(
         self,
         dir_path: str,
         base_entries: Set[str],
         backend_entries: Optional[Dict[str, Set[str]]] = None,
+        size_splits: Optional[Dict[str, Dict[str, int]]] = None,
     ) -> Set[str]:
         """
         Convert raw directory entries into conflict-aware view.
 
-        If multiple backends contain the same name with differing checksums,
-        present them as <name>.<backend>. Otherwise present the plain name.
-        backend_entries defaults to the directory's cached member names.
+        If multiple backends contain the same name with differing sizes
+        (size_splits) or, every copy hashed and verified, differing
+        checksums, present them as <name>.<backend>. Otherwise, including
+        while a hash is pending or a copy is unverified, present the plain
+        name. backend_entries defaults to the directory's cached member
+        names, size_splits to none.
         """
         if backend_entries is None:
             with self.dir_cache_lock:
                 backend_entries = dict(self.dir_cache.get(dir_path, {}))
+        size_splits = size_splits or {}
 
         aggregated: Dict[str, Set[str]] = {}
         for backend_name, names in backend_entries.items():
@@ -429,13 +498,21 @@ class NamespaceService:
                 visible.add(name)
                 continue
 
+            if name in size_splits:
+                for backend in backend_names:
+                    visible.add(f"{name}.{backend}")
+                continue
+
             canonical = str(Path(dir_path) / name)
             with self.checksum_lock:
                 checks = [
                     self.checksum_records.get((canonical, backend))
                     for backend in backend_names
                 ]
-            if all(checks) and len({c.checksum for c in checks if c}) > 1:
+            if (
+                all(c is not None and c.checksum is not None for c in checks)
+                and len({c.checksum for c in checks}) > 1
+            ):
                 for backend in backend_names:
                     visible.add(f"{name}.{backend}")
             else:
@@ -645,8 +722,20 @@ class NamespaceService:
             inputs = self._view_inputs.get(path)
         if inputs is None:
             return list(snapshot[1])
-        entries, member_entries = inputs
-        return sorted(self._apply_conflict_view(path, entries, member_entries))
+        entries, member_entries, size_splits, _ = inputs
+        return sorted(self._apply_conflict_view(path, entries, member_entries, size_splits))
+
+    def size_split_markers(self, canonical_path: str) -> Tuple[Dict[str, int], float]:
+        """({member: listed size}, wall time of that listing) when the
+        published listing of canonical_path's parent split it by size, else
+        ({}, 0.0). For user.storage.checksums: such a name was never hashed."""
+        parent = str(Path(canonical_path).parent)
+        with self.listing_lock:
+            inputs = self._view_inputs.get(parent)
+        if inputs is None:
+            return {}, 0.0
+        sizes = inputs[2].get(Path(canonical_path).name)
+        return (dict(sizes), inputs[3]) if sizes else ({}, 0.0)
 
     def _begin_listing(self, path: str) -> int:
         """Mark a listing of path in flight; return the generation it must match."""
@@ -802,6 +891,7 @@ class NamespaceService:
         """
 
         started_at = time.monotonic()
+        listed_wall = time.time()
         futures = self._submit_member_listings(path)
 
         entries: Set[str] = {".", ".."}
@@ -834,10 +924,12 @@ class NamespaceService:
 
         backend_attrs: Dict[str, Dict[str, dict]] = {}
         member_entries: Dict[str, Set[str]] = {}
+        failed: Set[str] = set()
         with self.dir_cache_lock:
             previous = self.dir_cache.get(path, {})
             for backend_name, outcome in outcomes.items():
                 if isinstance(outcome, Exception):
+                    failed.add(backend_name)
                     cached = previous.get(backend_name)
                     if cached is not None:
                         # Shared with the previous map: these sets are only
@@ -857,8 +949,30 @@ class NamespaceService:
         for names in member_entries.values():
             entries.update(names)
 
-        self._schedule_directory_checksums(path, member_entries, backend_attrs)
-        visible_entries = self._apply_conflict_view(path, entries, member_entries)
+        # A member whose listing failed keeps its previous names (above) and,
+        # for the size test only, the attributes of the published listing,
+        # so one failed refresh does not merge a split name; it is not hashed
+        # this round. A second failure in a row, a failure after a change to
+        # the name dropped the listing, or one after a local write forgot
+        # the name's attributes has none for it and shows the plain name:
+        # its sizes are not known.
+        split_attrs = backend_attrs
+        if failed:
+            split_attrs = dict(backend_attrs)
+            with self.listing_lock:
+                # Copied under the lock: forget_listed_attrs edits them in place.
+                published = self.entry_attrs.get(path)
+                for backend_name in failed:
+                    if published is not None and backend_name in published[1]:
+                        split_attrs[backend_name] = dict(published[1][backend_name])
+        size_splits = self._size_splits(member_entries, split_attrs)
+        self._schedule_directory_checksums(
+            path,
+            {name: names for name, names in member_entries.items() if name not in failed},
+            backend_attrs,
+            size_splits,
+        )
+        visible_entries = self._apply_conflict_view(path, entries, member_entries, size_splits)
         ordered_entries = sorted(visible_entries)
 
         # Published in one step: member names, time, snapshot, view inputs
@@ -880,7 +994,7 @@ class NamespaceService:
                     self.dir_cache[path] = member_entries
                     self._listing_as_of[path] = started_at
                     self.readdir_snapshot[path] = (started_at, ordered_entries)
-                    self._view_inputs[path] = (entries, member_entries)
+                    self._view_inputs[path] = (entries, member_entries, size_splits, listed_wall)
                     self.entry_attrs[path] = (started_at, backend_attrs, set())
                 # A listing that began later was published while this one
                 # ran: answer with it, so a readdir never shows names older

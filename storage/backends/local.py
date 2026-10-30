@@ -248,8 +248,11 @@ class LocalBackend(Backend):
     # ------------------------------------------------------------------ #
     # Optional capabilities used by conflict detection
     # ------------------------------------------------------------------ #
-    def get_fast_checksum(self, virtual_path: str) -> str:
-        """Compute checksum directly from the real file without caching."""
+    def get_fast_checksum(self, virtual_path: str, allow_download: bool = True) -> str:
+        """Compute checksum directly from the real file without caching.
+
+        A local read is not a download, so allow_download changes nothing.
+        """
         real_path = self._resolve_path(virtual_path)
         return fast_checksum_file(real_path)
 

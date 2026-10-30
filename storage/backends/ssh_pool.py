@@ -47,6 +47,13 @@ import paramiko
 from .base import is_interactive_request
 
 
+class CommandTimeout(socket.timeout):
+    """run_command's command started on a live transport and did not finish
+    within its timeout, and the transport answered the probe that followed:
+    the member was asked and has not answered. A socket.timeout, so the
+    pool treats it as any other timeout."""
+
+
 class MemberUnavailable(ConnectionError):
     """The pool could not serve a request: the member is down, closed, its
     reconnect is in progress, or no channel came free in time.
@@ -1022,10 +1029,34 @@ class MemberConnection:
                 raise socket.timeout(f"command did not finish within {timeout}s")
             return left
 
-        with self.exec_channel(timeout) as chan:
-            run_bounded(chan, remaining(), lambda: chan.exec_command(command))
-            chunks = []
-            size = 0
+        transport = None
+        try:
+            with self.exec_channel(timeout) as chan:
+                transport = chan.get_transport()
+                return self._run_started(chan, command, remaining)
+        except CommandTimeout as exc:
+            # exec_channel probed the transport on the way out; one the probe
+            # dropped (a half-open connection) was the cause, not the command.
+            if not self._is_current_transport(transport):
+                raise socket.timeout(str(exc)) from exc
+            raise
+
+    def _is_current_transport(self, transport) -> bool:
+        with self._cond:
+            return (
+                transport is not None
+                and self._state is _State.CONNECTED
+                and self._transport is transport
+            )
+
+    @staticmethod
+    def _run_started(chan, command: str, remaining) -> Tuple[Optional[int], bytes]:
+        """run_command's body on an open exec channel."""
+        run_bounded(chan, remaining(), lambda: chan.exec_command(command))
+        transport = chan.get_transport()
+        chunks = []
+        size = 0
+        try:
             while True:
                 chan.settimeout(remaining())
                 data = chan.recv(32768)
@@ -1037,7 +1068,26 @@ class MemberConnection:
                         f"command output exceeds {MAX_COMMAND_OUTPUT} bytes")
                 chunks.append(data)
             status = chan.exit_status if chan.status_event.wait(remaining()) else None
-            return status, b"".join(chunks)
+        except socket.timeout as exc:
+            # The command was started; a timeout from here on is the
+            # command's unless the transport is gone (a connect or channel
+            # open that timed out never gets this far; run_command rechecks
+            # after the pool's probe, for a transport that only looked alive).
+            if transport is not None and transport.is_active():
+                raise CommandTimeout(str(exc)) from exc
+            raise
+        if (transport is not None and not transport.is_active()) or (
+            status == -1 and not getattr(chan, "eof_received", True)
+        ):
+            # paramiko closes the channels of a transport that died: recv
+            # returns b"" and the status event fires with no exit status.
+            # It does so before it marks the transport inactive, so a reader
+            # woken in between sees it active; a server that closed the
+            # channel itself sent EOF first. Not an answer from the member.
+            # (A transport that dies just after a command finished turns
+            # its answer into this error too: a retry, the safe direction.)
+            raise EOFError("the transport closed during the command")
+        return status, b"".join(chunks)
 
     # ------------------------------------------------------------------ #
     # Introspection for tests and diagnostics

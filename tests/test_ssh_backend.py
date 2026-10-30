@@ -11,9 +11,11 @@ from unittest.mock import patch
 
 from storage.backends import ssh as ssh_module
 from storage.backends import ssh_pool
-from storage.backends.base import interactive_request, is_interactive_request
+from storage.backends.base import ChecksumUnavailable, interactive_request, is_interactive_request
 from storage.backends.ssh import SSHBackend
-from storage.backends.ssh_pool import MemberConnection, MemberUnavailable, is_connection_error
+from storage.backends.ssh_pool import (
+    CommandTimeout, MemberConnection, MemberUnavailable, is_connection_error,
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -34,6 +36,9 @@ class _FakeChannel:
 
     def settimeout(self, timeout):
         self.timeout = timeout
+
+    def get_transport(self):
+        return self.transport
 
     def gettimeout(self):
         return self.timeout
@@ -1504,6 +1509,99 @@ class TestSSHBackendOnThePool(_BackendTestCase):
         # And a nested call on a thread that already holds the one channel.
         with backend._pool.sftp(1.0):
             self.assertEqual(len(backend.get_fast_checksum("/movie.bin")), 32)
+
+    def test_checksum_without_download_raises_instead_of_fetching(self):
+        self.server.exec_handler = lambda _cmd: (127, b"")
+        backend = self._new_backend()
+        with patch.object(backend, "copy_to_local",
+                          side_effect=AssertionError("downloaded")):
+            with self.assertRaises(ChecksumUnavailable):
+                backend.get_fast_checksum("/movie.bin", allow_download=False)
+        self.assertEqual([name for name, *_ in self.server.requests if name == "open"], [])
+
+    def test_checksum_without_download_classifies_what_stopped_the_hash(self):
+        backend = self._new_backend()
+        # The member could not be asked: raised as is, for a retry.
+        with patch.object(backend._pool, "run_command",
+                          side_effect=MemberUnavailable("no exec channel came free")), \
+                patch.object(backend, "copy_to_local", side_effect=AssertionError("downloaded")):
+            with self.assertRaises(MemberUnavailable):
+                backend.get_fast_checksum("/movie.bin", allow_download=False)
+        # A connect that timed out (the hash worker may run the reconnect):
+        # the member was never asked.
+        with patch.object(backend._pool, "run_command", side_effect=socket.timeout("connect")), \
+                patch.object(backend, "copy_to_local", side_effect=AssertionError("downloaded")):
+            with self.assertRaises(socket.timeout) as raised:
+                backend.get_fast_checksum("/movie.bin", allow_download=False)
+        self.assertNotIsInstance(raised.exception, ChecksumUnavailable)
+        # The hash started and did not finish: it would not next time either.
+        with patch.object(backend._pool, "run_command", side_effect=CommandTimeout("slow")), \
+                patch.object(backend, "copy_to_local", side_effect=AssertionError("downloaded")):
+            with self.assertRaises(ChecksumUnavailable):
+                backend.get_fast_checksum("/movie.bin", allow_download=False)
+
+    def test_run_command_timeout_after_start_is_a_command_timeout(self):
+        backend = self._new_backend()
+
+        def stalled(chan, size):
+            raise socket.timeout("timed out")
+
+        with patch.object(_FakeChannel, "recv", stalled):
+            with self.assertRaises(CommandTimeout):
+                backend._pool.run_command("xxh128sum /data/movie.bin", 5.0)
+
+        def transport_lost(chan, size):
+            chan.transport.active = False
+            raise socket.timeout("timed out")
+
+        # The transport went away under the command: not the command's.
+        with patch.object(_FakeChannel, "recv", transport_lost):
+            with self.assertRaises(socket.timeout) as raised:
+                backend._pool.run_command("xxh128sum /data/movie.bin", 5.0)
+        self.assertNotIsInstance(raised.exception, CommandTimeout)
+
+    def test_run_command_timeout_on_a_half_open_transport_is_not_the_commands(self):
+        backend = self._new_backend()
+        backend._pool.run_command("true", 5.0)  # connected
+
+        def stalled(chan, size):
+            # The transport still says active, but the probe that follows
+            # gets no channel: the connection was half open.
+            self.server.transport.open_hook = lambda _timeout: (_ for _ in ()).throw(
+                socket.timeout("probe"))
+            raise socket.timeout("timed out")
+
+        with patch.object(_FakeChannel, "recv", stalled):
+            with self.assertRaises(socket.timeout) as raised:
+                backend._pool.run_command("xxh128sum /data/movie.bin", 5.0)
+        self.assertNotIsInstance(raised.exception, CommandTimeout)
+
+    def test_run_command_on_a_transport_that_died_is_not_an_answer(self):
+        backend = self._new_backend()
+
+        def died(chan, size):
+            chan.transport.active = False
+            return b""
+
+        with patch.object(_FakeChannel, "recv", died):
+            with self.assertRaises(EOFError):
+                backend._pool.run_command("xxh128sum /data/movie.bin", 5.0)
+            with self.assertRaises(EOFError):
+                backend.get_fast_checksum("/movie.bin", allow_download=False)
+
+    def test_run_command_woken_before_the_transport_is_marked_dead(self):
+        # paramiko closes the channel before it clears active: no exit
+        # status, no EOF from the server, transport still "active".
+        self.server.exec_handler = lambda _cmd: (-1, b"")
+        backend = self._new_backend()
+
+        def closed_without_eof(chan, size):
+            chan.eof_received = False
+            return b""
+
+        with patch.object(_FakeChannel, "recv", closed_without_eof):
+            with self.assertRaises(EOFError):
+                backend._pool.run_command("xxh128sum /data/movie.bin", 5.0)
 
     def test_remote_checksum_and_xattrs_close_their_exec_channels(self):
         digest = "0123456789abcdef0123456789abcdef"
