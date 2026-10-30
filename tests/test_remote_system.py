@@ -1268,3 +1268,100 @@ def test_mounted_browse_request_budget(remote, mounted_factory):
     for label, recorded in steps.items():
         others = [c for c in recorded if not c[2].startswith("/browse")]
         assert all(m == "listdir_attrs" and p == "/" for _, m, p in others), report
+
+
+def test_mounted_conflict_view_hash_budget(remote, mounted_factory):
+    """What listing a directory of duplicates costs the members.
+
+    docs/browsing_latency_plan.md D4: copies of different sizes split from
+    the listing without a hash; copies of the same size are hashed once per
+    member, one at a time, in the background, never by downloading. Counts
+    the member exec calls (xxh128sum), the bytes they hash and any download,
+    and prints them (run with --test_arg=-s to see them).
+    """
+    m0, m1 = remote.members
+    size = 256 * 1024
+    same, same_diverged, different = 4, 2, 4
+    for i in range(same):
+        # The last same_diverged hold different bytes of the same size.
+        remote.write_remote(m0, f"dups/same{i}.bin", b"a" * size)
+        remote.write_remote(m1, f"dups/same{i}.bin",
+                            (b"b" if i >= same - same_diverged else b"a") * size)
+    for i in range(different):
+        remote.write_remote(m0, f"dups/diff{i}.bin", b"a" * size)
+        remote.write_remote(m1, f"dups/diff{i}.bin", b"a" * (size + 1 + i))
+    mnt = mounted_factory(start_sync=False)
+    os.listdir(mnt.mount)
+
+    lock = threading.Lock()
+    commands: List[tuple] = []
+    downloads: List[tuple] = []
+    running = {name: 0 for name in mnt.backends}
+    peak = {name: 0 for name in mnt.backends}
+    for name, backend in mnt.backends.items():
+        real_run, real_copy = backend._pool.run_command, backend.copy_to_local
+
+        def run_command(command, timeout, _name=name, _real=real_run):
+            with lock:
+                commands.append((_name, command))
+                running[_name] += 1
+                peak[_name] = max(peak[_name], running[_name])
+            try:
+                return _real(command, timeout)
+            finally:
+                with lock:
+                    running[_name] -= 1
+
+        def copy_to_local(path, *args, _name=name, _real=real_copy, **kwargs):
+            with lock:
+                downloads.append((_name, path))
+            return _real(path, *args, **kwargs)
+
+        backend._pool.run_command = run_command
+        backend.copy_to_local = copy_to_local
+
+    def settled():
+        with mnt.fs._checksum_lock:
+            return not mnt.fs._checksum_tasks
+
+    started = time.monotonic()
+    first = set(os.listdir(mnt.mount / "dups"))
+    listed_in = time.monotonic() - started
+    assert _wait_for(settled, timeout=60.0)
+
+    hashed = [(n, c) for n, c in commands if c.startswith("xxh128sum")]
+    hashed_bytes = 0
+    for member, command in hashed:
+        name = shlex.split(command)[1].rsplit("/", 1)[1]
+        if name.startswith("diff") and member == m1.name:
+            hashed_bytes += size + 1 + int(name[len("diff"):-len(".bin")])
+        else:
+            hashed_bytes += size
+    print(f"\nconflict view hash budget ({same} same-size and {different} different-size "
+          f"duplicates of {size} bytes, 2 members): listing {listed_in * 1000:.0f} ms, "
+          f"{len(hashed)} member hashes, {hashed_bytes} bytes hashed on the members, "
+          f"{len(downloads)} downloads, peak hashes per member {peak}")
+
+    # Different sizes split at the first listing, from the listing alone.
+    for i in range(different):
+        assert {f"diff{i}.bin.{m0.name}", f"diff{i}.bin.{m1.name}"} <= first, first
+        assert f"diff{i}.bin" not in first
+    # Same sizes show the plain name until both hashes are in.
+    for i in range(same):
+        assert f"same{i}.bin" in first
+    assert sorted(hashed) == sorted(
+        (m.name, f"xxh128sum {shlex.quote(f'{REMOTE_ROOT}/dups/same{i}.bin')} 2>/dev/null")
+        for m in (m0, m1) for i in range(same)), hashed
+    assert hashed_bytes == 2 * same * size
+    assert downloads == []
+    assert all(v <= 1 for v in peak.values()), peak
+
+    # The next readdir serves the snapshot with the hashes applied; nothing
+    # is hashed again.
+    commands.clear()
+    second = set(os.listdir(mnt.mount / "dups"))
+    for i in range(same):
+        diverged = i >= same - same_diverged
+        assert (f"same{i}.bin" in second) != diverged, second
+        assert (f"same{i}.bin.{m1.name}" in second) == diverged, second
+    assert [c for c in commands if c[1].startswith("xxh128sum")] == []
