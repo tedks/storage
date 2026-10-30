@@ -369,7 +369,7 @@ class TestKernelCacheVisibility(_MountedCase):
 
     def test_kernel_keeps_names_and_misses_but_not_attributes(self):
         """Names are kept for the window and misses for 10 s; attributes
-        are asked at every stat (attr_timeout 0) and answered in-process."""
+        are asked at every stat (attr_timeout 0)."""
         os.mkdir(self.mount_dir / "d1")
         (self.mount_dir / "d1" / "f").write_text("k")
         calls = []

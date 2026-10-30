@@ -30,6 +30,12 @@ streaming_keep_after_close = "4M,50%"
 # holds it and refetches the file if the member's copy changed. 0 checks at
 # every open.
 revalidate_after = 60
+# Seconds a directory listing answers ls, stat and missing names without
+# asking a member. Unset, it follows revalidate_after.
+# readdir_ttl = 60
+# Past that a listing is still served while a background listing replaces
+# it, until it is this many seconds old.
+listing_max_stale = 3600
 # Kernel cache timeouts in seconds. Unset, names are kept for
 # revalidate_after (1 with enable_watchers) and missing names for 10.
 # Attributes are never kept: a kept size would truncate reads of a
