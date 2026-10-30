@@ -1,0 +1,28 @@
+id: sync-member-reconcile
+title: Reconcile a member's tree after it missed a chain of namespace operations
+desc: 'From council round 2 on #141. A member that is unreachable during a mkdir,
+  rmdir or rename gets one queued retry per missed operation, and each retry is checked
+  against the namespace on its own (PR #141: a mkdir while the directory exists, an
+  rmdir while the name stays gone, a rename while its destination exists). A chain
+  of operations missed together is not fully settled that way: a rename onto a destination
+  that was removed and made again can replace the new empty directory on the member
+  with the old contents; an old name reused and re-uploaded to the same member before
+  the rename retry runs is moved by it; renames whose retries run out of order leave
+  the old name; retries are dropped after max_retries. The full fix compares the member''s
+  tree with the namespace when it comes back (its listing against the cache and index,
+  per directory touched while it was away) and settles the difference, instead of
+  replaying operations. Needs a design: what is authoritative for a name the namespace
+  no longer has (ties to oq-unlink-member-copies).'
+type: feature
+component: sync
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-30T17:08:26-00:00
+references: []
+log_events:
+- time: 2026-10-30T17:08:26-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
