@@ -2,7 +2,6 @@
 SSH/SFTP backend implementation for remote filesystems
 """
 
-import errno
 import ipaddress
 import os
 import shlex
@@ -11,14 +10,15 @@ import socket
 import subprocess
 import stat as stat_module
 import logging
-import threading
 import time
-import weakref
 import paramiko
 from pathlib import Path, PurePosixPath
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, List, Optional, TypeVar
 
 from .base import Backend, BackendType, StorageMemberCapabilities, WatcherSpec
+from .ssh_pool import MemberConnection, SFTPLease, is_connection_error, is_transient_oserror
+
+_T = TypeVar("_T")
 
 
 # The flake-packaged storage runs on nixpkgs' glibc, which on a non-NixOS host
@@ -109,7 +109,11 @@ def _connect_via_host_resolver(host: str, port: int, timeout: float,
 
 
 class SSHBackend(Backend):
-    """Backend for SSH/SFTP remote filesystems"""
+    """Backend for SSH/SFTP remote filesystems.
+
+    One SSH transport per member, shared by every thread through a leased
+    pool of SFTP channels (see ssh_pool.MemberConnection).
+    """
 
     def __init__(self, name: str, host: str, remote_path: str,
                  username: str, password: Optional[str] = None,
@@ -128,7 +132,8 @@ class SSHBackend(Backend):
             key_filename: Path to private key file
             port: SSH port (default 22)
             speed_priority: Speed priority (default 50 for remote)
-            connect_timeout: Timeout in seconds for SSH connection/auth handshakes
+            connect_timeout: Timeout in seconds for SSH connection/auth
+                handshakes, and for metadata requests
         """
         super().__init__(
             name,
@@ -148,133 +153,51 @@ class SSHBackend(Backend):
         self.password = password
         self.key_filename = key_filename
         self.connect_timeout = connect_timeout
-        # Keep I/O timeout higher than connect timeout to avoid aborting large/slow reads.
+        # Reads and transfers get a longer timeout than metadata requests,
+        # so a large or slow read is not aborted as a dead link.
         self.sftp_operation_timeout = max(60.0, float(connect_timeout) * 6.0)
         self.logger = logging.getLogger(__name__)
-
-        # Per-thread SSH/SFTP connections (lazy connected). This avoids
-        # cross-thread contention and prevents one thread from closing a
-        # live channel owned by another thread.
-        self._thread_local = threading.local()
-        self._thread_clients: Dict[int, Tuple[paramiko.SSHClient, paramiko.SFTPClient, weakref.ReferenceType[threading.Thread]]] = {}
-        self._thread_clients_lock = threading.Lock()
-        self._availability_lock = threading.Lock()
-        self._probe_lock = threading.Lock()
         self._reconnect_probe_interval = max(1.0, min(5.0, float(connect_timeout) / 2.0))
-        self._next_connect_retry_at = 0.0
-        # Log the first getent fallback at info, later ones at debug: every
-        # thread's connect to an affected host takes it.
+        # Log the first getent fallback at info, later ones at debug.
         self._host_resolver_logged = False
+        self._pool = MemberConnection(
+            name,
+            self._open_client,
+            connect_timeout=connect_timeout,
+            retry_interval=self._reconnect_probe_interval,
+            on_availability=lambda available: Backend.set_available(self, available),
+            logger=self.logger,
+        )
 
-    @staticmethod
-    def _close_client_pair(ssh_client: Optional[paramiko.SSHClient], sftp_client: Optional[paramiko.SFTPClient]):
-        try:
-            if sftp_client:
-                sftp_client.close()
-        except Exception:
-            pass
-        try:
-            if ssh_client:
-                ssh_client.close()
-        except Exception:
-            pass
+    # ------------------------------------------------------------------ #
+    # Availability
+    # ------------------------------------------------------------------ #
+    def is_available(self) -> bool:
+        """Transport connected, or the retry window after a failed connect has passed."""
+        return self._pool.available()
 
-    def _prune_stale_thread_clients(self, exclude_thread_id: Optional[int] = None):
-        stale_clients: List[Tuple[paramiko.SSHClient, paramiko.SFTPClient]] = []
-
-        with self._thread_clients_lock:
-            for thread_id, entry in list(self._thread_clients.items()):
-                if exclude_thread_id is not None and thread_id == exclude_thread_id:
-                    continue
-
-                ssh_client, sftp_client, thread_ref = entry
-                thread_obj = thread_ref()
-                if thread_obj is None or not thread_obj.is_alive():
-                    self._thread_clients.pop(thread_id, None)
-                    stale_clients.append((ssh_client, sftp_client))
-
-        for ssh_client, sftp_client in stale_clients:
-            self._close_client_pair(ssh_client, sftp_client)
-
-    def _set_thread_clients(self, ssh_client: paramiko.SSHClient, sftp_client: paramiko.SFTPClient):
-        thread_id = threading.get_ident()
-        self._prune_stale_thread_clients(exclude_thread_id=thread_id)
-
-        old_pair: Optional[Tuple[paramiko.SSHClient, paramiko.SFTPClient]] = None
-        thread_ref = weakref.ref(threading.current_thread())
-        with self._thread_clients_lock:
-            previous = self._thread_clients.get(thread_id)
-            if previous is not None:
-                old_pair = (previous[0], previous[1])
-            self._thread_clients[thread_id] = (ssh_client, sftp_client, thread_ref)
-
-        self._thread_local.ssh_client = ssh_client
-        self._thread_local.sftp_client = sftp_client
-
-        if old_pair is not None and old_pair != (ssh_client, sftp_client):
-            self._close_client_pair(old_pair[0], old_pair[1])
-
-    def _get_thread_clients(self) -> Tuple[Optional[paramiko.SSHClient], Optional[paramiko.SFTPClient]]:
-        ssh_client = getattr(self._thread_local, "ssh_client", None)
-        sftp_client = getattr(self._thread_local, "sftp_client", None)
-        return ssh_client, sftp_client
-
-    @staticmethod
-    def _transport_active(ssh_client: Optional[paramiko.SSHClient]) -> bool:
-        if ssh_client is None:
-            return False
-        try:
-            transport = ssh_client.get_transport()
-            return bool(transport and transport.is_active())
-        except Exception:
-            return False
-
-    def _mark_available(self):
-        with self._availability_lock:
-            self._next_connect_retry_at = 0.0
-        self.set_available(True)
+    def set_available(self, available: bool):
+        if available:
+            self._pool.clear_down()
+        else:
+            self._pool.mark_down()
 
     def _mark_unavailable(self):
-        with self._availability_lock:
-            self._next_connect_retry_at = max(
-                self._next_connect_retry_at,
-                time.monotonic() + self._reconnect_probe_interval,
-            )
-        self.set_available(False)
+        self._pool.mark_down()
 
     @staticmethod
     def _is_transient_oserror(exc: OSError) -> bool:
         """Return True when an OSError likely indicates connection loss."""
-        transient_errnos = {
-            errno.ECONNABORTED,
-            errno.ECONNRESET,
-            errno.ENETRESET,
-            errno.ESHUTDOWN,
-            errno.EHOSTDOWN,
-            errno.EHOSTUNREACH,
-            errno.ENETDOWN,
-            errno.ENETUNREACH,
-            errno.ETIMEDOUT,
-            errno.EPIPE,
-        }
-        if exc.errno in transient_errnos:
-            return True
+        return is_transient_oserror(exc)
 
-        message = str(exc).lower()
-        markers = (
-            "socket is closed",
-            "connection reset",
-            "connection timed out",
-            "broken pipe",
-            "connection aborted",
-            "eof",
-        )
-        return any(marker in message for marker in markers)
-
-    def _connect(self):
-        """Establish per-thread SSH/SFTP connection."""
+    # ------------------------------------------------------------------ #
+    # Connection
+    # ------------------------------------------------------------------ #
+    def _open_client(self) -> paramiko.SSHClient:
+        """Connect and authenticate one SSH client; the pool calls this
+        once per transport, from one thread at a time."""
+        ssh_client = paramiko.SSHClient()
         try:
-            ssh_client = paramiko.SSHClient()
             ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
             connect_kwargs = {
@@ -320,43 +243,54 @@ class SSHBackend(Backend):
                         except Exception:
                             pass
                     raise
-            sftp_client = ssh_client.open_sftp()
-
-            # Keep SFTP socket/channel timeouts above connect timeout to tolerate
-            # large files and slower links without spurious range-read aborts.
-            transport = ssh_client.get_transport()
-            if transport and transport.sock:
-                try:
-                    transport.sock.settimeout(self.sftp_operation_timeout)
-                except Exception:
-                    # Best-effort; SFTP may still function without socket-level timeout
-                    pass
-
-            try:
-                chan = sftp_client.get_channel()
-                if chan:
-                    chan.settimeout(self.sftp_operation_timeout)
-            except Exception:
-                pass
-
-            self._set_thread_clients(ssh_client, sftp_client)
-            self._mark_available()
+            # paramiko's transport polls its socket with a short timeout to
+            # notice close(); request timeouts are set per channel instead.
+            return ssh_client
 
         except paramiko.AuthenticationException as e:
             self.logger.error("SSH authentication failed for %s@%s:%s: %s",
                               self.username, self.host, self.port, e)
-            self._mark_unavailable()
             raise
         except paramiko.SSHException as e:
             self.logger.error("SSH handshake failed for %s@%s:%s: %s",
                               self.username, self.host, self.port, e)
-            self._mark_unavailable()
             raise
         except Exception as e:
             self.logger.error("Failed to connect to %s@%s:%s: %s",
                               self.username, self.host, self.port, e)
-            self._mark_unavailable()
             raise
+
+    def _with_sftp(self, what: str, virtual_path: str,
+                   operation: Callable[[paramiko.SFTPClient], _T], *,
+                   timeout: Optional[float] = None, retry: bool = False) -> _T:
+        """Run operation on a leased SFTP channel.
+
+        timeout is the channel timeout (connect_timeout by default). With
+        retry, a connection error is retried once on a fresh channel, which
+        reconnects if the transport was lost; use it only for operations
+        that are safe to repeat. A nested call on the same thread reuses the
+        caller's channel and leaves the retry to the outermost call.
+        """
+        if timeout is None:
+            timeout = self.connect_timeout
+        attempts = 2 if retry else 1
+        for attempt in range(1, attempts + 1):
+            lease: SFTPLease = self._pool.acquire_sftp(timeout)
+            nested = lease.depth > 1
+            try:
+                result = operation(lease.client)
+            except BaseException as exc:
+                self._pool.release(lease, exc)
+                if not isinstance(exc, Exception) or not is_connection_error(exc):
+                    raise
+                self.logger.warning("SFTP %s failed on %s attempt=%d/%d: %r",
+                                    what, virtual_path, attempt, attempts, exc)
+                if nested or attempt == attempts:
+                    raise
+                continue
+            self._pool.release(lease)
+            return result
+        raise AssertionError("unreachable")
 
     def _resolve_path(self, virtual_path: str) -> PurePosixPath:
         """Convert virtual path to remote path"""
@@ -373,254 +307,108 @@ class SSHBackend(Backend):
             remote_path=str(self.remote_path),
         )
 
-    def _ensure_connected(self):
-        """Ensure current thread has an active SSH/SFTP connection."""
-        ssh_client, sftp_client = self._get_thread_clients()
-        if sftp_client is not None and self._transport_active(ssh_client):
-            return
-
-        with self._availability_lock:
-            is_available = self.is_available()
-            next_retry_at = self._next_connect_retry_at
-
-        if not is_available and time.monotonic() < next_retry_at:
-            raise ConnectionError(
-                f"SSH backend {self.name} is temporarily unavailable after a disconnect"
-            )
-
-        # While the member is believed up, each thread connects its own
-        # client (clients are per thread) without waiting for the others: a
-        # thread's first use of a member is a connect, and serializing those
-        # behind one gate made healthy members look failed to every thread
-        # but the first. If the member is in fact down, each attempt fails
-        # within the connect timeout and the first failure marks it
-        # unavailable, which sends later threads to the gate below.
-        if is_available:
-            self._reset_connection()
-            self._connect()
-            return
-
-        # Reconnect gate after a disconnect: one thread probes; others fail
-        # fast, so an outage does not pile threads up behind a dead host.
-        if not self._probe_lock.acquire(blocking=False):
-            raise ConnectionError(
-                f"SSH backend {self.name} reconnect probe already in progress"
-            )
-        try:
-            # Recheck after acquiring probe lock to avoid duplicate probes.
-            with self._availability_lock:
-                is_available = self.is_available()
-                next_retry_at = self._next_connect_retry_at
-
-            if not is_available and time.monotonic() < next_retry_at:
-                raise ConnectionError(
-                    f"SSH backend {self.name} is temporarily unavailable after a disconnect"
-                )
-
-            self._reset_connection()
-            self._connect()
-        finally:
-            self._probe_lock.release()
-
-    def _current_clients(self) -> Tuple[paramiko.SSHClient, paramiko.SFTPClient]:
-        self._prune_stale_thread_clients(exclude_thread_id=threading.get_ident())
-        self._ensure_connected()
-        ssh_client, sftp_client = self._get_thread_clients()
-        if ssh_client is None or sftp_client is None:
-            raise RuntimeError("SSH backend has no active thread client")
-        return ssh_client, sftp_client
-
-    def _reset_connection(self):
-        """Drop current thread's SSH/SFTP clients so the next operation reconnects."""
-        thread_id = threading.get_ident()
-        ssh_client, sftp_client = self._get_thread_clients()
-
-        with self._thread_clients_lock:
-            pair = self._thread_clients.pop(thread_id, None)
-            if pair:
-                ssh_client = pair[0]
-                sftp_client = pair[1]
-
-        self._close_client_pair(ssh_client, sftp_client)
-
-        self._thread_local.ssh_client = None
-        self._thread_local.sftp_client = None
-
+    # ------------------------------------------------------------------ #
+    # Operations
+    # ------------------------------------------------------------------ #
     def exists(self, virtual_path: str) -> bool:
-        """Check if a file exists on remote"""
+        """Check if a file exists on remote; False when it cannot be reached."""
         remote_path = str(self._resolve_path(virtual_path))
-
-        for attempt in range(2):
-            try:
-                _, sftp_client = self._current_clients()
-                sftp_client.stat(remote_path)
-                return True
-            except FileNotFoundError:
-                return False
-            except (socket.timeout, EOFError, paramiko.SSHException) as exc:
-                self.logger.warning(
-                    "SFTP exists() failed on %s attempt=%d/2: %r",
-                    virtual_path,
-                    attempt + 1,
-                    exc,
-                )
-                self._reset_connection()
-                if attempt == 1:
-                    self._mark_unavailable()
-                    return False
-            except OSError as exc:
-                if not self._is_transient_oserror(exc):
-                    self.logger.warning("Error checking existence of %s: %r", virtual_path, exc)
-                    return False
-                self.logger.warning(
-                    "SFTP exists() failed on %s attempt=%d/2: %r",
-                    virtual_path,
-                    attempt + 1,
-                    exc,
-                )
-                self._reset_connection()
-                if attempt == 1:
-                    self._mark_unavailable()
-                    return False
-            except Exception as exc:
+        try:
+            self._with_sftp("exists", virtual_path,
+                            lambda sftp: sftp.stat(remote_path), retry=True)
+            return True
+        except FileNotFoundError:
+            return False
+        except Exception as exc:
+            if not is_connection_error(exc):
                 self.logger.warning("Error checking existence of %s: %r", virtual_path, exc)
-                return False
-
-        return False
+            return False
 
     def read_file(self, virtual_path: str, offset: int, size: int) -> bytes:
-        """Read data from remote file with one reconnect/retry on transport errors."""
+        """Read data from remote file, retrying once on a connection error."""
         remote_path = str(self._resolve_path(virtual_path))
 
-        last_exc = None
-        for attempt in range(2):
-            try:
-                _, sftp_client = self._current_clients()
-                with sftp_client.open(remote_path, 'rb') as f:
-                    f.seek(offset)
-                    return f.read(size)
-            except FileNotFoundError:
-                raise
-            except (socket.timeout, EOFError, paramiko.SSHException) as exc:
-                last_exc = exc
-                self.logger.warning(
-                    "SFTP read failed on %s (offset=%d size=%d attempt=%d/2): %r",
-                    virtual_path,
-                    offset,
-                    size,
-                    attempt + 1,
-                    exc,
-                )
-                self._reset_connection()
-                if attempt == 1:
-                    self._mark_unavailable()
-                    raise
-            except OSError as exc:
-                if not self._is_transient_oserror(exc):
-                    raise
-                last_exc = exc
-                self.logger.warning(
-                    "SFTP read failed on %s (offset=%d size=%d attempt=%d/2): %r",
-                    virtual_path,
-                    offset,
-                    size,
-                    attempt + 1,
-                    exc,
-                )
-                self._reset_connection()
-                if attempt == 1:
-                    self._mark_unavailable()
-                    raise
+        def read(sftp):
+            with sftp.open(remote_path, 'rb') as f:
+                f.seek(offset)
+                return f.read(size)
 
-        if last_exc is not None:
-            raise last_exc
-        raise RuntimeError(f"read_file failed unexpectedly for {virtual_path}")
+        return self._with_sftp("read", virtual_path, read,
+                               timeout=self.sftp_operation_timeout, retry=True)
+
+    def _ensure_parent(self, sftp, remote_path: str):
+        parent = str(PurePosixPath(remote_path).parent)
+        try:
+            sftp.stat(parent)
+        except FileNotFoundError:
+            self._mkdir_recursive(parent, sftp_client=sftp)
 
     def write_file(self, virtual_path: str, data: bytes, offset: int):
         """Write data to remote file"""
-        _, sftp_client = self._current_clients()
         remote_path = str(self._resolve_path(virtual_path))
 
-        # Ensure parent directory exists
-        parent = str(PurePosixPath(remote_path).parent)
-        try:
-            sftp_client.stat(parent)
-        except FileNotFoundError:
-            self._mkdir_recursive(parent, sftp_client=sftp_client)
+        def write(sftp):
+            self._ensure_parent(sftp, remote_path)
+            # Open for update when the file exists; only a missing file is
+            # created, so a failed check never truncates one.
+            try:
+                sftp.stat(remote_path)
+                mode = 'r+b'
+            except FileNotFoundError:
+                mode = 'wb'
+            with sftp.open(remote_path, mode) as f:
+                f.seek(offset)
+                f.write(data)
 
-        # Open or create file. exists() may reconnect, so reacquire client afterward.
-        mode = 'r+b' if self.exists(virtual_path) else 'wb'
-        _, sftp_client = self._current_clients()
-
-        with sftp_client.open(remote_path, mode) as f:
-            f.seek(offset)
-            f.write(data)
+        self._with_sftp("write", virtual_path, write, timeout=self.sftp_operation_timeout)
 
     def create_file(self, virtual_path: str):
         """Create a new empty file on remote"""
-        _, sftp_client = self._current_clients()
         remote_path = str(self._resolve_path(virtual_path))
 
-        # Ensure parent directory exists
-        parent = str(PurePosixPath(remote_path).parent)
-        try:
-            sftp_client.stat(parent)
-        except FileNotFoundError:
-            self._mkdir_recursive(parent, sftp_client=sftp_client)
+        def create(sftp):
+            self._ensure_parent(sftp, remote_path)
+            with sftp.open(remote_path, 'wb'):
+                pass
 
-        # Create empty file
-        with sftp_client.open(remote_path, 'wb'):
-            pass
+        self._with_sftp("create", virtual_path, create)
 
     def delete_file(self, virtual_path: str):
         """Delete a file from remote"""
-        _, sftp_client = self._current_clients()
         remote_path = str(self._resolve_path(virtual_path))
-
         try:
-            sftp_client.remove(remote_path)
+            self._with_sftp("delete", virtual_path, lambda sftp: sftp.remove(remote_path))
         except FileNotFoundError:
             pass
 
     def truncate_file(self, virtual_path: str):
         """Truncate a file to zero length"""
-        _, sftp_client = self._current_clients()
         remote_path = str(self._resolve_path(virtual_path))
 
-        with sftp_client.open(remote_path, 'wb') as f:
-            f.truncate(0)
+        def truncate(sftp):
+            with sftp.open(remote_path, 'wb') as f:
+                f.truncate(0)
+
+        self._with_sftp("truncate", virtual_path, truncate)
 
     def get_size(self, virtual_path: str) -> int:
         """Get file size"""
         remote_path = str(self._resolve_path(virtual_path))
-        try:
-            _, sftp_client = self._current_clients()
-            stat_result = sftp_client.stat(remote_path)
-            return stat_result.st_size
-        except FileNotFoundError:
-            raise
-        except (socket.timeout, EOFError, paramiko.SSHException) as exc:
-            self.logger.warning("SFTP get_size failed on %s: %r", virtual_path, exc)
-            self._mark_unavailable()
-            self._reset_connection()
-            raise
-        except OSError as exc:
-            if self._is_transient_oserror(exc):
-                self.logger.warning("SFTP get_size failed on %s: %r", virtual_path, exc)
-                self._mark_unavailable()
-                self._reset_connection()
-            raise
+        return self._with_sftp("get_size", virtual_path,
+                               lambda sftp: sftp.stat(remote_path).st_size, retry=True)
 
     def mkdir(self, virtual_path: str):
         """Create a directory on remote"""
-        _, sftp_client = self._current_clients()
         remote_path = str(self._resolve_path(virtual_path))
-        self._mkdir_recursive(remote_path, sftp_client=sftp_client)
+        self._with_sftp("mkdir", virtual_path,
+                        lambda sftp: self._mkdir_recursive(remote_path, sftp_client=sftp))
 
     def _mkdir_recursive(self, remote_path: str, sftp_client: Optional[paramiko.SFTPClient] = None):
         """Recursively create directories on remote"""
         if sftp_client is None:
-            _, sftp_client = self._current_clients()
+            self._with_sftp("mkdir", remote_path,
+                            lambda sftp: self._mkdir_recursive(remote_path, sftp_client=sftp))
+            return
 
         try:
             sftp_client.stat(remote_path)
@@ -636,104 +424,73 @@ class SSHBackend(Backend):
         # Create this directory
         try:
             sftp_client.mkdir(remote_path)
-        except OSError:
-            pass  # May already exist due to race condition
+        except OSError as exc:
+            # May already exist due to a race; a lost connection is not that.
+            if is_connection_error(exc):
+                raise
 
     def rmdir(self, virtual_path: str):
         """Remove a directory from remote"""
-        _, sftp_client = self._current_clients()
         remote_path = str(self._resolve_path(virtual_path))
-
         try:
-            sftp_client.rmdir(remote_path)
+            self._with_sftp("rmdir", virtual_path, lambda sftp: sftp.rmdir(remote_path))
         except FileNotFoundError:
             pass
 
     def listdir(self, virtual_path: str) -> List[str]:
         """List directory contents on remote"""
         remote_path = str(self._resolve_path(virtual_path))
-
         try:
-            _, sftp_client = self._current_clients()
-            return sftp_client.listdir(remote_path)
+            return self._with_sftp("listdir", virtual_path,
+                                   lambda sftp: sftp.listdir(remote_path), retry=True)
         except FileNotFoundError:
             return []
-        except (socket.timeout, EOFError, paramiko.SSHException) as exc:
-            self.logger.warning("SFTP listdir failed on %s: %r", virtual_path, exc)
-            self._mark_unavailable()
-            self._reset_connection()
-            raise
-        except OSError as exc:
-            if self._is_transient_oserror(exc):
-                self.logger.warning("SFTP listdir failed on %s: %r", virtual_path, exc)
-                self._mark_unavailable()
-                self._reset_connection()
-            raise
 
     def listdir_attrs(self, virtual_path: str):
-        """List directory contents with attributes using SFTP listdir_attr."""
+        """List directory contents with attributes using SFTP listdir_attr.
+
+        Returns None when the listing fails; the caller falls back to listdir.
+        """
         remote_path = str(self._resolve_path(virtual_path))
         try:
-            _, sftp_client = self._current_clients()
-            attrs = sftp_client.listdir_attr(remote_path)
-            result = []
-            for attr in attrs:
-                # attr.filename may be bytes on some servers
-                name = attr.filename
-                if isinstance(name, bytes):
-                    name = name.decode()
-                # SFTPAttributes holds None for a field the server omitted.
-                # Mode, size and mtime stay None so getattr probes the member
-                # instead of answering from an incomplete listing.
-                mtime = getattr(attr, 'st_mtime', None)
-                atime = getattr(attr, 'st_atime', None)
-                gid = getattr(attr, 'st_gid', None)
-                uid = getattr(attr, 'st_uid', None)
-                nlink = getattr(attr, 'st_nlink', None)
-                result.append((name, {
-                    'st_mode': getattr(attr, 'st_mode', None),
-                    'st_size': getattr(attr, 'st_size', None),
-                    'st_mtime': mtime,
-                    'st_atime': atime if atime is not None else mtime,
-                    'st_gid': gid if gid is not None else os.getgid(),
-                    'st_uid': uid if uid is not None else os.getuid(),
-                    'st_nlink': nlink if nlink is not None else 1,
-                }))
-            return result
-        except (socket.timeout, EOFError, paramiko.SSHException) as exc:
-            self.logger.warning("SFTP listdir_attrs failed on %s: %r", virtual_path, exc)
-            self._mark_unavailable()
-            self._reset_connection()
-            return None
-        except OSError as exc:
-            if self._is_transient_oserror(exc):
-                self.logger.warning("SFTP listdir_attrs failed on %s: %r", virtual_path, exc)
-                self._mark_unavailable()
-                self._reset_connection()
-            return None
+            attrs = self._with_sftp("listdir_attrs", virtual_path,
+                                    lambda sftp: sftp.listdir_attr(remote_path), retry=True)
         except Exception:
             return None
+        result = []
+        for attr in attrs:
+            # attr.filename may be bytes on some servers
+            name = attr.filename
+            if isinstance(name, bytes):
+                name = name.decode()
+            # SFTPAttributes holds None for a field the server omitted.
+            # Mode, size and mtime stay None so getattr probes the member
+            # instead of answering from an incomplete listing.
+            mtime = getattr(attr, 'st_mtime', None)
+            atime = getattr(attr, 'st_atime', None)
+            gid = getattr(attr, 'st_gid', None)
+            uid = getattr(attr, 'st_uid', None)
+            nlink = getattr(attr, 'st_nlink', None)
+            result.append((name, {
+                'st_mode': getattr(attr, 'st_mode', None),
+                'st_size': getattr(attr, 'st_size', None),
+                'st_mtime': mtime,
+                'st_atime': atime if atime is not None else mtime,
+                'st_gid': gid if gid is not None else os.getgid(),
+                'st_uid': uid if uid is not None else os.getuid(),
+                'st_nlink': nlink if nlink is not None else 1,
+            }))
+        return result
 
     def isdir(self, virtual_path: str) -> bool:
         """Check if path is a directory on remote"""
+        remote_path = str(self._resolve_path(virtual_path))
         try:
-            _, sftp_client = self._current_clients()
-            remote_path = str(self._resolve_path(virtual_path))
-            stat_result = sftp_client.stat(remote_path)
-            return stat_module.S_ISDIR(stat_result.st_mode)
-        except (socket.timeout, EOFError, paramiko.SSHException) as exc:
-            self.logger.warning("SFTP isdir failed on %s: %r", virtual_path, exc)
-            self._mark_unavailable()
-            self._reset_connection()
-            return False
-        except OSError as exc:
-            if self._is_transient_oserror(exc):
-                self.logger.warning("SFTP isdir failed on %s: %r", virtual_path, exc)
-                self._mark_unavailable()
-                self._reset_connection()
-            return False
+            st = self._with_sftp("isdir", virtual_path,
+                                 lambda sftp: sftp.stat(remote_path), retry=True)
         except Exception:
             return False
+        return stat_module.S_ISDIR(st.st_mode)
 
     def copy_to_local(self, virtual_path: str, local_path: Path):
         """Copy a file from remote to local path"""
@@ -742,57 +499,35 @@ class SSHBackend(Backend):
         # Ensure local parent directory exists
         local_path.parent.mkdir(parents=True, exist_ok=True)
 
-        try:
-            _, sftp_client = self._current_clients()
-            # Download file
-            sftp_client.get(remote_path, str(local_path))
-        except FileNotFoundError:
-            raise
-        except (socket.timeout, EOFError, paramiko.SSHException) as exc:
-            self.logger.warning("SFTP copy_to_local failed on %s: %r", virtual_path, exc)
-            self._mark_unavailable()
-            self._reset_connection()
-            raise
-        except OSError as exc:
-            if self._is_transient_oserror(exc):
-                self.logger.warning("SFTP copy_to_local failed on %s: %r", virtual_path, exc)
-                self._mark_unavailable()
-                self._reset_connection()
-            raise
+        self._with_sftp("copy_to_local", virtual_path,
+                        lambda sftp: sftp.get(remote_path, str(local_path)),
+                        timeout=self.sftp_operation_timeout, retry=True)
 
     def copy_from_local(self, local_path: Path, virtual_path: str):
         """Copy a local file to remote"""
-        _, sftp_client = self._current_clients()
         remote_path = str(self._resolve_path(virtual_path))
 
-        # Ensure remote parent directory exists
-        parent = str(PurePosixPath(remote_path).parent)
-        try:
-            sftp_client.stat(parent)
-        except FileNotFoundError:
-            self._mkdir_recursive(parent, sftp_client=sftp_client)
+        def upload(sftp):
+            self._ensure_parent(sftp, remote_path)
+            sftp.put(str(local_path), remote_path)
 
-        # Upload file
-        sftp_client.put(str(local_path), remote_path)
+        self._with_sftp("copy_from_local", virtual_path, upload,
+                        timeout=self.sftp_operation_timeout)
 
     def rename(self, old_virtual_path: str, new_virtual_path: str):
         """Rename a file or directory on the remote backend."""
-        _, sftp_client = self._current_clients()
-
         old_remote = str(self._resolve_path(old_virtual_path))
         new_remote = str(self._resolve_path(new_virtual_path))
-        parent = str(PurePosixPath(new_remote).parent)
 
-        try:
-            sftp_client.stat(parent)
-        except FileNotFoundError:
-            self._mkdir_recursive(parent, sftp_client=sftp_client)
+        def rename(sftp):
+            self._ensure_parent(sftp, new_remote)
+            try:
+                sftp.rename(old_remote, new_remote)
+            except FileNotFoundError:
+                # Nothing to rename; best-effort
+                pass
 
-        try:
-            sftp_client.rename(old_remote, new_remote)
-        except FileNotFoundError:
-            # Nothing to rename; best-effort
-            pass
+        self._with_sftp("rename", old_virtual_path, rename)
 
     def get_free_space(self) -> Optional[int]:
         """Get free space on remote (if supported)"""
@@ -807,35 +542,14 @@ class SSHBackend(Backend):
 
     def stat(self, virtual_path: str):
         remote_path = str(self._resolve_path(virtual_path))
-        try:
-            _, sftp_client = self._current_clients()
-            return sftp_client.stat(remote_path)
-        except FileNotFoundError:
-            raise
-        except (socket.timeout, EOFError, paramiko.SSHException) as exc:
-            self.logger.warning("SFTP stat failed on %s: %r", virtual_path, exc)
-            self._mark_unavailable()
-            self._reset_connection()
-            raise
-        except OSError as exc:
-            if self._is_transient_oserror(exc):
-                self.logger.warning("SFTP stat failed on %s: %r", virtual_path, exc)
-                self._mark_unavailable()
-                self._reset_connection()
-            raise
+        return self._with_sftp("stat", virtual_path,
+                               lambda sftp: sftp.stat(remote_path), retry=True)
 
     def close(self):
-        """Close SSH/SFTP connections"""
-        with self._thread_clients_lock:
-            clients = [(entry[0], entry[1]) for entry in self._thread_clients.values()]
-            self._thread_clients.clear()
-
-        for ssh_client, sftp_client in clients:
-            self._close_client_pair(ssh_client, sftp_client)
-
-        self._thread_local.ssh_client = None
-        self._thread_local.sftp_client = None
-        self._mark_unavailable()
+        """Close the member's transport and channels."""
+        pool = getattr(self, "_pool", None)
+        if pool is not None:
+            pool.close()
 
     def __del__(self):
         """Cleanup on deletion"""
@@ -858,29 +572,23 @@ class SSHBackend(Backend):
         Falls back to downloading a temp copy and checksumming locally
         so the result is always consistent with local checksums.
         """
-        ssh_client, _ = self._current_clients()
         remote_path = str(self._resolve_path(virtual_path))
 
         # Try remote xxh128sum first (fast path, avoids download).
         # Use sftp_operation_timeout (not connect_timeout) since hashing
         # large files can take much longer than a connection handshake.
-        # Wrap in try/except so SSH channel errors (timeout, disconnect)
-        # fall through to the download-and-hash fallback.
+        # Any failure (no xxh128sum, a refused or timed-out channel) falls
+        # through to the download-and-hash fallback.
         try:
             cmd = f"xxh128sum {self._shell_quote(remote_path)} 2>/dev/null"
-            _, stdout, stderr = ssh_client.exec_command(
-                cmd, timeout=self.sftp_operation_timeout
-            )
-            rc = stdout.channel.recv_exit_status()
-            output = stdout.read().decode().strip()
+            rc, stdout = self._pool.run_command(cmd, self.sftp_operation_timeout)
+            output = stdout.decode(errors="replace").strip()
             if rc == 0 and output:
                 token = output.split()[0]
                 # xxh128sum outputs a 32-char hex digest; validate format.
                 if len(token) == 32 and all(c in "0123456789abcdef" for c in token):
                     return token
         except Exception:
-            # exec_command itself failed (timeout, channel error, etc.)
-            # Fall through to download-and-hash.
             pass
 
         # Fallback: download to temp file and compute locally.
@@ -900,30 +608,25 @@ class SSHBackend(Backend):
     def set_xattr(self, virtual_path: str, name: str, value: bytes):
         """Best-effort remote setfattr."""
         try:
-            ssh_client, _ = self._current_clients()
             remote_path = str(self._resolve_path(virtual_path))
             value_str = value.decode() if isinstance(value, (bytes, bytearray)) else str(value)
             cmd = (
                 f"setfattr -n {self._shell_quote(name)} "
-                f"-v {self._shell_quote(value_str)} {self._shell_quote(remote_path)}"
+                f"-v {self._shell_quote(value_str)} {self._shell_quote(remote_path)} 2>/dev/null"
             )
-            ssh_client.exec_command(cmd, timeout=self.connect_timeout)
+            self._pool.run_command(cmd, self.connect_timeout)
         except Exception:
             # Remote might not support xattrs; ignore
             pass
 
     def get_xattr(self, virtual_path: str, name: str):
         try:
-            ssh_client, _ = self._current_clients()
             remote_path = str(self._resolve_path(virtual_path))
             cmd = (
                 f"getfattr --absolute-names --only-values "
-                f"-n {self._shell_quote(name)} {self._shell_quote(remote_path)}"
+                f"-n {self._shell_quote(name)} {self._shell_quote(remote_path)} 2>/dev/null"
             )
-            _, stdout, _ = ssh_client.exec_command(
-                cmd, timeout=self.connect_timeout
-            )
-            data = stdout.read()
-            return data if data else None
+            rc, data = self._pool.run_command(cmd, self.connect_timeout)
+            return data if rc == 0 and data else None
         except Exception:
             return None

@@ -1,4 +1,5 @@
-import io
+import concurrent.futures
+import contextvars
 import socket
 import subprocess
 import threading
@@ -8,36 +9,113 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from storage.backends import ssh as ssh_module
+from storage.backends.base import interactive_request, is_interactive_request
 from storage.backends.ssh import SSHBackend
+from storage.backends.ssh_pool import MemberConnection
 
 
-class _FakeSocket:
-    def __init__(self):
+# --------------------------------------------------------------------------- #
+# Fakes: a paramiko Transport with session channels, and an SFTP client that
+# fails loudly if two threads use it at once (paramiko's is not thread-safe).
+# --------------------------------------------------------------------------- #
+
+class _FakeChannel:
+    def __init__(self, transport):
+        self.transport = transport
         self.timeout = None
+        self.closed = False
+        self.subsystem = None
+        self.command = None
+        self._out = b""
+        self.status_event = threading.Event()
+        self.exit_status = -1
 
     def settimeout(self, timeout):
         self.timeout = timeout
+
+    def gettimeout(self):
+        return self.timeout
+
+    def _check(self):
+        if self.closed or not self.transport.active:
+            raise EOFError("channel closed")
+
+    def invoke_subsystem(self, name):
+        self._check()
+        if self.transport.subsystem_hook is not None:
+            self.transport.subsystem_hook(self)
+        self.subsystem = name
+
+    def exec_command(self, command):
+        self._check()
+        self.command = command
+        self.transport.commands.append(command)
+        rc, out = self.transport.exec_handler(command)
+        self._out = out
+        self.exit_status = rc
+        self.status_event.set()
+
+    def recv(self, size):
+        self._check()
+        chunk, self._out = self._out[:size], self._out[size:]
+        return chunk
+
+    def close(self):
+        if not self.closed:
+            self.closed = True
+            self.transport._channel_closed(self)
 
 
 class _FakeTransport:
-    def __init__(self):
-        self.sock = _FakeSocket()
-        self._active = True
+    def __init__(self, max_sessions=10):
+        self.active = True
+        self.max_sessions = max_sessions
+        self.lock = threading.Lock()
+        self.open_channels = []
+        self.max_open_seen = 0
+        self.sessions_opened = 0
+        self.refusals = 0
+        self.commands = []
+        self.exec_handler = lambda _cmd: (0, b"")
+        self.open_hook = None
+        self.subsystem_hook = None
+        self.sock = SimpleNamespace(settimeout_calls=[])
+        self.sock.settimeout = self.sock.settimeout_calls.append
 
     def is_active(self):
-        return self._active
+        return self.active
 
+    def open_session(self, timeout=None):
+        if timeout is None:
+            raise AssertionError("open_session without a timeout")
+        if self.open_hook is not None:
+            self.open_hook(timeout)
+        if not self.active:
+            raise ssh_module.paramiko.SSHException("SSH session not active")
+        with self.lock:
+            if len(self.open_channels) >= self.max_sessions:
+                self.refusals += 1
+                raise ssh_module.paramiko.ChannelException(2, "open failed")
+            chan = _FakeChannel(self)
+            self.open_channels.append(chan)
+            self.sessions_opened += 1
+            self.max_open_seen = max(self.max_open_seen, len(self.open_channels))
+        return chan
 
-class _FakeChannel:
-    def __init__(self):
-        self.timeout = None
+    def _channel_closed(self, chan):
+        with self.lock:
+            if chan in self.open_channels:
+                self.open_channels.remove(chan)
 
-    def settimeout(self, timeout):
-        self.timeout = timeout
+    def close(self):
+        self.active = False
+        for chan in list(self.open_channels):
+            chan.close()
 
 
 class _FakeRemoteFile:
-    def __init__(self, data: bytes):
+    def __init__(self, sftp, data: bytes):
+        self._sftp = sftp
         self._data = data
         self._offset = 0
 
@@ -51,9 +129,7 @@ class _FakeRemoteFile:
         self._offset = offset
 
     def read(self, size: int):
-        start = self._offset
-        end = start + size
-        chunk = self._data[start:end]
+        chunk = self._data[self._offset:self._offset + size]
         self._offset += len(chunk)
         return chunk
 
@@ -65,415 +141,871 @@ class _FakeRemoteFile:
 
 
 class _FakeSFTPClient:
-    def __init__(self, payload: bytes, fail_open_count: int = 0,
-                 fail_stat_count: int = 0, fail_stat_match: str = None):
-        self.payload = payload
-        self.fail_open_count = fail_open_count
-        self.fail_stat_count = fail_stat_count
-        self.fail_stat_match = fail_stat_match
-        self.open_calls = []
+    """Built on a channel, as paramiko.SFTPClient(chan) is."""
+
+    # Set by tests: payload served by open(), files that exist, and hooks
+    # called at the start of every request.
+    def __init__(self, chan, server):
+        self.chan = chan
+        self.server = server
         self.closed = False
-        self._channel = _FakeChannel()
+        self._busy = threading.Lock()
+        server.clients.append(self)
 
     def get_channel(self):
-        return self._channel
-
-    def stat(self, path: str):
-        if self.fail_stat_count > 0:
-            if self.fail_stat_match is None or self.fail_stat_match in path:
-                self.fail_stat_count -= 1
-                raise socket.timeout("simulated stat timeout")
-        return SimpleNamespace(st_size=len(self.payload), st_mode=0o100644)
-
-    def open(self, path: str, mode: str):
-        self.open_calls.append((path, mode))
-        if self.closed:
-            raise OSError("simulated closed sftp client")
-        if self.fail_open_count > 0:
-            self.fail_open_count -= 1
-            raise socket.timeout("simulated timeout")
-        return _FakeRemoteFile(self.payload)
+        return self.chan
 
     def close(self):
         self.closed = True
+        self.chan.close()
 
-    def remove(self, _path: str):
-        pass
+    def _request(self, name, path):
+        if not self._busy.acquire(blocking=False):
+            self.server.concurrent_use.append(name)
+            self._busy.acquire()
+        try:
+            self.chan._check()
+            self.server.requests.append((name, path, self.chan.gettimeout(),
+                                         is_interactive_request()))
+            hook = self.server.hooks.get(name)
+            if hook is not None:
+                hook(self, path)
+            if self.server.delay:
+                time.sleep(self.server.delay)
+            self.chan._check()
+        finally:
+            self._busy.release()
 
-    def mkdir(self, _path: str):
-        pass
+    def stat(self, path):
+        self._request("stat", path)
+        if path in self.server.missing:
+            raise FileNotFoundError(path)
+        return SimpleNamespace(st_size=len(self.server.payload), st_mode=0o100644,
+                               st_mtime=1.0)
 
-    def rmdir(self, _path: str):
-        pass
+    def open(self, path, mode):
+        self._request("open", path)
+        return _FakeRemoteFile(self, self.server.payload)
 
-    def listdir(self, _path: str):
-        return []
+    def remove(self, path):
+        self._request("remove", path)
 
-    def listdir_attr(self, _path: str):
-        return []
+    def mkdir(self, path):
+        self._request("mkdir", path)
 
-    def get(self, _remote_path: str, _local_path: str):
-        pass
+    def rmdir(self, path):
+        self._request("rmdir", path)
 
-    def put(self, _local_path: str, _remote_path: str):
-        pass
+    def listdir(self, path):
+        self._request("listdir", path)
+        return ["a", "b"]
 
-    def rename(self, _old_path: str, _new_path: str):
-        pass
+    def listdir_attr(self, path):
+        self._request("listdir_attr", path)
+        return [SimpleNamespace(filename="a", st_mode=0o100644, st_size=1,
+                                st_mtime=1.0, st_atime=1.0, st_uid=0, st_gid=0,
+                                st_nlink=1)]
+
+    def get(self, remote_path, local_path):
+        self._request("get", remote_path)
+        with open(local_path, "wb") as f:
+            f.write(self.server.payload)
+
+    def put(self, local_path, remote_path):
+        self._request("put", remote_path)
+
+    def rename(self, old_path, new_path):
+        self._request("rename", old_path)
+
+
+class _FakeServer:
+    """One fake sshd: the transports it accepted and the SFTP clients on them."""
+
+    def __init__(self, max_sessions=10, payload=b"0123456789abcdef"):
+        self.max_sessions = max_sessions
+        self.payload = payload
+        self.missing = set()
+        self.hooks = {}
+        self.delay = 0.0
+        self.clients = []
+        self.requests = []
+        self.concurrent_use = []
+        self.transports = []
+        self.ssh_clients = []
+        self.connect_calls = 0
+        self.connect_error = None
+        self.connect_gate = None  # an Event a connect waits on, if set
+        self.exec_handler = lambda _cmd: (0, b"")
+        self.lock = threading.Lock()
+
+    def sftp_factory(self, chan):
+        return _FakeSFTPClient(chan, self)
+
+    def new_ssh_client(self):
+        client = _FakeSSHClient(self)
+        with self.lock:
+            self.ssh_clients.append(client)
+        return client
+
+    def connect(self):
+        """A MemberConnection connect callable."""
+        client = self.new_ssh_client()
+        client.connect()
+        return client
+
+    @property
+    def transport(self):
+        return self.transports[-1]
 
 
 class _FakeSSHClient:
-    def __init__(self, sftp_client: _FakeSFTPClient):
-        self.sftp_client = sftp_client
-        self.transport = _FakeTransport()
+    def __init__(self, server):
+        self.server = server
+        self.transport = None
         self.closed = False
+        self.connect_kwargs = []
 
     def set_missing_host_key_policy(self, _policy):
         pass
 
-    def connect(self, **_kwargs):
-        pass
-
-    def open_sftp(self):
-        return self.sftp_client
+    def connect(self, **kwargs):
+        self.connect_kwargs.append(kwargs)
+        with self.server.lock:
+            self.server.connect_calls += 1
+        if self.server.connect_gate is not None:
+            self.server.connect_gate.wait(timeout=10)
+        error = self.server.connect_error
+        if callable(error):
+            error = error(kwargs)
+        if error is not None:
+            raise error
+        self.transport = _FakeTransport(self.server.max_sessions)
+        self.transport.exec_handler = self.server.exec_handler
+        with self.server.lock:
+            self.server.transports.append(self.transport)
 
     def get_transport(self):
         return self.transport
 
-    def exec_command(self, _cmd: str, timeout=None):
-        _ = timeout
-        return None, io.BytesIO(b"deadbeef  file\n"), io.BytesIO(b"")
-
     def close(self):
         self.closed = True
-        self.transport._active = False
+        if self.transport is not None:
+            self.transport.close()
 
 
-class TestSSHBackendThreadedClients(unittest.TestCase):
-    def _new_backend(self):
-        return SSHBackend(
-            name="ssh0",
-            host="example.local",
-            remote_path="/data",
-            username="test",
-            key_filename="/tmp/id_test",
-        )
+def _pool(server, **kwargs):
+    kwargs.setdefault("connect_timeout", 2.0)
+    kwargs.setdefault("retry_interval", 5.0)
+    return MemberConnection("ssh0", server.connect,
+                            sftp_client_factory=server.sftp_factory, **kwargs)
 
-    @patch("storage.backends.ssh.paramiko.AutoAddPolicy")
-    @patch("storage.backends.ssh.paramiko.SSHClient")
-    def test_read_retry_does_not_quarantine_backend(self, mock_ssh_client_cls, mock_auto_add_policy):
-        _ = mock_auto_add_policy
-        payload = b"abcdefghijklmnopqrstuvwxyz"
 
-        first = _FakeSSHClient(_FakeSFTPClient(payload=payload, fail_open_count=1))
-        second = _FakeSSHClient(_FakeSFTPClient(payload=payload))
-        mock_ssh_client_cls.side_effect = [first, second]
+def _run_threads(count, target):
+    errors = []
 
-        backend = self._new_backend()
-        data = backend.read_file("/movie.bin", 0, 8)
+    def wrapped(index):
+        try:
+            target(index)
+        except BaseException as exc:  # pragma: no cover - reported below
+            errors.append(exc)
 
-        self.assertEqual(data, payload[:8])
-        self.assertTrue(backend.is_available())
-        self.assertEqual(mock_ssh_client_cls.call_count, 2)
-        self.assertTrue(first.closed)
-        self.assertFalse(second.closed)
+    threads = [threading.Thread(target=wrapped, args=(i,)) for i in range(count)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=20)
+    return errors
 
-        backend.close()
 
-    @patch("storage.backends.ssh.paramiko.AutoAddPolicy")
-    @patch("storage.backends.ssh.paramiko.SSHClient")
-    def test_exists_disconnect_sets_unavailable_and_respects_probe_interval(self, mock_ssh_client_cls, mock_auto_add_policy):
-        _ = mock_auto_add_policy
+class _InThread:
+    """Run fn in a thread; result or exception is kept for the test."""
 
-        failing = _FakeSSHClient(_FakeSFTPClient(payload=b""))
-
-        def _fail_connect(**_kwargs):
-            raise socket.timeout("simulated connect timeout")
-
-        failing.connect = _fail_connect
-        mock_ssh_client_cls.return_value = failing
-
-        backend = self._new_backend()
-
-        self.assertFalse(backend.exists("/movie.bin"))
-        self.assertFalse(backend.is_available())
-
-        # Immediate retry should short-circuit through cooldown, avoiding another client build.
-        self.assertFalse(backend.exists("/movie.bin"))
-        self.assertEqual(mock_ssh_client_cls.call_count, 1)
-
-        backend.close()
-
-    @patch("storage.backends.ssh.paramiko.AutoAddPolicy")
-    @patch("storage.backends.ssh.paramiko.SSHClient")
-    def test_exists_reconnects_on_next_probe_window(self, mock_ssh_client_cls, mock_auto_add_policy):
-        _ = mock_auto_add_policy
-
-        failing = _FakeSSHClient(_FakeSFTPClient(payload=b""))
-        recovered = _FakeSSHClient(_FakeSFTPClient(payload=b"ok"))
-
-        def _fail_connect(**_kwargs):
-            raise socket.timeout("simulated connect timeout")
-
-        failing.connect = _fail_connect
-        mock_ssh_client_cls.side_effect = [failing, recovered]
-
-        backend = self._new_backend()
-
-        self.assertFalse(backend.exists("/movie.bin"))
-        self.assertFalse(backend.is_available())
-
-        # Simulate probe interval elapsed and allow one reconnect probe.
-        backend._next_connect_retry_at = 0.0
-        self.assertTrue(backend.exists("/movie.bin"))
-        self.assertTrue(backend.is_available())
-        self.assertEqual(mock_ssh_client_cls.call_count, 2)
-
-        backend.close()
-
-    @patch("storage.backends.ssh.paramiko.AutoAddPolicy")
-    @patch("storage.backends.ssh.paramiko.SSHClient")
-    def test_stat_missing_file_does_not_mark_backend_unavailable(self, mock_ssh_client_cls, mock_auto_add_policy):
-        _ = mock_auto_add_policy
-
-        fake = _FakeSSHClient(_FakeSFTPClient(payload=b""))
-
-        def _missing(_path):
-            raise FileNotFoundError("missing")
-
-        fake.sftp_client.stat = _missing
-        mock_ssh_client_cls.return_value = fake
-
-        backend = self._new_backend()
-
-        with self.assertRaises(FileNotFoundError):
-            backend.stat("/missing.bin")
-
-        self.assertTrue(backend.is_available())
-
-        backend.close()
-
-    @patch("storage.backends.ssh.paramiko.AutoAddPolicy")
-    @patch("storage.backends.ssh.paramiko.SSHClient")
-    def test_reset_closes_only_calling_thread_client(self, mock_ssh_client_cls, mock_auto_add_policy):
-        _ = mock_auto_add_policy
-        payload = b"x" * 1024
-        created = []
-
-        def _factory():
-            client = _FakeSSHClient(_FakeSFTPClient(payload=payload))
-            created.append(client)
-            return client
-
-        mock_ssh_client_cls.side_effect = _factory
-        backend = self._new_backend()
-
-        barrier = threading.Barrier(2)
-        seen_clients = {}
-        still_open = {}
-        errors = []
-
-        def _worker(name: str, do_reset: bool):
-            try:
-                self.assertEqual(backend.get_size("/movie.bin"), len(payload))
-                ssh_client, _ = backend._get_thread_clients()
-                seen_clients[name] = ssh_client
-                barrier.wait(timeout=3)
-                if do_reset:
-                    backend._reset_connection()
-                barrier.wait(timeout=3)
-                still_open[name] = not ssh_client.closed
-            except Exception as exc:  # pragma: no cover - explicit test failure path
-                errors.append(exc)
-
-        t1 = threading.Thread(target=_worker, args=("a", True))
-        t2 = threading.Thread(target=_worker, args=("b", False))
-        t1.start()
-        t2.start()
-        t1.join(timeout=5)
-        t2.join(timeout=5)
-
-        if errors:
-            raise errors[0]
-
-        self.assertEqual(len(created), 2)
-        self.assertIsNotNone(seen_clients.get("a"))
-        self.assertIsNotNone(seen_clients.get("b"))
-        self.assertIsNot(seen_clients["a"], seen_clients["b"])
-        self.assertFalse(still_open["a"])
-        self.assertTrue(still_open["b"])
-
-        backend.close()
-        self.assertTrue(seen_clients["b"].closed)
-
-    @patch("storage.backends.ssh.paramiko.AutoAddPolicy")
-    @patch("storage.backends.ssh.paramiko.SSHClient")
-    def test_prune_stale_thread_clients_closes_dead_thread_connections(self, mock_ssh_client_cls, mock_auto_add_policy):
-        _ = mock_auto_add_policy
-        payload = b"y" * 1024
-        created = []
-
-        def _factory():
-            client = _FakeSSHClient(_FakeSFTPClient(payload=payload))
-            created.append(client)
-            return client
-
-        mock_ssh_client_cls.side_effect = _factory
-        backend = self._new_backend()
-
-        worker = threading.Thread(target=lambda: backend.get_size("/movie.bin"))
-        worker.start()
-        worker.join(timeout=5)
-        self.assertFalse(worker.is_alive())
-
-        with backend._thread_clients_lock:
-            self.assertEqual(len(backend._thread_clients), 1)
-
-        backend._prune_stale_thread_clients()
-
-        with backend._thread_clients_lock:
-            self.assertEqual(len(backend._thread_clients), 0)
-
-        self.assertEqual(len(created), 1)
-        self.assertTrue(created[0].closed)
-        backend.close()
-
-    @patch("storage.backends.ssh.paramiko.AutoAddPolicy")
-    @patch("storage.backends.ssh.paramiko.SSHClient")
-    def test_write_file_reacquires_client_after_exists_reconnect(self, mock_ssh_client_cls, mock_auto_add_policy):
-        _ = mock_auto_add_policy
-
-        first = _FakeSSHClient(
-            _FakeSFTPClient(payload=b"", fail_stat_count=1, fail_stat_match="movie.bin")
-        )
-        second = _FakeSSHClient(_FakeSFTPClient(payload=b""))
-        mock_ssh_client_cls.side_effect = [first, second]
-
-        backend = self._new_backend()
-        backend.write_file("/movie.bin", b"abc", 0)
-
-        self.assertTrue(first.closed)
-        self.assertFalse(second.closed)
-        self.assertEqual(len(first.sftp_client.open_calls), 0)
-        self.assertEqual(len(second.sftp_client.open_calls), 1)
-        backend.close()
-
-    def _blocking_first_connect(self, mock_ssh_client_cls):
-        """Make the first client's connect block until the returned event is set."""
-        release = threading.Event()
-        connecting = threading.Event()
-        created = []
-
-        def _factory():
-            client = _FakeSSHClient(_FakeSFTPClient(payload=b""))
-            if not created:
-                def _slow_connect(**_kwargs):
-                    connecting.set()
-                    release.wait(timeout=5)
-                client.connect = _slow_connect
-            created.append(client)
-            return client
-
-        mock_ssh_client_cls.side_effect = _factory
-        return release, connecting, created
-
-    @staticmethod
-    def _run_in_thread(fn):
-        outcome = {}
+    def __init__(self, fn, interactive=False):
+        self.result = None
+        self.error = None
+        self.done = threading.Event()
 
         def target():
             try:
-                outcome["result"] = fn()
-            except Exception as exc:  # pragma: no cover - asserted by callers
-                outcome["error"] = exc
+                if interactive:
+                    with interactive_request():
+                        self.result = fn()
+                else:
+                    self.result = fn()
+            except BaseException as exc:
+                self.error = exc
+            finally:
+                self.done.set()
 
-        thread = threading.Thread(target=target)
-        thread.start()
-        return thread, outcome
+        self.thread = threading.Thread(target=target, daemon=True)
+        self.thread.start()
 
-    @patch("storage.backends.ssh.paramiko.AutoAddPolicy")
-    @patch("storage.backends.ssh.paramiko.SSHClient")
-    def test_connects_in_parallel_while_available(self, mock_ssh_client_cls, mock_auto_add_policy):
-        # Two threads connecting an available member at once (a readdir
-        # listing thread and a sync worker) both get a client, and the second
-        # does not wait for the first: its connect completes while the first
-        # is still blocked.
-        _ = mock_auto_add_policy
-        release, connecting, created = self._blocking_first_connect(mock_ssh_client_cls)
-        backend = self._new_backend()
+    def join(self, timeout=10):
+        self.thread.join(timeout)
+        return not self.thread.is_alive()
 
-        first, first_outcome = self._run_in_thread(backend._current_clients)
+
+class _Holder:
+    """A thread that holds one SFTP lease until release() (a lease belongs to
+    the thread that took it)."""
+
+    def __init__(self, pool, interactive=False):
+        self.pool = pool
+        self._release = threading.Event()
+        self._released = threading.Event()
+        self._acquired = threading.Event()
+        self.lease = None
+        self.error = None
+
+        def target():
+            try:
+                if interactive:
+                    with interactive_request():
+                        self.lease = pool.acquire_sftp(1.0)
+                else:
+                    self.lease = pool.acquire_sftp(1.0)
+            except BaseException as exc:
+                self.error = exc
+                self._acquired.set()
+                return
+            self._acquired.set()
+            self._release.wait(timeout=20)
+            pool.release(self.lease)
+            self._released.set()
+
+        threading.Thread(target=target, daemon=True).start()
+        if not self._acquired.wait(timeout=10):
+            raise AssertionError("holder did not acquire")
+        if self.error is not None:
+            raise self.error
+
+    def release(self):
+        self._release.set()
+        if not self._released.wait(timeout=10):
+            raise AssertionError("holder did not release")
+
+
+# --------------------------------------------------------------------------- #
+# The pool on its own
+# --------------------------------------------------------------------------- #
+
+class TestMemberConnectionPool(unittest.TestCase):
+
+    def test_many_threads_share_one_connect_and_at_most_pool_size_channels(self):
+        server = _FakeServer()
+        server.delay = 0.002
+        pool = _pool(server)
+
+        def work(_index):
+            for _ in range(25):
+                with pool.sftp(1.0) as sftp:
+                    sftp.stat("/data/x")
+
+        self.assertEqual(_run_threads(16, work), [])
+        self.assertEqual(server.connect_calls, 1)
+        self.assertEqual(len(server.transports), 1)
+        self.assertLessEqual(server.transport.max_open_seen, 4)
+        self.assertEqual(server.concurrent_use, [])
+        self.assertEqual(len(server.requests), 16 * 25)
+        pool.close()
+
+    def test_sftp_channel_opened_with_timeout_and_subsystem(self):
+        server = _FakeServer()
+        pool = _pool(server, connect_timeout=3.0)
+        with pool.sftp(7.0) as sftp:
+            self.assertEqual(sftp.chan.subsystem, "sftp")
+            self.assertEqual(sftp.chan.gettimeout(), 7.0)
+        # Back to the metadata timeout once the lease is returned.
+        self.assertEqual(sftp.chan.gettimeout(), 3.0)
+        pool.close()
+
+    def test_saturated_background_pool_still_serves_an_interactive_request(self):
+        server = _FakeServer()
+        pool = _pool(server, connect_timeout=0.3)
+        held = [_Holder(pool) for _ in range(3)]  # the bulk limit
         try:
-            self.assertTrue(connecting.wait(timeout=5))
-            ssh_client, sftp_client = backend._current_clients()
-            self.assertTrue(first.is_alive())  # still connecting
+            started = time.monotonic()
+            bulk = _InThread(lambda: pool.acquire_sftp(1.0))
+            self.assertTrue(bulk.join())
+            self.assertIsInstance(bulk.error, ConnectionError)
+            self.assertLess(time.monotonic() - started, 2.0)
+            interactive = _InThread(lambda: pool.acquire_sftp(1.0), interactive=True)
+            self.assertTrue(interactive.join())
+            self.assertIsNone(interactive.error)
+            pool.release(interactive.result)
+            self.assertEqual(server.transport.max_open_seen, 4)
         finally:
-            release.set()
-            first.join(timeout=5)
+            for holder in held:
+                holder.release()
+        self.assertTrue(pool.available())
+        pool.close()
 
-        self.assertFalse(first.is_alive())
-        self.assertNotIn("error", first_outcome)
-        self.assertIsNot(first_outcome["result"][0], ssh_client)
-        self.assertIsNotNone(sftp_client)
-        self.assertEqual(len(created), 2)
-        self.assertTrue(backend.is_available())
-        backend.close()
+    def test_lease_wait_times_out_without_marking_the_member_down(self):
+        server = _FakeServer()
+        pool = _pool(server, connect_timeout=0.2, sftp_channels=1)
+        holder = _Holder(pool)
+        waiter = _InThread(lambda: pool.acquire_sftp(1.0))
+        self.assertTrue(waiter.join())
+        self.assertIsInstance(waiter.error, ConnectionError)
+        self.assertTrue(pool.available())
+        holder.release()
+        with pool.sftp(1.0) as sftp:
+            sftp.stat("/data/x")
+        self.assertEqual(server.connect_calls, 1)
+        pool.close()
 
-    @patch("storage.backends.ssh.paramiko.AutoAddPolicy")
-    @patch("storage.backends.ssh.paramiko.SSHClient")
-    def test_connect_failure_while_available_fails_fast_in_retry_window(self, mock_ssh_client_cls, mock_auto_add_policy):
-        _ = mock_auto_add_policy
+    def test_lease_is_reentrant_within_a_thread(self):
+        server = _FakeServer()
+        pool = _pool(server, sftp_channels=1)
+        with pool.sftp(5.0) as outer:
+            with pool.sftp(1.0) as inner:
+                self.assertIs(inner, outer)
+                self.assertEqual(inner.chan.gettimeout(), 1.0)
+            self.assertEqual(outer.chan.gettimeout(), 5.0)
+        self.assertEqual(pool.snapshot()["idle"], 1)
+        pool.close()
 
-        def _factory():
-            client = _FakeSSHClient(_FakeSFTPClient(payload=b""))
+    def test_refused_channel_shrinks_the_pool_and_leaves_the_member_available(self):
+        server = _FakeServer(max_sessions=2)
+        pool = _pool(server)
+        def work(_index):
+            with pool.sftp(1.0) as sftp:
+                sftp.stat("/data/x")
+                time.sleep(0.05)
 
-            def _fail_connect(**_kwargs):
-                raise socket.timeout("simulated connect timeout")
+        self.assertEqual(_run_threads(4, work), [])
+        self.assertGreaterEqual(server.transport.refusals, 1)
+        self.assertLessEqual(server.transport.max_open_seen, 2)
+        snapshot = pool.snapshot()
+        self.assertEqual(snapshot["sftp_cap"], 1)
+        self.assertEqual(snapshot["exec_cap"], 1)
+        self.assertTrue(pool.available())
+        self.assertEqual(server.connect_calls, 1)
+        self.assertEqual(server.concurrent_use, [])
+        pool.close()
 
-            client.connect = _fail_connect
-            return client
-
-        mock_ssh_client_cls.side_effect = _factory
-        backend = self._new_backend()
-
-        with self.assertRaises(socket.timeout):
-            backend._current_clients()
-        self.assertFalse(backend.is_available())
-
-        # Inside the retry window: fail fast, no new connection attempt.
+    def test_a_server_that_refuses_every_channel_fails_the_request_only(self):
+        server = _FakeServer(max_sessions=0)
+        pool = _pool(server)
         with self.assertRaises(ConnectionError):
-            backend._current_clients()
-        self.assertEqual(mock_ssh_client_cls.call_count, 1)
-        backend.close()
+            with pool.sftp(1.0):
+                pass
+        self.assertTrue(pool.available())
+        pool.close()
 
-    @patch("storage.backends.ssh.paramiko.AutoAddPolicy")
-    @patch("storage.backends.ssh.paramiko.SSHClient")
-    def test_connect_fails_fast_during_probe_after_disconnect(self, mock_ssh_client_cls, mock_auto_add_policy):
-        _ = mock_auto_add_policy
-        release, connecting, created = self._blocking_first_connect(mock_ssh_client_cls)
+    def test_transport_death_mid_operation_reconnects_once_with_a_new_generation(self):
+        server = _FakeServer()
+        pool = _pool(server)
+        with pool.sftp(1.0) as sftp:
+            sftp.stat("/data/x")
+        first_generation = pool.snapshot()["generation"]
+        first_transport = server.transport
+
+        def die(_sftp, _path):
+            server.hooks.pop("stat")
+            first_transport.close()
+            raise EOFError("connection dropped")
+
+        server.hooks["stat"] = die
+        with self.assertRaises(EOFError):
+            with pool.sftp(1.0) as sftp:
+                sftp.stat("/data/x")
+        with pool.sftp(1.0) as sftp:
+            sftp.stat("/data/x")
+        self.assertEqual(server.connect_calls, 2)
+        self.assertGreater(pool.snapshot()["generation"], first_generation)
+        self.assertTrue(server.ssh_clients[0].closed)
+        self.assertTrue(pool.available())
+        pool.close()
+
+    def test_stale_generation_channels_are_discarded_on_return(self):
+        server = _FakeServer()
+        pool = _pool(server)
+        old = _Holder(pool)
+        other = pool.acquire_sftp(1.0)
+        # Another operation finds the transport gone.
+        server.transport.close()
+        pool.release(other, EOFError("gone"))
+        with pool.sftp(1.0) as sftp:
+            sftp.stat("/data/x")
+        old.release()
+        self.assertTrue(old.lease.client.closed)
+        snapshot = pool.snapshot()
+        self.assertEqual(snapshot["idle"], 1)
+        self.assertEqual(snapshot["sftp_open"], 1)
+        pool.close()
+
+    def test_timeout_with_a_live_transport_drops_only_the_channel(self):
+        server = _FakeServer()
+        pool = _pool(server)
+        lease = pool.acquire_sftp(1.0)
+        pool.release(lease, socket.timeout("timed out"))
+        self.assertTrue(lease.client.closed)
+        with pool.sftp(1.0) as sftp:
+            sftp.stat("/data/x")
+        self.assertEqual(server.connect_calls, 1)
+        pool.close()
+
+    def test_timeout_with_a_dead_transport_closes_it(self):
+        server = _FakeServer()
+        pool = _pool(server)
+        lease = pool.acquire_sftp(1.0)
+
+        def no_reply(_timeout):
+            raise ssh_module.paramiko.SSHException("Timeout opening channel.")
+
+        server.transport.open_hook = no_reply
+        pool.release(lease, socket.timeout("timed out"))
+        self.assertTrue(server.ssh_clients[0].closed)
+        with pool.sftp(1.0) as sftp:
+            sftp.stat("/data/x")
+        self.assertEqual(server.connect_calls, 2)
+        pool.close()
+
+    def test_path_errors_keep_the_channel(self):
+        server = _FakeServer()
+        pool = _pool(server)
+        for exc in (FileNotFoundError("x"), PermissionError("x"), OSError(5, "I/O")):
+            lease = pool.acquire_sftp(1.0)
+            pool.release(lease, exc)
+            self.assertFalse(lease.client.closed)
+        self.assertEqual(len(server.clients), 1)
+        self.assertEqual(server.connect_calls, 1)
+        pool.close()
+
+    def test_connect_failure_marks_down_once_and_fails_fast(self):
+        server = _FakeServer()
+        server.connect_error = socket.timeout("connect timed out")
+        gate = threading.Event()
+        server.connect_gate = gate
+        pool = _pool(server, connect_timeout=5.0)
+        availability = []
+        pool._on_availability = availability.append
+
+        first = _InThread(lambda: pool.acquire_sftp(1.0))
+        while server.connect_calls == 0:
+            time.sleep(0.01)
+        waiters = [_InThread(lambda: pool.acquire_sftp(1.0)) for _ in range(4)]
+        time.sleep(0.05)
+        gate.set()
+        for thread in [first, *waiters]:
+            self.assertTrue(thread.join())
+        self.assertIsInstance(first.error, socket.timeout)
+        for waiter in waiters:
+            self.assertIsInstance(waiter.error, ConnectionError)
+        self.assertEqual(server.connect_calls, 1)
+        self.assertEqual(availability, [False])
+        self.assertFalse(pool.available())
+
+        # Inside the retry window: no new connect.
+        with self.assertRaises(ConnectionError):
+            pool.acquire_sftp(1.0)
+        self.assertEqual(server.connect_calls, 1)
+        pool.close()
+
+    def test_reconnect_probe_after_the_retry_window(self):
+        server = _FakeServer()
+        server.connect_error = socket.timeout("connect timed out")
+        pool = _pool(server, retry_interval=0.1)
+        with self.assertRaises(socket.timeout):
+            pool.acquire_sftp(1.0)
+        self.assertFalse(pool.available())
+        time.sleep(0.15)
+        self.assertTrue(pool.available())
+        server.connect_error = None
+        with pool.sftp(1.0) as sftp:
+            sftp.stat("/data/x")
+        self.assertTrue(pool.available())
+        self.assertEqual(server.connect_calls, 2)
+        pool.close()
+
+    def test_reconnect_probe_in_progress_fails_other_callers_fast(self):
+        server = _FakeServer()
+        pool = _pool(server, connect_timeout=30.0)
+        pool.mark_down()
+        pool.clear_down()
+        pool.mark_down()
+        pool._next_retry_at = 0.0  # the retry window has passed
+        gate = threading.Event()
+        server.connect_gate = gate
+        prober = _InThread(lambda: pool.acquire_sftp(1.0))
+        try:
+            while server.connect_calls == 0:
+                time.sleep(0.01)
+            self.assertFalse(pool.available())
+            started = time.monotonic()
+            with self.assertRaises(ConnectionError):
+                pool.acquire_sftp(1.0)
+            self.assertLess(time.monotonic() - started, 1.0)
+        finally:
+            gate.set()
+            self.assertTrue(prober.join())
+        self.assertIsNone(prober.error)
+        pool.release(prober.result)
+        self.assertEqual(server.connect_calls, 1)
+        pool.close()
+
+    def test_callers_wait_for_the_connect_of_an_available_member(self):
+        # A member believed up connects once; a second caller waits for that
+        # connect instead of failing or opening its own (#117).
+        server = _FakeServer()
+        gate = threading.Event()
+        server.connect_gate = gate
+        pool = _pool(server, connect_timeout=5.0)
+        first = _InThread(lambda: pool.acquire_sftp(1.0))
+        while server.connect_calls == 0:
+            time.sleep(0.01)
+        self.assertTrue(pool.available())
+        second = _InThread(lambda: pool.acquire_sftp(1.0))
+        time.sleep(0.05)
+        self.assertFalse(second.done.is_set())
+        gate.set()
+        self.assertTrue(first.join())
+        self.assertTrue(second.join())
+        self.assertIsNone(first.error)
+        self.assertIsNone(second.error)
+        self.assertEqual(server.connect_calls, 1)
+        pool.release(first.result)
+        pool.release(second.result)
+        pool.close()
+
+    def test_close_wakes_lease_waiters_and_connect_waiters(self):
+        server = _FakeServer()
+        pool = _pool(server, connect_timeout=30.0, sftp_channels=1)
+        holder = _Holder(pool)
+        waiter = _InThread(lambda: pool.acquire_sftp(1.0))
+        time.sleep(0.05)
+        started = time.monotonic()
+        pool.close()
+        self.assertTrue(waiter.join(timeout=5))
+        self.assertLess(time.monotonic() - started, 5.0)
+        self.assertIsInstance(waiter.error, ConnectionError)
+        self.assertTrue(holder.lease.client.chan.closed)
+        holder.release()
+        self.assertFalse(pool.available())
+
+        # A connect that close() raced is discarded.
+        server2 = _FakeServer()
+        gate = threading.Event()
+        server2.connect_gate = gate
+        pool2 = _pool(server2, connect_timeout=30.0)
+        connecting = _InThread(lambda: pool2.acquire_sftp(1.0))
+        while server2.connect_calls == 0:
+            time.sleep(0.01)
+        connect_waiter = _InThread(lambda: pool2.acquire_sftp(1.0))
+        time.sleep(0.05)
+        pool2.close()
+        self.assertTrue(connect_waiter.join(timeout=5))
+        self.assertIsInstance(connect_waiter.error, ConnectionError)
+        gate.set()
+        self.assertTrue(connecting.join())
+        self.assertIsInstance(connecting.error, ConnectionError)
+        self.assertTrue(server2.ssh_clients[0].closed)
+
+    def test_exec_channels_are_bounded_and_always_closed(self):
+        server = _FakeServer()
+        release = threading.Event()
+        in_flight = []
+
+        def slow(cmd):
+            in_flight.append(cmd)
+            release.wait(timeout=5)
+            return 0, b"ok\n"
+
+        server.exec_handler = slow
+        pool = _pool(server, connect_timeout=5.0)
+        runners = [_InThread(lambda i=i: pool.run_command(f"cmd{i}", 5.0)) for i in range(3)]
+        deadline = time.monotonic() + 5
+        while len(in_flight) < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        time.sleep(0.05)
+        self.assertEqual(len(in_flight), 2)
+        release.set()
+        for runner in runners:
+            self.assertTrue(runner.join())
+            self.assertIsNone(runner.error)
+            self.assertEqual(runner.result, (0, b"ok\n"))
+        self.assertEqual(server.transport.open_channels, [])
+        self.assertEqual(pool.snapshot()["exec_open"], 0)
+        pool.close()
+
+    def test_refused_exec_channel_raises_connection_error_and_member_stays_up(self):
+        server = _FakeServer(max_sessions=1)
+        pool = _pool(server)
+        with pool.sftp(1.0):
+            with self.assertRaises(ConnectionError):
+                pool.run_command("true", 1.0)
+        self.assertTrue(pool.available())
+        self.assertEqual(pool.snapshot()["exec_open"], 0)
+        pool.close()
+
+    def test_unanswered_channel_request_times_out(self):
+        server = _FakeServer()
+        pool = _pool(server, connect_timeout=0.2)
+        with pool.sftp(1.0):
+            pass
+
+        def hang(chan):
+            # paramiko's wait for a reply ends when the channel is closed.
+            while not chan.closed:
+                time.sleep(0.01)
+            raise ssh_module.paramiko.SSHException("Channel closed.")
+
+        server.transport.subsystem_hook = hang
+        held = _Holder(pool)  # the idle channel
+        started = time.monotonic()
+        # The open gets no reply within connect_timeout: the transport is
+        # treated as dead, and the lease reconnects.
+        lease = pool.acquire_sftp(1.0)
+        self.assertLess(time.monotonic() - started, 3.0)
+        self.assertTrue(server.ssh_clients[0].closed)
+        self.assertEqual(server.connect_calls, 2)
+        pool.release(lease)
+        held.release()
+        pool.close()
+
+    def test_one_members_stall_does_not_block_another(self):
+        slow_server, fast_server = _FakeServer(), _FakeServer()
+        gate = threading.Event()
+        slow_server.connect_gate = gate
+        slow_pool, fast_pool = _pool(slow_server, connect_timeout=10.0), _pool(fast_server)
+        stalled = _InThread(lambda: slow_pool.acquire_sftp(1.0))
+        try:
+            while slow_server.connect_calls == 0:
+                time.sleep(0.01)
+            started = time.monotonic()
+            with fast_pool.sftp(1.0) as sftp:
+                sftp.stat("/data/x")
+            self.assertLess(time.monotonic() - started, 1.0)
+        finally:
+            gate.set()
+            stalled.join()
+        slow_pool.release(stalled.result)
+        slow_pool.close()
+        fast_pool.close()
+
+    def test_interactive_marker_follows_a_copied_context_into_an_executor(self):
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        try:
+            with interactive_request():
+                inside = executor.submit(
+                    contextvars.copy_context().run, is_interactive_request).result()
+            outside = executor.submit(is_interactive_request).result()
+        finally:
+            executor.shutdown()
+        self.assertTrue(inside)
+        self.assertFalse(outside)
+        self.assertFalse(is_interactive_request())
+
+
+# --------------------------------------------------------------------------- #
+# SSHBackend on the pool
+# --------------------------------------------------------------------------- #
+
+class _BackendTestCase(unittest.TestCase):
+    """SSHBackend with paramiko's SSHClient and SFTPClient replaced by fakes."""
+
+    def setUp(self):
+        self.server = _FakeServer()
+        for target, replacement in (
+            ("storage.backends.ssh.paramiko.SSHClient", self.server.new_ssh_client),
+            ("storage.backends.ssh.paramiko.AutoAddPolicy", lambda: None),
+            ("storage.backends.ssh_pool.paramiko.SFTPClient", self.server.sftp_factory),
+        ):
+            patcher = patch(target, replacement)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _new_backend(self, **kwargs):
+        kwargs.setdefault("connect_timeout", 2.0)
         backend = SSHBackend(
             name="ssh0",
             host="example.local",
             remote_path="/data",
             username="test",
             key_filename="/tmp/id_test",
-            connect_timeout=30.0,
+            **kwargs,
         )
-        backend.set_available(False)  # retry window already open
+        self.addCleanup(backend.close)
+        return backend
 
-        first = threading.Thread(target=backend._current_clients)
-        first.start()
-        try:
-            self.assertTrue(connecting.wait(timeout=5))
-            started = time.monotonic()
-            with self.assertRaises(ConnectionError):
-                backend._current_clients()
-            self.assertLess(time.monotonic() - started, 5.0)
-            self.assertEqual(len(created), 1)
-        finally:
-            release.set()
-            first.join(timeout=5)
-            backend.close()
+
+class TestSSHBackendOnThePool(_BackendTestCase):
+
+    def test_parallel_operations_share_one_connection(self):
+        self.server.delay = 0.002
+        backend = self._new_backend()
+
+        def work(index):
+            for _ in range(10):
+                backend.stat(f"/f{index}")
+                backend.read_file("/movie.bin", 0, 4)
+                backend.listdir("/")
+
+        self.assertEqual(_run_threads(12, work), [])
+        self.assertEqual(self.server.connect_calls, 1)
+        self.assertLessEqual(self.server.transport.max_open_seen, 4)
+        self.assertEqual(self.server.concurrent_use, [])
+
+    def test_no_socket_timeout_override(self):
+        backend = self._new_backend()
+        backend.stat("/x")
+        self.assertEqual(self.server.transport.sock.settimeout_calls, [])
+
+    def test_metadata_uses_connect_timeout_and_reads_the_operation_timeout(self):
+        backend = self._new_backend(connect_timeout=3.0)
+        backend.stat("/x")
+        backend.read_file("/x", 0, 4)
+        timeouts = {name: timeout for name, _path, timeout, _i in self.server.requests}
+        self.assertEqual(timeouts["stat"], 3.0)
+        self.assertEqual(timeouts["open"], backend.sftp_operation_timeout)
+
+    def test_read_retry_after_transport_loss_does_not_quarantine(self):
+        backend = self._new_backend()
+
+        def die(_sftp, _path):
+            self.server.hooks.pop("open")
+            self.server.transport.close()
+            raise EOFError("connection dropped")
+
+        backend.stat("/x")
+        self.server.hooks["open"] = die
+        self.assertEqual(backend.read_file("/movie.bin", 0, 8), self.server.payload[:8])
+        self.assertTrue(backend.is_available())
+        self.assertEqual(self.server.connect_calls, 2)
+
+    def test_stat_missing_file_does_not_mark_backend_unavailable(self):
+        backend = self._new_backend()
+        self.server.missing.add("/data/missing.bin")
+        with self.assertRaises(FileNotFoundError):
+            backend.stat("/missing.bin")
+        self.assertFalse(backend.exists("/missing.bin"))
+        self.assertTrue(backend.is_available())
+        self.assertEqual(self.server.connect_calls, 1)
+        self.assertEqual(len(self.server.clients), 1)
+
+    def test_exists_connect_failure_marks_unavailable_and_respects_retry_window(self):
+        self.server.connect_error = socket.timeout("simulated connect timeout")
+        backend = self._new_backend()
+        self.assertFalse(backend.exists("/movie.bin"))
+        self.assertFalse(backend.is_available())
+        self.assertFalse(backend.exists("/movie.bin"))
+        self.assertEqual(self.server.connect_calls, 1)
+
+        # Retry window over: one probe connects and the member is back.
+        self.server.connect_error = None
+        backend._pool._next_retry_at = 0.0
+        self.assertTrue(backend.exists("/movie.bin"))
+        self.assertTrue(backend.is_available())
+        self.assertEqual(self.server.connect_calls, 2)
+
+    def test_set_available_maps_onto_the_pool(self):
+        backend = self._new_backend()
+        backend.set_available(False)
+        self.assertFalse(backend.is_available())
+        self.assertFalse(backend.get_info().available)
+        with self.assertRaises(ConnectionError):
+            backend.stat("/x")
+        backend.set_available(True)
+        self.assertTrue(backend.is_available())
+        backend.stat("/x")
+
+    def test_write_file_checks_existence_on_its_own_channel(self):
+        backend = self._new_backend(connect_timeout=2.0)
+        backend._pool._sftp_cap = 1
+        backend.write_file("/new.bin", b"abc", 0)
+        self.assertEqual(len(self.server.clients), 1)
+        self.server.missing.add("/data/gone.bin")
+        backend.write_file("/gone.bin", b"abc", 0)
+
+    def test_write_file_does_not_truncate_after_a_failed_existence_check(self):
+        backend = self._new_backend()
+
+        def fail_target(_sftp, path):
+            if path.endswith("movie.bin"):
+                raise socket.timeout("timed out")
+
+        self.server.hooks["stat"] = fail_target
+        with self.assertRaises(socket.timeout):
+            backend.write_file("/movie.bin", b"abc", 0)
+        self.assertNotIn("open", [name for name, *_ in self.server.requests])
+
+    def test_pool_of_one_survives_the_checksum_download_fallback(self):
+        self.server.exec_handler = lambda _cmd: (127, b"")
+        backend = self._new_backend()
+        backend._pool._sftp_cap = 1
+        digest = backend.get_fast_checksum("/movie.bin")
+        self.assertEqual(len(digest), 32)
+        self.assertEqual(self.server.transport.open_channels[0].subsystem, "sftp")
+        self.assertEqual(len(self.server.transport.open_channels), 1)
+
+        # And a nested call on a thread that already holds the one channel.
+        with backend._pool.sftp(1.0):
+            self.assertEqual(len(backend.get_fast_checksum("/movie.bin")), 32)
+
+    def test_remote_checksum_and_xattrs_close_their_exec_channels(self):
+        digest = "0123456789abcdef0123456789abcdef"
+
+        def handler(cmd):
+            if cmd.startswith("xxh128sum"):
+                return 0, f"{digest}  /data/movie.bin\n".encode()
+            if cmd.startswith("getfattr"):
+                return 0, b"value"
+            return 0, b""
+
+        self.server.exec_handler = handler
+        backend = self._new_backend()
+        self.assertEqual(backend.get_fast_checksum("/movie.bin"), digest)
+        backend.set_xattr("/movie.bin", "user.x", b"v")
+        self.assertEqual(backend.get_xattr("/movie.bin", "user.x"), b"value")
+        self.assertEqual(self.server.transport.open_channels, [])
+        self.assertEqual(len(self.server.transport.commands), 3)
+        self.assertTrue(all(cmd.endswith("2>/dev/null") for cmd in self.server.transport.commands))
+
+    def test_get_xattr_failure_is_none(self):
+        self.server.exec_handler = lambda _cmd: (1, b"")
+        backend = self._new_backend()
+        self.assertIsNone(backend.get_xattr("/movie.bin", "user.x"))
+
+    def test_close_wakes_waiters_and_marks_unavailable(self):
+        backend = self._new_backend(connect_timeout=30.0)
+        backend._pool._sftp_cap = 1
+        holder = _Holder(backend._pool)
+        waiter = _InThread(lambda: backend.stat("/x"))
+        time.sleep(0.05)
+        backend.close()
+        self.assertTrue(waiter.join(timeout=5))
+        self.assertIsInstance(waiter.error, ConnectionError)
+        holder.release()
+        self.assertFalse(backend.is_available())
+
+    def test_fuse_dispatch_marks_requests_interactive(self):
+        from storage.fs import StorageFS
+
+        class _Probe(StorageFS):
+            def __init__(self):  # no filesystem state needed
+                pass
+
+            def getattr(self, path, fh=None):
+                return is_interactive_request()
+
+        self.assertTrue(_Probe()("getattr", "/"))
+        self.assertFalse(is_interactive_request())
+
+    def test_rsync_mkdir_goes_through_the_pool(self):
+        from storage.backends.rsync import RsyncBackend
+
+        backend = RsyncBackend(name="r0", host="example.local", remote_path="/data",
+                               username="test", key_filename="/tmp/id_test",
+                               connect_timeout=2.0)
+        self.addCleanup(backend.close)
+        self.server.missing.add("/data/dir")
+        with patch.object(backend, "_run_rsync") as run_rsync:
+            backend.copy_from_local(SimpleNamespace(), "/dir/f.bin")
+        run_rsync.assert_called_once()
+        self.assertIn(("mkdir", "/data/dir"),
+                      [(name, path) for name, path, *_ in self.server.requests])
+        self.assertEqual(self.server.connect_calls, 1)
 
 
 _GETENT_AHOSTS = (
@@ -645,6 +1177,8 @@ class TestHostResolverFallback(unittest.TestCase):
         mock_create.assert_not_called()
 
 
+
+
 class _FakeTCPSocket:
     def __init__(self):
         self.closed = False
@@ -653,9 +1187,10 @@ class _FakeTCPSocket:
         self.closed = True
 
 
-class TestSSHBackendHostResolverConnect(unittest.TestCase):
-    def _new_backend(self):
-        return SSHBackend(
+class TestSSHBackendHostResolverConnect(_BackendTestCase):
+
+    def _make(self):
+        backend = SSHBackend(
             name="ssh0",
             host="nas.local",
             remote_path="/data",
@@ -664,80 +1199,79 @@ class TestSSHBackendHostResolverConnect(unittest.TestCase):
             port=2222,
             connect_timeout=3.0,
         )
+        self.addCleanup(backend.close)
+        return backend
 
-    @staticmethod
-    def _client_failing_lookup_without_sock(calls, fail_with_sock=None):
-        client = _FakeSSHClient(_FakeSFTPClient(payload=b""))
-
-        def _connect(**kwargs):
-            calls.append(kwargs)
+    def _fail_lookup_without_sock(self, fail_with_sock=None):
+        def error(kwargs):
             if "sock" not in kwargs:
-                raise socket.gaierror(-3, "Temporary failure in name resolution")
-            if fail_with_sock is not None:
-                raise fail_with_sock
+                return socket.gaierror(-3, "Temporary failure in name resolution")
+            return fail_with_sock
 
-        client.connect = _connect
-        return client
+        self.server.connect_error = error
 
     @patch("storage.backends.ssh._connect_via_host_resolver")
-    @patch("storage.backends.ssh.paramiko.AutoAddPolicy")
-    @patch("storage.backends.ssh.paramiko.SSHClient")
-    def test_lookup_failure_connects_over_host_resolver_socket(self, mock_ssh_client_cls, _policy, mock_fallback):
-        calls = []
-        mock_ssh_client_cls.side_effect = lambda: self._client_failing_lookup_without_sock(calls)
+    def test_lookup_failure_connects_over_host_resolver_socket(self, mock_fallback):
+        self._fail_lookup_without_sock()
         sock = _FakeTCPSocket()
         mock_fallback.return_value = sock
-        backend = self._new_backend()
+        backend = self._make()
 
-        backend._current_clients()
+        backend.stat("/x")
 
         self.assertTrue(backend.is_available())
-        self.assertEqual(mock_ssh_client_cls.call_count, 1)
+        self.assertEqual(len(self.server.ssh_clients), 1)
         host, port, timeout, lookup_error = mock_fallback.call_args.args
         self.assertEqual((host, port, timeout), ("nas.local", 2222, 3.0))
         self.assertIsInstance(lookup_error, socket.gaierror)
+        calls = self.server.ssh_clients[0].connect_kwargs
         self.assertEqual(len(calls), 2)
         # Same hostname (it names the host key) and settings, plus the socket.
         self.assertIs(calls[1].pop("sock"), sock)
         self.assertEqual(calls[1], calls[0])
         self.assertEqual(calls[1]["hostname"], "nas.local")
         self.assertFalse(sock.closed)
-        backend.close()
 
     @patch("storage.backends.ssh._connect_via_host_resolver")
-    @patch("storage.backends.ssh.paramiko.AutoAddPolicy")
-    @patch("storage.backends.ssh.paramiko.SSHClient")
-    def test_handshake_failure_over_fallback_socket_closes_it(self, mock_ssh_client_cls, _policy, mock_fallback):
-        calls = []
+    def test_getent_runs_once_per_connect_not_per_thread(self, mock_fallback):
+        self._fail_lookup_without_sock()
+        mock_fallback.side_effect = lambda *_args: _FakeTCPSocket()
+        backend = self._make()
+
+        def work(_index):
+            for _ in range(5):
+                backend.stat("/x")
+
+        self.assertEqual(_run_threads(8, work), [])
+        self.assertEqual(mock_fallback.call_count, 1)
+
+        # A reconnect resolves again: addresses are not cached.
+        self.server.transport.close()
+        backend.stat("/x")
+        self.assertEqual(mock_fallback.call_count, 2)
+
+    @patch("storage.backends.ssh._connect_via_host_resolver")
+    def test_handshake_failure_over_fallback_socket_closes_it(self, mock_fallback):
         handshake_error = ssh_module.paramiko.SSHException("banner")
-        clients = []
-
-        def _factory():
-            clients.append(self._client_failing_lookup_without_sock(
-                calls, fail_with_sock=handshake_error))
-            return clients[-1]
-
-        mock_ssh_client_cls.side_effect = _factory
+        self._fail_lookup_without_sock(fail_with_sock=handshake_error)
         sock = _FakeTCPSocket()
         mock_fallback.return_value = sock
-        backend = self._new_backend()
+        backend = self._make()
 
         with self.assertRaises(ssh_module.paramiko.SSHException):
-            backend._current_clients()
+            backend.stat("/x")
         self.assertTrue(sock.closed)
-        self.assertTrue(clients[0].closed)
+        self.assertTrue(self.server.ssh_clients[0].closed)
         self.assertFalse(backend.is_available())
-        backend.close()
 
     @patch("storage.backends.ssh._connect_via_host_resolver")
-    @patch("storage.backends.ssh.paramiko.AutoAddPolicy")
-    @patch("storage.backends.ssh.paramiko.SSHClient")
-    def test_client_close_error_does_not_hide_handshake_error_or_leak_socket(self, mock_ssh_client_cls, _policy, mock_fallback):
-        calls = []
+    def test_client_close_error_does_not_hide_handshake_error_or_leak_socket(self, mock_fallback):
         handshake_error = ssh_module.paramiko.SSHException("banner")
+        self._fail_lookup_without_sock(fail_with_sock=handshake_error)
+        original = self.server.new_ssh_client
 
-        def _factory():
-            client = self._client_failing_lookup_without_sock(calls, fail_with_sock=handshake_error)
+        def client_with_failing_close():
+            client = original()
 
             def _close_fails():
                 raise RuntimeError("close failed")
@@ -745,31 +1279,20 @@ class TestSSHBackendHostResolverConnect(unittest.TestCase):
             client.close = _close_fails
             return client
 
-        mock_ssh_client_cls.side_effect = _factory
         sock = _FakeTCPSocket()
         mock_fallback.return_value = sock
-        backend = self._new_backend()
+        backend = self._make()
 
-        with self.assertRaises(ssh_module.paramiko.SSHException) as caught:
-            backend._current_clients()
+        with patch("storage.backends.ssh.paramiko.SSHClient", client_with_failing_close):
+            with self.assertRaises(ssh_module.paramiko.SSHException) as caught:
+                backend.stat("/x")
         self.assertIs(caught.exception, handshake_error)
         self.assertTrue(sock.closed)
-        backend.close()
 
     @patch("storage.backends.ssh._connect_via_host_resolver")
-    @patch("storage.backends.ssh.paramiko.AutoAddPolicy")
-    @patch("storage.backends.ssh.paramiko.SSHClient")
-    def test_socket_close_error_does_not_hide_handshake_error(self, mock_ssh_client_cls, _policy, mock_fallback):
-        calls = []
+    def test_socket_close_error_does_not_hide_handshake_error(self, mock_fallback):
         handshake_error = ssh_module.paramiko.SSHException("banner")
-        clients = []
-
-        def _factory():
-            clients.append(self._client_failing_lookup_without_sock(
-                calls, fail_with_sock=handshake_error))
-            return clients[-1]
-
-        mock_ssh_client_cls.side_effect = _factory
+        self._fail_lookup_without_sock(fail_with_sock=handshake_error)
         sock = _FakeTCPSocket()
 
         def _close_fails():
@@ -777,31 +1300,27 @@ class TestSSHBackendHostResolverConnect(unittest.TestCase):
 
         sock.close = _close_fails
         mock_fallback.return_value = sock
-        backend = self._new_backend()
+        backend = self._make()
 
         with self.assertRaises(ssh_module.paramiko.SSHException) as caught:
-            backend._current_clients()
+            backend.stat("/x")
         self.assertIs(caught.exception, handshake_error)
-        self.assertTrue(clients[0].closed)
-        backend.close()
+        self.assertTrue(self.server.ssh_clients[0].closed)
 
     @patch("storage.backends.ssh._connect_via_host_resolver")
-    @patch("storage.backends.ssh.paramiko.AutoAddPolicy")
-    @patch("storage.backends.ssh.paramiko.SSHClient")
-    def test_unresolvable_host_keeps_lookup_error_and_marks_unavailable(self, mock_ssh_client_cls, _policy, mock_fallback):
-        calls = []
-        mock_ssh_client_cls.side_effect = lambda: self._client_failing_lookup_without_sock(calls)
+    def test_unresolvable_host_keeps_lookup_error_and_marks_unavailable(self, mock_fallback):
+        self._fail_lookup_without_sock()
+
         def _no_address(_host, _port, _timeout, lookup_error):
             raise lookup_error
 
         mock_fallback.side_effect = _no_address
-        backend = self._new_backend()
+        backend = self._make()
 
         with self.assertRaises(socket.gaierror):
-            backend._current_clients()
+            backend.stat("/x")
         self.assertFalse(backend.is_available())
-        self.assertEqual(len(calls), 1)
-        backend.close()
+        self.assertEqual(len(self.server.ssh_clients[0].connect_kwargs), 1)
 
 
 if __name__ == "__main__":

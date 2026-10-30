@@ -18,7 +18,7 @@ import logging
 import os
 import shlex
 import subprocess
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import List, Optional
 
 from .base import Backend, BackendType
@@ -159,7 +159,7 @@ class RsyncBackend(SSHBackend):
     # ------------------------------------------------------------------ #
 
     # copy_to_local is intentionally NOT overridden.  SFTP's persistent
-    # per-thread connection is faster for reads (no fork overhead, no
+    # pooled connection is faster for reads (no fork overhead, no
     # SSH handshake per file, progressive download).  rsync is only
     # beneficial for writes where delta compression matters.
 
@@ -168,13 +168,9 @@ class RsyncBackend(SSHBackend):
         # Ensure remote parent directory exists (rsync doesn't create
         # intermediate dirs on the remote like mkdir -p).
         remote_path = str(self._resolve_path(virtual_path))
-        parent = str(PurePosixPath(remote_path).parent)
         try:
-            _, sftp_client = self._current_clients()
-            try:
-                sftp_client.stat(parent)
-            except FileNotFoundError:
-                self._mkdir_recursive(parent, sftp_client=sftp_client)
+            self._with_sftp("mkdir", virtual_path,
+                            lambda sftp: self._ensure_parent(sftp, remote_path))
         except Exception:
             # If SFTP mkdir fails, rsync might still work if dir exists.
             pass
