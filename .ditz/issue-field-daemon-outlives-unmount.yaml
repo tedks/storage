@@ -1,0 +1,28 @@
+id: field-daemon-outlives-unmount
+title: Daemon keeps downloading for minutes after fusermount -u; a remount meanwhile
+  fails with 'Mount already active'
+desc: 'Field test 2026-10-30, master 39e4b79. After fusermount -u returned and the
+  mountpoint was gone, the storage process kept running 142 s (discovery mount, ~5
+  GiB received after unmount) and 188 s (threads-on mount, ~9 GiB after unmount),
+  with no /dev/fuse fd, two paramiko transport threads and the main thread in a futex
+  wait, finishing queued checksum downloads (field-listing-downloads-to-hash) before
+  exiting. A storage mount of the same profile during that time fails with ''Mount
+  already active''. Expected: unmount cancels queued background hashing and closes
+  member transports promptly. Separately (environment, not storage): a Bazel linux-sandbox
+  namespace created while a mount is up keeps a copy of it, so the daemon keeps serving
+  /dev/fuse after the unmount in the host namespace until the sandbox exits; writing
+  1 to /sys/fs/fuse/connections/<minor>/abort ends it. Possibly related: ded6d1578f6a1a798c68fa58c2a67173b614fe3f
+  (destroy hung in the remote gate).'
+type: bugfix
+component: fs
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-30T17:06:43-00:00
+references: []
+log_events:
+- time: 2026-10-30T17:06:43-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
