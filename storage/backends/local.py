@@ -2,11 +2,56 @@
 
 import os
 import shutil
+import stat
 from pathlib import Path
 from typing import List, Optional
 
 from .base import Backend, BackendType, StorageMemberCapabilities
 from ..checksums import fast_checksum_file
+from ..file_config import XATTR_CONFIG_NAME
+
+# The mount's own state on a cache file (metadata, member baselines, stream
+# state): never copied to a member, nor back from one. The config policy
+# is the user's and travels with the file.
+_INTERNAL_XATTR_PREFIX = "user.storage."
+
+
+def _is_internal_xattr(name: str) -> bool:
+    return name.startswith(_INTERNAL_XATTR_PREFIX) and name != XATTR_CONFIG_NAME
+
+
+def _listxattr(path) -> List[str]:
+    try:
+        return os.listxattr(path)
+    except OSError:
+        return []
+
+
+def _copy_file(src: Path, dst: Path):
+    """shutil.copy2 without the mount's internal xattrs.
+
+    Bytes, mode, times and every other xattr are copied as copy2 would
+    (xattrs best effort, as there). An existing destination keeps its inode,
+    and so its xattrs: internal ones it carries (left by an older copy2) are
+    removed. Times are set last, since nothing after them may move them.
+    """
+    shutil.copyfile(src, dst)
+    st = os.stat(src)
+    os.chmod(dst, stat.S_IMODE(st.st_mode))
+    for name in _listxattr(dst):
+        if _is_internal_xattr(name):
+            try:
+                os.removexattr(dst, name)
+            except OSError:
+                pass
+    for name in _listxattr(src):
+        if _is_internal_xattr(name):
+            continue
+        try:
+            os.setxattr(dst, name, os.getxattr(src, name))
+        except OSError:
+            pass
+    os.utime(dst, ns=(st.st_atime_ns, st.st_mtime_ns))
 
 
 class LocalBackend(Backend):
@@ -145,13 +190,13 @@ class LocalBackend(Backend):
         """Copy a file from backend to local path"""
         real_path = self._resolve_path(virtual_path)
         local_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(real_path, local_path)
+        _copy_file(real_path, local_path)
 
     def copy_from_local(self, local_path: Path, virtual_path: str):
         """Copy a local file to backend"""
         real_path = self._resolve_path(virtual_path)
         real_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(local_path, real_path)
+        _copy_file(local_path, real_path)
 
     def rename(self, old_virtual_path: str, new_virtual_path: str):
         """Rename a file or directory on the backend."""
