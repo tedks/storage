@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 from storage.backends import ssh as ssh_module
 from storage.backends import ssh_pool
-from storage.backends.base import interactive_request, is_interactive_request
+from storage.backends.base import ChecksumUnavailable, interactive_request, is_interactive_request
 from storage.backends.ssh import SSHBackend
 from storage.backends.ssh_pool import MemberConnection, MemberUnavailable, is_connection_error
 
@@ -1504,6 +1504,15 @@ class TestSSHBackendOnThePool(_BackendTestCase):
         # And a nested call on a thread that already holds the one channel.
         with backend._pool.sftp(1.0):
             self.assertEqual(len(backend.get_fast_checksum("/movie.bin")), 32)
+
+    def test_checksum_without_download_raises_instead_of_fetching(self):
+        self.server.exec_handler = lambda _cmd: (127, b"")
+        backend = self._new_backend()
+        with patch.object(backend, "copy_to_local",
+                          side_effect=AssertionError("downloaded")):
+            with self.assertRaises(ChecksumUnavailable):
+                backend.get_fast_checksum("/movie.bin", allow_download=False)
+        self.assertEqual([name for name, *_ in self.server.requests if name == "open"], [])
 
     def test_remote_checksum_and_xattrs_close_their_exec_channels(self):
         digest = "0123456789abcdef0123456789abcdef"

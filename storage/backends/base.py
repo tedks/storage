@@ -34,6 +34,10 @@ def is_interactive_request() -> bool:
     return _INTERACTIVE_REQUEST.get()
 
 
+class ChecksumUnavailable(OSError):
+    """The member could not hash the file itself and downloading was not allowed."""
+
+
 class BackendType(Enum):
     """Type of backend filesystem"""
     LOCAL = "local"
@@ -291,10 +295,13 @@ class Backend(ABC):
         return self.push_invalidation_spec()
 
     # Optional capabilities -------------------------------------------------
-    def get_fast_checksum(self, virtual_path: str) -> str:
+    def get_fast_checksum(self, virtual_path: str, allow_download: bool = True) -> str:
         """
         Compute a checksum on the backend side without routing through the cache.
         Implementations should avoid downloading the full file to the caller.
+        With allow_download False, an implementation that would otherwise
+        fall back to downloading the file and hashing it locally raises
+        ChecksumUnavailable instead.
         """
         raise NotImplementedError
 

@@ -2,6 +2,7 @@
 SSH/SFTP backend implementation for remote filesystems
 """
 
+import errno
 import ipaddress
 import os
 import shlex
@@ -15,7 +16,7 @@ import paramiko
 from pathlib import Path, PurePosixPath
 from typing import Callable, List, Optional, TypeVar
 
-from .base import Backend, BackendType, StorageMemberCapabilities, WatcherSpec
+from .base import Backend, BackendType, ChecksumUnavailable, StorageMemberCapabilities, WatcherSpec
 from .ssh_pool import MemberConnection, SFTPLease, is_connection_error, is_transient_oserror
 
 _T = TypeVar("_T")
@@ -593,13 +594,16 @@ class SSHBackend(Backend):
     def _shell_quote(self, value: str) -> str:
         return shlex.quote(value)
 
-    def get_fast_checksum(self, virtual_path: str) -> str:
+    def get_fast_checksum(self, virtual_path: str, allow_download: bool = True) -> str:
         """
         Compute checksum without downloading the full file.
 
         Tries xxh128sum on the remote (matches local xxh3_128).
         Falls back to downloading a temp copy and checksumming locally
-        so the result is always consistent with local checksums.
+        so the result is always consistent with local checksums; with
+        allow_download False it raises ChecksumUnavailable instead (the
+        conflict view's hashes, which must not move whole files over the
+        link to decide how a directory looks).
         """
         remote_path = str(self._resolve_path(virtual_path))
 
@@ -619,6 +623,10 @@ class SSHBackend(Backend):
                     return token
         except Exception:
             pass
+
+        if not allow_download:
+            raise ChecksumUnavailable(
+                errno.EIO, f"no remote hash for {virtual_path} on {self.name}")
 
         # Fallback: download to temp file and compute locally.
         import tempfile
