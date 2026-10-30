@@ -1,0 +1,22 @@
+id: listing-abandoned-future-interactive
+title: 'namespace: an abandoned member listing keeps the interactive marker'
+desc: 'Council round 1 on PR #132 (Claude seat nit). _submit_member_listings runs
+  each member listing in a copy of the caller''s context, so a listing started by
+  a FUSE readdir uses the SSH pool''s reserved interactive channel. If the readdir
+  gives up on a slow member (lane listing''s background refresh, or a future timeout),
+  the listing keeps running as interactive and can hold the reserved channel after
+  its caller has gone. Harmless today (readdir waits for every member). Revisit with
+  lane listing''s PR B: a listing whose caller stopped waiting should drop to background.'
+type: task
+component: fs
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-30T01:15:24-00:00
+references: []
+log_events:
+- time: 2026-10-30T01:15:24-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
