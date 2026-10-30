@@ -18,6 +18,8 @@ DEFAULT_STREAMING_CHUNK_SIZE = "1M"
 DEFAULT_MAX_STREAMING_SESSIONS = 8
 DEFAULT_REVALIDATE_AFTER = 60.0
 DEFAULT_MOUNT_CONFIG_NAME = "storage.toml"
+# Profile keys passed through to the kernel cache (storage.fs.fuse_mount_options).
+KERNEL_TIMEOUT_KEYS = ("entry_timeout", "negative_timeout")
 
 
 @dataclass(frozen=True)
@@ -44,6 +46,10 @@ class ResolvedMountConfig:
     streaming_keep_after_close: Optional[str] = None
     # Seconds after which opening a CLEAN cached file checks its member.
     revalidate_after: float = DEFAULT_REVALIDATE_AFTER
+    # Kernel cache timeouts in seconds, profile only; None derives them from
+    # revalidate_after and enable_watchers (see storage.fs.fuse_mount_options).
+    entry_timeout: Optional[float] = None
+    negative_timeout: Optional[float] = None
 
     @property
     def member_specs(self) -> Tuple[str, ...]:
@@ -181,6 +187,17 @@ def _validated_revalidate_after(value: float) -> float:
     if not math.isfinite(value) or value < 0:
         raise click.ClickException(
             f"revalidate_after must be a finite number of seconds, 0 or more (got {value})"
+        )
+    return float(value)
+
+
+def _validated_kernel_timeout(key: str, value: Optional[float]) -> Optional[float]:
+    """A kernel cache timeout is absent, or a finite number of seconds, 0 or more."""
+    if value is None:
+        return None
+    if not math.isfinite(value) or value < 0:
+        raise click.ClickException(
+            f"{key} must be a finite number of seconds, 0 or more (got {value})"
         )
     return float(value)
 
@@ -498,6 +515,10 @@ def _load_mount_profile_settings(config_path: Path, profile_name: str) -> Dict[s
         "readdir_ttl": _optional_profile_float(config_profile, "readdir_ttl", profile_name),
         "enable_watchers": _optional_profile_bool(config_profile, "enable_watchers", profile_name),
         "revalidate_after": _optional_profile_float(config_profile, "revalidate_after", profile_name),
+        **{
+            key: _validated_kernel_timeout(key, _optional_profile_float(config_profile, key, profile_name))
+            for key in KERNEL_TIMEOUT_KEYS
+        },
         "backing_paths": config_backing_paths,
         "remote": config_remote,
     }
@@ -592,6 +613,7 @@ def resolve_mount_configuration(
         "readdir_ttl": None,
         "enable_watchers": None,
         "revalidate_after": None,
+        **{key: None for key in KERNEL_TIMEOUT_KEYS},
         "backing_paths": (),
         "remote": (),
     }
@@ -701,4 +723,6 @@ def resolve_mount_configuration(
                 else DEFAULT_REVALIDATE_AFTER
             )
         ),
+        entry_timeout=config_values["entry_timeout"],
+        negative_timeout=config_values["negative_timeout"],
     )

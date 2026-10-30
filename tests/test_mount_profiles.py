@@ -329,6 +329,36 @@ revalidate_after = 300
         finally:
             config_path.unlink()
 
+    def test_kernel_timeouts_default_to_none(self):
+        config = self._resolve()
+        self.assertIsNone(config.entry_timeout)
+        self.assertIsNone(config.negative_timeout)
+
+    def _profile(self, body):
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.toml', delete=False) as f:
+            f.write('''
+[mounts.prof]
+mountpoint = "/mnt/test"
+cache = "/tmp/cache"
+backends = ["/srv/data"]
+''' + body)
+        path = Path(f.name)
+        self.addCleanup(path.unlink)
+        return path
+
+    def test_kernel_timeouts_from_profile(self):
+        config_path = self._profile("entry_timeout = 15.5\nnegative_timeout = 0\n")
+        config = self._resolve(mount_target="prof", backing_paths=[], config_path=config_path)
+        self.assertEqual(15.5, config.entry_timeout)
+        self.assertEqual(0.0, config.negative_timeout)
+
+    def test_kernel_timeouts_reject_negative_nan_infinity_and_strings(self):
+        for key in ("entry_timeout", "negative_timeout"):
+            for bad in ("-1", "nan", "inf", '"60"', "true"):
+                config_path = self._profile(f"{key} = {bad}\n")
+                with self.subTest(key=key, value=bad), self.assertRaises(click.ClickException):
+                    self._resolve(mount_target="prof", backing_paths=[], config_path=config_path)
+
     def test_revalidate_after_rejects_negative_nan_and_infinity(self):
         for bad in (-1.0, float("nan"), float("inf")):
             with self.assertRaises(click.ClickException):

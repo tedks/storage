@@ -6,7 +6,7 @@ from typing import Optional
 import click
 
 from .file_config import FileConfig, get_file_config, get_inherited_config, set_file_config
-from .fs import mount_storage
+from .fs import fuse_mount_options, mount_storage
 from .mount_profiles import (
     create_storage_members,
     parse_keep_after_close,
@@ -211,6 +211,17 @@ def mount(
     else:
         click.echo(f"  Invalidation: pull (TTL={resolved.readdir_ttl}s)")
     click.echo(f"  Revalidate cached files after: {resolved.revalidate_after}s")
+    kernel = fuse_mount_options(
+        backends,
+        enable_watchers=resolved.enable_watchers,
+        fresh_window=resolved.revalidate_after,
+        entry_timeout=resolved.entry_timeout,
+        negative_timeout=resolved.negative_timeout,
+    )
+    click.echo(
+        f"  Kernel cache: names {kernel['entry_timeout']}s, missing names {kernel['negative_timeout']}s, "
+        f"attributes {kernel['attr_timeout']}s, pages kept while unchanged"
+    )
     click.echo("\nPress Ctrl+C to unmount\n")
 
     logging.getLogger("paramiko").setLevel(logging.DEBUG if resolved.debug else logging.WARNING)
@@ -233,6 +244,8 @@ def mount(
             readdir_ttl=resolved.readdir_ttl,
             enable_watchers=resolved.enable_watchers,
             revalidate_after=resolved.revalidate_after,
+            entry_timeout=resolved.entry_timeout,
+            negative_timeout=resolved.negative_timeout,
         )
     except PermissionError as exc:
         click.echo(f"Permission error: {exc}", err=True)

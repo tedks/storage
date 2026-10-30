@@ -14,12 +14,19 @@ import threading
 import shutil
 from pathlib import Path
 
-from storage.fs import StorageFS
+from storage.fs import StorageFS, fuse_mount_options
 from storage.backends.local import LocalBackend
 
 
-class TestSyncSystemIntegration(unittest.TestCase):
-    """System tests with mounted filesystem"""
+class _MountedCase(unittest.TestCase):
+    """A two-member local mount; START_SYNC says whether sync workers run.
+
+    FS_KWARGS go to StorageFS and KERNEL_OPTIONS to fuse_mount_options.
+    """
+
+    START_SYNC = True
+    FS_KWARGS: dict = {}
+    KERNEL_OPTIONS: dict = {}
 
     def setUp(self):
         """Set up test environment with actual mount"""
@@ -48,8 +55,14 @@ class TestSyncSystemIntegration(unittest.TestCase):
             self.db_path,
             backends,
             cache_size=50 * 1024 * 1024,  # 50MB cache
-            num_sync_workers=2
+            num_sync_workers=2,
+            start_sync=self.START_SYNC,
+            **self.FS_KWARGS,
         )
+        if not self.START_SYNC:
+            # StorageFS.init() starts the workers at mount unless
+            # _sync_started says they already run (fs.py, init).
+            self.fs._sync_started = True
 
         # Mount in separate thread (FUSE blocks)
         self.mount_thread = threading.Thread(
@@ -74,7 +87,13 @@ class TestSyncSystemIntegration(unittest.TestCase):
                 str(self.mount_dir),
                 nothreads=True,
                 foreground=True,
-                allow_other=False
+                allow_other=False,
+                **fuse_mount_options(
+                    self.fs.backends,
+                    enable_watchers=self.fs._enable_watchers,
+                    fresh_window=self.fs._revalidate_after,
+                    **self.KERNEL_OPTIONS,
+                ),
             )
         except Exception as e:
             print(f"Mount error: {e}")
@@ -101,6 +120,11 @@ class TestSyncSystemIntegration(unittest.TestCase):
                 return True
             time.sleep(0.05)
         return predicate()
+
+
+
+class TestSyncSystemIntegration(_MountedCase):
+    """System tests with mounted filesystem"""
 
     def test_write_and_sync(self):
         """Test writing file and automatic sync"""
@@ -283,6 +307,143 @@ class TestSyncSystemIntegration(unittest.TestCase):
             ),
             "rsync temp files should not persist in cache or backends",
         )
+
+
+class TestKernelCacheVisibility(_MountedCase):
+    """Kernel cache options (fuse_mount_options) against writes through the mount.
+
+    Sync workers stay off, so members never change and every answer comes
+    from the cache and the kernel: uploads racing a rename or unlink leave
+    old names on members (ditz sync-namespace-orphans), a separate problem.
+    """
+
+    START_SYNC = False
+
+    def test_writes_through_the_mount_are_visible_at_once(self):
+        """The kernel keeps entries and attributes for the fresh window (60 s
+        here) and misses for 10 s; every write path must still show at once."""
+        m = self.mount_dir
+        (m / "a.txt").write_text("one")
+
+        # Prime the kernel's caches: a listing, positive entries, and a miss
+        # for every name about to appear.
+        self.assertEqual(["a.txt"], sorted(os.listdir(m)))
+        os.stat(m / "a.txt")
+        for name in ("b.txt", "c.txt", "link", "sub", "new.txt"):
+            self.assertFalse(os.path.lexists(m / name))
+
+        os.rename(m / "a.txt", m / "b.txt")
+        self.assertEqual(["b.txt"], sorted(os.listdir(m)))
+        self.assertFalse(os.path.lexists(m / "a.txt"))
+        self.assertEqual(3, os.stat(m / "b.txt").st_size)
+
+        (m / "c.txt").write_text("three")
+        os.symlink("b.txt", m / "link")
+        os.mkdir(m / "sub")
+        self.assertEqual(["b.txt", "c.txt", "link", "sub"], sorted(os.listdir(m)))
+        self.assertEqual(5, os.stat(m / "c.txt").st_size)
+        self.assertTrue(os.path.islink(m / "link"))
+        self.assertEqual("b.txt", os.readlink(m / "link"))
+        self.assertEqual("one", (m / "link").read_text())
+        self.assertTrue(os.path.isdir(m / "sub"))
+
+        # A write that changes the size is seen by stat at once.
+        with open(m / "c.txt", "a") as f:
+            f.write("+more")
+        self.assertEqual(10, os.stat(m / "c.txt").st_size)
+        self.assertEqual("three+more", (m / "c.txt").read_text())
+        os.truncate(m / "c.txt", 2)
+        self.assertEqual(2, os.stat(m / "c.txt").st_size)
+        os.chmod(m / "c.txt", 0o600)
+        self.assertEqual(0o600, os.stat(m / "c.txt").st_mode & 0o777)
+        os.utime(m / "c.txt", (1_000_000_000, 1_000_000_000))
+        self.assertEqual(1_000_000_000, int(os.stat(m / "c.txt").st_mtime))
+
+        # The miss cached for new.txt does not hide a file created through the mount.
+        (m / "sub" / "new.txt").write_text("n")
+        os.stat(m / "sub" / "new.txt")
+        os.rename(m / "sub", m / "sub2")
+        self.assertFalse(os.path.lexists(m / "sub" / "new.txt"))
+        self.assertEqual(1, os.stat(m / "sub2" / "new.txt").st_size)
+        os.rename(m / "sub2", m / "sub")
+        (m / "new.txt").write_text("n")
+        self.assertTrue(os.path.exists(m / "new.txt"))
+
+        os.unlink(m / "b.txt")
+        os.unlink(m / "link")
+        os.rename(m / "sub" / "new.txt", m / "sub" / "moved.txt")
+        os.unlink(m / "sub" / "moved.txt")
+        os.rmdir(m / "sub")
+        self.assertEqual(["c.txt", "new.txt"], sorted(os.listdir(m)))
+        for name in ("b.txt", "link", "sub"):
+            self.assertFalse(os.path.lexists(m / name))
+
+    def test_kernel_keeps_names_and_misses_but_not_attributes(self):
+        """Names are kept for the window and misses for 10 s; attributes
+        are asked at every stat (attr_timeout 0) and answered in-process."""
+        os.mkdir(self.mount_dir / "d1")
+        (self.mount_dir / "d1" / "f").write_text("k")
+        calls = []
+        original = self.fs.getattr
+
+        def counting_getattr(path, fh=None):
+            calls.append(path)
+            return original(path, fh)
+
+        self.fs.getattr = counting_getattr
+        try:
+            os.stat(self.mount_dir / "d1" / "f")
+            self.assertFalse(os.path.exists(self.mount_dir / "nope"))
+            time.sleep(1.5)  # past libfuse's 1 s default
+            before = list(calls)
+            for _ in range(5):
+                os.stat(self.mount_dir / "d1" / "f")
+                self.assertFalse(os.path.exists(self.mount_dir / "nope"))
+            after = calls[len(before):]
+            self.assertEqual(0, after.count("/d1"), "the walk through d1 looked it up again")
+            self.assertEqual(0, after.count("/nope"), "the miss was not remembered")
+            self.assertGreaterEqual(after.count("/d1/f"), 5, "stat did not reach getattr")
+        finally:
+            self.fs.getattr = original
+
+
+class TestKernelCacheRefetch(_MountedCase):
+    """A refetch after revalidation is read in full, never through stale
+    pages or a stale size the kernel still holds (fuse_mount_options)."""
+
+    START_SYNC = False
+    FS_KWARGS = {"revalidate_after": 1.0}
+    # Names kept far longer than the revalidation age, as on a real mount.
+    KERNEL_OPTIONS = {"entry_timeout": 60.0}
+
+    def _change_on_member(self, name, data):
+        path = self.backend1_dir / name
+        st = path.stat()
+        path.write_bytes(data)
+        os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 5_000_000_000))
+
+    def _read_after_revalidation(self, name, old, new):
+        (self.backend1_dir / name).write_bytes(old)
+        target = self.mount_dir / name
+        self.assertEqual(old, target.read_bytes())  # cached, pages primed
+        self.assertEqual(len(old), os.stat(target).st_size)
+        self._change_on_member(name, new)
+        time.sleep(1.3)  # past revalidate_after
+        # A stat just before the open is answered from the old cache copy,
+        # so the kernel and libfuse both hold the old size and mtime.
+        self.assertEqual(len(old), os.stat(target).st_size)
+        with open(target, "rb") as f:
+            self.assertEqual(new, f.read())
+        self.assertEqual(len(new), os.stat(target).st_size)
+
+    def test_grown_file_reads_in_full(self):
+        self._read_after_revalidation("grow.bin", b"a" * 100, b"b" * 200)
+
+    def test_same_size_rewrite_drops_old_pages(self):
+        self._read_after_revalidation("same.bin", b"a" * 100, b"c" * 100)
+
+    def test_shrunk_file_reads_short(self):
+        self._read_after_revalidation("shrink.bin", b"a" * 200, b"d" * 50)
 
 
 if __name__ == '__main__':

@@ -16,6 +16,7 @@ import logging
 import fcntl
 import time
 import hashlib
+import math
 import yaml
 import json
 import concurrent.futures
@@ -1856,19 +1857,28 @@ class StorageFS(Operations):
             raise FuseOSError(e.errno)
 
     def symlink(self, target, source):
-        """Create symbolic link"""
-        with self._path_locked(self._resolve_path(source).canonical_path):
-            return self._symlink(target, source)
+        """Create symbolic link: `ln -s source target`.
 
-    def _symlink(self, target, source):
-        """Create symbolic link"""
-        cache_path = self.cache_manager.get_cache_path(source)
+        fusepy passes the new link's path first and its contents second.
+        The link lives in the cache only; nothing syncs it to a member.
+        """
+        resolved = self._resolve_path(target)
+        with self._path_locked(resolved.canonical_path):
+            return self._symlink(resolved, source)
+
+    def _symlink(self, resolved: ResolvedPath, source):
+        cache_path = resolved.cache_path
 
         try:
             cache_path.parent.mkdir(parents=True, exist_ok=True)
-            os.symlink(target, str(cache_path))
+            os.symlink(source, str(cache_path))
         except OSError as e:
             raise FuseOSError(e.errno)
+
+        # Like create: a listing taken before the link would miss it, and
+        # any listing kept under the new path itself is now wrong.
+        self._invalidate_dir_cache_entry(resolved.parent_dir)
+        self._invalidate_dir_cache_entry(resolved.canonical_path)
 
     # Time operations
 
@@ -2036,6 +2046,89 @@ def fuse_subtype_options(backends: Dict[str, Backend]) -> Dict[str, str]:
     return {}
 
 
+# Kernel entry timeout while watchers run (libfuse's default). The mount
+# cannot evict kernel entries (see fuse_mount_options), so a watcher event
+# reaches lookups only once the kernel asks again.
+WATCHER_KERNEL_TIMEOUT = 1.0
+# Kernel attribute timeout: the kernel asks getattr at every stat (see
+# fuse_mount_options for why it is never longer).
+KERNEL_ATTR_TIMEOUT = 0.0
+# How long the kernel remembers that a name does not exist. Short, because a
+# remembered miss hides a name that appears behind the mount's back (a file
+# added on a member, or a conflict copy such as name.member0 after a split).
+DEFAULT_NEGATIVE_TIMEOUT = 10.0
+
+
+def _kernel_timeout(name: str, value: float) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a number of seconds (got {value!r})")
+    value = float(value)
+    if not math.isfinite(value) or value < 0:
+        raise ValueError(f"{name} must be a finite number of seconds, 0 or more (got {value})")
+    return value
+
+
+def fuse_mount_options(backends: Dict[str, Backend], *, enable_watchers: bool,
+                       fresh_window: float,
+                       entry_timeout: Optional[float] = None,
+                       negative_timeout: Optional[float] = None) -> Dict[str, object]:
+    """Every FUSE() keyword argument beyond nothreads, foreground and allow_other.
+
+    The mount and every mounted test pass these, so tests run under the
+    kernel cache the mount really has.
+
+    entry_timeout: how long the kernel trusts a name without a lookup.
+    fresh_window is how long the mount trusts a directory listing with
+    watchers off (revalidate_after); names are kept as long, so a path walk
+    asks nothing for a minute. With watchers on, entries stay at 1 s: a
+    watcher invalidates the mount's own listings, but fusepy runs libfuse
+    2's high-level fuse_main, which owns the inode table and exposes no
+    handle for fuse_lowlevel_notify_inval_entry, so nothing can evict the
+    kernel's.
+
+    attr_timeout is 0, so every stat reaches getattr, answered from the
+    cache file or the listing without a member round trip (or by a member
+    stat once the listing is too old). The kernel refreshes a file's size
+    only from expired attributes, even for a read past the size it holds:
+    with any attribute timeout, a stat answered from the old cache copy
+    just before an open that refetches a file grown on its member makes
+    the reads stop at the old size until the attributes expire (a copy out
+    of the mount comes out truncated). Not even libfuse's 1 s default is
+    safe; tests/test_sync_system.py TestKernelCacheRefetch shows it. So
+    it has no override.
+
+    negative_timeout: a missing name is remembered for 10 s. Short, because
+    a remembered miss hides a name added behind the mount's back (on a
+    member, or a conflict copy such as name.member0 after a split).
+
+    auto_cache keeps a file's pages across opens while its mtime and size
+    are unchanged and drops them otherwise, so a refetch after revalidation
+    is not read through old pages (kernel_cache would keep them). libfuse
+    compares against attributes it fetched within ac_attr_timeout, which
+    defaults to attr_timeout; ac_attr_timeout=0 states that a getattr
+    follows every open rather than leaving it implied.
+
+    Writes through the mount stay visible at once: create, mkdir, symlink,
+    unlink, rmdir and rename update the kernel's entries themselves.
+
+    The override arguments replace the defaults (per profile); each, and
+    fresh_window, must be finite and 0 or more.
+    """
+    window = _kernel_timeout("fresh_window", fresh_window)
+    if enable_watchers:
+        window = WATCHER_KERNEL_TIMEOUT
+    options: Dict[str, object] = dict(fuse_subtype_options(backends))
+    options["attr_timeout"] = KERNEL_ATTR_TIMEOUT
+    options["entry_timeout"] = window if entry_timeout is None else _kernel_timeout("entry_timeout", entry_timeout)
+    options["negative_timeout"] = (
+        DEFAULT_NEGATIVE_TIMEOUT if negative_timeout is None
+        else _kernel_timeout("negative_timeout", negative_timeout)
+    )
+    options["auto_cache"] = True
+    options["ac_attr_timeout"] = 0.0
+    return options
+
+
 def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
                  backends: Dict[str, Backend], cache_size: int,
                  foreground: bool = False, num_sync_workers: int = 2,
@@ -2047,7 +2140,9 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
                  readdir_ttl: float = 1.0,
                  enable_watchers: bool = False,
                  streaming_keep_after_close: Optional[StreamingKeepAfterClose] = None,
-                 revalidate_after: float = 60.0):
+                 revalidate_after: float = 60.0,
+                 entry_timeout: Optional[float] = None,
+                 negative_timeout: Optional[float] = None):
     """
     Mount a Storage filesystem
 
@@ -2069,6 +2164,8 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
             None for the default
         revalidate_after: Seconds after which opening a CLEAN cached file
             stats its member (see StorageFS._revalidate_cached_file)
+        entry_timeout, negative_timeout: kernel cache timeouts in seconds;
+            None derives them (see fuse_mount_options)
 
     Raises:
         PermissionError: If allow_other=True but not running as root and user_allow_other not set
@@ -2078,6 +2175,15 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
     logger = logging.getLogger(__name__)
+
+    # Before the mount lock, so a bad timeout fails without side effects.
+    fuse_options = fuse_mount_options(
+        backends,
+        enable_watchers=enable_watchers,
+        fresh_window=revalidate_after,
+        entry_timeout=entry_timeout,
+        negative_timeout=negative_timeout,
+    )
 
     is_root = os.geteuid() == 0
 
@@ -2137,7 +2243,7 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
         fs.request_stale_sweep()  # started by init(), after FUSE's fork
     try:
         FUSE(fs, mountpoint, nothreads=True, foreground=foreground, allow_other=allow_other,
-             **fuse_subtype_options(backends))
+             **fuse_options)
     finally:
         try:
             if not fs._sweep_pending:
