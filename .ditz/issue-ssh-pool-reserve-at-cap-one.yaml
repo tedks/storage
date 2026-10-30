@@ -1,0 +1,22 @@
+id: ssh-pool-reserve-at-cap-one
+title: 'ssh_pool: at an SFTP cap of 1 the interactive reserve disappears'
+desc: 'Council round 1 on PR #132 (Claude seat nit). The bulk limit is max(1, cap
+  - reserve), so when a server''s MaxSessions shrinks the SFTP pool to one channel,
+  background transfers can hold it and an interactive request (the FUSE thread) waits
+  up to connect_timeout and fails. Options: (a) log once when the reserve is lost;
+  (b) refuse bulk leases at cap 1 while an interactive request waits; (c) leave as
+  is (MaxSessions <= 2 is unusual). Recommendation: (a) now, (b) if a field host shows
+  it. Only reachable with sshd MaxSessions <= 2.'
+type: task
+component: fs
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-30T01:15:24-00:00
+references: []
+log_events:
+- time: 2026-10-30T01:15:24-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
