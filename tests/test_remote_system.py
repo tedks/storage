@@ -682,10 +682,13 @@ def mounted_factory(remote, tmp_path, request):
             if handle.fuse_threads:
                 join_timeout += 2 * max(b.sftp_operation_timeout for b in handle.backends.values())
             orphan_note = ""
+            join_deadline = time.monotonic() + join_timeout
             thread.join(timeout=min(join_timeout, ORPHAN_GRACE))
             if thread.is_alive() and not os.path.ismount(handle.mount):
-                orphan_note = release_orphaned_loop(handle.fs, thread)
-            thread.join(timeout=join_timeout)
+                orphan_note = release_orphaned_loop(
+                    handle.fs, thread,
+                    wait=max(0.0, min(10.0, join_deadline - time.monotonic())))
+            thread.join(timeout=max(0.0, join_deadline - time.monotonic()))
             if thread.is_alive():
                 problems.append("the FUSE thread did not finish after unmount "
                                 "(a request still in a member call, StorageFS.destroy "

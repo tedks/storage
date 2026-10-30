@@ -7,6 +7,7 @@ FUSE_THREAD_MODES parametrizes them (False is the single-threaded loop,
 still the default; True is fuse_threads).
 """
 
+import ctypes
 import os
 import shutil
 import subprocess
@@ -57,10 +58,10 @@ def run_fuse(fs: StorageFS, mountpoint: Union[str, Path], *, fuse_threads: bool,
 def _record_fuse_pointer(fs: StorageFS) -> None:
     """Keep the libfuse handle a request sees on the FUSE thread, for
     release_orphaned_loop. fusepy's fuse_exit() only works inside a callback."""
-    import ctypes
     import fuse
     real_destroy = fs.destroy
     fs.destroy_entered = threading.Event()
+    fs.fuse_handle = None  # a second mount of this fs must not reuse a freed handle
 
     def destroy(path):
         fs.destroy_entered.set()
@@ -72,8 +73,10 @@ def _record_fuse_pointer(fs: StorageFS) -> None:
 
     def getattr_(path, fh=None):
         # A request carries the context; init's does not reliably.
-        if getattr(fs, "fuse_handle", None) is None:
-            fs.fuse_handle = ctypes.c_void_p(fuse._libfuse.fuse_get_context().contents.fuse)
+        if fs.fuse_handle is None:
+            handle = ctypes.c_void_p(fuse._libfuse.fuse_get_context().contents.fuse)
+            if handle.value:  # off a FUSE thread libfuse hands back a zeroed context
+                fs.fuse_handle = handle
         return real_getattr(path, fh)
 
     fs.getattr = getattr_
@@ -81,6 +84,16 @@ def _record_fuse_pointer(fs: StorageFS) -> None:
 
 # tgkill(2) numbers; os.tgkill does not exist before Python 3.13.
 _SYS_TGKILL = {"x86_64": 234, "aarch64": 131}
+# The kernel's name for the machine says nothing about a 32-bit userland.
+ORPHAN_RELEASE_SUPPORTED = (os.uname().machine in _SYS_TGKILL
+                            and ctypes.sizeof(ctypes.c_void_p) == 8)
+
+
+def _noop_signal(*_):
+    """SIGUSR2 only has to interrupt a blocked read."""
+
+
+_handler_installed = False
 
 
 def release_orphaned_loop(fs: StorageFS, thread: threading.Thread,
@@ -100,10 +113,9 @@ def release_orphaned_loop(fs: StorageFS, thread: threading.Thread,
     destroy has not been entered, and a thread of this process is parked in
     fuse_dev_do_read. A destroy that hangs is not touched; the caller reports it.
     """
-    import ctypes
     import signal
     handle = getattr(fs, "fuse_handle", None)
-    tgkill = _SYS_TGKILL.get(os.uname().machine)
+    tgkill = _SYS_TGKILL.get(os.uname().machine) if ORPHAN_RELEASE_SUPPORTED else None
     if handle is None:
         return "no libfuse handle recorded (no request seen)"
     if tgkill is None:
@@ -125,16 +137,29 @@ def release_orphaned_loop(fs: StorageFS, thread: threading.Thread,
         return "no thread is reading /dev/fuse"
     import fuse
     libc = ctypes.CDLL(None, use_errno=True)
-    previous = signal.signal(signal.SIGUSR2, lambda *_: None)
-    try:
-        fuse._libfuse.fuse_exit(handle)
-        deadline = time.monotonic() + wait
-        while thread.is_alive() and time.monotonic() < deadline:
-            for tid in readers:
-                libc.syscall(tgkill, os.getpid(), tid, int(signal.SIGUSR2))
-            thread.join(timeout=0.2)
-    finally:
-        signal.signal(signal.SIGUSR2, previous)
+    # Installed once and never restored: a signal still pending when this
+    # returns (a reader that had it blocked, or a thread id reused) would meet
+    # the default disposition, which ends the whole test process. Nothing else
+    # here uses SIGUSR2.
+    global _handler_installed
+    if not _handler_installed:
+        signal.signal(signal.SIGUSR2, _noop_signal)
+        _handler_installed = True
+    # Known gap: the holder can exit between the check above and this call,
+    # letting libfuse tear the session down first; fuse_exit then writes freed
+    # memory. Only a process in another namespace exiting in that window
+    # triggers it.
+    fuse._libfuse.fuse_exit(handle)
+    deadline = time.monotonic() + wait
+    failed = 0
+    while thread.is_alive() and time.monotonic() < deadline:
+        for tid in readers:
+            if libc.syscall(ctypes.c_long(tgkill), ctypes.c_long(os.getpid()),
+                            ctypes.c_long(tid), ctypes.c_long(int(signal.SIGUSR2))) != 0:
+                failed += 1
+        thread.join(timeout=0.2)
+    if failed:
+        return f"{failed} tgkill calls failed (errno {ctypes.get_errno()})"
     return "" if not thread.is_alive() else f"readers {readers} did not leave after fuse_exit and SIGUSR2"
 
 
@@ -187,11 +212,12 @@ def stop_fuse(mount: Union[str, Path], thread: threading.Thread,
     problems: List[str] = []
     if os.path.ismount(mount):
         problems += unmount_fuse(mount)
+    deadline = time.monotonic() + join_timeout
     thread.join(timeout=min(join_timeout, ORPHAN_GRACE))
     why = ""
     if thread.is_alive() and fs is not None and not os.path.ismount(mount):
-        why = release_orphaned_loop(fs, thread)
-    thread.join(timeout=join_timeout)
+        why = release_orphaned_loop(fs, thread, wait=max(0.0, min(10.0, deadline - time.monotonic())))
+    thread.join(timeout=max(0.0, deadline - time.monotonic()))
     if thread.is_alive():
         problems.append("the FUSE thread did not finish after unmount"
                         + (f" (orphan release: {why})" if why else ""))
@@ -232,11 +258,11 @@ def _other_holders(mount: Union[str, Path]) -> str:
         try:
             comm = (proc / "comm").read_text().strip()
             ns = os.readlink(proc / "ns" / "mnt")
-            if needle in (proc / "mountinfo").read_text():
+            if f" {needle} " in (proc / "mountinfo").read_text():
                 listing.append(f"{comm}[{'same ns' if ns == mine else 'other ns'}]")
             for target in [os.readlink(proc / "cwd")] + [
                     os.readlink(f) for f in (proc / "fd").iterdir()]:
-                if target.startswith(needle):
+                if target == needle or target.startswith(needle + "/"):
                     holders.append(comm)
         except OSError:
             continue
