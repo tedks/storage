@@ -26,3 +26,12 @@ log_events:
   who: Ted Smith
   what: created
   comment: ""
+- time: 2026-10-30T17:12:13-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Council round 4 on #141 (Claude seat, pre-existing): a rename retry can
+    overwrite a newer file on the member: rename /a /b fails on X; /b is unlinked
+    and created again; the new /b uploads to X first (priority 100 vs the retry''s
+    90); the retry''s X.rename(/a, /b) replaces it with the old bytes while X''s location
+    row records the new checksum. Option: refuse a member rename whose destination
+    already exists on the member.'
