@@ -221,16 +221,17 @@ that window does not reach the mount at all; with watchers on it keeps
 them for 1 s, because the mount cannot evict the kernel's entries when a
 watcher reports a change. A name that does not exist is remembered as
 missing for 10 s. Attributes are not kept: each `stat` reaches the mount,
-which answers it from the cached file or a recent listing without a
-member round trip. (Kept attributes would hold a file's old size past a
-refetch, and reads would stop there.) A file's pages stay in the page
-cache across opens while its size and mtime are unchanged and are dropped
-when they change, so a refetched file is read fresh. Changes made through
-the mount are visible at once. A file added directly on a member can stay
-hidden for up to 10 s after a lookup missed it, and a name removed on a
-member can still be walked through for up to `revalidate_after`. The
-profile keys `entry_timeout`, `negative_timeout` and `attr_timeout`
-(seconds) override the three timeouts.
+which answers it from the cached file or from a listing of the parent
+directory made in the last 5 s, and otherwise asks a member. (Kept
+attributes would hold a file's old size past a refetch, and reads would
+stop there.) A file's pages stay in the page cache across opens while
+its size and mtime are unchanged and are dropped when they change, so a
+refetched file is read fresh. Changes made through the mount are visible
+at once. A file added directly on a member can stay hidden for up to
+10 s after a lookup missed it, and a name removed on a member can still
+be walked through for up to `revalidate_after`. The profile keys
+`entry_timeout` and `negative_timeout` (seconds) override the first two
+timeouts; attributes have no override.
 
 #### SSH host keys
 

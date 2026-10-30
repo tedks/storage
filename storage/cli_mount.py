@@ -215,7 +215,6 @@ def mount(
         backends,
         enable_watchers=resolved.enable_watchers,
         fresh_window=resolved.revalidate_after,
-        attr_timeout=resolved.attr_timeout,
         entry_timeout=resolved.entry_timeout,
         negative_timeout=resolved.negative_timeout,
     )
@@ -245,7 +244,6 @@ def mount(
             readdir_ttl=resolved.readdir_ttl,
             enable_watchers=resolved.enable_watchers,
             revalidate_after=resolved.revalidate_after,
-            attr_timeout=resolved.attr_timeout,
             entry_timeout=resolved.entry_timeout,
             negative_timeout=resolved.negative_timeout,
         )

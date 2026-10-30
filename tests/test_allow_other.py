@@ -260,7 +260,7 @@ class TestMountKernelCacheOptions(unittest.TestCase):
     @patch('storage.fs.FUSE')
     def test_bad_timeout_fails_before_the_mount_lock(self, mock_fuse):
         with self.assertRaises(ValueError):
-            self._mount(attr_timeout=float('inf'))
+            self._mount(entry_timeout=float('inf'))
         mock_fuse.assert_not_called()
         self.assertEqual([], list(self.cache_root.glob('.storage.mount.*.lock')))
 

@@ -31,12 +31,11 @@ streaming_keep_after_close = "4M,50%"
 # every open.
 revalidate_after = 60
 # Kernel cache timeouts in seconds. Unset, names are kept for
-# revalidate_after (1 with enable_watchers), missing names for 10, and
-# attributes not at all (a kept size would truncate reads of a refetched
-# file).
+# revalidate_after (1 with enable_watchers) and missing names for 10.
+# Attributes are never kept: a kept size would truncate reads of a
+# refetched file.
 # entry_timeout = 60
 # negative_timeout = 10
-# attr_timeout = 0
 backends = [
   "ssh://user@storage-host.example:/srv/raid/media/",
   "ssh://user@storage-host.example:/srv/chunk0/media/",

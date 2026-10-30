@@ -262,8 +262,9 @@ backends = [
         result, mock_mount = self._mount(extra_args=("--revalidate-after", "90"))
         self.assertEqual(result.exit_code, 0, msg=result.output)
         kwargs = mock_mount.call_args.kwargs
-        for key in ("attr_timeout", "entry_timeout", "negative_timeout"):
+        for key in ("entry_timeout", "negative_timeout"):
             self.assertIsNone(kwargs[key])
+        self.assertNotIn("attr_timeout", kwargs)
         self.assertIn(
             "Kernel cache: names 90.0s, missing names 10.0s, attributes 0.0s",
             result.output,
@@ -277,14 +278,13 @@ backends = [
 
     def test_profile_overrides_reach_mount_and_echo(self):
         result, mock_mount = self._mount(
-            "attr_timeout = 20\nentry_timeout = 30\nnegative_timeout = 0"
+            "entry_timeout = 30\nnegative_timeout = 0"
         )
         self.assertEqual(result.exit_code, 0, msg=result.output)
         kwargs = mock_mount.call_args.kwargs
-        self.assertEqual(20.0, kwargs["attr_timeout"])
         self.assertEqual(30.0, kwargs["entry_timeout"])
         self.assertEqual(0.0, kwargs["negative_timeout"])
-        self.assertIn("Kernel cache: names 30.0s, missing names 0.0s, attributes 20.0s",
+        self.assertIn("Kernel cache: names 30.0s, missing names 0.0s, attributes 0.0s",
                       result.output)
 
     def test_bad_timeout_rejected_before_mounting(self):

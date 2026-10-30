@@ -59,6 +59,12 @@ are never cached, and the page cache is dropped at every open.
   evict kernel entries), negative lookups cached for 10 s, and the
   mtime-checked page cache on so that a refetch drops stale pages. Per
   profile.
+  As built (PR #133): entry timeouts equal the fresh window, but
+  attributes are never kept (attr_timeout 0, no override). The kernel
+  refreshes a file's size only from expired attributes, so any kept
+  attributes let a stat taken just before an open that refetches a grown
+  file stop the reads at the old size. Each stat reaches the mount and is
+  answered from the cache file or the listing.
 - **D3. Not-found answered from the listing.** A name absent from a fresh
   listing of every available member is ENOENT without a stat. Product
   consequence: a file added directly on a member and opened by its typed

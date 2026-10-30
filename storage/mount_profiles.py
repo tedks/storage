@@ -19,7 +19,7 @@ DEFAULT_MAX_STREAMING_SESSIONS = 8
 DEFAULT_REVALIDATE_AFTER = 60.0
 DEFAULT_MOUNT_CONFIG_NAME = "storage.toml"
 # Profile keys passed through to the kernel cache (storage.fs.fuse_mount_options).
-KERNEL_TIMEOUT_KEYS = ("attr_timeout", "entry_timeout", "negative_timeout")
+KERNEL_TIMEOUT_KEYS = ("entry_timeout", "negative_timeout")
 
 
 @dataclass(frozen=True)
@@ -48,7 +48,6 @@ class ResolvedMountConfig:
     revalidate_after: float = DEFAULT_REVALIDATE_AFTER
     # Kernel cache timeouts in seconds, profile only; None derives them from
     # revalidate_after and enable_watchers (see storage.fs.fuse_mount_options).
-    attr_timeout: Optional[float] = None
     entry_timeout: Optional[float] = None
     negative_timeout: Optional[float] = None
 
@@ -724,7 +723,6 @@ def resolve_mount_configuration(
                 else DEFAULT_REVALIDATE_AFTER
             )
         ),
-        attr_timeout=config_values["attr_timeout"],
         entry_timeout=config_values["entry_timeout"],
         negative_timeout=config_values["negative_timeout"],
     )

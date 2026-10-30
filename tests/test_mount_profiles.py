@@ -331,7 +331,6 @@ revalidate_after = 300
 
     def test_kernel_timeouts_default_to_none(self):
         config = self._resolve()
-        self.assertIsNone(config.attr_timeout)
         self.assertIsNone(config.entry_timeout)
         self.assertIsNone(config.negative_timeout)
 
@@ -348,14 +347,13 @@ backends = ["/srv/data"]
         return path
 
     def test_kernel_timeouts_from_profile(self):
-        config_path = self._profile("attr_timeout = 30\nentry_timeout = 15.5\nnegative_timeout = 0\n")
+        config_path = self._profile("entry_timeout = 15.5\nnegative_timeout = 0\n")
         config = self._resolve(mount_target="prof", backing_paths=[], config_path=config_path)
-        self.assertEqual(30.0, config.attr_timeout)
         self.assertEqual(15.5, config.entry_timeout)
         self.assertEqual(0.0, config.negative_timeout)
 
     def test_kernel_timeouts_reject_negative_nan_infinity_and_strings(self):
-        for key in ("attr_timeout", "entry_timeout", "negative_timeout"):
+        for key in ("entry_timeout", "negative_timeout"):
             for bad in ("-1", "nan", "inf", '"60"', "true"):
                 config_path = self._profile(f"{key} = {bad}\n")
                 with self.subTest(key=key, value=bad), self.assertRaises(click.ClickException):
