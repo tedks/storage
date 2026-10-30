@@ -114,13 +114,16 @@ class TestCopyKeepsInternalXattrsOut(unittest.TestCase):
         self.addCleanup(os.chmod, dst, 0o644)
         self.assert_copied(dst, mode=0o444)
 
-    def test_upload_drops_user_xattrs_the_source_no_longer_has(self):
+    def test_upload_drops_a_config_the_source_no_longer_has(self):
         src = self.make_source(self.root / "cache-file")
         self.backend.copy_from_local(src, "/f")
+        dst = self.member_dir / "f"
+        os.setxattr(dst, "user.other.tool", b"set on the member")
         os.removexattr(src, "user.storage.config")
         os.removexattr(src, "user.tag")
         self.backend.copy_from_local(src, "/f")
-        self.assertEqual([], self.user_xattrs(self.member_dir / "f"))
+        # Only the reserved namespace follows the source; other names stay.
+        self.assertEqual(["user.other.tool", "user.tag"], self.user_xattrs(dst))
 
 
 if __name__ == "__main__":

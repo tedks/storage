@@ -40,17 +40,19 @@ def _copy_file(src: Path, dst: Path):
     Bytes, xattrs, mode and times, in copy2's order: the xattrs go before
     the chmod, since changing a user xattr on a file needs write permission
     on it. Internal user.storage.* names are never copied. An existing
-    destination keeps its inode, and so its xattrs: its user.* names are
-    made to match the source's (internal ones an older copy2 left, and
-    names the source no longer has, such as a config policy since removed);
-    other namespaces (ACLs, security labels) are only copied over, as copy2
-    does. Errors copy2 ignores per name are ignored; others raise.
+    destination keeps its inode, and so its xattrs: its user.storage.*
+    names are made to match the source's (internal ones an older copy2
+    left, and a config policy since removed). Every other name is only
+    copied over, as copy2 does: xattrs other software set on a member file
+    stay, and so do ACL entries the source no longer has. Errors copy2
+    ignores per name are ignored; others raise, leaving the new bytes with
+    the old metadata, as copy2 would.
     """
     shutil.copyfile(src, dst)
     st = os.stat(src)
     keep = {name for name in _listxattr(src) if not _is_internal_xattr(name)}
     for name in _listxattr(dst):
-        if name.startswith("user.") and name not in keep:
+        if name.startswith(_INTERNAL_XATTR_PREFIX) and name not in keep:
             try:
                 os.removexattr(dst, name)
             except OSError as exc:
