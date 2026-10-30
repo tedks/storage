@@ -31,7 +31,7 @@ from .backends.base import Backend, ChecksumUnavailable, interactive_request
 from .backends.ssh_mux import close_shared_control_sockets
 from .cache import PARTIAL_SUFFIX, CacheManager
 from .locks import NamespaceLock, PathLocks, UploadLocks
-from .cache_metadata import XATTR_CACHE_METADATA_NAME, scan_cache_entries
+from .cache_metadata import PREFIX_XATTR, XATTR_CACHE_METADATA_NAME, scan_cache_entries
 from .file_config import FileConfig, get_inherited_config
 from .models import FileLocation, FileMetadata, StreamingKeepAfterClose, SyncStatus
 from .state import StateManager
@@ -43,7 +43,7 @@ from .checksum_queue import DEFAULT_CHECKSUM_REVERIFY_INTERVAL, MemberHashQueues
 from .checksums import ChecksumBasis, ChecksumRecord
 from .pathing import ResolvedPath, resolve_path
 from .namespace import DEFAULT_LISTING_MAX_STALE, NamespaceService
-from .streaming import PREFIX_XATTR, PrefetchSession, StreamingReadManager
+from .streaming import PrefetchSession, StreamingReadManager
 
 
 @dataclass
@@ -1714,9 +1714,9 @@ class StorageFS(Operations):
                 if not is_open:
                     try:
                         cache_path.unlink()
-                        removed = True
                     except FileNotFoundError:
-                        pass
+                        pass  # gone already (an invalidation): fetch again all the same
+                    removed = True
         if removed:
             self.cache_manager.mark_cache_size_dirty()
         return removed
@@ -1793,7 +1793,8 @@ class StorageFS(Operations):
             if cached and self._is_unindexed_prefix(canonical_path, cache_path):
                 # Still a prefix (open elsewhere, or another one won again):
                 # serve it unindexed, as any open after a failed session's
-                # cleanup does.
+                # cleanup does. (If the second fetch fails instead, the open
+                # fails: the dropped prefix is not served.)
                 return True
             if cached:
                 # Fresh from the member: no check needed until revalidate_after.
@@ -1804,7 +1805,12 @@ class StorageFS(Operations):
                 except OSError:
                     return True
 
-                metadata = self.state_manager.get_file_metadata(canonical_path)
+                with self.state_manager.metadata_lock:
+                    # Under the lock the promotion takes: a prefix installed
+                    # after the checks above is still not indexed.
+                    if self._is_unindexed_prefix(canonical_path, cache_path):
+                        return True
+                    metadata = self.state_manager.get_file_metadata(canonical_path)
                 if not metadata:
                     config = self._get_config(canonical_path)
                     metadata = FileMetadata(

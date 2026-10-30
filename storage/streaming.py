@@ -14,6 +14,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 from fuse import FuseOSError
 
 from .backends.base import Backend
+from .cache_metadata import PREFIX_XATTR
 from .models import FileLocation, FileMetadata, StreamingKeepAfterClose, SyncStatus
 
 # A foreground read fetches only the bytes the reader asked for that are not
@@ -61,9 +62,7 @@ STREAMING_MAX_TRACKED_READ_SPANS = 64
 _LINK_UNSUPPORTED = (errno.EPERM, errno.EOPNOTSUPP, errno.ENOTSUP, errno.ENOSYS, errno.EMLINK)
 _NOREPLACE_UNSUPPORTED = (errno.EINVAL, errno.ENOSYS, errno.EOPNOTSUPP, errno.ENOTSUP)
 _AT_FDCWD = -100
-# On the inode of a failed session's prefix kept in the cache: the bytes are
-# a prefix of the member's file, never to be indexed as the whole file.
-PREFIX_XATTR = "user.storage.prefix"
+
 _RENAME_NOREPLACE = 1
 
 
