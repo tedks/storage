@@ -1,0 +1,25 @@
+id: streaming-prefix-write-open
+title: A write-open of a promoted streaming prefix edits a truncated file that never
+  syncs
+desc: 'Found by lane sync-correctness while fixing streaming-promoted-prefix-false-conflict.
+  A failed streamed fetch of a never-cached file still promotes its prefix into the
+  cache with no index row (the offline-prefix feature). A later write-open finds the
+  file cached and writes to the truncated copy; with no row, mark_dirty records nothing
+  and nothing ever syncs it, so the write is silently kept only in the cache (and
+  getattr may report the member''s full size from the listing while reads stop at
+  the prefix). Options: mark a promoted prefix (an xattr) so a write-open, or any
+  open while the member is reachable, fetches the whole file instead; or drop the
+  prefix on a write-open. Not a member-truncation risk (no row, so no sync).'
+type: bugfix
+component: cache
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-30T17:13:44-00:00
+references: []
+log_events:
+- time: 2026-10-30T17:13:44-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
