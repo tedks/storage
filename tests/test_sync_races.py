@@ -7,8 +7,10 @@ so each interleaving is forced. Every wait has a timeout.
 
 import os
 import time
+from unittest.mock import patch
 
 from storage.models import SyncStatus
+from storage.sync_tasks import DirOperation
 from tests.test_fs_threading import BLOCKED, WAIT, ThreadingTestBase, Worker
 
 
@@ -91,8 +93,8 @@ class TestUploadRacingRename(SyncRaceTestBase):
         self.assertEqual(SyncStatus.CLEAN, self.fs.state_manager.get_file_metadata("/e/f.txt").sync_status)
 
     def test_directory_rename_with_more_uploads_under_it(self):
-        """An upload starting under a directory whose rename is draining
-        waits for the rename, then finds its row moved and skips it."""
+        """Other uploads under the directory end under the new name, whether
+        they ran before the drain, waited in it, or found their rows moved."""
         self.fs.mkdir("/d", 0o755)
         self.write_file("/d/f.txt")
         self.write_file("/d/g.txt")
@@ -100,10 +102,7 @@ class TestUploadRacingRename(SyncRaceTestBase):
         self.fs.sync_manager.num_workers = 2
         self.start_sync()
         self.assertTrue(gate.started.wait(WAIT))
-        deadline = time.monotonic() + WAIT
-        while (self.fs.state_manager.get_file_metadata("/d/g.txt").sync_status != SyncStatus.CLEAN
-               and time.monotonic() < deadline):
-            time.sleep(0.02)
+        self.wait_synced("/d/g.txt")
 
         self.write_file("/d/h.txt")  # queued; the free worker picks it up
         rename = Worker(self.fs.rename, "/d", "/e")
@@ -149,3 +148,88 @@ class TestUploadRacingUnlink(SyncRaceTestBase):
         self.wait_idle()
         self.assertIsNone(self.fs.state_manager.get_file_metadata("/a.txt"))
         self.assertEqual([], self.fs.state_manager.get_file_locations("/a.txt"))
+        # An unlink does not delete member copies yet (oq-unlink-member-copies).
+        self.assertEqual(["a.txt"], self.member_names())
+
+
+class TestFailedAttemptRacingRename(SyncRaceTestBase):
+    def test_failed_attempt_is_settled_before_a_rename_can_move_its_row(self):
+        """An attempt that raises after claiming the row (SYNCING) gives it
+        back as DIRTY before releasing the guard: a rename between the
+        failure and the retry moves a DIRTY row, which it queues again."""
+        real_checksum = self.fs.state_manager.compute_checksum
+        calls = []
+
+        def failing_once(path):
+            calls.append(path)
+            if len(calls) == 1:
+                raise OSError("checksum read failed")
+            return real_checksum(path)
+
+        patch.object(self.fs.state_manager, "compute_checksum", side_effect=failing_once).start()
+        self.addCleanup(patch.stopall)
+        self.fs.sync_manager.config.retry_delay = 0
+        self.start_sync()
+        executor = self.fs.sync_manager.workers[0].executor
+        gate = self.gate(executor, "handle_task_failure")
+        self.write_file("/a.txt")
+        self.assertTrue(gate.started.wait(WAIT))
+
+        self.assertEqual(SyncStatus.DIRTY, self.fs.state_manager.get_file_metadata("/a.txt").sync_status)
+        self.fs.rename("/a.txt", "/b.txt")
+        gate.opened.set()
+        self.wait_synced("/b.txt")
+        self.wait_idle()
+        self.assertEqual(["b.txt"], self.member_names())
+
+
+class TestDirectoryRetries(SyncRaceTestBase):
+    def fail_member_once(self, name):
+        real = getattr(self.member, name)
+        calls = []
+
+        def failing_once(*args):
+            calls.append(args)
+            if len(calls) == 1:
+                raise OSError("member unreachable")
+            return real(*args)
+
+        patcher = patch.object(self.member, name, side_effect=failing_once)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return calls
+
+    def queued_dir_ops(self):
+        return sorted(
+            (task.operation, task.virtual_path)
+            for _priority, task in [(t.priority, t) for t in list(self.fs.sync_manager.task_queue.queue)]
+            if hasattr(task, "operation")
+        )
+
+    def test_mkdir_retry_after_the_directory_was_renamed_is_dropped(self):
+        self.fail_member_once("mkdir")
+        self.fs.mkdir("/d", 0o755)
+        self.assertEqual([(DirOperation.MKDIR, "/d")], self.queued_dir_ops())
+        self.fs.rename("/d", "/e")
+
+        self.start_sync()
+        self.wait_idle()
+        self.assertNotIn("d", self.member_names())
+
+    def test_mkdir_retry_still_applies_while_the_directory_exists(self):
+        self.fail_member_once("mkdir")
+        self.fs.mkdir("/d", 0o755)
+        self.start_sync()
+        self.wait_idle()
+        self.assertEqual(["d"], self.member_names())
+
+    def test_rmdir_retry_after_the_directory_was_made_again_is_dropped(self):
+        self.fs.mkdir("/d", 0o755)
+        self.fail_member_once("rmdir")
+        self.fs.rmdir("/d")
+        self.assertEqual([(DirOperation.RMDIR, "/d")], self.queued_dir_ops())
+        self.fs.mkdir("/d", 0o755)
+
+        self.start_sync()
+        self.wait_idle()
+        self.assertEqual(["d"], self.member_names())
