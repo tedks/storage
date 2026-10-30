@@ -13,7 +13,9 @@ from storage.backends import ssh as ssh_module
 from storage.backends import ssh_pool
 from storage.backends.base import ChecksumUnavailable, interactive_request, is_interactive_request
 from storage.backends.ssh import SSHBackend
-from storage.backends.ssh_pool import MemberConnection, MemberUnavailable, is_connection_error
+from storage.backends.ssh_pool import (
+    CommandTimeout, MemberConnection, MemberUnavailable, is_connection_error,
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -34,6 +36,9 @@ class _FakeChannel:
 
     def settimeout(self, timeout):
         self.timeout = timeout
+
+    def get_transport(self):
+        return self.transport
 
     def gettimeout(self):
         return self.timeout
@@ -1522,11 +1527,38 @@ class TestSSHBackendOnThePool(_BackendTestCase):
                 patch.object(backend, "copy_to_local", side_effect=AssertionError("downloaded")):
             with self.assertRaises(MemberUnavailable):
                 backend.get_fast_checksum("/movie.bin", allow_download=False)
-        # The hash did not finish: it would not next time either.
-        with patch.object(backend._pool, "run_command", side_effect=socket.timeout("slow")), \
+        # A connect that timed out (the hash worker may run the reconnect):
+        # the member was never asked.
+        with patch.object(backend._pool, "run_command", side_effect=socket.timeout("connect")), \
+                patch.object(backend, "copy_to_local", side_effect=AssertionError("downloaded")):
+            with self.assertRaises(socket.timeout) as raised:
+                backend.get_fast_checksum("/movie.bin", allow_download=False)
+        self.assertNotIsInstance(raised.exception, ChecksumUnavailable)
+        # The hash started and did not finish: it would not next time either.
+        with patch.object(backend._pool, "run_command", side_effect=CommandTimeout("slow")), \
                 patch.object(backend, "copy_to_local", side_effect=AssertionError("downloaded")):
             with self.assertRaises(ChecksumUnavailable):
                 backend.get_fast_checksum("/movie.bin", allow_download=False)
+
+    def test_run_command_timeout_after_start_is_a_command_timeout(self):
+        backend = self._new_backend()
+
+        def stalled(chan, size):
+            raise socket.timeout("timed out")
+
+        with patch.object(_FakeChannel, "recv", stalled):
+            with self.assertRaises(CommandTimeout):
+                backend._pool.run_command("xxh128sum /data/movie.bin", 5.0)
+
+        def transport_lost(chan, size):
+            chan.transport.active = False
+            raise socket.timeout("timed out")
+
+        # The transport went away under the command: not the command's.
+        with patch.object(_FakeChannel, "recv", transport_lost):
+            with self.assertRaises(socket.timeout) as raised:
+                backend._pool.run_command("xxh128sum /data/movie.bin", 5.0)
+        self.assertNotIsInstance(raised.exception, CommandTimeout)
 
     def test_remote_checksum_and_xattrs_close_their_exec_channels(self):
         digest = "0123456789abcdef0123456789abcdef"

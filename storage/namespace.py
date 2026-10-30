@@ -952,9 +952,10 @@ class NamespaceService:
         # A member whose listing failed keeps its previous names (above) and,
         # for the size test only, the attributes of the published listing,
         # so one failed refresh does not merge a split name; it is not hashed
-        # this round. A second failure in a row, or a failure after a change
-        # to the name dropped the listing, has no attributes for it and
-        # shows the plain name: its sizes are not known.
+        # this round. A second failure in a row, a failure after a change to
+        # the name dropped the listing, or one after a local write forgot
+        # the name's attributes has none for it and shows the plain name:
+        # its sizes are not known.
         split_attrs = backend_attrs
         if failed:
             split_attrs = dict(backend_attrs)

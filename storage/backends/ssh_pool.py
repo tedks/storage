@@ -47,6 +47,12 @@ import paramiko
 from .base import is_interactive_request
 
 
+class CommandTimeout(socket.timeout):
+    """run_command's command started on a live transport and did not finish
+    within its timeout: the member was asked and has not answered. A
+    socket.timeout, so the pool treats it as any other timeout."""
+
+
 class MemberUnavailable(ConnectionError):
     """The pool could not serve a request: the member is down, closed, its
     reconnect is in progress, or no channel came free in time.
@@ -1026,17 +1032,26 @@ class MemberConnection:
             run_bounded(chan, remaining(), lambda: chan.exec_command(command))
             chunks = []
             size = 0
-            while True:
-                chan.settimeout(remaining())
-                data = chan.recv(32768)
-                if not data:
-                    break
-                size += len(data)
-                if size > MAX_COMMAND_OUTPUT:
-                    raise RuntimeError(
-                        f"command output exceeds {MAX_COMMAND_OUTPUT} bytes")
-                chunks.append(data)
-            status = chan.exit_status if chan.status_event.wait(remaining()) else None
+            try:
+                while True:
+                    chan.settimeout(remaining())
+                    data = chan.recv(32768)
+                    if not data:
+                        break
+                    size += len(data)
+                    if size > MAX_COMMAND_OUTPUT:
+                        raise RuntimeError(
+                            f"command output exceeds {MAX_COMMAND_OUTPUT} bytes")
+                    chunks.append(data)
+                status = chan.exit_status if chan.status_event.wait(remaining()) else None
+            except socket.timeout as exc:
+                # The command was started; a timeout from here on is the
+                # command's unless the transport is gone (a connect or
+                # channel open that timed out never gets this far).
+                transport = chan.get_transport()
+                if transport is not None and transport.is_active():
+                    raise CommandTimeout(str(exc)) from exc
+                raise
             return status, b"".join(chunks)
 
     # ------------------------------------------------------------------ #

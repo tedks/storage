@@ -17,7 +17,9 @@ from pathlib import Path, PurePosixPath
 from typing import Callable, List, Optional, TypeVar
 
 from .base import Backend, BackendType, ChecksumUnavailable, StorageMemberCapabilities, WatcherSpec
-from .ssh_pool import MemberConnection, SFTPLease, is_connection_error, is_transient_oserror
+from .ssh_pool import (
+    CommandTimeout, MemberConnection, SFTPLease, is_connection_error, is_transient_oserror,
+)
 
 _T = TypeVar("_T")
 
@@ -627,16 +629,18 @@ class SSHBackend(Backend):
             remote_error = exc
 
         if not allow_download:
-            # An error that kept the member from being asked (the transport
-            # dropped, no exec channel free or the server refused one) may
-            # pass and costs nothing to retry, so it is raised as is. A
-            # timeout is not: the hash ran too long for this file, or the
-            # member runs exec but never answers (ForceCommand
-            # internal-sftp), and would every time. That, and a command
-            # that ran without a digest, is ChecksumUnavailable.
+            # An error that kept the member from being asked (a connect or
+            # channel open that failed or timed out, the transport dropped,
+            # no exec channel free or the server refused one) may pass and
+            # costs nothing to retry, so it is raised as is. A command that
+            # started and did not finish (CommandTimeout) is not: the hash
+            # runs too long for this file, or the member runs exec but never
+            # answers (ForceCommand internal-sftp), and would every time.
+            # That, and a command that ran without a digest, is
+            # ChecksumUnavailable.
             if (
                 remote_error is not None
-                and not isinstance(remote_error, TimeoutError)
+                and not isinstance(remote_error, CommandTimeout)
                 and is_connection_error(remote_error)
             ):
                 raise remote_error

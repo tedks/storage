@@ -54,6 +54,15 @@ class TestMemberHashQueues(unittest.TestCase):
         self.assertEqual(self.queues.submit("m", lambda: 3).result(timeout=5), 3)
         self.assertIsNot(self.queues._workers["m"], parent_worker)
 
+    def test_submit_after_fork_finishes_the_parents_items(self):
+        release, blocker = self._block("m")
+        waiting = self.queues.submit("m", lambda: 1)
+        self.queues._pid = -1  # as if forked: the worker holding blocker is gone
+        self.assertEqual(self.queues.submit("m", lambda: 2).result(timeout=5), 2)
+        self.assertTrue(waiting.cancelled())
+        self.assertIsNone(blocker.result(timeout=0))
+        release.set()
+
     def test_one_worker_per_member_and_members_independent(self):
         release, blocker = self._block("slow")
         # Another member is not held up by the busy one.

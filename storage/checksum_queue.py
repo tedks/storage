@@ -42,6 +42,9 @@ class MemberHashQueues:
         self._cond = threading.Condition()
         self._queues: Dict[str, Deque[_Item]] = {}
         self._workers: Dict[str, threading.Thread] = {}
+        # The item each worker is running, so a forked child can finish
+        # what the parent's (vanished) workers had started.
+        self._running: Dict[str, concurrent.futures.Future] = {}
         self._pid = os.getpid()
         self._shut_down = False
 
@@ -56,6 +59,7 @@ class MemberHashQueues:
         future: concurrent.futures.Future = concurrent.futures.Future()
         dropped = None
         orphaned = []
+        started = []
         with self._cond:
             if self._shut_down:
                 raise RuntimeError("checksum queues shut down")
@@ -64,7 +68,9 @@ class MemberHashQueues:
                 self._pid = os.getpid()
                 self._workers.clear()
                 orphaned = [item[0] for queue in self._queues.values() for item in queue]
+                started = list(self._running.values())
                 self._queues.clear()
+                self._running.clear()
             queue = self._queues.setdefault(member, collections.deque())
             queue.append((future, fn))
             if len(queue) > self.limit:
@@ -87,6 +93,13 @@ class MemberHashQueues:
         # caller's locks.
         for stale in orphaned:
             stale.cancel()
+        for stale in started:
+            # Running, so not cancellable: finished with no result, which
+            # the caller reads as "not hashed" (FS records nothing).
+            try:
+                stale.set_result(None)
+            except concurrent.futures.InvalidStateError:
+                pass
         if dropped is not None:
             dropped.cancel()
         return future
@@ -117,11 +130,19 @@ class MemberHashQueues:
                 if self._shut_down:
                     return
                 future, fn = self._queues[member].pop()
-            if not future.set_running_or_notify_cancel():
-                continue
+                if not future.set_running_or_notify_cancel():
+                    continue
+                self._running[member] = future
             try:
                 result = fn()
             except BaseException as exc:
-                future.set_exception(exc)
+                outcome = (future.set_exception, exc)
             else:
-                future.set_result(result)
+                outcome = (future.set_result, result)
+            with self._cond:
+                if self._running.get(member) is future:
+                    del self._running[member]
+            try:
+                outcome[0](outcome[1])
+            except concurrent.futures.InvalidStateError:
+                pass  # finished by a fork reset; cannot happen in this process
