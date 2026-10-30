@@ -367,6 +367,13 @@ class TestRenameRaces(ThreadingTestBase):
             self.assertTrue(move.started.wait(WAIT))
             writer = Worker(self.fs.write, "/w.txt", b"after", 0, fd)
             writer.start()
+            # The bytes land (the cache file has already moved), so the
+            # writer is past pwrite and waiting for the index lock to
+            # record them.
+            deadline = time.monotonic() + WAIT
+            while (self.cache_dir / "moved.txt").read_bytes()[:5] != b"after":
+                self.assertLess(time.monotonic(), deadline, "the write never landed")
+                time.sleep(0.01)
             writer.join(BLOCKED)
             self.assertTrue(writer.is_alive())
             move.opened.set()
@@ -413,10 +420,12 @@ class TestRenameRaces(ThreadingTestBase):
         copy.opened.set()
         self.assertEqual(b"slow", opener.finish())
 
-    def test_opposite_renames_of_two_files_do_not_deadlock(self):
-        # x -> y and y -> x take the same two locks in opposite argument
-        # order. (Onto an existing file a rename fails in the index today,
-        # ditz rename-onto-existing-unique, so y starts absent.)
+    def test_opposite_renames_wait_on_the_sorted_first_path(self):
+        # x -> y and y -> x name the same two locks in opposite argument
+        # order; the second waits on /x.txt, the path that sorts first, so
+        # neither can hold one lock while waiting for the other. (Onto an
+        # existing file a rename fails in the index today, ditz
+        # rename-onto-existing-unique, so y starts absent.)
         self.cache("x.txt", b"x")
         gate = self.gate(self.fs.state_manager, "rename_path")
         first = Worker(self.fs.rename, "/x.txt", "/y.txt")
