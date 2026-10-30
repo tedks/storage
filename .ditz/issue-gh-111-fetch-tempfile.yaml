@@ -1,0 +1,22 @@
+id: gh-111-fetch-tempfile
+title: Fetch into a temp file and rename; no cache lock across member I/O; positional
+  writes (threading stage 1)
+desc: Threading stage 1 (docs/browsing_latency_plan.md D6, 4.4). CacheManager.cache_file
+  holds the cache lock across the whole member transfer, and copy_to_local writes
+  onto the cache path in place, so a half-fetched file looks cached and a second fetch
+  truncates a file another reader has open. Reserve space under the lock, fetch into
+  a sibling partial temp file outside it, os.replace and account under the lock. FUSE
+  write uses os.pwrite. No behaviour change under nothreads.
+type: task
+component: performance
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-30T00:33:13-00:00
+references: []
+log_events:
+- time: 2026-10-30T00:33:13-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
