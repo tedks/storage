@@ -1514,6 +1514,14 @@ class TestSSHBackendOnThePool(_BackendTestCase):
                 backend.get_fast_checksum("/movie.bin", allow_download=False)
         self.assertEqual([name for name, *_ in self.server.requests if name == "open"], [])
 
+    def test_checksum_without_download_raises_the_error_that_stopped_the_hash(self):
+        backend = self._new_backend()
+        with patch.object(backend._pool, "run_command", side_effect=socket.timeout("slow")), \
+                patch.object(backend, "copy_to_local", side_effect=AssertionError("downloaded")):
+            with self.assertRaises(socket.timeout) as raised:
+                backend.get_fast_checksum("/movie.bin", allow_download=False)
+        self.assertNotIsInstance(raised.exception, ChecksumUnavailable)
+
     def test_remote_checksum_and_xattrs_close_their_exec_channels(self):
         digest = "0123456789abcdef0123456789abcdef"
 

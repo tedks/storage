@@ -27,7 +27,7 @@ from fuse import FUSE, FuseOSError, Operations
 from pathlib import Path
 from typing import Dict, Optional, Set, List, Tuple
 
-from .backends.base import Backend, interactive_request
+from .backends.base import Backend, ChecksumUnavailable, interactive_request
 from .cache import PARTIAL_SUFFIX, CacheManager
 from .locks import NamespaceLock, PathLocks, UploadLocks
 from .cache_metadata import XATTR_CACHE_METADATA_NAME, scan_cache_entries
@@ -637,27 +637,23 @@ class StorageFS(Operations):
     def _aggregate_checksums_yaml(self, canonical_path: str) -> bytes:
         """Return a YAML list of '<backend>:<value>:<timestamp>' entries.
 
-        value is the member's hash, 'unverified' when the member could not
-        hash it (the view never downloads to hash), or 'size=<bytes>' for a
-        copy the listing split by size and nothing hashed, timestamped with
-        that listing.
+        value is the member's hash, or 'unverified' when the member ran its
+        hash and gave no digest (the view never downloads to hash). A name
+        the published listing split by size lists 'size=<bytes>' for every
+        copy instead, timestamped with that listing, as the view does: a
+        hash recorded before the sizes diverged describes an older file.
         """
+        sizes, listed_at = self.namespace.size_split_markers(canonical_path)
+        if sizes:
+            entries = [f"{backend}:size={size}:{listed_at}"
+                       for backend, size in sorted(sizes.items())]
+            return yaml.dump(entries, default_flow_style=False).encode()
         with self._checksum_lock:
-            recorded = {
-                backend: record
+            entries = [
+                f"{backend}:{record.checksum or 'unverified'}:{record.timestamp}"
                 for (path, backend), record in self._checksum_records.items()
                 if path == canonical_path
-            }
-        entries = [
-            f"{backend}:{record.checksum or 'unverified'}:{record.timestamp}"
-            for backend, record in recorded.items()
-        ]
-        sizes, listed_at = self.namespace.size_split_markers(canonical_path)
-        entries += [
-            f"{backend}:size={size}:{listed_at}"
-            for backend, size in sorted(sizes.items())
-            if backend not in recorded
-        ]
+            ]
         return yaml.dump(entries, default_flow_style=False).encode()
 
     def _schedule_directory_checksums(self, dir_path: str, backend_entries: Dict[str, Set[str]]):
@@ -672,8 +668,9 @@ class StorageFS(Operations):
         basis is the member's (st_size, st_mtime, st_ctime) from the listing,
         st_ctime None where the member does not report it (SFTP). A record
         made from the same basis is still current (an unverified one too:
-        a hash that failed or timed out is not retried until the file
-        changes or its records are forgotten), so nothing is scheduled;
+        a member that ran its hash and gave no digest is not asked again
+        until the file changes or its records are forgotten), so nothing is
+        scheduled;
         without a basis (no listed attributes, or a symlink) the file is
         always hashed again. check_dir: the worker first asks the member
         whether the path is a directory and records nothing if so.
@@ -715,7 +712,14 @@ class StorageFS(Operations):
                     if self._checksum_tasks.get(key) is not done:
                         return
                     del self._checksum_tasks[key]
-                    result = None if done.cancelled() else done.result()
+                    if done.cancelled():
+                        # Still registered, so dropped by the member's
+                        # full queue, not superseded or invalidated: a
+                        # record left from before would outlive the change
+                        # that scheduled this hash (an upload, a new basis).
+                        self._checksum_records.pop(key, None)
+                        return
+                    result = done.result()
                     if result is not None and result is not self._IS_DIRECTORY:
                         checksum, ts = result
                         self._record_checksum(canonical_path, backend.name, checksum, ts, basis)
@@ -728,8 +732,11 @@ class StorageFS(Operations):
         """Compute a checksum on the member side, on its hash worker.
 
         Returns (checksum, timestamp), with checksum None when the member
-        could not hash the file (unverified: no download fallback here), or
-        _IS_DIRECTORY when check_dir found a directory. The caller records
+        ran its hash and gave no digest (ChecksumUnavailable: unverified, no
+        download fallback here); None when the hash could not run (a
+        connection, channel or timeout error, or a local read error), which
+        records nothing, so the next listing retries; or _IS_DIRECTORY when
+        check_dir found a directory. The caller records
         it in memory. Nothing is written to the member: an xattr write
         raises the watcher's ATTRIB event, whose invalidation would drop the
         record this hash made, and nothing reads it back (getxattr answers
@@ -743,9 +750,12 @@ class StorageFS(Operations):
         try:
             checksum = backend.get_fast_checksum(canonical_path, allow_download=False)
             return checksum, time.time()
+        except ChecksumUnavailable as exc:
+            self.logger.debug("checksum for %s on %s unavailable: %s", canonical_path, backend.name, exc)
+            return None, time.time()
         except Exception as exc:
             self.logger.debug("checksum for %s on %s failed: %s", canonical_path, backend.name, exc)
-            return None, time.time()
+            return None
 
     def _apply_conflict_view(self, dir_path: str, base_entries: Set[str]) -> Set[str]:
         """
@@ -1871,6 +1881,10 @@ class StorageFS(Operations):
                         backend.sync()
                         # Hashed on the member's worker, not this thread.
                         self._schedule_checksum_task(backend, entry.canonical_path, replace=True)
+                        # The member's listed size and mtime are now old;
+                        # a size split on the name drops the parent's
+                        # listing (see NamespaceService.forget_listed_attrs).
+                        self.namespace.forget_listed_attrs(entry.virtual_path)
                     except Exception as exc:
                         self.logger.error(
                             "direct sync failed for %s on %s: %s",

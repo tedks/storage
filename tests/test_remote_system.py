@@ -1346,8 +1346,10 @@ def test_mounted_conflict_view_hash_budget(remote, mounted_factory):
     for i in range(different):
         assert {f"diff{i}.bin.{m0.name}", f"diff{i}.bin.{m1.name}"} <= first, first
         assert f"diff{i}.bin" not in first
-    # Same sizes show the plain name until both hashes are in.
-    for i in range(same):
+    # Identical same-size copies show the plain name. (A diverged pair may
+    # already be split here if both hashes finished before the view was
+    # applied: the workers start while the listing is still being merged.)
+    for i in range(same - same_diverged):
         assert f"same{i}.bin" in first
     assert sorted(hashed) == sorted(
         (m.name, f"xxh128sum {shlex.quote(f'{REMOTE_ROOT}/dups/same{i}.bin')} 2>/dev/null")

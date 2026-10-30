@@ -9,11 +9,16 @@ the oldest waiting hash is dropped (its future cancelled). A dropped hash
 leaves its name unverified; the next listing of its directory schedules it
 again.
 
-Workers are daemon threads at the lowest scheduling priority, started on a
-member's first submit, which is after FUSE's daemonizing fork. They run in
-a fresh context, never a FUSE request's, so their member calls do not count
-as interactive (see backends.base.interactive_request) and cannot take the
-channel a FUSE request has reserved.
+Workers are daemon threads, started on a member's first submit, which is
+after FUSE's daemonizing fork (a submit in a forked child starts fresh
+workers: threads do not survive a fork). Their priority is relative to the
+member, not the CPU: they run in a fresh context, never a FUSE request's,
+so their member calls do not count as interactive (see
+backends.base.interactive_request), wait longer for a channel and cannot
+take the one a FUSE request has reserved. The threads are not reniced: a
+worker may be the caller that reconnects an SSH member, and paramiko's
+transport thread, which then carries every request to that member, would
+inherit the nice value.
 """
 
 from __future__ import annotations
@@ -37,6 +42,7 @@ class MemberHashQueues:
         self._cond = threading.Condition()
         self._queues: Dict[str, Deque[_Item]] = {}
         self._workers: Dict[str, threading.Thread] = {}
+        self._pid = os.getpid()
         self._shut_down = False
 
     def submit(self, member: str, fn: Callable[[], object]) -> concurrent.futures.Future:
@@ -52,8 +58,20 @@ class MemberHashQueues:
         with self._cond:
             if self._shut_down:
                 raise RuntimeError("checksum queues shut down")
+            if os.getpid() != self._pid:
+                # Forked: the parent's workers did not come along.
+                self._pid = os.getpid()
+                self._workers.clear()
+                self._queues.clear()
             queue = self._queues.setdefault(member, collections.deque())
             queue.append((future, fn))
+            if len(queue) > self.limit:
+                # Items cancelled while waiting (invalidated, superseded)
+                # go first; only then is a live one dropped.
+                live = [item for item in queue if not item[0].cancelled()]
+                if len(live) != len(queue):
+                    queue.clear()
+                    queue.extend(live)
             if len(queue) > self.limit:
                 dropped = queue.popleft()[0]
             if member not in self._workers:
@@ -86,11 +104,6 @@ class MemberHashQueues:
             future.cancel()
 
     def _run(self, member: str):
-        try:
-            # Per thread on Linux: setpriority on a thread id renices only it.
-            os.setpriority(os.PRIO_PROCESS, threading.get_native_id(), 19)
-        except (AttributeError, OSError):
-            pass
         while True:
             with self._cond:
                 while not self._shut_down and not self._queues.get(member):

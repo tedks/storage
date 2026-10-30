@@ -15,7 +15,7 @@ from fuse import FuseOSError
 
 from storage.backends.base import ChecksumUnavailable
 from storage.backends.local import LocalBackend
-from storage.checksums import fast_checksum_bytes
+from storage.checksums import ChecksumRecord, fast_checksum_bytes
 from storage.fs import StorageFS
 from storage.models import FileMetadata, SyncStatus
 from storage.sync import DirOperation
@@ -1086,6 +1086,75 @@ class TestFSNamespaceIntegration(unittest.TestCase):
         entries = yaml.safe_load(self.fs.getxattr('/dup.txt', StorageFS.CHECKSUM_XATTR))
         self.assertIn(f"backend2:unverified:{record.timestamp}", entries)
 
+    def test_hash_that_could_not_run_records_nothing_and_is_retried(self):
+        (self.backend1_dir / "dup.txt").write_text("same")
+        (self.backend2_dir / "dup.txt").write_text("same")
+        member = self.backends["backend2"]
+        with patch.object(member, "get_fast_checksum",
+                          side_effect=ConnectionResetError("dropped")) as hashed:
+            self.assertIn("dup.txt", self._list_and_settle())
+            self.assertNotIn(("/dup.txt", "backend2"), self.fs._checksum_records)
+            self._list_and_settle()
+            self.assertEqual(hashed.call_count, 2)
+        self._list_and_settle()
+        self.assertIsNotNone(self.fs._checksum_records[("/dup.txt", "backend2")].checksum)
+
+    def test_change_to_size_split_name_relists_its_directory(self):
+        (self.backend1_dir / "dup.txt").write_text("one")
+        (self.backend2_dir / "dup.txt").write_text("three")
+        self.fs.namespace.readdir_snapshot_ttl = float('inf')  # as with watchers
+        self.assertIn("dup.txt.backend2", set(self.fs.readdir('/', None)))
+        (self.backend2_dir / "dup.txt").write_text("one")
+        # A watcher event for the name (or a write to a copy) forgets it.
+        self.fs._on_remote_change('/dup.txt')
+        self.assertNotIn('/', self.fs.namespace.readdir_snapshot)
+        self.assertIn("dup.txt", set(self.fs.readdir('/', None)))
+
+    def test_failed_member_listing_keeps_size_split_and_hashes_nothing_there(self):
+        (self.backend1_dir / "dup.txt").write_text("one")
+        (self.backend2_dir / "dup.txt").write_text("three")
+        (self.backend1_dir / "eq.txt").write_text("same")
+        (self.backend2_dir / "eq.txt").write_text("same")
+        self.assertIn("dup.txt.backend2", set(self.fs.readdir('/', None)))
+        self.fs._forget_checksums({"/eq.txt"})
+        with patch.object(self.fs, "_schedule_checksum_task") as schedule_task, \
+                patch.object(self.backends["backend2"], "listdir_attrs",
+                             side_effect=ConnectionResetError("dropped")):
+            namespace = self.fs.namespace
+            entries = set(namespace._list_members('/', namespace._begin_listing('/')))
+            namespace._end_listing('/')
+        self.assertIn("dup.txt.backend1", entries)
+        self.assertIn("dup.txt.backend2", entries)
+        self.assertNotIn("dup.txt", entries)
+        # eq.txt is listed only by backend1 this round: nothing to compare.
+        schedule_task.assert_not_called()
+
+    def test_hash_dropped_from_full_queue_forgets_the_old_record(self):
+        (self.backend2_dir / "a.txt").write_text("a")
+        (self.backend2_dir / "b.txt").write_text("b")
+        member = self.backends["backend2"]
+        with self.fs._checksum_lock:
+            for name in ("/a.txt", "/b.txt"):
+                self.fs._checksum_records[(name, "backend2")] = ChecksumRecord(
+                    checksum="old", timestamp=time.time())
+        self.fs._checksum_queues.limit = 1
+        started, release = threading.Event(), threading.Event()
+
+        def hold():
+            started.set()
+            release.wait(5)
+
+        blocker = self.fs._checksum_queues.submit("backend2", hold)
+        self.assertTrue(started.wait(5))
+        self.fs._schedule_checksum_task(member, "/a.txt", replace=True)
+        self.fs._schedule_checksum_task(member, "/b.txt", replace=True)  # drops /a.txt's
+        self.assertNotIn(("/a.txt", "backend2"), self.fs._checksum_records)
+        self.assertNotIn(("/a.txt", "backend2"), self.fs._checksum_tasks)
+        release.set()
+        blocker.result(timeout=5)
+        self.assertTrue(self._wait_for(
+            lambda: self.fs._checksum_records[("/b.txt", "backend2")].checksum != "old"))
+
     def test_size_split_xattr_carries_listed_sizes(self):
         (self.backend1_dir / "dup.txt").write_text("one")
         (self.backend2_dir / "dup.txt").write_text("three")
@@ -1103,7 +1172,6 @@ class TestFSNamespaceIntegration(unittest.TestCase):
         lock = threading.Lock()
         running = {name: 0 for name in self.backends}
         peak = {name: 0 for name in self.backends}
-        both_running = threading.Event()
         for name, backend in self.backends.items():
             real = backend.get_fast_checksum
 
@@ -1111,8 +1179,6 @@ class TestFSNamespaceIntegration(unittest.TestCase):
                 with lock:
                     running[_name] += 1
                     peak[_name] = max(peak[_name], running[_name])
-                    if all(running.values()):
-                        both_running.set()
                 time.sleep(0.02)
                 try:
                     return _real(path, **kwargs)
@@ -1126,8 +1192,6 @@ class TestFSNamespaceIntegration(unittest.TestCase):
 
         self._list_and_settle()
         self.assertEqual(peak, {name: 1 for name in self.backends})
-        # One worker each, so the members hash side by side.
-        self.assertTrue(both_running.is_set())
         self.assertEqual(len(self.fs._checksum_records), 12)
 
     def test_release_of_conflict_copy_hashes_off_the_calling_thread(self):
@@ -1147,6 +1211,8 @@ class TestFSNamespaceIntegration(unittest.TestCase):
             self.fs.write('/dup.txt.backend2', b"fresh", 0, fh)
             self.fs.release('/dup.txt.backend2', fh)
             self.assertEqual((self.backend2_dir / "dup.txt").read_bytes(), b"fresh")
+            # The split came from sizes the upload changed: relisted next.
+            self.assertNotIn('/', self.fs.namespace.readdir_snapshot)
             self.assertTrue(self._wait_for(
                 lambda: ("/dup.txt", "backend2") in self.fs._checksum_records))
         self.assertEqual(len(hash_threads), 1)

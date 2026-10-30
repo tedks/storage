@@ -289,7 +289,23 @@ class NamespaceService:
         """Drop a path's names from its parent's listing; listing_lock held.
 
         With bump, a listing of the parent in flight is not published.
+
+        A name the parent's published listing split by size drops that
+        listing instead (snapshot, view inputs, attributes; the member
+        names stay in dir_cache, which needs dir_cache_lock), so the next
+        readdir lists again: the split came from sizes that just changed,
+        and with watchers the listing would otherwise never refresh. A
+        listing in flight is then never published, bump or not.
         """
+        inputs = self._view_inputs.get(parent)
+        if inputs is not None and (Path(path).name in inputs[2] or Path(canonical).name in inputs[2]):
+            if parent in self._listings_in_flight:
+                self._listing_generation[parent] += 1
+            self.readdir_snapshot.pop(parent, None)
+            self._view_inputs.pop(parent, None)
+            self.entry_attrs.pop(parent, None)
+            self._listing_as_of.pop(parent, None)
+            return
         if bump and parent in self._listings_in_flight:
             self._listing_generation[parent] += 1
         # The path's own attributes live in its parent's listing, under the
@@ -903,10 +919,12 @@ class NamespaceService:
 
         backend_attrs: Dict[str, Dict[str, dict]] = {}
         member_entries: Dict[str, Set[str]] = {}
+        failed: Set[str] = set()
         with self.dir_cache_lock:
             previous = self.dir_cache.get(path, {})
             for backend_name, outcome in outcomes.items():
                 if isinstance(outcome, Exception):
+                    failed.add(backend_name)
                     cached = previous.get(backend_name)
                     if cached is not None:
                         # Shared with the previous map: these sets are only
@@ -926,8 +944,25 @@ class NamespaceService:
         for names in member_entries.values():
             entries.update(names)
 
-        size_splits = self._size_splits(member_entries, backend_attrs)
-        self._schedule_directory_checksums(path, member_entries, backend_attrs, size_splits)
+        # A member whose listing failed keeps its previous names (above) and,
+        # for the size test only, its previous attributes, so one failed
+        # refresh does not merge a split name; it is not hashed this round.
+        split_attrs = backend_attrs
+        if failed:
+            split_attrs = dict(backend_attrs)
+            with self.listing_lock:
+                # Copied under the lock: forget_listed_attrs edits them in place.
+                published = self.entry_attrs.get(path)
+                for backend_name in failed:
+                    if published is not None and backend_name in published[1]:
+                        split_attrs[backend_name] = dict(published[1][backend_name])
+        size_splits = self._size_splits(member_entries, split_attrs)
+        self._schedule_directory_checksums(
+            path,
+            {name: names for name, names in member_entries.items() if name not in failed},
+            backend_attrs,
+            size_splits,
+        )
         visible_entries = self._apply_conflict_view(path, entries, member_entries, size_splits)
         ordered_entries = sorted(visible_entries)
 

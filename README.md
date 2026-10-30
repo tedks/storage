@@ -436,11 +436,12 @@ Configuration is hierarchical - child directories inherit from parents, with the
 
 **Conflict View:**
 1. A name on several members whose listings report regular files of different sizes is shown at once as `name.<member>`, one entry per copy, without hashing anything
-2. Copies of equal size show the plain name and are hashed on the member in the background (`xxh128sum` over SSH): one hash at a time per member, at the lowest priority, newest directory first; they split into `name.<member>` at the next `readdir` if the hashes differ. Equal mtimes are not taken as identity
-3. The view never downloads a file to hash it: a copy the member cannot hash itself (no `xxh128sum`, or the hash timed out) is left unverified, keeps the plain name, and is not hashed again until its listed size or mtime changes
-4. `getfattr -n user.storage.checksums` on the name lists each copy as `<member>:<hash>:<time>`, `<member>:unverified:<time>`, or `<member>:size=<bytes>:<time>` for a size split
-5. Hashes are kept in memory only, so a remount hashes equal-size duplicates again when their directories are listed
-6. Measured in the remote gate (`test_mounted_conflict_view_hash_budget`: two SSH members, four same-size and four different-size duplicates of 256 KiB): listing the directory schedules 8 member hashes reading 2 MiB, at most one at a time per member; before this change it was 16 hashes reading 4 MiB, up to four at a time per member, and the different-size copies split only after their hashes
+2. Copies of equal size show the plain name and are hashed on the member in the background (`xxh128sum` over SSH): one hash at a time per member, behind interactive requests for the member's connection, newest directory first; they split into `name.<member>` at the next `readdir` if the hashes differ. Equal mtimes are not taken as identity
+3. The view never downloads a file to hash it: a copy the member cannot hash itself (no `xxh128sum`) is left unverified, keeps the plain name, and is not hashed again until its listed size or mtime changes; a hash that could not run (the connection dropped, it timed out) records nothing and is retried at the next listing of the directory
+4. A change to a name split by size (a watcher event, a write to one of its copies) makes the next `readdir` list the directory again
+5. `getfattr -n user.storage.checksums` on the name lists each copy as `<member>:<hash>:<time>`, `<member>:unverified:<time>`, or `<member>:size=<bytes>:<time>` for a size split
+6. Hashes are kept in memory only, so a remount hashes equal-size duplicates again when their directories are listed
+7. Measured in the remote gate (`test_mounted_conflict_view_hash_budget`: two SSH members, four same-size and four different-size duplicates of 256 KiB): listing the directory schedules 8 member hashes reading 2 MiB, at most one at a time per member; before this change it was 16 hashes reading 4 MiB, up to four at a time per member, and the different-size copies split only after their hashes
 
 **Replication:**
 1. Use extended attributes for per-directory configuration

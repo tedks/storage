@@ -601,9 +601,10 @@ class SSHBackend(Backend):
         Tries xxh128sum on the remote (matches local xxh3_128).
         Falls back to downloading a temp copy and checksumming locally
         so the result is always consistent with local checksums; with
-        allow_download False it raises ChecksumUnavailable instead (the
-        conflict view's hashes, which must not move whole files over the
-        link to decide how a directory looks).
+        allow_download False it raises instead (the conflict view's hashes,
+        which must not move whole files over the link to decide how a
+        directory looks): ChecksumUnavailable when xxh128sum ran and gave no
+        digest, the command's own error when it could not run or timed out.
         """
         remote_path = str(self._resolve_path(virtual_path))
 
@@ -612,6 +613,7 @@ class SSHBackend(Backend):
         # large files can take much longer than a connection handshake.
         # Any failure (no xxh128sum, a refused or timed-out channel) falls
         # through to the download-and-hash fallback.
+        remote_error = None
         try:
             cmd = f"xxh128sum {self._shell_quote(remote_path)} 2>/dev/null"
             rc, stdout = self._pool.run_command(cmd, self.sftp_operation_timeout)
@@ -621,10 +623,15 @@ class SSHBackend(Backend):
                 # xxh128sum outputs a 32-char hex digest; validate format.
                 if len(token) == 32 and all(c in "0123456789abcdef" for c in token):
                     return token
-        except Exception:
-            pass
+        except Exception as exc:
+            remote_error = exc
 
         if not allow_download:
+            # Only a command that ran and produced no digest says the member
+            # cannot hash the file; a connection, channel or timeout error
+            # may pass, so it is raised as is and the caller may retry.
+            if remote_error is not None:
+                raise remote_error
             raise ChecksumUnavailable(
                 errno.EIO, f"no remote hash for {virtual_path} on {self.name}")
 

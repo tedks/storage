@@ -155,9 +155,9 @@ class LatencyBackend(Backend):
     def supports_range_reads(self) -> bool:
         return self._inner.supports_range_reads()
 
-    def get_fast_checksum(self, virtual_path: str) -> str:
+    def get_fast_checksum(self, virtual_path: str, allow_download: bool = True) -> str:
         self._delay()
-        return self._inner.get_fast_checksum(virtual_path)
+        return self._inner.get_fast_checksum(virtual_path, allow_download=allow_download)
 
     def set_xattr(self, virtual_path: str, name: str, value: bytes):
         self._delay()
