@@ -38,3 +38,12 @@ log_events:
     round-1 head and PR #144 5e7d2b3; each failing test passed 4/4 when rerun alone,
     and the full gates passed on #141 9353004 at lower load. Looks load-sensitive
     (join_timeout 30 s vs destroy''s joins), not tied to those PRs'' changes.'
+- time: 2026-10-30T17:46:52-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Seen again 2026-10-30 from lane ssh-pool-polish: under a host load average
+    of 9-35 (several lanes running gates at once), ''mount teardown ... the FUSE thread
+    did not finish after unmount'' failed 1 remote-gate case once and, on another
+    run, 3 mounted-gate cases (streaming_system, conflicts_integration, sync_system)
+    at once; all passed on rerun at load ~15. Not in the SSH pool or SIGPIPE code
+    paths.'
