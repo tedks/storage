@@ -47,6 +47,7 @@ from storage.backends.rsync import RsyncBackend
 from storage.backends.ssh import SSHBackend
 from storage.checksums import fast_checksum_bytes
 from storage.watcher import RemoteWatcher
+from tests.fuse_mount import FUSE_THREAD_MODES, fuse_mode_id, run_fuse
 
 IMAGE_DIR = Path(__file__).resolve().parent / "remote"
 IMAGE_REPO = "storage-test-sshd"
@@ -597,6 +598,16 @@ class Mounted:
     mount: Path
     cache: Path
     backends: dict
+    fuse_threads: bool = False
+
+
+# How long a plain unmount is retried while the mount is busy. A desktop
+# session probes every new mount (GIO's trash monitor looks up /.Trash and
+# /.Trash-<uid>), and over SSH members that lookup takes a member round
+# trip; with fuse_threads it can still be in flight when the test ends, and
+# the kernel refuses the unmount until it returns. Only a busy that outlasts
+# this is a problem.
+UNMOUNT_BUSY_RETRY = 10.0
 
 
 def _fusermount_unmount(mount: Path) -> List[str]:
@@ -606,29 +617,37 @@ def _fusermount_unmount(mount: Path) -> List[str]:
         for tool in ("fusermount", "fusermount3"):
             if shutil.which(tool) is None:
                 continue
-            try:
-                result = subprocess.run([tool, flags, str(mount)], capture_output=True,
-                                        text=True, timeout=30.0)
-            except subprocess.TimeoutExpired:
-                problems.append(f"{tool} {flags} timed out")
-                continue
-            if result.returncode == 0:
-                return problems
-            problems.append(f"{tool} {flags}: {result.stderr.strip()}")
+            deadline = time.monotonic() + (UNMOUNT_BUSY_RETRY if flags == "-u" else 0.0)
+            while True:
+                try:
+                    result = subprocess.run([tool, flags, str(mount)], capture_output=True,
+                                            text=True, timeout=30.0)
+                except subprocess.TimeoutExpired:
+                    problems.append(f"{tool} {flags} timed out")
+                    break
+                if result.returncode == 0:
+                    return problems
+                if "busy" in result.stderr and time.monotonic() < deadline:
+                    time.sleep(0.2)
+                    continue
+                problems.append(f"{tool} {flags}: {result.stderr.strip()}")
+                break
     problems.append(f"{mount} could not be unmounted")
     return problems
 
 
-@pytest.fixture
-def mounted_factory(remote, tmp_path):
+@pytest.fixture(params=FUSE_THREAD_MODES, ids=fuse_mode_id)
+def mounted_factory(remote, tmp_path, request):
     """Factory mounting StorageFS over remote0 and remote1 (both SSHBackend).
 
-    Unlike the other mounted suites this never skips: a mount that does not
-    come up is a failure.
+    Every mounted test runs twice, with the single-threaded FUSE loop and
+    with fuse_threads (Mounted.fuse_threads says which). Unlike the other
+    mounted suites this never skips: a mount that does not come up is a
+    failure.
     """
-    from fuse import FUSE
+    from storage.fs import StorageFS
 
-    from storage.fs import StorageFS, fuse_mount_options
+    fuse_threads = request.param
 
     created: List[tuple] = []
 
@@ -660,15 +679,13 @@ def mounted_factory(remote, tmp_path):
 
         def run():
             try:
-                FUSE(fs, str(mount), nothreads=True, foreground=True, allow_other=False,
-                     **fuse_mount_options(backends, enable_watchers=fs._enable_watchers,
-                                          fresh_window=fs._revalidate_after))
+                run_fuse(fs, mount, fuse_threads=fuse_threads)
             except BaseException as exc:  # reported by the failure below
                 errors.append(exc)
 
         thread = threading.Thread(target=run, daemon=True)
         thread.start()
-        handle = Mounted(fs, mount, cache, backends)
+        handle = Mounted(fs, mount, cache, backends, fuse_threads)
         came_up = _wait_for(lambda: os.path.ismount(mount) or bool(errors),
                             timeout=MOUNT_TIMEOUT, interval=0.1) and os.path.ismount(mount)
         created.append((handle, thread, errors, came_up, destroy_called))
@@ -687,7 +704,13 @@ def mounted_factory(remote, tmp_path):
                 problems.append("the mount went away before teardown")
             # On unmount libfuse calls StorageFS.destroy, which stops the
             # watchers and sync workers; a hang there leaves this thread alive.
-            thread.join(timeout=30.0)
+            # With fuse_threads libfuse first joins its workers, so a request
+            # still in a member call delays the end by up to that call's
+            # SFTP timeout.
+            join_timeout = 30.0
+            if handle.fuse_threads:
+                join_timeout += max(b.sftp_operation_timeout for b in handle.backends.values())
+            thread.join(timeout=join_timeout)
             if thread.is_alive():
                 problems.append("the FUSE thread did not finish after unmount "
                                 "(StorageFS.destroy hung?)")
@@ -834,6 +857,59 @@ def test_mounted_nonstreaming_read_makes_no_range_reads(remote, mounted_factory,
                                                      streaming=False)
     assert ranges == []
     assert downloads == ["/stream.bin"], "the whole file must be downloaded exactly once"
+
+
+def test_mounted_slow_read_does_not_delay_another_listing(remote, mounted_factory, monkeypatch):
+    """A member transfer held on one file must not hold up browsing another.
+
+    With fuse_threads a listing of the mount and a stat of another file
+    return while the transfer is held. With the single-threaded loop they
+    wait for it (what fuse_threads removes), which shows this case tells
+    the two loops apart.
+    """
+    member = remote.members[0]
+    remote.write_remote(member, "slow.bin", secrets.token_bytes(256 * 1024))
+    remote.write_remote(member, "other.txt", b"other")
+    mnt = mounted_factory(num_sync_workers=0, start_sync=False)
+    backend = mnt.backends[member.name]
+    original = backend.copy_to_local
+    held, release = threading.Event(), threading.Event()
+
+    def held_transfer(virtual_path, local_path):
+        if virtual_path == "/slow.bin":
+            held.set()
+            release.wait(60.0)
+        return original(virtual_path, local_path)
+
+    monkeypatch.setattr(backend, "copy_to_local", held_transfer)
+    read: List[bytes] = []
+    reader = threading.Thread(target=lambda: read.append((mnt.mount / "slow.bin").read_bytes()),
+                              daemon=True)
+    browsed = threading.Event()
+    seen: List[object] = []
+
+    def browse():
+        seen.append(set(os.listdir(mnt.mount)))
+        seen.append(os.stat(mnt.mount / "other.txt").st_size)
+        browsed.set()
+
+    browser = threading.Thread(target=browse, daemon=True)
+    reader.start()
+    try:
+        assert held.wait(20.0), "the read never reached the member transfer"
+        browser.start()
+        if mnt.fuse_threads:
+            assert browsed.wait(10.0), "browsing waited for another file's transfer"
+            assert reader.is_alive(), "the held transfer finished early; the case proves nothing"
+        else:
+            assert not browsed.wait(2.0), "the single-threaded loop answered during the transfer"
+    finally:
+        release.set()
+    reader.join(30.0)
+    assert not reader.is_alive() and len(read) == 1 and len(read[0]) == 256 * 1024
+    assert browsed.wait(10.0)
+    assert {"slow.bin", "other.txt"} <= seen[0]
+    assert seen[1] == len(b"other")
 
 
 def _record_range_reads(mnt, monkeypatch) -> List[tuple]:
