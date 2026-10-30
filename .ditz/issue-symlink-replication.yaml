@@ -1,0 +1,32 @@
+id: symlink-replication
+title: 'Replicate symlinks: a link follows its target'
+desc: 'From the ruling on oq-symlink-through-mount (2026-10-29): interim is to refuse
+  symlink() through the mount; this is the feature that makes links first-class. Placement
+  rule (Ted and CTO, 2026-10-29): resolve the target relative to the link''s directory
+  through the union namespace and create the link on exactly the members that hold
+  the target (all of them when it is replicated), creating the link''s directory on
+  that member if needed. Refuse absolute targets and relative targets that escape
+  the mount root (they cannot mean the same thing on a member and through the mount).
+  Refuse dangling targets at first (a link that becomes valid later cannot be placed).
+  Placement is decided at creation and does not follow later re-replication or eviction
+  of the target; document it, and let a verifier report links whose target no longer
+  sits on their member. Also: an index row per link with its target string; sync creates
+  links per backend (SFTP symlink, local os.symlink, rsync with links); the conflict
+  view compares links by target string; readlink answers from the member''s link when
+  nothing is cached; listings keep the link mode so getattr reports a link instead
+  of following the member''s stat, so ls -l shows the arrow and cp -a copies a link;
+  links to directories resolve inside the union. Remote-gate case per backend. Medium
+  lane.'
+type: feature
+component: fs
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-30T02:25:41-00:00
+references: []
+log_events:
+- time: 2026-10-30T02:25:41-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
