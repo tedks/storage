@@ -1,0 +1,23 @@
+id: ssh-pool-stall-start-time
+title: 'ssh_pool: a stall is dated from its lease, not its request'
+desc: 'Council round 3 on PR #132 (Claude seat nit, no action needed). A timed-out
+  SFTP request counts as a stall only if its lease began after the last counted stall,
+  so a burst of concurrent timeouts is one stall. The lease start is used, not the
+  start of the request that timed out, so a long multi-request operation (copy_to_local
+  of a big file, listdir_attr of a huge directory) that began before the last counted
+  stall is never counted. This undercounts: it errs toward keeping a member up, and
+  on a hung filesystem the next fresh lease still counts. Stricter semantics would
+  record the start of each request; not worth it without a field case.'
+type: task
+component: fs
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-30T01:22:09-00:00
+references: []
+log_events:
+- time: 2026-10-30T01:22:09-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
