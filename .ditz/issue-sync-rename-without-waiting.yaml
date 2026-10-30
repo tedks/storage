@@ -1,0 +1,26 @@
+id: sync-rename-without-waiting
+title: Renames wait for an in-flight upload; a design that does not
+desc: 'Follow-up to sync-namespace-orphans (PR #141). A rename or unlink of a file
+  whose upload is in flight now waits for the rest of the upload (UploadLocks); with
+  the single-threaded FUSE loop the whole mount waits with it, so a write-temp-then-rename
+  writer runs at member upload speed per file. A design that does not wait: the rename
+  marks the in-flight upload moved (prefix marks for a directory rename) and requeues
+  a SYNCING row it moves; the worker, after its transfer, takes the path lock, and
+  if moved deletes what it put on the member (and empty parent directories it recreated
+  that the cache does not have) instead of recording a location. More moving parts
+  (orphan cleanup on members, parent climbing), so only worth it if the wait shows
+  up in use. Measure first: time an rsync of many small files into a mount with SSH
+  members, fuse_threads off and on.'
+type: task
+component: sync
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-30T16:44:52-00:00
+references: []
+log_events:
+- time: 2026-10-30T16:44:52-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
