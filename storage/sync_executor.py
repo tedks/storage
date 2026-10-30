@@ -2,6 +2,7 @@
 
 import contextlib
 import logging
+import os
 import queue
 import time
 from pathlib import Path
@@ -33,6 +34,7 @@ class SyncExecutor:
         should_sync_path_cb: Optional[Callable[[str], bool]] = None,
         member_written_cb: Optional[Callable[[str, Backend, Path], None]] = None,
         upload_guard: Optional[Callable[[str], ContextManager]] = None,
+        path_guard: Optional[Callable[..., ContextManager]] = None,
     ):
         self.worker_id = worker_id
         self.state_manager = state_manager
@@ -49,6 +51,10 @@ class SyncExecutor:
         # member never gets the bytes under a name the namespace has just
         # given up (StorageFS: UploadLocks.hold_for_upload).
         self.upload_guard = upload_guard
+        # Held across a directory retry (StorageFS: the namespace lock shared
+        # and the paths' locks), so the check that the namespace still wants
+        # the operation and the member call are one step against handlers.
+        self.path_guard = path_guard
         self._stats = {
             "synced": 0,
             "failed": 0,
@@ -60,11 +66,42 @@ class SyncExecutor:
             return self.process_dir_task(task)
         return self.process_file_task(task)
 
+    def _upload_guard(self, virtual_path: str) -> ContextManager:
+        return self.upload_guard(virtual_path) if self.upload_guard else contextlib.nullcontext()
+
     def process_file_task(self, task: SyncTask) -> bool:
-        """Process a single file sync task under the path's upload guard."""
-        guard = self.upload_guard(task.virtual_path) if self.upload_guard else contextlib.nullcontext()
-        with guard:
-            return self._process_file_task(task)
+        """Process a single file sync task under the path's upload guard.
+
+        A failed attempt is settled before the guard is released: once it
+        is, a rename could move the row (as SYNCING, which nothing would
+        queue again) or put another file with the same generation count at
+        the path, and handle_task_failure runs later without the guard.
+        """
+        with self._upload_guard(task.virtual_path):
+            try:
+                return self._process_file_task(task)
+            except Exception:
+                self._settle_failed_attempt(task)
+                raise
+
+    def _settle_failed_attempt(self, task: SyncTask):
+        """Give a failed attempt's row back: DIRTY for a retry, ERROR after the last.
+
+        Conditioned on the attempt's generation like every sync-side status,
+        so a write since then keeps its DIRTY. Caller holds the upload guard.
+        """
+        if task.generation is None:
+            return
+        final = task.retry_count + 1 >= self.config.max_retries
+        status = SyncStatus.ERROR if final else SyncStatus.DIRTY
+        try:
+            cache_path = self.cache_manager.get_cache_path(task.virtual_path)
+            published = self._publish(task, task.generation, status, cache_path)
+        except Exception:
+            logger.exception("Could not record the failed sync of %s", task.virtual_path)
+            return
+        if final:
+            task.final_error = published
 
     def _process_file_task(self, task: SyncTask) -> bool:
         logger.debug("Worker %s syncing %s", self.worker_id, task.virtual_path)
@@ -254,21 +291,51 @@ class SyncExecutor:
             # say) has no generation to publish against; the row stays DIRTY
             # for the monitor. The failure still counts.
             self._stats["failed"] += 1
+        elif task.final_error is not None:
+            # The attempt published (or was refused) its ERROR under its guard.
+            if task.final_error:
+                self._stats["failed"] += 1
         else:
             # The failure belongs to the attempt that read task.generation. A
             # write since then owns the row, and its DIRTY must stand; a
             # failure it refuses is not counted, the file is simply dirty.
-            # Under the guard, so no rename moves another file's row (with
-            # the same generation count) onto the path in between.
-            guard = self.upload_guard(task.virtual_path) if self.upload_guard else contextlib.nullcontext()
-            with guard:
+            with self._upload_guard(task.virtual_path):
                 cache_path = self.cache_manager.get_cache_path(task.virtual_path)
                 if self._publish(task, task.generation, SyncStatus.ERROR, cache_path):
                     self._stats["failed"] += 1
         return True
 
     def process_dir_task(self, task: DirSyncTask) -> bool:
-        """Process a single directory operation."""
+        """Retry a directory operation on a member, if the namespace still wants it.
+
+        A retry queued for a member that missed the operation can run after
+        the namespace has moved on: a mkdir retry after the directory was
+        renamed away would recreate the old name on that member (ditz
+        sync-namespace-orphans). The cache holds every directory made, and
+        drops every directory removed or renamed, through the mount, so it
+        says whether the operation still applies; the check and the member
+        call run under the path guard.
+        """
+        paths = [task.virtual_path] + ([task.new_path] if task.new_path else [])
+        guard = self.path_guard(*paths) if self.path_guard else contextlib.nullcontext()
+        with guard:
+            if not self._dir_task_current(task):
+                logger.info(
+                    "Dropping %s retry for %s: the namespace no longer has it",
+                    task.operation.value,
+                    task.virtual_path,
+                )
+                return True
+            return self._process_dir_task(task)
+
+    def _dir_task_current(self, task: DirSyncTask) -> bool:
+        cache_path = self.cache_manager.get_cache_path(task.virtual_path)
+        if task.operation == DirOperation.MKDIR:
+            return cache_path.is_dir()
+        # RMDIR, or RENAME away from the path: only while the name stays gone.
+        return not os.path.lexists(cache_path)
+
+    def _process_dir_task(self, task: DirSyncTask) -> bool:
         logger.debug(
             "Worker %s processing dir op %s on %s",
             self.worker_id,

@@ -1049,7 +1049,10 @@ class NamespaceService:
             if renamed_entries:
                 for _, updated in renamed_entries:
                     metadata = self.state_manager.get_file_metadata(updated)
-                    if metadata and metadata.sync_status == SyncStatus.DIRTY:
+                    # A SYNCING row can only be one whose attempt ended
+                    # without settling it (the rename waits for uploads in
+                    # flight); nothing else would queue it again.
+                    if metadata and metadata.sync_status in (SyncStatus.DIRTY, SyncStatus.SYNCING):
                         self.sync_manager.queue_sync(updated, priority=80, force=True)
 
             for failed_backend in failures:

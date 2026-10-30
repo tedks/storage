@@ -49,7 +49,8 @@ class SyncWorker(threading.Thread):
                  replication_manager: ReplicationManager, config: SyncConfig,
                  task_complete_cb=None, should_sync_path_cb: Optional[Callable[[str], bool]] = None,
                  member_written_cb: Optional[Callable[[str, Backend, Path], None]] = None,
-                 upload_guard: Optional[Callable[[str], ContextManager]] = None):
+                 upload_guard: Optional[Callable[[str], ContextManager]] = None,
+                 path_guard: Optional[Callable[..., ContextManager]] = None):
         super().__init__(daemon=True, name=f"SyncWorker-{worker_id}")
         self.worker_id = worker_id
         self.task_queue = task_queue
@@ -66,6 +67,7 @@ class SyncWorker(threading.Thread):
             should_sync_path_cb=should_sync_path_cb,
             member_written_cb=member_written_cb,
             upload_guard=upload_guard,
+            path_guard=path_guard,
         )
         self._stop_event = threading.Event()
         self._active_task: Optional[str] = None
@@ -144,7 +146,8 @@ class SyncManager:
                  config: Optional[SyncConfig] = None,
                  should_sync_path_cb: Optional[Callable[[str], bool]] = None,
                  member_written_cb: Optional[Callable[[str, Backend, Path], None]] = None,
-                 upload_guard: Optional[Callable[[str], ContextManager]] = None):
+                 upload_guard: Optional[Callable[[str], ContextManager]] = None,
+                 path_guard: Optional[Callable[..., ContextManager]] = None):
         """
         Initialize sync manager
 
@@ -159,6 +162,8 @@ class SyncManager:
                 after each upload to a member
             upload_guard: Context manager factory held across each file
                 task (StorageFS's upload lock for the path)
+            path_guard: Context manager factory over paths, held across
+                each directory retry (StorageFS's path locks)
         """
         self.state_manager = state_manager
         self.cache_manager = cache_manager
@@ -168,6 +173,7 @@ class SyncManager:
         self._should_sync_path_cb = should_sync_path_cb
         self._member_written_cb = member_written_cb
         self._upload_guard = upload_guard
+        self._path_guard = path_guard
 
         # Task queue (priority queue)
         self.task_queue = queue.PriorityQueue()
@@ -201,6 +207,7 @@ class SyncManager:
                 should_sync_path_cb=self._should_sync_path_cb,
                 member_written_cb=self._member_written_cb,
                 upload_guard=self._upload_guard,
+                path_guard=self._path_guard,
             )
             worker.start()
             self.workers.append(worker)

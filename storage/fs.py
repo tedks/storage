@@ -216,6 +216,7 @@ class StorageFS(Operations):
             should_sync_path_cb=self._should_sync_path,
             member_written_cb=self._record_member_written,
             upload_guard=self._upload_locks.hold_for_upload,
+            path_guard=self._path_locked,
         )
         self._sync_started = False
         if start_sync:

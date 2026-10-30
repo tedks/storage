@@ -215,6 +215,42 @@ class TestSyncExecutorOverlappingWrite(_ExecutorTestBase):
         self.assertFalse(task.requeue)
         self.assertEqual(self.executor.get_stats()["failed"], 1)
 
+    def test_failed_attempt_gives_its_row_back_under_the_guard(self):
+        """A raise after SYNCING is settled before the upload guard is released:
+        DIRTY for a retry, ERROR (published once) after the last."""
+        self.state_manager.set_file_metadata(_make_metadata(sync_status=SyncStatus.DIRTY))
+        self._create_cache_file(content=b"v1")
+        statuses_under_guard = []
+        held = []
+
+        class Guard:
+            def __enter__(guard_self):
+                held.append(True)
+
+            def __exit__(guard_self, *exc):
+                statuses_under_guard.append(
+                    self.state_manager.get_file_metadata("/test.txt").sync_status)
+                held.pop()
+
+        self.executor.upload_guard = lambda path: Guard()
+        for retry_count, expected in ((0, SyncStatus.DIRTY),
+                                      (self.config.max_retries - 1, SyncStatus.ERROR)):
+            task = SyncTask("/test.txt", retry_count=retry_count)
+            with patch.object(self.state_manager, "compute_checksum", side_effect=OSError("eio")):
+                with self.assertRaises(OSError):
+                    self.executor.process_file_task(task)
+            self.assertEqual(expected, statuses_under_guard[-1])
+            self.assertFalse(held)
+
+        self.assertTrue(task.final_error)
+        publishes = []
+        real_publish = self.state_manager.publish_sync_status
+        with patch.object(self.state_manager, "publish_sync_status",
+                          side_effect=lambda *a, **k: publishes.append(a) or real_publish(*a, **k)):
+            self.assertTrue(self.executor.handle_task_failure(task, "eio", queue.PriorityQueue()))
+        self.assertEqual([], publishes)
+        self.assertEqual(self.executor.get_stats()["failed"], 1)
+
     def test_failure_before_the_row_was_read_leaves_it_alone(self):
         self.state_manager.set_file_metadata(_make_metadata(sync_status=SyncStatus.DIRTY))
         task = SyncTask("/test.txt", retry_count=self.config.max_retries - 1)
@@ -392,6 +428,7 @@ class TestSyncExecutorDirTask(_ExecutorTestBase):
 
     def test_mkdir_calls_backend(self):
         """DirSyncTask with MKDIR -> backend.mkdir called."""
+        self.cache_manager.get_cache_path("/newdir").mkdir()  # made through the mount
         task = DirSyncTask(virtual_path="/newdir", operation=DirOperation.MKDIR)
         result = self.executor.process_dir_task(task)
 
@@ -418,9 +455,24 @@ class TestSyncExecutorDirTask(_ExecutorTestBase):
         self.assertTrue(result)
         self.mock_backend.rename.assert_called_once_with("/oldname", "/newname")
 
+    def test_dir_retries_the_namespace_moved_past_are_dropped(self):
+        """A mkdir retry whose directory is gone from the cache, and an rmdir or
+        rename-away retry whose name is back, are dropped without a member call."""
+        self.cache_manager.get_cache_path("/back").mkdir()
+        for task in (
+            DirSyncTask(virtual_path="/gone", operation=DirOperation.MKDIR),
+            DirSyncTask(virtual_path="/back", operation=DirOperation.RMDIR),
+            DirSyncTask(virtual_path="/back", operation=DirOperation.RENAME, new_path="/elsewhere"),
+        ):
+            self.assertTrue(self.executor.process_dir_task(task))
+        self.mock_backend.mkdir.assert_not_called()
+        self.mock_backend.rmdir.assert_not_called()
+        self.mock_backend.rename.assert_not_called()
+
     def test_dir_task_backend_failure_raises(self):
         """Backend raises -> RuntimeError propagated."""
         self.mock_backend.mkdir.side_effect = OSError("permission denied")
+        self.cache_manager.get_cache_path("/faildir").mkdir()
 
         task = DirSyncTask(virtual_path="/faildir", operation=DirOperation.MKDIR)
         with self.assertRaises(RuntimeError):
