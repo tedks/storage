@@ -1,0 +1,22 @@
+id: gh-111-same-host-nits
+title: 'Same-host warning nits: click floor for result.stderr, host spelling'
+desc: 'PR #136 council (Claude seat) nits: (1) tests/test_cli_mount.py reads result.stderr,
+  which needs click >= 8.2 (Bazel pins 8.3.1; requirements.txt and setup.py allow
+  click>=8.0.0, so the pip/venv path on click 8.0-8.1 would raise ValueError); raise
+  the floor or construct the runner per version. (2) The warning prints the lowercased
+  host; printing the first member''s spelling would match the profile. (3) Trailing-dot
+  FQDNs and ssh_config aliases do not group either (covered by the README''s no-resolution
+  sentence).'
+type: task
+component: listing
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-30T02:29:51-00:00
+references: []
+log_events:
+- time: 2026-10-30T02:29:51-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
