@@ -106,6 +106,7 @@ py_test(
         "tests/test_member_capabilities.py",
         "tests/test_models.py",
         "tests/test_mount_lock.py",
+        "tests/test_mount_sigpipe.py",
         "tests/test_mount_profiles.py",
         "tests/test_namespace.py",
         "tests/test_pathing.py",

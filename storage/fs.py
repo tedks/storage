@@ -21,6 +21,7 @@ import yaml
 import json
 import concurrent.futures
 import contextlib
+import signal
 from dataclasses import dataclass, field
 from fuse import FUSE, FuseOSError, Operations
 from pathlib import Path
@@ -2177,6 +2178,22 @@ def fuse_mount_options(backends: Dict[str, Backend], *, enable_watchers: bool,
     return options
 
 
+def _restore_sigpipe_ignored() -> None:
+    """Put SIGPIPE back to ignored after FUSE() returns.
+
+    Python starts with SIGPIPE ignored. libfuse 2's teardown
+    (fuse_remove_signal_handlers) resets a SIGPIPE disposition it finds
+    ignored to the default, behind Python's back: signal.getsignal() still
+    says SIG_IGN. Without this, a write to a dead socket during shutdown
+    (closing an SSH transport whose peer is gone) ends the process with
+    exit 141 instead of raising BrokenPipeError. signal.signal() works only
+    on the main thread; a mount run from another thread leaves it to the
+    caller.
+    """
+    if threading.current_thread() is threading.main_thread():
+        signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+
+
 def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
                  backends: Dict[str, Backend], cache_size: int,
                  foreground: bool = False, num_sync_workers: int = 2,
@@ -2305,6 +2322,7 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
     try:
         FUSE(fs, mountpoint, nothreads=not fuse_threads, foreground=foreground, allow_other=allow_other,
              **fuse_options)
+        _restore_sigpipe_ignored()
     finally:
         try:
             if not fs._sweep_pending:
