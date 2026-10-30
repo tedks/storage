@@ -1,0 +1,31 @@
+id: rename-over-existing-file
+title: Rename onto an existing file fails after the cache file has moved
+desc: 'Found by lane sync-correctness. StorageFS.rename(src, dst) with dst an existing
+  file: NamespaceService.rename moves the cache file (old_cache.rename(new_cache)
+  replaces dst''s cached copy), then StateManager.rename_path runs UPDATE files SET
+  virtual_path = dst WHERE virtual_path = src and fails with sqlite3.IntegrityError
+  (UNIQUE constraint failed: files.virtual_path), since dst''s row still exists. The
+  rename reaches FUSE as an unhandled error, and leaves the cache holding src''s bytes
+  at dst under dst''s old row (CLEAN with the old stat: a lost write by the rule in
+  AGENTS.md, so it resyncs dst, but src''s row stays with no cache file). Repro: create
+  /src and /dst, rename /src -> /dst. This is the save path of most editors (write
+  a temp, rename over the original) and of rsync. Members: SFTP rename (SSH_FXP_RENAME)
+  fails when the target exists on OpenSSH unless posix-rename is used, so an SSH member
+  would also keep both names. A member holding dst but not src keeps dst''s old bytes
+  (deleting them there is the same decision as oq-unlink-member-copies). Fix sketch:
+  rename_path drops dst''s rows (files and file_locations) in the same transaction
+  before moving src''s; the SSH member uses posix_rename; test the cache, index and
+  both member kinds.'
+type: bugfix
+component: fs
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-30T16:44:52-00:00
+references: []
+log_events:
+- time: 2026-10-30T16:44:52-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
