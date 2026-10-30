@@ -1702,6 +1702,38 @@ class TestFSNamespaceIntegration(unittest.TestCase):
         row = self.fs.state_manager.get_member_checksum("/dup.txt", "backend2")
         self.assertEqual(row.checksum, fast_checksum_bytes(b"newer"))
 
+    def test_forced_verify_rehashes_and_counts(self):
+        zero = {"pending": 0, "verified": 0, "unverified": 0}
+        self.assertEqual(json.loads(self.fs.getxattr('/', StorageFS.VERIFY_XATTR)), zero)
+        (self.backend1_dir / "ok.txt").write_text("same")
+        (self.backend2_dir / "ok.txt").write_text("same")
+        (self.backend1_dir / "nohash.txt").write_text("same")
+        (self.backend2_dir / "nohash.txt").write_text("same")
+        (self.backend1_dir / "split.txt").write_text("one")
+        (self.backend2_dir / "split.txt").write_text("three")
+        (self.backend1_dir / "only1.txt").write_text("x")
+        member = self.backends["backend2"]
+        real = member.get_fast_checksum
+
+        def no_hash_for_one(path, *args, **kwargs):
+            if path == "/nohash.txt":
+                raise ChecksumUnavailable(errno.EIO, "no remote hash")
+            return real(path, *args, **kwargs)
+        with patch.object(member, "get_fast_checksum", side_effect=no_hash_for_one):
+            self._list_and_settle()
+            hashes = self._hashes()
+            # The listing expires at once here (ttl 0): verify lists itself.
+            self.fs.setxattr('/', StorageFS.VERIFY_XATTR, b"1", 0)
+            self.assertTrue(self._wait_for(lambda: not self.fs._checksum_tasks))
+        # Both names on both members hashed again; the size split was not.
+        self.assertEqual(sorted(hashes), [
+            ("backend1", "/nohash.txt"), ("backend1", "/ok.txt"),
+            ("backend2", "/nohash.txt"), ("backend2", "/ok.txt"),
+        ])
+        self.assertEqual(json.loads(self.fs.getxattr('/', StorageFS.VERIFY_XATTR)),
+                         {"pending": 0, "verified": 1, "unverified": 1})
+        self.assertNotIn(StorageFS.VERIFY_XATTR, self.fs.listxattr('/'))
+
     def test_readdir_rehashes_member_rewritten_with_same_size_and_mtime(self):
         # A tagger that preserves mtime: only ctime shows the change, and a
         # local member's listing carries it.

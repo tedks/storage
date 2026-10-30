@@ -81,6 +81,9 @@ class NamespaceService:
         ] = {}
         self.checksum_records = checksum_records
         self.checksum_lock = checksum_lock
+        # {dir: {name: members}} hashed again by the dir's last
+        # verify_listing (storage conflicts --verify); under listing_lock.
+        self._verify_queued: Dict[str, Dict[str, List[str]]] = {}
         # The listing state below (entry_attrs, readdir_snapshot and the
         # listings in flight) is guarded by listing_lock, not dir_cache_lock,
         # and where both are taken listing_lock nests inside dir_cache_lock:
@@ -420,7 +423,9 @@ class NamespaceService:
         backend_entries: Dict[str, Set[str]],
         backend_attrs: Optional[Dict[str, Dict[str, dict]]] = None,
         size_splits: Optional[Dict[str, Dict[str, int]]] = None,
-    ):
+        *,
+        replace: bool = False,
+    ) -> Dict[str, List[str]]:
         """Queue checksum computations for backend collisions in the directory.
 
         Names in size_splits (computed from the listing when not given) are
@@ -430,11 +435,14 @@ class NamespaceService:
         whether it is a directory before hashing, so the FUSE thread never
         does. A regular file's listed size, mtime and ctime (None where the
         member does not report it) go with the task as its basis, so a
-        checksum already recorded from the same basis is not recomputed.
-        Only queues; never calls a member.
+        checksum already recorded from the same basis is not recomputed,
+        unless replace (storage conflicts --verify), which hashes every one
+        again. Only queues; never calls a member. Returns {name: members}
+        for the regular files it queued with a basis.
         """
         if size_splits is None:
             size_splits = self._size_splits(backend_entries, backend_attrs)
+        queued: Dict[str, List[str]] = {}
         owners: Dict[str, Set[str]] = {}
         for backend_name, names in backend_entries.items():
             for name in names:
@@ -463,7 +471,11 @@ class NamespaceService:
                     # symlink's listed attributes are the link's, which do not
                     # change with its target, so it gets no basis.
                     check_dir = True
-                self.schedule_checksum_task(backend, virtual_child, basis, check_dir=check_dir)
+                self.schedule_checksum_task(backend, virtual_child, basis,
+                                            check_dir=check_dir, replace=replace)
+                if basis is not None:
+                    queued.setdefault(name, []).append(backend_name)
+        return queued
 
     def _apply_conflict_view(
         self,
@@ -878,10 +890,29 @@ class NamespaceService:
             futures[backend_name] = future
         return futures
 
-    def _list_members(self, path: str, generation: int, *, background: bool = False) -> List[str]:
+    def verify_listing(self, path: str):
+        """List path, hashing every copy of its names on several members
+        again (storage conflicts --verify), and keep which names on which
+        members that queued, for verified_names. Calls the members, like a
+        readdir that finds no fresh listing."""
+        generation = self._begin_listing(path)
+        try:
+            self._list_members(path, generation, verify=True)
+        finally:
+            self._end_listing(path)
+
+    def verified_names(self, path: str) -> Optional[Dict[str, List[str]]]:
+        """{name: members} queued by the last verify_listing of path, or
+        None if there was none."""
+        with self.listing_lock:
+            names = self._verify_queued.get(path)
+            return None if names is None else {n: list(m) for n, m in names.items()}
+
+    def _list_members(self, path: str, generation: int, *, background: bool = False,
+                      verify: bool = False) -> List[str]:
         """List the cache and every member, and publish the result unless an
         invalidation of the directory or a child raced it, or a listing that
-        began later was published first.
+        began later was published first. verify: see verify_listing.
 
         The members are listed concurrently and outside dir_cache_lock; their
         results are merged under it. The listing's time is when its reads
@@ -966,12 +997,16 @@ class NamespaceService:
                     if published is not None and backend_name in published[1]:
                         split_attrs[backend_name] = dict(published[1][backend_name])
         size_splits = self._size_splits(member_entries, split_attrs)
-        self._schedule_directory_checksums(
+        queued = self._schedule_directory_checksums(
             path,
             {name: names for name, names in member_entries.items() if name not in failed},
             backend_attrs,
             size_splits,
+            replace=verify,
         )
+        if verify:
+            with self.listing_lock:
+                self._verify_queued[path] = {n: m for n, m in queued.items() if len(m) > 1}
         visible_entries = self._apply_conflict_view(path, entries, member_entries, size_splits)
         ordered_entries = sorted(visible_entries)
 

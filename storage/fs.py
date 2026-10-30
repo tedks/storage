@@ -85,6 +85,10 @@ class StorageFS(Operations):
     """
 
     CHECKSUM_XATTR = "user.storage.checksums"
+    # On a directory: setting it hashes the directory's same-size names on
+    # several members again; reading it reports how far that has got
+    # (storage conflicts --verify). Not listed by listxattr.
+    VERIFY_XATTR = "user.storage.verify"
     # How long destroy() waits for an in-flight post-crash sweep.
     SWEEP_JOIN_TIMEOUT = 60.0
     CACHE_STATE_XATTR = "user.storage.cache"
@@ -795,6 +799,32 @@ class StorageFS(Operations):
                         self._record_checksum(canonical_path, backend.name, checksum, ts, basis)
 
             future.add_done_callback(_record)
+
+    def _force_verify(self, dir_path: str):
+        """List the directory and hash again every copy of its names on
+        several members that the listing does not split by size, whatever
+        is recorded (storage conflicts --verify). The hashes are queued;
+        the listing itself calls the members, as a readdir would."""
+        self.namespace.verify_listing(dir_path)
+
+    def _verify_status(self, dir_path: str) -> Dict[str, int]:
+        """Of the names the directory's last forced verification hashed
+        again (regular files of one size on several members): how many
+        have a hash still pending, how many are verified on every member,
+        and how many are not (a member could not hash its copy, or the hash
+        was dropped). All zero before any."""
+        status = {"pending": 0, "verified": 0, "unverified": 0}
+        queued = self.namespace.verified_names(dir_path) or {}
+        with self._checksum_lock:
+            for name, members in queued.items():
+                keys = [(str(Path(dir_path) / name), m) for m in members]
+                if any(key in self._checksum_tasks for key in keys):
+                    status["pending"] += 1
+                elif all(getattr(self._checksum_records.get(key), "checksum", None) for key in keys):
+                    status["verified"] += 1
+                else:
+                    status["unverified"] += 1
+        return status
 
     _IS_DIRECTORY = object()
     _GONE = object()
@@ -2184,6 +2214,9 @@ class StorageFS(Operations):
         if name == self.CHECKSUM_XATTR:
             return self._aggregate_checksums_yaml(resolved.canonical_path)
 
+        if name == self.VERIFY_XATTR:
+            return json.dumps(self._verify_status(resolved.canonical_path), sort_keys=True).encode()
+
         if name == self.CACHE_STATE_XATTR:
             payload = self._cache_state_payload(resolved)
             return json.dumps(payload, sort_keys=True).encode("utf-8")
@@ -2198,6 +2231,9 @@ class StorageFS(Operations):
         if name in {self.CHECKSUM_XATTR, self.CACHE_STATE_XATTR, self.CACHE_METADATA_XATTR,
                     self.MEMBER_STAT_XATTR}:
             # Ignore manual writes for derived attrs.
+            return
+        if name == self.VERIFY_XATTR:
+            self._force_verify(self._resolve_path(path).canonical_path)
             return
         cache_path = self.cache_manager.get_cache_path(path)
 
