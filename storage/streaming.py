@@ -1,3 +1,4 @@
+import ctypes
 import errno
 import json
 import os
@@ -52,6 +53,31 @@ STREAMING_KEEP_AFTER_CLOSE_PERCENT = Fraction(50)
 # scattered reads gets here, and losing a short span can only delay the
 # threshold, never fake it.
 STREAMING_MAX_TRACKED_READ_SPANS = 64
+
+# link() errors meaning the cache filesystem has no hard links (see
+# _install_partial); renameat2 errors meaning it has no RENAME_NOREPLACE.
+_LINK_UNSUPPORTED = (errno.EPERM, errno.EOPNOTSUPP, errno.ENOTSUP, errno.ENOSYS)
+_NOREPLACE_UNSUPPORTED = (errno.EINVAL, errno.ENOSYS, errno.EOPNOTSUPP, errno.ENOTSUP)
+_AT_FDCWD = -100
+_RENAME_NOREPLACE = 1
+
+
+def _rename_noreplace(src, dst) -> bool:
+    """rename(src, dst) unless dst exists: True if renamed, False if dst exists.
+
+    Raises OSError, with ENOSYS where libc has no renameat2.
+    """
+    try:
+        renameat2 = ctypes.CDLL(None, use_errno=True).renameat2
+    except AttributeError:
+        raise OSError(errno.ENOSYS, "renameat2 unavailable") from None
+    renameat2.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint)
+    if renameat2(_AT_FDCWD, os.fsencode(src), _AT_FDCWD, os.fsencode(dst), _RENAME_NOREPLACE) == 0:
+        return True
+    err = ctypes.get_errno()
+    if err == errno.EEXIST:
+        return False
+    raise OSError(err, os.strerror(err), str(src))
 
 
 @dataclass
@@ -194,7 +220,16 @@ class StreamingReadManager:
         its partial is unlinked once and a cleanup still running elsewhere
         skips the path. A session whose bytes have all arrived is left to
         finish its finalize while destroy waits for its worker (see
-        _claim_detach for why a complete session is never stopped).
+        _claim_detach for why a complete session is never stopped). One
+        whose worker outlives the wait is claimed anyway, against that
+        rule, and that is safe only because no successor can register now:
+        an unlink before finalize's link makes the link fail (the session
+        errors), one after it removes the partial's second name only.
+
+        An open that registered before destroy but has not yet opened the
+        partial finds it unlinked and fails with ENOENT, a clean error.
+        libfuse runs destroy after its loop has stopped serving requests,
+        so the multithreaded loop does not reach this either.
         """
         self._stop_control_server()
 
@@ -425,14 +460,13 @@ class StreamingReadManager:
         # detached in between could write one stale state onto a successor's
         # partial. The successor would have to finish a remote get_size in
         # that gap, and the xattr is informational, so it is not locked out.
+        # No fallback to the final path when the partial is gone: the
+        # final path may hold another file by then (a superseded session,
+        # see _install_partial), and the state describes this session only.
         with session.lock:
             if session.detached:
                 return
             target_path = session.final_cache_path if session.finalized else session.partial_cache_path
-            final_path = session.final_cache_path
-
-        if not target_path.exists() and final_path.exists():
-            target_path = final_path
 
         try:
             os.setxattr(
@@ -894,8 +928,11 @@ class StreamingReadManager:
         the member bytes the session fetched, and a writer may hold it open,
         so the session's bytes never replace it. The no-replace is atomic:
         link() fails if the name exists. Where the cache filesystem has no
-        hard links, the check and the rename are two steps, and a fill in
-        between is lost to the rename as before. Raises OSError otherwise.
+        hard links, renameat2(RENAME_NOREPLACE) does the same; where it has
+        neither, the partial is not installed at all (returns False): a
+        check followed by a rename would lose a fill in between. The
+        readers keep their bytes, and the file is not cached by this
+        session. Raises OSError otherwise.
         """
         partial_path = session.partial_cache_path
         final_path = session.final_cache_path
@@ -904,12 +941,19 @@ class StreamingReadManager:
         except FileExistsError:
             return False
         except OSError as exc:
-            if exc.errno not in (errno.EPERM, errno.EOPNOTSUPP, errno.ENOTSUP, errno.EMLINK):
+            if exc.errno not in _LINK_UNSUPPORTED:
                 raise
-            if os.path.lexists(final_path):
-                return False
-            os.replace(partial_path, final_path)
-            return True
+            try:
+                return _rename_noreplace(partial_path, final_path)
+            except OSError as rename_exc:
+                if rename_exc.errno not in _NOREPLACE_UNSUPPORTED:
+                    raise
+            self.logger.warning(
+                "streaming cannot install %s without replacing: the cache filesystem has neither "
+                "hard links nor RENAME_NOREPLACE; not caching it",
+                session.canonical_path,
+            )
+            return False
         try:
             os.unlink(partial_path)
         except FileNotFoundError:
@@ -1015,6 +1059,7 @@ class StreamingReadManager:
 
     def _cleanup_failed_session(self, session: PrefetchSession):
         """Promote a failed session's prefix, or drop it; caller claimed the cleanup."""
+        assert session.failed_cleanup_claimed, "claim with _claim_failed_cleanup first"
         if self._promote_failed_session_cache_prefix(session):
             self._cleanup_prefetch_session(session, "partial-cache")
             return
@@ -1217,8 +1262,10 @@ class StreamingReadManager:
         session.lock, where it is taken together with the no-readers
         decision (see _claim_failed_cleanup), so either this reader counts
         in that decision or it does not attach. A refused open takes the
-        full-file path; a promoted prefix, or the full fetch's file, is at
-        the final path then.
+        full-file path: if its fetch fills the final path first, promotion
+        leaves that file alone (see _install_partial); if promotion links
+        first, the opener gets the promoted prefix as the cached file, as
+        any open after a failed session's cleanup does.
         """
         with session.lock:
             if session.failed_cleanup_claimed:
@@ -1362,7 +1409,7 @@ class StreamingReadManager:
                 if not self._attach(existing):
                     return None
                 return existing
-            if final_cache_path.exists():
+            if os.path.lexists(final_cache_path):
                 # Filled since open() found the file uncached: a full-file
                 # fetch by a writer or another open, or create(). That file
                 # is the one to read (see _install_partial).

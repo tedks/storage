@@ -735,6 +735,7 @@ class TestFSStreamingIntegration(unittest.TestCase):
         with session_a.lock:
             session_a.error = OSError(errno.EIO, "late failure")
             session_a.available_ranges = [(0, 4096)]
+            self.assertTrue(manager._claim_failed_cleanup(session_a))
         manager._update_streaming_state_xattr(session_a, "error")
         manager._cleanup_failed_session(session_a)
         manager._cleanup_cancelled_session(session_a)
@@ -1694,6 +1695,55 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.fs.release('/cleanup.bin', vfd_b)
         # The full fetch filled the path first; the promotion left it alone.
         self._assert_cache_holds("cleanup.bin", payload, dirty=False)
+
+    def _install_case(self, name, final_bytes=None):
+        from types import SimpleNamespace
+        partial = self.cache_dir / (name + ".storage.partial")
+        final = self.cache_dir / name
+        partial.write_bytes(b"streamed")
+        if final_bytes is not None:
+            final.write_bytes(final_bytes)
+        session = SimpleNamespace(
+            partial_cache_path=partial, final_cache_path=final, canonical_path='/' + name,
+        )
+        return session, partial, final
+
+    def _no_hard_links(self):
+        real_link = os.link
+
+        def link(src, dst, *args, **kwargs):
+            if str(src).startswith(str(self.cache_dir)):
+                raise OSError(errno.EPERM, "no hard links here")
+            return real_link(src, dst, *args, **kwargs)
+
+        return patch("os.link", side_effect=link)
+
+    def test_streaming_install_without_hard_links_does_not_replace(self):
+        manager = self.fs._streaming_manager
+        session, partial, final = self._install_case("nolink-taken.bin", final_bytes=b"writer")
+        with self._no_hard_links():
+            self.assertFalse(manager._install_partial(session))
+        self.assertEqual(final.read_bytes(), b"writer")
+        self.assertTrue(partial.exists())
+
+        session, partial, final = self._install_case("nolink-free.bin")
+        with self._no_hard_links():
+            self.assertTrue(manager._install_partial(session))
+        self.assertEqual(final.read_bytes(), b"streamed")
+        self.assertFalse(partial.exists())
+
+    def test_streaming_install_without_any_no_replace_declines(self):
+        # Neither link() nor RENAME_NOREPLACE: a check and a rename would
+        # race a writer, so the partial is not installed at all.
+        import storage.streaming as streaming_module
+        manager = self.fs._streaming_manager
+        session, partial, final = self._install_case("noreplace.bin")
+        unsupported = OSError(errno.ENOSYS, "no renameat2")
+        with self._no_hard_links(), \
+                patch.object(streaming_module, "_rename_noreplace", side_effect=unsupported):
+            self.assertFalse(manager._install_partial(session))
+        self.assertFalse(os.path.lexists(final))
+        self.assertTrue(partial.exists())
 
 if __name__ == '__main__':
     unittest.main()
