@@ -411,16 +411,21 @@ class TestRevalidateAfterSync(RevalidateTestBase):
 
     def test_failed_post_sync_stat_keeps_a_baseline_a_check_recorded_meanwhile(self):
         cache_path, identity = self._written_file()
-        self.fs._store_member_check("/new.txt", cache_path, identity, {"member": (12, 1.0)})
 
-        def check_then_fail(path):
-            # A FUSE thread's check lands while this stat is in flight.
-            self.fs._store_member_check("/new.txt", cache_path, identity, {"member": (12, 5.0)})
-            raise OSError("connection reset")
+        # A FUSE thread's check lands while this stat is in flight. (The
+        # sync publishes CLEAN only after this callback, so in use a check
+        # rarely can; this tests _store_member_check's guard.) It records
+        # the same values as the old baseline, as an unchanged member does.
+        for fresh in ((12, 5.0), (12, 1.0)):
+            self.fs._store_member_check("/new.txt", cache_path, identity, {"member": (12, 1.0)})
 
-        with patch.object(self.member, "stat", side_effect=check_then_fail):
-            self.fs._record_member_written("/new.txt", self.member, cache_path)
-        self.assertEqual({"member": (12, 5.0)}, self.fs._member_checks["/new.txt"].members)
+            def check_then_fail(path, fresh=fresh):
+                self.fs._store_member_check("/new.txt", cache_path, identity, {"member": fresh})
+                raise OSError("connection reset")
+
+            with patch.object(self.member, "stat", side_effect=check_then_fail):
+                self.fs._record_member_written("/new.txt", self.member, cache_path)
+            self.assertEqual({"member": fresh}, self.fs._member_checks["/new.txt"].members)
 
 
 class TestRevalidateSftpLikeMember(RevalidateTestBase):
