@@ -225,8 +225,12 @@ background to replace it, until it is `listing_max_stale` seconds old
 (profile only, default 3600); an older listing is replaced before the
 answer. A name is still asked of the members when a member's listing
 failed or carried no attributes, or when the listing is past its fresh
-window. With watchers on every member, listings stay until a watcher
-invalidates them. Changes made through the mount (create, write, rename,
+window. A fresh window of 0 has no stale phase: every access lists. With
+watchers on every member, listings stay until a watcher invalidates them,
+so a change whose watcher event was lost (a watcher reconnect) stays out
+of `ls` until the directory is invalidated; a lookup of a name missing
+from a listing is still answered from it only for `readdir_ttl` (else
+`revalidate_after`) seconds, and stat'd after that. Changes made through the mount (create, write, rename,
 unlink, mkdir, rmdir, symlink) drop the affected listings at once; a file
 added or changed directly on a member shows within the fresh window, plus
 one more listing while a stale one is served.

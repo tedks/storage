@@ -808,6 +808,29 @@ class TestFSNamespaceIntegration(unittest.TestCase):
         with self.fs._dir_cache_lock:
             self.assertIn("new.txt", self.fs._dir_cache['/']['backend2'])
 
+    def test_superseded_foreground_listing_answers_with_the_newer_one(self):
+        # A foreground listing that read before a later listing published
+        # returns the published names, not its own older read.
+        (self.backend1_dir / "old.txt").write_text("o")
+        namespace = self.fs.namespace
+        real = namespace._schedule_directory_checksums
+        state = {"done": False}
+
+        def publish_newer_first(*args, **kwargs):
+            real(*args, **kwargs)
+            if not state["done"]:
+                state["done"] = True
+                (self.backend2_dir / "new.txt").write_text("n")
+                generation = namespace._begin_listing('/')
+                try:
+                    namespace._list_members('/', generation)
+                finally:
+                    namespace._end_listing('/')
+
+        with patch.object(namespace, "_schedule_directory_checksums", side_effect=publish_newer_first):
+            entries = set(self.fs.readdir('/', None))
+        self.assertIn("new.txt", entries)
+
     def test_background_refresh_lists_no_member_inline_after_shutdown(self):
         namespace = self.fs.namespace
         self._make_stale()
@@ -823,7 +846,6 @@ class TestFSNamespaceIntegration(unittest.TestCase):
         namespace.listing_max_stale = 3600.0
         list(self.fs.readdir('/', None))
         (self.backend2_dir / "new.txt").write_text("n")
-        time.sleep(0.01)
         self.assertIn("new.txt", set(self.fs.readdir('/', None)))
         self.assertEqual(namespace._background_refreshes, set())
 

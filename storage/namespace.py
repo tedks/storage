@@ -638,7 +638,8 @@ class NamespaceService:
 
         Checksums finish after the listing that scheduled them; a name whose
         copies turned out to differ splits into name.member at the next
-        readdir rather than at the next listing. In memory only.
+        readdir rather than at the next listing. In memory only, linear in
+        the directory's size per readdir.
         """
         with self.listing_lock:
             inputs = self._view_inputs.get(path)
@@ -886,6 +887,11 @@ class NamespaceService:
                 self.readdir_snapshot[path] = (started_at, ordered_entries)
                 self._view_inputs[path] = (entries, member_entries)
                 self.entry_attrs[path] = (started_at, backend_attrs, set())
+            # A listing that began later was published while this one ran:
+            # answer with it, so a readdir never shows names older than what
+            # getattr now answers from.
+            newer = self._listing_as_of.get(path, float("-inf")) > started_at
+            newer_snapshot = self.readdir_snapshot.get(path) if newer else None
             # A snapshot is not served once its listing has expired, so both go.
             now = time.monotonic()
             expired = [
@@ -896,7 +902,10 @@ class NamespaceService:
                 del self.entry_attrs[dir_path]
                 self.readdir_snapshot.pop(dir_path, None)
                 self._view_inputs.pop(dir_path, None)
+                self._listing_as_of.pop(dir_path, None)
 
+        if newer_snapshot is not None:
+            return self._served_snapshot(path, newer_snapshot)
         return ordered_entries
 
     def mkdir(self, path: str, mode: int):
