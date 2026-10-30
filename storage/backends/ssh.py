@@ -165,6 +165,8 @@ class SSHBackend(Backend):
             self._open_client,
             connect_timeout=connect_timeout,
             retry_interval=self._reconnect_probe_interval,
+            # Background work waits as long as a transfer may hold a channel.
+            bulk_wait=self.sftp_operation_timeout,
             on_availability=lambda available: Backend.set_available(self, available),
             logger=self.logger,
         )
@@ -263,10 +265,12 @@ class SSHBackend(Backend):
         """Run operation on a leased SFTP channel.
 
         timeout is the channel timeout (connect_timeout by default). With
-        retry, a connection error is retried once on a fresh channel, which
-        reconnects if the transport was lost; use it only for operations
-        that are safe to repeat. A nested call on the same thread reuses the
-        caller's channel and leaves the retry to the outermost call.
+        retry, an operation whose transport was lost under it is retried once
+        on a new connection; use it only for operations that are safe to
+        repeat. A request that timed out on a connection that still answers
+        is not retried: the member is slow, and the pool marks it down after
+        a few of those. A nested call on the same thread reuses the caller's
+        channel and leaves the retry to the outermost call.
         """
         if timeout is None:
             timeout = self.connect_timeout
@@ -282,7 +286,7 @@ class SSHBackend(Backend):
                     raise
                 self.logger.warning("SFTP %s failed on %s attempt=%d/%d: %r",
                                     what, virtual_path, attempt, attempts, exc)
-                if nested or attempt == attempts:
+                if nested or attempt == attempts or self._pool.is_current(lease.generation):
                     raise
                 continue
             self._pool.release(lease)
@@ -321,6 +325,16 @@ class SSHBackend(Backend):
                 self.logger.warning("Error checking existence of %s: %r", virtual_path, exc)
             return False
 
+    def exists_or_raise(self, virtual_path: str) -> bool:
+        """Like exists(), but raise when the member cannot be asked."""
+        remote_path = str(self._resolve_path(virtual_path))
+        try:
+            self._with_sftp("exists", virtual_path,
+                            lambda sftp: sftp.stat(remote_path), retry=True)
+            return True
+        except FileNotFoundError:
+            return False
+
     def read_file(self, virtual_path: str, offset: int, size: int) -> bytes:
         """Read data from remote file, retrying once on a connection error."""
         remote_path = str(self._resolve_path(virtual_path))
@@ -346,14 +360,20 @@ class SSHBackend(Backend):
 
         def write(sftp):
             self._ensure_parent(sftp, remote_path)
-            # Open for update when the file exists; only a missing file is
-            # created, so a failed check never truncates one.
+            # Never truncate: open for update, and create only exclusively,
+            # so a file another writer created in between is opened, not
+            # emptied.
             try:
-                sftp.stat(remote_path)
-                mode = 'r+b'
+                f = sftp.open(remote_path, 'r+b')
             except FileNotFoundError:
-                mode = 'wb'
-            with sftp.open(remote_path, mode) as f:
+                try:
+                    # 'x' alone sets no write flag in paramiko; '+' does.
+                    f = sftp.open(remote_path, 'x+b')
+                except OSError as exc:
+                    if is_connection_error(exc):
+                        raise
+                    f = sftp.open(remote_path, 'r+b')
+            with f:
                 f.seek(offset)
                 f.write(data)
 
@@ -374,7 +394,9 @@ class SSHBackend(Backend):
         """Delete a file from remote"""
         remote_path = str(self._resolve_path(virtual_path))
         try:
-            self._with_sftp("delete", virtual_path, lambda sftp: sftp.remove(remote_path))
+            # Unlinking a large file can take a while on some filesystems.
+            self._with_sftp("delete", virtual_path, lambda sftp: sftp.remove(remote_path),
+                            timeout=self.sftp_operation_timeout)
         except FileNotFoundError:
             pass
 
@@ -386,7 +408,8 @@ class SSHBackend(Backend):
             with sftp.open(remote_path, 'wb') as f:
                 f.truncate(0)
 
-        self._with_sftp("truncate", virtual_path, truncate)
+        self._with_sftp("truncate", virtual_path, truncate,
+                        timeout=self.sftp_operation_timeout)
 
     def get_size(self, virtual_path: str) -> int:
         """Get file size"""
@@ -543,7 +566,7 @@ class SSHBackend(Backend):
                                lambda sftp: sftp.stat(remote_path), retry=True)
 
     def close(self):
-        """Close the member's transport and channels."""
+        """Close the member's transport and channels; it does not reconnect."""
         pool = getattr(self, "_pool", None)
         if pool is not None:
             pool.close()

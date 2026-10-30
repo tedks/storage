@@ -59,7 +59,10 @@ class ConflictDetector:
             virtual_path, backend.name, local_checksum[:12] if local_checksum else None,
         )
 
-        if not backend.exists(virtual_path):
+        # Unknown is not absent: if the member cannot be asked, this raises
+        # and the sync to it fails and is retried, instead of overwriting a
+        # file whose remote state was never checked.
+        if not backend.exists_or_raise(virtual_path):
             return None
 
         locations = self.state_manager.get_file_locations(virtual_path)

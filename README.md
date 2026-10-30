@@ -210,7 +210,9 @@ first open. Each check is a remote round trip on the single FUSE thread:
 the first open after a member silently drops off can wait for the SSH
 connect timeout (10 s by default) three times over (the request, a probe
 of the connection, and a reconnect) before the member is marked
-unavailable, and walking a large cached tree after the age costs one
+unavailable. A member whose connection still answers while its requests
+time out (a hung remote disk) costs the request and a probe each time,
+and is marked unavailable after two such timeouts in a row. Walking a large cached tree after the age costs one
 round trip per file.
 
 #### SSH host keys

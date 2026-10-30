@@ -142,6 +142,15 @@ class Backend(ABC):
         """Check if a file exists on this backend"""
         pass
 
+    def exists_or_raise(self, virtual_path: str) -> bool:
+        """Whether the file exists, raising when the member cannot be asked.
+
+        exists() answers False for an unreachable member; a caller that must
+        not mistake "unknown" for "absent" (a conflict check before an
+        overwrite) uses this instead.
+        """
+        return self.exists(virtual_path)
+
     @abstractmethod
     def read_file(self, virtual_path: str, offset: int, size: int) -> bytes:
         """Read data from a file"""
