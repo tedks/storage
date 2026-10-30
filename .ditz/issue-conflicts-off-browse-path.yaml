@@ -1,0 +1,16 @@
+id: conflicts-off-browse-path
+title: Conflict detection off the browse path (size-first split, per-member hash worker)
+desc: ""
+type: task
+component: fs
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-30T15:59:28-00:00
+references: []
+log_events:
+- time: 2026-10-30T15:59:28-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
