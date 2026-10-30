@@ -44,3 +44,12 @@ log_events:
   who: Ted Smith
   what: created
   comment: ""
+- time: 2026-10-30T00:29:06-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Ruling (Ted, 2026-10-29): B. Fresh window = revalidate_after (60 s default)
+    when watchers are off, stale-while-revalidate up to a max-stale (1 h default),
+    both per profile; with watchers on the listing stays until invalidated and the
+    5 s attribute cap goes. Kernel attr/entry timeouts follow the fresh window (1
+    s with watchers), negative_timeout 10 s, auto_cache on. Spec: docs/browsing_latency_plan.md
+    D1, D2. Lane listing.'
