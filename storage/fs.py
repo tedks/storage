@@ -1137,7 +1137,9 @@ class StorageFS(Operations):
         if resolved.backend_name:
             backend = self.backends.get(resolved.backend_name)
 
-            if backend:
+            # The probe stays outside the try: its errors propagate, as
+            # they always have; only a failed transfer falls back below.
+            if backend and backend.exists(canonical_path):
                 try:
                     if self.cache_manager.cache_file(
                         resolved.requested_path, backend, source_virtual_path=canonical_path,

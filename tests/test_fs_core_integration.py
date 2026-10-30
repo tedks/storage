@@ -111,6 +111,15 @@ class TestFSCoreIntegration(unittest.TestCase):
         self.fs.release('/copy.txt.backend1', vfd)
         self.assertEqual(data, content)
 
+    def test_member_probe_error_on_a_suffixed_open_is_not_enoent(self):
+        (self.backend1_dir / "probe.txt").write_text("x")
+        with patch.object(self.backends["backend1"], "exists",
+                          side_effect=OSError(errno.ETIMEDOUT, "probe timed out")):
+            with self.assertRaises(OSError) as ctx:
+                self.fs.open('/probe.txt.backend1', os.O_RDONLY)
+        self.assertNotIsInstance(ctx.exception, FuseOSError)
+        self.assertEqual(ctx.exception.errno, errno.ETIMEDOUT)
+
     def test_cache_state_xattr_reports_cache_presence_and_backend_availability(self):
         content = "xattr-data"
         (self.backend1_dir / "xattr.txt").write_text(content)
