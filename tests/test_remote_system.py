@@ -416,6 +416,20 @@ def test_ssh_backend_operations(remote, ssh_backend, tmp_path):
     assert download.read_bytes() == made_remotely
 
 
+def test_ssh_backend_rename_replaces_an_existing_file(remote, ssh_backend, tmp_path):
+    """A rename onto an existing name replaces it, as rename(2) does: the
+    save path of most editors (ditz rename-over-existing-file). Plain SFTP
+    rename fails when the target exists on OpenSSH."""
+    member = remote.members[0]
+    new, old = secrets.token_bytes(10_000), secrets.token_bytes(20_000)
+    for name, payload in (("save.tmp", new), ("saved.txt", old)):
+        (tmp_path / name).write_bytes(payload)
+        ssh_backend.copy_from_local(tmp_path / name, f"/renames/{name}")
+    ssh_backend.rename("/renames/save.tmp", "/renames/saved.txt")
+    assert remote.read_remote(member, "renames/saved.txt") == new
+    assert not ssh_backend.exists("/renames/save.tmp")
+
+
 def _ssh_to(line: str, member: Member) -> bool:
     """Whether a shim log line is an ssh invocation aimed at this member."""
     args = line.split()
