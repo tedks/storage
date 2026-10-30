@@ -866,12 +866,14 @@ class StorageFS(Operations):
 
     def _store_member_check(self, canonical_path: str, cache_path: Path,
                             identity: Tuple[int, int, int],
-                            updates: Dict[str, Tuple[int, float]], *, replace: bool = False):
+                            updates: Dict[str, Tuple[int, float]], *, replace: bool = False,
+                            drop: Tuple[str, ...] = ()):
         """Record a check now, merging member baselines, in memory and on the cache file.
 
         The baselines already known for this cache file (in memory, else from
         its xattr) are kept and updates applied on top; replace=True starts
-        from nothing (a fetch: the old copy's baselines describe other bytes).
+        from nothing (a fetch: the old copy's baselines describe other bytes),
+        and the members named in drop lose theirs.
         The read, merge and both writes are one critical section under
         _member_checks_lock (a leaf: getxattr and setxattr take no other
         lock), so a sync worker and the FUSE thread cannot drop each other's
@@ -888,11 +890,12 @@ class StorageFS(Operations):
             else:
                 members = self._load_persisted_members(cache_path, identity)
             members.update(updates)
+            dropped = [name for name in drop if members.pop(name, None) is not None]
             check = MemberCheck(cache_identity=identity, verified_at=time.monotonic(),
                                 members=members)
             self._member_checks[canonical_path] = check
-            if members and (previous is None or previous.cache_identity != identity
-                            or previous.members != members):
+            if (members or dropped) and (previous is None or previous.cache_identity != identity
+                                         or previous.members != members):
                 payload = {"cache": list(identity),
                            "members": {name: list(stat) for name, stat in members.items()}}
                 try:
@@ -928,13 +931,21 @@ class StorageFS(Operations):
         member's stat after an upload is its baseline for later checks:
         without it, an upload that does not keep the mtime (SFTP) would look
         like a change on the member at the next stale open. Baselines for
-        the other members are kept while the cache file is the same one.
+        the other members are kept while the cache file is the same one. If
+        the member cannot be stat'd, its old baseline no longer describes
+        it (the upload replaced the file) and is dropped: its next check
+        uses the rule for a member without one.
         """
         try:
-            member_stat = backend.stat(virtual_path)
             identity = self._cache_identity(os.lstat(str(cache_path)))
+        except OSError as exc:
+            self.logger.debug("post-sync stat of the cache file failed: %r", exc)
+            return
+        try:
+            member_stat = backend.stat(virtual_path)
         except Exception as exc:
             self.logger.debug("post-sync stat on %s failed: %r", backend.name, exc)
+            self._store_member_check(virtual_path, cache_path, identity, {}, drop=(backend.name,))
             return
         self._store_member_check(virtual_path, cache_path, identity,
                                  {backend.name: (member_stat.st_size, member_stat.st_mtime)})
