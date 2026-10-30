@@ -1,0 +1,27 @@
+id: field-dir-by-path-stat-per-visit
+title: A directory reached by path (parent never listed) costs member stats on every
+  visit inside the fresh window
+desc: 'Field test 2026-10-30, master 39e4b79, 3 members. A directory whose own listing
+  is fresh but whose parent was reached only by path walk (never listed) costs member
+  stats each time it is visited: 1 member stat per readdir+stat-all visit with threads
+  off, 3 with threads on, at 20 s and again right after a background refresh. The
+  stat answer from the member is not remembered and attr_timeout is 0 (by design since
+  #133), so every getattr of that directory goes to a member. Plan section 2 target
+  for a path walk is 0 inside the window. A file manager that lists parents on the
+  way down does not hit this; a shell cd/ls to a deep path, a bookmark or a recent-files
+  entry does. Possible fix: keep member-stat answers for directories (or for every
+  path) for the fresh window, keyed like the listing attributes, invalidated by the
+  same writes.'
+type: bugfix
+component: listing
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-30T17:06:43-00:00
+references: []
+log_events:
+- time: 2026-10-30T17:06:43-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
