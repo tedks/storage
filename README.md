@@ -276,9 +276,9 @@ Symbolic links cannot be created through the mount: `ln -s` fails with
 local cache and vanish with it, so `cp -a`, `rsync -l` or `tar x` into the
 mount fail for each link. Links that already exist on a member are not
 supported either: an SSH member reports the link's target, so the name
-shows as a regular file or directory; a local member reports the link
-itself, which the mount lists but cannot read until the file is fetched,
-and then caches as a regular file.
+shows as a regular file or directory (a dangling link is listed but
+cannot be stat'ed); a local member reports the link itself, which the
+mount lists but cannot follow or read (`readlink` fails with `ENOENT`).
 
 #### SSH host keys
 
