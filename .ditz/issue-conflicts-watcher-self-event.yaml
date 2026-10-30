@@ -1,0 +1,24 @@
+id: conflicts-watcher-self-event
+title: Watcher event for a sync upload drops the hash sync recorded
+desc: 'Follow-up from PR #152 council (Claude seat). With enable_watchers, the member''s
+  inotify event for a sync upload reaches _on_remote_change -> _forget_checksums,
+  which deletes the hash sync just recorded, so the next listing hashes the copy once.
+  Safe (never trusts a stale record), but point 2 of the ruling (sync-recorded hashes
+  need no member hash) does not hold with watchers. A fix must tell the upload''s
+  own event from an outside same-basis rewrite, e.g. ignore an event for a path within
+  a short window after its upload only when the member stat still equals the recorded
+  basis; that reopens the same-second window for outside writes in that window, so
+  needs care. Also add a watcher-on remote-gate test.'
+type: task
+component: fs
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-30T18:41:47-00:00
+references: []
+log_events:
+- time: 2026-10-30T18:41:47-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
