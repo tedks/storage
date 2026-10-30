@@ -1523,6 +1523,66 @@ class TestFSNamespaceIntegration(unittest.TestCase):
             self.assertTrue(self._wait_for(
                 lambda: state.get_member_checksum("/dup.txt", "backend2") is None))
 
+    def _upload(self, name, content):
+        """What a sync of name does to backend2: copy, then the callback."""
+        cache_path = self.temp_dir / "upload-src"
+        cache_path.write_bytes(content)
+        member = self.backends["backend2"]
+        member.copy_from_local(cache_path, name)
+        self.fs._record_member_written(name, member, cache_path, fast_checksum_bytes(content))
+
+    def test_synced_upload_is_recorded_with_the_members_basis(self):
+        (self.backend1_dir / "dup.txt").write_text("aaaa")
+        self._upload("/dup.txt", b"bbbb")
+        st = (self.backend2_dir / "dup.txt").stat()
+        row = self.fs.state_manager.get_member_checksum("/dup.txt", "backend2")
+        self.assertEqual(row.checksum, fast_checksum_bytes(b"bbbb"))
+        self.assertEqual(row.basis, (4, st.st_mtime, st.st_ctime))
+        # Not tracked by the view yet: persisted, not held in memory.
+        self.assertNotIn(("/dup.txt", "backend2"), self.fs._checksum_records)
+        hashes = self._hashes()
+        self._list_and_settle()  # backend1's hash lands after this listing
+        self.assertIn("dup.txt.backend2", self._list_and_settle())
+        self.assertEqual(hashes, [("backend1", "/dup.txt")])
+
+    def test_synced_upload_replaces_a_tracked_record_and_its_hash(self):
+        (self.backend1_dir / "dup.txt").write_text("same")
+        (self.backend2_dir / "dup.txt").write_text("same")
+        self.assertIn("dup.txt", self._list_and_settle())
+        target = self.backend2_dir / "dup.txt"
+        before = target.stat()
+        # A same-size rewrite that keeps the mtime: on a member without
+        # ctime, no listing could tell. The upload's own record does.
+        self._upload("/dup.txt", b"diff")
+        os.utime(target, ns=(before.st_atime_ns, before.st_mtime_ns))
+        st = target.stat()
+        self.fs._record_member_written(
+            "/dup.txt", self.backends["backend2"], self.temp_dir / "upload-src",
+            fast_checksum_bytes(b"diff"))
+        record = self.fs._checksum_records[("/dup.txt", "backend2")]
+        self.assertEqual(record.checksum, fast_checksum_bytes(b"diff"))
+        self.assertEqual(record.basis, (4, st.st_mtime, st.st_ctime))
+        hashes = self._hashes()
+        self.assertIn("dup.txt.backend2", self._list_and_settle())
+        self.assertEqual(hashes, [])
+
+    def test_upload_of_unknown_content_drops_the_record(self):
+        (self.backend1_dir / "dup.txt").write_text("same")
+        (self.backend2_dir / "dup.txt").write_text("same")
+        self._list_and_settle()
+        cache_path = self.temp_dir / "upload-src"
+        cache_path.write_bytes(b"same")
+        self.fs._record_member_written("/dup.txt", self.backends["backend2"], cache_path, None)
+        self.assertNotIn(("/dup.txt", "backend2"), self.fs._checksum_records)
+        self.assertIsNone(self.fs.state_manager.get_member_checksum("/dup.txt", "backend2"))
+        # A member stat that fails leaves nothing either.
+        self._upload("/dup.txt", b"same")
+        self.assertIsNotNone(self.fs.state_manager.get_member_checksum("/dup.txt", "backend2"))
+        with patch.object(self.backends["backend2"], "stat", side_effect=OSError("gone")):
+            self.fs._record_member_written(
+                "/dup.txt", self.backends["backend2"], cache_path, fast_checksum_bytes(b"same"))
+        self.assertIsNone(self.fs.state_manager.get_member_checksum("/dup.txt", "backend2"))
+
     def test_readdir_rehashes_member_rewritten_with_same_size_and_mtime(self):
         # A tagger that preserves mtime: only ctime shows the change, and a
         # local member's listing carries it.

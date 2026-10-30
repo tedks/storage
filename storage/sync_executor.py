@@ -32,7 +32,7 @@ class SyncExecutor:
         replication_manager: ReplicationManager,
         config: SyncConfig,
         should_sync_path_cb: Optional[Callable[[str], bool]] = None,
-        member_written_cb: Optional[Callable[[str, Backend, Path], None]] = None,
+        member_written_cb: Optional[Callable[[str, Backend, Path, Optional[str]], None]] = None,
         upload_guard: Optional[Callable[[str], ContextManager]] = None,
         path_guard: Optional[Callable[..., ContextManager]] = None,
     ):
@@ -43,8 +43,11 @@ class SyncExecutor:
         self.config = config
         self.conflict_detector = ConflictDetector(state_manager)
         self.should_sync_path_cb = should_sync_path_cb
-        # Told (virtual_path, member, cache_path) after each upload, so the
-        # filesystem can record the member's new stat (StorageFS revalidation).
+        # Told (virtual_path, member, cache_path, checksum) after each upload,
+        # so the filesystem can record the member's new stat (StorageFS
+        # revalidation) and the hash of what it now holds (the conflict
+        # view); checksum is None when a write to the cache file may have
+        # overlapped the upload, so the member's bytes are not known.
         self.member_written_cb = member_written_cb
         # Held across a file task, from reading its row to publishing the
         # outcome: a rename or unlink of the path waits for it, so the
@@ -147,6 +150,13 @@ class SyncExecutor:
                 self._stats["failed"] += 1
             return True
 
+        # The file's identity when hashed: after each upload it is compared
+        # again, and the hash is reported as the member's content only if
+        # nothing wrote to the file in between.
+        try:
+            hashed_identity = _identity(os.lstat(str(cache_path)))
+        except OSError:
+            hashed_identity = None
         checksum = self.state_manager.compute_checksum(cache_path)
 
         sync_results: Dict[str, bool] = {}
@@ -171,7 +181,12 @@ class SyncExecutor:
                 backend.sync()
                 if self.member_written_cb:
                     try:
-                        self.member_written_cb(task.virtual_path, backend, cache_path)
+                        identity = _identity(os.lstat(str(cache_path)))
+                    except OSError:
+                        identity = None
+                    uploaded = checksum if identity is not None and identity == hashed_identity else None
+                    try:
+                        self.member_written_cb(task.virtual_path, backend, cache_path, uploaded)
                     except Exception:
                         logger.exception("member_written_cb failed for %s", task.virtual_path)
 
@@ -422,3 +437,9 @@ class SyncExecutor:
             backend = self.replication_manager.backends.get(backend_hint)
             return [backend] if backend else []
         return self.replication_manager.get_available_backends()
+
+
+def _identity(st: os.stat_result):
+    """What tells one state of the cache file from another: a write moves
+    the mtime (or the size), a replacement the inode."""
+    return (st.st_ino, st.st_size, st.st_mtime_ns)

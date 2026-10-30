@@ -1060,8 +1060,16 @@ class StorageFS(Operations):
         self._store_member_check(canonical_path, cache_path, identity, members, replace=True)
         self._clear_recheck(canonical_path, backend.name)
 
-    def _record_member_written(self, virtual_path: str, backend: Backend, cache_path: Path):
+    def _record_member_written(self, virtual_path: str, backend: Backend, cache_path: Path,
+                               checksum: Optional[str] = None):
         """Sync callback: backend now holds the cache file's content.
+
+        checksum is the hash of what was uploaded (None: not known, a write
+        may have overlapped the upload). With the member's stat after the
+        upload as its basis it becomes the member's conflict-view record,
+        so the mount's own writes never wait on, or hide from, a member
+        hash: a same-size rewrite within the member's mtime resolution
+        (or one that kept the mtime) is recorded as what it is.
 
         Runs in a sync worker, so the stat costs the FUSE loop nothing. The
         member's stat after an upload is its baseline for later checks:
@@ -1076,6 +1084,7 @@ class StorageFS(Operations):
             identity = self._cache_identity(os.lstat(str(cache_path)))
         except OSError as exc:
             self.logger.debug("post-sync stat of the cache file failed: %r", exc)
+            self._record_uploaded_checksum(virtual_path, backend.name, None, None)
             return
         with self._member_checks_lock:
             check = self._member_checks.get(virtual_path)
@@ -1087,12 +1096,50 @@ class StorageFS(Operations):
             member_stat = backend.stat(virtual_path)
         except Exception as exc:
             self.logger.debug("post-sync stat on %s failed: %r", backend.name, exc)
+            self._record_uploaded_checksum(virtual_path, backend.name, None, None)
             if had_baseline:
                 self._store_member_check(virtual_path, cache_path, identity, {},
                                          drop=(backend.name,), drop_unless_checked_since=check)
             return
+        self._record_uploaded_checksum(virtual_path, backend.name, checksum, member_stat)
         self._store_member_check(virtual_path, cache_path, identity,
                                  {backend.name: (member_stat.st_size, member_stat.st_mtime)})
+
+    def _record_uploaded_checksum(self, virtual_path: str, backend_name: str,
+                                  checksum: Optional[str], member_stat):
+        """The member now holds content hashing to checksum, with
+        member_stat as its basis; None for either: its content is not
+        known, and whatever was recorded for it predates the upload.
+
+        Persisted always, so a listing that reports this basis loads it;
+        installed in memory only where the name is already tracked (a
+        record or a hash in flight, which the upload supersedes), so
+        uploads of names on one member do not grow the in-memory table.
+        A conflict copy (name.member) uploads through release(), which
+        schedules its own hash.
+        """
+        resolved = self._resolve_path(virtual_path)
+        if resolved.backend_name is not None:
+            return
+        key = (resolved.canonical_path, backend_name)
+        record = None
+        if checksum is not None and member_stat is not None:
+            mode, size = getattr(member_stat, "st_mode", None), getattr(member_stat, "st_size", None)
+            mtime = getattr(member_stat, "st_mtime", None)
+            if mode is not None and stat.S_ISREG(mode) and size is not None and mtime is not None:
+                # The listing's basis: st_ctime is absent where the member
+                # does not report it (SFTP), as in its listings.
+                basis = (size, mtime, getattr(member_stat, "st_ctime", None))
+                record = ChecksumRecord(checksum=checksum, timestamp=time.time(), basis=basis)
+        with self._checksum_lock:
+            superseded = self._checksum_tasks.pop(key, None)
+            if superseded is not None:
+                superseded.cancel()
+            if record is None:
+                self._checksum_records.pop(key, None)
+            elif superseded is not None or key in self._checksum_records:
+                self._checksum_records[key] = record
+            self._persist_checksum(key[0], backend_name, record)
 
     def _member_for_revalidation(self, canonical_path: str) -> Tuple[Optional[Backend], List[str]]:
         """Pick the member to stat, from the index alone (no remote call).
