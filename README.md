@@ -417,6 +417,7 @@ Implemented:
 - Conflict detection on sync, and `storage conflicts` to list and resolve conflicts
 - Remote inotify watchers that invalidate the cache when a member changes
 - TOML mount profiles
+- A multithreaded FUSE loop (`fuse_threads`, off by default until field-tested), so a slow member call for one file does not hold up listings, stats and reads of others
 - Cache metadata xattrs, with `storage debug rebuild-index`, `reprobe-locations` and `verify-index`
 - File recomputation
 - Transparent encryption (implemented; one test covers `storage/crypto.py`, so treat it as unverified)

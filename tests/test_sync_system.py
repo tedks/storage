@@ -14,8 +14,9 @@ import threading
 import shutil
 from pathlib import Path
 
-from storage.fs import StorageFS, fuse_mount_options
+from storage.fs import StorageFS
 from storage.backends.local import LocalBackend
+from tests.fuse_mount import run_fuse, stop_fuse
 
 
 class _MountedCase(unittest.TestCase):
@@ -27,6 +28,8 @@ class _MountedCase(unittest.TestCase):
     START_SYNC = True
     FS_KWARGS: dict = {}
     KERNEL_OPTIONS: dict = {}
+    # Every suite also runs with the multithreaded loop (subclasses below).
+    fuse_threads = False
 
     def setUp(self):
         """Set up test environment with actual mount"""
@@ -81,37 +84,23 @@ class _MountedCase(unittest.TestCase):
     def _mount_fs(self):
         """Mount filesystem (runs in separate thread)"""
         try:
-            from fuse import FUSE
-            FUSE(
-                self.fs,
-                str(self.mount_dir),
-                nothreads=True,
-                foreground=True,
-                allow_other=False,
-                **fuse_mount_options(
-                    self.fs.backends,
-                    enable_watchers=self.fs._enable_watchers,
-                    fresh_window=self.fs._revalidate_after,
-                    **self.KERNEL_OPTIONS,
-                ),
-            )
+            run_fuse(self.fs, self.mount_dir, fuse_threads=self.fuse_threads,
+                     **self.KERNEL_OPTIONS)
         except Exception as e:
             print(f"Mount error: {e}")
 
     def tearDown(self):
         """Clean up and unmount"""
-        # Unmount
-        try:
-            subprocess.run(['fusermount', '-u', str(self.mount_dir)],
-                          timeout=5.0, check=False)
-        except Exception:
-            pass
-
-        # Wait a bit for unmount
-        time.sleep(0.5)
+        problems = stop_fuse(self.mount_dir, self.mount_thread)
+        if os.path.ismount(self.mount_dir) or self.mount_thread.is_alive():
+            # Still serving (a lazy unmount leaves it running): removing the
+            # cache or destroying under it would race its requests.
+            self.fail(f"mount teardown, {self.temp_dir} left in place: {problems}")
 
         # Clean up temp directory
         shutil.rmtree(self.temp_dir, ignore_errors=True)
+        if problems:
+            self.fail(f"mount teardown: {problems}")
 
     def _wait_for(self, predicate, timeout=5.0):
         deadline = time.time() + timeout
@@ -444,6 +433,18 @@ class TestKernelCacheRefetch(_MountedCase):
 
     def test_shrunk_file_reads_short(self):
         self._read_after_revalidation("shrink.bin", b"a" * 200, b"d" * 50)
+
+
+class TestSyncSystemIntegrationThreaded(TestSyncSystemIntegration):
+    fuse_threads = True
+
+
+class TestKernelCacheVisibilityThreaded(TestKernelCacheVisibility):
+    fuse_threads = True
+
+
+class TestKernelCacheRefetchThreaded(TestKernelCacheRefetch):
+    fuse_threads = True
 
 
 if __name__ == '__main__':

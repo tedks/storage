@@ -10,7 +10,6 @@ import errno
 import json
 import os
 import shutil
-import subprocess
 import tempfile
 import threading
 import time
@@ -18,7 +17,8 @@ import unittest
 from pathlib import Path
 
 from storage.backends.local import LocalBackend
-from storage.fs import StorageFS, fuse_mount_options
+from storage.fs import StorageFS
+from tests.fuse_mount import run_fuse, stop_fuse
 
 
 class SlowRemoteLoopbackBackend(LocalBackend):
@@ -35,22 +35,11 @@ class SlowRemoteLoopbackBackend(LocalBackend):
         return super().read_file(virtual_path, offset, size)
 
 
-def _mount_fs(fs: StorageFS, mount_dir: Path):
-    """Mount the filesystem in foreground mode (run in a daemon thread)."""
-    from fuse import FUSE
-
-    FUSE(
-        fs,
-        str(mount_dir),
-        nothreads=True,
-        foreground=True,
-        allow_other=False,
-        **fuse_mount_options(fs.backends, enable_watchers=fs._enable_watchers, fresh_window=fs._revalidate_after),
-    )
-
-
 class TestStreamingSystemRegression(unittest.TestCase):
     """Mounted-FUSE streaming regression checks."""
+
+    # Also run with the multithreaded loop (subclass below).
+    fuse_threads = False
 
     def setUp(self):
         self.temp_dir = tempfile.mkdtemp()
@@ -81,7 +70,10 @@ class TestStreamingSystemRegression(unittest.TestCase):
             max_streaming_sessions=4,
         )
 
-        self.mount_thread = threading.Thread(target=_mount_fs, args=(self.fs, self.mount_dir), daemon=True)
+        self.mount_thread = threading.Thread(
+            target=run_fuse, args=(self.fs, self.mount_dir),
+            kwargs={"fuse_threads": self.fuse_threads}, daemon=True,
+        )
         self.mount_thread.start()
         time.sleep(1.0)
 
@@ -91,21 +83,21 @@ class TestStreamingSystemRegression(unittest.TestCase):
             self.skipTest(f"Mount unavailable in this environment: {exc}")
 
     def tearDown(self):
-        for cmd in (
-            ["fusermount", "-u", str(self.mount_dir)],
-            ["umount", str(self.mount_dir)],
-        ):
-            try:
-                subprocess.run(cmd, check=False, timeout=5)
-            except Exception:
-                pass
-
+        # After the FUSE thread has finished, so this destroy never runs
+        # beside libfuse's own (or a request still in flight).
+        problems = stop_fuse(self.mount_dir, self.mount_thread)
+        if os.path.ismount(self.mount_dir) or self.mount_thread.is_alive():
+            # Still serving (a lazy unmount leaves it running): removing the
+            # cache or destroying under it would race its requests.
+            self.fail(f"mount teardown, {self.temp_dir} left in place: {problems}")
         try:
             self.fs.destroy("/")
         except Exception:
             pass
 
         shutil.rmtree(self.temp_dir, ignore_errors=True)
+        if problems:
+            self.fail(f"mount teardown: {problems}")
 
     def _wait_for(self, predicate, timeout: float = 8.0) -> bool:
         deadline = time.time() + timeout
@@ -189,6 +181,10 @@ class TestStreamingSystemRegression(unittest.TestCase):
         stream_state = self._read_stream_state(cache_path, partial_path)
         if stream_state is not None:
             self.assertNotIn(stream_state.get("status"), {"error", "failed"})
+
+
+class TestStreamingSystemRegressionThreaded(TestStreamingSystemRegression):
+    fuse_threads = True
 
 
 if __name__ == "__main__":

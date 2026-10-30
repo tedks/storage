@@ -109,6 +109,14 @@ and add that to the mounted gate. New `storage/` modules go in
 gate, fails when a `tests/test_*.py` or `storage/` module on disk is not
 listed.
 
+A test that mounts goes through `run_fuse` in `tests/fuse_mount.py` (list
+it and `tests/__init__.py` in the target's `srcs`; the check above does not
+see helpers), so it mounts with the options the real mount passes, and runs
+in both FUSE loop modes: a unittest class gets a subclass with
+`fuse_threads = True`, a pytest fixture is parametrized over
+`FUSE_THREAD_MODES`. With `fuse_threads` an unmount waits for every request
+still in a member call, so a teardown's join allows for the SFTP timeout.
+
 The gates are `test_suite`s over those `py_test`s:
 
 | Target | Runs |

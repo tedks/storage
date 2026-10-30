@@ -18,22 +18,9 @@ from pathlib import Path
 
 import yaml
 
-from storage.fs import StorageFS, fuse_mount_options
+from storage.fs import StorageFS
 from storage.backends.local import LocalBackend
-
-
-def _mount_fs(fs, mount_dir: Path):
-    """Mount the filesystem in the foreground (runs in a thread for tests)."""
-    from fuse import FUSE
-
-    FUSE(
-        fs,
-        str(mount_dir),
-        nothreads=True,
-        foreground=True,
-        allow_other=False,
-        **fuse_mount_options(fs.backends, enable_watchers=fs._enable_watchers, fresh_window=fs._revalidate_after),
-    )
+from tests.fuse_mount import run_fuse, stop_fuse
 
 
 class BaseConflictMountTest(unittest.TestCase):
@@ -41,6 +28,8 @@ class BaseConflictMountTest(unittest.TestCase):
 
     backend0_name = "local0"
     backend1_name = "local1"
+    # Each suite also runs with the multithreaded loop (subclasses below).
+    fuse_threads = False
 
     def setUp(self):
         self.temp_dir = tempfile.mkdtemp()
@@ -77,7 +66,8 @@ class BaseConflictMountTest(unittest.TestCase):
         )
 
         self.mount_thread = threading.Thread(
-            target=_mount_fs, args=(self.fs, self.mount_dir), daemon=True
+            target=run_fuse, args=(self.fs, self.mount_dir),
+            kwargs={"fuse_threads": self.fuse_threads}, daemon=True
         )
         self.mount_thread.start()
 
@@ -85,20 +75,17 @@ class BaseConflictMountTest(unittest.TestCase):
         time.sleep(1.0)
 
     def tearDown(self):
-        try:
-            subprocess.run(
-                ["fusermount", "-u", str(self.mount_dir)],
-                check=False,
-                timeout=5,
-            )
-        except Exception:
-            pass
-
-        time.sleep(0.5)
+        problems = stop_fuse(self.mount_dir, self.mount_thread)
+        if os.path.ismount(self.mount_dir) or self.mount_thread.is_alive():
+            # Still serving (a lazy unmount leaves it running): removing the
+            # cache or destroying under it would race its requests.
+            self.fail(f"mount teardown, {self.temp_dir} left in place: {problems}")
 
         import shutil
 
         shutil.rmtree(self.temp_dir, ignore_errors=True)
+        if problems:
+            self.fail(f"mount teardown: {problems}")
 
     # Utility helpers -----------------------------------------------------
 
@@ -271,6 +258,18 @@ class TestRemoteConflictMount(BaseConflictMountTest):
         checksum_list = self._read_xattr_yaml(self.mount_dir / conflict_remote, "user.storage.checksums")
         backend_tags = {entry.split(':')[0] for entry in checksum_list}
         self.assertIn(self.backend1_name, backend_tags)
+
+
+class TestLocalConflictMountThreaded(TestLocalConflictMount):
+    fuse_threads = True
+
+
+class TestConflictMergeThreaded(TestConflictMerge):
+    fuse_threads = True
+
+
+class TestRemoteConflictMountThreaded(TestRemoteConflictMount):
+    fuse_threads = True
 
 
 if __name__ == "__main__":

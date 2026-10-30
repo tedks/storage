@@ -151,6 +151,8 @@ py_test(
 py_test(
     name = "storage_tests_conflicts_integration",
     srcs = [
+        "tests/__init__.py",
+        "tests/fuse_mount.py",
         "tests/pytest_main.py",
         "tests/test_conflicts_integration.py",
     ],
@@ -179,6 +181,8 @@ py_test(
 py_test(
     name = "storage_tests_streaming_system",
     srcs = [
+        "tests/__init__.py",
+        "tests/fuse_mount.py",
         "tests/pytest_main.py",
         "tests/test_streaming_system.py",
     ],
@@ -192,6 +196,8 @@ py_test(
 py_test(
     name = "storage_tests_sync_system",
     srcs = [
+        "tests/__init__.py",
+        "tests/fuse_mount.py",
         "tests/pytest_main.py",
         "tests/test_sync_system.py",
     ],
@@ -211,6 +217,8 @@ py_test(
 py_test(
     name = "storage_tests_remote_system",
     srcs = [
+        "tests/__init__.py",
+        "tests/fuse_mount.py",
         "tests/pytest_main.py",
         "tests/test_remote_system.py",
     ],

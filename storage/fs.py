@@ -187,6 +187,8 @@ class StorageFS(Operations):
         self._member_checks_lock = threading.Lock()
         # Members whose failed revalidation has been logged; cleared by the
         # member's next successful stat, so an outage is logged once.
+        # Deliberately unlocked: with fuse_threads a race costs at most a
+        # duplicate or missed log line.
         self._revalidate_outages: Set[str] = set()
         # A check that found a change pins the refetch to the member it
         # checked (consumed by _select_backend_for_read). If that member is
@@ -953,8 +955,9 @@ class StorageFS(Operations):
 
         Called by open() for a canonical path. Within revalidate_after of the
         last check this is a dict lookup. Past it, and only for a CLEAN row,
-        it costs one stat of one member (FUSE runs nothreads, so this blocks
-        every other operation): the fastest available holder in the index,
+        it costs one stat of one member (with the FUSE loop single-threaded
+        this blocks every other operation; with fuse_threads, only this
+        path's): the fastest available holder in the index,
         never a listing or an exists() probe. The member's copy changed when:
 
         - with a baseline for that member (its stat when the cache file was
@@ -2142,7 +2145,8 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
                  streaming_keep_after_close: Optional[StreamingKeepAfterClose] = None,
                  revalidate_after: float = 60.0,
                  entry_timeout: Optional[float] = None,
-                 negative_timeout: Optional[float] = None):
+                 negative_timeout: Optional[float] = None,
+                 fuse_threads: bool = False):
     """
     Mount a Storage filesystem
 
@@ -2166,6 +2170,15 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
             stats its member (see StorageFS._revalidate_cached_file)
         entry_timeout, negative_timeout: kernel cache timeouts in seconds;
             None derives them (see fuse_mount_options)
+        fuse_threads: Run libfuse's multithreaded loop instead of nothreads.
+            The handlers lock as storage/locks.py describes. libfuse 2 has no
+            thread cap (a worker is started whenever none is idle, and idle
+            workers above 10 exit), so a burst of requests can start as many
+            threads, each waiting on a path lock or a member channel; the
+            member transport pools bound only what reaches the members
+            (ditz threading-fuse-worker-cap). On unmount libfuse joins every
+            worker before destroy, so an unmount waits for the slowest member
+            call in flight.
 
     Raises:
         PermissionError: If allow_other=True but not running as root and user_allow_other not set
@@ -2242,7 +2255,7 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
         )
         fs.request_stale_sweep()  # started by init(), after FUSE's fork
     try:
-        FUSE(fs, mountpoint, nothreads=True, foreground=foreground, allow_other=allow_other,
+        FUSE(fs, mountpoint, nothreads=not fuse_threads, foreground=foreground, allow_other=allow_other,
              **fuse_options)
     finally:
         try:
