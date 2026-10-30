@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Dict, Optional, Set, List, Tuple
 
 from .backends.base import Backend, ChecksumUnavailable, interactive_request
+from .backends.ssh_mux import close_shared_control_sockets
 from .cache import PARTIAL_SUFFIX, CacheManager
 from .locks import NamespaceLock, PathLocks, UploadLocks
 from .cache_metadata import XATTR_CACHE_METADATA_NAME, scan_cache_entries
@@ -554,6 +555,7 @@ class StorageFS(Operations):
     def _start_watchers(self):
         """Start push-invalidation watchers, coalescing members by watch scope."""
         from .watcher import RemoteWatcher
+        from .backends.ssh_mux import shared_control_sockets
 
         # Group watch-capable members by connection identity so members on the
         # same host share a single SSH+inotifywait process.
@@ -586,6 +588,7 @@ class StorageFS(Operations):
                 on_change=self._on_remote_change,
                 username=meta["username"],
                 key_filename=meta["key_filename"],
+                control_sockets=shared_control_sockets(),
             )
             watcher.start()
             self._watchers.append(watcher)
@@ -2115,6 +2118,8 @@ class StorageFS(Operations):
             self._sweep_thread.join(timeout=self.SWEEP_JOIN_TIMEOUT)
 
         self.sync_manager.stop()
+        # After the last rsync upload and the watchers: they share the masters.
+        close_shared_control_sockets()
         self.state_manager.close()
         if not self._sweep_pending:
             _clear_mount_lock_pid(self.mount_lock_file)

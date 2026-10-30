@@ -45,6 +45,7 @@ import pytest
 
 from storage.backends.rsync import RsyncBackend
 from storage.backends.ssh import SSHBackend
+from storage.backends.ssh_mux import ControlSockets
 from storage.checksums import fast_checksum_bytes
 from storage.watcher import RemoteWatcher
 from tests.fuse_mount import FUSE_THREAD_MODES, fuse_mode_id, run_fuse, unmount_fuse
@@ -975,6 +976,98 @@ def test_mounted_revalidate_sees_container_change_after_age(remote, mounted_fact
 # --------------------------------------------------------------------------- #
 # Connections: one SSH transport per member (ditz ssh-connection-per-thread)
 # --------------------------------------------------------------------------- #
+
+def _accepted_logins(remote, member) -> int:
+    """Public-key logins the member's sshd has accepted, from its log (-e
+    sends it to stderr): one per TCP connection that authenticated."""
+    result = _docker("logs", member.container, check=False)
+    return sum(1 for line in (result.stdout + result.stderr).splitlines()
+               if "Accepted publickey" in line)
+
+
+UPLOADS = 5
+
+
+@pytest.mark.parametrize("shared", [True, False], ids=["shared", "own-connections"])
+def test_rsync_uploads_and_the_watcher_share_one_ssh_connection(remote, tmp_path, shared):
+    """ditz ssh-system-ssh-controlmaster: with sharing, five uploads and a
+    watcher add one connection (the master) to the transport's; without it,
+    each upload and the watcher handshake for themselves."""
+    member = remote.members[1]
+    sockets = ControlSockets() if shared else None
+    backend = RsyncBackend(**remote.backend_kwargs(member), control_sockets=sockets)
+    events: List[str] = []
+    watcher = RemoteWatcher(
+        backend_name=member.name, ssh_host=member.host, ssh_port=member.port,
+        remote_path=REMOTE_ROOT, on_change=events.append, username=REMOTE_USER,
+        key_filename=str(remote.key_path), control_sockets=sockets)
+    logins_before = _accepted_logins(remote, member)
+    payloads = {}
+    try:
+        watcher.start()
+        _wait_for_watch(remote, member, "", events)
+        started = time.monotonic()
+        for index in range(UPLOADS):
+            payloads[index] = secrets.token_bytes(50_000)
+            source = tmp_path / f"mux-{index}.bin"
+            source.write_bytes(payloads[index])
+            backend.copy_from_local(source, f"/mux/{index}.bin")
+        # A master that kept the first upload's pipes open would hold the
+        # first rsync until ControlPersist ended it.
+        assert time.monotonic() - started < 40
+        for index, payload in payloads.items():
+            assert remote.read_remote(member, f"mux/{index}.bin") == payload
+        logins = _accepted_logins(remote, member) - logins_before
+    finally:
+        watcher.stop()
+        backend.close()
+        if sockets is not None:
+            socket_dir = next(iter(sockets._keys), None)
+            socket_dir = socket_dir.parent if socket_dir else None
+            sockets.close()
+    # paramiko's transport and the watcher are one connection each; every
+    # upload is one more unless they share.
+    if shared:
+        assert logins == 2, logins  # the transport, and the shared master
+        assert socket_dir is not None and not socket_dir.exists()
+        assert _wait_for(lambda: _established_ssh_connections(remote, member) == 0,
+                         timeout=10.0), "a master outlived close()"
+    else:
+        assert logins == 2 + UPLOADS, logins
+
+
+def test_a_killed_ssh_master_does_not_wedge_the_next_upload(remote, tmp_path):
+    member = remote.members[1]
+    sockets = ControlSockets()
+    backend = RsyncBackend(**remote.backend_kwargs(member), control_sockets=sockets)
+    try:
+        first = tmp_path / "first.bin"
+        first.write_bytes(secrets.token_bytes(10_000))
+        backend.copy_from_local(first, "/stale/first.bin")
+        control_path = next(iter(sockets._keys))
+        check = subprocess.run(
+            ["ssh", "-o", f"ControlPath={control_path}", "-O", "check",
+             "-p", str(member.port), f"{REMOTE_USER}@{member.host}"],
+            capture_output=True, text=True, timeout=20)
+        found = re.search(r"pid=(\d+)", check.stderr + check.stdout)
+        assert found, f"no master to kill: {check.stderr!r}"
+        master_pid = int(found.group(1))
+        os.kill(master_pid, signal.SIGKILL)
+        assert _wait_for(lambda: not Path(f"/proc/{master_pid}").exists(), timeout=10.0)
+        assert control_path.exists(), "a killed master leaves its socket behind"
+
+        second_payload = secrets.token_bytes(10_000)
+        second = tmp_path / "second.bin"
+        second.write_bytes(second_payload)
+        started = time.monotonic()
+        backend.copy_from_local(second, "/stale/second.bin")
+
+        assert time.monotonic() - started < 30
+        assert remote.read_remote(member, "stale/second.bin") == second_payload
+    finally:
+        backend.close()
+        sockets.close()
+
 
 def _established_ssh_connections(remote, member) -> int:
     """Established TCP connections to the container's sshd, from its /proc.

@@ -21,6 +21,8 @@ import time
 from pathlib import PurePosixPath
 from typing import Callable, Dict, List, Optional, Tuple
 
+from .backends.ssh_mux import ControlSockets
+
 logger = logging.getLogger(__name__)
 
 # inotifywait events that mean "contents may have changed".
@@ -70,6 +72,7 @@ class RemoteWatcher:
         key_filename: Optional[str] = None,
         *,
         remote_paths: Optional[List[str]] = None,
+        control_sockets: Optional[ControlSockets] = None,
     ):
         self.backend_name = backend_name
         self.ssh_host = ssh_host
@@ -77,6 +80,7 @@ class RemoteWatcher:
         self.on_change = on_change
         self.username = username
         self.key_filename = key_filename
+        self._control_sockets = control_sockets
 
         # Accept either remote_paths (list) or remote_path (single string).
         if not remote_paths and remote_path:
@@ -111,6 +115,9 @@ class RemoteWatcher:
                    "-o", "ServerAliveInterval=30",
                    "-o", "ServerAliveCountMax=3",
                    "-p", str(self.ssh_port)]
+        if self._control_sockets is not None:
+            ssh_cmd += self._control_sockets.options(
+                self.username, self.ssh_host, self.ssh_port, self.key_filename)
         if self.key_filename:
             ssh_cmd += ["-i", self.key_filename]
         target = f"{self.username}@{self.ssh_host}" if self.username else self.ssh_host

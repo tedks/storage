@@ -23,11 +23,26 @@ from typing import List, Optional
 
 from .base import Backend, BackendType
 from .ssh import SSHBackend
+from .ssh_mux import ControlSockets
 
 # Hidden directory on each side for rsync partial transfers.
 # rsync writes to this dir and atomically renames to destination on
 # success.  On failure, the destination is untouched.
 _PARTIAL_DIR = ".storage.rsync-tmp"
+
+# rsync exit codes that say the connection, not the files, failed (12: the
+# protocol stream ended; 255: ssh itself failed). A shared ssh master behind
+# one of them may be hung or gone, so it is ended and the next upload starts
+# a fresh one.
+_CONNECTION_EXIT_CODES = frozenset({12, 255})
+
+
+class RsyncError(RuntimeError):
+    """rsync exited non-zero."""
+
+    def __init__(self, message: str, returncode: int):
+        super().__init__(message)
+        self.returncode = returncode
 
 
 class RsyncBackend(SSHBackend):
@@ -62,6 +77,10 @@ class RsyncBackend(SSHBackend):
         Extra arguments passed to rsync (e.g. ['--bwlimit=1000']).
     compress : bool
         Enable rsync compression (-z). Default True for remote transfers.
+    control_sockets : ControlSockets, optional
+        Share one system ssh connection per host among rsync runs (and the
+        watcher, given the same object) instead of one handshake per
+        upload. None connects afresh every time.
     """
 
     def __init__(self, name: str, host: str, remote_path: str,
@@ -70,7 +89,8 @@ class RsyncBackend(SSHBackend):
                  port: int = 22, speed_priority: int = 50,
                  connect_timeout: float = 10.0,
                  rsync_args: Optional[List[str]] = None,
-                 compress: bool = True):
+                 compress: bool = True,
+                 control_sockets: Optional[ControlSockets] = None):
         super().__init__(
             name=name,
             host=host,
@@ -85,6 +105,7 @@ class RsyncBackend(SSHBackend):
         self.backend_type = BackendType.RSYNC
         self._rsync_args = rsync_args or []
         self._compress = compress
+        self._control_sockets = control_sockets
         self.logger = logging.getLogger(__name__)
 
     def _build_rsync_ssh_cmd(self) -> str:
@@ -98,7 +119,20 @@ class RsyncBackend(SSHBackend):
         # a changed one; unlike paramiko this records them in known_hosts.
         parts.append("-o StrictHostKeyChecking=accept-new")
         parts.append(f"-o ConnectTimeout={int(self.connect_timeout)}")
+        if self._control_sockets is not None:
+            options = self._control_sockets.options(
+                self.username, self.host, self.port, self.key_filename)
+            if options:
+                # A shared master that goes quiet must die, not hold every
+                # later upload; it takes its options from whoever started it.
+                parts.extend(["-o ServerAliveInterval=15", "-o ServerAliveCountMax=2"])
+                parts.extend(shlex.quote(option) for option in options)
         return " ".join(parts)
+
+    def _reset_shared_connection(self) -> None:
+        if self._control_sockets is not None:
+            self._control_sockets.reset(
+                self.username, self.host, self.port, self.key_filename)
 
     def _remote_spec(self, virtual_path: str) -> str:
         """Build rsync remote file spec: user@host:/path."""
@@ -147,9 +181,12 @@ class RsyncBackend(SSHBackend):
                 "rsync failed (rc=%d): %s",
                 result.returncode, result.stderr.strip()
             )
-            raise RuntimeError(
+            if result.returncode in _CONNECTION_EXIT_CODES:
+                self._reset_shared_connection()
+            raise RsyncError(
                 f"rsync failed with exit code {result.returncode}: "
-                f"{result.stderr.strip()}"
+                f"{result.stderr.strip()}",
+                result.returncode,
             )
 
         return result
@@ -183,6 +220,7 @@ class RsyncBackend(SSHBackend):
             # rsync runs over its own ssh; probe the member's transport rather
             # than drop it under the other operations sharing it.
             self._pool.check(exc)
+            self._reset_shared_connection()
             raise
         except RuntimeError:
             raise
