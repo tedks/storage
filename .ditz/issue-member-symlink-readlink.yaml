@@ -1,0 +1,23 @@
+id: member-symlink-readlink
+title: readlink of a symlink that exists only on a local member fails
+desc: 'Found by the PR #138 council (Claude seat). A symlink that exists only on a
+  local member is listed (LocalBackend.stat uses lstat, so getattr reports S_IFLNK),
+  but StorageFS.readlink reads only the cache path and fails with ENOENT, so readlink,
+  cat and stat -L fail until the file is fetched; the fetch (shutil.copy2) follows
+  the link and caches a regular file, so the name changes type. SSH members report
+  the target (sftp.stat follows), so links never appear. Related: symlink-replication
+  (the feature), cache-scans-follow-symlinks. Options: readlink falls back to the
+  member''s readlink; or getattr follows links on local members too, matching SSH.'
+type: bugfix
+component: namespace
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-30T02:42:33-00:00
+references: []
+log_events:
+- time: 2026-10-30T02:42:33-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
