@@ -26,7 +26,10 @@ _T = TypeVar("_T")
 # the host's nsswitch.conf names) and has no nscd to ask, so getaddrinfo fails
 # for names the host resolves. getent is the host's own NSS front end, so SSH
 # connects fall back to it on a lookup failure. /usr/bin first: a nixpkgs
-# getent earlier on PATH has the same blind spot.
+# getent earlier on PATH has the same blind spot. A member holds one
+# transport, so this runs once per connect or retry window, not per thread;
+# the result is not cached, because the connect that follows an address
+# change is the one that must resolve afresh.
 _GETENT_CANDIDATES = ("/usr/bin/getent", "/bin/getent")
 
 
