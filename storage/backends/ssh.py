@@ -619,7 +619,13 @@ class SSHBackend(Backend):
         finally:
             if client is not None:
                 try:
+                    transport = client.get_transport()
                     client.close()
+                    # close() does not wait for the transport thread; a thread
+                    # still running at FUSE's fork could leave a lock held in
+                    # the child.
+                    if transport is not None:
+                        transport.join(self.connect_timeout)
                 except Exception:
                     pass
 

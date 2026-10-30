@@ -375,6 +375,10 @@ class _FakeClient:
         rc, out = self.member.fs
         return None, _FakeStdout(out, rc), None
 
+    def get_transport(self):
+        self.member.joined = []
+        return SimpleNamespace(join=self.member.joined.append)
+
     def close(self):
         self.closed = True
 
@@ -467,6 +471,8 @@ class TestSharedFilesystems(unittest.TestCase):
         # Nothing left open before the mount forks, and the root is quoted.
         self.assertTrue(all(c.closed for c in member.clients + other.clients))
         self.assertEqual(["stat -L -c %d -- /srv/root"], member.commands)
+        # The transport thread is joined, so none is running at the fork.
+        self.assertEqual([member.connect_timeout], member.joined)
 
     def test_local_members_group_by_st_dev(self):
         root = Path(tempfile.mkdtemp())
