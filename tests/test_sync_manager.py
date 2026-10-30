@@ -1,5 +1,6 @@
 import shutil
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -61,6 +62,48 @@ class TestSyncManager(unittest.TestCase):
         # Workers should be stopped
         for worker in self.sync_manager.workers:
             self.assertFalse(worker.is_alive())
+
+    def test_stop_returns_promptly_and_leaves_an_idle_queue(self):
+        """stop() must not wait out the monitor sleep or a worker's poll."""
+        self.sync_manager.config.monitor_interval = 30.0
+        self.sync_manager.start()
+        time.sleep(0.2)  # monitor asleep, workers idle in their queue wait
+        started = time.monotonic()
+        self.sync_manager.stop()
+        self.assertLess(time.monotonic() - started, 0.5)
+        self.assertEqual(self.sync_manager.get_queue_size(), 0)
+        self.assertTrue(self.sync_manager.wait_for_completion(timeout=0.1))
+
+    def test_stop_with_a_busy_worker_leaves_no_wake_tasks(self):
+        """A worker that exits without taking its wake must not leave it queued."""
+        release = threading.Event()
+        taken = threading.Event()
+
+        self.sync_manager.start()
+        for worker in self.sync_manager.workers:
+            def slow(task, _w=worker):
+                taken.set()
+                release.wait(5.0)
+                return True
+            worker.executor.process = slow
+        self.sync_manager.queue_sync("/busy.txt")
+        self.assertTrue(taken.wait(5.0))
+        threading.Timer(0.3, release.set).start()
+        self.sync_manager.stop()
+        self.assertEqual(self.sync_manager.get_queue_size(), 0)
+        self.assertTrue(self.sync_manager.wait_for_completion(timeout=0.1))
+
+    def test_restart_after_stop_processes_work(self):
+        self.sync_manager.start()
+        self.sync_manager.stop()
+        self.sync_manager.start()
+        self.assertTrue(all(w.is_alive() for w in self.sync_manager.workers))
+        done = threading.Event()
+        for worker in self.sync_manager.workers:
+            worker.executor.process = lambda task: done.set() or True
+        self.sync_manager.queue_sync("/again.txt")
+        self.assertTrue(done.wait(5.0))
+        self.sync_manager.stop()
 
     def test_queue_sync(self):
         """Test queuing a sync task"""

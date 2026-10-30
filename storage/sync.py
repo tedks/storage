@@ -24,7 +24,8 @@ from .sync_tasks import DirOperation, DirSyncTask, SyncConfig, SyncTask, dir_tas
 logger = logging.getLogger(__name__)
 
 # Posted to the task queue by SyncManager.stop() so idle workers wake at once
-# instead of at the end of their poll. Sorts ahead of every real task.
+# instead of at the end of their poll. Sorts ahead of every real task (the
+# highest real priority is 1000). Never processed; compared by identity.
 _WAKE = SyncTask(virtual_path="", priority=sys.maxsize)
 
 __all__ = [
@@ -168,7 +169,9 @@ class SyncManager:
         # Workers
         self.workers = []
         self._running = False
-        # Set by stop() to end the monitor's sleep between scans.
+        # Set by stop() to end the monitor's sleep between scans. Each start()
+        # makes a fresh one, so a monitor that outlived stop()'s join can never
+        # be revived by a later start().
         self._monitor_stop = threading.Event()
         self._monitor_thread = None
         self._queued_tasks: Set[str] = set()
@@ -197,8 +200,9 @@ class SyncManager:
 
         # Start monitor thread
         self._running = True
-        self._monitor_stop.clear()
-        self._monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
+        self._monitor_stop = threading.Event()
+        self._monitor_thread = threading.Thread(
+            target=self._monitor_loop, args=(self._monitor_stop,), daemon=True)
         self._monitor_thread.start()
 
         logger.info("Sync manager started")
@@ -212,9 +216,12 @@ class SyncManager:
         self._running = False
         self._monitor_stop.set()
 
-        # Stop workers; one wake task each ends an idle worker's queue wait
+        # Stop every worker before waking any, so a woken worker cannot take a
+        # sibling's wake before its own stop flag is set. One wake task each
+        # ends an idle worker's queue wait.
         for worker in self.workers:
             worker.stop()
+        for _ in self.workers:
             self.task_queue.put(_WAKE)
 
         # Wait for workers to finish
@@ -226,13 +233,33 @@ class SyncManager:
             self._monitor_thread.join(timeout=5.0)
 
         self.workers.clear()
+        self._drop_wake_tasks()
         logger.info("Sync manager stopped")
 
-    def _monitor_loop(self):
+    def _drop_wake_tasks(self):
+        """Remove wake tasks no worker took (it was busy or exited first).
+
+        They would otherwise stay in qsize() and unfinished_tasks, so a
+        stopped manager would look busy and wait_for_completion would never
+        see an idle queue. Real tasks are put back.
+        """
+        kept = []
+        while True:
+            try:
+                task = self.task_queue.get_nowait()
+            except queue.Empty:
+                break
+            self.task_queue.task_done()
+            if task is not _WAKE:
+                kept.append(task)
+        for task in kept:
+            self.task_queue.put(task)
+
+    def _monitor_loop(self, stop: threading.Event):
         """Monitor for dirty files and queue them for sync"""
         logger.info("Sync monitor started")
 
-        while self._running:
+        while not stop.is_set():
             try:
                 # Get dirty files
                 dirty_files = self.state_manager.get_dirty_files()
@@ -244,11 +271,11 @@ class SyncManager:
                     self.queue_sync(metadata.virtual_path, priority=50)
 
                 # Sleep before next check
-                self._monitor_stop.wait(self.config.monitor_interval)
+                stop.wait(self.config.monitor_interval)
 
             except Exception as e:
                 logger.error(f"Monitor loop error: {e}")
-                time.sleep(1.0)
+                stop.wait(1.0)
 
         logger.info("Sync monitor stopped")
 
