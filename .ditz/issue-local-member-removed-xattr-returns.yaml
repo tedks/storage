@@ -1,0 +1,22 @@
+id: local-member-removed-xattr-returns
+title: An xattr removed through the mount comes back from a local member after a refetch
+desc: 'Council round 3 on #148 (Claude, nit; same as master with copy2). LocalBackend
+  copies every non-internal xattr over and removes only the reserved user.storage.*
+  names on an existing destination, so a user xattr (or ACL entry) removed through
+  the mount stays on the member copy and returns when the file is evicted and fetched
+  again. Removing other names would also remove xattrs other software set on member
+  files; a fix needs a record of which names the mount owns (e.g. a list in an internal
+  xattr on the cache file).'
+type: bugfix
+component: backends
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-30T17:37:15-00:00
+references: []
+log_events:
+- time: 2026-10-30T17:37:15-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
