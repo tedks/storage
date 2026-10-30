@@ -231,7 +231,17 @@ unlink, mkdir, rmdir, symlink) drop the affected listings at once; a file
 added or changed directly on a member shows within the fresh window, plus
 one more listing while a stale one is served.
 
-BROWSE_BUDGET_TABLE
+Member requests for a browse of one directory, 2 SSH members, 20 entries,
+a 3 s window (the remote gate's `test_mounted_browse_request_budget`):
+
+| Step | Before (10c5cc8) | Now |
+|---|---|---|
+| list | 2 listings | 2 listings |
+| stat every entry | 0 | 0 |
+| probe a missing name | 2 stats | 0 |
+| list and stat again 1.5 s later | 2 listings, 1 stat | 0 |
+| list after the window | 2 listings, 2 stats | 2 background listings (and 2 of the parent) |
+| stat every entry after the next window, no list | 61 stats | 2 background listings (and 2 of the parent) |
 
 The kernel keeps its own cache in front of the mount. With watchers off,
 it remembers names for the listing's fresh window, so a path walk inside
