@@ -500,6 +500,22 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.assertNotIn(PREFIX_XATTR, os.listxattr(str(cache_path)))
         self.assertIsNotNone(self.fs.state_manager.get_file_metadata('/marked.bin'))
 
+    def test_an_owner_unreadable_marked_copy_is_cleared(self):
+        # Council round 5 on #146: getxattr needs read permission, and the
+        # copy keeps the member file's mode (write-only here).
+        from storage.cache import _remove_prefix_marker
+        from storage.cache_metadata import PREFIX_XATTR
+        for mode, marked in ((0o200, True), (0o200, False), (0o000, True)):
+            path = self.cache_dir / f"wo-{mode:o}-{marked}"
+            path.write_bytes(b"x")
+            if marked:
+                os.setxattr(str(path), PREFIX_XATTR, b"1")
+            os.chmod(path, mode)
+            _remove_prefix_marker(path)
+            self.assertEqual(mode, os.stat(path).st_mode & 0o777)
+            os.chmod(path, 0o600)
+            self.assertNotIn(PREFIX_XATTR, os.listxattr(str(path)))
+
     def test_a_read_only_member_file_without_the_marker_is_fetched(self):
         # Council round 4 on #146: on a read-only copy the kernel answers
         # EACCES before ENODATA, so removing an absent marker failed the

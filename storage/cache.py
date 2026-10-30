@@ -24,27 +24,40 @@ from .state import StateManager
 def _remove_prefix_marker(path: Path):
     """Remove the streaming-prefix marker from a whole-file copy.
 
-    Looked for first, which needs only read permission: most copies have
-    none. Changing a user xattr needs write permission on the file, owner
-    or not, so a read-only copy (a member file's mode is kept) gets owner
-    write for the removal. No xattrs on this filesystem: nothing to do. Any
+    Reading a user xattr needs read permission on the file and changing one
+    needs write permission, owner or not, and the copy keeps the member
+    file's mode. So the marker is looked for as the file is; only if that
+    is refused does the copy get owner read and write for the check and the
+    removal, its mode restored after. Most copies have no marker, which
+    costs one getxattr. No xattrs on this filesystem: nothing to do. Any
     other failure raises: a copy that keeps the marker would be served
     unindexed for good.
     """
+    absent = (errno.ENODATA, errno.ENOTSUP, errno.EOPNOTSUPP)
     try:
         os.getxattr(path, PREFIX_XATTR)
+        refused = False
     except OSError as exc:
-        if exc.errno in (errno.ENODATA, errno.ENOTSUP, errno.EOPNOTSUPP):
+        if exc.errno in absent:
             return
-        raise
+        if exc.errno not in (errno.EACCES, errno.EPERM):
+            raise
+        refused = True
     mode = stat_module.S_IMODE(os.stat(path).st_mode)
-    writable = mode | stat_module.S_IWUSR
-    if writable != mode:
-        os.chmod(path, writable)
+    usable = mode | stat_module.S_IRUSR | stat_module.S_IWUSR
+    if usable != mode:
+        os.chmod(path, usable)
     try:
+        if refused:
+            try:
+                os.getxattr(path, PREFIX_XATTR)
+            except OSError as exc:
+                if exc.errno in absent:
+                    return
+                raise
         os.removexattr(path, PREFIX_XATTR)
     finally:
-        if writable != mode:
+        if usable != mode:
             os.chmod(path, mode)
 
 
