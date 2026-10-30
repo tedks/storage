@@ -46,7 +46,7 @@ def _copy_file(src: Path, dst: Path):
     copied over, as copy2 does: xattrs other software set on a member file
     stay, and so do ACL entries the source no longer has. Errors copy2
     ignores per name are ignored; others raise, leaving the new bytes with
-    the old metadata, as copy2 would.
+    partly updated metadata, as copy2 would.
     """
     shutil.copyfile(src, dst)
     st = os.stat(src)
