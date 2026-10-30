@@ -23,14 +23,20 @@ try-acquires (NamespaceLock.try_shared, PathLocks.try_hold) and skips a
 busy path. Nothing else may take a level-1 or level-2 lock while holding a
 lock from levels 3 to 5.
 
-Outside the order: the sync workers and the streaming prefetch worker take
-neither outer lock. A sync upload can still race a rename of its path, as
-it could before (ditz threading-sync-vs-rename).
+Uploads have their own table, UploadLocks, below the path locks (level
+2b): a sync worker holds a path's upload lock, and no other lock, across
+reading its row, the member transfers and publishing the outcome. A file
+rename or unlink takes the upload locks of its paths while it holds their
+path locks, so it waits for an upload in flight; a directory rename drains
+the uploads under its names before it takes the namespace lock exclusive
+(ditz sync-namespace-orphans). Opens never wait for an upload. The sync
+workers take neither outer lock, and the streaming prefetch worker takes
+none of these.
 """
 
 import threading
 from contextlib import contextmanager
-from typing import Dict, Iterator, List
+from typing import Dict, Iterator, List, Tuple
 
 
 class NamespaceLock:
@@ -189,3 +195,98 @@ class PathLocks:
     def __len__(self) -> int:
         with self._mutex:
             return len(self._entries)
+
+
+def _covers(prefix: str, path: str) -> bool:
+    prefix = prefix.rstrip("/")
+    return not prefix or path == prefix or path.startswith(prefix + "/")
+
+
+class UploadLocks:
+    """Per-path upload locks, reentrant for the holding thread, with drains.
+
+    hold_for_upload is the sync worker's: it waits while another thread
+    holds the path or a drain covers it. hold is a FUSE handler's: it waits
+    only for the holder, never for a drain, since the handler holds the
+    namespace lock shared and the draining directory rename waits for that.
+    drain(*prefixes) stops new uploads under the prefixes (a path equal to
+    one, or below it), waits until no other thread holds a path there, and
+    keeps new uploads out until it exits; it must be entered holding no
+    outer lock.
+    """
+
+    def __init__(self):
+        self._cond = threading.Condition(threading.Lock())
+        # path -> (holding thread, depth)
+        self._owners: Dict[str, Tuple[int, int]] = {}
+        self._drains: List[str] = []
+
+    def _acquire(self, path: str, *, upload: bool):
+        me = threading.get_ident()
+        with self._cond:
+            while True:
+                owner = self._owners.get(path)
+                if owner is not None and owner[0] == me:
+                    self._owners[path] = (me, owner[1] + 1)
+                    return
+                if owner is None and not (
+                    upload and any(_covers(prefix, path) for prefix in self._drains)
+                ):
+                    self._owners[path] = (me, 1)
+                    return
+                self._cond.wait()
+
+    def _release(self, path: str):
+        with self._cond:
+            me, depth = self._owners[path]
+            if depth > 1:
+                self._owners[path] = (me, depth - 1)
+            else:
+                del self._owners[path]
+                self._cond.notify_all()
+
+    @contextmanager
+    def _held(self, paths, *, upload: bool) -> Iterator[None]:
+        held: List[str] = []
+        try:
+            for path in sorted(set(paths)):
+                self._acquire(path, upload=upload)
+                held.append(path)
+            yield
+        finally:
+            for path in reversed(held):
+                self._release(path)
+
+    def hold(self, *paths: str):
+        """Hold every distinct path's upload lock, in sorted order."""
+        return self._held(paths, upload=False)
+
+    def hold_for_upload(self, path: str):
+        """Hold the path's upload lock once no drain covers it."""
+        return self._held((path,), upload=True)
+
+    @contextmanager
+    def drain(self, *prefixes: str) -> Iterator[None]:
+        me = threading.get_ident()
+        with self._cond:
+            self._drains.extend(prefixes)
+            try:
+                while any(
+                    owner != me and _covers(prefix, path)
+                    for path, (owner, _) in self._owners.items()
+                    for prefix in prefixes
+                ):
+                    self._cond.wait()
+            except BaseException:
+                self._remove_drains(prefixes)
+                raise
+        try:
+            yield
+        finally:
+            with self._cond:
+                self._remove_drains(prefixes)
+
+    def _remove_drains(self, prefixes):
+        for prefix in prefixes:
+            self._drains.remove(prefix)
+        self._cond.notify_all()

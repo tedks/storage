@@ -1,9 +1,9 @@
-"""NamespaceLock and PathLocks (storage/locks.py)."""
+"""NamespaceLock, PathLocks and UploadLocks (storage/locks.py)."""
 
 import threading
 import unittest
 
-from storage.locks import NamespaceLock, PathLocks
+from storage.locks import NamespaceLock, PathLocks, UploadLocks
 
 WAIT = 5.0
 BLOCKED = 0.2
@@ -204,6 +204,66 @@ class TestPathLocks(unittest.TestCase):
         self.assertTrue(a.wait(WAIT * 4))
         self.assertTrue(b.wait(WAIT * 4))
         self.assertEqual(0, len(self.locks))
+
+
+class TestUploadLocks(unittest.TestCase):
+    def setUp(self):
+        self.locks = UploadLocks()
+
+    def test_upload_and_handler_exclude_each_other_on_one_path(self):
+        with self.locks.hold_for_upload("/a"):
+            handler = start(passing_through(lambda: self.locks.hold("/a")))
+            other = start(passing_through(lambda: self.locks.hold("/b")))
+            self.assertTrue(other.wait(WAIT))
+            self.assertFalse(handler.wait(BLOCKED))
+        self.assertTrue(handler.wait(WAIT))
+        with self.locks.hold("/a", "/b"):
+            upload = start(passing_through(lambda: self.locks.hold_for_upload("/b")))
+            self.assertFalse(upload.wait(BLOCKED))
+        self.assertTrue(upload.wait(WAIT))
+
+    def test_reentrant_for_the_holder(self):
+        with self.locks.hold("/a", "/a"), self.locks.hold_for_upload("/a"):
+            pass
+        self.assertEqual({}, self.locks._owners)
+
+    def test_drain_waits_for_holders_under_its_prefixes_only(self):
+        released = threading.Event()
+        holding = threading.Event()
+
+        def upload():
+            with self.locks.hold_for_upload("/d/f"):
+                holding.set()
+                released.wait(WAIT)
+
+        threading.Thread(target=upload, daemon=True).start()
+        self.assertTrue(holding.wait(WAIT))
+        with self.locks.hold_for_upload("/dx"):  # a sibling name, not under /d
+            pass
+        drained = start(passing_through(lambda: self.locks.drain("/d", "/e")))
+        self.assertFalse(drained.wait(BLOCKED))
+        released.set()
+        self.assertTrue(drained.wait(WAIT))
+        self.assertEqual([], self.locks._drains)
+
+    def test_drain_holds_back_uploads_but_not_handlers(self):
+        with self.locks.drain("/d"):
+            handler = start(passing_through(lambda: self.locks.hold("/d/f")))
+            self.assertTrue(handler.wait(WAIT))
+            upload = start(passing_through(lambda: self.locks.hold_for_upload("/d/f")))
+            whole = start(passing_through(lambda: self.locks.hold_for_upload("/d")))
+            outside = start(passing_through(lambda: self.locks.hold_for_upload("/e/f")))
+            self.assertTrue(outside.wait(WAIT))
+            self.assertFalse(upload.wait(BLOCKED))
+            self.assertFalse(whole.wait(0))
+        self.assertTrue(upload.wait(WAIT))
+        self.assertTrue(whole.wait(WAIT))
+
+    def test_root_drain_covers_everything_and_skips_its_own_holds(self):
+        with self.locks.hold("/a"), self.locks.drain("/"):
+            upload = start(passing_through(lambda: self.locks.hold_for_upload("/x/y")))
+            self.assertFalse(upload.wait(BLOCKED))
+        self.assertTrue(upload.wait(WAIT))
 
 
 if __name__ == "__main__":
