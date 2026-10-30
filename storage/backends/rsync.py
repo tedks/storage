@@ -18,6 +18,7 @@ import logging
 import os
 import shlex
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import List, Optional
 
@@ -169,12 +170,22 @@ class RsyncBackend(SSHBackend):
         # take much longer than an SFTP stat/read call, especially for the
         # large files this backend is meant to handle.
         rsync_timeout = max(300.0, self.sftp_operation_timeout * 5)
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=rsync_timeout,
-        )
+        # Output goes to files, not pipes: a shared ssh master forked from this
+        # run's ssh may keep its descriptors, and a pipe would then not reach
+        # EOF until the master exits (older OpenSSH releases keep stderr).
+        with tempfile.TemporaryFile("w+", errors="replace") as out, \
+                tempfile.TemporaryFile("w+", errors="replace") as err:
+            completed = subprocess.run(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=out,
+                stderr=err,
+                timeout=rsync_timeout,
+            )
+            out.seek(0)
+            err.seek(0)
+            result = subprocess.CompletedProcess(
+                cmd, completed.returncode, out.read(), err.read())
 
         if result.returncode != 0:
             self.logger.warning(

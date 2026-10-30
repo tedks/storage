@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 import os
 import shlex
+import tempfile
 import threading
 import time
 from pathlib import PurePosixPath
@@ -182,11 +183,17 @@ class RemoteWatcher:
         backoff = self._INITIAL_BACKOFF
 
         while not self._stop_event.is_set():
+            stderr_file = None
             try:
+                # stderr goes to a file, not a pipe: a shared ssh master
+                # forked from this ssh may keep its descriptors (older
+                # OpenSSH releases keep stderr), and reading a pipe would
+                # wait for it to exit.
+                stderr_file = tempfile.TemporaryFile("w+", errors="replace")
                 self._process = subprocess.Popen(
                     cmd,
                     stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
+                    stderr=stderr_file,
                     text=True,
                     start_new_session=True,
                 )
@@ -213,9 +220,15 @@ class RemoteWatcher:
                 if rc != 0:
                     stderr_text = ""
                     try:
-                        stderr_text = self._process.stderr.read().strip()
+                        stderr_file.seek(0)
+                        stderr_text = stderr_file.read().strip()
                     except Exception:
                         pass
+                    if rc == 255 and self._control_sockets is not None:
+                        # ssh itself failed: a shared master behind it may be
+                        # gone or hung; the next ssh starts a fresh one.
+                        self._control_sockets.reset(
+                            self.username, self.ssh_host, self.ssh_port, self.key_filename)
                     if stderr_text:
                         logger.warning(
                             "inotifywait exited with code %d for %s: %s",
@@ -231,6 +244,9 @@ class RemoteWatcher:
 
             except Exception:
                 logger.exception("Watcher error for %s", self.backend_name)
+            finally:
+                if stderr_file is not None:
+                    stderr_file.close()
 
             if not self._stop_event.is_set():
                 logger.info(

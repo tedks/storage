@@ -1003,18 +1003,25 @@ def test_rsync_uploads_and_the_watcher_share_one_ssh_connection(remote, tmp_path
         key_filename=str(remote.key_path), control_sockets=sockets)
     logins_before = _accepted_logins(remote, member)
     payloads = {}
+
+    def upload(index):
+        payloads[index] = secrets.token_bytes(50_000)
+        source = tmp_path / f"mux-{index}.bin"
+        source.write_bytes(payloads[index])
+        backend.copy_from_local(source, f"/mux/{index}.bin")
+
     try:
+        # The first upload starts the master. One that kept this rsync's
+        # pipes open would hold it until ControlPersist ended the master.
+        started = time.monotonic()
+        upload(0)
+        assert time.monotonic() - started < 30
         watcher.start()
         _wait_for_watch(remote, member, "", events)
         started = time.monotonic()
-        for index in range(UPLOADS):
-            payloads[index] = secrets.token_bytes(50_000)
-            source = tmp_path / f"mux-{index}.bin"
-            source.write_bytes(payloads[index])
-            backend.copy_from_local(source, f"/mux/{index}.bin")
-        # A master that kept the first upload's pipes open would hold the
-        # first rsync until ControlPersist ended it.
-        assert time.monotonic() - started < 40
+        for index in range(1, UPLOADS):
+            upload(index)
+        assert time.monotonic() - started < 30
         for index, payload in payloads.items():
             assert remote.read_remote(member, f"mux/{index}.bin") == payload
         logins = _accepted_logins(remote, member) - logins_before
@@ -1043,7 +1050,9 @@ def test_a_killed_ssh_master_does_not_wedge_the_next_upload(remote, tmp_path):
     try:
         first = tmp_path / "first.bin"
         first.write_bytes(secrets.token_bytes(10_000))
+        started = time.monotonic()
         backend.copy_from_local(first, "/stale/first.bin")
+        assert time.monotonic() - started < 30  # not held by the master's pipes
         control_path = next(iter(sockets._keys))
         check = subprocess.run(
             ["ssh", "-o", f"ControlPath={control_path}", "-O", "check",
