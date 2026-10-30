@@ -1,0 +1,18 @@
+id: conflicts-verify-timeout
+title: 'conflicts --verify: timeout and progress'
+desc: 'Follow-up from PR #152 council: storage conflicts --verify polls user.storage.verify
+  until nothing is pending with no timeout (each hash is bounded by the member timeouts,
+  and Ctrl-C works). Consider a --timeout and a progress line for large directories.'
+type: task
+component: fs
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-30T18:41:47-00:00
+references: []
+log_events:
+- time: 2026-10-30T18:41:47-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
