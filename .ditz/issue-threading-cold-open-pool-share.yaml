@@ -1,0 +1,24 @@
+id: threading-cold-open-pool-share
+title: A few concurrent cold opens on one SSH member can take every pooled channel
+  from browsing
+desc: 'From PR #137 council round 1 (Claude seat). A FUSE open''s full fetch counts
+  as an interactive request in the SSH channel pool (#132): with the default 4 channels
+  and 1 interactive reserve, 4 concurrent slow cold opens on one member hold every
+  channel, so listings and stats on that member wait out the interactive deadline
+  and fall back to cached listings. Only reachable with fuse_threads. Options: classify
+  full-file transfers as bulk (not interactive) so the reserve stays for metadata;
+  or cap concurrent transfers per member below the pool size. Recommendation: the
+  first. Measure in the fuse_threads field test (stage 4).'
+type: task
+component: performance
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-30T02:21:55-00:00
+references: []
+log_events:
+- time: 2026-10-30T02:21:55-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
