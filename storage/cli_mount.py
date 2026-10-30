@@ -220,8 +220,8 @@ def mount(
         negative_timeout=resolved.negative_timeout,
     )
     click.echo(
-        f"  Kernel cache: attributes {kernel['attr_timeout']}s, entries {kernel['entry_timeout']}s, "
-        f"missing names {kernel['negative_timeout']}s, pages kept while unchanged"
+        f"  Kernel cache: names {kernel['entry_timeout']}s, missing names {kernel['negative_timeout']}s, "
+        f"attributes {kernel['attr_timeout']}s, pages kept while unchanged"
     )
     click.echo("\nPress Ctrl+C to unmount\n")
 

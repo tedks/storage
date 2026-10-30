@@ -228,11 +228,6 @@ class TestAllowOther(unittest.TestCase):
     def test_local_only_mount_requests_no_subtype(self, mock_geteuid, mock_fuse):
         self.assertNotIn('subtype', self._mount_with(self.backends, mock_fuse))
 
-
-if __name__ == '__main__':
-    unittest.main()
-
-
 class TestMountKernelCacheOptions(unittest.TestCase):
     """mount_storage hands fuse_mount_options to FUSE, and rejects bad timeouts first."""
 
@@ -255,7 +250,7 @@ class TestMountKernelCacheOptions(unittest.TestCase):
     def test_options_reach_fuse(self, mock_fuse):
         self._mount(revalidate_after=45.0, negative_timeout=3.0)
         kwargs = mock_fuse.call_args.kwargs
-        self.assertEqual(45.0, kwargs['attr_timeout'])
+        self.assertEqual(0.0, kwargs['attr_timeout'])
         self.assertEqual(45.0, kwargs['entry_timeout'])
         self.assertEqual(3.0, kwargs['negative_timeout'])
         self.assertIs(True, kwargs['auto_cache'])
@@ -268,3 +263,7 @@ class TestMountKernelCacheOptions(unittest.TestCase):
             self._mount(attr_timeout=float('inf'))
         mock_fuse.assert_not_called()
         self.assertEqual([], list(self.cache_root.glob('.storage.mount.*.lock')))
+
+
+if __name__ == '__main__':
+    unittest.main()

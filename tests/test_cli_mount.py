@@ -265,14 +265,14 @@ backends = [
         for key in ("attr_timeout", "entry_timeout", "negative_timeout"):
             self.assertIsNone(kwargs[key])
         self.assertIn(
-            "Kernel cache: attributes 90.0s, entries 90.0s, missing names 10.0s",
+            "Kernel cache: names 90.0s, missing names 10.0s, attributes 0.0s",
             result.output,
         )
 
     def test_watchers_echo_one_second(self):
         result, _ = self._mount(extra_args=("--enable-watchers",))
         self.assertEqual(result.exit_code, 0, msg=result.output)
-        self.assertIn("Kernel cache: attributes 1.0s, entries 1.0s, missing names 10.0s",
+        self.assertIn("Kernel cache: names 1.0s, missing names 10.0s, attributes 0.0s",
                       result.output)
 
     def test_profile_overrides_reach_mount_and_echo(self):
@@ -284,7 +284,7 @@ backends = [
         self.assertEqual(20.0, kwargs["attr_timeout"])
         self.assertEqual(30.0, kwargs["entry_timeout"])
         self.assertEqual(0.0, kwargs["negative_timeout"])
-        self.assertIn("Kernel cache: attributes 20.0s, entries 30.0s, missing names 0.0s",
+        self.assertIn("Kernel cache: names 30.0s, missing names 0.0s, attributes 20.0s",
                       result.output)
 
     def test_bad_timeout_rejected_before_mounting(self):

@@ -1875,7 +1875,8 @@ class StorageFS(Operations):
         except OSError as e:
             raise FuseOSError(e.errno)
 
-        # Like create: a listing taken before the link would miss it.
+        # Like create: a listing taken before the link would miss it, and
+        # any listing kept under the new path itself is now wrong.
         self._invalidate_dir_cache_entry(resolved.parent_dir)
         self._invalidate_dir_cache_entry(resolved.canonical_path)
 
@@ -2045,10 +2046,13 @@ def fuse_subtype_options(backends: Dict[str, Backend]) -> Dict[str, str]:
     return {}
 
 
-# Kernel entry and attribute timeout while watchers run (libfuse's default).
-# The mount cannot evict kernel entries (see fuse_mount_options), so a
-# watcher event reaches stat callers only once the kernel asks again.
+# Kernel entry timeout while watchers run (libfuse's default). The mount
+# cannot evict kernel entries (see fuse_mount_options), so a watcher event
+# reaches lookups only once the kernel asks again.
 WATCHER_KERNEL_TIMEOUT = 1.0
+# Kernel attribute timeout: the kernel asks getattr at every stat, which
+# the mount answers in-process (see fuse_mount_options for why not longer).
+DEFAULT_ATTR_TIMEOUT = 0.0
 # How long the kernel remembers that a name does not exist. Short, because a
 # remembered miss hides a name that appears behind the mount's back (a file
 # added on a member, or a conflict copy such as name.member0 after a split).
@@ -2056,6 +2060,8 @@ DEFAULT_NEGATIVE_TIMEOUT = 10.0
 
 
 def _kernel_timeout(name: str, value: float) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a number of seconds (got {value!r})")
     value = float(value)
     if not math.isfinite(value) or value < 0:
         raise ValueError(f"{name} must be a finite number of seconds, 0 or more (got {value})")
@@ -2070,34 +2076,51 @@ def fuse_mount_options(backends: Dict[str, Backend], *, enable_watchers: bool,
     """Every FUSE() keyword argument beyond nothreads, foreground and allow_other.
 
     The mount and every mounted test pass these, so tests run under the
-    kernel cache the mount really has. fresh_window is how long a directory
-    listing is served without asking a member (revalidate_after, with
-    watchers off); the kernel then keeps entries and attributes as long,
-    because it would otherwise ask again for answers that have not changed.
-    With watchers on, entries stay at 1 s: a watcher invalidates the
-    mount's own listings, but fusepy runs libfuse 2's high-level fuse_main,
-    which owns the inode table and exposes no handle for
-    fuse_lowlevel_notify_inval_entry, so nothing can evict the kernel's.
+    kernel cache the mount really has.
+
+    entry_timeout: how long the kernel trusts a name without a lookup.
+    fresh_window is how long the mount trusts a directory listing with
+    watchers off (revalidate_after); names are kept as long, so a path walk
+    asks nothing for a minute. With watchers on, entries stay at 1 s: a
+    watcher invalidates the mount's own listings, but fusepy runs libfuse
+    2's high-level fuse_main, which owns the inode table and exposes no
+    handle for fuse_lowlevel_notify_inval_entry, so nothing can evict the
+    kernel's.
+
+    attr_timeout stays 0, so every stat reaches getattr, answered from the
+    cache file or the listing without a member round trip (or by a member
+    stat once the listing is too old). The kernel refreshes a file's size
+    only from expired attributes, even for a read past the size it holds:
+    with any attribute timeout, a stat answered from the old cache copy
+    just before an open that refetches a file grown on its member makes
+    the reads stop at the old size until the attributes expire (a copy out
+    of the mount comes out truncated). Not even libfuse's 1 s default is
+    safe; tests/test_sync_system.py TestKernelCacheRefetch shows it.
+
+    negative_timeout: a missing name is remembered for 10 s. Short, because
+    a remembered miss hides a name added behind the mount's back (on a
+    member, or a conflict copy such as name.member0 after a split).
+
+    auto_cache keeps a file's pages across opens while its mtime and size
+    are unchanged and drops them otherwise, so a refetch after revalidation
+    is not read through old pages (kernel_cache would keep them). libfuse
+    compares against attributes it fetched within ac_attr_timeout, which
+    defaults to attr_timeout; ac_attr_timeout=0 keeps that check fresh, so
+    a getattr follows every open, even with attr_timeout overridden.
 
     Writes through the mount stay visible at once: create, mkdir, symlink,
-    unlink, rmdir and rename update the kernel's entries themselves, and a
-    write or setattr refreshes the file's attributes.
+    unlink, rmdir and rename update the kernel's entries themselves.
 
-    auto_cache keeps a file's pages across opens while its mtime and size are
-    unchanged and drops them otherwise, so a refetch after revalidation is
-    not shadowed by old pages (kernel_cache would keep them regardless).
-    libfuse compares against attributes it fetched within ac_attr_timeout,
-    which defaults to attr_timeout: an attribute answered before open
-    refetched the file would then keep the old pages for the whole window.
-    ac_attr_timeout=0 makes libfuse ask getattr after every open instead,
-    which this mount answers from the cache file or the listing.
-
-    The override arguments replace the derived timeouts (per profile); each
-    must be finite and 0 or more.
+    The override arguments replace the defaults (per profile); each, and
+    fresh_window, must be finite and 0 or more.
     """
-    window = WATCHER_KERNEL_TIMEOUT if enable_watchers else _kernel_timeout("fresh_window", fresh_window)
+    window = _kernel_timeout("fresh_window", fresh_window)
+    if enable_watchers:
+        window = WATCHER_KERNEL_TIMEOUT
     options: Dict[str, object] = dict(fuse_subtype_options(backends))
-    options["attr_timeout"] = window if attr_timeout is None else _kernel_timeout("attr_timeout", attr_timeout)
+    options["attr_timeout"] = (
+        DEFAULT_ATTR_TIMEOUT if attr_timeout is None else _kernel_timeout("attr_timeout", attr_timeout)
+    )
     options["entry_timeout"] = window if entry_timeout is None else _kernel_timeout("entry_timeout", entry_timeout)
     options["negative_timeout"] = (
         DEFAULT_NEGATIVE_TIMEOUT if negative_timeout is None

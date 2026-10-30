@@ -30,11 +30,13 @@ streaming_keep_after_close = "4M,50%"
 # holds it and refetches the file if the member's copy changed. 0 checks at
 # every open.
 revalidate_after = 60
-# Kernel cache timeouts in seconds. Unset, attributes and names are kept for
-# revalidate_after (1 with enable_watchers) and missing names for 10.
-# attr_timeout = 60
+# Kernel cache timeouts in seconds. Unset, names are kept for
+# revalidate_after (1 with enable_watchers), missing names for 10, and
+# attributes not at all (a kept size would truncate reads of a refetched
+# file).
 # entry_timeout = 60
 # negative_timeout = 10
+# attr_timeout = 0
 backends = [
   "ssh://user@storage-host.example:/srv/raid/media/",
   "ssh://user@storage-host.example:/srv/chunk0/media/",

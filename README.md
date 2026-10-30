@@ -216,17 +216,21 @@ and is marked unavailable after two such timeouts in a row. Walking a large cach
 round trip per file.
 
 The kernel keeps its own cache in front of the mount. With watchers off,
-it remembers names and attributes for `revalidate_after` seconds, so a
-path walk or a repeated `stat` inside that window does not reach the
-mount at all; with watchers on it keeps them for 1 s, because the mount
-cannot evict the kernel's entries when a watcher reports a change. A name
-that does not exist is remembered as missing for 10 s. A file's pages stay
-in the page cache across opens while its size and mtime are unchanged and
-are dropped when they change, so a refetched file is read fresh. Changes
-made through the mount are visible at once. A change made directly on a
-member can take up to that long to show in `stat`. The profile keys
-`attr_timeout`, `entry_timeout` and `negative_timeout` (seconds) override
-the three timeouts.
+it remembers names for `revalidate_after` seconds, so a path walk inside
+that window does not reach the mount at all; with watchers on it keeps
+them for 1 s, because the mount cannot evict the kernel's entries when a
+watcher reports a change. A name that does not exist is remembered as
+missing for 10 s. Attributes are not kept: each `stat` reaches the mount,
+which answers it from the cached file or a recent listing without a
+member round trip. (Kept attributes would hold a file's old size past a
+refetch, and reads would stop there.) A file's pages stay in the page
+cache across opens while its size and mtime are unchanged and are dropped
+when they change, so a refetched file is read fresh. Changes made through
+the mount are visible at once. A file added directly on a member can stay
+hidden for up to 10 s after a lookup missed it, and a name removed on a
+member can still be walked through for up to `revalidate_after`. The
+profile keys `entry_timeout`, `negative_timeout` and `attr_timeout`
+(seconds) override the three timeouts.
 
 #### SSH host keys
 
