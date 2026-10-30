@@ -55,3 +55,9 @@ log_events:
     test_mounted_revalidate_sees_container_change_after_age[nothreads] (23306be);
     the full gates passed on fe9be40 and d1ba7ef between them. Same ''FUSE thread
     did not finish after unmount'' shape; host also running other lanes'' gates.'
+- time: 2026-10-30T19:02:22-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Seen again 2026-10-30 on PR #152 head 47b2f6e: remote_system test_mounted_browse_request_budget[nothreads]
+    teardown (''FUSE thread did not finish after unmount''), host load ~10-15 with
+    other lanes running.'
