@@ -47,3 +47,11 @@ log_events:
     run, 3 mounted-gate cases (streaming_system, conflicts_integration, sync_system)
     at once; all passed on rerun at load ~15. Not in the SSH pool or SIGPIPE code
     paths.'
+- time: 2026-10-30T18:02:43-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Lane conflicts, 2026-10-30: seen in sync_system test_same_size_rewrite_drops_old_pages
+    (once nothreads on PR #140 23306be, once threads on 82144d2) and remote_system
+    test_mounted_revalidate_sees_container_change_after_age[nothreads] (23306be);
+    the full gates passed on fe9be40 and d1ba7ef between them. Same ''FUSE thread
+    did not finish after unmount'' shape; host also running other lanes'' gates.'
