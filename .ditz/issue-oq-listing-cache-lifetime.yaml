@@ -35,8 +35,8 @@ type: task
 component: open-questions
 release:
 reporter: Ted Smith <tedks@riseup.net>
-status: unstarted
-disposition:
+status: closed
+disposition: fixed
 creation_time: 2026-10-29T22:01:44-00:00
 references: []
 log_events:
@@ -53,3 +53,7 @@ log_events:
     5 s attribute cap goes. Kernel attr/entry timeouts follow the fresh window (1
     s with watchers), negative_timeout 10 s, auto_cache on. Spec: docs/browsing_latency_plan.md
     D1, D2. Lane listing.'
+- time: 2026-10-30T00:29:07-00:00
+  who: Ted Smith
+  what: 'closed: fixed'
+  comment: 'Ruled: B (60 s fresh, 1 h max stale, per profile)'
