@@ -212,7 +212,8 @@ class UploadLocks:
     drain(*prefixes) stops new uploads under the prefixes (a path equal to
     one, or below it), waits until no other thread holds a path there, and
     keeps new uploads out until it exits; it must be entered holding no
-    outer lock.
+    outer lock. Level 2b: hold() only under the outer locks, never with a
+    lock from levels 3 to 5 held, since the upload it waits for takes them.
     """
 
     def __init__(self):
@@ -267,6 +268,7 @@ class UploadLocks:
 
     @contextmanager
     def drain(self, *prefixes: str) -> Iterator[None]:
+        prefixes = tuple(dict.fromkeys(prefixes))
         me = threading.get_ident()
         with self._cond:
             self._drains.extend(prefixes)
