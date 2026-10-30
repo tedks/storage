@@ -179,6 +179,9 @@ class TestFSCoreIntegration(unittest.TestCase):
         self.assertEqual([True], callback_results)
 
     def test_create_write_and_truncate_each_bump_the_dirty_generation(self):
+        # The row states asserted below are DIRTY; a live sync worker may
+        # legitimately move them to SYNCING when the monitor's scan lands mid-test.
+        self.fs.sync_manager.stop()
         fd = self.fs.create("/gen.txt", 0o644)
         created = self.fs.state_manager.get_file_metadata("/gen.txt")
         self.assertEqual(created.sync_status, SyncStatus.DIRTY)
