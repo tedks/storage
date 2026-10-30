@@ -47,6 +47,36 @@ class TestMemberHashQueues(unittest.TestCase):
         self.assertEqual((live.result(timeout=5), newest.result(timeout=5)), (1, 2))
         blocker.result(timeout=5)
 
+    def test_pinned_items_are_never_dropped_or_counted(self):
+        release, blocker = self._block("m")
+        pinned = [self.queues.submit("m", lambda i=i: i, pinned=True) for i in range(5)]
+        a = self.queues.submit("m", lambda: "a")
+        b = self.queues.submit("m", lambda: "b")
+        c = self.queues.submit("m", lambda: "c")  # limit 2: drops a, not a pinned one
+        self.assertTrue(a.cancelled())
+        self.assertFalse(any(f.cancelled() for f in pinned))
+        release.set()
+        self.assertEqual([f.result(timeout=5) for f in pinned], list(range(5)))
+        self.assertEqual((b.result(timeout=5), c.result(timeout=5)), ("b", "c"))
+        blocker.result(timeout=5)
+
+    def test_idle_while_nothing_waits_or_runs(self):
+        self.assertTrue(self.queues.idle("m"))
+        release, blocker = self._block("m")
+        self.assertFalse(self.queues.idle("m"))
+        self.assertTrue(self.queues.idle("other"))
+        waiting = self.queues.submit("m", lambda: 0)
+        waiting.cancel()
+        release.set()
+        blocker.result(timeout=5)
+        deadline = threading.Event()
+        for _ in range(100):
+            if self.queues.idle("m"):
+                break
+            deadline.wait(0.05)
+        # Only a cancelled item is left (or none): idle.
+        self.assertTrue(self.queues.idle("m"))
+
     def test_submit_after_fork_starts_fresh_workers(self):
         self.queues.submit("m", lambda: None).result(timeout=5)
         parent_worker = self.queues._workers["m"]

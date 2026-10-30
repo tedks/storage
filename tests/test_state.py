@@ -436,3 +436,119 @@ class TestDirtyGeneration(unittest.TestCase):
         updated = self.state_manager.get_file_metadata("/f.txt")
         self.assertEqual((updated.size, updated.last_modified), (10, 2.0))
         self.assertEqual(updated.sync_status, SyncStatus.DIRTY)
+
+
+class TestMemberChecksums(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.db_path = Path(self.temp_dir) / "state.db"
+        self.state = StateManager(str(self.db_path))
+
+    def tearDown(self):
+        self.state.close()
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _record(self, checksum="a" * 32, ts=100.0, basis=(5, 1700000000, None)):
+        from storage.checksums import ChecksumRecord
+        return ChecksumRecord(checksum=checksum, timestamp=ts, basis=basis)
+
+    def test_round_trip_keeps_basis_exactly(self):
+        basis = (5, 1700000000.123456789, 1700000001.5)
+        self.state.put_member_checksum("/d/f", "m0", self._record(basis=basis))
+        got = self.state.get_member_checksum("/d/f", "m0")
+        self.assertEqual(got.checksum, "a" * 32)
+        self.assertEqual(got.basis, basis)
+        self.assertEqual(got.timestamp, 100.0)
+        # An SFTP basis has no ctime, and an integer mtime compares equal.
+        self.state.put_member_checksum("/d/f", "m1", self._record(basis=(5, 1700000000, None)))
+        self.assertEqual(self.state.get_member_checksum("/d/f", "m1").basis, (5, 1700000000, None))
+        self.assertIsNone(self.state.get_member_checksum("/d/f", "m2"))
+
+    def test_put_replaces_and_refuses_unverified_or_basisless(self):
+        self.state.put_member_checksum("/f", "m0", self._record(checksum="a" * 32))
+        self.state.put_member_checksum("/f", "m0", self._record(checksum="b" * 32, basis=(6, 2.0, None)))
+        got = self.state.get_member_checksum("/f", "m0")
+        self.assertEqual((got.checksum, got.basis), ("b" * 32, (6, 2.0, None)))
+        with self.assertRaises(ValueError):
+            self.state.put_member_checksum("/f", "m0", self._record(checksum=None))
+        with self.assertRaises(ValueError):
+            self.state.put_member_checksum("/f", "m0", self._record(basis=None))
+
+    def test_delete_exact_subtree_and_member(self):
+        for path in ("/a", "/a/x", "/a/y/z", "/a%", "/a_b", "/ab", "/a0"):
+            for member in ("m0", "m1"):
+                self.state.put_member_checksum(path, member, self._record())
+        self.state.delete_member_checksums({"/a"}, subtree=True, backend_name="m0")
+        remaining = {
+            (p, m) for p in ("/a", "/a/x", "/a/y/z", "/a%", "/a_b", "/ab", "/a0")
+            for m in ("m0", "m1") if self.state.get_member_checksum(p, m)
+        }
+        self.assertEqual(remaining, {
+            ("/a", "m1"), ("/a/x", "m1"), ("/a/y/z", "m1"),
+            ("/a%", "m0"), ("/a%", "m1"), ("/a_b", "m0"), ("/a_b", "m1"),
+            ("/ab", "m0"), ("/ab", "m1"), ("/a0", "m0"), ("/a0", "m1"),
+        })
+        self.state.delete_member_checksums({"/ab"})
+        self.assertIsNone(self.state.get_member_checksum("/ab", "m1"))
+        self.assertIsNotNone(self.state.get_member_checksum("/a%", "m1"))
+
+    def test_oldest_and_mark_verified(self):
+        for member in ("m0", "m1"):
+            self.state.put_member_checksum("/old", member, self._record(ts=10.0))
+            self.state.put_member_checksum("/new", member, self._record(ts=50.0))
+        self.state.put_member_checksum("/single", "m0", self._record(ts=1.0))
+        path, record, verified_at = self.state.oldest_member_checksum("m0", verified_before=60.0)
+        # /single is on one member only: the view never compares it.
+        self.assertEqual((path, verified_at), ("/old", 10.0))
+        self.assertIsNone(self.state.oldest_member_checksum("m0", verified_before=10.0))
+        self.assertEqual(self.state.oldest_member_checksum("m0", 60.0, exclude={"/old"})[0], "/new")
+        self.assertIsNone(self.state.oldest_member_checksum("m0", 60.0, exclude={"/old", "/new"}))
+        # Verified again with the same digest: it goes to the back.
+        self.assertTrue(self.state.mark_member_checksum_verified("/old", "m0", "a" * 32, 70.0))
+        self.assertEqual(self.state.oldest_member_checksum("m0", verified_before=100.0)[0], "/new")
+        # A row replaced since it was read is left alone.
+        self.assertFalse(self.state.mark_member_checksum_verified("/new", "m0", "c" * 32, 80.0))
+        self.assertEqual(self.state.oldest_member_checksum("m0", verified_before=100.0)[2], 50.0)
+        # Never moved backwards.
+        self.state.mark_member_checksum_verified("/old", "m0", "a" * 32, 5.0)
+        self.assertEqual(self.state.oldest_member_checksum("m0", verified_before=100.0)[0], "/new")
+
+    def test_oldest_pages_past_excluded_rows(self):
+        for i in range(150):
+            for member in ("m0", "m1"):
+                self.state.put_member_checksum(f"/f{i:03}", member, self._record(ts=float(i)))
+        exclude = {f"/f{i:03}" for i in range(140)}
+        self.assertEqual(self.state.oldest_member_checksum("m0", 1000.0, exclude)[0], "/f140")
+
+    def test_older_index_gains_the_table(self):
+        self.state.close()
+        import sqlite3
+        old = Path(self.temp_dir) / "old.db"
+        conn = sqlite3.connect(str(old))
+        conn.executescript('''
+            CREATE TABLE files (
+                virtual_path TEXT PRIMARY KEY, size INTEGER NOT NULL, checksum TEXT,
+                last_access REAL NOT NULL, last_modified REAL NOT NULL,
+                sync_status TEXT NOT NULL, replica_count INTEGER NOT NULL,
+                recomputable INTEGER NOT NULL, recompute_cmd TEXT,
+                encrypted INTEGER NOT NULL, encryption_key_id TEXT,
+                dirty_generation INTEGER NOT NULL DEFAULT 0);
+            CREATE TABLE file_locations (
+                virtual_path TEXT NOT NULL, backend_name TEXT NOT NULL,
+                checksum TEXT NOT NULL, last_synced REAL NOT NULL,
+                is_cached INTEGER NOT NULL, PRIMARY KEY (virtual_path, backend_name));
+        ''')
+        conn.commit()
+        conn.close()
+        self.state = StateManager(str(old))
+        self.assertIsNone(self.state.get_member_checksum("/f", "m0"))
+        self.state.put_member_checksum("/f", "m0", self._record())
+        self.assertIsNotNone(self.state.get_member_checksum("/f", "m0"))
+
+    def test_in_memory_index_keeps_one_database(self):
+        state = StateManager(":memory:")
+        try:
+            state.put_member_checksum("/f", "m0", self._record())
+            self.assertIsNotNone(state.get_member_checksum("/f", "m0"))
+        finally:
+            state.close()

@@ -15,8 +15,12 @@ Two outer locks order the handlers that change what a path names
 3. CacheManager._lock, never held across member I/O.
 4. The index lock (StateManager.metadata_lock), then StorageFS._fd_lock.
 5. Leaves, unchanged: _member_checks_lock, dir_cache_lock then
-   listing_lock, _checksum_lock, prefetch_sessions_lock then session.lock,
-   _access_lock then _db_lock.
+   listing_lock, _checksum_lock then StateManager._checksum_db_lock (the
+   persisted member hashes have their own connection, so _checksum_lock,
+   which readdir takes, never waits on the index lock; besides it, only
+   MemberHashQueues' condition is taken under _checksum_lock), prefetch_sessions_lock then session.lock,
+   _access_lock then _db_lock. (An index on ":memory:" shares one
+   connection, so there _checksum_db_lock is the index lock; tests only.)
 
 Eviction runs under the cache lock, against the order, so it only
 try-acquires (NamespaceLock.try_shared, PathLocks.try_hold) and skips a

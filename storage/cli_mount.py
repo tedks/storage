@@ -109,6 +109,15 @@ def shared_ssh_hosts(backends: Dict[str, Backend]) -> List[Tuple[str, int, List[
         "hold up listings, stats and reads of other files (default off)."
     ),
 )
+@click.option(
+    "--checksum-reverify-interval",
+    type=float,
+    help=(
+        "Seconds between re-verifications of the conflict view's persisted hashes: each "
+        "interval, every idle member hashes again the one file checked longest ago "
+        "(default 60; 0 = off)."
+    ),
+)
 def mount(
     mount_target,
     backing_paths,
@@ -130,6 +139,7 @@ def mount(
     enable_watchers,
     revalidate_after,
     fuse_threads,
+    checksum_reverify_interval,
 ):
     """
     Mount a Storage filesystem
@@ -179,6 +189,7 @@ def mount(
         streaming_keep_after_close=streaming_keep_after_close,
         revalidate_after=revalidate_after,
         fuse_threads=fuse_threads,
+        checksum_reverify_interval=checksum_reverify_interval,
     )
 
     try:
@@ -264,6 +275,13 @@ def mount(
         f"attributes {kernel['attr_timeout']}s, pages kept while unchanged"
     )
     click.echo(f"  FUSE loop: {'multithreaded' if resolved.fuse_threads else 'single-threaded'}")
+    if resolved.checksum_reverify_interval > 0:
+        click.echo(
+            f"  Hash re-verification: one file per idle member every "
+            f"{resolved.checksum_reverify_interval}s"
+        )
+    else:
+        click.echo("  Hash re-verification: off")
     click.echo("\nPress Ctrl+C to unmount\n")
 
     logging.getLogger("paramiko").setLevel(logging.DEBUG if resolved.debug else logging.WARNING)
@@ -290,6 +308,7 @@ def mount(
             entry_timeout=resolved.entry_timeout,
             negative_timeout=resolved.negative_timeout,
             fuse_threads=resolved.fuse_threads,
+            checksum_reverify_interval=resolved.checksum_reverify_interval,
         )
     except PermissionError as exc:
         click.echo(f"Permission error: {exc}", err=True)

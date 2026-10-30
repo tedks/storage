@@ -1483,3 +1483,57 @@ def test_mounted_conflict_view_hash_budget(remote, mounted_factory):
         assert (f"same{i}.bin" in second) != diverged, second
         assert (f"same{i}.bin.{m1.name}" in second) == diverged, second
     assert [c for c in commands if c[1].startswith("xxh128sum")] == []
+
+
+def test_mounted_synced_upload_needs_no_view_hash(remote, mounted_factory):
+    """Sync records the hash of what it uploads against the SFTP member's
+    stat after the upload. That stat must be the basis the member's listing
+    reports (whole-second mtime, no ctime), or the record is never used: a
+    listing of the synced name, now on both members, runs no member hash.
+    """
+    from storage.file_config import FileConfig, set_file_config
+
+    m0, m1 = remote.members
+    mnt = mounted_factory()
+    set_file_config(mnt.cache, FileConfig(replica_count=2))
+    payload = secrets.token_bytes(64 * 1024)
+    (mnt.mount / "synced.bin").write_bytes(payload)
+
+    state = mnt.fs.state_manager
+
+    def recorded():
+        return all(state.get_member_checksum("/synced.bin", m.name) for m in (m0, m1))
+
+    assert _wait_for(recorded, timeout=30.0), "sync recorded no hash for an upload"
+    for member in (m0, m1):
+        row = state.get_member_checksum("/synced.bin", member.name)
+        assert row.checksum == fast_checksum_bytes(payload)
+        assert row.basis[0] == len(payload) and row.basis[2] is None, row.basis
+
+    lock = threading.Lock()
+    commands: List[tuple] = []
+    for name, backend in mnt.backends.items():
+        real_run = backend._pool.run_command
+
+        def run_command(command, timeout, _name=name, _real=real_run):
+            with lock:
+                commands.append((_name, command))
+            return _real(command, timeout)
+
+        backend._pool.run_command = run_command
+
+    # List the members again rather than serve a snapshot from before the
+    # uploads.
+    mnt.fs.namespace.readdir_snapshot_ttl = 0
+    mnt.fs.namespace.listing_max_stale = 0
+    assert "synced.bin" in os.listdir(mnt.mount)
+
+    def settled():
+        with mnt.fs._checksum_lock:
+            return not mnt.fs._checksum_tasks
+
+    assert _wait_for(settled, timeout=30.0)
+    assert [c for c in commands if c[1].startswith("xxh128sum")] == []
+    for member in (m0, m1):
+        record = mnt.fs._checksum_records[("/synced.bin", member.name)]
+        assert record.checksum == fast_checksum_bytes(payload)

@@ -31,8 +31,13 @@ import threading
 from typing import Callable, Deque, Dict, Tuple
 
 DEFAULT_QUEUE_LIMIT = 256
+# Seconds between re-verifications of persisted member hashes, one file per
+# idle member each (storage.fs.StorageFS._reverify_tick); 0 turns them off.
+DEFAULT_CHECKSUM_REVERIFY_INTERVAL = 60.0
 
-_Item = Tuple[concurrent.futures.Future, Callable[[], object]]
+# (future, fn, pinned): a pinned item is never dropped and does not count
+# against the limit.
+_Item = Tuple[concurrent.futures.Future, Callable[[], object], bool]
 
 
 class MemberHashQueues:
@@ -47,12 +52,18 @@ class MemberHashQueues:
         self._running: Dict[str, concurrent.futures.Future] = {}
         self._pid = os.getpid()
         self._shut_down = False
+        # Unpinned items waiting per member, so a submit does not count a
+        # queue that pinned items may make long.
+        self._unpinned: Dict[str, int] = {}
 
-    def submit(self, member: str, fn: Callable[[], object]) -> concurrent.futures.Future:
+    def submit(self, member: str, fn: Callable[[], object],
+               pinned: bool = False) -> concurrent.futures.Future:
         """Queue fn on member's worker; RuntimeError after shutdown().
 
-        The future of the oldest waiting item is cancelled when the queue
-        overflows. Its done callbacks run in this thread, outside the
+        The future of the oldest waiting unpinned item is cancelled when
+        the unpinned items overflow the limit. pinned: never dropped (work
+        nothing else would schedule again, such as an explicit verify),
+        and not counted. Its done callbacks run in this thread, outside the
         queue's lock, so they may take the caller's locks only if the
         caller does not hold them in an order the callback would invert.
         """
@@ -71,17 +82,24 @@ class MemberHashQueues:
                 started = list(self._running.values())
                 self._queues.clear()
                 self._running.clear()
+                self._unpinned.clear()
             queue = self._queues.setdefault(member, collections.deque())
-            queue.append((future, fn))
-            if len(queue) > self.limit:
+            queue.append((future, fn, pinned))
+            if not pinned:
+                self._unpinned[member] = self._unpinned.get(member, 0) + 1
+            if self._unpinned.get(member, 0) > self.limit:
                 # Items cancelled while waiting (invalidated, superseded)
                 # go first; only then is a live one dropped.
                 live = [item for item in queue if not item[0].cancelled()]
                 if len(live) != len(queue):
                     queue.clear()
                     queue.extend(live)
-            if len(queue) > self.limit:
-                dropped = queue.popleft()[0]
+                    self._unpinned[member] = sum(1 for item in live if not item[2])
+            if self._unpinned.get(member, 0) > self.limit:
+                oldest = next(item for item in queue if not item[2])
+                queue.remove(oldest)
+                self._unpinned[member] -= 1
+                dropped = oldest[0]
             if member not in self._workers:
                 worker = threading.Thread(
                     target=self._run, args=(member,), name=f"checksum-{member}", daemon=True,
@@ -108,6 +126,14 @@ class MemberHashQueues:
         with self._cond:
             return len(self._queues.get(member, ()))
 
+    def idle(self, member: str) -> bool:
+        """Nothing waiting for member's worker (cancelled items aside) and
+        nothing running on it."""
+        with self._cond:
+            if member in self._running:
+                return False
+            return all(item[0].cancelled() for item in self._queues.get(member, ()))
+
     def shutdown(self):
         """Cancel every waiting item; workers exit after the item they run.
 
@@ -118,6 +144,7 @@ class MemberHashQueues:
             self._shut_down = True
             waiting = [item[0] for queue in self._queues.values() for item in queue]
             self._queues.clear()
+            self._unpinned.clear()
             self._cond.notify_all()
         for future in waiting:
             future.cancel()
@@ -129,7 +156,9 @@ class MemberHashQueues:
                     self._cond.wait()
                 if self._shut_down:
                     return
-                future, fn = self._queues[member].pop()
+                future, fn, pinned = self._queues[member].pop()
+                if not pinned:
+                    self._unpinned[member] -= 1
                 if not future.set_running_or_notify_cancel():
                     continue
                 self._running[member] = future
