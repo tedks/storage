@@ -1199,7 +1199,7 @@ def test_mounted_browse_request_budget(remote, mounted_factory):
     for member in (m0, m1):
         writes = " && ".join(f"printf x > {REMOTE_ROOT}/browse/{n}" for n in names[member.name])
         remote.exec(member, f"mkdir -p {REMOTE_ROOT}/browse && {writes}")
-    window = 3.0
+    window = 6.0
     mnt = mounted_factory(revalidate_after=window, start_sync=False)
     browse = mnt.mount / "browse"
     os.listdir(mnt.mount)
@@ -1217,14 +1217,14 @@ def test_mounted_browse_request_budget(remote, mounted_factory):
     step("stat every entry", lambda: [os.stat(browse / n) for n in every])
     step("list inside window", lambda: os.listdir(browse))
     step("missing name", lambda: os.path.exists(browse / "missing.bin"))
-    time.sleep(1.5)  # still inside the window, past libfuse's 1 s and the old 1 s listing TTL
+    time.sleep(2.0)  # still inside the window, past libfuse's 1 s and the old 1 s listing TTL
 
     def list_and_stat():
         os.listdir(browse)
         for n in every:
             os.stat(browse / n)
-    step("list and stat 1.5 s later", list_and_stat)
-    time.sleep(window - 1.0)
+    step("list and stat 2 s later", list_and_stat)
+    time.sleep(window - 1.5)
 
     def list_after_window():
         os.listdir(browse)
@@ -1258,7 +1258,7 @@ def test_mounted_browse_request_budget(remote, mounted_factory):
     assert on_browse["stat every entry"] == [], report
     assert on_browse["list inside window"] == [], report
     assert on_browse["missing name"] == [], report
-    assert on_browse["list and stat 1.5 s later"] == [], report
+    assert on_browse["list and stat 2 s later"] == [], report
     assert sorted(m for _, m, _ in on_browse["list after window"]) == ["listdir_attrs"] * 2, report
     assert on_browse["stat after window"] == [], report
     # Served from the stale listing; its refresh is the only request.

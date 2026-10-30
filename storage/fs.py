@@ -276,6 +276,9 @@ class StorageFS(Operations):
             checksum_records=self._checksum_records,
             checksum_lock=self._checksum_lock,
             listing_max_stale=max(0.0, float(listing_max_stale)),
+            # Finite even with watchers (an infinite fresh window): see
+            # NamespaceService.negative_window.
+            negative_window=listing_fresh_window(readdir_ttl, revalidate_after),
         )
         self.cache_manager.forget_listed_attrs = self._forget_cached_copy_attrs
         self.cache_manager.path_guard = self._try_path_locked
