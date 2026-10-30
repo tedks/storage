@@ -1,5 +1,6 @@
 """Local filesystem storage-member implementation."""
 
+import errno
 import os
 import shutil
 import stat
@@ -20,37 +21,48 @@ def _is_internal_xattr(name: str) -> bool:
     return name.startswith(_INTERNAL_XATTR_PREFIX) and name != XATTR_CONFIG_NAME
 
 
+# Errors copy2 ignores per xattr: the name cannot be read or written here.
+_XATTR_SKIP_ERRNOS = (errno.EPERM, errno.ENOTSUP, errno.ENODATA, errno.EINVAL)
+
+
 def _listxattr(path) -> List[str]:
     try:
         return os.listxattr(path)
-    except OSError:
-        return []
+    except OSError as exc:
+        if exc.errno in (errno.ENOTSUP, errno.ENODATA, errno.EINVAL):
+            return []
+        raise
 
 
 def _copy_file(src: Path, dst: Path):
     """shutil.copy2 without the mount's internal xattrs.
 
-    Bytes, mode, times and every other xattr are copied as copy2 would
-    (xattrs best effort, as there). An existing destination keeps its inode,
-    and so its xattrs: internal ones it carries (left by an older copy2) are
-    removed. Times are set last, since nothing after them may move them.
+    Bytes, xattrs, mode and times, in copy2's order: the xattrs go before
+    the chmod, since changing a user xattr on a file needs write permission
+    on it. Internal user.storage.* names are never copied. An existing
+    destination keeps its inode, and so its xattrs: its user.* names are
+    made to match the source's (internal ones an older copy2 left, and
+    names the source no longer has, such as a config policy since removed);
+    other namespaces (ACLs, security labels) are only copied over, as copy2
+    does. Errors copy2 ignores per name are ignored; others raise.
     """
     shutil.copyfile(src, dst)
     st = os.stat(src)
-    os.chmod(dst, stat.S_IMODE(st.st_mode))
+    keep = {name for name in _listxattr(src) if not _is_internal_xattr(name)}
     for name in _listxattr(dst):
-        if _is_internal_xattr(name):
+        if name.startswith("user.") and name not in keep:
             try:
                 os.removexattr(dst, name)
-            except OSError:
-                pass
-    for name in _listxattr(src):
-        if _is_internal_xattr(name):
-            continue
+            except OSError as exc:
+                if exc.errno not in _XATTR_SKIP_ERRNOS:
+                    raise
+    for name in sorted(keep):
         try:
             os.setxattr(dst, name, os.getxattr(src, name))
-        except OSError:
-            pass
+        except OSError as exc:
+            if exc.errno not in _XATTR_SKIP_ERRNOS:
+                raise
+    os.chmod(dst, stat.S_IMODE(st.st_mode))
     os.utime(dst, ns=(st.st_atime_ns, st.st_mtime_ns))
 
 
