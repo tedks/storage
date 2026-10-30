@@ -1526,6 +1526,28 @@ class TestFSStreamingIntegration(unittest.TestCase):
         edit = b"E" * 4096
         expected = edit + payload[len(edit):]
 
+        # The index lock, traced: the writer's first attempt to take it
+        # shows it reached the window (with the fix it then waits there).
+        writer_at_index = threading.Event()
+        real_lock = self.fs.state_manager._db_lock
+
+        class TracedLock:
+            def acquire(self, *args, **kwargs):
+                if threading.current_thread().name == "window-writer":
+                    writer_at_index.set()
+                return real_lock.acquire(*args, **kwargs)
+
+            def release(self):
+                real_lock.release()
+
+            __enter__ = acquire
+
+            def __exit__(self, *exc):
+                real_lock.release()
+
+        self.fs.state_manager._db_lock = TracedLock()
+        self.addCleanup(setattr, self.fs.state_manager, "_db_lock", real_lock)
+
         cache = self.fs.cache_manager
         real_store = cache.store_file_metadata
         at_store = threading.Event()
@@ -1552,9 +1574,11 @@ class TestFSStreamingIntegration(unittest.TestCase):
             rvfd, session = self._stream_whole_file("window.bin", payload)
             self.assertTrue(at_store.wait(timeout=3.0))
             self.assertTrue((self.cache_dir / "window.bin").exists())
-            writer = threading.Thread(target=write_through_mount, daemon=True)
+            writer = threading.Thread(target=write_through_mount, name="window-writer", daemon=True)
             writer.start()
-            writer.join(0.3)
+            self.assertTrue(writer_at_index.wait(timeout=3.0))
+            # Unfixed, the writer finishes inside the window; fixed, it waits.
+            writer.join(0.2)
             go.set()
             writer.join(timeout=5.0)
             session.worker.join(timeout=5.0)
