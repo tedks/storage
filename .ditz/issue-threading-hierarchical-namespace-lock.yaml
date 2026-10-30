@@ -21,3 +21,11 @@ log_events:
   who: Ted Smith
   what: created
   comment: ""
+- time: 2026-10-30T02:21:57-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'PR #137 council round 1 (Claude seat): now live behind fuse_threads. A
+    directory rename or rmdir waiting behind one slow open''s member transfer (up
+    to the SFTP timeout) blocks, by writer preference, every new path-locked handler
+    on the mount for that time (getattr/readdir unaffected). Decide before fuse_threads
+    defaults on (stage 4).'
