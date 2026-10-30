@@ -359,11 +359,13 @@ class TestFSStreamingIntegration(unittest.TestCase):
     def _fail_streamed_refetch(self, path, payload):
         """Open and read past fail_after_offset, so the session fails after a prefix."""
         vfd = self.fs.open(path, os.O_RDONLY)
-        self.assertIsNotNone(self._session_for(vfd))
-        self.assertEqual(self.fs.read(path, 4096, 0, vfd), payload[:4096])
-        with self.assertRaises(FuseOSError):
-            self.fs.read(path, 4096, 96 * 1024, vfd)
-        self.fs.release(path, vfd)
+        try:
+            self.assertIsNotNone(self._session_for(vfd))
+            self.assertEqual(self.fs.read(path, 4096, 0, vfd), payload[:4096])
+            with self.assertRaises(FuseOSError):
+                self.fs.read(path, 4096, 96 * 1024, vfd)
+        finally:
+            self.fs.release(path, vfd)
         partial = self.cache_dir / (path.lstrip('/') + ".storage.partial")
         self.assertTrue(self._wait_for(lambda: not partial.exists(), timeout=5.0))
 
@@ -418,6 +420,84 @@ class TestFSStreamingIntegration(unittest.TestCase):
         row = self.fs.state_manager.get_file_metadata('/changed.bin')
         self.assertEqual(SyncStatus.CLEAN, row.sync_status)
         self.assertEqual(len(changed), row.size)
+
+    def test_full_fetch_losing_to_a_promoted_prefix_does_not_index_it(self):
+        # Council round 1 on #146: a full fetch (a write-open) copies the
+        # whole file while a streaming session for the same never-cached
+        # path fails and promotes its prefix; the fetch's link then finds
+        # the prefix at the path and used to index it as the whole file
+        # (CLEAN, prefix size), so it was served truncated and, once
+        # written, synced over the member.
+        self.backend.copy_delay = 0
+        payload = os.urandom(192 * 1024)
+        (self.backend_dir / "raced.bin").write_bytes(payload)
+
+        real_copy = self.backend.copy_to_local
+        in_copy = threading.Event()
+        go = threading.Event()
+        self.addCleanup(go.set)
+        copies = []
+
+        def held_copy(virtual_path, local_path):
+            copies.append(virtual_path)
+            if len(copies) == 1:
+                in_copy.set()
+                self.assertTrue(go.wait(timeout=10.0))
+            return real_copy(virtual_path, local_path)
+
+        rvfd = self.fs.open('/raced.bin', os.O_RDONLY)
+        self.assertIsNotNone(self._session_for(rvfd))
+        self.assertEqual(self.fs.read('/raced.bin', 4096, 0, rvfd), payload[:4096])
+
+        outcome = {}
+
+        def write_open():
+            try:
+                outcome["vfd"] = self.fs.open('/raced.bin', os.O_RDWR)
+            except BaseException as exc:  # noqa: BLE001 - reported below
+                outcome["error"] = exc
+
+        with patch.object(self.backend, "copy_to_local", side_effect=held_copy):
+            writer = threading.Thread(target=write_open, daemon=True)
+            writer.start()
+            self.assertTrue(in_copy.wait(timeout=5.0))
+            self.backend.fail_after_offset = 64 * 1024
+            with self.assertRaises(FuseOSError):
+                self.fs.read('/raced.bin', 4096, 96 * 1024, rvfd)
+            self.fs.release('/raced.bin', rvfd)
+            cache_path = self.cache_dir / "raced.bin"
+            self.assertTrue(self._wait_for(lambda: cache_path.exists(), timeout=5.0))
+            self.assertLess(cache_path.stat().st_size, len(payload))  # the prefix won
+            go.set()
+            writer.join(timeout=5.0)
+        self.assertFalse(writer.is_alive())
+        self.assertNotIn("error", outcome)
+        self.fs.release('/raced.bin', outcome["vfd"])
+
+        self.assertEqual(payload, cache_path.read_bytes())
+        row = self.fs.state_manager.get_file_metadata('/raced.bin')
+        self.assertEqual(len(payload), row.size)
+        self.assertEqual(SyncStatus.CLEAN, row.sync_status)
+
+    def test_unindexed_prefix_is_dropped_only_when_unopened_and_unindexed(self):
+        from storage.streaming import PREFIX_XATTR
+        cache_path = self.cache_dir / "p.bin"
+        cache_path.write_bytes(b"prefix")
+        os.setxattr(str(cache_path), PREFIX_XATTR, b"1")
+        vfd = self.fs.open('/p.bin', os.O_RDONLY)
+        self.assertFalse(self.fs._drop_unindexed_prefix('/p.bin', cache_path))
+        self.assertTrue(cache_path.exists())
+        self.fs.release('/p.bin', vfd)
+        self.assertTrue(self.fs._drop_unindexed_prefix('/p.bin', cache_path))
+        self.assertFalse(cache_path.exists())
+
+        # An indexed file is never a droppable prefix, marker or not.
+        fh = self.fs.create('/q.bin', 0o644)
+        self.fs.release('/q.bin', fh)
+        q_path = self.cache_dir / "q.bin"
+        os.setxattr(str(q_path), PREFIX_XATTR, b"1")
+        self.assertFalse(self.fs._drop_unindexed_prefix('/q.bin', q_path))
+        self.assertTrue(q_path.exists())
 
     def test_streaming_session_is_shared_across_readers(self):
         payload = os.urandom(512 * 1024)
