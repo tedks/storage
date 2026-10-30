@@ -1,0 +1,33 @@
+id: ssh-system-ssh-controlmaster
+title: 'rsync and the watcher: share one OpenSSH connection per host (ControlMaster)'
+desc: 'Follow-up from ditz ssh-connection-per-thread (lane connections, browsing-latency
+  plan D5). The paramiko side now holds one transport per member, but RsyncBackend
+  uploads run `rsync -e ssh` (a full SSH handshake per file) and each watcher group
+  runs its own system `ssh`. OpenSSH connection sharing (ControlMaster=auto, ControlPath
+  under a per-mount runtime directory, ControlPersist bounded) would make each upload
+  reuse one connection per host.
+
+
+  Interactions: the remote gate''s `ssh` shim (#107) passes `-F` with a per-run config;
+  a ControlPath must not land in a shared directory, must be removed at unmount, and
+  a stale socket after a crash must not wedge uploads (ControlMaster=auto falls back
+  when the socket is dead, but a hung master blocks clients). A multiplexed master
+  also counts against the server''s MaxSessions alongside nothing else (it is a separate
+  TCP connection from paramiko''s).
+
+
+  Measure first: count rsync handshakes per sync batch in the remote gate before deciding
+  it matters.'
+type: task
+component: fs
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-30T00:48:31-00:00
+references: []
+log_events:
+- time: 2026-10-30T00:48:31-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
