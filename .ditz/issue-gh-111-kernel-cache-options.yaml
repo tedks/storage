@@ -1,0 +1,20 @@
+id: gh-111-kernel-cache-options
+title: Kernel cache options follow the listing fresh window
+desc: 'Lane listing PR A (docs/browsing_latency_plan.md D2): one fuse_mount_options()
+  helper used by the mount and the mounted tests; attr/entry timeouts follow the listing
+  fresh window (1 s with watchers), negative_timeout 10 s, auto_cache; per-profile
+  overrides and CLI echo. Ruling: oq-listing-cache-lifetime B. Supersedes gh-111-fuse-attr-timeouts
+  A.'
+type: feature
+component: listing
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-30T00:32:08-00:00
+references: []
+log_events:
+- time: 2026-10-30T00:32:08-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
