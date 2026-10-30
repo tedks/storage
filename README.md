@@ -434,6 +434,14 @@ Configuration is hierarchical - child directories inherit from parents, with the
 5. `storage debug reprobe-locations` explicitly repopulates non-cache member rows for the rebuilt file set using the cache root to keep `user.storage.metadata` authoritative
 6. `storage debug verify-index` audits the cache/index boundary without mutating state
 
+**Conflict View:**
+1. A name on several members whose listings report regular files of different sizes is shown at once as `name.<member>`, one entry per copy, without hashing anything
+2. Copies of equal size show the plain name and are hashed on the member in the background (`xxh128sum` over SSH): one hash at a time per member, at the lowest priority, newest directory first; they split into `name.<member>` at the next `readdir` if the hashes differ. Equal mtimes are not taken as identity
+3. The view never downloads a file to hash it: a copy the member cannot hash itself (no `xxh128sum`, or the hash timed out) is left unverified, keeps the plain name, and is not hashed again until its listed size or mtime changes
+4. `getfattr -n user.storage.checksums` on the name lists each copy as `<member>:<hash>:<time>`, `<member>:unverified:<time>`, or `<member>:size=<bytes>:<time>` for a size split
+5. Hashes are kept in memory only, so a remount hashes equal-size duplicates again when their directories are listed
+6. Measured in the remote gate (`test_mounted_conflict_view_hash_budget`: two SSH members, four same-size and four different-size duplicates of 256 KiB): listing the directory schedules 8 member hashes reading 2 MiB, at most one at a time per member; before this change it was 16 hashes reading 4 MiB, up to four at a time per member, and the different-size copies split only after their hashes
+
 **Replication:**
 1. Use extended attributes for per-directory configuration
 2. Select storage members using consistent hashing
@@ -463,7 +471,7 @@ Implemented:
 - Directory listings fresh for `revalidate_after` and refreshed in the background after it, answering `stat` and missing names without a member round trip
 - Local cache with LRU eviction, revalidated against the member on open (`revalidate_after`); streaming cold reads with background prefetch that stops when readers close early (`streaming_keep_after_close`)
 - Background sync workers with retry; N-way replication configured per directory through xattrs
-- Conflict detection on sync, and `storage conflicts` to list and resolve conflicts
+- Conflict detection on sync, and `storage conflicts` to list and resolve conflicts; a conflict view in listings that splits copies of different sizes from the listing alone and hashes equal-size copies in the background on the members, never by download
 - Remote inotify watchers that invalidate the cache when a member changes
 - TOML mount profiles
 - A multithreaded FUSE loop (`fuse_threads`, off by default until field-tested), so a slow member call for one file does not hold up listings, stats and reads of others
