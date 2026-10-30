@@ -229,3 +229,66 @@ backends = [
                 self.assertNotEqual(result.exit_code, 0, msg=result.output)
                 self.assertRegex(result.output, "keep.after.close")
                 mock_mount.assert_not_called()
+
+
+class TestMountKernelCacheCLI(unittest.TestCase):
+    """The kernel cache timeouts come from the profile and are echoed at mount."""
+
+    def setUp(self):
+        self.temp_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.temp_dir, True)
+        self.runner = CliRunner()
+        self.config_path = self.temp_dir / "storage.toml"
+
+    def _mount(self, profile_lines="", extra_args=()):
+        self.config_path.write_text(
+            f"""
+[mounts.kc]
+mountpoint = "{self.temp_dir / 'mnt'}"
+cache = "{self.temp_dir / 'cache'}"
+{profile_lines}
+backends = [
+  "ssh://user@storage-host.example:/srv/raid/media/",
+]
+""".strip()
+        )
+        with patch("storage.cli_mount.mount_storage") as mock_mount:
+            result = self.runner.invoke(
+                main, ["mount", "--config", str(self.config_path), *extra_args, "kc"],
+            )
+        return result, mock_mount
+
+    def test_defaults_follow_revalidate_after(self):
+        result, mock_mount = self._mount(extra_args=("--revalidate-after", "90"))
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        kwargs = mock_mount.call_args.kwargs
+        for key in ("attr_timeout", "entry_timeout", "negative_timeout"):
+            self.assertIsNone(kwargs[key])
+        self.assertIn(
+            "Kernel cache: attributes 90.0s, entries 90.0s, missing names 10.0s",
+            result.output,
+        )
+
+    def test_watchers_echo_one_second(self):
+        result, _ = self._mount(extra_args=("--enable-watchers",))
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        self.assertIn("Kernel cache: attributes 1.0s, entries 1.0s, missing names 10.0s",
+                      result.output)
+
+    def test_profile_overrides_reach_mount_and_echo(self):
+        result, mock_mount = self._mount(
+            "attr_timeout = 20\nentry_timeout = 30\nnegative_timeout = 0"
+        )
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        kwargs = mock_mount.call_args.kwargs
+        self.assertEqual(20.0, kwargs["attr_timeout"])
+        self.assertEqual(30.0, kwargs["entry_timeout"])
+        self.assertEqual(0.0, kwargs["negative_timeout"])
+        self.assertIn("Kernel cache: attributes 20.0s, entries 30.0s, missing names 0.0s",
+                      result.output)
+
+    def test_bad_timeout_rejected_before_mounting(self):
+        result, mock_mount = self._mount("negative_timeout = -1")
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("negative_timeout", result.output)
+        mock_mount.assert_not_called()

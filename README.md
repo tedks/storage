@@ -215,6 +215,19 @@ time out (a hung remote disk) costs the request and a probe each time,
 and is marked unavailable after two such timeouts in a row. Walking a large cached tree after the age costs one
 round trip per file.
 
+The kernel keeps its own cache in front of the mount. With watchers off,
+it remembers names and attributes for `revalidate_after` seconds, so a
+path walk or a repeated `stat` inside that window does not reach the
+mount at all; with watchers on it keeps them for 1 s, because the mount
+cannot evict the kernel's entries when a watcher reports a change. A name
+that does not exist is remembered as missing for 10 s. A file's pages stay
+in the page cache across opens while its size and mtime are unchanged and
+are dropped when they change, so a refetched file is read fresh. Changes
+made through the mount are visible at once. A change made directly on a
+member can take up to that long to show in `stat`. The profile keys
+`attr_timeout`, `entry_timeout` and `negative_timeout` (seconds) override
+the three timeouts.
+
 #### SSH host keys
 
 There is no host-key setting yet: host-key verification is not configurable,
