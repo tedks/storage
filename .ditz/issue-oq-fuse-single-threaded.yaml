@@ -36,8 +36,8 @@ type: task
 component: open-questions
 release:
 reporter: Ted Smith <tedks@riseup.net>
-status: unstarted
-disposition:
+status: closed
+disposition: fixed
 creation_time: 2026-10-29T21:52:15-00:00
 references: []
 log_events:
@@ -53,3 +53,7 @@ log_events:
     Ted''s field test. Locking design and stages in docs/browsing_latency_plan.md
     D6 and 4.4. Lane threading; the stage that turns threads on waits for lane connections
     (per-member transport pool) to land.'
+- time: 2026-10-30T00:29:08-00:00
+  who: Ted Smith
+  what: 'closed: fixed'
+  comment: 'Ruled: B, staged behind a mount option'
