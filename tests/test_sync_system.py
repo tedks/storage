@@ -14,12 +14,14 @@ import threading
 import shutil
 from pathlib import Path
 
-from storage.fs import StorageFS
+from storage.fs import StorageFS, fuse_mount_options
 from storage.backends.local import LocalBackend
 
 
-class TestSyncSystemIntegration(unittest.TestCase):
-    """System tests with mounted filesystem"""
+class _MountedCase(unittest.TestCase):
+    """A two-member local mount; START_SYNC says whether sync workers run."""
+
+    START_SYNC = True
 
     def setUp(self):
         """Set up test environment with actual mount"""
@@ -48,8 +50,12 @@ class TestSyncSystemIntegration(unittest.TestCase):
             self.db_path,
             backends,
             cache_size=50 * 1024 * 1024,  # 50MB cache
-            num_sync_workers=2
+            num_sync_workers=2,
+            start_sync=self.START_SYNC,
         )
+        if not self.START_SYNC:
+            # init() starts the workers at mount unless they look started.
+            self.fs._sync_started = True
 
         # Mount in separate thread (FUSE blocks)
         self.mount_thread = threading.Thread(
@@ -74,7 +80,12 @@ class TestSyncSystemIntegration(unittest.TestCase):
                 str(self.mount_dir),
                 nothreads=True,
                 foreground=True,
-                allow_other=False
+                allow_other=False,
+                **fuse_mount_options(
+                    self.fs.backends,
+                    enable_watchers=self.fs._enable_watchers,
+                    fresh_window=self.fs._revalidate_after,
+                ),
             )
         except Exception as e:
             print(f"Mount error: {e}")
@@ -101,6 +112,11 @@ class TestSyncSystemIntegration(unittest.TestCase):
                 return True
             time.sleep(0.05)
         return predicate()
+
+
+
+class TestSyncSystemIntegration(_MountedCase):
+    """System tests with mounted filesystem"""
 
     def test_write_and_sync(self):
         """Test writing file and automatic sync"""
@@ -283,6 +299,94 @@ class TestSyncSystemIntegration(unittest.TestCase):
             ),
             "rsync temp files should not persist in cache or backends",
         )
+
+
+class TestKernelCacheVisibility(_MountedCase):
+    """Kernel cache options (fuse_mount_options) against writes through the mount.
+
+    Sync workers stay off, so members never change and every answer comes
+    from the cache and the kernel: uploads racing a rename or unlink leave
+    old names on members (ditz sync-namespace-orphans), a separate problem.
+    """
+
+    START_SYNC = False
+
+    def test_writes_through_the_mount_are_visible_at_once(self):
+        """The kernel keeps entries and attributes for the fresh window (60 s
+        here) and misses for 10 s; every write path must still show at once."""
+        m = self.mount_dir
+        try:
+            (m / "a.txt").write_text("one")
+        except Exception as e:
+            self.skipTest(f"Cannot write to mount (may need FUSE permissions): {e}")
+
+        # Prime the kernel's caches: a listing, positive entries, and a miss
+        # for every name about to appear.
+        self.assertEqual(["a.txt"], sorted(os.listdir(m)))
+        os.stat(m / "a.txt")
+        for name in ("b.txt", "c.txt", "link", "sub", "new.txt"):
+            self.assertFalse(os.path.lexists(m / name))
+
+        os.rename(m / "a.txt", m / "b.txt")
+        self.assertEqual(["b.txt"], sorted(os.listdir(m)))
+        self.assertFalse(os.path.lexists(m / "a.txt"))
+        self.assertEqual(3, os.stat(m / "b.txt").st_size)
+
+        (m / "c.txt").write_text("three")
+        os.symlink("b.txt", m / "link")
+        os.mkdir(m / "sub")
+        self.assertEqual(["b.txt", "c.txt", "link", "sub"], sorted(os.listdir(m)))
+        self.assertEqual(5, os.stat(m / "c.txt").st_size)
+        self.assertTrue(os.path.islink(m / "link"))
+        self.assertEqual("b.txt", os.readlink(m / "link"))
+        self.assertEqual("one", (m / "link").read_text())
+        self.assertTrue(os.path.isdir(m / "sub"))
+
+        # A write that changes the size is seen by stat at once.
+        with open(m / "c.txt", "a") as f:
+            f.write("+more")
+        self.assertEqual(10, os.stat(m / "c.txt").st_size)
+        self.assertEqual("three+more", (m / "c.txt").read_text())
+        os.truncate(m / "c.txt", 2)
+        self.assertEqual(2, os.stat(m / "c.txt").st_size)
+
+        # The miss cached for new.txt does not hide a file created through the mount.
+        (m / "sub" / "new.txt").write_text("n")
+        (m / "new.txt").write_text("n")
+        self.assertTrue(os.path.exists(m / "new.txt"))
+
+        os.unlink(m / "b.txt")
+        os.unlink(m / "link")
+        os.rename(m / "sub" / "new.txt", m / "sub" / "moved.txt")
+        os.unlink(m / "sub" / "moved.txt")
+        os.rmdir(m / "sub")
+        self.assertEqual(["c.txt", "new.txt"], sorted(os.listdir(m)))
+        for name in ("b.txt", "link", "sub"):
+            self.assertFalse(os.path.lexists(m / name))
+
+    def test_kernel_keeps_attributes_for_the_window(self):
+        """A repeated stat inside the window does not reach the mount."""
+        try:
+            (self.mount_dir / "kept.txt").write_text("k")
+        except Exception as e:
+            self.skipTest(f"Cannot write to mount (may need FUSE permissions): {e}")
+        calls = []
+        original = self.fs.getattr
+
+        def counting_getattr(path, fh=None):
+            calls.append(path)
+            return original(path, fh)
+
+        self.fs.getattr = counting_getattr
+        try:
+            os.stat(self.mount_dir / "kept.txt")
+            first = calls.count("/kept.txt")
+            time.sleep(1.5)  # past libfuse's 1 s default
+            for _ in range(5):
+                os.stat(self.mount_dir / "kept.txt")
+            self.assertEqual(first, calls.count("/kept.txt"))
+        finally:
+            self.fs.getattr = original
 
 
 if __name__ == '__main__':

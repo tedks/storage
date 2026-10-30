@@ -628,7 +628,7 @@ def mounted_factory(remote, tmp_path):
     """
     from fuse import FUSE
 
-    from storage.fs import StorageFS, fuse_subtype_options
+    from storage.fs import StorageFS, fuse_mount_options
 
     created: List[tuple] = []
 
@@ -661,7 +661,8 @@ def mounted_factory(remote, tmp_path):
         def run():
             try:
                 FUSE(fs, str(mount), nothreads=True, foreground=True, allow_other=False,
-                     **fuse_subtype_options(backends))
+                     **fuse_mount_options(backends, enable_watchers=fs._enable_watchers,
+                                          fresh_window=fs._revalidate_after))
             except BaseException as exc:  # reported by the failure below
                 errors.append(exc)
 

@@ -18,7 +18,7 @@ import unittest
 from pathlib import Path
 
 from storage.backends.local import LocalBackend
-from storage.fs import StorageFS
+from storage.fs import StorageFS, fuse_mount_options
 
 
 class SlowRemoteLoopbackBackend(LocalBackend):
@@ -45,6 +45,7 @@ def _mount_fs(fs: StorageFS, mount_dir: Path):
         nothreads=True,
         foreground=True,
         allow_other=False,
+        **fuse_mount_options(fs.backends, enable_watchers=fs._enable_watchers, fresh_window=fs._revalidate_after),
     )
 
 
