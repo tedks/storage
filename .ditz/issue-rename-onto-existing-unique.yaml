@@ -1,0 +1,21 @@
+id: rename-onto-existing-unique
+title: Renaming onto an existing file fails in the index (UNIQUE constraint on files.virtual_path)
+desc: 'StateManager.rename_path moves the old row onto the new path without removing
+  the target''s row, so a rename that replaces an existing file (mv a b with b present,
+  both indexed) raises sqlite3.IntegrityError: UNIQUE constraint failed: files.virtual_path
+  after the cache copy has already moved. Found by lane threading on 051627d while
+  testing rename locking. Fix: drop or replace the target''s rows (and locations)
+  inside rename_path, matching POSIX rename-over semantics.'
+type: bugfix
+component: fs
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-30T01:10:09-00:00
+references: []
+log_events:
+- time: 2026-10-30T01:10:09-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
