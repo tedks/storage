@@ -1869,12 +1869,21 @@ class StorageFS(Operations):
         except OSError as e:
             raise FuseOSError(e.errno)
 
-    def symlink(self, target, source):
-        """Create symbolic link: `ln -s source target`.
+    # Symlinks are refused until they replicate (ruling
+    # oq-symlink-through-mount B; ditz symlink-replication): a link kept
+    # only in the cache would vanish with it.
+    _SYMLINKS_ENABLED = False
 
-        fusepy passes the new link's path first and its contents second.
-        The link lives in the cache only; nothing syncs it to a member.
+    def symlink(self, target, source):
+        """Create symbolic link: `ln -s source target`; refused with EPERM.
+
+        symlink(2) documents EPERM for a filesystem that does not support
+        symbolic links. fusepy passes the new link's path first and its
+        contents second; _symlink keeps that order for when links
+        replicate.
         """
+        if not self._SYMLINKS_ENABLED:
+            raise FuseOSError(errno.EPERM)
         resolved = self._resolve_path(target)
         with self._path_locked(resolved.canonical_path):
             return self._symlink(resolved, source)

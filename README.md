@@ -271,6 +271,11 @@ host as written in the profile (case aside) and the port; nothing is
 resolved, so members that reach one machine by different names or by
 its address are not grouped and get no warning.
 
+Symbolic links cannot be created through the mount: `ln -s` fails with
+`EPERM` ("Operation not permitted"), because a link would live only in the
+local cache and vanish with it. Links that already exist on a member are
+listed and followed as the member reports them.
+
 #### SSH host keys
 
 There is no host-key setting yet: host-key verification is not configurable,
