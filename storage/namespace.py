@@ -888,7 +888,10 @@ class NamespaceService:
                 newer = self._listing_as_of.get(path, float("-inf")) > started_at
                 newer_snapshot = self.readdir_snapshot.get(path) if newer else None
                 # A snapshot is not served once its listing has expired, so
-                # both go; the time goes only with the listing it stamps.
+                # both go; the time goes only with the listing it stamps (a
+                # guard: they are always set and dropped together). Linear
+                # in the listed directories, under both locks, once per
+                # listing.
                 now = time.monotonic()
                 expired = [
                     dir_path for dir_path, (at, _, _) in self.entry_attrs.items()
