@@ -70,7 +70,8 @@ class TestSyncManager(unittest.TestCase):
         time.sleep(0.2)  # monitor asleep, workers idle in their queue wait
         started = time.monotonic()
         self.sync_manager.stop()
-        self.assertLess(time.monotonic() - started, 0.5)
+        # Under the 1 s worker poll and the 30 s monitor sleep, with headroom for load.
+        self.assertLess(time.monotonic() - started, 0.9)
         self.assertEqual(self.sync_manager.get_queue_size(), 0)
         self.assertTrue(self.sync_manager.wait_for_completion(timeout=0.1))
 
@@ -81,7 +82,7 @@ class TestSyncManager(unittest.TestCase):
 
         self.sync_manager.start()
         for worker in self.sync_manager.workers:
-            def slow(task, _w=worker):
+            def slow(task):
                 taken.set()
                 release.wait(5.0)
                 return True

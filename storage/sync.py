@@ -243,17 +243,19 @@ class SyncManager:
         stopped manager would look busy and wait_for_completion would never
         see an idle queue. Real tasks are put back.
         """
-        kept = []
+        drained = []
         while True:
             try:
-                task = self.task_queue.get_nowait()
+                drained.append(self.task_queue.get_nowait())
             except queue.Empty:
                 break
-            self.task_queue.task_done()
+        # Re-put real tasks before releasing the drained items' unfinished
+        # counts, so the count never reaches zero while real work is pending.
+        for task in drained:
             if task is not _WAKE:
-                kept.append(task)
-        for task in kept:
-            self.task_queue.put(task)
+                self.task_queue.put(task)
+        for _ in drained:
+            self.task_queue.task_done()
 
     def _monitor_loop(self, stop: threading.Event):
         """Monitor for dirty files and queue them for sync"""
