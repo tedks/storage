@@ -1551,8 +1551,9 @@ class StorageFS(Operations):
             raise FuseOSError(errno.EROFS)
 
         try:
-            os.lseek(entry.real_fd, offset, os.SEEK_SET)
-            written = os.write(entry.real_fd, data)
+            # Positional: a descriptor's offset is shared state, and
+            # concurrent writes through one fh must not move each other's.
+            written = os.pwrite(entry.real_fd, data, offset)
             self.cache_manager.mark_cache_size_dirty()
 
             if entry.backend_name is None:
