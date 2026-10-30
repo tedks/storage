@@ -1,0 +1,29 @@
+id: gh-111-refresh-followups
+title: 'Listing lifetime follow-ups: one refresh thread, refresh starvation, unbounded
+  watcher state'
+desc: 'PR #135 council round 1 (Claude seat) nits, deferred: (1) background refreshes
+  run on one thread, so a refresh blocked on a hung member (until its SFTP timeout)
+  holds up every other directory''s refresh; stale serving masks it, the connections
+  lane''s pool may change the cost; consider one refresh thread per member set or
+  a timeout. (2) A directory with a steady stream of child invalidations (evictions,
+  watcher events) never publishes a background refresh (each is raced), and each stale
+  access queues another full listing until the listing expires; consider publishing
+  a refresh raced only by child invalidations with those names marked unknown. (3)
+  With watchers on every member, listing state (entry_attrs, dir_cache, unknown names)
+  never ages out: memory grows with directories browsed, and unknown names cost a
+  stat each until the directory is invalidated; consider an LRU bound or the max-stale
+  prune with watchers too. (4) PR #135 notes: a negative readdir_ttl now fails validation
+  instead of clamping to 0.'
+type: task
+component: listing
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-30T02:29:50-00:00
+references: []
+log_events:
+- time: 2026-10-30T02:29:50-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
