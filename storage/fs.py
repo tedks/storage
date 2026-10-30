@@ -2193,19 +2193,22 @@ def _sigpipe_survives_fuse():
     closing an SSH transport or streaming socket whose peer is gone, there
     or afterwards, would end the process with exit 141 instead of raising
     BrokenPipeError. libfuse leaves a handler alone, so install a no-op one
-    for the duration of the mount and put back what the caller had.
+    for the duration of the mount and ignore it again afterwards.
 
-    signal.signal() works only on the main thread (the CLI's); a mount run
-    from another thread cannot be guarded and leaves SIGPIPE to the caller.
+    Only an ignored SIGPIPE is at risk; a handler or the default the caller
+    chose is left in place for the whole mount. signal.signal() works only
+    on the main thread (the CLI's); a mount run from another thread cannot
+    be guarded and leaves SIGPIPE to the caller.
     """
-    if threading.current_thread() is not threading.main_thread():
+    if (threading.current_thread() is not threading.main_thread()
+            or signal.getsignal(signal.SIGPIPE) != signal.SIG_IGN):
         yield
         return
-    previous = signal.signal(signal.SIGPIPE, _discard_sigpipe)
+    signal.signal(signal.SIGPIPE, _discard_sigpipe)
     try:
         yield
     finally:
-        signal.signal(signal.SIGPIPE, previous if previous is not None else signal.SIG_DFL)
+        signal.signal(signal.SIGPIPE, signal.SIG_IGN)
 
 
 def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,

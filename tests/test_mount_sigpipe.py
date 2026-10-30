@@ -40,6 +40,7 @@ class FakeLibfuse:
         if sigpipe_ignored():
             signal.signal(signal.SIGPIPE, signal.SIG_DFL)
         self.seen_in_destroy = (sigpipe_ignored(), sigpipe_caught())
+        self.handler_during = signal.getsignal(signal.SIGPIPE)
         if self.fail:
             raise self.fail
 
@@ -79,16 +80,20 @@ class TestMountKeepsSigpipeHarmless(unittest.TestCase):
             self._mount(FakeLibfuse(fail=RuntimeError("mount failed")))
         self.assertTrue(sigpipe_ignored())
 
-    def test_a_callers_own_disposition_comes_back(self):
+    def test_a_callers_own_handler_is_left_alone(self):
         def handler(signum, frame):
             pass
         signal.signal(signal.SIGPIPE, handler)
-        self._mount(FakeLibfuse())
+        fake = FakeLibfuse()
+        self._mount(fake)
+        self.assertIs(fake.handler_during, handler)  # not replaced for the mount
         self.assertIs(signal.getsignal(signal.SIGPIPE), handler)
 
-    def test_a_default_disposition_comes_back_as_default(self):
+    def test_a_default_disposition_is_left_alone(self):
         signal.signal(signal.SIGPIPE, signal.SIG_DFL)
-        self._mount(FakeLibfuse())
+        fake = FakeLibfuse()
+        self._mount(fake)
+        self.assertIs(fake.handler_during, signal.SIG_DFL)
         self.assertIs(signal.getsignal(signal.SIGPIPE), signal.SIG_DFL)
 
 
