@@ -9,8 +9,8 @@ type: feature
 component: listing
 release:
 reporter: Ted Smith <tedks@riseup.net>
-status: in_progress
-disposition:
+status: closed
+disposition: fixed
 creation_time: 2026-10-30T00:32:08-00:00
 references: []
 log_events:
@@ -26,5 +26,10 @@ log_events:
   who: Ted Smith
   what: started
   comment: ""
+- time: 2026-10-30T03:31:06-00:00
+  who: Ted Smith
+  what: 'closed: fixed'
+  comment: 'PR #135 merged c2fd2b1 (head 994ad5d). Browse after the window: 61 member
+    stats -> 2 background listings.'
 blocks:
 - gh-111
