@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Dict, Optional, Set, List, Tuple
 
 from .backends.base import Backend
-from .cache import CacheManager
+from .cache import PARTIAL_SUFFIX, CacheManager
 from .cache_metadata import XATTR_CACHE_METADATA_NAME, scan_cache_entries
 from .file_config import FileConfig, get_inherited_config
 from .models import FileLocation, FileMetadata, StreamingKeepAfterClose, SyncStatus
@@ -85,7 +85,7 @@ class StorageFS(Operations):
     CACHE_STATE_XATTR = "user.storage.cache"
     CACHE_METADATA_XATTR = XATTR_CACHE_METADATA_NAME
     _STUB_XATTR = "user.storage.stub"
-    _PARTIAL_SUFFIX = ".storage.partial"
+    _PARTIAL_SUFFIX = PARTIAL_SUFFIX
     _STREAM_STATE_XATTR = "user.storage.stream"
     # Member baselines for revalidation on open (see _store_member_check).
     MEMBER_STAT_XATTR = "user.storage.member_stat"
@@ -1136,12 +1136,15 @@ class StorageFS(Operations):
         # If a backend is explicitly requested (conflict suffix), bypass replication manager.
         if resolved.backend_name:
             backend = self.backends.get(resolved.backend_name)
-            cache_path.parent.mkdir(parents=True, exist_ok=True)
 
+            # The probe stays outside the try: its errors propagate, as
+            # they always have; only a failed transfer falls back below.
             if backend and backend.exists(canonical_path):
                 try:
-                    backend.copy_to_local(canonical_path, cache_path)
-                    return True
+                    if self.cache_manager.cache_file(
+                        resolved.requested_path, backend, source_virtual_path=canonical_path,
+                    ):
+                        return True
                 except Exception:
                     pass
 
@@ -1552,8 +1555,9 @@ class StorageFS(Operations):
             raise FuseOSError(errno.EROFS)
 
         try:
-            os.lseek(entry.real_fd, offset, os.SEEK_SET)
-            written = os.write(entry.real_fd, data)
+            # Positional: a descriptor's offset is shared state, and
+            # concurrent writes through one fh must not move each other's.
+            written = os.pwrite(entry.real_fd, data, offset)
             self.cache_manager.mark_cache_size_dirty()
 
             if entry.backend_name is None:

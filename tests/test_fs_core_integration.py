@@ -87,6 +87,39 @@ class TestFSCoreIntegration(unittest.TestCase):
             self.fs.open('/offline.txt', os.O_RDONLY)
         self.assertEqual(ctx.exception.errno, errno.EHOSTUNREACH)
 
+    def test_failed_member_copy_open_serves_no_partial_file(self):
+        content = b"member-copy " * 100
+        (self.backend1_dir / "copy.txt").write_bytes(content)
+        real_copy = self.backends["backend1"].copy_to_local
+
+        def half_then_fail(virtual_path, local_path):
+            Path(local_path).write_bytes(content[: len(content) // 2])
+            raise OSError(errno.EIO, "member went away mid-transfer")
+
+        # A copy that dies mid-transfer leaves nothing at the cache path, so
+        # the cached-copy fallback cannot serve half a file.
+        with patch.object(self.backends["backend1"], "copy_to_local", side_effect=half_then_fail):
+            with self.assertRaises(FuseOSError) as ctx:
+                self.fs.open('/copy.txt.backend1', os.O_RDONLY)
+        self.assertEqual(ctx.exception.errno, errno.ENOENT)
+        self.assertEqual(sorted(p.name for p in self.cache_dir.rglob("*.storage.partial")), [])
+        self.assertFalse((self.cache_dir / "copy.txt.backend1").exists())
+
+        with patch.object(self.backends["backend1"], "copy_to_local", side_effect=real_copy):
+            vfd = self.fs.open('/copy.txt.backend1', os.O_RDONLY)
+        data = self.fs.read('/copy.txt.backend1', len(content) + 1, 0, vfd)
+        self.fs.release('/copy.txt.backend1', vfd)
+        self.assertEqual(data, content)
+
+    def test_member_probe_error_on_a_suffixed_open_is_not_enoent(self):
+        (self.backend1_dir / "probe.txt").write_text("x")
+        with patch.object(self.backends["backend1"], "exists",
+                          side_effect=OSError(errno.ETIMEDOUT, "probe timed out")):
+            with self.assertRaises(OSError) as ctx:
+                self.fs.open('/probe.txt.backend1', os.O_RDONLY)
+        self.assertNotIsInstance(ctx.exception, FuseOSError)
+        self.assertEqual(ctx.exception.errno, errno.ETIMEDOUT)
+
     def test_cache_state_xattr_reports_cache_presence_and_backend_availability(self):
         content = "xattr-data"
         (self.backend1_dir / "xattr.txt").write_text(content)

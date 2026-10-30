@@ -6,6 +6,7 @@ Files are cached on first access and evicted using LRU when space is needed.
 """
 
 import os
+import secrets
 import time
 import threading
 from pathlib import Path
@@ -13,7 +14,7 @@ from contextlib import nullcontext
 from typing import Callable, ContextManager, Optional, List, Set
 
 from .backends.base import Backend
-from .cache_metadata import write_cache_metadata
+from .cache_metadata import PARTIAL_SUFFIX, write_cache_metadata
 from .models import FileMetadata, SyncStatus
 from .state import StateManager
 
@@ -53,6 +54,13 @@ class CacheManager:
         self.state_manager = state_manager
         self.max_size_bytes = max_size_bytes
         self._lock = threading.RLock()
+        # Bytes promised to fetches in flight (cache_file): counted against
+        # max_size_bytes so concurrent fetches cannot each see the same free
+        # space. Under _lock.
+        self._reserved_bytes = 0
+        # Bumped by every rescan; a fetch that sees it move knows the scan
+        # may have counted its temp file (see _replace_into_cache).
+        self._scan_count = 0
 
         # Ensure cache root exists
         self.cache_root.mkdir(parents=True, exist_ok=True)
@@ -76,6 +84,7 @@ class CacheManager:
         if self._size_dirty:
             self._current_size_bytes = self._scan_total_cache_size()
             self._size_dirty = False
+            self._scan_count += 1
 
     def get_cache_path(self, virtual_path: str) -> Path:
         """Get the local cache path for a virtual file"""
@@ -115,7 +124,7 @@ class CacheManager:
         """
         with self._lock:
             self._ensure_size_current_locked()
-            available = self.max_size_bytes - self._current_size_bytes
+            available = self.max_size_bytes - self._current_size_bytes - self._reserved_bytes
 
         if available >= required_bytes:
             return 0
@@ -234,47 +243,94 @@ class CacheManager:
         """
         Download a file from backend into cache
 
+        The cache lock is not held across member I/O: space is reserved
+        under it, the bytes land in a temp file beside the cache path and
+        are installed only if the cache path is still absent
+        (fetch_into_cache), so nothing sees a half-fetched file as cached
+        and a file that appeared meanwhile, possibly written, is kept.
+
         Args:
             virtual_path: Virtual path of file
             backend: Backend to download from
             source_virtual_path: Virtual path to read from backend (defaults to virtual_path)
 
         Returns:
-            True if successfully cached, False otherwise
+            True if the path is cached afterwards (by this fetch or one that
+            installed first), False otherwise
         """
         source_virtual_path = source_virtual_path or virtual_path
+        # Member probes: no lock, and their errors propagate as before.
+        if not backend.exists(source_virtual_path):
+            return False
+        file_size = backend.get_size(source_virtual_path)
+
         with self._lock:
-            cache_path = self.get_cache_path(virtual_path)
-            existing_size = cache_path.stat().st_size if cache_path.exists() else 0
-
-            # Check if backend has the file
-            if not backend.exists(source_virtual_path):
-                return False
-
-            # Get file size to ensure we have space
-            file_size = backend.get_size(source_virtual_path)
-
-            # Ensure we have space
             if not self.ensure_space(file_size):
                 print(f"Warning: Insufficient cache space for {virtual_path}")
                 return False
+            self._reserved_bytes += file_size
+        try:
+            self.fetch_into_cache(backend, source_virtual_path, self.get_cache_path(virtual_path))
+            self.state_manager.update_access_time(virtual_path)
+            return True
+        except Exception as e:
+            print(f"Error caching {virtual_path} from {backend.name}: {e}")
+            return False
+        finally:
+            with self._lock:
+                self._reserved_bytes -= file_size
 
-            # Download file
-            try:
-                backend.copy_to_local(source_virtual_path, cache_path)
-                new_size = cache_path.stat().st_size if cache_path.exists() else 0
-                self._current_size_bytes += (new_size - existing_size)
-                self._size_dirty = False
+    def fetch_into_cache(self, backend: Backend, source_virtual_path: str, cache_path: Path) -> bool:
+        """Copy a member file to cache_path through a temp file beside it.
 
-                # Update access time in state
-                self.state_manager.update_access_time(virtual_path)
+        The copy runs without the cache lock into a fresh name that ends in
+        PARTIAL_SUFFIX, so listings hide it and the startup sweep removes
+        it after a crash. It is then hard-linked to cache_path, which fails
+        if anything is there already: a concurrent fetch that installed
+        first, a create, or a copy a writer has since changed is never
+        replaced, and the existing inode keeps its bytes and xattrs. The
+        link and the size accounting run under the lock. The cache
+        filesystem must support hard links (it must support xattrs anyway).
+        No space is reserved here (cache_file does that).
 
-                return True
-
-            except Exception as e:
+        Returns True when this copy was installed, False when a file was
+        already there and this copy was discarded. Raises what the copy or
+        the link raised (FileExistsError when something other than a
+        regular file is there), with the temp file removed.
+        """
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = cache_path.parent / f".{secrets.token_hex(8)}{PARTIAL_SUFFIX}"
+        with self._lock:
+            scans = self._scan_count
+        try:
+            backend.copy_to_local(source_virtual_path, temp_path)
+            size = os.lstat(temp_path).st_size
+            with self._lock:
+                try:
+                    os.link(temp_path, cache_path)
+                except FileExistsError:
+                    if not (cache_path.is_file() and not cache_path.is_symlink()):
+                        raise
+                    return False
+                self._current_size_bytes += size
+            return True
+        except BaseException:
+            # Whatever the copy wrote may have been counted by a rescan,
+            # and a failure after the link leaves the sum unknown.
+            with self._lock:
                 self._size_dirty = True
-                print(f"Error caching {virtual_path} from {backend.name}: {e}")
-                return False
+            raise
+        finally:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                with self._lock:
+                    self._size_dirty = True
+            with self._lock:
+                if self._scan_count != scans:
+                    # A rescan during the copy may have counted the temp
+                    # file as well as the linked copy.
+                    self._size_dirty = True
 
     def mark_accessed(self, virtual_path: str):
         """Mark a file as accessed (update LRU)"""
@@ -447,7 +503,6 @@ class CacheManager:
             cache_path.touch()
             new_size = cache_path.stat().st_size if cache_path.exists() else 0
             self._current_size_bytes += (new_size - existing_size)
-            self._size_dirty = False
 
             # Mark as accessed
             self.mark_accessed(virtual_path)
@@ -463,7 +518,6 @@ class CacheManager:
                     file_size = cache_path.stat().st_size
                     cache_path.unlink()
                     self._current_size_bytes = max(0, self._current_size_bytes - file_size)
-                    self._size_dirty = False
                 except OSError as e:
                     self._size_dirty = True
                     print(f"Warning: Failed to delete cache file {virtual_path}: {e}")

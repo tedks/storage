@@ -24,8 +24,12 @@ _INTERNAL_CACHE_PREFIXES = (
     ".storage.mount.",
     ".storage.db-",
 )
+# Names ending in this are cache-internal scratch (full-fetch temp files,
+# streaming partials): hidden from listings, never indexed, and removed by
+# the startup sweep (StreamingReadManager.cleanup_stale_partials).
+PARTIAL_SUFFIX = ".storage.partial"
 _INTERNAL_CACHE_SUFFIXES = (
-    ".storage.partial",
+    PARTIAL_SUFFIX,
 )
 
 
