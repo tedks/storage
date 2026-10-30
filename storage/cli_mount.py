@@ -25,8 +25,9 @@ def shared_filesystems(backends: Dict[str, Backend]) -> List[List[str]]:
     An SSH member alone on its host cannot share with anyone, so it is not
     probed (no connection is opened for it); local members are always
     checked, which is a stat. A member whose probe fails drops out of the
-    grouping, and the host's remaining members are not probed, so an
-    unreachable host costs one connect timeout, not one per member.
+    grouping; if the connection itself failed, the host's remaining members
+    are not probed either, so an unreachable host costs one connect
+    timeout, not one per member.
     """
     on_host: Dict[Tuple[str, int], int] = {}
     for backend in backends.values():
@@ -42,7 +43,7 @@ def shared_filesystems(backends: Dict[str, Backend]) -> List[List[str]]:
                 continue
         identity = backend.filesystem_identity()
         if identity is None:
-            if isinstance(backend, SSHBackend):
+            if isinstance(backend, SSHBackend) and not backend.probe_reached_host:
                 failed_hosts.add((backend.host, backend.port))
             continue
         groups.setdefault(identity, []).append(name)
@@ -231,7 +232,7 @@ def mount(
     for names in shared_filesystems(backends):
         click.echo(
             f"Warning: members {', '.join(names)} store on the same filesystem; "
-            "replicas on it add no redundancy beyond the filesystem's own.",
+            "replicas on it do not protect against that filesystem failing.",
             err=True,
         )
 

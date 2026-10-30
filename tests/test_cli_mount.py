@@ -1,4 +1,5 @@
 import shutil
+import threading
 import tempfile
 import unittest
 from pathlib import Path
@@ -344,13 +345,13 @@ backends = ["{self.temp_dir}"]
 
 class _FakeChannel:
     def __init__(self, rc):
-        self.rc = rc
+        self.exit_status = rc
+        self.status_event = threading.Event()
+        if rc is not None:
+            self.status_event.set()
 
     def settimeout(self, _t):
         pass
-
-    def recv_exit_status(self):
-        return self.rc
 
 
 class _FakeStdout:
@@ -437,9 +438,25 @@ class TestSharedFilesystems(unittest.TestCase):
                     "f": _fake("f", "g.example", fs_output=b"7\n"),
                     "g": _fake("g", "g.example", fs_output=b"7\n"),
                 }
-                # The failing host's other members are not probed; others are.
-                self.assertEqual([["f", "g"]], shared_filesystems(backends))
-                self.assertEqual(0, backends["d"].probes)
+                reachable = not kwargs.get("fail")
+                expected = [["f", "g"]] if not reachable else [["d", "e"], ["f", "g"]]
+                self.assertEqual(expected, shared_filesystems(backends))
+                # A connection failure skips the host's other members;
+                # a bad stat on a reachable host costs only that member.
+                self.assertEqual(0 if kwargs.get("fail") else 1, backends["d"].probes)
+
+    def test_bad_root_on_a_reachable_host_does_not_hide_the_others(self):
+        backends = {
+            "bad": _fake("bad", "h.example", rc=1, fs_output=b""),
+            "d": _fake("d", "h.example", fs_output=b"7\n"),
+            "e": _fake("e", "h.example", fs_output=b"7\n"),
+        }
+        self.assertEqual([["d", "e"]], shared_filesystems(backends))
+
+    def test_missing_exit_status_times_out(self):
+        member = _fake("a", "h.example", rc=None)
+        member.connect_timeout = 0.05
+        self.assertIsNone(member.filesystem_identity())
 
     def test_probe_uses_its_own_connection_and_closes_it(self):
         member = _fake("a", "h.example", fs_output=b"7\n")
@@ -495,7 +512,7 @@ backends = ["{self.temp_dir / 'a'}", "{self.temp_dir / 'b'}"]
         warnings = [l for l in result.stderr.splitlines() if l.startswith("Warning:")]
         self.assertEqual(
             ["Warning: members local0, local1 store on the same filesystem; "
-             "replicas on it add no redundancy beyond the filesystem's own."],
+             "replicas on it do not protect against that filesystem failing."],
             warnings,
         )
         self.assertNotIn(str(self.temp_dir), "\n".join(warnings))
