@@ -1,0 +1,29 @@
+id: cache-scans-follow-symlinks
+title: Cache scans follow symlinks in the cache tree (size accounting, metadata xattrs
+  written through links)
+desc: 'Found by the PR #133 council (Claude seat). Symlinks in the cache tree (made
+  through the mount, which works since PR #133 fixed symlink()''s argument order;
+  master''s inverted handler also planted links with a caller-chosen absolute target)
+  are followed by cache scans: CacheManager.is_cached and NamespaceService.cache_state_payload
+  use exists()/is_file(); _scan_total_cache_size uses Path.stat(), so a link to a
+  large file counts its size against the cache and, having no index row, is never
+  evicted; scan_cache_entries checks os.path.isfile, then read_cache_metadata and
+  rebuild_index_from_cache''s write_cache_metadata get/set xattrs through the link,
+  so a link to another cache file rewrites that file''s metadata with the link''s
+  stat (it then looks stale-clean and is resynced), and with allow_other under root
+  a link to any host file gets a user.storage.metadata xattr written on it. Fix: lstat
+  and skip S_ISLNK in those scans and in is_cached, use follow_symlinks=False xattr
+  calls. Related: oq-symlink-through-mount.'
+type: bugfix
+component: cache
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-30T01:03:16-00:00
+references: []
+log_events:
+- time: 2026-10-30T01:03:16-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
