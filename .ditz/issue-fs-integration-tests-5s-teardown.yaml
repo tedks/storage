@@ -13,8 +13,8 @@ type: task
 component: build
 release:
 reporter: Ted Smith <tedks@riseup.net>
-status: in_progress
-disposition:
+status: closed
+disposition: fixed
 creation_time: 2026-10-30T01:41:12-00:00
 references: []
 log_events:
@@ -26,3 +26,8 @@ log_events:
   who: Ted Smith
   what: started
   comment: ""
+- time: 2026-10-30T16:57:21-00:00
+  who: Ted Smith
+  what: 'closed: fixed'
+  comment: 'Fixed by PR #143 (merge 5cbce75): SyncManager.stop no longer waits out
+    the 5 s monitor sleep; sandboxed target 675 s -> 71 s'
