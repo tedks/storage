@@ -1,0 +1,23 @@
+id: gh-111-kernel-cache-nits
+title: 'PR #133 council nits: stat wording, D2 note, attr_timeout key'
+desc: 'PR #133 council round 3 nits, deferred to PR B (gh-111-listing-lifetime), which
+  rewrites the same sentences when listings serve attributes for the fresh window:
+  (1) fs.py fuse_mount_options docstring and tests/test_sync_system.py counting-test
+  docstring say stats are answered in-process / without a member round trip; align
+  with README (a member stat once the listing is too old). (2) docs/browsing_latency_plan.md
+  D2 as-built note: add the member-stat case. (3) Optional: reject a leftover attr_timeout
+  profile key by name (profiles ignore unknown keys; the key never reached master,
+  so low risk).'
+type: task
+component: listing
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-30T01:23:51-00:00
+references: []
+log_events:
+- time: 2026-10-30T01:23:51-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
