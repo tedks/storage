@@ -420,7 +420,9 @@ class NamespaceService:
         backend_entries: Dict[str, Set[str]],
         backend_attrs: Optional[Dict[str, Dict[str, dict]]] = None,
         size_splits: Optional[Dict[str, Dict[str, int]]] = None,
-    ):
+        *,
+        replace: bool = False,
+    ) -> Dict[str, List[str]]:
         """Queue checksum computations for backend collisions in the directory.
 
         Names in size_splits (computed from the listing when not given) are
@@ -430,11 +432,14 @@ class NamespaceService:
         whether it is a directory before hashing, so the FUSE thread never
         does. A regular file's listed size, mtime and ctime (None where the
         member does not report it) go with the task as its basis, so a
-        checksum already recorded from the same basis is not recomputed.
-        Only queues; never calls a member.
+        checksum already recorded from the same basis is not recomputed,
+        unless replace (storage conflicts --verify), which hashes every one
+        again. Only queues; never calls a member. Returns {name: members}
+        for the regular files it queued with a basis.
         """
         if size_splits is None:
             size_splits = self._size_splits(backend_entries, backend_attrs)
+        queued: Dict[str, List[str]] = {}
         owners: Dict[str, Set[str]] = {}
         for backend_name, names in backend_entries.items():
             for name in names:
@@ -463,7 +468,11 @@ class NamespaceService:
                     # symlink's listed attributes are the link's, which do not
                     # change with its target, so it gets no basis.
                     check_dir = True
-                self.schedule_checksum_task(backend, virtual_child, basis, check_dir=check_dir)
+                self.schedule_checksum_task(backend, virtual_child, basis,
+                                            check_dir=check_dir, replace=replace)
+                if basis is not None:
+                    queued.setdefault(name, []).append(backend_name)
+        return queued
 
     def _apply_conflict_view(
         self,
@@ -878,10 +887,24 @@ class NamespaceService:
             futures[backend_name] = future
         return futures
 
-    def _list_members(self, path: str, generation: int, *, background: bool = False) -> List[str]:
+    def verify_listing(self, path: str) -> Dict[str, List[str]]:
+        """List path, hashing every copy of its names on several members
+        again (storage conflicts --verify); return {name: members} for the
+        names that queued on more than one member. Calls the members, like
+        a readdir that finds no fresh listing."""
+        queued: Dict[str, List[str]] = {}
+        generation = self._begin_listing(path)
+        try:
+            self._list_members(path, generation, verify_out=queued)
+        finally:
+            self._end_listing(path)
+        return queued
+
+    def _list_members(self, path: str, generation: int, *, background: bool = False,
+                      verify_out: Optional[Dict[str, List[str]]] = None) -> List[str]:
         """List the cache and every member, and publish the result unless an
         invalidation of the directory or a child raced it, or a listing that
-        began later was published first.
+        began later was published first. verify_out: see verify_listing.
 
         The members are listed concurrently and outside dir_cache_lock; their
         results are merged under it. The listing's time is when its reads
@@ -966,12 +989,15 @@ class NamespaceService:
                     if published is not None and backend_name in published[1]:
                         split_attrs[backend_name] = dict(published[1][backend_name])
         size_splits = self._size_splits(member_entries, split_attrs)
-        self._schedule_directory_checksums(
+        queued = self._schedule_directory_checksums(
             path,
             {name: names for name, names in member_entries.items() if name not in failed},
             backend_attrs,
             size_splits,
+            replace=verify_out is not None,
         )
+        if verify_out is not None:
+            verify_out.update({n: m for n, m in queued.items() if len(m) > 1})
         visible_entries = self._apply_conflict_view(path, entries, member_entries, size_splits)
         ordered_entries = sorted(visible_entries)
 

@@ -281,6 +281,65 @@ class TestRemoteConflictMount(BaseConflictMountTest):
         self.assertIn(self.backend1_name, backend_tags)
 
 
+class TestVerifyConflictMount(BaseConflictMountTest):
+    """storage conflicts --verify hashes again what the view trusts."""
+
+    content0 = "alpha\n"
+    content1 = "alpha\n"
+
+    def _cli(self, *args):
+        return subprocess.run(
+            [sys.executable, "-m", "storage.cli", "conflicts", *args],
+            capture_output=True, text=True,
+        )
+
+    def test_verify_finds_a_change_the_recorded_hash_hides(self):
+        try:
+            os.listdir(self.mount_dir)
+        except Exception as exc:
+            self.skipTest(f"Mount unavailable: {exc}")
+        # Keep the published listing: no relist sees the member's new stat,
+        # as for a rewrite that keeps size and timestamps on a member
+        # without ctime.
+        self.fs.namespace.readdir_snapshot_ttl = float('inf')
+
+        def hashed():
+            with self.fs._checksum_lock:
+                return all(
+                    getattr(self.fs._checksum_records.get(("/report.txt", m)), "checksum", None)
+                    for m in (self.backend0_name, self.backend1_name))
+        deadline = time.time() + 5
+        while not hashed() and time.time() < deadline:
+            time.sleep(0.05)
+        self.assertTrue(hashed())
+        (self.backend1_dir / "report.txt").write_text("gamma\n")
+        self.assertIn("report.txt", os.listdir(self.mount_dir))
+
+        result = self._cli(str(self.mount_dir))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("No conflicts detected.", result.stdout)
+
+        result = self._cli("--verify", str(self.mount_dir))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Verified 1 name(s) on several members; 0 could not be verified.", result.stdout)
+        self.assertIn(f"report.txt: {self.backend0_name}, {self.backend1_name}", result.stdout)
+        entries = os.listdir(self.mount_dir)
+        self.assertIn(f"report.txt.{self.backend1_name}", entries)
+        self.assertNotIn("report.txt", entries)
+
+    def test_verify_outside_a_mount_writes_nothing(self):
+        plain = Path(self.temp_dir) / "plain"
+        plain.mkdir()
+        result = self._cli("--verify", str(plain))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("is not on a storage mount", result.stderr)
+        self.assertEqual(os.listxattr(str(plain)), [])
+
+
+class TestVerifyConflictMountThreaded(TestVerifyConflictMount):
+    fuse_threads = True
+
+
 class TestLocalConflictMountThreaded(TestLocalConflictMount):
     fuse_threads = True
 

@@ -48,7 +48,7 @@ class SyncWorker(threading.Thread):
                  state_manager: StateManager, cache_manager: CacheManager,
                  replication_manager: ReplicationManager, config: SyncConfig,
                  task_complete_cb=None, should_sync_path_cb: Optional[Callable[[str], bool]] = None,
-                 member_written_cb: Optional[Callable[[str, Backend, Path], None]] = None,
+                 member_written_cb: Optional[Callable[[str, Backend, Path, Optional[str]], None]] = None,
                  upload_guard: Optional[Callable[[str], ContextManager]] = None,
                  path_guard: Optional[Callable[..., ContextManager]] = None):
         super().__init__(daemon=True, name=f"SyncWorker-{worker_id}")
@@ -145,7 +145,7 @@ class SyncManager:
                  replication_manager: ReplicationManager, num_workers: int = 2,
                  config: Optional[SyncConfig] = None,
                  should_sync_path_cb: Optional[Callable[[str], bool]] = None,
-                 member_written_cb: Optional[Callable[[str, Backend, Path], None]] = None,
+                 member_written_cb: Optional[Callable[[str, Backend, Path, Optional[str]], None]] = None,
                  upload_guard: Optional[Callable[[str], ContextManager]] = None,
                  path_guard: Optional[Callable[..., ContextManager]] = None):
         """
@@ -158,8 +158,10 @@ class SyncManager:
             num_workers: Number of sync worker threads
             config: Sync configuration (uses defaults if None)
             should_sync_path_cb: Whether a path may sync now (no open writer)
-            member_written_cb: Called (virtual_path, member, cache_path)
-                after each upload to a member
+            member_written_cb: Called (virtual_path, member, cache_path,
+                checksum) after each upload to a member; checksum is the
+                hash of what was uploaded, or None when a write to the
+                cache file may have overlapped the upload
             upload_guard: Context manager factory held across each file
                 task (StorageFS's upload lock for the path)
             path_guard: Context manager factory over paths, held across

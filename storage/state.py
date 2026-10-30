@@ -16,7 +16,7 @@ import time
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
-from .checksums import fast_checksum_file
+from .checksums import ChecksumBasis, ChecksumRecord, fast_checksum_file
 from .file_config import (
     XATTR_CONFIG_NAME as FILE_CONFIG_XATTR_NAME,
     FileConfig,
@@ -96,6 +96,21 @@ class StateManager:
         self._last_access_flush_mono = time.monotonic()
         self._configure_connection()
         self._init_db()
+        # member_checksums has its own connection and lock: callers hold
+        # StorageFS._checksum_lock across these statements, and readdir
+        # takes that lock, so they must not wait behind the index lock
+        # (held by eviction across file deletions). A leaf: nothing is
+        # taken under it. WAL lets the two connections read concurrently;
+        # SQLite's busy timeout orders their writes.
+        if db_path == ":memory:":
+            # A second connection would open another, empty database.
+            self._checksum_conn = self.conn
+            self._checksum_db_lock = self._db_lock
+        else:
+            self._checksum_conn = sqlite3.connect(db_path, check_same_thread=False)
+            self._checksum_conn.row_factory = sqlite3.Row
+            self._checksum_db_lock = threading.Lock()
+            self._configure_connection(self._checksum_conn)
 
     def _execute_write(self, query: str, params: tuple = ()):
         """Execute a single write statement and commit it atomically."""
@@ -118,8 +133,9 @@ class StateManager:
         """
         return self._db_lock
 
-    def _configure_connection(self):
+    def _configure_connection(self, conn: Optional[sqlite3.Connection] = None):
         """Configure SQLite pragmas for lower write amplification."""
+        conn = conn or self.conn
         pragmas = (
             "PRAGMA journal_mode=WAL",
             "PRAGMA synchronous=NORMAL",
@@ -128,7 +144,7 @@ class StateManager:
         )
         for pragma in pragmas:
             try:
-                self.conn.execute(pragma)
+                conn.execute(pragma)
             except sqlite3.DatabaseError:
                 # In-memory DBs and some filesystems may not support all pragmas.
                 continue
@@ -165,6 +181,25 @@ class StateManager:
             CREATE INDEX IF NOT EXISTS idx_sync_status ON files(sync_status);
             CREATE INDEX IF NOT EXISTS idx_recomputable ON files(recomputable);
             CREATE INDEX IF NOT EXISTS idx_cached ON file_locations(is_cached);
+
+            -- Member-side hashes for the conflict view, one per path and
+            -- member, valid only while the member still reports the basis
+            -- (st_size, st_mtime, st_ctime or NULL) it had when hashed.
+            -- Acceleration state: a missing row costs one member hash.
+            -- Created on open, so an older index gains it empty.
+            CREATE TABLE IF NOT EXISTS member_checksums (
+                virtual_path TEXT NOT NULL,
+                backend_name TEXT NOT NULL,
+                checksum TEXT NOT NULL,
+                hashed_at REAL NOT NULL,
+                basis_size INTEGER NOT NULL,
+                basis_mtime REAL NOT NULL,
+                basis_ctime REAL,
+                verified_at REAL NOT NULL,
+                PRIMARY KEY (virtual_path, backend_name)
+            );
+            CREATE INDEX IF NOT EXISTS idx_member_checksums_verified
+                ON member_checksums(backend_name, verified_at);
         ''')
         # Indexes created before dirty_generation existed get the column
         # appended, at the same default a fresh schema holds.
@@ -703,6 +738,125 @@ class StateManager:
         """Rename a single file entry (alias for rename_path)."""
         self.rename_path(old_virtual_path, new_virtual_path)
 
+    # ------------------------------------------------------------------ #
+    # Member checksums (the conflict view's persisted hashes)
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _member_checksum_record(row) -> ChecksumRecord:
+        basis: ChecksumBasis = (row['basis_size'], row['basis_mtime'], row['basis_ctime'])
+        return ChecksumRecord(checksum=row['checksum'], timestamp=row['hashed_at'], basis=basis)
+
+    def get_member_checksum(self, virtual_path: str, backend_name: str) -> Optional[ChecksumRecord]:
+        """The persisted hash of virtual_path on backend_name, or None.
+
+        The caller compares its basis with the member's current one: a row
+        whose basis differs describes an older file.
+        """
+        with self._checksum_db_lock:
+            row = self._checksum_conn.execute(
+                'SELECT * FROM member_checksums WHERE virtual_path = ? AND backend_name = ?',
+                (virtual_path, backend_name),
+            ).fetchone()
+        return self._member_checksum_record(row) if row else None
+
+    def put_member_checksum(self, virtual_path: str, backend_name: str, record: ChecksumRecord):
+        """Persist a verified hash with its basis, replacing the path's row
+        for the member; it counts as verified at record.timestamp.
+
+        Only a digest taken from a known basis is worth keeping: an
+        unverified record or one without a basis is refused (ValueError).
+        """
+        if record.checksum is None or record.basis is None:
+            raise ValueError("only a digest with a basis is persisted")
+        size, mtime, ctime = record.basis
+        with self._checksum_db_lock:
+            self._checksum_conn.execute(
+                '''
+                INSERT OR REPLACE INTO member_checksums
+                (virtual_path, backend_name, checksum, hashed_at,
+                 basis_size, basis_mtime, basis_ctime, verified_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ''',
+                (virtual_path, backend_name, record.checksum, record.timestamp,
+                 size, mtime, ctime, record.timestamp),
+            )
+            self._checksum_conn.commit()
+
+    def mark_member_checksum_verified(self, virtual_path: str, backend_name: str,
+                                      checksum: str, verified_at: float) -> bool:
+        """Move a row's verified_at forward if it still holds checksum.
+
+        For a re-verify that found the same digest: a row replaced since the
+        re-verify read it is left alone. Returns whether it applied.
+        """
+        with self._checksum_db_lock:
+            cursor = self._checksum_conn.execute(
+                '''
+                UPDATE member_checksums SET verified_at = MAX(verified_at, ?)
+                WHERE virtual_path = ? AND backend_name = ? AND checksum = ?
+                ''',
+                (verified_at, virtual_path, backend_name, checksum),
+            )
+            self._checksum_conn.commit()
+            return cursor.rowcount == 1
+
+    def delete_member_checksums(self, virtual_paths: Iterable[str], *, subtree: bool = False,
+                                backend_name: Optional[str] = None):
+        """Drop the persisted hashes of virtual_paths (with subtree, also of
+        everything under them), for every member or only backend_name."""
+        member_clause = '' if backend_name is None else ' AND backend_name = ?'
+        member_args: tuple = () if backend_name is None else (backend_name,)
+        with self._checksum_db_lock:
+            for path in set(virtual_paths):
+                self._checksum_conn.execute(
+                    'DELETE FROM member_checksums WHERE virtual_path = ?' + member_clause,
+                    (path,) + member_args,
+                )
+                if subtree:
+                    # A range, not LIKE: names may hold % and _. '0' sorts
+                    # right after '/', so the range is exactly path/*.
+                    prefix = path.rstrip('/')
+                    self._checksum_conn.execute(
+                        'DELETE FROM member_checksums WHERE virtual_path > ? AND virtual_path < ?'
+                        + member_clause,
+                        (prefix + '/', prefix + '0') + member_args,
+                    )
+            self._checksum_conn.commit()
+
+    def oldest_member_checksum(self, backend_name: str, verified_before: float,
+                               exclude: Iterable[str] = ()) -> Optional[Tuple[str, ChecksumRecord, float]]:
+        """The backend's row verified longest ago, if before verified_before
+        and its path has a row on another member too (a name the conflict
+        view compares; one recorded on a single member is never shown as a
+        conflict on its own), skipping paths in exclude:
+        (virtual_path, record, verified_at), else None.
+
+        Walks the (backend_name, verified_at) index in order, checking each
+        row's path by primary key, in pages.
+        """
+        exclude = set(exclude)
+        offset = 0
+        page = 64
+        while True:
+            with self._checksum_db_lock:
+                rows = self._checksum_conn.execute(
+                    '''
+                    SELECT * FROM member_checksums AS m
+                    WHERE m.backend_name = ? AND m.verified_at < ?
+                      AND EXISTS (SELECT 1 FROM member_checksums AS o
+                                  WHERE o.virtual_path = m.virtual_path
+                                    AND o.backend_name != m.backend_name)
+                    ORDER BY m.verified_at ASC LIMIT ? OFFSET ?
+                    ''',
+                    (backend_name, verified_before, page, offset),
+                ).fetchall()
+            for row in rows:
+                if row['virtual_path'] not in exclude:
+                    return row['virtual_path'], self._member_checksum_record(row), row['verified_at']
+            if len(rows) < page:
+                return None
+            offset += page
+
     def update_access_time(self, virtual_path: str):
         """Update last access time (for LRU)"""
         now = time.time()
@@ -901,3 +1055,6 @@ class StateManager:
         self._flush_access_updates(force=True)
         with self._db_lock:
             self.conn.close()
+        if self._checksum_conn is not self.conn:
+            with self._checksum_db_lock:
+                self._checksum_conn.close()

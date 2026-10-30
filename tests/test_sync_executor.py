@@ -263,6 +263,43 @@ class TestSyncExecutorOverlappingWrite(_ExecutorTestBase):
         self.assertEqual(self.executor.get_stats()["failed"], 1)
 
 
+class TestSyncExecutorUploadedChecksum(_ExecutorTestBase):
+    """The member-written callback carries the hash of what was uploaded,
+    and None when a write to the cache file may have overlapped it."""
+
+    def setUp(self):
+        super().setUp()
+        self.written = []
+        self.executor.member_written_cb = lambda *args: self.written.append(args)
+
+    def _sync(self):
+        task = SyncTask("/test.txt")
+        with patch.object(self.executor.conflict_detector, "check_conflict", return_value=None):
+            self.executor.process_file_task(task)
+
+    def test_steady_upload_reports_its_hash(self):
+        self.state_manager.set_file_metadata(_make_metadata(checksum=None))
+        cache_path = self._create_cache_file(content=b"steady")
+        self._sync()
+        self.assertEqual(self.written, [
+            ("/test.txt", self.mock_backend, cache_path,
+             self.state_manager.compute_checksum(cache_path)),
+        ])
+
+    def test_write_overlapping_the_upload_reports_no_hash(self):
+        self.state_manager.set_file_metadata(_make_metadata(checksum=None, size=2))
+        cache_path = self._create_cache_file(content=b"v1")
+
+        def write_during_copy(local_path, virtual_path):
+            cache_path.write_bytes(b"v2, longer")
+            self.cache_manager.mark_file_dirty("/test.txt", cache_path)
+
+        self.mock_backend.copy_from_local.side_effect = write_during_copy
+        self._sync()
+        self.assertEqual(len(self.written), 1)
+        self.assertIsNone(self.written[0][3])
+
+
 class TestSyncExecutorFileTask(_ExecutorTestBase):
     """Tests for SyncExecutor.process_file_task."""
 

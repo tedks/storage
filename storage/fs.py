@@ -39,7 +39,7 @@ from .replication import ReplicationManager
 from .sync import SyncManager
 from .sync_tasks import DirOperation
 from .recompute import RecomputeEngine
-from .checksum_queue import MemberHashQueues
+from .checksum_queue import DEFAULT_CHECKSUM_REVERIFY_INTERVAL, MemberHashQueues
 from .checksums import ChecksumBasis, ChecksumRecord
 from .pathing import ResolvedPath, resolve_path
 from .namespace import DEFAULT_LISTING_MAX_STALE, NamespaceService
@@ -85,6 +85,10 @@ class StorageFS(Operations):
     """
 
     CHECKSUM_XATTR = "user.storage.checksums"
+    # On a directory: setting it hashes the directory's same-size names on
+    # several members again; reading it reports how far that has got
+    # (storage conflicts --verify). Not listed by listxattr.
+    VERIFY_XATTR = "user.storage.verify"
     # How long destroy() waits for an in-flight post-crash sweep.
     SWEEP_JOIN_TIMEOUT = 60.0
     CACHE_STATE_XATTR = "user.storage.cache"
@@ -131,7 +135,8 @@ class StorageFS(Operations):
                  enable_watchers: bool = False,
                  streaming_keep_after_close: Optional[StreamingKeepAfterClose] = None,
                  revalidate_after: float = 60.0,
-                 listing_max_stale: float = DEFAULT_LISTING_MAX_STALE):
+                 listing_max_stale: float = DEFAULT_LISTING_MAX_STALE,
+                 checksum_reverify_interval: float = DEFAULT_CHECKSUM_REVERIFY_INTERVAL):
         """
         Initialize Storage filesystem
 
@@ -166,6 +171,11 @@ class StorageFS(Operations):
             listing_max_stale: Seconds after which a listing past its fresh
                 window is no longer served while a background refresh
                 runs, but replaced by listing every member at once
+            checksum_reverify_interval: Seconds between re-verifications
+                of persisted member hashes: each interval, every member
+                whose hash worker is idle hashes again the one file whose
+                persisted hash was checked longest ago (and over
+                CHECKSUM_REVERIFY_MIN_AGE ago); 0 turns it off
         """
         self.state_manager = StateManager(str(state_db))
         self.cache_manager = CacheManager(cache_root, self.state_manager, cache_size)
@@ -265,6 +275,23 @@ class StorageFS(Operations):
         # One low-priority worker per member, newest first, bounded (see
         # checksum_queue); threads start on first use, after the fork.
         self._checksum_queues = MemberHashQueues(logger=self.logger)
+        # Re-verification of persisted hashes (_reverify_tick), on a thread
+        # started by init(), after the daemonizing fork.
+        # Clamped to what Event.wait accepts.
+        self._checksum_reverify_interval = min(max(0.0, float(checksum_reverify_interval)),
+                                               threading.TIMEOUT_MAX)
+        # {member: {path: monotonic time}}: rows a re-verification could not
+        # settle, skipped until then (_settle_reverify). Under _checksum_lock.
+        self._reverify_skipped: Dict[str, Dict[str, float]] = {}
+        # (path, member or None, subtree): persisted rows a failed write may
+        # have left describing an older file; never loaded this mount.
+        # Under _checksum_lock.
+        self._persisted_refused: Set[Tuple[str, Optional[str], bool]] = set()
+        # {dir: {name: members}} queued by the dir's last forced
+        # verification (_force_verify). Under _checksum_lock.
+        self._verify_results: Dict[str, Dict[str, List[str]]] = {}
+        self._reverify_stop = threading.Event()
+        self._reverify_thread: Optional[threading.Thread] = None
 
         self.namespace = NamespaceService(
             backends=self.backends,
@@ -340,6 +367,12 @@ class StorageFS(Operations):
 
         if self._enable_watchers and not self._watchers:
             self._start_watchers()
+
+        if self._checksum_reverify_interval > 0 and self._reverify_thread is None:
+            self._reverify_thread = threading.Thread(
+                target=self._run_reverify, name="checksum-reverify", daemon=True,
+            )
+            self._reverify_thread.start()
 
     def _get_config(self, virtual_path: str) -> FileConfig:
         """Get configuration for a file"""
@@ -509,10 +542,12 @@ class StorageFS(Operations):
 
     def _forget_checksums(self, paths: Set[str], subtree: bool = False):
         """Drop the checksum records and tasks for paths (and, with subtree,
-        everything under them).
+        everything under them), persisted records included.
 
         A task that is already running cannot be cancelled; dropping it from
-        _checksum_tasks is what keeps its result from being recorded.
+        _checksum_tasks is what keeps its result from being recorded. The
+        rows go under _checksum_lock, which every record write holds, so no
+        result recorded before the forget lands after it.
         """
         prefixes = tuple(p.rstrip("/") + "/" for p in paths) if subtree else ()
 
@@ -524,6 +559,61 @@ class StorageFS(Operations):
                 del self._checksum_records[k]
             for k in [k for k in self._checksum_tasks if matches(k[0])]:
                 self._checksum_tasks.pop(k).cancel()
+            self._drop_persisted_checksums(paths, subtree=subtree)
+
+    def _drop_persisted_checksums(self, paths, *, subtree: bool = False, backend_name: Optional[str] = None):
+        """Delete persisted hashes; the caller holds _checksum_lock.
+
+        A row that could not be deleted describes a member that changed,
+        possibly without a change to its basis (a watcher event, an
+        upload), so it is refused for the rest of this mount
+        (_persisted_refused) rather than trusted on its basis.
+        """
+        paths = list(paths)
+        try:
+            self.state_manager.delete_member_checksums(paths, subtree=subtree, backend_name=backend_name)
+        except Exception as exc:
+            self.logger.warning("could not drop persisted checksums: %r", exc)
+            for path in paths:
+                self._persisted_refused.add((path, backend_name, subtree))
+            return
+        if self._persisted_refused:
+            self._retry_refused_deletes()
+
+    def _retry_refused_deletes(self):
+        """Delete the rows failed writes left, so a refusal outlives the
+        mount; the caller holds _checksum_lock. Called once the index
+        answers again (a delete succeeded, or before a write) and at
+        destroy. One statement batch per (member, subtree) group. A write
+        still covered by a refusal is skipped (_persist_checksum), so a
+        retry removes only rows from before the failure."""
+        groups: Dict[Tuple[Optional[str], bool], List[str]] = {}
+        for path, backend_name, subtree in self._persisted_refused:
+            groups.setdefault((backend_name, subtree), []).append(path)
+        for (backend_name, subtree), paths in groups.items():
+            try:
+                self.state_manager.delete_member_checksums(paths, subtree=subtree,
+                                                           backend_name=backend_name)
+            except Exception as exc:
+                self.logger.debug("retrying refused checksum deletes failed: %r", exc)
+                return
+            for path in paths:
+                self._persisted_refused.discard((path, backend_name, subtree))
+
+    def _persisted_row_refused(self, key: tuple, ignore=None) -> bool:
+        """Whether a failed write covered key (not counting the refusal
+        entry ignore); the caller holds _checksum_lock."""
+        path, backend_name = key
+        for entry in self._persisted_refused:
+            if entry == ignore:
+                continue
+            refused_path, refused_backend, subtree = entry
+            if refused_backend not in (None, backend_name):
+                continue
+            if path == refused_path or (
+                    subtree and path.startswith(refused_path.rstrip("/") + "/")):
+                return True
+        return False
 
     def _on_remote_change(self, virtual_path: str):
         """
@@ -626,16 +716,60 @@ class StorageFS(Operations):
         """Record a checksum for (path, backend) and keep only the latest.
 
         A task still hashing the same key started before this result, so its
-        result is dropped rather than allowed to replace this one.
+        result is dropped rather than allowed to replace this one. A digest
+        with a basis is persisted too, so the next mount does not hash the
+        file again while the member reports the same basis; any other
+        result replaces the persisted one by none.
         """
         key = (canonical_path, backend_name)
+        record = ChecksumRecord(checksum=checksum, timestamp=timestamp, basis=basis)
         with self._checksum_lock:
             superseded = self._checksum_tasks.pop(key, None)
             if superseded is not None:
                 superseded.cancel()
-            self._checksum_records[key] = ChecksumRecord(
-                checksum=checksum, timestamp=timestamp, basis=basis,
-            )
+            self._checksum_records[key] = record
+            self._persist_checksum(canonical_path, backend_name, record)
+
+    def _persist_checksum(self, canonical_path: str, backend_name: str, record: Optional[ChecksumRecord]):
+        """Write (or, for None or a record not worth keeping, delete) the
+        persisted hash; the caller holds _checksum_lock."""
+        if record is None or record.checksum is None or record.basis is None:
+            self._drop_persisted_checksums({canonical_path}, backend_name=backend_name)
+            return
+        own = (canonical_path, backend_name, False)
+        if self._persisted_refused:
+            # Before the write, so a refused subtree or member-wide delete
+            # does not remove the row written now.
+            self._retry_refused_deletes()
+            if self._persisted_row_refused((canonical_path, backend_name), ignore=own):
+                # Still refused: the index is not answering, a row written
+                # now would be deleted by a later retry and is not loaded
+                # meanwhile, so it is not written; the old row stays refused.
+                self._persisted_refused.add(own)
+                return
+        try:
+            self.state_manager.put_member_checksum(canonical_path, backend_name, record)
+        except Exception as exc:
+            # The row left behind, if any, predates this record.
+            self.logger.warning("could not persist a checksum: %r", exc)
+            self._persisted_refused.add((canonical_path, backend_name, False))
+            return
+        self._persisted_refused.discard(own)
+
+    def _load_persisted_checksum(self, key: tuple, basis: ChecksumBasis) -> bool:
+        """Install the persisted record for key if it was taken from basis;
+        the caller holds _checksum_lock. Returns whether it did."""
+        if self._persisted_refused and self._persisted_row_refused(key):
+            return False
+        try:
+            record = self.state_manager.get_member_checksum(*key)
+        except Exception as exc:
+            self.logger.debug("could not read a persisted checksum: %r", exc)
+            return False
+        if record is None or record.basis != basis:
+            return False
+        self._checksum_records[key] = record
+        return True
 
     def _aggregate_checksums_yaml(self, canonical_path: str) -> bytes:
         """Return a YAML list of '<backend>:<value>:<timestamp>' entries.
@@ -675,7 +809,9 @@ class StorageFS(Operations):
         file changes or its records are forgotten), so nothing is
         scheduled;
         without a basis (no listed attributes, or a symlink) the file is
-        always hashed again. check_dir: the worker first asks the member
+        always hashed again. A record persisted by an earlier mount (or
+        by sync, for what it uploaded) counts as made from its basis: one
+        that matches is loaded instead of hashing. check_dir: the worker first asks the member
         whether the path is a directory and records nothing if so.
         replace: the member's copy just changed (a release uploaded it), so
         a task already queued or running for it is superseded rather than
@@ -694,15 +830,21 @@ class StorageFS(Operations):
                 # and records nothing.
                 del self._checksum_tasks[key]
                 previous.cancel()
-            elif not replace:
+            elif not replace and basis is not None:
                 record = self._checksum_records.get(key)
-                if basis is not None and record is not None and record.basis == basis:
+                if record is not None and record.basis == basis:
+                    return
+                # Sync may have persisted a hash of what it uploaded.
+                if self._load_persisted_checksum(key, basis):
                     return
 
             try:
+                # A replacing hash (an upload, conflicts --verify) is never
+                # dropped from a full queue: nothing would schedule it again.
                 future = self._checksum_queues.submit(
                     backend.name,
                     lambda: self._compute_checksum(backend, canonical_path, check_dir),
+                    pinned=replace,
                 )
             except RuntimeError:
                 return  # destroy() shut the queues down
@@ -721,19 +863,233 @@ class StorageFS(Operations):
                         # record left from before would outlive the change
                         # that scheduled this hash (an upload, a new basis).
                         self._checksum_records.pop(key, None)
+                        self._persist_checksum(canonical_path, backend.name, None)
                         return
                     result = done.result()
                     if result is None:
                         # Could not be asked: whatever was recorded before
                         # predates the change that scheduled this hash.
                         self._checksum_records.pop(key, None)
+                        self._persist_checksum(canonical_path, backend.name, None)
                     elif result is not self._IS_DIRECTORY:
                         checksum, ts = result
                         self._record_checksum(canonical_path, backend.name, checksum, ts, basis)
 
             future.add_done_callback(_record)
 
+    def _force_verify(self, dir_path: str):
+        """List the directory and hash again every copy of its names on
+        several members that the listing does not split by size, whatever
+        is recorded (storage conflicts --verify). The hashes are queued;
+        the listing itself calls the members, as a readdir would. Which
+        names it queued is kept for _verify_status, for the last
+        VERIFY_RESULTS_KEPT directories, never dropping one still pending."""
+        queued = self.namespace.verify_listing(dir_path)
+        with self._checksum_lock:
+            self._verify_results.pop(dir_path, None)
+            self._verify_results[dir_path] = queued
+            # Pending directories are never dropped, so with many verified
+            # at once this holds more; each is bounded by its directory.
+            for old in list(self._verify_results):
+                if len(self._verify_results) <= self.VERIFY_RESULTS_KEPT:
+                    break
+                if old != dir_path and not self._verify_counts(old)["pending"]:
+                    del self._verify_results[old]
+
+    # Directories whose last forced verification _verify_status reports.
+    VERIFY_RESULTS_KEPT = 64
+
+    def _verify_status(self, dir_path: str) -> Dict[str, int]:
+        """Of the names the directory's last forced verification hashed
+        again (regular files of one size on several members): how many
+        have a hash still pending, how many are verified on every member,
+        and how many are not (a member could not hash its copy, or the
+        copy changed and its record was forgotten). known is 0 when no
+        verification of the directory is on record (none yet, or one
+        settled and since dropped), and the counts are then zero."""
+        with self._checksum_lock:
+            if dir_path not in self._verify_results:
+                return {"known": 0, "pending": 0, "verified": 0, "unverified": 0}
+            return dict(self._verify_counts(dir_path), known=1)
+
+    def _verify_counts(self, dir_path: str) -> Dict[str, int]:
+        """_verify_status's counts; the caller holds _checksum_lock."""
+        status = {"pending": 0, "verified": 0, "unverified": 0}
+        for name, members in self._verify_results.get(dir_path, {}).items():
+            keys = [(str(Path(dir_path) / name), m) for m in members]
+            if any(key in self._checksum_tasks for key in keys):
+                status["pending"] += 1
+            elif all(getattr(self._checksum_records.get(key), "checksum", None) for key in keys):
+                status["verified"] += 1
+            else:
+                status["unverified"] += 1
+        return status
+
     _IS_DIRECTORY = object()
+    _GONE = object()
+
+    # A persisted hash checked more recently than this is not re-verified:
+    # with few rows, the pass would otherwise hash the same files over and
+    # over.
+    CHECKSUM_REVERIFY_MIN_AGE = 3600.0
+
+    def _run_reverify(self):
+        while not self._reverify_stop.wait(self._checksum_reverify_interval):
+            try:
+                self._reverify_tick()
+            except Exception:
+                self.logger.exception("checksum re-verification pass failed")
+
+    def _reverify_tick(self):
+        """Queue one re-verification per member that is idle and reachable.
+
+        Persisted hashes are trusted while the member reports the same
+        basis, which a same-size rewrite within the member's mtime
+        resolution (or one that kept the mtime, on a member that reports
+        no ctime) does not change. Hashing the oldest-checked row again,
+        one file per member per interval, finds such a rewrite eventually,
+        off the browse path: only an idle hash worker takes one, so a
+        listing's hashes always go first. Only names recorded on several
+        members are taken: they are the ones the view compares. A row the
+        pass could not settle (not asked, no digest, changed while hashed)
+        is skipped for CHECKSUM_REVERIFY_MIN_AGE, so one file cannot hold
+        up the rest.
+        """
+        verified_before = time.time() - self.CHECKSUM_REVERIFY_MIN_AGE
+        now = time.monotonic()
+        for name, backend in self.backends.items():
+            if not self._checksum_queues.idle(name):
+                continue
+            with self._checksum_lock:
+                skipped = self._reverify_skipped.get(name, {})
+                for path in [p for p, until in skipped.items() if until <= now]:
+                    del skipped[path]
+                exclude = set(skipped)
+            try:
+                if not backend.is_available():
+                    continue
+                row = self.state_manager.oldest_member_checksum(name, verified_before, exclude)
+            except Exception as exc:
+                self.logger.debug("re-verification on %s skipped: %r", name, exc)
+                continue
+            if row is not None:
+                self._schedule_reverify(backend, row[0], row[1])
+
+    def _schedule_reverify(self, backend: Backend, canonical_path: str, persisted: ChecksumRecord):
+        """Hash canonical_path on backend again and settle its persisted row.
+
+        Registered like a listing's hash, so a forget, an upload or a
+        replacing hash supersedes it, and a listing meanwhile waits for it.
+        Settled under _checksum_lock (_settle_reverify).
+        """
+        key = (canonical_path, backend.name)
+        with self._checksum_lock:
+            if key in self._checksum_tasks:
+                return
+            # Read again under the lock: a record written since the pass
+            # read the row replaced it, and this re-verification would
+            # judge the new row by the old one.
+            try:
+                if self.state_manager.get_member_checksum(*key) != persisted:
+                    return
+            except Exception:
+                return
+            try:
+                future = self._checksum_queues.submit(
+                    backend.name,
+                    lambda: self._reverify_member_copy(backend, canonical_path, persisted.basis),
+                )
+            except RuntimeError:
+                return
+            self._checksum_tasks[key] = future
+
+            def _settle(done):
+                with self._checksum_lock:
+                    if self._checksum_tasks.get(key) is not done:
+                        return
+                    del self._checksum_tasks[key]
+                    if not done.cancelled():
+                        self._settle_reverify(key, persisted, done.result())
+
+            future.add_done_callback(_settle)
+
+    def _reverify_member_copy(self, backend: Backend, canonical_path: str,
+                              persisted_basis: ChecksumBasis):
+        """On the member's hash worker: stat, hash, stat again.
+
+        Returns (checksum or None, timestamp); _GONE when the member no
+        longer has the file (or it is not a regular file) or reports
+        another basis than persisted_basis (the row describes an older
+        file; nothing is hashed); None when the member could not be asked
+        or the file changed while it was hashed.
+        """
+        def basis_of():
+            st = backend.stat(canonical_path)
+            mode = getattr(st, "st_mode", None)
+            if mode is None or not stat.S_ISREG(mode):
+                return None
+            return (st.st_size, st.st_mtime, getattr(st, "st_ctime", None))
+
+        try:
+            before = basis_of()
+        except FileNotFoundError:
+            return self._GONE
+        except Exception as exc:
+            self.logger.debug("re-verification stat on %s failed: %r", backend.name, exc)
+            return None
+        if before is None or before != persisted_basis:
+            return self._GONE
+        result = self._compute_checksum(backend, canonical_path)
+        if result is None:
+            return None
+        try:
+            after = basis_of()
+        except Exception as exc:
+            self.logger.debug("re-verification stat on %s failed: %r", backend.name, exc)
+            return None
+        if after != before:
+            return None  # changed while hashed
+        return result
+
+    def _settle_reverify(self, key: tuple, persisted: ChecksumRecord, result):
+        """Apply a re-verification; the caller holds _checksum_lock.
+
+        Gone, or another basis: the row goes, and the in-memory record if
+        it was made from the same basis. Not asked, changed while hashed,
+        or no digest (the member cannot hash it now; the row is still what
+        it last reported): the row stays as it is, and is skipped by the
+        pass for CHECKSUM_REVERIFY_MIN_AGE. The same digest: checked. Another
+        digest from the same basis: a rewrite the basis could not show; the
+        new hash replaces the row and, where the view tracks the name, its
+        record.
+        """
+        canonical_path, backend_name = key
+        if result is self._GONE:
+            record = self._checksum_records.get(key)
+            if record is not None and record.basis == persisted.basis:
+                del self._checksum_records[key]
+            self._persist_checksum(canonical_path, backend_name, None)
+            return
+        if result is None or result[0] is None:
+            self._reverify_skipped.setdefault(backend_name, {})[canonical_path] = (
+                time.monotonic() + self.CHECKSUM_REVERIFY_MIN_AGE)
+            return
+        checksum, ts = result
+        if checksum == persisted.checksum:
+            try:
+                self.state_manager.mark_member_checksum_verified(
+                    canonical_path, backend_name, persisted.checksum, ts)
+            except Exception as exc:
+                self.logger.debug("could not mark a checksum verified: %r", exc)
+            return
+        self.logger.info(
+            "re-verification found a copy on %s rewritten without a change "
+            "to its size or timestamps", backend_name,
+        )
+        record = ChecksumRecord(checksum=checksum, timestamp=ts, basis=persisted.basis)
+        if key in self._checksum_records:
+            self._checksum_records[key] = record
+        self._persist_checksum(canonical_path, backend_name, record)
 
     def _compute_checksum(self, backend: Backend, canonical_path: str, check_dir: bool = False):
         """Compute a checksum on the member side, on its hash worker.
@@ -1014,8 +1370,16 @@ class StorageFS(Operations):
         self._store_member_check(canonical_path, cache_path, identity, members, replace=True)
         self._clear_recheck(canonical_path, backend.name)
 
-    def _record_member_written(self, virtual_path: str, backend: Backend, cache_path: Path):
+    def _record_member_written(self, virtual_path: str, backend: Backend, cache_path: Path,
+                               checksum: Optional[str] = None):
         """Sync callback: backend now holds the cache file's content.
+
+        checksum is the hash of what was uploaded (None: not known, a write
+        may have overlapped the upload). With the member's stat after the
+        upload as its basis it becomes the member's conflict-view record,
+        so the mount's own writes never wait on, or hide from, a member
+        hash: a same-size rewrite within the member's mtime resolution
+        (or one that kept the mtime) is recorded as what it is.
 
         Runs in a sync worker, so the stat costs the FUSE loop nothing. The
         member's stat after an upload is its baseline for later checks:
@@ -1030,6 +1394,7 @@ class StorageFS(Operations):
             identity = self._cache_identity(os.lstat(str(cache_path)))
         except OSError as exc:
             self.logger.debug("post-sync stat of the cache file failed: %r", exc)
+            self._record_uploaded_checksum(virtual_path, backend.name, None, None)
             return
         with self._member_checks_lock:
             check = self._member_checks.get(virtual_path)
@@ -1041,12 +1406,50 @@ class StorageFS(Operations):
             member_stat = backend.stat(virtual_path)
         except Exception as exc:
             self.logger.debug("post-sync stat on %s failed: %r", backend.name, exc)
+            self._record_uploaded_checksum(virtual_path, backend.name, None, None)
             if had_baseline:
                 self._store_member_check(virtual_path, cache_path, identity, {},
                                          drop=(backend.name,), drop_unless_checked_since=check)
             return
+        self._record_uploaded_checksum(virtual_path, backend.name, checksum, member_stat)
         self._store_member_check(virtual_path, cache_path, identity,
                                  {backend.name: (member_stat.st_size, member_stat.st_mtime)})
+
+    def _record_uploaded_checksum(self, virtual_path: str, backend_name: str,
+                                  checksum: Optional[str], member_stat):
+        """The member now holds content hashing to checksum, with
+        member_stat as its basis; None for either: its content is not
+        known, and whatever was recorded for it predates the upload.
+
+        Persisted always, so a listing that reports this basis loads it;
+        installed in memory only where the name is already tracked (a
+        record or a hash in flight, which the upload supersedes), so
+        uploads of names on one member do not grow the in-memory table.
+        A conflict copy (name.member) uploads through release(), which
+        schedules its own hash.
+        """
+        resolved = self._resolve_path(virtual_path)
+        if resolved.backend_name is not None:
+            return
+        key = (resolved.canonical_path, backend_name)
+        record = None
+        if checksum is not None and member_stat is not None:
+            mode, size = getattr(member_stat, "st_mode", None), getattr(member_stat, "st_size", None)
+            mtime = getattr(member_stat, "st_mtime", None)
+            if mode is not None and stat.S_ISREG(mode) and size is not None and mtime is not None:
+                # The listing's basis: st_ctime is absent where the member
+                # does not report it (SFTP), as in its listings.
+                basis = (size, mtime, getattr(member_stat, "st_ctime", None))
+                record = ChecksumRecord(checksum=checksum, timestamp=time.time(), basis=basis)
+        with self._checksum_lock:
+            superseded = self._checksum_tasks.pop(key, None)
+            if superseded is not None:
+                superseded.cancel()
+            if record is None:
+                self._checksum_records.pop(key, None)
+            elif superseded is not None or key in self._checksum_records:
+                self._checksum_records[key] = record
+            self._persist_checksum(key[0], backend_name, record)
 
     def _member_for_revalidation(self, canonical_path: str) -> Tuple[Optional[Backend], List[str]]:
         """Pick the member to stat, from the index alone (no remote call).
@@ -1935,6 +2338,9 @@ class StorageFS(Operations):
         if name == self.CHECKSUM_XATTR:
             return self._aggregate_checksums_yaml(resolved.canonical_path)
 
+        if name == self.VERIFY_XATTR:
+            return json.dumps(self._verify_status(resolved.canonical_path), sort_keys=True).encode()
+
         if name == self.CACHE_STATE_XATTR:
             payload = self._cache_state_payload(resolved)
             return json.dumps(payload, sort_keys=True).encode("utf-8")
@@ -1949,6 +2355,11 @@ class StorageFS(Operations):
         if name in {self.CHECKSUM_XATTR, self.CACHE_STATE_XATTR, self.CACHE_METADATA_XATTR,
                     self.MEMBER_STAT_XATTR}:
             # Ignore manual writes for derived attrs.
+            return
+        if name == self.VERIFY_XATTR:
+            if not stat.S_ISDIR(self.getattr(path)["st_mode"]):
+                raise FuseOSError(errno.ENOTDIR)
+            self._force_verify(self._resolve_path(path).canonical_path)
             return
         cache_path = self.cache_manager.get_cache_path(path)
 
@@ -2105,11 +2516,17 @@ class StorageFS(Operations):
         self._streaming_manager.destroy()
         self._stop_watchers()
 
+        self._reverify_stop.set()
+        with self._checksum_lock:
+            if self._persisted_refused:
+                self._retry_refused_deletes()
         try:
             self._checksum_queues.shutdown()
         except Exception:
             pass
         self.namespace.shutdown()
+        if self._reverify_thread is not None:
+            self._reverify_thread.join(timeout=5)
 
         # The sweep uses the index; give it a bounded chance to finish before
         # the index closes. If it has not, _sweep_pending stays True, the pid
@@ -2340,7 +2757,8 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
                  listing_max_stale: float = DEFAULT_LISTING_MAX_STALE,
                  entry_timeout: Optional[float] = None,
                  negative_timeout: Optional[float] = None,
-                 fuse_threads: bool = False):
+                 fuse_threads: bool = False,
+                 checksum_reverify_interval: float = DEFAULT_CHECKSUM_REVERIFY_INTERVAL):
     """
     Mount a Storage filesystem
 
@@ -2363,6 +2781,8 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
         revalidate_after: Seconds after which opening a CLEAN cached file
             stats its member (see StorageFS._revalidate_cached_file)
         readdir_ttl, listing_max_stale: listing freshness (see StorageFS)
+        checksum_reverify_interval: seconds between re-verifications of
+            persisted member hashes; 0 turns them off (see StorageFS)
         entry_timeout, negative_timeout: kernel cache timeouts in seconds;
             None derives them (see fuse_mount_options)
         fuse_threads: Run libfuse's multithreaded loop instead of nothreads.
@@ -2443,6 +2863,7 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
         streaming_keep_after_close=streaming_keep_after_close,
         revalidate_after=revalidate_after,
         listing_max_stale=listing_max_stale,
+        checksum_reverify_interval=checksum_reverify_interval,
     )
     fs.mount_lock_file = lock_file
     if unclean_shutdown:

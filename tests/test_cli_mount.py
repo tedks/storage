@@ -338,6 +338,55 @@ backends = ["{self.temp_dir}"]
         self.assertIs(True, self._mount("", ["--fuse-threads"])[1])
 
 
+class TestMountChecksumReverify(unittest.TestCase):
+    """checksum_reverify_interval: profile key and flag, default 60, 0 = off."""
+
+    def setUp(self):
+        self.temp_dir = Path(tempfile.mkdtemp())
+        self.runner = CliRunner()
+        self.config_path = self.temp_dir / "storage.toml"
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _mount(self, profile_line="", extra_args=()):
+        self.config_path.write_text(
+            f"""
+[mounts.reverify]
+mountpoint = "{self.temp_dir / 'mnt'}"
+cache = "{self.temp_dir / 'cache'}"
+{profile_line}
+backends = ["{self.temp_dir}"]
+""".strip()
+        )
+        with patch("storage.cli_mount.mount_storage") as mock_mount:
+            result = self.runner.invoke(
+                main,
+                ["mount", "--config", str(self.config_path), *extra_args, "reverify"],
+            )
+        interval = mock_mount.call_args.kwargs["checksum_reverify_interval"] if mock_mount.called else None
+        return result, interval
+
+    def test_default_once_a_minute(self):
+        result, interval = self._mount()
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        self.assertEqual(interval, 60.0)
+        self.assertIn("Hash re-verification: one file per idle member every 60.0s", result.output)
+
+    def test_profile_and_flag(self):
+        self.assertEqual(self._mount("checksum_reverify_interval = 300")[1], 300.0)
+        result, interval = self._mount("checksum_reverify_interval = 300",
+                                       ["--checksum-reverify-interval", "0"])
+        self.assertEqual(interval, 0.0)
+        self.assertIn("Hash re-verification: off", result.output)
+
+    def test_negative_rejected_before_mounting(self):
+        result, interval = self._mount("checksum_reverify_interval = -5")
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("checksum_reverify_interval", result.output)
+        self.assertIsNone(interval)
+
+
 class TestSharedSSHHostWarning(unittest.TestCase):
     """Members on one SSH host compete for it; the mount says so on stderr."""
 

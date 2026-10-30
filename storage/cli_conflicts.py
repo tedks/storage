@@ -1,7 +1,10 @@
+import json
+import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -72,8 +75,43 @@ def _run_merge_tool(tool: str, local: Path, ancestor: Path, remote: Path) -> Opt
         return None
 
 
+# Set on a directory of a storage mount to hash its names on several members
+# again; read for {"pending", "verified", "unverified"} (StorageFS.VERIFY_XATTR).
+VERIFY_XATTR = "user.storage.verify"
+
+
+def _verify_directory(directory: Path, poll_interval: float = 0.5) -> dict:
+    """Have the mount list directory and hash again every same-size copy of
+    a name in it found on several members, and wait until none is pending.
+
+    The status is read before anything is set, so a directory outside a
+    storage mount gets no xattr written to it.
+    """
+    path = str(directory)
+    try:
+        json.loads(os.getxattr(path, VERIFY_XATTR))
+    except (OSError, ValueError) as exc:
+        raise click.ClickException(f"{directory} is not on a storage mount") from exc
+    try:
+        os.setxattr(path, VERIFY_XATTR, b"1")
+    except OSError as exc:
+        raise click.ClickException(f"Could not verify {directory}: {exc}") from exc
+    while True:
+        try:
+            status = json.loads(os.getxattr(path, VERIFY_XATTR))
+        except (OSError, ValueError) as exc:
+            raise click.ClickException(f"Lost track of the verification of {directory}: {exc}") from exc
+        if not status.get("known"):
+            raise click.ClickException(
+                f"The mount no longer holds the verification of {directory} (many other "
+                "directories were verified since); run it again")
+        if not status.get("pending"):
+            return status
+        time.sleep(poll_interval)
+
+
 @click.command("conflicts")
-@click.argument("directory", type=click.Path(exists=True))
+@click.argument("directory", type=click.Path(exists=True, file_okay=False))
 @click.option(
     "-f",
     "--file",
@@ -95,7 +133,16 @@ def _run_merge_tool(tool: str, local: Path, ancestor: Path, remote: Path) -> Opt
     is_flag=True,
     help="Attempt a 3-way merge for the specified conflict",
 )
-def conflicts(directory, target_file, take_backend, merge):
+@click.option(
+    "--verify",
+    is_flag=True,
+    help=(
+        "Hash every copy of a name found on several members with the same size again "
+        "first; otherwise a recorded hash is trusted while the member reports the same "
+        "size and timestamps"
+    ),
+)
+def conflicts(directory, target_file, take_backend, merge, verify):
     """
     List and resolve checksum conflicts in a mounted directory.
 
@@ -104,6 +151,12 @@ def conflicts(directory, target_file, take_backend, merge):
     or --merge/--meld to attempt a trivial merge when possible.
     """
     dir_path = Path(directory)
+    if verify:
+        status = _verify_directory(dir_path)
+        click.echo(
+            f"Verified {status.get('verified', 0)} name(s) on several members; "
+            f"{status.get('unverified', 0)} could not be verified."
+        )
     conflict_groups = _scan_conflict_groups(dir_path)
 
     if not conflict_groups:
