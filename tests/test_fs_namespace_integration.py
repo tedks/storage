@@ -1089,7 +1089,8 @@ class TestFSNamespaceIntegration(unittest.TestCase):
     def test_size_split_xattr_carries_listed_sizes(self):
         (self.backend1_dir / "dup.txt").write_text("one")
         (self.backend2_dir / "dup.txt").write_text("three")
-        self.assertIn("dup.txt.backend1", self._list_and_settle())
+        # A listing that stays published (_list_and_settle's expires at once).
+        self.assertIn("dup.txt.backend1", set(self.fs.readdir('/', None)))
         entries = yaml.safe_load(self.fs.getxattr('/dup.txt.backend1', StorageFS.CHECKSUM_XATTR))
         self.assertEqual(sorted(e.rsplit(":", 1)[0] for e in entries),
                          ["backend1:size=3", "backend2:size=5"])
