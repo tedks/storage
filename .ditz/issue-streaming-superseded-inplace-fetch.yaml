@@ -1,0 +1,24 @@
+id: streaming-superseded-inplace-fetch
+title: Streaming reader can see a half-copied full fetch after a superseded discard
+desc: 'Council round 1 on #130 (Codex Important, Claude nit). A write-open''s full
+  fetch (copy_to_local, copy2 in place) makes the final path exist before it is complete.
+  A finishing stream then sees EEXIST and discards its complete partial; if the fetch
+  later fails, the cache is left without the file (a refetch, no writer bytes lost),
+  and a reader attached to the superseded session that reopens via the final path
+  can see a short file. Same class as the in-place fetch racing an installed file.
+  Closed by lane threading''s fetch-to-tempfile work (gh-111-fetch-tempfile): atomic
+  publication means the final path exists only when complete. Verify and close after
+  that lands.'
+type: bugfix
+component: fs
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-30T01:00:25-00:00
+references: []
+log_events:
+- time: 2026-10-30T01:00:25-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
