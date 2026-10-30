@@ -866,12 +866,23 @@ class StorageFS(Operations):
 
     def _store_member_check(self, canonical_path: str, cache_path: Path,
                             identity: Tuple[int, int, int],
-                            updates: Dict[str, Tuple[int, float]], *, replace: bool = False):
+                            updates: Dict[str, Tuple[int, float]], *, replace: bool = False,
+                            drop: Tuple[str, ...] = (),
+                            drop_unless_checked_since: Optional[MemberCheck] = None):
         """Record a check now, merging member baselines, in memory and on the cache file.
 
         The baselines already known for this cache file (in memory, else from
         its xattr) are kept and updates applied on top; replace=True starts
-        from nothing (a fetch: the old copy's baselines describe other bytes).
+        from nothing (a fetch: the old copy's baselines describe other bytes),
+        and the members in drop lose theirs unless that member's baseline was
+        recorded since drop_unless_checked_since (the MemberCheck the caller
+        read before, or None). Compared by object: a record merges the
+        other members' baseline tuples unchanged and stores a new tuple for
+        each member it observed, so a baseline recorded meanwhile, even with
+        the same values, is newer and stays, while a record for another
+        member does not hold the drop back. A baseline that came from the
+        xattr has no object to compare once a record is made, and stays.
+        Updates and drops name different members.
         The read, merge and both writes are one critical section under
         _member_checks_lock (a leaf: getxattr and setxattr take no other
         lock), so a sync worker and the FUSE thread cannot drop each other's
@@ -888,11 +899,27 @@ class StorageFS(Operations):
             else:
                 members = self._load_persisted_members(cache_path, identity)
             members.update(updates)
+            dropped = []
+            token = drop_unless_checked_since
+            for name in drop:
+                if name not in members:
+                    continue
+                if previous is not token:
+                    # Compared by object: the merge above must carry each
+                    # member's tuple unchanged, and every observation must
+                    # store a fresh one (never rebuilt, cached or reused).
+                    read = token.members.get(name) if token is not None else None
+                    recorded_since = (read is None or previous is None
+                                      or previous.members.get(name) is not read)
+                    if recorded_since:
+                        continue
+                del members[name]
+                dropped.append(name)
             check = MemberCheck(cache_identity=identity, verified_at=time.monotonic(),
                                 members=members)
             self._member_checks[canonical_path] = check
-            if members and (previous is None or previous.cache_identity != identity
-                            or previous.members != members):
+            if (members or dropped) and (previous is None or previous.cache_identity != identity
+                                         or previous.members != members):
                 payload = {"cache": list(identity),
                            "members": {name: list(stat) for name, stat in members.items()}}
                 try:
@@ -928,13 +955,29 @@ class StorageFS(Operations):
         member's stat after an upload is its baseline for later checks:
         without it, an upload that does not keep the mtime (SFTP) would look
         like a change on the member at the next stale open. Baselines for
-        the other members are kept while the cache file is the same one.
+        the other members are kept while the cache file is the same one. If
+        the member cannot be stat'd, its old baseline no longer describes
+        it (the upload replaced the file) and is dropped: its next check
+        uses the rule for a member without one.
         """
         try:
-            member_stat = backend.stat(virtual_path)
             identity = self._cache_identity(os.lstat(str(cache_path)))
+        except OSError as exc:
+            self.logger.debug("post-sync stat of the cache file failed: %r", exc)
+            return
+        with self._member_checks_lock:
+            check = self._member_checks.get(virtual_path)
+            if check is not None and check.cache_identity == identity:
+                had_baseline = backend.name in check.members
+            else:
+                had_baseline = backend.name in self._load_persisted_members(cache_path, identity)
+        try:
+            member_stat = backend.stat(virtual_path)
         except Exception as exc:
             self.logger.debug("post-sync stat on %s failed: %r", backend.name, exc)
+            if had_baseline:
+                self._store_member_check(virtual_path, cache_path, identity, {},
+                                         drop=(backend.name,), drop_unless_checked_since=check)
             return
         self._store_member_check(virtual_path, cache_path, identity,
                                  {backend.name: (member_stat.st_size, member_stat.st_mtime)})
