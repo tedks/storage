@@ -1,0 +1,18 @@
+id: conflicts-release-double-hash
+title: Release of a conflict copy hashes it twice (no basis on the release hash)
+desc: 'PR #140 round 1 (Claude nit): the release hash is recorded with basis None,
+  so the next listing''s basis does not match and the copy is hashed again. Pass the
+  post-upload stat as the basis. Pre-existing on master.'
+type: task
+component: fs
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-30T18:07:21-00:00
+references: []
+log_events:
+- time: 2026-10-30T18:07:21-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
