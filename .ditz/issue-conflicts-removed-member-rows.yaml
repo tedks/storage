@@ -1,0 +1,19 @@
+id: conflicts-removed-member-rows
+title: Prune persisted hashes of members removed from the profile
+desc: 'Follow-up from PR #152 council: member_checksums rows for a member no longer
+  in the profile are never selected or deleted. Harmless (never loaded for an absent
+  member) but grow forever. Prune rows whose backend_name is not a configured member
+  at mount (or in storage debug).'
+type: task
+component: fs
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-30T18:41:47-00:00
+references: []
+log_events:
+- time: 2026-10-30T18:41:47-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
