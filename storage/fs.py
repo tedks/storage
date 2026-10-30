@@ -39,7 +39,7 @@ from .sync_tasks import DirOperation
 from .recompute import RecomputeEngine
 from .checksums import ChecksumBasis, ChecksumRecord
 from .pathing import ResolvedPath, resolve_path
-from .namespace import NamespaceService
+from .namespace import DEFAULT_LISTING_MAX_STALE, NamespaceService
 from .streaming import PrefetchSession, StreamingReadManager
 
 
@@ -124,10 +124,11 @@ class StorageFS(Operations):
                  cache_size: int, num_sync_workers: int = 2, start_sync: bool = True,
                  streaming_reads: bool = False, streaming_chunk_size: int = 1024 * 1024,
                  max_streaming_sessions: int = 8,
-                 readdir_ttl: float = 1.0,
+                 readdir_ttl: Optional[float] = None,
                  enable_watchers: bool = False,
                  streaming_keep_after_close: Optional[StreamingKeepAfterClose] = None,
-                 revalidate_after: float = 60.0):
+                 revalidate_after: float = 60.0,
+                 listing_max_stale: float = DEFAULT_LISTING_MAX_STALE):
         """
         Initialize Storage filesystem
 
@@ -145,9 +146,12 @@ class StorageFS(Operations):
             streaming_keep_after_close: When read-ahead outlives the last
                 close of a streaming session; None for the default, 4 chunks
                 or 50% of the file
-            readdir_ttl: Seconds to cache readdir results before re-querying
-                         backends (pull-based invalidation). Ignored when
-                         enable_watchers is True.
+            readdir_ttl: Seconds a directory listing is fresh: it answers
+                         readdir, getattr of its entries and lookups of
+                         names it lacks without asking a member. None
+                         follows revalidate_after. Ignored when watchers
+                         cover every member (listings then stay until
+                         invalidated).
             enable_watchers: Use push-based cache invalidation via inotifywait
                              on SSH backends instead of TTL polling. When True,
                              readdir_ttl is ignored and directory listings are
@@ -156,6 +160,9 @@ class StorageFS(Operations):
             revalidate_after: Seconds after which opening a CLEAN cached
                 file stats the member holding it, and refetches it if the
                 member's copy changed (0: every open)
+            listing_max_stale: Seconds after which a listing past its fresh
+                window is no longer served while a background refresh
+                runs, but replaced by listing every member at once
         """
         self.state_manager = StateManager(str(state_db))
         self.cache_manager = CacheManager(cache_root, self.state_manager, cache_size)
@@ -239,11 +246,10 @@ class StorageFS(Operations):
         )
         if enable_watchers and all_watchable:
             self._readdir_snapshot_ttl = float('inf')
-        elif enable_watchers and not all_watchable:
-            # Mixed mount: push invalidation for capable members, TTL for the rest.
-            self._readdir_snapshot_ttl = max(0.0, float(readdir_ttl))
         else:
-            self._readdir_snapshot_ttl = max(0.0, float(readdir_ttl))
+            # Watchers off, or a mixed mount (push invalidation for capable
+            # members, the fresh window for the rest).
+            self._readdir_snapshot_ttl = listing_fresh_window(readdir_ttl, revalidate_after)
 
         # Per-backend checksum index used for conflict surfacing
         self._checksum_lock = threading.RLock()
@@ -269,6 +275,7 @@ class StorageFS(Operations):
             readdir_snapshot_ttl=self._readdir_snapshot_ttl,
             checksum_records=self._checksum_records,
             checksum_lock=self._checksum_lock,
+            listing_max_stale=max(0.0, float(listing_max_stale)),
         )
         self.cache_manager.forget_listed_attrs = self._forget_cached_copy_attrs
         self.cache_manager.path_guard = self._try_path_locked
@@ -2049,6 +2056,12 @@ def fuse_subtype_options(backends: Dict[str, Backend]) -> Dict[str, str]:
     return {}
 
 
+def listing_fresh_window(readdir_ttl: Optional[float], revalidate_after: float) -> float:
+    """Seconds a listing is fresh with watchers off: readdir_ttl when set,
+    else revalidate_after, so directories follow the content policy."""
+    return max(0.0, float(revalidate_after if readdir_ttl is None else readdir_ttl))
+
+
 # Kernel entry timeout while watchers run (libfuse's default). The mount
 # cannot evict kernel entries (see fuse_mount_options), so a watcher event
 # reaches lookups only once the kernel asks again.
@@ -2082,16 +2095,16 @@ def fuse_mount_options(backends: Dict[str, Backend], *, enable_watchers: bool,
 
     entry_timeout: how long the kernel trusts a name without a lookup.
     fresh_window is how long the mount trusts a directory listing with
-    watchers off (revalidate_after); names are kept as long, so a path walk
-    asks nothing for a minute. With watchers on, entries stay at 1 s: a
+    watchers off (listing_fresh_window: readdir_ttl, else revalidate_after);
+    names are kept as long, so a path walk asks nothing for a minute. With watchers on, entries stay at 1 s: a
     watcher invalidates the mount's own listings, but fusepy runs libfuse
     2's high-level fuse_main, which owns the inode table and exposes no
     handle for fuse_lowlevel_notify_inval_entry, so nothing can evict the
     kernel's.
 
-    attr_timeout is 0, so every stat reaches getattr, answered from the
-    cache file or the listing without a member round trip (or by a member
-    stat once the listing is too old). The kernel refreshes a file's size
+    attr_timeout is 0, so every stat reaches getattr, which answers from
+    the cache file or the parent's listing while it is fresh or stale, and
+    otherwise stats a member (see NamespaceService.getattr). The kernel refreshes a file's size
     only from expired attributes, even for a read past the size it holds:
     with any attribute timeout, a stat answered from the old cache copy
     just before an open that refetches a file grown on its member makes
@@ -2140,10 +2153,11 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
                  streaming_reads: bool = False,
                  streaming_chunk_size: int = 1024 * 1024,
                  max_streaming_sessions: int = 8,
-                 readdir_ttl: float = 1.0,
+                 readdir_ttl: Optional[float] = None,
                  enable_watchers: bool = False,
                  streaming_keep_after_close: Optional[StreamingKeepAfterClose] = None,
                  revalidate_after: float = 60.0,
+                 listing_max_stale: float = DEFAULT_LISTING_MAX_STALE,
                  entry_timeout: Optional[float] = None,
                  negative_timeout: Optional[float] = None,
                  fuse_threads: bool = False):
@@ -2168,6 +2182,7 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
             None for the default
         revalidate_after: Seconds after which opening a CLEAN cached file
             stats its member (see StorageFS._revalidate_cached_file)
+        readdir_ttl, listing_max_stale: listing freshness (see StorageFS)
         entry_timeout, negative_timeout: kernel cache timeouts in seconds;
             None derives them (see fuse_mount_options)
         fuse_threads: Run libfuse's multithreaded loop instead of nothreads.
@@ -2193,7 +2208,7 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
     fuse_options = fuse_mount_options(
         backends,
         enable_watchers=enable_watchers,
-        fresh_window=revalidate_after,
+        fresh_window=listing_fresh_window(readdir_ttl, revalidate_after),
         entry_timeout=entry_timeout,
         negative_timeout=negative_timeout,
     )
@@ -2247,6 +2262,7 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
         enable_watchers=enable_watchers,
         streaming_keep_after_close=streaming_keep_after_close,
         revalidate_after=revalidate_after,
+        listing_max_stale=listing_max_stale,
     )
     fs.mount_lock_file = lock_file
     if unclean_shutdown:

@@ -10,6 +10,7 @@ from typing import Any, Dict, Optional, Sequence, Tuple
 from .backends.local import LocalBackend
 from .backends.ssh import SSHBackend
 from .models import StreamingKeepAfterClose
+from .namespace import DEFAULT_LISTING_MAX_STALE
 
 
 DEFAULT_CACHE_SIZE = "10G"
@@ -38,7 +39,8 @@ class ResolvedMountConfig:
     streaming_reads: bool
     streaming_chunk_size: str
     max_streaming_sessions: int
-    readdir_ttl: float
+    # Seconds a listing is fresh; None follows revalidate_after.
+    readdir_ttl: Optional[float]
     enable_watchers: bool
     profile_name: Optional[str] = None
     profile_source: Optional[Path] = None
@@ -53,6 +55,9 @@ class ResolvedMountConfig:
     # Run the FUSE loop multithreaded (storage.fs.mount_storage). Off by
     # default until the field test (docs/browsing_latency_plan.md D6).
     fuse_threads: bool = False
+    # Seconds a listing past its fresh window is still served while a
+    # background refresh runs (profile only).
+    listing_max_stale: float = DEFAULT_LISTING_MAX_STALE
 
     @property
     def member_specs(self) -> Tuple[str, ...]:
@@ -194,8 +199,8 @@ def _validated_revalidate_after(value: float) -> float:
     return float(value)
 
 
-def _validated_kernel_timeout(key: str, value: Optional[float]) -> Optional[float]:
-    """A kernel cache timeout is absent, or a finite number of seconds, 0 or more."""
+def _validated_seconds(key: str, value: Optional[float]) -> Optional[float]:
+    """Absent, or a finite number of seconds, 0 or more."""
     if value is None:
         return None
     if not math.isfinite(value) or value < 0:
@@ -518,8 +523,9 @@ def _load_mount_profile_settings(config_path: Path, profile_name: str) -> Dict[s
         "readdir_ttl": _optional_profile_float(config_profile, "readdir_ttl", profile_name),
         "enable_watchers": _optional_profile_bool(config_profile, "enable_watchers", profile_name),
         "revalidate_after": _optional_profile_float(config_profile, "revalidate_after", profile_name),
+        "listing_max_stale": _optional_profile_float(config_profile, "listing_max_stale", profile_name),
         **{
-            key: _validated_kernel_timeout(key, _optional_profile_float(config_profile, key, profile_name))
+            key: _validated_seconds(key, _optional_profile_float(config_profile, key, profile_name))
             for key in KERNEL_TIMEOUT_KEYS
         },
         "fuse_threads": _optional_profile_bool(config_profile, "fuse_threads", profile_name),
@@ -620,6 +626,7 @@ def resolve_mount_configuration(
         "readdir_ttl": None,
         "enable_watchers": None,
         "revalidate_after": None,
+        "listing_max_stale": None,
         **{key: None for key in KERNEL_TIMEOUT_KEYS},
         "fuse_threads": None,
         "backing_paths": (),
@@ -708,10 +715,9 @@ def resolve_mount_configuration(
             if config_values["max_streaming_sessions"] is not None
             else DEFAULT_MAX_STREAMING_SESSIONS
         ),
-        readdir_ttl=readdir_ttl if readdir_ttl is not None else (
-            config_values["readdir_ttl"]
-            if config_values["readdir_ttl"] is not None
-            else 1.0
+        readdir_ttl=_validated_seconds(
+            "readdir_ttl",
+            readdir_ttl if readdir_ttl is not None else config_values["readdir_ttl"],
         ),
         enable_watchers=enable_watchers if enable_watchers is not None else (
             config_values["enable_watchers"]
@@ -739,4 +745,7 @@ def resolve_mount_configuration(
             if config_values["fuse_threads"] is not None
             else False
         ),
+        listing_max_stale=_validated_seconds(
+            "listing_max_stale", config_values["listing_max_stale"]
+        ) if config_values["listing_max_stale"] is not None else DEFAULT_LISTING_MAX_STALE,
     )

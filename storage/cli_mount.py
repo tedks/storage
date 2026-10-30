@@ -6,7 +6,7 @@ from typing import Optional
 import click
 
 from .file_config import FileConfig, get_file_config, get_inherited_config, set_file_config
-from .fs import fuse_mount_options, mount_storage
+from .fs import fuse_mount_options, listing_fresh_window, mount_storage
 from .mount_profiles import (
     create_storage_members,
     parse_keep_after_close,
@@ -66,7 +66,11 @@ from .mount_profiles import (
 @click.option(
     "--readdir-ttl",
     type=float,
-    help="Seconds to cache directory listings (default 1.0). Higher = less backend load.",
+    help=(
+        "Seconds a directory listing answers readdir, stat and lookups of missing names "
+        "without asking a member (default: --revalidate-after). Past it the listing is "
+        "served while one background refresh runs, up to the profile's listing_max_stale."
+    ),
 )
 @click.option(
     "--enable-watchers/--no-enable-watchers",
@@ -209,22 +213,27 @@ def mount(
         "  Streaming keep after close: "
         f"{resolved.streaming_keep_after_close if keep_after_close else 'default (4 chunks or 50%)'}"
     )
+    fresh_window = listing_fresh_window(resolved.readdir_ttl, resolved.revalidate_after)
+    pull = (
+        f"listings fresh {fresh_window}s, then served while refreshing up to "
+        f"{max(fresh_window, resolved.listing_max_stale)}s"
+    )
     if resolved.enable_watchers:
         non_watchable = [n for n, b in backends.items() if not b.supports_push_invalidation()]
         if non_watchable:
             click.echo(
-                f"  Invalidation: push (watch-capable members) + pull TTL={resolved.readdir_ttl}s "
+                f"  Invalidation: push (watch-capable members) + pull, {pull} "
                 f"({', '.join(non_watchable)})"
             )
         else:
-            click.echo("  Invalidation: push (inotifywait)")
+            click.echo("  Invalidation: push (inotifywait); listings kept until invalidated")
     else:
-        click.echo(f"  Invalidation: pull (TTL={resolved.readdir_ttl}s)")
+        click.echo(f"  Invalidation: pull, {pull}")
     click.echo(f"  Revalidate cached files after: {resolved.revalidate_after}s")
     kernel = fuse_mount_options(
         backends,
         enable_watchers=resolved.enable_watchers,
-        fresh_window=resolved.revalidate_after,
+        fresh_window=fresh_window,
         entry_timeout=resolved.entry_timeout,
         negative_timeout=resolved.negative_timeout,
     )
@@ -255,6 +264,7 @@ def mount(
             readdir_ttl=resolved.readdir_ttl,
             enable_watchers=resolved.enable_watchers,
             revalidate_after=resolved.revalidate_after,
+            listing_max_stale=resolved.listing_max_stale,
             entry_timeout=resolved.entry_timeout,
             negative_timeout=resolved.negative_timeout,
             fuse_threads=resolved.fuse_threads,
