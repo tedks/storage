@@ -61,6 +61,9 @@ STREAMING_MAX_TRACKED_READ_SPANS = 64
 _LINK_UNSUPPORTED = (errno.EPERM, errno.EOPNOTSUPP, errno.ENOTSUP, errno.ENOSYS, errno.EMLINK)
 _NOREPLACE_UNSUPPORTED = (errno.EINVAL, errno.ENOSYS, errno.EOPNOTSUPP, errno.ENOTSUP)
 _AT_FDCWD = -100
+# On the inode of a failed session's prefix kept in the cache: the bytes are
+# a prefix of the member's file, never to be indexed as the whole file.
+PREFIX_XATTR = "user.storage.prefix"
 _RENAME_NOREPLACE = 1
 
 
@@ -1029,7 +1032,13 @@ class StreamingReadManager:
             if io_fd >= 0:
                 with session.io_lock:
                     os.ftruncate(io_fd, contiguous_bytes)
+                    # A full fetch that loses the install race to this
+                    # prefix must not index it (StorageFS._ensure_file_in_cache);
+                    # an unmarked prefix is not kept.
+                    os.setxattr(io_fd, PREFIX_XATTR, b"1")
                     os.fsync(io_fd)
+            else:
+                os.setxattr(str(session.partial_cache_path), PREFIX_XATTR, b"1")
 
             final_path.parent.mkdir(parents=True, exist_ok=True)
             # A prefix is kept only for a file the index does not describe
@@ -1039,9 +1048,11 @@ class StreamingReadManager:
             # lost write and mark it DIRTY, and the sync would upload the
             # prefix over the member, or report a false CONFLICT after an
             # invalidation (ditz streaming-promoted-prefix-false-conflict).
-            # The check and the install are one step under the index lock;
-            # a row made outside it comes with a file at the final path
-            # (create, a full fetch), which the no-replace install refuses.
+            # The check and the install are one step under the index lock.
+            # A create makes its file before its row, which the no-replace
+            # install refuses; a full fetch that loses the race to this
+            # install finds the marker and fetches again instead of indexing
+            # the prefix.
             with self.state_manager.metadata_lock:
                 if self.state_manager.get_file_metadata(session.canonical_path) is not None:
                     outcome = "indexed"
