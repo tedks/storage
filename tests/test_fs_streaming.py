@@ -683,7 +683,10 @@ class TestFSStreamingIntegration(unittest.TestCase):
             session_a.condition.notify_all()
         self.assertTrue(self._wait_for(lambda: not session_a.worker.is_alive(), timeout=3.0))
 
-        # First cleanup, as the worker's tail runs it once no reader is left.
+        # First cleanup, as the worker's tail runs it once no reader is left:
+        # claimed, then run.
+        with session_a.lock:
+            self.assertTrue(manager._claim_failed_cleanup(session_a))
         manager._cleanup_failed_session(session_a)
         self.assertFalse(partial_path.exists())
 
@@ -1613,8 +1616,10 @@ class TestFSStreamingIntegration(unittest.TestCase):
         real_worker = session_a.worker
 
         class JoinSpy:
+            # Alive until joined, so destroy always waits here, however fast
+            # the stopped worker really exits.
             def is_alive(self):
-                return real_worker.is_alive()
+                return not in_join.is_set() or real_worker.is_alive()
 
             def join(self, timeout=None):
                 in_join.set()

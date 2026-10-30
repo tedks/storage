@@ -95,8 +95,11 @@ class PrefetchSession:
     # set, and otherwise leaves it to the tail, which will then see no
     # readers. Exactly one of the two sees both conditions.
     worker_done: bool = False
-    # Claimed by the first _cleanup_failed_session, which alone promotes and
-    # removes the session; any later call returns at once.
+    # Claimed (see _claim_failed_cleanup) in the session.lock section that
+    # decides a failed session has no readers left, by the worker's tail or
+    # the last release; the claimer alone promotes and removes the session.
+    # Opens refuse to attach once it is set, so no reader joins a session
+    # whose partial is about to be truncated and renamed.
     failed_cleanup_claimed: bool = False
     # Merged spans the readers asked for, until readers_consumed is set.
     foreground_read_spans: List[Tuple[int, int]] = field(default_factory=list)
@@ -158,6 +161,9 @@ class StreamingReadManager:
 
         self.prefetch_sessions: Dict[str, PrefetchSession] = {}
         self.prefetch_sessions_lock = threading.RLock()
+        # Set under prefetch_sessions_lock when destroy() starts; no session
+        # registers or is attached to after that.
+        self._destroying = False
         self._streaming_stats_lock = threading.Lock()
         self._streaming_stats = {
             "streaming_sessions_started": 0,
@@ -179,21 +185,31 @@ class StreamingReadManager:
             self._start_control_server()
 
     def destroy(self):
+        """Stop every session; from here on, opens get no session (full-file path).
+
+        The refusal is set in the same prefetch_sessions_lock section that
+        takes the sessions, so an open racing destroy either registered
+        before it (and is stopped here) or registers nothing. Each session
+        is detached by claim, as on any other way out of the registry, so
+        its partial is unlinked once and a cleanup still running elsewhere
+        skips the path. A session whose bytes have all arrived is left to
+        finish its finalize while destroy waits for its worker (see
+        _claim_detach for why a complete session is never stopped).
+        """
         self._stop_control_server()
 
         with self.prefetch_sessions_lock:
+            self._destroying = True
             sessions = list(self.prefetch_sessions.values())
-            self.prefetch_sessions.clear()
-
-        for session in sessions:
-            with session.lock:
-                session.stop_requested = True
-                session.condition.notify_all()
+            for session in sessions:
+                self._detach_for_destroy(session)
 
         for session in sessions:
             worker = session.worker
             if worker and worker.is_alive():
                 worker.join(timeout=2.0)
+            with self.prefetch_sessions_lock:
+                self._detach_for_destroy(session, complete_too=True)
             if worker and worker.is_alive():
                 self.logger.warning(
                     "Streaming worker still alive during destroy; skipping forced close for %s",
@@ -202,13 +218,26 @@ class StreamingReadManager:
                 continue
 
             self._close_streaming_session_resources(session)
-            if not session.finalized:
-                try:
-                    session.partial_cache_path.unlink(missing_ok=True)
-                except OSError:
-                    pass
         if sessions:
             self.cache_manager.mark_cache_size_dirty()
+
+    def _detach_for_destroy(self, session: PrefetchSession, complete_too: bool = False):
+        """Stop the session and, unless it is finishing, claim it and unlink its partial.
+
+        Caller holds prefetch_sessions_lock. Without complete_too a session
+        whose bytes have all arrived only gets the stop request, so its
+        worker can still finalize it.
+        """
+        with session.lock:
+            session.stop_requested = True
+            session.condition.notify_all()
+            if session.finalized:
+                return
+            if session.prefetch_complete and not complete_too:
+                return
+            claimed = self._claim_detach(session)
+        if claimed:
+            self._unregister_and_unlink(session)
 
     def cleanup_stale_partials(self):
         """Delete stale partial-cache files left by prior crashes.
@@ -809,8 +838,8 @@ class StreamingReadManager:
         Callers that also decide something about the session (the stop on
         last close) claim in the same session.lock section as the decision.
         Finalize checks detached and range completeness under session.lock
-        and renames after dropping it, so the stop alone does not exclude a
-        rename already past that check. What does is that the stop also
+        and installs the partial after dropping it, so the stop alone does
+        not exclude an install already past that check. What does is that the stop also
         requires prefetch_complete to be unset, and _fetch_range_into_session
         sets it in the same section that completes the ranges: a finalize
         past its check implies prefetch_complete, so no stop. Keep both, the
@@ -826,10 +855,10 @@ class StreamingReadManager:
 
         Caller holds prefetch_sessions_lock, which is what keeps a fresh
         session from installing its partial at the same path (the rename at
-        registration) until the unlink is done. A session that is not in the
-        registry was dropped by destroy() (unmount), after which no open is
-        served, so no successor can own the path and the unlink is still
-        ours.
+        registration) until the unlink is done. A session no longer in the
+        registry here is one destroy() claims after its worker stopped
+        short of finalizing; destroy refuses every open from its start, so
+        no successor owns the path and the unlink is still ours.
         """
         if self.prefetch_sessions.get(session.canonical_path) is session:
             self.prefetch_sessions.pop(session.canonical_path, None)
@@ -854,13 +883,81 @@ class StreamingReadManager:
         self._close_streaming_session_resources(session)
         self.cache_manager.mark_cache_size_dirty()
 
+    def _install_partial(self, session: PrefetchSession) -> bool:
+        """Move the session's partial to the final cache path unless that path is taken.
+
+        Returns False, leaving the partial where it is, if the final path
+        already exists. A session starts only for a file that is not cached,
+        so anything at the final path now was put there since: a full-file
+        fetch (a write-open, or an open that found no streaming slot),
+        create(), or a rename onto the path. That file is at least as new as
+        the member bytes the session fetched, and a writer may hold it open,
+        so the session's bytes never replace it. The no-replace is atomic:
+        link() fails if the name exists. Where the cache filesystem has no
+        hard links, the check and the rename are two steps, and a fill in
+        between is lost to the rename as before. Raises OSError otherwise.
+        """
+        partial_path = session.partial_cache_path
+        final_path = session.final_cache_path
+        try:
+            os.link(partial_path, final_path)
+        except FileExistsError:
+            return False
+        except OSError as exc:
+            if exc.errno not in (errno.EPERM, errno.EOPNOTSUPP, errno.ENOTSUP, errno.EMLINK):
+                raise
+            if os.path.lexists(final_path):
+                return False
+            os.replace(partial_path, final_path)
+            return True
+        try:
+            os.unlink(partial_path)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            # A second name for the cached file; the next session for the
+            # path renames its own partial over it, a restart sweeps it.
+            self.logger.warning(
+                "streaming could not remove partial %s after install: %r", partial_path, exc,
+            )
+        return True
+
+    def _discard_superseded_session(self, session: PrefetchSession):
+        """Finish a complete session whose final path was filled by something else.
+
+        The partial is dropped (see _install_partial) and the session leaves
+        the registry, so later opens use the cached file. Readers still
+        attached keep reading their descriptors on the partial's inode, which
+        holds every byte. finalized is set so their last release closes the
+        session's descriptor; no metadata is recorded and on_finalized does
+        not run, since the cache holds the other file.
+        """
+        self.logger.info(
+            "streaming superseded path=%s backend=%s: the cache path was filled while streaming; partial discarded",
+            session.canonical_path,
+            session.backend.name,
+        )
+        with self.prefetch_sessions_lock:
+            with session.lock:
+                claimed = self._claim_detach(session)
+            if claimed:
+                self._unregister_and_unlink(session)
+        with session.lock:
+            session.prefetch_complete = True
+            session.finalized = True
+            should_close = session.refcount == 0
+            session.condition.notify_all()
+        self._log_streaming_state_change(session, self._snapshot_streaming_state(session, "superseded"))
+        self.cache_manager.mark_cache_size_dirty()
+        if should_close:
+            self._close_streaming_session_resources(session)
+
     def _promote_failed_session_cache_prefix(self, session: PrefetchSession) -> bool:
         with session.lock:
             if session.detached:
                 return False
             ranges = list(session.available_ranges)
             contiguous_bytes = self._contiguous_available_prefix(ranges, session.file_size)
-            partial_path = session.partial_cache_path
             final_path = session.final_cache_path
             io_fd = session.io_fd
 
@@ -874,7 +971,13 @@ class StreamingReadManager:
                     os.fsync(io_fd)
 
             final_path.parent.mkdir(parents=True, exist_ok=True)
-            os.replace(partial_path, final_path)
+            if not self._install_partial(session):
+                self.logger.info(
+                    "streaming partial-cache skipped path=%s backend=%s: the cache path was filled meanwhile",
+                    session.canonical_path,
+                    session.backend.name,
+                )
+                return False
             self.logger.info(
                 "streaming partial-cache path=%s backend=%s bytes=%d",
                 session.canonical_path,
@@ -892,14 +995,26 @@ class StreamingReadManager:
             )
             return False
 
+    @staticmethod
+    def _claim_failed_cleanup(session: PrefetchSession) -> bool:
+        """Claim the cleanup of a failed session; False if it was claimed already.
+
+        Caller holds session.lock, in the same section where it saw the
+        error and no readers. The claim has to be made there, not later in
+        _cleanup_failed_session: an open attaching in between would hold a
+        ref to a session whose partial is then truncated to its contiguous
+        prefix (short reads), and _create_or_attach_prefetch_session checks
+        the claim under session.lock to refuse exactly that. Promotion
+        checks detached and then renames outside session.lock, so the claim
+        also keeps a second cleanup out entirely.
+        """
+        if session.failed_cleanup_claimed:
+            return False
+        session.failed_cleanup_claimed = True
+        return True
+
     def _cleanup_failed_session(self, session: PrefetchSession):
-        # Promotion checks detached and then renames outside session.lock, so
-        # two cleanups in flight could both pass the check; the claim keeps
-        # the second out entirely.
-        with session.lock:
-            if session.failed_cleanup_claimed:
-                return
-            session.failed_cleanup_claimed = True
+        """Promote a failed session's prefix, or drop it; caller claimed the cleanup."""
         if self._promote_failed_session_cache_prefix(session):
             self._cleanup_prefetch_session(session, "partial-cache")
             return
@@ -922,11 +1037,15 @@ class StreamingReadManager:
         try:
             os.fsync(io_fd)
             session.final_cache_path.parent.mkdir(parents=True, exist_ok=True)
-            os.replace(session.partial_cache_path, session.final_cache_path)
+            installed = self._install_partial(session)
         except OSError as exc:
             with session.lock:
                 session.error = exc
                 session.condition.notify_all()
+            return
+
+        if not installed:
+            self._discard_superseded_session(session)
             return
 
         self.cache_manager.mark_cache_size_dirty()
@@ -1084,11 +1203,44 @@ class StreamingReadManager:
             no_readers = session.refcount == 0
             stopped = session.stop_requested
             finalized = session.finalized
+            clean_up_failed = has_error and no_readers and self._claim_failed_cleanup(session)
 
-        if has_error and no_readers:
+        if clean_up_failed:
             self._cleanup_failed_session(session)
-        elif stopped and not finalized and no_readers:
+        elif not has_error and stopped and not finalized and no_readers:
             self._cleanup_cancelled_session(session)
+
+    def _attach(self, session: PrefetchSession) -> bool:
+        """Add a reader to a registered session; False if its failed cleanup is claimed.
+
+        Caller holds prefetch_sessions_lock. The claim is read under
+        session.lock, where it is taken together with the no-readers
+        decision (see _claim_failed_cleanup), so either this reader counts
+        in that decision or it does not attach. A refused open takes the
+        full-file path; a promoted prefix, or the full fetch's file, is at
+        the final path then.
+        """
+        with session.lock:
+            if session.failed_cleanup_claimed:
+                refused = True
+            else:
+                refused = False
+                session.refcount += 1
+                readers = session.refcount
+        if refused:
+            self.logger.info(
+                "streaming attach refused path=%s backend=%s: failed session being cleaned up",
+                session.canonical_path,
+                session.backend.name,
+            )
+            return False
+        self.logger.info(
+            "streaming attach path=%s backend=%s readers=%d",
+            session.canonical_path,
+            session.backend.name,
+            readers,
+        )
+        return True
 
     def _create_or_attach_prefetch_session(
         self,
@@ -1096,16 +1248,12 @@ class StreamingReadManager:
         canonical_path: str,
     ) -> Optional[PrefetchSession]:
         with self.prefetch_sessions_lock:
+            if self._destroying:
+                return None
             existing = self.prefetch_sessions.get(canonical_path)
             if existing:
-                with existing.lock:
-                    existing.refcount += 1
-                self.logger.info(
-                    "streaming attach path=%s backend=%s readers=%d",
-                    canonical_path,
-                    existing.backend.name,
-                    existing.refcount,
-                )
+                if not self._attach(existing):
+                    return None
                 return existing
 
             if len(self.prefetch_sessions) >= self.max_streaming_sessions:
@@ -1205,18 +1353,25 @@ class StreamingReadManager:
         )
 
         with self.prefetch_sessions_lock:
+            if self._destroying:
+                self._discard_unregistered_prefetch_session(session)
+                return None
             existing = self.prefetch_sessions.get(canonical_path)
             if existing:
-                with existing.lock:
-                    existing.refcount += 1
+                self._discard_unregistered_prefetch_session(session)
+                if not self._attach(existing):
+                    return None
+                return existing
+            if final_cache_path.exists():
+                # Filled since open() found the file uncached: a full-file
+                # fetch by a writer or another open, or create(). That file
+                # is the one to read (see _install_partial).
                 self.logger.info(
-                    "streaming attach path=%s backend=%s readers=%d",
+                    "streaming session unavailable: %s was cached during setup",
                     canonical_path,
-                    existing.backend.name,
-                    existing.refcount,
                 )
                 self._discard_unregistered_prefetch_session(session)
-                return existing
+                return None
             if len(self.prefetch_sessions) >= self.max_streaming_sessions:
                 self.logger.warning(
                     "Streaming session limit reached (%d) during registration; falling back to full-file cache for %s",
@@ -1307,7 +1462,11 @@ class StreamingReadManager:
                     if session.finalized:
                         return "close"
                     # Decided with the decrement, not after it: see worker_done.
-                    if session.error is not None and session.worker_done:
+                    if (
+                        session.error is not None
+                        and session.worker_done
+                        and self._claim_failed_cleanup(session)
+                    ):
                         return "cleanup-failed"
                     return ""
                 # One section with the decision: see _claim_detach.
