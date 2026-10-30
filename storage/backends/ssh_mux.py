@@ -78,6 +78,7 @@ class ControlSockets:
         self.logger = logger or logging.getLogger(__name__)
         self._lock = threading.Lock()
         self._dir: Optional[Path] = None
+        self._dir_identity = None  # (st_dev, st_ino) of _dir as mkdtemp made it
         self._keys: Dict[Path, _SocketKey] = {}
         self._atexit_registered = False
 
@@ -117,14 +118,17 @@ class ControlSockets:
 
     def _ensure_dir_locked(self) -> Optional[Path]:
         if self._dir is not None:
-            if self._dir.is_dir():
+            if _identity(self._dir, follow=False) == self._dir_identity:
                 return self._dir
             # Removed from under us (a runtime directory cleaned at logout, a
-            # tmp cleaner). ssh cannot bind a socket in a missing directory
-            # and exits 255, so every client would fail until remount.
+            # tmp cleaner), or replaced by someone else's directory or link
+            # of the same name. ssh cannot bind a socket in a missing
+            # directory and exits 255, so every client would fail until
+            # remount; and a replacement is not ours to put sockets in.
             self.logger.warning("ssh socket directory %s disappeared; making a new one",
                                 self._dir)
             self._dir = None
+            self._dir_identity = None
             self._keys = {}
         candidates = []
         if self._parent_dir is not None:
@@ -143,6 +147,7 @@ class ControlSockets:
                 shutil.rmtree(directory, ignore_errors=True)  # just made, ours
                 continue
             self._dir = directory
+            self._dir_identity = _identity(directory, follow=False)
             if not self._atexit_registered:
                 atexit.register(self.close)
                 self._atexit_registered = True
@@ -174,6 +179,7 @@ class ControlSockets:
             directory = self._dir
             self._keys = {}
             self._dir = None
+            self._dir_identity = None
         for path, key in keys.items():
             self._end_master(path, key, "exit")
         if directory is not None:
@@ -208,9 +214,9 @@ class ControlSockets:
                 self.logger.debug("could not remove %s", path, exc_info=True)
 
 
-def _identity(path: Path):
+def _identity(path: Path, follow: bool = True):
     try:
-        info = os.stat(path)
+        info = os.stat(path) if follow else os.lstat(path)
     except OSError:
         return None
     return (info.st_dev, info.st_ino)

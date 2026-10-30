@@ -16,8 +16,9 @@ from storage.watcher import RemoteWatcher
 
 
 class _FakeSSH:
-    """An executable that records its arguments and, like a master told to
-    exit, removes nothing itself (ControlSockets unlinks the socket)."""
+    """An executable that records its arguments and exits with a given code. A
+    real master removes its own socket when it answers; this one never does,
+    so ControlSockets' unlink after a failed call is what the tests see."""
 
     def __init__(self, directory: Path, exit_code: int = 0,
                  replace_socket: bool = False):
@@ -136,6 +137,18 @@ class TestControlSockets(unittest.TestCase):
         with self.assertLogs(ssh_mux.__name__, level="WARNING"):
             second = self._control_path(sockets.options("u", "h", 22, None))
         self.assertTrue(second.parent.is_dir())
+
+    def test_a_replaced_socket_directory_is_not_trusted(self):
+        sockets = self._sockets()
+        first = self._control_path(sockets.options("u", "h", 22, None)).parent
+        shutil.rmtree(first)
+        elsewhere = self.tmp / "elsewhere"
+        elsewhere.mkdir()
+        first.symlink_to(elsewhere)  # someone else's link under our name
+        with self.assertLogs(ssh_mux.__name__, level="WARNING"):
+            second = self._control_path(sockets.options("u", "h", 22, None)).parent
+        self.assertNotEqual(second, first)
+        self.assertEqual(list(elsewhere.iterdir()), [])
 
     def test_percent_in_the_path_is_escaped_for_ssh(self):
         odd = self.parent / "100%"
@@ -269,9 +282,13 @@ class TestWatcherResetsAfterAnSshFailure(unittest.TestCase):
         process = Process()
         process.returncode = returncode
 
+        runs = []
+
         def popen(cmd, **kwargs):
-            # Stop after this run, once the exit has been handled.
-            threading.Timer(0.05, watcher._stop_event.set).start()
+            runs.append(cmd)
+            if len(runs) > 1:  # the restart after the first exit: stop here
+                watcher._stop_event.set()
+                raise RuntimeError("stop")
             kwargs["stderr"].write("Connection closed by remote host")
             return process
 
