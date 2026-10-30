@@ -16,6 +16,7 @@ import logging
 import fcntl
 import time
 import hashlib
+import math
 import yaml
 import json
 import concurrent.futures
@@ -2044,6 +2045,69 @@ def fuse_subtype_options(backends: Dict[str, Backend]) -> Dict[str, str]:
     return {}
 
 
+# Kernel entry and attribute timeout while watchers run (libfuse's default).
+# The mount cannot evict kernel entries (see fuse_mount_options), so a
+# watcher event reaches stat callers only once the kernel asks again.
+WATCHER_KERNEL_TIMEOUT = 1.0
+# How long the kernel remembers that a name does not exist. Short, because a
+# remembered miss hides a name that appears behind the mount's back (a file
+# added on a member, or a conflict copy such as name.member0 after a split).
+DEFAULT_NEGATIVE_TIMEOUT = 10.0
+
+
+def _kernel_timeout(name: str, value: float) -> float:
+    value = float(value)
+    if not math.isfinite(value) or value < 0:
+        raise ValueError(f"{name} must be a finite number of seconds, 0 or more (got {value})")
+    return value
+
+
+def fuse_mount_options(backends: Dict[str, Backend], *, enable_watchers: bool,
+                       fresh_window: float,
+                       attr_timeout: Optional[float] = None,
+                       entry_timeout: Optional[float] = None,
+                       negative_timeout: Optional[float] = None) -> Dict[str, object]:
+    """Every FUSE() keyword argument beyond nothreads, foreground and allow_other.
+
+    The mount and every mounted test pass these, so tests run under the
+    kernel cache the mount really has. fresh_window is how long a directory
+    listing is served without asking a member (revalidate_after, with
+    watchers off); the kernel then keeps entries and attributes as long,
+    because it would otherwise ask again for answers that have not changed.
+    With watchers on, entries stay at 1 s: a watcher invalidates the
+    mount's own listings, but fusepy runs libfuse 2's high-level fuse_main,
+    which owns the inode table and exposes no handle for
+    fuse_lowlevel_notify_inval_entry, so nothing can evict the kernel's.
+
+    Writes through the mount stay visible at once: create, mkdir, symlink,
+    unlink, rmdir and rename update the kernel's entries themselves, and a
+    write or setattr refreshes the file's attributes.
+
+    auto_cache keeps a file's pages across opens while its mtime and size are
+    unchanged and drops them otherwise, so a refetch after revalidation is
+    not shadowed by old pages (kernel_cache would keep them regardless).
+    libfuse compares against attributes it fetched within ac_attr_timeout,
+    which defaults to attr_timeout: an attribute answered before open
+    refetched the file would then keep the old pages for the whole window.
+    ac_attr_timeout=0 makes libfuse ask getattr after every open instead,
+    which this mount answers from the cache file or the listing.
+
+    The override arguments replace the derived timeouts (per profile); each
+    must be finite and 0 or more.
+    """
+    window = WATCHER_KERNEL_TIMEOUT if enable_watchers else _kernel_timeout("fresh_window", fresh_window)
+    options: Dict[str, object] = dict(fuse_subtype_options(backends))
+    options["attr_timeout"] = window if attr_timeout is None else _kernel_timeout("attr_timeout", attr_timeout)
+    options["entry_timeout"] = window if entry_timeout is None else _kernel_timeout("entry_timeout", entry_timeout)
+    options["negative_timeout"] = (
+        DEFAULT_NEGATIVE_TIMEOUT if negative_timeout is None
+        else _kernel_timeout("negative_timeout", negative_timeout)
+    )
+    options["auto_cache"] = True
+    options["ac_attr_timeout"] = 0.0
+    return options
+
+
 def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
                  backends: Dict[str, Backend], cache_size: int,
                  foreground: bool = False, num_sync_workers: int = 2,
@@ -2055,7 +2119,10 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
                  readdir_ttl: float = 1.0,
                  enable_watchers: bool = False,
                  streaming_keep_after_close: Optional[StreamingKeepAfterClose] = None,
-                 revalidate_after: float = 60.0):
+                 revalidate_after: float = 60.0,
+                 attr_timeout: Optional[float] = None,
+                 entry_timeout: Optional[float] = None,
+                 negative_timeout: Optional[float] = None):
     """
     Mount a Storage filesystem
 
@@ -2077,6 +2144,8 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
             None for the default
         revalidate_after: Seconds after which opening a CLEAN cached file
             stats its member (see StorageFS._revalidate_cached_file)
+        attr_timeout, entry_timeout, negative_timeout: kernel cache timeouts
+            in seconds; None derives them (see fuse_mount_options)
 
     Raises:
         PermissionError: If allow_other=True but not running as root and user_allow_other not set
@@ -2086,6 +2155,16 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
     logger = logging.getLogger(__name__)
+
+    # Before the mount lock, so a bad timeout fails without side effects.
+    fuse_options = fuse_mount_options(
+        backends,
+        enable_watchers=enable_watchers,
+        fresh_window=revalidate_after,
+        attr_timeout=attr_timeout,
+        entry_timeout=entry_timeout,
+        negative_timeout=negative_timeout,
+    )
 
     is_root = os.geteuid() == 0
 
@@ -2145,7 +2224,7 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
         fs.request_stale_sweep()  # started by init(), after FUSE's fork
     try:
         FUSE(fs, mountpoint, nothreads=True, foreground=foreground, allow_other=allow_other,
-             **fuse_subtype_options(backends))
+             **fuse_options)
     finally:
         try:
             if not fs._sweep_pending:

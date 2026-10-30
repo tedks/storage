@@ -231,3 +231,40 @@ class TestAllowOther(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestMountKernelCacheOptions(unittest.TestCase):
+    """mount_storage hands fuse_mount_options to FUSE, and rejects bad timeouts first."""
+
+    def setUp(self):
+        self.temp_dir = Path(tempfile.mkdtemp())
+        import shutil
+        self.addCleanup(shutil.rmtree, self.temp_dir, True)
+        self.cache_root = self.temp_dir / 'cache'
+        self.cache_root.mkdir()
+        self.mount_point = self.temp_dir / 'mount'
+        self.mount_point.mkdir()
+        (self.temp_dir / 'backend').mkdir()
+        self.backends = {'local0': LocalBackend('local0', str(self.temp_dir / 'backend'))}
+
+    def _mount(self, **kwargs):
+        mount_storage(str(self.mount_point), self.cache_root, self.cache_root / 'state.db',
+                      self.backends, 1024 * 1024, foreground=True, allow_other=False, **kwargs)
+
+    @patch('storage.fs.FUSE')
+    def test_options_reach_fuse(self, mock_fuse):
+        self._mount(revalidate_after=45.0, negative_timeout=3.0)
+        kwargs = mock_fuse.call_args.kwargs
+        self.assertEqual(45.0, kwargs['attr_timeout'])
+        self.assertEqual(45.0, kwargs['entry_timeout'])
+        self.assertEqual(3.0, kwargs['negative_timeout'])
+        self.assertIs(True, kwargs['auto_cache'])
+        self.assertEqual(0.0, kwargs['ac_attr_timeout'])
+        self.assertTrue(kwargs['nothreads'])
+
+    @patch('storage.fs.FUSE')
+    def test_bad_timeout_fails_before_the_mount_lock(self, mock_fuse):
+        with self.assertRaises(ValueError):
+            self._mount(attr_timeout=float('inf'))
+        mock_fuse.assert_not_called()
+        self.assertEqual([], list(self.cache_root.glob('.storage.mount.*.lock')))
