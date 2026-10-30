@@ -1,0 +1,26 @@
+id: field-seq-read-serialized
+title: Streaming sequential reads run at 4-8 MiB/s on a LAN; pipelined sftp.get on
+  the same connection does ~94 MB/s
+desc: 'Field test 2026-10-30, master 39e4b79, wired LAN, member RTT 0.18 ms. Uncached
+  sequential reads through the mount: 107.8 MiB at 4.4 MiB/s and 57.1 MiB at 5.8 MiB/s
+  (threads off), 1791 MiB at 7.8 MiB/s (threads on), one SFTP open/read/close per
+  1 MiB chunk. 97% of the time is inside the member read call (median 178 ms per 1
+  MiB chunk, p90 429 ms; gaps between chunks median 2 ms), i.e. ~5.5 ms per serialized
+  32 KiB request. The same transport delivered ~94 MB/s to sftp.get (paramiko''s pipelined
+  prefetch) in the checksum fallback, so the member''s disk is not the limit: the
+  serialized 32 KiB requests are. Member bytes match the bytes read (57.4 MiB received
+  for 57.1 MiB). This is the spec section 4.5 follow-up (pipelined range reads once
+  connections are pooled); connections are now pooled (#132).'
+type: task
+component: performance
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-30T17:06:43-00:00
+references: []
+log_events:
+- time: 2026-10-30T17:06:43-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
