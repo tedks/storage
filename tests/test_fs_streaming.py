@@ -500,6 +500,19 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.assertNotIn(PREFIX_XATTR, os.listxattr(str(cache_path)))
         self.assertIsNotNone(self.fs.state_manager.get_file_metadata('/marked.bin'))
 
+    def test_a_read_only_member_file_without_the_marker_is_fetched(self):
+        # Council round 4 on #146: on a read-only copy the kernel answers
+        # EACCES before ENODATA, so removing an absent marker failed the
+        # fetch of every read-only file.
+        member_file = self.backend_dir / "plain-ro.bin"
+        member_file.write_bytes(b"whole file")
+        os.chmod(member_file, 0o444)
+        self.assertTrue(self.fs._ensure_file_in_cache(self.fs._resolve_path('/plain-ro.bin')))
+        cache_path = self.cache_dir / "plain-ro.bin"
+        self.assertEqual(b"whole file", cache_path.read_bytes())
+        self.assertEqual(0o444, os.stat(cache_path).st_mode & 0o777)
+        self.assertIsNotNone(self.fs.state_manager.get_file_metadata('/plain-ro.bin'))
+
     def test_unindexed_prefix_is_dropped_only_when_unopened_and_unindexed(self):
         from storage.cache_metadata import PREFIX_XATTR
         cache_path = self.cache_dir / "p.bin"

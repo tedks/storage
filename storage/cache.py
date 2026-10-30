@@ -24,26 +24,28 @@ from .state import StateManager
 def _remove_prefix_marker(path: Path):
     """Remove the streaming-prefix marker from a whole-file copy.
 
-    Changing a user xattr needs write permission on the file, owner or not,
-    so a read-only copy (a member file's mode is kept) gets owner write for
-    the removal. Absent, or no xattrs on this filesystem: nothing to do. Any
+    Looked for first, which needs only read permission: most copies have
+    none. Changing a user xattr needs write permission on the file, owner
+    or not, so a read-only copy (a member file's mode is kept) gets owner
+    write for the removal. No xattrs on this filesystem: nothing to do. Any
     other failure raises: a copy that keeps the marker would be served
     unindexed for good.
     """
     try:
-        os.removexattr(path, PREFIX_XATTR)
-        return
+        os.getxattr(path, PREFIX_XATTR)
     except OSError as exc:
         if exc.errno in (errno.ENODATA, errno.ENOTSUP, errno.EOPNOTSUPP):
             return
-        if exc.errno not in (errno.EACCES, errno.EPERM):
-            raise
+        raise
     mode = stat_module.S_IMODE(os.stat(path).st_mode)
-    os.chmod(path, mode | stat_module.S_IWUSR)
+    writable = mode | stat_module.S_IWUSR
+    if writable != mode:
+        os.chmod(path, writable)
     try:
         os.removexattr(path, PREFIX_XATTR)
     finally:
-        os.chmod(path, mode)
+        if writable != mode:
+            os.chmod(path, mode)
 
 
 class CacheManager:

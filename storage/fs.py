@@ -1292,6 +1292,9 @@ class StorageFS(Operations):
                 except OSError:
                     return True
 
+                # Read before the lock (xattrs up the parents); unused when
+                # the row exists.
+                config = self._get_config(canonical_path)
                 with self.state_manager.metadata_lock:
                     # The check and the new row are one step under the lock
                     # the promotion takes: a prefix installed meanwhile is
@@ -1300,7 +1303,6 @@ class StorageFS(Operations):
                         return True
                     metadata = self.state_manager.get_file_metadata(canonical_path)
                     if not metadata:
-                        config = self._get_config(canonical_path)
                         metadata = FileMetadata(
                             virtual_path=canonical_path,
                             size=st.st_size,
