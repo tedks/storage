@@ -905,8 +905,13 @@ class StorageFS(Operations):
                 if name not in members:
                     continue
                 if previous is not token:
+                    # Compared by object: the merge above must carry each
+                    # member's tuple unchanged, and every observation must
+                    # store a fresh one (never rebuilt, cached or reused).
                     read = token.members.get(name) if token is not None else None
-                    if read is None or previous is None or previous.members.get(name) is not read:
+                    recorded_since = (read is None or previous is None
+                                      or previous.members.get(name) is not read)
+                    if recorded_since:
                         continue
                 del members[name]
                 dropped.append(name)
