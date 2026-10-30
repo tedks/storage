@@ -231,7 +231,7 @@ so a change whose watcher event was lost (a watcher reconnect) stays out
 of `ls` until the directory is invalidated; a lookup of a name missing
 from a listing is still answered from it only for `readdir_ttl` (else
 `revalidate_after`) seconds, and stat'd after that. Changes made through the mount (create, write, rename,
-unlink, mkdir, rmdir, symlink) drop the affected listings at once; a file
+unlink, mkdir, rmdir) drop the affected listings at once; a file
 added or changed directly on a member shows within the fresh window, plus
 one more listing while a stale one is served.
 
