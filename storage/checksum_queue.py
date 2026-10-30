@@ -145,7 +145,7 @@ class MemberHashQueues:
             try:
                 outcome[0](outcome[1])
             except concurrent.futures.InvalidStateError:
-                pass  # already finished by a fork reset
+                pass  # already finished by a fork reset (in tests, a simulated one)
             with self._cond:
                 if self._running.get(member) is future:
                     del self._running[member]

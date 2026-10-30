@@ -1076,10 +1076,16 @@ class MemberConnection:
             if transport is not None and transport.is_active():
                 raise CommandTimeout(str(exc)) from exc
             raise
-        if transport is not None and not transport.is_active():
+        if (transport is not None and not transport.is_active()) or (
+            status == -1 and not getattr(chan, "eof_received", True)
+        ):
             # paramiko closes the channels of a transport that died: recv
             # returns b"" and the status event fires with no exit status.
-            # Not an answer from the member.
+            # It does so before it marks the transport inactive, so a reader
+            # woken in between sees it active; a server that closed the
+            # channel itself sent EOF first. Not an answer from the member.
+            # (A transport that dies just after a command finished turns
+            # its answer into this error too: a retry, the safe direction.)
             raise EOFError("the transport closed during the command")
         return status, b"".join(chunks)
 

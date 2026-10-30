@@ -1589,6 +1589,20 @@ class TestSSHBackendOnThePool(_BackendTestCase):
             with self.assertRaises(EOFError):
                 backend.get_fast_checksum("/movie.bin", allow_download=False)
 
+    def test_run_command_woken_before_the_transport_is_marked_dead(self):
+        # paramiko closes the channel before it clears active: no exit
+        # status, no EOF from the server, transport still "active".
+        self.server.exec_handler = lambda _cmd: (-1, b"")
+        backend = self._new_backend()
+
+        def closed_without_eof(chan, size):
+            chan.eof_received = False
+            return b""
+
+        with patch.object(_FakeChannel, "recv", closed_without_eof):
+            with self.assertRaises(EOFError):
+                backend._pool.run_command("xxh128sum /data/movie.bin", 5.0)
+
     def test_remote_checksum_and_xattrs_close_their_exec_channels(self):
         digest = "0123456789abcdef0123456789abcdef"
 
