@@ -3,7 +3,8 @@
 Status: draft for the commander's review, 2026-10-29. Written by the CTO
 from four read-only design audits of master at 033d8ac (listing and
 attribute caching, SSH connections, the FUSE loop's threading, conflict
-detection) and two measurements on a live mount (counts only).
+detection) and two measurements on a live mount (counts only). Section 6,
+added 2026-10-30, records a field test of the landed wave.
 
 ## 1. Goal
 
@@ -170,41 +171,72 @@ sharing for rsync and the watcher is filed as a follow-up.
 A read-only field test of master at 39e4b79 (the whole wave: #128, #130 to
 #138) on a desktop on the members' wired network (member round trip
 0.18 ms), against a profile of three SSH members on one host with the
-default listing settings (60 s fresh, 1 h stale), streaming reads with 1M
-chunks and watchers off. Counts are member SFTP requests taken from
-paramiko's debug log; bytes are the mount's own socket counters. Times are
-medians. Debug logging was on throughout.
+default listing settings (60 s fresh, 1 h stale), streaming reads with the
+default 1M chunks (the 2026-10-29 tuning is reverted) and watchers off.
 
-| Action | Target (section 2) | Measured, threads off | Threads on |
+How it was measured. Request counts are member SFTP requests (listings,
+stats, opens) from paramiko's debug log, which was on throughout and may
+add to every time below. Small byte counts (the sniff) are the mount's own
+socket counters. The large download volumes are estimated from paramiko
+rekeys, one per about 512 MiB received on a connection, so they are good
+to about half a GiB. Times are medians unless a range or a maximum is
+given. Directories viewed had 64, 69 and 87 entries (threads off) and 127
+(threads on).
+
+The table counts the requests a browse waits for (the foreground). A
+listing also schedules background checksums, counted separately below.
+Targets marked "derived" are not rows of section 2 but follow from it.
+
+| Action | Target | Measured, threads off | Threads on |
 |---|---|---|---|
-| First view of a directory of 64 to 127 entries (readdir, stat every entry) | 1 listing per member | 1 listing per member, no per-entry request; 18 ms | same; 47 ms |
-| Revisit inside the window | 0 | 1 member stat for the directory itself when its parent was reached by path and never listed; 0 otherwise; 5 ms | 3 stats; 24 ms |
+| First view of a directory (readdir, stat every entry) | 1 listing per member | 1 listing per member, no per-entry request; 18 ms | same; 47 ms |
+| Revisit inside the window | 0 | 1 member stat when the directory was reached by path and its parent never listed, 0 otherwise; 5 ms | 3 member stats in the by-path case; 24 ms |
 | A name no listing has, from a fresh listing | 0 | 0; ENOENT in under 1 ms | 0 |
 | Revisit past the window | served, one background refresh per directory | served in 17 ms; one background listing per member for each stale directory touched; no per-entry request | same; 30 ms |
-| A 4-level path walk past the window | 0 in the foreground | 0 in the foreground, 2.3 ms; background refreshes of the stale ancestors | not measured |
-| Sniff: open, read 4 KiB, close of an uncached 3 to 19 MiB file | the kernel's request | 16.7 KiB received, 2 member reads, nothing kept in the cache | same |
-| Sequential read of an uncached file | unchanged (section 4.5) | 4.4 to 5.8 MiB/s, one member read per 1 MiB chunk, 97% of the time inside member calls | 7.8 MiB/s |
+| A 4-level path walk past the window | derived: 0 in the foreground | 0 in the foreground, 2.3 ms; background refreshes of the stale ancestors | not measured |
+| Sniff: open, read 4 KiB, close of an uncached 3 to 19 MiB file | the kernel's request | 2 member read calls and 16.7 KiB received (SSH and SFTP framing included; the kernel's request size was not observed); nothing kept in the cache | same |
 | SSH connections | one per member | one per member after mount, during browsing and during reads | same |
 | A listing while another file is read sequentially | overlapped | 175 ms (idle: 4 to 38 ms); a stat of the mount root 158 ms (idle: 0.1 ms) | 25 ms; 0.3 to 0.9 ms |
-| Ten minutes of mixed listings, sniffs and stats | no errors or stalls | not run | 0 errors; 2157 listings, median 5 ms, but 6 over 10 s (max 105 s) |
+| Ten minutes of mixed listings, sniffs and stats | derived: no errors, no listing waiting seconds | not run | not met: 0 errors, 2157 listings at a median of 5 ms, but 6 over 10 s and one of 105 s |
+
+Why threads on is slower for a first view and faster for sequential
+reads was not investigated. The by-path revisit cost 1 stat with threads
+off and 3 with threads on, in different directories; the difference was
+not isolated.
 
 What section 2 does not yet meet on this profile:
 
-- A listing still schedules a checksum of every name with equal-size
-  copies on several members (D4, not yet landed). On a member without
-  `xxh128sum` each checksum downloads the whole file to a temporary file
-  and hashes it locally: about 5 GiB for a mount that only listed
-  directories, 11 to 19 GiB per test session, still running for two to
-  three minutes after unmount (a remount in that time fails as already
-  active), and the likely cause of the slow listings under load. ditz
-  `field-listing-downloads-to-hash`, `field-daemon-outlives-unmount`,
-  `field-listing-stalls-under-load`.
+- Background checksums. A listing still schedules a checksum of every
+  name with equal-size copies on several members (D4, not yet landed). A
+  checksum runs `xxh128sum` on the member and, when that fails, downloads
+  the whole file to a temporary file and hashes it locally. These members
+  took the download path (presumably they have no `xxh128sum`; not
+  checked on the host): about 5 GiB for a mount that only listed
+  directories, 11 to 19 GiB per test session, still running 142 s and
+  188 s after unmount, during which a remount fails as already active.
+  ditz `field-listing-downloads-to-hash`, `field-daemon-outlives-unmount`.
+- Listing stalls under load. With threads on, 6 of 2157 listings in ten
+  minutes of mixed load took over 10 s, the longest 105 s. Checksum
+  downloads were running at the time and hold member channels, so they are
+  the suspected cause, but the cause was not isolated
+  (`field-listing-stalls-under-load`). The threading target holds for a
+  single sequential read; it is not shown to hold under this load.
 - A directory reached by path whose parent was never listed answers its
-  own stat from a member on every visit (`field-dir-by-path-stat-per-visit`).
-- Sequential reads issue one 32 KiB request at a time, about 5.5 ms each
-  at this latency, while the same connection carries about 94 MB/s for a
-  pipelined transfer. Section 4.5's pipelined range reads are no longer
-  blocked on pooled connections (`field-seq-read-serialized`).
+  own stat from a member on every visit
+  (`field-dir-by-path-stat-per-visit`).
+
+Below expectations, outside section 2's targets (section 4.5):
+
+- Uncached sequential reads ran at 4.4 to 5.8 MiB/s with threads off and
+  7.8 MiB/s with threads on. Each 1 MiB chunk is one member read call (an
+  open, about 32 serialized 32 KiB requests, a close), and 97% of the time
+  is inside those calls: about 5.5 ms per request, some 30 times the
+  round trip, so the cost is per-request overhead on the member or in
+  paramiko, not network latency. The same connection carried about
+  90 MiB/s for a pipelined transfer (the checksum download). This changes
+  section 4.5's premise that the cost appears only at latency: pipelined
+  range reads would help on a LAN too. Connections are now pooled (#132),
+  so that work is unblocked (`field-seq-read-serialized`).
 
 Also seen: a desktop session probes a new mount within a second (stats and
-a root listing) before anything else touches it.
+a root listing), adding member requests before any user action.
