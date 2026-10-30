@@ -4,12 +4,34 @@ Base storage member abstraction.
 Defines the interface and capability surface all storage transports must follow.
 """
 
+import contextvars
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from enum import Enum
 from pathlib import Path
 from typing import Optional, List, Tuple
 import os
 from dataclasses import dataclass, replace
+
+
+# Set while serving a request someone is waiting on: a FUSE operation, or a
+# directory listing started by one. Members with a connection pool keep a
+# channel for these, so background transfers cannot starve them.
+_INTERACTIVE_REQUEST = contextvars.ContextVar("storage_interactive_request", default=False)
+
+
+@contextmanager
+def interactive_request():
+    """Mark the calls made inside the with block as interactive."""
+    token = _INTERACTIVE_REQUEST.set(True)
+    try:
+        yield
+    finally:
+        _INTERACTIVE_REQUEST.reset(token)
+
+
+def is_interactive_request() -> bool:
+    return _INTERACTIVE_REQUEST.get()
 
 
 class BackendType(Enum):

@@ -14,6 +14,7 @@ py_library(
         "storage/backends/local.py",
         "storage/backends/rsync.py",
         "storage/backends/ssh.py",
+        "storage/backends/ssh_pool.py",
         "storage/cache.py",
         "storage/locks.py",
         "storage/cache_metadata.py",
