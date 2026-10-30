@@ -1,0 +1,24 @@
+id: fs-integration-tests-5s-teardown
+title: Many fs integration tests take 5 s each; the sandboxed target runs about 520
+  s
+desc: 'Seen while gating PR #132. pytest --durations on //:storage_tests_sandboxed
+  shows a long tail of tests in test_fs_core_integration.py and test_fs_namespace_integration.py
+  at 5.0-5.3 s each (e.g. TestFSNamespaceIntegration::test_getattr_skips_unavailable_backend:
+  5.01 s on 66b0cf1, on 051627d, and on PR #132''s head alike), and the whole target
+  at about 520 s on a lightly loaded 32-core host, where AGENTS.md says "about 200s".
+  The constant 5 s suggests a teardown wait (a join or shutdown with a 5 s timeout)
+  rather than work. Finding and removing it would cut the fast gate by minutes. Not
+  investigated further.'
+type: task
+component: build
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-30T01:41:12-00:00
+references: []
+log_events:
+- time: 2026-10-30T01:41:12-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
