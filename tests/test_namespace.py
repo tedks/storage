@@ -29,6 +29,7 @@ def _make_namespace_service(
     state_db_path=None,
     readdir_snapshot_ttl=1.0,
     checksum_records=None,
+    listing_max_stale=3600.0,
 ):
     """Build a NamespaceService with sensible test defaults.
 
@@ -78,6 +79,7 @@ def _make_namespace_service(
         readdir_snapshot_ttl=readdir_snapshot_ttl,
         checksum_records=checksum_records,
         checksum_lock=threading.RLock(),
+        listing_max_stale=listing_max_stale,
     )
     # Attach for cleanup in tearDown
     ns._test_state_manager = state_manager
@@ -312,6 +314,7 @@ class TestReaddirSnapshotTTL(unittest.TestCase):
             cache_root=self.cache_root,
             backends={"backend0": self.backend},
             readdir_snapshot_ttl=0.15,
+            listing_max_stale=0.15,  # expired, not stale: relisted at once
         )
         cache_dir = self.cache_root / "ttl_expire"
         cache_dir.mkdir()
@@ -327,6 +330,43 @@ class TestReaddirSnapshotTTL(unittest.TestCase):
         refreshed = self._ns.readdir("/ttl_expire")
         self.assertIn("alpha.txt", refreshed)
         self.assertIn("beta.txt", refreshed)
+
+
+    def test_readdir_serves_stale_snapshot_then_the_refresh(self):
+        self._ns = _make_namespace_service(
+            cache_root=self.cache_root,
+            backends={"backend0": self.backend},
+            readdir_snapshot_ttl=0.15,
+        )
+        self.addCleanup(self._ns.shutdown)
+        cache_dir = self.cache_root / "ttl_stale"
+        cache_dir.mkdir()
+        (cache_dir / "alpha.txt").touch()
+        self.assertIn("alpha.txt", self._ns.readdir("/ttl_stale"))
+        (cache_dir / "beta.txt").touch()
+        time.sleep(0.25)
+
+        self.assertNotIn("beta.txt", self._ns.readdir("/ttl_stale"))
+        deadline = time.monotonic() + 5
+        while "/ttl_stale" in self._ns._background_refreshes and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertIn("beta.txt", self._ns.readdir("/ttl_stale"))
+
+    def test_listing_state_boundaries(self):
+        ns = self._ns = _make_namespace_service(
+            cache_root=self.cache_root, backends={"backend0": self.backend},
+            readdir_snapshot_ttl=60.0, listing_max_stale=3600.0,
+        )
+        self.assertEqual("fresh", ns.listing_state(1000.0, 1060.0))
+        self.assertEqual("stale", ns.listing_state(1000.0, 1060.5))
+        self.assertEqual("stale", ns.listing_state(1000.0, 4600.0))
+        self.assertEqual("expired", ns.listing_state(1000.0, 4600.5))
+        # max_stale below the fresh window: nothing is stale.
+        ns.listing_max_stale = 10.0
+        self.assertEqual("fresh", ns.listing_state(1000.0, 1060.0))
+        self.assertEqual("expired", ns.listing_state(1000.0, 1060.5))
+        ns.readdir_snapshot_ttl = float("inf")
+        self.assertEqual("fresh", ns.listing_state(0.0, 10.0 ** 9))
 
 
 class TestDirOperationPropagation(unittest.TestCase):
