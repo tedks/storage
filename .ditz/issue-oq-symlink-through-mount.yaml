@@ -1,0 +1,32 @@
+id: oq-symlink-through-mount
+title: 'Symlinks created through the mount live only in the cache: keep, refuse, or
+  replicate?'
+desc: 'Context: StorageFS.symlink() had its arguments inverted since the rewrite (fusepy
+  passes the new link''s path first, its contents second), so ''ln -s b.txt link''
+  through the mount failed with EEXIST, or, when no cached file had the contents''
+  name, created a symlink named after the contents in the cache root pointing at the
+  link path (which then showed in the mount under that name). Lane listing PR A fixes
+  the argument order and invalidates the parent listing. The link still lives only
+  in the cache: nothing records it in the index or syncs it to a member, so it is
+  lost if the cache is dropped, and readlink of a symlink that exists only on a member
+  fails (readlink reads only the cache; getattr follows the member''s stat). Options:
+  (A) keep the fixed cache-only behaviour and document it; (B) refuse symlink() with
+  EPERM/ENOTSUP until links replicate; (C) replicate symlinks: index row, sync through
+  each backend (SFTP symlink, local os.symlink, rsync -l), readlink from members.
+  Recommendation: B now if durability matters more than convenience (a link that silently
+  vanishes with the cache is worse than a refused one), C as a feature when wanted;
+  A only if links are scratch. Who decides: Ted. Blocks: nothing in lane listing (PR
+  A ships the argument-order fix either way; B would be a follow-up one-liner).'
+type: task
+component: open-questions
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-30T00:45:16-00:00
+references: []
+log_events:
+- time: 2026-10-30T00:45:16-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
