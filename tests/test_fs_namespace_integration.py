@@ -1823,6 +1823,27 @@ class TestFSNamespaceIntegration(unittest.TestCase):
         self.assertIsNotNone(state.get_member_checksum("/d/dup.txt", "backend2"))
         self.assertEqual(self.fs._persisted_refused, set())
 
+    def test_write_under_a_refusal_the_retry_cannot_lift_is_skipped(self):
+        (self.backend1_dir / "d").mkdir()
+        (self.backend2_dir / "d").mkdir()
+        (self.backend1_dir / "d" / "dup.txt").write_text("same")
+        (self.backend2_dir / "d" / "dup.txt").write_text("same")
+        self._list_and_settle('/d')
+        state = self.fs.state_manager
+        with patch.object(state, "delete_member_checksums", side_effect=sqlite3.OperationalError("locked")):
+            self.fs._forget_checksums({"/d"}, subtree=True)
+            with patch.object(state, "put_member_checksum") as put:
+                self._upload("/d/dup.txt", b"diff")
+            put.assert_not_called()
+        # In memory the upload's record stands; the old row stays refused.
+        self.assertEqual(self.fs._checksum_records.get(("/d/dup.txt", "backend2"), None) is None
+                         or self.fs._checksum_records[("/d/dup.txt", "backend2")].checksum
+                         == fast_checksum_bytes(b"diff"), True)
+        # Once deletes work again, a successful delete clears the backlog.
+        self.fs._forget_checksums({"/elsewhere"})
+        self.assertEqual(self.fs._persisted_refused, set())
+        self.assertIsNone(state.get_member_checksum("/d/dup.txt", "backend2"))
+
     def test_settled_verify_results_are_dropped_first(self):
         self.fs.VERIFY_RESULTS_KEPT = 2
         for d in ("a", "b", "c"):

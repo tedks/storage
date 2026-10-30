@@ -594,15 +594,20 @@ class StorageFS(Operations):
             try:
                 self.state_manager.delete_member_checksums(paths, subtree=subtree,
                                                            backend_name=backend_name)
-            except Exception:
+            except Exception as exc:
+                self.logger.debug("retrying refused checksum deletes failed: %r", exc)
                 return
             for path in paths:
                 self._persisted_refused.discard((path, backend_name, subtree))
 
-    def _persisted_row_refused(self, key: tuple) -> bool:
-        """Whether a failed write covered key; the caller holds _checksum_lock."""
+    def _persisted_row_refused(self, key: tuple, ignore=None) -> bool:
+        """Whether a failed write covered key (not counting the refusal
+        entry ignore); the caller holds _checksum_lock."""
         path, backend_name = key
-        for refused_path, refused_backend, subtree in self._persisted_refused:
+        for entry in self._persisted_refused:
+            if entry == ignore:
+                continue
+            refused_path, refused_backend, subtree = entry
             if refused_backend not in (None, backend_name):
                 continue
             if path == refused_path or (
@@ -731,10 +736,18 @@ class StorageFS(Operations):
         if record is None or record.checksum is None or record.basis is None:
             self._drop_persisted_checksums({canonical_path}, backend_name=backend_name)
             return
+        own = (canonical_path, backend_name, False)
         if self._persisted_refused:
             # Before the write, so a refused subtree or member-wide delete
             # does not remove the row written now.
             self._retry_refused_deletes()
+            if self._persisted_refused - {own} and self._persisted_row_refused(
+                    (canonical_path, backend_name), ignore=own):
+                # Still refused: the index is not answering, a row written
+                # now would be deleted by a later retry and is not loaded
+                # meanwhile, so it is not written; the old row stays refused.
+                self._persisted_refused.add(own)
+                return
         try:
             self.state_manager.put_member_checksum(canonical_path, backend_name, record)
         except Exception as exc:
@@ -742,7 +755,7 @@ class StorageFS(Operations):
             self.logger.warning("could not persist a checksum: %r", exc)
             self._persisted_refused.add((canonical_path, backend_name, False))
             return
-        self._persisted_refused.discard((canonical_path, backend_name, False))
+        self._persisted_refused.discard(own)
 
     def _load_persisted_checksum(self, key: tuple, basis: ChecksumBasis) -> bool:
         """Install the persisted record for key if it was taken from basis;
