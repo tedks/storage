@@ -46,6 +46,10 @@ listing_max_stale = 3600
 # does not hold up listings, stats and reads of others. Off by default until
 # it has been field-tested.
 # fuse_threads = true
+# Seconds between re-verifications of the conflict view's recorded hashes:
+# each interval, every member whose hash queue is idle hashes again the one
+# file checked longest ago (and over an hour ago). 0 turns it off.
+# checksum_reverify_interval = 60
 backends = [
   "ssh://user@storage-host.example:/srv/raid/media/",
   "ssh://user@storage-host.example:/srv/chunk0/media/",
