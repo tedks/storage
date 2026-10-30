@@ -118,7 +118,8 @@ class ControlSockets:
 
     def _ensure_dir_locked(self) -> Optional[Path]:
         if self._dir is not None:
-            if _identity(self._dir, follow=False) == self._dir_identity:
+            identity = _identity(self._dir, follow=False)
+            if identity is not None and identity == self._dir_identity:
                 return self._dir
             # Removed from under us (a runtime directory cleaned at logout, a
             # tmp cleaner), or replaced by someone else's directory or link
@@ -146,8 +147,11 @@ class ControlSockets:
             if len(os.fsencode(str(directory))) + 17 > _MAX_CONTROL_PATH:
                 shutil.rmtree(directory, ignore_errors=True)  # just made, ours
                 continue
+            identity = _identity(directory, follow=False)
+            if identity is None:  # gone already
+                continue
             self._dir = directory
-            self._dir_identity = _identity(directory, follow=False)
+            self._dir_identity = identity
             if not self._atexit_registered:
                 atexit.register(self.close)
                 self._atexit_registered = True

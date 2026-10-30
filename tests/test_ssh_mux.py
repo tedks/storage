@@ -138,6 +138,14 @@ class TestControlSockets(unittest.TestCase):
             second = self._control_path(sockets.options("u", "h", 22, None))
         self.assertTrue(second.parent.is_dir())
 
+    def test_a_missing_directory_is_never_taken_for_the_one_we_made(self):
+        sockets = self._sockets()
+        first = self._control_path(sockets.options("u", "h", 22, None)).parent
+        sockets._dir_identity = None  # as if the identity had not been read
+        shutil.rmtree(first)
+        second = self._control_path(sockets.options("u", "h", 22, None)).parent
+        self.assertTrue(second.is_dir())
+
     def test_a_replaced_socket_directory_is_not_trusted(self):
         sockets = self._sockets()
         first = self._control_path(sockets.options("u", "h", 22, None)).parent
