@@ -1356,6 +1356,20 @@ class TestFSNamespaceIntegration(unittest.TestCase):
 
         self.assertNotIn(("/dup.txt", "backend2"), self.fs._checksum_records)
 
+    def test_rename_onto_an_existing_file_replaces_it(self):
+        """ditz rename-over-existing-file: the save path of most editors."""
+        for path, data in (("/src.txt", b"new contents"), ("/dst.txt", b"old")):
+            fh = self.fs.create(path, 0o644)
+            self.fs.write(path, data, 0, fh)
+            self.fs.release(path, fh)
+        self.fs.rename("/src.txt", "/dst.txt")
+        self.assertIsNone(self.fs.state_manager.get_file_metadata("/src.txt"))
+        row = self.fs.state_manager.get_file_metadata("/dst.txt")
+        self.assertEqual(len(b"new contents"), row.size)
+        fh = self.fs.open("/dst.txt", os.O_RDONLY)
+        self.assertEqual(b"new contents", self.fs.read("/dst.txt", 100, 0, fh))
+        self.fs.release("/dst.txt", fh)
+
     def test_rename_and_unlink_forget_recorded_checksums(self):
         (self.backend1_dir / "sub").mkdir()
         (self.backend2_dir / "sub").mkdir()
