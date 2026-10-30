@@ -230,6 +230,16 @@ class Backend(ABC):
         """Rename or move a path on this backend."""
         pass
 
+    def filesystem_identity(self) -> Optional[Tuple[str, int, int]]:
+        """(host, port, device id) of the filesystem holding this member's root.
+
+        Two members with equal identities store on one filesystem. The host is
+        the literal string the member was configured with ("" for a local
+        member), never resolved. None when unknown or the probe failed;
+        callers treat that as "no information", not an error.
+        """
+        return None
+
     @abstractmethod
     def get_free_space(self) -> Optional[int]:
         """Get free space in bytes, None if unknown"""

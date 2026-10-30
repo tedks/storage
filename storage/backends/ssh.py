@@ -153,6 +153,7 @@ class SSHBackend(Backend):
         self.password = password
         self.key_filename = key_filename
         self.connect_timeout = connect_timeout
+        self.probe_reached_host = False
         # Reads and transfers get a longer timeout than metadata requests,
         # so a large or slow read is not aborted as a dead link.
         self.sftp_operation_timeout = max(60.0, float(connect_timeout) * 6.0)
@@ -587,6 +588,52 @@ class SSHBackend(Backend):
     # ------------------------------------------------------------------ #
     # Optional capabilities used by conflict detection
     # ------------------------------------------------------------------ #
+    def filesystem_identity(self):
+        """The device id of the remote root (`stat -c %d`), on this host and port.
+
+        Runs on a connection of its own, closed before returning: this is
+        called before FUSE's daemonizing fork, and a pooled transport opened
+        here would reach the forked child with its reader thread gone. A
+        failure here also leaves the member's pool state untouched.
+        probe_reached_host says whether the connection itself succeeded.
+        """
+        client = None
+        self.probe_reached_host = False
+        try:
+            client = self._open_client()
+            self.probe_reached_host = True
+            cmd = f"stat -L -c %d -- {self._shell_quote(str(self.remote_path))}"
+            _stdin, stdout, _stderr = client.exec_command(cmd, timeout=self.connect_timeout)
+            stdout.channel.settimeout(self.connect_timeout)
+            text = stdout.read(64).decode(errors="replace").strip()
+            # recv_exit_status() has no timeout; bound the wait ourselves.
+            if not stdout.channel.status_event.wait(self.connect_timeout):
+                raise socket.timeout("no exit status from stat")
+            rc = stdout.channel.exit_status
+            if rc != 0 or not text.isdigit():
+                raise ValueError(f"unusable stat output (exit {rc})")
+            return (self.host, self.port, int(text))
+        except Exception as exc:
+            self.logger.debug("member %s: filesystem probe failed: %s", self.name, exc)
+            return None
+        finally:
+            if client is not None:
+                try:
+                    transport = client.get_transport()
+                    client.close()
+                    # close() does not wait for the transport thread; a thread
+                    # still running at FUSE's fork could leave a lock held in
+                    # the child.
+                    if transport is not None:
+                        transport.join(self.connect_timeout)
+                        if transport.is_alive():
+                            # Nothing safe to do about it here; say so.
+                            self.logger.warning(
+                                "member %s: probe connection's transport thread "
+                                "did not stop in %ss", self.name, self.connect_timeout)
+                except Exception:
+                    pass
+
     def _shell_quote(self, value: str) -> str:
         return shlex.quote(value)
 
