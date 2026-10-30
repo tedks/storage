@@ -5,6 +5,7 @@ Handles asynchronous synchronization of files from cache to backing filesystems.
 Monitors dirty files and syncs them according to their replication configuration.
 """
 
+import sys
 import time
 import threading
 import queue
@@ -21,6 +22,11 @@ from .sync_executor import SyncExecutor
 from .sync_tasks import DirOperation, DirSyncTask, SyncConfig, SyncTask, dir_task_key
 
 logger = logging.getLogger(__name__)
+
+# Posted to the task queue by SyncManager.stop() so idle workers wake at once
+# instead of at the end of their poll. Sorts ahead of every real task (the
+# highest real priority is 1000). Never processed; compared by identity.
+_WAKE = SyncTask(virtual_path="", priority=sys.maxsize)
 
 __all__ = [
     "DirOperation",
@@ -73,6 +79,11 @@ class SyncWorker(threading.Thread):
                 try:
                     task = self.task_queue.get(timeout=1.0)
                 except queue.Empty:
+                    continue
+
+                if task is _WAKE:
+                    # stop() posted this to end the idle wait; nothing to run.
+                    self.task_queue.task_done()
                     continue
 
                 self._active_task = task.virtual_path
@@ -158,6 +169,10 @@ class SyncManager:
         # Workers
         self.workers = []
         self._running = False
+        # Set by stop() to end the monitor's sleep between scans. Each start()
+        # makes a fresh one, so a monitor that outlived stop()'s join can never
+        # be revived by a later start().
+        self._monitor_stop = threading.Event()
         self._monitor_thread = None
         self._queued_tasks: Set[str] = set()
         self._queued_dir_tasks: Set[Tuple[str, str, Optional[str]]] = set()
@@ -185,7 +200,9 @@ class SyncManager:
 
         # Start monitor thread
         self._running = True
-        self._monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
+        self._monitor_stop = threading.Event()
+        self._monitor_thread = threading.Thread(
+            target=self._monitor_loop, args=(self._monitor_stop,), daemon=True)
         self._monitor_thread.start()
 
         logger.info("Sync manager started")
@@ -197,10 +214,15 @@ class SyncManager:
 
         logger.info("Stopping sync manager")
         self._running = False
+        self._monitor_stop.set()
 
-        # Stop workers
+        # Stop every worker before waking any, so a woken worker cannot take a
+        # sibling's wake before its own stop flag is set. One wake task each
+        # ends an idle worker's queue wait.
         for worker in self.workers:
             worker.stop()
+        for _ in self.workers:
+            self.task_queue.put(_WAKE)
 
         # Wait for workers to finish
         for worker in self.workers:
@@ -211,13 +233,35 @@ class SyncManager:
             self._monitor_thread.join(timeout=5.0)
 
         self.workers.clear()
+        self._drop_wake_tasks()
         logger.info("Sync manager stopped")
 
-    def _monitor_loop(self):
+    def _drop_wake_tasks(self):
+        """Remove wake tasks no worker took (it was busy or exited first).
+
+        They would otherwise stay in qsize() and unfinished_tasks, so a
+        stopped manager would look busy and wait_for_completion would never
+        see an idle queue. Real tasks are put back.
+        """
+        drained = []
+        while True:
+            try:
+                drained.append(self.task_queue.get_nowait())
+            except queue.Empty:
+                break
+        # Re-put real tasks before releasing the drained items' unfinished
+        # counts, so the count never reaches zero while real work is pending.
+        for task in drained:
+            if task is not _WAKE:
+                self.task_queue.put(task)
+        for _ in drained:
+            self.task_queue.task_done()
+
+    def _monitor_loop(self, stop: threading.Event):
         """Monitor for dirty files and queue them for sync"""
         logger.info("Sync monitor started")
 
-        while self._running:
+        while not stop.is_set():
             try:
                 # Get dirty files
                 dirty_files = self.state_manager.get_dirty_files()
@@ -229,11 +273,11 @@ class SyncManager:
                     self.queue_sync(metadata.virtual_path, priority=50)
 
                 # Sleep before next check
-                time.sleep(self.config.monitor_interval)
+                stop.wait(self.config.monitor_interval)
 
             except Exception as e:
                 logger.error(f"Monitor loop error: {e}")
-                time.sleep(1.0)
+                stop.wait(1.0)
 
         logger.info("Sync monitor stopped")
 
