@@ -334,6 +334,91 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.assertEqual(retry_head, payload[:4096])
         self.assertEqual(retry_tail, payload[max(0, cached_size - 4096):cached_size])
 
+    def _sync_now(self, path):
+        from storage.sync_executor import SyncExecutor
+        from storage.sync_tasks import SyncTask
+        executor = SyncExecutor(
+            worker_id=0, state_manager=self.fs.state_manager, cache_manager=self.fs.cache_manager,
+            replication_manager=self.fs.replication_manager, config=self.fs.sync_manager.config,
+        )
+        executor.process(SyncTask(path))
+
+    def _read_whole(self, path, size):
+        vfd = self.fs.open(path, os.O_RDONLY)
+        try:
+            data = b""
+            while len(data) < size:
+                chunk = self.fs.read(path, 32 * 1024, len(data), vfd)
+                if not chunk:
+                    break
+                data += chunk
+            return data
+        finally:
+            self.fs.release(path, vfd)
+
+    def _fail_streamed_refetch(self, path, payload):
+        """Open and read past fail_after_offset, so the session fails after a prefix."""
+        vfd = self.fs.open(path, os.O_RDONLY)
+        self.assertIsNotNone(self._session_for(vfd))
+        self.assertEqual(self.fs.read(path, 4096, 0, vfd), payload[:4096])
+        with self.assertRaises(FuseOSError):
+            self.fs.read(path, 4096, 96 * 1024, vfd)
+        self.fs.release(path, vfd)
+        partial = self.cache_dir / (path.lstrip('/') + ".storage.partial")
+        self.assertTrue(self._wait_for(lambda: not partial.exists(), timeout=5.0))
+
+    def test_failed_refetch_of_an_evicted_file_never_reaches_the_member(self):
+        # ditz streaming-promoted-prefix-false-conflict, worse case: an
+        # evicted file keeps its CLEAN row and location checksums. A failed
+        # streamed refetch promoted its prefix, the next open saw a lost
+        # write (the row's stat is the whole file's) and marked it DIRTY,
+        # and the sync, finding the member unchanged, uploaded the prefix
+        # over it.
+        self.backend.copy_delay = 0
+        payload = os.urandom(192 * 1024)
+        fh = self.fs.create('/evicted.bin', 0o644)
+        self.fs.write('/evicted.bin', payload, 0, fh)
+        self.fs.release('/evicted.bin', fh)
+        self._sync_now('/evicted.bin')
+        self.assertEqual(payload, (self.backend_dir / "evicted.bin").read_bytes())
+        cache_path = self.cache_dir / "evicted.bin"
+        self.assertGreater(self.fs.cache_manager._evict_if_still_clean('/evicted.bin', cache_path), 0)
+
+        self.backend.fail_after_offset = 64 * 1024
+        self._fail_streamed_refetch('/evicted.bin', payload)
+        self.assertFalse(cache_path.exists(), "a prefix was promoted for an indexed file")
+
+        self.backend.fail_after_offset = None
+        self.assertEqual(self._read_whole('/evicted.bin', len(payload)), payload)
+        self.assertEqual(SyncStatus.CLEAN, self.fs.state_manager.get_file_metadata('/evicted.bin').sync_status)
+        self._sync_now('/evicted.bin')
+        self.assertEqual(payload, (self.backend_dir / "evicted.bin").read_bytes())
+
+    def test_failed_refetch_after_invalidation_is_no_conflict(self):
+        # The issue's case: after _invalidate_file_cache the row is CLEAN with
+        # size 0 and no checksum; a promoted prefix then looked like a write,
+        # and the sync reported CONFLICT on a file nobody wrote.
+        self.backend.copy_delay = 0
+        payload = os.urandom(192 * 1024)
+        (self.backend_dir / "changed.bin").write_bytes(payload)
+        self.assertEqual(self._read_whole('/changed.bin', len(payload)), payload)
+        self.assertTrue(self._wait_for(lambda: (self.cache_dir / "changed.bin").exists(), timeout=5.0))
+        self.assertIsNotNone(self.fs.state_manager.get_file_metadata('/changed.bin'))
+
+        changed = os.urandom(192 * 1024)
+        (self.backend_dir / "changed.bin").write_bytes(changed)
+        self.fs._invalidate_file_cache('/changed.bin')
+        self.backend.fail_after_offset = 64 * 1024
+        self._fail_streamed_refetch('/changed.bin', changed)
+        self.assertFalse((self.cache_dir / "changed.bin").exists())
+
+        self.backend.fail_after_offset = None
+        self.assertEqual(self._read_whole('/changed.bin', len(changed)), changed)
+        self.assertTrue(self._wait_for(lambda: (self.cache_dir / "changed.bin").exists(), timeout=5.0))
+        row = self.fs.state_manager.get_file_metadata('/changed.bin')
+        self.assertEqual(SyncStatus.CLEAN, row.sync_status)
+        self.assertEqual(len(changed), row.size)
+
     def test_streaming_session_is_shared_across_readers(self):
         payload = os.urandom(512 * 1024)
         (self.backend_dir / "shared.bin").write_bytes(payload)
