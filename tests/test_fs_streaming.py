@@ -445,6 +445,9 @@ class TestFSStreamingIntegration(unittest.TestCase):
                 self.assertTrue(go.wait(timeout=10.0))
             return real_copy(virtual_path, local_path)
 
+        # The read-ahead worker waits at its first read until the failure is
+        # set up, so it can neither finish the file nor pass 64 KiB first.
+        self.backend.worker_gate = threading.Event()
         rvfd = self.fs.open('/raced.bin', os.O_RDONLY)
         self.assertIsNotNone(self._session_for(rvfd))
         self.assertEqual(self.fs.read('/raced.bin', 4096, 0, rvfd), payload[:4096])
@@ -465,6 +468,7 @@ class TestFSStreamingIntegration(unittest.TestCase):
             with self.assertRaises(FuseOSError):
                 self.fs.read('/raced.bin', 4096, 96 * 1024, rvfd)
             self.fs.release('/raced.bin', rvfd)
+            self.backend.worker_gate.set()
             cache_path = self.cache_dir / "raced.bin"
             self.assertTrue(self._wait_for(lambda: cache_path.exists(), timeout=5.0))
             self.assertLess(cache_path.stat().st_size, len(payload))  # the prefix won
@@ -479,8 +483,22 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.assertEqual(len(payload), row.size)
         self.assertEqual(SyncStatus.CLEAN, row.sync_status)
 
+    def test_a_member_file_carrying_the_prefix_marker_is_fetched_whole_and_indexed(self):
+        # Council round 2 on #146: a member file may carry the marker (an
+        # older local member copy kept xattrs). A whole-file fetch clears it,
+        # or the file would be served unindexed for ever.
+        from storage.cache_metadata import PREFIX_XATTR
+        member_file = self.backend_dir / "marked.bin"
+        member_file.write_bytes(b"whole file")
+        os.setxattr(str(member_file), PREFIX_XATTR, b"1")
+        vfd = self.fs.open('/marked.bin', os.O_RDWR)
+        self.fs.release('/marked.bin', vfd)
+        cache_path = self.cache_dir / "marked.bin"
+        self.assertNotIn(PREFIX_XATTR, os.listxattr(str(cache_path)))
+        self.assertIsNotNone(self.fs.state_manager.get_file_metadata('/marked.bin'))
+
     def test_unindexed_prefix_is_dropped_only_when_unopened_and_unindexed(self):
-        from storage.streaming import PREFIX_XATTR
+        from storage.cache_metadata import PREFIX_XATTR
         cache_path = self.cache_dir / "p.bin"
         cache_path.write_bytes(b"prefix")
         os.setxattr(str(cache_path), PREFIX_XATTR, b"1")
