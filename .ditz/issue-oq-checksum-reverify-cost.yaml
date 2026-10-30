@@ -1,0 +1,34 @@
+id: oq-checksum-reverify-cost
+title: 'Re-verification cost on large replicated trees: cap it?'
+desc: 'Raised by the council on PR #152 (conflicts-persisted-records). The re-verification
+  Ted ruled (one file per member per minute at idle, interval a mount option) now
+  covers names recorded on two or more members, which on a replicated tree is every
+  synced file. A full pass over a member takes one interval per recorded name (about
+  a week per 10,000 files at the default), and while rows are older than an hour every
+  member reads one whole file per minute, indefinitely: disks never idle, and a large
+  file''s re-verify can delay that member''s next listing hashes by up to the SFTP
+  operation timeout (idle gates only its start).
+
+
+  Options: (a) keep as ruled (current code; documented in README). (b) Add a per-member
+  daily cap on bytes re-verified (e.g. a profile key), keeping the per-minute cadence
+  for small files. (c) Re-verify only names the conflict view has actually compared
+  this mount or the last (rows created by listing hashes), not every sync-recorded
+  replica. (d) Raise the default interval.
+
+
+  Recommendation: (b) with a generous default, or (a) and revisit after the field
+  test. Who decides: Ted. Blocks: nothing; PR #152 ships (a).'
+type: task
+component: open-questions
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-30T18:41:47-00:00
+references: []
+log_events:
+- time: 2026-10-30T18:41:47-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
