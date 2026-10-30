@@ -1526,16 +1526,19 @@ class TestFSStreamingIntegration(unittest.TestCase):
         edit = b"E" * 4096
         expected = edit + payload[len(edit):]
 
-        # The index lock, traced: the writer's first attempt to take it
-        # shows it reached the window (with the fix it then waits there).
-        writer_at_index = threading.Event()
+        # The index lock, traced: finalize is let go only once the writer
+        # has either finished inside the window (the old code) or found the
+        # lock held and is waiting for it (the fix), never on a timer.
+        writer_settled = threading.Event()
         real_lock = self.fs.state_manager._db_lock
 
         class TracedLock:
-            def acquire(self, *args, **kwargs):
+            def acquire(self, blocking=True, timeout=-1):
                 if threading.current_thread().name == "window-writer":
-                    writer_at_index.set()
-                return real_lock.acquire(*args, **kwargs)
+                    if real_lock.acquire(blocking=False):
+                        return True
+                    writer_settled.set()
+                return real_lock.acquire(blocking, timeout)
 
             def release(self):
                 real_lock.release()
@@ -1569,6 +1572,8 @@ class TestFSStreamingIntegration(unittest.TestCase):
                 outcome["done"] = True
             except BaseException as exc:  # noqa: BLE001 - reported below
                 outcome["error"] = exc
+            finally:
+                writer_settled.set()
 
         with patch.object(cache, "store_file_metadata", side_effect=held_store):
             rvfd, session = self._stream_whole_file("window.bin", payload)
@@ -1576,9 +1581,7 @@ class TestFSStreamingIntegration(unittest.TestCase):
             self.assertTrue((self.cache_dir / "window.bin").exists())
             writer = threading.Thread(target=write_through_mount, name="window-writer", daemon=True)
             writer.start()
-            self.assertTrue(writer_at_index.wait(timeout=3.0))
-            # Unfixed, the writer finishes inside the window; fixed, it waits.
-            writer.join(0.2)
+            self.assertTrue(writer_settled.wait(timeout=3.0))
             go.set()
             writer.join(timeout=5.0)
             session.worker.join(timeout=5.0)

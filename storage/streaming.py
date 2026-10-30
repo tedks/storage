@@ -1106,8 +1106,9 @@ class StreamingReadManager:
         # queues no sync (ditz streaming-finalize-row-window). The location
         # rows go in the same section, so an eviction or rename cannot run
         # between the row and them. Only local file calls run under it (no
-        # fsync); the cache lock is taken after. Only the calls before the
-        # install raise OSError here: _store_finalized_row catches its own.
+        # fsync); the cache lock is taken after. Only the install and the
+        # calls before it raise OSError here: the row and location stores
+        # catch their own.
         metadata = None
         try:
             os.fsync(io_fd)
