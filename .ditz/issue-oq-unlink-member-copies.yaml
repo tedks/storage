@@ -1,0 +1,47 @@
+id: oq-unlink-member-copies
+title: 'Unlink through the mount never deletes member copies: delete, keep, or tombstone?'
+desc: 'Context: StorageFS.unlink of a canonical path removes the cache file and the
+  index row (NamespaceService.unlink) and never touches a member: the backend delete
+  runs only for a member-qualified (conflict-suffixed) path, and the original "TODO:
+  Propagate to backends in background" was never done. So a file that had synced reappears
+  after rm through the mount, from the members'' listings, and the same holds for
+  a file in a directory being removed (rmdir then fails on a member with ENOTEMPTY
+  and the directory stays listed). Found by lane sync-correctness while fixing sync-namespace-orphans;
+  verified with a direct StorageFS run (write, sync to CLEAN, unlink: the member keeps
+  the file and readdir lists it).
+
+
+  Options: (A) unlink deletes the file on every member that holds it (index locations,
+  plus a stat of the others), synchronously like rename, with a queued retry for an
+  unreachable member; irreversible on the archive, as rm is everywhere else. (B) keep
+  the member copies and hide the name with a tombstone (an index row or an xattr on
+  the parent), so rm through the mount is reversible from the members; needs a way
+  to list and purge tombstones and survives only as long as the index/xattrs. (C)
+  keep the status quo and document that rm through the mount does not delete synced
+  files.
+
+
+  Recommendation: A. The mount''s job is one filesystem; an rm that comes back is
+  wrong, and members that need history should get it from their own snapshots/backups,
+  not from rm being a no-op. If an undelete window is wanted, B can follow on top
+  of A later.
+
+
+  Who decides: Ted (irreversible deletion on the archive members).
+
+  Blocks: the unlink half of sync-namespace-orphans (PR for rename and upload races
+  proceeds without it: unlink now waits for an in-flight upload, so no orphan location
+  row is left, but the member copy stays as it does today).'
+type: task
+component: open-questions
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-10-30T16:35:41-00:00
+references: []
+log_events:
+- time: 2026-10-30T16:35:41-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
