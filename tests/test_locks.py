@@ -34,7 +34,7 @@ class TestNamespaceLock(unittest.TestCase):
 
     def test_readers_share(self):
         with self.lock.shared():
-            entered = start(lambda: self.lock.shared().__enter__())
+            entered = start(passing_through(self.lock.shared))
             self.assertTrue(entered.wait(WAIT))
 
     def test_writer_waits_for_readers_and_excludes_them(self):
@@ -88,7 +88,7 @@ class TestNamespaceLock(unittest.TestCase):
 
         reader_done = start(reader)
         self.assertTrue(holding.wait(WAIT))
-        writer_done = start(lambda: self.lock.exclusive().__enter__())
+        writer_done = start(passing_through(self.lock.exclusive))
         self.assertFalse(writer_done.wait(BLOCKED))
         proceed.set()
         self.assertTrue(reentered.wait(WAIT))
@@ -113,6 +113,27 @@ class TestNamespaceLock(unittest.TestCase):
         # Still usable afterwards.
         with self.lock.exclusive():
             pass
+
+
+    def test_try_shared(self):
+        with self.lock.try_shared() as got:
+            self.assertTrue(got)
+        holding = threading.Event()
+        release = threading.Event()
+
+        def writer():
+            with self.lock.exclusive():
+                holding.set()
+                release.wait(WAIT)
+
+        done = start(writer)
+        self.assertTrue(holding.wait(WAIT))
+        with self.lock.try_shared() as got:
+            self.assertFalse(got)
+        release.set()
+        self.assertTrue(done.wait(WAIT))
+        with self.lock.try_shared() as got:
+            self.assertTrue(got)
 
 
 class TestPathLocks(unittest.TestCase):

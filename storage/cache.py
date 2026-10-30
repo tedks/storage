@@ -54,8 +54,10 @@ class CacheManager:
         # Set by StorageFS: a context manager that try-acquires the outer
         # locks of a canonical path (storage/locks.py) and yields whether it
         # got them. Eviction runs under self._lock, inside those locks'
-        # order, so it never waits for one: a path an open, a rename or an
-        # upload holds is skipped. None (no StorageFS) means no contention.
+        # order, so it never waits for one: a path another thread's open,
+        # rename or upload holds is skipped (the locks are reentrant, so a
+        # path the evicting thread holds itself is not). None (no
+        # StorageFS) means no contention.
         self.path_guard: Optional[Callable[[str], ContextManager[bool]]] = None
         self.state_manager = state_manager
         self.max_size_bytes = max_size_bytes

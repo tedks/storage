@@ -1360,25 +1360,34 @@ class StorageFS(Operations):
         A file rename holds both paths' locks (sorted) across the cache move
         and the member renames, so an open of either name waits for the
         members to agree with the cache and cannot fetch a stale copy under
-        the old name. Anything else (a directory, which changes every path
-        under it, or a name the cache does not hold as a file) holds the
-        namespace lock exclusive, which is always safe. Whether the cache
-        holds old as a file is checked again under the path locks, since it
-        can change while waiting.
+        the old name. A directory rename changes every path under it, so it
+        holds the namespace lock exclusive, which waits for every in-flight
+        path-locked handler (ditz threading-hierarchical-namespace-lock).
+        A name the cache does not hold is classified by getattr (served
+        from the listing when it is fresh); one that does not exist is
+        renamed as a file, which fails as before. A directory appearing in
+        the cache meanwhile (a fetch beneath it) is caught by the recheck
+        under the path locks.
         """
         old_resolved = self._resolve_path(old)
         new_canonical = self._resolve_path(new).canonical_path
-
-        def cached_as_file() -> bool:
-            cache_path = old_resolved.canonical_cache_path
-            return os.path.lexists(cache_path) and not os.path.isdir(cache_path)
-
-        while cached_as_file():
-            with self._path_locked(old_resolved.canonical_path, new_canonical):
-                if cached_as_file():
+        cache_path = old_resolved.canonical_cache_path
+        while True:
+            if os.path.isdir(cache_path):
+                is_dir = True
+            elif os.path.lexists(cache_path):
+                is_dir = False
+            else:
+                try:
+                    is_dir = stat.S_ISDIR(self.getattr(old)["st_mode"])
+                except FuseOSError:
+                    is_dir = False
+            if is_dir:
+                with self._namespace_lock.exclusive():
                     return self._rename(old, new)
-        with self._namespace_lock.exclusive():
-            return self._rename(old, new)
+            with self._path_locked(old_resolved.canonical_path, new_canonical):
+                if not os.path.isdir(cache_path):
+                    return self._rename(old, new)
 
     def _rename(self, old, new):
         old_canonical = self._resolve_path(old).canonical_path
@@ -1676,16 +1685,18 @@ class StorageFS(Operations):
     def release(self, path, fh):
         """Release (close) a file
 
-        Closing a member copy (a conflict-suffixed path) uploads it, under
-        the path's lock so that no rename, unlink, refetch or watcher
-        invalidation of the path runs under the upload. The descriptor's
-        path is read again once the lock is held, since a rename re-points
-        it; a canonical path's close only queues a sync and takes no lock.
+        Holds the path's lock (the descriptor's current path, read again
+        once the lock is held, since a rename re-points it): closing a
+        member copy (a conflict-suffixed path) uploads it, and no rename,
+        unlink, refetch or watcher invalidation may run under the upload; a
+        canonical close reads the path's row and queues its sync, which a
+        rename must not move in between. A streaming descriptor takes no
+        lock: its close only releases the session.
         """
         while True:
             with self._fd_lock:
                 entry = self._fd_map.get(fh)
-            if entry is None or not entry.backend_name or entry.prefetch_session is not None:
+            if entry is None or entry.prefetch_session is not None:
                 return self._release(path, fh)
             locked_path = entry.canonical_path
             with self._path_locked(locked_path):
@@ -1718,7 +1729,7 @@ class StorageFS(Operations):
             raise FuseOSError(close_error.errno)
 
         try:
-            self.cache_manager.flush_file(path)
+            self.cache_manager.flush_file(entry.virtual_path)
 
             if entry.backend_name:
                 backend = self.backends.get(entry.backend_name)

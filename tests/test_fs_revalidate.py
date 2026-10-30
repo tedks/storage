@@ -315,7 +315,7 @@ class TestRevalidateOnOpen(RevalidateTestBase):
         self.assertEqual(b"ORIGINAL", self.read_through("/f.txt"))
 
     def test_rename_failing_after_the_cache_moved_drops_baselines(self):
-        def move_cache_then_fail(old, new):
+        def move_cache_then_fail(old, new, on_local_moved=None):
             os.rename(self.cache_dir / "f.txt", self.cache_dir / "g.txt")
             raise OSError(5, "I/O error")
 

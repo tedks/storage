@@ -9,8 +9,9 @@ Two outer locks order the handlers that change what a path names
    and rmdir, which change what many paths name at once.
 2. PathLocks: one reentrant lock per canonical path, held across open,
    create, unlink, truncate, utimens, mkdir, symlink, a file rename (both
-   paths, in sorted order) and release's upload of a member copy. getattr,
-   readdir, read, write, the xattr handlers and statfs take neither lock.
+   paths, in sorted order) and release (including its upload of a member
+   copy). getattr, readdir, readlink, read, write, fsync, chmod, chown,
+   the xattr handlers and statfs take neither lock.
 3. CacheManager._lock, never held across member I/O.
 4. The index lock (StateManager.metadata_lock), then StorageFS._fd_lock.
 5. Leaves, unchanged: _member_checks_lock, dir_cache_lock then
@@ -21,6 +22,10 @@ Eviction runs under the cache lock, against the order, so it only
 try-acquires (NamespaceLock.try_shared, PathLocks.try_hold) and skips a
 busy path. Nothing else may take a level-1 or level-2 lock while holding a
 lock from levels 3 to 5.
+
+Outside the order: the sync workers and the streaming prefetch worker take
+neither outer lock. A sync upload can still race a rename of its path, as
+it could before (ditz threading-sync-vs-rename).
 """
 
 import threading
