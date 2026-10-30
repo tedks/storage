@@ -38,6 +38,7 @@ from .replication import ReplicationManager
 from .sync import SyncManager
 from .sync_tasks import DirOperation
 from .recompute import RecomputeEngine
+from .checksum_queue import MemberHashQueues
 from .checksums import ChecksumBasis, ChecksumRecord
 from .pathing import ResolvedPath, resolve_path
 from .namespace import DEFAULT_LISTING_MAX_STALE, NamespaceService
@@ -260,7 +261,9 @@ class StorageFS(Operations):
         self._checksum_lock = threading.RLock()
         self._checksum_records: Dict[tuple, ChecksumRecord] = {}
         self._checksum_tasks: Dict[tuple, concurrent.futures.Future] = {}
-        self._checksum_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+        # One low-priority worker per member, newest first, bounded (see
+        # checksum_queue); threads start on first use, after the fork.
+        self._checksum_queues = MemberHashQueues(logger=self.logger)
 
         self.namespace = NamespaceService(
             backends=self.backends,
@@ -269,8 +272,8 @@ class StorageFS(Operations):
             sync_manager=self.sync_manager,
             logger=self.logger,
             resolve_path=lambda path: self._resolve_path(path),
-            schedule_checksum_task=lambda backend, path, basis=None: self._schedule_checksum_task(
-                backend, path, basis
+            schedule_checksum_task=lambda backend, path, basis=None, **kw: self._schedule_checksum_task(
+                backend, path, basis, **kw
             ),
             partial_suffix=self._PARTIAL_SUFFIX,
             is_hidden_entry=self._is_hidden_entry,
@@ -615,7 +618,7 @@ class StorageFS(Operations):
             backend_names=backend_names,
         )
 
-    def _record_checksum(self, canonical_path: str, backend_name: str, checksum: str, timestamp: float,
+    def _record_checksum(self, canonical_path: str, backend_name: str, checksum: Optional[str], timestamp: float,
                          basis: Optional[ChecksumBasis] = None):
         """Record a checksum for (path, backend) and keep only the latest.
 
@@ -632,13 +635,29 @@ class StorageFS(Operations):
             )
 
     def _aggregate_checksums_yaml(self, canonical_path: str) -> bytes:
-        """Return YAML list of '<backend>:<checksum>:<timestamp>' entries."""
+        """Return a YAML list of '<backend>:<value>:<timestamp>' entries.
+
+        value is the member's hash, 'unverified' when the member could not
+        hash it (the view never downloads to hash), or 'size=<bytes>' for a
+        copy the listing split by size and nothing hashed, timestamped with
+        that listing.
+        """
         with self._checksum_lock:
-            entries = [
-                f"{backend}:{record.checksum}:{record.timestamp}"
+            recorded = {
+                backend: record
                 for (path, backend), record in self._checksum_records.items()
                 if path == canonical_path
-            ]
+            }
+        entries = [
+            f"{backend}:{record.checksum or 'unverified'}:{record.timestamp}"
+            for backend, record in recorded.items()
+        ]
+        sizes, listed_at = self.namespace.size_split_markers(canonical_path)
+        entries += [
+            f"{backend}:size={size}:{listed_at}"
+            for backend, size in sorted(sizes.items())
+            if backend not in recorded
+        ]
         return yaml.dump(entries, default_flow_style=False).encode()
 
     def _schedule_directory_checksums(self, dir_path: str, backend_entries: Dict[str, Set[str]]):
@@ -646,26 +665,47 @@ class StorageFS(Operations):
         self.namespace._schedule_directory_checksums(dir_path, backend_entries)
 
     def _schedule_checksum_task(self, backend: Backend, canonical_path: str,
-                                basis: Optional[ChecksumBasis] = None):
+                                basis: Optional[ChecksumBasis] = None, *,
+                                check_dir: bool = False, replace: bool = False):
         """Hash canonical_path on backend in the background.
 
         basis is the member's (st_size, st_mtime, st_ctime) from the listing,
         st_ctime None where the member does not report it (SFTP). A record
-        made from the same basis is still current, so nothing is scheduled;
+        made from the same basis is still current (an unverified one too:
+        a hash that failed or timed out is not retried until the file
+        changes or its records are forgotten), so nothing is scheduled;
         without a basis (no listed attributes, or a symlink) the file is
-        always hashed again.
+        always hashed again. check_dir: the worker first asks the member
+        whether the path is a directory and records nothing if so.
+        replace: the member's copy just changed (a release uploaded it), so
+        a task already queued or running for it is superseded rather than
+        reused; the old record stays until the new hash replaces it.
+
+        Only queues, under _checksum_lock; the member is called on its own
+        hash worker, never on the calling (FUSE) thread.
         """
         key = (canonical_path, backend.name)
         with self._checksum_lock:
-            if key in self._checksum_tasks:
-                return
-            record = self._checksum_records.get(key)
-            if basis is not None and record is not None and record.basis == basis:
-                return
+            previous = self._checksum_tasks.get(key)
+            if previous is not None:
+                if not replace:
+                    return
+                # Popped first: its done callback then finds itself gone
+                # and records nothing.
+                del self._checksum_tasks[key]
+                previous.cancel()
+            elif not replace:
+                record = self._checksum_records.get(key)
+                if basis is not None and record is not None and record.basis == basis:
+                    return
 
-            future = self._checksum_executor.submit(
-                self._compute_checksum, backend, canonical_path
-            )
+            try:
+                future = self._checksum_queues.submit(
+                    backend.name,
+                    lambda: self._compute_checksum(backend, canonical_path, check_dir),
+                )
+            except RuntimeError:
+                return  # destroy() shut the queues down
             self._checksum_tasks[key] = future
 
             def _record(done):
@@ -676,27 +716,36 @@ class StorageFS(Operations):
                         return
                     del self._checksum_tasks[key]
                     result = None if done.cancelled() else done.result()
-                    if result is not None:
+                    if result is not None and result is not self._IS_DIRECTORY:
                         checksum, ts = result
                         self._record_checksum(canonical_path, backend.name, checksum, ts, basis)
 
             future.add_done_callback(_record)
 
-    def _compute_checksum(self, backend: Backend, canonical_path: str):
-        """Compute a checksum on the member side.
+    _IS_DIRECTORY = object()
 
-        Returns (checksum, timestamp), or None when the hash failed; the
-        caller records it in memory. Nothing is written to the member: an
-        xattr write raises the watcher's ATTRIB event, whose invalidation
-        would drop the record this hash made, and nothing reads it back
-        (getxattr answers user.storage.checksums from memory).
+    def _compute_checksum(self, backend: Backend, canonical_path: str, check_dir: bool = False):
+        """Compute a checksum on the member side, on its hash worker.
+
+        Returns (checksum, timestamp), with checksum None when the member
+        could not hash the file (unverified: no download fallback here), or
+        _IS_DIRECTORY when check_dir found a directory. The caller records
+        it in memory. Nothing is written to the member: an xattr write
+        raises the watcher's ATTRIB event, whose invalidation would drop the
+        record this hash made, and nothing reads it back (getxattr answers
+        user.storage.checksums from memory).
         """
         try:
-            checksum = backend.get_fast_checksum(canonical_path)
+            if check_dir and backend.isdir(canonical_path):
+                return self._IS_DIRECTORY
+        except Exception as exc:
+            self.logger.debug("isdir for %s on %s failed: %s", canonical_path, backend.name, exc)
+        try:
+            checksum = backend.get_fast_checksum(canonical_path, allow_download=False)
             return checksum, time.time()
         except Exception as exc:
             self.logger.debug("checksum for %s on %s failed: %s", canonical_path, backend.name, exc)
-            return None
+            return None, time.time()
 
     def _apply_conflict_view(self, dir_path: str, base_entries: Set[str]) -> Set[str]:
         """
@@ -1820,9 +1869,8 @@ class StorageFS(Operations):
                     try:
                         backend.copy_from_local(entry.cache_path, entry.canonical_path)
                         backend.sync()
-                        checksum = backend.get_fast_checksum(entry.canonical_path)
-                        ts = time.time()
-                        self._record_checksum(entry.canonical_path, entry.backend_name, checksum, ts)
+                        # Hashed on the member's worker, not this thread.
+                        self._schedule_checksum_task(backend, entry.canonical_path, replace=True)
                     except Exception as exc:
                         self.logger.error(
                             "direct sync failed for %s on %s: %s",
@@ -1902,7 +1950,7 @@ class StorageFS(Operations):
             has_checksum = any(
                 key[0] == resolved.canonical_path for key in self._checksum_records.keys()
             )
-        if has_checksum:
+        if has_checksum or self.namespace.size_split_markers(resolved.canonical_path)[0]:
             attrs.add(self.CHECKSUM_XATTR)
 
         attrs.add(self.CACHE_STATE_XATTR)
@@ -2037,7 +2085,7 @@ class StorageFS(Operations):
         self._stop_watchers()
 
         try:
-            self._checksum_executor.shutdown(wait=False, cancel_futures=True)
+            self._checksum_queues.shutdown()
         except Exception:
             pass
         self.namespace.shutdown()

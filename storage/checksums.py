@@ -45,12 +45,17 @@ def fast_checksum_bytes(data: bytes) -> str:
 class ChecksumRecord:
     """Checksum value plus the time it was produced.
 
+    checksum is None when the member could not hash the file itself and the
+    caller would not download it to hash locally (the conflict view never
+    does): the copy is unverified, shown as such in user.storage.checksums,
+    and not hashed again from the same basis.
+
     basis is the member's (st_size, st_mtime, st_ctime) from the listing
     that scheduled the hash, or None when it was not known; st_ctime is None
     where the member does not report it (SFTP). A listing that reports the
     same basis does not hash the file again.
     """
 
-    checksum: str
+    checksum: Optional[str]
     timestamp: float
     basis: Optional[ChecksumBasis] = None
