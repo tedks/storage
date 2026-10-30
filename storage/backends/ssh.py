@@ -603,8 +603,8 @@ class SSHBackend(Backend):
         so the result is always consistent with local checksums; with
         allow_download False it raises instead (the conflict view's hashes,
         which must not move whole files over the link to decide how a
-        directory looks): ChecksumUnavailable when xxh128sum ran and gave no
-        digest, the command's own error when it could not run or timed out.
+        directory looks): the pool's own error when the member could not be
+        asked, ChecksumUnavailable otherwise (no digest, a timeout).
         """
         remote_path = str(self._resolve_path(virtual_path))
 
@@ -627,13 +627,21 @@ class SSHBackend(Backend):
             remote_error = exc
 
         if not allow_download:
-            # Only a command that ran and produced no digest says the member
-            # cannot hash the file; a connection, channel or timeout error
-            # may pass, so it is raised as is and the caller may retry.
-            if remote_error is not None:
+            # An error that kept the member from being asked (the transport
+            # dropped, no exec channel free or the server refused one) may
+            # pass and costs nothing to retry, so it is raised as is. A
+            # timeout is not: the hash ran too long for this file, or the
+            # member runs exec but never answers (ForceCommand
+            # internal-sftp), and would every time. That, and a command
+            # that ran without a digest, is ChecksumUnavailable.
+            if (
+                remote_error is not None
+                and not isinstance(remote_error, TimeoutError)
+                and is_connection_error(remote_error)
+            ):
                 raise remote_error
             raise ChecksumUnavailable(
-                errno.EIO, f"no remote hash for {virtual_path} on {self.name}")
+                errno.EIO, f"no remote hash for {virtual_path} on {self.name}") from remote_error
 
         # Fallback: download to temp file and compute locally.
         import tempfile

@@ -668,8 +668,8 @@ class StorageFS(Operations):
         basis is the member's (st_size, st_mtime, st_ctime) from the listing,
         st_ctime None where the member does not report it (SFTP). A record
         made from the same basis is still current (an unverified one too:
-        a member that ran its hash and gave no digest is not asked again
-        until the file changes or its records are forgotten), so nothing is
+        a hash that gave no digest or timed out is not run again until the
+        file changes or its records are forgotten), so nothing is
         scheduled;
         without a basis (no listed attributes, or a symlink) the file is
         always hashed again. check_dir: the worker first asks the member
@@ -720,7 +720,11 @@ class StorageFS(Operations):
                         self._checksum_records.pop(key, None)
                         return
                     result = done.result()
-                    if result is not None and result is not self._IS_DIRECTORY:
+                    if result is None:
+                        # Could not be asked: whatever was recorded before
+                        # predates the change that scheduled this hash.
+                        self._checksum_records.pop(key, None)
+                    elif result is not self._IS_DIRECTORY:
                         checksum, ts = result
                         self._record_checksum(canonical_path, backend.name, checksum, ts, basis)
 
@@ -731,12 +735,12 @@ class StorageFS(Operations):
     def _compute_checksum(self, backend: Backend, canonical_path: str, check_dir: bool = False):
         """Compute a checksum on the member side, on its hash worker.
 
-        Returns (checksum, timestamp), with checksum None when the member
-        ran its hash and gave no digest (ChecksumUnavailable: unverified, no
-        download fallback here); None when the hash could not run (a
-        connection, channel or timeout error, or a local read error), which
-        records nothing, so the next listing retries; or _IS_DIRECTORY when
-        check_dir found a directory. The caller records
+        Returns (checksum, timestamp), with checksum None when the member's
+        hash gave no digest or did not finish (ChecksumUnavailable:
+        unverified, no download fallback here); None when the member could
+        not be asked (connection lost, no channel) or a local read failed,
+        which drops any older record and lets the next listing retry; or
+        _IS_DIRECTORY when check_dir found a directory. The caller records
         it in memory. Nothing is written to the member: an xattr write
         raises the watcher's ATTRIB event, whose invalidation would drop the
         record this hash made, and nothing reads it back (getxattr answers

@@ -301,9 +301,9 @@ class Backend(ABC):
         Implementations should avoid downloading the full file to the caller.
         With allow_download False, an implementation that would otherwise
         fall back to downloading the file and hashing it locally raises
-        ChecksumUnavailable instead when the member ran its hash and
-        produced no digest, and the original error when it could not run it
-        (a connection, channel or timeout error).
+        ChecksumUnavailable instead when the member's hash gave no digest
+        or did not finish, and the original error when the member could not
+        be asked at all (connection lost, no channel).
         """
         raise NotImplementedError
 

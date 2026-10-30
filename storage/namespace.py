@@ -290,15 +290,20 @@ class NamespaceService:
 
         With bump, a listing of the parent in flight is not published.
 
-        A name the parent's published listing split by size drops that
-        listing instead (snapshot, view inputs, attributes; the member
-        names stay in dir_cache, which needs dir_cache_lock), so the next
-        readdir lists again: the split came from sizes that just changed,
-        and with watchers the listing would otherwise never refresh. A
-        listing in flight is then never published, bump or not.
+        With bump (a member's copy changed: watcher event, release upload,
+        eviction), a name the parent's published listing split by size
+        drops that listing instead (snapshot, view inputs, attributes; the
+        member names stay in dir_cache, which needs dir_cache_lock), so the
+        next readdir lists again: the split came from sizes that just
+        changed, and with watchers the listing would otherwise never
+        refresh. A local write (no bump) changes no member's size, so it
+        does not, and keeps from starving listings of a directory with an
+        active writer.
         """
         inputs = self._view_inputs.get(parent)
-        if inputs is not None and (Path(path).name in inputs[2] or Path(canonical).name in inputs[2]):
+        if bump and inputs is not None and (
+            Path(path).name in inputs[2] or Path(canonical).name in inputs[2]
+        ):
             if parent in self._listings_in_flight:
                 self._listing_generation[parent] += 1
             self.readdir_snapshot.pop(parent, None)
@@ -945,8 +950,11 @@ class NamespaceService:
             entries.update(names)
 
         # A member whose listing failed keeps its previous names (above) and,
-        # for the size test only, its previous attributes, so one failed
-        # refresh does not merge a split name; it is not hashed this round.
+        # for the size test only, the attributes of the published listing,
+        # so one failed refresh does not merge a split name; it is not hashed
+        # this round. A second failure in a row, or a failure after a change
+        # to the name dropped the listing, has no attributes for it and
+        # shows the plain name: its sizes are not known.
         split_attrs = backend_attrs
         if failed:
             split_attrs = dict(backend_attrs)

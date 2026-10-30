@@ -1099,6 +1099,26 @@ class TestFSNamespaceIntegration(unittest.TestCase):
         self._list_and_settle()
         self.assertIsNotNone(self.fs._checksum_records[("/dup.txt", "backend2")].checksum)
 
+    def test_failed_replacement_hash_drops_the_old_record(self):
+        (self.backend1_dir / "dup.txt").write_text("same")
+        (self.backend2_dir / "dup.txt").write_text("same")
+        self._list_and_settle()
+        member = self.backends["backend2"]
+        self.assertIn(("/dup.txt", "backend2"), self.fs._checksum_records)
+        with patch.object(member, "get_fast_checksum", side_effect=ConnectionResetError("dropped")):
+            self.fs._schedule_checksum_task(member, "/dup.txt", replace=True)
+            self.assertTrue(self._wait_for(
+                lambda: ("/dup.txt", "backend2") not in self.fs._checksum_records))
+
+    def test_local_write_to_size_split_name_keeps_the_listing(self):
+        (self.backend1_dir / "dup.txt").write_text("one")
+        (self.backend2_dir / "dup.txt").write_text("three")
+        self.fs.namespace.readdir_snapshot_ttl = float('inf')
+        self.assertIn("dup.txt.backend2", set(self.fs.readdir('/', None)))
+        # What mark_file_dirty does on every write: no member changed yet.
+        self.fs.namespace.forget_listed_attrs('/dup.txt.backend2', removing=False)
+        self.assertIn('/', self.fs.namespace.readdir_snapshot)
+
     def test_change_to_size_split_name_relists_its_directory(self):
         (self.backend1_dir / "dup.txt").write_text("one")
         (self.backend2_dir / "dup.txt").write_text("three")

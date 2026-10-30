@@ -55,6 +55,7 @@ class MemberHashQueues:
         """
         future: concurrent.futures.Future = concurrent.futures.Future()
         dropped = None
+        orphaned = []
         with self._cond:
             if self._shut_down:
                 raise RuntimeError("checksum queues shut down")
@@ -62,6 +63,7 @@ class MemberHashQueues:
                 # Forked: the parent's workers did not come along.
                 self._pid = os.getpid()
                 self._workers.clear()
+                orphaned = [item[0] for queue in self._queues.values() for item in queue]
                 self._queues.clear()
             queue = self._queues.setdefault(member, collections.deque())
             queue.append((future, fn))
@@ -81,6 +83,10 @@ class MemberHashQueues:
                 self._workers[member] = worker
                 worker.start()
             self._cond.notify_all()
+        # Cancelled outside the queue's lock: their done callbacks take the
+        # caller's locks.
+        for stale in orphaned:
+            stale.cancel()
         if dropped is not None:
             dropped.cancel()
         return future

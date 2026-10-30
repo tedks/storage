@@ -1514,13 +1514,19 @@ class TestSSHBackendOnThePool(_BackendTestCase):
                 backend.get_fast_checksum("/movie.bin", allow_download=False)
         self.assertEqual([name for name, *_ in self.server.requests if name == "open"], [])
 
-    def test_checksum_without_download_raises_the_error_that_stopped_the_hash(self):
+    def test_checksum_without_download_classifies_what_stopped_the_hash(self):
         backend = self._new_backend()
+        # The member could not be asked: raised as is, for a retry.
+        with patch.object(backend._pool, "run_command",
+                          side_effect=MemberUnavailable("no exec channel came free")), \
+                patch.object(backend, "copy_to_local", side_effect=AssertionError("downloaded")):
+            with self.assertRaises(MemberUnavailable):
+                backend.get_fast_checksum("/movie.bin", allow_download=False)
+        # The hash did not finish: it would not next time either.
         with patch.object(backend._pool, "run_command", side_effect=socket.timeout("slow")), \
                 patch.object(backend, "copy_to_local", side_effect=AssertionError("downloaded")):
-            with self.assertRaises(socket.timeout) as raised:
+            with self.assertRaises(ChecksumUnavailable):
                 backend.get_fast_checksum("/movie.bin", allow_download=False)
-        self.assertNotIsInstance(raised.exception, ChecksumUnavailable)
 
     def test_remote_checksum_and_xattrs_close_their_exec_channels(self):
         digest = "0123456789abcdef0123456789abcdef"
