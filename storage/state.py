@@ -939,7 +939,7 @@ class StateManager:
         with self._db_lock:
             cursor = self.conn.execute('''
                 SELECT * FROM files
-                WHERE sync_status = ?
+                WHERE sync_status = ? AND link_target IS NULL
                 ORDER BY last_access ASC
                 LIMIT ?
             ''', (SyncStatus.CLEAN.value, limit))

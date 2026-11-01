@@ -43,7 +43,7 @@ from .recompute import RecomputeEngine
 from .checksum_queue import DEFAULT_CHECKSUM_REVERIFY_INTERVAL, MemberHashQueues
 from .checksums import ChecksumBasis, ChecksumRecord
 from .pathing import ResolvedPath, resolve_path
-from .links import LinkRefused, link_checksum, resolve_link_target
+from .links import LinkRefused, intermediate_paths, link_checksum, resolve_link_target
 from .namespace import DEFAULT_LISTING_MAX_STALE, NamespaceService
 from .streaming import PrefetchSession, StreamingReadManager
 
@@ -2740,15 +2740,35 @@ class StorageFS(Operations):
         except LinkRefused as refused:
             self.logger.warning("symlink refused: %s", refused)
             raise FuseOSError(errno.EPERM)
-        if self._name_exists(link_path):
+        # As for create, a name held only on an unreachable member is not
+        # seen; the link's sync finds it there and records a conflict.
+        if self._name_exists(link_path, unreachable_is_missing=True):
             raise FuseOSError(errno.EEXIST)
-        try:
-            self.namespace.getattr(target_path)
-        except FuseOSError as exc:
-            if exc.errno == errno.ENOENT:
+        if self.state_manager.get_file_metadata(link_path) is not None:
+            # A row at a name nobody holds: a synced file removed on its
+            # member outside the mount. Stale only if every member answered;
+            # dropped, so the link's row is not merged into it.
+            if any(not backend.is_available() for backend in self.backends.values()):
+                raise FuseOSError(errno.EEXIST)
+            self.state_manager.delete_file(link_path)
+        # The resolution above is lexical: right only if the kernel walks no
+        # link on the way (one from a member may point anywhere, and a '..'
+        # after it would climb from there).
+        for directory in intermediate_paths(link_path, source):
+            if not self._name_exists(directory):
                 self.logger.warning("symlink refused: dangling target")
                 raise FuseOSError(errno.EPERM)
-            raise
+            mode = self.namespace.getattr(directory)["st_mode"]
+            if stat.S_ISLNK(mode):
+                self.logger.warning("symlink refused: target passes through a link")
+                raise FuseOSError(errno.EPERM)
+        if self._resolve_path(target_path).backend_name:
+            # A conflict view's name is on no member; it could not be placed.
+            self.logger.warning("symlink refused: target is a conflict view")
+            raise FuseOSError(errno.EPERM)
+        if not self._name_exists(target_path):
+            self.logger.warning("symlink refused: dangling target")
+            raise FuseOSError(errno.EPERM)
 
         cache_path = resolved.cache_path
         try:
@@ -2790,14 +2810,22 @@ class StorageFS(Operations):
         self._invalidate_dir_cache_entry(link_path)
         self.sync_manager.queue_sync(link_path, priority=100)
 
-    def _name_exists(self, canonical_path: str) -> bool:
-        """Whether getattr would find the name (in the cache or on a member)."""
+    def _name_exists(self, canonical_path: str, *, unreachable_is_missing: bool = False) -> bool:
+        """Whether the name is in the cache or on a member.
+
+        getattr passes over an unavailable member, so a miss with one down
+        proves nothing: EHOSTUNREACH then (a target cannot be called
+        dangling), unless the caller accepts the miss.
+        """
         try:
             self.namespace.getattr(canonical_path)
         except FuseOSError as exc:
-            if exc.errno == errno.ENOENT:
-                return False
-            raise
+            if exc.errno != errno.ENOENT:
+                raise
+            if not unreachable_is_missing and any(
+                    not backend.is_available() for backend in self.backends.values()):
+                raise FuseOSError(errno.EHOSTUNREACH)
+            return False
         return True
 
     # Time operations

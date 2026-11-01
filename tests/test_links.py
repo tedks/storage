@@ -10,7 +10,8 @@ from pathlib import Path
 from storage.backends.local import LocalBackend
 from storage.cache import CacheManager
 from storage.links import (
-    LinkRefused, find_holders, is_link_checksum, link_checksum, resolve_link_target,
+    LinkRefused, find_holders, intermediate_paths, is_link_checksum, link_checksum,
+    resolve_link_target,
 )
 from storage.models import FileLocation, FileMetadata, SyncStatus
 from storage.replication import ReplicationManager
@@ -37,6 +38,12 @@ class TestResolveLinkTarget(unittest.TestCase):
                              ("/link", "a\0b")):
             with self.assertRaises(LinkRefused, msg=(link, target)):
                 resolve_link_target(link, target)
+
+    def test_intermediate_paths_are_the_directories_walked(self):
+        self.assertEqual(intermediate_paths("/a/link", "t.txt"), [])
+        self.assertEqual(intermediate_paths("/a/link", "out/../secret"), ["/a/out"])
+        self.assertEqual(intermediate_paths("/a/link", "../b/c/d"), ["/b", "/b/c"])
+        self.assertEqual(intermediate_paths("/link", "./x/./y"), ["/x"])
 
     def test_link_checksum_compares_target_strings(self):
         self.assertEqual(link_checksum("a"), link_checksum("a"))
@@ -82,6 +89,9 @@ class TestFindHolders(_Members):
         self.assertEqual((holders, unsure), ([], ["m0"]))
         holders, unsure = find_holders("/t.txt", self.backends, located=set())
         self.assertEqual((holders, unsure), ([], []))
+        # No index row for the target: where it is cannot be known.
+        holders, unsure = find_holders("/t.txt", self.backends, located=None)
+        self.assertEqual((holders, unsure), ([], ["m0"]))
 
 
 class TestLinkSync(_Members):
@@ -185,6 +195,26 @@ class TestLinkSync(_Members):
         # The target syncs to m0; the next pass places the link there.
         (self.roots["m0"] / "t.txt").write_text("t")
         self.assertEqual(self._sync("/l").sync_status, SyncStatus.CLEAN)
+        self.assertEqual(self._located("/l"), ["m0"])
+
+    def test_the_same_link_made_meanwhile_is_not_a_conflict(self):
+        (self.roots["m0"] / "t.txt").write_text("t")
+        self._link_row("/l", "t.txt")
+        member = self.backends["m0"]
+        real = member.symlink
+
+        def raced(target, path):
+            real(target, path)  # someone else made the same link first
+            raise FileExistsError(17, "exists", path)
+
+        member.symlink = raced
+        self.assertEqual(self._sync("/l").sync_status, SyncStatus.CLEAN)
+
+    def test_unreachable_member_without_a_target_row_keeps_the_link_pending(self):
+        (self.roots["m0"] / "dir").mkdir()
+        self.backends["m1"].set_available(False)
+        self._link_row("/l", "dir")
+        self.assertEqual(self._sync("/l").sync_status, SyncStatus.DIRTY)
         self.assertEqual(self._located("/l"), ["m0"])
 
     def test_target_gone_everywhere_is_an_error(self):

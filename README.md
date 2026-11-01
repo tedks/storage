@@ -306,12 +306,21 @@ in the mount's log:
   neither means the same thing on a member as through the mount;
 - a target that does not exist yet: a link that only becomes valid later
   could not be placed. So `cp -a` or `tar x` of a tree fails for a link
-  copied before its target.
+  copied before its target;
+- a target whose path passes through another link (`dl/file` where `dl` is
+  a link): the target is resolved without following links, which is only
+  right when there are none on the way.
+
+These checks hold when the link is made. Renaming the link, or a directory
+above it, keeps its target string, as on any filesystem, so a relative
+target can then name something else or climb out of the mount; such a link
+is not placed if it has not synced yet.
 
 Placement is decided once, when the link first syncs (a target written
 just before the link waits for its own sync), and is not revisited: a
 target replicated to another member later, or removed from one, does not
-move the link. A member that already has something else at the link's
+move the link (a `storage debug rebuild-index`, which forgets every
+member location, places each link again). A member that already has something else at the link's
 name is a conflict, and nothing is overwritten. The conflict view compares
 copies of a link by their target string, never by what they point at.
 

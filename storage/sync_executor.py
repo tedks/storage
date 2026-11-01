@@ -265,7 +265,12 @@ class SyncExecutor:
         has it and none was unsure; a holder unreachable or a target not
         yet on any member (still DIRTY in the cache) leaves the link DIRTY
         for a later pass. Placement is not revisited after that: later
-        replication or eviction of the target does not move the link.
+        replication or eviction of the target does not move the link (a
+        rebuild-index, which drops every member location, places it again).
+
+        Runs under the path's upload guard (process_file_task), which unlink
+        and rename of the link wait for, so neither can move or drop the row
+        between the members' links being made and their locations recorded.
         """
         target = metadata.link_target
         try:
@@ -290,11 +295,16 @@ class SyncExecutor:
             self._publish(task, generation, SyncStatus.ERROR, cache_path)
             return True
 
-        located = {
-            location.backend_name
-            for location in self.state_manager.get_file_locations(target_path)
-            if not location.is_cached
-        }
+        # Where an indexed target is recorded; None for a target without a
+        # row (a directory, or a file only ever seen on members), whose
+        # holders cannot be known while a member is unreachable.
+        located = None
+        if self.state_manager.get_file_metadata(target_path) is not None:
+            located = {
+                location.backend_name
+                for location in self.state_manager.get_file_locations(target_path)
+                if not location.is_cached
+            }
         holders, unsure = find_holders(target_path, self.replication_manager.backends, located)
         identity = link_checksum(target)
         if not holders:
@@ -313,11 +323,15 @@ class SyncExecutor:
                 try:
                     existing = backend.readlink(task.virtual_path)
                 except FileNotFoundError:
-                    backend.symlink(target, task.virtual_path)
-                    existing = target
+                    try:
+                        backend.symlink(target, task.virtual_path)
+                        existing = target
+                    except FileExistsError:
+                        # Made meanwhile (outside the mount): what is it?
+                        existing = backend.readlink(task.virtual_path)
             except OSError as exc:
-                if exc.errno in (errno.EINVAL, errno.EEXIST):
-                    existing = None  # something else is at the name
+                if exc.errno == errno.EINVAL:
+                    existing = None  # something else is at the name (not a link)
                 else:
                     logger.error("Failed to link %s on %s: %s",
                                  task.virtual_path, backend.name, exc)

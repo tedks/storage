@@ -371,6 +371,70 @@ class TestFSNamespaceIntegration(unittest.TestCase):
             self.assertFalse(os.path.lexists(self.cache_dir / name), link)
             self.assertIsNone(self.fs.state_manager.get_file_metadata(link), link)
 
+    def test_symlink_through_a_link_is_eperm(self):
+        # out is a member's link to a directory outside the mount: out/..
+        # would climb from there, whatever the lexical path says.
+        outside = self.temp_dir / "outside"
+        (outside / "dir").mkdir(parents=True)
+        (self.backend1_dir / "out").symlink_to(outside / "dir")
+        (self.backend1_dir / "secret").write_text("in the mount")
+        (self.cache_dir / "real").mkdir()
+        (self.cache_dir / "real" / "f").write_text("x")
+        (self.cache_dir / "dl").symlink_to("real")
+        for target in ("out/../secret", "dl/f"):
+            with self.assertRaises(FuseOSError, msg=target) as raised:
+                self.fs.symlink('/link', target)
+            self.assertEqual(raised.exception.errno, errno.EPERM, target)
+            self.assertFalse(os.path.lexists(self.cache_dir / "link"))
+
+    def test_symlink_over_a_stale_row_replaces_it(self):
+        # A synced, evicted file later removed on its member outside the
+        # mount leaves a row with a newer generation; the link must not be
+        # merged into it (it would never sync as a link).
+        (self.backend1_dir / "target.txt").write_text("target")
+        now = time.time()
+        self.fs.state_manager.set_file_metadata(FileMetadata(
+            virtual_path='/x', size=5, checksum="old", last_access=now, last_modified=now,
+            sync_status=SyncStatus.CLEAN, replica_count=1, recomputable=False,
+            recompute_cmd=None, encrypted=False, encryption_key_id=None, dirty_generation=4,
+        ))
+        with patch.object(self.fs.sync_manager, "queue_sync"):
+            self.fs.symlink('/x', 'target.txt')
+        row = self.fs.state_manager.get_file_metadata('/x')
+        self.assertEqual(row.link_target, "target.txt")
+        self.assertEqual(row.sync_status, SyncStatus.DIRTY)
+        self.assertEqual(self.fs.state_manager.get_file_locations('/x'), [])
+
+    def test_symlink_with_a_member_down_cannot_prove_a_miss(self):
+        (self.backend1_dir / "target.txt").write_text("target")
+        self.backends["backend2"].set_available(False)
+        # A target not found may be on the member that is down.
+        with self.assertRaises(FuseOSError) as raised:
+            self.fs.symlink('/other', 'maybe-on-backend2')
+        self.assertEqual(raised.exception.errno, errno.EHOSTUNREACH)
+        self.assertFalse(os.path.lexists(self.cache_dir / "other"))
+        # A row at the name may describe a copy on that member: kept.
+        now = time.time()
+        self.fs.state_manager.set_file_metadata(FileMetadata(
+            virtual_path='/kept', size=5, checksum="c", last_access=now, last_modified=now,
+            sync_status=SyncStatus.CLEAN, replica_count=1, recomputable=False,
+            recompute_cmd=None, encrypted=False, encryption_key_id=None,
+        ))
+        with self.assertRaises(FuseOSError) as raised:
+            self.fs.symlink('/kept', 'target.txt')
+        self.assertEqual(raised.exception.errno, errno.EEXIST)
+        self.assertEqual(self.fs.state_manager.get_file_metadata('/kept').checksum, "c")
+        # A free name is taken, as create takes it; sync settles a clash.
+        with patch.object(self.fs.sync_manager, "queue_sync"):
+            self.fs.symlink('/new', 'target.txt')
+        self.assertEqual(os.readlink(self.cache_dir / "new"), "target.txt")
+
+    def test_symlink_to_a_conflict_view_is_eperm(self):
+        (self.backend1_dir / "f").write_text("one")
+        with self.assertRaises(FuseOSError) as raised:
+            self.fs.symlink('/link', 'f.backend1')
+        self.assertEqual(raised.exception.errno, errno.EPERM)
+
     def test_symlink_over_an_existing_name_is_eexist(self):
         (self.backend1_dir / "target.txt").write_text("target")
         (self.backend2_dir / "taken").write_text("on a member only")

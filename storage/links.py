@@ -44,6 +44,28 @@ def resolve_link_target(link_path: str, target: str) -> str:
     return "/" + "/".join(parts)
 
 
+def intermediate_paths(link_path: str, target: str):
+    """The virtual paths the kernel walks through before the target's last
+    component, in order (each a directory it must enter).
+
+    resolve_link_target is lexical, so it is only right when none of these
+    is itself a link: a link there (one from a member may point anywhere)
+    would be followed first, and a later '..' would climb from wherever it
+    pointed. The caller refuses a target if any of them is a link.
+    """
+    parts = [p for p in posixpath.dirname(link_path).split("/") if p]
+    components = [c for c in target.split("/") if c not in ("", ".")]
+    paths = []
+    for component in components[:-1]:
+        if component == "..":
+            if parts:
+                parts.pop()
+            continue
+        parts.append(component)
+        paths.append("/" + "/".join(parts))
+    return paths
+
+
 def link_checksum(target: str) -> str:
     """Identity of a link for the conflict view and its location rows.
 
@@ -61,15 +83,17 @@ def find_holders(target_path: str, backends, located=()):
     """The members holding target_path now: (holders, unsure).
 
     holders: available members whose lstat finds the target. unsure: names
-    of members that may hold it but cannot be asked (unavailable with a
-    location row for it, or whose lstat failed other than ENOENT); a link
-    whose holders include one of these is retried later.
+    of members that may hold it but cannot be asked (whose lstat failed
+    other than ENOENT, or unavailable: with a location row for the target,
+    or any unavailable member when located is None, meaning the target has
+    no index row and so no record of where it is); a link with any unsure
+    member is retried later rather than settled without it.
     """
     holders = []
     unsure = []
     for name, backend in backends.items():
         if not backend.is_available():
-            if name in located:
+            if located is None or name in located:
                 unsure.append(name)
             continue
         try:
