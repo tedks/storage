@@ -2486,10 +2486,12 @@ class StorageFS(Operations):
         order getattr asks them, so readlink describes the copy getattr
         did: the first available member holding the name decides, and a
         name there that is not a link is EINVAL. A member whose readlink
-        fails otherwise is asked for an lstat, the call getattr's fallback
-        makes: if it holds the name, its failure is the answer (EIO when
-        it carries no errno); if not, it is passed over, as getattr passes
-        it over. A conflict view (`name.<member>`) asks only that member.
+        fails otherwise is asked for an lstat: only a member that
+        definitely does not hold the name (ENOENT) or cannot be reached is
+        passed over; otherwise its failure is the answer (EIO when it
+        carries no errno), never another member's copy, which getattr may
+        not have reported (it can answer from a listing taken earlier). A
+        conflict view (`name.<member>`) asks only that member.
 
         Only a missing cache path falls back to the members; any other
         error from the cache (EINVAL for a cached file, ENOTDIR under one)
@@ -2529,14 +2531,18 @@ class StorageFS(Operations):
                 if isinstance(e, FileNotFoundError):
                     continue
                 failure = e
-            # EACCES, EIO, ENOSYS, or a bug: does this member hold the name?
-            self.logger.warning("readlink on member %s failed: %r", name, failure)
+            # EACCES, EIO, ENOSYS, or a bug: pass over only a member that
+            # definitely does not hold the name.
             try:
                 backend.lstat(resolved.canonical_path)
+            except FileNotFoundError:
+                self.logger.debug("readlink on member %s failed: %r", name, failure)
+                continue
             except Exception as e:
                 if is_connection_error(e):
                     unreachable = True
-                continue
+                    continue
+            self.logger.warning("readlink on member %s failed: %r", name, failure)
             errno_value = getattr(failure, "errno", None)
             raise FuseOSError(errno_value if isinstance(failure, OSError) and errno_value
                               else errno.EIO)

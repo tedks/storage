@@ -398,6 +398,13 @@ class TestFSNamespaceIntegration(unittest.TestCase):
                 with self.assertRaises(FuseOSError) as raised:
                     self.fs.readlink('/link')
             self.assertEqual(raised.exception.errno, expected, error)
+        # An lstat that cannot tell (EACCES: getattr may have answered from
+        # an earlier listing) keeps the failure too.
+        with patch.object(first, "readlink", side_effect=OSError(errno.EIO, "io")), \
+                patch.object(first, "lstat", side_effect=PermissionError(errno.EACCES, "denied")):
+            with self.assertRaises(FuseOSError) as raised:
+                self.fs.readlink('/link')
+        self.assertEqual(raised.exception.errno, errno.EIO)
 
     def test_readlink_of_a_missing_name_is_enoent(self):
         with self.assertRaises(FuseOSError) as raised:
