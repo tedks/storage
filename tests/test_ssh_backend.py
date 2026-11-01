@@ -1375,6 +1375,16 @@ class TestSSHBackendOnThePool(_BackendTestCase):
                          [name for name, *_ in self.server.requests
                           if name in ("posix_rename", "rename")])
 
+    def test_rename_does_not_fall_back_on_a_timeout(self):
+        # socket.timeout is an OSError without an errno too; a retry on the
+        # timed-out channel would hide the timeout from the pool.
+        def slow(client, path):
+            raise socket.timeout()
+        self.server.hooks["posix_rename"] = slow
+        with self.assertRaises(OSError):
+            self._new_backend().rename("/a", "/b")
+        self.assertNotIn("rename", [name for name, *_ in self.server.requests])
+
     def test_rename_does_not_fall_back_on_an_errno_failure(self):
         def denied(client, path):
             raise PermissionError(errno.EACCES, "denied")
