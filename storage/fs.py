@@ -29,6 +29,7 @@ from typing import Dict, Optional, Set, List, Tuple
 
 from .backends.base import Backend, ChecksumUnavailable, interactive_request
 from .backends.ssh_mux import close_shared_control_sockets
+from .backends.ssh_pool import is_connection_error
 from .cache import PARTIAL_SUFFIX, CacheManager
 from .locks import NamespaceLock, PathLocks, UploadLocks
 from .cache_metadata import PREFIX_XATTR, XATTR_CACHE_METADATA_NAME, scan_cache_entries
@@ -2478,13 +2479,50 @@ class StorageFS(Operations):
     # Symbolic links
 
     def readlink(self, path):
-        """Read symbolic link"""
-        cache_path = self.cache_manager.get_cache_path(path)
+        """Read symbolic link: the cached link's target, else a member's.
 
+        A link that exists only on a member (getattr reports it from the
+        member's listing or lstat) is answered from the members in the
+        order getattr asks them, so readlink describes the copy getattr
+        did: the first available member holding the name decides, and a
+        name there that is not a link is EINVAL. A conflict view
+        (`name.<member>`) asks only that member.
+        """
+        resolved = self._resolve_path(path)
         try:
-            return os.readlink(str(cache_path))
+            return os.readlink(str(resolved.cache_path))
+        except FileNotFoundError:
+            pass
         except OSError as e:
             raise FuseOSError(e.errno)
+        return self._member_readlink(resolved)
+
+    def _member_readlink(self, resolved: ResolvedPath) -> str:
+        if resolved.backend_name:
+            members = [(resolved.backend_name, self.backends.get(resolved.backend_name))]
+        else:
+            members = list(self.backends.items())
+        unreachable = False
+        for name, backend in members:
+            if backend is None:
+                continue
+            if not backend.is_available():
+                unreachable = True
+                continue
+            try:
+                return backend.readlink(resolved.canonical_path)
+            except FileNotFoundError:
+                continue
+            except Exception as e:
+                # An answer about the path (EINVAL: not a link) decides, as
+                # getattr's member did; a member that could not be asked
+                # (or cannot readlink) is passed over, as getattr does.
+                if isinstance(e, OSError) and e.errno and not is_connection_error(e) \
+                        and e.errno != errno.ENOSYS:
+                    raise FuseOSError(e.errno)
+                self.logger.debug("readlink on member %s failed: %r", name, e)
+                unreachable = True
+        raise FuseOSError(errno.EHOSTUNREACH if unreachable else errno.ENOENT)
 
     # Symlinks are refused until they replicate (ruling
     # oq-symlink-through-mount B; ditz symlink-replication): a link kept

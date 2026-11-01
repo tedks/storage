@@ -10,6 +10,7 @@ from contextlib import contextmanager
 from enum import Enum
 from pathlib import Path
 from typing import Optional, List, Tuple
+import errno
 import os
 from dataclasses import dataclass, replace
 
@@ -242,6 +243,23 @@ class Backend(ABC):
     def stat(self, virtual_path: str) -> os.stat_result:
         """Get full stat info for a path"""
         raise NotImplementedError
+
+    def lstat(self, virtual_path: str):
+        """Stat a path without following a symlink at its last component.
+
+        getattr reports a member's link as a link, as a listing (lstat on
+        every member) does. Backends whose stat already does not follow
+        links inherit this.
+        """
+        return self.stat(virtual_path)
+
+    def readlink(self, virtual_path: str) -> str:
+        """The target of the symlink at virtual_path, as stored.
+
+        Raises FileNotFoundError when nothing is there and OSError(EINVAL)
+        when it is not a link.
+        """
+        raise OSError(errno.ENOSYS, "readlink is not supported", virtual_path)
 
     @abstractmethod
     def sync(self):

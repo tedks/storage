@@ -672,7 +672,7 @@ class TestFSNamespaceIntegration(unittest.TestCase):
         self.fs._invalidate_dir_cache_entry('/changed.txt')
         (self.backend1_dir / "changed.txt").write_text("newer bytes")
 
-        with patch.object(self.backends["backend1"], "stat", wraps=self.backends["backend1"].stat) as member_stat:
+        with patch.object(self.backends["backend1"], "lstat", wraps=self.backends["backend1"].lstat) as member_stat:
             self.assertEqual(self.fs.getattr('/sibling.txt')['st_size'], len("sibling"))
             self.assertEqual(self.fs.getattr('/changed.txt')['st_size'], len("newer bytes"))
         member_stat.assert_called_once_with('/changed.txt')

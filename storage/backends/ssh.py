@@ -593,6 +593,39 @@ class SSHBackend(Backend):
         return self._with_sftp("stat", virtual_path,
                                lambda sftp: sftp.stat(remote_path), retry=True)
 
+    def lstat(self, virtual_path: str):
+        """Like stat, but a link at the last component is reported as a link.
+
+        The member root is stat'ed: a root configured through a link is the
+        directory it names.
+        """
+        if virtual_path.strip("/") == "":
+            return self.stat(virtual_path)
+        remote_path = str(self._resolve_path(virtual_path))
+        return self._with_sftp("lstat", virtual_path,
+                               lambda sftp: sftp.lstat(remote_path), retry=True)
+
+    def readlink(self, virtual_path: str) -> str:
+        """The link's target, from SFTP readlink (rsync members use it too).
+
+        sftp-server answers readlink of a non-link with a generic failure
+        (paramiko raises it without an errno); that is reported as EINVAL,
+        as readlink(2) does. A missing path keeps paramiko's ENOENT.
+        """
+        remote_path = str(self._resolve_path(virtual_path))
+        try:
+            target = self._with_sftp("readlink", virtual_path,
+                                     lambda sftp: sftp.readlink(remote_path), retry=True)
+        except OSError as exc:
+            if exc.errno is None and not is_connection_error(exc):
+                raise OSError(errno.EINVAL, "not a symlink", virtual_path) from exc
+            raise
+        if target is None:
+            raise OSError(errno.EINVAL, "not a symlink", virtual_path)
+        if isinstance(target, bytes):
+            target = os.fsdecode(target)
+        return target
+
     def close(self):
         """Close the member's transport and channels; it does not reconnect."""
         pool = getattr(self, "_pool", None)

@@ -1344,7 +1344,7 @@ def test_session_killed_mid_transfer_is_retried_on_a_new_connection(remote, ssh_
 
 
 _MEMBER_IO = ("exists", "read_file", "get_size", "listdir", "listdir_attrs", "isdir",
-              "copy_to_local", "stat", "get_fast_checksum", "get_xattr")
+              "copy_to_local", "stat", "lstat", "readlink", "get_fast_checksum", "get_xattr")
 
 
 def _count_member_requests(backends):
