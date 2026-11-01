@@ -1,0 +1,16 @@
+id: oq-strict-up-to-date
+title: Require branches to be up to date before merging (branch protection)
+desc: ""
+type: task
+component: open-questions
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-01T04:02:29-00:00
+references: []
+log_events:
+- time: 2026-11-01T04:02:29-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
