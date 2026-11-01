@@ -1150,6 +1150,13 @@ class NamespaceService:
 
         try:
             with self.state_manager.metadata_lock:
+                # A directory whose files were all evicted is empty in the
+                # cache, so the cache rename would replace it; its rows are
+                # the only record of those files.
+                if self.state_manager.has_rows_below(
+                    new_resolved.canonical_path, excluding=old_resolved.canonical_path
+                ):
+                    raise OSError(errno.ENOTEMPTY, os.strerror(errno.ENOTEMPTY), new)
                 new_cache.parent.mkdir(parents=True, exist_ok=True)
                 old_cache.rename(new_cache)
 
