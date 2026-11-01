@@ -1,0 +1,17 @@
+id: gates-ssh-mux-socket-path
+title: 'run-gates.sh: storage_tests_sandboxed fails 12 test_ssh_mux tests that pass
+  under a direct bazel test'
+desc: ""
+type: bugfix
+component: gates
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-01T02:57:11-00:00
+references: []
+log_events:
+- time: 2026-11-01T02:57:11-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
