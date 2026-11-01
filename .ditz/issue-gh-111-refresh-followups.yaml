@@ -18,8 +18,8 @@ type: task
 component: listing
 release:
 reporter: Ted Smith <tedks@riseup.net>
-status: in_progress
-disposition:
+status: closed
+disposition: fixed
 creation_time: 2026-10-30T02:29:50-00:00
 references: []
 log_events:
@@ -43,5 +43,9 @@ log_events:
   who: Ted Smith
   what: started
   comment: ""
+- time: 2026-11-01T03:06:32-00:00
+  who: Ted Smith
+  what: 'closed: fixed'
+  comment: 'Landed in PR #156 (merge 3c6fd0f). Single flight split out as listing-foreground-single-flight.'
 blocks:
 - gh-111
