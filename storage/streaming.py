@@ -205,6 +205,7 @@ class StreamingReadManager:
         # registers or is attached to after that.
         self._destroying = False
         self._warned_no_noreplace = False
+        self._warned_no_noreplace_lock = threading.Lock()
         self._streaming_stats_lock = threading.Lock()
         self._streaming_stats = {
             "streaming_sessions_started": 0,
@@ -756,13 +757,18 @@ class StreamingReadManager:
         return (missing[0] // session.chunk_size) * session.chunk_size
 
     @staticmethod
-    def _missing_run_start(session: PrefetchSession, offset: int) -> int:
+    def _covered_ranges(session: PrefetchSession) -> List[Tuple[int, int]]:
+        """The session's available and in-flight ranges, sorted. Caller holds session.lock."""
+        return sorted(session.available_ranges + session.in_flight_ranges)
+
+    @staticmethod
+    def _missing_run_start(covered: List[Tuple[int, int]], offset: int) -> int:
         """Where the run of unfetched, unclaimed bytes holding offset begins.
 
-        Caller holds session.lock.
+        covered is _covered_ranges(session), taken under session.lock.
         """
         run_start = 0
-        for range_start, range_end in sorted(session.available_ranges + session.in_flight_ranges):
+        for range_start, range_end in covered:
             if range_start > offset:
                 break
             run_start = max(run_start, range_end)
@@ -773,12 +779,15 @@ class StreamingReadManager:
         session: PrefetchSession,
         start: int,
         end: int,
+        covered: Optional[List[Tuple[int, int]]] = None,
     ) -> Optional[Tuple[int, int]]:
         """The first range in [start, end) neither available nor in flight.
 
-        Caller holds session.lock.
+        Caller holds session.lock. covered, if given, is _covered_ranges(session)
+        taken in the same locked section (a caller asking twice sorts once).
         """
-        covered = sorted(session.available_ranges + session.in_flight_ranges)
+        if covered is None:
+            covered = StreamingReadManager._covered_ranges(session)
         return StreamingReadManager._first_missing_range(covered, start, end)
 
     def _ensure_streaming_range(self, session: PrefetchSession, start: int, end: int):
@@ -810,7 +819,8 @@ class StreamingReadManager:
 
                 # Only what the reader asked for: not rounded up to a chunk,
                 # which is what made a 4 KiB sniff cost a whole chunk.
-                fetch = self._first_unclaimed_missing_range(session, start, end)
+                covered = self._covered_ranges(session)
+                fetch = self._first_unclaimed_missing_range(session, start, end, covered)
                 if fetch is None:
                     # The rest is in flight; its fetch notifies when done.
                     session.condition.wait(timeout=0.05)
@@ -820,7 +830,8 @@ class StreamingReadManager:
                     chunk_start = (fetch[0] // session.chunk_size) * session.chunk_size
                     chunk_end = min(chunk_start + session.chunk_size, session.file_size)
                     fetch = self._first_unclaimed_missing_range(
-                        session, max(chunk_start, self._missing_run_start(session, fetch[0])), chunk_end,
+                        session, max(chunk_start, self._missing_run_start(covered, fetch[0])), chunk_end,
+                        covered,
                     )
 
                 session.in_flight_ranges.append(fetch)
@@ -963,8 +974,10 @@ class StreamingReadManager:
             except OSError as rename_exc:
                 if rename_exc.errno not in _NOREPLACE_UNSUPPORTED:
                     raise
-            if not self._warned_no_noreplace:
+            with self._warned_no_noreplace_lock:
+                first_warning = not self._warned_no_noreplace
                 self._warned_no_noreplace = True
+            if first_warning:
                 self.logger.warning(
                     "streaming cannot install files in the cache without replacing: its filesystem "
                     "has neither hard links nor RENAME_NOREPLACE; streamed files are not cached",
@@ -982,6 +995,11 @@ class StreamingReadManager:
             )
         return "installed"
 
+    @staticmethod
+    def _not_installed_reason(outcome: str) -> str:
+        """The log reason for an _install_partial outcome other than "installed"."""
+        return "cache-path-filled" if outcome == "taken" else outcome
+
     def _discard_superseded_session(self, session: PrefetchSession, outcome: str):
         """Finish a complete session whose partial was not installed (outcome, see _install_partial).
 
@@ -998,7 +1016,7 @@ class StreamingReadManager:
             "streaming not installed path=%s backend=%s reason=%s; partial discarded",
             session.canonical_path,
             session.backend.name,
-            "cache-path-filled" if outcome == "taken" else outcome,
+            self._not_installed_reason(outcome),
         )
         with self.prefetch_sessions_lock:
             with session.lock:
@@ -1010,7 +1028,8 @@ class StreamingReadManager:
             session.finalized = True
             should_close = session.refcount == 0
             session.condition.notify_all()
-        self._log_streaming_state_change(session, self._snapshot_streaming_state(session, "superseded"))
+        self._log_streaming_state_change(session, self._snapshot_streaming_state(
+            session, "superseded" if outcome == "taken" else outcome))
         self.cache_manager.mark_cache_size_dirty()
         if should_close:
             self._close_streaming_session_resources(session)
@@ -1062,7 +1081,7 @@ class StreamingReadManager:
                     "streaming partial-cache skipped path=%s backend=%s reason=%s",
                     session.canonical_path,
                     session.backend.name,
-                    "cache-path-filled" if outcome == "taken" else outcome,
+                    self._not_installed_reason(outcome),
                 )
                 return False
             self.logger.info(
@@ -1101,7 +1120,14 @@ class StreamingReadManager:
         return True
 
     def _cleanup_failed_session(self, session: PrefetchSession):
-        """Promote a failed session's prefix, or drop it; caller claimed the cleanup."""
+        """Promote a failed session's prefix, or drop it; caller claimed the cleanup.
+
+        The claim is taken before promote and cleanup run, so if either
+        raised something other than OSError (promotion catches those) no
+        later release could retry, and the session would stay registered.
+        That cannot happen today; do not add a raising step here without
+        handling it.
+        """
         assert session.failed_cleanup_claimed, "claim with _claim_failed_cleanup first"
         if self._promote_failed_session_cache_prefix(session):
             self._cleanup_prefetch_session(session, "partial-cache")
@@ -1260,7 +1286,10 @@ class StreamingReadManager:
                 # readers' own fetches leave holes of any size in it.
                 fetch = self._first_unclaimed_missing_range(session, chunk_start, chunk_end)
                 if fetch is None:
-                    session.condition.wait(timeout=0.05)
+                    # Every missing byte is in a reader's fetch, which
+                    # notifies when it ends (success or failure), as do
+                    # stop and errors; the timeout is only a backstop.
+                    session.condition.wait(timeout=1.0)
                     continue
 
                 session.in_flight_ranges.append(fetch)
@@ -1319,9 +1348,15 @@ class StreamingReadManager:
         leaves that file alone (see _install_partial); if promotion links
         first, the opener gets the promoted prefix as the cached file, as
         any open after a failed session's cleanup does.
+
+        A session with an error set is refused too, before its cleanup is
+        claimed: an attach would get EIO on every range the session lacks,
+        where the full-file path may succeed. The cost: with the member
+        down that full fetch fails too, and the opener gets the open's
+        error instead of the ranges the session had already cached.
         """
         with session.lock:
-            if session.failed_cleanup_claimed:
+            if session.failed_cleanup_claimed or session.error is not None:
                 refused = True
             else:
                 refused = False
@@ -1329,7 +1364,7 @@ class StreamingReadManager:
                 readers = session.refcount
         if refused:
             self.logger.info(
-                "streaming attach refused path=%s backend=%s: failed session being cleaned up",
+                "streaming attach refused path=%s backend=%s: session failed",
                 session.canonical_path,
                 session.backend.name,
             )
@@ -1418,8 +1453,12 @@ class StreamingReadManager:
         # also missed the registry prepares its own file meanwhile, and only
         # the one that registers takes the shared path. The name is short
         # (a file name near the length limit must not fail here) and keeps
-        # the partial suffix so listings hide it and a restart sweeps it.
-        staging_path = final_cache_path.parent / f".{secrets.token_hex(8)}{self.partial_suffix}"
+        # the partial suffix so listings hide it and a restart sweeps it. The
+        # prefix is not a bare token, so no virtual file named like a token
+        # has a partial that can collide with a staging file.
+        staging_path = (
+            final_cache_path.parent / f".storage-staging-{secrets.token_hex(8)}{self.partial_suffix}"
+        )
 
         io_fd = -1
         try:
@@ -1427,8 +1466,9 @@ class StreamingReadManager:
             os.ftruncate(io_fd, file_size)
         except OSError as exc:
             self.logger.debug(
-                "streaming session unavailable: failed to prepare partial cache file %s: %s",
+                "streaming session unavailable: failed to prepare partial cache file %s for %s: %s",
                 staging_path,
+                final_cache_path,
                 exc,
             )
             if io_fd >= 0:
