@@ -1,0 +1,21 @@
+id: member-link-target-memo
+title: Memoise member link targets in the listing (readlink costs a member round trip
+  per link)
+desc: 'Council PR #158 nit (Claude seat): readlink of a member-only link asks the
+  member on the FUSE thread every time, so ls -l of a directory of member-only links
+  costs one SFTP round trip per link. The listing could carry the target (memoised
+  under listing_lock in the member''s attrs, dropped with the listing). Defer until
+  measured; option B of oq-member-link-escaping-targets would need the same memo.'
+type: task
+component: namespace
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-01T02:42:56-00:00
+references: []
+log_events:
+- time: 2026-11-01T02:42:56-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
