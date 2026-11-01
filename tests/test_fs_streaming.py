@@ -2077,6 +2077,7 @@ class TestFSStreamingIntegration(unittest.TestCase):
             return real_wait(timeout)
 
         session.condition.wait = recording_wait
+        self.addCleanup(setattr, session.condition, "wait", real_wait)
         with session.lock:
             session.in_flight_ranges.append((0, session.file_size))
             session.readers_consumed = True
