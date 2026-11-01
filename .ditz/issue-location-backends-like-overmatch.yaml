@@ -1,0 +1,21 @@
+id: location-backends-like-overmatch
+title: get_location_backends(recursive=True) over-matches through LIKE wildcards
+desc: 'StateManager.get_location_backends(recursive=True) selects virtual_path LIKE
+  path/% without escaping, so a name holding ''_'' or ''%'' also matches siblings
+  (/a_b matches /axb/...). A directory rename then also targets members that hold
+  only the sibling, so the member rename for a path they lack is a best-effort no-op
+  today, but the set is wrong. Use the primary-key range rename_path uses since PR
+  #149 (StateManager._subtree).'
+type: bugfix
+component: sync
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-01T02:33:07-00:00
+references: []
+log_events:
+- time: 2026-11-01T02:33:07-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
