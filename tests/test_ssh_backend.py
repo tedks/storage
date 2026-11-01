@@ -206,6 +206,13 @@ class _FakeSFTPClient:
         return SimpleNamespace(st_size=len(self.server.payload), st_mode=0o100644,
                                st_mtime=1.0)
 
+    def symlink(self, source, dest):
+        self._request("symlink", dest)
+        if dest in self.server.links or dest not in self.server.missing:
+            raise OSError("Failure")  # sftp-server: EEXIST carries no errno
+        self.server.missing.discard(dest)
+        self.server.links[dest] = source
+
     def readlink(self, path):
         self._request("readlink", path)
         if path in self.server.missing:
@@ -1415,6 +1422,19 @@ class TestSSHBackendLinks(_BackendTestCase):
         backend = self._new_backend()
         self.assertTrue(stat.S_ISLNK(backend.lstat("/link").st_mode))
         self.assertTrue(stat.S_ISREG(backend.stat("/link").st_mode))
+
+    def test_symlink_creates_the_link_after_its_parent(self):
+        self.server.missing.update({"/data/d/link"})
+        backend = self._new_backend()
+        backend.symlink("../t", "/d/link")
+        self.assertEqual(self.server.links["/data/d/link"], "../t")
+        names = [r[0] for r in self.server.requests]
+        self.assertLess(names.index("stat"), names.index("symlink"))
+
+    def test_symlink_over_an_existing_name_is_file_exists(self):
+        backend = self._new_backend()
+        with self.assertRaises(FileExistsError):
+            backend.symlink("t", "/taken")
 
     def test_lstat_of_the_root_follows_a_linked_root(self):
         backend = self._new_backend()

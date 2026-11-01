@@ -320,7 +320,7 @@ class TestKernelCacheVisibility(_MountedCase):
         # for every name about to appear.
         self.assertEqual(["a.txt"], sorted(os.listdir(m)))
         os.stat(m / "a.txt")
-        for name in ("b.txt", "c.txt", "sub", "new.txt"):
+        for name in ("b.txt", "c.txt", "sub", "new.txt", "link"):
             self.assertFalse(os.path.lexists(m / name))
 
         os.rename(m / "a.txt", m / "b.txt")
@@ -329,13 +329,12 @@ class TestKernelCacheVisibility(_MountedCase):
         self.assertEqual(3, os.stat(m / "b.txt").st_size)
 
         (m / "c.txt").write_text("three")
-        # Symlinks are refused until they replicate (oq-symlink-through-mount B).
-        with self.assertRaises(PermissionError) as refused:
-            os.symlink("b.txt", m / "link")
-        self.assertEqual(errno.EPERM, refused.exception.errno)
-        self.assertFalse(os.path.lexists(m / "link"))
+        # A link (its name primed as a miss above) shows at once.
+        os.symlink("b.txt", m / "link")
+        self.assertTrue(os.path.islink(m / "link"))
+        self.assertEqual("b.txt", os.readlink(m / "link"))
         os.mkdir(m / "sub")
-        self.assertEqual(["b.txt", "c.txt", "sub"], sorted(os.listdir(m)))
+        self.assertEqual(["b.txt", "c.txt", "link", "sub"], sorted(os.listdir(m)))
         self.assertEqual(5, os.stat(m / "c.txt").st_size)
         self.assertTrue(os.path.isdir(m / "sub"))
 
@@ -361,6 +360,8 @@ class TestKernelCacheVisibility(_MountedCase):
         (m / "new.txt").write_text("n")
         self.assertTrue(os.path.exists(m / "new.txt"))
 
+        os.unlink(m / "link")
+        self.assertFalse(os.path.lexists(m / "link"))
         os.unlink(m / "b.txt")
         os.rename(m / "sub" / "new.txt", m / "sub" / "moved.txt")
         os.unlink(m / "sub" / "moved.txt")
@@ -466,6 +467,57 @@ class TestMemberSymlinks(_MountedCase):
 
 
 class TestMemberSymlinksThreaded(TestMemberSymlinks):
+    fuse_threads = True
+
+
+class TestSymlinkReplication(_MountedCase):
+    """ln -s through the mount places the link with its target
+    (ditz symlink-replication)."""
+
+    def test_link_follows_its_target_to_its_member(self):
+        m = self.mount_dir
+        (self.backend2_dir / "data").mkdir()
+        (self.backend2_dir / "data" / "t.txt").write_text("target bytes")
+        os.mkdir(m / "links")
+
+        os.symlink("../data/t.txt", m / "links" / "l")
+
+        link = m / "links" / "l"
+        self.assertTrue(stat.S_ISLNK(os.lstat(link).st_mode))
+        self.assertEqual(os.readlink(link), "../data/t.txt")
+        self.assertEqual(link.read_text(), "target bytes")
+        member_link = self.backend2_dir / "links" / "l"
+        self.assertTrue(self._wait_for(lambda: os.path.islink(member_link), timeout=10.0))
+        self.assertEqual(os.readlink(member_link), "../data/t.txt")
+        self.assertFalse(os.path.lexists(self.backend1_dir / "links" / "l"))
+
+    def test_refused_links_are_eperm(self):
+        m = self.mount_dir
+        (m / "here.txt").write_text("x")
+        for target in ("/etc/hostname", "../outside", "missing.txt"):
+            with self.assertRaises(PermissionError, msg=target):
+                os.symlink(target, m / "refused")
+            self.assertFalse(os.path.lexists(m / "refused"))
+
+    def test_cp_a_copies_a_link_and_a_directory_link_resolves(self):
+        m = self.mount_dir
+        os.mkdir(m / "dir")
+        (m / "dir" / "inside.txt").write_text("inside")
+        source = Path(self.temp_dir) / "src"
+        source.mkdir()
+        (source / "dl").symlink_to("dir")
+        subprocess.run(["cp", "-a", str(source / "dl"), str(m / "dl")], check=True)
+
+        self.assertEqual(os.readlink(m / "dl"), "dir")
+        self.assertEqual(os.listdir(m / "dl"), ["inside.txt"])
+        self.assertEqual((m / "dl" / "inside.txt").read_text(), "inside")
+        # The directory went to every member on mkdir; so does its link.
+        for member in (self.backend1_dir, self.backend2_dir):
+            self.assertTrue(self._wait_for(lambda member=member: os.path.islink(member / "dl"),
+                                           timeout=10.0), member)
+
+
+class TestSymlinkReplicationThreaded(TestSymlinkReplication):
     fuse_threads = True
 
 

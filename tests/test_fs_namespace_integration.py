@@ -18,6 +18,7 @@ from storage.backends.base import ChecksumUnavailable
 from storage.backends.local import LocalBackend
 from storage.checksums import ChecksumRecord, fast_checksum_bytes
 from storage.fs import StorageFS
+from storage.links import link_checksum
 from storage.models import FileMetadata, SyncStatus
 from storage.sync import DirOperation
 
@@ -327,23 +328,75 @@ class TestFSNamespaceIntegration(unittest.TestCase):
         self.assertFalse(payload["cache_present"])
         self.assertEqual(payload["cache_size"], 0)
 
-    def test_symlink_is_refused_with_eperm(self):
+    def test_symlink_creates_a_cached_link_with_a_dirty_link_row(self):
+        # fusepy passes the link path first; the target must exist.
+        (self.backend1_dir / "target.txt").write_text("target")
         list(self.fs.readdir('/', None))
-        with self.assertRaises(FuseOSError) as raised:
-            self.fs.symlink('/link', 'target.txt')
-        self.assertEqual(raised.exception.errno, errno.EPERM)
-        self.assertFalse(os.path.lexists(self.cache_dir / "link"))
-        self.assertFalse(os.path.lexists(self.cache_dir / "target.txt"))
-        self.assertIn('/', self.fs.namespace.entry_attrs)
-
-    def test_enabled_symlink_creates_the_link_path_and_drops_the_listing(self):
-        # Kept for when links replicate: fusepy passes the link path first.
-        list(self.fs.readdir('/', None))
-        with patch.object(type(self.fs), "_SYMLINKS_ENABLED", True):
+        with patch.object(self.fs.sync_manager, "queue_sync") as queue_sync:
             self.fs.symlink('/link', 'target.txt')
         self.assertEqual(os.readlink(self.cache_dir / "link"), "target.txt")
         self.assertFalse(os.path.lexists(self.cache_dir / "target.txt"))
         self.assertNotIn('/', self.fs.namespace.entry_attrs)
+        row = self.fs.state_manager.get_file_metadata('/link')
+        self.assertEqual(row.link_target, "target.txt")
+        self.assertEqual(row.sync_status, SyncStatus.DIRTY)
+        self.assertGreater(row.dirty_generation, 0)
+        queue_sync.assert_called_once_with('/link', priority=100)
+        self.assertTrue(stat.S_ISLNK(self.fs.getattr('/link')['st_mode']))
+        self.assertEqual(self.fs.readlink('/link'), "target.txt")
+
+    def test_symlink_to_a_cached_only_target_or_a_directory(self):
+        (self.cache_dir / "new.txt").write_text("not synced yet")
+        (self.backend2_dir / "dir").mkdir()
+        with patch.object(self.fs.sync_manager, "queue_sync"):
+            self.fs.symlink('/a', 'new.txt')
+            self.fs.symlink('/b', 'dir')
+            self.fs.symlink('/dir/up', '../new.txt')
+        self.assertEqual(self.fs.state_manager.get_file_metadata('/b').link_target, "dir")
+        self.assertEqual(os.readlink(self.cache_dir / "dir" / "up"), "../new.txt")
+
+    def test_refused_symlinks_are_eperm_and_leave_nothing(self):
+        (self.backend1_dir / "target.txt").write_text("target")
+        (self.backend1_dir / "sub").mkdir()
+        cases = (('/abs', '/etc/passwd'),          # absolute
+                 ('/esc', '../target.txt'),        # escapes the mount root
+                 ('/sub/esc', '../../x'),
+                 ('/dangling', 'missing.txt'),     # nothing there yet
+                 ('/target.txt.backend1', 'x'))    # a conflict view's name
+        for link, target in cases:
+            with self.assertRaises(FuseOSError, msg=link) as raised:
+                self.fs.symlink(link, target)
+            self.assertEqual(raised.exception.errno, errno.EPERM, link)
+            name = link.lstrip('/')
+            self.assertFalse(os.path.lexists(self.cache_dir / name), link)
+            self.assertIsNone(self.fs.state_manager.get_file_metadata(link), link)
+
+    def test_symlink_over_an_existing_name_is_eexist(self):
+        (self.backend1_dir / "target.txt").write_text("target")
+        (self.backend2_dir / "taken").write_text("on a member only")
+        with self.assertRaises(FuseOSError) as raised:
+            self.fs.symlink('/taken', 'target.txt')
+        self.assertEqual(raised.exception.errno, errno.EEXIST)
+        self.assertFalse(os.path.lexists(self.cache_dir / "taken"))
+
+    def test_symlink_row_failure_removes_the_cached_link(self):
+        (self.backend1_dir / "target.txt").write_text("target")
+        with patch.object(self.fs.state_manager, "set_file_metadata",
+                          side_effect=sqlite3.OperationalError("disk I/O error")):
+            with self.assertRaises(sqlite3.OperationalError):
+                self.fs.symlink('/link', 'target.txt')
+        self.assertFalse(os.path.lexists(self.cache_dir / "link"))
+
+    def test_rename_of_a_link_to_a_directory_moves_the_link(self):
+        (self.cache_dir / "dir").mkdir()
+        (self.cache_dir / "dir" / "inside.txt").write_text("x")
+        with patch.object(self.fs.sync_manager, "queue_sync"):
+            self.fs.symlink('/link', 'dir')
+            self.fs.rename('/link', '/moved')
+        self.assertEqual(os.readlink(self.cache_dir / "moved"), "dir")
+        self.assertTrue((self.cache_dir / "dir" / "inside.txt").exists())
+        self.assertIsNone(self.fs.state_manager.get_file_metadata('/link'))
+        self.assertEqual(self.fs.state_manager.get_file_metadata('/moved').link_target, "dir")
 
     def test_getattr_reports_a_listed_member_symlink_as_a_link(self):
         # Listings are lstat: a member's link is listed as a link, and
@@ -1547,32 +1600,43 @@ class TestFSNamespaceIntegration(unittest.TestCase):
         list(self.fs.readdir('/sub', None))
         self.assertEqual(namespace._background_refreshes, set())
 
-    def test_readdir_checksum_scheduling_follows_symlinked_directories(self):
+    def test_conflict_view_compares_member_links_by_target(self):
+        # ditz symlink-replication: a link copy is compared by its target
+        # string, on the hash worker, never by what it points at, and a link
+        # to a directory is no longer passed over as a directory.
         (self.backend1_dir / "real").mkdir()
         (self.backend2_dir / "real").mkdir()
         (self.backend1_dir / "linked").symlink_to("real")
         (self.backend2_dir / "linked").symlink_to("real")
         listing_thread = threading.get_ident()
-        isdir_threads = []
+        readlink_threads = []
         for backend in self.backends.values():
-            real = backend.isdir
+            real = backend.readlink
 
-            def isdir(path, _real=real):
-                isdir_threads.append(threading.get_ident())
+            def readlink(path, _real=real):
+                readlink_threads.append(threading.get_ident())
                 return _real(path)
 
-            patcher = patch.object(backend, "isdir", side_effect=isdir)
+            patcher = patch.object(backend, "readlink", side_effect=readlink)
             patcher.start()
             self.addCleanup(patcher.stop)
         hashes = self._hashes()
 
-        # The link is followed on the hash worker, not the listing thread,
-        # and a directory behind it is neither hashed nor recorded.
-        self.assertIn("linked", self._list_and_settle())
-        self.assertEqual(len(isdir_threads), 2)
-        self.assertNotIn(listing_thread, isdir_threads)
-        self.assertEqual([h for h in hashes if h[1] == "/linked"], [])
-        self.assertNotIn(("/linked", "backend1"), self.fs._checksum_records)
+        entries = self._list_and_settle()
+        self.assertIn("linked", entries)
+        self.assertNotIn("linked.backend1", entries)
+        self.assertEqual(len(readlink_threads), 2)
+        self.assertNotIn(listing_thread, readlink_threads)
+        self.assertEqual(hashes, [])
+        self.assertEqual(self.fs._checksum_records[("/linked", "backend1")].checksum,
+                         link_checksum("real"))
+
+        (self.backend2_dir / "linked").unlink()
+        (self.backend2_dir / "linked").symlink_to("real/.")
+        self._list_and_settle()  # hashes; the next listing applies them
+        entries = self._list_and_settle()
+        self.assertIn("linked.backend1", entries)
+        self.assertIn("linked.backend2", entries)
 
     def test_view_hashes_never_download(self):
         (self.backend1_dir / "dup.txt").write_text("same")
@@ -2646,10 +2710,22 @@ class TestFSNamespaceIntegration(unittest.TestCase):
             (member_dir / "link.txt").symlink_to("target.txt")
         hashes = self._hashes()
 
+        readlinks = []
+        for name, backend in self.backends.items():
+            patcher = patch.object(
+                backend, "readlink",
+                side_effect=lambda path, _real=backend.readlink, _name=name:
+                    readlinks.append((_name, path)) or _real(path))
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
         self._list_and_settle()
         self._list_and_settle()
 
-        self.assertEqual(sum(1 for h in hashes if h[1] == "/link.txt"), 4)
+        # Links compare by target string: read again every listing, never
+        # hashed as content.
+        self.assertEqual(sum(1 for h in hashes if h[1] == "/link.txt"), 0)
+        self.assertEqual(sum(1 for r in readlinks if r[1] == "/link.txt"), 4)
         self.assertEqual(sum(1 for h in hashes if h[1] == "/target.txt"), 2)
 
     def test_conflict_view_survives_skipped_rehash_and_clears_on_change(self):

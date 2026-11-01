@@ -373,9 +373,25 @@ class TestDirtyGeneration(unittest.TestCase):
         self.state_manager = StateManager(str(self.db_path))
         row = self.state_manager.get_file_metadata("/old.txt")
         self.assertEqual(row.dirty_generation, 0)
+        # link_target arrives with it, NULL: every old row is a file.
+        self.assertIsNone(row.link_target)
         self.assertEqual(row.sync_status, SyncStatus.DIRTY)
         self.assertEqual(self.state_manager.mark_dirty("/old.txt", size=6, last_modified=2.0), 1)
         self.assertEqual([m.virtual_path for m in self.state_manager.get_dirty_files()], ["/old.txt"])
+
+    def test_link_target_round_trips_and_follows_a_rename(self):
+        now = time.time()
+        self.state_manager.set_file_metadata(FileMetadata(
+            virtual_path="/d/link", size=3, checksum=None, last_access=now,
+            last_modified=now, sync_status=SyncStatus.DIRTY, replica_count=1,
+            recomputable=False, recompute_cmd=None, encrypted=False,
+            encryption_key_id=None, link_target="../t",
+        ))
+        self.assertEqual(self.state_manager.get_file_metadata("/d/link").link_target, "../t")
+        self.state_manager.rename_path("/d", "/e")
+        self.assertEqual(self.state_manager.get_file_metadata("/e/link").link_target, "../t")
+        self.assertEqual(
+            [m.link_target for m in self.state_manager.iter_file_metadata()], ["../t"])
 
     def test_mark_dirty_from_cache_file_records_the_file_stat(self):
         self.state_manager.set_file_metadata(self._metadata())

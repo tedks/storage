@@ -41,6 +41,7 @@ class TestFileMetadataModel(unittest.TestCase):
             "encrypted": True,
             "encryption_key_id": "key-1",
             "dirty_generation": 7,
+            "link_target": None,
         }
 
         metadata = FileMetadata.from_dict(payload)
