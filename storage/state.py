@@ -9,6 +9,7 @@ This module manages the state of all files in the Storage filesystem, including:
 - Conflict information
 """
 
+import errno
 import os
 import threading
 import sqlite3
@@ -694,43 +695,97 @@ class StateManager:
             path = path.rstrip('/')
         return path
 
+    @staticmethod
+    def _subtree(root: str, below_only: bool = False) -> Tuple[str, Tuple[str, ...]]:
+        """A WHERE clause for virtual_path at root (unless below_only) or below it.
+
+        A range on the primary key, not LIKE: exact for names holding '_' or
+        '%', and indexed. '0' is the byte after '/', so the range holds
+        exactly the paths that start with root + '/' under SQLite's
+        default BINARY collation, which virtual_path uses. root is
+        normalized and not '/'.
+        """
+        below = '(virtual_path > ? AND virtual_path < ?)'
+        params = (root + '/', root + '0')
+        if below_only:
+            return below, params
+        return f'(virtual_path = ? OR {below})', (root,) + params
+
+    def _has_rows_below(self, path: str, excluding: str) -> bool:
+        below, below_params = self._subtree(path, below_only=True)
+        source, source_params = self._subtree(excluding)
+        cursor = self.conn.execute(
+            f'SELECT 1 FROM files WHERE {below} AND NOT {source} LIMIT 1',
+            below_params + source_params,
+        )
+        return cursor.fetchone() is not None
+
+    def has_rows_below(self, virtual_path: str, excluding: str) -> bool:
+        """Whether files rows exist strictly below virtual_path, other than
+        at or below excluding (a rename's source)."""
+        path = self._normalize_virtual_path(virtual_path)
+        excluding = self._normalize_virtual_path(excluding)
+        if '/' in (path, excluding):
+            raise ValueError("root is not a rename endpoint")
+        with self._db_lock:
+            return self._has_rows_below(path, excluding)
+
     def rename_path(self, old_virtual_path: str, new_virtual_path: str) -> List[Tuple[str, str]]:
-        """Rename metadata entries from old path (and descendants) to new path."""
+        """Rename metadata entries from old path (and descendants) to new path.
+
+        Like rename(2), the move replaces what was at the new path: a file,
+        or an empty directory. A directory is empty only if no files rows
+        lie below it (a file evicted from the cache keeps its row), else
+        this raises OSError(ENOTEMPTY) and changes nothing; the caller
+        checks has_rows_below before moving the cache. The destination's
+        row and location rows are dropped in the same transaction as the
+        move, with any location rows below it, which no files row owns, so
+        they cannot collide with the moved ones. That happens even when the
+        source has no rows: the cache move has replaced the destination
+        already. Root is never an endpoint (ValueError). Returns (old, new)
+        for every files row moved.
+        """
         old_path = self._normalize_virtual_path(old_virtual_path)
         new_path = self._normalize_virtual_path(new_virtual_path)
+        if '/' in (old_path, new_path):
+            raise ValueError("root is not a rename endpoint")
 
         if old_path == new_path:
             return []
 
-        like_pattern = f"{old_path}/%"
         rename_map: List[Tuple[str, str]] = []
         with self._db_lock:
-            cursor = self.conn.execute(
-                'SELECT virtual_path FROM files WHERE virtual_path = ? OR virtual_path LIKE ?',
-                (old_path, like_pattern)
-            )
-
-            for row in cursor.fetchall():
-                current_path = row['virtual_path']
-                if old_path == '/':
-                    suffix = current_path
-                else:
-                    suffix = current_path[len(old_path):]
-                new_entry = new_path + suffix
-                rename_map.append((current_path, new_entry))
-
-            for original, updated in rename_map:
+            try:
+                if self._has_rows_below(new_path, old_path):
+                    raise OSError(errno.ENOTEMPTY, os.strerror(errno.ENOTEMPTY), new_path)
+                self.conn.execute('DELETE FROM files WHERE virtual_path = ?', (new_path,))
+                target, target_params = self._subtree(new_path)
+                source, source_params = self._subtree(old_path)
                 self.conn.execute(
-                    'UPDATE files SET virtual_path = ? WHERE virtual_path = ?',
-                    (updated, original)
-                )
-                self.conn.execute(
-                    'UPDATE file_locations SET virtual_path = ? WHERE virtual_path = ?',
-                    (updated, original)
+                    f'DELETE FROM file_locations WHERE {target} AND NOT {source}',
+                    target_params + source_params,
                 )
 
-            if rename_map:
+                cursor = self.conn.execute(
+                    f'SELECT virtual_path FROM files WHERE {source}', source_params
+                )
+                for row in cursor.fetchall():
+                    current_path = row['virtual_path']
+                    rename_map.append((current_path, new_path + current_path[len(old_path):]))
+
+                for original, updated in rename_map:
+                    self.conn.execute(
+                        'UPDATE files SET virtual_path = ? WHERE virtual_path = ?',
+                        (updated, original)
+                    )
+                    self.conn.execute(
+                        'UPDATE file_locations SET virtual_path = ? WHERE virtual_path = ?',
+                        (updated, original)
+                    )
                 self.conn.commit()
+            except BaseException:
+                self.conn.rollback()
+                raise
 
         return rename_map
 

@@ -239,6 +239,9 @@ class _FakeSFTPClient:
     def rename(self, old_path, new_path):
         self._request("rename", old_path)
 
+    def posix_rename(self, old_path, new_path):
+        self._request("posix_rename", old_path)
+
 
 class _FakeServer:
     """One fake sshd: the transports it accepted and the SFTP clients on them."""
@@ -1356,6 +1359,40 @@ class TestSSHBackendOnThePool(_BackendTestCase):
         self.assertEqual(self.server.connect_calls, 1)
         self.assertLessEqual(self.server.transport.max_open_seen, 4)
         self.assertEqual(self.server.concurrent_use, [])
+
+    def test_rename_uses_posix_rename(self):
+        """posix-rename replaces an existing target (ditz rename-over-existing-file)."""
+        self._new_backend().rename("/a", "/b")
+        self.assertIn("posix_rename", [name for name, *_ in self.server.requests])
+        self.assertNotIn("rename", [name for name, *_ in self.server.requests])
+
+    def test_rename_falls_back_without_the_posix_rename_extension(self):
+        def unsupported(client, path):
+            raise IOError("Operation unsupported")
+        self.server.hooks["posix_rename"] = unsupported
+        self._new_backend().rename("/a", "/b")
+        self.assertEqual(["posix_rename", "rename"],
+                         [name for name, *_ in self.server.requests
+                          if name in ("posix_rename", "rename")])
+
+    def test_rename_does_not_fall_back_on_a_timeout(self):
+        # socket.timeout is an OSError without an errno too; a retry on the
+        # timed-out channel would hide the timeout from the pool.
+        def slow(client, path):
+            raise socket.timeout()
+        self.server.hooks["posix_rename"] = slow
+        with self.assertRaises(socket.timeout):
+            self._new_backend().rename("/a", "/b")
+        self.assertNotIn("rename", [name for name, *_ in self.server.requests])
+
+    def test_rename_does_not_fall_back_on_an_errno_failure(self):
+        def denied(client, path):
+            raise PermissionError(errno.EACCES, "denied")
+        self.server.hooks["posix_rename"] = denied
+        with self.assertRaises(OSError) as raised:
+            self._new_backend().rename("/a", "/b")
+        self.assertEqual(errno.EACCES, raised.exception.errno)
+        self.assertNotIn("rename", [name for name, *_ in self.server.requests])
 
     def test_no_socket_timeout_override(self):
         backend = self._new_backend()

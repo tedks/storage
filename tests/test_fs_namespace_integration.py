@@ -2044,6 +2044,73 @@ class TestFSNamespaceIntegration(unittest.TestCase):
 
         self.assertNotIn(("/dup.txt", "backend2"), self.fs._checksum_records)
 
+    def test_rename_onto_an_existing_file_replaces_it(self):
+        """ditz rename-over-existing-file: the save path of most editors."""
+        for path, data in (("/src.txt", b"new contents"), ("/dst.txt", b"old")):
+            fh = self.fs.create(path, 0o644)
+            self.fs.write(path, data, 0, fh)
+            self.fs.release(path, fh)
+        state = self.fs.state_manager
+        self.assertTrue(self._wait_for(lambda: all(
+            state.get_file_metadata(p).sync_status == SyncStatus.CLEAN
+            for p in ("/src.txt", "/dst.txt")), timeout=30.0))
+        holders = state.get_location_backends("/src.txt")
+        self.assertTrue(holders)
+        self.fs.rename("/src.txt", "/dst.txt")
+        self.assertIsNone(state.get_file_metadata("/src.txt"))
+        row = state.get_file_metadata("/dst.txt")
+        self.assertEqual(len(b"new contents"), row.size)
+        self.assertEqual(holders, state.get_location_backends("/dst.txt"))
+        fh = self.fs.open("/dst.txt", os.O_RDONLY)
+        self.assertEqual(b"new contents", self.fs.read("/dst.txt", 100, 0, fh))
+        self.fs.release("/dst.txt", fh)
+        members = {"backend1": self.backend1_dir, "backend2": self.backend2_dir}
+        for name in holders:
+            self.assertEqual(b"new contents", (members[name] / "dst.txt").read_bytes())
+        for root in members.values():
+            self.assertFalse((root / "src.txt").exists())
+
+    def test_rename_onto_a_directory_whose_files_were_evicted_is_refused(self):
+        """The cache directory is empty, but the index still has its files."""
+        self.fs.sync_manager.stop()
+        self.fs.mkdir("/src", 0o755)
+        self.fs.mkdir("/dst", 0o755)
+        (self.backend1_dir / "dst").mkdir(exist_ok=True)
+        (self.backend1_dir / "dst" / "kept.txt").write_bytes(b"member copy")
+        self.fs.state_manager.set_file_metadata(FileMetadata(
+            virtual_path="/dst/kept.txt", size=11, checksum="c", last_access=1.0,
+            last_modified=1.0, sync_status=SyncStatus.CLEAN, replica_count=1,
+            recomputable=False, recompute_cmd=None, encrypted=False,
+            encryption_key_id=None,
+        ))
+        self.assertFalse((self.cache_dir / "dst" / "kept.txt").exists())
+        with self.assertRaises(FuseOSError) as raised:
+            self.fs.rename("/src", "/dst")
+        self.assertEqual(errno.ENOTEMPTY, raised.exception.errno)
+        self.assertTrue((self.cache_dir / "src").is_dir())
+        self.assertIsNotNone(self.fs.state_manager.get_file_metadata("/dst/kept.txt"))
+        self.assertTrue((self.backend1_dir / "dst" / "kept.txt").exists())
+
+    def test_a_file_onto_a_directory_with_evicted_files_is_eisdir(self):
+        """As rename(2): the source is a file, so the target's contents do not matter."""
+        self.fs.sync_manager.stop()
+        fh = self.fs.create("/f.txt", 0o644)
+        self.fs.release("/f.txt", fh)
+        self.fs.mkdir("/dst", 0o755)
+        self.fs.state_manager.set_file_metadata(FileMetadata(
+            virtual_path="/dst/kept.txt", size=11, checksum="c", last_access=1.0,
+            last_modified=1.0, sync_status=SyncStatus.CLEAN, replica_count=1,
+            recomputable=False, recompute_cmd=None, encrypted=False,
+            encryption_key_id=None,
+        ))
+        with self.assertRaises(FuseOSError) as raised:
+            self.fs.rename("/f.txt", "/dst")
+        self.assertEqual(errno.EISDIR, raised.exception.errno)
+        with self.assertRaises(FuseOSError) as raised:
+            self.fs.rename("/missing", "/dst")
+        self.assertEqual(errno.ENOENT, raised.exception.errno)
+        self.assertIsNotNone(self.fs.state_manager.get_file_metadata("/dst/kept.txt"))
+
     def test_rename_and_unlink_forget_recorded_checksums(self):
         (self.backend1_dir / "sub").mkdir()
         (self.backend2_dir / "sub").mkdir()
