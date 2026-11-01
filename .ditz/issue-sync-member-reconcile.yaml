@@ -35,3 +35,10 @@ log_events:
     90); the retry''s X.rename(/a, /b) replaces it with the old bytes while X''s location
     row records the new checksum. Option: refuse a member rename whose destination
     already exists on the member.'
+- time: 2026-11-01T02:33:08-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'PR #149: SSHBackend.rename now uses posix-rename, which replaces an existing
+    target. A stale RENAME retry on an SSH member therefore overwrites whatever is
+    at the destination there instead of failing, as the local member already did.
+    Reconcile should consider this when deciding which copy wins.'
