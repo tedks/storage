@@ -21,8 +21,8 @@ type: feature
 component: fs
 release:
 reporter: Ted Smith <tedks@riseup.net>
-status: in_progress
-disposition:
+status: closed
+disposition: fixed
 creation_time: 2026-10-30T02:25:41-00:00
 references: []
 log_events:
@@ -34,3 +34,8 @@ log_events:
   who: Ted Smith
   what: started
   comment: ""
+- time: 2026-11-01T03:31:41-00:00
+  who: Ted Smith
+  what: 'closed: fixed'
+  comment: 'PR #162 merged c774c9d (head fdc3750); council converged round 3; gates
+    green on head'
