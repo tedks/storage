@@ -355,6 +355,9 @@ class TestFSCoreIntegration(unittest.TestCase):
         with patch.object(self.fs, "_persist_checksum") as persist:
             self.fs._schedule_checksum_task(self.fs.backends["backend1"], "/kept.txt", None, replace=True)
             self.assertTrue(started.wait(5))
+            # Queued behind the running one: cancelled by the queues' shutdown.
+            (self.backend1_dir / "queued.txt").write_text("y")
+            self.fs._schedule_checksum_task(self.fs.backends["backend1"], "/queued.txt", None, replace=True)
             self.fs.destroy("/")
             deadline = time.monotonic() + 5
             while self.fs._checksum_tasks and time.monotonic() < deadline:

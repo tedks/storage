@@ -866,6 +866,10 @@ class StorageFS(Operations):
                         # record left from before would outlive the change
                         # that scheduled this hash (an upload, a new basis).
                         self._checksum_records.pop(key, None)
+                        # Not while the unmount ends the hash: the row it
+                        # leaves is keyed by the basis it was made from, so
+                        # a changed file (an upload, a new basis) never
+                        # loads it, and an unchanged one keeps a valid row.
                         if not self._destroying.is_set():
                             self._persist_checksum(canonical_path, backend.name, None)
                         return
@@ -2606,11 +2610,13 @@ class StorageFS(Operations):
             self._sweep_thread.join(timeout=self.SWEEP_JOIN_TIMEOUT)
 
         try:
-            self.sync_manager.stop()
+            # Each step on its own: a failing one must not skip the index
+            # close, which is what lets the lock go (see the finally).
+            self._best_effort("stop the sync workers", self.sync_manager.stop)
             # After the last rsync upload and the watchers: they share the
             # masters (rsync members have no close() of their own; this ends
             # their connections).
-            close_shared_control_sockets()
+            self._best_effort("close the shared ssh connections", close_shared_control_sockets)
             # Close the members' transports once nothing of ours should still
             # use them. Hash and listing workers blocked in member I/O (the
             # queues and executors cancel only what has not started) then
@@ -2618,7 +2624,7 @@ class StorageFS(Operations):
             # the process alive, and the mount lock held, long after the
             # unmount.
             self._close_backends()
-            self.state_manager.close()
+            self._best_effort("close the index", self.state_manager.close)
             if not self._sweep_pending:
                 _clear_mount_lock_pid(self.mount_lock_file)
         finally:
@@ -2630,6 +2636,12 @@ class StorageFS(Operations):
             # index, which is closed. Keep it that way: a cache mutation not
             # gated on the index would race the next mount.
             _release_mount_lock(self.mount_lock_file)
+
+    def _best_effort(self, what: str, step) -> None:
+        try:
+            step()
+        except Exception:
+            self.logger.exception("destroy: could not %s", what)
 
     def _close_backends(self):
         for backend in self.backends.values():

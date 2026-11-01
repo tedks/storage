@@ -1571,7 +1571,7 @@ def test_unmount_stops_background_work_and_frees_the_mount_lock(remote, mounted_
     payload = secrets.token_bytes(256 * 1024)
     for member in (m0, m1):
         remote.write_remote(member, "both.bin", payload)
-    before = {t.ident for t in threading.enumerate()}
+    before = set(threading.enumerate())
     mnt = mounted_factory()
     lock_path = tmp_path / "mount.lock"
     mnt.fs.mount_lock_file, _ = _acquire_mount_lock_ex(lock_path, str(mnt.mount))
@@ -1599,8 +1599,8 @@ def test_unmount_stops_background_work_and_frees_the_mount_lock(remote, mounted_
 
     def background_threads():
         return [t.name for t in threading.enumerate()
-                if t.is_alive() and t.ident not in before
-                and t.name.startswith(("checksum-", "readdir-")) and t.name != "checksum-reverify"]
+                if t.is_alive() and t not in before
+                and t.name.startswith(("checksum-", "readdir-"))]
 
     def remount_ready():
         try:
