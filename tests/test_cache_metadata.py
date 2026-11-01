@@ -1,3 +1,4 @@
+import errno
 import os
 import shutil
 import stat
@@ -194,3 +195,62 @@ class TestStaleRecordDerivation(unittest.TestCase):
         self.assertIn("stale_clean_xattr", kinds)
         self.assertIn("size_mismatch", kinds)
         self.assertEqual(entry.build_file_metadata().sync_status, SyncStatus.DIRTY)
+
+
+class TestCacheScansDoNotFollowLinks(unittest.TestCase):
+    """A symlink in the cache tree is not a cached copy: scans skip it and
+    nothing reads or writes metadata through it
+    (ditz cache-scans-follow-symlinks)."""
+
+    def setUp(self):
+        self.temp_dir = Path(tempfile.mkdtemp())
+        self.cache_root = self.temp_dir / "cache"
+        self.cache_root.mkdir()
+        self.real = self.cache_root / "real.bin"
+        self.real.write_bytes(b"real bytes")
+        write_cache_metadata(self.real, self._metadata("/real.bin", self.real))
+        self.link = self.cache_root / "link.bin"
+        self.link.symlink_to("real.bin")
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    @staticmethod
+    def _metadata(virtual_path, path):
+        st = os.lstat(path)
+        return FileMetadata(
+            virtual_path=virtual_path, size=st.st_size, checksum=None,
+            last_access=1.0, last_modified=st.st_mtime, sync_status=SyncStatus.CLEAN,
+            replica_count=1, recomputable=False, recompute_cmd=None,
+            encrypted=False, encryption_key_id=None,
+        )
+
+    def test_scan_skips_a_link(self):
+        paths = [entry.virtual_path for entry in scan_cache_entries(self.cache_root)]
+        self.assertEqual(paths, ["/real.bin"])
+
+    def test_would_be_scanned_is_false_for_a_link(self):
+        self.assertTrue(cache_file_would_be_scanned(self.cache_root.resolve(), "/real.bin"))
+        self.assertFalse(cache_file_would_be_scanned(self.cache_root.resolve(), "/link.bin"))
+
+    def test_write_refuses_a_link_and_leaves_the_target(self):
+        with self.assertRaises(OSError) as raised:
+            write_cache_metadata(self.link, self._metadata("/link.bin", self.link))
+        self.assertEqual(raised.exception.errno, errno.EINVAL)
+        self.assertEqual(read_cache_metadata(self.real).virtual_path, "/real.bin")
+
+    def test_read_does_not_follow_a_link(self):
+        self.assertIsNone(read_cache_metadata(self.link))
+
+    def test_rebuild_index_does_not_rewrite_the_target_through_a_link(self):
+        from storage.index_audit import rebuild_index_from_cache
+        from storage.state import StateManager
+
+        state = StateManager(str(self.temp_dir / "state.db"))
+        try:
+            rebuild_index_from_cache(self.cache_root, state)
+            self.assertIsNone(state.get_file_metadata("/link.bin"))
+            self.assertIsNotNone(state.get_file_metadata("/real.bin"))
+        finally:
+            state.close()
+        self.assertEqual(read_cache_metadata(self.real).virtual_path, "/real.bin")
