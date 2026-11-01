@@ -557,7 +557,16 @@ class SSHBackend(Backend):
                 # posix-rename@openssh.com replaces an existing target, as
                 # rename(2) and the local member do; plain SFTP rename fails
                 # on OpenSSH when the target exists (an editor's save).
-                sftp.posix_rename(old_remote, new_remote)
+                try:
+                    sftp.posix_rename(old_remote, new_remote)
+                except OSError as exc:
+                    # paramiko leaves errno unset for SFTP statuses it does
+                    # not map, an unsupported extension among them. Plain
+                    # rename still moves onto an absent target, and its own
+                    # error is the one raised.
+                    if exc.errno is not None:
+                        raise
+                    sftp.rename(old_remote, new_remote)
             except FileNotFoundError:
                 # Nothing to rename; best-effort
                 pass
