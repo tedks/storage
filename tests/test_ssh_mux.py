@@ -214,6 +214,24 @@ class TestControlSockets(unittest.TestCase):
         self.assertEqual(path.parent.parent, good)
         self.assertFalse((open_parent / "storage-mux").exists())
 
+    def test_a_sticky_parent_owned_by_someone_else_is_skipped(self):
+        real = os.stat
+        def fake(path, *a, **k):
+            info = real(path, *a, **k)
+            if str(path) == str(self.parent / "sticky"):
+                return os.stat_result((info.st_mode | 0o1777, info.st_ino, info.st_dev,
+                                       info.st_nlink, os.getuid() + 12345, info.st_gid,
+                                       info.st_size, 0, 0, 0))
+            return info
+        (self.parent / "sticky").mkdir()
+        good = self.parent / "good"
+        with patch.object(ssh_mux.os, "stat", fake):
+            sockets = ControlSockets(base_dirs=[self.parent / "sticky" / "b", good],
+                                     ssh=str(self.fake.path))
+            self.addCleanup(sockets.close)
+            path = self._control_path(sockets.options("u", "h", 22, None))
+        self.assertEqual(path.parent.parent, good)
+
     def test_a_missing_base_is_created_0700(self):
         base = self.parent / "storage-mux"
         sockets = ControlSockets(base_dirs=[base], ssh=str(self.fake.path))

@@ -84,8 +84,9 @@ def _private_base(base: Path) -> bool:
         # Whoever can rename entries in the parent can swap the base after the
         # checks below: it must be ours or root's and closed to others, or sticky (/tmp).
         parent = os.stat(base.parent)
-        if not (parent.st_mode & stat.S_ISVTX or (
-                parent.st_uid in (os.getuid(), 0) and not parent.st_mode & 0o022)):
+        # An owner can rename entries even in a sticky directory.
+        if parent.st_uid not in (os.getuid(), 0) or not (
+                parent.st_mode & stat.S_ISVTX or not parent.st_mode & 0o022):
             return False
         try:
             os.mkdir(base, 0o700)
