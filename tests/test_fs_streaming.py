@@ -505,7 +505,7 @@ class TestFSStreamingIntegration(unittest.TestCase):
         # copy keeps the member file's mode (write-only here).
         from storage.cache import _remove_prefix_marker
         from storage.cache_metadata import PREFIX_XATTR
-        for mode, marked in ((0o200, True), (0o200, False), (0o000, True)):
+        for mode, marked in ((0o200, True), (0o200, False), (0o000, True), (0o000, False)):
             path = self.cache_dir / f"wo-{mode:o}-{marked}"
             path.write_bytes(b"x")
             if marked:
