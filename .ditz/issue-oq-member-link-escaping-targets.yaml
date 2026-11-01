@@ -1,0 +1,36 @@
+id: oq-member-link-escaping-targets
+title: 'Member-made links with absolute or escaping targets: show as links, follow
+  on the member, or hide?'
+desc: 'Context: PR #158 (member-symlink-readlink) reports a member''s link as a link
+  on every backend, per the ruling in symlink-replication (listings keep the link
+  mode; ls -l shows the arrow). Before it, an SSH member followed links on the member
+  host: a link like media -> /abs/path/on/member showed as the directory it names
+  there. Now the kernel resolves the target on the client: an absolute target, or
+  a relative one that climbs out of the mount, names a client path (as over NFS or
+  sshfs). Council PR #158 (Claude and agy seats) flagged two consequences: (1) such
+  links on SSH members no longer show their member-side contents; (2) a member host
+  can plant a link to a client file (e.g. a key under the user''s home), which a tool
+  following links over the mount (cp -rL, backup, grep -R) reads on the client, and
+  could copy back into the mount and so onto members. Members are the user''s own
+  configured hosts. Options: (A) keep as shipped and documented in README (sshfs/NFS
+  behaviour); (B) report a member link whose target is absolute or escapes the mount
+  root as the member''s followed stat (old SSH behaviour for those; in-union links
+  stay links); costs a readlink per link at getattr, memoised in the listing; (C)
+  hide such links. Recommendation: B; it matches the creation rule in symlink-replication
+  (absolute and escaping targets cannot mean the same thing on a member and through
+  the mount) and removes the client-side exposure. Who decides: Ted. Blocks: nothing
+  merged; PR #158 ships A, documented; B is a follow-up of about one getattr change
+  plus tests.'
+type: task
+component: open-questions
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-01T02:42:56-00:00
+references: []
+log_events:
+- time: 2026-11-01T02:42:56-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
