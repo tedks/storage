@@ -18,8 +18,8 @@ type: bugfix
 component: cache
 release:
 reporter: Ted Smith <tedks@riseup.net>
-status: in_progress
-disposition:
+status: closed
+disposition: fixed
 creation_time: 2026-10-30T01:03:16-00:00
 references: []
 log_events:
@@ -31,3 +31,8 @@ log_events:
   who: Ted Smith
   what: started
   comment: ""
+- time: 2026-11-01T02:57:49-00:00
+  who: Ted Smith
+  what: 'closed: fixed'
+  comment: 'PR #159 merged fa5c97e0fd90ca43a575fe3d8dabb1924818f646 (head 465b97c);
+    council converged round 3; gates green on head'
