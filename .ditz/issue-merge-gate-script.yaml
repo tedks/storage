@@ -1,0 +1,30 @@
+id: merge-gate-script
+title: 'scripts/merge-gated.sh: refuse to merge a PR whose head is not rebased on
+  origin/master or lacks a gate receipt for that exact commit'
+desc: 'Process audit 2026-11-01: two Sonnet lanes merged PRs whose heads were behind
+  origin/master (#156 by 26 commits, #155 by 5) after gating the stale head; both
+  gated the merge commit afterwards and master''s tree is verified gated, but the
+  rule ''rebase and re-gate when master moved'' was skipped by hand. Make it mechanical.
+  (1) scripts/run-gates.sh writes a receipt on success: .gates/<full sha>.json (git-ignored)
+  with the sha, tree hash, targets, host, timestamp, and refuses to write one when
+  the tree is dirty. (2) New scripts/merge-gated.sh <pr>: fetches origin, refuses
+  unless origin/master is an ancestor of HEAD (0 behind), HEAD matches the PR head
+  on GitHub, the tree is clean, and a receipt exists for HEAD''s exact sha and tree;
+  prints the council-record line to paste (''rebased on <master sha>, 0 behind; gates
+  <targets> on <sha>''); then runs gh pr merge --merge --match-head-commit <sha>.
+  (3) AGENTS.md''s merge rule names the script; the lane briefs will too. Tests for
+  the receipt writer and the refusal cases with a fake gh and a local bare origin
+  (pattern in the run-gates tests). No change to what the gates test.'
+type: task
+component: build
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-01T03:57:58-00:00
+references: []
+log_events:
+- time: 2026-11-01T03:57:58-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
