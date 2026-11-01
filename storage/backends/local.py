@@ -217,7 +217,8 @@ class LocalBackend(Backend):
         old_path = self._resolve_path(old_virtual_path)
         new_path = self._resolve_path(new_virtual_path)
         new_path.parent.mkdir(parents=True, exist_ok=True)
-        if not old_path.exists():
+        # lexists: a link whose target is elsewhere is still renamed.
+        if not os.path.lexists(old_path):
             return
         os.replace(old_path, new_path)
 
@@ -237,6 +238,11 @@ class LocalBackend(Backend):
 
     def readlink(self, virtual_path: str) -> str:
         return os.readlink(self._resolve_path(virtual_path))
+
+    def symlink(self, target: str, virtual_path: str):
+        real_path = self._resolve_path(virtual_path)
+        real_path.parent.mkdir(parents=True, exist_ok=True)
+        os.symlink(target, real_path)
 
     def sync(self):
         """Sync any buffered writes to storage"""

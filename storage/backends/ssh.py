@@ -630,6 +630,32 @@ class SSHBackend(Backend):
             target = os.fsdecode(target)
         return target
 
+    def symlink(self, target: str, virtual_path: str):
+        """Create the link over SFTP (rsync members too: link creation is
+        metadata, like mkdir and rename, which they also do over SFTP).
+
+        sftp-server fails an existing path with a status that carries no
+        errno; an lstat that finds something there makes it FileExistsError.
+        paramiko's symlink(source, dest) sends source first, the order
+        OpenSSH's sftp-server takes as (target, link path).
+        """
+        remote_path = str(self._resolve_path(virtual_path))
+
+        def create(sftp):
+            self._ensure_parent(sftp, remote_path)
+            sftp.symlink(target, remote_path)
+
+        try:
+            self._with_sftp("symlink", virtual_path, create)
+        except OSError as exc:
+            if exc.errno is not None or is_connection_error(exc):
+                raise
+            try:
+                self.lstat(virtual_path)
+            except FileNotFoundError:
+                raise exc from None
+            raise FileExistsError(errno.EEXIST, "already exists", virtual_path) from exc
+
     def close(self):
         """Close the member's transport and channels; it does not reconnect."""
         pool = getattr(self, "_pool", None)
