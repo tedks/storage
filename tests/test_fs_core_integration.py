@@ -335,6 +335,33 @@ class TestFSCoreIntegration(unittest.TestCase):
         future.result(timeout=5)
         self.assertLess(time.monotonic() - began, 10)
 
+    def test_destroy_closing_a_member_keeps_the_persisted_hash_row(self):
+        # A hash that ends because the unmount closed its member says
+        # nothing about the persisted row: it is kept for the next mount.
+        closed = threading.Event()
+        started = threading.Event()
+
+        class ClosingMember(LocalBackend):
+            def get_fast_checksum(self, virtual_path, allow_download=True):
+                started.set()
+                closed.wait(30)
+                raise OSError("transport closed")
+
+            def close(self):
+                closed.set()
+
+        (self.backend1_dir / "kept.txt").write_text("x")
+        self.fs.backends["backend1"] = ClosingMember("backend1", str(self.backend1_dir))
+        with patch.object(self.fs, "_persist_checksum") as persist:
+            self.fs._schedule_checksum_task(self.fs.backends["backend1"], "/kept.txt", None, replace=True)
+            self.assertTrue(started.wait(5))
+            self.fs.destroy("/")
+            deadline = time.monotonic() + 5
+            while self.fs._checksum_tasks and time.monotonic() < deadline:
+                time.sleep(0.01)
+        self.assertEqual(self.fs._checksum_tasks, {})
+        persist.assert_not_called()
+
     def test_init_runs_a_requested_sweep_and_clears_pending(self):
         self.fs.sync_manager.stop()
         fd = self.fs.create("/swept.txt", 0o644)

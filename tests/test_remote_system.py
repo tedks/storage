@@ -1571,17 +1571,36 @@ def test_unmount_stops_background_work_and_frees_the_mount_lock(remote, mounted_
     payload = secrets.token_bytes(256 * 1024)
     for member in (m0, m1):
         remote.write_remote(member, "both.bin", payload)
+    before = {t.ident for t in threading.enumerate()}
     mnt = mounted_factory()
     lock_path = tmp_path / "mount.lock"
     mnt.fs.mount_lock_file, _ = _acquire_mount_lock_ex(lock_path, str(mnt.mount))
+
+    # Hold every view hash in a real exec channel: the command a member runs
+    # for it becomes a long sleep, so the worker is inside member I/O when
+    # the unmount comes.
+    in_channel = threading.Event()
+    for backend in mnt.backends.values():
+        real_run = backend._pool.run_command
+
+        def run_command(command, timeout, _real=real_run):
+            if command.startswith("xxh128sum"):
+                in_channel.set()
+                return _real("sleep 120", 150.0)
+            return _real(command, timeout)
+
+        backend._pool.run_command = run_command
+
     assert "both.bin" in os.listdir(mnt.mount)
+    assert in_channel.wait(10.0), "no view hash reached a member channel"
 
     assert unmount_fuse(mnt.mount) == []
     mnt.unmounted_by_test = True
 
     def background_threads():
         return [t.name for t in threading.enumerate()
-                if t.is_alive() and t.name.startswith(("checksum-", "readdir-"))]
+                if t.is_alive() and t.ident not in before
+                and t.name.startswith(("checksum-", "readdir-")) and t.name != "checksum-reverify"]
 
     def remount_ready():
         try:
