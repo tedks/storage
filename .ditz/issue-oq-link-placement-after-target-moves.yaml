@@ -1,0 +1,30 @@
+id: oq-link-placement-after-target-moves
+title: 'Link placement does not follow re-replication of its target: keep fixed, or
+  re-place?'
+desc: 'From lane symlinks PR 3. The ruling (symlink-replication) fixes a link''s placement
+  at creation; PR 3 fixes it at the link''s first sync (BEND: lets ln -s right after
+  writing the target work). Not covered by the ruling: what happens to existing links
+  when their target is later replicated to more members (replica_count raised), moved
+  off a member (eviction from a member, re-replication), or renamed. Today: nothing;
+  the link stays where it was placed, so a member gaining the target lacks the link,
+  and a member losing it keeps a link that dangles there (through the mount it still
+  resolves through the union). Options: (A) keep fixed and documented (shipped), plus
+  a verifier (storage debug verify-links) that reports links whose target is no longer
+  on their member and links missing where the target now is; (B) re-place links when
+  their target''s locations change (sync of the target queues its incoming links;
+  needs a reverse index target->links); (C) place links on every member regardless
+  of the target. Recommendation: A now with the verifier as a follow-up, B only if
+  a real use needs it. Who decides: Ted. Blocks: nothing; PR 3 ships A.'
+type: task
+component: open-questions
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-01T03:10:23-00:00
+references: []
+log_events:
+- time: 2026-11-01T03:10:23-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
