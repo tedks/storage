@@ -1327,8 +1327,9 @@ class StorageFS(Operations):
                             identity: Tuple[int, int, int],
                             updates: Dict[str, Tuple[int, float]], *, replace: bool = False,
                             drop: Tuple[str, ...] = (),
-                            drop_unless_checked_since: Optional[MemberCheck] = None):
-        """Record a check now, merging member baselines, in memory and on the cache file.
+                            drop_unless_checked_since: Optional[MemberCheck] = None,
+                            verified_at: Optional[float] = None):
+        """Record a check now (or at verified_at, a time.monotonic() value), merging member baselines, in memory and on the cache file.
 
         The baselines already known for this cache file (in memory, else from
         its xattr) are kept and updates applied on top; replace=True starts
@@ -1374,8 +1375,10 @@ class StorageFS(Operations):
                         continue
                 del members[name]
                 dropped.append(name)
-            check = MemberCheck(cache_identity=identity, verified_at=time.monotonic(),
-                                members=members)
+            check = MemberCheck(
+                cache_identity=identity,
+                verified_at=time.monotonic() if verified_at is None else verified_at,
+                members=members)
             self._member_checks[canonical_path] = check
             if (members or dropped) and (previous is None or previous.cache_identity != identity
                                          or previous.members != members):
@@ -1547,8 +1550,8 @@ class StorageFS(Operations):
         return False
 
     def _listing_confirms_baseline(self, resolved: ResolvedPath, backend: Backend,
-                                   members: Dict[str, Tuple[int, float]]) -> bool:
-        """Whether a recent listing of the parent shows backend's copy still at its baseline.
+                                   members: Dict[str, Tuple[int, float]]) -> Optional[float]:
+        """The start time of a recent listing that shows of the parent shows backend's copy still at its baseline.
 
         Saves a stat per file when a tree is walked: the listing (a member
         read the directory listing already paid for) carries each entry's
@@ -1564,19 +1567,24 @@ class StorageFS(Operations):
           postdates the baseline;
         - the name is still in the listing (not dropped by an invalidation)
           and the member listed it with exactly the baseline's size and
-          mtime.
+          mtime. (SFTP listings carry lstat-style attributes and
+          SSHBackend.stat follows symlinks, so a symlinked file simply
+          never matches and is stat-ed.)
         """
         baseline = members.get(backend.name)
         if baseline is None:
-            return False
+            return None
         with self._member_checks_lock:
             if backend.name in self._recheck.get(resolved.canonical_path, ()):
-                return False
-        attrs = self.namespace.listed_member_attrs(
+                return None
+        listed = self.namespace.listed_member_attrs(
             resolved, backend.name, time.monotonic() - self._revalidate_after)
-        if attrs is None:
-            return False
-        return (attrs.get("st_size"), attrs.get("st_mtime")) == baseline
+        if listed is None:
+            return None
+        listed_at, attrs = listed
+        if (attrs.get("st_size"), attrs.get("st_mtime")) != baseline:
+            return None
+        return listed_at
 
     def _revalidate_cached_file(self, resolved: ResolvedPath):
         """Refetch a CLEAN cached file whose member copy changed.
@@ -1651,9 +1659,17 @@ class StorageFS(Operations):
                         time.monotonic(), tuple(unavailable))
             return
 
-        if self._listing_confirms_baseline(resolved, backend, members):
+        listed_at = self._listing_confirms_baseline(resolved, backend, members)
+        if listed_at is not None:
+            # Dated from the member read behind the listing, not from now:
+            # a stat at that moment would have expired at listed_at + age,
+            # so this check must too. The baseline tuple is carried over
+            # deliberately (not rebuilt as a fresh observation): a
+            # concurrent post-sync drop of it then goes through, which at
+            # worst costs one refetch.
             self._store_member_check(canonical_path, cache_path, identity,
-                                     {backend.name: members[backend.name]})
+                                     {backend.name: members[backend.name]},
+                                     verified_at=listed_at)
             return
 
         try:

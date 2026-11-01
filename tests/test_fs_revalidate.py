@@ -848,8 +848,33 @@ class TestRevalidateFromListing(RevalidateTestBase):
         with self.count_stats() as stat:
             self.assertEqual(b"original", self.read_through("/f.txt"))
         stat.assert_not_called()
-        # It counts as a check: no listing or stat again until the age passes.
-        self.assertEqual({"member": (8, 1_700_000_000.0)}, self.fs._member_checks["/f.txt"].members)
+        # It counts as a check, dated from the member read behind the listing
+        # (not from now), so the next one is due a full age after that read.
+        check = self.fs._member_checks["/f.txt"]
+        self.assertEqual({"member": (8, 1_700_000_000.0)}, check.members)
+        self.assertEqual(self.fs.namespace.entry_attrs["/"][0], check.verified_at)
+
+    def test_check_from_a_listing_expires_with_the_listing_not_with_now(self):
+        self.age_checks()
+        self.list_root()
+        with self.fs.namespace.listing_lock:
+            at, attrs, unknown = self.fs.namespace.entry_attrs["/"]
+            # The read behind the listing began just inside the age.
+            self.fs.namespace.entry_attrs["/"] = (
+                time.monotonic() - self.revalidate_after + 5, attrs, unknown)
+        self.read_through("/f.txt")
+        self.rewrite_member("f.txt", b"changed-and-longer")
+        with self.count_stats() as stat:
+            self.read_through("/f.txt")
+            stat.assert_not_called()
+            # Ten seconds on, a stat taken at the listing would be stale:
+            # so are this check and the listing, and the change is seen.
+            self.age_checks(10)
+            with self.fs.namespace.listing_lock:
+                at, attrs, unknown = self.fs.namespace.entry_attrs["/"]
+                self.fs.namespace.entry_attrs["/"] = (at - 10, attrs, unknown)
+            self.assertEqual(b"changed-and-longer", self.read_through("/f.txt"))
+        self.assertEqual(1, stat.call_count)
 
     def test_changed_listing_falls_back_to_a_stat_and_refetches(self):
         self.rewrite_member("f.txt", b"ORIGINAL", mtime=1_600_000_000)
