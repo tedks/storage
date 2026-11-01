@@ -24,3 +24,10 @@ log_events:
   who: Ted Smith
   what: created
   comment: ""
+- time: 2026-11-01T03:26:28-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Round 2 (Claude nit 4): after rebuild-index drops every member location,
+    a target that still has a row has an empty located set, so a down member is passed
+    over (not unsure) until reprobe-locations runs; a link synced in that window settles
+    without it. Operator-tool path only.'
