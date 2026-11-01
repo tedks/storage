@@ -8,10 +8,14 @@ file, and one more for each watcher group. OpenSSH connection sharing makes
 the first of them the master and the rest clients of its socket.
 
 The sockets live in a directory made for this process (mkdtemp: mode 0700,
-a unique name), under XDG_RUNTIME_DIR when there is one, because a unix
-socket path is limited to about a hundred bytes and the socket names here are
-short hashes. The directory goes away when the mount ends (close, also run
-at interpreter exit). A master that outlives a crash exits by itself after
+a unique short name) inside a fixed private base directory: the first of
+$XDG_RUNTIME_DIR/storage-mux and /tmp/storage-mux-<uid> that is usable. The
+base never derives from the mount, the cache or TMPDIR, because a unix socket
+path is limited to about a hundred bytes and a test runner's or a
+sandbox's temporary directory can use most of that. The socket names are
+short hashes of the identity. If no base is usable, sharing is off and one
+WARNING says so. The process directory goes away when the mount ends (close,
+also run at interpreter exit). A master that outlives a crash exits by itself after
 its idle time (ControlPersist) and takes its socket with it; one that is
 alive but hung is ended by reset(), which callers run when an rsync times out
 or loses its connection, with ssh -O stop: the master stops taking new
@@ -35,16 +39,21 @@ import hashlib
 import logging
 import os
 import shutil
+import stat
 import subprocess
 import tempfile
 import threading
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 # sockaddr_un.sun_path holds 108 bytes with the terminating NUL, and ssh binds
 # a temporary name (the path, a dot and 16 random characters) before renaming
 # the socket into place.
 _MAX_CONTROL_PATH = 108 - 1 - 17
+
+# Length of the per-process directory name inside a base: "/p" and 8 random
+# characters from mkdtemp.
+_PROCESS_DIR_LEN = 1 + 1 + 8
 
 # How long an idle master stays up once its last client is gone.
 DEFAULT_PERSIST_SECONDS = 60
@@ -55,24 +64,60 @@ _EXIT_TIMEOUT = 5.0
 _SocketKey = Tuple[str, str, int, str]
 
 
-def _private_to_us(directory: Path) -> bool:
-    """Whether directory is ours alone to write: nobody else could rename or
-    replace the socket directory made inside it."""
+def default_base_dirs(environ: Optional[Mapping[str, str]] = None,
+                      uid: Optional[int] = None) -> List[Path]:
+    """The base directories for control sockets, in order of preference."""
+    environ = os.environ if environ is None else environ
+    uid = os.getuid() if uid is None else uid
+    bases = []
+    runtime = environ.get("XDG_RUNTIME_DIR")
+    if runtime and os.path.isabs(runtime):
+        bases.append(Path(runtime) / "storage-mux")
+    bases.append(Path("/tmp") / f"storage-mux-{uid}")
+    return bases
+
+
+def _private_base(base: Path) -> bool:
+    """Make base if it is missing and report whether it is a real directory
+    of ours, closed to everyone else (not a link, not someone else's)."""
     try:
-        info = directory.stat()
+        # Whoever can rename entries in the parent can swap the base after the
+        # checks below: it must be ours or root's and closed to others, or sticky (/tmp).
+        parent = os.stat(base.parent)
+        # An owner can rename entries even in a sticky directory.
+        if parent.st_uid not in (os.getuid(), 0) or not (
+                parent.st_mode & stat.S_ISVTX or not parent.st_mode & 0o022):
+            return False
+        try:
+            os.mkdir(base, 0o700)
+        except FileExistsError:
+            pass
+        info = os.lstat(base)  # not stat: a link planted at the name is no base
     except OSError:
         return False
-    return info.st_uid == os.getuid() and not info.st_mode & 0o022
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+        return False
+    if info.st_mode & 0o077:
+        try:
+            os.chmod(base, 0o700)
+        except OSError:
+            return False
+    return True
 
 
 class ControlSockets:
-    """The control sockets of one process's system ssh connections."""
+    """The control sockets of one process's system ssh connections.
 
-    def __init__(self, parent_dir: Optional[Path] = None,
+    base_dirs: candidate base directories in order of preference (default:
+    default_base_dirs()); tests pass their own, including over-long ones.
+    """
+
+    def __init__(self, base_dirs: Optional[Sequence[Path]] = None,
                  persist_seconds: int = DEFAULT_PERSIST_SECONDS,
                  ssh: str = "ssh",
                  logger: Optional[logging.Logger] = None):
-        self._parent_dir = Path(parent_dir) if parent_dir is not None else None
+        self._base_dirs = ([Path(b) for b in base_dirs]
+                           if base_dirs is not None else None)
         self._persist = int(persist_seconds)
         self._ssh = ssh
         self.logger = logger or logging.getLogger(__name__)
@@ -81,6 +126,7 @@ class ControlSockets:
         self._dir_identity = None  # (st_dev, st_ino) of _dir as mkdtemp made it
         self._keys: Dict[Path, _SocketKey] = {}
         self._atexit_registered = False
+        self._warned_unusable = False
 
     # ------------------------------------------------------------------ #
     # Options for a client
@@ -131,21 +177,17 @@ class ControlSockets:
             self._dir = None
             self._dir_identity = None
             self._keys = {}
-        candidates = []
-        if self._parent_dir is not None:
-            candidates.append(self._parent_dir)
-        else:
-            runtime = os.environ.get("XDG_RUNTIME_DIR")
-            if runtime and _private_to_us(Path(runtime)):
-                candidates.append(Path(runtime))
-            candidates.append(Path(tempfile.gettempdir()))
-        for parent in candidates:
-            try:
-                directory = Path(tempfile.mkdtemp(prefix="storage-ssh-", dir=parent))
-            except OSError:
+        for base in (self._base_dirs if self._base_dirs is not None
+                     else default_base_dirs()):
+            # The longest socket path is base/<process dir>/<digest>.
+            if len(os.fsencode(str(base))) + _PROCESS_DIR_LEN + 17 > _MAX_CONTROL_PATH:
+                self.logger.debug("ssh socket base %s is too long for a unix socket", base)
                 continue
-            if len(os.fsencode(str(directory))) + 17 > _MAX_CONTROL_PATH:
-                shutil.rmtree(directory, ignore_errors=True)  # just made, ours
+            if not _private_base(base):
+                continue
+            try:
+                directory = Path(tempfile.mkdtemp(prefix="p", dir=base))
+            except OSError:
                 continue
             identity = _identity(directory, follow=False)
             if identity is None:  # gone already
@@ -156,7 +198,10 @@ class ControlSockets:
                 atexit.register(self.close)
                 self._atexit_registered = True
             return directory
-        self.logger.warning("ssh connection sharing is off: no usable socket directory")
+        # Every client asks again (a base may become usable), so warn once.
+        if not self._warned_unusable:
+            self._warned_unusable = True
+            self.logger.warning("ssh connection sharing is off: no usable socket directory")
         return None
 
     # ------------------------------------------------------------------ #
