@@ -1357,10 +1357,15 @@ class StreamingReadManager:
         the whole file before it returns (on the single-threaded loop that
         holds up the mount, for a large file), and with the member down that
         fetch fails after the SFTP timeout, so the opener gets the open's
-        error instead of the ranges the session had already cached.
+        error instead of the ranges the session had already cached. An
+        attach to an errored session with every byte leaves the cache with
+        the promoted file and no index row (as for a lone reader), where a
+        refusal would have run a full fetch that stores one.
         """
         with session.lock:
-            if session.failed_cleanup_claimed or (session.error is not None and not session.prefetch_complete):
+            if session.failed_cleanup_claimed or (
+                session.error is not None and not session.prefetch_complete
+            ):
                 refused = True
             else:
                 refused = False
@@ -1368,7 +1373,7 @@ class StreamingReadManager:
                 readers = session.refcount
         if refused:
             self.logger.info(
-                "streaming attach refused path=%s backend=%s: session failed",
+                "streaming attach refused path=%s backend=%s: session failed or being cleaned up",
                 session.canonical_path,
                 session.backend.name,
             )

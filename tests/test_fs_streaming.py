@@ -2042,14 +2042,19 @@ class TestFSStreamingIntegration(unittest.TestCase):
         (self.backend_dir / "whole.bin").write_bytes(payload)
         vfd_a = self.fs.open('/whole.bin', os.O_RDONLY)
         session = self._session_for(vfd_a)
-        with session.lock:
-            session.prefetch_complete = True
-            session.error = OSError(errno.EIO, "simulated finalize failure")
-            session.condition.notify_all()
+        hold, at_finalize, go = self._hold_finalize()
+        with hold:
+            self.assertEqual(self.fs.read('/whole.bin', len(payload), 0, vfd_a), payload)
+            self.assertTrue(at_finalize.wait(timeout=5.0))
+            with session.lock:
+                session.error = OSError(errno.EIO, "simulated finalize failure")
+                session.condition.notify_all()
 
-        vfd_b = self.fs.open('/whole.bin', os.O_RDONLY)
+            vfd_b = self.fs.open('/whole.bin', os.O_RDONLY)
 
-        self.assertIs(self._session_for(vfd_b), session)
+            self.assertIs(self._session_for(vfd_b), session)
+            self.assertEqual(self.fs.read('/whole.bin', len(payload), 0, vfd_b), payload)
+            go.set()
         self.fs.release('/whole.bin', vfd_b)
         self.fs.release('/whole.bin', vfd_a)
 
