@@ -1,6 +1,7 @@
 import errno
 import json
 import os
+import re
 import shutil
 import tempfile
 import threading
@@ -912,7 +913,10 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.assertIsNot(session_b, session_a)
         partial_inode = partial_path.stat().st_ino
 
-        # Second cleanup, through release of the failed session's reader.
+        # Second cleanup, through release of the failed session's reader. It
+        # stops at failed_cleanup_claimed (the first cleanup claimed it), so
+        # it never reaches the detached guard in promote/claim; that guard is
+        # covered by test_streaming_stopped_session_leaves_successor_partial_alone.
         self.fs.release('/twice.bin', vfd_a)
 
         self.assertTrue(partial_path.exists())
@@ -1597,17 +1601,25 @@ class TestFSStreamingIntegration(unittest.TestCase):
                     self.fs.read('/scatter.bin', 1, offset, vfd),
                     payload[offset:offset + 1],
                 )
-                with session.lock:
-                    self.assertLessEqual(
-                        len(session.available_ranges), limit + 1 + len(payload) // chunk,
-                    )
             self.fs.release('/scatter.bin', vfd)
             session.worker.join(timeout=5.0)
             self.assertFalse(session.worker.is_alive())
         self.assertFalse(any(background for _o, _s, background in reads))
         # The first reads cost one byte each; past the limit a read's fetch
         # runs to the end of its chunk.
-        self.assertEqual(reads[:limit], [(offset, 1, False) for offset in range(0, limit * stride, stride)])
+        self.assertEqual(reads[:limit + 1], [(offset, 1, False) for offset in range(0, (limit + 1) * stride, stride)])
+        # What bounds the range list: every fetch past the limit ends on a
+        # chunk boundary or at the end of the file, so it merges into a run
+        # of whole chunks.
+        # (the read that makes the limit-th range is itself one byte)
+        for offset, size, _bg in reads[limit + 1:]:
+            end = offset + size
+            self.assertTrue(end % chunk == 0 or end == len(payload), (offset, size))
+        # The first fallback fetch reaches back to the start of the missing
+        # run (the byte after the last range) and out to the chunk end.
+        self.assertEqual(reads[limit + 1], (limit * stride + 1, ((limit + 1) * stride // chunk + 1) * chunk - (limit * stride + 1), False))
+        with session.lock:
+            self.assertLessEqual(len(session.available_ranges), limit + 1 + len(payload) // chunk)
         offset, size, _bg = reads[-1]
         self.assertEqual(offset + size, len(payload))
         self.assertGreater(size, 1)
@@ -1999,6 +2011,102 @@ class TestFSStreamingIntegration(unittest.TestCase):
         # The full fetch filled the path first; the promotion left it alone.
         self._assert_cache_holds("cleanup.bin", payload, dirty=False)
 
+    def test_streaming_open_does_not_attach_to_a_failed_session(self):
+        # The session has an error and a reader still attached, so its
+        # cleanup is not claimed yet. An open attaching now would get EIO on
+        # every range the session lacks; it takes the full-file path.
+        self.backend.copy_delay = 0
+        payload = os.urandom(192 * 1024)
+        (self.backend_dir / "failed.bin").write_bytes(payload)
+        vfd_a = self.fs.open('/failed.bin', os.O_RDONLY)
+        session = self._session_for(vfd_a)
+        self.assertEqual(self.fs.read('/failed.bin', 4096, 0, vfd_a), payload[:4096])
+        with session.lock:
+            session.error = OSError(errno.EIO, "simulated failure")
+            session.condition.notify_all()
+            self.assertFalse(session.failed_cleanup_claimed)
+
+        vfd_b = self.fs.open('/failed.bin', os.O_RDONLY)
+
+        with self.fs._fd_lock:
+            self.assertIsNone(self.fs._fd_map[vfd_b].prefetch_session)
+        self.assertEqual(self.fs.read('/failed.bin', len(payload), 0, vfd_b), payload)
+        self.fs.release('/failed.bin', vfd_b)
+        self.fs.release('/failed.bin', vfd_a)
+
+    def test_streaming_open_attaches_to_an_errored_session_with_every_byte(self):
+        # Only its finalize failed: the session lacks no range, so an attach
+        # reads from it and the opener does not refetch the file.
+        self.backend.copy_delay = 0
+        payload = os.urandom(64 * 1024)
+        (self.backend_dir / "whole.bin").write_bytes(payload)
+        vfd_a = self.fs.open('/whole.bin', os.O_RDONLY)
+        session = self._session_for(vfd_a)
+        hold, at_finalize, go = self._hold_finalize()
+        with hold:
+            self.assertEqual(self.fs.read('/whole.bin', len(payload), 0, vfd_a), payload)
+            self.assertTrue(at_finalize.wait(timeout=5.0))
+            with session.lock:
+                session.error = OSError(errno.EIO, "simulated finalize failure")
+                session.condition.notify_all()
+
+            vfd_b = self.fs.open('/whole.bin', os.O_RDONLY)
+
+            self.assertIs(self._session_for(vfd_b), session)
+            self.assertEqual(self.fs.read('/whole.bin', len(payload), 0, vfd_b), payload)
+            go.set()
+        self.fs.release('/whole.bin', vfd_b)
+        self.fs.release('/whole.bin', vfd_a)
+
+    def test_streaming_worker_waits_on_claimed_chunk_without_polling(self):
+        # Every missing byte of the worker's chunk is in a reader's fetch.
+        # The fetch notifies when it ends, so the worker waits for that
+        # (with a long backstop) instead of waking every 50 ms.
+        self.backend.copy_delay = 0
+        payload = os.urandom(192 * 1024)
+        (self.backend_dir / "claimed.bin").write_bytes(payload)
+        vfd = self.fs.open('/claimed.bin', os.O_RDONLY)
+        session = self._session_for(vfd)
+        timeouts = []
+        real_wait = session.condition.wait
+
+        def recording_wait(timeout=None):
+            # Called with session.lock held; only the worker's waits count.
+            if session.in_flight_ranges and threading.current_thread() is session.worker:
+                timeouts.append(timeout)
+            return real_wait(timeout)
+
+        session.condition.wait = recording_wait
+        self.addCleanup(setattr, session.condition, "wait", real_wait)
+        with session.lock:
+            session.in_flight_ranges.append((0, session.file_size))
+            session.readers_consumed = True
+            session.read_ahead_started = True
+            session.condition.notify_all()
+        self.assertTrue(self._wait_for(lambda: bool(timeouts), timeout=3.0))
+        with session.lock:
+            session.in_flight_ranges.clear()
+            session.condition.notify_all()
+
+        session.condition.wait = real_wait
+        self.assertTrue(all(t is not None and t >= 1.0 for t in timeouts), timeouts)
+        self.fs.release('/claimed.bin', vfd)
+
+    def test_streaming_staging_file_name_is_not_a_bare_token(self):
+        (self.backend_dir / "staged.bin").write_bytes(os.urandom(64 * 1024))
+        created = []
+        real_open = os.open
+
+        def spy_open(path, *args, **kwargs):
+            created.append(Path(path).name)
+            return real_open(path, *args, **kwargs)
+
+        with patch.object(os, "open", side_effect=spy_open):
+            vfd = self.fs.open('/staged.bin', os.O_RDONLY)
+        self.fs.release('/staged.bin', vfd)
+        self.assertTrue(any(name.startswith(".storage-staging-") for name in created), created)
+        self.assertFalse(any(re.match(r"\.[0-9a-f]{16}\.", name) for name in created), created)
+
     def _install_case(self, name, final_bytes=None):
         from types import SimpleNamespace
         partial = self.cache_dir / (name + ".storage.partial")
@@ -2050,6 +2158,27 @@ class TestFSStreamingIntegration(unittest.TestCase):
             self.assertEqual(manager._install_partial(session), "unsupported")
         self.assertFalse(os.path.lexists(final))
         self.assertTrue(partial.exists())
+
+    def test_streaming_discard_labels_state_with_the_real_outcome(self):
+        manager = self.fs._streaming_manager
+        for outcome, status in (("taken", "superseded"), ("unsupported", "unsupported")):
+            name = f"label-{outcome}.bin"
+            (self.backend_dir / name).write_bytes(os.urandom(64 * 1024))
+            vfd = self.fs.open('/' + name, os.O_RDONLY)
+            session = self._session_for(vfd)
+            # As in production, discard runs with no worker fetching.
+            with session.lock:
+                session.stop_requested = True
+                session.condition.notify_all()
+            session.worker.join(timeout=5.0)
+            self.assertFalse(session.worker.is_alive())
+            with patch.object(manager, "_snapshot_streaming_state") as snapshot, \
+                    patch.object(manager, "_log_streaming_state_change"):
+                manager._discard_superseded_session(session, outcome)
+            snapshot.assert_called_once_with(session, status)
+            self.fs.release('/' + name, vfd)
+        self.assertEqual(manager._not_installed_reason("taken"), "cache-path-filled")
+        self.assertEqual(manager._not_installed_reason("unsupported"), "unsupported")
 
 if __name__ == '__main__':
     unittest.main()

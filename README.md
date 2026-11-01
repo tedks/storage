@@ -156,7 +156,8 @@ default; the keep-after-close threshold below if that is smaller), then
 prefetches in chunks of that size. So a file manager sniffing a content
 type costs about what it reads, as on a plain sftp mount. A reader making
 more than 1024 scattered reads of one file (a database, an archive index)
-gets whole-chunk fetches again.
+gets whole-chunk fetches again: once a file's session is that fragmented,
+even a small read costs up to one chunk.
 
 Measured in the remote gate (SSH members in local containers, one run
 each), before and after this behaviour, at the default 1M chunk:
