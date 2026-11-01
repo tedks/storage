@@ -110,6 +110,7 @@ py_test(
         "tests/test_locks.py",
         "tests/test_member_capabilities.py",
         "tests/test_models.py",
+        "tests/test_merge_gated.py",
         "tests/test_mount_lock.py",
         "tests/test_mount_sigpipe.py",
         "tests/test_mount_profiles.py",
@@ -130,7 +131,7 @@ py_test(
         "tests/test_sync_tasks.py",
         "tests/test_watcher.py",
     ],
-    data = ["scripts/run-gates.sh"],
+    data = ["scripts/merge-gated.sh", "scripts/run-gates.sh"],
     main = "tests/pytest_main.py",
     precompile = "disabled",
     # About 200s on a fast host; the default 300s leaves little headroom.
