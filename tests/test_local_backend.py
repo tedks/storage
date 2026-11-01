@@ -36,6 +36,17 @@ class TestBackendLinks(unittest.TestCase):
         with self.assertRaises(FileNotFoundError):
             self.backend.readlink("/gone")
 
+    def test_symlink_creates_the_link_and_its_directory(self):
+        self.backend.symlink("../t.txt", "/new/dir/link")
+        self.assertEqual(os.readlink(self.root / "new" / "dir" / "link"), "../t.txt")
+        with self.assertRaises(FileExistsError):
+            self.backend.symlink("other", "/new/dir/link")
+
+    def test_rename_moves_a_dangling_link(self):
+        (self.root / "link").symlink_to("nowhere")
+        self.backend.rename("/link", "/moved")
+        self.assertEqual(os.readlink(self.root / "moved"), "nowhere")
+
     def test_lstat_does_not_follow_the_link(self):
         (self.root / "target.txt").write_text("target")
         (self.root / "link").symlink_to("target.txt")

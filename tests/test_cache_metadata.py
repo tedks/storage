@@ -248,9 +248,15 @@ class TestCacheScansDoNotFollowLinks(unittest.TestCase):
 
         state = StateManager(str(self.temp_dir / "state.db"))
         try:
-            rebuild_index_from_cache(self.cache_root, state)
-            self.assertIsNone(state.get_file_metadata("/link.bin"))
-            self.assertIsNotNone(state.get_file_metadata("/real.bin"))
+            report = rebuild_index_from_cache(self.cache_root, state)
+            # The link comes back as a link row (ditz symlink-replication),
+            # never as a file carrying the target's metadata.
+            link_row = state.get_file_metadata("/link.bin")
+            self.assertEqual(link_row.link_target, "real.bin")
+            self.assertEqual(link_row.sync_status, SyncStatus.DIRTY)
+            self.assertEqual(report.rebuilt_links, 1)
+            self.assertIsNone(state.get_file_metadata("/real.bin").link_target)
+            self.assertEqual(state.get_file_locations("/link.bin"), [])
         finally:
             state.close()
         self.assertEqual(read_cache_metadata(self.real).virtual_path, "/real.bin")

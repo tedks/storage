@@ -340,6 +340,33 @@ def cache_file_would_be_scanned(cache_root: Path, virtual_path: str) -> bool:
     return regular_file_stat(current / parts[-1]) is not None
 
 
+def scan_cache_links(cache_root: Path) -> Iterator[tuple]:
+    """Walk the cache for symlinks: (virtual_path, target, lstat) each.
+
+    The links made through the mount (ditz symlink-replication); they carry
+    no metadata xattr (Linux refuses user.* on a link), so the link itself
+    is the record. Internal artifacts are skipped as scan_cache_entries
+    skips them; directory links are not descended into.
+    """
+    cache_root = cache_root.resolve()
+    for root, dirnames, filenames in os.walk(cache_root):
+        dirnames[:] = [name for name in dirnames if not is_internal_cache_artifact(name)]
+        root_path = Path(root)
+        # os.walk lists a link to a directory among dirnames.
+        for name in [*filenames, *dirnames]:
+            if is_internal_cache_artifact(name):
+                continue
+            path = root_path / name
+            try:
+                st = os.lstat(str(path))
+                if not stat.S_ISLNK(st.st_mode):
+                    continue
+                target = os.readlink(str(path))
+            except OSError:
+                continue
+            yield cache_path_to_virtual_path(cache_root, path), target, st
+
+
 def scan_cache_entries(cache_root: Path) -> Iterator[CacheScanEntry]:
     """Walk cache files, parse metadata xattrs, and surface drift/invariant issues."""
     cache_root = cache_root.resolve()

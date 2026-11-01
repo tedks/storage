@@ -138,6 +138,7 @@ def debug_rebuild_index(cache: Path, database: Path, json_output: bool):
     click.echo(f"Rebuilt index at {database}:")
     click.echo(f"  Scanned files: {payload['scanned_files']}")
     click.echo(f"  Rebuilt files: {payload['rebuilt_files']}")
+    click.echo(f"  Rebuilt links: {payload.get('rebuilt_links', 0)}")
     click.echo(f"  Inferred metadata files: {payload['inferred_metadata_files']}")
     click.echo(f"  Normalized xattrs: {payload['normalized_xattrs']}")
     click.echo(f"  Skipped files: {payload['skipped_files']}")

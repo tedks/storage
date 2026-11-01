@@ -35,6 +35,10 @@ class FileMetadata:
     # status changes are conditioned on it, so a write that overlaps an
     # in-flight sync cannot be reported as synced.
     dirty_generation: int = 0
+    # The target string of a symbolic link made through the mount; None for
+    # a regular file. A link's row is synced by creating the link on the
+    # members holding its target (SyncExecutor._process_link_task).
+    link_target: Optional[str] = None
 
     def to_dict(self) -> Dict:
         """Convert to a SQLite-friendly dictionary."""

@@ -43,6 +43,7 @@ from .recompute import RecomputeEngine
 from .checksum_queue import DEFAULT_CHECKSUM_REVERIFY_INTERVAL, MemberHashQueues
 from .checksums import ChecksumBasis, ChecksumRecord
 from .pathing import ResolvedPath, resolve_path
+from .links import LinkRefused, intermediate_paths, link_checksum, resolve_link_target
 from .namespace import DEFAULT_LISTING_MAX_STALE, NamespaceService
 from .streaming import PrefetchSession, StreamingReadManager
 
@@ -1133,11 +1134,22 @@ class StorageFS(Operations):
         record this hash made, and nothing reads it back (getxattr answers
         user.storage.checksums from memory).
         """
-        try:
-            if check_dir and backend.isdir(canonical_path):
-                return self._IS_DIRECTORY
-        except Exception as exc:
-            self.logger.debug("isdir for %s on %s failed: %s", canonical_path, backend.name, exc)
+        if check_dir:
+            # A copy listed as a link compares by its target string, never
+            # by what it points at (ditz symlink-replication); a copy listed
+            # without a mode may be a directory, which is not hashed.
+            try:
+                if stat.S_ISLNK(backend.lstat(canonical_path).st_mode):
+                    return link_checksum(backend.readlink(canonical_path)), time.time()
+            except Exception as exc:
+                self.logger.debug("link check for %s on %s failed: %s",
+                                  canonical_path, backend.name, exc)
+                return None
+            try:
+                if backend.isdir(canonical_path):
+                    return self._IS_DIRECTORY
+            except Exception as exc:
+                self.logger.debug("isdir for %s on %s failed: %s", canonical_path, backend.name, exc)
         try:
             checksum = backend.get_fast_checksum(canonical_path, allow_download=False)
             return checksum, time.time()
@@ -2134,7 +2146,8 @@ class StorageFS(Operations):
         new_canonical = self._resolve_path(new).canonical_path
         cache_path = old_resolved.canonical_cache_path
         while True:
-            if os.path.isdir(cache_path):
+            # A cached link (even to a directory) is renamed as a file.
+            if os.path.isdir(cache_path) and not os.path.islink(cache_path):
                 is_dir = True
             elif os.path.lexists(cache_path):
                 is_dir = False
@@ -2149,7 +2162,7 @@ class StorageFS(Operations):
                         return self._rename(old, new)
             with self._path_locked(old_resolved.canonical_path, new_canonical):
                 with self._upload_locks.hold(old_resolved.canonical_path, new_canonical):
-                    if not os.path.isdir(cache_path):
+                    if not os.path.isdir(cache_path) or os.path.islink(cache_path):
                         return self._rename(old, new)
 
     def _rename(self, old, new):
@@ -2701,38 +2714,156 @@ class StorageFS(Operations):
                               else errno.EIO)
         raise FuseOSError(errno.EHOSTUNREACH if unreachable else errno.ENOENT)
 
-    # Symlinks are refused until they replicate (ruling
-    # oq-symlink-through-mount B; ditz symlink-replication): a link kept
-    # only in the cache would vanish with it.
-    _SYMLINKS_ENABLED = False
-
     def symlink(self, target, source):
-        """Create symbolic link: `ln -s source target`; refused with EPERM.
+        """Create symbolic link: `ln -s source target` (ditz symlink-replication).
 
-        symlink(2) documents EPERM for a filesystem that does not support
-        symbolic links. fusepy passes the new link's path first and its
-        contents second; _symlink keeps that order for when links
-        replicate.
+        fusepy passes the new link's path first and its contents second.
+        The link is made in the cache with an index row carrying its target,
+        and sync creates it on the members that hold the target. Refused
+        with EPERM (symlink(2): the filesystem does not support this link),
+        the reason logged: an absolute target or one climbing above the
+        mount root (it cannot mean the same thing on a member and through
+        the mount), a dangling target (a link that becomes valid later
+        could not be placed), and a conflict view's name.
         """
-        if not self._SYMLINKS_ENABLED:
-            raise FuseOSError(errno.EPERM)
         resolved = self._resolve_path(target)
         with self._path_locked(resolved.canonical_path):
             return self._symlink(resolved, source)
 
     def _symlink(self, resolved: ResolvedPath, source):
-        cache_path = resolved.cache_path
+        link_path = resolved.canonical_path
+        if resolved.backend_name:
+            self.logger.warning("symlink refused: a conflict view's name cannot be a link")
+            raise FuseOSError(errno.EPERM)
+        try:
+            target_path = resolve_link_target(link_path, source)
+        except LinkRefused as refused:
+            self.logger.warning("symlink refused: %s", refused)
+            raise FuseOSError(errno.EPERM)
+        # As for create, a name held only on an unreachable member is not
+        # seen. The link's sync records a conflict if that member also holds
+        # the target; otherwise the listing's conflict view shows the clash.
+        if self._name_exists(link_path, unreachable_is_missing=True):
+            raise FuseOSError(errno.EEXIST)
+        stale_row = self.state_manager.get_file_metadata(link_path) is not None
+        # The resolution above is lexical: right only if the kernel walks no
+        # link on the way (one from a member may point anywhere, and a '..'
+        # after it would climb from there).
+        for directory in intermediate_paths(link_path, source):
+            mode = self._existing_mode(directory)
+            if mode is None:
+                self.logger.warning("symlink refused: dangling target")
+                raise FuseOSError(errno.EPERM)
+            if stat.S_ISLNK(mode):
+                self.logger.warning("symlink refused: target passes through a link")
+                raise FuseOSError(errno.EPERM)
+            if not stat.S_ISDIR(mode):
+                # file/.. resolves lexically, but the kernel says ENOTDIR.
+                self.logger.warning("symlink refused: target passes through a non-directory")
+                raise FuseOSError(errno.EPERM)
+        if self._resolve_path(target_path).backend_name:
+            # A conflict view's name is on no member; it could not be placed.
+            self.logger.warning("symlink refused: target is a conflict view")
+            raise FuseOSError(errno.EPERM)
+        if not self._name_exists(target_path):
+            self.logger.warning("symlink refused: dangling target")
+            raise FuseOSError(errno.EPERM)
 
+        if stale_row:
+            # A row at a name nobody holds (a synced file removed on its
+            # member outside the mount) would absorb the link's row, which
+            # then never syncs as a link. Dropped only when every member
+            # says the name is absent; any other answer keeps it.
+            if not self._absent_on_every_member(link_path):
+                raise FuseOSError(errno.EEXIST)
+            self.state_manager.delete_file(link_path)
+
+        cache_path = resolved.cache_path
         try:
             cache_path.parent.mkdir(parents=True, exist_ok=True)
             os.symlink(source, str(cache_path))
         except OSError as e:
             raise FuseOSError(e.errno)
+        try:
+            st = os.lstat(str(cache_path))
+            config = self._get_config(link_path)
+            self.state_manager.set_file_metadata(FileMetadata(
+                virtual_path=link_path,
+                size=st.st_size,
+                checksum=None,
+                last_access=time.time(),
+                last_modified=st.st_mtime,
+                sync_status=SyncStatus.DIRTY,
+                replica_count=config.replica_count,
+                recomputable=False,
+                recompute_cmd=None,
+                encrypted=False,
+                encryption_key_id=None,
+                link_target=source,
+            ))
+            self._mark_cache_file_dirty(link_path, cache_path)
+        except BaseException:
+            # No row, no link: a link the index does not describe would
+            # never sync.
+            self.state_manager.delete_file(link_path)
+            try:
+                os.unlink(str(cache_path))
+            except OSError:
+                pass
+            raise
 
         # Like create: a listing taken before the link would miss it, and
         # any listing kept under the new path itself is now wrong.
         self._invalidate_dir_cache_entry(resolved.parent_dir)
-        self._invalidate_dir_cache_entry(resolved.canonical_path)
+        self._invalidate_dir_cache_entry(link_path)
+        self.sync_manager.queue_sync(link_path, priority=100)
+
+    def _existing_mode(self, canonical_path: str) -> Optional[int]:
+        """The name's st_mode, None when absent (EHOSTUNREACH as _name_exists)."""
+        try:
+            return self.namespace.getattr(canonical_path)["st_mode"]
+        except FuseOSError as exc:
+            if exc.errno != errno.ENOENT:
+                raise
+        if any(not backend.is_available() for backend in self.backends.values()):
+            raise FuseOSError(errno.EHOSTUNREACH)
+        return None
+
+    def _absent_on_every_member(self, canonical_path: str) -> bool:
+        """Every member answers that it has nothing at the path.
+
+        getattr passes over a member whose lstat fails, so its miss is not
+        enough to drop a row; here only ENOENT counts as an answer.
+        """
+        for backend in self.backends.values():
+            if not backend.is_available():
+                return False
+            try:
+                backend.lstat(canonical_path)
+            except FileNotFoundError:
+                continue
+            except Exception:
+                return False
+            return False
+        return True
+
+    def _name_exists(self, canonical_path: str, *, unreachable_is_missing: bool = False) -> bool:
+        """Whether the name is in the cache or on a member.
+
+        getattr passes over an unavailable member, so a miss with one down
+        proves nothing: EHOSTUNREACH then (a target cannot be called
+        dangling), unless the caller accepts the miss.
+        """
+        try:
+            self.namespace.getattr(canonical_path)
+        except FuseOSError as exc:
+            if exc.errno != errno.ENOENT:
+                raise
+            if not unreachable_is_missing and any(
+                    not backend.is_available() for backend in self.backends.values()):
+                raise FuseOSError(errno.EHOSTUNREACH)
+            return False
+        return True
 
     # Time operations
 

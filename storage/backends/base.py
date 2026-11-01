@@ -262,6 +262,14 @@ class Backend(ABC):
         """
         raise OSError(errno.ENOSYS, "readlink is not supported", virtual_path)
 
+    def symlink(self, target: str, virtual_path: str):
+        """Create a symlink at virtual_path whose contents are target.
+
+        Creates the link's parent directories. Raises FileExistsError when
+        something is already at virtual_path (a link is never replaced).
+        """
+        raise OSError(errno.ENOSYS, "symlink is not supported", virtual_path)
+
     @abstractmethod
     def sync(self):
         """Sync any buffered writes to storage"""

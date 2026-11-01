@@ -556,6 +556,30 @@ def test_mounted_member_only_link_reads_through_the_mount(remote, mounted_factor
     assert not os.path.lexists(mnt.cache / "links" / "link.txt")
 
 
+@pytest.mark.parametrize("backend_class", [SSHBackend, RsyncBackend], ids=["ssh", "rsync"])
+def test_mounted_link_is_placed_on_the_member_holding_its_target(remote, mounted_factory,
+                                                                 backend_class):
+    """ln -s through the mount: the link syncs to the member holding its
+    target (and its directory is made there), not to the other member
+    (ditz symlink-replication)."""
+    m0, m1 = remote.members
+    remote.write_remote(m1, "data/t.txt", b"target bytes")
+    mnt = mounted_factory(backend_class=backend_class)
+    (mnt.mount / "links").mkdir()
+
+    os.symlink("../data/t.txt", mnt.mount / "links" / "l")
+
+    link = mnt.mount / "links" / "l"
+    assert stat.S_ISLNK(os.lstat(link).st_mode)
+    assert link.read_bytes() == b"target bytes"
+    readlink = f"readlink {REMOTE_ROOT}/links/l"
+    assert _wait_for(lambda: remote.exec(m1, readlink, check=False).stdout.strip()
+                     == "../data/t.txt", timeout=30.0), "the link never reached its target's member"
+    assert remote.exec(m0, f"test -L {REMOTE_ROOT}/links/l", check=False).returncode != 0
+    with pytest.raises(PermissionError):
+        os.symlink("/etc/hostname", mnt.mount / "absolute")
+
+
 def _watcher_for(remote, member, on_change) -> RemoteWatcher:
     return RemoteWatcher(
         backend_name=member.name,
