@@ -228,13 +228,18 @@ answer. A name is still asked of the members when a member's listing
 failed or carried no attributes, or when the listing is past its fresh
 window. A fresh window of 0 has no stale phase: every access lists. With
 watchers on every member, listings stay until a watcher invalidates them,
-so a change whose watcher event was lost (a watcher reconnect) stays out
-of `ls` until the directory is invalidated; a lookup of a name missing
+so a change whose watcher event was lost stays out of `ls` until the
+directory is invalidated, except across a watcher outage: whenever a
+watcher reports its watches established (at mount and after every
+restart) every listing is dropped; a lookup of a name missing
 from a listing is still answered from it only for `readdir_ttl` (else
 `revalidate_after`) seconds, and stat'd after that. Changes made through the mount (create, write, rename,
 unlink, mkdir, rmdir) drop the affected listings at once; a file
 added or changed directly on a member shows within the fresh window, plus
 one more listing while a stale one is served.
+A path whose parent was never listed (a `cd` to a deep path) is asked of a
+member once per fresh window, not once per access; the answer is dropped by
+the same writes that drop listings.
 A background refresh stops waiting for a member that has not answered 60
 seconds after the refresh began (queue time included) and publishes without
 it, as for a member that failed; refreshes then skip that member until its

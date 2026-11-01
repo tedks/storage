@@ -656,6 +656,13 @@ class StorageFS(Operations):
             suffixed = f"{virtual_path}.{backend_name}"
             self._invalidate_file_cache(suffixed)
 
+    def _on_watcher_resync(self):
+        """A watcher's watches were (re)established: events before that
+        moment were never seen, so every listing and remembered stat that
+        predates it is dropped. Cached files are revalidated on open."""
+        self.logger.info("watcher watches established; dropping listing state")
+        self.namespace.invalidate_all_listings()
+
     def _start_watchers(self):
         """Start push-invalidation watchers, coalescing members by watch scope."""
         from .watcher import RemoteWatcher
@@ -690,6 +697,7 @@ class StorageFS(Operations):
                 ssh_port=meta["ssh_port"],
                 remote_paths=paths,
                 on_change=self._on_remote_change,
+                on_resync=self._on_watcher_resync,
                 username=meta["username"],
                 key_filename=meta["key_filename"],
                 control_sockets=shared_control_sockets(),

@@ -1137,6 +1137,113 @@ class TestFSNamespaceIntegration(unittest.TestCase):
         self.assertEqual(set(self.fs._dir_cache), {'/a', '/c'})
         self.assertEqual(set(namespace._listing_as_of), {'/a', '/c'})
 
+    # Member stat answers for paths no listing answers.
+
+    def _count_stats(self, name="backend1"):
+        backend = self.backends[name]
+        return patch.object(backend, "lstat", side_effect=backend.lstat)
+
+    def test_path_reached_without_listing_asks_a_member_once_per_window(self):
+        (self.backend1_dir / "deep").mkdir()
+        self.fs.namespace.readdir_snapshot_ttl = 60.0
+        with self._count_stats() as stat_mock:
+            first = self.fs.getattr('/deep')
+            second = self.fs.getattr('/deep')
+        self.assertEqual(first, second)
+        self.assertTrue(stat.S_ISDIR(first['st_mode']))
+        self.assertEqual(stat_mock.call_count, 1)
+
+    def test_remembered_stat_ends_with_the_window(self):
+        (self.backend1_dir / "deep").mkdir()
+        self.fs.namespace.readdir_snapshot_ttl = 0.1
+        with self._count_stats() as stat_mock:
+            self.fs.getattr('/deep')
+            time.sleep(0.2)
+            self.fs.getattr('/deep')
+        self.assertEqual(stat_mock.call_count, 2)
+
+    def test_no_window_remembers_nothing(self):
+        (self.backend1_dir / "deep").mkdir()
+        self.fs.namespace.readdir_snapshot_ttl = 0
+        with self._count_stats() as stat_mock:
+            self.fs.getattr('/deep')
+            self.fs.getattr('/deep')
+        self.assertEqual(stat_mock.call_count, 2)
+
+    def test_remembered_stat_is_dropped_by_the_writes_that_drop_listings(self):
+        (self.backend1_dir / "deep").mkdir()
+        namespace = self.fs.namespace
+        namespace.readdir_snapshot_ttl = 60.0
+        drops = {
+            "dir invalidation": lambda: self.fs._invalidate_dir_cache_entry('/deep'),
+            "child invalidation": lambda: namespace.forget_listed_attrs('/deep', removing=True),
+            "write": lambda: namespace.forget_listed_attrs('/deep', removing=False),
+            "subtree": lambda: namespace.invalidate_listing_subtree('/deep'),
+            "ancestor subtree": lambda: namespace.invalidate_listing_subtree('/'),
+            "resync": namespace.invalidate_all_listings,
+        }
+        for label, drop in drops.items():
+            namespace.invalidate_all_listings()
+            with self.subTest(label), self._count_stats() as stat_mock:
+                self.fs.getattr('/deep')
+                drop()
+                self.fs.getattr('/deep')
+                self.assertEqual(stat_mock.call_count, 2)
+
+    def test_stat_that_began_before_a_drop_is_not_remembered(self):
+        (self.backend1_dir / "deep").mkdir()
+        namespace = self.fs.namespace
+        namespace.readdir_snapshot_ttl = 60.0
+        backend = self.backends["backend1"]
+        real = backend.lstat
+        calls = []
+
+        def stat_then_invalidate(path):
+            result = real(path)
+            if not calls:
+                self.fs._invalidate_dir_cache_entry('/deep')
+            calls.append(path)
+            return result
+
+        with patch.object(backend, "lstat", side_effect=stat_then_invalidate):
+            self.fs.getattr('/deep')
+            self.fs.getattr('/deep')
+        self.assertEqual(len(calls), 2)
+
+    def test_stat_memo_is_bounded(self):
+        namespace = self.fs.namespace
+        namespace.readdir_snapshot_ttl = 60.0
+        namespace.stat_memo_limit = 2
+        for name in ("a", "b", "c"):
+            (self.backend1_dir / name).mkdir()
+            self.fs.getattr('/' + name)
+        self.assertEqual(set(namespace._stat_memo), {'/b', '/c'})
+
+    def test_resync_drops_listings_and_keeps_in_flight_ones_unpublished(self):
+        (self.backend1_dir / "f.txt").write_text("1")
+        namespace = self.fs.namespace
+        list(self.fs.readdir('/', None))
+        started, release = threading.Event(), threading.Event()
+
+        def before(_path):
+            started.set()
+            release.wait(5)
+
+        result = {}
+        with self._wrap_listdir_attrs("backend1", before=before):
+            thread = threading.Thread(
+                target=lambda: result.setdefault('e', list(self.fs.readdir('/d', None))))
+            (self.backend1_dir / "d").mkdir()
+            thread.start()
+            self.assertTrue(started.wait(5))
+            namespace.invalidate_all_listings()
+            release.set()
+            thread.join(5)
+        self.assertEqual(namespace.entry_attrs, {})
+        self.assertEqual(namespace.readdir_snapshot, {})
+        self.assertEqual(self.fs._dir_cache, {})
+        self.assertEqual(namespace._listings_in_flight, {})
+
     def test_older_background_refresh_does_not_replace_newer_listing(self):
         # A background refresh reads the old directory, then stalls; a
         # foreground listing (the stale one expired meanwhile) reads the new
