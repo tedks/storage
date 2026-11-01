@@ -45,3 +45,10 @@ log_events:
   who: Ted Smith
   what: created
   comment: ""
+- time: 2026-11-01T02:33:09-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Related, from PR #149: rename onto an existing file replaces the destination''s
+    rows, but a member that held the old destination and never had the source keeps
+    its copy of the old destination, which then surfaces through the listing merge.
+    The same answer (delete on members, or not) decides it.'
