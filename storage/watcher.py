@@ -260,7 +260,7 @@ class RemoteWatcher:
                             daemon=True,
                         )
                         announcer.start()
-                    except BaseException:
+                    except Exception:  # RuntimeError: no thread was started
                         announcer = None
                         os.close(announce_fd)
                         raise
