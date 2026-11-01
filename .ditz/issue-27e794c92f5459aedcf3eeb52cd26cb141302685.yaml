@@ -15,3 +15,12 @@ log_events:
   who: Ted Smith
   what: created
   comment: ""
+- time: 2026-11-01T02:45:48-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Council round 4 nit on PR 154. Steps before the try in StorageFS.destroy
+    (streaming destroy, stop watchers, retry refused deletes, namespace.shutdown)
+    can raise; fusepy logs and returns EINVAL, then mount_storage''s finally clears
+    the pid (if no sweep pending) although sync workers were not stopped and the index
+    not closed. Fix: stop clearing the pid in the finally, only destroy clears it
+    (cost: one extra sweep after a mount that never reached destroy).'
