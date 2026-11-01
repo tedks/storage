@@ -5,7 +5,9 @@ Manages the local cache of files from remote backing filesystems.
 Files are cached on first access and evicted using LRU when space is needed.
 """
 
+import errno
 import os
+import stat as stat_module
 import secrets
 import time
 import threading
@@ -14,9 +16,49 @@ from contextlib import nullcontext
 from typing import Callable, ContextManager, Optional, List, Set
 
 from .backends.base import Backend
-from .cache_metadata import PARTIAL_SUFFIX, write_cache_metadata
+from .cache_metadata import PARTIAL_SUFFIX, PREFIX_XATTR, write_cache_metadata
 from .models import FileMetadata, SyncStatus
 from .state import StateManager
+
+
+def _remove_prefix_marker(path: Path):
+    """Remove the streaming-prefix marker from a whole-file copy.
+
+    Reading a user xattr needs read permission on the file and changing one
+    needs write permission, owner or not, and the copy keeps the member
+    file's mode. So the marker is looked for as the file is; only if that
+    is refused does the copy get owner read and write for the check and the
+    removal, its mode restored after. Most copies have no marker, which
+    costs one getxattr. No xattrs on this filesystem: nothing to do. Any
+    other failure raises: a copy that keeps the marker would be served
+    unindexed for good.
+    """
+    absent = (errno.ENODATA, errno.ENOTSUP, errno.EOPNOTSUPP)
+    try:
+        os.getxattr(path, PREFIX_XATTR)
+        refused = False
+    except OSError as exc:
+        if exc.errno in absent:
+            return
+        if exc.errno not in (errno.EACCES, errno.EPERM):
+            raise
+        refused = True
+    mode = stat_module.S_IMODE(os.stat(path).st_mode)
+    usable = mode | stat_module.S_IRUSR | stat_module.S_IWUSR
+    if usable != mode:
+        os.chmod(path, usable)
+    try:
+        if refused:
+            try:
+                os.getxattr(path, PREFIX_XATTR)
+            except OSError as exc:
+                if exc.errno in absent:
+                    return
+                raise
+        os.removexattr(path, PREFIX_XATTR)
+    finally:
+        if usable != mode:
+            os.chmod(path, mode)
 
 
 class CacheManager:
@@ -319,6 +361,9 @@ class CacheManager:
             scans = self._scan_count
         try:
             backend.copy_to_local(source_virtual_path, temp_path)
+            # A whole file is never a streaming prefix, whatever xattrs the
+            # member's copy came with.
+            _remove_prefix_marker(temp_path)
             size = os.lstat(temp_path).st_size
             with self._lock:
                 try:
