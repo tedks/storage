@@ -598,7 +598,9 @@ class NamespaceService:
                         raise FuseOSError(errno.EHOSTUNREACH)
                     continue
                 try:
-                    st = backend.stat(resolved.canonical_path)
+                    # lstat: a member's link is reported as a link, as its
+                    # listing reports it (readlink answers its target).
+                    st = backend.lstat(resolved.canonical_path)
                     return {
                         "st_atime": getattr(st, "st_atime", time.time()),
                         "st_ctime": getattr(
@@ -633,9 +635,9 @@ class NamespaceService:
         Walks the members in the order getattr probes them, skipping the
         unavailable ones as getattr does. The first available member that
         lists the name decides: its listed attributes are returned when
-        complete, and None (probe the members) when it lists the name as a
-        symlink (listings are lstat; the member's stat decides whether to
-        follow it) or without mode, size or mtime. None is also returned
+        complete (a symlink is listed by lstat, so it is reported as a link
+        and the kernel asks readlink for its target), and None (probe the
+        members) when it lists the name without mode, size or mtime. None is also returned
         when there is no listing, it has expired, the name is unknown (see
         entry_attrs), or a member walked before the name was found has no
         attributes in it (its listing failed or carried none). A member
@@ -685,7 +687,6 @@ class NamespaceService:
             mode = attrs.get("st_mode")
             if (
                 mode is None
-                or stat.S_ISLNK(mode)
                 or attrs.get("st_size") is None
                 or attrs.get("st_mtime") is None
             ):

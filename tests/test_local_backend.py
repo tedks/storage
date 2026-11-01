@@ -1,3 +1,4 @@
+import errno
 import os
 import shutil
 import stat
@@ -6,6 +7,39 @@ import unittest
 from pathlib import Path
 
 from storage.backends.local import LocalBackend
+
+
+class TestBackendLinks(unittest.TestCase):
+    """readlink and lstat report a member's link (ditz member-symlink-readlink)."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.root = Path(self.temp_dir) / "backend"
+        self.root.mkdir()
+        self.backend = LocalBackend("test", str(self.root))
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_readlink_returns_the_target_as_stored(self):
+        (self.root / "dir").mkdir()
+        (self.root / "dir" / "link").symlink_to("../target.txt")
+        self.assertEqual(self.backend.readlink("/dir/link"), "../target.txt")
+
+    def test_readlink_of_a_regular_file_is_einval(self):
+        (self.root / "plain.txt").write_text("x")
+        with self.assertRaises(OSError) as raised:
+            self.backend.readlink("/plain.txt")
+        self.assertEqual(raised.exception.errno, errno.EINVAL)
+
+    def test_readlink_of_a_missing_path_is_enoent(self):
+        with self.assertRaises(FileNotFoundError):
+            self.backend.readlink("/gone")
+
+    def test_lstat_does_not_follow_the_link(self):
+        (self.root / "target.txt").write_text("target")
+        (self.root / "link").symlink_to("target.txt")
+        self.assertTrue(stat.S_ISLNK(self.backend.lstat("/link").st_mode))
 
 
 class TestBackendRename(unittest.TestCase):

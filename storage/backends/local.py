@@ -232,6 +232,12 @@ class LocalBackend(Backend):
     def stat(self, virtual_path: str) -> os.stat_result:
         return os.lstat(self._resolve_path(virtual_path))
 
+    def lstat(self, virtual_path: str) -> os.stat_result:
+        return os.lstat(self._resolve_path(virtual_path))
+
+    def readlink(self, virtual_path: str) -> str:
+        return os.readlink(self._resolve_path(virtual_path))
+
     def sync(self):
         """Sync any buffered writes to storage"""
         # On Linux, sync specific directory

@@ -10,6 +10,7 @@ import unittest
 import tempfile
 import time
 import os
+import stat
 import subprocess
 import threading
 import shutil
@@ -434,6 +435,38 @@ class TestKernelCacheRefetch(_MountedCase):
 
     def test_shrunk_file_reads_short(self):
         self._read_after_revalidation("shrink.bin", b"a" * 200, b"d" * 50)
+
+
+class TestMemberSymlinks(_MountedCase):
+    """A link that exists only on a member reads through the mount
+    (ditz member-symlink-readlink)."""
+
+    START_SYNC = False
+
+    def test_member_only_link_is_a_link_through_the_mount(self):
+        (self.backend2_dir / "data").mkdir()
+        (self.backend2_dir / "data" / "target.txt").write_text("target bytes")
+        (self.backend1_dir / "links").mkdir()
+        (self.backend1_dir / "links" / "link.txt").symlink_to("../data/target.txt")
+        m = self.mount_dir
+
+        # A lookup before any listing (the member lstat), then after one
+        # (the kernel may answer the second from its own attribute cache;
+        # the listed path is covered without a mount in
+        # test_fs_namespace_integration).
+        st = os.lstat(m / "links" / "link.txt")
+        self.assertTrue(stat.S_ISLNK(st.st_mode), oct(st.st_mode))
+        self.assertIn("link.txt", os.listdir(m / "links"))
+        self.assertTrue(stat.S_ISLNK(os.lstat(m / "links" / "link.txt").st_mode))
+        self.assertEqual(os.readlink(m / "links" / "link.txt"), "../data/target.txt")
+        # The kernel resolves the target through the union (another member).
+        self.assertEqual((m / "links" / "link.txt").read_text(), "target bytes")
+        # Reading through the link fetched the target, never the link as a file.
+        self.assertFalse(os.path.lexists(self.cache_dir / "links" / "link.txt"))
+
+
+class TestMemberSymlinksThreaded(TestMemberSymlinks):
+    fuse_threads = True
 
 
 class TestSyncSystemIntegrationThreaded(TestSyncSystemIntegration):

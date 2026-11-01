@@ -24,6 +24,7 @@ Docker is a hard requirement of this gate: without it every test fails with
 a message naming Docker. It never skips.
 """
 
+import errno
 import hashlib
 import os
 import re
@@ -32,6 +33,7 @@ import shlex
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import threading
 import time
@@ -509,6 +511,51 @@ def test_rsync_write_over_ssh(remote, tmp_path):
         backend.close()
 
 
+@pytest.mark.parametrize("backend_class", [SSHBackend, RsyncBackend], ids=["ssh", "rsync"])
+def test_member_link_lstat_and_readlink(remote, backend_class):
+    """A member's link: lstat reports it, readlink returns its target, and
+    real sftp-server's answers for a non-link and a missing path map to
+    EINVAL and ENOENT (ditz member-symlink-readlink)."""
+    member = remote.members[0]
+    remote.write_remote(member, "dir/target.txt", b"target")
+    remote.exec(member, f"ln -s ../dir/target.txt {REMOTE_ROOT}/dir/link.txt")
+    backend = backend_class(**remote.backend_kwargs(member))
+    try:
+        assert stat.S_ISLNK(backend.lstat("/dir/link.txt").st_mode)
+        assert stat.S_ISREG(backend.stat("/dir/link.txt").st_mode)
+        assert stat.S_ISDIR(backend.lstat("/").st_mode)
+        assert backend.readlink("/dir/link.txt") == "../dir/target.txt"
+        with pytest.raises(OSError) as not_link:
+            backend.readlink("/dir/target.txt")
+        assert not_link.value.errno == errno.EINVAL
+        with pytest.raises(FileNotFoundError):
+            backend.readlink("/dir/missing")
+        assert backend.is_available()
+    finally:
+        backend.close()
+
+
+@pytest.mark.parametrize("backend_class", [SSHBackend, RsyncBackend], ids=["ssh", "rsync"])
+def test_mounted_member_only_link_reads_through_the_mount(remote, mounted_factory,
+                                                          backend_class):
+    """A link made on a member (not through the mount) is a link through it:
+    lstat, readlink, and a read that the kernel resolves through the union
+    to a target on the other member."""
+    m0, m1 = remote.members
+    remote.write_remote(m1, "data/target.txt", b"target bytes")
+    remote.exec(m0, f"mkdir -p {REMOTE_ROOT}/links && "
+                    f"ln -s ../data/target.txt {REMOTE_ROOT}/links/link.txt")
+    mnt = mounted_factory(backend_class=backend_class)
+    link = mnt.mount / "links" / "link.txt"
+
+    assert stat.S_ISLNK(os.lstat(link).st_mode)
+    assert "link.txt" in os.listdir(mnt.mount / "links")
+    assert stat.S_ISLNK(os.lstat(link).st_mode)
+    assert os.readlink(link) == "../data/target.txt"
+    assert link.read_bytes() == b"target bytes"
+    assert not os.path.lexists(mnt.cache / "links" / "link.txt")
+
+
 def _watcher_for(remote, member, on_change) -> RemoteWatcher:
     return RemoteWatcher(
         backend_name=member.name,
@@ -637,9 +684,9 @@ def mounted_factory(remote, tmp_path, request):
 
     created: List[tuple] = []
 
-    def make(backend_kwargs=None, **fs_kwargs) -> Mounted:
-        """backend_kwargs: SSHBackend arguments per member name, in place of
-        one member per container."""
+    def make(backend_kwargs=None, backend_class=SSHBackend, **fs_kwargs) -> Mounted:
+        """backend_kwargs: backend_class arguments per member name, in place
+        of one member per container."""
         assert not created, "one mount per test"
         mount = tmp_path / "mount"
         cache = tmp_path / "cache"
@@ -647,7 +694,7 @@ def mounted_factory(remote, tmp_path, request):
         cache.mkdir()
         if backend_kwargs is None:
             backend_kwargs = {m.name: remote.backend_kwargs(m) for m in remote.members}
-        backends = {name: SSHBackend(**kwargs) for name, kwargs in backend_kwargs.items()}
+        backends = {name: backend_class(**kwargs) for name, kwargs in backend_kwargs.items()}
         fs_kwargs.setdefault("num_sync_workers", 2)
         fs = StorageFS(cache_root=cache, state_db=tmp_path / "state.db",
                        backends=backends, cache_size=256 * 1024 * 1024, **fs_kwargs)
@@ -1297,7 +1344,7 @@ def test_session_killed_mid_transfer_is_retried_on_a_new_connection(remote, ssh_
 
 
 _MEMBER_IO = ("exists", "read_file", "get_size", "listdir", "listdir_attrs", "isdir",
-              "copy_to_local", "stat", "get_fast_checksum", "get_xattr")
+              "copy_to_local", "stat", "lstat", "readlink", "get_fast_checksum", "get_xattr")
 
 
 def _count_member_requests(backends):

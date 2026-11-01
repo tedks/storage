@@ -29,6 +29,7 @@ from typing import Dict, Optional, Set, List, Tuple
 
 from .backends.base import Backend, ChecksumUnavailable, interactive_request
 from .backends.ssh_mux import close_shared_control_sockets
+from .backends.ssh_pool import is_connection_error
 from .cache import PARTIAL_SUFFIX, CacheManager
 from .locks import NamespaceLock, PathLocks, UploadLocks
 from .cache_metadata import PREFIX_XATTR, XATTR_CACHE_METADATA_NAME, scan_cache_entries
@@ -2478,13 +2479,74 @@ class StorageFS(Operations):
     # Symbolic links
 
     def readlink(self, path):
-        """Read symbolic link"""
-        cache_path = self.cache_manager.get_cache_path(path)
+        """Read symbolic link: the cached link's target, else a member's.
 
+        A link that exists only on a member (getattr reports it from the
+        member's listing or lstat) is answered from the members in the
+        order getattr asks them, so readlink describes the copy getattr
+        did: the first available member holding the name decides, and a
+        name there that is not a link is EINVAL. A member whose readlink
+        fails otherwise is asked for an lstat: only a member that
+        definitely does not hold the name (ENOENT) or cannot be reached is
+        passed over; otherwise its failure is the answer (EIO when it
+        carries no errno), never another member's copy, which getattr may
+        not have reported (it can answer from a listing taken earlier). A
+        conflict view (`name.<member>`) asks only that member.
+
+        Only a missing cache path falls back to the members; any other
+        error from the cache (EINVAL for a cached file, ENOTDIR under one)
+        describes the cached copy, which getattr reports first.
+        """
+        resolved = self._resolve_path(path)
         try:
-            return os.readlink(str(cache_path))
+            return os.readlink(str(resolved.cache_path))
+        except FileNotFoundError:
+            pass
         except OSError as e:
             raise FuseOSError(e.errno)
+        return self._member_readlink(resolved)
+
+    def _member_readlink(self, resolved: ResolvedPath) -> str:
+        if resolved.backend_name:
+            members = [(resolved.backend_name, self.backends.get(resolved.backend_name))]
+        else:
+            members = list(self.backends.items())
+        unreachable = False
+        for name, backend in members:
+            if backend is None:
+                continue
+            if not backend.is_available():
+                unreachable = True
+                continue
+            try:
+                return backend.readlink(resolved.canonical_path)
+            except Exception as e:
+                if isinstance(e, OSError) and e.errno == errno.EINVAL:
+                    # The member holds the name and it is not a link: it
+                    # decides, as the copy getattr reported.
+                    raise FuseOSError(errno.EINVAL)
+                if is_connection_error(e):
+                    unreachable = True
+                    continue
+                if isinstance(e, FileNotFoundError):
+                    continue
+                failure = e
+            # EACCES, EIO, ENOSYS, or a bug: pass over only a member that
+            # definitely does not hold the name.
+            try:
+                backend.lstat(resolved.canonical_path)
+            except FileNotFoundError:
+                self.logger.debug("readlink on member %s failed: %r", name, failure)
+                continue
+            except Exception as e:
+                if is_connection_error(e):
+                    unreachable = True
+                    continue
+            self.logger.warning("readlink on member %s failed: %r", name, failure)
+            errno_value = getattr(failure, "errno", None)
+            raise FuseOSError(errno_value if isinstance(failure, OSError) and errno_value
+                              else errno.EIO)
+        raise FuseOSError(errno.EHOSTUNREACH if unreachable else errno.ENOENT)
 
     # Symlinks are refused until they replicate (ruling
     # oq-symlink-through-mount B; ditz symlink-replication): a link kept
