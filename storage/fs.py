@@ -226,6 +226,10 @@ class StorageFS(Operations):
         # queries until one of those holders answers again or the age
         # passes. Under _member_checks_lock.
         self._revalidate_unreachable: Dict[str, Tuple[float, Tuple[str, ...]]] = {}
+        # The stat that found the change, kept with the pin so the refetch
+        # takes its baseline from it instead of stat-ing the member again.
+        # Same lifetime as the pin (dropped when open() ends).
+        self._pinned_stats: Dict[str, Tuple[Backend, os.stat_result]] = {}
 
         # Background sync manager
         self.sync_manager = SyncManager(
@@ -1182,6 +1186,14 @@ class StorageFS(Operations):
                 self._recheck.setdefault(canonical_path, set()).add(pinned.name)
         return backend
 
+    def _pinned_stat(self, canonical_path: str, backend: Backend) -> Optional[os.stat_result]:
+        """The stat revalidation just took of backend, when this open is refetching from it."""
+        with self._member_checks_lock:
+            held = self._pinned_stats.get(canonical_path)
+        if held is not None and held[0] is backend:
+            return held[1]
+        return None
+
     def _clear_recheck(self, canonical_path: str, backend_name: str):
         """backend_name is supplying the file's bytes now: no forced refetch is owed to it."""
         with self._member_checks_lock:
@@ -1232,7 +1244,7 @@ class StorageFS(Operations):
         prefix = virtual_path.rstrip("/") + "/"
         tables = [self._member_checks, self._revalidate_unreachable]
         if path_gone:
-            tables += [self._refetch_pins, self._recheck]
+            tables += [self._refetch_pins, self._pinned_stats, self._recheck]
         with self._member_checks_lock:
             for table in tables:
                 table.pop(virtual_path, None)
@@ -1270,8 +1282,8 @@ class StorageFS(Operations):
         old_prefix = old.rstrip("/") + "/"
         new_prefix = new.rstrip("/") + "/"
         with self._member_checks_lock:
-            for table in (self._member_checks, self._refetch_pins, self._recheck,
-                          self._revalidate_unreachable):
+            for table in (self._member_checks, self._refetch_pins, self._pinned_stats,
+                          self._recheck, self._revalidate_unreachable):
                 for key in [k for k in table if k == new or k.startswith(new_prefix)]:
                     del table[key]
                 moved = {}
@@ -1315,8 +1327,11 @@ class StorageFS(Operations):
                             identity: Tuple[int, int, int],
                             updates: Dict[str, Tuple[int, float]], *, replace: bool = False,
                             drop: Tuple[str, ...] = (),
-                            drop_unless_checked_since: Optional[MemberCheck] = None):
-        """Record a check now, merging member baselines, in memory and on the cache file.
+                            drop_unless_checked_since: Optional[MemberCheck] = None,
+                            verified_at: Optional[float] = None):
+        """Record a check, merging member baselines, in memory and on the cache file.
+
+        The check is dated now, or verified_at (a time.monotonic() value).
 
         The baselines already known for this cache file (in memory, else from
         its xattr) are kept and updates applied on top; replace=True starts
@@ -1362,8 +1377,10 @@ class StorageFS(Operations):
                         continue
                 del members[name]
                 dropped.append(name)
-            check = MemberCheck(cache_identity=identity, verified_at=time.monotonic(),
-                                members=members)
+            check = MemberCheck(
+                cache_identity=identity,
+                verified_at=time.monotonic() if verified_at is None else verified_at,
+                members=members)
             self._member_checks[canonical_path] = check
             if (members or dropped) and (previous is None or previous.cache_identity != identity
                                          or previous.members != members):
@@ -1534,6 +1551,43 @@ class StorageFS(Operations):
                 del self._revalidate_unreachable[canonical_path]
         return False
 
+    def _listing_confirms_baseline(self, resolved: ResolvedPath, backend: Backend,
+                                   members: Dict[str, Tuple[int, float]]) -> Optional[float]:
+        """The start time of a recent listing of the parent that shows backend's copy at its baseline.
+
+        Saves a stat per file when a tree is walked: the listing (a member
+        read the directory listing already paid for) carries each entry's
+        size and mtime. It counts only as evidence of "unchanged", and only
+        when all of these hold; anything else leaves the decision to a real
+        stat, so a listing can never cause a refetch:
+
+        - the member has a baseline (recorded when the cache file was known
+          to match it) and no forced recheck is owed to it;
+        - the listing began within revalidate_after, so it is no older than
+          what a fresh check allows to go unverified; the caller is past
+          the age of the last check or fetch, so such a listing also
+          postdates the baseline;
+        - the name is still in the listing (not dropped by an invalidation)
+          and the member listed it with exactly the baseline's size and
+          mtime. (SFTP listings carry lstat-style attributes and
+          SSHBackend.stat follows symlinks, so a symlinked file simply
+          never matches and is stat-ed.)
+        """
+        baseline = members.get(backend.name)
+        if baseline is None:
+            return None
+        with self._member_checks_lock:
+            if backend.name in self._recheck.get(resolved.canonical_path, ()):
+                return None
+        listed = self.namespace.listed_member_attrs(
+            resolved, backend.name, time.monotonic() - self._revalidate_after)
+        if listed is None:
+            return None
+        listed_at, attrs = listed
+        if (attrs.get("st_size"), attrs.get("st_mtime")) != baseline:
+            return None
+        return listed_at
+
     def _revalidate_cached_file(self, resolved: ResolvedPath):
         """Refetch a CLEAN cached file whose member copy changed.
 
@@ -1555,6 +1609,11 @@ class StorageFS(Operations):
           time (SFTP), so an unchanged member is not later unless its clock
           is ahead; the refetch then records a baseline, so that costs one
           refetch, not one per check.
+
+        Before the stat, a listing of the parent no older than
+        revalidate_after that shows the member's baseline unchanged stands in
+        for it (_listing_confirms_baseline); a listing is never used to
+        decide that something changed.
 
         A changed copy goes through _invalidate_file_cache, which keeps a
         file that became DIRTY or has a writer open; whatever is no longer
@@ -1602,6 +1661,19 @@ class StorageFS(Operations):
                         time.monotonic(), tuple(unavailable))
             return
 
+        listed_at = self._listing_confirms_baseline(resolved, backend, members)
+        if listed_at is not None:
+            # Dated from the member read behind the listing, not from now:
+            # a stat at that moment would have expired at listed_at + age,
+            # so this check must too. The baseline tuple is carried over
+            # deliberately (not rebuilt as a fresh observation): a
+            # concurrent post-sync drop of it then goes through, which at
+            # worst costs one refetch.
+            self._store_member_check(canonical_path, cache_path, identity,
+                                     {backend.name: members[backend.name]},
+                                     verified_at=listed_at)
+            return
+
         try:
             member_stat = backend.stat(canonical_path)
         except FileNotFoundError:
@@ -1643,6 +1715,7 @@ class StorageFS(Operations):
             # A recheck mark stays until this member supplies the bytes
             # (_clear_recheck): the invalidation below may be refused.
             self._refetch_pins[canonical_path] = backend
+            self._pinned_stats[canonical_path] = (backend, member_stat)
         self._invalidate_file_cache(resolved.requested_path)
         if self.cache_manager.is_cached(resolved.requested_path):
             # Kept (a writer is open, or it turned out to be a lost write):
@@ -1654,6 +1727,7 @@ class StorageFS(Operations):
                 return
             with self._member_checks_lock:
                 self._refetch_pins.pop(canonical_path, None)
+                self._pinned_stats.pop(canonical_path, None)
             if kept_identity == identity:
                 self._store_member_check(canonical_path, cache_path, identity, {})
         else:
@@ -1834,10 +1908,12 @@ class StorageFS(Operations):
             # revalidation (see _record_fetched); without it the fetch
             # still works, and the first check falls back to comparing the
             # member against the cache file.
-            try:
-                member_stat = backend.stat(canonical_path)
-            except Exception:
-                member_stat = None
+            member_stat = self._pinned_stat(canonical_path, backend)
+            if member_stat is None:
+                try:
+                    member_stat = backend.stat(canonical_path)
+                except Exception:
+                    member_stat = None
             # Download to cache
             cached = self.cache_manager.cache_file(
                 resolved.requested_path,
@@ -2176,6 +2252,7 @@ class StorageFS(Operations):
                 # or the file was kept) must not steer a later fetch.
                 with self._member_checks_lock:
                     self._refetch_pins.pop(canonical_path, None)
+                    self._pinned_stats.pop(canonical_path, None)
 
     def _open(self, path, flags):
         """Open a file"""
