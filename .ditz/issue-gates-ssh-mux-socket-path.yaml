@@ -6,8 +6,8 @@ type: bugfix
 component: gates
 release:
 reporter: Ted Smith <tedks@riseup.net>
-status: in_progress
-disposition:
+status: closed
+disposition: fixed
 creation_time: 2026-11-01T02:57:11-00:00
 references: []
 log_events:
@@ -30,3 +30,7 @@ log_events:
   who: Ted Smith
   what: started
   comment: ""
+- time: 2026-11-01T04:14:29-00:00
+  who: Ted Smith
+  what: 'closed: fixed'
+  comment: 'Fixed in PR #164, merge f481705'
