@@ -1,0 +1,26 @@
+id: symlink-replication-nits
+title: 'symlink-replication council nits (PR #162 round 1)'
+desc: 'Claude seat nits, deferred with rationale: (2) a link row whose cached link
+  was lost to cache damage stays DIRTY and logs every monitor pass (no end state;
+  files behave alike when their cache file vanishes); (3) a holder failing permanently
+  (EACCES) keeps the link DIRTY forever, as for files; (4) _get_config(link_path)
+  may read the config xattr through the new link (harmless: link sync ignores replica_count);
+  (6) verify-index does not report a cached link without a row (a crash between os.symlink
+  and the row insert); (7) a link to an existing link whose own target was later deleted
+  passes the dangling check (getattr is lstat). Also I4 (rollback): after #162 lands,
+  an older binary''s SELECT * into FileMetadata.from_dict fails on the link_target
+  column; a rollback needs ALTER TABLE files DROP COLUMN link_target first. Recorded
+  in the PR.'
+type: task
+component: fs
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-01T03:22:19-00:00
+references: []
+log_events:
+- time: 2026-11-01T03:22:19-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
