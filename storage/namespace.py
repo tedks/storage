@@ -1487,7 +1487,8 @@ class NamespaceService:
                 new_cache.parent.mkdir(parents=True, exist_ok=True)
                 old_cache.rename(new_cache)
 
-                if new_cache.is_dir():
+                # A link (even to a directory) moves on its own members.
+                if new_cache.is_dir() and not new_cache.is_symlink():
                     rename_backend_names = set(self.backends.keys())
                 else:
                     rename_backend_names = self.state_manager.get_location_backends(
