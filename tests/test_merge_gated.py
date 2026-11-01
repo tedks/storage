@@ -264,3 +264,59 @@ def test_gh_merge_failure_is_distinct(env):
     _gates(repo, environ)
     environ["FAKE_GH_MERGE_EXIT"] = "1"
     assert _merge(repo, environ).returncode == 20
+
+
+def test_run_that_started_dirty_gets_no_receipt_even_if_clean_at_the_end(env, tmp_path):
+    repo, _, environ = env
+    (repo / "feature.txt").write_text("edited")
+    # the gates "test" the edit, which is gone before the run ends
+    (tmp_path / "bin" / "nix").write_text(
+        f'#!/bin/sh\ngit -C "{repo}" checkout -- feature.txt\n'
+    )
+    result = _gates(repo, environ)
+    assert result.returncode == 0
+    assert "dirty when the run started" in result.stderr
+    assert not _receipt(repo).exists()
+
+
+def test_head_moving_during_the_run_gets_no_receipt(env, tmp_path):
+    repo, _, environ = env
+    (tmp_path / "bin" / "nix").write_text(
+        f'#!/bin/sh\ngit -C "{repo}" commit -q --allow-empty -m moved\n'
+    )
+    result = _gates(repo, environ)
+    assert result.returncode == 0
+    assert "HEAD moved" in result.stderr
+    assert not _receipt(repo).exists()
+
+
+def test_unwritable_receipt_dir_says_no_receipt_not_success(env):
+    repo, _, environ = env
+    (repo / ".gates").write_text("a file, so mkdir -p fails")
+    result = _gates(repo, environ)
+    assert "run-gates: receipt" not in result.stdout
+
+
+@pytest.mark.parametrize("base", ["-x", "a b"])
+def test_unusable_base_branch_name_cannot_be_verified(env, base):
+    repo, log, environ = env
+    _gates(repo, environ)
+    environ["FAKE_PR_BASE"] = base
+    assert _merge(repo, environ).returncode == 65
+    assert "pr] [merge" not in log.read_text()
+
+
+def test_missing_base_branch_cannot_be_verified(env):
+    repo, log, environ = env
+    _gates(repo, environ)
+    environ["FAKE_PR_BASE"] = "nonexistent"
+    assert _merge(repo, environ).returncode == 65
+
+
+def test_receipt_with_trailing_junk_in_tree_is_refused(env):
+    repo, log, environ = env
+    _gates(repo, environ)
+    path = _receipt(repo)
+    tree = _git(repo, "rev-parse", "HEAD^{tree}")
+    path.write_text(path.read_text().replace(f'"{tree}"', f'"{tree}0"'))
+    assert _merge(repo, environ).returncode == REFUSAL_CODES["receipt"]

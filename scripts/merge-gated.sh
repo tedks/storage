@@ -19,7 +19,10 @@
 # (a normal merge, never squash or rebase). GitHub itself rejects the merge
 # if the PR head moved after the check. The base branch is fetched last, right
 # before the merge, to keep the window in which master can move small; a
-# merge in that window is not detected, so rerun the script if you notice one.
+# merge in that window is not detected (only GitHub's "require branches to be
+# up to date" rule would close it; see ditz open-questions), so rerun the
+# script if you notice one. A receipt is a guard against mistakes, not a
+# defence against forgery: anyone can write one.
 #
 # Other exits: 64 usage, 65 cannot verify (fetch or gh failed), 20 gh refused
 # the merge.
@@ -51,6 +54,9 @@ pr_info=$(gh pr view "$pr" --json headRefOid,baseRefName \
   --jq '.headRefOid + " " + .baseRefName') ||
   refuse 65 "could not read PR #$pr from GitHub"
 pr_head=${pr_info%% *}
+case $pr_head in
+  '' | *[!0-9a-f]*) refuse 65 "unusable head sha from GitHub for PR #$pr" ;;
+esac
 base=${pr_info#* }
 case $base in
   '' | -* | *[!A-Za-z0-9._/-]*) refuse 65 "unusable base branch name for PR #$pr" ;;
@@ -61,8 +67,8 @@ esac
 
 receipt=$root/.gates/$sha.json
 if [ ! -f "$receipt" ] ||
-  ! grep -qF "\"sha\": \"$sha\"" "$receipt" ||
-  ! grep -qF "\"tree\": \"$tree\"" "$receipt"; then
+  ! grep -qxF "  \"sha\": \"$sha\"," "$receipt" ||
+  ! grep -qxF "  \"tree\": \"$tree\"," "$receipt"; then
   refuse 13 "no gate receipt for $sha (tree $tree); run scripts/run-gates.sh on this commit"
 fi
 

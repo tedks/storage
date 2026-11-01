@@ -42,11 +42,15 @@ bazel_test() {
 
 # Writes .gates/<HEAD sha>.json for the targets given. Only called after a run
 # that passed; refuses (returns 1, says why) unless the tree is clean, HEAD is
-# still the commit the run started on ($1), and no extra arguments narrowed it.
+# still the commit the run started on ($1), was clean at the start too, and no extra arguments narrowed it.
 write_receipt() {
   local started=$1 sha tree host stamp dir targets t first=1 tmp
   shift
   sha=$(git rev-parse HEAD)
+  if [ "$started_dirty" -ne 0 ]; then
+    echo "run-gates: the tree was dirty when the run started, so it tested more than $sha; no receipt written (commit and rerun)" >&2
+    return 1
+  fi
   if [ -n "$(git status --porcelain)" ]; then
     echo "run-gates: gates passed on $sha plus uncommitted changes; no receipt written (commit and rerun to attest the commit)" >&2
     return 1
@@ -60,7 +64,7 @@ write_receipt() {
     return 1
   fi
   tree=$(git rev-parse 'HEAD^{tree}')
-  host=$(hostname | sha256sum | cut -c1-12)
+  host=$(uname -n | sha256sum | cut -c1-12)
   stamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   targets=
   for t in "$@"; do
@@ -69,11 +73,11 @@ write_receipt() {
     first=0
   done
   dir=$root/.gates
-  mkdir -p "$dir"
-  tmp=$(mktemp "$dir/.receipt.XXXXXX")
+  mkdir -p "$dir" || return 1
+  tmp=$(mktemp "$dir/.receipt.XXXXXX") || return 1
   printf '{\n  "sha": "%s",\n  "tree": "%s",\n  "targets": [%s],\n  "host": "%s",\n  "timestamp": "%s"\n}\n' \
-    "$sha" "$tree" "$targets" "$host" "$stamp" >"$tmp"
-  mv -f "$tmp" "$dir/$sha.json"
+    "$sha" "$tree" "$targets" "$host" "$stamp" >"$tmp" || { rm -f -- "$tmp"; return 1; }
+  mv -f "$tmp" "$dir/$sha.json" || { rm -f -- "$tmp"; return 1; }
   echo "run-gates: receipt $dir/$sha.json"
 }
 
@@ -152,6 +156,8 @@ run_remote_gate() {
 
 extra_args=$#
 started=$(git rev-parse HEAD)
+started_dirty=0
+[ -z "$(git status --porcelain)" ] || started_dirty=1
 
 if docker_usable; then
   echo "run-gates: Docker is usable; running all gates here"

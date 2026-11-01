@@ -270,7 +270,10 @@ could not verify (fetch or `gh` failed), 20 that `gh` refused the merge. When
 it passes it prints the council-record line (`rebased on <master sha>, 0
 behind; gates <targets> on <sha>`) to paste into the PR comment, then runs
 `gh pr merge <pr> --merge --match-head-commit <sha>`: a normal merge, never a
-squash or rebase. If master moves while it runs, rerun it.
+squash or rebase. If master moves while it runs, rerun it: only GitHub's
+"require branches to be up to date" rule would close that window, and a
+receipt guards against mistakes, not forgery. A run that started with a dirty
+tree gets no receipt even if the tree is clean at the end.
 
 ## Issue tracking (ditz)
 
