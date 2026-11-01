@@ -1120,10 +1120,6 @@ class NamespaceService:
                     if published is not None and backend_name in published[1]:
                         split_attrs[backend_name] = dict(published[1][backend_name])
         size_splits = self._size_splits(member_entries, split_attrs)
-        owners: Dict[str, Set[str]] = {}
-        for backend_name, names in member_entries.items():
-            for name in names:
-                owners.setdefault(name, set()).add(backend_name)
         queued = self._schedule_directory_checksums(
             path,
             {name: names for name, names in member_entries.items() if name not in failed},
@@ -1152,13 +1148,16 @@ class NamespaceService:
                 if (
                     self._listing_generation[path] == ticket.generation
                     and started_at >= self._listing_as_of.get(path, float("-inf"))
-                    # A name on several members may be split, or not, from
-                    # sizes read before a change to it: the published listing
-                    # would show the wrong conflict view for the whole
-                    # window (a published listing drops in the same case,
-                    # see _forget_listed_name_locked).
+                    # A name split by size was split from sizes read before a
+                    # change to it: the listing would show the conflict view
+                    # for the whole window (a published listing drops in the
+                    # same case, see _forget_listed_name_locked). Equal sizes
+                    # read before one copy changed are not caught here or
+                    # there (ditz listing-equal-size-duplicate-changed); not
+                    # refusing every raced replicated name keeps evictions
+                    # and uploads of replicas from starving the listing.
                     and not any(
-                        seq > ticket.child_seq and len(owners.get(name, ())) > 1
+                        seq > ticket.child_seq and name in size_splits
                         for name, seq in self._child_races.get(path, {}).items())
                 ):
                     # Children invalidated since the listing began may have
@@ -1213,7 +1212,8 @@ class NamespaceService:
                         del self._listing_as_of[dir_path]
                 # Names of directories whose listing was dropped (expired,
                 # size-split) stay as the member-error fallback; past the
-                # limit the oldest of those go.
+                # limit the oldest of those go (directories being listed are spared, so
+                # the cache can exceed the limit by that many).
                 excess = len(self.dir_cache) - self.listing_limit
                 if excess > 0:
                     unlisted = [

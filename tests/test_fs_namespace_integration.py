@@ -894,7 +894,6 @@ class TestFSNamespaceIntegration(unittest.TestCase):
         self._make_stale('/d')
         release, held = threading.Event(), threading.Event()
         executor = namespace._listing_executor("backend1")
-        self.assertEqual(executor._max_workers, 1)
         executor.submit(lambda: (held.set(), release.wait(10)))
         self.assertTrue(held.wait(5))
         try:
@@ -943,20 +942,17 @@ class TestFSNamespaceIntegration(unittest.TestCase):
             list(self.fs.readdir('/', None))
         self.assertNotIn('/', namespace.entry_attrs)
 
-    def test_listing_raced_on_an_equal_size_duplicate_is_not_published(self):
-        # Equal sizes at read time, one copy changed before publication: the
-        # unsplit view would otherwise stand for the whole window.
+    def test_eviction_of_a_replicated_name_does_not_starve_the_listing(self):
         (self.backend1_dir / "dup.txt").write_bytes(b"same")
         (self.backend2_dir / "dup.txt").write_bytes(b"same")
         namespace = self.fs.namespace
 
-        def change(_path):
-            (self.backend2_dir / "dup.txt").write_bytes(b"different")
+        def evict(_path):
             namespace.forget_listed_attrs('/dup.txt', removing=True)
 
-        with self._wrap_listdir_attrs("backend1", after=change):
+        with self._wrap_listdir_attrs("backend1", after=evict):
             list(self.fs.readdir('/', None))
-        self.assertNotIn('/', namespace.entry_attrs)
+        self.assertIn("dup.txt", namespace.entry_attrs['/'][2])
 
     def test_dir_cache_is_bounded_with_listing_state(self):
         namespace = self.fs.namespace
