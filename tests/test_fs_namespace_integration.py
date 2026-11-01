@@ -894,6 +894,7 @@ class TestFSNamespaceIntegration(unittest.TestCase):
         self._make_stale('/d')
         release, held = threading.Event(), threading.Event()
         executor = namespace._listing_executor("backend1")
+        self.assertEqual(executor._max_workers, 1)
         executor.submit(lambda: (held.set(), release.wait(10)))
         self.assertTrue(held.wait(5))
         try:
@@ -923,6 +924,9 @@ class TestFSNamespaceIntegration(unittest.TestCase):
                 list(self.fs.readdir('/', None))
                 self._wait_refreshed('/')
                 self.assertLess(time.monotonic() - begun, 3.0)
+                self.assertIn("f.txt", self.fs._dir_cache['/']["backend1"])
+                with namespace._listing_executors_lock:
+                    self.assertIn("backend1", namespace._hung_listings)
         finally:
             release.set()
         self.assertTrue(self._wait_for(lambda: not namespace._hung_listings))
@@ -933,6 +937,21 @@ class TestFSNamespaceIntegration(unittest.TestCase):
         namespace = self.fs.namespace
 
         def change(_path):
+            namespace.forget_listed_attrs('/dup.txt', removing=True)
+
+        with self._wrap_listdir_attrs("backend1", after=change):
+            list(self.fs.readdir('/', None))
+        self.assertNotIn('/', namespace.entry_attrs)
+
+    def test_listing_raced_on_an_equal_size_duplicate_is_not_published(self):
+        # Equal sizes at read time, one copy changed before publication: the
+        # unsplit view would otherwise stand for the whole window.
+        (self.backend1_dir / "dup.txt").write_bytes(b"same")
+        (self.backend2_dir / "dup.txt").write_bytes(b"same")
+        namespace = self.fs.namespace
+
+        def change(_path):
+            (self.backend2_dir / "dup.txt").write_bytes(b"different")
             namespace.forget_listed_attrs('/dup.txt', removing=True)
 
         with self._wrap_listdir_attrs("backend1", after=change):
@@ -965,6 +984,7 @@ class TestFSNamespaceIntegration(unittest.TestCase):
             list(self.fs.readdir('/', None))
             self._wait_refreshed()
         self.assertEqual(len(seen), 1)
+        self.assertTrue(all(name.startswith("readdir-") for name in seen), seen)
         self.assertEqual(set(seen.values()), {False})
 
     def test_listing_limit_drops_the_least_recently_used_directory(self):

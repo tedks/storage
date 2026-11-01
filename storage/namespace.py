@@ -303,7 +303,8 @@ class NamespaceService:
 
         When removing, a listing of the parent in flight is published
         without the name's attributes and with the name unknown, so a
-        listing read before the write was synced cannot put the name back.
+        listing read before the write was synced cannot put the name's old
+        attributes back.
         A write does not do that: while the file is dirty its copy exists
         and getattr never reads the listing; a listing published meanwhile
         is cleaned up by the removal's forget.
@@ -1062,6 +1063,12 @@ class NamespaceService:
                     outcomes[backend_name] = future.result(
                         timeout=max(0.0, deadline - time.monotonic()))
             except concurrent.futures.TimeoutError:
+                if future.done() and not future.cancelled():
+                    try:
+                        outcomes[backend_name] = future.result()  # it just finished
+                    except Exception as exc:
+                        outcomes[backend_name] = exc
+                    continue
                 self._abandon_listing(backend_name, future)
                 outcomes[backend_name] = TimeoutError(
                     f"{backend_name} did not list {path} in {self.refresh_member_timeout:g}s")
@@ -1113,6 +1120,10 @@ class NamespaceService:
                     if published is not None and backend_name in published[1]:
                         split_attrs[backend_name] = dict(published[1][backend_name])
         size_splits = self._size_splits(member_entries, split_attrs)
+        owners: Dict[str, Set[str]] = {}
+        for backend_name, names in member_entries.items():
+            for name in names:
+                owners.setdefault(name, set()).add(backend_name)
         queued = self._schedule_directory_checksums(
             path,
             {name: names for name, names in member_entries.items() if name not in failed},
@@ -1141,11 +1152,13 @@ class NamespaceService:
                 if (
                     self._listing_generation[path] == ticket.generation
                     and started_at >= self._listing_as_of.get(path, float("-inf"))
-                    # A name split by size was split from sizes read before a
-                    # change to it: the published listing would show the
-                    # wrong conflict view for the whole window.
+                    # A name on several members may be split, or not, from
+                    # sizes read before a change to it: the published listing
+                    # would show the wrong conflict view for the whole
+                    # window (a published listing drops in the same case,
+                    # see _forget_listed_name_locked).
                     and not any(
-                        seq > ticket.child_seq and name in size_splits
+                        seq > ticket.child_seq and len(owners.get(name, ())) > 1
                         for name, seq in self._child_races.get(path, {}).items())
                 ):
                     # Children invalidated since the listing began may have
@@ -1203,7 +1216,10 @@ class NamespaceService:
                 # limit the oldest of those go.
                 excess = len(self.dir_cache) - self.listing_limit
                 if excess > 0:
-                    unlisted = [k for k in self.dir_cache if k not in self.entry_attrs]
+                    unlisted = [
+                        k for k in self.dir_cache
+                        if k not in self.entry_attrs and k not in self._listings_in_flight
+                    ]
                     for dir_path in unlisted[:excess]:
                         del self.dir_cache[dir_path]
 
