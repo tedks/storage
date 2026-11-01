@@ -560,11 +560,15 @@ class SSHBackend(Backend):
                 try:
                     sftp.posix_rename(old_remote, new_remote)
                 except OSError as exc:
-                    # paramiko leaves errno unset for SFTP statuses it does
-                    # not map, an unsupported extension among them. Plain
-                    # rename still moves onto an absent target, and its own
-                    # error is the one raised.
-                    if exc.errno is not None:
+                    # paramiko raises a bare OSError without an errno for
+                    # SFTP statuses it does not map: an unsupported
+                    # extension, or a generic failure (a non-empty target
+                    # directory, say). Plain rename still moves onto an
+                    # absent target; otherwise its own error is raised. A
+                    # timeout (socket.timeout, also errno-less) or a lost
+                    # connection is raised as it is, for the pool to see.
+                    if (type(exc) is not OSError or exc.errno is not None
+                            or is_connection_error(exc)):
                         raise
                     sftp.rename(old_remote, new_remote)
             except FileNotFoundError:

@@ -701,8 +701,9 @@ class StateManager:
 
         A range on the primary key, not LIKE: exact for names holding '_' or
         '%', and indexed. '0' is the byte after '/', so the range holds
-        exactly the paths that start with root + '/'. root is normalized
-        and not '/'.
+        exactly the paths that start with root + '/' under SQLite's
+        default BINARY collation, which virtual_path uses. root is
+        normalized and not '/'.
         """
         below = '(virtual_path > ? AND virtual_path < ?)'
         params = (root + '/', root + '0')
