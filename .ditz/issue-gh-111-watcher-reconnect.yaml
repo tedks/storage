@@ -42,8 +42,8 @@ type: task
 component: performance
 release:
 reporter: Ted Smith <tedks@riseup.net>
-status: in_progress
-disposition:
+status: closed
+disposition: fixed
 creation_time: 2026-10-24T21:01:16-00:00
 references: []
 log_events:
@@ -73,5 +73,12 @@ log_events:
   who: Ted Smith
   what: started
   comment: ""
+- time: 2026-11-01T03:25:44-00:00
+  who: Ted Smith
+  what: 'closed: fixed'
+  comment: 'PR #161: RemoteWatcher on_resync (inotifywait ''Watches established'',
+    first time and after each restart) drops all listings and remembered stats, per
+    the 2026-10-27 ruling (cached files stay with revalidate-on-open). Checksum records
+    not dropped (outside the ruling).'
 blocks:
 - gh-111
