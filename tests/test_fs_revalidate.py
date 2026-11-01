@@ -770,6 +770,15 @@ class TestRevalidateStreamBail(RevalidateTestBase):
         self.fs.release("/f.txt", self.fs.open("/f.txt", os.O_RDONLY))
         self.assertNotIn("/f.txt", self.fs._refetch_pins)
 
+    def test_a_pin_no_fetch_used_does_not_outlive_the_open(self):
+        self._cached_on_both()
+        # Fresh check, cached file: this open revalidates nothing and fetches
+        # nothing, so only open()'s own cleanup can drop a pin left behind.
+        with self.fs._member_checks_lock:
+            self.fs._refetch_pins["/f.txt"] = self.fast
+        self.fs.release("/f.txt", self.fs.open("/f.txt", os.O_RDONLY))
+        self.assertNotIn("/f.txt", self.fs._refetch_pins)
+
     def test_stream_bailing_to_the_fallback_still_fetches_from_the_pinned_member(self):
         self._cached_on_both()
         (self.fast_dir / "f.txt").write_bytes(b"changed on fast")

@@ -215,10 +215,10 @@ class StorageFS(Operations):
         self._revalidate_outages: Set[str] = set()
         # A check that found a change pins the refetch to the member it
         # checked (read by _select_backend_for_read, dropped when open()
-        # ends). If that member is
-        # gone by then and another supplies the bytes, its name is kept in
-        # _recheck so its next check refetches again instead of adopting the
-        # change as a baseline. Both under _member_checks_lock.
+        # ends). If that member is gone by then and another supplies the
+        # bytes, its name is kept in _recheck so its next check refetches
+        # again instead of adopting the change as a baseline. Both under
+        # _member_checks_lock.
         self._refetch_pins: Dict[str, Backend] = {}
         self._recheck: Dict[str, Set[str]] = {}
         # Paths whose holders were all unavailable at the last open past the
@@ -1163,7 +1163,11 @@ class StorageFS(Operations):
         (see _revalidate_cached_file) while it is available. The pin stays
         until open() ends, so selection is idempotent within one open: a
         stream that bails out after selecting and the full-file fallback
-        both honour it.
+        both honour it. Within a streaming open the pinned member is the
+        only one tried: if its stream setup fails, the fallback fetch asks
+        it again rather than another holder, which keeps the guarantee that
+        a change seen on the checked member is never adopted unseen (the
+        non-streaming path always behaved so).
         """
         with self._member_checks_lock:
             pinned = self._refetch_pins.get(canonical_path)
@@ -1564,8 +1568,6 @@ class StorageFS(Operations):
         canonical_path = resolved.canonical_path
         cache_path = resolved.cache_path
         with self._member_checks_lock:
-            # A pin no fetch consumed (the open attached to a running stream).
-            self._refetch_pins.pop(canonical_path, None)
             check = self._member_checks.get(canonical_path)
         if check is not None and time.monotonic() - check.verified_at < self._revalidate_after:
             return
