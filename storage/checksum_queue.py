@@ -137,7 +137,8 @@ class MemberHashQueues:
     def shutdown(self):
         """Cancel every waiting item; workers exit after the item they run.
 
-        A worker blocked in member I/O is not interrupted; it ends at that
+        A worker blocked in member I/O is not interrupted here; it ends when
+        the member's transport is closed (StorageFS.destroy) or at that
         call's timeout. Workers are daemon threads, so none holds up exit.
         """
         with self._cond:

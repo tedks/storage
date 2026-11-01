@@ -291,6 +291,9 @@ class StorageFS(Operations):
         # verification (_force_verify). Under _checksum_lock.
         self._verify_results: Dict[str, Dict[str, List[str]]] = {}
         self._reverify_stop = threading.Event()
+        # Set first thing in destroy(): a hash that ends because the unmount
+        # cancelled or closed its member says nothing about the persisted row.
+        self._destroying = threading.Event()
         self._reverify_thread: Optional[threading.Thread] = None
 
         self.namespace = NamespaceService(
@@ -863,14 +866,20 @@ class StorageFS(Operations):
                         # record left from before would outlive the change
                         # that scheduled this hash (an upload, a new basis).
                         self._checksum_records.pop(key, None)
-                        self._persist_checksum(canonical_path, backend.name, None)
+                        # Not while the unmount ends the hash: the row it
+                        # leaves is keyed by the basis it was made from, so
+                        # a changed file (an upload, a new basis) never
+                        # loads it, and an unchanged one keeps a valid row.
+                        if not self._destroying.is_set():
+                            self._persist_checksum(canonical_path, backend.name, None)
                         return
                     result = done.result()
                     if result is None:
                         # Could not be asked: whatever was recorded before
                         # predates the change that scheduled this hash.
                         self._checksum_records.pop(key, None)
-                        self._persist_checksum(canonical_path, backend.name, None)
+                        if not self._destroying.is_set():
+                            self._persist_checksum(canonical_path, backend.name, None)
                     elif result is not self._IS_DIRECTORY:
                         checksum, ts = result
                         self._record_checksum(canonical_path, backend.name, checksum, ts, basis)
@@ -2578,6 +2587,7 @@ class StorageFS(Operations):
 
     def destroy(self, path):
         """Cleanup on unmount"""
+        self._destroying.set()
         self._streaming_manager.destroy()
         self._stop_watchers()
 
@@ -2599,12 +2609,70 @@ class StorageFS(Operations):
         if self._sweep_thread is not None and self._sweep_thread.is_alive():
             self._sweep_thread.join(timeout=self.SWEEP_JOIN_TIMEOUT)
 
-        self.sync_manager.stop()
-        # After the last rsync upload and the watchers: they share the masters.
-        close_shared_control_sockets()
-        self.state_manager.close()
-        if not self._sweep_pending:
-            _clear_mount_lock_pid(self.mount_lock_file)
+        try:
+            # Each step on its own: a failing one must not skip the index
+            # close, which is what lets the lock go (see the finally).
+            clean = self._best_effort("stop the sync workers", self.sync_manager.stop)
+            # After the last rsync upload and the watchers: they share the
+            # masters (rsync members have no close() of their own; this ends
+            # their connections).
+            clean &= self._best_effort(
+                "close the shared ssh connections", close_shared_control_sockets,
+            )
+            # Close the members' transports once nothing of ours should still
+            # use them. Hash and listing workers blocked in member I/O (the
+            # queues and executors cancel only what has not started) then
+            # fail at once instead of running to their own end, which kept
+            # the process alive, and the mount lock held, long after the
+            # unmount.
+            clean &= self._close_backends()
+            clean &= self._best_effort("close the index", self.state_manager.close)
+            # A step that failed is not a clean shutdown: the pid stays, and
+            # the next mount sweeps.
+            if clean and not self._sweep_pending:
+                _clear_mount_lock_pid(self.mount_lock_file)
+        finally:
+            # Release the lock here, not at process exit: the mountpoint is
+            # free as soon as the unmount returns, even if a straggler thread
+            # (a worker in a call that ignores the close, or past its join
+            # timeout) delays the exit. A straggler cannot touch the cache
+            # next to a new mount: its cache and index writes go through the
+            # index, which is closed. Keep it that way: a cache mutation not
+            # gated on the index would race the next mount.
+            _release_mount_lock(self.mount_lock_file)
+
+    def _best_effort(self, what: str, step) -> bool:
+        """Run a destroy step; log and report False if it raised."""
+        try:
+            step()
+        except Exception:
+            self.logger.exception("destroy: could not %s", what)
+            return False
+        return True
+
+    def _close_backends(self) -> bool:
+        """Close the members that can be closed; False if any close raised."""
+        clean = True
+        for backend in self.backends.values():
+            close = getattr(backend, "close", None)
+            if close is None:
+                continue
+            try:
+                close()
+            except Exception:
+                clean = False
+                self.logger.exception("Could not close member %s", backend.name)
+        return clean
+
+
+def _release_mount_lock(lock_file) -> None:
+    """Close the mount lock file, which releases the flock; idempotent."""
+    if lock_file is None or lock_file.closed:
+        return
+    try:
+        lock_file.close()
+    except (OSError, ValueError):
+        logging.getLogger(__name__).exception("Could not release the mount lock")
 
 
 def _clear_mount_lock_pid(lock_file) -> None:

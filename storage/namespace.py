@@ -826,7 +826,7 @@ class NamespaceService:
         the names it had; it may still publish that into the in-memory
         maps, which nothing reads after destroy. A worker
         still blocked in member I/O (a hung member) is not interrupted and
-        ends at its SFTP timeout, as the checksum executor's workers do.
+        ends when destroy closes the member or at its SFTP timeout.
         """
         with self._listing_executors_lock:
             self._listing_shut_down = True

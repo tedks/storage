@@ -617,6 +617,9 @@ class Mounted:
     cache: Path
     backends: dict
     fuse_threads: bool = False
+    # Set by a test that unmounts itself, so teardown does not report the
+    # mount as lost.
+    unmounted_by_test: bool = False
 
 
 @pytest.fixture(params=FUSE_THREAD_MODES, ids=fuse_mode_id)
@@ -683,7 +686,7 @@ def mounted_factory(remote, tmp_path, request):
         try:
             if os.path.ismount(handle.mount):
                 problems += unmount_fuse(handle.mount)
-            elif came_up:
+            elif came_up and not handle.unmounted_by_test:
                 problems.append("the mount went away before teardown")
             # On unmount libfuse calls StorageFS.destroy, which stops the
             # watchers and sync workers; a hang there leaves this thread alive.
@@ -1551,3 +1554,62 @@ def test_mounted_synced_upload_needs_no_view_hash(remote, mounted_factory):
     for member in (m0, m1):
         record = mnt.fs._checksum_records[("/synced.bin", member.name)]
         assert record.checksum == fast_checksum_bytes(payload)
+
+
+def test_unmount_stops_background_work_and_frees_the_mount_lock(remote, mounted_factory, tmp_path):
+    """After fusermount -u returns, the daemon ends its hash and listing
+    workers and a remount can take the mount lock within 2 s.
+
+    A listing schedules a view hash per name present on both members and
+    starts a listing worker per member. Field test: the process ran minutes
+    past the unmount finishing those, and a remount failed with 'Mount
+    already active' meanwhile.
+    """
+    from storage.fs import _acquire_mount_lock_ex
+
+    m0, m1 = remote.members
+    payload = secrets.token_bytes(256 * 1024)
+    for member in (m0, m1):
+        remote.write_remote(member, "both.bin", payload)
+    before = set(threading.enumerate())
+    mnt = mounted_factory()
+    lock_path = tmp_path / "mount.lock"
+    mnt.fs.mount_lock_file, _ = _acquire_mount_lock_ex(lock_path, str(mnt.mount))
+
+    # Hold every view hash in a real exec channel: the command a member runs
+    # for it becomes a long sleep, so the worker is inside member I/O when
+    # the unmount comes.
+    in_channel = threading.Event()
+    for backend in mnt.backends.values():
+        real_run = backend._pool.run_command
+
+        def run_command(command, timeout, _real=real_run):
+            if command.startswith("xxh128sum"):
+                in_channel.set()
+                return _real("sleep 120", 150.0)
+            return _real(command, timeout)
+
+        backend._pool.run_command = run_command
+
+    assert "both.bin" in os.listdir(mnt.mount)
+    assert in_channel.wait(10.0), "no view hash reached a member channel"
+
+    assert unmount_fuse(mnt.mount) == []
+    mnt.unmounted_by_test = True
+
+    def background_threads():
+        return [t.name for t in threading.enumerate()
+                if t.is_alive() and t not in before
+                and t.name.startswith(("checksum-", "readdir-"))]
+
+    def remount_ready():
+        try:
+            lock, _ = _acquire_mount_lock_ex(lock_path, str(mnt.mount))
+        except RuntimeError:
+            return False
+        lock.close()
+        return not background_threads()
+
+    assert _wait_for(remount_ready, timeout=2.0, interval=0.05), (
+        f"after unmount: threads {background_threads()}, lock "
+        f"{'free' if mnt.fs.mount_lock_file.closed else 'held'}")

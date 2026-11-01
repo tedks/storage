@@ -3,6 +3,8 @@ import json
 import os
 import shutil
 import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import patch
 from pathlib import Path
@@ -294,6 +296,87 @@ class TestFSCoreIntegration(unittest.TestCase):
 
         self.assertNotEqual(lock_path.read_text().strip(), "")
         lock_file.close()
+
+    def test_destroy_with_a_failed_step_keeps_the_pid_but_frees_the_lock(self):
+        lock_path = self.temp_dir / "lock"
+        lock_file, _ = _acquire_mount_lock_ex(lock_path, "/mnt/t")
+        self.fs.mount_lock_file = lock_file
+
+        with patch.object(self.fs.state_manager, "close", side_effect=OSError("disk")):
+            self.fs.destroy("/")
+
+        self.assertNotEqual(lock_path.read_text().strip(), "")  # the next mount sweeps
+        again, previous_pid_left = _acquire_mount_lock_ex(lock_path, "/mnt/t")
+        again.close()
+        self.assertTrue(previous_pid_left)
+
+    def test_destroy_releases_the_mount_lock_for_a_remount(self):
+        lock_path = self.temp_dir / "lock"
+        lock_file, _ = _acquire_mount_lock_ex(lock_path, "/mnt/t")
+        self.fs.mount_lock_file = lock_file
+
+        self.fs.destroy("/")
+
+        # A remount (another open file description) takes the lock at once,
+        # while this process is still alive.
+        again, _ = _acquire_mount_lock_ex(lock_path, "/mnt/t")
+        again.close()
+
+    def test_destroy_closes_members_so_a_blocked_hash_worker_ends(self):
+        closed = threading.Event()
+        started = threading.Event()
+
+        class BlockingMember(LocalBackend):
+            def close(self):
+                closed.set()
+
+        member = BlockingMember("backend1", str(self.backend1_dir))
+        self.fs.backends["backend1"] = member
+
+        def hash_blocked_in_member_io():
+            started.set()
+            # A member exec channel that answers when its transport closes.
+            return None if closed.wait(30) else "late"
+
+        future = self.fs._checksum_queues.submit("backend1", hash_blocked_in_member_io)
+        self.assertTrue(started.wait(5))
+
+        began = time.monotonic()
+        self.fs.destroy("/")
+
+        self.assertTrue(closed.is_set())
+        future.result(timeout=5)
+        self.assertLess(time.monotonic() - began, 10)
+
+    def test_destroy_closing_a_member_keeps_the_persisted_hash_row(self):
+        # A hash that ends because the unmount closed its member says
+        # nothing about the persisted row: it is kept for the next mount.
+        closed = threading.Event()
+        started = threading.Event()
+
+        class ClosingMember(LocalBackend):
+            def get_fast_checksum(self, virtual_path, allow_download=True):
+                started.set()
+                closed.wait(30)
+                raise OSError("transport closed")
+
+            def close(self):
+                closed.set()
+
+        (self.backend1_dir / "kept.txt").write_text("x")
+        self.fs.backends["backend1"] = ClosingMember("backend1", str(self.backend1_dir))
+        with patch.object(self.fs, "_persist_checksum") as persist:
+            self.fs._schedule_checksum_task(self.fs.backends["backend1"], "/kept.txt", None, replace=True)
+            self.assertTrue(started.wait(5))
+            # Queued behind the running one: cancelled by the queues' shutdown.
+            (self.backend1_dir / "queued.txt").write_text("y")
+            self.fs._schedule_checksum_task(self.fs.backends["backend1"], "/queued.txt", None, replace=True)
+            self.fs.destroy("/")
+            deadline = time.monotonic() + 5
+            while self.fs._checksum_tasks and time.monotonic() < deadline:
+                time.sleep(0.01)
+        self.assertEqual(self.fs._checksum_tasks, {})
+        persist.assert_not_called()
 
     def test_init_runs_a_requested_sweep_and_clears_pending(self):
         self.fs.sync_manager.stop()
