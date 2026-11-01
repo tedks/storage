@@ -3,6 +3,7 @@
 import errno
 import json
 import os
+import stat
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator, List, Optional
@@ -36,6 +37,21 @@ PREFIX_XATTR = "user.storage.prefix"
 _INTERNAL_CACHE_SUFFIXES = (
     PARTIAL_SUFFIX,
 )
+
+
+def regular_file_stat(path) -> Optional[os.stat_result]:
+    """The lstat of path when it is a regular file, else None.
+
+    Cache scans and xattr writes use this rather than exists()/is_file(),
+    which follow a symlink: a link in the cache tree (made through the
+    mount, or planted) is not a cached copy, and following it would count
+    or rewrite whatever it points at (ditz cache-scans-follow-symlinks).
+    """
+    try:
+        st = os.lstat(str(path))
+    except (OSError, ValueError):
+        return None
+    return st if stat.S_ISREG(st.st_mode) else None
 
 
 def _is_missing_xattr_error(exc: OSError) -> bool:
@@ -225,7 +241,7 @@ class CacheScanEntry:
 def read_cache_metadata(cache_path: Path) -> Optional[CacheMetadataRecord]:
     """Read the cache metadata xattr, returning None when it is absent."""
     try:
-        raw = os.getxattr(str(cache_path), XATTR_CACHE_METADATA_NAME)
+        raw = os.getxattr(str(cache_path), XATTR_CACHE_METADATA_NAME, follow_symlinks=False)
     except OSError as exc:
         if _is_missing_xattr_error(exc):
             return None
@@ -247,8 +263,15 @@ def write_cache_metadata(
     *,
     virtual_path: Optional[str] = None,
 ) -> CacheMetadataRecord:
-    """Write the cache metadata xattr for a cache file."""
+    """Write the cache metadata xattr for a cache file.
+
+    Only on a regular file, and never through a link: a symlink is refused
+    with EINVAL, and the setxattr does not follow one swapped in after the
+    lstat.
+    """
     st = os.lstat(str(cache_path))
+    if not stat.S_ISREG(st.st_mode):
+        raise OSError(errno.EINVAL, "not a regular file", str(cache_path))
     record = CacheMetadataRecord.from_file_metadata(
         metadata,
         virtual_path=virtual_path,
@@ -259,6 +282,7 @@ def write_cache_metadata(
         str(cache_path),
         XATTR_CACHE_METADATA_NAME,
         json.dumps(record.to_dict(), sort_keys=True).encode("utf-8"),
+        follow_symlinks=False,
     )
     return record
 
@@ -280,7 +304,7 @@ def cache_file_would_be_scanned(cache_root: Path, virtual_path: str) -> bool:
     components), no component is an internal cache artifact (the scanner prunes
     those), the root and every parent are real, listable directories (os.walk
     neither follows directory symlinks nor lists unreadable directories), and
-    the leaf lstats and is a regular file once a final symlink is followed.
+    the leaf lstats as a regular file (a symlink is never scanned).
     cache_root must already be resolved.
 
     Known limit: on a case-folding or Unicode-normalizing filesystem (APFS, ext4
@@ -307,12 +331,7 @@ def cache_file_would_be_scanned(cache_root: Path, virtual_path: str) -> bool:
         if not _is_listable_dir(current):
             return False
 
-    leaf = current / parts[-1]
-    try:
-        os.lstat(str(leaf))
-    except (OSError, ValueError):
-        return False
-    return os.path.isfile(str(leaf))
+    return regular_file_stat(current / parts[-1]) is not None
 
 
 def scan_cache_entries(cache_root: Path) -> Iterator[CacheScanEntry]:
@@ -332,7 +351,9 @@ def scan_cache_entries(cache_root: Path) -> Iterator[CacheScanEntry]:
             except OSError:
                 continue
 
-            if not os.path.isfile(str(cache_path)):
+            if not stat.S_ISREG(st.st_mode):
+                # A symlink is not a cached copy: never follow it to read
+                # or rewrite its target's metadata.
                 continue
 
             virtual_path = cache_path_to_virtual_path(cache_root, cache_path)

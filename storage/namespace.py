@@ -11,6 +11,7 @@ from typing import Callable, Dict, List, Optional, Set, Tuple
 from fuse import FuseOSError
 
 from .backends.base import Backend
+from .cache_metadata import regular_file_stat
 from .checksums import ChecksumBasis, ChecksumRecord
 from .models import SyncStatus
 from .pathing import ResolvedPath, canonicalize_virtual_path
@@ -177,8 +178,11 @@ class NamespaceService:
         partial_path = Path(f"{cache_path}{self.partial_suffix}")
         available_backends, unavailable_backends = self.backend_availability()
 
-        cache_present = bool(cache_path.exists() and cache_path.is_file())
-        partial_present = bool(partial_path.exists() and partial_path.is_file())
+        # lstat: a link at either path is not a cached copy.
+        cache_stat = regular_file_stat(cache_path)
+        partial_stat = regular_file_stat(partial_path)
+        cache_present = cache_stat is not None
+        partial_present = partial_stat is not None
 
         payload: Dict[str, object] = {
             "path": resolved.canonical_path,
@@ -190,15 +194,9 @@ class NamespaceService:
             "updated_at": time.time(),
         }
 
-        try:
-            payload["cache_size"] = cache_path.stat().st_size if cache_present else 0
-        except OSError:
-            payload["cache_size"] = 0
+        payload["cache_size"] = cache_stat.st_size if cache_present else 0
 
-        try:
-            payload["partial_size"] = partial_path.stat().st_size if partial_present else 0
-        except OSError:
-            payload["partial_size"] = 0
+        payload["partial_size"] = partial_stat.st_size if partial_present else 0
 
         return payload
 

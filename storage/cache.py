@@ -16,7 +16,7 @@ from contextlib import nullcontext
 from typing import Callable, ContextManager, Optional, List, Set
 
 from .backends.base import Backend
-from .cache_metadata import PARTIAL_SUFFIX, PREFIX_XATTR, write_cache_metadata
+from .cache_metadata import PARTIAL_SUFFIX, PREFIX_XATTR, regular_file_stat, write_cache_metadata
 from .models import FileMetadata, SyncStatus
 from .state import StateManager
 
@@ -118,15 +118,18 @@ class CacheManager:
         self._size_dirty = False
 
     def _scan_total_cache_size(self) -> int:
-        """Calculate total size of cache in bytes by scanning the filesystem."""
+        """Calculate total size of cache in bytes by scanning the filesystem.
+
+        Counts regular files only, by lstat: a symlink in the cache tree is
+        not a cached copy, and following it would charge its target's size
+        (anything on the host) against a cache that can never evict it.
+        """
         total = 0
         for root, dirs, files in os.walk(self.cache_root):
             for name in files:
-                filepath = Path(root) / name
-                try:
-                    total += filepath.stat().st_size
-                except OSError:
-                    pass
+                st = regular_file_stat(Path(root) / name)
+                if st is not None:
+                    total += st.st_size
         return total
 
     def _ensure_size_current_locked(self):
@@ -144,15 +147,12 @@ class CacheManager:
 
     def is_cached(self, virtual_path: str) -> bool:
         """Check if a file is in the cache"""
-        cache_path = self.get_cache_path(virtual_path)
-        return cache_path.exists() and cache_path.is_file()
+        return regular_file_stat(self.get_cache_path(virtual_path)) is not None
 
     def get_cached_size(self, virtual_path: str) -> int:
         """Get size of cached file"""
-        cache_path = self.get_cache_path(virtual_path)
-        if cache_path.exists():
-            return cache_path.stat().st_size
-        return 0
+        st = regular_file_stat(self.get_cache_path(virtual_path))
+        return st.st_size if st is not None else 0
 
     def get_total_cache_size(self) -> int:
         """Calculate total size of cache in bytes"""
@@ -217,7 +217,7 @@ class CacheManager:
                 # Evict this file
                 cache_path = self.get_cache_path(metadata.virtual_path)
                 with self._path_guard(metadata.virtual_path) as free:
-                    if not free or not cache_path.exists():
+                    if not free or regular_file_stat(cache_path) is None:
                         continue
                     try:
                         freed += self._evict_if_still_clean(metadata.virtual_path, cache_path)
@@ -246,10 +246,13 @@ class CacheManager:
 
                 cache_path = self.get_cache_path(metadata.virtual_path)
                 with self._path_guard(metadata.virtual_path) as free:
-                    if not free or not cache_path.exists():
+                    st = regular_file_stat(cache_path) if free else None
+                    if st is None:
+                        # Gone, or not a regular file: never truncate
+                        # through a link.
                         continue
                     try:
-                        file_size = cache_path.stat().st_size
+                        file_size = st.st_size
                         # Truncate to preserve xattrs
                         with open(cache_path, 'wb') as f:
                             f.truncate(0)
@@ -526,7 +529,7 @@ class CacheManager:
     ) -> bool:
         """Mirror file metadata into the cache file xattr when the cache entry exists."""
         target_path = cache_path or self.get_cache_path(virtual_path)
-        if not target_path.exists() or not target_path.is_file():
+        if regular_file_stat(target_path) is None:
             return False
 
         try:
@@ -538,7 +541,7 @@ class CacheManager:
     def flush_file(self, virtual_path: str):
         """Flush a cached file to ensure writes are synced"""
         cache_path = self.get_cache_path(virtual_path)
-        if cache_path.exists():
+        if regular_file_stat(cache_path) is not None:
             try:
                 # Open and sync file
                 with open(cache_path, 'rb') as f:
@@ -573,9 +576,11 @@ class CacheManager:
         """Delete a file from cache"""
         with self._lock:
             cache_path = self.get_cache_path(virtual_path)
-            if cache_path.exists():
+            if os.path.lexists(cache_path):
                 try:
-                    file_size = cache_path.stat().st_size
+                    # A link is removed, not followed; it was never counted.
+                    st = regular_file_stat(cache_path)
+                    file_size = st.st_size if st is not None else 0
                     cache_path.unlink()
                     self._current_size_bytes = max(0, self._current_size_bytes - file_size)
                 except OSError as e:
