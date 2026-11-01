@@ -252,13 +252,18 @@ class RemoteWatcher:
                     # The helper owns a duplicate descriptor, closed when it
                     # ends, so nothing can close one it is still reading.
                     announce_fd = os.dup(stderr_file.fileno())
-                    announcer = threading.Thread(
-                        target=self._announce_watches,
-                        args=(announce_fd, self._process, announce_done),
-                        name=f"WatcherReady-{self.backend_name}",
-                        daemon=True,
-                    )
-                    announcer.start()
+                    try:
+                        announcer = threading.Thread(
+                            target=self._announce_watches,
+                            args=(announce_fd, self._process, announce_done),
+                            name=f"WatcherReady-{self.backend_name}",
+                            daemon=True,
+                        )
+                        announcer.start()
+                    except BaseException:
+                        announcer = None
+                        os.close(announce_fd)
+                        raise
 
                 for line in self._process.stdout:
                     if self._stop_event.is_set():

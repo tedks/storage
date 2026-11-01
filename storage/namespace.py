@@ -143,7 +143,7 @@ class NamespaceService:
         # dropped after it began (_stat_dropped, bounded), or everything was
         # (_stat_floor: a subtree drop, a resync, or a trimmed record), so
         # writes elsewhere do not keep stat answers from being stored.
-        self._stat_memo: Dict[str, Dict[Optional[str], Tuple[float, dict]]] = {}
+        self._stat_memo: Dict[str, Dict[Optional[str], Tuple[float, dict, str]]] = {}
         self._stat_epoch = 0
         self._stat_dropped: Dict[str, int] = {}
         self._stat_floor = 0
@@ -329,6 +329,7 @@ class NamespaceService:
                               self._child_races):
                     table.clear()
                 self._stat_memo.clear()
+                self._stat_dropped.clear()
                 self._stat_epoch += 1
                 self._stat_floor = self._stat_epoch
 
@@ -365,9 +366,10 @@ class NamespaceService:
             if not self._answers_missing(entry[0], time.monotonic()):
                 self._drop_stat_memo_entry_locked(path, hint)
                 return None, epoch
-            return dict(entry[1]), epoch
+            return {**entry[1], "_answered_by": entry[2]}, epoch
 
-    def _stat_memo_put(self, path: str, hint: Optional[str], attrs: dict, epoch: int, at: float):
+    def _stat_memo_put(self, path: str, hint: Optional[str], attrs: dict, epoch: int, at: float,
+                       answered_by: str):
         with self.listing_lock:
             if (
                 self.readdir_snapshot_ttl <= 0
@@ -380,7 +382,7 @@ class NamespaceService:
             if existing is not None and existing[0] > at:
                 return  # a stat that began later was stored first
             by_hint = self._stat_memo.pop(path, {})
-            by_hint[hint] = (at, dict(attrs))
+            by_hint[hint] = (at, dict(attrs), answered_by)
             self._stat_memo[path] = by_hint  # most recently stored last
             while len(self._stat_memo) > self.stat_memo_limit:
                 del self._stat_memo[next(iter(self._stat_memo))]
@@ -754,13 +756,11 @@ class NamespaceService:
             # listed, would otherwise cost a member stat at every getattr.
             remembered, epoch = self._stat_memo_get(resolved.canonical_path, resolved.backend_name)
             if remembered is not None:
-                # Not for a member that is down: the hinted one, or (no hint,
-                # and the answering member not recorded) every member.
-                hinted = self.backends.get(resolved.backend_name) if resolved.backend_name else None
-                if (
-                    hinted.is_available() if hinted is not None
-                    else any(b.is_available() for b in self.backends.values())
-                ):
+                # Not for a member that is down, as a listing's attributes
+                # are not (see _listed_attrs): the answer is the answering
+                # member's.
+                answered_by = self.backends.get(remembered.pop("_answered_by"))
+                if answered_by is not None and answered_by.is_available():
                     return remembered
 
             for backend_name, backend in backend_iter:
@@ -790,7 +790,8 @@ class NamespaceService:
                         "st_uid": getattr(st, "st_uid", os.getuid()),
                     }
                     self._stat_memo_put(
-                        resolved.canonical_path, resolved.backend_name, answer, epoch, began)
+                        resolved.canonical_path, resolved.backend_name, answer, epoch, began,
+                        backend_name)
                     return answer
                 except Exception as backend_error:
                     self.logger.debug(
