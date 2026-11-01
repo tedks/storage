@@ -1394,6 +1394,8 @@ class StorageFS(Operations):
             members[backend.name] = (member_stat.st_size, member_stat.st_mtime)
         self._store_member_check(canonical_path, cache_path, identity, members, replace=True)
         self._clear_recheck(canonical_path, backend.name)
+        with self._member_checks_lock:
+            self._revalidate_unreachable.pop(canonical_path, None)
 
     def _record_member_written(self, virtual_path: str, backend: Backend, cache_path: Path,
                                checksum: Optional[str] = None):
@@ -1509,6 +1511,8 @@ class StorageFS(Operations):
         again, or revalidate_after has passed since it was recorded: the
         holder set can change meanwhile (a sync reaching another member),
         and the cached copy is no staler than the age allows anyway.
+        is_available() must stay a local flag read (every member's is): this
+        runs at every open of the path.
         """
         with self._member_checks_lock:
             entry = self._revalidate_unreachable.get(canonical_path)

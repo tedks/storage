@@ -196,13 +196,11 @@ class TestRevalidateOnOpen(RevalidateTestBase):
         self.member.set_available(False)
         self.age_checks()
         state = self.fs.state_manager
-        with patch.object(state, "get_file_locations", wraps=state.get_file_locations) as locs, \
-                patch.object(state, "get_file_metadata", wraps=state.get_file_metadata) as meta:
+        with patch.object(state, "get_file_locations", wraps=state.get_file_locations) as locs:
             for _ in range(5):
                 self.assertEqual(b"original", self.read_through("/f.txt"))
-            first = (locs.call_count, meta.call_count)
-        # One look at the index (the open's own metadata reads aside), not five.
-        self.assertEqual(1, first[0])
+        # One look at the index, not five.
+        self.assertEqual(1, locs.call_count)
         # The member answers again: the very next open revalidates.
         self.member.set_available(True)
         self.assertEqual(b"changed-and-longer", self.read_through("/f.txt"))
@@ -211,13 +209,16 @@ class TestRevalidateOnOpen(RevalidateTestBase):
     def test_unreachable_entry_expires_with_the_age(self):
         self.member.set_available(False)
         self.age_checks()
-        self.read_through("/f.txt")
-        since, names = self.fs._revalidate_unreachable["/f.txt"]
-        self.fs._revalidate_unreachable["/f.txt"] = (since - self.revalidate_after - 1, names)
         state = self.fs.state_manager
         with patch.object(state, "get_file_locations", wraps=state.get_file_locations) as locs:
             self.read_through("/f.txt")
-        self.assertEqual(1, locs.call_count)
+            self.read_through("/f.txt")
+            self.assertEqual(1, locs.call_count)
+            since, names = self.fs._revalidate_unreachable["/f.txt"]
+            self.fs._revalidate_unreachable["/f.txt"] = (
+                since - self.revalidate_after - 1, names)
+            self.read_through("/f.txt")
+        self.assertEqual(2, locs.call_count)
 
     def test_unreachable_entry_goes_with_the_cached_copy(self):
         self.member.set_available(False)
@@ -391,11 +392,12 @@ class TestRevalidateOnOpen(RevalidateTestBase):
         self.assertNotIn("/g.txt", self.fs._member_checks)
 
     def test_failed_rename_from_a_never_cached_source_keeps_the_targets_baselines(self):
+        before = os.getxattr(self.cache_dir / "f.txt", StorageFS.MEMBER_STAT_XATTR)
         with patch.object(self.fs.namespace, "rename", side_effect=OSError(5, "I/O error")):
             with self.assertRaises(OSError):
                 self.fs.rename("/never-cached.txt", "/f.txt")
         self.assertEqual({"member": (8, 1_700_000_000.0)}, self.fs._member_checks["/f.txt"].members)
-        os.getxattr(self.cache_dir / "f.txt", StorageFS.MEMBER_STAT_XATTR)
+        self.assertEqual(before, os.getxattr(self.cache_dir / "f.txt", StorageFS.MEMBER_STAT_XATTR))
 
     def test_rename_to_itself_keeps_check(self):
         self.fs._move_member_checks("/f.txt", "/f.txt")
@@ -780,7 +782,7 @@ class TestRevalidateStreamBail(RevalidateTestBase):
             self.assertEqual(b"changed on fast", self.read_through("/f.txt"))
         self.assertNotIn("/f.txt", self.fs._refetch_pins)
 
-    def test_recheck_mark_survives_a_stream_that_bails_after_selection(self):
+    def test_recheck_mark_survives_a_stream_that_bails_when_the_pinned_member_drops(self):
         self._cached_on_both()
         (self.fast_dir / "f.txt").write_bytes(b"changed on fast")
         self.age_checks()
