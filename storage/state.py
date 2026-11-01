@@ -66,8 +66,8 @@ class StateManager:
         INSERT INTO files
         (virtual_path, size, checksum, last_access, last_modified,
          sync_status, replica_count, recomputable, recompute_cmd,
-         encrypted, encryption_key_id, dirty_generation)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         encrypted, encryption_key_id, dirty_generation, link_target)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(virtual_path) DO UPDATE SET
             size = CASE WHEN files.dirty_generation > excluded.dirty_generation
                         THEN files.size ELSE excluded.size END,
@@ -77,6 +77,8 @@ class StateManager:
                                  THEN files.last_modified ELSE excluded.last_modified END,
             sync_status = CASE WHEN files.dirty_generation > excluded.dirty_generation
                                THEN files.sync_status ELSE excluded.sync_status END,
+            link_target = CASE WHEN files.dirty_generation > excluded.dirty_generation
+                               THEN files.link_target ELSE excluded.link_target END,
             dirty_generation = MAX(files.dirty_generation, excluded.dirty_generation),
             last_access = excluded.last_access,
             replica_count = excluded.replica_count,
@@ -165,7 +167,8 @@ class StateManager:
                 recompute_cmd TEXT,
                 encrypted INTEGER NOT NULL,
                 encryption_key_id TEXT,
-                dirty_generation INTEGER NOT NULL DEFAULT 0
+                dirty_generation INTEGER NOT NULL DEFAULT 0,
+                link_target TEXT
             );
 
             CREATE TABLE IF NOT EXISTS file_locations (
@@ -209,6 +212,10 @@ class StateManager:
             self.conn.execute(
                 'ALTER TABLE files ADD COLUMN dirty_generation INTEGER NOT NULL DEFAULT 0'
             )
+        # Likewise link_target (NULL: a regular file), from before links
+        # replicated.
+        if 'link_target' not in columns:
+            self.conn.execute('ALTER TABLE files ADD COLUMN link_target TEXT')
         self.conn.commit()
 
     def _flush_access_updates(self, force: bool = False):
@@ -260,6 +267,7 @@ class StateManager:
             encrypted=bool(row['encrypted']),
             encryption_key_id=row['encryption_key_id'],
             dirty_generation=row['dirty_generation'],
+            link_target=row['link_target'],
         )
 
     def set_file_metadata(self, metadata: FileMetadata):
@@ -539,6 +547,7 @@ class StateManager:
             int(metadata.encrypted),
             metadata.encryption_key_id,
             metadata.dirty_generation,
+            metadata.link_target,
         )
 
     @staticmethod
@@ -561,8 +570,8 @@ class StateManager:
             INSERT INTO {table_name}
             (virtual_path, size, checksum, last_access, last_modified,
              sync_status, replica_count, recomputable, recompute_cmd,
-             encrypted, encryption_key_id, dirty_generation)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             encrypted, encryption_key_id, dirty_generation, link_target)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''',
             rows,
         )
@@ -991,7 +1000,7 @@ class StateManager:
 
     def replace_index_from_entries(
         self,
-        entries: Iterable[Tuple[FileMetadata, FileLocation]],
+        entries: Iterable[Tuple[FileMetadata, Optional[FileLocation]]],
     ):
         """Replace the index from a streaming metadata/location entry source."""
         with self._access_lock:
@@ -1016,7 +1025,8 @@ class StateManager:
                         recompute_cmd TEXT,
                         encrypted INTEGER NOT NULL,
                         encryption_key_id TEXT,
-                        dirty_generation INTEGER NOT NULL DEFAULT 0
+                        dirty_generation INTEGER NOT NULL DEFAULT 0,
+                        link_target TEXT
                     )
                     '''
                 )
@@ -1037,7 +1047,8 @@ class StateManager:
                 location_batch: List[tuple] = []
                 for metadata, location in entries:
                     metadata_batch.append(self._metadata_row(metadata))
-                    location_batch.append(self._location_row(location))
+                    if location is not None:  # a link has no cache location row
+                        location_batch.append(self._location_row(location))
                     if len(metadata_batch) >= self.WRITE_BATCH_SIZE:
                         self._insert_metadata_rows_locked(metadata_batch, table_name="replacement_files")
                         self._insert_location_rows_locked(location_batch, table_name="replacement_file_locations")
@@ -1053,10 +1064,10 @@ class StateManager:
                     INSERT INTO files
                     (virtual_path, size, checksum, last_access, last_modified,
                      sync_status, replica_count, recomputable, recompute_cmd,
-                     encrypted, encryption_key_id, dirty_generation)
+                     encrypted, encryption_key_id, dirty_generation, link_target)
                     SELECT virtual_path, size, checksum, last_access, last_modified,
                            sync_status, replica_count, recomputable, recompute_cmd,
-                           encrypted, encryption_key_id, dirty_generation
+                           encrypted, encryption_key_id, dirty_generation, link_target
                     FROM replacement_files
                     '''
                 )
