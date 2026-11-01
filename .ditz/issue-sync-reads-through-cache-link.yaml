@@ -1,0 +1,21 @@
+id: sync-reads-through-cache-link
+title: Sync and replication read a cache entry through a symlink
+desc: 'From the PR #159 council (Claude nit 3). sync_executor (cache_path.exists(),
+  compute_checksum, copy_from_local) and replication.py (exists, copy_from_local)
+  follow a link at the cache path: a dirty row whose cache entry is a link uploads
+  the target''s bytes. Not reachable today (symlink() is refused; pre-#138 links had
+  no row). symlink-replication (lane symlinks PR 3) gives links index rows and must
+  sync them as links; it handles this there.'
+type: task
+component: sync
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-01T02:50:53-00:00
+references: []
+log_events:
+- time: 2026-11-01T02:50:53-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
