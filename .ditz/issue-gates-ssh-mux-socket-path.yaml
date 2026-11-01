@@ -6,7 +6,7 @@ type: bugfix
 component: gates
 release:
 reporter: Ted Smith <tedks@riseup.net>
-status: unstarted
+status: in_progress
 disposition:
 creation_time: 2026-11-01T02:57:11-00:00
 references: []
@@ -26,3 +26,7 @@ log_events:
     the unix-socket path length limit (_MAX_CONTROL_PATH) against the test tmp dir
     under all_gates. Not caused by #155. Needs investigation of the tmp dir the sandboxed
     test gets under all_gates.'
+- time: 2026-11-01T03:59:41-00:00
+  who: Ted Smith
+  what: started
+  comment: ""
