@@ -11,8 +11,8 @@ type: task
 component: fs
 release:
 reporter: Ted Smith <tedks@riseup.net>
-status: unstarted
-disposition:
+status: closed
+disposition: fixed
 creation_time: 2026-10-30T01:10:25-00:00
 references: []
 log_events:
@@ -20,3 +20,7 @@ log_events:
   who: Ted Smith
   what: created
   comment: ""
+- time: 2026-11-01T02:48:30-00:00
+  who: Ted Smith
+  what: 'closed: fixed'
+  comment: PR 157 merged 1028e99 (head c0e2f03).
