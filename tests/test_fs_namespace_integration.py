@@ -1249,6 +1249,16 @@ class TestFSNamespaceIntegration(unittest.TestCase):
         namespace._stat_memo_put('/a', None, {"st_size": 1}, epoch, time.monotonic())
         self.assertIsNone(namespace._stat_memo_get('/a', None)[0])
 
+    def test_remembered_stat_is_not_served_when_every_member_is_down(self):
+        (self.backend1_dir / "deep").mkdir()
+        self.fs.namespace.readdir_snapshot_ttl = 60.0
+        self.fs.getattr('/deep')
+        with patch.object(self.backends["backend1"], "is_available", return_value=False), \
+                patch.object(self.backends["backend2"], "is_available", return_value=False):
+            with self.assertRaises(FuseOSError) as caught:
+                self.fs.getattr('/deep')
+        self.assertEqual(caught.exception.errno, errno.EHOSTUNREACH)
+
     def test_stat_memo_is_bounded(self):
         namespace = self.fs.namespace
         namespace.readdir_snapshot_ttl = 60.0

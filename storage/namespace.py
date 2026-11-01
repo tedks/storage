@@ -754,8 +754,13 @@ class NamespaceService:
             # listed, would otherwise cost a member stat at every getattr.
             remembered, epoch = self._stat_memo_get(resolved.canonical_path, resolved.backend_name)
             if remembered is not None:
+                # Not for a member that is down: the hinted one, or (no hint,
+                # and the answering member not recorded) every member.
                 hinted = self.backends.get(resolved.backend_name) if resolved.backend_name else None
-                if hinted is None or hinted.is_available():
+                if (
+                    hinted.is_available() if hinted is not None
+                    else any(b.is_available() for b in self.backends.values())
+                ):
                     return remembered
 
             for backend_name, backend in backend_iter:
