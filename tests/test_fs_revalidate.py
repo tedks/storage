@@ -191,6 +191,69 @@ class TestRevalidateOnOpen(RevalidateTestBase):
             self.assertEqual(2, stat.call_count)
         self.assertEqual(1, sum("Cannot revalidate" in line for line in logs.output))
 
+    def test_unreachable_holders_skip_the_index_until_one_returns(self):
+        self.rewrite_member("f.txt", b"changed-and-longer")
+        self.member.set_available(False)
+        self.age_checks()
+        state = self.fs.state_manager
+        with patch.object(state, "get_file_locations", wraps=state.get_file_locations) as locs, \
+                patch.object(state, "get_file_metadata", wraps=state.get_file_metadata) as meta:
+            for _ in range(5):
+                self.assertEqual(b"original", self.read_through("/f.txt"))
+            first = (locs.call_count, meta.call_count)
+        # One look at the index (the open's own metadata reads aside), not five.
+        self.assertEqual(1, first[0])
+        # The member answers again: the very next open revalidates.
+        self.member.set_available(True)
+        self.assertEqual(b"changed-and-longer", self.read_through("/f.txt"))
+        self.assertNotIn("/f.txt", self.fs._revalidate_unreachable)
+
+    def test_unreachable_entry_expires_with_the_age(self):
+        self.member.set_available(False)
+        self.age_checks()
+        self.read_through("/f.txt")
+        since, names = self.fs._revalidate_unreachable["/f.txt"]
+        self.fs._revalidate_unreachable["/f.txt"] = (since - self.revalidate_after - 1, names)
+        state = self.fs.state_manager
+        with patch.object(state, "get_file_locations", wraps=state.get_file_locations) as locs:
+            self.read_through("/f.txt")
+        self.assertEqual(1, locs.call_count)
+
+    def test_unreachable_entry_goes_with_the_cached_copy(self):
+        self.member.set_available(False)
+        self.age_checks()
+        self.read_through("/f.txt")
+        self.assertIn("/f.txt", self.fs._revalidate_unreachable)
+        self.fs.unlink("/f.txt")
+        self.assertNotIn("/f.txt", self.fs._revalidate_unreachable)
+
+    def test_revalidation_stat_runs_as_an_interactive_request(self):
+        # The short per-call timeout (connect_timeout, not the bulk
+        # operation timeout) applies to pooled members only for interactive
+        # requests; every FUSE op is one, whatever the loop mode.
+        from storage.backends.base import is_interactive_request
+        seen = []
+        real_stat = self.member.stat
+
+        def stat(path):
+            seen.append(is_interactive_request())
+            return real_stat(path)
+
+        self.age_checks()
+        with patch.object(self.member, "stat", side_effect=stat):
+            fd = self.fs("open", "/f.txt", os.O_RDONLY)
+            self.fs("release", "/f.txt", fd)
+        self.assertEqual([True], seen)
+
+    def test_stalled_stat_serves_the_cached_copy_once_per_age(self):
+        import socket
+        self.rewrite_member("f.txt", b"changed-and-longer")
+        self.age_checks()
+        with patch.object(self.member, "stat", side_effect=socket.timeout("timed out")) as stat:
+            self.assertEqual(b"original", self.read_through("/f.txt"))
+            self.assertEqual(b"original", self.read_through("/f.txt"))
+        self.assertEqual(1, stat.call_count)
+
     def test_member_without_the_file_keeps_cached_copy(self):
         self.member_file.unlink()
         self.age_checks()
@@ -326,6 +389,13 @@ class TestRevalidateOnOpen(RevalidateTestBase):
             os.getxattr(self.cache_dir / "g.txt", StorageFS.MEMBER_STAT_XATTR)
         self.assertNotIn("/f.txt", self.fs._member_checks)
         self.assertNotIn("/g.txt", self.fs._member_checks)
+
+    def test_failed_rename_from_a_never_cached_source_keeps_the_targets_baselines(self):
+        with patch.object(self.fs.namespace, "rename", side_effect=OSError(5, "I/O error")):
+            with self.assertRaises(OSError):
+                self.fs.rename("/never-cached.txt", "/f.txt")
+        self.assertEqual({"member": (8, 1_700_000_000.0)}, self.fs._member_checks["/f.txt"].members)
+        os.getxattr(self.cache_dir / "f.txt", StorageFS.MEMBER_STAT_XATTR)
 
     def test_rename_to_itself_keeps_check(self):
         self.fs._move_member_checks("/f.txt", "/f.txt")
@@ -643,6 +713,98 @@ class TestRevalidateStreamedFetch(RevalidateTestBase):
         self.assertEqual({"member": (len(old), 1_700_000_000.0)}, check.members)
         self.age_checks()
         self.assertEqual(new, self.read_through("/m.bin"))
+
+
+class TestRevalidateStreamBail(RevalidateTestBase):
+    """A stream that selects the pinned member and then bails to a full fetch."""
+
+    def _make_fs(self, start_sync=False):
+        fast_dir = self.temp_dir / "fast"
+        fast_dir.mkdir(exist_ok=True)
+        self.fast_dir = fast_dir
+        self.fast = LocalBackend("fast", str(fast_dir))
+        self.member.speed_priority = 50
+        self.fast.speed_priority = 0
+        return StorageFS(
+            cache_root=self.cache_dir, state_db=self.db_path,
+            backends={"member": self.member, "fast": self.fast},
+            cache_size=10 * 1024 * 1024, num_sync_workers=1, start_sync=start_sync,
+            streaming_reads=True, streaming_chunk_size=4096,
+            revalidate_after=self.revalidate_after,
+        )
+
+    def tearDown(self):
+        self.fs.destroy("/")
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _cached_on_both(self):
+        from storage.models import FileLocation
+        for d in (self.fast_dir, self.member_dir):
+            (d / "f.txt").write_bytes(b"original")
+            os.utime(d / "f.txt", (1_700_000_000, 1_700_000_000))
+        self.assertEqual(b"original", self.read_through("/f.txt"))
+        # The first read streamed; wait for the finished stream to be cached.
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            check = self.fs._member_checks.get("/f.txt")
+            if check is not None and check.members:
+                break
+            time.sleep(0.05)
+        else:
+            self.fail("stream never recorded a baseline")
+        for name in ("member", "fast"):
+            self.fs.state_manager.add_file_location(FileLocation(
+                virtual_path="/f.txt", backend_name=name, checksum="",
+                last_synced=time.time(), is_cached=False))
+
+    def test_selection_is_idempotent_within_one_open(self):
+        self._cached_on_both()
+        with self.fs._member_checks_lock:
+            self.fs._refetch_pins["/f.txt"] = self.member
+        # The stream's selection and the fallback's both see the pin, even
+        # though the unpinned order would prefer "fast".
+        self.assertIs(self.member, self.fs._select_backend_for_read("/f.txt"))
+        self.assertIs(self.member, self.fs._select_backend_for_read("/f.txt"))
+        self.fs.release("/f.txt", self.fs.open("/f.txt", os.O_RDONLY))
+        self.assertNotIn("/f.txt", self.fs._refetch_pins)
+
+    def test_stream_bailing_to_the_fallback_still_fetches_from_the_pinned_member(self):
+        self._cached_on_both()
+        (self.fast_dir / "f.txt").write_bytes(b"changed on fast")
+        self.age_checks()
+        # The unpinned order would now choose "member" (old bytes): only the
+        # pin, carried into the fallback, brings in the checked member's.
+        with patch.object(self.fast, "supports_range_reads", return_value=False), \
+                patch.object(self.fs.replication_manager, "get_backend_for_read",
+                             return_value=self.member):
+            self.assertEqual(b"changed on fast", self.read_through("/f.txt"))
+        self.assertNotIn("/f.txt", self.fs._refetch_pins)
+
+    def test_recheck_mark_survives_a_stream_that_bails_after_selection(self):
+        self._cached_on_both()
+        (self.fast_dir / "f.txt").write_bytes(b"changed on fast")
+        self.age_checks()
+        real_stat = self.fast.stat
+
+        def stat_then_drop(path):
+            result = real_stat(path)
+            self.fast.set_available(False)
+            return result
+
+        with patch.object(self.fast, "stat", side_effect=stat_then_drop), \
+                patch.object(self.member, "supports_range_reads", return_value=False):
+            # The slower member supplies its older bytes through the fallback.
+            self.assertEqual(b"original", self.read_through("/f.txt"))
+        self.assertEqual({"fast"}, self.fs._recheck["/f.txt"])
+        self.assertNotIn("/f.txt", self.fs._refetch_pins)
+        self.fast.set_available(True)
+        self.age_checks()
+        self.assertEqual(b"changed on fast", self.read_through("/f.txt"))
+        # Streamed this time: the mark clears when the stream finishes.
+        deadline = time.monotonic() + 10
+        while "/f.txt" in self.fs._recheck and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertNotIn("/f.txt", self.fs._recheck)
 
 
 if __name__ == "__main__":

@@ -214,12 +214,18 @@ class StorageFS(Operations):
         # duplicate or missed log line.
         self._revalidate_outages: Set[str] = set()
         # A check that found a change pins the refetch to the member it
-        # checked (consumed by _select_backend_for_read). If that member is
+        # checked (read by _select_backend_for_read, dropped when open()
+        # ends). If that member is
         # gone by then and another supplies the bytes, its name is kept in
         # _recheck so its next check refetches again instead of adopting the
         # change as a baseline. Both under _member_checks_lock.
         self._refetch_pins: Dict[str, Backend] = {}
         self._recheck: Dict[str, Set[str]] = {}
+        # Paths whose holders were all unavailable at the last open past the
+        # age: (monotonic time, holder names). Later opens skip the index
+        # queries until one of those holders answers again or the age
+        # passes. Under _member_checks_lock.
+        self._revalidate_unreachable: Dict[str, Tuple[float, Tuple[str, ...]]] = {}
 
         # Background sync manager
         self.sync_manager = SyncManager(
@@ -1154,10 +1160,13 @@ class StorageFS(Operations):
         """Pick a readable backend, preferring existing replication metadata.
 
         A refetch after revalidation reads from the member that was checked
-        (see _revalidate_cached_file) while it is available.
+        (see _revalidate_cached_file) while it is available. The pin stays
+        until open() ends, so selection is idempotent within one open: a
+        stream that bails out after selecting and the full-file fallback
+        both honour it.
         """
         with self._member_checks_lock:
-            pinned = self._refetch_pins.pop(canonical_path, None)
+            pinned = self._refetch_pins.get(canonical_path)
         if pinned is not None and pinned.is_available():
             # The recheck mark stays until the bytes arrive (_record_fetched,
             # for a full fetch or a finished stream); a transfer that fails
@@ -1217,7 +1226,7 @@ class StorageFS(Operations):
         keeps them, since they are about the members, not the copy.
         """
         prefix = virtual_path.rstrip("/") + "/"
-        tables = [self._member_checks]
+        tables = [self._member_checks, self._revalidate_unreachable]
         if path_gone:
             tables += [self._refetch_pins, self._recheck]
         with self._member_checks_lock:
@@ -1257,7 +1266,8 @@ class StorageFS(Operations):
         old_prefix = old.rstrip("/") + "/"
         new_prefix = new.rstrip("/") + "/"
         with self._member_checks_lock:
-            for table in (self._member_checks, self._refetch_pins, self._recheck):
+            for table in (self._member_checks, self._refetch_pins, self._recheck,
+                          self._revalidate_unreachable):
                 for key in [k for k in table if k == new or k.startswith(new_prefix)]:
                     del table[key]
                 moved = {}
@@ -1368,6 +1378,11 @@ class StorageFS(Operations):
         than the copy, which costs one needless refetch at the next check;
         the other order could pair a new baseline with old bytes and never
         see the change.
+
+        Also called off the FUSE thread, from a stream's on_finalized. It can
+        then land after the FUSE thread's own refetch of the same path and
+        install the older stream-start baseline over the newer one. That is
+        conservative: the next check sees a difference and refetches once.
         """
         try:
             identity = self._cache_identity(os.lstat(str(cache_path)))
@@ -1487,6 +1502,28 @@ class StorageFS(Operations):
             backend_name, reason,
         )
 
+    def _holders_still_unreachable(self, canonical_path: str) -> bool:
+        """True while the last revalidation found every holder unavailable.
+
+        Ends (and forgets the entry) when any of those holders is available
+        again, or revalidate_after has passed since it was recorded: the
+        holder set can change meanwhile (a sync reaching another member),
+        and the cached copy is no staler than the age allows anyway.
+        """
+        with self._member_checks_lock:
+            entry = self._revalidate_unreachable.get(canonical_path)
+        if entry is None:
+            return False
+        since, names = entry
+        if time.monotonic() - since < self._revalidate_after:
+            backends = [self.backends.get(name) for name in names]
+            if not any(b is None or b.is_available() for b in backends):
+                return True
+        with self._member_checks_lock:
+            if self._revalidate_unreachable.get(canonical_path) is entry:
+                del self._revalidate_unreachable[canonical_path]
+        return False
+
     def _revalidate_cached_file(self, resolved: ResolvedPath):
         """Refetch a CLEAN cached file whose member copy changed.
 
@@ -1528,6 +1565,8 @@ class StorageFS(Operations):
             check = self._member_checks.get(canonical_path)
         if check is not None and time.monotonic() - check.verified_at < self._revalidate_after:
             return
+        if self._holders_still_unreachable(canonical_path):
+            return
 
         metadata = self.state_manager.get_file_metadata(canonical_path)
         if metadata is None or metadata.sync_status != SyncStatus.CLEAN:
@@ -1544,10 +1583,15 @@ class StorageFS(Operations):
 
         backend, unavailable = self._member_for_revalidation(canonical_path)
         if backend is None:
-            # Nothing is recorded as checked, so the next open looks again;
-            # with no available holder that costs no remote call.
+            # Not recorded as checked: the first open after a holder
+            # answers again must revalidate. Until then (or until the age
+            # passes) opens skip the index queries too.
             for name in unavailable:
                 self._note_revalidation_outage(name, "unavailable")
+            if unavailable:
+                with self._member_checks_lock:
+                    self._revalidate_unreachable[canonical_path] = (
+                        time.monotonic(), tuple(unavailable))
             return
 
         try:
@@ -2019,6 +2063,9 @@ class StorageFS(Operations):
     def _rename(self, old, new):
         old_canonical = self._resolve_path(old).canonical_path
         new_canonical = self._resolve_path(new).canonical_path
+        # A source the cache never held cannot have moved into the target:
+        # the target's baselines are about the copy that was already there.
+        old_was_cached = os.path.lexists(self.cache_manager.get_cache_path(old_canonical))
         try:
             self.namespace.rename(old, new, on_local_moved=lambda: self._repoint_descriptors(old, new))
         except BaseException:
@@ -2028,7 +2075,7 @@ class StorageFS(Operations):
             # did not move, they still describe this path and stay.
             old_cache = self.cache_manager.get_cache_path(old_canonical)
             new_cache = self.cache_manager.get_cache_path(new_canonical)
-            if not os.path.lexists(old_cache) and os.path.lexists(new_cache):
+            if old_was_cached and not os.path.lexists(old_cache) and os.path.lexists(new_cache):
                 self._forget_member_check(old_canonical, subtree=True, path_gone=True)
                 self._forget_member_check(new_canonical, subtree=True, path_gone=True)
                 self._drop_persisted_baselines(new_canonical)
@@ -2109,8 +2156,16 @@ class StorageFS(Operations):
 
     def open(self, path, flags):
         """Open a file"""
-        with self._path_locked(self._resolve_path(path).canonical_path):
-            return self._open(path, flags)
+        canonical_path = self._resolve_path(path).canonical_path
+        with self._path_locked(canonical_path):
+            try:
+                return self._open(path, flags)
+            finally:
+                # The pin belongs to this open (_select_backend_for_read):
+                # one no fetch used (the open attached to a running stream,
+                # or the file was kept) must not steer a later fetch.
+                with self._member_checks_lock:
+                    self._refetch_pins.pop(canonical_path, None)
 
     def _open(self, path, flags):
         """Open a file"""
