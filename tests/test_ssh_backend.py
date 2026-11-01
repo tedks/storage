@@ -1381,7 +1381,7 @@ class TestSSHBackendOnThePool(_BackendTestCase):
         def slow(client, path):
             raise socket.timeout()
         self.server.hooks["posix_rename"] = slow
-        with self.assertRaises(OSError):
+        with self.assertRaises(socket.timeout):
             self._new_backend().rename("/a", "/b")
         self.assertNotIn("rename", [name for name, *_ in self.server.requests])
 
