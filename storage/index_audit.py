@@ -1,5 +1,6 @@
 """Cache/index rebuild and verification tooling."""
 
+import errno
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 import stat as stat_module
@@ -11,8 +12,10 @@ from .cache_metadata import (
     cache_file_would_be_scanned,
     regular_file_stat,
     scan_cache_entries,
+    scan_cache_links,
     write_cache_metadata,
 )
+from .links import link_checksum
 from .models import FileLocation, FileMetadata, SyncStatus
 from .state import StateManager
 
@@ -42,6 +45,7 @@ class RebuildIndexReport:
     inferred_metadata_files: int = 0
     normalized_xattrs: int = 0
     skipped_files: int = 0
+    rebuilt_links: int = 0
     issue_count: int = 0
     issues: List[IndexIssue] = field(default_factory=list)
 
@@ -49,6 +53,7 @@ class RebuildIndexReport:
         return {
             "scanned_files": self.scanned_files,
             "rebuilt_files": self.rebuilt_files,
+            "rebuilt_links": self.rebuilt_links,
             "inferred_metadata_files": self.inferred_metadata_files,
             "normalized_xattrs": self.normalized_xattrs,
             "skipped_files": self.skipped_files,
@@ -293,6 +298,28 @@ def rebuild_index_from_cache(cache_root: Path, state_manager: StateManager) -> R
 
             yield metadata, cache_location
 
+        # Links made through the mount: the cache link is the record (it can
+        # carry no xattr). Each comes back DIRTY, so the next sync places it
+        # again on the members holding its target and records its
+        # locations; a member that already has the same link counts as done.
+        for virtual_path, target, st in scan_cache_links(cache_root):
+            legacy = state_manager.get_file_metadata(virtual_path)
+            yield FileMetadata(
+                virtual_path=virtual_path,
+                size=st.st_size,
+                checksum=None,
+                last_access=st.st_atime,
+                last_modified=st.st_mtime,
+                sync_status=SyncStatus.DIRTY,
+                replica_count=legacy.replica_count if legacy else 1,
+                recomputable=False,
+                recompute_cmd=None,
+                encrypted=False,
+                encryption_key_id=None,
+                link_target=target,
+            ), None
+            report.rebuilt_links += 1
+
     state_manager.replace_index_from_entries(replacement_entries())
     report.issue_count = len(report.issues)
     return report
@@ -411,6 +438,44 @@ def reprobe_member_locations(
         member_failed = False
 
         for metadata in state_manager.iter_file_metadata():
+            if metadata.link_target is not None:
+                # A link made through the mount: the member holds it when its
+                # link there has the same target (compared by string, never
+                # by what it points at).
+                try:
+                    member_target = backend.readlink(metadata.virtual_path)
+                except FileNotFoundError:
+                    replaceable_paths.append(metadata.virtual_path)
+                    continue
+                except Exception as exc:
+                    if isinstance(exc, OSError) and exc.errno == errno.EINVAL:
+                        member_target = None
+                    else:
+                        issue_kind = ("member_unavailable" if not backend.is_available()
+                                      else "member_probe_error")
+                        if issue_kind == "member_unavailable":
+                            report.members_unavailable += 1
+                        report.issues.append(IndexIssue(
+                            kind=issue_kind, virtual_path=metadata.virtual_path,
+                            detail=f"{backend.name}: {exc}",
+                        ))
+                        member_failed = True
+                        break
+                replaceable_paths.append(metadata.virtual_path)
+                if member_target != metadata.link_target:
+                    report.issues.append(IndexIssue(
+                        kind="member_link_mismatch", virtual_path=metadata.virtual_path,
+                        detail=f"{backend.name}: not this link",
+                    ))
+                    continue
+                found_locations.append(FileLocation(
+                    virtual_path=metadata.virtual_path,
+                    backend_name=backend.name,
+                    checksum=link_checksum(metadata.link_target),
+                    last_synced=time.time(),
+                    is_cached=False,
+                ))
+                continue
             try:
                 stat_result = backend.stat(metadata.virtual_path)
             except FileNotFoundError:
