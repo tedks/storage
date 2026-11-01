@@ -24,3 +24,12 @@ log_events:
   who: Ted Smith
   what: created
   comment: ""
+- time: 2026-11-01T02:51:54-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Claude seat, PR #159 round 2: the ''only someone who can write the cache''
+    argument has one more path to record: before #138 the mount itself could create
+    links, and a background worker could reach cache_root/d/x if an index row for
+    /d/x outlived a directory d later replaced by a link (an evicted child keeps its
+    row). The namespace''s rmdir/rename row checks (508b42b) are believed to refuse
+    removing a directory that still has rows, which closes this; verify when fixing.'
