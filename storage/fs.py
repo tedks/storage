@@ -2485,8 +2485,13 @@ class StorageFS(Operations):
         member's listing or lstat) is answered from the members in the
         order getattr asks them, so readlink describes the copy getattr
         did: the first available member holding the name decides, and a
-        name there that is not a link is EINVAL. A conflict view
-        (`name.<member>`) asks only that member.
+        name there that is not a link is EINVAL. A member that fails for
+        any other reason is passed over, as getattr passes it over. A
+        conflict view (`name.<member>`) asks only that member.
+
+        Only a missing cache path falls back to the members; any other
+        error from the cache (EINVAL for a cached file, ENOTDIR under one)
+        describes the cached copy, which getattr reports first.
         """
         resolved = self._resolve_path(path)
         try:
@@ -2511,17 +2516,17 @@ class StorageFS(Operations):
                 continue
             try:
                 return backend.readlink(resolved.canonical_path)
-            except FileNotFoundError:
-                continue
             except Exception as e:
-                # An answer about the path (EINVAL: not a link) decides, as
-                # getattr's member did; a member that could not be asked
-                # (or cannot readlink) is passed over, as getattr does.
-                if isinstance(e, OSError) and e.errno and not is_connection_error(e) \
-                        and e.errno != errno.ENOSYS:
-                    raise FuseOSError(e.errno)
-                self.logger.debug("readlink on member %s failed: %r", name, e)
-                unreachable = True
+                if isinstance(e, OSError) and e.errno == errno.EINVAL:
+                    # The member holds the name and it is not a link: it
+                    # decides, as the copy getattr reported.
+                    raise FuseOSError(errno.EINVAL)
+                if is_connection_error(e):
+                    unreachable = True
+                elif not isinstance(e, FileNotFoundError):
+                    # ENOSYS, EACCES, EIO: getattr's lstat would have passed
+                    # this member over too.
+                    self.logger.debug("readlink on member %s failed: %r", name, e)
         raise FuseOSError(errno.EHOSTUNREACH if unreachable else errno.ENOENT)
 
     # Symlinks are refused until they replicate (ruling

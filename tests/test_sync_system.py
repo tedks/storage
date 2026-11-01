@@ -450,7 +450,10 @@ class TestMemberSymlinks(_MountedCase):
         (self.backend1_dir / "links" / "link.txt").symlink_to("../data/target.txt")
         m = self.mount_dir
 
-        # Fresh lookup (no listing) and listed lookup both report the link.
+        # A lookup before any listing (the member lstat), then after one
+        # (the kernel may answer the second from its own attribute cache;
+        # the listed path is covered without a mount in
+        # test_fs_namespace_integration).
         st = os.lstat(m / "links" / "link.txt")
         self.assertTrue(stat.S_ISLNK(st.st_mode), oct(st.st_mode))
         self.assertIn("link.txt", os.listdir(m / "links"))

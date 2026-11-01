@@ -275,11 +275,15 @@ its address are not grouped and get no warning.
 Symbolic links cannot be created through the mount: `ln -s` fails with
 `EPERM` ("Operation not permitted"), because a link would live only in the
 local cache and vanish with it, so `cp -a`, `rsync -l` or `tar x` into the
-mount fail for each link. Links that already exist on a member are not
-supported either: an SSH member reports the link's target, so the name
-shows as a regular file or directory (a dangling link is listed but
-cannot be stat'ed); a local member reports the link itself, which the
-mount lists but cannot follow or read (`readlink` fails with `ENOENT`).
+mount fail for each link. Links that already exist on a member show as
+links on every kind of member: `ls -l` shows the arrow, `readlink` answers
+from the member, and the kernel resolves the target on the client, through
+the mount for a relative target that stays inside it. An absolute target,
+or a relative one that climbs out of the mount, resolves against the
+client's own filesystem, not the member's (as over NFS or sshfs), so such a
+link on an SSH member no longer shows as the directory or file it names on
+that host. A name that was cached before this changed keeps its cached
+view until it is evicted.
 
 #### SSH host keys
 

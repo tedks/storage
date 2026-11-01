@@ -244,12 +244,13 @@ class Backend(ABC):
         """Get full stat info for a path"""
         raise NotImplementedError
 
-    def lstat(self, virtual_path: str):
+    def lstat(self, virtual_path: str) -> os.stat_result:
         """Stat a path without following a symlink at its last component.
 
         getattr reports a member's link as a link, as a listing (lstat on
-        every member) does. Backends whose stat already does not follow
-        links inherit this.
+        every member) does. This default delegates to stat, which is right
+        only for a backend whose stat does not follow links; one whose stat
+        follows them (SSH) must override it.
         """
         return self.stat(virtual_path)
 

@@ -1379,6 +1379,31 @@ class TestSSHBackendLinks(_BackendTestCase):
         self.assertEqual(raised.exception.errno, errno.EINVAL)
         self.assertNotIsInstance(raised.exception, FileNotFoundError)
 
+    def test_readlink_failure_on_a_link_is_eio_not_einval(self):
+        # An errno-less failure that is not "not a link" (the lstat says it
+        # is one) stays a failure.
+        self.server.links["/data/link"] = "t"
+
+        def fail(_client, _path):
+            raise OSError("Failure")
+
+        self.server.hooks["readlink"] = fail
+        backend = self._new_backend()
+        with self.assertRaises(OSError) as raised:
+            backend.readlink("/link")
+        self.assertEqual(raised.exception.errno, errno.EIO)
+
+    def test_readlink_connection_error_is_not_einval(self):
+        def drop(_client, _path):
+            raise OSError("Socket is closed")
+
+        self.server.hooks["readlink"] = drop
+        backend = self._new_backend()
+        with self.assertRaises(OSError) as raised:
+            backend.readlink("/plain.txt")
+        self.assertNotEqual(raised.exception.errno, errno.EINVAL)
+        self.assertTrue(is_connection_error(raised.exception))
+
     def test_readlink_of_a_missing_path_is_enoent(self):
         self.server.missing.add("/data/gone")
         backend = self._new_backend()

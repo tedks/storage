@@ -608,18 +608,22 @@ class SSHBackend(Backend):
     def readlink(self, virtual_path: str) -> str:
         """The link's target, from SFTP readlink (rsync members use it too).
 
-        sftp-server answers readlink of a non-link with a generic failure
-        (paramiko raises it without an errno); that is reported as EINVAL,
-        as readlink(2) does. A missing path keeps paramiko's ENOENT.
+        sftp-server answers readlink of a non-link with a status paramiko
+        raises without an errno, as it does other failures (EIO on the
+        member); an lstat tells them apart: a path that is there and not a
+        link is EINVAL, as readlink(2) gives, and anything else keeps the
+        failure as EIO. A missing path keeps paramiko's ENOENT.
         """
         remote_path = str(self._resolve_path(virtual_path))
         try:
             target = self._with_sftp("readlink", virtual_path,
                                      lambda sftp: sftp.readlink(remote_path), retry=True)
         except OSError as exc:
-            if exc.errno is None and not is_connection_error(exc):
+            if exc.errno is not None or is_connection_error(exc):
+                raise
+            if not stat_module.S_ISLNK(self.lstat(virtual_path).st_mode):
                 raise OSError(errno.EINVAL, "not a symlink", virtual_path) from exc
-            raise
+            raise OSError(errno.EIO, f"readlink failed: {exc}", virtual_path) from exc
         if target is None:
             raise OSError(errno.EINVAL, "not a symlink", virtual_path)
         if isinstance(target, bytes):

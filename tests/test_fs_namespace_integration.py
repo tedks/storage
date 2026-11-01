@@ -316,11 +316,13 @@ class TestFSNamespaceIntegration(unittest.TestCase):
         list(self.fs.readdir('/', None))
 
         member = self.backends["backend1"]
-        with patch.object(member, "stat", side_effect=AssertionError("stat")), \
-                patch.object(member, "lstat", side_effect=AssertionError("lstat")):
+        with patch.object(member, "stat", wraps=member.stat) as member_stat, \
+                patch.object(member, "lstat", wraps=member.lstat) as member_lstat:
             attrs = self.fs.getattr('/link.txt')
         self.assertTrue(stat.S_ISLNK(attrs['st_mode']))
         self.assertEqual(attrs['st_size'], len("target.txt"))
+        member_stat.assert_not_called()
+        member_lstat.assert_not_called()
 
     def test_getattr_without_a_listing_lstats_the_member(self):
         # A member whose stat follows links (SSH) must still report the link.
@@ -363,8 +365,24 @@ class TestFSNamespaceIntegration(unittest.TestCase):
 
     def test_readlink_of_a_conflict_view_asks_only_that_member(self):
         (self.backend1_dir / "name").symlink_to("one")
-        (self.backend2_dir / "name").symlink_to("two")
-        self.assertEqual(self.fs.readlink('/name.backend2'), "two")
+        (self.backend2_dir / "name").symlink_to("the second")
+        self.assertEqual(self.fs.readlink('/name.backend2'), "the second")
+        self.assertEqual(self.fs.readlink('/name.backend1'), "one")
+
+    def test_readlink_passes_over_a_member_failing_otherwise(self):
+        # As getattr's lstat would: EACCES or ENOSYS on one member is not an
+        # answer about the name, and a member that cannot readlink is not
+        # unreachable.
+        (self.backend2_dir / "link").symlink_to("there")
+        first = self.backends["backend1"]
+        for error in (PermissionError(errno.EACCES, "denied"), OSError(errno.ENOSYS, "no")):
+            with patch.object(first, "readlink", side_effect=error):
+                self.assertEqual(self.fs.readlink('/link'), "there")
+        (self.backend2_dir / "link").unlink()
+        with patch.object(first, "readlink", side_effect=OSError(errno.ENOSYS, "no")):
+            with self.assertRaises(FuseOSError) as raised:
+                self.fs.readlink('/link')
+        self.assertEqual(raised.exception.errno, errno.ENOENT)
 
     def test_readlink_of_a_missing_name_is_enoent(self):
         with self.assertRaises(FuseOSError) as raised:
