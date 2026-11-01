@@ -44,12 +44,14 @@ class TestControlSockets(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.tmp = Path(self._tmp.name)
-        self.parent = self.tmp / "run"
-        self.parent.mkdir()
+        # A socket base must be short whatever TMPDIR is (bazel's is long),
+        # so it is made under /tmp, not under self.tmp.
+        self.parent = Path(tempfile.mkdtemp(prefix="sm", dir="/tmp"))
+        self.addCleanup(shutil.rmtree, self.parent, True)
         self.fake = _FakeSSH(self.tmp)
 
     def _sockets(self, **kwargs):
-        sockets = ControlSockets(parent_dir=self.parent, ssh=str(self.fake.path), **kwargs)
+        sockets = ControlSockets(base_dirs=[self.parent], ssh=str(self.fake.path), **kwargs)
         self.addCleanup(sockets.close)
         return sockets
 
@@ -113,7 +115,7 @@ class TestControlSockets(unittest.TestCase):
     def test_a_socket_nobody_answers_for_is_unlinked(self):
         (self.tmp / "silent").mkdir()
         fake = _FakeSSH(self.tmp / "silent", exit_code=255)
-        sockets = ControlSockets(parent_dir=self.parent, ssh=str(fake.path))
+        sockets = ControlSockets(base_dirs=[self.parent], ssh=str(fake.path))
         self.addCleanup(sockets.close)
         path = self._control_path(sockets.options("u", "h", 22, None))
         path.write_text("")
@@ -123,7 +125,7 @@ class TestControlSockets(unittest.TestCase):
     def test_a_socket_another_master_bound_meanwhile_is_not_unlinked(self):
         (self.tmp / "racing").mkdir()
         fake = _FakeSSH(self.tmp / "racing", exit_code=255, replace_socket=True)
-        sockets = ControlSockets(parent_dir=self.parent, ssh=str(fake.path))
+        sockets = ControlSockets(base_dirs=[self.parent], ssh=str(fake.path))
         self.addCleanup(sockets.close)
         path = self._control_path(sockets.options("u", "h", 22, None))
         path.write_text("")
@@ -161,43 +163,105 @@ class TestControlSockets(unittest.TestCase):
     def test_percent_in_the_path_is_escaped_for_ssh(self):
         odd = self.parent / "100%"
         odd.mkdir()
-        sockets = ControlSockets(parent_dir=odd, ssh=str(self.fake.path))
+        sockets = ControlSockets(base_dirs=[odd], ssh=str(self.fake.path))
         self.addCleanup(sockets.close)
         options = sockets.options("u", "h", 22, None)
         value = next(o for o in options if o.startswith("ControlPath="))
         self.assertIn("100%%", value)
 
-    def test_a_runtime_directory_others_can_write_is_not_used(self):
-        shared = self.parent / "shared-runtime"
-        shared.mkdir()
-        shared.chmod(0o777)
-        self.assertFalse(ssh_mux._private_to_us(shared))
-        shared.chmod(0o700)
-        self.assertTrue(ssh_mux._private_to_us(shared))
-        with patch.dict(os.environ, {"XDG_RUNTIME_DIR": str(shared)}):
-            shared.chmod(0o777)
+    def test_default_bases_prefer_the_runtime_directory_then_tmp(self):
+        self.assertEqual(
+            ssh_mux.default_base_dirs({"XDG_RUNTIME_DIR": "/run/user/7"}, uid=7),
+            [Path("/run/user/7/storage-mux"), Path("/tmp/storage-mux-7")])
+        for environ in ({}, {"XDG_RUNTIME_DIR": ""}, {"XDG_RUNTIME_DIR": "rel"}):
+            self.assertEqual(ssh_mux.default_base_dirs(environ, uid=7),
+                             [Path("/tmp/storage-mux-7")])
+
+    def test_the_first_usable_base_wins_and_is_made_private(self):
+        missing_parent = self.parent / "no" / "such" / "storage-mux"
+        first = self.parent / "first"
+        second = self.parent / "second"
+        first.mkdir(mode=0o755)  # exists, ours, too open: tightened
+        sockets = ControlSockets(base_dirs=[missing_parent, first, second],
+                                 ssh=str(self.fake.path))
+        self.addCleanup(sockets.close)
+        path = self._control_path(sockets.options("u", "h", 22, None))
+        self.assertEqual(path.parent.parent, first)
+        self.assertEqual(stat.S_IMODE(first.stat().st_mode), 0o700)
+        self.assertFalse(second.exists())
+
+    def test_the_default_uses_the_runtime_directory_whatever_tmpdir_is(self):
+        long_tmp = self.tmp / ("t" * 120)
+        long_tmp.mkdir()
+        with patch.dict(os.environ, {"XDG_RUNTIME_DIR": str(self.parent),
+                                     "TMPDIR": str(long_tmp)}):
+            tempfile.tempdir = None  # re-read TMPDIR
+            self.addCleanup(setattr, tempfile, "tempdir", None)
             sockets = ControlSockets(ssh=str(self.fake.path))
             self.addCleanup(sockets.close)
             path = self._control_path(sockets.options("u", "h", 22, None))
-        self.assertNotEqual(path.parent.parent, shared)
+        self.assertEqual(path.parent.parent, self.parent / "storage-mux")
+
+    def test_a_missing_base_is_created_0700(self):
+        base = self.parent / "storage-mux"
+        sockets = ControlSockets(base_dirs=[base], ssh=str(self.fake.path))
+        self.addCleanup(sockets.close)
+        self._control_path(sockets.options("u", "h", 22, None))
+        self.assertEqual(stat.S_IMODE(base.stat().st_mode), 0o700)
+
+    def test_a_base_that_is_a_link_is_skipped(self):
+        real = self.parent / "real"
+        real.mkdir()
+        link = self.parent / "link"
+        link.symlink_to(real)
+        good = self.parent / "good"
+        sockets = ControlSockets(base_dirs=[link, good], ssh=str(self.fake.path))
+        self.addCleanup(sockets.close)
+        path = self._control_path(sockets.options("u", "h", 22, None))
+        self.assertEqual(path.parent.parent, good)
+        self.assertEqual(list(real.iterdir()), [])
+
+    def test_an_over_long_base_is_skipped_for_the_next(self):
+        deep = self.parent
+        for _ in range(12):
+            deep = deep / "a-rather-long-directory-name"
+        sockets = ControlSockets(base_dirs=[deep, self.parent / "ok"],
+                                 ssh=str(self.fake.path))
+        self.addCleanup(sockets.close)
+        path = self._control_path(sockets.options("u", "h", 22, None))
+        self.assertEqual(path.parent.parent, self.parent / "ok")
+        self.assertFalse((self.parent / "a-rather-long-directory-name").exists())
+        self.assertLessEqual(len(os.fsencode(str(path))), ssh_mux._MAX_CONTROL_PATH)
+
+    def test_the_longest_accepted_base_makes_a_bindable_socket_path(self):
+        # A base at exactly the limit still leaves room for ssh's temporary name.
+        room = ssh_mux._MAX_CONTROL_PATH - ssh_mux._PROCESS_DIR_LEN - 17
+        base = Path("/tmp") / ("b" * (room - len("/tmp/")))
+        self.assertEqual(len(os.fsencode(str(base))), room)
+        self.addCleanup(shutil.rmtree, base, True)
+        sockets = ControlSockets(base_dirs=[base], ssh=str(self.fake.path))
+        self.addCleanup(sockets.close)
+        path = self._control_path(sockets.options("u", "h", 22, None))
+        self.assertLessEqual(len(os.fsencode(str(path))) + 17, 107)
+
+    def test_no_usable_base_turns_sharing_off_with_one_warning(self):
+        deep = self.parent
+        for _ in range(12):
+            deep = deep / "a-rather-long-directory-name"
+        sockets = ControlSockets(base_dirs=[deep], ssh=str(self.fake.path))
+        self.addCleanup(sockets.close)
+        with self.assertLogs(ssh_mux.__name__, level="WARNING") as logs:
+            self.assertEqual(sockets.options("u", "h", 22, None), [])
+        self.assertEqual(len(logs.records), 1)
+        self.assertIn("no usable socket directory", logs.output[0])
 
     def test_a_master_that_does_not_answer_still_loses_its_socket(self):
-        sockets = ControlSockets(parent_dir=self.parent, ssh="/nonexistent/ssh")
+        sockets = ControlSockets(base_dirs=[self.parent], ssh="/nonexistent/ssh")
         self.addCleanup(sockets.close)
         path = self._control_path(sockets.options("u", "h", 22, None))
         path.write_text("")
         sockets.reset("u", "h", 22, None)
         self.assertFalse(path.exists())
-
-    def test_a_path_too_long_for_a_unix_socket_turns_sharing_off(self):
-        deep = self.parent
-        for _ in range(12):
-            deep = deep / "a-rather-long-directory-name"
-            deep.mkdir()
-        sockets = ControlSockets(parent_dir=deep, ssh=str(self.fake.path))
-        self.addCleanup(sockets.close)
-        self.assertEqual(sockets.options("u", "h", 22, None), [])
-        self.assertEqual(list(deep.iterdir()), [])  # the directory it made is gone
 
     def test_close_then_options_makes_a_fresh_directory(self):
         sockets = self._sockets()
@@ -214,9 +278,9 @@ class TestControlSockets(unittest.TestCase):
 
 class TestClientsUseTheSockets(unittest.TestCase):
     def setUp(self):
-        self._tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self._tmp.cleanup)
-        self.sockets = ControlSockets(parent_dir=Path(self._tmp.name),
+        base = Path(tempfile.mkdtemp(prefix="sm", dir="/tmp"))  # short whatever TMPDIR is
+        self.addCleanup(shutil.rmtree, base, True)
+        self.sockets = ControlSockets(base_dirs=[base],
                                       ssh="/nonexistent/ssh")
         self.addCleanup(self.sockets.close)
 
