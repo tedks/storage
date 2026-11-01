@@ -39,7 +39,7 @@ agent genuinely needs divergent instructions.
 - `third_party/` - forked-submodule vendoring workflow (see its README) and
   `update.sh`
 - `flake.nix`, `.envrc`, `.devcontainer/` - development environment
-- `scripts/` - `run-gates.sh` (every quality gate), manual mount/unmount helpers and `ensure-nix-shell.sh`
+- `scripts/` - `run-gates.sh` (every quality gate; writes the receipt), `merge-gated.sh` (the gated merge), manual mount/unmount helpers and `ensure-nix-shell.sh`
 - `setup.py`, `setup-venv.sh` - non-Bazel pip/virtualenv install path
 - `docs/` - refactor roadmap and feature plans
 - `storage.example.toml` - example mount profile
@@ -151,6 +151,11 @@ such host it fails, naming both: a skipped gate must be a decision. On
 the Docker path the script tests the working tree and says so when it is
 dirty; commit and rerun to attest a commit.
 
+On success, with a clean tree and no extra arguments, `run-gates.sh` writes a
+receipt, `.gates/<full sha>.json` (git-ignored): the sha, its tree hash, the
+targets run, a hash of the host name and a timestamp. A dirty tree or extra
+arguments still run the gates but get no receipt.
+
 The three local gates by hand (everything but the remote gate), for
 iterating:
 
@@ -247,6 +252,25 @@ loads or writes a known_hosts file here.
 [#106](https://github.com/tedks/storage/issues/106) (the remote
 `inotifywait` outlives `RemoteWatcher.stop()`). Fixing #106 turns it
 red; then remove the marker.
+
+### Merging
+
+Merge a PR with the script, from the worktree of its branch, never with a
+bare `gh pr merge`:
+
+```bash
+scripts/merge-gated.sh <pr-number>
+```
+
+It refuses, with a one-line reason and its own exit code, unless the tree is
+clean (12), HEAD is the PR's head on GitHub (11), a receipt exists for HEAD's
+sha and tree (13), and the PR's base (`origin/master`) is an ancestor of HEAD
+(10: rebase, rerun the gates, push). Exit 64 is a usage error, 65 means it
+could not verify (fetch or `gh` failed), 20 that `gh` refused the merge. When
+it passes it prints the council-record line (`rebased on <master sha>, 0
+behind; gates <targets> on <sha>`) to paste into the PR comment, then runs
+`gh pr merge <pr> --merge --match-head-commit <sha>`: a normal merge, never a
+squash or rebase. If master moves while it runs, rerun it.
 
 ## Issue tracking (ditz)
 
