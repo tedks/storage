@@ -253,13 +253,14 @@ class CacheManager:
                         continue
                     try:
                         # Truncate in place to preserve xattrs; O_NOFOLLOW
-                        # and the fstat refuse a link or other file swapped
-                        # in after the lstat.
+                        # and the fstat refuse a link, or any other file,
+                        # swapped in after the lstat.
                         fd = os.open(cache_path, os.O_WRONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
                         try:
-                            st = os.fstat(fd)
-                            if not stat_module.S_ISREG(st.st_mode):
+                            opened = os.fstat(fd)
+                            if (opened.st_dev, opened.st_ino) != (st.st_dev, st.st_ino):
                                 continue
+                            st = opened
                             os.ftruncate(fd, 0)
                         finally:
                             os.close(fd)

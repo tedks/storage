@@ -85,6 +85,24 @@ class TestCacheLinks(unittest.TestCase):
             self.cache_manager.evict_recomputable_files(1)
         self.assertEqual(self.outside.stat().st_size, 100_000)
 
+    def test_recomputable_eviction_refuses_a_file_swapped_in_after_the_check(self):
+        self._row("/swapped", recomputable=True, recompute_cmd="true")
+        swapped = self.cache_dir / "swapped"
+        swapped.write_bytes(b"y" * 10)
+        real_check = regular_file_stat
+
+        def check_then_swap(path):
+            st = real_check(path)
+            if Path(path) == swapped:
+                replacement = self.cache_dir / "replacement"
+                replacement.write_bytes(b"z" * 20)
+                os.replace(replacement, swapped)
+            return st
+
+        with patch("storage.cache.regular_file_stat", side_effect=check_then_swap):
+            self.cache_manager.evict_recomputable_files(1)
+        self.assertEqual(swapped.read_bytes(), b"z" * 20)
+
     def test_lru_eviction_skips_a_link(self):
         self._row("/big-link")
         self.cache_manager.evict_lru_files(1)
