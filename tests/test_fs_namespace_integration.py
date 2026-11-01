@@ -2106,6 +2106,9 @@ class TestFSNamespaceIntegration(unittest.TestCase):
         with self.assertRaises(FuseOSError) as raised:
             self.fs.rename("/f.txt", "/dst")
         self.assertEqual(errno.EISDIR, raised.exception.errno)
+        with self.assertRaises(FuseOSError) as raised:
+            self.fs.rename("/missing", "/dst")
+        self.assertEqual(errno.ENOENT, raised.exception.errno)
         self.assertIsNotNone(self.fs.state_manager.get_file_metadata("/dst/kept.txt"))
 
     def test_rename_and_unlink_forget_recorded_checksums(self):
