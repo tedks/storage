@@ -289,18 +289,41 @@ host as written in the profile (case aside) and the port; nothing is
 resolved, so members that reach one machine by different names or by
 its address are not grouped and get no warning.
 
-Symbolic links cannot be created through the mount: `ln -s` fails with
-`EPERM` ("Operation not permitted"), because a link would live only in the
-local cache and vanish with it, so `cp -a`, `rsync -l` or `tar x` into the
-mount fail for each link. Links that already exist on a member show as
-links on every kind of member: `ls -l` shows the arrow, `readlink` answers
-from the member, and the kernel resolves the target on the client, through
-the mount for a relative target that stays inside it. An absolute target,
-or a relative one that climbs out of the mount, resolves against the
-client's own filesystem, not the member's (as over NFS or sshfs), so such a
-link on an SSH member no longer shows as the directory or file it names on
-that host. A name that was cached before this changed keeps its cached
-view until it is evicted.
+#### Symbolic links
+
+A link made through the mount (`ln -s`, `cp -a`, `tar x`) follows its
+target. Its target is resolved relative to the link's directory through
+the mount, and the link is created on exactly the members that hold the
+target: on all of them when the target is replicated, making the link's
+directory there if needed. Until then it lives in the cache with an index
+row, as a new file does. Members get the link over SFTP (rsync members
+too) or `os.symlink` (local members).
+
+Some links are refused with `EPERM` ("Operation not permitted"), the reason
+in the mount's log:
+
+- an absolute target, or a relative one that climbs above the mount root:
+  neither means the same thing on a member as through the mount;
+- a target that does not exist yet: a link that only becomes valid later
+  could not be placed. So `cp -a` or `tar x` of a tree fails for a link
+  copied before its target.
+
+Placement is decided once, when the link first syncs (a target written
+just before the link waits for its own sync), and is not revisited: a
+target replicated to another member later, or removed from one, does not
+move the link. A member that already has something else at the link's
+name is a conflict, and nothing is overwritten. The conflict view compares
+copies of a link by their target string, never by what they point at.
+
+Links that already exist on a member show as links on every kind of
+member: `ls -l` shows the arrow, `readlink` answers from the member, and
+the kernel resolves the target on the client, through the mount for a
+relative target that stays inside it. An absolute target, or a relative
+one that climbs out of the mount, resolves against the client's own
+filesystem, not the member's (as over NFS or sshfs), so such a link on an
+SSH member no longer shows as the directory or file it names on that host.
+A name that was cached before this changed keeps its cached view until it
+is evicted.
 
 #### SSH host keys
 
@@ -510,6 +533,7 @@ Implemented:
 - A multithreaded FUSE loop (`fuse_threads`, off by default until field-tested), so a slow member call for one file does not hold up listings, stats and reads of others
 - Cache metadata xattrs, with `storage debug rebuild-index`, `reprobe-locations` and `verify-index`
 - File recomputation
+- Symbolic links: made through the mount, replicated to the members holding their target; links already on members show as links
 - Transparent encryption (implemented; one test covers `storage/crypto.py`, so treat it as unverified)
 
 Not implemented:
