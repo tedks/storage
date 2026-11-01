@@ -1,6 +1,7 @@
 """Execution policy for background sync workers."""
 
 import contextlib
+import errno
 import logging
 import os
 import queue
@@ -12,6 +13,7 @@ from .backends.base import Backend
 from .cache import CacheManager
 from .conflicts import ConflictDetector
 from .file_config import get_inherited_config
+from .links import LinkRefused, find_holders, link_checksum, resolve_link_target
 from .models import FileLocation, SyncStatus
 from .replication import ReplicationManager
 from .state import StateManager
@@ -126,6 +128,14 @@ class SyncExecutor:
             return True
 
         cache_path = self.cache_manager.get_cache_path(task.virtual_path)
+        if metadata.link_target is not None:
+            return self._process_link_task(task, metadata, cache_path)
+        if os.path.islink(cache_path):
+            # A file row whose cache entry is a link: never upload what the
+            # link points at (ditz sync-reads-through-cache-link).
+            logger.warning("Cache entry for %s is a link without a link row; skipping",
+                           task.virtual_path)
+            return True
         if not cache_path.exists():
             logger.warning("Cache file missing for %s", task.virtual_path)
             return True
@@ -242,6 +252,108 @@ class SyncExecutor:
         else:
             self._stats["failed"] += 1
             logger.error("Failed to sync %s to any backend", task.virtual_path)
+        return True
+
+    def _process_link_task(self, task: SyncTask, metadata, cache_path: Path) -> bool:
+        """Create a link made through the mount on the members holding its target.
+
+        The holders are found when the link syncs: the members whose lstat
+        finds the target, resolved relative to the link's directory. The
+        link goes on each, its directory created there if needed. A member
+        already holding the same link counts as done; anything else at the
+        name there is a conflict, never overwritten. CLEAN once every holder
+        has it and none was unsure; a holder unreachable or a target not
+        yet on any member (still DIRTY in the cache) leaves the link DIRTY
+        for a later pass. Placement is not revisited after that: later
+        replication or eviction of the target does not move the link.
+        """
+        target = metadata.link_target
+        try:
+            cached = os.readlink(cache_path)
+        except OSError:
+            cached = None
+        if cached != target:
+            # Unlinked, renamed or replaced since the row was read; the
+            # namespace operation that did it settles the row.
+            logger.warning("Cached link for %s is gone or changed; skipping", task.virtual_path)
+            return True
+
+        generation = metadata.dirty_generation
+        task.generation = generation
+        if not self._publish(task, generation, SyncStatus.SYNCING, cache_path):
+            return True
+
+        try:
+            target_path = resolve_link_target(task.virtual_path, target)
+        except LinkRefused as refused:
+            logger.error("Link %s cannot be placed: %s", task.virtual_path, refused)
+            self._publish(task, generation, SyncStatus.ERROR, cache_path)
+            return True
+
+        located = {
+            location.backend_name
+            for location in self.state_manager.get_file_locations(target_path)
+            if not location.is_cached
+        }
+        holders, unsure = find_holders(target_path, self.replication_manager.backends, located)
+        identity = link_checksum(target)
+        if not holders:
+            target_row = self.state_manager.get_file_metadata(target_path)
+            pending = unsure or (target_row is not None and target_row.sync_status != SyncStatus.CLEAN)
+            if not pending:
+                logger.error("Link %s: no member holds its target", task.virtual_path)
+            self._publish(task, generation,
+                          SyncStatus.DIRTY if pending else SyncStatus.ERROR, cache_path)
+            return True
+
+        placed = 0
+        conflict = False
+        for backend in holders:
+            try:
+                try:
+                    existing = backend.readlink(task.virtual_path)
+                except FileNotFoundError:
+                    backend.symlink(target, task.virtual_path)
+                    existing = target
+            except OSError as exc:
+                if exc.errno in (errno.EINVAL, errno.EEXIST):
+                    existing = None  # something else is at the name
+                else:
+                    logger.error("Failed to link %s on %s: %s",
+                                 task.virtual_path, backend.name, exc)
+                    continue
+            except Exception as exc:
+                logger.error("Failed to link %s on %s: %s", task.virtual_path, backend.name, exc)
+                continue
+            if existing != target:
+                logger.warning("Conflict: %s on %s is not this link", task.virtual_path, backend.name)
+                conflict = True
+                continue
+            self.state_manager.add_file_location(FileLocation(
+                virtual_path=task.virtual_path,
+                backend_name=backend.name,
+                checksum=identity,
+                last_synced=time.time(),
+                is_cached=False,
+            ))
+            placed += 1
+
+        if conflict:
+            status = SyncStatus.CONFLICT
+        elif placed == len(holders) and not unsure:
+            status = SyncStatus.CLEAN
+        elif placed or unsure:
+            status = SyncStatus.DIRTY
+        else:
+            status = SyncStatus.ERROR
+        if self._publish(task, generation, status, cache_path,
+                         checksum=identity if status == SyncStatus.CLEAN else None):
+            if status == SyncStatus.CLEAN:
+                self._stats["synced"] += 1
+            elif status == SyncStatus.CONFLICT:
+                self._stats["conflicts"] += 1
+            elif status == SyncStatus.ERROR:
+                self._stats["failed"] += 1
         return True
 
     def _publish(
