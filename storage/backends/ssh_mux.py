@@ -81,7 +81,12 @@ def _private_base(base: Path) -> bool:
     """Make base if it is missing and report whether it is a real directory
     of ours, closed to everyone else (not a link, not someone else's)."""
     try:
-        base.parent.stat()
+        # Whoever can rename entries in the parent can swap the base after the
+        # checks below: it must be ours or root's and closed to others, or sticky (/tmp).
+        parent = os.stat(base.parent)
+        if not (parent.st_mode & stat.S_ISVTX or (
+                parent.st_uid in (os.getuid(), 0) and not parent.st_mode & 0o022)):
+            return False
         try:
             os.mkdir(base, 0o700)
         except FileExistsError:
@@ -120,6 +125,7 @@ class ControlSockets:
         self._dir_identity = None  # (st_dev, st_ino) of _dir as mkdtemp made it
         self._keys: Dict[Path, _SocketKey] = {}
         self._atexit_registered = False
+        self._warned_unusable = False
 
     # ------------------------------------------------------------------ #
     # Options for a client
@@ -191,7 +197,10 @@ class ControlSockets:
                 atexit.register(self.close)
                 self._atexit_registered = True
             return directory
-        self.logger.warning("ssh connection sharing is off: no usable socket directory")
+        # Every client asks again (a base may become usable), so warn once.
+        if not self._warned_unusable:
+            self._warned_unusable = True
+            self.logger.warning("ssh connection sharing is off: no usable socket directory")
         return None
 
     # ------------------------------------------------------------------ #

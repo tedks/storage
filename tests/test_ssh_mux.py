@@ -195,12 +195,24 @@ class TestControlSockets(unittest.TestCase):
         long_tmp.mkdir()
         with patch.dict(os.environ, {"XDG_RUNTIME_DIR": str(self.parent),
                                      "TMPDIR": str(long_tmp)}):
+            self.addCleanup(setattr, tempfile, "tempdir", tempfile.tempdir)
             tempfile.tempdir = None  # re-read TMPDIR
-            self.addCleanup(setattr, tempfile, "tempdir", None)
             sockets = ControlSockets(ssh=str(self.fake.path))
             self.addCleanup(sockets.close)
             path = self._control_path(sockets.options("u", "h", 22, None))
         self.assertEqual(path.parent.parent, self.parent / "storage-mux")
+
+    def test_a_base_in_a_parent_others_can_rename_in_is_skipped(self):
+        open_parent = self.parent / "open"
+        open_parent.mkdir()
+        open_parent.chmod(0o777)  # not sticky: another user could swap the base
+        good = self.parent / "good"
+        sockets = ControlSockets(base_dirs=[open_parent / "storage-mux", good],
+                                 ssh=str(self.fake.path))
+        self.addCleanup(sockets.close)
+        path = self._control_path(sockets.options("u", "h", 22, None))
+        self.assertEqual(path.parent.parent, good)
+        self.assertFalse((open_parent / "storage-mux").exists())
 
     def test_a_missing_base_is_created_0700(self):
         base = self.parent / "storage-mux"
@@ -236,9 +248,8 @@ class TestControlSockets(unittest.TestCase):
     def test_the_longest_accepted_base_makes_a_bindable_socket_path(self):
         # A base at exactly the limit still leaves room for ssh's temporary name.
         room = ssh_mux._MAX_CONTROL_PATH - ssh_mux._PROCESS_DIR_LEN - 17
-        base = Path("/tmp") / ("b" * (room - len("/tmp/")))
+        base = self.parent / ("b" * (room - len(str(self.parent)) - 1))
         self.assertEqual(len(os.fsencode(str(base))), room)
-        self.addCleanup(shutil.rmtree, base, True)
         sockets = ControlSockets(base_dirs=[base], ssh=str(self.fake.path))
         self.addCleanup(sockets.close)
         path = self._control_path(sockets.options("u", "h", 22, None))
@@ -252,8 +263,18 @@ class TestControlSockets(unittest.TestCase):
         self.addCleanup(sockets.close)
         with self.assertLogs(ssh_mux.__name__, level="WARNING") as logs:
             self.assertEqual(sockets.options("u", "h", 22, None), [])
+            sockets.options("u", "h", 22, None)  # asked again: no second warning
         self.assertEqual(len(logs.records), 1)
         self.assertIn("no usable socket directory", logs.output[0])
+
+    def test_a_file_at_the_base_name_is_skipped(self):
+        (self.parent / "file").write_text("")
+        good = self.parent / "good"
+        sockets = ControlSockets(base_dirs=[self.parent / "file", good],
+                                 ssh=str(self.fake.path))
+        self.addCleanup(sockets.close)
+        path = self._control_path(sockets.options("u", "h", 22, None))
+        self.assertEqual(path.parent.parent, good)
 
     def test_a_master_that_does_not_answer_still_loses_its_socket(self):
         sockets = ControlSockets(base_dirs=[self.parent], ssh="/nonexistent/ssh")
