@@ -1366,6 +1366,24 @@ class TestSSHBackendOnThePool(_BackendTestCase):
         self.assertIn("posix_rename", [name for name, *_ in self.server.requests])
         self.assertNotIn("rename", [name for name, *_ in self.server.requests])
 
+    def test_rename_falls_back_without_the_posix_rename_extension(self):
+        def unsupported(client, path):
+            raise IOError("Operation unsupported")
+        self.server.hooks["posix_rename"] = unsupported
+        self._new_backend().rename("/a", "/b")
+        self.assertEqual(["posix_rename", "rename"],
+                         [name for name, *_ in self.server.requests
+                          if name in ("posix_rename", "rename")])
+
+    def test_rename_does_not_fall_back_on_an_errno_failure(self):
+        def denied(client, path):
+            raise PermissionError(errno.EACCES, "denied")
+        self.server.hooks["posix_rename"] = denied
+        with self.assertRaises(OSError) as raised:
+            self._new_backend().rename("/a", "/b")
+        self.assertEqual(errno.EACCES, raised.exception.errno)
+        self.assertNotIn("rename", [name for name, *_ in self.server.requests])
+
     def test_no_socket_timeout_override(self):
         backend = self._new_backend()
         backend.stat("/x")

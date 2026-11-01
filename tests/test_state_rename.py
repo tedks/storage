@@ -1,4 +1,6 @@
+import errno
 import shutil
+import sqlite3
 import tempfile
 import time
 import unittest
@@ -147,9 +149,6 @@ class TestHierarchicalRename(unittest.TestCase):
 
 
 
-if __name__ == '__main__':
-    unittest.main()
-
 
 class TestRenameOntoAndAround(unittest.TestCase):
     """rename_path over an existing destination, and names with LIKE wildcards
@@ -191,3 +190,77 @@ class TestRenameOntoAndAround(unittest.TestCase):
         self.assertEqual(2, self.state_manager.get_file_metadata("/axb/f").size)
         self.assertEqual([("/a%/g", "/d/g")], self.state_manager.rename_path("/a%", "/d"))
         self.assertEqual(4, self.state_manager.get_file_metadata("/aZ/g").size)
+
+    def test_rename_onto_a_directory_with_rows_below_it_is_refused(self):
+        # Its files were evicted, so the cache directory is empty and the
+        # cache move succeeds; their rows are the only record of them.
+        self.add("/src/f", 1)
+        self.add("/dst/g", 2)
+        with self.assertRaises(OSError) as raised:
+            self.state_manager.rename_path("/src", "/dst")
+        self.assertEqual(errno.ENOTEMPTY, raised.exception.errno)
+        self.assertEqual(1, self.state_manager.get_file_metadata("/src/f").size)
+        self.assertEqual(2, self.state_manager.get_file_metadata("/dst/g").size)
+        self.assertTrue(self.state_manager.has_rows_below("/dst", excluding="/src"))
+        self.assertFalse(self.state_manager.has_rows_below("/dst/g", excluding="/src"))
+
+    def test_rename_onto_an_ancestor_counts_only_rows_outside_the_source(self):
+        self.add("/a/b/f", 1)
+        self.assertFalse(self.state_manager.has_rows_below("/a", excluding="/a/b"))
+        self.add("/a/g", 2)
+        self.assertTrue(self.state_manager.has_rows_below("/a", excluding="/a/b"))
+
+    def test_rename_of_a_directory_onto_an_empty_directory(self):
+        self.add("/src/f", 1, backend="a")
+        # A location row with no files row would collide with the moved one.
+        self.state_manager.add_file_location(FileLocation(
+            virtual_path="/dst/f", backend_name="a", checksum="stale",
+            last_synced=time.time(), is_cached=False,
+        ))
+        self.assertEqual([("/src/f", "/dst/f")], self.state_manager.rename_path("/src", "/dst"))
+        self.assertEqual(["c1"], [l.checksum for l in self.state_manager.get_file_locations("/dst/f")])
+
+    def test_root_is_not_a_rename_endpoint(self):
+        self.add("/a/f", 1)
+        self.add("/b", 2)
+        for old, new in (("/a", "/"), ("/", "/a"), ("/a", "")):
+            with self.assertRaises(ValueError):
+                self.state_manager.rename_path(old, new)
+        self.assertEqual(1, self.state_manager.get_file_metadata("/a/f").size)
+        self.assertEqual(2, self.state_manager.get_file_metadata("/b").size)
+
+    def test_a_source_without_rows_still_replaces_the_destination_rows(self):
+        # The cache move already replaced the destination (an unindexed
+        # source, such as an empty directory), so its rows are stale.
+        self.add("/dst", 2)
+        self.assertEqual([], self.state_manager.rename_path("/src", "/dst"))
+        self.assertIsNone(self.state_manager.get_file_metadata("/dst"))
+        self.assertEqual([], self.state_manager.get_file_locations("/dst"))
+
+    def test_a_failed_rename_keeps_the_destination_rows(self):
+        self.add("/src", 1, backend="a")
+        self.add("/dst", 2, backend="b")
+        real = self.state_manager.conn
+
+        class FailingMove:
+            def __getattr__(self, name):
+                return getattr(real, name)
+
+            def execute(self, sql, *args):
+                if sql.startswith("UPDATE files SET virtual_path"):
+                    raise sqlite3.OperationalError("injected")
+                return real.execute(sql, *args)
+
+        self.state_manager.conn = FailingMove()
+        try:
+            with self.assertRaises(sqlite3.OperationalError):
+                self.state_manager.rename_path("/src", "/dst")
+        finally:
+            self.state_manager.conn = real
+        self.assertEqual(2, self.state_manager.get_file_metadata("/dst").size)
+        self.assertEqual(["b"], [l.backend_name for l in self.state_manager.get_file_locations("/dst")])
+        self.assertEqual(1, self.state_manager.get_file_metadata("/src").size)
+
+
+if __name__ == '__main__':
+    unittest.main()
