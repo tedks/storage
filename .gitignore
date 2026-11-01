@@ -62,3 +62,6 @@ tests/benchmarks/graphs/
 # nix build output links
 /result
 /result-*
+
+# Gate receipts written by scripts/run-gates.sh
+/.gates/

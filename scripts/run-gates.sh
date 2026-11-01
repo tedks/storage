@@ -18,6 +18,12 @@
 #                             usually works: the host fetches the commit by
 #                             SHA, which GitHub allows).
 #
+# On success, with a clean tree and no extra arguments, it writes a receipt,
+# .gates/<full sha>.json (git-ignored): the sha, its tree hash, the targets
+# run, a hash of this host's name (the repo is public) and a timestamp.
+# scripts/merge-gated.sh refuses to merge a head with no receipt. A dirty
+# tree, or extra arguments (which can narrow a gate), still run but get none.
+#
 # Extra arguments go to every bazel test, local and remote; a pytest flag such
 # as --test_arg=-k fails any module it selects nothing in, so avoid it here.
 set -euo pipefail
@@ -32,6 +38,47 @@ die() {
 
 bazel_test() {
   nix develop --command bazel test "$@" --test_output=errors
+}
+
+# Writes .gates/<HEAD sha>.json for the targets given. Only called after a run
+# that passed; refuses (returns 1, says why) unless the tree is clean, HEAD is
+# still the commit the run started on ($1), was clean at the start too, and no extra arguments narrowed it.
+write_receipt() {
+  local started=$1 sha tree host stamp dir targets t first=1 tmp
+  shift
+  sha=$(git rev-parse HEAD)
+  if [ "$started_dirty" -ne 0 ]; then
+    echo "run-gates: the tree was dirty when the run started, so it tested more than $sha; no receipt written (commit and rerun)" >&2
+    return 1
+  fi
+  if [ -n "$(git status --porcelain)" ]; then
+    echo "run-gates: gates passed on $sha plus uncommitted changes; no receipt written (commit and rerun to attest the commit)" >&2
+    return 1
+  fi
+  [ "$sha" = "$started" ] || {
+    echo "run-gates: HEAD moved during the run; no receipt written" >&2
+    return 1
+  }
+  if [ "$extra_args" -ne 0 ]; then
+    echo "run-gates: extra arguments were given, so this run may not have been the full gates; no receipt written" >&2
+    return 1
+  fi
+  tree=$(git rev-parse 'HEAD^{tree}')
+  host=$(uname -n | sha256sum | cut -c1-12)
+  stamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  targets=
+  for t in "$@"; do
+    [ "$first" = 1 ] || targets+=", "
+    targets+="\"$t\""
+    first=0
+  done
+  dir=$root/.gates
+  mkdir -p "$dir" || return 1
+  tmp=$(mktemp "$dir/.receipt.XXXXXX") || return 1
+  printf '{\n  "sha": "%s",\n  "tree": "%s",\n  "targets": [%s],\n  "host": "%s",\n  "timestamp": "%s"\n}\n' \
+    "$sha" "$tree" "$targets" "$host" "$stamp" >"$tmp" || { rm -f -- "$tmp"; return 1; }
+  mv -f "$tmp" "$dir/$sha.json" || { rm -f -- "$tmp"; return 1; }
+  echo "run-gates: receipt $dir/$sha.json"
 }
 
 docker_usable() {
@@ -107,14 +154,17 @@ run_remote_gate() {
   remote_script | ssh -o BatchMode=yes -- "$host" "$cmd"
 }
 
+extra_args=$#
+started=$(git rev-parse HEAD)
+started_dirty=0
+[ -z "$(git status --porcelain)" ] || started_dirty=1
+
 if docker_usable; then
   echo "run-gates: Docker is usable; running all gates here"
   [ -z "$(git status --porcelain)" ] ||
     echo "run-gates: warning: uncommitted changes are included in this run" >&2
   bazel_test //:storage_tests_all_gates "$@"
-  if [ -n "$(git status --porcelain)" ]; then
-    echo "run-gates: gates passed on HEAD $(git rev-parse HEAD) plus uncommitted changes; rerun after committing to attest the commit" >&2
-  fi
+  write_receipt "$started" //:storage_tests_all_gates || true
 elif [ -n "${STORAGE_REMOTE_GATE_HOST:-}" ]; then
   case $STORAGE_REMOTE_GATE_HOST in
     -*) die "STORAGE_REMOTE_GATE_HOST must be an ssh destination, not an option" ;;
@@ -124,6 +174,8 @@ elif [ -n "${STORAGE_REMOTE_GATE_HOST:-}" ]; then
   bazel_test //:storage_tests_fast_gate //:storage_tests_mounted_system_gate \
     //:storage_tests_resilience_gate "$@"
   run_remote_gate "$STORAGE_REMOTE_GATE_HOST" "$sha" "$@"
+  write_receipt "$started" //:storage_tests_fast_gate //:storage_tests_mounted_system_gate \
+    //:storage_tests_resilience_gate //:storage_tests_remote_gate || true
 else
   die "the remote gate needs Docker, and none is usable here. Start Docker, or set STORAGE_REMOTE_GATE_HOST to an ssh host that has it (the gate then runs there at your pushed commit)."
 fi
