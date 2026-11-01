@@ -14,3 +14,9 @@ log_events:
   who: Ted Smith
   what: created
   comment: ""
+- time: 2026-11-01T04:02:32-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Council nit on PR 163: a closed/draft PR only fails at gh pr merge (exit
+    20) after the record line printed. Fetch state,isDraft and refuse with 65. Low
+    value; gh already refuses.'
