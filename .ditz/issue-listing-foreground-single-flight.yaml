@@ -14,3 +14,12 @@ log_events:
   who: Ted Smith
   what: created
   comment: ""
+- time: 2026-11-01T02:31:50-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'From the PR #135 round 3 comment on gh-111-refresh-followups: N threads
+    on one expired directory each submit a full member listing. A later readdir could
+    wait on the one in flight, but may only take its result if it was published (an
+    invalidation after it began means the caller must list again). No test runs the
+    listing paths with fuse_threads on. Split out of gh-111-refresh-followups when
+    PR #156 landed the rest.'
