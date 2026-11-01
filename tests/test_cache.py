@@ -9,9 +9,113 @@ from pathlib import Path
 
 from storage.backends.local import LocalBackend
 from storage.cache import PARTIAL_SUFFIX, CacheManager
-from storage.cache_metadata import read_cache_metadata
+from storage.cache_metadata import read_cache_metadata, regular_file_stat
 from storage.models import FileMetadata, SyncStatus
 from storage.state import StateManager
+
+
+class TestCacheLinks(unittest.TestCase):
+    """Symlinks in the cache tree are not cached copies
+    (ditz cache-scans-follow-symlinks)."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.cache_dir = Path(self.temp_dir) / "cache"
+        self.cache_dir.mkdir()
+        self.outside = Path(self.temp_dir) / "outside.bin"
+        self.outside.write_bytes(b"x" * 100_000)
+        (self.cache_dir / "small.txt").write_bytes(b"12345")
+        (self.cache_dir / "big-link").symlink_to(self.outside)
+        (self.cache_dir / "dangling").symlink_to(Path(self.temp_dir) / "nowhere")
+        self.state_manager = StateManager(str(Path(self.temp_dir) / "state.db"))
+        self.cache_manager = CacheManager(self.cache_dir, self.state_manager, 1024 * 1024)
+
+    def tearDown(self):
+        self.state_manager.close()
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_size_scan_does_not_charge_a_link_target(self):
+        self.assertEqual(self.cache_manager._scan_total_cache_size(), 5)
+        self.assertEqual(self.cache_manager.get_total_cache_size(), 5)
+
+    def test_a_link_is_not_cached(self):
+        self.assertTrue(self.cache_manager.is_cached("/small.txt"))
+        self.assertFalse(self.cache_manager.is_cached("/big-link"))
+        self.assertEqual(self.cache_manager.get_cached_size("/big-link"), 0)
+
+    def test_sync_cache_metadata_skips_a_link(self):
+        metadata = FileMetadata(
+            virtual_path="/big-link", size=1, checksum=None, last_access=1.0,
+            last_modified=1.0, sync_status=SyncStatus.CLEAN, replica_count=1,
+            recomputable=False, recompute_cmd=None, encrypted=False, encryption_key_id=None,
+        )
+        self.assertFalse(self.cache_manager.sync_cache_metadata("/big-link", metadata))
+        self.assertEqual(os.listxattr(str(self.outside)), [])
+
+    def _row(self, virtual_path, **changes):
+        fields = dict(
+            virtual_path=virtual_path, size=100_000, checksum=None, last_access=1.0,
+            last_modified=1.0, sync_status=SyncStatus.CLEAN, replica_count=1,
+            recomputable=False, recompute_cmd=None, encrypted=False, encryption_key_id=None,
+        )
+        fields.update(changes)
+        self.state_manager.set_file_metadata(FileMetadata(**fields))
+
+    def test_recomputable_eviction_never_truncates_through_a_link(self):
+        self._row("/big-link", recomputable=True, recompute_cmd="true")
+        self.cache_manager.evict_recomputable_files(1)
+        self.assertEqual(self.outside.stat().st_size, 100_000)
+        self.assertTrue((self.cache_dir / "big-link").is_symlink())
+
+    def test_recomputable_eviction_refuses_a_link_swapped_in_after_the_check(self):
+        # The link replaces the file between the lstat and the open.
+        self._row("/swapped", recomputable=True, recompute_cmd="true")
+        swapped = self.cache_dir / "swapped"
+        swapped.write_bytes(b"y" * 10)
+        real_check = regular_file_stat
+
+        def check_then_swap(path):
+            st = real_check(path)
+            if Path(path) == swapped:
+                swapped.unlink()
+                swapped.symlink_to(self.outside)
+            return st
+
+        with patch("storage.cache.regular_file_stat", side_effect=check_then_swap):
+            self.cache_manager.evict_recomputable_files(1)
+        self.assertEqual(self.outside.stat().st_size, 100_000)
+
+    def test_recomputable_eviction_refuses_a_file_swapped_in_after_the_check(self):
+        self._row("/swapped", recomputable=True, recompute_cmd="true")
+        swapped = self.cache_dir / "swapped"
+        swapped.write_bytes(b"y" * 10)
+        real_check = regular_file_stat
+
+        def check_then_swap(path):
+            st = real_check(path)
+            if Path(path) == swapped:
+                replacement = self.cache_dir / "replacement"
+                replacement.write_bytes(b"z" * 20)
+                os.replace(replacement, swapped)
+            return st
+
+        with patch("storage.cache.regular_file_stat", side_effect=check_then_swap):
+            self.cache_manager.evict_recomputable_files(1)
+        self.assertEqual(swapped.read_bytes(), b"z" * 20)
+
+    def test_lru_eviction_skips_a_link(self):
+        self._row("/big-link")
+        self.cache_manager.evict_lru_files(1)
+        self.assertTrue((self.cache_dir / "big-link").is_symlink())
+        self.assertEqual(self.outside.stat().st_size, 100_000)
+
+    def test_delete_removes_a_dangling_link_without_touching_the_size(self):
+        self.cache_manager.delete_cached_file("/dangling")
+        self.assertFalse(os.path.lexists(self.cache_dir / "dangling"))
+        self.cache_manager.delete_cached_file("/big-link")
+        self.assertFalse(os.path.lexists(self.cache_dir / "big-link"))
+        self.assertTrue(self.outside.exists())
+        self.assertEqual(self.cache_manager.get_total_cache_size(), 5)
 
 
 class TestCacheAccounting(unittest.TestCase):

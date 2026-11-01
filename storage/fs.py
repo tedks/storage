@@ -32,7 +32,7 @@ from .backends.ssh_mux import close_shared_control_sockets
 from .backends.ssh_pool import is_connection_error
 from .cache import PARTIAL_SUFFIX, CacheManager
 from .locks import NamespaceLock, PathLocks, UploadLocks
-from .cache_metadata import PREFIX_XATTR, XATTR_CACHE_METADATA_NAME, scan_cache_entries
+from .cache_metadata import PREFIX_XATTR, XATTR_CACHE_METADATA_NAME, regular_file_stat, scan_cache_entries
 from .file_config import FileConfig, get_inherited_config
 from .models import FileLocation, FileMetadata, StreamingKeepAfterClose, SyncStatus
 from .state import StateManager
@@ -494,7 +494,7 @@ class StorageFS(Operations):
         self._forget_checksums({virtual_path, canonical_path})
 
         cache_path = self.cache_manager.get_cache_path(virtual_path)
-        if not (cache_path.exists() and cache_path.is_file()):
+        if regular_file_stat(cache_path) is None:
             return
 
         with self.state_manager.metadata_lock:
@@ -1286,7 +1286,8 @@ class StorageFS(Operations):
         inode.
         """
         try:
-            payload = json.loads(os.getxattr(str(cache_path), self.MEMBER_STAT_XATTR))
+            payload = json.loads(os.getxattr(str(cache_path), self.MEMBER_STAT_XATTR,
+                                             follow_symlinks=False))
             if tuple(payload.get("cache")) != identity:
                 return {}
             return {
@@ -1356,7 +1357,8 @@ class StorageFS(Operations):
                            "members": {name: list(stat) for name, stat in members.items()}}
                 try:
                     os.setxattr(str(cache_path), self.MEMBER_STAT_XATTR,
-                                json.dumps(payload, sort_keys=True).encode("utf-8"))
+                                json.dumps(payload, sort_keys=True).encode("utf-8"),
+                                follow_symlinks=False)
                 except OSError as exc:
                     self.logger.debug("could not persist member baseline: %r", exc)
 
@@ -1766,7 +1768,7 @@ class StorageFS(Operations):
                     pass
 
             # Graceful fallback when a cached copy already exists locally.
-            if cache_path.exists() and cache_path.is_file():
+            if regular_file_stat(cache_path) is not None:
                 return True
 
             if backend and not backend.is_available():
@@ -2074,8 +2076,10 @@ class StorageFS(Operations):
         """Change file owner"""
         cache_path = self.cache_manager.get_cache_path(path)
 
+        # lchown: the kernel sends chown -h for a link, which must change
+        # the link, never its target. (chmod is never sent for a link.)
         try:
-            os.chown(cache_path, uid, gid)
+            os.chown(cache_path, uid, gid, follow_symlinks=False)
         except OSError as e:
             raise FuseOSError(e.errno)
 
@@ -2420,8 +2424,11 @@ class StorageFS(Operations):
             payload = self._cache_state_payload(resolved)
             return json.dumps(payload, sort_keys=True).encode("utf-8")
 
+        # follow_symlinks=False here and below: a name in the cache that is a
+        # link carries its own xattrs (none, for user.* on Linux), never its
+        # target's (ditz cache-scans-follow-symlinks).
         try:
-            return os.getxattr(str(resolved.cache_path), name)
+            return os.getxattr(str(resolved.cache_path), name, follow_symlinks=False)
         except OSError as e:
             raise FuseOSError(e.errno)
 
@@ -2439,7 +2446,7 @@ class StorageFS(Operations):
         cache_path = self.cache_manager.get_cache_path(path)
 
         try:
-            os.setxattr(str(cache_path), name, value)
+            os.setxattr(str(cache_path), name, value, follow_symlinks=False)
         except OSError as e:
             raise FuseOSError(e.errno)
 
@@ -2448,7 +2455,7 @@ class StorageFS(Operations):
         resolved = self._resolve_path(path)
 
         try:
-            attrs = set(os.listxattr(str(resolved.cache_path)))
+            attrs = set(os.listxattr(str(resolved.cache_path), follow_symlinks=False))
         except OSError:
             attrs = set()
 
@@ -2472,7 +2479,7 @@ class StorageFS(Operations):
         cache_path = self.cache_manager.get_cache_path(path)
 
         try:
-            os.removexattr(str(cache_path), name)
+            os.removexattr(str(cache_path), name, follow_symlinks=False)
         except OSError as e:
             raise FuseOSError(e.errno)
 
@@ -2595,7 +2602,8 @@ class StorageFS(Operations):
 
         try:
             before = os.lstat(str(cache_path))
-            os.utime(str(cache_path), times)
+            # touch -h on a link must not move its target's times.
+            os.utime(str(cache_path), times, follow_symlinks=False)
             after = os.lstat(str(cache_path))
         except OSError as e:
             raise FuseOSError(e.errno)

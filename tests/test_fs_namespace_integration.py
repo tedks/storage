@@ -289,6 +289,44 @@ class TestFSNamespaceIntegration(unittest.TestCase):
 
         self.assertEqual(self.fs.getattr('/synced.txt')['st_size'], len("synced"))
 
+    def test_xattr_handlers_do_not_follow_a_cached_link(self):
+        # ditz cache-scans-follow-symlinks: an lsetxattr on a link through
+        # the mount reaches setxattr with the link's path; it must not land
+        # on the link's target (another cached file, or any host file).
+        target = self.cache_dir / "target.txt"
+        target.write_text("target")
+        (self.cache_dir / "link").symlink_to("target.txt")
+        with self.assertRaises(FuseOSError):
+            self.fs.setxattr('/link', 'user.note', b'v', 0)
+        self.assertNotIn('user.note', os.listxattr(str(target)))
+        os.setxattr(str(target), 'user.kept', b'1')
+        with self.assertRaises(FuseOSError):
+            self.fs.removexattr('/link', 'user.kept')
+        self.assertIn('user.kept', os.listxattr(str(target)))
+        with self.assertRaises(FuseOSError):
+            self.fs.getxattr('/link', 'user.kept')
+        self.assertNotIn('user.kept', self.fs.listxattr('/link'))
+
+    def test_chown_and_utimens_change_a_cached_link_not_its_target(self):
+        # chown -h and touch -h reach the handlers with the link's path.
+        target = self.cache_dir / "target.txt"
+        target.write_text("target")
+        os.utime(target, (1_000_000, 1_000_000))
+        (self.cache_dir / "link").symlink_to("target.txt")
+        self.fs.utimens('/link', (2_000_000, 2_000_000))
+        self.assertEqual(os.stat(target).st_mtime, 1_000_000)
+        self.assertEqual(os.lstat(self.cache_dir / "link").st_mtime, 2_000_000)
+        with patch("storage.fs.os.chown") as chown:
+            self.fs.chown('/link', os.getuid(), os.getgid())
+        self.assertEqual(chown.call_args.kwargs, {"follow_symlinks": False})
+
+    def test_cache_state_does_not_count_a_cached_link(self):
+        (self.cache_dir / "target.txt").write_text("target")
+        (self.cache_dir / "link").symlink_to("target.txt")
+        payload = json.loads(self.fs.getxattr('/link', StorageFS.CACHE_STATE_XATTR))
+        self.assertFalse(payload["cache_present"])
+        self.assertEqual(payload["cache_size"], 0)
+
     def test_symlink_is_refused_with_eperm(self):
         list(self.fs.readdir('/', None))
         with self.assertRaises(FuseOSError) as raised:
