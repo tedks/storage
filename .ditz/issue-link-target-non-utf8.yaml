@@ -1,0 +1,19 @@
+id: link-target-non-utf8
+title: readlink of a non-UTF-8 member link target fails in fusepy
+desc: 'Council PR #158 nit (Claude seat): paramiko and os.readlink give a surrogate-escaped
+  str for a non-UTF-8 target; fusepy encodes readlink''s result strictly as UTF-8
+  and raises. Same class as fusepy''s path handling for non-UTF-8 names; fix together
+  (return bytes or encode with surrogateescape) if it matters.'
+type: bugfix
+component: fs
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-01T02:42:56-00:00
+references: []
+log_events:
+- time: 2026-11-01T02:42:56-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
