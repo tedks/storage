@@ -15,3 +15,15 @@ log_events:
   who: Ted Smith
   what: created
   comment: ""
+- time: 2026-11-01T02:43:03-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Council PR #156 rounds 2-3. _forget_listed_name_locked drops a published
+    listing only for a name its size split covers, and the publish check in _list_members
+    refuses a raced listing only for such a name. A name on several members whose
+    copies were equal in size when listed and then differ (a change on one member)
+    shows the plain name for the whole window (indefinitely with watchers) until the
+    next listing. Refusing every raced replicated name starves listings of replicated
+    directories under evictions and uploads, which change no member bytes. Needs the
+    race kind (member change vs local eviction) recorded, or the changed member''s
+    size compared at the event.'
