@@ -2076,8 +2076,10 @@ class StorageFS(Operations):
         """Change file owner"""
         cache_path = self.cache_manager.get_cache_path(path)
 
+        # lchown: the kernel sends chown -h for a link, which must change
+        # the link, never its target. (chmod is never sent for a link.)
         try:
-            os.chown(cache_path, uid, gid)
+            os.chown(cache_path, uid, gid, follow_symlinks=False)
         except OSError as e:
             raise FuseOSError(e.errno)
 
@@ -2600,7 +2602,8 @@ class StorageFS(Operations):
 
         try:
             before = os.lstat(str(cache_path))
-            os.utime(str(cache_path), times)
+            # touch -h on a link must not move its target's times.
+            os.utime(str(cache_path), times, follow_symlinks=False)
             after = os.lstat(str(cache_path))
         except OSError as e:
             raise FuseOSError(e.errno)

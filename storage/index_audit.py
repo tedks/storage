@@ -9,6 +9,7 @@ from typing import Dict, List
 from .backends.base import Backend
 from .cache_metadata import (
     cache_file_would_be_scanned,
+    regular_file_stat,
     scan_cache_entries,
     write_cache_metadata,
 )
@@ -129,7 +130,7 @@ def _write_conflict_xattr(
     """Write the conflict xattr for a cache file without mutating SQLite state."""
     promoted = _promoted_conflict_metadata(metadata)
     cache_path = _cache_path_for_metadata(cache_root, metadata.virtual_path)
-    if not cache_path.exists() or not cache_path.is_file():
+    if regular_file_stat(cache_path) is None:
         report.issues.append(
             IndexIssue(
                 kind="missing_cache_file_for_conflict_sync",

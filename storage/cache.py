@@ -252,10 +252,18 @@ class CacheManager:
                         # through a link.
                         continue
                     try:
+                        # Truncate in place to preserve xattrs; O_NOFOLLOW
+                        # and the fstat refuse a link or other file swapped
+                        # in after the lstat.
+                        fd = os.open(cache_path, os.O_WRONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                        try:
+                            st = os.fstat(fd)
+                            if not stat_module.S_ISREG(st.st_mode):
+                                continue
+                            os.ftruncate(fd, 0)
+                        finally:
+                            os.close(fd)
                         file_size = st.st_size
-                        # Truncate to preserve xattrs
-                        with open(cache_path, 'wb') as f:
-                            f.truncate(0)
                         freed += file_size
                         self._current_size_bytes = max(0, self._current_size_bytes - file_size)
 

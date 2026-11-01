@@ -46,6 +46,12 @@ def regular_file_stat(path) -> Optional[os.stat_result]:
     which follow a symlink: a link in the cache tree (made through the
     mount, or planted) is not a cached copy, and following it would count
     or rewrite whatever it points at (ditz cache-scans-follow-symlinks).
+
+    Only the last component is checked. A directory component that is a
+    link is still traversed; through the mount none can be reached (getattr
+    lstats the cache first, so the kernel follows a cached link itself and
+    never sends a path beneath it), so only someone who can already write
+    the cache directory could plant one (ditz cache-parent-symlink-traversal).
     """
     try:
         st = os.lstat(str(path))
