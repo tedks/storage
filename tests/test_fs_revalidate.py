@@ -134,8 +134,8 @@ class TestRevalidateOnOpen(RevalidateTestBase):
         self.age_checks()
         with self.count_stats() as stat:
             self.assertEqual(b"changed-and-longer", self.read_through("/f.txt"))
-        # The check, then the refetch's baseline.
-        self.assertEqual(2, stat.call_count)
+        # The check's stat is also the refetch's baseline.
+        self.assertEqual(1, stat.call_count)
         self.assertEqual(b"changed-and-longer", (self.cache_dir / "f.txt").read_bytes())
         meta = self.fs.state_manager.get_file_metadata("/f.txt")
         self.assertEqual(SyncStatus.CLEAN, meta.sync_status)
@@ -254,6 +254,17 @@ class TestRevalidateOnOpen(RevalidateTestBase):
             self.assertEqual(b"original", self.read_through("/f.txt"))
             self.assertEqual(b"original", self.read_through("/f.txt"))
         self.assertEqual(1, stat.call_count)
+
+    def test_refetch_stats_the_member_once(self):
+        # The stat that found the change is the refetch's baseline too.
+        self.rewrite_member("f.txt", b"changed-and-longer", mtime=1_700_000_500)
+        self.age_checks()
+        with self.count_stats() as stat:
+            self.assertEqual(b"changed-and-longer", self.read_through("/f.txt"))
+        self.assertEqual(1, stat.call_count)
+        self.assertEqual({"member": (len(b"changed-and-longer"), 1_700_000_500.0)},
+                         self.fs._member_checks["/f.txt"].members)
+        self.assertNotIn("/f.txt", self.fs._pinned_stats)
 
     def test_member_without_the_file_keeps_cached_copy(self):
         self.member_file.unlink()
@@ -816,6 +827,73 @@ class TestRevalidateStreamBail(RevalidateTestBase):
         while "/f.txt" in self.fs._recheck and time.monotonic() < deadline:
             time.sleep(0.05)
         self.assertNotIn("/f.txt", self.fs._recheck)
+
+
+class TestRevalidateFromListing(RevalidateTestBase):
+    """A recent listing of the parent stands in for the stat when it shows no change."""
+
+    def setUp(self):
+        super().setUp()
+        self.rewrite_member("f.txt", b"original", mtime=1_700_000_000)
+        self.assertEqual(b"original", self.read_through("/f.txt"))
+
+    def list_root(self):
+        self.fs.namespace.invalidate_dir_cache_entry("/")
+        self.assertIn("f.txt", list(self.fs.readdir("/", None)))
+        self.assertIn("/", self.fs.namespace.entry_attrs)
+
+    def test_unchanged_listing_replaces_the_stat(self):
+        self.age_checks()
+        self.list_root()
+        with self.count_stats() as stat:
+            self.assertEqual(b"original", self.read_through("/f.txt"))
+        stat.assert_not_called()
+        # It counts as a check: no listing or stat again until the age passes.
+        self.assertEqual({"member": (8, 1_700_000_000.0)}, self.fs._member_checks["/f.txt"].members)
+
+    def test_changed_listing_falls_back_to_a_stat_and_refetches(self):
+        self.rewrite_member("f.txt", b"ORIGINAL", mtime=1_600_000_000)
+        self.age_checks()
+        self.list_root()
+        with self.count_stats() as stat:
+            self.assertEqual(b"ORIGINAL", self.read_through("/f.txt"))
+        self.assertEqual(1, stat.call_count)
+
+    def test_listing_older_than_the_age_is_ignored(self):
+        self.list_root()
+        with self.fs.namespace.listing_lock:
+            at, attrs, unknown = self.fs.namespace.entry_attrs["/"]
+            self.fs.namespace.entry_attrs["/"] = (at - self.revalidate_after - 5, attrs, unknown)
+        self.age_checks(self.revalidate_after + 100)
+        with self.count_stats() as stat:
+            self.read_through("/f.txt")
+        self.assertEqual(1, stat.call_count)
+
+    def test_dropped_name_is_not_trusted(self):
+        self.age_checks()
+        self.list_root()
+        self.fs.namespace.forget_listed_attrs("/f.txt", removing=False)
+        with self.count_stats() as stat:
+            self.read_through("/f.txt")
+        self.assertEqual(1, stat.call_count)
+
+    def test_owed_recheck_is_not_answered_from_a_listing(self):
+        self.age_checks()
+        self.list_root()
+        with self.fs._member_checks_lock:
+            self.fs._recheck["/f.txt"] = {"member"}
+        with self.count_stats() as stat:
+            self.read_through("/f.txt")
+        self.assertEqual(1, stat.call_count)
+
+    def test_member_without_a_baseline_is_stat_ed(self):
+        with self.fs._member_checks_lock:
+            self.fs._member_checks.pop("/f.txt")
+        os.removexattr(self.cache_dir / "f.txt", StorageFS.MEMBER_STAT_XATTR)
+        self.list_root()
+        with self.count_stats() as stat:
+            self.read_through("/f.txt")
+        self.assertEqual(1, stat.call_count)
 
 
 if __name__ == "__main__":

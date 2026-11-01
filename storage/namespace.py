@@ -737,6 +737,26 @@ class NamespaceService:
         if listing is not None:
             self.entry_attrs[path] = listing
 
+    def listed_member_attrs(self, resolved: ResolvedPath, backend_name: str,
+                            newer_than: float) -> Optional[dict]:
+        """What one member's listing of the parent says about a file, if recent enough.
+
+        The attributes recorded for backend_name's entry, when the parent's
+        listing began after newer_than (a time.monotonic() value), the name
+        is not among the unknown names (see entry_attrs), and that member
+        listed it. None otherwise: no listing, an older one, a name
+        dropped from it since, or a member that did not list it. Never
+        probes a member and never schedules a refresh; it is evidence for
+        revalidation, not an answer to getattr.
+        """
+        name = Path(resolved.canonical_path).name
+        with self.listing_lock:
+            listing = self.entry_attrs.get(resolved.parent_dir)
+            if listing is None or listing[0] <= newer_than or name in listing[2]:
+                return None
+            attrs = listing[1].get(backend_name, {}).get(name)
+            return dict(attrs) if attrs is not None else None
+
     @staticmethod
     def _walk_listing_locked(listing, name: str, available: List[str]):
         for backend_name in available:
