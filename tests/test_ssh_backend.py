@@ -1486,9 +1486,10 @@ class TestSSHBackendOnThePool(_BackendTestCase):
         self.assertEqual(timeouts["stat"], 3.0)
         self.assertEqual(timeouts["open"], backend.sftp_operation_timeout)
 
-    def test_a_fuse_request_stat_uses_connect_timeout_not_the_operation_timeout(self):
-        # What the revalidation stat on the FUSE thread runs as: every FUSE
-        # op is an interactive request.
+    def test_stat_in_an_interactive_request_keeps_the_connect_timeout(self):
+        # What the revalidation stat on the FUSE thread runs as (every FUSE
+        # op is an interactive request): interactivity picks the lease wait
+        # and channel, the request timeout stays connect_timeout.
         from storage.backends.base import interactive_request
         backend = self._new_backend(connect_timeout=3.0)
         with interactive_request():
