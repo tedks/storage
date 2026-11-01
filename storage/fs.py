@@ -2485,9 +2485,11 @@ class StorageFS(Operations):
         member's listing or lstat) is answered from the members in the
         order getattr asks them, so readlink describes the copy getattr
         did: the first available member holding the name decides, and a
-        name there that is not a link is EINVAL. A member that fails for
-        any other reason is passed over, as getattr passes it over. A
-        conflict view (`name.<member>`) asks only that member.
+        name there that is not a link is EINVAL. A member whose readlink
+        fails otherwise is asked for an lstat, the call getattr's fallback
+        makes: if it holds the name, its failure is the answer (EIO when
+        it carries no errno); if not, it is passed over, as getattr passes
+        it over. A conflict view (`name.<member>`) asks only that member.
 
         Only a missing cache path falls back to the members; any other
         error from the cache (EINVAL for a cached file, ENOTDIR under one)
@@ -2523,10 +2525,21 @@ class StorageFS(Operations):
                     raise FuseOSError(errno.EINVAL)
                 if is_connection_error(e):
                     unreachable = True
-                elif not isinstance(e, FileNotFoundError):
-                    # ENOSYS, EACCES, EIO: getattr's lstat would have passed
-                    # this member over too.
-                    self.logger.debug("readlink on member %s failed: %r", name, e)
+                    continue
+                if isinstance(e, FileNotFoundError):
+                    continue
+                failure = e
+            # EACCES, EIO, ENOSYS, or a bug: does this member hold the name?
+            self.logger.warning("readlink on member %s failed: %r", name, failure)
+            try:
+                backend.lstat(resolved.canonical_path)
+            except Exception as e:
+                if is_connection_error(e):
+                    unreachable = True
+                continue
+            errno_value = getattr(failure, "errno", None)
+            raise FuseOSError(errno_value if isinstance(failure, OSError) and errno_value
+                              else errno.EIO)
         raise FuseOSError(errno.EHOSTUNREACH if unreachable else errno.ENOENT)
 
     # Symlinks are refused until they replicate (ruling

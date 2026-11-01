@@ -369,10 +369,10 @@ class TestFSNamespaceIntegration(unittest.TestCase):
         self.assertEqual(self.fs.readlink('/name.backend2'), "the second")
         self.assertEqual(self.fs.readlink('/name.backend1'), "one")
 
-    def test_readlink_passes_over_a_member_failing_otherwise(self):
-        # As getattr's lstat would: EACCES or ENOSYS on one member is not an
-        # answer about the name, and a member that cannot readlink is not
-        # unreachable.
+    def test_readlink_passes_over_a_failing_member_without_the_name(self):
+        # As getattr's lstat would: a member whose readlink fails and whose
+        # lstat finds nothing is passed over, and one that cannot readlink
+        # is not unreachable.
         (self.backend2_dir / "link").symlink_to("there")
         first = self.backends["backend1"]
         for error in (PermissionError(errno.EACCES, "denied"), OSError(errno.ENOSYS, "no")):
@@ -383,6 +383,21 @@ class TestFSNamespaceIntegration(unittest.TestCase):
             with self.assertRaises(FuseOSError) as raised:
                 self.fs.readlink('/link')
         self.assertEqual(raised.exception.errno, errno.ENOENT)
+
+    def test_readlink_failure_on_the_member_holding_the_name_is_the_answer(self):
+        # getattr reports backend1's link; its readlink failing must not
+        # answer with backend2's different link.
+        (self.backend1_dir / "link").symlink_to("first")
+        (self.backend2_dir / "link").symlink_to("second")
+        first = self.backends["backend1"]
+        for error, expected in ((OSError(errno.EIO, "io"), errno.EIO),
+                                (PermissionError(errno.EACCES, "denied"), errno.EACCES),
+                                (OSError("no errno"), errno.EIO),
+                                (RuntimeError("bug"), errno.EIO)):
+            with patch.object(first, "readlink", side_effect=error):
+                with self.assertRaises(FuseOSError) as raised:
+                    self.fs.readlink('/link')
+            self.assertEqual(raised.exception.errno, expected, error)
 
     def test_readlink_of_a_missing_name_is_enoent(self):
         with self.assertRaises(FuseOSError) as raised:
