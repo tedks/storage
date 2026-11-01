@@ -1,0 +1,28 @@
+id: oq-link-rename-retarget
+title: Renaming a link (or a directory above it) can make its relative target escape
+  or point elsewhere
+desc: 'From the PR #162 council (Claude seat). The escape and dangling checks of symlink-replication
+  hold when the link is made. rename keeps the target string (POSIX), so /a/l -> ../t
+  moved to /l now climbs above the mount root, and moving a directory above links
+  changes what their relative targets name; member renames move the members'' links
+  the same way. A link renamed before its first sync goes to ERROR (resolve_link_target
+  refuses it) and stays only in the cache. Options: (A) document (shipped in #162''s
+  README); (B) refuse a rename of a link whose target would escape or dangle at the
+  new path (EPERM; or EXDEV, which makes mv copy+unlink, and the copy''s symlink()
+  then refuses with EPERM), leaving directory renames documented; (C) also check every
+  link below a renamed directory (index rows WHERE link_target IS NOT NULL under the
+  subtree) and refuse the rename. Recommendation: B for single links (cheap, one check
+  in fs.rename), A for directories. Who decides: Ted. Blocks: nothing merged.'
+type: task
+component: open-questions
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-01T03:22:19-00:00
+references: []
+log_events:
+- time: 2026-11-01T03:22:19-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
