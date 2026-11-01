@@ -297,6 +297,19 @@ class TestFSCoreIntegration(unittest.TestCase):
         self.assertNotEqual(lock_path.read_text().strip(), "")
         lock_file.close()
 
+    def test_destroy_with_a_failed_step_keeps_the_pid_but_frees_the_lock(self):
+        lock_path = self.temp_dir / "lock"
+        lock_file, _ = _acquire_mount_lock_ex(lock_path, "/mnt/t")
+        self.fs.mount_lock_file = lock_file
+
+        with patch.object(self.fs.state_manager, "close", side_effect=OSError("disk")):
+            self.fs.destroy("/")
+
+        self.assertNotEqual(lock_path.read_text().strip(), "")  # the next mount sweeps
+        again, previous_pid_left = _acquire_mount_lock_ex(lock_path, "/mnt/t")
+        again.close()
+        self.assertTrue(previous_pid_left)
+
     def test_destroy_releases_the_mount_lock_for_a_remount(self):
         lock_path = self.temp_dir / "lock"
         lock_file, _ = _acquire_mount_lock_ex(lock_path, "/mnt/t")
