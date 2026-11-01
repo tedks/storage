@@ -42,3 +42,10 @@ log_events:
     target. A stale RENAME retry on an SSH member therefore overwrites whatever is
     at the destination there instead of failing, as the local member already did.
     Reconcile should consider this when deciding which copy wins.'
+- time: 2026-11-01T02:35:22-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Also from PR #149 council: a destination directory whose files exist only
+    on members (listed, never fetched, so no index rows) passes the ENOTEMPTY guard;
+    the cache rename replaces it and the member renames fail with ENOTEMPTY on every
+    retry. Reconcile is where that surfaces.'
