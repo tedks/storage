@@ -623,3 +623,78 @@ class TestWatcherInvalidation(TestCase):
                 self.assertFalse(cache_path.exists())
             finally:
                 fs.state_manager.close()
+
+
+class TestRemoteWatcherResync(TestCase):
+    """on_resync fires when inotifywait reports its watches established."""
+
+    def _run(self, script, restarts):
+        import threading
+        resyncs, events = [], []
+        done = threading.Event()
+
+        def resync():
+            resyncs.append(1)
+            if len(resyncs) >= restarts:
+                done.set()
+
+        w = RemoteWatcher(
+            backend_name="resync", ssh_host="h", ssh_port=22, remote_path="/data",
+            on_change=events.append, on_resync=resync,
+        )
+        w._build_ssh_command = lambda: ["sh", "-c", script]
+        w._INITIAL_BACKOFF = 0.05
+        w.start()
+        try:
+            self.assertTrue(done.wait(10), f"on_resync fired {len(resyncs)} times")
+        finally:
+            w.stop()
+        return resyncs, events
+
+    def test_fires_once_per_establishment_including_restarts(self):
+        script = ("echo 'Setting up watches.  Beware: this may take a while!' >&2; "
+                  "echo 'Watches established.' >&2; echo 'CREATE /data/x'; sleep 0.2")
+        resyncs, events = self._run(script, restarts=2)
+        self.assertGreaterEqual(len(resyncs), 2)
+        self.assertIn("/x", events)
+
+    def test_not_fired_while_watches_are_still_being_set_up(self):
+        import threading
+        resyncs = []
+        w = RemoteWatcher(
+            backend_name="resync", ssh_host="h", ssh_port=22, remote_path="/data",
+            on_change=lambda p: None, on_resync=lambda: resyncs.append(1),
+        )
+        w._build_ssh_command = lambda: ["sh", "-c", "echo 'Setting up watches.' >&2; sleep 1"]
+        w.start()
+        try:
+            threading.Event().wait(0.5)
+            self.assertEqual(resyncs, [])
+        finally:
+            w.stop()
+
+    def test_command_does_not_hide_inotifywait_progress(self):
+        w = RemoteWatcher(backend_name="b", ssh_host="h", ssh_port=22, remote_path="/data")
+        self.assertNotIn("-mrq", w._build_ssh_command()[-1])
+
+    def test_fires_exactly_once_per_process(self):
+        import threading
+        resyncs = []
+        w = RemoteWatcher(
+            backend_name="resync", ssh_host="h", ssh_port=22, remote_path="/data",
+            on_change=lambda p: None, on_resync=lambda: resyncs.append(1),
+        )
+        w._build_ssh_command = lambda: [
+            "sh", "-c", "echo 'Watches established.' >&2; echo 'CREATE /data/x'; sleep 3"]
+        w.start()
+        try:
+            threading.Event().wait(1.0)
+            self.assertEqual(resyncs, [1])
+        finally:
+            w.stop()
+
+    def test_marker_after_a_lot_of_stderr_is_still_seen(self):
+        script = ("i=0; while [ $i -lt 3000 ]; do echo 'inotify: setting up a watch of some path ......' >&2; "
+                  "i=$((i+1)); done; echo 'Watches established.' >&2; sleep 0.3")
+        resyncs, _ = self._run(script, restarts=1)
+        self.assertGreaterEqual(len(resyncs), 1)

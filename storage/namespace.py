@@ -32,6 +32,10 @@ DEFAULT_REFRESH_MEMBER_TIMEOUT = 60.0
 # expires, so without a bound the state grows with every directory browsed.
 DEFAULT_LISTING_LIMIT = 4096
 
+# Member stat answers kept for the fresh window (paths). A path reached
+# without its parent ever being listed has no listing to answer from.
+DEFAULT_STAT_MEMO_LIMIT = 8192
+
 # Child names remembered per directory while a listing of it is in flight
 # (see _note_child_race_locked); past this the listing is dropped instead.
 _MAX_CHILD_RACES = 1024
@@ -69,6 +73,7 @@ class NamespaceService:
         negative_window: Optional[float] = None,
         refresh_member_timeout: float = DEFAULT_REFRESH_MEMBER_TIMEOUT,
         listing_limit: int = DEFAULT_LISTING_LIMIT,
+        stat_memo_limit: int = DEFAULT_STAT_MEMO_LIMIT,
     ):
         self.backends = backends
         self.cache_manager = cache_manager
@@ -95,6 +100,7 @@ class NamespaceService:
         self.negative_window = negative_window
         self.refresh_member_timeout = refresh_member_timeout
         self.listing_limit = max(1, listing_limit)
+        self.stat_memo_limit = max(1, stat_memo_limit)
         # Each published snapshot's merge inputs, (cache and member names,
         # member names by member, size splits, wall time of the listing), so
         # serving it recomputes the conflict view from the checksums
@@ -126,6 +132,21 @@ class NamespaceService:
         # With watchers, a change that reaches no invalidation (a dropped
         # watcher event) stays unseen until the directory is invalidated.
         self.entry_attrs: Dict[str, Tuple[float, Dict[str, Dict[str, dict]], Set[str]]] = {}
+        # Member stat answers for paths no listing answers (the parent was
+        # never listed, or lists the name as a symlink): {canonical path:
+        # {backend hint or None: (monotonic time, attributes)}}, kept while
+        # the answer is within the negative window, like a listing's. The
+        # epoch counts drops: a stat that began before one is not stored,
+        # so it cannot reinstate what the drop removed. Guarded by
+        # listing_lock; dropped by the same writes as the listing's names.
+        # Drops are numbered: a stat is refused only if its own path was
+        # dropped after it began (_stat_dropped, bounded), or everything was
+        # (_stat_floor: a subtree drop, a resync, or a trimmed record), so
+        # writes elsewhere do not keep stat answers from being stored.
+        self._stat_memo: Dict[str, Dict[Optional[str], Tuple[float, dict, str]]] = {}
+        self._stat_epoch = 0
+        self._stat_dropped: Dict[str, int] = {}
+        self._stat_floor = 0
         # Directories being listed, and a generation per such directory that
         # an invalidation of the directory itself (or too many of its
         # children, or one of a name split by size) bumps. A listing that
@@ -252,6 +273,7 @@ class NamespaceService:
         with self.dir_cache_lock:
             self.dir_cache.pop(path, None)
             with self.listing_lock:
+                self._drop_stat_memo_locked({path, canonical})
                 self._listing_as_of.pop(path, None)
                 if path in self._listings_in_flight:
                     self._listing_generation[path] += 1
@@ -287,6 +309,90 @@ class NamespaceService:
                               self.entry_attrs, self._listing_as_of):
                     for key in [k for k in table if under(k)]:
                         del table[key]
+                self._drop_stat_memo_locked(
+                    {k for k in self._stat_memo if under(k)} | {canonical},
+                    everything_below=True)
+
+    def invalidate_all_listings(self):
+        """Drop every listing and remembered stat (a watcher's events may
+        have been lost: it was down, or its watches were being set up).
+
+        A listing in flight began before now, so it is not published.
+        """
+        with self.dir_cache_lock:
+            self.dir_cache.clear()
+            with self.listing_lock:
+                for key in self._listings_in_flight:
+                    self._listing_generation[key] += 1
+                for table in (self.readdir_snapshot, self._view_inputs,
+                              self.entry_attrs, self._listing_as_of,
+                              self._child_races):
+                    table.clear()
+                self._stat_memo.clear()
+                self._stat_dropped.clear()
+                self._stat_epoch += 1
+                self._stat_floor = self._stat_epoch
+
+    _MAX_STAT_DROPS = 1024
+
+    def _drop_stat_memo_locked(self, paths: Set[str], *, everything_below: bool = False):
+        """Forget the stat answers for paths; listing_lock held.
+
+        everything_below: a subtree drop, which also refuses every stat
+        that began earlier (it names too many paths to record).
+        Descendants of a path dropped without it are not dropped (a remote
+        rename of a directory leaves them until the window ends).
+        """
+        self._stat_epoch += 1
+        for path in paths:
+            self._stat_memo.pop(path, None)
+            self._stat_dropped.pop(path, None)
+            self._stat_dropped[path] = self._stat_epoch
+        if everything_below:
+            self._stat_floor = self._stat_epoch
+        while len(self._stat_dropped) > self._MAX_STAT_DROPS:
+            oldest = next(iter(self._stat_dropped))
+            self._stat_floor = max(self._stat_floor, self._stat_dropped.pop(oldest))
+
+    def _stat_memo_get(self, path: str, hint: Optional[str]) -> Tuple[Optional[dict], int]:
+        """(a remembered stat answer, or None) and the epoch to store a new one under."""
+        with self.listing_lock:
+            epoch = self._stat_epoch
+            if self.readdir_snapshot_ttl <= 0:
+                return None, epoch
+            entry = self._stat_memo.get(path, {}).get(hint)
+            if entry is None:
+                return None, epoch
+            if not self._answers_missing(entry[0], time.monotonic()):
+                self._drop_stat_memo_entry_locked(path, hint)
+                return None, epoch
+            return {**entry[1], "_answered_by": entry[2]}, epoch
+
+    def _stat_memo_put(self, path: str, hint: Optional[str], attrs: dict, epoch: int, at: float,
+                       answered_by: str):
+        with self.listing_lock:
+            if (
+                self.readdir_snapshot_ttl <= 0
+                or self._stat_floor > epoch
+                or self._stat_dropped.get(path, 0) > epoch
+            ):
+                return
+            by_hint = self._stat_memo.get(path, {})
+            existing = by_hint.get(hint)
+            if existing is not None and existing[0] > at:
+                return  # a stat that began later was stored first
+            by_hint = self._stat_memo.pop(path, {})
+            by_hint[hint] = (at, dict(attrs), answered_by)
+            self._stat_memo[path] = by_hint  # most recently stored last
+            while len(self._stat_memo) > self.stat_memo_limit:
+                del self._stat_memo[next(iter(self._stat_memo))]
+
+    def _drop_stat_memo_entry_locked(self, path: str, hint: Optional[str]):
+        by_hint = self._stat_memo.get(path)
+        if by_hint is not None:
+            by_hint.pop(hint, None)
+            if not by_hint:
+                del self._stat_memo[path]
 
     def forget_listed_attrs(self, path: str, *, removing: bool = True):
         """Stop answering getattr for a path from its parent's listing.
@@ -340,6 +446,7 @@ class NamespaceService:
         active writer.
         """
         names_to_drop = {Path(path).name, Path(canonical).name}
+        self._drop_stat_memo_locked({path, canonical})
         inputs = self._view_inputs.get(parent)
         if bump and inputs is not None and (
             Path(path).name in inputs[2] or Path(canonical).name in inputs[2]
@@ -644,6 +751,18 @@ class NamespaceService:
                     "st_uid": field("st_uid", os.getuid()),
                 }
 
+            # A member's answer is remembered for the fresh window (see
+            # _stat_memo): a directory reached by path, whose parent was never
+            # listed, would otherwise cost a member stat at every getattr.
+            remembered, epoch = self._stat_memo_get(resolved.canonical_path, resolved.backend_name)
+            if remembered is not None:
+                # Not for a member that is down, as a listing's attributes
+                # are not (see _listed_attrs): the answer is the answering
+                # member's.
+                answered_by = self.backends.get(remembered.pop("_answered_by"))
+                if answered_by is not None and answered_by.is_available():
+                    return remembered
+
             for backend_name, backend in backend_iter:
                 if not backend:
                     continue
@@ -652,10 +771,11 @@ class NamespaceService:
                         raise FuseOSError(errno.EHOSTUNREACH)
                     continue
                 try:
+                    began = time.monotonic()
                     # lstat: a member's link is reported as a link, as its
                     # listing reports it (readlink answers its target).
                     st = backend.lstat(resolved.canonical_path)
-                    return {
+                    answer = {
                         "st_atime": getattr(st, "st_atime", time.time()),
                         "st_ctime": getattr(
                             st,
@@ -669,6 +789,10 @@ class NamespaceService:
                         "st_size": getattr(st, "st_size", 0),
                         "st_uid": getattr(st, "st_uid", os.getuid()),
                     }
+                    self._stat_memo_put(
+                        resolved.canonical_path, resolved.backend_name, answer, epoch, began,
+                        backend_name)
+                    return answer
                 except Exception as backend_error:
                     self.logger.debug(
                         "getattr backend fallback failed for %s on %s: %s",
@@ -1324,6 +1448,9 @@ class NamespaceService:
                     backend.delete_file(resolved.canonical_path)
                 except Exception:
                     pass
+                # Again, now the member has changed: a getattr that stat'd
+                # it before the delete must not leave its answer behind.
+                self.invalidate_dir_cache_entry(resolved.canonical_path)
         except OSError as exc:
             raise FuseOSError(exc.errno)
 

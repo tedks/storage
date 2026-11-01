@@ -60,6 +60,12 @@ class RemoteWatcher:
         SSH username.
     key_filename : str, optional
         Path to SSH private key.
+    on_resync : callable, optional
+        ``on_resync()`` is called each time inotifywait reports that its
+        watches are established, the first time and after every restart.
+        Events between the old process's end and that moment were never
+        seen, so the caller drops what it learned before it (listings).
+        It runs on a helper thread, holding nothing.
     """
 
     def __init__(
@@ -74,11 +80,13 @@ class RemoteWatcher:
         *,
         remote_paths: Optional[List[str]] = None,
         control_sockets: Optional[ControlSockets] = None,
+        on_resync: Optional[Callable[[], None]] = None,
     ):
         self.backend_name = backend_name
         self.ssh_host = ssh_host
         self.ssh_port = ssh_port
         self.on_change = on_change
+        self.on_resync = on_resync
         self.username = username
         self.key_filename = key_filename
         self._control_sockets = control_sockets
@@ -127,7 +135,7 @@ class RemoteWatcher:
         events = ",".join(sorted(_CHANGE_EVENTS))
         quoted_paths = " ".join(shlex.quote(p) for p in self._remote_paths)
         inotify_cmd = (
-            f"inotifywait -mrq --format '%e %w%f' "
+            f"inotifywait -mr --format '%e %w%f' "
             f"-e {events} "
             f"{quoted_paths}"
         )
@@ -169,6 +177,47 @@ class RemoteWatcher:
         parent = str(PurePosixPath(virtual_path).parent)
         return parent if parent != virtual_path else "/"
 
+    # inotifywait's own progress lines (stderr; -q would hide them, and
+    # "Watches established." is the signal that no event is lost from here).
+    _WATCHES_ESTABLISHED = b"Watches established"
+    _INFO_LINES = ("Setting up watches", "Watches established")
+
+    def _announce_watches(self, fd: int, process, done: threading.Event):
+        """Call on_resync once inotifywait's stderr says its watches are set.
+
+        Polls the stderr file with pread (the child shares its offset),
+        incrementally, keeping the marker's length across reads. Owns fd
+        (a duplicate) and closes it on return.
+        """
+        try:
+            self._poll_for_watches(fd, process, done)
+        finally:
+            os.close(fd)
+
+    def _poll_for_watches(self, fd: int, process, done: threading.Event):
+        offset = 0
+        tail = b""
+        while not done.is_set() and not self._stop_event.is_set():
+            exited = process.poll() is not None  # before the read: it is the last
+            try:
+                chunk = os.pread(fd, 65536, offset)
+            except OSError:
+                return
+            offset += len(chunk)
+            text = tail + chunk
+            if self._WATCHES_ESTABLISHED in text:
+                if self.on_resync is not None and not self._stop_event.is_set():
+                    try:
+                        self.on_resync()
+                    except Exception:
+                        logger.exception("Error in on_resync callback")
+                return
+            tail = text[-len(self._WATCHES_ESTABLISHED):]
+            if exited and not chunk:
+                return
+            if not chunk:
+                done.wait(0.1)
+
     _MAX_BACKOFF = 300.0  # 5 minutes
     _INITIAL_BACKOFF = 5.0
 
@@ -184,6 +233,8 @@ class RemoteWatcher:
 
         while not self._stop_event.is_set():
             stderr_file = None
+            announce_done = threading.Event()
+            announcer = None
             try:
                 # stderr goes to a file, not a pipe: a shared ssh master
                 # forked from this ssh may keep its descriptors (older
@@ -197,6 +248,22 @@ class RemoteWatcher:
                     text=True,
                     start_new_session=True,
                 )
+                if self.on_resync is not None:
+                    # The helper owns a duplicate descriptor, closed when it
+                    # ends, so nothing can close one it is still reading.
+                    announce_fd = os.dup(stderr_file.fileno())
+                    try:
+                        announcer = threading.Thread(
+                            target=self._announce_watches,
+                            args=(announce_fd, self._process, announce_done),
+                            name=f"WatcherReady-{self.backend_name}",
+                            daemon=True,
+                        )
+                        announcer.start()
+                    except Exception:  # RuntimeError: no thread was started
+                        announcer = None
+                        os.close(announce_fd)
+                        raise
 
                 for line in self._process.stdout:
                     if self._stop_event.is_set():
@@ -221,7 +288,10 @@ class RemoteWatcher:
                     stderr_text = ""
                     try:
                         stderr_file.seek(0)
-                        stderr_text = stderr_file.read().strip()
+                        stderr_text = "\n".join(
+                            line for line in stderr_file.read().splitlines()
+                            if line.strip() and not line.startswith(self._INFO_LINES)
+                        )
                     except Exception:
                         pass
                     if rc == 255 and self._control_sockets is not None:
@@ -245,6 +315,9 @@ class RemoteWatcher:
             except Exception:
                 logger.exception("Watcher error for %s", self.backend_name)
             finally:
+                announce_done.set()
+                if announcer is not None:
+                    announcer.join(timeout=10)
                 if stderr_file is not None:
                     stderr_file.close()
 

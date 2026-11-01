@@ -825,6 +825,26 @@ def test_mounted_write_syncs_to_both_members(remote, mounted_factory):
         assert remote.read_remote(member, "replicated.bin") == payload
 
 
+def test_watcher_reports_established_watches_after_every_restart(remote):
+    # on_resync is what drops a mount's listings after an outage: it must
+    # fire once the real inotifywait says its watches are set (the first
+    # time too), and again for the process the watcher restarts after the
+    # remote one dies.
+    member = remote.members[0]
+    resyncs: List[float] = []
+    watcher = _watcher_for(remote, member, lambda _path: None)
+    watcher.on_resync = lambda: resyncs.append(time.monotonic())
+    watcher.start()
+    try:
+        assert _wait_for(lambda: len(resyncs) >= 1, timeout=20.0, interval=0.2), \
+            "no 'Watches established' from the first inotifywait"
+        remote.exec(member, "pkill -u storage -x inotifywait", check=False)
+        assert _wait_for(lambda: len(resyncs) >= 2, timeout=40.0, interval=0.2), \
+            "no resync after the remote inotifywait was killed"
+    finally:
+        watcher.stop()
+
+
 def test_mounted_watcher_refreshes_listing(remote, mounted_factory):
     m1 = remote.members[1]
     log_before = len(remote.ssh_log_lines())
@@ -1448,6 +1468,41 @@ def test_mounted_browse_request_budget(remote, mounted_factory):
     for label, recorded in steps.items():
         others = [c for c in recorded if not c[2].startswith("/browse")]
         assert all(m == "listdir_attrs" and p == "/" for _, m, p in others), report
+
+
+def test_mounted_directory_reached_by_path_costs_one_stat_per_window(remote, mounted_factory):
+    """A directory whose parent was never listed (a cd to a deep path).
+
+    docs/browsing_latency_plan.md section 6: visiting it again inside the
+    fresh window used to cost a member stat each time (attr_timeout is 0).
+    Now the first stat is remembered for the window; listing it and
+    stat-ing its entries stays at one listing per member.
+    """
+    m0, m1 = remote.members
+    for member in (m0, m1):
+        remote.exec(member, f"mkdir -p {REMOTE_ROOT}/deep/er && printf x > {REMOTE_ROOT}/deep/er/{member.name}.bin")
+    window = 30.0
+    mnt = mounted_factory(revalidate_after=window, start_sync=False)
+    os.listdir(mnt.mount)
+    calls = _count_member_requests(mnt.backends)
+    target = mnt.mount / "deep" / "er"
+
+    def under_deep():
+        return [c for c in calls if c[2].startswith("/deep")]
+
+    os.stat(target)
+    first = list(under_deep())
+    assert first and all(m == "lstat" for _, m, _ in first), first
+    for _ in range(5):
+        os.stat(target)
+    assert under_deep() == first, f"a revisit inside the window asked a member: {under_deep()[len(first):]}"
+
+    before = len(under_deep())
+    entries = os.listdir(target)
+    for n in entries:
+        os.stat(target / n)
+    after = under_deep()[before:]
+    assert sorted(m for _, m, _ in after) == ["listdir_attrs"] * 2, after
 
 
 def test_mounted_conflict_view_hash_budget(remote, mounted_factory):
