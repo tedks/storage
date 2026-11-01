@@ -2741,26 +2741,25 @@ class StorageFS(Operations):
             self.logger.warning("symlink refused: %s", refused)
             raise FuseOSError(errno.EPERM)
         # As for create, a name held only on an unreachable member is not
-        # seen; the link's sync finds it there and records a conflict.
+        # seen. The link's sync records a conflict if that member also holds
+        # the target; otherwise the listing's conflict view shows the clash.
         if self._name_exists(link_path, unreachable_is_missing=True):
             raise FuseOSError(errno.EEXIST)
-        if self.state_manager.get_file_metadata(link_path) is not None:
-            # A row at a name nobody holds: a synced file removed on its
-            # member outside the mount. Stale only if every member answered;
-            # dropped, so the link's row is not merged into it.
-            if any(not backend.is_available() for backend in self.backends.values()):
-                raise FuseOSError(errno.EEXIST)
-            self.state_manager.delete_file(link_path)
+        stale_row = self.state_manager.get_file_metadata(link_path) is not None
         # The resolution above is lexical: right only if the kernel walks no
         # link on the way (one from a member may point anywhere, and a '..'
         # after it would climb from there).
         for directory in intermediate_paths(link_path, source):
-            if not self._name_exists(directory):
+            mode = self._existing_mode(directory)
+            if mode is None:
                 self.logger.warning("symlink refused: dangling target")
                 raise FuseOSError(errno.EPERM)
-            mode = self.namespace.getattr(directory)["st_mode"]
             if stat.S_ISLNK(mode):
                 self.logger.warning("symlink refused: target passes through a link")
+                raise FuseOSError(errno.EPERM)
+            if not stat.S_ISDIR(mode):
+                # file/.. resolves lexically, but the kernel says ENOTDIR.
+                self.logger.warning("symlink refused: target passes through a non-directory")
                 raise FuseOSError(errno.EPERM)
         if self._resolve_path(target_path).backend_name:
             # A conflict view's name is on no member; it could not be placed.
@@ -2769,6 +2768,15 @@ class StorageFS(Operations):
         if not self._name_exists(target_path):
             self.logger.warning("symlink refused: dangling target")
             raise FuseOSError(errno.EPERM)
+
+        if stale_row:
+            # A row at a name nobody holds (a synced file removed on its
+            # member outside the mount) would absorb the link's row, which
+            # then never syncs as a link. Dropped only when every member
+            # says the name is absent; any other answer keeps it.
+            if not self._absent_on_every_member(link_path):
+                raise FuseOSError(errno.EEXIST)
+            self.state_manager.delete_file(link_path)
 
         cache_path = resolved.cache_path
         try:
@@ -2809,6 +2817,35 @@ class StorageFS(Operations):
         self._invalidate_dir_cache_entry(resolved.parent_dir)
         self._invalidate_dir_cache_entry(link_path)
         self.sync_manager.queue_sync(link_path, priority=100)
+
+    def _existing_mode(self, canonical_path: str) -> Optional[int]:
+        """The name's st_mode, None when absent (EHOSTUNREACH as _name_exists)."""
+        try:
+            return self.namespace.getattr(canonical_path)["st_mode"]
+        except FuseOSError as exc:
+            if exc.errno != errno.ENOENT:
+                raise
+        if any(not backend.is_available() for backend in self.backends.values()):
+            raise FuseOSError(errno.EHOSTUNREACH)
+        return None
+
+    def _absent_on_every_member(self, canonical_path: str) -> bool:
+        """Every member answers that it has nothing at the path.
+
+        getattr passes over a member whose lstat fails, so its miss is not
+        enough to drop a row; here only ENOENT counts as an answer.
+        """
+        for backend in self.backends.values():
+            if not backend.is_available():
+                return False
+            try:
+                backend.lstat(canonical_path)
+            except FileNotFoundError:
+                continue
+            except Exception:
+                return False
+            return False
+        return True
 
     def _name_exists(self, canonical_path: str, *, unreachable_is_missing: bool = False) -> bool:
         """Whether the name is in the cache or on a member.

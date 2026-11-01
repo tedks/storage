@@ -381,7 +381,8 @@ class TestFSNamespaceIntegration(unittest.TestCase):
         (self.cache_dir / "real").mkdir()
         (self.cache_dir / "real" / "f").write_text("x")
         (self.cache_dir / "dl").symlink_to("real")
-        for target in ("out/../secret", "dl/f"):
+        (self.cache_dir / "plain").write_text("a file")
+        for target in ("out/../secret", "dl/f", "out/", "out/.", "plain/..", "dl/"):
             with self.assertRaises(FuseOSError, msg=target) as raised:
                 self.fs.symlink('/link', target)
             self.assertEqual(raised.exception.errno, errno.EPERM, target)
@@ -428,6 +429,35 @@ class TestFSNamespaceIntegration(unittest.TestCase):
         with patch.object(self.fs.sync_manager, "queue_sync"):
             self.fs.symlink('/new', 'target.txt')
         self.assertEqual(os.readlink(self.cache_dir / "new"), "target.txt")
+
+    def test_a_row_is_kept_when_a_member_cannot_answer(self):
+        # getattr passes over a member whose lstat fails; that miss must not
+        # drop the only record of the copy on it.
+        (self.backend1_dir / "target.txt").write_text("target")
+        now = time.time()
+        self.fs.state_manager.set_file_metadata(FileMetadata(
+            virtual_path='/x', size=5, checksum="c", last_access=now, last_modified=now,
+            sync_status=SyncStatus.CLEAN, replica_count=1, recomputable=False,
+            recompute_cmd=None, encrypted=False, encryption_key_id=None,
+        ))
+        member = self.backends["backend2"]
+        with patch.object(member, "lstat", side_effect=OSError(errno.EIO, "io")):
+            with self.assertRaises(FuseOSError) as raised:
+                self.fs.symlink('/x', 'target.txt')
+        self.assertEqual(raised.exception.errno, errno.EEXIST)
+        self.assertEqual(self.fs.state_manager.get_file_metadata('/x').checksum, "c")
+        self.assertFalse(os.path.lexists(self.cache_dir / "x"))
+
+    def test_a_refused_symlink_keeps_a_stale_row(self):
+        now = time.time()
+        self.fs.state_manager.set_file_metadata(FileMetadata(
+            virtual_path='/x', size=5, checksum="c", last_access=now, last_modified=now,
+            sync_status=SyncStatus.CLEAN, replica_count=1, recomputable=False,
+            recompute_cmd=None, encrypted=False, encryption_key_id=None,
+        ))
+        with self.assertRaises(FuseOSError):
+            self.fs.symlink('/x', 'missing.txt')
+        self.assertIsNotNone(self.fs.state_manager.get_file_metadata('/x'))
 
     def test_symlink_to_a_conflict_view_is_eperm(self):
         (self.backend1_dir / "f").write_text("one")

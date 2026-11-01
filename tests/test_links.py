@@ -44,6 +44,10 @@ class TestResolveLinkTarget(unittest.TestCase):
         self.assertEqual(intermediate_paths("/a/link", "out/../secret"), ["/a/out"])
         self.assertEqual(intermediate_paths("/a/link", "../b/c/d"), ["/b", "/b/c"])
         self.assertEqual(intermediate_paths("/link", "./x/./y"), ["/x"])
+        # A trailing '/' or '/.' enters the last component too.
+        self.assertEqual(intermediate_paths("/link", "out/"), ["/out"])
+        self.assertEqual(intermediate_paths("/link", "out/."), ["/out"])
+        self.assertEqual(intermediate_paths("/link", "d/../"), ["/d"])
 
     def test_link_checksum_compares_target_strings(self):
         self.assertEqual(link_checksum("a"), link_checksum("a"))

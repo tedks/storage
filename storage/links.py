@@ -54,15 +54,20 @@ def intermediate_paths(link_path: str, target: str):
     pointed. The caller refuses a target if any of them is a link.
     """
     parts = [p for p in posixpath.dirname(link_path).split("/") if p]
-    components = [c for c in target.split("/") if c not in ("", ".")]
+    raw = target.split("/")
     paths = []
-    for component in components[:-1]:
+    for index, component in enumerate(raw):
+        if component in ("", "."):
+            continue
         if component == "..":
             if parts:
                 parts.pop()
             continue
         parts.append(component)
-        paths.append("/" + "/".join(parts))
+        # Anything after it, even a trailing '/' or '/.', makes the kernel
+        # enter it as a directory (following it if it is a link).
+        if index < len(raw) - 1:
+            paths.append("/" + "/".join(parts))
     return paths
 
 
