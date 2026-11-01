@@ -1,0 +1,23 @@
+id: conflicts-cli-links
+title: storage conflicts resolves a link conflict by copying bytes through the link
+desc: 'From lane symlinks PR 3 (symlink-replication). cli_conflicts groups a link
+  copy with files (is_dir follows links) and its ''take member X'' step reads and
+  writes bytes (read_bytes/write_bytes), which follow a link: resolving a conflict
+  whose winner is a link would replace the base name with the target''s contents instead
+  of the link. The conflict view now compares link copies by target string (link:
+  checksums), and sync records a link whose member already has something else at the
+  name as CONFLICT. Fix: in cli_conflicts, recreate a link winner as a link (os.symlink
+  of its target) and skip byte copies for link copies.'
+type: bugfix
+component: conflicts
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-01T03:10:23-00:00
+references: []
+log_events:
+- time: 2026-11-01T03:10:23-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
