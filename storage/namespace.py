@@ -742,9 +742,9 @@ class NamespaceService:
         """What one member's listing of the parent says about a file, if recent enough.
 
         (listing start, attributes) for backend_name's entry, when the
-        parent's listing began after newer_than (a time.monotonic() value), the name
-        is not among the unknown names (see entry_attrs), and that member
-        listed it. None otherwise: no listing, an older one, a name
+        parent's listing began after newer_than (a time.monotonic()
+        value), the name is not among the unknown names (see entry_attrs),
+        and that member listed it. None otherwise: no listing, an older one, a name
         dropped from it since, or a member that did not list it. Never
         probes a member and never schedules a refresh; it is evidence for
         revalidation, not an answer to getattr.

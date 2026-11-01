@@ -1329,7 +1329,9 @@ class StorageFS(Operations):
                             drop: Tuple[str, ...] = (),
                             drop_unless_checked_since: Optional[MemberCheck] = None,
                             verified_at: Optional[float] = None):
-        """Record a check now (or at verified_at, a time.monotonic() value), merging member baselines, in memory and on the cache file.
+        """Record a check, merging member baselines, in memory and on the cache file.
+
+        The check is dated now, or verified_at (a time.monotonic() value).
 
         The baselines already known for this cache file (in memory, else from
         its xattr) are kept and updates applied on top; replace=True starts
@@ -1551,7 +1553,7 @@ class StorageFS(Operations):
 
     def _listing_confirms_baseline(self, resolved: ResolvedPath, backend: Backend,
                                    members: Dict[str, Tuple[int, float]]) -> Optional[float]:
-        """The start time of a recent listing that shows of the parent shows backend's copy still at its baseline.
+        """The start time of a recent listing of the parent that shows backend's copy at its baseline.
 
         Saves a stat per file when a tree is walked: the listing (a member
         read the directory listing already paid for) carries each entry's
