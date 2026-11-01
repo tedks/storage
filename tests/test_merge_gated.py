@@ -66,7 +66,7 @@ def env(tmp_path):
     for name in ("run-gates.sh", "merge-gated.sh"):
         shutil.copy(SCRIPTS / name, repo / "scripts" / name)
     (repo / "MODULE.bazel").write_text("")
-    (repo / ".gitignore").write_text("/.gates/\n")
+    (repo / ".gitignore").write_text("/.gates\n")
     _git(repo, "init", "-q", "-b", "main")
     _git(repo, "add", ".")
     _git(repo, "commit", "-q", "-m", "init")
@@ -294,6 +294,7 @@ def test_unwritable_receipt_dir_says_no_receipt_not_success(env):
     repo, _, environ = env
     (repo / ".gates").write_text("a file, so mkdir -p fails")
     result = _gates(repo, environ)
+    assert "dirty when the run started" not in result.stderr
     assert "run-gates: receipt" not in result.stdout
 
 
@@ -313,10 +314,12 @@ def test_missing_base_branch_cannot_be_verified(env):
     assert _merge(repo, environ).returncode == 65
 
 
-def test_receipt_with_trailing_junk_in_tree_is_refused(env):
+def test_receipt_whose_tree_line_is_not_exact_is_refused(env):
     repo, log, environ = env
     _gates(repo, environ)
     path = _receipt(repo)
     tree = _git(repo, "rev-parse", "HEAD^{tree}")
-    path.write_text(path.read_text().replace(f'"{tree}"', f'"{tree}0"'))
+    # the right text, on a line that is not exactly the tree line
+    path.write_text(path.read_text().replace('  "tree"', '  "x-tree"'))
+    assert f'"x-tree": "{tree}",' in path.read_text()
     assert _merge(repo, environ).returncode == REFUSAL_CODES["receipt"]
