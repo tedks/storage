@@ -829,17 +829,17 @@ class TestFSNamespaceIntegration(unittest.TestCase):
     def test_child_invalidation_before_a_listing_began_does_not_touch_it(self):
         (self.backend1_dir / "f.txt").write_text("1")
         namespace = self.fs.namespace
-        ticket = namespace._begin_listing('/')
+        earlier = namespace._begin_listing('/')  # keeps the directory in flight
         try:
-            self.fs._invalidate_dir_cache_entry('/f.txt')  # before the next begins
+            self.fs._invalidate_dir_cache_entry('/f.txt')
             later = namespace._begin_listing('/')
+            self.assertGreater(later.child_seq, earlier.child_seq)
             try:
                 namespace._list_members('/', later)
             finally:
                 namespace._end_listing('/')
         finally:
             namespace._end_listing('/')
-        self.assertIsNotNone(ticket)
         self.assertEqual(namespace.entry_attrs['/'][2], set())
         self.assertIn("f.txt", namespace.entry_attrs['/'][1]["backend1"])
 
@@ -848,7 +848,7 @@ class TestFSNamespaceIntegration(unittest.TestCase):
         (self.backend1_dir / "d").mkdir()
         (self.backend1_dir / "d" / "g.txt").write_text("1")
         namespace = self.fs.namespace
-        namespace.refresh_member_timeout = 0.3
+        namespace.refresh_member_timeout = 0.5
         self._make_stale('/')
         self._make_stale('/d')
         stale_at = namespace.entry_attrs['/'][0]
@@ -875,13 +875,79 @@ class TestFSNamespaceIntegration(unittest.TestCase):
                 begun = time.monotonic()
                 list(self.fs.readdir('/d', None))
                 self._wait_refreshed('/d')
-                self.assertLess(time.monotonic() - begun, 0.25)
+                self.assertLess(time.monotonic() - begun, 0.4)
                 self.assertEqual(calls, ["/"])
                 self.assertNotIn("backend1", namespace.entry_attrs['/d'][1])
         finally:
             release.set()
         self.assertTrue(self._wait_for(lambda: not namespace._hung_listings))
         self.assertEqual(namespace._listings_in_flight, {})
+
+    def test_refresh_skips_a_member_busy_with_a_foreground_listing(self):
+        # A member's worker held by something else (here a foreground
+        # listing) makes a refresh time out while queued: the cancel
+        # succeeds, but the next refresh must not wait again.
+        (self.backend1_dir / "d").mkdir()
+        namespace = self.fs.namespace
+        namespace.refresh_member_timeout = 0.3
+        self._make_stale('/')
+        self._make_stale('/d')
+        release, held = threading.Event(), threading.Event()
+        executor = namespace._listing_executor("backend1")
+        executor.submit(lambda: (held.set(), release.wait(10)))
+        self.assertTrue(held.wait(5))
+        try:
+            list(self.fs.readdir('/', None))
+            self._wait_refreshed('/')
+            with namespace._listing_executors_lock:
+                self.assertIn("backend1", namespace._hung_listings)
+            begun = time.monotonic()
+            list(self.fs.readdir('/d', None))
+            self._wait_refreshed('/d')
+            self.assertLess(time.monotonic() - begun, 0.25)
+        finally:
+            release.set()
+        self.assertTrue(self._wait_for(lambda: not namespace._hung_listings))
+
+    def test_background_refresh_of_a_lone_member_stops_waiting_too(self):
+        member = {"backend1": self.backends["backend1"]}
+        namespace = self.fs.namespace
+        namespace.backends = member
+        namespace.refresh_member_timeout = 0.3
+        (self.backend1_dir / "f.txt").write_text("1")
+        self._make_stale('/')
+        release = threading.Event()
+        try:
+            with self._wrap_listdir_attrs("backend1", before=lambda _p: release.wait(10)):
+                begun = time.monotonic()
+                list(self.fs.readdir('/', None))
+                self._wait_refreshed('/')
+                self.assertLess(time.monotonic() - begun, 3.0)
+        finally:
+            release.set()
+        self.assertTrue(self._wait_for(lambda: not namespace._hung_listings))
+
+    def test_listing_raced_on_a_size_split_name_is_not_published(self):
+        (self.backend1_dir / "dup.txt").write_bytes(b"one")
+        (self.backend2_dir / "dup.txt").write_bytes(b"longer")
+        namespace = self.fs.namespace
+
+        def change(_path):
+            namespace.forget_listed_attrs('/dup.txt', removing=True)
+
+        with self._wrap_listdir_attrs("backend1", after=change):
+            list(self.fs.readdir('/', None))
+        self.assertNotIn('/', namespace.entry_attrs)
+
+    def test_dir_cache_is_bounded_with_listing_state(self):
+        namespace = self.fs.namespace
+        namespace.listing_limit = 2
+        with self.fs._dir_cache_lock:
+            for name in ("/x", "/y", "/z"):
+                self.fs._dir_cache[name] = {"backend1": set()}  # fallback names only
+        (self.backend1_dir / "a").mkdir()
+        list(self.fs.readdir('/a', None))
+        self.assertEqual(set(self.fs._dir_cache), {"/z", "/a"})
 
     def test_refresh_listings_are_not_interactive(self):
         # The refresh thread is started from a FUSE request, which is
@@ -893,12 +959,13 @@ class TestFSNamespaceIntegration(unittest.TestCase):
         seen = {}
 
         def record(_path):
-            seen[threading.current_thread().name.split("-")[0]] = is_interactive_request()
+            seen[threading.current_thread().name] = is_interactive_request()
 
         with self._wrap_listdir_attrs("backend1", before=record), interactive_request():
             list(self.fs.readdir('/', None))
             self._wait_refreshed()
-        self.assertEqual(seen, {"readdir": False})
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(set(seen.values()), {False})
 
     def test_listing_limit_drops_the_least_recently_used_directory(self):
         for name in ("a", "b", "c"):

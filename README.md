@@ -234,13 +234,16 @@ from a listing is still answered from it only for `readdir_ttl` (else
 unlink, mkdir, rmdir) drop the affected listings at once; a file
 added or changed directly on a member shows within the fresh window, plus
 one more listing while a stale one is served.
-A background refresh stops waiting for a member that has not answered in 60
-seconds and publishes without it, as for a member that failed; it skips that
-member until its listing ends. A refresh is also published when only
-children of its directory were invalidated meanwhile (their names are
-stat'd rather than answered from it). At most 4096 directories keep a
-listing, the least recently used going first, which bounds the memory a
-mount with watchers uses.
+A background refresh stops waiting for a member that has not answered 60
+seconds after the refresh began (queue time included) and publishes without
+it, as for a member that failed; refreshes then skip that member until its
+listing worker is free, and a listing that slow is replaced only when it
+expires. A refresh is also published when only children of its directory
+were invalidated meanwhile by an eviction or an upload (their names are
+stat'd rather than answered from it); a directory's own invalidation, which
+a watcher event makes for the event's parent, still keeps it from being
+published. At most 4096 directories keep a listing, the least recently used
+going first, which bounds the memory a mount with watchers uses.
 
 Member requests for a browse of one directory, 2 SSH members, 20 entries,
 a 6 s window (the remote gate's `test_mounted_browse_request_budget`):
