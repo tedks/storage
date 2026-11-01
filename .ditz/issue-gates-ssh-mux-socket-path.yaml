@@ -15,3 +15,14 @@ log_events:
   who: Ted Smith
   what: created
   comment: ""
+- time: 2026-11-01T02:57:12-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Seen 2026-11-01 on a Linux dev host: scripts/run-gates.sh (//:storage_tests_all_gates)
+    fails 12 tests in tests/test_ssh_mux.py::TestControlSockets with ''ssh connection
+    sharing is off: no usable socket directory'' (StopIteration in _control_path).
+    Same failure on a clean origin/master worktree. The same target passes with ''bazel
+    test //:storage_tests_sandboxed'' and with the three local gates by hand. Suspect:
+    the unix-socket path length limit (_MAX_CONTROL_PATH) against the test tmp dir
+    under all_gates. Not caused by #155. Needs investigation of the tmp dir the sandboxed
+    test gets under all_gates.'
