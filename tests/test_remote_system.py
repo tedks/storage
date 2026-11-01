@@ -1492,7 +1492,7 @@ def test_mounted_directory_reached_by_path_costs_one_stat_per_window(remote, mou
 
     os.stat(target)
     first = list(under_deep())
-    assert first and all(m == "stat" for _, m, _ in first), first
+    assert first and all(m == "lstat" for _, m, _ in first), first
     for _ in range(5):
         os.stat(target)
     assert under_deep() == first, f"a revisit inside the window asked a member: {under_deep()[len(first):]}"

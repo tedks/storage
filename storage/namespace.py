@@ -139,8 +139,14 @@ class NamespaceService:
         # epoch counts drops: a stat that began before one is not stored,
         # so it cannot reinstate what the drop removed. Guarded by
         # listing_lock; dropped by the same writes as the listing's names.
+        # Drops are numbered: a stat is refused only if its own path was
+        # dropped after it began (_stat_dropped, bounded), or everything was
+        # (_stat_floor: a subtree drop, a resync, or a trimmed record), so
+        # writes elsewhere do not keep stat answers from being stored.
         self._stat_memo: Dict[str, Dict[Optional[str], Tuple[float, dict]]] = {}
         self._stat_epoch = 0
+        self._stat_dropped: Dict[str, int] = {}
+        self._stat_floor = 0
         # Directories being listed, and a generation per such directory that
         # an invalidation of the directory itself (or too many of its
         # children, or one of a name split by size) bumps. A listing that
@@ -304,7 +310,8 @@ class NamespaceService:
                     for key in [k for k in table if under(k)]:
                         del table[key]
                 self._drop_stat_memo_locked(
-                    {k for k in self._stat_memo if under(k)} | {canonical})
+                    {k for k in self._stat_memo if under(k)} | {canonical},
+                    everything_below=True)
 
     def invalidate_all_listings(self):
         """Drop every listing and remembered stat (a watcher's events may
@@ -323,12 +330,28 @@ class NamespaceService:
                     table.clear()
                 self._stat_memo.clear()
                 self._stat_epoch += 1
+                self._stat_floor = self._stat_epoch
 
-    def _drop_stat_memo_locked(self, paths: Set[str]):
-        """Forget the stat answers for paths; listing_lock held."""
+    _MAX_STAT_DROPS = 1024
+
+    def _drop_stat_memo_locked(self, paths: Set[str], *, everything_below: bool = False):
+        """Forget the stat answers for paths; listing_lock held.
+
+        everything_below: a subtree drop, which also refuses every stat
+        that began earlier (it names too many paths to record).
+        Descendants of a path dropped without it are not dropped (a remote
+        rename of a directory leaves them until the window ends).
+        """
         self._stat_epoch += 1
         for path in paths:
             self._stat_memo.pop(path, None)
+            self._stat_dropped.pop(path, None)
+            self._stat_dropped[path] = self._stat_epoch
+        if everything_below:
+            self._stat_floor = self._stat_epoch
+        while len(self._stat_dropped) > self._MAX_STAT_DROPS:
+            oldest = next(iter(self._stat_dropped))
+            self._stat_floor = max(self._stat_floor, self._stat_dropped.pop(oldest))
 
     def _stat_memo_get(self, path: str, hint: Optional[str]) -> Tuple[Optional[dict], int]:
         """(a remembered stat answer, or None) and the epoch to store a new one under."""
@@ -346,8 +369,16 @@ class NamespaceService:
 
     def _stat_memo_put(self, path: str, hint: Optional[str], attrs: dict, epoch: int, at: float):
         with self.listing_lock:
-            if epoch != self._stat_epoch or self.readdir_snapshot_ttl <= 0:
+            if (
+                self.readdir_snapshot_ttl <= 0
+                or self._stat_floor > epoch
+                or self._stat_dropped.get(path, 0) > epoch
+            ):
                 return
+            by_hint = self._stat_memo.get(path, {})
+            existing = by_hint.get(hint)
+            if existing is not None and existing[0] > at:
+                return  # a stat that began later was stored first
             by_hint = self._stat_memo.pop(path, {})
             by_hint[hint] = (at, dict(attrs))
             self._stat_memo[path] = by_hint  # most recently stored last
@@ -723,7 +754,9 @@ class NamespaceService:
             # listed, would otherwise cost a member stat at every getattr.
             remembered, epoch = self._stat_memo_get(resolved.canonical_path, resolved.backend_name)
             if remembered is not None:
-                return remembered
+                hinted = self.backends.get(resolved.backend_name) if resolved.backend_name else None
+                if hinted is None or hinted.is_available():
+                    return remembered
 
             for backend_name, backend in backend_iter:
                 if not backend:
@@ -1409,6 +1442,9 @@ class NamespaceService:
                     backend.delete_file(resolved.canonical_path)
                 except Exception:
                     pass
+                # Again, now the member has changed: a getattr that stat'd
+                # it before the delete must not leave its answer behind.
+                self.invalidate_dir_cache_entry(resolved.canonical_path)
         except OSError as exc:
             raise FuseOSError(exc.errno)
 

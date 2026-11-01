@@ -676,3 +676,25 @@ class TestRemoteWatcherResync(TestCase):
     def test_command_does_not_hide_inotifywait_progress(self):
         w = RemoteWatcher(backend_name="b", ssh_host="h", ssh_port=22, remote_path="/data")
         self.assertNotIn("-mrq", w._build_ssh_command()[-1])
+
+    def test_fires_exactly_once_per_process(self):
+        import threading
+        resyncs = []
+        w = RemoteWatcher(
+            backend_name="resync", ssh_host="h", ssh_port=22, remote_path="/data",
+            on_change=lambda p: None, on_resync=lambda: resyncs.append(1),
+        )
+        w._build_ssh_command = lambda: [
+            "sh", "-c", "echo 'Watches established.' >&2; echo 'CREATE /data/x'; sleep 3"]
+        w.start()
+        try:
+            threading.Event().wait(1.0)
+            self.assertEqual(resyncs, [1])
+        finally:
+            w.stop()
+
+    def test_marker_after_a_lot_of_stderr_is_still_seen(self):
+        script = ("i=0; while [ $i -lt 3000 ]; do echo 'inotify: setting up a watch of some path ......' >&2; "
+                  "i=$((i+1)); done; echo 'Watches established.' >&2; sleep 0.3")
+        resyncs, _ = self._run(script, restarts=1)
+        self.assertGreaterEqual(len(resyncs), 1)

@@ -238,8 +238,9 @@ unlink, mkdir, rmdir) drop the affected listings at once; a file
 added or changed directly on a member shows within the fresh window, plus
 one more listing while a stale one is served.
 A path whose parent was never listed (a `cd` to a deep path) is asked of a
-member once per fresh window, not once per access; the answer is dropped by
-the same writes that drop listings.
+member once per window (the shorter of the fresh and negative windows), not
+once per access; the answer is dropped by the same writes that drop
+listings.
 A background refresh stops waiting for a member that has not answered 60
 seconds after the refresh began (queue time included) and publishes without
 it, as for a member that failed; refreshes then skip that member until its

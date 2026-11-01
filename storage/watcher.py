@@ -185,14 +185,26 @@ class RemoteWatcher:
     def _announce_watches(self, fd: int, process, done: threading.Event):
         """Call on_resync once inotifywait's stderr says its watches are set.
 
-        Polls the stderr file with pread (the child shares its offset).
-        The caller keeps the file open until this has returned.
+        Polls the stderr file with pread (the child shares its offset),
+        incrementally, keeping the marker's length across reads. Owns fd
+        (a duplicate) and closes it on return.
         """
+        try:
+            self._poll_for_watches(fd, process, done)
+        finally:
+            os.close(fd)
+
+    def _poll_for_watches(self, fd: int, process, done: threading.Event):
+        offset = 0
+        tail = b""
         while not done.is_set() and not self._stop_event.is_set():
+            exited = process.poll() is not None  # before the read: it is the last
             try:
-                text = os.pread(fd, 65536, 0)
+                chunk = os.pread(fd, 65536, offset)
             except OSError:
                 return
+            offset += len(chunk)
+            text = tail + chunk
             if self._WATCHES_ESTABLISHED in text:
                 if self.on_resync is not None and not self._stop_event.is_set():
                     try:
@@ -200,9 +212,11 @@ class RemoteWatcher:
                     except Exception:
                         logger.exception("Error in on_resync callback")
                 return
-            if process.poll() is not None:
+            tail = text[-len(self._WATCHES_ESTABLISHED):]
+            if exited and not chunk:
                 return
-            done.wait(0.1)
+            if not chunk:
+                done.wait(0.1)
 
     _MAX_BACKOFF = 300.0  # 5 minutes
     _INITIAL_BACKOFF = 5.0
@@ -235,9 +249,12 @@ class RemoteWatcher:
                     start_new_session=True,
                 )
                 if self.on_resync is not None:
+                    # The helper owns a duplicate descriptor, closed when it
+                    # ends, so nothing can close one it is still reading.
+                    announce_fd = os.dup(stderr_file.fileno())
                     announcer = threading.Thread(
                         target=self._announce_watches,
-                        args=(stderr_file.fileno(), self._process, announce_done),
+                        args=(announce_fd, self._process, announce_done),
                         name=f"WatcherReady-{self.backend_name}",
                         daemon=True,
                     )
@@ -293,8 +310,6 @@ class RemoteWatcher:
             except Exception:
                 logger.exception("Watcher error for %s", self.backend_name)
             finally:
-                # The announcer reads the file by descriptor: it ends before
-                # the descriptor can be closed (and reused).
                 announce_done.set()
                 if announcer is not None:
                     announcer.join(timeout=10)

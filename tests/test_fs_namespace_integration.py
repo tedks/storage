@@ -1210,6 +1210,45 @@ class TestFSNamespaceIntegration(unittest.TestCase):
             self.fs.getattr('/deep')
         self.assertEqual(len(calls), 2)
 
+    def test_a_drop_elsewhere_does_not_keep_a_stat_from_being_stored(self):
+        (self.backend1_dir / "deep").mkdir()
+        namespace = self.fs.namespace
+        namespace.readdir_snapshot_ttl = 60.0
+        backend = self.backends["backend1"]
+        real = backend.lstat
+        calls = []
+
+        def stat_during_a_write_elsewhere(path):
+            result = real(path)
+            namespace.forget_listed_attrs('/elsewhere.txt', removing=False)
+            calls.append(path)
+            return result
+
+        with patch.object(backend, "lstat", side_effect=stat_during_a_write_elsewhere):
+            self.fs.getattr('/deep')
+            self.fs.getattr('/deep')
+        self.assertEqual(len(calls), 1)
+
+    def test_older_stat_does_not_replace_a_newer_one(self):
+        namespace = self.fs.namespace
+        namespace.readdir_snapshot_ttl = 60.0
+        now = time.monotonic()
+        epoch = namespace._stat_epoch
+        namespace._stat_memo_put('/p', None, {"st_size": 2}, epoch, now)
+        namespace._stat_memo_put('/p', None, {"st_size": 1}, epoch, now - 1.0)
+        self.assertEqual(namespace._stat_memo_get('/p', None)[0], {"st_size": 2})
+
+    def test_trimmed_drop_records_refuse_older_stats(self):
+        namespace = self.fs.namespace
+        namespace.readdir_snapshot_ttl = 60.0
+        namespace._MAX_STAT_DROPS = 2
+        epoch = namespace._stat_epoch
+        with namespace.listing_lock:
+            for name in ("/a", "/b", "/c"):
+                namespace._drop_stat_memo_locked({name})
+        namespace._stat_memo_put('/a', None, {"st_size": 1}, epoch, time.monotonic())
+        self.assertIsNone(namespace._stat_memo_get('/a', None)[0])
+
     def test_stat_memo_is_bounded(self):
         namespace = self.fs.namespace
         namespace.readdir_snapshot_ttl = 60.0
@@ -1239,6 +1278,7 @@ class TestFSNamespaceIntegration(unittest.TestCase):
             namespace.invalidate_all_listings()
             release.set()
             thread.join(5)
+        self.assertFalse(thread.is_alive())
         self.assertEqual(namespace.entry_attrs, {})
         self.assertEqual(namespace.readdir_snapshot, {})
         self.assertEqual(self.fs._dir_cache, {})
