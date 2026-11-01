@@ -2602,9 +2602,39 @@ class StorageFS(Operations):
         self.sync_manager.stop()
         # After the last rsync upload and the watchers: they share the masters.
         close_shared_control_sockets()
+        # Close the members' transports once nothing of ours should still use
+        # them. Hash and listing workers blocked in member I/O (the queues and
+        # executors cancel only what has not started) then fail at once
+        # instead of running to their own end, which kept the process alive,
+        # and the mount lock held, long after the unmount.
+        self._close_backends()
         self.state_manager.close()
         if not self._sweep_pending:
             _clear_mount_lock_pid(self.mount_lock_file)
+        # Release the lock here, not at process exit: the mountpoint is free
+        # as soon as the unmount returns, even if a straggler thread (a
+        # worker in a call that ignores the close) delays the exit.
+        _release_mount_lock(self.mount_lock_file)
+
+    def _close_backends(self):
+        for backend in self.backends.values():
+            close = getattr(backend, "close", None)
+            if close is None:
+                continue
+            try:
+                close()
+            except Exception:
+                self.logger.exception("Could not close member %s", backend.name)
+
+
+def _release_mount_lock(lock_file) -> None:
+    """Close the mount lock file, which releases the flock; idempotent."""
+    if lock_file is None or lock_file.closed:
+        return
+    try:
+        lock_file.close()
+    except (OSError, ValueError):
+        logging.getLogger(__name__).exception("Could not release the mount lock")
 
 
 def _clear_mount_lock_pid(lock_file) -> None:

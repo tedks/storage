@@ -3,6 +3,8 @@ import json
 import os
 import shutil
 import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import patch
 from pathlib import Path
@@ -294,6 +296,44 @@ class TestFSCoreIntegration(unittest.TestCase):
 
         self.assertNotEqual(lock_path.read_text().strip(), "")
         lock_file.close()
+
+    def test_destroy_releases_the_mount_lock_for_a_remount(self):
+        lock_path = self.temp_dir / "lock"
+        lock_file, _ = _acquire_mount_lock_ex(lock_path, "/mnt/t")
+        self.fs.mount_lock_file = lock_file
+
+        self.fs.destroy("/")
+
+        # A remount (another open file description) takes the lock at once,
+        # while this process is still alive.
+        again, _ = _acquire_mount_lock_ex(lock_path, "/mnt/t")
+        again.close()
+
+    def test_destroy_closes_members_so_a_blocked_hash_worker_ends(self):
+        closed = threading.Event()
+        started = threading.Event()
+
+        class BlockingMember(LocalBackend):
+            def close(self):
+                closed.set()
+
+        member = BlockingMember("backend1", str(self.backend1_dir))
+        self.fs.backends["backend1"] = member
+
+        def hash_blocked_in_member_io():
+            started.set()
+            # A member exec channel that answers when its transport closes.
+            return None if closed.wait(30) else "late"
+
+        future = self.fs._checksum_queues.submit("backend1", hash_blocked_in_member_io)
+        self.assertTrue(started.wait(5))
+
+        began = time.monotonic()
+        self.fs.destroy("/")
+
+        self.assertTrue(closed.is_set())
+        future.result(timeout=5)
+        self.assertLess(time.monotonic() - began, 10)
 
     def test_init_runs_a_requested_sweep_and_clears_pending(self):
         self.fs.sync_manager.stop()
