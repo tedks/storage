@@ -1338,7 +1338,7 @@ class StreamingReadManager:
             self._cleanup_cancelled_session(session)
 
     def _attach(self, session: PrefetchSession) -> bool:
-        """Add a reader to a registered session; False if its failed cleanup is claimed.
+        """Add a reader to a registered session; False if it failed or its cleanup is claimed.
 
         Caller holds prefetch_sessions_lock. The claim is read under
         session.lock, where it is taken together with the no-readers
@@ -1351,12 +1351,16 @@ class StreamingReadManager:
 
         A session with an error set is refused too, before its cleanup is
         claimed: an attach would get EIO on every range the session lacks,
-        where the full-file path may succeed. The cost: with the member
-        down that full fetch fails too, and the opener gets the open's
+        where the full-file path may succeed. A session that has every byte
+        (prefetch_complete; only its finalize failed) is not refused: it
+        lacks no range. The costs of a refusal: the opener's open() fetches
+        the whole file before it returns (on the single-threaded loop that
+        holds up the mount, for a large file), and with the member down that
+        fetch fails after the SFTP timeout, so the opener gets the open's
         error instead of the ranges the session had already cached.
         """
         with session.lock:
-            if session.failed_cleanup_claimed or session.error is not None:
+            if session.failed_cleanup_claimed or (session.error is not None and not session.prefetch_complete):
                 refused = True
             else:
                 refused = False
@@ -1454,8 +1458,8 @@ class StreamingReadManager:
         # the one that registers takes the shared path. The name is short
         # (a file name near the length limit must not fail here) and keeps
         # the partial suffix so listings hide it and a restart sweeps it. The
-        # prefix is not a bare token, so no virtual file named like a token
-        # has a partial that can collide with a staging file.
+        # prefix is not a bare token, so a virtual file named like one has
+        # no partial that can match a staging file (O_EXCL covers the rest).
         staging_path = (
             final_cache_path.parent / f".storage-staging-{secrets.token_hex(8)}{self.partial_suffix}"
         )

@@ -1617,7 +1617,9 @@ class TestFSStreamingIntegration(unittest.TestCase):
             self.assertTrue(end % chunk == 0 or end == len(payload), (offset, size))
         # The first fallback fetch reaches back to the start of the missing
         # run (the byte after the last range) and out to the chunk end.
-        self.assertEqual(reads[limit + 1], (2097153, 2129920 - 2097153, False))
+        self.assertEqual(reads[limit + 1], (limit * stride + 1, ((limit + 1) * stride // chunk + 1) * chunk - (limit * stride + 1), False))
+        with session.lock:
+            self.assertLessEqual(len(session.available_ranges), limit + 1 + len(payload) // chunk)
         offset, size, _bg = reads[-1]
         self.assertEqual(offset + size, len(payload))
         self.assertGreater(size, 1)
@@ -2032,6 +2034,25 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.fs.release('/failed.bin', vfd_b)
         self.fs.release('/failed.bin', vfd_a)
 
+    def test_streaming_open_attaches_to_an_errored_session_with_every_byte(self):
+        # Only its finalize failed: the session lacks no range, so an attach
+        # reads from it and the opener does not refetch the file.
+        self.backend.copy_delay = 0
+        payload = os.urandom(64 * 1024)
+        (self.backend_dir / "whole.bin").write_bytes(payload)
+        vfd_a = self.fs.open('/whole.bin', os.O_RDONLY)
+        session = self._session_for(vfd_a)
+        with session.lock:
+            session.prefetch_complete = True
+            session.error = OSError(errno.EIO, "simulated finalize failure")
+            session.condition.notify_all()
+
+        vfd_b = self.fs.open('/whole.bin', os.O_RDONLY)
+
+        self.assertIs(self._session_for(vfd_b), session)
+        self.fs.release('/whole.bin', vfd_b)
+        self.fs.release('/whole.bin', vfd_a)
+
     def test_streaming_worker_waits_on_claimed_chunk_without_polling(self):
         # Every missing byte of the worker's chunk is in a reader's fetch.
         # The fetch notifies when it ends, so the worker waits for that
@@ -2045,8 +2066,8 @@ class TestFSStreamingIntegration(unittest.TestCase):
         real_wait = session.condition.wait
 
         def recording_wait(timeout=None):
-            # Called with session.lock held.
-            if session.in_flight_ranges:
+            # Called with session.lock held; only the worker's waits count.
+            if session.in_flight_ranges and threading.current_thread() is session.worker:
                 timeouts.append(timeout)
             return real_wait(timeout)
 
@@ -2061,11 +2082,11 @@ class TestFSStreamingIntegration(unittest.TestCase):
             session.in_flight_ranges.clear()
             session.condition.notify_all()
 
+        session.condition.wait = real_wait
         self.assertTrue(all(t is not None and t >= 1.0 for t in timeouts), timeouts)
         self.fs.release('/claimed.bin', vfd)
 
     def test_streaming_staging_file_name_is_not_a_bare_token(self):
-        manager = self.fs._streaming_manager
         (self.backend_dir / "staged.bin").write_bytes(os.urandom(64 * 1024))
         created = []
         real_open = os.open
@@ -2074,7 +2095,7 @@ class TestFSStreamingIntegration(unittest.TestCase):
             created.append(Path(path).name)
             return real_open(path, *args, **kwargs)
 
-        with patch("storage.streaming.os.open", side_effect=spy_open):
+        with patch.object(os, "open", side_effect=spy_open):
             vfd = self.fs.open('/staged.bin', os.O_RDONLY)
         self.fs.release('/staged.bin', vfd)
         self.assertTrue(any(name.startswith(".storage-staging-") for name in created), created)
@@ -2139,6 +2160,12 @@ class TestFSStreamingIntegration(unittest.TestCase):
             (self.backend_dir / name).write_bytes(os.urandom(64 * 1024))
             vfd = self.fs.open('/' + name, os.O_RDONLY)
             session = self._session_for(vfd)
+            # As in production, discard runs with no worker fetching.
+            with session.lock:
+                session.stop_requested = True
+                session.condition.notify_all()
+            session.worker.join(timeout=5.0)
+            self.assertFalse(session.worker.is_alive())
             with patch.object(manager, "_snapshot_streaming_state") as snapshot, \
                     patch.object(manager, "_log_streaming_state_change"):
                 manager._discard_superseded_session(session, outcome)
