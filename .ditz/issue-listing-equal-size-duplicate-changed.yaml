@@ -1,0 +1,17 @@
+id: listing-equal-size-duplicate-changed
+title: A duplicate whose copies were equal in size when listed stays unsplit after
+  one changes
+desc: ""
+type: bugfix
+component: listing
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-01T02:43:02-00:00
+references: []
+log_events:
+- time: 2026-11-01T02:43:02-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
