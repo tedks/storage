@@ -307,17 +307,76 @@ class TestFSNamespaceIntegration(unittest.TestCase):
         self.assertFalse(os.path.lexists(self.cache_dir / "target.txt"))
         self.assertNotIn('/', self.fs.namespace.entry_attrs)
 
-    def test_getattr_leaves_member_symlink_to_member_stat(self):
-        # Listings are lstat; whether a symlink is followed is the member's
-        # stat's call (SSH follows it), so getattr still asks the member.
+    def test_getattr_reports_a_listed_member_symlink_as_a_link(self):
+        # Listings are lstat: a member's link is listed as a link, and
+        # getattr answers that without asking the member (whose stat may
+        # follow it, as SSH's does).
         (self.backend1_dir / "target.txt").write_text("target")
         (self.backend1_dir / "link.txt").symlink_to("target.txt")
         list(self.fs.readdir('/', None))
 
         member = self.backends["backend1"]
-        with patch.object(member, "stat", wraps=member.stat) as member_stat:
-            self.fs.getattr('/link.txt')
-        member_stat.assert_called_once_with('/link.txt')
+        with patch.object(member, "stat", side_effect=AssertionError("stat")), \
+                patch.object(member, "lstat", side_effect=AssertionError("lstat")):
+            attrs = self.fs.getattr('/link.txt')
+        self.assertTrue(stat.S_ISLNK(attrs['st_mode']))
+        self.assertEqual(attrs['st_size'], len("target.txt"))
+
+    def test_getattr_without_a_listing_lstats_the_member(self):
+        # A member whose stat follows links (SSH) must still report the link.
+        (self.backend1_dir / "target.txt").write_text("target")
+        (self.backend1_dir / "link.txt").symlink_to("target.txt")
+        member = self.backends["backend1"]
+        following = os.stat(self.backend1_dir / "link.txt")
+        with patch.object(member, "stat", return_value=following):
+            attrs = self.fs.getattr('/link.txt')
+        self.assertTrue(stat.S_ISLNK(attrs['st_mode']))
+
+    def test_readlink_answers_a_link_only_on_a_member(self):
+        (self.backend1_dir / "sub").mkdir()
+        (self.backend1_dir / "sub" / "link.txt").symlink_to("../target.txt")
+        self.assertEqual(self.fs.readlink('/sub/link.txt'), "../target.txt")
+        # Nothing was fetched: the cache holds no copy of the link's target.
+        self.assertFalse(os.path.lexists(self.cache_dir / "sub" / "link.txt"))
+
+    def test_readlink_prefers_the_cached_link(self):
+        (self.backend1_dir / "link.txt").symlink_to("member-target")
+        (self.cache_dir / "link.txt").symlink_to("cached-target")
+        self.assertEqual(self.fs.readlink('/link.txt'), "cached-target")
+
+    def test_readlink_of_a_member_regular_file_is_einval(self):
+        (self.backend1_dir / "plain.txt").write_text("x")
+        with self.assertRaises(FuseOSError) as raised:
+            self.fs.readlink('/plain.txt')
+        self.assertEqual(raised.exception.errno, errno.EINVAL)
+
+    def test_readlink_asks_members_in_getattr_order(self):
+        # The first member holding the name decides, as for getattr.
+        (self.backend1_dir / "name").write_text("a file here")
+        (self.backend2_dir / "name").symlink_to("elsewhere")
+        with self.assertRaises(FuseOSError) as raised:
+            self.fs.readlink('/name')
+        self.assertEqual(raised.exception.errno, errno.EINVAL)
+        # A member without the name is passed over.
+        (self.backend2_dir / "only2").symlink_to("there")
+        self.assertEqual(self.fs.readlink('/only2'), "there")
+
+    def test_readlink_of_a_conflict_view_asks_only_that_member(self):
+        (self.backend1_dir / "name").symlink_to("one")
+        (self.backend2_dir / "name").symlink_to("two")
+        self.assertEqual(self.fs.readlink('/name.backend2'), "two")
+
+    def test_readlink_of_a_missing_name_is_enoent(self):
+        with self.assertRaises(FuseOSError) as raised:
+            self.fs.readlink('/nowhere')
+        self.assertEqual(raised.exception.errno, errno.ENOENT)
+
+    def test_readlink_with_the_holder_unreachable_is_ehostunreach(self):
+        (self.backend1_dir / "link").symlink_to("t")
+        self.backends["backend1"].set_available(False)
+        with self.assertRaises(FuseOSError) as raised:
+            self.fs.readlink('/link')
+        self.assertEqual(raised.exception.errno, errno.EHOSTUNREACH)
 
     def test_readdir_checksum_scheduling_skips_directories_without_isdir(self):
         (self.backend1_dir / "shared").mkdir()

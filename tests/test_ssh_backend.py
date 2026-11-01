@@ -2,6 +2,7 @@ import concurrent.futures
 import errno
 import contextvars
 import socket
+import stat
 import subprocess
 import threading
 import time
@@ -195,6 +196,25 @@ class _FakeSFTPClient:
         return SimpleNamespace(st_size=len(self.server.payload), st_mode=0o100644,
                                st_mtime=1.0)
 
+    def lstat(self, path):
+        self._request("lstat", path)
+        if path in self.server.missing:
+            raise FileNotFoundError(errno.ENOENT, "No such file")
+        if path in self.server.links:
+            return SimpleNamespace(st_size=len(self.server.links[path]), st_mode=0o120777,
+                                   st_mtime=1.0)
+        return SimpleNamespace(st_size=len(self.server.payload), st_mode=0o100644,
+                               st_mtime=1.0)
+
+    def readlink(self, path):
+        self._request("readlink", path)
+        if path in self.server.missing:
+            raise FileNotFoundError(errno.ENOENT, "No such file")
+        if path in self.server.links:
+            return self.server.links[path]
+        # sftp-server: readlink(2)'s EINVAL becomes a status without an errno.
+        raise OSError("Bad message")
+
     def open(self, path, mode):
         self._request("open", path)
         self.server.opens.append((path, mode))
@@ -250,6 +270,7 @@ class _FakeServer:
         self.max_sessions = max_sessions
         self.payload = payload
         self.missing = set()
+        self.links = {}  # remote path -> link target
         self.hooks = {}
         self.delay = 0.0
         self.clients = []
@@ -1341,6 +1362,39 @@ class _BackendTestCase(unittest.TestCase):
         )
         self.addCleanup(backend.close)
         return backend
+
+
+class TestSSHBackendLinks(_BackendTestCase):
+    """readlink and lstat answer for a member's link (ditz member-symlink-readlink)."""
+
+    def test_readlink_returns_the_target(self):
+        self.server.links["/data/dir/link"] = "../target.txt"
+        backend = self._new_backend()
+        self.assertEqual(backend.readlink("/dir/link"), "../target.txt")
+
+    def test_readlink_of_a_non_link_is_einval(self):
+        backend = self._new_backend()
+        with self.assertRaises(OSError) as raised:
+            backend.readlink("/plain.txt")
+        self.assertEqual(raised.exception.errno, errno.EINVAL)
+        self.assertNotIsInstance(raised.exception, FileNotFoundError)
+
+    def test_readlink_of_a_missing_path_is_enoent(self):
+        self.server.missing.add("/data/gone")
+        backend = self._new_backend()
+        with self.assertRaises(FileNotFoundError):
+            backend.readlink("/gone")
+
+    def test_lstat_reports_the_link_and_stat_still_follows(self):
+        self.server.links["/data/link"] = "target.txt"
+        backend = self._new_backend()
+        self.assertTrue(stat.S_ISLNK(backend.lstat("/link").st_mode))
+        self.assertTrue(stat.S_ISREG(backend.stat("/link").st_mode))
+
+    def test_lstat_of_the_root_follows_a_linked_root(self):
+        backend = self._new_backend()
+        backend.lstat("/")
+        self.assertEqual([r[0] for r in self.server.requests if r[1] == "/data"], ["stat"])
 
 
 class TestSSHBackendOnThePool(_BackendTestCase):
