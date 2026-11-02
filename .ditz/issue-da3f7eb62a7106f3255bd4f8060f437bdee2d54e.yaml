@@ -1,0 +1,16 @@
+id: da3f7eb62a7106f3255bd4f8060f437bdee2d54e
+title: Quiet ERROR log lines when the same-filesystem probe cannot connect
+desc: ""
+type: bugfix
+component: cli
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-02T05:07:14-00:00
+references: []
+log_events:
+- time: 2026-11-02T05:07:14-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
