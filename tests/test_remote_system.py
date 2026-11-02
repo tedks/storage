@@ -49,6 +49,7 @@ from storage.backends.rsync import RsyncBackend
 from storage.backends.ssh import SSHBackend
 from storage.backends.ssh_mux import ControlSockets
 from storage.checksums import fast_checksum_bytes
+from storage.cli_mount import shared_filesystems
 from storage.watcher import RemoteWatcher
 from tests.fuse_mount import (
     FUSE_THREAD_MODES, ORPHAN_GRACE, _thread_stacks, fuse_mode_id, native_thread_state,
@@ -434,6 +435,32 @@ def test_ssh_backend_rename_replaces_an_existing_file(remote, ssh_backend, tmp_p
     ssh_backend.rename("/renames/save.tmp", "/renames/saved.txt")
     assert remote.read_remote(member, "renames/saved.txt") == new
     assert not ssh_backend.exists("/renames/save.tmp")
+
+def test_filesystem_identity_tells_same_and_different_filesystems_apart(remote):
+    """Two roots in one container share a device unless one is its own mount."""
+    member = remote.members[0]
+    remote.exec(member, f"mkdir -p {REMOTE_ROOT}/sub")
+    # /dev/shm is a tmpfs mount in every Docker container: a second filesystem.
+    kwargs = remote.backend_kwargs(member)
+    backends = {
+        "same0": SSHBackend(**{**kwargs, "name": "same0"}),
+        "same1": SSHBackend(**{**kwargs, "name": "same1", "remote_path": f"{REMOTE_ROOT}/sub"}),
+        "other": SSHBackend(**{**kwargs, "name": "other", "remote_path": "/dev/shm"}),
+    }
+    try:
+        assert shared_filesystems(backends) == [["same0", "same1"]]
+    finally:
+        for backend in backends.values():
+            backend.close()
+
+
+def test_filesystem_identity_of_a_missing_root_is_none(remote):
+    backend = SSHBackend(**{**remote.backend_kwargs(remote.members[0]),
+                            "remote_path": "/no/such/root"})
+    try:
+        assert backend.filesystem_identity() is None
+    finally:
+        backend.close()
 
 
 def _ssh_to(line: str, member: Member) -> bool:
