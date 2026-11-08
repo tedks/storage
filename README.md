@@ -382,8 +382,11 @@ Rsync uploads and remote watchers explicitly set `UpdateHostKeys=no`. An
 authenticated SSH server can offer additional host keys, and OpenSSH's
 host-key update mechanism can remove trusted keys that server does not offer.
 Keeping it off preserves keys for other backends sharing the same hostname,
-including when ssh config points to a dedicated known-hosts file. This does
-not stop `accept-new` from adding an unseen host key.
+even if ssh config explicitly enables updates for a dedicated known-hosts
+file (which disables updates by default). This does not stop `accept-new`
+from adding an unseen host key. It also means a server's replacement host key
+is not learned automatically; verify and replace rotated keys as described
+below.
 
 **A changed host key splits the paths.** After a member is re-provisioned,
 or its address is reused by another host, the paramiko paths keep working
