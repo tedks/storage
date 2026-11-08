@@ -40,5 +40,16 @@ log_events:
     full local gates and formal review on pushed head. Repair authority: reversible
     worktree and synthetic scratch only. Stops: product scope, secrets/system changes,
     live storage access, or repeated setup failure.'
+- time: 2026-11-08T23:23:03-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Implemented on PR #165 at 64c04d6cde73ca5bd3815ed896ad9e71aa9582dc. Rsync
+    and watcher system SSH commands pass UpdateHostKeys=no; two synthetic command-builder
+    regression tests and README policy/rotation documentation added. Both tests fail
+    when their option is removed and pass when restored. scripts/run-gates.sh passed
+    all eight targets at exact head, including Docker remote gate, and wrote the gate
+    receipt; storage_cli build passed. Formal council round 2 clean for Anthropic
+    and OpenAI; Google seat empty due provider quota. PR ready for review, not merged
+    or deployed. #107 remains open for configurable host stores and strict verification.'
 blocks:
 - gh-107
