@@ -1,0 +1,22 @@
+id: reprobe-descriptive-name-typos
+title: Guard reprobe-locations against misspelled descriptive member names.
+desc: 'PR #166 round 2 nit: `storage debug reprobe-locations --member riad=...` is
+  syntactically valid when the mounted identity is raid, and may write location or
+  conflict metadata under the wrong identity. Canonical numbered names retain a gap
+  guard, but descriptive names have no registry to compare against. Investigate validation
+  against a mounted profile or persisted member identity set before mutating xattrs/index.
+  Preserve rebuild/reprobe paths for a fresh cache with no rows. Do not infer identity
+  from hostname or order.'
+type: task
+component: cli
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-08T23:28:31-00:00
+references: []
+log_events:
+- time: 2026-11-08T23:28:31-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
