@@ -1,0 +1,23 @@
+id: oq-remove-member-preserve-identity
+title: Decide how to remove a numbered member without renaming later members.
+desc: 'PR #166 council nit: a profile that used remote0,remote1,remote2 cannot simply
+  remove remote1 while retaining remote2 under the current numbered-name count guard.
+  Existing bare-member behavior already shifts identities when a member is removed,
+  so this is not a regression from PR #166. Options: allow explicit numbered gaps
+  with an index/profile identity guard; require migrating all remaining members to
+  descriptive names first; or keep removal unsupported. Recommendation: design an
+  explicit identity migration and persist a member registry before loosening the guard.
+  Ted decides. Does not block PR #166''s current draft unless removal is in scope.'
+type: task
+component: open-questions
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-08T23:28:31-00:00
+references: []
+log_events:
+- time: 2026-11-08T23:28:31-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
