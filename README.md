@@ -140,8 +140,10 @@ list position; reordering named members then keeps their identities.
 Existing bare entries keep their `local0`, `remote0`, etc. identities. Adding
 `NAME=` to an existing member changes its identity in the index and cached
 metadata; do not rename a member in an existing cache without a separate
-migration. The same warning applies to reordering bare entries. For a local
-relative path containing `=`, prefix it with `./` to keep it a bare path.
+migration. Named members must follow bare members of the same type, so adding
+a named member cannot shift a bare member's number. Reordering bare entries
+can still change their identities. For a local relative path containing `=`,
+prefix it with `./` to keep it a bare path.
 
 Save that as `~/.config/storage/storage.toml` to auto-load by name:
 

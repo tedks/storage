@@ -463,15 +463,23 @@ key_file = "/tmp/profile-key"
                 cache_root=Path("/tmp/cache"),
             )
 
-    def test_explicit_members_accept_stable_names_without_ordinal_gaps(self):
+    def test_explicit_members_accept_stable_names(self):
         resolved = resolve_member_configuration(
             profile_name=None,
             config_path=None,
-            member_specs=["archive=ssh://user@host:/srv/archive", "local1=/srv/data"],
+            member_specs=["archive=ssh://user@host:/srv/archive", "fast=/srv/data"],
             key_file=None,
             cache_root=Path("/tmp/cache"),
         )
-        self.assertEqual(("archive", "local1"), resolved.member_names)
+        self.assertEqual(("archive", "fast"), resolved.member_names)
+
+    def test_explicit_members_reject_numbered_name_beyond_member_count(self):
+        with self.assertRaises(click.ClickException):
+            resolve_member_configuration(
+                profile_name=None, config_path=None,
+                member_specs=["local1=/srv/data"], key_file=None,
+                cache_root=Path("/tmp/cache"),
+            )
 
     def test_profile_and_reprobe_use_same_named_identities(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -503,6 +511,16 @@ backends = ["fast=/srv/fast", "archive=ssh://user@host:/srv/a", "backup=ssh://us
         self.assertEqual({"a": "/one", "b": "/two"}, {n: str(v.remote_path) for n, v in a.items()})
         self.assertEqual({n: str(v.remote_path) for n, v in a.items()},
                          {n: str(v.remote_path) for n, v in b.items()})
+
+    def test_named_member_cannot_shift_legacy_ordinals(self):
+        with self.assertRaisesRegex(click.ClickException, "shift existing numbered identities"):
+            create_storage_members([
+                "new=ssh://user@host:/new", "ssh://user@host:/old",
+            ], None, announce=False)
+        backends = create_storage_members([
+            "ssh://user@host:/old", "new=ssh://user@host:/new",
+        ], None, announce=False)
+        self.assertEqual(("remote0", "new"), tuple(backends))
 
     def test_invalid_names_and_collisions_fail(self):
         cases = (

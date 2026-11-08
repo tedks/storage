@@ -273,7 +273,7 @@ def split_storage_member_specs(member_specs: Sequence[str]) -> Tuple[Tuple[str, 
 
 
 _MEMBER_NAME_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]*", re.ASCII)
-_LEGACY_MEMBER_NAME_RE = re.compile(r"(local|remote)\d+", re.ASCII)
+_LEGACY_MEMBER_NAME_RE = re.compile(r"(local|remote)(\d+)", re.ASCII)
 
 
 def _member_target(raw: str) -> str:
@@ -294,23 +294,42 @@ def _resolve_member_specs(
     defaults = _default_member_names(member_specs)
     specs = []
     names = []
+    named_kinds = set()
     for raw, default in zip(member_specs, defaults):
         spec = _member_target(raw)
         name = raw.split("=", 1)[0] if spec != raw else None
+        kind = "remote" if spec.startswith(("ssh://", "rsync://")) else "local"
         if require_names and name is None:
             raise click.ClickException("Explicit --member values must use NAME=SPEC to preserve backend identities.")
         if not spec.strip():
             raise click.ClickException("Storage member target must not be empty")
+        if name is None and kind in named_kinds:
+            raise click.ClickException(
+                f"Unnamed {kind} member cannot follow a named {kind} member; "
+                "this would shift existing numbered identities"
+            )
         if name is not None:
+            named_kinds.add(kind)
             legacy = _LEGACY_MEMBER_NAME_RE.fullmatch(name)
             if legacy:
-                expected = "remote" if spec.startswith(("ssh://", "rsync://")) else "local"
-                if legacy.group(1) != expected:
-                    raise click.ClickException(f"Storage member {name!r} must name a {expected} target")
+                if legacy.group(1) != kind:
+                    raise click.ClickException(f"Storage member {name!r} must name a {kind} target")
         names.append(name or default)
         specs.append(spec)
     if len(names) != len(set(names)):
-        raise click.ClickException("Duplicate storage member name")
+        duplicate = next(name for name in names if names.count(name) > 1)
+        raise click.ClickException(f"Duplicate storage member name: {duplicate}")
+    for kind in ("local", "remote"):
+        count = sum(
+            spec.startswith(("ssh://", "rsync://")) == (kind == "remote")
+            for spec in specs
+        )
+        if any(
+            int(match.group(2)) >= count
+            for name in names
+            if (match := _LEGACY_MEMBER_NAME_RE.fullmatch(name)) and match.group(1) == kind
+        ):
+            raise click.ClickException(f"Numbered {kind} member name exceeds configured {kind} member count")
     return tuple(specs), tuple(names)
 
 
@@ -344,10 +363,17 @@ def create_storage_members(
     resolved_names = tuple(member_names) if member_names is not None else parsed_names
     if len(resolved_names) != len(specs):
         raise click.ClickException("member_names must match member_specs length")
-    if len(resolved_names) != len(set(resolved_names)) or "cache" in resolved_names:
-        raise click.ClickException("Duplicate or reserved storage member name")
-    if any(not _MEMBER_NAME_RE.fullmatch(name) for name in resolved_names):
-        raise click.ClickException("Invalid storage member name")
+    if len(resolved_names) != len(set(resolved_names)):
+        duplicate = next(name for name in resolved_names if resolved_names.count(name) > 1)
+        raise click.ClickException(f"Duplicate storage member name: {duplicate}")
+    for name in resolved_names:
+        if name == "cache" or not _MEMBER_NAME_RE.fullmatch(name):
+            raise click.ClickException(f"Invalid storage member name: {name!r}")
+    for name, spec in zip(resolved_names, specs):
+        legacy = _LEGACY_MEMBER_NAME_RE.fullmatch(name)
+        kind = "remote" if spec.startswith(("ssh://", "rsync://")) else "local"
+        if legacy and legacy.group(1) != kind:
+            raise click.ClickException(f"Storage member {name!r} must name a {kind} target")
 
     local_index = 0
     remote_index = 0

@@ -34,6 +34,17 @@ class TestMountConfigCLI(unittest.TestCase):
         self.assertEqual(("archive",), tuple(mock_mount.call_args.args[3]))
         self.assertIn("Added SSH storage member: archive", result.output)
 
+    def test_named_local_positional_member_reaches_backend_identity(self):
+        root = self.temp_dir / "root"
+        root.mkdir()
+        with patch("storage.cli_mount.mount_storage") as mock_mount:
+            result = self.runner.invoke(main, [
+                "mount", str(self.temp_dir / "mount"), f"fast={root}",
+                "-c", str(self.temp_dir / "cache"),
+            ])
+        self.assertEqual(0, result.exit_code, result.output)
+        self.assertEqual(("fast",), tuple(mock_mount.call_args.args[3]))
+
     def test_mount_uses_named_profile_from_toml_config(self):
         config_path = self.temp_dir / "storage.toml"
         config_path.write_text(
