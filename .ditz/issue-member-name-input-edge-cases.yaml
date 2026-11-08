@@ -21,3 +21,11 @@ log_events:
   who: Ted Smith
   what: created
   comment: ""
+- time: 2026-11-08T23:28:31-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'PR #166 round 2 added: remote01 is accepted as distinct from remote1 despite
+    looking numbered; canonical numbered names should reject leading zeros. README
+    should explain that explicit remote2 can retain a later legacy identity when a
+    middle member is renamed, subject to a deliberate migration for the renamed member.
+    These remain follow-up nits; they do not clear the separate suffix ambiguity.'
