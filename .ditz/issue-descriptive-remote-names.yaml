@@ -1,0 +1,21 @@
+id: descriptive-remote-names
+title: Allow stable, descriptive storage member names in mount profiles and explicit
+  CLI inputs while preserving legacy ordinal identities for unchanged profiles. Validate
+  names and collisions; document identity migration boundary; add synthetic regression
+  coverage.
+desc: Stable member names should flow through mount, conflict views, policy, and reprobe.
+  Existing unnamed configurations must retain remoteN/localN identities. No live data
+  inspection or migration in this task.
+type: feature
+component: cli
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-08T23:15:28-00:00
+references: []
+log_events:
+- time: 2026-11-08T23:15:28-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
