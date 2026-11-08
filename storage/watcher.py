@@ -119,8 +119,11 @@ class RemoteWatcher:
 
     def _build_ssh_command(self) -> list:
         """Build the SSH command that runs inotifywait on the remote."""
+        # Preserve trusted keys for other members sharing this hostname;
+        # OpenSSH can otherwise prune keys the current member did not offer.
         ssh_cmd = ["ssh", "-T", "-o", "BatchMode=yes",
                    "-o", "StrictHostKeyChecking=accept-new",
+                   "-o", "UpdateHostKeys=no",
                    "-o", "ServerAliveInterval=30",
                    "-o", "ServerAliveCountMax=3",
                    "-p", str(self.ssh_port)]

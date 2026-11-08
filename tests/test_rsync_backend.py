@@ -7,6 +7,7 @@ works without requiring a real SSH connection).
 """
 
 import os
+import shlex
 import shutil
 import tempfile
 from pathlib import Path
@@ -60,6 +61,9 @@ class TestRsyncSSHCommand(TestCase):
             self.assertIn("ssh", cmd)
             self.assertIn("-p 22", cmd)
             self.assertIn("BatchMode=yes", cmd)
+            args = shlex.split(cmd)
+            options = [args[i + 1] for i, arg in enumerate(args[:-1]) if arg == "-o"]
+            self.assertEqual(options.count("UpdateHostKeys=no"), 1)
             backend.close()
 
     def test_custom_port_and_key(self):
