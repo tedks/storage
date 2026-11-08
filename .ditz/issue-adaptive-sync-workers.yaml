@@ -30,3 +30,18 @@ log_events:
     sync only; FUSE threading is separate and libfuse 2 has no cap. Plan: configurable
     min/max sync pool with idle retirement and SSH-safe ceiling; assess load heuristic
     after bounded tests.'
+- time: 2026-11-08T23:44:51-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Design checkpoint (no code yet; Ted is deciding foreground vs background
+    scope). Existing `workers` and `--workers` govern only SyncManager; `fuse_threads`
+    is separate and its unbounded libfuse 2 handler count has an existing deferred
+    issue `threading-fuse-worker-cap`. Proposed sync extension: retain `workers` as
+    minimum and existing fixed behavior if no maximum is set; opt-in `max_sync_workers`
+    permits growth on distinct queued tasks, capped at 8 with SSH members (shared
+    rsync master MaxSessions 10, watcher 1) and up to 32 local-only; retire excess
+    after bounded idle period. Queue pressure is an I/O-relevant signal; CPU/load
+    average would misread blocked I/O and is not a reliable or portable throttle.
+    Synthetic tests should pin bounded growth, no growth on duplicate tasks, priority/fairness,
+    idle shrink, stop/restart with busy and queued tasks, and actual overlap via barrier
+    events without wall-clock speed thresholds.'
