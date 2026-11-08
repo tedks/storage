@@ -23,3 +23,14 @@ log_events:
   who: Ted Smith
   what: started
   comment: ""
+- time: 2026-11-08T23:15:35-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Lane: /root/remote_names, feat/descriptive-remote-names at a7467c6. Scope:
+    source and synthetic fixtures only; no live member/cache/profile access. Assumptions:
+    backend.name is persistent identity; legacy unnamed members retain ordinal identity;
+    explicit names are user-chosen stable identifiers. Acceptance: named mount and
+    reprobe round trip, collisions and unsafe names fail, legacy behavior preserved,
+    docs and gates, formal council on pushed head. Repair authority: reversible worktree
+    fixes, three attempts per repeated failure. Stop: migration or product ruling,
+    secrets, system-wide or outward mutation beyond branch/PR.'
