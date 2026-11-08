@@ -42,3 +42,14 @@ log_events:
     running at clean head with local Docker. Formal council round opened at this head:
     OpenAI native and Anthropic ask-agent in progress; Google ask-agent unavailable
     (individual quota reset in ~145h), will record EMPTY usage-limit, never backfill.'
+- time: 2026-11-08T23:26:12-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Formal council round 1 on 6998ec6: OpenAI native Important 1 (arbitrary
+    name like jpg collides with ordinary file extension); Anthropic Important 2 (named-before-bare
+    shifts ordinal, debug reprobe gap guard), Nits 5; Google EMPTY usage-limit. Findings
+    comment on PR #166. Fix b4fceb4 pushed: ordinal shift guard, debug gap guard,
+    positional local and named conflict path tests. Targeted Nix/Bazel tests pass.
+    Full gates rerunning at clean b4fceb4. Open product ruling filed as oq-member-name-conflict-suffix;
+    remaining input edge nits filed as member-name-input-edge-cases. No live mount/backing/cache
+    inspection.'
