@@ -53,3 +53,14 @@ log_events:
     Full gates rerunning at clean b4fceb4. Open product ruling filed as oq-member-name-conflict-suffix;
     remaining input edge nits filed as member-name-input-edge-cases. No live mount/backing/cache
     inspection.'
+- time: 2026-11-08T23:28:53-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Full scripts/run-gates.sh passed all eight targets on clean pushed b4fceb40ab56f0d4074c2ec9ec170c0c8d53da37,
+    receipt present. Formal council convergence round 2: Anthropic resolved identity-shift
+    and ordinal-gap findings, OpenAI says those fixes hold; no new Important in fix
+    delta. Existing Important conflict suffix ambiguity remains; `council_pr.py check`
+    reports not CLEAN. Google seat EMPTY due usage limit. PR #166 remains draft, unmerged.
+    Lane awaiting Ted''s naming-policy ruling in oq-member-name-conflict-suffix; no
+    further product code change authorized until then. Follow-up nits: member-name-input-edge-cases,
+    oq-remove-member-preserve-identity, reprobe-descriptive-name-typos.'
