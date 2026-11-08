@@ -1,0 +1,20 @@
+id: gh-107
+title: Align SSH host-key handling across storage paths
+desc: 'GitHub issue: https://github.com/tedks/storage/issues/107
+
+  The SSHBackend, rsync, and remote watcher differ in host-key handling. Track the
+  broader policy and configuration work here; the UpdateHostKeys preservation task
+  is only one member and does not close this epic.'
+type: bugfix
+component: ssh
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-08T23:14:54-00:00
+references: []
+log_events:
+- time: 2026-11-08T23:14:54-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
