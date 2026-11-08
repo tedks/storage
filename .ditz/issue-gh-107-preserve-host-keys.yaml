@@ -30,5 +30,15 @@ log_events:
   who: Ted Smith
   what: started
   comment: ""
+- time: 2026-11-08T23:15:06-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Lane state: implementing in fix/ssh-hostkey-update-policy at a7467c6.
+    Assumptions: only RsyncBackend and RemoteWatcher launch authenticated system SSH
+    for member operations; SSHBackend uses paramiko. Acceptance: both command builders
+    pass explicit UpdateHostKeys=no, targeted tests can fail if either flag is removed,
+    full local gates and formal review on pushed head. Repair authority: reversible
+    worktree and synthetic scratch only. Stops: product scope, secrets/system changes,
+    live storage access, or repeated setup failure.'
 blocks:
 - gh-107
