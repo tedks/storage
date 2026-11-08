@@ -122,11 +122,26 @@ cache_size = "50G"
 key_file = "/home/user/.ssh/id_ed25519"
 foreground = true
 backends = [
-  "ssh://user@storage-host.example:/srv/raid/media/",
-  "ssh://user@storage-host.example:/srv/chunk0/media/",
-  "ssh://user@storage-host.example:/srv/chunk1/media/",
+  "raid=ssh://user@storage-host.example:/srv/raid/media/",
+  "chunk0=ssh://user@storage-host.example:/srv/chunk0/media/",
+  "chunk1=ssh://user@storage-host.example:/srv/chunk1/media/",
 ]
 ```
+
+Each `NAME=SPEC` name is the member's persistent identity. It appears in
+status and logs, conflict filenames (for example `photo.jpg.raid`), and
+`storage conflicts --take NAME`; use the same name in any `storage debug
+reprobe-locations --member NAME=SPEC` command. Names are ASCII letters followed
+by letters, digits, `_` or `-`; `cache` is reserved. Names must be unique in a
+mount, including against automatically assigned names. Two roots on the same
+host need two distinct names. Choose names that describe the member, not its
+list position; reordering named members then keeps their identities.
+
+Existing bare entries keep their `local0`, `remote0`, etc. identities. Adding
+`NAME=` to an existing member changes its identity in the index and cached
+metadata; do not rename a member in an existing cache without a separate
+migration. The same warning applies to reordering bare entries. For a local
+relative path containing `=`, prefix it with `./` to keep it a bare path.
 
 Save that as `~/.config/storage/storage.toml` to auto-load by name:
 

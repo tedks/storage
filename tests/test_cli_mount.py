@@ -22,6 +22,18 @@ class TestMountConfigCLI(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
+    def test_named_remote_flag_reaches_backend_identity(self):
+        cache = self.temp_dir / "cache"
+        mountpoint = self.temp_dir / "mount"
+        with patch("storage.cli_mount.mount_storage") as mock_mount:
+            result = self.runner.invoke(main, [
+                "mount", str(mountpoint), "-c", str(cache),
+                "--remote", "archive=ssh://user@host.example:/srv/archive",
+            ])
+        self.assertEqual(0, result.exit_code, result.output)
+        self.assertEqual(("archive",), tuple(mock_mount.call_args.args[3]))
+        self.assertIn("Added SSH storage member: archive", result.output)
+
     def test_mount_uses_named_profile_from_toml_config(self):
         config_path = self.temp_dir / "storage.toml"
         config_path.write_text(

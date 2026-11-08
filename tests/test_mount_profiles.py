@@ -71,6 +71,14 @@ class TestSplitStorageMemberSpecs(unittest.TestCase):
         self.assertEqual(("/local/one", "/local/two"), local)
         self.assertEqual(("ssh://user@host:/remote", "rsync://user@host2:/other"), remote)
 
+    def test_named_remote_specs_split(self):
+        local, remote = split_storage_member_specs([
+            "ssd=/srv/data", "archive=ssh://user@host:/remote",
+            "backup=rsync://user@host:/backup",
+        ])
+        self.assertEqual(("ssd=/srv/data",), local)
+        self.assertEqual(("archive=ssh://user@host:/remote", "backup=rsync://user@host:/backup"), remote)
+
 
 class TestOptionalProfileFloat(unittest.TestCase):
     def test_float_value_returned(self):
@@ -455,15 +463,67 @@ key_file = "/tmp/profile-key"
                 cache_root=Path("/tmp/cache"),
             )
 
-    def test_explicit_members_reject_noncanonical_name_gaps(self):
-        with self.assertRaises(click.ClickException):
-            resolve_member_configuration(
-                profile_name=None,
-                config_path=None,
-                member_specs=["local1=/srv/data"],
-                key_file=None,
-                cache_root=Path("/tmp/cache"),
+    def test_explicit_members_accept_stable_names_without_ordinal_gaps(self):
+        resolved = resolve_member_configuration(
+            profile_name=None,
+            config_path=None,
+            member_specs=["archive=ssh://user@host:/srv/archive", "local1=/srv/data"],
+            key_file=None,
+            cache_root=Path("/tmp/cache"),
+        )
+        self.assertEqual(("archive", "local1"), resolved.member_names)
+
+    def test_profile_and_reprobe_use_same_named_identities(self):
+        with tempfile.TemporaryDirectory() as directory:
+            profile = Path(directory) / "storage.toml"
+            profile.write_text('''
+[mounts.test]
+mountpoint = "/mnt/test"
+cache = "/tmp/cache"
+backends = ["fast=/srv/fast", "archive=ssh://user@host:/srv/a", "backup=ssh://user@host:/srv/b"]
+''')
+            mount = resolve_mount_configuration(
+                mount_target="test", backing_paths=(), config_path=profile,
+                cache=None, cache_size=None, database=None, workers=None,
+                remote=(), key_file=None, foreground=None, allow_other=None,
+                debug=None, streaming_reads=None, streaming_chunk_size=None,
+                max_streaming_sessions=None, readdir_ttl=None,
+                enable_watchers=None,
             )
+            reprobe = resolve_member_configuration("test", profile, (), None, None)
+        self.assertEqual(("fast", "archive", "backup"), mount.member_names)
+        self.assertEqual(mount.member_names, reprobe.member_names)
+        self.assertEqual(mount.member_specs, reprobe.member_specs)
+
+    def test_names_do_not_depend_on_remote_order_or_userinfo(self):
+        first = ["a=ssh://alice@host:/one", "b=ssh://bob@host:/two"]
+        second = list(reversed(first))
+        a = create_storage_members(first, None, announce=False)
+        b = create_storage_members(second, None, announce=False)
+        self.assertEqual({"a": "/one", "b": "/two"}, {n: str(v.remote_path) for n, v in a.items()})
+        self.assertEqual({n: str(v.remote_path) for n, v in a.items()},
+                         {n: str(v.remote_path) for n, v in b.items()})
+
+    def test_invalid_names_and_collisions_fail(self):
+        cases = (
+            ["a=ssh://user@host:/one", "a=ssh://user@host:/two"],
+            ["ssh://user@host:/one", "remote0=ssh://user@host:/two"],
+            ["cache=/srv/data"],
+            ["bad.name=ssh://user@host:/one"],
+            ["bad/name=ssh://user@host:/one"],
+            ["remote0=/srv/data"],
+            ["local0=ssh://user@host:/one"],
+        )
+        for specs in cases:
+            with self.subTest(specs=specs), self.assertRaises(click.ClickException):
+                create_storage_members(specs, None, announce=False)
+
+    def test_legacy_relative_path_with_equals_remains_a_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "dir=one"
+            root.mkdir()
+            backends = create_storage_members([str(root)], None, announce=False)
+        self.assertEqual(("local0",), tuple(backends))
 
     def test_create_storage_members_handles_interleaved_specs_without_name_mismatch(self):
         with tempfile.TemporaryDirectory() as temp_dir:
