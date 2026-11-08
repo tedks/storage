@@ -64,7 +64,11 @@ class ResolvedMountConfig:
 
     @property
     def member_specs(self) -> Tuple[str, ...]:
-        return self.backing_paths + self.remote
+        return _resolve_member_specs(self.backing_paths + self.remote)[0]
+
+    @property
+    def member_names(self) -> Tuple[str, ...]:
+        return _resolve_member_specs(self.backing_paths + self.remote)[1]
 
 
 @dataclass(frozen=True)
@@ -261,14 +265,53 @@ def split_storage_member_specs(member_specs: Sequence[str]) -> Tuple[Tuple[str, 
     local_members = []
     remote_members = []
     for spec in member_specs:
-        if spec.startswith("ssh://") or spec.startswith("rsync://"):
+        if _member_target(spec).startswith(("ssh://", "rsync://")):
             remote_members.append(spec)
         else:
             local_members.append(spec)
     return tuple(local_members), tuple(remote_members)
 
 
-_EXPLICIT_MEMBER_NAME_RE = re.compile(r"^(local|remote)(\d+)$")
+_MEMBER_NAME_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]*", re.ASCII)
+_LEGACY_MEMBER_NAME_RE = re.compile(r"(local|remote)\d+", re.ASCII)
+
+
+def _member_target(raw: str) -> str:
+    """Return the target from NAME=SPEC, leaving legacy bare specs alone."""
+    if raw.startswith(("ssh://", "rsync://", "/", "./", "../", "~/")):
+        return raw
+    name, sep, target = raw.partition("=")
+    if sep and target.startswith(("ssh://", "rsync://", "/", "./", "../", "~/")):
+        if not _MEMBER_NAME_RE.fullmatch(name) or name == "cache":
+            raise click.ClickException(f"Invalid storage member name: {name!r}")
+        return target
+    return raw
+
+
+def _resolve_member_specs(
+    member_specs: Sequence[str], *, require_names: bool = False,
+) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
+    defaults = _default_member_names(member_specs)
+    specs = []
+    names = []
+    for raw, default in zip(member_specs, defaults):
+        spec = _member_target(raw)
+        name = raw.split("=", 1)[0] if spec != raw else None
+        if require_names and name is None:
+            raise click.ClickException("Explicit --member values must use NAME=SPEC to preserve backend identities.")
+        if not spec.strip():
+            raise click.ClickException("Storage member target must not be empty")
+        if name is not None:
+            legacy = _LEGACY_MEMBER_NAME_RE.fullmatch(name)
+            if legacy:
+                expected = "remote" if spec.startswith(("ssh://", "rsync://")) else "local"
+                if legacy.group(1) != expected:
+                    raise click.ClickException(f"Storage member {name!r} must name a {expected} target")
+        names.append(name or default)
+        specs.append(spec)
+    if len(names) != len(set(names)):
+        raise click.ClickException("Duplicate storage member name")
+    return tuple(specs), tuple(names)
 
 
 def _default_member_names(member_specs: Sequence[str]) -> Tuple[str, ...]:
@@ -276,7 +319,7 @@ def _default_member_names(member_specs: Sequence[str]) -> Tuple[str, ...]:
     local_index = 0
     remote_index = 0
     for spec in member_specs:
-        if spec.startswith(("ssh://", "rsync://")):
+        if _member_target(spec).startswith(("ssh://", "rsync://")):
             names.append(f"remote{remote_index}")
             remote_index += 1
         else:
@@ -286,51 +329,7 @@ def _default_member_names(member_specs: Sequence[str]) -> Tuple[str, ...]:
 
 
 def _parse_explicit_member_specs(member_specs: Sequence[str]) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
-    names = []
-    specs = []
-    seen_names = set()
-    local_names = []
-    remote_names = []
-    for raw in member_specs:
-        name, sep, spec = raw.partition("=")
-        if sep != "=" or not name.strip() or not spec.strip():
-            raise click.ClickException(
-                "Explicit --member values must use NAME=SPEC so reprobe preserves stable backend identities."
-            )
-
-        name = name.strip()
-        spec = spec.strip()
-        match = _EXPLICIT_MEMBER_NAME_RE.fullmatch(name)
-        if not match:
-            raise click.ClickException(
-                "Explicit --member names must match the mounted backend names, e.g. local0=/srv/data or remote1=ssh://user@host:/path."
-            )
-
-        expected_prefix = "remote" if spec.startswith(("ssh://", "rsync://")) else "local"
-        if match.group(1) != expected_prefix:
-            raise click.ClickException(
-                f"Explicit member {name!r} does not match {spec!r}; use a {expected_prefix}N name."
-            )
-
-        if name in seen_names:
-            raise click.ClickException(f"Duplicate explicit storage member name: {name}")
-        seen_names.add(name)
-        names.append(name)
-        specs.append(spec)
-        if expected_prefix == "local":
-            local_names.append(name)
-        else:
-            remote_names.append(name)
-
-    expected_local_names = {f"local{i}" for i in range(len(local_names))}
-    expected_remote_names = {f"remote{i}" for i in range(len(remote_names))}
-    if set(local_names) != expected_local_names or set(remote_names) != expected_remote_names:
-        raise click.ClickException(
-            "Explicit --member names must use the canonical mounted identity set with no gaps, "
-            "for example local0..localN and remote0..remoteM for the supplied members."
-        )
-
-    return tuple(specs), tuple(names)
+    return _resolve_member_specs(member_specs, require_names=True)
 
 
 def create_storage_members(
@@ -341,13 +340,18 @@ def create_storage_members(
     member_names: Optional[Sequence[str]] = None,
 ):
     backends = {}
-    resolved_names = tuple(member_names) if member_names is not None else _default_member_names(member_specs)
-    if len(resolved_names) != len(tuple(member_specs)):
+    specs, parsed_names = _resolve_member_specs(member_specs)
+    resolved_names = tuple(member_names) if member_names is not None else parsed_names
+    if len(resolved_names) != len(specs):
         raise click.ClickException("member_names must match member_specs length")
+    if len(resolved_names) != len(set(resolved_names)) or "cache" in resolved_names:
+        raise click.ClickException("Duplicate or reserved storage member name")
+    if any(not _MEMBER_NAME_RE.fullmatch(name) for name in resolved_names):
+        raise click.ClickException("Invalid storage member name")
 
     local_index = 0
     remote_index = 0
-    for name, spec in zip(resolved_names, member_specs):
+    for name, spec in zip(resolved_names, specs):
         try:
             is_rsync = spec.startswith("rsync://")
             is_ssh = spec.startswith("ssh://")
@@ -464,7 +468,7 @@ def resolve_member_configuration(
         else:
             settings = _load_mount_profile_settings(profile_source, profile_name)
 
-        resolved_specs = settings["backing_paths"] + settings["remote"]
+        resolved_specs, resolved_names = _resolve_member_specs(settings["backing_paths"] + settings["remote"])
         if not resolved_specs:
             raise click.ClickException(
                 f"Mount profile '{profile_name}' does not define any storage members"
@@ -472,7 +476,7 @@ def resolve_member_configuration(
 
         return ResolvedMemberConfig(
             member_specs=resolved_specs,
-            member_names=_default_member_names(resolved_specs),
+            member_names=resolved_names,
             key_file=key_file or settings["key_file"],
             cache_root=(cache_root or Path(settings["cache"])).resolve(),
             profile_name=profile_name,
