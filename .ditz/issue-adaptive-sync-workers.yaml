@@ -23,3 +23,10 @@ log_events:
   who: Ted Smith
   what: started
   comment: ""
+- time: 2026-11-08T23:42:17-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Lane feat/adaptive-workers started at a7467c6. Source trace: workers controls
+    sync only; FUSE threading is separate and libfuse 2 has no cap. Plan: configurable
+    min/max sync pool with idle retirement and SSH-safe ceiling; assess load heuristic
+    after bounded tests.'
