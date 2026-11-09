@@ -145,10 +145,18 @@ CLI) to add workers when distinct tasks wait behind busy workers. Excess
 workers exit after 30 seconds idle. The configured maximum must be at least
 `workers`; it can be at most 8 with any SSH member or 32 with local members
 only. The SSH limit leaves room under the usual ten-session OpenSSH limit for
-the remote watcher and other operations on the shared rsync connection.
-Servers configured with a lower session limit may need a lower maximum. CPU
+the remote watcher and another operation on the shared rsync connection.
+Foreground reads and streaming prefetch use a separate Paramiko connection
+with an SFTP channel reserved for interactive calls. Servers configured with
+a lower session limit may need a lower maximum. CPU
 load average is not used: sync spends most of its time waiting for member I/O,
 so CPU load is a poor guide to useful concurrency.
+
+Stopping a sync pool gives all its workers a shared five-second grace period
+to finish current tasks and leaves queued tasks for a later start. If a
+worker is still finishing after that period, the pool refuses a restart until
+it exits. This applies to fixed and adaptive pools alike; it prevents two
+generations from syncing the same path concurrently.
 
 Or mount from an explicit TOML path (`storage.example.toml` in this repo
 is a fuller version of the same profile):
