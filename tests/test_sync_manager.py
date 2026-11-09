@@ -170,7 +170,7 @@ class TestSyncManager(unittest.TestCase):
 
         def held_get(*args, **kwargs):
             task = original_get(*args, **kwargs)
-            if task.virtual_path == '/first':
+            if getattr(task, 'virtual_path', None) == '/first':
                 taken.set()
                 allow_get_to_return.wait(5.0)
             return task
@@ -320,6 +320,31 @@ class TestSyncManager(unittest.TestCase):
                 release.set()
             self.sync_manager._lingering_workers[0].join(timeout=5.0)
         self.sync_manager.start()
+        self.sync_manager.stop()
+
+    def test_failed_initial_worker_start_cleans_up_partial_pool(self):
+        self.sync_manager = SyncManager(
+            self.state_manager, self.cache_manager, self.replication_manager,
+            num_workers=2, config=SyncConfig(monitor_interval=30.0),
+        )
+        original_start = SyncWorker.start
+        attempts = 0
+
+        def fail_second_start(worker):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 2:
+                raise RuntimeError('synthetic thread exhaustion')
+            return original_start(worker)
+
+        with patch.object(SyncWorker, 'start', fail_second_start):
+            with self.assertRaisesRegex(RuntimeError, 'synthetic thread exhaustion'):
+                self.sync_manager.start()
+        self.assertFalse(self.sync_manager._running)
+        self.assertEqual([], self.sync_manager.workers)
+        self.assertEqual(0, self.sync_manager.get_queue_size())
+        self.sync_manager.start()
+        self.assertEqual(2, len(self.sync_manager.workers))
         self.sync_manager.stop()
 
     def test_queue_sync(self):
