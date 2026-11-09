@@ -103,6 +103,8 @@ Required:
 Options:
   -s, --cache-size SIZE    Cache size (e.g., 10G, 500M) [default: 10G]
   -d, --database PATH      State database path [default: cache/.storage.db]
+  -w, --workers N          Minimum background sync workers [default: 2]
+  --max-sync-workers N     Grow sync workers on queued tasks up to N
   -f, --foreground         Run in foreground
 ```
 
@@ -121,6 +123,8 @@ cache = "/home/user/.cache/storage/media"
 cache_size = "50G"
 key_file = "/home/user/.ssh/id_ed25519"
 foreground = true
+workers = 2
+# max_sync_workers = 8
 backends = [
   "ssh://user@storage-host.example:/srv/raid/media/",
   "ssh://user@storage-host.example:/srv/chunk0/media/",
@@ -133,6 +137,18 @@ Save that as `~/.config/storage/storage.toml` to auto-load by name:
 ```bash
 storage mount example-media
 ```
+
+`workers` controls background file and directory sync, not foreground FUSE
+requests or streaming prefetch. By default it stays a fixed pool of two, as
+before. Set `max_sync_workers` in a profile (or `--max-sync-workers` on the
+CLI) to add workers when distinct tasks wait behind busy workers. Excess
+workers exit after 30 seconds idle. The configured maximum must be at least
+`workers`; it can be at most 8 with any SSH member or 32 with local members
+only. The SSH limit leaves room under the usual ten-session OpenSSH limit for
+the remote watcher and other operations on the shared rsync connection.
+Servers configured with a lower session limit may need a lower maximum. CPU
+load average is not used: sync spends most of its time waiting for member I/O,
+so CPU load is a poor guide to useful concurrency.
 
 Or mount from an explicit TOML path (`storage.example.toml` in this repo
 is a fuller version of the same profile):

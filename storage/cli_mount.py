@@ -63,6 +63,10 @@ def shared_filesystems(backends: Dict[str, Backend]) -> List[List[str]]:
 @click.option("-s", "--cache-size", help="Cache size (e.g., 10G, 500M)")
 @click.option("-d", "--database", help="State database path (default: cache/.storage.db)")
 @click.option("-w", "--workers", type=int, help="Number of sync worker threads")
+@click.option(
+    "--max-sync-workers", type=int,
+    help="Grow background sync from --workers up to this limit when tasks queue (8 with SSH members, 32 local-only).",
+)
 @click.option("-r", "--remote", multiple=True, help="Remote storage member (ssh://user@host:/path)")
 @click.option("-k", "--key-file", help="SSH private key file")
 @click.option("-f", "--foreground", is_flag=True, default=None, help="Run in foreground")
@@ -145,6 +149,7 @@ def mount(
     cache_size,
     database,
     workers,
+    max_sync_workers,
     remote,
     key_file,
     foreground,
@@ -209,6 +214,7 @@ def mount(
         revalidate_after=revalidate_after,
         fuse_threads=fuse_threads,
         checksum_reverify_interval=checksum_reverify_interval,
+        max_sync_workers=max_sync_workers,
     )
 
     try:
@@ -240,6 +246,14 @@ def mount(
     mountpoint_path.mkdir(parents=True, exist_ok=True)
 
     backends = create_storage_members(resolved.member_specs, resolved.key_file)
+    if resolved.workers < 0:
+        raise click.ClickException("workers must be non-negative")
+    if resolved.max_sync_workers is not None:
+        limit = 8 if any(isinstance(b, SSHBackend) for b in backends.values()) else 32
+        if not resolved.workers <= resolved.max_sync_workers <= limit:
+            raise click.ClickException(
+                f"max-sync-workers must be between workers ({resolved.workers}) and {limit}"
+            )
     for names in shared_filesystems(backends):
         click.echo(
             f"Warning: members {', '.join(names)} store on the same filesystem; "
@@ -255,7 +269,10 @@ def mount(
     click.echo(f"  Cache size: {resolved.cache_size} ({cache_size_bytes:,} bytes)")
     click.echo(f"  Database: {db_path}")
     click.echo(f"  Storage members: {len(backends)}")
-    click.echo(f"  Sync workers: {resolved.workers}")
+    click.echo(
+        f"  Sync workers: {resolved.workers}"
+        + (f" to {resolved.max_sync_workers} on demand" if resolved.max_sync_workers is not None else "")
+    )
     click.echo(f"  Streaming reads: {'enabled' if resolved.streaming_reads else 'disabled'}")
     click.echo(
         f"  Streaming chunk: {resolved.streaming_chunk_size} ({streaming_chunk_bytes:,} bytes)"
@@ -314,6 +331,7 @@ def mount(
             cache_size_bytes,
             foreground=resolved.foreground,
             num_sync_workers=resolved.workers,
+            max_sync_workers=resolved.max_sync_workers,
             allow_other=resolved.allow_other,
             debug=resolved.debug,
             streaming_reads=resolved.streaming_reads,
