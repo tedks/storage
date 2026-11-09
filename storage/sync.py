@@ -24,6 +24,12 @@ from .sync_tasks import DirOperation, DirSyncTask, SyncConfig, SyncTask, dir_tas
 
 logger = logging.getLogger(__name__)
 
+
+def sync_worker_ceiling(backends) -> int:
+    """Conservative adaptive cap; rsync uploads share one SSH master per host."""
+    remote = (BackendType.SSH, BackendType.RSYNC)
+    return 8 if any(b.backend_type in remote for b in backends.values()) else 32
+
 # Posted to the task queue by SyncManager.stop() so idle workers wake at once
 # instead of at the end of their poll. Sorts ahead of every real task (the
 # highest real priority is 1000). Never processed; compared by identity.
@@ -54,7 +60,7 @@ class SyncWorker(threading.Thread):
                  path_guard: Optional[Callable[..., ContextManager]] = None,
                  idle_timeout: float = 30.0,
                  retire_cb: Optional[Callable[['SyncWorker'], bool]] = None,
-                 task_done_cb: Optional[Callable[[], None]] = None):
+                 demand_changed_cb: Optional[Callable[[], None]] = None):
         super().__init__(daemon=True, name=f"SyncWorker-{worker_id}")
         self.worker_id = worker_id
         self.task_queue = task_queue
@@ -78,7 +84,7 @@ class SyncWorker(threading.Thread):
         self._task_complete_cb = task_complete_cb
         self._idle_timeout = idle_timeout
         self._retire_cb = retire_cb
-        self._task_done_cb = task_done_cb
+        self._demand_changed_cb = demand_changed_cb
 
     def run(self):
         """Main worker loop"""
@@ -109,6 +115,10 @@ class SyncWorker(threading.Thread):
                     break
 
                 self._active_task = task.virtual_path
+                # A dequeued task is absent from qsize() until marked
+                # active. Recheck demand now to close that gap. A failure to
+                # add a thread must not strand this task before processing.
+                self._notify_demand_change()
 
                 try:
                     success = self.executor.process(task)
@@ -130,13 +140,19 @@ class SyncWorker(threading.Thread):
                     self._active_task = None
                     self.task_queue.task_done()
                     idle_since = time.monotonic()
-                    if self._task_done_cb:
-                        self._task_done_cb()
+                    self._notify_demand_change()
 
             except Exception as e:
                 logger.error(f"Worker {self.worker_id} error: {e}")
 
         logger.info(f"Sync worker {self.worker_id} stopped")
+
+    def _notify_demand_change(self):
+        if self._demand_changed_cb:
+            try:
+                self._demand_changed_cb()
+            except Exception:
+                logger.exception("Could not adjust sync worker count")
 
     def _notify_task_complete(self, task):
         if self._task_complete_cb:
@@ -199,11 +215,9 @@ class SyncManager:
         self.replication_manager = replication_manager
         if num_workers < 0 or max_workers is not None and max_workers < num_workers:
             raise ValueError("sync worker limits must satisfy 0 <= workers <= max_workers")
-        if max_workers is not None and max_workers > 32:
-            raise ValueError("max sync workers cannot exceed 32")
-        if (max_workers is not None and max_workers > 8
-                and any(b.backend_type == BackendType.SSH for b in replication_manager.backends.values())):
-            raise ValueError("max sync workers cannot exceed 8 with SSH members")
+        ceiling = sync_worker_ceiling(replication_manager.backends)
+        if max_workers is not None and max_workers > ceiling:
+            raise ValueError(f"max sync workers cannot exceed {ceiling}")
         if idle_timeout <= 0:
             raise ValueError("sync worker idle timeout must be positive")
         self.num_workers = num_workers
@@ -269,11 +283,11 @@ class SyncManager:
             path_guard=self._path_guard,
             idle_timeout=self.idle_timeout,
             retire_cb=self._retire_idle,
-            task_done_cb=self._maybe_grow,
+            demand_changed_cb=self._maybe_grow,
         )
         self._next_worker_id += 1
-        self.workers.append(worker)
         worker.start()
+        self.workers.append(worker)
 
     def _maybe_grow(self):
         with self._workers_lock:
@@ -282,16 +296,21 @@ class SyncManager:
             active = sum(worker.get_active_task() is not None for worker in self.workers)
             target = min(self.max_workers, max(self.num_workers, active + self.task_queue.qsize()))
             for _ in range(target - len(self.workers)):
-                self._start_worker_locked()
+                try:
+                    self._start_worker_locked()
+                except RuntimeError:
+                    logger.exception("Could not start another sync worker")
+                    break
 
     def _retire_idle(self, worker: SyncWorker) -> bool:
         with self._workers_lock:
             if (not self._running or len(self.workers) <= self.num_workers
                     or self.task_queue.qsize() or worker not in self.workers):
                 return False
+            worker_stats = worker.get_stats()
+            for key in self._retired_stats:
+                self._retired_stats[key] += worker_stats.get(key, 0)
             self.workers.remove(worker)
-            for key, value in worker.get_stats().items():
-                self._retired_stats[key] += value
             return True
 
     def stop(self):
@@ -322,6 +341,7 @@ class SyncManager:
             with self._workers_lock:
                 self._lingering_workers = [w for w in workers if w.is_alive()]
                 self.workers.clear()
+                self._retired_stats = {'synced': 0, 'failed': 0, 'conflicts': 0}
             self._drop_wake_tasks()
             if self._lingering_workers:
                 logger.warning("%d sync worker(s) still finishing after stop timeout",

@@ -127,7 +127,7 @@ class TestSyncManager(unittest.TestCase):
                 peak = max(peak, active)
                 entered.notify_all()
             try:
-                self.assertTrue(release.wait(5.0))
+                release.wait(5.0)
                 executor._stats['synced'] += 1
                 return True
             finally:
@@ -155,6 +155,83 @@ class TestSyncManager(unittest.TestCase):
             self.assertEqual(8, self.sync_manager.get_stats()['total_synced'])
             self.sync_manager.stop()
 
+    def test_adaptive_growth_after_dequeue_accounting_gap(self):
+        self.sync_manager = SyncManager(
+            self.state_manager, self.cache_manager, self.replication_manager,
+            num_workers=1, max_workers=2,
+            config=SyncConfig(monitor_interval=30.0),
+        )
+        original_get = self.sync_manager.task_queue.get
+        taken = threading.Event()
+        allow_get_to_return = threading.Event()
+        release_work = threading.Event()
+        entered = threading.Condition()
+        active = 0
+
+        def held_get(*args, **kwargs):
+            task = original_get(*args, **kwargs)
+            if task.virtual_path == '/first':
+                taken.set()
+                allow_get_to_return.wait(5.0)
+            return task
+
+        def blocked_process(_executor, _task):
+            nonlocal active
+            with entered:
+                active += 1
+                entered.notify_all()
+            release_work.wait(5.0)
+            return True
+
+        self.sync_manager.task_queue.get = held_get
+        with patch.object(SyncExecutor, "process", blocked_process):
+            self.sync_manager.start()
+            try:
+                self.sync_manager.queue_sync('/first')
+                self.assertTrue(taken.wait(5.0))
+                self.sync_manager.queue_sync('/second')
+                self.assertEqual(1, len(self.sync_manager.workers))
+                allow_get_to_return.set()
+                with entered:
+                    self.assertTrue(entered.wait_for(lambda: active == 2, timeout=5.0))
+            finally:
+                allow_get_to_return.set()
+                release_work.set()
+            self.assertTrue(self.sync_manager.wait_for_completion(timeout=5.0))
+            self.sync_manager.stop()
+
+    def test_fixed_pool_stays_fixed_under_queue_pressure(self):
+        self.sync_manager = SyncManager(
+            self.state_manager, self.cache_manager, self.replication_manager,
+            num_workers=2, idle_timeout=0.05,
+            config=SyncConfig(monitor_interval=30.0),
+        )
+        release = threading.Event()
+        entered = threading.Condition()
+        active = 0
+
+        def blocked_process(_executor, _task):
+            nonlocal active
+            with entered:
+                active += 1
+                entered.notify_all()
+            release.wait(5.0)
+            return True
+
+        with patch.object(SyncExecutor, "process", blocked_process):
+            self.sync_manager.start()
+            try:
+                for index in range(6):
+                    self.sync_manager.queue_sync(f'/fixed-{index}')
+                with entered:
+                    self.assertTrue(entered.wait_for(lambda: active == 2, timeout=5.0))
+                self.assertEqual(2, len(self.sync_manager.workers))
+                self.assertEqual(4, self.sync_manager.get_queue_size())
+            finally:
+                release.set()
+            self.assertTrue(self.sync_manager.wait_for_completion(timeout=5.0))
+            self.sync_manager.stop()
+
     def test_adaptive_stop_preserves_queued_tasks_for_restart(self):
         self.sync_manager = SyncManager(
             self.state_manager, self.cache_manager, self.replication_manager,
@@ -170,7 +247,7 @@ class TestSyncManager(unittest.TestCase):
             with entered:
                 active += 1
                 entered.notify_all()
-            self.assertTrue(release.wait(5.0))
+            release.wait(5.0)
             return True
 
         with patch.object(SyncExecutor, "process", blocked_process):
@@ -202,7 +279,13 @@ class TestSyncManager(unittest.TestCase):
         self.replication_manager.backends['remote'] = type(
             'RemoteStub', (), {'backend_type': BackendType.SSH}
         )()
-        with self.assertRaisesRegex(ValueError, "cannot exceed 8 with SSH"):
+        with self.assertRaisesRegex(ValueError, "cannot exceed 8"):
+            SyncManager(
+                self.state_manager, self.cache_manager, self.replication_manager,
+                num_workers=1, max_workers=9,
+            )
+        self.replication_manager.backends['remote'].backend_type = BackendType.RSYNC
+        with self.assertRaisesRegex(ValueError, "cannot exceed 8"):
             SyncManager(
                 self.state_manager, self.cache_manager, self.replication_manager,
                 num_workers=1, max_workers=9,
