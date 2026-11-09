@@ -73,3 +73,10 @@ log_events:
     test failed at its active==2 assertion (1 failed, 988 deselected). Restored the
     exact source bytes (git diff --exit-code clean) and reran the same test: passed.
     Final full gate receipt remains on unchanged d61bdb1.'
+- time: 2026-11-09T00:25:58-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Lane DONE and idle awaiting parent integration/scope ruling. Branch feat/adaptive-workers
+    clean, pushed and up to date at d61bdb17601aba8918fe552bd456442e4a69b412; PR #167
+    draft/open. No processes or leases retained; owned council scratch directories
+    removed.'
