@@ -196,6 +196,8 @@ backends = ["ssh://user@storage-host.example:/srv/data/"]
         self.assertNotEqual(0, result.exit_code)
         self.assertIn("max-sync-workers cannot exceed 8", result.output)
         mock_mount.assert_not_called()
+        self.assertFalse((self.temp_dir / 'cache').exists())
+        self.assertFalse((self.temp_dir / 'mount').exists())
 
     def test_mount_rejects_negative_or_reversed_sync_worker_limits(self):
         local_member = self.temp_dir / "member"
