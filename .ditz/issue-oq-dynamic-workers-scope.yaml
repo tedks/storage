@@ -1,0 +1,26 @@
+id: oq-dynamic-workers-scope
+title: Decide whether demand-driven workers also means foreground FUSE requests
+desc: 'Ted asked for dynamic workers that grow with more requests. `workers` / `--workers`
+  controls queued background sync; PR #167 implements opt-in demand scaling for that
+  path. Foreground FUSE requests are separate: `fuse_threads` defaults off, and libfuse
+  2''s multithreaded loop has no thread cap. Options: (a) accept PR #167 as background
+  sync only and leave foreground policy to the existing `threading-fuse-worker-cap`
+  issue after field testing; (b) add a separate foreground concurrency project, likely
+  requiring a different FUSE loop or careful handler admission that still does not
+  cap libfuse threads; (c) request both as one product milestone, holding integration
+  until foreground design is ruled. Recommendation: (a), then assess foreground with
+  measured field evidence. Ted decides. This blocks interpreting PR #167 as the complete
+  answer to foreground request concurrency, not the reviewability of its sync changes.'
+type: task
+component: open-questions
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-09T00:24:00-00:00
+references: []
+log_events:
+- time: 2026-11-09T00:24:00-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
