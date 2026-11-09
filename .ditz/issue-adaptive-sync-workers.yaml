@@ -65,3 +65,11 @@ log_events:
   comment: 'Background sync scaling implemented in pushed draft PR #167 at d61bdb1;
     local gates and present council seats clean. Integration and product scope remain
     with Ted/parent.'
+- time: 2026-11-09T00:25:43-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Mutation check on final d61bdb1: temporarily removed the post-dequeue
+    demand callback in the owned worktree; the isolated adaptive_growth_after_dequeue_accounting_gap
+    test failed at its active==2 assertion (1 failed, 988 deselected). Restored the
+    exact source bytes (git diff --exit-code clean) and reran the same test: passed.
+    Final full gate receipt remains on unchanged d61bdb1.'
