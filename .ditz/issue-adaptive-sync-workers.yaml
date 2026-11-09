@@ -51,3 +51,11 @@ log_events:
   comment: 'Prototype commit b3c3e7d pushed on feat/adaptive-workers; draft PR #167
     created. The internal pool tests passed via Bazel. Mount profile/CLI wiring and
     final scope await Ted foreground/background answer; no live mount or host touched.'
+- time: 2026-11-09T00:24:01-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Final pushed head d61bdb1: all 8 gates and CLI build passed; formal council
+    round 3 clean from OpenAI and Claude, Google empty (usage limit); helper check
+    clean=true. PR #167 remains draft and unmerged pending Ted foreground/background
+    scope. Follow-up nit adaptive-sync-cleanup-error-context filed; product question
+    oq-dynamic-workers-scope filed.'
