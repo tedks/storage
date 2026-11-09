@@ -15,6 +15,7 @@ from .mount_profiles import (
     parse_size,
     resolve_mount_configuration,
 )
+from .sync import sync_worker_ceiling
 
 
 def shared_filesystems(backends: Dict[str, Backend]) -> List[List[str]]:
@@ -228,6 +229,14 @@ def mount(
     except ValueError as exc:
         raise click.ClickException(f"Invalid cache size: {exc}") from exc
 
+    if resolved.workers < 0:
+        raise click.ClickException("workers must be non-negative")
+    if (resolved.max_sync_workers is not None
+            and resolved.max_sync_workers < resolved.workers):
+        raise click.ClickException(
+            f"max-sync-workers must be at least workers ({resolved.workers})"
+        )
+
     try:
         streaming_chunk_bytes = parse_size(resolved.streaming_chunk_size)
     except ValueError as exc:
@@ -258,10 +267,10 @@ def mount(
     if resolved.workers < 0:
         raise click.ClickException("workers must be non-negative")
     if resolved.max_sync_workers is not None:
-        limit = 8 if any(isinstance(b, SSHBackend) for b in backends.values()) else 32
-        if not resolved.workers <= resolved.max_sync_workers <= limit:
+        limit = sync_worker_ceiling(backends)
+        if resolved.max_sync_workers > limit:
             raise click.ClickException(
-                f"max-sync-workers must be between workers ({resolved.workers}) and {limit}"
+                f"max-sync-workers cannot exceed {limit} for these storage members"
             )
     for names in shared_filesystems(backends):
         click.echo(

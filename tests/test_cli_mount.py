@@ -194,7 +194,31 @@ backends = ["ssh://user@storage-host.example:/srv/data/"]
                 main, ["mount", "--config", str(config_path), "too-many"]
             )
         self.assertNotEqual(0, result.exit_code)
-        self.assertIn("max-sync-workers must be between workers (2) and 8", result.output)
+        self.assertIn("max-sync-workers cannot exceed 8", result.output)
+        mock_mount.assert_not_called()
+
+    def test_mount_rejects_negative_or_reversed_sync_worker_limits(self):
+        local_member = self.temp_dir / "member"
+        local_member.mkdir()
+        config_path = self.temp_dir / "storage.toml"
+        config_path.write_text(
+            f'''
+[mounts.bad-limits]
+mountpoint = "{self.temp_dir / 'mount'}"
+cache = "{self.temp_dir / 'cache'}"
+backends = ["{local_member}"]
+'''.strip()
+        )
+        with patch("storage.cli_mount.mount_storage") as mock_mount:
+            negative = self.runner.invoke(
+                main, ["mount", "--config", str(config_path), "--workers", "-1", "bad-limits"]
+            )
+            reversed_limits = self.runner.invoke(
+                main, ["mount", "--config", str(config_path),
+                       "--workers", "2", "--max-sync-workers", "1", "bad-limits"]
+            )
+        self.assertIn("workers must be non-negative", negative.output)
+        self.assertIn("max-sync-workers must be at least workers (2)", reversed_limits.output)
         mock_mount.assert_not_called()
 
     def test_mount_fails_when_named_profile_is_missing(self):
