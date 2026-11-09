@@ -65,6 +65,8 @@ class ResolvedMountConfig:
     checksum_reverify_interval: float = DEFAULT_CHECKSUM_REVERIFY_INTERVAL
     # Optional presentation labels, in member_specs order. Never backend IDs.
     member_display_names: Tuple[Optional[str], ...] = ()
+    # None keeps the historical fixed sync pool at `workers`.
+    max_sync_workers: Optional[int] = None
 
     @property
     def member_specs(self) -> Tuple[str, ...]:
@@ -563,6 +565,7 @@ def _load_mount_profile_settings(config_path: Path, profile_name: str) -> Dict[s
         "cache_size": _optional_profile_string(config_profile, "cache_size", profile_name),
         "database": _optional_profile_string(config_profile, "database", profile_name),
         "workers": _optional_profile_int(config_profile, "workers", profile_name),
+        "max_sync_workers": _optional_profile_int(config_profile, "max_sync_workers", profile_name),
         "key_file": _optional_profile_string(config_profile, "key_file", profile_name),
         "foreground": _optional_profile_bool(config_profile, "foreground", profile_name),
         "allow_other": _optional_profile_bool(config_profile, "allow_other", profile_name),
@@ -629,6 +632,7 @@ def _can_auto_load_mount_profile(
     fuse_threads: Optional[bool] = None,
     checksum_reverify_interval: Optional[float] = None,
     max_foreground_operations: Optional[int] = None,
+    max_sync_workers: Optional[int] = None,
 ) -> bool:
     if not _target_looks_like_profile_name(mount_target):
         return False
@@ -653,6 +657,7 @@ def _can_auto_load_mount_profile(
         fuse_threads is not None,
         checksum_reverify_interval is not None,
         max_foreground_operations is not None,
+        max_sync_workers is not None,
     ))
 
 
@@ -679,6 +684,7 @@ def resolve_mount_configuration(
     fuse_threads: Optional[bool] = None,
     checksum_reverify_interval: Optional[float] = None,
     max_foreground_operations: Optional[int] = None,
+    max_sync_workers: Optional[int] = None,
 ) -> ResolvedMountConfig:
     config_values = {
         "mountpoint": None,
@@ -686,6 +692,7 @@ def resolve_mount_configuration(
         "cache_size": None,
         "database": None,
         "workers": None,
+        "max_sync_workers": None,
         "key_file": None,
         "foreground": None,
         "allow_other": None,
@@ -736,6 +743,7 @@ def resolve_mount_configuration(
         fuse_threads,
         checksum_reverify_interval,
         max_foreground_operations,
+        max_sync_workers,
     ):
         available_configs = [candidate for candidate in default_mount_config_paths() if candidate.exists()]
         if available_configs:
@@ -791,6 +799,9 @@ def resolve_mount_configuration(
         database=database or config_values["database"],
         workers=workers if workers is not None else (
             config_values["workers"] if config_values["workers"] is not None else DEFAULT_SYNC_WORKERS
+        ),
+        max_sync_workers=(
+            max_sync_workers if max_sync_workers is not None else config_values["max_sync_workers"]
         ),
         key_file=key_file or config_values["key_file"],
         foreground=foreground if foreground is not None else (

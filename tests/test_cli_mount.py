@@ -56,6 +56,7 @@ foreground = true
 streaming_reads = true
 streaming_chunk_size = "2M"
 max_streaming_sessions = 16
+max_sync_workers = 6
 backends = [
   "ssh://user@storage-host.example:/srv/raid/media/",
   "ssh://user@storage-host.example:/srv/chunk0/media/",
@@ -87,6 +88,7 @@ backends = [
         self.assertTrue(kwargs["streaming_reads"])
         self.assertEqual(2 * 1024 ** 2, kwargs["streaming_chunk_size"])
         self.assertEqual(16, kwargs["max_streaming_sessions"])
+        self.assertEqual(6, kwargs["max_sync_workers"])
 
     def test_mount_auto_loads_default_storage_toml(self):
         home_dir = self.temp_dir / "home"
@@ -130,6 +132,7 @@ mountpoint = "{mount_dir}"
 cache = "{cache_dir}"
 cache_size = "50G"
 workers = 2
+max_sync_workers = 6
 foreground = false
 backends = [
   {{ spec = "ssh://user@storage-host.example:/srv/raid/media/", name = "Original host" }},
@@ -148,6 +151,8 @@ backends = [
                     "5G",
                     "--workers",
                     "4",
+                    "--max-sync-workers",
+                    "7",
                     "--foreground",
                     "--remote",
                     "ssh://user@mirror.example:/srv/cache/media/",
@@ -171,6 +176,26 @@ backends = [
         self.assertEqual("/srv/cache/media", str(args[3]["remote0"].remote_path))
         self.assertTrue(kwargs["foreground"])
         self.assertEqual(4, kwargs["num_sync_workers"])
+        self.assertEqual(7, kwargs["max_sync_workers"])
+
+    def test_mount_rejects_ssh_worker_limit_above_session_budget(self):
+        config_path = self.temp_dir / "storage.toml"
+        config_path.write_text(
+            f'''
+[mounts.too-many]
+mountpoint = "{self.temp_dir / 'mount'}"
+cache = "{self.temp_dir / 'cache'}"
+max_sync_workers = 9
+backends = ["ssh://user@storage-host.example:/srv/data/"]
+'''.strip()
+        )
+        with patch("storage.cli_mount.mount_storage") as mock_mount:
+            result = self.runner.invoke(
+                main, ["mount", "--config", str(config_path), "too-many"]
+            )
+        self.assertNotEqual(0, result.exit_code)
+        self.assertIn("max-sync-workers must be between workers (2) and 8", result.output)
+        mock_mount.assert_not_called()
 
     def test_mount_fails_when_named_profile_is_missing(self):
         config_path = self.temp_dir / "storage.toml"

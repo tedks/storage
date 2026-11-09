@@ -13,7 +13,7 @@ import logging
 from pathlib import Path
 from typing import Callable, ContextManager, Optional, Set, Union, Tuple
 
-from .backends.base import Backend
+from .backends.base import Backend, BackendType
 from .cache import CacheManager
 from .models import SyncStatus
 from .replication import ReplicationManager
@@ -195,6 +195,11 @@ class SyncManager:
         self.replication_manager = replication_manager
         if num_workers < 0 or max_workers is not None and max_workers < num_workers:
             raise ValueError("sync worker limits must satisfy 0 <= workers <= max_workers")
+        if max_workers is not None and max_workers > 32:
+            raise ValueError("max sync workers cannot exceed 32")
+        if (max_workers is not None and max_workers > 8
+                and any(b.backend_type == BackendType.SSH for b in replication_manager.backends.values())):
+            raise ValueError("max sync workers cannot exceed 8 with SSH members")
         if idle_timeout <= 0:
             raise ValueError("sync worker idle timeout must be positive")
         self.num_workers = num_workers

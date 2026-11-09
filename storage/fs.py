@@ -159,7 +159,8 @@ class StorageFS(Operations):
                  revalidate_after: float = 60.0,
                  listing_max_stale: float = DEFAULT_LISTING_MAX_STALE,
                  checksum_reverify_interval: float = DEFAULT_CHECKSUM_REVERIFY_INTERVAL,
-                 max_foreground_operations: Optional[int] = None):
+                 max_foreground_operations: Optional[int] = None,
+                 max_sync_workers: Optional[int] = None):
         """
         Initialize Storage filesystem
 
@@ -169,6 +170,7 @@ class StorageFS(Operations):
             backends: Dictionary of backend name -> Backend instance
             cache_size: Maximum cache size in bytes
             num_sync_workers: Number of background sync worker threads
+            max_sync_workers: Optional upper limit for demand-driven sync workers
             streaming_reads: Enable uncached range streaming + background prefetch
             streaming_chunk_size: Unit of background read-ahead (foreground
                 reads fetch only what the reader asked for); read-ahead
@@ -263,6 +265,7 @@ class StorageFS(Operations):
             self.cache_manager,
             self.replication_manager,
             num_workers=num_sync_workers,
+            max_workers=max_sync_workers,
             should_sync_path_cb=self._should_sync_path,
             member_written_cb=self._record_member_written,
             upload_guard=self._upload_locks.hold_for_upload,
@@ -3268,7 +3271,8 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
                  negative_timeout: Optional[float] = None,
                  fuse_threads: bool = False,
                  max_foreground_operations: Optional[int] = None,
-                 checksum_reverify_interval: float = DEFAULT_CHECKSUM_REVERIFY_INTERVAL):
+                 checksum_reverify_interval: float = DEFAULT_CHECKSUM_REVERIFY_INTERVAL,
+                 max_sync_workers: Optional[int] = None):
     """
     Mount a Storage filesystem
 
@@ -3280,6 +3284,7 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
         cache_size: Maximum cache size in bytes
         foreground: Run in foreground (default: False)
         num_sync_workers: Number of background sync workers
+        max_sync_workers: Optional upper limit for demand-driven sync workers
         allow_other: Allow other users to access the mount (requires root or fuse.conf setting).
                      If None, auto-detects based on whether running as root.
         debug: Enable verbose debug logging
@@ -3385,6 +3390,7 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
         listing_max_stale=listing_max_stale,
         checksum_reverify_interval=checksum_reverify_interval,
         max_foreground_operations=max_foreground_operations,
+        max_sync_workers=max_sync_workers,
     )
     fs.mount_lock_file = lock_file
     if unclean_shutdown:

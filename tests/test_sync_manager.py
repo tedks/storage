@@ -7,12 +7,13 @@ from pathlib import Path
 from unittest.mock import patch
 
 from storage.backends.local import LocalBackend
+from storage.backends.base import BackendType
 from storage.cache import CacheManager
 from storage.file_config import FileConfig, set_file_config
 from storage.models import FileLocation, FileMetadata, SyncStatus
 from storage.replication import ReplicationManager
 from storage.state import StateManager
-from storage.sync import DirOperation, DirSyncTask, SyncConfig, SyncManager, SyncTask
+from storage.sync import DirOperation, DirSyncTask, SyncConfig, SyncManager, SyncTask, SyncWorker
 from storage.sync_executor import SyncExecutor
 
 
@@ -190,6 +191,52 @@ class TestSyncManager(unittest.TestCase):
         self.assertEqual(1, self.sync_manager.get_queue_size())
         self.sync_manager.start()
         self.assertTrue(self.sync_manager.wait_for_completion(timeout=5.0))
+        self.sync_manager.stop()
+
+    def test_adaptive_worker_limits_are_bounded_before_start(self):
+        with self.assertRaisesRegex(ValueError, "cannot exceed 32"):
+            SyncManager(
+                self.state_manager, self.cache_manager, self.replication_manager,
+                num_workers=1, max_workers=33,
+            )
+        self.replication_manager.backends['remote'] = type(
+            'RemoteStub', (), {'backend_type': BackendType.SSH}
+        )()
+        with self.assertRaisesRegex(ValueError, "cannot exceed 8 with SSH"):
+            SyncManager(
+                self.state_manager, self.cache_manager, self.replication_manager,
+                num_workers=1, max_workers=9,
+            )
+
+    def test_restart_waits_for_worker_that_outlived_stop(self):
+        self.sync_manager = SyncManager(
+            self.state_manager, self.cache_manager, self.replication_manager,
+            num_workers=1, max_workers=2,
+            config=SyncConfig(monitor_interval=30.0),
+        )
+        entered = threading.Event()
+        release = threading.Event()
+
+        def blocked_process(_executor, _task):
+            entered.set()
+            release.wait(5.0)
+            return True
+
+        with patch.object(SyncExecutor, "process", blocked_process):
+            self.sync_manager.start()
+            self.sync_manager.queue_sync("/busy")
+            self.assertTrue(entered.wait(5.0))
+            try:
+                # Simulate the five-second deadline without spending five
+                # seconds in this test; the worker remains in its task.
+                with patch.object(SyncWorker, "join"):
+                    self.sync_manager.stop()
+                with self.assertRaisesRegex(RuntimeError, "still finishing"):
+                    self.sync_manager.start()
+            finally:
+                release.set()
+            self.sync_manager._lingering_workers[0].join(timeout=5.0)
+        self.sync_manager.start()
         self.sync_manager.stop()
 
     def test_queue_sync(self):
