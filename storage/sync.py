@@ -230,7 +230,7 @@ class SyncManager:
 
         # Workers
         self.workers = []
-        self._lifecycle_lock = threading.Lock()
+        self._lifecycle_lock = threading.RLock()
         self._workers_lock = threading.Lock()
         self._next_worker_id = 0
         self._retired_stats = {'synced': 0, 'failed': 0, 'conflicts': 0}
@@ -248,21 +248,26 @@ class SyncManager:
     def start(self):
         """Start sync workers"""
         with self._lifecycle_lock:
-            with self._workers_lock:
+            try:
+                with self._workers_lock:
+                    if self._running:
+                        logger.warning("Sync manager already running")
+                        return
+                    self._lingering_workers = [w for w in self._lingering_workers if w.is_alive()]
+                    if self._lingering_workers:
+                        raise RuntimeError("previous sync workers are still finishing; cannot restart")
+                    logger.info("Starting sync manager with %d-%d workers", self.num_workers, self.max_workers)
+                    self._running = True
+                    self._monitor_stop = threading.Event()
+                    for _ in range(self.num_workers):
+                        self._start_worker_locked()
+                    self._monitor_thread = threading.Thread(
+                        target=self._monitor_loop, args=(self._monitor_stop,), daemon=True)
+                    self._monitor_thread.start()
+            except Exception:
                 if self._running:
-                    logger.warning("Sync manager already running")
-                    return
-                self._lingering_workers = [w for w in self._lingering_workers if w.is_alive()]
-                if self._lingering_workers:
-                    raise RuntimeError("previous sync workers are still finishing; cannot restart")
-                logger.info("Starting sync manager with %d-%d workers", self.num_workers, self.max_workers)
-                self._running = True
-                self._monitor_stop = threading.Event()
-                for _ in range(self.num_workers):
-                    self._start_worker_locked()
-                self._monitor_thread = threading.Thread(
-                    target=self._monitor_loop, args=(self._monitor_stop,), daemon=True)
-                self._monitor_thread.start()
+                    self.stop()
+                raise
 
             self._maybe_grow()
 
@@ -331,7 +336,7 @@ class SyncManager:
             deadline = time.monotonic() + 5.0
             for worker in workers:
                 worker.join(timeout=max(0.0, deadline - time.monotonic()))
-            if self._monitor_thread:
+            if self._monitor_thread and self._monitor_thread.ident is not None:
                 self._monitor_thread.join(timeout=max(0.0, deadline - time.monotonic()))
 
             with self._workers_lock:

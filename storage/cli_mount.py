@@ -244,7 +244,6 @@ def mount(
             raise click.ClickException(f"Invalid streaming keep-after-close: {exc}") from exc
 
     cache_root = Path(resolved.cache).resolve()
-    cache_root.mkdir(parents=True, exist_ok=True)
 
     if resolved.database:
         db_path = Path(resolved.database)
@@ -252,7 +251,6 @@ def mount(
         db_path = cache_root / ".storage.db"
 
     mountpoint_path = Path(resolved.mountpoint)
-    mountpoint_path.mkdir(parents=True, exist_ok=True)
 
     backends = create_storage_members(resolved.member_specs, resolved.key_file)
     if resolved.max_sync_workers is not None:
@@ -261,6 +259,8 @@ def mount(
             raise click.ClickException(
                 f"max-sync-workers cannot exceed {limit} for these storage members"
             )
+    cache_root.mkdir(parents=True, exist_ok=True)
+    mountpoint_path.mkdir(parents=True, exist_ok=True)
     for names in shared_filesystems(backends):
         click.echo(
             f"Warning: members {', '.join(names)} store on the same filesystem; "
