@@ -45,3 +45,9 @@ log_events:
     Synthetic tests should pin bounded growth, no growth on duplicate tasks, priority/fairness,
     idle shrink, stop/restart with busy and queued tasks, and actual overlap via barrier
     events without wall-clock speed thresholds.'
+- time: 2026-11-09T00:01:15-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Prototype commit b3c3e7d pushed on feat/adaptive-workers; draft PR #167
+    created. The internal pool tests passed via Bazel. Mount profile/CLI wiring and
+    final scope await Ted foreground/background answer; no live mount or host touched.'
