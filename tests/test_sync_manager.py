@@ -4,14 +4,17 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from storage.backends.local import LocalBackend
+from storage.backends.base import BackendType
 from storage.cache import CacheManager
 from storage.file_config import FileConfig, set_file_config
 from storage.models import FileLocation, FileMetadata, SyncStatus
 from storage.replication import ReplicationManager
 from storage.state import StateManager
-from storage.sync import DirOperation, DirSyncTask, SyncConfig, SyncManager, SyncTask
+from storage.sync import DirOperation, DirSyncTask, SyncConfig, SyncManager, SyncTask, SyncWorker
+from storage.sync_executor import SyncExecutor
 
 
 class TestSyncManager(unittest.TestCase):
@@ -104,6 +107,244 @@ class TestSyncManager(unittest.TestCase):
             worker.executor.process = lambda task: done.set() or True
         self.sync_manager.queue_sync("/again.txt")
         self.assertTrue(done.wait(5.0))
+        self.sync_manager.stop()
+
+    def test_adaptive_workers_overlap_distinct_tasks_and_retire(self):
+        self.sync_manager = SyncManager(
+            self.state_manager, self.cache_manager, self.replication_manager,
+            num_workers=1, max_workers=4, idle_timeout=0.1,
+            config=SyncConfig(monitor_interval=30.0),
+        )
+        release = threading.Event()
+        entered = threading.Condition()
+        active = 0
+        peak = 0
+
+        def blocked_process(executor, _task):
+            nonlocal active, peak
+            with entered:
+                active += 1
+                peak = max(peak, active)
+                entered.notify_all()
+            try:
+                release.wait(5.0)
+                executor._stats['synced'] += 1
+                return True
+            finally:
+                with entered:
+                    active -= 1
+                    entered.notify_all()
+
+        with patch.object(SyncExecutor, "process", blocked_process):
+            self.sync_manager.start()
+            try:
+                for index in range(8):
+                    self.sync_manager.queue_sync(f"/queued-{index}")
+                self.sync_manager.queue_sync("/queued-0")
+                with entered:
+                    self.assertTrue(entered.wait_for(lambda: active == 4, timeout=5.0))
+                self.assertEqual(4, peak)
+                self.assertEqual(4, len(self.sync_manager.workers))
+            finally:
+                release.set()
+            self.assertTrue(self.sync_manager.wait_for_completion(timeout=5.0))
+            deadline = time.monotonic() + 3.0
+            while len(self.sync_manager.workers) != 1 and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertEqual(1, len(self.sync_manager.workers))
+            self.assertEqual(8, self.sync_manager.get_stats()['total_synced'])
+            self.sync_manager.stop()
+
+    def test_adaptive_growth_after_dequeue_accounting_gap(self):
+        self.sync_manager = SyncManager(
+            self.state_manager, self.cache_manager, self.replication_manager,
+            num_workers=1, max_workers=2,
+            config=SyncConfig(monitor_interval=30.0),
+        )
+        original_get = self.sync_manager.task_queue.get
+        taken = threading.Event()
+        allow_get_to_return = threading.Event()
+        release_work = threading.Event()
+        entered = threading.Condition()
+        active = 0
+
+        def held_get(*args, **kwargs):
+            task = original_get(*args, **kwargs)
+            if getattr(task, 'virtual_path', None) == '/first':
+                taken.set()
+                allow_get_to_return.wait(5.0)
+            return task
+
+        def blocked_process(_executor, _task):
+            nonlocal active
+            with entered:
+                active += 1
+                entered.notify_all()
+            release_work.wait(5.0)
+            return True
+
+        self.sync_manager.task_queue.get = held_get
+        with patch.object(SyncExecutor, "process", blocked_process):
+            self.sync_manager.start()
+            try:
+                self.sync_manager.queue_sync('/first')
+                self.assertTrue(taken.wait(5.0))
+                self.sync_manager.queue_sync('/second')
+                self.assertEqual(1, len(self.sync_manager.workers))
+                allow_get_to_return.set()
+                with entered:
+                    self.assertTrue(entered.wait_for(lambda: active == 2, timeout=5.0))
+            finally:
+                allow_get_to_return.set()
+                release_work.set()
+            self.assertTrue(self.sync_manager.wait_for_completion(timeout=5.0))
+            self.sync_manager.stop()
+
+    def test_fixed_pool_stays_fixed_under_queue_pressure(self):
+        self.sync_manager = SyncManager(
+            self.state_manager, self.cache_manager, self.replication_manager,
+            num_workers=2, idle_timeout=0.05,
+            config=SyncConfig(monitor_interval=30.0),
+        )
+        release = threading.Event()
+        entered = threading.Condition()
+        active = 0
+
+        def blocked_process(_executor, _task):
+            nonlocal active
+            with entered:
+                active += 1
+                entered.notify_all()
+            release.wait(5.0)
+            return True
+
+        with patch.object(SyncExecutor, "process", blocked_process):
+            self.sync_manager.start()
+            try:
+                for index in range(6):
+                    self.sync_manager.queue_sync(f'/fixed-{index}')
+                with entered:
+                    self.assertTrue(entered.wait_for(lambda: active == 2, timeout=5.0))
+                self.assertEqual(2, len(self.sync_manager.workers))
+                self.assertEqual(4, self.sync_manager.get_queue_size())
+            finally:
+                release.set()
+            self.assertTrue(self.sync_manager.wait_for_completion(timeout=5.0))
+            self.sync_manager.stop()
+
+    def test_adaptive_stop_preserves_queued_tasks_for_restart(self):
+        self.sync_manager = SyncManager(
+            self.state_manager, self.cache_manager, self.replication_manager,
+            num_workers=1, max_workers=2,
+            config=SyncConfig(monitor_interval=30.0),
+        )
+        release = threading.Event()
+        entered = threading.Condition()
+        active = 0
+
+        def blocked_process(_executor, _task):
+            nonlocal active
+            with entered:
+                active += 1
+                entered.notify_all()
+            release.wait(5.0)
+            return True
+
+        with patch.object(SyncExecutor, "process", blocked_process):
+            self.sync_manager.start()
+            for index in range(3):
+                self.sync_manager.queue_sync(f"/pending-{index}")
+            with entered:
+                self.assertTrue(entered.wait_for(lambda: active == 2, timeout=5.0))
+            stopping = threading.Thread(target=self.sync_manager.stop)
+            stopping.start()
+            deadline = time.monotonic() + 5.0
+            while self.sync_manager._running and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertFalse(self.sync_manager._running)
+            release.set()
+            stopping.join(timeout=5.0)
+            self.assertFalse(stopping.is_alive())
+        self.assertEqual(1, self.sync_manager.get_queue_size())
+        self.sync_manager.start()
+        self.assertTrue(self.sync_manager.wait_for_completion(timeout=5.0))
+        self.sync_manager.stop()
+
+    def test_adaptive_worker_limits_are_bounded_before_start(self):
+        with self.assertRaisesRegex(ValueError, "cannot exceed 32"):
+            SyncManager(
+                self.state_manager, self.cache_manager, self.replication_manager,
+                num_workers=1, max_workers=33,
+            )
+        self.replication_manager.backends['remote'] = type(
+            'RemoteStub', (), {'backend_type': BackendType.SSH}
+        )()
+        with self.assertRaisesRegex(ValueError, "cannot exceed 8"):
+            SyncManager(
+                self.state_manager, self.cache_manager, self.replication_manager,
+                num_workers=1, max_workers=9,
+            )
+        self.replication_manager.backends['remote'].backend_type = BackendType.RSYNC
+        with self.assertRaisesRegex(ValueError, "cannot exceed 8"):
+            SyncManager(
+                self.state_manager, self.cache_manager, self.replication_manager,
+                num_workers=1, max_workers=9,
+            )
+
+    def test_restart_waits_for_worker_that_outlived_stop(self):
+        self.sync_manager = SyncManager(
+            self.state_manager, self.cache_manager, self.replication_manager,
+            num_workers=1, max_workers=2,
+            config=SyncConfig(monitor_interval=30.0),
+        )
+        entered = threading.Event()
+        release = threading.Event()
+
+        def blocked_process(_executor, _task):
+            entered.set()
+            release.wait(5.0)
+            return True
+
+        with patch.object(SyncExecutor, "process", blocked_process):
+            self.sync_manager.start()
+            self.sync_manager.queue_sync("/busy")
+            self.assertTrue(entered.wait(5.0))
+            try:
+                # Simulate the five-second deadline without spending five
+                # seconds in this test; the worker remains in its task.
+                with patch.object(SyncWorker, "join"):
+                    self.sync_manager.stop()
+                with self.assertRaisesRegex(RuntimeError, "still finishing"):
+                    self.sync_manager.start()
+            finally:
+                release.set()
+            self.sync_manager._lingering_workers[0].join(timeout=5.0)
+        self.sync_manager.start()
+        self.sync_manager.stop()
+
+    def test_failed_initial_worker_start_cleans_up_partial_pool(self):
+        self.sync_manager = SyncManager(
+            self.state_manager, self.cache_manager, self.replication_manager,
+            num_workers=2, config=SyncConfig(monitor_interval=30.0),
+        )
+        original_start = SyncWorker.start
+        attempts = 0
+
+        def fail_second_start(worker):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 2:
+                raise RuntimeError('synthetic thread exhaustion')
+            return original_start(worker)
+
+        with patch.object(SyncWorker, 'start', fail_second_start):
+            with self.assertRaisesRegex(RuntimeError, 'synthetic thread exhaustion'):
+                self.sync_manager.start()
+        self.assertFalse(self.sync_manager._running)
+        self.assertEqual([], self.sync_manager.workers)
+        self.assertEqual(0, self.sync_manager.get_queue_size())
+        self.sync_manager.start()
+        self.assertEqual(2, len(self.sync_manager.workers))
         self.sync_manager.stop()
 
     def test_queue_sync(self):
