@@ -1,0 +1,20 @@
+id: adaptive-sync-cleanup-error-context
+title: Preserve the original worker-start error if cleanup also raises
+desc: 'Formal PR #167 council final-round Nit. `SyncManager.start()` calls `stop()`
+  inside its exception handler. If cleanup itself raises, Python chains the original
+  start failure as context but reports the cleanup failure first. Low likelihood and
+  the original is still visible; follow up by logging cleanup failure while re-raising
+  the original, with a synthetic test. Does not block PR #167.'
+type: task
+component: sync
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-09T00:24:00-00:00
+references: []
+log_events:
+- time: 2026-11-09T00:24:00-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
