@@ -346,8 +346,8 @@ is evicted.
 #### SSH host keys
 
 There is no host-key setting yet: host-key verification is not configurable,
-and the three SSH code paths behave as follows (the decision for now is to
-keep this and document it). Which ones a mount uses depends on its members:
+and the three SSH code paths behave as follows. Which ones a mount uses
+depends on its members:
 
 - **`ssh://` members** use paramiko (`SSHBackend`) for everything: reads,
   metadata and writes. It uses `AutoAddPolicy` without loading any
@@ -377,6 +377,16 @@ logged when the command fails), and refuses a host whose recorded key
 differs. Those `ssh` runs read your ssh config, so a `UserKnownHostsFile` or
 `HostKeyAlias` there changes where the entry lives. Members are always
 reached on port 22.
+
+Rsync uploads and remote watchers explicitly set `UpdateHostKeys=no`. An
+authenticated SSH server can offer additional host keys, and OpenSSH's
+host-key update mechanism can remove trusted keys that server does not offer.
+Keeping it off preserves keys for other backends sharing the same hostname,
+even if ssh config explicitly enables updates for a dedicated known-hosts
+file (which disables updates by default). This does not stop `accept-new`
+from adding an unseen host key. It also means a server's replacement host key
+is not learned automatically; verify and replace rotated keys as described
+below.
 
 **A changed host key splits the paths.** After a member is re-provisioned,
 or its address is reused by another host, the paramiko paths keep working

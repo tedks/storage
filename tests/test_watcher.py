@@ -137,6 +137,8 @@ class TestRemoteWatcherSSHCommand(TestCase):
         self.assertIn("user@example.com", cmd)
         self.assertIn("inotifywait", cmd[-1])
         self.assertIn("/srv/storage", cmd[-1])
+        options = [cmd[i + 1] for i, arg in enumerate(cmd[:-1]) if arg == "-o"]
+        self.assertEqual(options.count("UpdateHostKeys=no"), 1)
 
     def test_custom_port_and_key(self):
         w = RemoteWatcher(

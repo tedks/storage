@@ -119,6 +119,9 @@ class RsyncBackend(SSHBackend):
         # Accept unseen host keys (like paramiko's AutoAddPolicy) but refuse
         # a changed one; unlike paramiko this records them in known_hosts.
         parts.append("-o StrictHostKeyChecking=accept-new")
+        # A member sharing a hostname may advertise only its own keys.
+        # Never let OpenSSH prune other trusted keys after authentication.
+        parts.append("-o UpdateHostKeys=no")
         parts.append(f"-o ConnectTimeout={int(self.connect_timeout)}")
         if self._control_sockets is not None:
             options = self._control_sockets.options(
