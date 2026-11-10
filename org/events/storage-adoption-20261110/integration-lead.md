@@ -260,3 +260,25 @@
 - state: DONE/IDLE for this roster amendment. Draft PR #168 is the
   reviewable record; no implementation package or integration action is
   assigned to this lane.
+
+## integration-lead:23
+
+- kind: state-change
+- refs: integration-lead:22
+- based_on: `2a5490c8d50b436843710fa698d9cd326221b33a`
+- state: STARTED bounded BUILD coordination record. Responsiveness lead
+  reported adding only `foreground_admission.py` to `storage/BUILD` explicit
+  srcs and passing `//:storage_build_srcs_check`. This lane inspected that
+  BUILD diff: one added src line, no changed label or tag. GitHub PR #171
+  was observed draft/open at `3f982b14e7e901af0823f2b9765e1d82be620f1b`;
+  its intervening change from `2a5490c` touched only lane records and left
+  BUILD bytes identical. PR #167 remains draft/open at `d61bdb1`. No
+  independent gate or review of #171 is claimed.
+
+## integration-lead:24
+
+- kind: state-change
+- refs: integration-lead:23
+- based_on: `3f982b14e7e901af0823f2b9765e1d82be620f1b`
+- state: DONE/IDLE for this roster note. No implementation branch, live
+  storage resource, merge or deployment was touched by this lane.

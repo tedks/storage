@@ -17,7 +17,7 @@ a draft proposal report, amended for the GH #74 policy ruling.
 | --- | --- | --- | --- |
 | Parent coordinator | `storage:0`, storage coordinator | CTO/root; active | Receive consolidated evidence and resolve rulings |
 | Integration lead | `storage:1` pane `%93`, `orgs-integration-20261110`, `chore/orgs-integration-20261110`, Sol | Lead; DONE/IDLE after bounded update | Draft PR #168 awaits parent review; no implementation assignment |
-| Responsiveness lead | `foreground-responsiveness-20261110`, `feat/foreground-responsiveness-20261110`, Sol | Assigned by parent; worktree observed at `66c640a` | Own foreground reads/browsing design and evidence; may reuse #167 on its own branch; no merge/deploy authority inferred |
+| Responsiveness lead | `foreground-responsiveness-20261110`, `feat/foreground-responsiveness-20261110`, Sol | Active on draft PR #171; last observed head `3f982b1` | Own foreground reads/browsing design and evidence; may reuse #167 on its own branch; no merge/deploy authority inferred |
 | Performance audit | `storage:2` pane `%94`, `perf-triage-20261110`, `docs/perf-triage-20261110`, Sol | Peer lead; DONE/IDLE | Draft PR #169 at `d6bdb394`; GH #74 amendment is proposal only |
 | #166 repair owner | `descriptive-remote-names`, `feat/descriptive-remote-names`, native Sol | Implementer; bounded evidence delivered | No further branch change assigned |
 | Other prior implementation lanes | #165 and #167 worktrees | Implementers; DONE/idle | No additional task assigned; preserve branches |
@@ -53,6 +53,16 @@ requires manifest coordination. #17 scheduler design waits for #167's
 interface. Exact heads and this contract were delivered to the parent coordinator at pane
 `%87` with a submitted receipt before any merge. No onboarding code is in
 this package.
+
+Responsiveness PR #171 added one explicit `storage/BUILD` source entry,
+`foreground_admission.py`, at reported pushed head `2a5490c8d50b436843710fa698d9cd326221b33a`.
+The lead reports `//:storage_build_srcs_check` passed there. This lane
+verified the one-line BUILD diff against base `66c640a`; no label or tag
+change appears in that BUILD diff. PR #171 then advanced to `3f982b14`
+through a records-only commit, with identical BUILD bytes. This is source
+coordination, not a quality-gate, review or acceptance claim for #171. The
+responsiveness lead owns the branch; #167 remains open/draft at `d61bdb1`
+and was not edited by this lane.
 
 ## Safety and authority
 
