@@ -30,3 +30,8 @@ log_events:
   who: Ted Smith
   what: created
   comment: ""
+- time: 2026-11-10T15:39:29-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Ted ruling 2026-11-10: raised full-download threshold applies fleetwide
+    for now. Numeric threshold remains open; no profile edits or deployment claimed.'
