@@ -39,3 +39,12 @@
 - evidence: Admission synthetic test was red before implementation and green afterward. Four focused Bazel targets passed. Fake SSH pool held three foreground-initiated bulk transfers with `bulk_leased=3` and `sftp_open=3` while metadata and demand interactive acquisitions completed; its targeted Bazel test passed. No live member or mount used.
 - limitation: Active Python callback cap only. Libfuse 2 native threads can still grow with waiting callbacks. This is documented in CLI, README and spec. Full gates and review pending.
 - control: tmux message attempt to root `%87` returned `mixed-input-after-paste`, no new receipt; its pending payload is not replayed. Root delivery remains unknown and will be retried only from a verified empty composer.
+
+## foreground-lead:5
+
+- kind: state-change
+- state: FR-foreground pushed, review pending
+- based_on: `2a5490c`
+- refs: foreground-lead:4
+- evidence: Exact branch push succeeded; `git diff --check` clean. Focused Bazel commands cited in FR-foreground package ran on the pre-commit tree, not the final head; exact-head gates remain pending. Self-review found no changed byte/write path: admission wraps callbacks and the cold-copy scope only changes SSH lease classification.
+- next: FR-sync reconciliation, then final gate and independent review.
