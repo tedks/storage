@@ -49,6 +49,10 @@ from .namespace import DEFAULT_LISTING_MAX_STALE, NamespaceService
 from .streaming import PrefetchSession, StreamingReadManager
 
 
+class _RetryOpenAsOrdinary(Exception):
+    """Drop outer path locks before a cached open waits for bulk capacity."""
+
+
 @dataclass
 class FDEntry:
     """Bookkeeping record for an opened file descriptor."""
@@ -149,8 +153,13 @@ class StorageFS(Operations):
             return "demand"
         # An already cached open supplies the descriptor needed for a demand
         # read. Cold full-file opens remain ordinary while copying bytes.
-        if op == "open" and args and self.cache_manager.is_cached(args[0]):
-            return "demand"
+        if op == "open" and args:
+            try:
+                if self.cache_manager.is_cached(args[0]):
+                    return "demand"
+            except OSError:
+                # A failed preflight must not change the open's error path.
+                pass
         return "ordinary"
 
     def __init__(self, cache_root: Path, state_db: Path, backends: Dict[str, Backend],
@@ -1929,10 +1938,13 @@ class StorageFS(Operations):
                 self.cache_manager.heal_stale_clean(canonical_path, cache_path)
             return True
 
-        # A cached open may have lost its cache entry during revalidation or
-        # eviction. Release its protected demand slot before any full fetch.
-        if self._foreground_admission is not None:
-            self._foreground_admission.reclassify_current("ordinary")
+        # A cached open may have lost its entry during revalidation or
+        # eviction. The caller must drop its path and namespace locks before
+        # waiting for ordinary capacity; otherwise another ordinary open
+        # could hold that capacity while waiting for this path lock.
+        if (self._foreground_admission is not None
+                and self._foreground_admission.current_kind() == "demand"):
+            raise _RetryOpenAsOrdinary()
 
         # If a backend is explicitly requested (conflict suffix), bypass replication manager.
         if resolved.backend_name:
@@ -2303,16 +2315,37 @@ class StorageFS(Operations):
     def open(self, path, flags):
         """Open a file"""
         canonical_path = self._resolve_path(path).canonical_path
-        with self._path_locked(canonical_path):
-            try:
-                return self._open(path, flags)
-            finally:
-                # The pin belongs to this open (_select_backend_for_read):
-                # one no fetch used (the open attached to a running stream,
-                # or the file was kept) must not steer a later fetch.
-                with self._member_checks_lock:
-                    self._refetch_pins.pop(canonical_path, None)
-                    self._pinned_stats.pop(canonical_path, None)
+        refetch_pin = None
+        pinned_stat = None
+        try:
+            while True:
+                with self._path_locked(canonical_path):
+                    # A revalidation pin belongs to this open. Keep it out
+                    # of the shared path table while ordinary admission is
+                    # pending; a concurrent open may use that table meanwhile.
+                    if (refetch_pin is not None
+                            and not self.cache_manager.is_cached(path)):
+                        with self._member_checks_lock:
+                            self._refetch_pins[canonical_path] = refetch_pin
+                            if pinned_stat is not None:
+                                self._pinned_stats[canonical_path] = pinned_stat
+                    try:
+                        return self._open(path, flags)
+                    except _RetryOpenAsOrdinary:
+                        with self._member_checks_lock:
+                            refetch_pin = self._refetch_pins.pop(canonical_path, None)
+                            pinned_stat = self._pinned_stats.pop(canonical_path, None)
+                # No path/namespace lock is held while this callback waits
+                # behind other ordinary work. The next pass sees the cache
+                # again, or fetches it while holding ordinary capacity.
+                self._foreground_admission.reclassify_current("ordinary")
+        finally:
+            # The pin belongs to this open (_select_backend_for_read): one
+            # that did not fetch must not steer a later fetch. Preserve it
+            # across the admission retry, then drop it on every exit path.
+            with self._member_checks_lock:
+                self._refetch_pins.pop(canonical_path, None)
+                self._pinned_stats.pop(canonical_path, None)
 
     def _open(self, path, flags):
         """Open a file"""

@@ -211,9 +211,10 @@ class SyncManager:
         self.replication_manager = replication_manager
         if num_workers < 0 or max_workers is not None and max_workers < num_workers:
             raise ValueError("sync worker limits must satisfy 0 <= workers <= max_workers")
-        ceiling = sync_worker_ceiling(replication_manager.backends)
-        if max_workers is not None and max_workers > ceiling:
-            raise ValueError(f"max sync workers cannot exceed {ceiling}")
+        if max_workers is not None:
+            ceiling = sync_worker_ceiling(replication_manager.backends)
+            if max_workers > ceiling:
+                raise ValueError(f"max sync workers cannot exceed {ceiling}")
         if idle_timeout <= 0:
             raise ValueError("sync worker idle timeout must be positive")
         self.num_workers = num_workers

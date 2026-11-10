@@ -231,6 +231,7 @@ class TestForegroundAdmission(ThreadingTestBase):
 
     def test_warm_open_and_directory_handles_progress_while_cold_open_waits(self):
         (self.cache_dir / "warm").write_bytes(b"cached")
+        self.assertEqual("demand", self.fs._foreground_class("open", ("/warm", os.O_RDONLY)))
         cold_entered = threading.Event()
         cold_release = threading.Event()
         warm_entered = threading.Event()
@@ -262,6 +263,7 @@ class TestForegroundAdmission(ThreadingTestBase):
     def test_changed_cached_open_releases_demand_slot_before_full_copy(self):
         (self.member_dir / "changed").write_bytes(b"new contents")
         (self.cache_dir / "changed").write_bytes(b"old")
+        self.assertEqual("demand", self.fs._foreground_class("open", ("/changed", os.O_RDONLY)))
         (self.member_dir / "ready").write_bytes(b"ready bytes")
         ready_fd = self.fs.__call__("open", "/ready", os.O_RDONLY)
         copy = self.gate(self.member, "copy_to_local",
@@ -271,7 +273,9 @@ class TestForegroundAdmission(ThreadingTestBase):
             if resolved.requested_path == "/changed":
                 (self.cache_dir / "changed").unlink()
 
-        with patch.object(self.fs, "_revalidate_cached_file", side_effect=invalidate_changed):
+        with patch.object(self.fs, "_revalidate_cached_file", side_effect=invalidate_changed), \
+                patch.object(self.fs._foreground_admission, "reclassify_current",
+                             wraps=self.fs._foreground_admission.reclassify_current) as moved:
             changed = Worker(self.fs.__call__, "open", "/changed", os.O_RDONLY)
             changed.start()
             self.assertTrue(copy.started.wait(WAIT))
@@ -288,6 +292,33 @@ class TestForegroundAdmission(ThreadingTestBase):
                 self.fs.__call__("release", "/changed", changed_fd)
                 self.fs.__call__("release", "/ready", ready_fd)
                 read.finish()
+            self.assertEqual(1, moved.call_count)
+        self.assertEqual(0, self.fs._foreground_admission.active_count)
+
+    def test_changed_open_drops_path_lock_before_ordinary_admission(self):
+        (self.member_dir / "changed").write_bytes(b"fresh bytes")
+        (self.cache_dir / "changed").write_bytes(b"old")
+
+        def invalidate_changed(resolved):
+            if resolved.requested_path == "/changed":
+                with self.fs._member_checks_lock:
+                    self.fs._refetch_pins["/changed"] = self.member
+                (self.cache_dir / "changed").unlink()
+
+        with patch.object(self.fs, "_revalidate_cached_file", side_effect=invalidate_changed):
+            with self.fs._foreground_admission.admit("ordinary"):
+                changed = Worker(self.fs.__call__, "open", "/changed", os.O_RDONLY)
+                changed.start()
+                self.assertTrue(self.fs._foreground_admission.waiting_for("ordinary", 1, WAIT))
+                with self.fs._path_locks._mutex:
+                    self.assertNotIn("/changed", self.fs._path_locks._entries)
+                with self.fs._member_checks_lock:
+                    self.assertNotIn("/changed", self.fs._refetch_pins)
+            fd = changed.finish()
+            try:
+                self.assertEqual(b"fresh bytes", self.fs.__call__("read", "/changed", 32, 0, fd))
+            finally:
+                self.fs.__call__("release", "/changed", fd)
         self.assertEqual(0, self.fs._foreground_admission.active_count)
 
     def test_invalid_direct_sync_limit_fails_before_mount_lock(self):

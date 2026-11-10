@@ -32,6 +32,10 @@ class ForegroundAdmission:
         with self._cond:
             return sum(self._active.values())
 
+    def current_kind(self):
+        """Class held by this callback thread, or None outside admission."""
+        return getattr(self._local, "kind", None)
+
     def waiting_for(self, kind: str, count: int, timeout: float) -> bool:
         """Observe queued demand without inspecting private callback state."""
         with self._cond:
