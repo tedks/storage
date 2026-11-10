@@ -1,0 +1,32 @@
+id: oq-streaming-fleet-keep-threshold
+title: Choose raised streaming keep-after-close threshold for splinter1 and fleet
+desc: 'Ted requested raising streaming_keep_after_close on splinter1 and perhaps the
+  fleet. Current default continues after the contiguous read span reaches the smaller
+  of 4 chunks (4 MiB at the default chunk size) or 50% of the file; the 2026-10-27
+  ruling in oq-streaming-continue-after-close made the threshold configurable as bytes
+  or percentage. The target higher value and rollout scope remain unruled.
+
+
+  Options: (a) keep the current default pending more evidence; (b) set an explicit
+  higher byte threshold such as 8 MiB; (c) set an explicit higher percentage such
+  as 75%. A percentage scales with file size, while a byte threshold is predictable
+  for large media. Recommendation: Ted choose an explicit trial value and whether
+  it is splinter1-only or fleet-wide before any profile change; record the observed
+  reason for that value. Ted decides. Blocks profile edits or deployment for this
+  request, not synthetic code review. Tracked fleet profiles are in dotfiles/master/.config/storage/storage.toml;
+  the live splinter1 profile was previously custom and must not be assumed to match.
+  No live mount, backing directory, host, profile or benchmark access is authorized
+  in this integration mission.'
+type: task
+component: open-questions
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-10T08:25:21-00:00
+references: []
+log_events:
+- time: 2026-11-10T08:25:21-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
