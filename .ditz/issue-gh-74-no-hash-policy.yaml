@@ -29,8 +29,13 @@ log_events:
   who: Ted Smith
   what: blocks gh-74-tests
   comment: ""
+- time: 2026-11-10T08:26:05-00:00
+  who: Ted Smith
+  what: blocked by oq-conflict-no-remote-hash
+  comment: ""
 blocks:
 - gh-74
 - gh-74-tests
 blocked_by:
 - gh-74-fast-checksum
+- oq-conflict-no-remote-hash
