@@ -228,3 +228,35 @@
 - state: DONE/IDLE for the bounded roster/ledger update. No new integration
   or implementation assignment is held. Draft PR #168 remains the reviewable
   record; the parent owns future assignments and any acceptance decisions.
+
+## integration-lead:20
+
+- kind: state-change
+- refs: integration-lead:19
+- based_on: `d6bdb39438d427906802b48d3c27586a0e51b134`
+- state: STARTED bounded amendment to the consolidated roster. GitHub PR
+  #169 confirms this exact draft head on master `66c640a`; ditz confirms
+  `oq-conflict-fallback-limits` is open and blocks
+  `gh-74-no-hash-policy`. No implementation, acceptance or merge is assigned.
+
+## integration-lead:21
+
+- kind: state-change
+- refs: integration-lead:20
+- based_on: `d6bdb39438d427906802b48d3c27586a0e51b134`
+- state: Peer performance audit DONE/IDLE after GH #74 amendment. The peer
+  reports docs-only diff check and 44 valid links; no tests or live access.
+  Its 64 MiB, 60 second and one-active-per-mount limits remain proposals.
+  The peer reports a QUEUED receipt to responsiveness lead `%106` for the
+  cold-open finding, not acknowledgment or execution. Its send to parent
+  `%87` is ambiguous after mixed composer input, so this record does not
+  claim that attempt delivered. No source review or merge claim follows.
+
+## integration-lead:22
+
+- kind: state-change
+- refs: integration-lead:21
+- based_on: `d6bdb39438d427906802b48d3c27586a0e51b134`
+- state: DONE/IDLE for this roster amendment. Draft PR #168 is the
+  reviewable record; no implementation package or integration action is
+  assigned to this lane.

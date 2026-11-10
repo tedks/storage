@@ -11,14 +11,14 @@ foreground reads and browsing are in the worker-responsiveness scope. #167's
 background-only implementation remains draft and incomplete for that mission.
 The parent assigned a separate Sol responsiveness lead; this integration
 lane has only a bounded record update. The sibling performance audit completed
-a draft proposal report.
+a draft proposal report, amended for the GH #74 policy ruling.
 
 | Lane | Worktree / branch | Hat and state | Next bounded action |
 | --- | --- | --- | --- |
 | Parent coordinator | `storage:0`, storage coordinator | CTO/root; active | Receive consolidated evidence and resolve rulings |
 | Integration lead | `storage:1` pane `%93`, `orgs-integration-20261110`, `chore/orgs-integration-20261110`, Sol | Lead; DONE/IDLE after bounded update | Draft PR #168 awaits parent review; no implementation assignment |
 | Responsiveness lead | `foreground-responsiveness-20261110`, `feat/foreground-responsiveness-20261110`, Sol | Assigned by parent; worktree observed at `66c640a` | Own foreground reads/browsing design and evidence; may reuse #167 on its own branch; no merge/deploy authority inferred |
-| Performance audit | `storage:2` pane `%94`, `perf-triage-20261110`, `docs/perf-triage-20261110`, Sol | Peer lead; DONE/IDLE | Draft PR #169 at `e2d2e127`; no implementation assignment |
+| Performance audit | `storage:2` pane `%94`, `perf-triage-20261110`, `docs/perf-triage-20261110`, Sol | Peer lead; DONE/IDLE | Draft PR #169 at `d6bdb394`; GH #74 amendment is proposal only |
 | #166 repair owner | `descriptive-remote-names`, `feat/descriptive-remote-names`, native Sol | Implementer; bounded evidence delivered | No further branch change assigned |
 | Other prior implementation lanes | #165 and #167 worktrees | Implementers; DONE/idle | No additional task assigned; preserve branches |
 
@@ -77,12 +77,17 @@ responsiveness lane have no acceptance, merge or deployment claim here.
   unavailable. The implementation must enforce bounds and leave exhaustion
   or failure unverified, never silently no-conflict. GitHub #74 remains
   implementation work.
+- `oq-conflict-fallback-limits`: OPEN and synced by the performance audit;
+  blocks `gh-74-no-hash-policy`. The proposed 64 MiB byte limit, 60 second
+  deadline, and one active fallback per mount are not Ted-approved values.
 
 ## Draft performance backlog
 
-The peer audit is a proposal at pinned `a7467c6`, pushed as draft PR #169
-(`e2d2e127e077e124038f0dc057021f6642c476d8`). It makes no test or
-acceptance claim. Ranked bounded candidates:
+The peer audit began at pinned `a7467c6` and its GH #74 amendment was pushed
+on master `66c640a` as draft PR #169
+(`d6bdb39438d427906802b48d3c27586a0e51b134`). The peer reports a
+docs-only diff check and 44 valid relative links at that head; no tests,
+live access, acceptance or merge are claimed. Ranked bounded candidates:
 
 1. `streaming-prefix-write-open`: protect dirty sync state when write-open
    encounters a promoted partial prefix. Correctness first; no ruling needed
@@ -95,18 +100,23 @@ acceptance claim. Ranked bounded candidates:
    cold fetches occupy others; deterministic concurrency test first.
 5. GitHub #74 / `gh-74-no-hash-policy`: implement the ruled bounded download
    fallback and local hashing, with explicit bounds and unverified failures.
+   Numeric limits and override scope await `oq-conflict-fallback-limits`.
 
 These are not authorized implementation packages in this lane. #17 scheduler
 work waits for #167's implementation interface; the scope ruling is settled.
-The full source and boundary
-test proposals live in the peer audit document, not this summary.
+The full source and boundary test proposals live in the peer audit document,
+not this summary. The peer reports its cold-open channel finding reached the
+responsiveness lead at pane `%106` with a queued receipt; that is delivery,
+not acknowledgment or execution. Its message to parent pane `%87` became
+ambiguous after mixed composer input; no parent delivery is claimed from
+that attempt.
 
 ## Handoff
 
 The adoption record is on draft PR #168. #165 and #166 are integrated,
 not deployed. #167 remains a draft, incomplete for the ruled foreground
 scope, and has a known textual merge conflict with current master. The
-performance backlog is draft PR #169. The parent assigned the new
+performance backlog is draft PR #169 at `d6bdb394`. The parent assigned the new
 responsiveness lead; this integration lane has no implementation assignment.
 PR #170's incident remains under the onboarding root's remediation, with no
 waiver or acceptance from this lane.
