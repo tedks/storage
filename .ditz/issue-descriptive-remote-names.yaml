@@ -76,3 +76,14 @@ log_events:
     limit. Formal council helper remains unrecorded because local gh CLI authentication
     returns HTTP 401; GitHub connector works. Awaiting restoration or equivalent record
     decision before review clearance. No deploy or live storage inspection.'
+- time: 2026-11-10T08:23:17-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Assignment A166-REBASE-20261110: rebased PR #166 from old pushed head
+    84bb8d6210ee03aaec6845c16fe63cd8becd2f0a onto merged master 38c3bdb9562cade82411751acca058b04c974b5c
+    (#165), producing and pushing 4ca26cd8b1a041a6308bf4b77fb847e3fea033e1. Source
+    worktree was clean and remote feature head matched old SHA before rewrite. Rebase
+    had no conflicts; git range-diff found all five commits patch-equivalent. Explicit
+    --force-with-lease used after verifying remote head. Now rerunning full local
+    gates and fresh frozen-head council; prior gate/review evidence does not cover
+    new head. No live storage access or deployment.'
