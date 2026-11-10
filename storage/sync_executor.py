@@ -181,7 +181,7 @@ class SyncExecutor:
                     logger.warning(
                         "Conflict detected for %s on %s",
                         task.virtual_path,
-                        backend.name,
+                        backend.label,
                     )
                     if self._publish(task, generation, SyncStatus.CONFLICT, cache_path):
                         self._stats["conflicts"] += 1
@@ -210,12 +210,12 @@ class SyncExecutor:
                 self.state_manager.add_file_location(location)
 
                 sync_results[backend.name] = True
-                logger.debug("Synced %s to %s", task.virtual_path, backend.name)
+                logger.debug("Synced %s to %s", task.virtual_path, backend.label)
             except Exception as exc:
                 logger.error(
                     "Failed to sync %s to %s: %s",
                     task.virtual_path,
-                    backend.name,
+                    backend.label,
                     exc,
                 )
                 sync_results[backend.name] = False
@@ -334,13 +334,13 @@ class SyncExecutor:
                     existing = None  # something else is at the name (not a link)
                 else:
                     logger.error("Failed to link %s on %s: %s",
-                                 task.virtual_path, backend.name, exc)
+                                 task.virtual_path, backend.label, exc)
                     continue
             except Exception as exc:
-                logger.error("Failed to link %s on %s: %s", task.virtual_path, backend.name, exc)
+                logger.error("Failed to link %s on %s: %s", task.virtual_path, backend.label, exc)
                 continue
             if existing != target:
-                logger.warning("Conflict: %s on %s is not this link", task.virtual_path, backend.name)
+                logger.warning("Conflict: %s on %s is not this link", task.virtual_path, backend.label)
                 conflict = True
                 continue
             self.state_manager.add_file_location(FileLocation(

@@ -78,6 +78,7 @@ class BackendInfo:
     speed_priority: int  # Lower is faster (0=fastest local, 100=slowest remote)
     encrypt_all: bool  # Encrypt all files written to this backend
     available: bool  # Is backend currently available/connected
+    display_name: Optional[str] = None
 
     @property
     def is_remote(self) -> bool:
@@ -97,6 +98,7 @@ class Backend(ABC):
         capabilities: Optional[StorageMemberCapabilities] = None,
     ):
         self.name = name
+        self.display_name: Optional[str] = None
         self.backend_type = backend_type
         self._transport_is_remote = bool(is_remote)
         self._capabilities = capabilities or StorageMemberCapabilities(
@@ -105,6 +107,11 @@ class Backend(ABC):
         self.speed_priority = speed_priority
         self.encrypt_all = False
         self._available = True
+
+    @property
+    def label(self) -> str:
+        """Human-facing member label with its stable backend identity."""
+        return f"{self.display_name} ({self.name})" if self.display_name else self.name
 
     @property
     def capabilities(self) -> StorageMemberCapabilities:
@@ -139,7 +146,8 @@ class Backend(ABC):
             capabilities=self.capabilities,
             speed_priority=self.speed_priority,
             encrypt_all=self.encrypt_all,
-            available=self._available
+            available=self._available,
+            display_name=self.display_name,
         )
 
     @abstractmethod

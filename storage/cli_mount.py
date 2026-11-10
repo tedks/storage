@@ -63,7 +63,7 @@ def shared_filesystems(backends: Dict[str, Backend]) -> List[List[str]]:
 @click.option("-s", "--cache-size", help="Cache size (e.g., 10G, 500M)")
 @click.option("-d", "--database", help="State database path (default: cache/.storage.db)")
 @click.option("-w", "--workers", type=int, help="Number of sync worker threads")
-@click.option("-r", "--remote", multiple=True, help="Remote storage member (NAME=ssh://user@host:/path, or legacy URL)")
+@click.option("-r", "--remote", multiple=True, help="Remote storage member (ssh://user@host:/path)")
 @click.option("-k", "--key-file", help="SSH private key file")
 @click.option("-f", "--foreground", is_flag=True, default=None, help="Run in foreground")
 @click.option(
@@ -167,7 +167,7 @@ def mount(
     BACKING_PATHS: Zero or more local storage member roots (optional)
 
     Remote storage members can be specified with --remote:
-        --remote archive=ssh://user@host:/remote/path
+        --remote ssh://user@host:/remote/path
 
     Examples:
         # With local and remote backends
@@ -228,9 +228,6 @@ def mount(
         except ValueError as exc:
             raise click.ClickException(f"Invalid streaming keep-after-close: {exc}") from exc
 
-    member_specs = resolved.member_specs
-    member_names = resolved.member_names
-
     cache_root = Path(resolved.cache).resolve()
     cache_root.mkdir(parents=True, exist_ok=True)
 
@@ -243,11 +240,12 @@ def mount(
     mountpoint_path.mkdir(parents=True, exist_ok=True)
 
     backends = create_storage_members(
-        member_specs, resolved.key_file, member_names=member_names,
+        resolved.member_specs, resolved.key_file,
+        display_names=resolved.member_display_names,
     )
     for names in shared_filesystems(backends):
         click.echo(
-            f"Warning: members {', '.join(names)} store on the same filesystem; "
+            f"Warning: members {', '.join(backends[name].label for name in names)} store on the same filesystem; "
             "replicas on it do not protect against that filesystem failing.",
             err=True,
         )

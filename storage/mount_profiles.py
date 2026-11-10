@@ -61,14 +61,12 @@ class ResolvedMountConfig:
     listing_max_stale: float = DEFAULT_LISTING_MAX_STALE
     # Seconds between re-verifications of persisted member hashes; 0: off.
     checksum_reverify_interval: float = DEFAULT_CHECKSUM_REVERIFY_INTERVAL
+    # Optional presentation labels, in member_specs order. Never backend IDs.
+    member_display_names: Tuple[Optional[str], ...] = ()
 
     @property
     def member_specs(self) -> Tuple[str, ...]:
-        return _resolve_member_specs(self.backing_paths + self.remote)[0]
-
-    @property
-    def member_names(self) -> Tuple[str, ...]:
-        return _resolve_member_specs(self.backing_paths + self.remote)[1]
+        return self.backing_paths + self.remote
 
 
 @dataclass(frozen=True)
@@ -79,6 +77,7 @@ class ResolvedMemberConfig:
     cache_root: Path
     profile_name: Optional[str] = None
     profile_source: Optional[Path] = None
+    member_display_names: Tuple[Optional[str], ...] = ()
 
 
 def default_mount_config_paths() -> Tuple[Path, ...]:
@@ -250,87 +249,59 @@ def _optional_profile_bool(profile: Dict[str, Any], key: str, profile_name: str)
     return value
 
 
-def _profile_backends(profile: Dict[str, Any], profile_name: str) -> Tuple[str, ...]:
+def _profile_backends(
+    profile: Dict[str, Any], profile_name: str,
+) -> Tuple[Tuple[str, Optional[str]], ...]:
     raw = profile.get("backends")
     if raw is None:
         return ()
-    if not isinstance(raw, list) or not all(isinstance(item, str) and item.strip() for item in raw):
+    if not isinstance(raw, list):
         raise click.ClickException(
-            f"Mount profile '{profile_name}' must define 'backends' as a list of non-empty strings"
+            f"Mount profile '{profile_name}' must define 'backends' as a list"
         )
-    return tuple(raw)
+    entries = []
+    seen_labels = set()
+    for item in raw:
+        if isinstance(item, str):
+            spec, label = item, None
+        elif isinstance(item, dict) and set(item) == {"spec", "name"}:
+            spec, label = item["spec"], item["name"]
+        else:
+            raise click.ClickException(
+                f"Mount profile '{profile_name}' backends must be strings or {{spec, name}} tables"
+            )
+        if not isinstance(spec, str) or not spec.strip():
+            raise click.ClickException(f"Mount profile '{profile_name}' backend spec must be non-empty")
+        if label is not None:
+            if not _valid_display_name(label):
+                raise click.ClickException(
+                    f"Mount profile '{profile_name}' backend name must be printable text of 1 to 80 characters"
+                )
+            label = label.strip()
+            if label.casefold() in seen_labels:
+                raise click.ClickException(f"Duplicate display name in mount profile '{profile_name}': {label}")
+            seen_labels.add(label.casefold())
+        entries.append((spec, label))
+    return tuple(entries)
+
+
+def _valid_display_name(value: Any) -> bool:
+    return (isinstance(value, str) and bool(value.strip())
+            and value.isprintable() and len(value) <= 80)
 
 
 def split_storage_member_specs(member_specs: Sequence[str]) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
     local_members = []
     remote_members = []
     for spec in member_specs:
-        if _member_target(spec).startswith(("ssh://", "rsync://")):
+        if spec.startswith("ssh://") or spec.startswith("rsync://"):
             remote_members.append(spec)
         else:
             local_members.append(spec)
     return tuple(local_members), tuple(remote_members)
 
 
-_MEMBER_NAME_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]*", re.ASCII)
-_LEGACY_MEMBER_NAME_RE = re.compile(r"(local|remote)(\d+)", re.ASCII)
-
-
-def _member_target(raw: str) -> str:
-    """Return the target from NAME=SPEC, leaving legacy bare specs alone."""
-    if raw.startswith(("ssh://", "rsync://", "/", "./", "../", "~/")):
-        return raw
-    name, sep, target = raw.partition("=")
-    if sep and target.startswith(("ssh://", "rsync://", "/", "./", "../", "~/")):
-        if not _MEMBER_NAME_RE.fullmatch(name) or name == "cache":
-            raise click.ClickException(f"Invalid storage member name: {name!r}")
-        return target
-    return raw
-
-
-def _resolve_member_specs(
-    member_specs: Sequence[str], *, require_names: bool = False,
-) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
-    defaults = _default_member_names(member_specs)
-    specs = []
-    names = []
-    named_kinds = set()
-    for raw, default in zip(member_specs, defaults):
-        spec = _member_target(raw)
-        name = raw.split("=", 1)[0] if spec != raw else None
-        kind = "remote" if spec.startswith(("ssh://", "rsync://")) else "local"
-        if require_names and name is None:
-            raise click.ClickException("Explicit --member values must use NAME=SPEC to preserve backend identities.")
-        if not spec.strip():
-            raise click.ClickException("Storage member target must not be empty")
-        if name is None and kind in named_kinds:
-            raise click.ClickException(
-                f"Unnamed {kind} member cannot follow a named {kind} member; "
-                "this would shift existing numbered identities"
-            )
-        if name is not None:
-            named_kinds.add(kind)
-            legacy = _LEGACY_MEMBER_NAME_RE.fullmatch(name)
-            if legacy:
-                if legacy.group(1) != kind:
-                    raise click.ClickException(f"Storage member {name!r} must name a {kind} target")
-        names.append(name or default)
-        specs.append(spec)
-    if len(names) != len(set(names)):
-        duplicate = next(name for name in names if names.count(name) > 1)
-        raise click.ClickException(f"Duplicate storage member name: {duplicate}")
-    for kind in ("local", "remote"):
-        count = sum(
-            spec.startswith(("ssh://", "rsync://")) == (kind == "remote")
-            for spec in specs
-        )
-        if any(
-            int(match.group(2)) >= count
-            for name in names
-            if (match := _LEGACY_MEMBER_NAME_RE.fullmatch(name)) and match.group(1) == kind
-        ):
-            raise click.ClickException(f"Numbered {kind} member name exceeds configured {kind} member count")
-    return tuple(specs), tuple(names)
+_EXPLICIT_MEMBER_NAME_RE = re.compile(r"^(local|remote)(\d+)$")
 
 
 def _default_member_names(member_specs: Sequence[str]) -> Tuple[str, ...]:
@@ -338,7 +309,7 @@ def _default_member_names(member_specs: Sequence[str]) -> Tuple[str, ...]:
     local_index = 0
     remote_index = 0
     for spec in member_specs:
-        if _member_target(spec).startswith(("ssh://", "rsync://")):
+        if spec.startswith(("ssh://", "rsync://")):
             names.append(f"remote{remote_index}")
             remote_index += 1
         else:
@@ -348,7 +319,51 @@ def _default_member_names(member_specs: Sequence[str]) -> Tuple[str, ...]:
 
 
 def _parse_explicit_member_specs(member_specs: Sequence[str]) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
-    return _resolve_member_specs(member_specs, require_names=True)
+    names = []
+    specs = []
+    seen_names = set()
+    local_names = []
+    remote_names = []
+    for raw in member_specs:
+        name, sep, spec = raw.partition("=")
+        if sep != "=" or not name.strip() or not spec.strip():
+            raise click.ClickException(
+                "Explicit --member values must use NAME=SPEC so reprobe preserves stable backend identities."
+            )
+
+        name = name.strip()
+        spec = spec.strip()
+        match = _EXPLICIT_MEMBER_NAME_RE.fullmatch(name)
+        if not match:
+            raise click.ClickException(
+                "Explicit --member names must match the mounted backend names, e.g. local0=/srv/data or remote1=ssh://user@host:/path."
+            )
+
+        expected_prefix = "remote" if spec.startswith(("ssh://", "rsync://")) else "local"
+        if match.group(1) != expected_prefix:
+            raise click.ClickException(
+                f"Explicit member {name!r} does not match {spec!r}; use a {expected_prefix}N name."
+            )
+
+        if name in seen_names:
+            raise click.ClickException(f"Duplicate explicit storage member name: {name}")
+        seen_names.add(name)
+        names.append(name)
+        specs.append(spec)
+        if expected_prefix == "local":
+            local_names.append(name)
+        else:
+            remote_names.append(name)
+
+    expected_local_names = {f"local{i}" for i in range(len(local_names))}
+    expected_remote_names = {f"remote{i}" for i in range(len(remote_names))}
+    if set(local_names) != expected_local_names or set(remote_names) != expected_remote_names:
+        raise click.ClickException(
+            "Explicit --member names must use the canonical mounted identity set with no gaps, "
+            "for example local0..localN and remote0..remoteM for the supplied members."
+        )
+
+    return tuple(specs), tuple(names)
 
 
 def create_storage_members(
@@ -357,27 +372,25 @@ def create_storage_members(
     *,
     announce: bool = True,
     member_names: Optional[Sequence[str]] = None,
+    display_names: Optional[Sequence[Optional[str]]] = None,
 ):
     backends = {}
-    specs, parsed_names = _resolve_member_specs(member_specs)
-    resolved_names = tuple(member_names) if member_names is not None else parsed_names
-    if len(resolved_names) != len(specs):
+    resolved_names = tuple(member_names) if member_names is not None else _default_member_names(member_specs)
+    if len(resolved_names) != len(tuple(member_specs)):
         raise click.ClickException("member_names must match member_specs length")
-    if len(resolved_names) != len(set(resolved_names)):
-        duplicate = next(name for name in resolved_names if resolved_names.count(name) > 1)
-        raise click.ClickException(f"Duplicate storage member name: {duplicate}")
-    for name in resolved_names:
-        if name == "cache" or not _MEMBER_NAME_RE.fullmatch(name):
-            raise click.ClickException(f"Invalid storage member name: {name!r}")
-    for name, spec in zip(resolved_names, specs):
-        legacy = _LEGACY_MEMBER_NAME_RE.fullmatch(name)
-        kind = "remote" if spec.startswith(("ssh://", "rsync://")) else "local"
-        if legacy and legacy.group(1) != kind:
-            raise click.ClickException(f"Storage member {name!r} must name a {kind} target")
+    labels = tuple(display_names) if display_names is not None else (None,) * len(resolved_names)
+    if len(labels) != len(resolved_names):
+        raise click.ClickException("display_names must match member_specs length")
+    if any(label is not None and not _valid_display_name(label) for label in labels):
+        raise click.ClickException("display_names must be printable text of 1 to 80 characters")
+    present = [label.strip().casefold() for label in labels if label is not None]
+    if len(present) != len(set(present)):
+        raise click.ClickException("Duplicate display name")
+    labels = tuple(label.strip() if label is not None else None for label in labels)
 
     local_index = 0
     remote_index = 0
-    for name, spec in zip(resolved_names, specs):
+    for index, (name, spec) in enumerate(zip(resolved_names, member_specs)):
         try:
             is_rsync = spec.startswith("rsync://")
             is_ssh = spec.startswith("ssh://")
@@ -406,9 +419,10 @@ def create_storage_members(
                         speed_priority=priority,
                         control_sockets=shared_control_sockets(),
                     )
+                    backend.display_name = labels[index]
                     if announce:
                         click.echo(
-                            f"Added rsync storage member: {name} -> "
+                            f"Added rsync storage member: {backend.label} -> "
                             f"{username}@{host}:{remote_path} (priority: {priority})"
                         )
                 else:
@@ -420,17 +434,19 @@ def create_storage_members(
                         key_filename=key_file,
                         speed_priority=priority,
                     )
+                    backend.display_name = labels[index]
                     if announce:
                         click.echo(
-                            f"Added SSH storage member: {name} -> "
+                            f"Added SSH storage member: {backend.label} -> "
                             f"{username}@{host}:{remote_path} (priority: {priority})"
                         )
             else:
                 priority = local_index * 10
                 local_index += 1
                 backend = LocalBackend(name, spec, speed_priority=priority)
+                backend.display_name = labels[index]
                 if announce:
-                    click.echo(f"Added local storage member: {name} -> {spec} (priority: {priority})")
+                    click.echo(f"Added local storage member: {backend.label} -> {spec} (priority: {priority})")
             backends[name] = backend
         except ValueError as exc:
             raise click.ClickException(str(exc)) from exc
@@ -494,7 +510,7 @@ def resolve_member_configuration(
         else:
             settings = _load_mount_profile_settings(profile_source, profile_name)
 
-        resolved_specs, resolved_names = _resolve_member_specs(settings["backing_paths"] + settings["remote"])
+        resolved_specs = settings["backing_paths"] + settings["remote"]
         if not resolved_specs:
             raise click.ClickException(
                 f"Mount profile '{profile_name}' does not define any storage members"
@@ -502,11 +518,12 @@ def resolve_member_configuration(
 
         return ResolvedMemberConfig(
             member_specs=resolved_specs,
-            member_names=resolved_names,
+            member_names=_default_member_names(resolved_specs),
             key_file=key_file or settings["key_file"],
             cache_root=(cache_root or Path(settings["cache"])).resolve(),
             profile_name=profile_name,
             profile_source=profile_source,
+            member_display_names=settings["local_display_names"] + settings["remote_display_names"],
         )
 
     if config_path is not None:
@@ -527,14 +544,17 @@ def resolve_member_configuration(
         member_names=resolved_names,
         key_file=key_file,
         cache_root=cache_root.resolve(),
+        member_display_names=(None,) * len(resolved_specs),
     )
 
 
 def _load_mount_profile_settings(config_path: Path, profile_name: str) -> Dict[str, Any]:
     config_profile = _load_mount_profile(config_path, profile_name)
-    config_backing_paths, config_remote = split_storage_member_specs(
-        _profile_backends(config_profile, profile_name)
-    )
+    entries = _profile_backends(config_profile, profile_name)
+    local_entries = [(spec, label) for spec, label in entries if not spec.startswith(("ssh://", "rsync://"))]
+    remote_entries = [(spec, label) for spec, label in entries if spec.startswith(("ssh://", "rsync://"))]
+    config_backing_paths = tuple(spec for spec, _ in local_entries)
+    config_remote = tuple(spec for spec, _ in remote_entries)
     return {
         "mountpoint": _require_profile_string(config_profile, "mountpoint", profile_name),
         "cache": _require_profile_string(config_profile, "cache", profile_name),
@@ -569,6 +589,8 @@ def _load_mount_profile_settings(config_path: Path, profile_name: str) -> Dict[s
         ),
         "backing_paths": config_backing_paths,
         "remote": config_remote,
+        "local_display_names": tuple(label for _, label in local_entries),
+        "remote_display_names": tuple(label for _, label in remote_entries),
     }
 
 
@@ -673,6 +695,8 @@ def resolve_mount_configuration(
         "checksum_reverify_interval": None,
         "backing_paths": (),
         "remote": (),
+        "local_display_names": (),
+        "remote_display_names": (),
     }
     profile_name = None
 
@@ -729,10 +753,18 @@ def resolve_mount_configuration(
     if not cache:
         raise click.ClickException("Missing cache directory. Provide --cache or set 'cache' in the mount profile.")
 
+    resolved_local = tuple(backing_paths) if backing_paths else config_values["backing_paths"]
+    resolved_remote = tuple(remote) if remote else config_values["remote"]
+    display_names = (
+        (None,) * len(resolved_local) if backing_paths else config_values["local_display_names"]
+    ) + (
+        (None,) * len(resolved_remote) if remote else config_values["remote_display_names"]
+    )
+
     return ResolvedMountConfig(
         mountpoint=mountpoint,
-        backing_paths=tuple(backing_paths) if backing_paths else config_values["backing_paths"],
-        remote=tuple(remote) if remote else config_values["remote"],
+        backing_paths=resolved_local,
+        remote=resolved_remote,
         cache=cache,
         cache_size=cache_size or config_values["cache_size"] or DEFAULT_CACHE_SIZE,
         database=database or config_values["database"],
@@ -799,4 +831,5 @@ def resolve_mount_configuration(
                 else DEFAULT_CHECKSUM_REVERIFY_INTERVAL
             ),
         ),
+        member_display_names=display_names,
     )
