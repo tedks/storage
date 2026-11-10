@@ -2075,8 +2075,9 @@ class StorageFS(Operations):
 
     def readdir(self, path, fh):
         """Read directory contents"""
-        for entry in self.namespace.readdir(path):
-            yield entry
+        # Resolve while __call__ still marks this FUSE request interactive.
+        # A generator would defer member I/O until after that context exited.
+        return self.namespace.readdir(path)
 
     def mkdir(self, path, mode):
         """Create a directory"""

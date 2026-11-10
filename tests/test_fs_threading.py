@@ -19,6 +19,7 @@ from unittest.mock import patch
 from fuse import FuseOSError
 
 from storage.backends.local import LocalBackend
+from storage.backends.base import is_interactive_request
 from storage.fs import StorageFS
 from storage.models import SyncStatus
 
@@ -151,6 +152,33 @@ class ThreadingTestBase(unittest.TestCase):
         self.assertEqual(
             SyncStatus.CLEAN, self.fs.state_manager.get_file_metadata("/" + name).sync_status,
         )
+
+
+class TestForegroundTransferClass(ThreadingTestBase):
+    def test_cold_full_copy_is_bulk_but_browsing_remains_interactive(self):
+        (self.member_dir / "cold.bin").write_bytes(b"cold bytes")
+        observed = []
+        real_copy = self.member.copy_to_local
+        real_list = self.member.listdir_attrs
+
+        def copy(path, target):
+            observed.append(("copy", is_interactive_request()))
+            return real_copy(path, target)
+
+        def listing(path):
+            observed.append(("listing", is_interactive_request()))
+            return real_list(path)
+
+        with patch.object(self.member, "copy_to_local", side_effect=copy), \
+                patch.object(self.member, "listdir_attrs", side_effect=listing):
+            fd = self.fs.__call__("open", "/cold.bin", os.O_RDONLY)
+            self.assertEqual(b"cold bytes", self.fs.__call__("read", "/cold.bin", 32, 0, fd))
+            self.fs.__call__("release", "/cold.bin", fd)
+            self.assertIn("cold.bin", self.fs.__call__("readdir", "/", 0))
+
+        self.assertIn(("copy", False), observed)
+        self.assertIn(("listing", True), observed)
+        self.assertFalse(is_interactive_request())
 
 
 class TestOpenRaces(ThreadingTestBase):
