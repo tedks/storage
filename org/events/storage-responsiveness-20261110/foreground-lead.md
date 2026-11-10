@@ -107,4 +107,14 @@
 - evidence: OpenAI and Anthropic formal seats each found Important freshness race(s): private changed-member pin during ordinary-admission wait permits another opener to fetch stale holder bytes without recheck; outer cleanup after path-lock release can erase a newer opener's pin. Third unresolved repair failure triggered stop. Round outcome and separate findings comment posted; Google EMPTY usage limit. Anthropic's possible non-open sentinel escape was checked against source: `_ensure_file_in_cache` has only `_open` as caller at this head.
 - decision: Root retains warm-open demand guarantee, rejects all-open-ordinary downgrade, and authorizes only contract/huddle design plus deterministic two-member regression source. Durable path-scoped freshness obligation/generation must remain visible and owed until checked member bytes commit or explicit path invalidation; cancellation, failed fetch, unavailable member, rename and late stream must not erase newer debt. Root reviews boundary before application-code repair resumes.
 - prerequisite: Sole-owner read began after explicit 16:27:02 UTC scope (exact second not logged) and ended before 16:30:04 UTC. Local Docker Unix socket verified; cached named image present, 95,680,856 bytes, ID `sha256:0f7e761730d313b2cdcd74d36c53b6bbb9f1dc0093890e26d8ec5c20cd0ed07b`; `/dev/fuse` and setuid helper available; host libfuse2 absent, flake/lock unchanged since earlier CLI pass. No retained process/fixture. Fleet %68 received cancellation with submitted receipt; quiet/release confirmation pending.
-- next: checkpoint/push, compact for token tripwire, then source-only design and tests under adjudication; no runtime tests or gate scheduling.
+- next: checkpoint/push, then stop/compact for token tripwire; source-only design and tests await bounded resume. No runtime tests or gate scheduling.
+
+## foreground-lead:12
+
+- kind: state-change
+- state: IDLE_AT_CHECKPOINT pending bounded resume
+- based_on: `4887e70`
+- refs: foreground-lead:11
+- evidence: Root acknowledged prerequisite execution/quiet and Fleet cancellation; token tripwire 316>300 calls for checkpoint and compact/stop now. Formal third-round outcome includes finished Anthropic and OpenAI findings; separate PR comment records both races and triages Anthropic's non-open sentinel concern against the sole `_open` caller. No application repair, runtime test or gate followed root stop.
+- open_question: cap 3 gives one demand slot; a slow cached-open freshness stat may hold it until member timeout. Root retains warm-open demand guarantee and requires this limitation to remain explicit; file an open-questions tracker issue on bounded resume if a further product choice is needed.
+- next: await bounded resume for design/contract and deterministic two-member regression source only; root must lift application-code and runtime holds separately.
