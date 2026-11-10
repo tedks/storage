@@ -96,3 +96,15 @@
 - evidence: Formal round at `96f5c3d` had OpenAI one new Important, Anthropic abandoned because head moved, Google empty. Formal round at `e53cb50` had OpenAI CLEAN and Anthropic one new Important: admission transfer waited while holding path/namespace locks, allowing a lock-slot cycle; Google empty. Round records and findings posted to PR #171. Latest repair drops outer locks before transfer, retries open and carries revalidation pin outside shared state during the wait; added lock-release and pin test. Python AST and diff checks passed; runtime tests/gates remain unrun under absent Fleet grant.
 - limit: at cap 3 a slow cached-open freshness stat may occupy the only protected demand slot until its member timeout; documented as a product tradeoff. Native libfuse thread count remains unbounded.
 - next: new formal council convergence and exact-head tests when Fleet grants a local cached-image slot; changed head invalidates earlier CLI build for acceptance.
+
+## foreground-lead:11
+
+- kind: stop-and-adjudication
+- state: DESIGN_SOURCE_ONLY; application repair and runtime stopped
+- based_on: `0631a73bff98b7649b9d65c181b5fe04dcf72ff9`
+- applied_at: this unique ledger checkpoint after root ruling `foreground-open-pin-ownership`
+- refs: foreground-lead:10, PR #171 formal round at `0631a73`
+- evidence: OpenAI and Anthropic formal seats each found Important freshness race(s): private changed-member pin during ordinary-admission wait permits another opener to fetch stale holder bytes without recheck; outer cleanup after path-lock release can erase a newer opener's pin. Third unresolved repair failure triggered stop. Round outcome and separate findings comment posted; Google EMPTY usage limit. Anthropic's possible non-open sentinel escape was checked against source: `_ensure_file_in_cache` has only `_open` as caller at this head.
+- decision: Root retains warm-open demand guarantee, rejects all-open-ordinary downgrade, and authorizes only contract/huddle design plus deterministic two-member regression source. Durable path-scoped freshness obligation/generation must remain visible and owed until checked member bytes commit or explicit path invalidation; cancellation, failed fetch, unavailable member, rename and late stream must not erase newer debt. Root reviews boundary before application-code repair resumes.
+- prerequisite: Sole-owner read began after explicit 16:27:02 UTC scope (exact second not logged) and ended before 16:30:04 UTC. Local Docker Unix socket verified; cached named image present, 95,680,856 bytes, ID `sha256:0f7e761730d313b2cdcd74d36c53b6bbb9f1dc0093890e26d8ec5c20cd0ed07b`; `/dev/fuse` and setuid helper available; host libfuse2 absent, flake/lock unchanged since earlier CLI pass. No retained process/fixture. Fleet %68 received cancellation with submitted receipt; quiet/release confirmation pending.
+- next: checkpoint/push, compact for token tripwire, then source-only design and tests under adjudication; no runtime tests or gate scheduling.
