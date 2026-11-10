@@ -172,3 +172,15 @@
   boundary tests only; no code changes, gates, acceptance or merge.
   `oq-conflict-no-remote-hash` was filed and synced by that lane. No new
   implementation authority was assigned by this integration lead.
+
+## integration-lead:15
+
+- kind: state-change
+- refs: integration-lead:14
+- based_on: `81793ac27b70f82c231bf607b55e775d2b905974`
+- state: DONE/IDLE. #165 and #166 integrated with exact-head gate,
+  council, lead review and scripted merge evidence. #167 held for Ted's
+  ruling and a future rebase. Performance audit proposals remain draft.
+  The consolidated record is on draft PR #168 for parent review. No new
+  implementation package is assigned; no mission-owned process or lease
+  remains. Open product questions are in ditz, not solely this handoff.

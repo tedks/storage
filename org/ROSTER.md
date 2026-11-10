@@ -13,7 +13,7 @@ this mission. The sibling performance audit completed a draft proposal report.
 | Lane | Worktree / branch | Hat and state | Next bounded action |
 | --- | --- | --- | --- |
 | Parent coordinator | `storage:0`, storage coordinator | CTO/root; active | Receive consolidated evidence and resolve rulings |
-| Integration lead | `storage:1` pane `%93`, `orgs-integration-20261110`, `chore/orgs-integration-20261110`, Sol | Lead; recording final audit | #165/#166 landed; deliver consolidated record |
+| Integration lead | `storage:1` pane `%93`, `orgs-integration-20261110`, `chore/orgs-integration-20261110`, Sol | Lead; DONE/IDLE after handoff | Draft record PR #168 awaits parent review; no new implementation mission |
 | Performance audit | `storage:2` pane `%94`, `perf-triage-20261110`, `docs/perf-triage-20261110`, Sol | Peer lead; DONE/IDLE | Draft PR #169 at `e2d2e127`; no implementation assignment |
 | #166 repair owner | `descriptive-remote-names`, `feat/descriptive-remote-names`, native Sol | Implementer; bounded evidence delivered | No further branch change assigned |
 | Other prior implementation lanes | #165 and #167 worktrees | Implementers; DONE/idle | No additional task assigned; preserve branches |
@@ -92,3 +92,12 @@ acceptance claim. Ranked bounded candidates:
 These are not authorized implementation packages in this lane. #17 scheduler
 work waits for #167's interface and scope ruling. The full source and boundary
 test proposals live in the peer audit document, not this summary.
+
+## Handoff
+
+The adoption record is on draft PR #168. #165 and #166 are integrated,
+not deployed. #167 remains a draft held for `oq-dynamic-workers-scope` and
+has a known textual merge conflict with current master. The performance
+backlog is draft PR #169. Parent coordinator owns any new lane assignment;
+the integration and performance audit lanes are idle. No mission-owned
+process, mount, remote host session, or cache lease is retained.
