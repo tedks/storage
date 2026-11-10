@@ -20,6 +20,8 @@ The default foreground cap when opted in is 32, with one protected active
 slot for each class and the rest shared; a configured cap from 3 to 128 is
 allowed. Directory handles and listing use the metadata slot; warm cached
 opens and reads use the demand slot; cold full-file opens use ordinary capacity.
+A cached open whose entry disappears during freshness checking or eviction
+releases its demand slot before waiting for ordinary admission to fetch.
 At cap 3, each class has exactly one slot and progress still
 depends on the active call finishing or its member timeout; admission does
 not interrupt it. Explicit gate close cancels queued callbacks. During a

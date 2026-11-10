@@ -259,6 +259,37 @@ class TestForegroundAdmission(ThreadingTestBase):
                 cold_release.set()
                 cold.finish()
 
+    def test_changed_cached_open_releases_demand_slot_before_full_copy(self):
+        (self.member_dir / "changed").write_bytes(b"new contents")
+        (self.cache_dir / "changed").write_bytes(b"old")
+        (self.member_dir / "ready").write_bytes(b"ready bytes")
+        ready_fd = self.fs.__call__("open", "/ready", os.O_RDONLY)
+        copy = self.gate(self.member, "copy_to_local",
+                         only=lambda path, _dest: path == "/changed")
+
+        def invalidate_changed(resolved):
+            if resolved.requested_path == "/changed":
+                (self.cache_dir / "changed").unlink()
+
+        with patch.object(self.fs, "_revalidate_cached_file", side_effect=invalidate_changed):
+            changed = Worker(self.fs.__call__, "open", "/changed", os.O_RDONLY)
+            changed.start()
+            self.assertTrue(copy.started.wait(WAIT))
+            read = Worker(self.fs.__call__, "read", "/ready", 32, 0, ready_fd)
+            read.start()
+            try:
+                read.join(BLOCKED)
+                self.assertFalse(read.is_alive(), "a full copy held the demand slot")
+                self.assertEqual(b"ready bytes", read.finish())
+                self.assertLessEqual(self.fs._foreground_admission.peak_active, 3)
+            finally:
+                copy.opened.set()
+                changed_fd = changed.finish()
+                self.fs.__call__("release", "/changed", changed_fd)
+                self.fs.__call__("release", "/ready", ready_fd)
+                read.finish()
+        self.assertEqual(0, self.fs._foreground_admission.active_count)
+
     def test_invalid_direct_sync_limit_fails_before_mount_lock(self):
         for workers, maximum in ((-1, None), (2, 1), (1, 33)):
             with self.subTest(workers=workers, maximum=maximum), \
@@ -271,6 +302,28 @@ class TestForegroundAdmission(ThreadingTestBase):
                         max_sync_workers=maximum,
                     )
                 acquire.assert_not_called()
+
+    def test_reclassification_cancel_releases_both_slots(self):
+        from storage.foreground_admission import AdmissionClosed, ForegroundAdmission
+
+        gate = ForegroundAdmission(3)
+        with gate.admit("ordinary"):
+            moved = Worker(lambda: self._move_admission(gate))
+            moved.start()
+            self.assertTrue(gate.waiting_for("ordinary", 1, WAIT))
+            self.assertEqual(1, gate.active_count)
+            gate.close()
+            moved.join(WAIT)
+            self.assertFalse(moved.is_alive())
+            self.assertIsInstance(moved.error, AdmissionClosed)
+            self.assertEqual(0, gate.waiting_count("ordinary"))
+            self.assertEqual(1, gate.active_count)
+        self.assertEqual(0, gate.active_count)
+
+    @staticmethod
+    def _move_admission(gate):
+        with gate.admit("demand"):
+            gate.reclassify_current("ordinary")
 
     def test_class_reserves_fifo_and_queued_cancellation(self):
         from storage.foreground_admission import AdmissionClosed

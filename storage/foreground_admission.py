@@ -24,6 +24,7 @@ class ForegroundAdmission:
         self._active = {kind: 0 for kind in self.CLASSES}
         self._waiting = {kind: deque() for kind in self.CLASSES}
         self._closed = False
+        self._local = threading.local()
         self.peak_active = 0
 
     @property
@@ -57,6 +58,40 @@ class ForegroundAdmission:
         excess = sum(max(0, count - 1) for count in self._active.values())
         return excess < self.cap - len(self.CLASSES)
 
+    def reclassify_current(self, kind: str) -> bool:
+        """Move this admitted callback to another class before slow work.
+
+        The old slot is released before waiting for the new class. A direct
+        method call outside FUSE admission has no slot to move.
+        """
+        if kind not in self._active:
+            raise ValueError(f"unknown foreground class: {kind}")
+        current = getattr(self._local, "kind", None)
+        if current is None or current == kind:
+            return False
+        ticket = object()
+        with self._cond:
+            self._active[current] -= 1
+            self._local.kind = None
+            self._waiting[kind].append(ticket)
+            self._cond.notify_all()
+            try:
+                while True:
+                    if self._closed:
+                        raise AdmissionClosed("foreground callback admission cancelled")
+                    if self._waiting[kind][0] is ticket and self._can_enter(kind):
+                        self._waiting[kind].popleft()
+                        self._active[kind] += 1
+                        self.peak_active = max(self.peak_active, sum(self._active.values()))
+                        self._local.kind = kind
+                        self._cond.notify_all()
+                        return True
+                    self._cond.wait()
+            finally:
+                if self._local.kind is None:
+                    self._waiting[kind].remove(ticket)
+                    self._cond.notify_all()
+
     @contextmanager
     def admit(self, kind: str, cancel: threading.Event = None):
         if kind not in self._active:
@@ -84,8 +119,13 @@ class ForegroundAdmission:
                     self._waiting[kind].remove(ticket)
                     self._cond.notify_all()
         try:
+            previous = getattr(self._local, "kind", None)
+            self._local.kind = kind
             yield
         finally:
+            held = self._local.kind
+            self._local.kind = previous
             with self._cond:
-                self._active[kind] -= 1
+                if held is not None:
+                    self._active[held] -= 1
                 self._cond.notify_all()

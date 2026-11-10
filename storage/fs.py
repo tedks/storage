@@ -1929,6 +1929,11 @@ class StorageFS(Operations):
                 self.cache_manager.heal_stale_clean(canonical_path, cache_path)
             return True
 
+        # A cached open may have lost its cache entry during revalidation or
+        # eviction. Release its protected demand slot before any full fetch.
+        if self._foreground_admission is not None:
+            self._foreground_admission.reclassify_current("ordinary")
+
         # If a backend is explicitly requested (conflict suffix), bypass replication manager.
         if resolved.backend_name:
             backend = self.backends.get(resolved.backend_name)
