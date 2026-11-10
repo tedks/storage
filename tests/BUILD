@@ -85,7 +85,9 @@ storage_test(
 storage_test("sync_dir_ops")
 storage_test("sync_executor")
 storage_test("sync_manager")
-storage_test("sync_races", data = ["test_fs_threading.py"])
+# The runner selects sync_races explicitly, so the helper's test cases are not
+# collected a second time even though the helper is in the runfiles sources.
+storage_test("sync_races", extra_srcs = ["test_fs_threading.py"])
 storage_test(
     "sync_system",
     target = "storage_tests_sync_system",

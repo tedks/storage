@@ -70,7 +70,7 @@ resilience gates) also need `/dev/fuse` and a setuid `fusermount`:
   always wins, and the shell banner's `libfuse2:` line shows the choice.
   Every pytest `py_test` in `tests/BUILD` passes the variable into the tests
   (`env_inherit`).
-  fallback is the pinned nixos-23.05 `fuse` 2.9.9 build (the `fuse2`
+  The fallback is the pinned nixos-23.05 `fuse` 2.9.9 build (the `fuse2`
   attribute did not exist in that nixpkgs release). It needs only
   `GLIBC_2.34`, so it loads on Debian 12 and Ubuntu 24.04. The flake cannot
   inspect host glibc; changing this fallback affects every host without a
