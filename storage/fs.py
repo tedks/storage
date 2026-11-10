@@ -34,6 +34,7 @@ from .cache import PARTIAL_SUFFIX, CacheManager
 from .locks import NamespaceLock, PathLocks, UploadLocks
 from .cache_metadata import PREFIX_XATTR, XATTR_CACHE_METADATA_NAME, regular_file_stat, scan_cache_entries
 from .file_config import FileConfig, get_inherited_config
+from .foreground_admission import AdmissionClosed, ForegroundAdmission
 from .models import FileLocation, FileMetadata, StreamingKeepAfterClose, SyncStatus
 from .state import StateManager
 from .replication import ReplicationManager
@@ -126,8 +127,27 @@ class StorageFS(Operations):
     def __call__(self, op, *args):
         # Every FUSE operation has a caller waiting on it: members with a
         # connection pool serve it from the channel kept for that.
-        with interactive_request():
-            return super().__call__(op, *args)
+        gate = self._foreground_admission
+        kind = self._foreground_class(op)
+        try:
+            admission = (
+                gate.admit(kind)
+                if gate is not None and op not in ("init", "destroy")
+                else contextlib.nullcontext()
+            )
+            with admission:
+                with interactive_request():
+                    return super().__call__(op, *args)
+        except AdmissionClosed as exc:
+            raise FuseOSError(errno.EINTR) from exc
+
+    @staticmethod
+    def _foreground_class(op: str) -> str:
+        if op in ("getattr", "readdir", "access", "readlink", "getxattr", "listxattr", "statfs"):
+            return "metadata"
+        if op in ("read", "write", "flush", "fsync", "release"):
+            return "demand"
+        return "ordinary"
 
     def __init__(self, cache_root: Path, state_db: Path, backends: Dict[str, Backend],
                  cache_size: int, num_sync_workers: int = 2, start_sync: bool = True,
@@ -138,7 +158,8 @@ class StorageFS(Operations):
                  streaming_keep_after_close: Optional[StreamingKeepAfterClose] = None,
                  revalidate_after: float = 60.0,
                  listing_max_stale: float = DEFAULT_LISTING_MAX_STALE,
-                 checksum_reverify_interval: float = DEFAULT_CHECKSUM_REVERIFY_INTERVAL):
+                 checksum_reverify_interval: float = DEFAULT_CHECKSUM_REVERIFY_INTERVAL,
+                 max_foreground_operations: Optional[int] = None):
         """
         Initialize Storage filesystem
 
@@ -186,6 +207,10 @@ class StorageFS(Operations):
         self.backends = backends
 
         self.logger = logging.getLogger(__name__)
+        self._foreground_admission = (
+            ForegroundAdmission(max_foreground_operations)
+            if max_foreground_operations is not None else None
+        )
 
         # File descriptor tracking
         self._fd_counter = 0
@@ -2935,7 +2960,9 @@ class StorageFS(Operations):
         self._sweep_pending = False
 
     def destroy(self, path):
-        """Cleanup on unmount"""
+        """Cleanup on unmount."""
+        if self._foreground_admission is not None:
+            self._foreground_admission.close()
         self._destroying.set()
         self._streaming_manager.destroy()
         self._stop_watchers()
@@ -3240,6 +3267,7 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
                  entry_timeout: Optional[float] = None,
                  negative_timeout: Optional[float] = None,
                  fuse_threads: bool = False,
+                 max_foreground_operations: Optional[int] = None,
                  checksum_reverify_interval: float = DEFAULT_CHECKSUM_REVERIFY_INTERVAL):
     """
     Mount a Storage filesystem
@@ -3276,6 +3304,8 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
             (ditz threading-fuse-worker-cap). On unmount libfuse joins every
             worker before destroy, so an unmount waits for the slowest member
             call in flight.
+        max_foreground_operations: Active Python callback cap in threaded mode;
+            None uses 32 when threaded. This does not cap libfuse threads.
 
     Raises:
         PermissionError: If allow_other=True but not running as root and user_allow_other not set
@@ -3285,6 +3315,14 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
     logger = logging.getLogger(__name__)
+
+    if max_foreground_operations is not None and not fuse_threads:
+        raise ValueError("max_foreground_operations requires fuse_threads")
+    if fuse_threads:
+        max_foreground_operations = (
+            32 if max_foreground_operations is None else max_foreground_operations
+        )
+        ForegroundAdmission(max_foreground_operations)  # validate before mount lock
 
     # Before the mount lock, so a bad timeout fails without side effects.
     fuse_options = fuse_mount_options(
@@ -3346,6 +3384,7 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
         revalidate_after=revalidate_after,
         listing_max_stale=listing_max_stale,
         checksum_reverify_interval=checksum_reverify_interval,
+        max_foreground_operations=max_foreground_operations,
     )
     fs.mount_lock_file = lock_file
     if unclean_shutdown:

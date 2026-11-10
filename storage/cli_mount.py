@@ -129,6 +129,10 @@ def shared_filesystems(backends: Dict[str, Backend]) -> List[List[str]]:
     ),
 )
 @click.option(
+    "--max-foreground-operations", type=int,
+    help="Cap active FUSE callbacks (3-128; enables threaded FUSE; native thread count is not capped).",
+)
+@click.option(
     "--checksum-reverify-interval",
     type=float,
     help=(
@@ -158,6 +162,7 @@ def mount(
     enable_watchers,
     revalidate_after,
     fuse_threads,
+    max_foreground_operations,
     checksum_reverify_interval,
 ):
     """
@@ -208,6 +213,7 @@ def mount(
         streaming_keep_after_close=streaming_keep_after_close,
         revalidate_after=revalidate_after,
         fuse_threads=fuse_threads,
+        max_foreground_operations=max_foreground_operations,
         checksum_reverify_interval=checksum_reverify_interval,
     )
 
@@ -297,6 +303,8 @@ def mount(
         f"attributes {kernel['attr_timeout']}s, pages kept while unchanged"
     )
     click.echo(f"  FUSE loop: {'multithreaded' if resolved.fuse_threads else 'single-threaded'}")
+    if resolved.max_foreground_operations is not None:
+        click.echo(f"  Active foreground callback cap: {resolved.max_foreground_operations}")
     if resolved.checksum_reverify_interval > 0:
         click.echo(
             f"  Hash re-verification: one file per idle member every "
@@ -330,6 +338,7 @@ def mount(
             entry_timeout=resolved.entry_timeout,
             negative_timeout=resolved.negative_timeout,
             fuse_threads=resolved.fuse_threads,
+            max_foreground_operations=resolved.max_foreground_operations,
             checksum_reverify_interval=resolved.checksum_reverify_interval,
         )
     except PermissionError as exc:

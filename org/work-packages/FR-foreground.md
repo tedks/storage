@@ -13,7 +13,7 @@
 - **Budget:** bounded source package, one focused red/green cycle and one local gate cycle; escalate repeated third failure.
 - **Authority:** scratch synthetic tests and branch edits; push draft PR. Exact-head all-gates and council remain required; root accepts/merges.
 - **Worker bound:** one implementer at a time because config and `fs.py` overlap the sync package.
-- **Evidence:** pending, to map each item to tested SHA and command.
+- **Evidence at pre-commit tree from `edc9736`:** Admission test `-k foreground_admission` failed before implementation (`StorageFS` rejected the cap argument), then passed. Full `//tests:storage_test_fs_threading`, `//tests:storage_test_cli_mount`, `//tests:storage_test_mount_profiles` and `//:storage_build_srcs_check` passed after the implementation. SSH fake-pool `-k foreground_bulk_copy` passed: three bulk leases occupied three of four channels while both metadata and demand interactive leases completed, with `bulk_leased=3`, `sftp_open=3`, maximum open at most four. The tests use scratch/local fakes and do not measure live latency or native libfuse thread count. Exact pushed-head all-gates and independent review remain pending.
 - **Stop conditions:** changed product scope, live-data need, boundary collision, third unresolved failure.
 - **Escalation destination:** root coordinator at `%87`.
 - **Expected artifact:** commits on this branch and draft PR succeeding #167.

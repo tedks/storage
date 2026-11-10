@@ -56,6 +56,8 @@ class ResolvedMountConfig:
     # Run the FUSE loop multithreaded (storage.fs.mount_storage). Off by
     # default until the field test (docs/browsing_latency_plan.md D6).
     fuse_threads: bool = False
+    # None preserves the single-threaded default; a threaded mount uses 32.
+    max_foreground_operations: Optional[int] = None
     # Seconds a listing past its fresh window is still served while a
     # background refresh runs (profile only).
     listing_max_stale: float = DEFAULT_LISTING_MAX_STALE
@@ -584,6 +586,9 @@ def _load_mount_profile_settings(config_path: Path, profile_name: str) -> Dict[s
             for key in KERNEL_TIMEOUT_KEYS
         },
         "fuse_threads": _optional_profile_bool(config_profile, "fuse_threads", profile_name),
+        "max_foreground_operations": _optional_profile_int(
+            config_profile, "max_foreground_operations", profile_name
+        ),
         "checksum_reverify_interval": _optional_profile_float(
             config_profile, "checksum_reverify_interval", profile_name
         ),
@@ -623,6 +628,7 @@ def _can_auto_load_mount_profile(
     revalidate_after: Optional[float] = None,
     fuse_threads: Optional[bool] = None,
     checksum_reverify_interval: Optional[float] = None,
+    max_foreground_operations: Optional[int] = None,
 ) -> bool:
     if not _target_looks_like_profile_name(mount_target):
         return False
@@ -646,6 +652,7 @@ def _can_auto_load_mount_profile(
         revalidate_after is not None,
         fuse_threads is not None,
         checksum_reverify_interval is not None,
+        max_foreground_operations is not None,
     ))
 
 
@@ -671,6 +678,7 @@ def resolve_mount_configuration(
     revalidate_after: Optional[float] = None,
     fuse_threads: Optional[bool] = None,
     checksum_reverify_interval: Optional[float] = None,
+    max_foreground_operations: Optional[int] = None,
 ) -> ResolvedMountConfig:
     config_values = {
         "mountpoint": None,
@@ -692,6 +700,7 @@ def resolve_mount_configuration(
         "listing_max_stale": None,
         **{key: None for key in KERNEL_TIMEOUT_KEYS},
         "fuse_threads": None,
+        "max_foreground_operations": None,
         "checksum_reverify_interval": None,
         "backing_paths": (),
         "remote": (),
@@ -726,6 +735,7 @@ def resolve_mount_configuration(
         revalidate_after,
         fuse_threads,
         checksum_reverify_interval,
+        max_foreground_operations,
     ):
         available_configs = [candidate for candidate in default_mount_config_paths() if candidate.exists()]
         if available_configs:
@@ -760,6 +770,17 @@ def resolve_mount_configuration(
     ) + (
         (None,) * len(resolved_remote) if remote else config_values["remote_display_names"]
     )
+
+    cap = (max_foreground_operations if max_foreground_operations is not None
+           else config_values["max_foreground_operations"])
+    if cap is not None and not 3 <= cap <= 128:
+        raise click.ClickException("max_foreground_operations must be between 3 and 128")
+    explicit_threads = fuse_threads if fuse_threads is not None else config_values["fuse_threads"]
+    if cap is not None and explicit_threads is False:
+        raise click.ClickException("max_foreground_operations requires fuse_threads")
+    threaded = explicit_threads if explicit_threads is not None else cap is not None
+    if threaded and cap is None:
+        cap = 32
 
     return ResolvedMountConfig(
         mountpoint=mountpoint,
@@ -815,11 +836,8 @@ def resolve_mount_configuration(
         ),
         entry_timeout=config_values["entry_timeout"],
         negative_timeout=config_values["negative_timeout"],
-        fuse_threads=fuse_threads if fuse_threads is not None else (
-            config_values["fuse_threads"]
-            if config_values["fuse_threads"] is not None
-            else False
-        ),
+        fuse_threads=threaded,
+        max_foreground_operations=cap,
         listing_max_stale=_validated_seconds(
             "listing_max_stale", config_values["listing_max_stale"]
         ) if config_values["listing_max_stale"] is not None else DEFAULT_LISTING_MAX_STALE,

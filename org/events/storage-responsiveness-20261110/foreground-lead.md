@@ -29,3 +29,13 @@
 - refs: foreground-lead:2
 - necessity: Fresh OpenAI Luna/Utility critique returned SIMPLIFY. Retain the two tracer fixes; require a red admission saturation test before its machinery. Clarified cap-3 reserve, progress conditional on active completion, queued cancellation versus active member I/O, and the one-channel SSH limit in spec/package. No additional scheduler or load policy justified.
 - next: implement FR-foreground first; review its diff and publish the config interface before FR-sync.
+
+## foreground-lead:4
+
+- kind: state-change
+- state: FR-foreground implemented, focused verification; not accepted
+- based_on: `edc9736` plus uncommitted foreground diff
+- refs: foreground-lead:3
+- evidence: Admission synthetic test was red before implementation and green afterward. Four focused Bazel targets passed. Fake SSH pool held three foreground-initiated bulk transfers with `bulk_leased=3` and `sftp_open=3` while metadata and demand interactive acquisitions completed; its targeted Bazel test passed. No live member or mount used.
+- limitation: Active Python callback cap only. Libfuse 2 native threads can still grow with waiting callbacks. This is documented in CLI, README and spec. Full gates and review pending.
+- control: tmux message attempt to root `%87` returned `mixed-input-after-paste`, no new receipt; its pending payload is not replayed. Root delivery remains unknown and will be retried only from a verified empty composer.

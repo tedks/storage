@@ -181,6 +181,127 @@ class TestForegroundTransferClass(ThreadingTestBase):
         self.assertFalse(is_interactive_request())
 
 
+class TestForegroundAdmission(ThreadingTestBase):
+    def setUp(self):
+        super().setUp()
+        self.fs.destroy('/')
+        self.fs = StorageFS(
+            cache_root=self.cache_dir,
+            state_db=self.temp_dir / "state.db",
+            backends={"member": self.member},
+            cache_size=10 * 1024 * 1024,
+            num_sync_workers=0,
+            start_sync=False,
+            max_foreground_operations=3,
+        )
+
+    def test_foreground_admission_keeps_browsing_and_reads_moving(self):
+        entered = threading.Event()
+        release = threading.Event()
+        second_entered = threading.Event()
+
+        def blocked_open(path, flags):
+            if path == "/first":
+                entered.set()
+                self.assertTrue(release.wait(WAIT))
+            else:
+                second_entered.set()
+            return path
+
+        with patch.object(self.fs, "open", side_effect=blocked_open), \
+                patch.object(self.fs, "getattr", return_value={"st_mode": 0}), \
+                patch.object(self.fs, "read", return_value=b"demand bytes"):
+            first = Worker(self.fs.__call__, "open", "/first", os.O_RDONLY)
+            second = Worker(self.fs.__call__, "open", "/second", os.O_RDONLY)
+            first.start()
+            self.assertTrue(entered.wait(WAIT))
+            second.start()
+            try:
+                self.assertTrue(self.fs._foreground_admission.waiting_for("ordinary", 1, WAIT))
+                self.assertFalse(second_entered.is_set())
+                self.assertEqual({"st_mode": 0}, self.fs.__call__("getattr", "/", None))
+                self.assertEqual(b"demand bytes", self.fs.__call__("read", "/first", 12, 0, 0))
+                self.assertLessEqual(self.fs._foreground_admission.peak_active, 3)
+            finally:
+                release.set()
+                first.finish()
+                second.finish()
+            self.assertTrue(second_entered.is_set())
+            self.assertEqual(0, self.fs._foreground_admission.active_count)
+
+    def test_class_reserves_fifo_and_queued_cancellation(self):
+        from storage.foreground_admission import AdmissionClosed
+
+        gate = self.fs._foreground_admission
+        release = threading.Event()
+        started = [threading.Event() for _ in range(3)]
+        order = []
+
+        def hold(kind, index):
+            with gate.admit(kind):
+                started[index].set()
+                order.append(index)
+                self.assertTrue(release.wait(WAIT))
+
+        holders = [Worker(hold, kind, index) for index, kind in enumerate(
+            ("ordinary", "metadata", "demand")
+        )]
+        for holder in holders:
+            holder.start()
+        try:
+            self.assertTrue(all(event.wait(WAIT) for event in started))
+            self.assertEqual(3, gate.active_count)
+            queued_order = []
+
+            def queued(index):
+                with gate.admit("ordinary"):
+                    queued_order.append(index)
+
+            first = Worker(queued, 1)
+            second = Worker(queued, 2)
+            first.start()
+            self.assertTrue(gate.waiting_for("ordinary", 1, WAIT))
+            second.start()
+            self.assertTrue(gate.waiting_for("ordinary", 2, WAIT))
+            self.assertEqual([], queued_order)
+        finally:
+            release.set()
+            for holder in holders:
+                holder.finish()
+        first.finish()
+        second.finish()
+        self.assertEqual([1, 2], queued_order)
+        self.assertEqual(3, gate.peak_active)
+
+        cancel = threading.Event()
+        with gate.admit("ordinary"):
+            waiter = Worker(lambda: self._admit_once(gate, cancel))
+            waiter.start()
+            self.assertTrue(gate.waiting_for("ordinary", 1, WAIT))
+            cancel.set()
+            waiter.join(WAIT)
+            self.assertFalse(waiter.is_alive())
+            self.assertIsInstance(waiter.error, AdmissionClosed)
+            self.assertEqual(0, gate.waiting_count("ordinary"))
+
+        with gate.admit("ordinary"):
+            waiter = Worker(lambda: self._admit_once(gate))
+            waiter.start()
+            self.assertTrue(gate.waiting_for("ordinary", 1, WAIT))
+            gate.close()
+            waiter.join(WAIT)
+            self.assertFalse(waiter.is_alive())
+            self.assertIsInstance(waiter.error, AdmissionClosed)
+            self.assertEqual(1, gate.active_count)  # close did not interrupt us
+        self.assertEqual(0, gate.active_count)
+        self.assertEqual(0, gate.waiting_count("ordinary"))
+
+    @staticmethod
+    def _admit_once(gate, cancel=None):
+        with gate.admit("ordinary", cancel=cancel):
+            pass
+
+
 class TestOpenRaces(ThreadingTestBase):
     def test_two_opens_of_one_uncached_path_fetch_once(self):
         payload = os.urandom(256 * 1024)

@@ -46,6 +46,10 @@ listing_max_stale = 3600
 # does not hold up listings, stats and reads of others. Off by default until
 # it has been field-tested.
 # fuse_threads = true
+# Active Python FUSE callbacks, 3-128; setting this enables fuse_threads.
+# Native libfuse 2 threads are not capped. A threaded mount without this key
+# uses 32 active callbacks, with protected slots for metadata and reads.
+# max_foreground_operations = 32
 # Seconds between re-verifications of the conflict view's recorded hashes:
 # each interval, every member whose hash queue is idle hashes again the one
 # file checked longest ago (and over an hour ago). 0 turns it off.

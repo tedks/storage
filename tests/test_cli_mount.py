@@ -364,6 +364,36 @@ backends = ["{self.temp_dir}"]
         self.assertIs(False, self._mount("fuse_threads = true", ["--no-fuse-threads"])[1])
         self.assertIs(True, self._mount("", ["--fuse-threads"])[1])
 
+    def test_foreground_cap_enables_threads_and_reaches_mount(self):
+        self.config_path.write_text(
+            f'[mounts.threads]\nmountpoint = "{self.temp_dir / "mnt"}"\n'
+            f'cache = "{self.temp_dir / "cache"}"\n'
+            'max_foreground_operations = 3\n'
+            f'backends = ["{self.temp_dir}"]\n'
+        )
+        with patch("storage.cli_mount.mount_storage") as mock_mount:
+            result = self.runner.invoke(main, ["mount", "--config", str(self.config_path), "threads"])
+        self.assertEqual(0, result.exit_code, msg=result.output)
+        self.assertTrue(mock_mount.call_args.kwargs["fuse_threads"])
+        self.assertEqual(3, mock_mount.call_args.kwargs["max_foreground_operations"])
+        self.assertIn("Active foreground callback cap: 3", result.output)
+
+    def test_bad_or_disabled_foreground_cap_fails_before_mount(self):
+        for line in ("max_foreground_operations = 2", "max_foreground_operations = 129",
+                     "max_foreground_operations = 3\nfuse_threads = false"):
+            with self.subTest(line=line):
+                self.config_path.write_text(
+                    f'[mounts.threads]\nmountpoint = "{self.temp_dir / "mnt"}"\n'
+                    f'cache = "{self.temp_dir / "cache"}"\n{line}\n'
+                    f'backends = ["{self.temp_dir}"]\n'
+                )
+                with patch("storage.cli_mount.mount_storage") as mock_mount:
+                    result = self.runner.invoke(
+                        main, ["mount", "--config", str(self.config_path), "threads"]
+                    )
+                self.assertNotEqual(0, result.exit_code)
+                mock_mount.assert_not_called()
+
 
 class TestMountChecksumReverify(unittest.TestCase):
     """checksum_reverify_interval: profile key and flag, default 60, 0 = off."""
