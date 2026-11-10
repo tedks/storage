@@ -10,8 +10,8 @@ type: feature
 component: cli
 release:
 reporter: Ted Smith <tedks@riseup.net>
-status: in_progress
-disposition:
+status: closed
+disposition: fixed
 creation_time: 2026-11-08T23:15:28-00:00
 references: []
 log_events:
@@ -101,3 +101,9 @@ log_events:
     check 166 --expect-head <sha> returned clean:true, exit 0. PR has outcome and
     readable disposition comments. No live mount/backing access, deployment or merge.
     Lane idle awaiting integration lead.'
+- time: 2026-11-10T08:29:42-00:00
+  who: Ted Smith
+  what: 'closed: fixed'
+  comment: 'Display-only names implemented, verified and normally merged in PR #166
+    at 81793ac; stable localN/remoteN identities preserved. Earlier identity-name
+    wording was superseded by Ted ruling.'
