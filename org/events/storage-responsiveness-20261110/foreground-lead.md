@@ -48,3 +48,13 @@
 - refs: foreground-lead:4
 - evidence: Exact branch push succeeded; `git diff --check` clean. Focused Bazel commands cited in FR-foreground package ran on the pre-commit tree, not the final head; exact-head gates remain pending. Self-review found no changed byte/write path: admission wraps callbacks and the cold-copy scope only changes SSH lease classification.
 - next: FR-sync reconciliation, then final gate and independent review.
+
+## foreground-lead:6
+
+- kind: state-change
+- state: FR-sync reconciled, focused verification; not accepted
+- based_on: `effadd7` plus uncommitted compatibility fix
+- refs: foreground-lead:5
+- evidence: Four #167 commits cherry-picked in order into this branch without touching its sibling. Conflicts in `fs.py`, `cli_mount.py`, and `mount_profiles.py` retained both cap interfaces and current-master display names. `UpdateHostKeys=no` remains in rsync and watcher. Five focused targets passed; full SSH module initially exposed the no-init probe subclass and passed after the optional gate lookup fix. No live member used.
+- limitation: Original #167 all-gates/council evidence does not transfer to this union tree. Exact pushed-head gates and fresh review required.
+- control: BUILD one-line source addition delivered to integration lead `%93` with submitted receipt. Root `%87` message still lacks a receipt after mixed input; do not count it delivered.

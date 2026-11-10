@@ -13,7 +13,7 @@
 - **Budget:** reuse four #167 commits after a range diff, one targeted red/green reconciliation and focused gates; do not iterate indefinitely on a conflict.
 - **Authority:** read-only inspection of #167, edits/cherry-picks only in this branch; branch push and draft PR; no sibling force push, merge or deploy.
 - **Worker bound:** sequential with foreground package because shared files collide.
-- **Evidence:** pending; cite #167 source head and this branch's exact test head distinctly.
+- **Evidence on combined pre-fix tree `effadd7` plus two compatibility lines:** `git range-diff` maps all four #167 commits to `afd5318`, `630b76d`, `cc70ba6`, `effadd7`. Merge conflicts resolved by retaining current-master display labels and the foreground cap alongside sync config. `//tests:storage_test_sync_manager`, `//tests:storage_test_cli_mount`, `//tests:storage_test_mount_profiles`, `//tests:storage_test_fs_threading`, and `//:storage_build_srcs_check` passed on the combined tree. Full `//tests:storage_test_ssh_backend` first exposed a subclass that bypasses `StorageFS.__init__`; making the optional gate lookup tolerant restored its full 114-test pass. Exact-head all-gates, CLI build, council and lead review remain pending. Original #167's prior receipt is not this branch's evidence.
 - **Stop conditions:** changed product scope, interface collision that cannot be reconciled without a ruling, third unresolved failure.
 - **Escalation destination:** root coordinator at `%87`.
 - **Expected artifact:** this branch's commits and draft PR explicitly superseding #167 without silently closing it.

@@ -127,7 +127,7 @@ class StorageFS(Operations):
     def __call__(self, op, *args):
         # Every FUSE operation has a caller waiting on it: members with a
         # connection pool serve it from the channel kept for that.
-        gate = self._foreground_admission
+        gate = getattr(self, "_foreground_admission", None)
         kind = self._foreground_class(op)
         try:
             admission = (

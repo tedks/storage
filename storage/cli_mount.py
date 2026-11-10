@@ -262,8 +262,6 @@ def mount(
         resolved.member_specs, resolved.key_file,
         display_names=resolved.member_display_names,
     )
-    if resolved.workers < 0:
-        raise click.ClickException("workers must be non-negative")
     if resolved.max_sync_workers is not None:
         limit = sync_worker_ceiling(backends)
         if resolved.max_sync_workers > limit:
