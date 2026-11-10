@@ -58,3 +58,22 @@
 - evidence: Four #167 commits cherry-picked in order into this branch without touching its sibling. Conflicts in `fs.py`, `cli_mount.py`, and `mount_profiles.py` retained both cap interfaces and current-master display names. `UpdateHostKeys=no` remains in rsync and watcher. Five focused targets passed; full SSH module initially exposed the no-init probe subclass and passed after the optional gate lookup fix. No live member used.
 - limitation: Original #167 all-gates/council evidence does not transfer to this union tree. Exact pushed-head gates and fresh review required.
 - control: BUILD one-line source addition delivered to integration lead `%93` with submitted receipt. Root `%87` message still lacks a receipt after mixed input; do not count it delivered.
+
+## foreground-lead:7
+
+- kind: state-change
+- state: PR #171 draft, council round 1 findings; no gate acceptance
+- based_on: `1f96002449914088621964445880dcf16c889376`
+- refs: foreground-lead:6
+- evidence: Combined compatibility fix committed and pushed. Five focused Bazel targets and `//:storage_build_srcs_check` passed; exact-head `nix develop --command bazel build //:storage_cli` passed. Formal council opened on exact pushed head, with OpenAI one Important, Anthropic three Important plus nits, and Google empty due to usage limit. Outcome and findings posted to PR #171. No all-gates receipt.
+- repairs: pre-lock sync validation; metadata browse admission for `opendir`/`releasedir`; warm `open` progress under cold copies; shutdown cancellation contract. Nits to resolve or file follow-up per council rules.
+- authority: Root retains acceptance and merge. Fleet has not granted a runtime slot. Root `%87` received a later fresh submitted receipt for status and prep; integration `%93` remains consolidated-roster owner.
+
+## foreground-lead:8
+
+- kind: state-change
+- state: fixture source prep committed, runtime denied pending Fleet grant
+- based_on: `cf82398`
+- refs: foreground-lead:7
+- evidence: User correction withdrew private wrapper/client-3CPU proposal and authorized source-only fixture edit. Each of three `docker create` calls now carries literal 0.5 CPU, 512 MiB memory/no swap, 128 PID caps; flushed run, network and returned container IDs precede next operation. Existing exact-ID container teardown and exact-name network teardown retained. `git diff --check` passed. No Docker probe, image acquisition, container, FUSE or gate operation ran.
+- next: push coherent record, inform root and Fleet of new head, compact, then repair council findings. Later gates require a named grant, fresh admission and cached image/tooling preflight; image absence stops.
