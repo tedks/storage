@@ -64,3 +64,15 @@ log_events:
     Lane awaiting Ted''s naming-policy ruling in oq-member-name-conflict-suffix; no
     further product code change authorized until then. Follow-up nits: member-name-input-edge-cases,
     oq-remove-member-preserve-identity, reprobe-descriptive-name-typos.'
+- time: 2026-11-10T00:51:04-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Reworked PR #166 for Ted''s display-only naming ruling. Pushed 84bb8d6210ee03aaec6845c16fe63cd8becd2f0a:
+    optional {spec, name} profile entries label logs/diagnostics while legacy strings
+    and localN/remoteN routing, metadata and conflict suffixes remain unchanged. Full
+    scripts/run-gates.sh passed on exact SHA (8/8 Bazel targets; receipt .gates/<sha>.json).
+    Fresh OpenAI native review CLEAN; Anthropic Opus review CLEAN with four presentation
+    nits, dispositioned in display-name-ux-followups; Google seat EMPTY due usage
+    limit. Formal council helper remains unrecorded because local gh CLI authentication
+    returns HTTP 401; GitHub connector works. Awaiting restoration or equivalent record
+    decision before review clearance. No deploy or live storage inspection.'
