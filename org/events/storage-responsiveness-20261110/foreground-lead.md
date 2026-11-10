@@ -86,3 +86,13 @@
 - refs: foreground-lead:8
 - evidence: Direct sync limits validate before mount lock; directory handles classified metadata; cached opens classified demand, cold opens ordinary. Added synthetic saturation and direct-lock tests. Corrected shutdown contract to state libfuse joins/drains callbacks before `destroy` closes the admission gate; explicit gate close still cancels queued callbacks. Python AST parsing and `git diff --check` passed. No runtime tests, Docker probe or gates under absent Fleet grant.
 - next: push new head, formal council convergence on the pushed delta, then exact-head CLI/all-gates under named Fleet grant and fresh admission. Root receives independent review package after council.
+
+## foreground-lead:10
+
+- kind: state-change
+- state: formal convergence findings and second repair pushed; no gate acceptance
+- based_on: `22379e2`
+- refs: foreground-lead:9
+- evidence: Formal round at `96f5c3d` had OpenAI one new Important, Anthropic abandoned because head moved, Google empty. Formal round at `e53cb50` had OpenAI CLEAN and Anthropic one new Important: admission transfer waited while holding path/namespace locks, allowing a lock-slot cycle; Google empty. Round records and findings posted to PR #171. Latest repair drops outer locks before transfer, retries open and carries revalidation pin outside shared state during the wait; added lock-release and pin test. Python AST and diff checks passed; runtime tests/gates remain unrun under absent Fleet grant.
+- limit: at cap 3 a slow cached-open freshness stat may occupy the only protected demand slot until its member timeout; documented as a product tradeoff. Native libfuse thread count remains unbounded.
+- next: new formal council convergence and exact-head tests when Fleet grants a local cached-image slot; changed head invalidates earlier CLI build for acceptance.
