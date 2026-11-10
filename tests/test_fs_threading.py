@@ -20,7 +20,7 @@ from fuse import FuseOSError
 
 from storage.backends.local import LocalBackend
 from storage.backends.base import is_interactive_request
-from storage.fs import StorageFS
+from storage.fs import StorageFS, mount_storage
 from storage.models import SyncStatus
 
 WAIT = 5.0
@@ -228,6 +228,49 @@ class TestForegroundAdmission(ThreadingTestBase):
                 second.finish()
             self.assertTrue(second_entered.is_set())
             self.assertEqual(0, self.fs._foreground_admission.active_count)
+
+    def test_warm_open_and_directory_handles_progress_while_cold_open_waits(self):
+        (self.cache_dir / "warm").write_bytes(b"cached")
+        cold_entered = threading.Event()
+        cold_release = threading.Event()
+        warm_entered = threading.Event()
+
+        def opened(path, flags):
+            if path == "/cold":
+                cold_entered.set()
+                self.assertTrue(cold_release.wait(WAIT))
+            if path == "/warm":
+                warm_entered.set()
+            return path
+
+        with patch.object(self.fs, "open", side_effect=opened), \
+                patch.object(self.fs, "opendir", return_value=17, create=True), \
+                patch.object(self.fs, "releasedir", return_value=0, create=True):
+            cold = Worker(self.fs.__call__, "open", "/cold", os.O_RDONLY)
+            cold.start()
+            self.assertTrue(cold_entered.wait(WAIT))
+            try:
+                self.assertEqual(17, self.fs.__call__("opendir", "/", 0))
+                self.assertEqual(0, self.fs.__call__("releasedir", "/", 17))
+                self.assertEqual("/warm", self.fs.__call__("open", "/warm", os.O_RDONLY))
+                self.assertTrue(warm_entered.is_set())
+                self.assertLessEqual(self.fs._foreground_admission.peak_active, 3)
+            finally:
+                cold_release.set()
+                cold.finish()
+
+    def test_invalid_direct_sync_limit_fails_before_mount_lock(self):
+        for workers, maximum in ((-1, None), (2, 1), (1, 33)):
+            with self.subTest(workers=workers, maximum=maximum), \
+                    patch("storage.fs._acquire_mount_lock_ex") as acquire:
+                with self.assertRaises(ValueError):
+                    mount_storage(
+                        str(self.temp_dir / "mount"), self.cache_dir,
+                        self.temp_dir / "state.db", {"member": self.member},
+                        1024, allow_other=False, num_sync_workers=workers,
+                        max_sync_workers=maximum,
+                    )
+                acquire.assert_not_called()
 
     def test_class_reserves_fifo_and_queued_cancellation(self):
         from storage.foreground_admission import AdmissionClosed

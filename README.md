@@ -593,7 +593,7 @@ Implemented:
 - Remote inotify watchers that invalidate the cache when a member changes
 - TOML mount profiles with optional display names for members; numbered member IDs remain stable when labels change
 - A multithreaded FUSE loop (`fuse_threads`, off by default until field-tested), so a slow member call for one file does not hold up listings, stats and reads of others
-- Opt-in bounded active FUSE callback admission (`max_foreground_operations`, default 32 when `fuse_threads` is enabled), with protected metadata, demand-I/O and ordinary slots. Cold full-file cache copies use bulk SSH channel capacity while browsing and range reads retain interactive priority. The cap limits active Python callbacks, not libfuse 2's native thread count; waiting callbacks may still cause native thread growth.
+- Opt-in bounded active FUSE callback admission (`max_foreground_operations`, default 32 when `fuse_threads` is enabled), with protected metadata, demand-I/O and ordinary slots. Directory handles use metadata capacity; warm cached opens and range reads use demand capacity; cold full-file opens use ordinary capacity and bulk SSH channels. The cap limits active Python callbacks, not libfuse 2's native thread count; waiting callbacks may still cause native thread growth. Normal unmount can drain queued callbacks before libfuse calls `destroy`, so its duration still depends on member I/O timeouts.
 - Cache metadata xattrs, with `storage debug rebuild-index`, `reprobe-locations` and `verify-index`
 - File recomputation
 - Symbolic links: made through the mount, replicated to the members holding their target; links already on members show as links

@@ -38,7 +38,7 @@ from .foreground_admission import AdmissionClosed, ForegroundAdmission
 from .models import FileLocation, FileMetadata, StreamingKeepAfterClose, SyncStatus
 from .state import StateManager
 from .replication import ReplicationManager
-from .sync import SyncManager
+from .sync import SyncManager, sync_worker_ceiling
 from .sync_tasks import DirOperation
 from .recompute import RecomputeEngine
 from .checksum_queue import DEFAULT_CHECKSUM_REVERIFY_INTERVAL, MemberHashQueues
@@ -128,7 +128,7 @@ class StorageFS(Operations):
         # Every FUSE operation has a caller waiting on it: members with a
         # connection pool serve it from the channel kept for that.
         gate = getattr(self, "_foreground_admission", None)
-        kind = self._foreground_class(op)
+        kind = self._foreground_class(op, args) if gate is not None else "ordinary"
         try:
             admission = (
                 gate.admit(kind)
@@ -141,11 +141,15 @@ class StorageFS(Operations):
         except AdmissionClosed as exc:
             raise FuseOSError(errno.EINTR) from exc
 
-    @staticmethod
-    def _foreground_class(op: str) -> str:
-        if op in ("getattr", "readdir", "access", "readlink", "getxattr", "listxattr", "statfs"):
+    def _foreground_class(self, op: str, args: tuple) -> str:
+        if op in ("getattr", "opendir", "readdir", "releasedir", "access", "readlink",
+                  "getxattr", "listxattr", "statfs"):
             return "metadata"
         if op in ("read", "write", "flush", "fsync", "release"):
+            return "demand"
+        # An already cached open supplies the descriptor needed for a demand
+        # read. Cold full-file opens remain ordinary while copying bytes.
+        if op == "open" and args and self.cache_manager.is_cached(args[0]):
             return "demand"
         return "ordinary"
 
@@ -2105,7 +2109,7 @@ class StorageFS(Operations):
         """Read directory contents"""
         # Resolve while __call__ still marks this FUSE request interactive.
         # A generator would defer member I/O until after that context exited.
-        return self.namespace.readdir(path)
+        return list(self.namespace.readdir(path))
 
     def mkdir(self, path, mode):
         """Create a directory"""
@@ -3270,9 +3274,9 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
                  entry_timeout: Optional[float] = None,
                  negative_timeout: Optional[float] = None,
                  fuse_threads: bool = False,
-                 max_foreground_operations: Optional[int] = None,
                  checksum_reverify_interval: float = DEFAULT_CHECKSUM_REVERIFY_INTERVAL,
-                 max_sync_workers: Optional[int] = None):
+                 max_sync_workers: Optional[int] = None,
+                 max_foreground_operations: Optional[int] = None):
     """
     Mount a Storage filesystem
 
@@ -3328,6 +3332,16 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
             32 if max_foreground_operations is None else max_foreground_operations
         )
         ForegroundAdmission(max_foreground_operations)  # validate before mount lock
+
+    # Direct callers do not pass through cli_mount's validation. Keep an
+    # invalid sync limit from acquiring a persistent mount lock or PID.
+    if num_sync_workers < 0 or (max_sync_workers is not None
+                                and max_sync_workers < num_sync_workers):
+        raise ValueError("sync worker limits must satisfy 0 <= workers <= max_workers")
+    if max_sync_workers is not None:
+        ceiling = sync_worker_ceiling(backends)
+        if max_sync_workers > ceiling:
+            raise ValueError(f"max sync workers cannot exceed {ceiling}")
 
     # Before the mount lock, so a bad timeout fails without side effects.
     fuse_options = fuse_mount_options(

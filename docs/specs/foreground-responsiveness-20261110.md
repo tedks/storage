@@ -18,10 +18,14 @@ metadata, demand I/O, and remaining operations. It does not cap libfuse 2
 native threads: blocked callbacks can still cause libfuse to create more.
 The default foreground cap when opted in is 32, with one protected active
 slot for each class and the rest shared; a configured cap from 3 to 128 is
-allowed. At cap 3, each class has exactly one slot and progress still
+allowed. Directory handles and listing use the metadata slot; warm cached
+opens and reads use the demand slot; cold full-file opens use ordinary capacity.
+At cap 3, each class has exactly one slot and progress still
 depends on the active call finishing or its member timeout; admission does
-not interrupt it. Shutdown wakes queued callbacks but waits for active
-callbacks under libfuse's own unmount behavior. Sync may grow from its configured minimum up to a separately
+not interrupt it. Explicit gate close cancels queued callbacks. During a
+normal unmount libfuse joins handlers before calling `destroy`, so queued
+callbacks may drain before `destroy` closes the gate; unmount latency depends
+on active member operations and their timeouts. Sync may grow from its configured minimum up to a separately
 configured maximum, capped at 8 with SSH members or 32 local-only. Neither
 pool may silently expand without its configured limit.
 
