@@ -87,7 +87,7 @@
         packages.storage = storage;
 
         devShells.default = pkgs.mkShell {
-          JAVA_HOME = "${pkgs.jdk21_headless}";
+          JAVA_HOME = pkgs.jdk21_headless.home;
           packages = [
             pkgs.bazel_7
             # Bazel 7.6.0 needs a Java 21 runtime (class-file version 65).

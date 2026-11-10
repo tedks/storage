@@ -50,7 +50,7 @@ agent genuinely needs divergent instructions.
 
 ## Environment
 
-This repo uses a Nix flake (Bazel 7, JDK 11, Python 3.11). Run project
+This repo uses a Nix flake (Bazel 7, JDK 21, Python 3.11). Run project
 tooling through it:
 
 ```bash
