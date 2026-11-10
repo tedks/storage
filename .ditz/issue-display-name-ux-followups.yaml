@@ -1,0 +1,26 @@
+id: display-name-ux-followups
+title: Refine optional storage member display-name ergonomics
+desc: 'Follow-up from PR #166 council nits, not required for safe routing or metadata
+  compatibility.
+
+
+  Consider whether labels shaped like another member ID (for example remote1 displayed
+  on remote0) should warn or be rejected; the current UI always prints the real ID
+  in parentheses and routing uses only the ID. Consider allowing {spec = "..."} without
+  a name, trimming before the 80-character limit, and keeping numeric IDs as watcher
+  thread names while logging the display label separately. These are presentation
+  choices; preserve existing numbered backend IDs, conflict suffixes and persisted
+  locations. Inspect operator use and add narrow tests before changing validation.'
+type: task
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-10T00:50:54-00:00
+references: []
+log_events:
+- time: 2026-11-10T00:50:54-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
