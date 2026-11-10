@@ -1,0 +1,39 @@
+id: oq-conflict-fallback-limits
+title: 'Choose numeric limits for GH #74 bounded conflict-check fallback'
+desc: 'Ted''s 2026-11-10 ruling in closed oq-conflict-no-remote-hash permits a bounded
+  member-file download with local hashing when the remote hash is unavailable. It
+  did not choose numeric limits or an override policy. This question came from revising
+  draft PR #169, docs/performance_backlog_2026-11-10.md, package 5.
+
+
+  Proposed initial limits: 64 MiB actual downloaded bytes per member file, 60 seconds
+  wall time including slot wait, transfer and local hash, one active fallback per
+  mount and per member, at most one second waiting for the slot, and 1 MiB maximum
+  read chunks for deadline/cancel checks. Member stat above 64 MiB or unknown size,
+  observed growth past the byte limit, deadline/slot exhaustion, cancellation or hash
+  failure leaves the member explicitly unverified and blocks its upload. This default
+  intentionally cannot verify multi-gigabyte files on a member without remote hashing;
+  they remain DIRTY/ERROR until the member provides a remote digest or the limit changes.
+
+
+  Options: (A) accept these conservative defaults with no user override initially;
+  (B) choose larger byte/time values with the same hard bounds; (C) accept conservative
+  defaults but add a profile override with a documented maximum. Recommendation: A
+  for the first implementation, to cap background bandwidth and protect foreground
+  reads/browsing; revisit with synthetic measurements and a separate override design
+  if necessary. Decision owner: Ted. Blocks acceptance of gh-74-no-hash-policy and
+  GH #74 package 5. The existing policy ruling is already closed; this issue only
+  asks for numeric/override scope. No implementation is authorized here.'
+type: task
+component: open-questions
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-10T15:44:59-00:00
+references: []
+log_events:
+- time: 2026-11-10T15:44:59-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
