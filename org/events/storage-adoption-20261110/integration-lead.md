@@ -125,3 +125,50 @@
 - issue: `oq-streaming-fleet-keep-threshold`, filed and `ditz sync` succeeded.
   Ted chooses a higher byte or percentage threshold and rollout scope before
   profile edits. No live profile or host inspection was performed.
+
+## integration-lead:11
+
+- kind: lead-review
+- refs: integration-lead:9
+- based_on: `4ca26cd8b1a041a6308bf4b77fb847e3fea033e1`
+- package: A166
+- verdict: ACCEPTED. The exact SHA/tree all-gates receipt attests
+  `//:storage_tests_all_gates`; the assigned lane reported a CLI build on
+  this clean head. Formal helper `check 166 --expect-head 4ca26cd...`
+  returned `clean: true`, Anthropic and OpenAI CLEAN, Google EMPTY due usage
+  limit. Presentation nits are in `display-name-ux-followups`. The earlier
+  full-diff lead review remains clean on this unchanged head.
+
+## integration-lead:12
+
+- kind: state-change
+- refs: integration-lead:11
+- based_on: `4ca26cd8b1a041a6308bf4b77fb847e3fea033e1`
+- package: A166
+- state: INTEGRATED. `scripts/merge-gated.sh 166` exited 0 after checking
+  PR head, receipt and ancestry at master `38c3bdb...`. GitHub PR #166 is
+  MERGED at `81793ac27b70f82c231bf607b55e775d2b905974`; merged tree
+  `33a8d2b...` equals the gated source tree. PR acceptance comment posted;
+  `descriptive-remote-names` closed and `ditz sync` succeeded. No deploy.
+
+## integration-lead:13
+
+- kind: crystal-conflict
+- refs: integration-lead:12
+- based_on: `81793ac27b70f82c231bf607b55e775d2b905974`
+- package: A167
+- result: `git merge-tree --write-tree origin/master d61bdb...` reports
+  textual conflicts in `storage/cli_mount.py` and
+  `storage/mount_profiles.py`. #167 is held for Ted's scope ruling; no
+  rebasing, union gates, review refresh or merge is authorized here.
+
+## integration-lead:14
+
+- kind: state-change
+- refs: integration-lead:13
+- based_on: `e2d2e127e077e124038f0dc057021f6642c476d8`
+- package: performance audit peer
+- state: DONE/IDLE. Draft PR #169 contains five ranked proposals and
+  boundary tests only; no code changes, gates, acceptance or merge.
+  `oq-conflict-no-remote-hash` was filed and synced by that lane. No new
+  implementation authority was assigned by this integration lead.
