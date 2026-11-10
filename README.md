@@ -122,11 +122,21 @@ cache_size = "50G"
 key_file = "/home/user/.ssh/id_ed25519"
 foreground = true
 backends = [
-  "ssh://user@storage-host.example:/srv/raid/media/",
-  "ssh://user@storage-host.example:/srv/chunk0/media/",
-  "ssh://user@storage-host.example:/srv/chunk1/media/",
+  { spec = "ssh://user@storage-host.example:/srv/raid/media/", name = "RAID media" },
+  { spec = "ssh://user@storage-host.example:/srv/chunk0/media/", name = "Chunk 0 media" },
+  { spec = "ssh://user@storage-host.example:/srv/chunk1/media/", name = "Chunk 1 media" },
 ]
 ```
+
+Each backend can be a bare string, as before, or an inline table with `spec`
+and a human-readable `name`. The name appears with the stable member
+ID in mount output and selected diagnostics, for example `RAID media (remote0)`.
+Names must be non-empty printable text and unique within a profile ignoring
+case. They are display labels only: `remote0`/`local0` remain the keys for
+cache metadata, replication preferences, `storage conflicts --take`, and
+conflict filenames such as `photo.jpg.remote0`. Changing a display name does
+not rename a member or migrate indexed locations. As with bare entries,
+reordering members of the same type can change their numbered IDs.
 
 Save that as `~/.config/storage/storage.toml` to auto-load by name:
 
@@ -557,7 +567,7 @@ Implemented:
 - Background sync workers with retry; N-way replication configured per directory through xattrs
 - Conflict detection on sync, and `storage conflicts` to list and resolve conflicts (`--verify` to hash a directory's duplicates again first); a conflict view in listings that splits copies of different sizes from the listing alone and hashes equal-size copies in the background on the members, never by download, keeping hashes across remounts, recording what sync uploads and re-verifying recorded hashes slowly
 - Remote inotify watchers that invalidate the cache when a member changes
-- TOML mount profiles
+- TOML mount profiles with optional display names for members; numbered member IDs remain stable when labels change
 - A multithreaded FUSE loop (`fuse_threads`, off by default until field-tested), so a slow member call for one file does not hold up listings, stats and reads of others
 - Cache metadata xattrs, with `storage debug rebuild-index`, `reprobe-locations` and `verify-index`
 - File recomputation

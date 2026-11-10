@@ -22,6 +22,27 @@ class TestMountConfigCLI(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
+    def test_mount_profile_display_name_keeps_remote_identity(self):
+        profile = self.temp_dir / "storage.toml"
+        profile.write_text(f'''
+[mounts.named]
+mountpoint = "{self.temp_dir / "mount"}"
+cache = "{self.temp_dir / "cache"}"
+backends = [
+  {{ spec = "ssh://u@host.example:/one", name = "Archive" }},
+  {{ spec = "ssh://u@host.example:/two", name = "Second root" }},
+]
+''')
+        with patch("storage.cli_mount.mount_storage") as mock_mount, \
+             patch("storage.cli_mount.shared_filesystems", return_value=[]):
+            result = self.runner.invoke(main, ["mount", "--config", str(profile), "named"])
+        self.assertEqual(0, result.exit_code, result.output)
+        backends = mock_mount.call_args.args[3]
+        self.assertEqual(("remote0", "remote1"), tuple(backends))
+        self.assertEqual("Archive", backends["remote0"].display_name)
+        self.assertEqual("Second root (remote1)", backends["remote1"].label)
+        self.assertIn("Added SSH storage member: Archive (remote0)", result.output)
+
     def test_mount_uses_named_profile_from_toml_config(self):
         config_path = self.temp_dir / "storage.toml"
         config_path.write_text(
@@ -111,7 +132,7 @@ cache_size = "50G"
 workers = 2
 foreground = false
 backends = [
-  "ssh://user@storage-host.example:/srv/raid/media/",
+  {{ spec = "ssh://user@storage-host.example:/srv/raid/media/", name = "Original host" }},
 ]
 """.strip()
         )
@@ -146,6 +167,7 @@ backends = [
         self.assertEqual(["local0", "remote0"], sorted(args[3].keys()))
         self.assertEqual(local_backend.resolve(), args[3]["local0"].root_path)
         self.assertEqual("mirror.example", args[3]["remote0"].host)
+        self.assertIsNone(args[3]["remote0"].display_name)
         self.assertEqual("/srv/cache/media", str(args[3]["remote0"].remote_path))
         self.assertTrue(kwargs["foreground"])
         self.assertEqual(4, kwargs["num_sync_workers"])

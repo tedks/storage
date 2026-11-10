@@ -690,7 +690,7 @@ class StorageFS(Operations):
             names = [b[0] for b in backends_on_host]
             paths = [b[1] for b in backends_on_host]
             meta = host_meta[key]
-            label = ",".join(names)
+            label = ",".join(self.backends[name].label for name in names)
 
             watcher = RemoteWatcher(
                 backend_name=label,
@@ -1542,9 +1542,10 @@ class StorageFS(Operations):
         if backend_name in self._revalidate_outages:
             return
         self._revalidate_outages.add(backend_name)
+        backend = self.backends.get(backend_name)
         self.logger.warning(
             "Cannot revalidate cached files against %s (%s); serving cached copies",
-            backend_name, reason,
+            backend.label if backend is not None else backend_name, reason,
         )
 
     def _holders_still_unreachable(self, canonical_path: str) -> bool:
@@ -1700,7 +1701,7 @@ class StorageFS(Operations):
             # The member may have lost the file or its disk; the cached copy
             # may be the only one left, so it stays.
             self.logger.info("revalidate: %s no longer has %s; keeping the cached copy",
-                             backend.name, canonical_path)
+                             backend.label, canonical_path)
             self._store_member_check(canonical_path, cache_path, identity, {})
             return
         except Exception as exc:
@@ -1711,7 +1712,7 @@ class StorageFS(Operations):
             return
         if backend.name in self._revalidate_outages:
             self._revalidate_outages.discard(backend.name)
-            self.logger.info("Revalidating cached files against %s again", backend.name)
+            self.logger.info("Revalidating cached files against %s again", backend.label)
 
         observed = (member_stat.st_size, member_stat.st_mtime)
         baseline = members.get(backend.name)
@@ -1730,7 +1731,7 @@ class StorageFS(Operations):
                                      {backend.name: observed})
             return
 
-        self.logger.info("revalidate: %s changed on %s; refetching", canonical_path, backend.name)
+        self.logger.info("revalidate: %s changed on %s; refetching", canonical_path, backend.label)
         with self._member_checks_lock:
             # A recheck mark stays until this member supplies the bytes
             # (_clear_recheck): the invalidation below may be refused.

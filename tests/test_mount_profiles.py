@@ -19,6 +19,7 @@ from storage.mount_profiles import (
     resolve_mount_configuration,
     split_storage_member_specs,
 )
+from storage.pathing import resolve_path
 
 
 class TestParseSize(unittest.TestCase):
@@ -485,6 +486,56 @@ key_file = "/tmp/profile-key"
             self.assertIsInstance(backends["local0"], LocalBackend)
             self.assertIsInstance(backends["remote0"], SSHBackend)
             self.assertIsInstance(backends["local1"], LocalBackend)
+
+
+class TestMemberDisplayNames(unittest.TestCase):
+    def _profile(self, backends):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = Path(directory.name) / "storage.toml"
+        path.write_text('''
+[mounts.test]
+mountpoint = "/mnt/test"
+cache = "/tmp/cache"
+backends = [
+''' + backends + "\n]\n")
+        return path
+
+    def test_named_tables_preserve_numbered_backend_identities(self):
+        profile = self._profile('''
+  { spec = "ssh://alice@host:/one", name = "jpg" },
+  { spec = "/srv/fast", name = "Fast local" },
+  "ssh://bob@host:/two",
+  { spec = "ssh://carol@host:/three", name = "Archive" },''')
+        settings = _load_mount_profile_settings(profile, "test")
+        self.assertEqual(("/srv/fast",), settings["backing_paths"])
+        self.assertEqual(("ssh://alice@host:/one", "ssh://bob@host:/two", "ssh://carol@host:/three"), settings["remote"])
+        self.assertEqual(("Fast local",), settings["local_display_names"])
+        self.assertEqual(("jpg", None, "Archive"), settings["remote_display_names"])
+        resolved = resolve_member_configuration("test", profile, (), None, None)
+        self.assertEqual(("local0", "remote0", "remote1", "remote2"), resolved.member_names)
+        self.assertEqual(("Fast local", "jpg", None, "Archive"), resolved.member_display_names)
+        remote = create_storage_members(resolved.member_specs[1:], None, announce=False,
+                                        display_names=resolved.member_display_names[1:])
+        self.assertEqual(("remote0", "remote1", "remote2"), tuple(remote))
+        self.assertEqual("jpg (remote0)", remote["remote0"].label)
+        self.assertEqual("remote1", remote["remote1"].label)
+        self.assertEqual("jpg", remote["remote0"].get_info().display_name)
+        path = resolve_path("/photo.jpg", remote, lambda p: Path("/cache") / p.lstrip("/"))
+        self.assertEqual("/photo.jpg", path.canonical_path)
+        self.assertIsNone(path.backend_name)
+
+    def test_duplicate_and_invalid_labels_fail(self):
+        for entries in (
+            '{ spec = "ssh://u@h:/one", name = "Archive" }, { spec = "ssh://u@h:/two", name = "archive" },',
+            '{ spec = "ssh://u@h:/one", name = "  " },',
+            '{ spec = "ssh://u@h:/one", name = "bad\\nname" },',
+            '{ spec = "ssh://u@h:/one", name = "' + 'x' * 81 + '" },',
+            '{ spec = "ssh://u@h:/one", name = 7 },',
+            '{ spec = "ssh://u@h:/one" },',
+        ):
+            with self.subTest(entries=entries), self.assertRaises(click.ClickException):
+                _load_mount_profile_settings(self._profile(entries), "test")
 
 
 if __name__ == "__main__":

@@ -51,7 +51,7 @@ listing_max_stale = 3600
 # file checked longest ago (and over an hour ago). 0 turns it off.
 # checksum_reverify_interval = 60
 backends = [
-  "ssh://user@storage-host.example:/srv/raid/media/",
-  "ssh://user@storage-host.example:/srv/chunk0/media/",
-  "ssh://user@storage-host.example:/srv/chunk1/media/",
+  { spec = "ssh://user@storage-host.example:/srv/raid/media/", name = "RAID media" },
+  { spec = "ssh://user@storage-host.example:/srv/chunk0/media/", name = "Chunk 0 media" },
+  { spec = "ssh://user@storage-host.example:/srv/chunk1/media/", name = "Chunk 1 media" },
 ]

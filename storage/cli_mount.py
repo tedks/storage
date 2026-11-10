@@ -239,10 +239,13 @@ def mount(
     mountpoint_path = Path(resolved.mountpoint)
     mountpoint_path.mkdir(parents=True, exist_ok=True)
 
-    backends = create_storage_members(resolved.member_specs, resolved.key_file)
+    backends = create_storage_members(
+        resolved.member_specs, resolved.key_file,
+        display_names=resolved.member_display_names,
+    )
     for names in shared_filesystems(backends):
         click.echo(
-            f"Warning: members {', '.join(names)} store on the same filesystem; "
+            f"Warning: members {', '.join(backends[name].label for name in names)} store on the same filesystem; "
             "replicas on it do not protect against that filesystem failing.",
             err=True,
         )

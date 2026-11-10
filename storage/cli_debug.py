@@ -238,6 +238,7 @@ def debug_reprobe_locations(
         resolved.key_file,
         announce=not json_output,
         member_names=resolved.member_names,
+        display_names=resolved.member_display_names,
     )
 
     state_manager = _with_state_manager(database.resolve())
