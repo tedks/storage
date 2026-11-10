@@ -18,7 +18,10 @@ metadata, demand I/O, and remaining operations. It does not cap libfuse 2
 native threads: blocked callbacks can still cause libfuse to create more.
 The default foreground cap when opted in is 32, with one protected active
 slot for each class and the rest shared; a configured cap from 3 to 128 is
-allowed. Sync may grow from its configured minimum up to a separately
+allowed. At cap 3, each class has exactly one slot and progress still
+depends on the active call finishing or its member timeout; admission does
+not interrupt it. Shutdown wakes queued callbacks but waits for active
+callbacks under libfuse's own unmount behavior. Sync may grow from its configured minimum up to a separately
 configured maximum, capped at 8 with SSH members or 32 local-only. Neither
 pool may silently expand without its configured limit.
 
@@ -48,10 +51,13 @@ stop/restart; no task is dropped because worker growth or shutdown raced it.
 1. Tracer: an executable cold-open/listing classification test fails on the
    old head, then passes without changing bytes. It must expose deferred
    `readdir` generator execution as well as full-copy classification.
-2. Foreground gate: synthetic saturation proves metadata, demand read, and
-   ordinary work each progress; cap, FIFO within class, cancellation, close,
-   and no lost callback or leaked slot. Use FUSE callbacks directly, without
-   a manual mount. If native thread growth is observed, report it plainly.
+2. Foreground gate: a synthetic red test first shows cold opens occupying
+   callback capacity that browsing and demand reads need. Then saturation
+   proves metadata, demand read, and ordinary work each progress when a
+   class slot becomes free; cap, FIFO within class, cancellation, close,
+   and no lost callback or leaked slot. Assert exact bytes and unchanged
+   exceptions. Use FUSE callbacks directly, without a manual mount. Native
+   libfuse thread growth remains outside this test's claim.
 3. Sync demand growth: reuse #167's reviewed logic where compatible with
    current master. Prove cap, idle retirement, stop/restart, queue
    preservation and partial startup cleanup. Keep display labels separate
