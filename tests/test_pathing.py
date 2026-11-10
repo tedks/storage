@@ -39,11 +39,3 @@ class TestPathResolution(unittest.TestCase):
         self.assertEqual("/docs/readme.txt.remote9", resolved.canonical_path)
         self.assertIsNone(resolved.backend_name)
         self.assertEqual(Path("/cache-root/docs/readme.txt.remote9"), resolved.cache_path)
-
-    def test_named_member_conflict_suffix_resolves_to_stable_identity(self):
-        resolved = resolve_path(
-            "/videos/movie.mp4.archive-raid", ["archive-raid", "backup"], self._cache_path,
-        )
-        self.assertEqual("/videos/movie.mp4", resolved.canonical_path)
-        self.assertEqual("archive-raid", resolved.backend_name)
-        self.assertEqual(Path("/cache-root/videos/movie.mp4.archive-raid"), resolved.cache_path)

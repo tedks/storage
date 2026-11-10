@@ -413,10 +413,12 @@ class TestConfigurableTTL(TestCase):
             db = Path(tmp) / "state.db"
             be_root = Path(tmp) / "backend"
             be_root.mkdir()
+            member = WatchableLoopbackMember("member0", str(be_root))
+            member.display_name = "Archive"
             fs = StorageFS(
                 cache_root=cache,
                 state_db=db,
-                backends={"member0": WatchableLoopbackMember("member0", str(be_root))},
+                backends={"member0": member},
                 cache_size=1024 * 1024,
                 num_sync_workers=0,
                 start_sync=False,
@@ -428,7 +430,7 @@ class TestConfigurableTTL(TestCase):
                     fs._start_watchers()
                     watcher.start.assert_called_once()
                     _, kwargs = watcher_cls.call_args
-                    self.assertEqual("member0", kwargs["backend_name"])
+                    self.assertEqual("Archive (member0)", kwargs["backend_name"])
                     self.assertEqual("watch-host", kwargs["ssh_host"])
                     self.assertEqual(["/srv/data"], kwargs["remote_paths"])
             finally:

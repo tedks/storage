@@ -122,28 +122,21 @@ cache_size = "50G"
 key_file = "/home/user/.ssh/id_ed25519"
 foreground = true
 backends = [
-  "raid=ssh://user@storage-host.example:/srv/raid/media/",
-  "chunk0=ssh://user@storage-host.example:/srv/chunk0/media/",
-  "chunk1=ssh://user@storage-host.example:/srv/chunk1/media/",
+  { spec = "ssh://user@storage-host.example:/srv/raid/media/", name = "RAID media" },
+  { spec = "ssh://user@storage-host.example:/srv/chunk0/media/", name = "Chunk 0 media" },
+  { spec = "ssh://user@storage-host.example:/srv/chunk1/media/", name = "Chunk 1 media" },
 ]
 ```
 
-Each `NAME=SPEC` name is the member's persistent identity. It appears in
-status and logs, conflict filenames (for example `photo.jpg.raid`), and
-`storage conflicts --take NAME`; use the same name in any `storage debug
-reprobe-locations --member NAME=SPEC` command. Names are ASCII letters followed
-by letters, digits, `_` or `-`; `cache` is reserved. Names must be unique in a
-mount, including against automatically assigned names. Two roots on the same
-host need two distinct names. Choose names that describe the member, not its
-list position; reordering named members then keeps their identities.
-
-Existing bare entries keep their `local0`, `remote0`, etc. identities. Adding
-`NAME=` to an existing member changes its identity in the index and cached
-metadata; do not rename a member in an existing cache without a separate
-migration. Named members must follow bare members of the same type, so adding
-a named member cannot shift a bare member's number. Reordering bare entries
-can still change their identities. For a local relative path containing `=`,
-prefix it with `./` to keep it a bare path.
+Each backend can be a bare string, as before, or an inline table with `spec`
+and a human-readable `name`. The name appears with the stable member
+ID in mount output and selected diagnostics, for example `RAID media (remote0)`.
+Names must be non-empty printable text and unique within a profile ignoring
+case. They are display labels only: `remote0`/`local0` remain the keys for
+cache metadata, replication preferences, `storage conflicts --take`, and
+conflict filenames such as `photo.jpg.remote0`. Changing a display name does
+not rename a member or migrate indexed locations. As with bare entries,
+reordering members of the same type can change their numbered IDs.
 
 Save that as `~/.config/storage/storage.toml` to auto-load by name:
 
@@ -574,7 +567,7 @@ Implemented:
 - Background sync workers with retry; N-way replication configured per directory through xattrs
 - Conflict detection on sync, and `storage conflicts` to list and resolve conflicts (`--verify` to hash a directory's duplicates again first); a conflict view in listings that splits copies of different sizes from the listing alone and hashes equal-size copies in the background on the members, never by download, keeping hashes across remounts, recording what sync uploads and re-verifying recorded hashes slowly
 - Remote inotify watchers that invalidate the cache when a member changes
-- TOML mount profiles
+- TOML mount profiles with optional display names for members; numbered member IDs remain stable when labels change
 - A multithreaded FUSE loop (`fuse_threads`, off by default until field-tested), so a slow member call for one file does not hold up listings, stats and reads of others
 - Cache metadata xattrs, with `storage debug rebuild-index`, `reprobe-locations` and `verify-index`
 - File recomputation

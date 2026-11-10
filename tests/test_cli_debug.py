@@ -1502,7 +1502,7 @@ class TestDebugIndexCLI(unittest.TestCase):
         )
 
         self.assertNotEqual(result.exit_code, 0)
-        self.assertIn("exceeds configured local member count", result.output)
+        self.assertIn("canonical mounted identity set", result.output)
 
         state_manager = StateManager(str(self.db_path))
         try:

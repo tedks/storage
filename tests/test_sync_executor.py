@@ -49,6 +49,7 @@ def _make_mock_backend(name="test0"):
     """Create a MagicMock backend with spec=Backend and sensible defaults."""
     backend = MagicMock(spec=Backend)
     backend.name = name
+    backend.label = name
     backend.is_available.return_value = True
     backend.speed_priority = 0
     backend.copy_from_local = MagicMock()
@@ -356,11 +357,13 @@ class TestSyncExecutorFileTask(_ExecutorTestBase):
 
     def test_sync_success_marks_clean(self):
         """DIRTY file synced to backend -> status becomes CLEAN, location recorded."""
+        self.mock_backend.label = "Archive (test0)"
         meta = _make_metadata(sync_status=SyncStatus.DIRTY)
         self.state_manager.set_file_metadata(meta)
         self._create_cache_file()
 
-        with patch.object(self.executor.conflict_detector, "check_conflict", return_value=None):
+        with patch.object(self.executor.conflict_detector, "check_conflict", return_value=None), \
+             patch("storage.sync_executor.logger") as logger:
             task = SyncTask("/test.txt")
             result = self.executor.process_file_task(task)
 
@@ -372,6 +375,7 @@ class TestSyncExecutorFileTask(_ExecutorTestBase):
         locations = self.state_manager.get_file_locations("/test.txt")
         backend_names = {loc.backend_name for loc in locations}
         self.assertIn("test0", backend_names)
+        logger.debug.assert_any_call("Synced %s to %s", "/test.txt", "Archive (test0)")
 
         self.mock_backend.copy_from_local.assert_called_once()
 

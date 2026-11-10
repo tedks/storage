@@ -19,6 +19,7 @@ from storage.mount_profiles import (
     resolve_mount_configuration,
     split_storage_member_specs,
 )
+from storage.pathing import resolve_path
 
 
 class TestParseSize(unittest.TestCase):
@@ -70,14 +71,6 @@ class TestSplitStorageMemberSpecs(unittest.TestCase):
         local, remote = split_storage_member_specs(specs)
         self.assertEqual(("/local/one", "/local/two"), local)
         self.assertEqual(("ssh://user@host:/remote", "rsync://user@host2:/other"), remote)
-
-    def test_named_remote_specs_split(self):
-        local, remote = split_storage_member_specs([
-            "ssd=/srv/data", "archive=ssh://user@host:/remote",
-            "backup=rsync://user@host:/backup",
-        ])
-        self.assertEqual(("ssd=/srv/data",), local)
-        self.assertEqual(("archive=ssh://user@host:/remote", "backup=rsync://user@host:/backup"), remote)
 
 
 class TestOptionalProfileFloat(unittest.TestCase):
@@ -463,85 +456,15 @@ key_file = "/tmp/profile-key"
                 cache_root=Path("/tmp/cache"),
             )
 
-    def test_explicit_members_accept_stable_names(self):
-        resolved = resolve_member_configuration(
-            profile_name=None,
-            config_path=None,
-            member_specs=["archive=ssh://user@host:/srv/archive", "fast=/srv/data"],
-            key_file=None,
-            cache_root=Path("/tmp/cache"),
-        )
-        self.assertEqual(("archive", "fast"), resolved.member_names)
-
-    def test_explicit_members_reject_numbered_name_beyond_member_count(self):
+    def test_explicit_members_reject_noncanonical_name_gaps(self):
         with self.assertRaises(click.ClickException):
             resolve_member_configuration(
-                profile_name=None, config_path=None,
-                member_specs=["local1=/srv/data"], key_file=None,
+                profile_name=None,
+                config_path=None,
+                member_specs=["local1=/srv/data"],
+                key_file=None,
                 cache_root=Path("/tmp/cache"),
             )
-
-    def test_profile_and_reprobe_use_same_named_identities(self):
-        with tempfile.TemporaryDirectory() as directory:
-            profile = Path(directory) / "storage.toml"
-            profile.write_text('''
-[mounts.test]
-mountpoint = "/mnt/test"
-cache = "/tmp/cache"
-backends = ["fast=/srv/fast", "archive=ssh://user@host:/srv/a", "backup=ssh://user@host:/srv/b"]
-''')
-            mount = resolve_mount_configuration(
-                mount_target="test", backing_paths=(), config_path=profile,
-                cache=None, cache_size=None, database=None, workers=None,
-                remote=(), key_file=None, foreground=None, allow_other=None,
-                debug=None, streaming_reads=None, streaming_chunk_size=None,
-                max_streaming_sessions=None, readdir_ttl=None,
-                enable_watchers=None,
-            )
-            reprobe = resolve_member_configuration("test", profile, (), None, None)
-        self.assertEqual(("fast", "archive", "backup"), mount.member_names)
-        self.assertEqual(mount.member_names, reprobe.member_names)
-        self.assertEqual(mount.member_specs, reprobe.member_specs)
-
-    def test_names_do_not_depend_on_remote_order_or_userinfo(self):
-        first = ["a=ssh://alice@host:/one", "b=ssh://bob@host:/two"]
-        second = list(reversed(first))
-        a = create_storage_members(first, None, announce=False)
-        b = create_storage_members(second, None, announce=False)
-        self.assertEqual({"a": "/one", "b": "/two"}, {n: str(v.remote_path) for n, v in a.items()})
-        self.assertEqual({n: str(v.remote_path) for n, v in a.items()},
-                         {n: str(v.remote_path) for n, v in b.items()})
-
-    def test_named_member_cannot_shift_legacy_ordinals(self):
-        with self.assertRaisesRegex(click.ClickException, "shift existing numbered identities"):
-            create_storage_members([
-                "new=ssh://user@host:/new", "ssh://user@host:/old",
-            ], None, announce=False)
-        backends = create_storage_members([
-            "ssh://user@host:/old", "new=ssh://user@host:/new",
-        ], None, announce=False)
-        self.assertEqual(("remote0", "new"), tuple(backends))
-
-    def test_invalid_names_and_collisions_fail(self):
-        cases = (
-            ["a=ssh://user@host:/one", "a=ssh://user@host:/two"],
-            ["ssh://user@host:/one", "remote0=ssh://user@host:/two"],
-            ["cache=/srv/data"],
-            ["bad.name=ssh://user@host:/one"],
-            ["bad/name=ssh://user@host:/one"],
-            ["remote0=/srv/data"],
-            ["local0=ssh://user@host:/one"],
-        )
-        for specs in cases:
-            with self.subTest(specs=specs), self.assertRaises(click.ClickException):
-                create_storage_members(specs, None, announce=False)
-
-    def test_legacy_relative_path_with_equals_remains_a_path(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory) / "dir=one"
-            root.mkdir()
-            backends = create_storage_members([str(root)], None, announce=False)
-        self.assertEqual(("local0",), tuple(backends))
 
     def test_create_storage_members_handles_interleaved_specs_without_name_mismatch(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -563,6 +486,56 @@ backends = ["fast=/srv/fast", "archive=ssh://user@host:/srv/a", "backup=ssh://us
             self.assertIsInstance(backends["local0"], LocalBackend)
             self.assertIsInstance(backends["remote0"], SSHBackend)
             self.assertIsInstance(backends["local1"], LocalBackend)
+
+
+class TestMemberDisplayNames(unittest.TestCase):
+    def _profile(self, backends):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = Path(directory.name) / "storage.toml"
+        path.write_text('''
+[mounts.test]
+mountpoint = "/mnt/test"
+cache = "/tmp/cache"
+backends = [
+''' + backends + "\n]\n")
+        return path
+
+    def test_named_tables_preserve_numbered_backend_identities(self):
+        profile = self._profile('''
+  { spec = "ssh://alice@host:/one", name = "jpg" },
+  { spec = "/srv/fast", name = "Fast local" },
+  "ssh://bob@host:/two",
+  { spec = "ssh://carol@host:/three", name = "Archive" },''')
+        settings = _load_mount_profile_settings(profile, "test")
+        self.assertEqual(("/srv/fast",), settings["backing_paths"])
+        self.assertEqual(("ssh://alice@host:/one", "ssh://bob@host:/two", "ssh://carol@host:/three"), settings["remote"])
+        self.assertEqual(("Fast local",), settings["local_display_names"])
+        self.assertEqual(("jpg", None, "Archive"), settings["remote_display_names"])
+        resolved = resolve_member_configuration("test", profile, (), None, None)
+        self.assertEqual(("local0", "remote0", "remote1", "remote2"), resolved.member_names)
+        self.assertEqual(("Fast local", "jpg", None, "Archive"), resolved.member_display_names)
+        remote = create_storage_members(resolved.member_specs[1:], None, announce=False,
+                                        display_names=resolved.member_display_names[1:])
+        self.assertEqual(("remote0", "remote1", "remote2"), tuple(remote))
+        self.assertEqual("jpg (remote0)", remote["remote0"].label)
+        self.assertEqual("remote1", remote["remote1"].label)
+        self.assertEqual("jpg", remote["remote0"].get_info().display_name)
+        path = resolve_path("/photo.jpg", remote, lambda p: Path("/cache") / p.lstrip("/"))
+        self.assertEqual("/photo.jpg", path.canonical_path)
+        self.assertIsNone(path.backend_name)
+
+    def test_duplicate_and_invalid_labels_fail(self):
+        for entries in (
+            '{ spec = "ssh://u@h:/one", name = "Archive" }, { spec = "ssh://u@h:/two", name = "archive" },',
+            '{ spec = "ssh://u@h:/one", name = "  " },',
+            '{ spec = "ssh://u@h:/one", name = "bad\\nname" },',
+            '{ spec = "ssh://u@h:/one", name = "' + 'x' * 81 + '" },',
+            '{ spec = "ssh://u@h:/one", name = 7 },',
+            '{ spec = "ssh://u@h:/one" },',
+        ):
+            with self.subTest(entries=entries), self.assertRaises(click.ClickException):
+                _load_mount_profile_settings(self._profile(entries), "test")
 
 
 if __name__ == "__main__":
