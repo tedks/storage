@@ -24,3 +24,21 @@ log_events:
   who: Ted Smith
   what: created
   comment: ""
+- time: 2026-11-10T08:27:48-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Rebased PR #166 formal Anthropic council at 4ca26cd found eight nonblocking
+    presentation/maintenance nits. This follow-up owns them after merge: (1) decide
+    whether empty member_display_names defaults should mean absent when manually constructing
+    resolved configs; (2) warn/reject ID-looking labels and punctuation that makes
+    comma-joined watcher labels ambiguous, subject to operator UX ruling; (3) validate
+    trimmed label length; (4) add targeted tests for local-only CLI override, labelled
+    debug reprobe and direct create_storage_members invalid/duplicate labels; (5)
+    consider defensive label fallback for non-Backend test doubles in sync executor;
+    (6) make README reordering warning explicit; (7) deduplicate the remote-spec classifier
+    only if touching those paths; (8) update watcher.py backend_name docstring example.
+    No routing or metadata defect was found. The classifier''s current four uses are
+    equivalent, and watcher backend_name enters logs/thread names only, never SSH
+    commands or paths; those two initially unverified points were checked against
+    immutable source and resolved CLEAN by the same Anthropic seat. Do not change
+    numbered backend identities or suffixes.'
