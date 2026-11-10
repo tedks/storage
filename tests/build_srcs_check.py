@@ -11,7 +11,13 @@ import sys
 
 def main() -> int:
     with open(sys.argv[1]) as query_output:
-        listed = {line.strip().removeprefix("//:") for line in query_output if line.strip()}
+        listed = set()
+        for line in query_output:
+            label = line.strip()
+            if not label.startswith("//"):
+                continue
+            package, target = label[2:].split(":", 1)
+            listed.add(os.path.join(package, target) if package else target)
 
     # MODULE.bazel is a runfile symlinked from the source tree.
     root = os.path.dirname(os.path.realpath("MODULE.bazel"))

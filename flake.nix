@@ -1,13 +1,15 @@
 {
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    nixpkgs-fuse2.url = "github:NixOS/nixpkgs/nixos-23.05";
     flake-utils.url = "github:numtide/flake-utils";
   };
 
-  outputs = { self, nixpkgs, flake-utils }:
+  outputs = { self, nixpkgs, nixpkgs-fuse2, flake-utils }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import nixpkgs { inherit system; };
+        fuse2 = (import nixpkgs-fuse2 { inherit system; }).fuse;
         python = pkgs.python311;
 
         # fusepy loads libfuse 2 (libfuse.so.2), which many hosts no longer
@@ -34,7 +36,7 @@
         libfuse2Hook = pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
           case "$(/sbin/ldconfig -p 2>/dev/null)" in
             *"libfuse.so.2 (${ldconfigAbi}"*) ;;
-            *) export FUSE_LIBRARY_PATH="''${FUSE_LIBRARY_PATH:-${pkgs.fuse2.out}/lib/libfuse.so.2}" ;;
+            *) export FUSE_LIBRARY_PATH="''${FUSE_LIBRARY_PATH:-${fuse2.out}/lib/libfuse.so.2}" ;;
           esac
           echo "  libfuse2:  ''${FUSE_LIBRARY_PATH:-host, via find_library}"
         '';
