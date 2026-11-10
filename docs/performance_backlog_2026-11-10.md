@@ -1,6 +1,6 @@
 # Performance and correctness backlog audit, 2026-11-10
 
-**State:** DRAFT proposals for integration triage; no implementation lane or review gate is claimed here.
+**State:** audit DONE; proposals DRAFT for integration triage. The audit lane is IDLE pending a new bounded assignment. No implementation lane or review gate is claimed here.
 **Pinned source:** `a7467c6862b08588df0fb451e4e3eac89e87394b` (`master`).
 **Audit owner:** storage performance audit lead, `storage:perf-audit-sol`, pane `%94`, branch `docs/perf-triage-20261110`.
 **Boundary:** source, tests and ditz/GitHub issues only. No live mount, backing directory, remote host, real cache or profile was inspected; no performance measurement was run.
