@@ -77,3 +77,12 @@
 - refs: foreground-lead:7
 - evidence: User correction withdrew private wrapper/client-3CPU proposal and authorized source-only fixture edit. Each of three `docker create` calls now carries literal 0.5 CPU, 512 MiB memory/no swap, 128 PID caps; flushed run, network and returned container IDs precede next operation. Existing exact-ID container teardown and exact-name network teardown retained. `git diff --check` passed. No Docker probe, image acquisition, container, FUSE or gate operation ran.
 - next: push coherent record, inform root and Fleet of new head, compact, then repair council findings. Later gates require a named grant, fresh admission and cached image/tooling preflight; image absence stops.
+
+## foreground-lead:9
+
+- kind: state-change
+- state: council repairs coded, source review pending
+- based_on: `05401f8`
+- refs: foreground-lead:8
+- evidence: Direct sync limits validate before mount lock; directory handles classified metadata; cached opens classified demand, cold opens ordinary. Added synthetic saturation and direct-lock tests. Corrected shutdown contract to state libfuse joins/drains callbacks before `destroy` closes the admission gate; explicit gate close still cancels queued callbacks. Python AST parsing and `git diff --check` passed. No runtime tests, Docker probe or gates under absent Fleet grant.
+- next: push new head, formal council convergence on the pushed delta, then exact-head CLI/all-gates under named Fleet grant and fresh admission. Root receives independent review package after council.
