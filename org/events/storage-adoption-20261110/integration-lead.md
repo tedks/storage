@@ -89,3 +89,39 @@
   exact-head gates and renewed formal review before the scripted merge.
   The lead requested branch repair authority or reassignment from the parent
   over `tmux-message`, with a submitted receipt; no source branch edit yet.
+
+## integration-lead:8
+
+- kind: state-change
+- refs: integration-lead:7
+- based_on: `4ca26cd8b1a041a6308bf4b77fb847e3fea033e1`
+- package: A166
+- state: REVIEWING. Parent assigned prior native Sol lane as sole rebase,
+  gates and council owner. It rebased/pushed to this head over #165's merge
+  commit `38c3bdb...`; five commits are patch-equivalent by `git range-diff`.
+  GitHub reports this exact head and base. No duplicate repair lane spawned.
+
+## integration-lead:9
+
+- kind: lead-review
+- refs: integration-lead:8
+- based_on: `4ca26cd8b1a041a6308bf4b77fb847e3fea033e1`
+- package: A166
+- verdict: CLEAN on the full `38c3bdb..4ca26cd` diff. Optional
+  `{spec, name}` parsing retains local/remote ordinal IDs; the labels flow
+  only into mount output, diagnostics and `BackendInfo.display_name`.
+  Persistence, policies, conflict suffixes, and watcher callback paths still
+  use numbered identities. Synthetic tests cover mixed profile forms,
+  duplicate/invalid labels, legacy CLI overrides, conflict routing, watcher
+  labels, and stable sync location keys. `git diff --check` passed.
+- limitation: No new-head gates or formal council verdict yet. CLEAN lead
+  review alone is not acceptance. Re-review any subsequent fix delta.
+
+## integration-lead:10
+
+- kind: interpretation-filed
+- refs: integration-lead:9
+- based_on: `4ca26cd8b1a041a6308bf4b77fb847e3fea033e1`
+- issue: `oq-streaming-fleet-keep-threshold`, filed and `ditz sync` succeeded.
+  Ted chooses a higher byte or percentage threshold and rollout scope before
+  profile edits. No live profile or host inspection was performed.
