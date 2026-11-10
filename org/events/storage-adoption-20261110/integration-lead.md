@@ -184,3 +184,47 @@
   The consolidated record is on draft PR #168 for parent review. No new
   implementation package is assigned; no mission-owned process or lease
   remains. Open product questions are in ditz, not solely this handoff.
+
+## integration-lead:16
+
+- kind: state-change
+- refs: integration-lead:15
+- based_on: `b080975285001d6860e88e0a916b8c6223222f5c`
+- state: STARTED bounded ruling/status record update on draft PR #168,
+  assigned by parent. No implementation or live-system work is in scope.
+
+## integration-lead:17
+
+- kind: interpretation-filed
+- refs: integration-lead:16
+- based_on: `81793ac27b70f82c231bf607b55e775d2b905974`
+- rulings: Verified in ditz: `oq-dynamic-workers-scope` closed with
+  foreground reads/browsing in scope, so #167 background-only is incomplete;
+  `oq-conflict-no-remote-hash` closed with bounded download fallback and
+  local hash allowed, but bounds/failures still need implementation;
+  `oq-streaming-fleet-keep-threshold` commented with fleetwide scope while
+  the numeric threshold remains open. No branch acceptance follows from
+  these policy decisions.
+
+## integration-lead:18
+
+- kind: state-change
+- refs: integration-lead:17
+- based_on: `81793ac27b70f82c231bf607b55e775d2b905974`
+- state: Parent assigned a separate Sol responsiveness lead in
+  `foreground-responsiveness-20261110`; worktree observed at `66c640a`.
+  This lane made no sibling edits. Parent also relayed that splinter1's
+  installed/running `pq8kn2` rsync, watcher and mount-profile hashes match
+  `a7467c6` and differ from `81793ac`; #165/#166 are not rolled out there.
+  That host observation was not independently repeated by this lane. PR #170
+  remains under onboarding-root incident remediation without waiver or
+  acceptance. No merge, deployment or live inspection was performed here.
+
+## integration-lead:19
+
+- kind: state-change
+- refs: integration-lead:18
+- based_on: `81793ac27b70f82c231bf607b55e775d2b905974`
+- state: DONE/IDLE for the bounded roster/ledger update. No new integration
+  or implementation assignment is held. Draft PR #168 remains the reviewable
+  record; the parent owns future assignments and any acceptance decisions.
