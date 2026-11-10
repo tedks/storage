@@ -36,7 +36,7 @@ storage_test("links")
 storage_test("local_backend", tags = ["no-remote"])
 storage_test("locks")
 storage_test("member_capabilities")
-storage_test("merge_gated", data = ["//:scripts/merge-gated.sh"])
+storage_test("merge_gated", data = ["//:scripts/merge-gated.sh", "//:scripts/run-gates.sh"])
 storage_test("models")
 storage_test("mount_lock")
 storage_test("mount_profiles")
@@ -47,10 +47,18 @@ storage_test("recompute")
 storage_test(
     "remote_system",
     target = "storage_tests_remote_system",
+    extra_srcs = ["fuse_mount.py"],
     data = [
         "remote/Dockerfile",
         "remote/entrypoint.sh",
         "remote/sshd_config",
+    ],
+    env_inherit = [
+        "DOCKER_CONFIG",
+        "DOCKER_CONTEXT",
+        "DOCKER_HOST",
+        "FUSE_LIBRARY_PATH",
+        "STORAGE_TEST_REMOTE_PUBLISHED",
     ],
     tags = ["local", "manual"],
     timeout = "long",
@@ -77,7 +85,7 @@ storage_test(
 storage_test("sync_dir_ops")
 storage_test("sync_executor")
 storage_test("sync_manager")
-storage_test("sync_races", extra_srcs = ["test_fs_threading.py"])
+storage_test("sync_races", data = ["test_fs_threading.py"])
 storage_test(
     "sync_system",
     target = "storage_tests_sync_system",

@@ -36,7 +36,7 @@ def main() -> int:
 
     missing = sorted(on_disk - listed)
     for path in missing:
-        print(f"{path} is not in a gate's py_test or storage_lib in BUILD", file=sys.stderr)
+        print(f"{path} is not included by a storage source library or test gate in BUILD", file=sys.stderr)
     return 1 if missing else 0
 
 

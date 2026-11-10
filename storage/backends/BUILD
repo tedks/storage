@@ -14,6 +14,7 @@ py_library(
         "ssh_pool.py",
     ],
     deps = [
+        "//storage:storage_core",
         "@pypi//paramiko",
         "@pypi//xxhash",
     ],

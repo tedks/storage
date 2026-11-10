@@ -52,7 +52,7 @@ py_test(
         ":MODULE.bazel",
         ":build_srcs",
     ],
-    main = "tests/build_srcs_check.py",
+    main = "//tests:build_srcs_check.py",
     tags = ["external", "local"],
 )
 
@@ -103,9 +103,10 @@ test_suite(
 # The check sees sources under the nonmounting, mounted, and remote gates.
 genquery(
     name = "build_srcs",
-    expression = "labels(srcs, tests(//:storage_tests_nonmounting) + //tests:storage_tests_resilience_gradient + //tests:storage_tests_conflicts_integration + //tests:storage_tests_fuse_thread_state + //tests:storage_tests_streaming_system + //tests:storage_tests_sync_system + //tests:storage_tests_remote_system + //storage:storage_lib + //storage/backends:storage_backends)",
+    expression = "labels(srcs, tests(//:storage_tests_nonmounting) + //tests:storage_tests_resilience_gradient + //tests:storage_tests_conflicts_integration + //tests:storage_tests_fuse_thread_state + //tests:storage_tests_streaming_system + //tests:storage_tests_sync_system + //tests:storage_tests_remote_system + //storage:storage_lib + //storage:storage_core + //storage/backends:storage_backends)",
     scope = [
         "//storage:storage_lib",
+        "//storage:storage_core",
         "//storage/backends:storage_backends",
         ":storage_tests_nonmounting",
         "//tests:storage_tests_resilience_gradient",

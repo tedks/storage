@@ -7,18 +7,15 @@ package(default_visibility = ["//visibility:public"])
 py_library(
     name = "storage_lib",
     srcs = [
-        "__init__.py",
         "cache.py",
         "cache_metadata.py",
         "checksum_queue.py",
-        "checksums.py",
         "cli.py",
         "cli_conflicts.py",
         "cli_debug.py",
         "cli_mount.py",
         "conflicts.py",
         "crypto.py",
-        "file_config.py",
         "fs.py",
         "index_audit.py",
         "links.py",
@@ -38,10 +35,22 @@ py_library(
         "watcher.py",
     ],
     deps = [
+        ":storage_core",
         "//storage/backends:storage_backends",
         "@pypi//click",
         "@pypi//cryptography",
         "@pypi//fusepy",
+    ],
+)
+
+py_library(
+    name = "storage_core",
+    srcs = [
+        "__init__.py",
+        "checksums.py",
+        "file_config.py",
+    ],
+    deps = [
         "@pypi//pyyaml",
         "@pypi//xxhash",
     ],

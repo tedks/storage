@@ -6,7 +6,7 @@ TEST_DEPS = [
     "@pypi//pytest_timeout",
 ]
 
-def storage_test(module, target = None, tags = [], extra_srcs = [], data = [], timeout = "moderate"):
+def storage_test(module, target = None, tags = [], extra_srcs = [], data = [], env_inherit = ["FUSE_LIBRARY_PATH"], timeout = "moderate"):
     name = target or "storage_test_" + module
     py_test(
         name = name,
@@ -17,6 +17,6 @@ def storage_test(module, target = None, tags = [], extra_srcs = [], data = [], t
         timeout = timeout,
         deps = TEST_DEPS,
         data = data,
-        env_inherit = ["FUSE_LIBRARY_PATH"],
+        env_inherit = env_inherit,
         tags = tags,
     )
