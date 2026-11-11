@@ -517,11 +517,47 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.assertEqual(len(payload), row.size)
         self.assertEqual(SyncStatus.CLEAN, row.sync_status)
 
-    def test_full_fetch_no_replace_rejects_prefix_winning_its_link(self):
-        # Primitive collision retained even though a failed close now skips
-        # promotion when a FUSE full copy owns the same path lock.
+    def _assert_full_open_recovers_prefix_link_collision(self, path):
         from storage.cache_metadata import PREFIX_XATTR
-        path = '/prefix-link.bin'
+        payload = os.urandom(64 * 1024)
+        (self.backend_dir / path.lstrip('/')).write_bytes(payload)
+        final = self.cache_dir / path.lstrip('/')
+        real_link = os.link
+        injected = False
+
+        def prefix_wins(src, dst, *args, **kwargs):
+            nonlocal injected
+            if str(dst) == str(final) and not injected:
+                injected = True
+                final.write_bytes(payload[:4096])
+                os.setxattr(str(final), PREFIX_XATTR, b'1')
+            return real_link(src, dst, *args, **kwargs)
+
+        # O_WRONLY takes the production full-copy path even with streaming on.
+        # The first link loses to the marked prefix; the open must remove it
+        # and fetch again without help from this fixture.
+        with patch('storage.cache.os.link', side_effect=prefix_wins):
+            fd = self.fs.open(path, os.O_WRONLY)
+        self.fs.release(path, fd)
+        self.assertTrue(injected)
+        self.assertEqual(payload, final.read_bytes())
+        row = self.fs.state_manager.get_file_metadata(path)
+        self.assertEqual(len(payload), row.size)
+        self.assertEqual(SyncStatus.CLEAN, row.sync_status)
+
+    def test_full_fetch_no_replace_rejects_prefix_winning_its_link(self):
+        self._assert_full_open_recovers_prefix_link_collision('/prefix-link.bin')
+
+    def test_full_fetch_prefix_retry_mutation_control(self):
+        # Disabling the production loser-prefix drop/retry makes the same
+        # full-open byte assertion fail on the first-link collision.
+        with patch.object(self.fs, '_drop_unindexed_prefix', return_value=False):
+            with self.assertRaises(AssertionError):
+                self._assert_full_open_recovers_prefix_link_collision('/mutant-prefix-link.bin')
+
+    def test_cache_file_no_replace_keeps_prefix_winner_unindexed(self):
+        from storage.cache_metadata import PREFIX_XATTR
+        path = '/primitive-prefix-link.bin'
         payload = os.urandom(64 * 1024)
         (self.backend_dir / path.lstrip('/')).write_bytes(payload)
         final = self.cache_dir / path.lstrip('/')
@@ -543,10 +579,6 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.assertFalse(installed)
         self.assertEqual(payload[:4096], final.read_bytes())
         self.assertIsNone(self.fs.state_manager.get_file_metadata(path))
-        self.assertTrue(self.fs._drop_unindexed_prefix(path, final))
-        self.assertTrue(self.fs._ensure_file_in_cache(self.fs._resolve_path(path)))
-        self.assertEqual(payload, final.read_bytes())
-        self.assertEqual(len(payload), self.fs.state_manager.get_file_metadata(path).size)
 
     def test_a_member_file_carrying_the_prefix_marker_is_fetched_whole_and_indexed(self):
         # Council round 2 on #146: a member file may carry the marker (an
