@@ -623,36 +623,32 @@ class TestRevalidateTwoMembers(RevalidateTestBase):
     def test_recheck_mark_survives_a_failed_pinned_transfer(self):
         self.test_checks_the_member_a_refetch_reads()
         fast, fast_dir = self.fast, self.fast_dir
-        with self.fs._member_checks_lock:
-            self.fs._recheck["/f.txt"] = {"fast"}
+        (fast_dir / "f.txt").write_bytes(b"CHANGED ON FAST")
         self.age_checks()
         with patch.object(fast, "copy_to_local", side_effect=OSError(5, "I/O error")):
             with self.assertRaises(Exception):
                 self.read_through("/f.txt")
-        # Selected but never delivered: the forced refetch is still owed.
-        self.assertEqual({"fast"}, self.fs._recheck["/f.txt"])
-        (fast_dir / "f.txt").write_bytes(b"CHANGED ON FAST")
+        # Observation survives a selected transfer that delivered no bytes.
+        self.assertIn("fast", self.fs._freshness_snapshot("/f.txt")["debts"])
         self.assertEqual(b"CHANGED ON FAST", self.read_through("/f.txt"))
-        self.assertNotIn("/f.txt", self.fs._recheck)
+        self.assertIsNone(self.fs._freshness_snapshot("/f.txt"))
 
     def test_recheck_mark_survives_a_refused_invalidation(self):
         self.test_checks_the_member_a_refetch_reads()
         fast, fast_dir = self.fast, self.fast_dir
-        with self.fs._member_checks_lock:
-            self.fs._recheck["/f.txt"] = {"fast"}
         writer = self.fs.open("/f.txt", os.O_RDWR)
         try:
+            (fast_dir / "f.txt").write_bytes(b"CHANGED ON FAST")
             self.age_checks()
             # The forced refetch is refused (a writer is open): the copy and
             # the mark both stay.
             self.assertEqual(b"changed on fast", self.read_through("/f.txt"))
-            self.assertEqual({"fast"}, self.fs._recheck["/f.txt"])
+            self.assertIn("fast", self.fs._freshness_snapshot("/f.txt")["debts"])
         finally:
             self.fs.release("/f.txt", writer)
-        (fast_dir / "f.txt").write_bytes(b"CHANGED ON FAST")
         self.age_checks()
         self.assertEqual(b"CHANGED ON FAST", self.read_through("/f.txt"))
-        self.assertNotIn("/f.txt", self.fs._recheck)
+        self.assertIsNone(self.fs._freshness_snapshot("/f.txt"))
 
 
 
@@ -772,23 +768,31 @@ class TestRevalidateStreamBail(RevalidateTestBase):
 
     def test_selection_is_idempotent_within_one_open(self):
         self._cached_on_both()
-        with self.fs._member_checks_lock:
-            self.fs._refetch_pins["/f.txt"] = self.member
-        # The stream's selection and the fallback's both see the pin, even
-        # though the unpinned order would prefer "fast".
-        self.assertIs(self.member, self.fs._select_backend_for_read("/f.txt"))
-        self.assertIs(self.member, self.fs._select_backend_for_read("/f.txt"))
-        self.fs.release("/f.txt", self.fs.open("/f.txt", os.O_RDONLY))
-        self.assertNotIn("/f.txt", self.fs._refetch_pins)
+        writer = self.fs.open("/f.txt", os.O_RDWR)
+        try:
+            (self.fast_dir / "f.txt").write_bytes(b"changed on fast")
+            self.age_checks()
+            self.assertEqual(b"original", self.read_through("/f.txt"))
+            self.assertIn("fast", self.fs._freshness_snapshot("/f.txt")["debts"])
+            self.assertIs(self.fast, self.fs._select_backend_for_read("/f.txt"))
+            self.assertIs(self.fast, self.fs._select_backend_for_read("/f.txt"))
+        finally:
+            self.fs.release("/f.txt", writer)
 
     def test_a_pin_no_fetch_used_does_not_outlive_the_open(self):
         self._cached_on_both()
-        # Fresh check, cached file: this open revalidates nothing and fetches
-        # nothing, so only open()'s own cleanup can drop a pin left behind.
-        with self.fs._member_checks_lock:
-            self.fs._refetch_pins["/f.txt"] = self.fast
-        self.fs.release("/f.txt", self.fs.open("/f.txt", os.O_RDONLY))
-        self.assertNotIn("/f.txt", self.fs._refetch_pins)
+        # A cached open that transfers nothing does not erase a later
+        # observation; the obligation lasts until matching bytes commit.
+        writer = self.fs.open("/f.txt", os.O_RDWR)
+        try:
+            (self.fast_dir / "f.txt").write_bytes(b"changed on fast")
+            self.age_checks()
+            self.assertEqual(b"original", self.read_through("/f.txt"))
+            self.assertIn("fast", self.fs._freshness_snapshot("/f.txt")["debts"])
+        finally:
+            self.fs.release("/f.txt", writer)
+        self.assertEqual(b"changed on fast", self.read_through("/f.txt"))
+        self.assertIsNone(self.fs._freshness_snapshot("/f.txt"))
 
     def test_stream_bailing_to_the_fallback_still_fetches_from_the_pinned_member(self):
         self._cached_on_both()
@@ -817,16 +821,15 @@ class TestRevalidateStreamBail(RevalidateTestBase):
                 patch.object(self.member, "supports_range_reads", return_value=False):
             # The slower member supplies its older bytes through the fallback.
             self.assertEqual(b"original", self.read_through("/f.txt"))
-        self.assertEqual({"fast"}, self.fs._recheck["/f.txt"])
-        self.assertNotIn("/f.txt", self.fs._refetch_pins)
+        self.assertIn("fast", self.fs._freshness_snapshot("/f.txt")["debts"])
         self.fast.set_available(True)
         self.age_checks()
         self.assertEqual(b"changed on fast", self.read_through("/f.txt"))
         # Streamed this time: the mark clears when the stream finishes.
         deadline = time.monotonic() + 10
-        while "/f.txt" in self.fs._recheck and time.monotonic() < deadline:
+        while self.fs._freshness_snapshot("/f.txt") is not None and time.monotonic() < deadline:
             time.sleep(0.05)
-        self.assertNotIn("/f.txt", self.fs._recheck)
+        self.assertIsNone(self.fs._freshness_snapshot("/f.txt"))
 
 
 class TestRevalidateFromListing(RevalidateTestBase):

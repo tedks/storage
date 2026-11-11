@@ -946,6 +946,57 @@ class TestSharedFreshnessObligation(ThreadingTestBase):
         self._assert_a_baseline()
         self._assert_slots_released()
 
+    def _prepared_stream(self, backend):
+        """Start a real session, then supply its complete scratch-owned bytes."""
+        manager = self.fs._streaming_manager
+        with patch.object(manager, "select_backend_for_read", return_value=backend):
+            session = manager._create_or_attach_prefetch_session(self.PATH, self.PATH)
+        self.assertIsNotNone(session)
+        data = (self.member_dir if backend is self.a else self.b_dir) / "f.txt"
+        payload = data.read_bytes()
+        os.pwrite(session.io_fd, payload, 0)
+        with session.lock:
+            session.available_ranges = [(0, len(payload))]
+        return session
+
+    def test_current_a_stream_commits_baseline_and_its_debt(self):
+        self._change_a()
+        with self.fs._path_locked(self.PATH):
+            self.fs._observe_changed_member(self.PATH, self.a, self.a.stat(self.PATH))
+            self.fs._invalidate_file_cache(self.PATH)
+        session = self._prepared_stream(self.a)
+        self.fs._finalize_streaming_session(session)
+        self.assertEqual(self.NEW, (self.cache_dir / "f.txt").read_bytes())
+        self._assert_a_baseline()
+        self.assertIsNone(self._snapshot())
+
+    def test_old_b_stream_cannot_install_after_a_observation(self):
+        final = self.cache_dir / "f.txt"
+        final.unlink()
+        session = self._prepared_stream(self.b)
+        self._change_a()
+        with self.fs._path_locked(self.PATH):
+            self.fs._observe_changed_member(self.PATH, self.a, self.a.stat(self.PATH))
+        before = self._snapshot()
+        self.fs._finalize_streaming_session(session)
+        self.assertFalse(final.exists())
+        self.assertEqual(before["debts"], self._snapshot()["debts"])
+        self.assertEqual(before["publication_revision"], self._snapshot()["publication_revision"])
+
+    def test_b_stream_fallback_keeps_a_debt(self):
+        self._change_a()
+        with self.fs._path_locked(self.PATH):
+            self.fs._observe_changed_member(self.PATH, self.a, self.a.stat(self.PATH))
+            self.fs._invalidate_file_cache(self.PATH)
+        self.a.set_available(False)
+        session = self._prepared_stream(self.b)
+        self.fs._finalize_streaming_session(session)
+        self.assertEqual(self.OLD, (self.cache_dir / "f.txt").read_bytes())
+        self.assertIn("changedA", self._snapshot()["debts"])
+        check = self.fs._member_checks[self.PATH]
+        self.assertIn("staleB", check.members)
+        self.assertNotIn("changedA", check.members)
+
     def test_write_byte_to_dirty_interval_rejects_late_stream_commit(self):
         fd = self.fs.open(self.PATH, os.O_RDWR)
         self._change_a()
