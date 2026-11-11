@@ -1,0 +1,25 @@
+id: mounted-sftp-pool-recycle
+title: Prove quiescent single-member SFTP pool recycle
+desc: Follow-up from docs/mounted_restart_design_2026-11-11.md, P1. Build a narrow
+  internal admission/drain/reconnect boundary for one SSH SFTP pool while StorageFS,
+  FUSE, cache, index, descriptor map, sync policy, and mount lock remain live. Do
+  not call mark_down or close on an active lease. On timeout or cancellation before
+  retirement, preserve the old pool and reopen admission. Synthetic tests must cover
+  active foreground read, streaming range, sync upload with overlapping local write,
+  blocked new lease, hung watchdog request, reconnect failure, and dirty-generation
+  preservation in both FUSE loop modes where mounted tests apply. Stop if leases cannot
+  be counted/fenced or a bounded unwind cannot be proven. Operator command and watcher/rsync
+  restart are separate scope.
+type: task
+component: mount
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-11T21:29:47-00:00
+references: []
+log_events:
+- time: 2026-11-11T21:29:47-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
