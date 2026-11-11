@@ -1,0 +1,24 @@
+id: oq-mounted-daemon-handoff-scope
+title: Decide whether same-connection daemon replacement is a product requirement
+desc: 'Decision owner: Ted. docs/mounted_restart_design_2026-11-11.md finds no supported
+  live FUSE-session and open-handle handoff in the current fusepy 3.0.1/libfuse 2
+  path. Options: (A) treat in-process member/worker maintenance with the same daemon
+  as sufficient for mounted continuity (recommended first); (B) require replacement
+  of the entire daemon while preserving the same kernel connection and open handles,
+  which needs a separate kernel/libfuse feasibility study before any promise; (C)
+  accept a conventional unmount/remount window for daemon upgrades. This blocks only
+  the scope of a future P4 feasibility package, not P1 source work. No rollout or
+  live experiment is authorized by this issue.'
+type: task
+component: open-questions
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-11T21:30:00-00:00
+references: []
+log_events:
+- time: 2026-11-11T21:30:00-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
