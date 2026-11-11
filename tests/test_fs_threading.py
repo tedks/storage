@@ -432,11 +432,10 @@ class TestForegroundAdmission(ThreadingTestBase):
 
 
 class TestSharedFreshnessObligation(ThreadingTestBase):
-    """Red contract tests: two members expose opener-private freshness loss.
+    """Two-member schedules for shared freshness and later contract slices.
 
-    These tests are source only until root authorizes runtime checks. The
-    proposed _freshness_snapshot and _freshness_token are diagnostic seams
-    specified in contracts/path-freshness-obligation.md, not present yet.
+    _freshness_snapshot and _freshness_token are internal diagnostic seams
+    specified in contracts/path-freshness-obligation.md.
     """
 
     OLD = b"old on both"
@@ -625,7 +624,8 @@ class TestSharedFreshnessObligation(ThreadingTestBase):
 
     def test_old_open_exit_cannot_erase_newer_observation(self):
         # First opener pauses after releasing the path lock but before its
-        # cleanup. The second opener then publishes A's newer observation.
+        # former private-pin cleanup point. The second opener then publishes
+        # A's newer observation; first's exit cannot clear the shared debt.
         released = threading.Event()
         first_resume = threading.Event()
         self.addCleanup(first_resume.set)
@@ -718,6 +718,80 @@ class TestSharedFreshnessObligation(ThreadingTestBase):
             self.a.set_available(True)
         self.assertEqual(self.NEW, self._read(self.PATH))
         self.assertIsNone(self._snapshot())
+        self._assert_a_baseline()
+        self._assert_slots_released()
+
+    def _prime_owed_a_with_b_cached(self):
+        """Observe changed A, then make its copy unavailable so B fills cache."""
+        self._change_a()
+        real_stat = self.a.stat
+
+        def stat_then_drop(path):
+            result = real_stat(path)
+            self.a.set_available(False)
+            return result
+
+        self.addCleanup(self.a.set_available, True)
+        with patch.object(self.a, "stat", side_effect=stat_then_drop), \
+                patch.object(self.fs, "_select_unpinned_backend_for_read", return_value=self.b):
+            self.assertEqual(self.OLD, self._read(self.PATH))
+        self.a.set_available(True)
+        self.assertEqual("changedA", self._snapshot()["owed_member"])
+
+    def _expire_owed_probe(self):
+        key = (self.PATH, "changedA")
+        with self.fs._member_checks_lock:
+            generation, _deadline, was_available = self.fs._freshness_probe_retry[key]
+            self.fs._freshness_probe_retry[key] = (
+                generation, time.monotonic() - 1.0, was_available,
+            )
+
+    def test_owed_available_stat_failure_is_throttled_until_expiry(self):
+        self._prime_owed_a_with_b_cached()
+        with patch.object(self.a, "stat", side_effect=OSError(errno.EIO, "slow member")) as probe:
+            for _ in range(4):
+                self.assertEqual(self.OLD, self._read(self.PATH))
+            self.assertEqual(1, probe.call_count)
+        self.assertEqual("changedA", self._snapshot()["owed_member"])
+        # A fresh successful B baseline must not extend A's retry deadline.
+        cache_path = self.cache_dir / "f.txt"
+        identity = self.fs._cache_identity(os.lstat(cache_path))
+        b_stat = self.b.stat(self.PATH)
+        self.fs._store_member_check(self.PATH, cache_path, identity,
+                                    {"staleB": (b_stat.st_size, b_stat.st_mtime)})
+        self._expire_owed_probe()
+        self.assertEqual(self.NEW, self._read(self.PATH))
+        self._assert_a_baseline()
+        self.assertIsNone(self._snapshot())
+        self._assert_slots_released()
+
+    def test_owed_missing_file_probe_is_throttled_while_member_reports_available(self):
+        self._prime_owed_a_with_b_cached()
+        with patch.object(self.a, "stat", side_effect=FileNotFoundError(self.PATH)) as probe:
+            for _ in range(4):
+                self.assertEqual(self.OLD, self._read(self.PATH))
+            self.assertEqual(1, probe.call_count)
+        self.assertTrue(self.a.is_available())
+        self.assertEqual("changedA", self._snapshot()["owed_member"])
+        self._expire_owed_probe()
+        self.assertEqual(self.NEW, self._read(self.PATH))
+        self._assert_a_baseline()
+        self._assert_slots_released()
+
+    def test_owed_failed_probe_retries_when_member_becomes_available(self):
+        self._prime_owed_a_with_b_cached()
+
+        def fail_and_drop(_path):
+            self.a.set_available(False)
+            raise OSError(errno.EIO, "member went away")
+
+        with patch.object(self.a, "stat", side_effect=fail_and_drop) as probe:
+            self.assertEqual(self.OLD, self._read(self.PATH))
+            self.assertEqual(self.OLD, self._read(self.PATH))
+            self.assertEqual(1, probe.call_count)
+        self.assertEqual("changedA", self._snapshot()["owed_member"])
+        self.a.set_available(True)
+        self.assertEqual(self.NEW, self._read(self.PATH))
         self._assert_a_baseline()
         self._assert_slots_released()
 
