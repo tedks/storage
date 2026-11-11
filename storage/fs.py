@@ -1261,7 +1261,8 @@ class StorageFS(Operations):
                     state.generations.get(member_name, 0), state.local_epoch)
 
     @contextlib.contextmanager
-    def _local_mutation(self, canonical_path: str, *, replacement: bool = False):
+    def _local_mutation(self, canonical_path: str, cache_path: Path,
+                        *, replacement: bool = False):
         """Invalidate member stages before bytes change; retain uncertainty on failure.
 
         The leaf is released before filesystem I/O and DIRTY publication. A
@@ -1276,14 +1277,22 @@ class StorageFS(Operations):
             state.local_epoch += 1
             state.revision += 1
             state.active_mutations += 1
+            epoch = state.local_epoch
             self._member_checks.pop(canonical_path, None)
-        published = {"dirty": False}
+        published = {"dirty": False, "inode": None}
         try:
             yield published
         finally:
             with self._member_checks_lock:
-                if not published["dirty"]:
-                    state.uncertain_local = True
+                # A later successful mark covers an earlier failed write only
+                # if it describes this same current inode and no overlapping
+                # mutation can still change its bytes after that mark.
+                current = regular_file_stat(cache_path) if published["dirty"] else None
+                settled = (current is not None
+                           and published["inode"] == (current.st_dev, current.st_ino)
+                           and state.local_epoch == epoch
+                           and state.active_mutations == 1)
+                state.uncertain_local = not settled
                 state.active_mutations -= 1
 
     def _has_open_writer(self, canonical_path: str) -> bool:
@@ -2465,6 +2474,34 @@ class StorageFS(Operations):
         """Record a modification of a cached file (see CacheManager.mark_file_dirty)."""
         return self.cache_manager.mark_file_dirty(canonical_path, cache_path)
 
+    def _publish_local_dirty(self, canonical_path: str, cache_path: Path,
+                             published) -> Optional[int]:
+        """Record the row and inode that can settle this mutation's uncertainty."""
+        generation = self._mark_cache_file_dirty(canonical_path, cache_path)
+        if published is not None and generation is not None:
+            current = regular_file_stat(cache_path)
+            if current is not None:
+                published["inode"] = (current.st_dev, current.st_ino)
+                published["dirty"] = True
+        return generation
+
+    def _close_failed_open_attempt(self, vfd: Optional[int], entry: Optional[FDEntry],
+                                   real_fd: Optional[int], registered: bool) -> None:
+        """Discard only this failed callback's descriptor, without release/sync."""
+        if real_fd is None:
+            return
+        if registered:
+            with self._fd_lock:
+                if self._fd_map.get(vfd) is not entry:
+                    return  # Never close a descriptor another entry now owns.
+                del self._fd_map[vfd]
+        try:
+            os.close(real_fd)
+        except OSError as exc:
+            # Retrying close after EINTR could close a reused fd. The callback
+            # still reports its original failure, not this cleanup outcome.
+            self.logger.warning("failed to close abandoned open descriptor: %r", exc)
+
     def truncate(self, path, length, fh=None):
         """Truncate a file"""
         with self._path_locked(self._resolve_path(path).canonical_path):
@@ -2476,7 +2513,7 @@ class StorageFS(Operations):
         cache_path = resolved.cache_path
 
         try:
-            mutation = (self._local_mutation(resolved.canonical_path)
+            mutation = (self._local_mutation(resolved.canonical_path, cache_path)
                         if not resolved.backend_name else contextlib.nullcontext(None))
             with mutation as published:
                 with open(cache_path, 'r+b') as f:
@@ -2484,8 +2521,7 @@ class StorageFS(Operations):
                 self.cache_manager.mark_cache_size_dirty()
 
                 if published is not None:
-                    published["dirty"] = (
-                        self._mark_cache_file_dirty(resolved.canonical_path, cache_path) is not None)
+                    self._publish_local_dirty(resolved.canonical_path, cache_path, published)
 
         except OSError as e:
             raise FuseOSError(e.errno)
@@ -2550,49 +2586,59 @@ class StorageFS(Operations):
                 raise FuseOSError(errno.ENOENT)
             cache_path = resolved.cache_path
 
+        attempt_real_fd = None
+        attempt_entry = None
+        attempt_vfd = None
+        registered = False
         try:
             # Hold _fd_lock across os.open AND _fd_map registration so that
             # _invalidate_file_cache (which also holds _fd_lock) cannot
             # unlink the cache file between os.open and registration.
-            mutation = (self._local_mutation(resolved.canonical_path)
+            mutation = (self._local_mutation(resolved.canonical_path, cache_path)
                         if flags & os.O_TRUNC and resolved.backend_name is None
                         else contextlib.nullcontext(None))
             with mutation as published:
                 with self._fd_lock:
                     try:
-                        real_fd = os.open(str(cache_path), flags)
+                        attempt_real_fd = os.open(str(cache_path), flags)
                     except FileNotFoundError:
                         if prefetch_session is not None and prefetch_session.final_cache_path.exists():
                             cache_path = prefetch_session.final_cache_path
-                            real_fd = os.open(str(cache_path), flags)
+                            attempt_real_fd = os.open(str(cache_path), flags)
                         else:
                             raise
 
                     vfd = self._fd_counter
                     self._fd_counter += 1
-                    self._fd_map[vfd] = FDEntry(
+                    attempt_vfd = vfd
+                    attempt_entry = FDEntry(
                         virtual_path=resolved.requested_path,
                         cache_path=cache_path,
-                        real_fd=real_fd,
+                        real_fd=attempt_real_fd,
                         flags=flags,
                         backend_name=resolved.backend_name,
                         canonical_path=resolved.canonical_path,
                         prefetch_session=prefetch_session,
                     )
+                    self._fd_map[vfd] = attempt_entry
+                    registered = True
                 if published is not None:
                     self.cache_manager.mark_cache_size_dirty()
-                    published["dirty"] = (
-                        self._mark_cache_file_dirty(resolved.canonical_path, cache_path) is not None)
+                    self._publish_local_dirty(resolved.canonical_path, cache_path, published)
 
             if resolved.backend_name is None:
                 self.cache_manager.mark_accessed(resolved.requested_path)
 
             return vfd
 
-        except OSError as e:
+        except BaseException as e:
+            self._close_failed_open_attempt(attempt_vfd, attempt_entry,
+                                            attempt_real_fd, registered)
             if prefetch_session is not None:
                 self._release_prefetch_session(prefetch_session)
-            raise FuseOSError(e.errno)
+            if isinstance(e, OSError):
+                raise FuseOSError(e.errno) from e
+            raise
 
     def create(self, path, mode, fi=None):
         """Create a file"""
@@ -2602,24 +2648,33 @@ class StorageFS(Operations):
     def _create(self, path, mode, fi=None):
         """Create a file"""
         resolved = self._resolve_path(path)
+        attempt_real_fd = None
+        attempt_entry = None
+        attempt_vfd = None
+        registered = False
         try:
-            mutation = (self._local_mutation(resolved.canonical_path, replacement=True)
+            mutation = (self._local_mutation(resolved.canonical_path, resolved.cache_path,
+                                             replacement=True)
                         if resolved.backend_name is None else contextlib.nullcontext(None))
             with mutation as published:
                 cache_path = self.cache_manager.create_cached_file(resolved.requested_path)
                 with self._fd_lock:
-                    real_fd = os.open(str(cache_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+                    attempt_real_fd = os.open(str(cache_path),
+                                              os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
                     vfd = self._fd_counter
                     self._fd_counter += 1
-                    self._fd_map[vfd] = FDEntry(
+                    attempt_vfd = vfd
+                    attempt_entry = FDEntry(
                         virtual_path=resolved.requested_path,
                         cache_path=cache_path,
-                        real_fd=real_fd,
+                        real_fd=attempt_real_fd,
                         flags=os.O_WRONLY,
                         backend_name=resolved.backend_name,
                         canonical_path=resolved.canonical_path,
                         prefetch_session=None,
                     )
+                    self._fd_map[vfd] = attempt_entry
+                    registered = True
 
                 config = self._get_config(resolved.canonical_path)
                 metadata = FileMetadata(
@@ -2636,9 +2691,7 @@ class StorageFS(Operations):
                     encryption_key_id=None
                 )
                 self.state_manager.set_file_metadata(metadata)
-                generation = self._mark_cache_file_dirty(resolved.canonical_path, cache_path)
-                if published is not None:
-                    published["dirty"] = generation is not None
+                self._publish_local_dirty(resolved.canonical_path, cache_path, published)
 
             parent_dir = resolved.parent_dir
             self._invalidate_dir_cache_entry(parent_dir)
@@ -2646,8 +2699,12 @@ class StorageFS(Operations):
 
             return vfd
 
-        except OSError as e:
-            raise FuseOSError(e.errno)
+        except BaseException as e:
+            self._close_failed_open_attempt(attempt_vfd, attempt_entry,
+                                            attempt_real_fd, registered)
+            if isinstance(e, OSError):
+                raise FuseOSError(e.errno) from e
+            raise
 
     def read(self, path, size, offset, fh):
         """Read from a file"""
@@ -2695,7 +2752,7 @@ class StorageFS(Operations):
         try:
             # Positional: a descriptor's offset is shared state, and
             # concurrent writes through one fh must not move each other's.
-            mutation = (self._local_mutation(entry.canonical_path)
+            mutation = (self._local_mutation(entry.canonical_path, entry.cache_path)
                         if entry.backend_name is None else contextlib.nullcontext(None))
             with mutation as published:
                 written = os.pwrite(entry.real_fd, data, offset)
@@ -2707,8 +2764,7 @@ class StorageFS(Operations):
                     with self.state_manager.metadata_lock:
                         with self._fd_lock:
                             canonical_path, cache_path = entry.canonical_path, entry.cache_path
-                        published["dirty"] = (
-                            self._mark_cache_file_dirty(canonical_path, cache_path) is not None)
+                        self._publish_local_dirty(canonical_path, cache_path, published)
 
             return written
 
