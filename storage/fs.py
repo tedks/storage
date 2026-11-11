@@ -405,8 +405,11 @@ class StorageFS(Operations):
             keep_after_close=streaming_keep_after_close,
             on_finalized=lambda session: self._record_fetched(
                 session.canonical_path, session.final_cache_path,
-                session.backend, session.member_stat,
+                session.backend, session.member_stat, token=session.freshness_token,
             ),
+            freshness_token=self._freshness_token,
+            freshness_valid=self._stream_freshness_valid,
+            commit_guard=self._stream_commit_guard,
             partial_suffix=self._PARTIAL_SUFFIX,
             stream_state_xattr=self._STREAM_STATE_XATTR,
         )
@@ -1254,6 +1257,26 @@ class StorageFS(Operations):
             return (state.identity, state.revision, member_name,
                     state.generations.get(member_name, 0), state.local_epoch)
 
+    def _stream_freshness_valid(self, session: PrefetchSession) -> bool:
+        """The stream still describes this path and member's current revision."""
+        token = getattr(session, "freshness_token", None)
+        if token is None:
+            return False
+        with self._member_checks_lock:
+            state = self._freshness.get(session.canonical_path)
+            return state is not None and token == (
+                state.identity, state.revision, session.backend.name,
+                state.generations.get(session.backend.name, 0), state.local_epoch,
+            )
+
+    @contextlib.contextmanager
+    def _stream_commit_guard(self, session: PrefetchSession):
+        """Serialize validation, no-replace install and baseline publication."""
+        with self._path_locked(session.canonical_path):
+            with self.state_manager.metadata_lock:
+                with self._member_checks_lock:
+                    yield
+
     def _freshness_snapshot(self, canonical_path: str):
         with self._member_checks_lock:
             state = self._freshness.get(canonical_path)
@@ -1558,9 +1581,8 @@ class StorageFS(Operations):
         """A full fetch from backend just finished; member_stat was taken before it.
 
         Stat before copy can cost one later refetch if the member changes
-        during transfer. A full fetch carries a token so a later observation
-        cannot be cleared by an older attempt. A stream without such a token
-        cannot settle any outstanding debt; its install guard is a later slice.
+        during transfer. Full fetches and streams carry a token so a later
+        observation cannot be cleared by an older attempt.
         """
         with self._member_checks_lock:
             state = self._freshness.get(canonical_path)

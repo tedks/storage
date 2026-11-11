@@ -153,6 +153,8 @@ class PrefetchSession:
     # The member's stat at session start (None when the member has no
     # stat); handed to on_finalized as the revalidation baseline.
     member_stat: Optional[object] = None
+    # Captured after source selection but before the first member stat/read.
+    freshness_token: Optional[object] = None
 
     def __post_init__(self):
         self.lock = threading.RLock()
@@ -178,11 +180,17 @@ class StreamingReadManager:
         stream_state_xattr: str,
         keep_after_close: Optional[StreamingKeepAfterClose] = None,
         on_finalized: Optional[Callable[["PrefetchSession"], None]] = None,
+        freshness_token: Optional[Callable[[str, str], object]] = None,
+        freshness_valid: Optional[Callable[["PrefetchSession"], bool]] = None,
+        commit_guard: Optional[Callable[["PrefetchSession"], object]] = None,
     ):
         self.cache_manager = cache_manager
         # Called once the complete file is in the cache (StorageFS records
         # the member baseline for revalidation on open).
         self.on_finalized = on_finalized
+        self.freshness_token = freshness_token
+        self.freshness_valid = freshness_valid
+        self.commit_guard = commit_guard
         self.state_manager = state_manager
         self.logger = logger
         self.get_config = get_config
@@ -960,6 +968,11 @@ class StreamingReadManager:
         readers keep their bytes, and the file is not cached by this
         session (warned once per mount). Raises OSError otherwise.
         """
+        # Production callers hold the path and freshness locks through this
+        # test and the subsequent publication. Direct low-level tests may
+        # invoke this method without those outer locks.
+        if self.freshness_valid is not None and not self.freshness_valid(session):
+            return "stale"
         partial_path = session.partial_cache_path
         final_path = session.final_cache_path
         try:
@@ -1071,7 +1084,9 @@ class StreamingReadManager:
             # install refuses; a full fetch that loses the race to this
             # install finds the marker and fetches again instead of indexing
             # the prefix.
-            with self.state_manager.metadata_lock:
+            guard = (self.commit_guard(session) if self.commit_guard is not None
+                     else self.state_manager.metadata_lock)
+            with guard:
                 if self.state_manager.get_file_metadata(session.canonical_path) is not None:
                     outcome = "indexed"
                 else:
@@ -1163,12 +1178,24 @@ class StreamingReadManager:
         try:
             os.fsync(io_fd)
             session.final_cache_path.parent.mkdir(parents=True, exist_ok=True)
-            with self.state_manager.metadata_lock:
+            guard = (self.commit_guard(session) if self.commit_guard is not None
+                     else self.state_manager.metadata_lock)
+            with guard:
                 outcome = self._install_partial(session)
                 if outcome == "installed":
-                    metadata = self._store_finalized_row(session)
-                    if metadata is not None:
-                        self._add_finalized_locations(session, metadata)
+                    staged = os.fstat(io_fd)
+                    installed = os.lstat(session.final_cache_path)
+                    if (staged.st_dev, staged.st_ino) != (installed.st_dev, installed.st_ino):
+                        outcome = "stale"
+                    else:
+                        metadata = self._store_finalized_row(session)
+                        if metadata is not None:
+                            self._add_finalized_locations(session, metadata)
+                            if self.on_finalized is not None:
+                                try:
+                                    self.on_finalized(session)
+                                except Exception:
+                                    self.logger.exception("on_finalized failed for %s", session.canonical_path)
         except OSError as exc:
             with session.lock:
                 session.error = exc
@@ -1186,12 +1213,6 @@ class StreamingReadManager:
             session.finalized = True
             should_close = session.refcount == 0
             session.condition.notify_all()
-
-        if self.on_finalized is not None:
-            try:
-                self.on_finalized(session)
-            except Exception:
-                self.logger.exception("on_finalized failed for %s", session.canonical_path)
 
         self._update_streaming_state_xattr(session, "complete")
         self._remove_prefetch_session(session)
@@ -1421,6 +1442,9 @@ class StreamingReadManager:
             )
             return None
 
+        token = (self.freshness_token(canonical_path, backend.name)
+                 if self.freshness_token is not None else None)
+
         member_stat = None
         try:
             # One round trip either way: get_size is a stat on every member.
@@ -1499,6 +1523,7 @@ class StreamingReadManager:
             io_fd=io_fd,
             refcount=1,
             member_stat=member_stat,
+            freshness_token=token,
         )
 
         with self.prefetch_sessions_lock:
