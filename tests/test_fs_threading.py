@@ -892,46 +892,185 @@ class TestSharedFreshnessObligation(ThreadingTestBase):
         self._assert_slots_released()
 
     def test_failed_rename_during_wait_keeps_old_identity_and_debt(self):
-        self._change_a()
+        self._prime_owed_a_with_b_cached()
+        before = self._snapshot()
+        old_token = self.fs._freshness_token(self.PATH, "staleB")
         gate = self.fs._foreground_admission
         with patch.object(self.fs, "_select_unpinned_backend_for_read", return_value=self.b):
-            with gate.admit("ordinary"):
+            with gate.admit("demand"):
                 first = Worker(self._read, self.PATH)
                 first.start()
-                self.assertTrue(gate.waiting_for("ordinary", 1, WAIT))
+                self.assertTrue(gate.waiting_for("demand", 1, WAIT))
                 with patch.object(self.fs.namespace, "rename", side_effect=OSError(errno.EIO, "rename failed")):
                     with self.assertRaises(OSError):
                         self.fs.rename(self.PATH, "/moved.txt")
-                self.assertEqual("changedA", self._snapshot()["owed_member"])
+                self.assertEqual(before, self._snapshot())
+                self.assertEqual(old_token, self.fs._freshness_token(self.PATH, "staleB"))
+                self.assertEqual(self.OLD, (self.cache_dir / "f.txt").read_bytes())
             self.assertEqual(self.NEW, first.finish())
         self._assert_a_baseline()
         self._assert_slots_released()
 
     def test_partial_failed_rename_during_wait_requires_reprobe(self):
-        self._change_a()
+        self._prime_owed_a_with_b_cached()
+        old_token = self.fs._freshness_token(self.PATH, "staleB")
         gate = self.fs._foreground_admission
-
-        def move_members_then_fail(old, new, on_local_moved=None):
-            for directory in (self.member_dir, self.b_dir):
-                os.rename(directory / "f.txt", directory / "moved.txt")
-            raise OSError(errno.EIO, "rename failed after member moves")
-
         with patch.object(self.fs, "_select_unpinned_backend_for_read", return_value=self.b):
-            with gate.admit("ordinary"):
+            with gate.admit("demand"):
                 first = Worker(self._read, self.PATH)
                 first.start()
-                self.assertTrue(gate.waiting_for("ordinary", 1, WAIT))
-                with patch.object(self.fs.namespace, "rename", side_effect=move_members_then_fail):
+                self.assertTrue(gate.waiting_for("demand", 1, WAIT))
+                # The real namespace path has already moved the cache inode
+                # when its index rewrite fails. Members still have old names.
+                with patch.object(self.fs.state_manager, "rename_path",
+                                  side_effect=OSError(errno.EIO, "index move failed")):
                     with self.assertRaises(OSError):
                         self.fs.rename(self.PATH, "/moved.txt")
                 self.assertEqual("reprobe", self._snapshot(self.PATH)["state"])
                 self.assertEqual("reprobe", self._snapshot("/moved.txt")["state"])
+                for name in (self.PATH, "/moved.txt"):
+                    self.assertIn("changedA", self._snapshot(name)["debts"])
+                self.assertNotEqual(old_token, self.fs._freshness_token(self.PATH, "staleB"))
             first.join(WAIT)
             self.assertFalse(first.is_alive())
-            self.assertIsNotNone(first.error)
-            self.assertEqual(self.NEW, self._read("/moved.txt", direct=True))
-        self._assert_a_baseline("/moved.txt")
+            self.assertIsInstance(first.error, FuseOSError)
+            self.assertEqual(errno.EIO, first.error.errno)
+            with self.assertRaises(FuseOSError) as raised:
+                self._read("/moved.txt", direct=True)
+            self.assertEqual(errno.EIO, raised.exception.errno)
+            self.assertEqual(self.OLD, (self.cache_dir / "moved.txt").read_bytes())
         self._assert_slots_released()
+
+    def test_replacement_retires_target_and_source_stages_and_descriptor(self):
+        self._prime_owed_a_with_b_cached()
+        target = "/target.txt"
+        for directory in (self.member_dir, self.b_dir):
+            (directory / "target.txt").write_bytes(b"old target inode")
+        self.assertEqual(b"old target inode", self._read(target))
+        old_target_fd = self.fs.open(target, os.O_RDWR)
+        target_token = self.fs._freshness_token(target, "staleB")
+        source_token = self.fs._freshness_token(self.PATH, "staleB")
+        source_identity = self._snapshot()["path_identity"]
+        try:
+            self.fs.rename(self.PATH, target)
+            moved = self._snapshot(target)
+            self.assertEqual(source_identity, moved["path_identity"])
+            self.assertIn("changedA", moved["debts"])
+            self.assertIsNone(self._snapshot(self.PATH))
+            with self.assertRaises(FuseOSError) as stale:
+                self.fs.write(target, b"wrong", 0, old_target_fd)
+            self.assertEqual(errno.ESTALE, stale.exception.errno)
+            self.assertEqual(self.OLD, (self.cache_dir / "target.txt").read_bytes())
+
+            # Both late streams reach the real guarded install boundary.
+            for path, token, final in (
+                (target, target_token, self.cache_dir / "target.txt"),
+                (self.PATH, source_token, self.cache_dir / "f.txt"),
+            ):
+                partial = Path(str(final) + ".storage.partial")
+                partial.write_bytes(b"stale stage")
+                session = SimpleNamespace(canonical_path=path, final_cache_path=final,
+                                          partial_cache_path=partial, backend=self.b,
+                                          member_stat=self.b.stat(target),
+                                          freshness_token=token)
+                self.assertNotEqual("installed", self.fs._streaming_manager._install_partial(session))
+                self.assertEqual(moved["debts"], self._snapshot(target)["debts"])
+                self.fs._streaming_manager.on_finalized(session)
+                self.assertEqual(moved["debts"], self._snapshot(target)["debts"])
+        finally:
+            self.fs.release(target, old_target_fd)
+        self.assertEqual(self.NEW, self._read(target, direct=True))
+        self._assert_a_baseline(target)
+
+    def test_directory_move_preserves_descendant_debt_and_retires_old_token(self):
+        self._prime_owed_a_with_b_cached()
+        self.fs.mkdir("/dir", 0o755)
+        self.fs.rename(self.PATH, "/dir/f.txt")
+        before = self._snapshot("/dir/f.txt")
+        token = self.fs._freshness_token("/dir/f.txt", "staleB")
+        self.fs.rename("/dir", "/moved")
+        after = self._snapshot("/moved/f.txt")
+        self.assertIsNone(self._snapshot("/dir/f.txt"))
+        self.assertEqual(before["path_identity"], after["path_identity"])
+        self.assertEqual(before["debts"], after["debts"])
+        self.assertNotEqual(token, self.fs._freshness_token("/moved/f.txt", "staleB"))
+        self.assertEqual(self.NEW, self._read("/moved/f.txt", direct=True))
+        self._assert_a_baseline("/moved/f.txt")
+
+    def test_unlink_retires_only_removed_identity_and_late_callback(self):
+        self._prime_owed_a_with_b_cached()
+        other = "/keep.txt"
+        for directory in (self.member_dir, self.b_dir):
+            (directory / "keep.txt").write_bytes(self.OLD)
+        self.assertEqual(self.OLD, self._read(other))
+        (self.member_dir / "keep.txt").write_bytes(self.NEW)
+        with self.fs._path_locked(other):
+            self.fs._observe_changed_member(other, self.a, self.a.stat(other))
+        other_debt = self._snapshot(other)
+        token = self.fs._freshness_token(self.PATH, "staleB")
+        old_identity = self._snapshot()["path_identity"]
+        self.fs.unlink(self.PATH)
+        self.assertIsNone(self._snapshot())
+        fd = self.fs.create(self.PATH, 0o644)
+        try:
+            self.assertEqual(5, self.fs.write(self.PATH, b"local", 0, fd))
+        finally:
+            self.fs.release(self.PATH, fd)
+        self.assertNotEqual(old_identity, self.fs._freshness_token(self.PATH, "staleB")[0])
+        late = SimpleNamespace(canonical_path=self.PATH,
+                               final_cache_path=self.cache_dir / "f.txt",
+                               backend=self.b, member_stat=self.b.stat(self.PATH),
+                               freshness_token=token)
+        self.fs._streaming_manager.on_finalized(late)
+        self._assert_local_dirty(b"local")
+        self._assert_no_b_baseline()
+        self.assertEqual(other_debt, self._snapshot(other))
+
+    def test_failed_unlink_preserves_identity_debt_and_cache(self):
+        self._prime_owed_a_with_b_cached()
+        before = self._snapshot()
+        token = self.fs._freshness_token(self.PATH, "staleB")
+        with patch.object(self.fs.namespace, "unlink", side_effect=OSError(errno.EIO, "unlink failed")):
+            with self.assertRaises(OSError):
+                self.fs.unlink(self.PATH)
+        self.assertEqual(before, self._snapshot())
+        self.assertEqual(token, self.fs._freshness_token(self.PATH, "staleB"))
+        self.assertEqual(self.OLD, (self.cache_dir / "f.txt").read_bytes())
+        late = self._late_b_session(token)
+        self.fs._streaming_manager.on_finalized(late)
+        self.assertIn("changedA", self._snapshot()["debts"])
+        self.assertEqual(self.OLD, (self.cache_dir / "f.txt").read_bytes())
+
+    def test_write_crossing_local_move_keeps_inode_dirty_and_a_debt(self):
+        fd = self.fs.open(self.PATH, os.O_RDWR)
+        self._change_a()
+        with self.fs._path_locked(self.PATH):
+            self.fs._observe_changed_member(self.PATH, self.a, self.a.stat(self.PATH))
+            self.fs._invalidate_file_cache(self.PATH)  # writer keeps its inode
+        before = self._snapshot()
+        move = self.gate(self.fs.state_manager, "rename_path")
+        renamer = Worker(self.fs.rename, self.PATH, "/moved.txt")
+        renamer.start()
+        self.assertTrue(move.started.wait(WAIT))
+        writer = Worker(self.fs.write, self.PATH, b"local", 0, fd)
+        writer.start()
+        deadline = time.monotonic() + WAIT
+        while (self.cache_dir / "moved.txt").read_bytes()[:5] != b"local":
+            self.assertLess(time.monotonic(), deadline, "write did not land in moved inode")
+            time.sleep(0.01)
+        move.opened.set()
+        renamer.finish()
+        self.assertEqual(5, writer.finish())
+        self.fs.release("/moved.txt", fd)
+        self.assertIsNone(self._snapshot(self.PATH))
+        after = self._snapshot("/moved.txt")
+        self.assertEqual(before["path_identity"], after["path_identity"])
+        self.assertEqual(before["debts"], after["debts"])
+        self.assertEqual(SyncStatus.DIRTY,
+                         self.fs.state_manager.get_file_metadata("/moved.txt").sync_status)
+        self.assertEqual(b"local", (self.cache_dir / "moved.txt").read_bytes()[:5])
+        with self.fs._member_checks_lock:
+            self.assertFalse(self.fs._freshness["/moved.txt"].uncertain_local)
 
     def test_late_stream_callback_cannot_replace_newer_a_baseline(self):
         # A session started on stale B before A's changed generation existed.
