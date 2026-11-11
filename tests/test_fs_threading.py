@@ -1423,6 +1423,142 @@ class TestSharedFreshnessObligation(ThreadingTestBase):
         finally:
             self.a.set_available(True)
 
+    def _overlapping_writes_then_refetch(self, first_to_finish):
+        fd = self.fs.open(self.PATH, os.O_RDWR)
+        self._change_a()
+        self.assertEqual(self.OLD, self._read(self.PATH))
+        self.a.set_available(False)
+        cache_path = self.cache_dir / "f.txt"
+        entered = [threading.Event(), threading.Event()]
+        resume = [threading.Event(), threading.Event()]
+        for gate in resume:
+            self.addCleanup(gate.set)
+        real_pwrite = os.pwrite
+        workers = []
+
+        def pause_before_bytes(real_fd, data, offset):
+            for index, worker in enumerate(workers):
+                if threading.current_thread() is worker:
+                    entered[index].set()
+                    self.assertTrue(resume[index].wait(WAIT))
+                    break
+            return real_pwrite(real_fd, data, offset)
+
+        workers.extend((Worker(self.fs.write, self.PATH, b"first", 0, fd),
+                        Worker(self.fs.write, self.PATH, b"later", 0, fd)))
+        try:
+            with patch("storage.fs.os.pwrite", side_effect=pause_before_bytes):
+                workers[0].start()
+                self.assertTrue(entered[0].wait(WAIT))
+                workers[1].start()
+                self.assertTrue(entered[1].wait(WAIT))
+                resume[first_to_finish].set()
+                self.assertEqual(5, workers[first_to_finish].finish())
+                resume[1 - first_to_finish].set()
+                self.assertEqual(5, workers[1 - first_to_finish].finish())
+            expected = (b"first" if first_to_finish == 1 else b"later") + self.OLD[5:]
+            self._assert_local_dirty(expected)
+            self.assertIn("changedA", self._snapshot()["debts"])
+            self._assert_no_b_baseline()
+        finally:
+            for gate in resume:
+                gate.set()
+            for worker in workers:
+                if worker.ident is not None:
+                    worker.join(WAIT)
+            self.fs.release(self.PATH, fd)
+
+        # This is the behavioral assertion: permanent uncertainty makes the
+        # correctly uploaded bytes unreachable after clean eviction.
+        self._sync_evict_and_refetch_local_bytes(expected)
+
+    def _sync_evict_and_refetch_local_bytes(self, expected):
+        cache_path = self.cache_dir / "f.txt"
+        self.b.copy_from_local(cache_path, self.PATH)
+        row = self.fs.state_manager.get_file_metadata(self.PATH)
+        self.assertTrue(self.fs.state_manager.publish_sync_status(
+            self.PATH, row.dirty_generation, SyncStatus.CLEAN))
+        row = self.fs.state_manager.get_file_metadata(self.PATH)
+        self.fs.cache_manager.sync_cache_metadata(self.PATH, row, cache_path=cache_path)
+        self.fs.cache_manager._evict_if_still_clean(self.PATH, cache_path)
+        self.assertFalse(cache_path.exists())
+        try:
+            self.assertEqual(expected, self._read(self.PATH))
+            self.assertIn("changedA", self._snapshot()["debts"])
+            self.assertIn("staleB", self.fs._member_checks[self.PATH].members)
+            with self.fs._member_checks_lock:
+                self.assertFalse(self.fs._freshness[self.PATH].uncertain_local)
+        finally:
+            self.a.set_available(True)
+
+    def test_overlapping_successful_writes_older_finishes_last_refetches(self):
+        self._overlapping_writes_then_refetch(first_to_finish=1)
+
+    def test_overlapping_successful_writes_newer_finishes_last_refetches(self):
+        self._overlapping_writes_then_refetch(first_to_finish=0)
+
+    def test_later_failed_dirty_mark_survives_old_successful_finalizer(self):
+        fd = self.fs.open(self.PATH, os.O_RDWR)
+        self._change_a()
+        self.assertEqual(self.OLD, self._read(self.PATH))
+        self.a.set_available(False)
+        marked, resume = threading.Event(), threading.Event()
+        self.addCleanup(resume.set)
+        real_mutation = self.fs._local_mutation
+        real_mark = self.fs._mark_cache_file_dirty
+        workers = []
+
+        @contextmanager
+        def pause_after_first_mark(path, cache_path, **kwargs):
+            with real_mutation(path, cache_path, **kwargs) as published:
+                yield published
+                if threading.current_thread() is workers[0]:
+                    marked.set()
+                    self.assertTrue(resume.wait(WAIT))
+
+        def fail_later_mark(path, cache_path):
+            if threading.current_thread() is workers[1]:
+                raise OSError(errno.EIO, "later DIRTY publication failed")
+            return real_mark(path, cache_path)
+
+        workers.extend((Worker(self.fs.write, self.PATH, b"first", 0, fd),
+                        Worker(self.fs.write, self.PATH, b"later", 0, fd)))
+        try:
+            with patch.object(self.fs, "_local_mutation", side_effect=pause_after_first_mark), \
+                    patch.object(self.fs, "_mark_cache_file_dirty", side_effect=fail_later_mark):
+                workers[0].start()
+                self.assertTrue(marked.wait(WAIT))
+                workers[1].start()
+                workers[1].join(WAIT)
+                self.assertFalse(workers[1].is_alive())
+                self.assertIsInstance(workers[1].error, FuseOSError)
+                self.assertEqual(errno.EIO, workers[1].error.errno)
+                resume.set()
+                self.assertEqual(5, workers[0].finish())
+            self._assert_local_dirty(b"later" + self.OLD[5:])
+            with self.fs._member_checks_lock:
+                state = self.fs._freshness[self.PATH]
+                self.assertTrue(state.uncertain_local)
+                self.assertEqual(0, state.active_mutations)
+            self.assertIn("changedA", self._snapshot()["debts"])
+            self._assert_no_b_baseline()
+        finally:
+            resume.set()
+            for worker in workers:
+                if worker.ident is not None:
+                    worker.join(WAIT)
+            self.fs.release(self.PATH, fd)
+
+        token = self.fs._freshness_token(self.PATH, "staleB")
+        self.assertFalse(self.fs._stream_freshness_valid(self._late_b_session(token)))
+        recovery_fd = self.fs.open(self.PATH, os.O_RDWR)
+        try:
+            self.assertEqual(5, self.fs.write(self.PATH, b"valid", 0, recovery_fd))
+            self._assert_local_dirty(b"valid" + self.OLD[5:])
+        finally:
+            self.fs.release(self.PATH, recovery_fd)
+        self._sync_evict_and_refetch_local_bytes(b"valid" + self.OLD[5:])
+
     def test_o_trunc_dirty_failure_closes_only_attempt_descriptor(self):
         keep_fd = self.fs.open(self.PATH, os.O_RDWR)
         with self.fs._fd_lock:
