@@ -130,3 +130,16 @@
 - open_question: filed and synced ditz `oq-foreground-freshness-stat-slot` for the cap-3 slow-stat demand-slot product choice. Warm-open demand admission stays as ruled.
 - authority: Ted's bounded resume allows design/contracts/tests/status only. Root must review boundary and explicitly lift application-code repair separately. Runtime gates/probes and tedks/Fleet liaison remain stopped; no capacity request sent.
 - next: push reviewable checkpoint, update draft PR evidence and deliver one exact-head boundary summary to Storage root `%91`; then remain idle pending root review.
+
+## foreground-lead:14
+
+- kind: review-feedback-disposition
+- state: BOUNDARY_FEEDBACK_DELTA_DELIVERED; root re-review pending
+- based_on: frozen `cd116cc7b590c142a172b450940b6c38b4581d2c` boundary review at `/home/tedks/.cache/storage-orgs-20261110/boundary-review-cd116cc.md`; verdict FINDINGS, no application or runtime clearance
+- applied_at: source feedback commit `e91ccabe74118236c2f9d877cffd25e5c5360d9b`
+- refs: foreground-lead:13, `contracts/path-freshness-obligation.md` v2, `docs/specs/foreground-responsiveness-20261110.md`, `tests/test_fs_threading.py`, PR #171
+- F1 disposition: specify a short content-epoch/active-mutation leaf guard announced before `pwrite`, truncate or O_TRUNC, DIRTY publication before retirement, exact staged-inode ownership and no-replace install. Three Event-gated tests hold the real byte-to-DIRTY boundary for write/truncate/create and assert local bytes and DIRTY state. Path lock alone is explicitly insufficient; no writer wait while holding namespace/path locks.
+- F2 disposition: choose versioned cache-file xattr as durable debt authority, sync it before invalidation or B fallback visibility, and force first-open all-holder reprobe when marker/cache is missing or invalid. Two restart sequences assert B cache retains A debt and missing cache refetches changed A despite stale-B ordinary selection. Ambiguous holder copies require content comparison or conservative failure, never silent B certification.
+- F3 disposition: independent member-ID debt map and per-member generations; C completion clears only C while A remains owed. Added A-unavailable/B-fallback, changed-C completion, then A-return sequence asserting C bytes/baseline followed by A bytes/baseline and debt cleanup.
+- evidence: Python AST parsing and `git diff --check` passed on the source delta. All tests/gates UNRUN as instructed. No `storage/` edit, daemon probe, live data or paused Fleet request. Feedback is contract/test source, not a runtime or implementation outcome.
+- next: push frozen head, annotate draft PR and deliver one checkpoint to Storage root `%91`; await boundary re-review before any application repair.
