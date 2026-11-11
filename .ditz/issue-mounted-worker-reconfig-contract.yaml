@@ -1,0 +1,24 @@
+id: mounted-worker-reconfig-contract
+title: Specify reversible mounted worker and member reconfiguration
+desc: Conditional P3 from docs/mounted_restart_design_2026-11-11.md. Define a separate
+  in-process contract for sync-worker restart and/or member-set changes after the
+  narrow SFTP pool phase is evaluated. Current SyncManager.stop joins for five seconds
+  then clears its worker list; a survivor can race a new start. Account for queued
+  file and directory tasks, dirty-generation fencing, listing/checksum futures, watcher
+  event gaps, streaming sessions pinned to members, and existing virtual handles.
+  Produce synthetic boundary tests and a necessity decision before implementation.
+  Do not treat PR 171 proposals as accepted contracts or start a supervisor rewrite
+  by default.
+type: task
+component: mount
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-11T21:29:53-00:00
+references: []
+log_events:
+- time: 2026-11-11T21:29:53-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
