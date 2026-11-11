@@ -92,11 +92,16 @@ class FreshnessDebt:
 @dataclass
 class PathFreshness:
     identity: int
+    # Updated with the same inode's confirmed namespace move. An active
+    # mutation can finish after the move without mistaking its old name for
+    # the current inode.
+    current_path: str
     revision: int = 0
     local_epoch: int = 0
     active_mutations: int = 0
     uncertain_local: bool = False
     mutation_group_failed: bool = False
+    namespace_uncertain: bool = False
     generations: Dict[str, int] = field(default_factory=dict)
     debts: Dict[str, FreshnessDebt] = field(default_factory=dict)
 
@@ -1251,7 +1256,8 @@ class StorageFS(Operations):
         state = self._freshness.get(canonical_path)
         if state is None:
             self._next_freshness_identity += 1
-            state = PathFreshness(identity=self._next_freshness_identity)
+            state = PathFreshness(identity=self._next_freshness_identity,
+                                  current_path=canonical_path)
             self._freshness[canonical_path] = state
         return state
 
@@ -1294,7 +1300,8 @@ class StorageFS(Operations):
                 # regardless of which mutation exits last. A failed mark or
                 # mismatched inode poisons the whole group; an old finalizer
                 # cannot clear a later participant's failure.
-                current = regular_file_stat(cache_path) if published["dirty"] else None
+                current_path = self.cache_manager.get_cache_path(state.current_path)
+                current = regular_file_stat(current_path) if published["dirty"] else None
                 if (current is None
                         or published["inode"] != (current.st_dev, current.st_ino)):
                     state.mutation_group_failed = True
@@ -1316,7 +1323,8 @@ class StorageFS(Operations):
                 state.identity, state.revision, backend.name,
                 state.generations.get(backend.name, 0), state.local_epoch):
             return False
-        if state.active_mutations or state.uncertain_local or self._has_open_writer(canonical_path):
+        if (state.active_mutations or state.uncertain_local or state.namespace_uncertain
+                or self._has_open_writer(canonical_path)):
             return False
         row = self.state_manager.get_file_metadata(canonical_path)
         return row is None or row.sync_status != SyncStatus.DIRTY
@@ -1328,7 +1336,7 @@ class StorageFS(Operations):
             return False
         with self._member_checks_lock:
             state = self._freshness.get(session.canonical_path)
-            return state is not None and not state.active_mutations and not state.uncertain_local and token == (
+            return state is not None and not state.active_mutations and not state.uncertain_local and not state.namespace_uncertain and token == (
                 state.identity, state.revision, session.backend.name,
                 state.generations.get(session.backend.name, 0), state.local_epoch,
             )
@@ -1359,16 +1367,17 @@ class StorageFS(Operations):
     def _freshness_snapshot(self, canonical_path: str):
         with self._member_checks_lock:
             state = self._freshness.get(canonical_path)
-            if state is None or not state.debts:
+            if state is None or (not state.debts and not state.namespace_uncertain):
                 return None
             debts = {name: (debt.generation,
                             debt.member_stat.st_size, debt.member_stat.st_mtime)
                      for name, debt in state.debts.items()}
-            owed = min(debts, key=lambda name: (self.backends[name].speed_priority, name))
+            owed = min(debts, key=lambda name: (self.backends[name].speed_priority, name),
+                       default=None)
             return {"path_identity": state.identity, "publication_revision": state.revision,
                     "local_epoch": state.local_epoch, "debts": debts,
                     "owed_member": owed, "recheck_members": frozenset(debts),
-                    "state": "owed"}
+                    "state": "reprobe" if state.namespace_uncertain else "owed"}
 
     def _observe_changed_member(self, canonical_path: str, backend: Backend,
                                 member_stat: os.stat_result):
@@ -1533,7 +1542,7 @@ class StorageFS(Operations):
                 pass
 
     def _move_member_checks(self, old: str, new: str):
-        """A rename succeeded: the checks (and recheck marks) follow the files.
+        """The local rename committed: baselines and obligations follow its inodes.
 
         The cache files keep their identity across a rename, and the members
         are renamed too, so the baselines still hold. Whatever was recorded
@@ -1553,6 +1562,78 @@ class StorageFS(Operations):
                     target = new if key == old else new_prefix + key[len(old_prefix):]
                     moved[target] = table.pop(key)
                 table.update(moved)
+            # Keep the source object's never-reused identity and independent
+            # member debts. A path revision change rejects all source tokens;
+            # dropping the target object rejects tokens for its old inode.
+            for key in [k for k in self._freshness if k == new or k.startswith(new_prefix)]:
+                del self._freshness[key]
+            moved = {}
+            for key in [k for k in self._freshness if k == old or k.startswith(old_prefix)]:
+                target = new if key == old else new_prefix + key[len(old_prefix):]
+                state = self._freshness.pop(key)
+                state.current_path = target
+                state.revision += 1
+                moved[target] = state
+            self._freshness.update(moved)
+            for key in [k for k in self._freshness_probe_retry
+                        if k[0] == new or k[0].startswith(new_prefix)]:
+                del self._freshness_probe_retry[key]
+            moved_retry = {}
+            for key in [k for k in self._freshness_probe_retry
+                        if k[0] == old or k[0].startswith(old_prefix)]:
+                path, member = key
+                target = new if path == old else new_prefix + path[len(old_prefix):]
+                moved_retry[(target, member)] = self._freshness_probe_retry.pop(key)
+            self._freshness_probe_retry.update(moved_retry)
+
+    def _retire_namespace_identity(self, path: str):
+        """A confirmed unlink makes every old attempt for this name inert."""
+        with self._member_checks_lock:
+            self._freshness.pop(path, None)
+            for key in [k for k in self._freshness_probe_retry if k[0] == path]:
+                del self._freshness_probe_retry[key]
+
+    def _mark_namespace_uncertain(self, old: str, new: str, prior_debts):
+        """A partial local move leaves both possible names requiring proof.
+
+        This in-memory slice cannot certify which member still owns either
+        name. CLEAN opens fail closed; no ranked fallback may erase the debt.
+        """
+        old_prefix = old.rstrip("/") + "/"
+        new_prefix = new.rstrip("/") + "/"
+        with self._member_checks_lock:
+            suffixes = {""}
+            for path in set(prior_debts) | set(self._freshness):
+                if path == old or path.startswith(old_prefix):
+                    suffixes.add(path[len(old):])
+                if path == new or path.startswith(new_prefix):
+                    suffixes.add(path[len(new):])
+            for suffix in suffixes:
+                obligations = [prior_debts.get(old + suffix), prior_debts.get(new + suffix),
+                               self._freshness.get(old + suffix), self._freshness.get(new + suffix)]
+                debts = {}
+                generations = {}
+                for state in obligations:
+                    if state is not None:
+                        debts.update(state.debts)
+                        for member, generation in state.generations.items():
+                            generations[member] = max(generations.get(member, 0), generation)
+                for path in (old + suffix, new + suffix):
+                    self._next_freshness_identity += 1
+                    self._freshness[path] = PathFreshness(
+                        identity=self._next_freshness_identity, current_path=path,
+                        revision=1, generations=dict(generations), debts=dict(debts),
+                        namespace_uncertain=True,
+                    )
+                    self._member_checks.pop(path, None)
+                    self._revalidate_unreachable.pop(path, None)
+                    self._refetch_pins.pop(path, None)
+                    self._pinned_stats.pop(path, None)
+                    self._recheck[path] = set(debts)
+            for key in [k for k in self._freshness_probe_retry
+                        if k[0] == old or k[0].startswith(old_prefix)
+                        or k[0] == new or k[0].startswith(new_prefix)]:
+                del self._freshness_probe_retry[key]
 
     def _forget_cached_copy_attrs(self, virtual_path: str, *, removing: bool = True):
         """Forget what was known about a cached copy that is going or changing.
@@ -2358,10 +2439,13 @@ class StorageFS(Operations):
         """Remove a file"""
         try:
             self.namespace.unlink(path)
-        finally:
-            canonical_path = self._resolve_path(path).canonical_path
-            self._forget_checksums({canonical_path})
-            self._forget_member_check(canonical_path, path_gone=True)
+        except BaseException:
+            # A failed local unlink has not retired the namespace identity.
+            raise
+        canonical_path = self._resolve_path(path).canonical_path
+        self._forget_checksums({canonical_path})
+        self._forget_member_check(canonical_path, path_gone=True)
+        self._retire_namespace_identity(canonical_path)
 
     def rename(self, old, new):
         """Rename a file or directory
@@ -2415,47 +2499,77 @@ class StorageFS(Operations):
         # A source the cache never held cannot have moved into the target:
         # the target's baselines are about the copy that was already there.
         old_was_cached = os.path.lexists(self.cache_manager.get_cache_path(old_canonical))
+        old_cache = self.cache_manager.get_cache_path(old_canonical)
+        new_cache = self.cache_manager.get_cache_path(new_canonical)
         try:
-            self.namespace.rename(old, new, on_local_moved=lambda: self._repoint_descriptors(old, new))
+            source_stat = os.lstat(old_cache)
+            source_inode = (source_stat.st_dev, source_stat.st_ino)
+        except OSError:
+            source_inode = None
+        with self._member_checks_lock:
+            prior_obligations = {
+                path: state for path, state in self._freshness.items()
+                if path in (old_canonical, new_canonical)
+                or path.startswith(old_canonical.rstrip("/") + "/")
+                or path.startswith(new_canonical.rstrip("/") + "/")
+            }
+        local_moved = False
+
+        def publish_local_move():
+            nonlocal local_moved
+            # NamespaceService holds metadata here. Serialize descriptor
+            # ownership and freshness rekeying with write's byte boundary.
+            with self._fd_lock:
+                self._move_member_checks(old_canonical, new_canonical)
+                self._repoint_descriptors(old, new)
+                local_moved = True
+
+        try:
+            self.namespace.rename(old, new, on_local_moved=publish_local_move)
         except BaseException:
-            # If the cached copy moved but the rename failed after (or
-            # before) the members', its baselines, matched on identity alone,
-            # may describe a member file at the other path: drop them. If it
-            # did not move, they still describe this path and stay.
-            old_cache = self.cache_manager.get_cache_path(old_canonical)
-            new_cache = self.cache_manager.get_cache_path(new_canonical)
-            if old_was_cached and not os.path.lexists(old_cache) and os.path.lexists(new_cache):
-                self._forget_member_check(old_canonical, subtree=True, path_gone=True)
-                self._forget_member_check(new_canonical, subtree=True, path_gone=True)
+            # A failure before the local move leaves the old evidence alone.
+            # A failure after it (including between cache and index moves)
+            # cannot certify member names, so both possibilities retain debt
+            # and require explicit source proof before any CLEAN open.
+            try:
+                moved_stat = os.lstat(new_cache)
+                same_inode_moved = source_inode == (moved_stat.st_dev, moved_stat.st_ino)
+            except OSError:
+                same_inode_moved = False
+            if local_moved or (old_was_cached and same_inode_moved
+                               and not os.path.lexists(old_cache)):
+                self._mark_namespace_uncertain(old_canonical, new_canonical,
+                                               prior_obligations)
                 self._drop_persisted_baselines(new_canonical)
+                self._drop_persisted_baselines(old_canonical)
             raise
         finally:
             # Records are keyed by path, so neither name's records (nor, for a
             # directory, its children's) describe what is there now. Dropping
             # them is always safe, so a failed rename drops them too.
             self._forget_checksums({old_canonical, new_canonical}, subtree=True)
-        self._move_member_checks(old_canonical, new_canonical)
+        # The local move callback already published identity and baselines
+        # before member propagation and before any writer could use a moved fd.
 
     def _repoint_descriptors(self, old, new):
         """Open descriptors follow the file (or everything under a renamed directory).
 
         write() records against, and eviction and sync look up, the path
-        they carry. Called by NamespaceService.rename under the index lock,
-        right after the cache move and the index rewrite.
+        they carry. Caller holds metadata and descriptor locks, immediately
+        after the cache move, index rewrite and freshness rekey.
         """
         prefix = old.rstrip("/") + "/"
-        with self._fd_lock:
-            for entry in self._fd_map.values():
-                if entry.virtual_path == old:
-                    moved = new
-                elif entry.virtual_path.startswith(prefix):
-                    moved = new.rstrip("/") + "/" + entry.virtual_path[len(prefix):]
-                else:
-                    continue
-                target = self._resolve_path(moved)
-                entry.virtual_path = moved
-                entry.canonical_path = target.canonical_path
-                entry.cache_path = target.cache_path
+        for entry in self._fd_map.values():
+            if entry.virtual_path == old:
+                moved = new
+            elif entry.virtual_path.startswith(prefix):
+                moved = new.rstrip("/") + "/" + entry.virtual_path[len(prefix):]
+            else:
+                continue
+            target = self._resolve_path(moved)
+            entry.virtual_path = moved
+            entry.canonical_path = target.canonical_path
+            entry.cache_path = target.cache_path
 
     def chmod(self, path, mode):
         """Change file mode"""
@@ -2482,8 +2596,12 @@ class StorageFS(Operations):
         return self.cache_manager.mark_file_dirty(canonical_path, cache_path)
 
     def _publish_local_dirty(self, canonical_path: str, cache_path: Path,
-                             published) -> Optional[int]:
+                             published, *, expected_fd: Optional[int] = None) -> Optional[int]:
         """Record the row and inode that can settle this mutation's uncertainty."""
+        if expected_fd is not None and not self._fd_owns_cache_path(expected_fd, cache_path):
+            # An unlink or replacement crossed a descriptor write. Bytes on
+            # its old inode must never mark the new path's inode DIRTY.
+            raise FuseOSError(errno.ESTALE)
         generation = self._mark_cache_file_dirty(canonical_path, cache_path)
         if published is not None and generation is not None:
             current = regular_file_stat(cache_path)
@@ -2491,6 +2609,15 @@ class StorageFS(Operations):
                 published["inode"] = (current.st_dev, current.st_ino)
                 published["dirty"] = True
         return generation
+
+    @staticmethod
+    def _fd_owns_cache_path(real_fd: int, cache_path: Path) -> bool:
+        try:
+            opened = os.fstat(real_fd)
+            named = os.stat(cache_path)
+            return (opened.st_dev, opened.st_ino) == (named.st_dev, named.st_ino)
+        except OSError:
+            return False
 
     def _close_failed_open_attempt(self, vfd: Optional[int], entry: Optional[FDEntry],
                                    real_fd: Optional[int], registered: bool) -> None:
@@ -2553,6 +2680,21 @@ class StorageFS(Operations):
         resolved = self._resolve_path(path)
         cache_path = resolved.cache_path
         prefetch_session: Optional[PrefetchSession] = None
+
+        if resolved.backend_name is None:
+            with self._member_checks_lock:
+                state = self._freshness.get(resolved.canonical_path)
+                uncertain = state is not None and state.namespace_uncertain
+            if uncertain:
+                # A partial namespace move has no certified CLEAN source at
+                # either name. Preserve a local DIRTY inode, but never pick a
+                # ranked member merely because it has a copy there.
+                if self.cache_manager.is_cached(resolved.requested_path):
+                    self.cache_manager.heal_stale_clean(resolved.canonical_path, cache_path)
+                row = self.state_manager.get_file_metadata(resolved.canonical_path)
+                if (row is None or row.sync_status != SyncStatus.DIRTY
+                        or regular_file_stat(cache_path) is None):
+                    raise FuseOSError(errno.EIO)
 
         # Before the streaming decision: a copy dropped here is refetched
         # like any uncached file, streamed if streaming is on.
@@ -2748,21 +2890,29 @@ class StorageFS(Operations):
 
     def write(self, path, data, offset, fh):
         """Write to a file"""
-        with self._fd_lock:
-            entry = self._fd_map.get(fh)
-            if entry is None:
-                raise FuseOSError(errno.EBADF)
-
-        if entry.prefetch_session is not None:
-            raise FuseOSError(errno.EROFS)
-
         try:
             # Positional: a descriptor's offset is shared state, and
             # concurrent writes through one fh must not move each other's.
-            mutation = (self._local_mutation(entry.canonical_path, entry.cache_path)
-                        if entry.backend_name is None else contextlib.nullcontext(None))
-            with mutation as published:
-                written = os.pwrite(entry.real_fd, data, offset)
+            with contextlib.ExitStack() as stack:
+                with self._fd_lock:
+                    entry = self._fd_map.get(fh)
+                    if entry is None:
+                        raise FuseOSError(errno.EBADF)
+                    if entry.prefetch_session is not None:
+                        raise FuseOSError(errno.EROFS)
+                    # A rename may already have moved the inode locally
+                    # while its index transaction still holds the old path
+                    # in this descriptor. In that window the name is absent;
+                    # pwrite may proceed and publication waits for the move.
+                    # An occupied name with a different inode is a replaced
+                    # target descriptor and cannot be written through here.
+                    if (not self._fd_owns_cache_path(entry.real_fd, entry.cache_path)
+                            and os.path.lexists(entry.cache_path)):
+                        raise FuseOSError(errno.ESTALE)
+                    mutation = (self._local_mutation(entry.canonical_path, entry.cache_path)
+                                if entry.backend_name is None else contextlib.nullcontext(None))
+                    published = stack.enter_context(mutation)
+                    written = os.pwrite(entry.real_fd, data, offset)
                 self.cache_manager.mark_cache_size_dirty()
 
                 if published is not None:
@@ -2771,7 +2921,8 @@ class StorageFS(Operations):
                     with self.state_manager.metadata_lock:
                         with self._fd_lock:
                             canonical_path, cache_path = entry.canonical_path, entry.cache_path
-                        self._publish_local_dirty(canonical_path, cache_path, published)
+                        self._publish_local_dirty(canonical_path, cache_path, published,
+                                                  expected_fd=entry.real_fd)
 
             return written
 
@@ -2810,6 +2961,7 @@ class StorageFS(Operations):
             return 0
 
         close_error: Optional[OSError] = None
+        owns_path = self._fd_owns_cache_path(entry.real_fd, entry.cache_path)
         try:
             os.close(entry.real_fd)
         except OSError as exc:
@@ -2823,6 +2975,10 @@ class StorageFS(Operations):
 
         if close_error is not None:
             raise FuseOSError(close_error.errno)
+        if not owns_path:
+            # The old inode remains readable through its descriptor after a
+            # replacement/unlink, but no longer owns this namespace row.
+            return 0
 
         try:
             self.cache_manager.flush_file(entry.virtual_path)
