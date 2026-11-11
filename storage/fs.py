@@ -2912,7 +2912,11 @@ class StorageFS(Operations):
                     mutation = (self._local_mutation(entry.canonical_path, entry.cache_path)
                                 if entry.backend_name is None else contextlib.nullcontext(None))
                     published = stack.enter_context(mutation)
-                    written = os.pwrite(entry.real_fd, data, offset)
+                # The descriptor lock protects the ownership check and
+                # mutation announcement, not the byte operation: independent
+                # writes may overlap. Rename rekeys the announced state and
+                # descriptor before the later DIRTY publication.
+                written = os.pwrite(entry.real_fd, data, offset)
                 self.cache_manager.mark_cache_size_dirty()
 
                 if published is not None:
