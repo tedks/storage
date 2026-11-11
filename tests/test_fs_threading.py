@@ -868,20 +868,26 @@ class TestSharedFreshnessObligation(ThreadingTestBase):
         self._assert_slots_released()
 
     def test_rename_during_admission_wait_moves_or_preserves_debt(self):
-        self._change_a()
+        # Leave B's CLEAN cache inode in place with A still owed. The older
+        # uncached setup made the real rename fail ENOENT before any move.
+        self._prime_owed_a_with_b_cached()
+        old_identity = self._snapshot()["path_identity"]
         gate = self.fs._foreground_admission
         with patch.object(self.fs, "_select_unpinned_backend_for_read", return_value=self.b):
-            with gate.admit("ordinary"):
+            with gate.admit("demand"):
                 first = Worker(self._read, self.PATH)
                 first.start()
-                self.assertTrue(gate.waiting_for("ordinary", 1, WAIT))
+                self.assertTrue(gate.waiting_for("demand", 1, WAIT))
                 self.fs.rename(self.PATH, "/moved.txt")
-                self.assertIsNone(self._snapshot(self.PATH))
-                self.assertEqual("changedA", self._snapshot("/moved.txt")["owed_member"])
+                moved_debt = self._snapshot("/moved.txt")
             first.join(WAIT)
             self.assertFalse(first.is_alive())
             self.assertIsNotNone(first.error)  # old name no longer resolves
             self.assertEqual(self.NEW, self._read("/moved.txt", direct=True))
+        self.assertIsNone(self._snapshot(self.PATH))
+        self.assertIsNotNone(moved_debt)
+        self.assertEqual("changedA", moved_debt["owed_member"])
+        self.assertEqual(old_identity, moved_debt["path_identity"])
         self._assert_a_baseline("/moved.txt")
         self._assert_slots_released()
 
