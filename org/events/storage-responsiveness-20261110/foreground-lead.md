@@ -156,3 +156,16 @@
 - C3 disposition: write test holds after `pwrite` and before DIRTY, observes late callback at `_record_fetched` publication entry, finishes its validation before releasing the writer, and asserts A debt and absence of B baseline along with local bytes/DIRTY. Truncate/create retain path-locked interleavings and assert post-callback baseline/debt/bytes. The absent-final-path late-partial test independently exercises token guard without no-replace shortcut.
 - evidence: Python AST parse and `git diff --check` passed; 17 regression sources and all gates UNRUN under source-only authority. No `storage/` application edit, daemon probe, live-data work, deployment or paused Fleet request.
 - next: push frozen head, annotate draft PR and deliver one exact-head checkpoint to Storage root `%91`; await its boundary re-review before any application or runtime phase.
+
+## foreground-lead:16
+
+- kind: targeted-review-disposition
+- state: TARGETED_BOUNDARY_TEST_DELTA_DELIVERED; root re-review pending
+- based_on: root source review of frozen `7b1f5e6ee4f64605959c8d8aceef79ec1f95a2b5`; C1 path-wide revision and C2 local demand recovery architecture clean, C3 test integration and remote freshness wording needed correction
+- applied_at: source correction `09242aee96e256c668f9b4c43c3447d3448b2ea0`
+- refs: foreground-lead:15, `contracts/path-freshness-obligation.md`, `docs/specs/foreground-responsiveness-20261110.md`, `tests/test_fs_threading.py`, PR #171
+- C3 disposition: B token is captured after A debt and before local mutation, so the write itself invalidates it. Callback entry is observed while writer pauses after `pwrite` inside metadata-locked DIRTY marking; the test permits early rejection or metadata-lock blocking, releases writer before joining callback, then asserts local bytes, DIRTY, A debt and no B baseline. Removed the forced `_record_fetched` entry helper that deadlocked a correct callback.
+- C2 disposition: valid local marker restores identity/debt only; it does not skip normal first-open freshness stat or forge `verified_at`. The ordinary-saturated restarted warm test now permits and observes A's unchanged stat while demand progresses. Added a changed-A-while-stopped case: demand observes changed A, releases path lock, waits for ordinary behind a cold copy, then returns A bytes/baseline. Missing-cache ambiguity remains conservative.
+- evidence: Python AST parse and `git diff --check` passed. Eighteen scratch regression sources and all gates UNRUN under source-only authority. No application edit, runtime probe, live-data work, paused Fleet request or #171 deployment.
+- boundary: Ted's splinter1 authorization is being exercised by Storage root only for accepted `81793ac` (#165/#166); separate restart-design Sol `%99` studies mount-preserving restart. Neither changes this branch's hold.
+- next: push clean frozen head, annotate draft PR and deliver exact-head checkpoint to root `%91`; await re-review before application/runtime work.
