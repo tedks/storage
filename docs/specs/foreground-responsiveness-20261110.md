@@ -2,6 +2,12 @@
 
 State: draft on `66c640a`; Ted's 2026-11-10 ruling includes reads and browsing.
 
+The review stop at `0631a73` is governed by the proposed
+[`path-freshness-obligation`](../../contracts/path-freshness-obligation.md)
+contract and huddle key `foreground-open-pin-ownership`. Two-member Event-gated
+regression sources in `tests/test_fs_threading.py` are intentionally unrun
+until root reviews that boundary and separately lifts the runtime hold.
+
 ## Intent and limits
 
 Serve DESIGN's large-file streaming and offline-cache goals while background

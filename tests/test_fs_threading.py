@@ -13,7 +13,9 @@ import tempfile
 import threading
 import time
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from fuse import FuseOSError
@@ -21,7 +23,7 @@ from fuse import FuseOSError
 from storage.backends.local import LocalBackend
 from storage.backends.base import is_interactive_request
 from storage.fs import StorageFS, mount_storage
-from storage.models import SyncStatus
+from storage.models import FileLocation, SyncStatus
 
 WAIT = 5.0
 # How long a thread that should be blocked is given to (wrongly) finish.
@@ -427,6 +429,335 @@ class TestForegroundAdmission(ThreadingTestBase):
     def _admit_once(gate, cancel=None):
         with gate.admit("ordinary", cancel=cancel):
             pass
+
+
+class TestSharedFreshnessObligation(ThreadingTestBase):
+    """Red contract tests: two members expose opener-private freshness loss.
+
+    These tests are source only until root authorizes runtime checks. The
+    proposed _freshness_snapshot and _freshness_token are diagnostic seams
+    specified in contracts/path-freshness-obligation.md, not present yet.
+    """
+
+    OLD = b"old on both"
+    NEW = b"new bytes from changed A"
+    PATH = "/f.txt"
+
+    def setUp(self):
+        super().setUp()
+        self.fs.destroy("/")
+        self.a = LocalBackend("changedA", str(self.member_dir))
+        self.b_dir = self.temp_dir / "staleB"
+        self.b_dir.mkdir()
+        self.b = LocalBackend("staleB", str(self.b_dir))
+        self.a.speed_priority = 0
+        self.b.speed_priority = 50
+        self.fs = StorageFS(
+            cache_root=self.cache_dir, state_db=self.temp_dir / "state.db",
+            backends={"changedA": self.a, "staleB": self.b},
+            cache_size=10 * 1024 * 1024, num_sync_workers=0,
+            start_sync=False, revalidate_after=60.0,
+            max_foreground_operations=3,
+        )
+        # Force the member stat boundary on every aged open. A fresh parent
+        # listing must not short-circuit the observation under test.
+        listing = patch.object(self.fs, "_listing_confirms_baseline", return_value=None)
+        listing.start()
+        self.addCleanup(listing.stop)
+        for directory in (self.member_dir, self.b_dir):
+            (directory / "f.txt").write_bytes(self.OLD)
+            os.utime(directory / "f.txt", (1_700_000_000, 1_700_000_000))
+        self.assertEqual(self.OLD, self._read(self.PATH))
+        for member in (self.a, self.b):
+            self.fs.state_manager.add_file_location(FileLocation(
+                virtual_path=self.PATH, backend_name=member.name, checksum="",
+                last_synced=time.time(), is_cached=False,
+            ))
+
+    def _read(self, path, *, direct=False):
+        call = getattr(self.fs, "__call__") if not direct else None
+        fd = call("open", path, os.O_RDONLY) if call else self.fs.open(path, os.O_RDONLY)
+        try:
+            return (call("read", path, 4096, 0, fd) if call else
+                    self.fs.read(path, 4096, 0, fd))
+        finally:
+            if call:
+                call("release", path, fd)
+            else:
+                self.fs.release(path, fd)
+
+    def _change_a(self):
+        (self.member_dir / "f.txt").write_bytes(self.NEW)
+        os.utime(self.member_dir / "f.txt", (1_700_000_100, 1_700_000_100))
+        with self.fs._member_checks_lock:
+            for path, check in list(self.fs._member_checks.items()):
+                self.fs._member_checks[path] = dataclasses.replace(
+                    check, verified_at=check.verified_at - 3600,
+                )
+
+    def _snapshot(self, path=PATH):
+        return self.fs._freshness_snapshot(path)
+
+    def _assert_a_baseline(self, path=PATH):
+        check = self.fs._member_checks[path]
+        self.assertEqual((len(self.NEW), 1_700_000_100.0), check.members["changedA"])
+        self.assertNotIn(path, self.fs._refetch_pins)
+        self.assertNotIn(path, self.fs._pinned_stats)
+
+    def _assert_slots_released(self):
+        self.assertEqual(0, self.fs._foreground_admission.active_count)
+        for kind in self.fs._foreground_admission.CLASSES:
+            self.assertEqual(0, self.fs._foreground_admission.waiting_count(kind))
+
+    def _hold_after_invalidation(self):
+        dropped = threading.Event()
+        resume = threading.Event()
+        self.addCleanup(resume.set)
+        real = self.fs._invalidate_file_cache
+
+        def invalidate(path):
+            result = real(path)
+            dropped.set()
+            if not resume.wait(WAIT):
+                raise AssertionError("invalidation gate was not released")
+            return result
+
+        return dropped, resume, patch.object(self.fs, "_invalidate_file_cache", side_effect=invalidate)
+
+    def test_racing_opener_cannot_select_stale_b_while_a_is_owed(self):
+        self._change_a()
+        dropped, resume, hold = self._hold_after_invalidation()
+        with hold, patch.object(self.fs, "_select_unpinned_backend_for_read", return_value=self.b), \
+                patch.object(self.a, "copy_to_local", wraps=self.a.copy_to_local) as a_copy, \
+                patch.object(self.b, "copy_to_local", wraps=self.b.copy_to_local) as b_copy:
+            first = Worker(self._read, self.PATH)
+            first.start()
+            self.assertTrue(dropped.wait(WAIT))
+            second = Worker(self._read, self.PATH)
+            second.start()
+            self.wait_for_path_waiter(self.PATH)
+            try:
+                resume.set()
+                self.assertEqual(self.NEW, first.finish())
+                self.assertEqual(self.NEW, second.finish())
+            finally:
+                resume.set()
+            self.assertGreaterEqual(a_copy.call_count, 1)
+            b_copy.assert_not_called()
+        self._assert_a_baseline()
+        self.assertIsNone(self._snapshot())
+        self._assert_slots_released()
+
+    def test_old_open_exit_cannot_erase_newer_observation(self):
+        # First opener pauses after releasing the path lock but before its
+        # cleanup. The second opener then publishes A's newer observation.
+        released = threading.Event()
+        first_resume = threading.Event()
+        self.addCleanup(first_resume.set)
+        dropped, second_resume, hold_invalidation = self._hold_after_invalidation()
+        real_path_locked = self.fs._path_locked
+        first = None
+
+        @contextmanager
+        def hold_after_path_lock(*paths):
+            with real_path_locked(*paths):
+                yield
+            if threading.current_thread() is first:
+                released.set()
+                if not first_resume.wait(WAIT):
+                    raise AssertionError("first opener exit gate was not released")
+
+        with patch.object(self.fs, "_path_locked", side_effect=hold_after_path_lock), \
+                patch.object(self.fs, "_select_unpinned_backend_for_read", return_value=self.b), \
+                hold_invalidation:
+            first = Worker(self.fs.open, self.PATH, os.O_RDONLY)
+            first.start()
+            self.assertTrue(released.wait(WAIT))
+            self._change_a()
+            second = Worker(self._read, self.PATH)
+            second.start()
+            self.assertTrue(dropped.wait(WAIT))
+            first_fd = None
+            try:
+                first_resume.set()
+                first_fd = first.finish()
+                second_resume.set()
+                self.assertEqual(self.NEW, second.finish())
+                self.assertEqual(self.OLD, self.fs.read(self.PATH, 4096, 0, first_fd))
+            finally:
+                first_resume.set()
+                second_resume.set()
+                if first_fd is not None:
+                    self.fs.release(self.PATH, first_fd)
+        self._assert_a_baseline()
+        self._assert_slots_released()
+
+    def test_cancelled_admission_leaves_a_owed_for_next_opener(self):
+        self._change_a()
+        gate = self.fs._foreground_admission
+        with patch.object(self.fs, "_select_unpinned_backend_for_read", return_value=self.b):
+            with gate.admit("ordinary"):
+                first = Worker(self._read, self.PATH)
+                first.start()
+                self.assertTrue(gate.waiting_for("ordinary", 1, WAIT))
+                gate.close()
+                first.join(WAIT)
+                self.assertFalse(first.is_alive())
+                self.assertIsInstance(first.error, FuseOSError)
+                self.assertEqual(errno.EINTR, first.error.errno)
+            self.assertEqual("changedA", self._snapshot()["owed_member"])
+            # Direct StorageFS call bypasses the now-closed FUSE gate; the
+            # shared freshness obligation still controls member selection.
+            self.assertEqual(self.NEW, self._read(self.PATH, direct=True))
+        self._assert_a_baseline()
+        self._assert_slots_released()
+
+    def test_failed_a_fetch_keeps_obligation_and_never_accepts_stale_b(self):
+        self._change_a()
+        with patch.object(self.fs, "_select_unpinned_backend_for_read", return_value=self.b):
+            with patch.object(self.a, "copy_to_local", side_effect=OSError(errno.EIO, "A failed")):
+                with self.assertRaises((OSError, FuseOSError)):
+                    self._read(self.PATH)
+            self.assertEqual("changedA", self._snapshot()["owed_member"])
+            self.assertEqual(self.NEW, self._read(self.PATH, direct=True))
+        self._assert_a_baseline()
+        self._assert_slots_released()
+
+    def test_unavailable_a_fallback_keeps_recheck_debt_until_a_returns(self):
+        self._change_a()
+        real_stat = self.a.stat
+
+        def stat_then_drop(path):
+            result = real_stat(path)
+            self.a.set_available(False)
+            return result
+
+        try:
+            with patch.object(self.a, "stat", side_effect=stat_then_drop), \
+                    patch.object(self.fs, "_select_unpinned_backend_for_read", return_value=self.b):
+                self.assertEqual(self.OLD, self._read(self.PATH))
+            debt = self._snapshot()
+            self.assertEqual("changedA", debt["owed_member"])
+            self.assertIn("changedA", debt["recheck_members"])
+        finally:
+            self.a.set_available(True)
+        self.assertEqual(self.NEW, self._read(self.PATH))
+        self.assertIsNone(self._snapshot())
+        self._assert_a_baseline()
+        self._assert_slots_released()
+
+    def test_rename_during_admission_wait_moves_or_preserves_debt(self):
+        self._change_a()
+        gate = self.fs._foreground_admission
+        with patch.object(self.fs, "_select_unpinned_backend_for_read", return_value=self.b):
+            with gate.admit("ordinary"):
+                first = Worker(self._read, self.PATH)
+                first.start()
+                self.assertTrue(gate.waiting_for("ordinary", 1, WAIT))
+                self.fs.rename(self.PATH, "/moved.txt")
+                self.assertIsNone(self._snapshot(self.PATH))
+                self.assertEqual("changedA", self._snapshot("/moved.txt")["owed_member"])
+            first.join(WAIT)
+            self.assertFalse(first.is_alive())
+            self.assertIsNotNone(first.error)  # old name no longer resolves
+            self.assertEqual(self.NEW, self._read("/moved.txt", direct=True))
+        self._assert_a_baseline("/moved.txt")
+        self._assert_slots_released()
+
+    def test_failed_rename_during_wait_keeps_old_identity_and_debt(self):
+        self._change_a()
+        gate = self.fs._foreground_admission
+        with patch.object(self.fs, "_select_unpinned_backend_for_read", return_value=self.b):
+            with gate.admit("ordinary"):
+                first = Worker(self._read, self.PATH)
+                first.start()
+                self.assertTrue(gate.waiting_for("ordinary", 1, WAIT))
+                with patch.object(self.fs.namespace, "rename", side_effect=OSError(errno.EIO, "rename failed")):
+                    with self.assertRaises(OSError):
+                        self.fs.rename(self.PATH, "/moved.txt")
+                self.assertEqual("changedA", self._snapshot()["owed_member"])
+            self.assertEqual(self.NEW, first.finish())
+        self._assert_a_baseline()
+        self._assert_slots_released()
+
+    def test_partial_failed_rename_during_wait_requires_reprobe(self):
+        self._change_a()
+        gate = self.fs._foreground_admission
+
+        def move_members_then_fail(old, new, on_local_moved=None):
+            for directory in (self.member_dir, self.b_dir):
+                os.rename(directory / "f.txt", directory / "moved.txt")
+            raise OSError(errno.EIO, "rename failed after member moves")
+
+        with patch.object(self.fs, "_select_unpinned_backend_for_read", return_value=self.b):
+            with gate.admit("ordinary"):
+                first = Worker(self._read, self.PATH)
+                first.start()
+                self.assertTrue(gate.waiting_for("ordinary", 1, WAIT))
+                with patch.object(self.fs.namespace, "rename", side_effect=move_members_then_fail):
+                    with self.assertRaises(OSError):
+                        self.fs.rename(self.PATH, "/moved.txt")
+                self.assertEqual("reprobe", self._snapshot(self.PATH)["state"])
+                self.assertEqual("reprobe", self._snapshot("/moved.txt")["state"])
+            first.join(WAIT)
+            self.assertFalse(first.is_alive())
+            self.assertIsNotNone(first.error)
+            self.assertEqual(self.NEW, self._read("/moved.txt", direct=True))
+        self._assert_a_baseline("/moved.txt")
+        self._assert_slots_released()
+
+    def test_late_stream_callback_cannot_replace_newer_a_baseline(self):
+        # A session started on stale B before A's changed generation existed.
+        # Its callback arrives after A bytes and baseline have committed.
+        old_token = self.fs._freshness_token(self.PATH, "staleB")
+        old_session = SimpleNamespace(
+            canonical_path=self.PATH,
+            final_cache_path=self.cache_dir / "f.txt",
+            backend=self.b,
+            member_stat=self.b.stat(self.PATH),
+            freshness_token=old_token,
+        )
+        self._change_a()
+        with patch.object(self.fs, "_select_unpinned_backend_for_read", return_value=self.b):
+            self.assertEqual(self.NEW, self._read(self.PATH))
+        self._assert_a_baseline()
+        late = Worker(self.fs._streaming_manager.on_finalized, old_session)
+        late.finish_started()
+        self.assertEqual(self.NEW, (self.cache_dir / "f.txt").read_bytes())
+        self._assert_a_baseline()
+        self.assertIsNone(self._snapshot())
+        self._assert_slots_released()
+
+    def test_late_stream_partial_cannot_install_stale_b_bytes(self):
+        # Model a B stream that began before A's newer observation. The
+        # actual no-replace install boundary must reject its old token even
+        # while the final cache path is temporarily absent.
+        old_token = self.fs._freshness_token(self.PATH, "staleB")
+        self._change_a()
+        gate = self.fs._foreground_admission
+        with gate.admit("ordinary"):
+            opener = Worker(self._read, self.PATH)
+            opener.start()
+            self.assertTrue(gate.waiting_for("ordinary", 1, WAIT))
+            final = self.cache_dir / "f.txt"
+            self.assertFalse(final.exists())
+            partial = self.cache_dir / "f.txt.storage.partial"
+            partial.write_bytes(self.OLD)
+            old_session = SimpleNamespace(
+                canonical_path=self.PATH,
+                final_cache_path=final,
+                partial_cache_path=partial,
+                backend=self.b,
+                member_stat=self.b.stat(self.PATH),
+                freshness_token=old_token,
+            )
+            outcome = self.fs._streaming_manager._install_partial(old_session)
+            self.assertNotEqual("installed", outcome)
+            self.assertFalse(final.exists())
+        self.assertEqual(self.NEW, opener.finish())
+        self.assertEqual(self.NEW, final.read_bytes())
+        self._assert_a_baseline()
+        self._assert_slots_released()
 
 
 class TestOpenRaces(ThreadingTestBase):
