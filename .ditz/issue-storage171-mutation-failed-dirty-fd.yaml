@@ -34,3 +34,14 @@ log_events:
   who: Ted Smith
   what: started
   comment: ""
+- time: 2026-11-11T23:17:24-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Pushed code/test head 832571d89f9c271789b0ed7b7a7603917eb61c9e. RED at
+    prior application head: O_TRUNC EIO and create RuntimeError after registration
+    each left the attempted FDEntry. The repair removes only the matching attempt
+    entry and closes its owned real fd once, without normal release/sync. GREEN verifies
+    exact fd closure, unrelated fd preservation, original error, local bytes and uncertainty.
+    Exact-head affected nonmount suites pass: revalidation 57/57, streaming 66/66,
+    selected threading 27/27. Root review remains pending; issue stays in progress
+    until acceptance.'
