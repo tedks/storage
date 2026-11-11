@@ -17,8 +17,8 @@ type: bugfix
 component: fs
 release:
 reporter: Ted Smith <tedks@riseup.net>
-status: in_progress
-disposition:
+status: closed
+disposition: fixed
 creation_time: 2026-11-11T23:16:52-00:00
 references: []
 log_events:
@@ -44,3 +44,9 @@ log_events:
   who: Ted Smith
   what: updated description
   comment: ""
+- time: 2026-11-11T23:53:29-00:00
+  who: Ted Smith
+  what: 'closed: fixed'
+  comment: 'Scoped sequential and overlapping uncertainty settlement is verified by
+    behavioral RED/GREEN, exact-head nonmount regressions at 053b5d3 and root plus
+    independent Sol CLEAN bounded delta; PR #171 acceptance remains separate.'
