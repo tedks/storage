@@ -1,0 +1,24 @@
+id: storage171-partial-namespace-reprobe
+title: Recover partial rename uncertainty with source proof
+desc: 'PR #171 namespace identity slice at d1a856d. A local cache move followed by
+  index rewrite failure preserves the moved scratch cache inode and member A debt
+  at both possible names, invalidates old tokens, and returns EIO for CLEAN opens
+  rather than selecting stale B by rank. This is the approved in-memory fail-closed
+  boundary. A future bounded package must reconcile the possible member names with
+  source proof and clear namespace_uncertain only after proving the correct source
+  and publishing its bytes/baseline; integrate with durable marker/restart work. Do
+  not infer policy for member rename retries, deletion propagation or remote conflicts.
+  Root owns next package and review.'
+type: task
+component: fs
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-11T23:53:39-00:00
+references: []
+log_events:
+- time: 2026-11-11T23:53:39-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
