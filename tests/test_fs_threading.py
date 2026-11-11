@@ -535,6 +535,48 @@ class TestSharedFreshnessObligation(ThreadingTestBase):
         if check is not None:
             self.assertNotIn("staleB", check.members)
 
+    def _fail_dirty_after_registration(self, error, keep_fd):
+        captured = {"close_calls": 0}
+
+        def fail(path, cache_path):
+            with self.fs._fd_lock:
+                attempts = [(vfd, entry) for vfd, entry in self.fs._fd_map.items()
+                            if vfd != keep_fd]
+                self.assertEqual(1, len(attempts))
+                vfd, entry = attempts[0]
+                captured.update(vfd=vfd, entry=entry, real_fd=entry.real_fd)
+                os.fstat(entry.real_fd)
+            raise error
+
+        return fail, captured
+
+    @staticmethod
+    def _count_failed_attempt_closes(captured):
+        real_close = os.close
+
+        def close(fd):
+            if fd == captured.get("real_fd"):
+                captured["close_calls"] += 1
+            return real_close(fd)
+
+        return patch("storage.fs.os.close", side_effect=close)
+
+    def _assert_failed_attempt_closed(self, captured, keep_fd, keep_real_fd):
+        with self.fs._fd_lock:
+            self.assertNotIn(captured["vfd"], self.fs._fd_map)
+            self.assertEqual(keep_real_fd, self.fs._fd_map[keep_fd].real_fd)
+        with self.assertRaises(OSError) as closed:
+            os.fstat(captured["real_fd"])
+        self.assertEqual(errno.EBADF, closed.exception.errno)
+        self.assertEqual(1, captured["close_calls"])
+        os.fstat(keep_real_fd)
+        with self.fs._member_checks_lock:
+            state = self.fs._freshness[self.PATH]
+            self.assertTrue(state.uncertain_local)
+            self.assertEqual(0, state.active_mutations)
+        self.assertIn("changedA", self._snapshot()["debts"])
+        self._assert_no_b_baseline()
+
     def _start_late_callback(self, session):
         """Observe callback entry before a path-locked mutation finishes."""
         entered = threading.Event()
@@ -1340,6 +1382,87 @@ class TestSharedFreshnessObligation(ThreadingTestBase):
         finally:
             self.a.set_available(True)
             self.fs.release(self.PATH, fd)
+
+    def test_successful_dirty_publication_recovers_failed_mutation_for_refetch(self):
+        fd = self.fs.open(self.PATH, os.O_RDWR)
+        self._change_a()
+        self.assertEqual(self.OLD, self._read(self.PATH))
+        self.a.set_available(False)
+        cache_path = self.cache_dir / "f.txt"
+        try:
+            with patch.object(self.fs, "_mark_cache_file_dirty",
+                              side_effect=OSError(errno.EIO, "failed dirty row")):
+                with self.assertRaises(FuseOSError):
+                    self.fs.write(self.PATH, b"first", 0, fd)
+            self.assertEqual(b"first" + self.OLD[5:], cache_path.read_bytes())
+            self.assertEqual(5, self.fs.write(self.PATH, b"local", 0, fd))
+            self._assert_local_dirty(b"local" + self.OLD[5:])
+        finally:
+            self.fs.release(self.PATH, fd)
+
+        # Model a completed, generation-checked upload to the available B
+        # member without a live sync worker. The independently owed A debt
+        # cannot be cleared by B's copy or by this CLEAN row.
+        self.b.copy_from_local(cache_path, self.PATH)
+        row = self.fs.state_manager.get_file_metadata(self.PATH)
+        self.assertTrue(self.fs.state_manager.publish_sync_status(
+            self.PATH, row.dirty_generation, SyncStatus.CLEAN))
+        row = self.fs.state_manager.get_file_metadata(self.PATH)
+        self.fs.cache_manager.sync_cache_metadata(self.PATH, row, cache_path=cache_path)
+        self.fs.cache_manager._evict_if_still_clean(self.PATH, cache_path)
+        self.assertFalse(cache_path.exists())
+
+        try:
+            # The old code keeps uncertain_local forever, rejects this
+            # private B stage and cannot return the bytes it just synced.
+            self.assertEqual(b"local" + self.OLD[5:], self._read(self.PATH))
+            self.assertIn("changedA", self._snapshot()["debts"])
+            self.assertIn("staleB", self.fs._member_checks[self.PATH].members)
+            with self.fs._member_checks_lock:
+                self.assertFalse(self.fs._freshness[self.PATH].uncertain_local)
+        finally:
+            self.a.set_available(True)
+
+    def test_o_trunc_dirty_failure_closes_only_attempt_descriptor(self):
+        keep_fd = self.fs.open(self.PATH, os.O_RDWR)
+        with self.fs._fd_lock:
+            keep_real_fd = self.fs._fd_map[keep_fd].real_fd
+        self._change_a()
+        self.assertEqual(self.OLD, self._read(self.PATH))
+        self.a.set_available(False)
+        fail, captured = self._fail_dirty_after_registration(
+            OSError(errno.EIO, "dirty publication failed"), keep_fd)
+        try:
+            with self._count_failed_attempt_closes(captured), \
+                    patch.object(self.fs, "_mark_cache_file_dirty", side_effect=fail):
+                with self.assertRaises(FuseOSError) as error:
+                    self.fs.open(self.PATH, os.O_RDWR | os.O_TRUNC)
+            self.assertEqual(errno.EIO, error.exception.errno)
+            self.assertEqual(b"", (self.cache_dir / "f.txt").read_bytes())
+            self._assert_failed_attempt_closed(captured, keep_fd, keep_real_fd)
+        finally:
+            self.a.set_available(True)
+            self.fs.release(self.PATH, keep_fd)
+
+    def test_create_dirty_failure_closes_only_attempt_descriptor(self):
+        keep_fd = self.fs.open(self.PATH, os.O_RDWR)
+        with self.fs._fd_lock:
+            keep_real_fd = self.fs._fd_map[keep_fd].real_fd
+        self._change_a()
+        self.assertEqual(self.OLD, self._read(self.PATH))
+        self.a.set_available(False)
+        fail, captured = self._fail_dirty_after_registration(
+            RuntimeError("dirty publication failed"), keep_fd)
+        try:
+            with self._count_failed_attempt_closes(captured), \
+                    patch.object(self.fs, "_mark_cache_file_dirty", side_effect=fail):
+                with self.assertRaisesRegex(RuntimeError, "dirty publication failed"):
+                    self.fs.create(self.PATH, 0o600)
+            self.assertEqual(b"", (self.cache_dir / "f.txt").read_bytes())
+            self._assert_failed_attempt_closed(captured, keep_fd, keep_real_fd)
+        finally:
+            self.a.set_available(True)
+            self.fs.release(self.PATH, keep_fd)
 
     def test_restart_of_b_fallback_restores_a_debt_before_freshness_shortcut(self):
         self._change_a()
