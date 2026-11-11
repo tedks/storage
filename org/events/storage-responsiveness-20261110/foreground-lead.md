@@ -118,3 +118,15 @@
 - evidence: Root acknowledged prerequisite execution/quiet and Fleet cancellation; token tripwire 316>300 calls for checkpoint and compact/stop now. Formal third-round outcome includes finished Anthropic and OpenAI findings; separate PR comment records both races and triages Anthropic's non-open sentinel concern against the sole `_open` caller. No application repair, runtime test or gate followed root stop.
 - open_question: cap 3 gives one demand slot; a slow cached-open freshness stat may hold it until member timeout. Root retains warm-open demand guarantee and requires this limitation to remain explicit; file an open-questions tracker issue on bounded resume if a further product choice is needed.
 - next: await bounded resume for design/contract and deterministic two-member regression source only; root must lift application-code and runtime holds separately.
+
+## foreground-lead:13
+
+- kind: state-change
+- state: DESIGN_REGRESSION_SOURCE_DELIVERED; root boundary review pending
+- based_on: root adjudication `foreground-open-pin-ownership` at `0631a73bff98b7649b9d65c181b5fe04dcf72ff9` and clean resume checkpoint `a95f6d6c34413f042aa4cd02febc524132ba9b12`
+- applied_at: source contract/regressions `47937490c085132f6fb51a56614329dd0745f452`
+- refs: foreground-lead:11, foreground-lead:12, `contracts/path-freshness-obligation.md`, `org/huddles/foreground-open-pin-ownership.md`, PR #171
+- evidence: Proposed shared path identity/generation, checked-member obligation, private staging before token-checked byte and baseline publication, fallback recheck debt, rename success/failure identity, late stream exclusion, and lock order. Added ten two-member Event-gated scratch regression sources in the existing threading test module, forcing ordinary selection toward stale member B. Python AST parse and `git diff --check` passed before commit; tests were UNRUN under the runtime stop. No `storage/` application code changed.
+- open_question: filed and synced ditz `oq-foreground-freshness-stat-slot` for the cap-3 slow-stat demand-slot product choice. Warm-open demand admission stays as ruled.
+- authority: Ted's bounded resume allows design/contracts/tests/status only. Root must review boundary and explicitly lift application-code repair separately. Runtime gates/probes and tedks/Fleet liaison remain stopped; no capacity request sent.
+- next: push reviewable checkpoint, update draft PR evidence and deliver one exact-head boundary summary to Storage root `%91`; then remain idle pending root review.

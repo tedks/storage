@@ -2,7 +2,7 @@
 
 - Adjudicator: Storage root; owner applying decision: responsiveness lead.
 - based_on: `0631a73bff98b7649b9d65c181b5fe04dcf72ff9`.
-- applied_at: design-source checkpoint descending from `a95f6d6c34413f042aa4cd02febc524132ba9b12`.
+- applied_at: source contract and regression commit `47937490c085132f6fb51a56614329dd0745f452`, reconciled against clean resume checkpoint `a95f6d6c34413f042aa4cd02febc524132ba9b12`.
 - Trigger: third formal convergence exposed two byte-freshness races in
   opener-private pin transfer and unlocked final cleanup.
 - Decision: retain the warm-open demand admission guarantee; do not classify
