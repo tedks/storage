@@ -1,13 +1,14 @@
 id: oq-mounted-sftp-maintenance-semantics
-title: Rule on mounted SFTP maintenance request semantics
+title: Rule on mounted SSH member maintenance request semantics
 desc: 'Design: docs/mounted_restart_design_2026-11-11.md (source snapshot 66c640a).
-  Decision owner: Ted (product ruling). Choose behavior for new requests to a member
-  while its SFTP pool drains: bounded wait with explicit deadline, or prompt retryable
-  error. Decide whether a maintenance request must refuse when an active streaming
-  read or sync upload exceeds that deadline. Recommendation: bounded wait, then report
-  not restarted without closing an active lease; never promise zero latency or automatic
-  replay of an unknown remote mutation. This blocks the operator-facing P2 command
-  and final user-visible contract, not source-only P1 tests.'
+  Decision owner: Ted (product ruling). Choose behavior for new SFTP or exec requests
+  to a member while its SSH pool drains: bounded wait with explicit deadline, or prompt
+  retryable error. Decide whether a maintenance request must refuse when an active
+  streaming read, sync upload, or exec command exceeds that deadline. Recommendation:
+  bounded wait, then report not restarted without closing an active channel; never
+  promise zero latency or automatic replay of an unknown remote mutation. This blocks
+  the operator-facing P2 command and final user-visible contract, not source-only
+  P1 tests.'
 type: task
 component: open-questions
 release:
@@ -20,4 +21,12 @@ log_events:
 - time: 2026-11-11T21:29:41-00:00
   who: Ted Smith
   what: created
+  comment: ""
+- time: 2026-11-11T21:31:24-00:00
+  who: Ted Smith
+  what: changed title
+  comment: ""
+- time: 2026-11-11T21:31:24-00:00
+  who: Ted Smith
+  what: updated description
   comment: ""
