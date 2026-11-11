@@ -143,3 +143,16 @@
 - F3 disposition: independent member-ID debt map and per-member generations; C completion clears only C while A remains owed. Added A-unavailable/B-fallback, changed-C completion, then A-return sequence asserting C bytes/baseline followed by A bytes/baseline and debt cleanup.
 - evidence: Python AST parsing and `git diff --check` passed on the source delta. All tests/gates UNRUN as instructed. No `storage/` edit, daemon probe, live data or paused Fleet request. Feedback is contract/test source, not a runtime or implementation outcome.
 - next: push frozen head, annotate draft PR and deliver one checkpoint to Storage root `%91`; await boundary re-review before any application repair.
+
+## foreground-lead:15
+
+- kind: review-feedback-disposition
+- state: BOUNDARY_CONVERGENCE_DELTA_DELIVERED; root re-review pending
+- based_on: frozen `baa66ed105212dd647eb46a13e91cce444407241` convergence review at `/home/tedks/.cache/storage-orgs-20261110/boundary-review-baa66ed.md`; verdict FINDINGS, no application or runtime clearance
+- applied_at: source correction `794d0536df1555d5505a579289728eea0022163a`
+- refs: foreground-lead:14, `contracts/path-freshness-obligation.md` v3, `docs/specs/foreground-responsiveness-20261110.md`, `tests/test_fs_threading.py`, PR #171
+- C1 disposition: path-wide publication revision advances on any changed-member observation, byte/baseline materialization, local mutation start or namespace identity change. Stream/fetch tokens capture it before reads and validate at locked install and baseline publication. An A observation invalidates old B publication attempts while per-member A/C debts remain independent. Absent-final-path late-B test now asserts B generation unchanged, revision changed, and A debt retained after rejection.
+- C2 disposition: every CLEAN cached inode carries a versioned local marker; locally verifiable restart opens stay demand. Only uncertain member recovery releases namespace/path locks and transfers to ordinary. New cap-3 Event-gated cold-copy test saturates ordinary while first restarted warm read completes without member stat. Missing-cache A/B divergence without source proof now fails EIO in the proposed contract/test, instead of picking A by ranking.
+- C3 disposition: write test holds after `pwrite` and before DIRTY, observes late callback at `_record_fetched` publication entry, finishes its validation before releasing the writer, and asserts A debt and absence of B baseline along with local bytes/DIRTY. Truncate/create retain path-locked interleavings and assert post-callback baseline/debt/bytes. The absent-final-path late-partial test independently exercises token guard without no-replace shortcut.
+- evidence: Python AST parse and `git diff --check` passed; 17 regression sources and all gates UNRUN under source-only authority. No `storage/` application edit, daemon probe, live-data work, deployment or paused Fleet request.
+- next: push frozen head, annotate draft PR and deliver one exact-head checkpoint to Storage root `%91`; await its boundary re-review before any application or runtime phase.
