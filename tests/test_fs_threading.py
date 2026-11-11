@@ -580,22 +580,43 @@ class TestSharedFreshnessObligation(ThreadingTestBase):
 
     def test_racing_opener_cannot_select_stale_b_while_a_is_owed(self):
         self._change_a()
-        dropped, resume, hold = self._hold_after_invalidation()
-        with hold, patch.object(self.fs, "_select_unpinned_backend_for_read", return_value=self.b), \
+        # First open has observed changed A and invalidated the old cache,
+        # then drops the path lock to transfer to ordinary admission. Hold it
+        # at that boundary so a second opener can choose from the members.
+        paused = threading.Event()
+        resume = threading.Event()
+        self.addCleanup(resume.set)
+        gate = self.fs._foreground_admission
+        real_reclassify = gate.reclassify_current
+        first = None
+
+        def hold_first_reclassify(kind):
+            if threading.current_thread() is first:
+                paused.set()
+                if not resume.wait(WAIT):
+                    raise AssertionError("first opener admission gate was not released")
+            return real_reclassify(kind)
+
+        # A fourth slot lets the second demand request enter while the first
+        # still owns its demand slot at this deterministic handoff barrier.
+        with patch.object(gate, "cap", 4), \
+                patch.object(gate, "reclassify_current", side_effect=hold_first_reclassify), \
+                patch.object(self.fs, "_select_unpinned_backend_for_read", return_value=self.b), \
                 patch.object(self.a, "copy_to_local", wraps=self.a.copy_to_local) as a_copy, \
                 patch.object(self.b, "copy_to_local", wraps=self.b.copy_to_local) as b_copy:
             first = Worker(self._read, self.PATH)
             first.start()
-            self.assertTrue(dropped.wait(WAIT))
-            second = Worker(self._read, self.PATH)
-            second.start()
-            self.wait_for_path_waiter(self.PATH)
+            self.assertTrue(paused.wait(WAIT))
             try:
-                resume.set()
-                self.assertEqual(self.NEW, first.finish())
-                self.assertEqual(self.NEW, second.finish())
+                second_bytes = self._read(self.PATH)
             finally:
                 resume.set()
+                first.join(WAIT)
+                self.assertFalse(first.is_alive())
+            # The byte assertion comes before diagnostics: a missing proposed
+            # snapshot method is not the red signal for this regression.
+            self.assertEqual(self.NEW, second_bytes)
+            self.assertEqual(self.NEW, first.finish())
             self.assertGreaterEqual(a_copy.call_count, 1)
             b_copy.assert_not_called()
         self._assert_a_baseline()
