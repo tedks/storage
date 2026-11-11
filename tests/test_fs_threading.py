@@ -795,6 +795,36 @@ class TestSharedFreshnessObligation(ThreadingTestBase):
         self._assert_a_baseline()
         self._assert_slots_released()
 
+    def test_owed_failed_probe_recovers_after_later_offline_observation(self):
+        self._prime_owed_a_with_b_cached()
+        with patch.object(self.a, "stat", side_effect=OSError(errno.EIO, "stat failed")) as probe:
+            self.assertEqual(self.OLD, self._read(self.PATH))
+            self.assertEqual(1, probe.call_count)
+        self.assertEqual("changedA", self._snapshot()["owed_member"])
+
+        # The failure happened while A reported available. A later open
+        # actually observes it offline; its return before the retry deadline
+        # must recheck immediately rather than serve B for the full delay.
+        self.a.set_available(False)
+        seen_available = []
+        real_available = self.a.is_available
+
+        def observe_available():
+            value = real_available()
+            seen_available.append(value)
+            return value
+
+        with patch.object(self.a, "is_available", side_effect=observe_available):
+            self.assertEqual(self.OLD, self._read(self.PATH))
+        self.assertIn(False, seen_available)
+        self.assertEqual("changedA", self._snapshot()["owed_member"])
+
+        self.a.set_available(True)
+        self.assertEqual(self.NEW, self._read(self.PATH))
+        self._assert_a_baseline()
+        self.assertIsNone(self._snapshot())
+        self._assert_slots_released()
+
     def test_rename_during_admission_wait_moves_or_preserves_debt(self):
         self._change_a()
         gate = self.fs._foreground_admission
