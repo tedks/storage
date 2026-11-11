@@ -7,6 +7,12 @@ The review stop at `0631a73` is governed by the proposed
 contract and huddle key `foreground-open-pin-ownership`. Two-member Event-gated
 regression sources in `tests/test_fs_threading.py` are intentionally unrun
 until root reviews that boundary and separately lifts the runtime hold.
+The `cd116cc7` boundary review returned F1-F3 findings. Contract v2 maps F1
+to the byte-mutation epoch, active-writer and no-replace publication rules;
+F2 to durable cache-xattr debt plus conservative restart reprobe; and F3 to
+per-member debts and generation checks. The threading test source adds
+Event-gated write/truncate/create, two restart, and A-then-C completion
+sequences. These are proposed acceptance tests, still unrun.
 
 ## Intent and limits
 

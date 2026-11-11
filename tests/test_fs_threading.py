@@ -489,11 +489,45 @@ class TestSharedFreshnessObligation(ThreadingTestBase):
     def _change_a(self):
         (self.member_dir / "f.txt").write_bytes(self.NEW)
         os.utime(self.member_dir / "f.txt", (1_700_000_100, 1_700_000_100))
+        self._age_checks()
+
+    def _age_checks(self):
         with self.fs._member_checks_lock:
             for path, check in list(self.fs._member_checks.items()):
                 self.fs._member_checks[path] = dataclasses.replace(
                     check, verified_at=check.verified_at - 3600,
                 )
+
+    def _restart_fs(self):
+        """Close the mount instance, retaining only scratch cache/member state."""
+        self.fs.destroy("/")
+        self.fs = StorageFS(
+            cache_root=self.cache_dir, state_db=self.temp_dir / "state.db",
+            backends={"changedA": self.a, "staleB": self.b},
+            cache_size=10 * 1024 * 1024, num_sync_workers=0,
+            start_sync=False, revalidate_after=60.0,
+            max_foreground_operations=3,
+        )
+        listing = patch.object(self.fs, "_listing_confirms_baseline", return_value=None)
+        listing.start()
+        self.addCleanup(listing.stop)
+
+    def _late_b_session(self, token, partial=None):
+        return SimpleNamespace(
+            canonical_path=self.PATH,
+            final_cache_path=self.cache_dir / "f.txt",
+            partial_cache_path=partial,
+            backend=self.b,
+            member_stat=self.b.stat(self.PATH),
+            freshness_token=token,
+        )
+
+    def _assert_local_dirty(self, expected):
+        self.assertEqual(expected, (self.cache_dir / "f.txt").read_bytes())
+        self.assertEqual(
+            SyncStatus.DIRTY,
+            self.fs.state_manager.get_file_metadata(self.PATH).sync_status,
+        )
 
     def _snapshot(self, path=PATH):
         return self.fs._freshness_snapshot(path)
@@ -757,6 +791,178 @@ class TestSharedFreshnessObligation(ThreadingTestBase):
         self.assertEqual(self.NEW, opener.finish())
         self.assertEqual(self.NEW, final.read_bytes())
         self._assert_a_baseline()
+        self._assert_slots_released()
+
+    def test_write_byte_to_dirty_interval_rejects_late_stream_commit(self):
+        token = self.fs._freshness_token(self.PATH, "staleB")
+        fd = self.fs.open(self.PATH, os.O_RDWR)
+        entered, resume = threading.Event(), threading.Event()
+        self.addCleanup(resume.set)
+        real_mark = self.fs._mark_cache_file_dirty
+
+        def mark_after_bytes(path, cache_path):
+            entered.set()
+            self.assertTrue(resume.wait(WAIT))
+            return real_mark(path, cache_path)
+
+        partial = self.cache_dir / "write-race.storage.partial"
+        partial.write_bytes(self.OLD)
+        try:
+            with patch.object(self.fs, "_mark_cache_file_dirty", side_effect=mark_after_bytes):
+                writer = Worker(self.fs.write, self.PATH, b"local", 0, fd)
+                writer.start()
+                self.assertTrue(entered.wait(WAIT))
+                self.assertEqual(b"local", (self.cache_dir / "f.txt").read_bytes()[:5])
+                late = self._late_b_session(token, partial)
+                # The final inode belongs to the writer. No-replace must win
+                # even before its DIRTY row is published.
+                self.assertNotEqual("installed", self.fs._streaming_manager._install_partial(late))
+                callback = Worker(self.fs._streaming_manager.on_finalized, late)
+                callback.start()
+                resume.set()
+                self.assertEqual(5, writer.finish())
+                callback.finish()
+            self._assert_local_dirty(b"local" + self.OLD[5:])
+        finally:
+            resume.set()
+            self.fs.release(self.PATH, fd)
+        self._assert_slots_released()
+
+    def test_truncate_byte_to_dirty_interval_rejects_late_baseline(self):
+        token = self.fs._freshness_token(self.PATH, "staleB")
+        entered, resume = threading.Event(), threading.Event()
+        self.addCleanup(resume.set)
+        real_mark = self.fs._mark_cache_file_dirty
+
+        def mark_after_truncate(path, cache_path):
+            entered.set()
+            self.assertTrue(resume.wait(WAIT))
+            return real_mark(path, cache_path)
+
+        with patch.object(self.fs, "_mark_cache_file_dirty", side_effect=mark_after_truncate):
+            truncater = Worker(self.fs.truncate, self.PATH, 3)
+            truncater.start()
+            self.assertTrue(entered.wait(WAIT))
+            self.assertEqual(b"old", (self.cache_dir / "f.txt").read_bytes())
+            late = Worker(self.fs._streaming_manager.on_finalized, self._late_b_session(token))
+            late.start()
+            resume.set()
+            truncater.finish()
+            late.finish()
+        self._assert_local_dirty(b"old")
+        self._assert_slots_released()
+
+    def test_create_replacement_rejects_old_stream_and_keeps_dirty_bytes(self):
+        token = self.fs._freshness_token(self.PATH, "staleB")
+        entered, resume = threading.Event(), threading.Event()
+        self.addCleanup(resume.set)
+        real_set = self.fs.state_manager.set_file_metadata
+
+        def set_after_truncation(metadata):
+            entered.set()
+            self.assertTrue(resume.wait(WAIT))
+            return real_set(metadata)
+
+        with patch.object(self.fs.state_manager, "set_file_metadata", side_effect=set_after_truncation):
+            creator = Worker(self.fs.create, self.PATH, 0o600)
+            creator.start()
+            self.assertTrue(entered.wait(WAIT))
+            self.assertEqual(b"", (self.cache_dir / "f.txt").read_bytes())
+            late = Worker(self.fs._streaming_manager.on_finalized, self._late_b_session(token))
+            late.start()
+            resume.set()
+            fd = creator.finish()
+            late.finish()
+        try:
+            self.assertEqual(5, self.fs.write(self.PATH, b"local", 0, fd))
+            self._assert_local_dirty(b"local")
+        finally:
+            self.fs.release(self.PATH, fd)
+        self._assert_slots_released()
+
+    def test_restart_of_b_fallback_restores_a_debt_before_freshness_shortcut(self):
+        self._change_a()
+        real_stat = self.a.stat
+
+        def stat_then_drop(path):
+            result = real_stat(path)
+            self.a.set_available(False)
+            return result
+
+        try:
+            with patch.object(self.a, "stat", side_effect=stat_then_drop), \
+                    patch.object(self.fs, "_select_unpinned_backend_for_read", return_value=self.b):
+                self.assertEqual(self.OLD, self._read(self.PATH))
+            self.assertEqual(self.OLD, (self.cache_dir / "f.txt").read_bytes())
+            self._restart_fs()
+            self.assertEqual(self.OLD, self._read(self.PATH))
+            self.assertIn("changedA", self._snapshot()["debts"])
+        finally:
+            self.a.set_available(True)
+        with patch.object(self.fs, "_select_unpinned_backend_for_read", return_value=self.b):
+            self.assertEqual(self.NEW, self._read(self.PATH))
+        self._assert_a_baseline()
+        self.assertIsNone(self._snapshot())
+        self._assert_slots_released()
+
+    def test_restart_with_missing_cache_reprobes_a_not_stale_b(self):
+        self._change_a()
+        gate = self.fs._foreground_admission
+        with gate.admit("ordinary"):
+            opener = Worker(self._read, self.PATH)
+            opener.start()
+            self.assertTrue(gate.waiting_for("ordinary", 1, WAIT))
+            self.assertFalse((self.cache_dir / "f.txt").exists())
+            gate.close()
+            opener.join(WAIT)
+            self.assertFalse(opener.is_alive())
+            self.assertIsInstance(opener.error, FuseOSError)
+        self._restart_fs()
+        with patch.object(self.fs, "_select_unpinned_backend_for_read", return_value=self.b):
+            self.assertEqual(self.NEW, self._read(self.PATH))
+        self._assert_a_baseline()
+        self.assertIsNone(self._snapshot())
+        self._assert_slots_released()
+
+    def test_c_completion_cannot_clear_independent_a_debt(self):
+        self._change_a()
+        real_stat = self.a.stat
+
+        def stat_then_drop(path):
+            result = real_stat(path)
+            self.a.set_available(False)
+            return result
+
+        try:
+            with patch.object(self.a, "stat", side_effect=stat_then_drop), \
+                    patch.object(self.fs, "_select_unpinned_backend_for_read", return_value=self.b):
+                self.assertEqual(self.OLD, self._read(self.PATH))
+            self.assertIn("changedA", self._snapshot()["debts"])
+            c_dir = self.temp_dir / "changedC"
+            c_dir.mkdir()
+            c_bytes = b"C has an independent change"
+            (c_dir / "f.txt").write_bytes(c_bytes)
+            os.utime(c_dir / "f.txt", (1_700_000_200, 1_700_000_200))
+            c = LocalBackend("changedC", str(c_dir))
+            c.speed_priority = -10
+            self.fs.backends[c.name] = c
+            self.fs.replication_manager.backends[c.name] = c
+            self.fs.state_manager.add_file_location(FileLocation(
+                virtual_path=self.PATH, backend_name=c.name, checksum="",
+                last_synced=time.time(), is_cached=False,
+            ))
+            self._age_checks()
+            self.assertEqual(c_bytes, self._read(self.PATH))
+            after_c = self._snapshot()
+            self.assertIn("changedA", after_c["debts"])
+            self.assertNotIn("changedC", after_c["debts"])
+            self.assertEqual((len(c_bytes), 1_700_000_200.0),
+                             self.fs._member_checks[self.PATH].members["changedC"])
+        finally:
+            self.a.set_available(True)
+        self.assertEqual(self.NEW, self._read(self.PATH))
+        self._assert_a_baseline()
+        self.assertIsNone(self._snapshot())
         self._assert_slots_released()
 
 
