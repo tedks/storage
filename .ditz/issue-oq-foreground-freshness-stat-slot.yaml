@@ -1,0 +1,29 @@
+id: oq-foreground-freshness-stat-slot
+title: Decide cap-3 freshness-stat demand-slot latency
+desc: 'Foreground responsiveness keeps warm cached opens in the demand class. A stale
+  cached open may stat a slow SSH member while holding the sole demand slot when max_foreground_operations=3,
+  delaying an unrelated demand read until the member I/O timeout. The default cap
+  of 32 has shared spare capacity, but does not guarantee a read at the minimum cap.
+
+
+  Options: (a) accept and document the cap-3 limit while keeping warm-open demand
+  admission; (b) require at least two demand slots or a higher minimum cap; (c) move
+  freshness stat outside the demand slot with a separate bounded path that preserves
+  byte freshness and lock order. Recommendation: retain the current documented limit
+  for this review phase, then choose (b) if cap 3 is intended as a production responsiveness
+  setting. Ted/root decides. This blocks a claim of bounded demand-read latency at
+  cap 3, but does not block source-only freshness contract/test design or review of
+  the known limitation.'
+type: task
+component: open-questions
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-11T20:58:23-00:00
+references: []
+log_events:
+- time: 2026-11-11T20:58:23-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
