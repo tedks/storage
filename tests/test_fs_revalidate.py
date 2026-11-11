@@ -11,6 +11,7 @@ import dataclasses
 import logging
 import os
 import shutil
+import threading
 import tempfile
 import time
 import unittest
@@ -791,7 +792,17 @@ class TestRevalidateStreamBail(RevalidateTestBase):
             self.assertIn("fast", self.fs._freshness_snapshot("/f.txt")["debts"])
         finally:
             self.fs.release("/f.txt", writer)
-        self.assertEqual(b"changed on fast", self.read_through("/f.txt"))
+        finalized = threading.Event()
+        manager = self.fs._streaming_manager
+        real_finalized = manager.on_finalized
+
+        def record_finalized(session):
+            real_finalized(session)
+            finalized.set()
+
+        with patch.object(manager, "on_finalized", side_effect=record_finalized):
+            self.assertEqual(b"changed on fast", self.read_through("/f.txt"))
+            self.assertTrue(finalized.wait(timeout=10.0))
         self.assertIsNone(self.fs._freshness_snapshot("/f.txt"))
 
     def test_stream_bailing_to_the_fallback_still_fetches_from_the_pinned_member(self):

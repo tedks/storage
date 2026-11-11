@@ -1,4 +1,5 @@
 import errno
+import contextlib
 import json
 import os
 import re
@@ -423,15 +424,23 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.assertEqual(len(changed), row.size)
 
     def test_full_fetch_losing_to_a_promoted_prefix_does_not_index_it(self):
-        # Council round 1 on #146: a full fetch (a write-open) copies the
-        # whole file while a streaming session for the same never-cached
-        # path fails and promotes its prefix; the fetch's link then finds
-        # the prefix at the path and used to index it as the whole file
-        # (CLEAN, prefix size), so it was served truncated and, once
-        # written, synced over the member.
+        # A failed session's close must not hold the sole demand slot while
+        # a same-path ordinary full copy owns the path lock. The copy wins;
+        # the optional prefix is discarded under contention.
+        self.fs.destroy('/')
+        self.fs = StorageFS(
+            cache_root=self.cache_dir, state_db=self.db_path,
+            backends={"backend": self.backend}, cache_size=32 * 1024 * 1024,
+            num_sync_workers=0, start_sync=False, streaming_reads=True,
+            streaming_chunk_size=32 * 1024, max_streaming_sessions=2,
+            max_foreground_operations=3,
+        )
         self.backend.copy_delay = 0
         payload = os.urandom(192 * 1024)
         (self.backend_dir / "raced.bin").write_bytes(payload)
+        (self.backend_dir / "warm.bin").write_bytes(b"warm")
+        warm_fd = self.fs.open('/warm.bin', os.O_RDWR)
+        self.fs.release('/warm.bin', warm_fd)
 
         real_copy = self.backend.copy_to_local
         in_copy = threading.Event()
@@ -449,7 +458,7 @@ class TestFSStreamingIntegration(unittest.TestCase):
         # The read-ahead worker waits at its first read until the failure is
         # set up, so it can neither finish the file nor pass 64 KiB first.
         self.backend.worker_gate = threading.Event()
-        rvfd = self.fs.open('/raced.bin', os.O_RDONLY)
+        rvfd = self.fs.__call__('open', '/raced.bin', os.O_RDONLY)
         self.assertIsNotNone(self._session_for(rvfd))
         self.assertEqual(self.fs.read('/raced.bin', 4096, 0, rvfd), payload[:4096])
 
@@ -468,13 +477,37 @@ class TestFSStreamingIntegration(unittest.TestCase):
             self.backend.fail_after_offset = 64 * 1024
             with self.assertRaises(FuseOSError):
                 self.fs.read('/raced.bin', 4096, 96 * 1024, rvfd)
-            self.fs.release('/raced.bin', rvfd)
             self.backend.worker_gate.set()
+            session = self._session_for(rvfd)
+            self.assertTrue(self._wait_for(lambda: session.worker_done, timeout=3.0))
+            released = threading.Event()
+            release_errors = []
+
+            def close_failed_reader():
+                try:
+                    self.fs.__call__('release', '/raced.bin', rvfd)
+                except BaseException as exc:
+                    release_errors.append(exc)
+                finally:
+                    released.set()
+
+            closer = threading.Thread(target=close_failed_reader, daemon=True)
+            closer.start()
             cache_path = self.cache_dir / "raced.bin"
-            self.assertTrue(self._wait_for(lambda: cache_path.exists(), timeout=5.0))
-            self.assertLess(cache_path.stat().st_size, len(payload))  # the prefix won
-            go.set()
-            writer.join(timeout=5.0)
+            try:
+                self.assertTrue(released.wait(timeout=3.0), "failed close held demand behind full copy")
+                self.assertFalse(release_errors)
+                self.assertFalse(cache_path.exists())
+                warm = self.fs.__call__('open', '/warm.bin', os.O_RDONLY)
+                try:
+                    self.assertEqual(b"warm", self.fs.__call__('read', '/warm.bin', 4, 0, warm))
+                finally:
+                    self.fs.__call__('release', '/warm.bin', warm)
+                self.assertEqual(0, self.fs._foreground_admission.active_count)
+            finally:
+                go.set()
+                closer.join(timeout=5.0)
+                writer.join(timeout=5.0)
         self.assertFalse(writer.is_alive())
         self.assertNotIn("error", outcome)
         self.fs.release('/raced.bin', outcome["vfd"])
@@ -483,6 +516,37 @@ class TestFSStreamingIntegration(unittest.TestCase):
         row = self.fs.state_manager.get_file_metadata('/raced.bin')
         self.assertEqual(len(payload), row.size)
         self.assertEqual(SyncStatus.CLEAN, row.sync_status)
+
+    def test_full_fetch_no_replace_rejects_prefix_winning_its_link(self):
+        # Primitive collision retained even though a failed close now skips
+        # promotion when a FUSE full copy owns the same path lock.
+        from storage.cache_metadata import PREFIX_XATTR
+        path = '/prefix-link.bin'
+        payload = os.urandom(64 * 1024)
+        (self.backend_dir / path.lstrip('/')).write_bytes(payload)
+        final = self.cache_dir / path.lstrip('/')
+        real_link = os.link
+        injected = False
+
+        def prefix_wins(src, dst, *args, **kwargs):
+            nonlocal injected
+            if str(dst) == str(final) and not injected:
+                injected = True
+                final.write_bytes(payload[:4096])
+                os.setxattr(str(final), PREFIX_XATTR, b'1')
+            return real_link(src, dst, *args, **kwargs)
+
+        with patch('storage.cache.os.link', side_effect=prefix_wins):
+            cached, installed = self.fs.cache_manager.cache_file(
+                path, self.backend, with_install_result=True)
+        self.assertTrue(cached)
+        self.assertFalse(installed)
+        self.assertEqual(payload[:4096], final.read_bytes())
+        self.assertIsNone(self.fs.state_manager.get_file_metadata(path))
+        self.assertTrue(self.fs._drop_unindexed_prefix(path, final))
+        self.assertTrue(self.fs._ensure_file_in_cache(self.fs._resolve_path(path)))
+        self.assertEqual(payload, final.read_bytes())
+        self.assertEqual(len(payload), self.fs.state_manager.get_file_metadata(path).size)
 
     def test_a_member_file_carrying_the_prefix_marker_is_fetched_whole_and_indexed(self):
         # Council round 2 on #146: a member file may carry the marker (an
@@ -1753,30 +1817,17 @@ class TestFSStreamingIntegration(unittest.TestCase):
         edit = b"E" * 4096
         expected = edit + payload[len(edit):]
 
-        # The index lock, traced: finalize is let go only once the writer
-        # has either finished inside the window (the old code) or found the
-        # lock held and is waiting for it (the fix), never on a timer.
-        writer_settled = threading.Event()
-        real_lock = self.fs.state_manager._db_lock
+        # The writer reaches the path lock while finalize owns it. The
+        # finalizer then publishes the row before the writer may mutate it.
+        writer_at_path = threading.Event()
+        real_hold = self.fs._path_locks.hold
 
-        class TracedLock:
-            def acquire(self, blocking=True, timeout=-1):
-                if threading.current_thread().name == "window-writer":
-                    if real_lock.acquire(blocking=False):
-                        return True
-                    writer_settled.set()
-                return real_lock.acquire(blocking, timeout)
-
-            def release(self):
-                real_lock.release()
-
-            __enter__ = acquire
-
-            def __exit__(self, *exc):
-                real_lock.release()
-
-        self.fs.state_manager._db_lock = TracedLock()
-        self.addCleanup(setattr, self.fs.state_manager, "_db_lock", real_lock)
+        @contextlib.contextmanager
+        def traced_hold(*paths):
+            if threading.current_thread().name == "window-writer":
+                writer_at_path.set()
+            with real_hold(*paths):
+                yield
 
         cache = self.fs.cache_manager
         real_store = cache.store_file_metadata
@@ -1799,16 +1850,16 @@ class TestFSStreamingIntegration(unittest.TestCase):
                 outcome["done"] = True
             except BaseException as exc:  # noqa: BLE001 - reported below
                 outcome["error"] = exc
-            finally:
-                writer_settled.set()
 
-        with patch.object(cache, "store_file_metadata", side_effect=held_store):
+        with patch.object(cache, "store_file_metadata", side_effect=held_store), \
+                patch.object(self.fs._path_locks, "hold", side_effect=traced_hold):
             rvfd, session = self._stream_whole_file("window.bin", payload)
             self.assertTrue(at_store.wait(timeout=3.0))
             self.assertTrue((self.cache_dir / "window.bin").exists())
             writer = threading.Thread(target=write_through_mount, name="window-writer", daemon=True)
             writer.start()
-            self.assertTrue(writer_settled.wait(timeout=3.0))
+            self.assertTrue(writer_at_path.wait(timeout=3.0))
+            self.assertNotIn("done", outcome)
             go.set()
             writer.join(timeout=5.0)
             session.worker.join(timeout=5.0)
@@ -2116,6 +2167,8 @@ class TestFSStreamingIntegration(unittest.TestCase):
             final.write_bytes(final_bytes)
         session = SimpleNamespace(
             partial_cache_path=partial, final_cache_path=final, canonical_path='/' + name,
+            backend=self.backend,
+            freshness_token=self.fs._freshness_token('/' + name, self.backend.name),
         )
         return session, partial, final
 

@@ -983,6 +983,76 @@ class TestSharedFreshnessObligation(ThreadingTestBase):
         self.assertEqual(before["debts"], self._snapshot()["debts"])
         self.assertEqual(before["publication_revision"], self._snapshot()["publication_revision"])
 
+    def test_old_b_stream_cannot_publish_over_occupied_final_path(self):
+        final = self.cache_dir / "f.txt"
+        final.unlink()
+        session = self._prepared_stream(self.b)
+        self._change_a()
+        with self.fs._path_locked(self.PATH):
+            self.fs._observe_changed_member(self.PATH, self.a, self.a.stat(self.PATH))
+        final.write_bytes(self.NEW)
+        before = self._snapshot()
+        self.fs._finalize_streaming_session(session)
+        self.assertEqual(self.NEW, final.read_bytes())
+        self.assertEqual(before["debts"], self._snapshot()["debts"])
+        self._assert_no_b_baseline()
+
+    def test_failed_and_cancelled_a_streams_keep_debt(self):
+        self._change_a()
+        with self.fs._path_locked(self.PATH):
+            self.fs._observe_changed_member(self.PATH, self.a, self.a.stat(self.PATH))
+            self.fs._invalidate_file_cache(self.PATH)
+        manager = self.fs._streaming_manager
+        failed = self._prepared_stream(self.a)
+        with failed.lock:
+            failed.error = OSError(5, "failed member read")
+            failed.available_ranges = []
+            failed.condition.notify_all()
+        manager._finalize_streaming_session(failed)
+        manager._release_prefetch_session(failed)
+        failed.worker.join(WAIT)
+        self.assertFalse(failed.worker.is_alive())
+        self.assertFalse((self.cache_dir / "f.txt").exists())
+        self.assertIn("changedA", self._snapshot()["debts"])
+        cancelled = self._prepared_stream(self.a)
+        manager._release_prefetch_session(cancelled)
+        cancelled.worker.join(WAIT)
+        self.assertFalse(cancelled.worker.is_alive())
+        self.assertFalse((self.cache_dir / "f.txt").exists())
+        self.assertIn("changedA", self._snapshot()["debts"])
+        self._assert_no_b_baseline()
+
+    def test_stale_b_prefix_rejected_before_install(self):
+        final = self.cache_dir / "f.txt"
+        final.unlink()
+        self.fs.state_manager.delete_file(self.PATH)
+        session = self._prepared_stream(self.b)
+        self._change_a()
+        with self.fs._path_locked(self.PATH):
+            self.fs._observe_changed_member(self.PATH, self.a, self.a.stat(self.PATH))
+        before = self._snapshot()
+        self.assertFalse(self.fs._promote_failed_session_cache_prefix(session))
+        self.assertFalse(final.exists())
+        self.assertEqual(before["debts"], self._snapshot()["debts"])
+        self.fs._streaming_manager._cleanup_prefetch_session(session, "failed")
+
+    def test_b_stream_commit_leaves_independent_a_debt(self):
+        self._change_a()
+        with self.fs._path_locked(self.PATH):
+            self.fs._observe_changed_member(self.PATH, self.a, self.a.stat(self.PATH))
+            self.fs._invalidate_file_cache(self.PATH)
+        (self.b_dir / "f.txt").write_bytes(b"independent B change")
+        os.utime(self.b_dir / "f.txt", (1_700_000_200, 1_700_000_200))
+        with self.fs._path_locked(self.PATH):
+            self.fs._observe_changed_member(self.PATH, self.b, self.b.stat(self.PATH))
+        session = self._prepared_stream(self.b)
+        self.fs._finalize_streaming_session(session)
+        self.assertEqual(b"independent B change", (self.cache_dir / "f.txt").read_bytes())
+        debt = self._snapshot()["debts"]
+        self.assertIn("changedA", debt)
+        self.assertNotIn("staleB", debt)
+        self.assertIn("staleB", self.fs._member_checks[self.PATH].members)
+
     def test_b_stream_fallback_keeps_a_debt(self):
         self._change_a()
         with self.fs._path_locked(self.PATH):
