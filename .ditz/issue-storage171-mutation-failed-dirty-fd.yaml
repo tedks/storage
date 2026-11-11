@@ -1,0 +1,32 @@
+id: storage171-mutation-failed-dirty-fd
+title: Close fd registration on failed O_TRUNC/create DIRTY publication
+desc: 'PR #171 foreground responsiveness, pushed checkpoint eca224850cc287a33d0103b8689c349ae289d8da.
+
+
+  Static self-review finding: StorageFS._open with O_TRUNC and StorageFS._create register
+  a new FDEntry before _mark_cache_file_dirty. If DIRTY publication raises OSError,
+  their FUSE error paths do not remove/close that descriptor. The local mutation state
+  remains conservatively uncertain, but the descriptor can leak and later release
+  cannot name it.
+
+
+  Add deterministic scratch-only tests injecting DIRTY-publication failure after registration
+  for O_TRUNC and create. Assert the callback errors, no fd-map entry or real fd remains,
+  local bytes and uncertainty are handled conservatively, and no stale fetch publishes
+  CLEAN. Repair only those error paths without weakening pre-byte mutation announcement
+  or the full-fetch/stream commit guard. Re-run focused nonmount tests under a new
+  authorized resource envelope, then full PR gates/council later. Root owns review/acceptance;
+  this issue is not a runtime grant.'
+type: bugfix
+component: fs
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-11T23:07:39-00:00
+references: []
+log_events:
+- time: 2026-11-11T23:07:39-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
