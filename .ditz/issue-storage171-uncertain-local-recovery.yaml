@@ -1,0 +1,31 @@
+id: storage171-uncertain-local-recovery
+title: Settle uncertain local state after a later authoritative DIRTY mark
+desc: 'PR #171 foreground responsiveness. Root and warm Sol found at frozen eca2248
+  that uncertain_local stayed true forever after failed DIRTY publication, so a later
+  successful write and sync could still leave every clean-cache refetch rejected.
+
+
+  Disposition in pushed code/test commit 832571d89f9c271789b0ed7b7a7603917eb61c9e:
+  a later successful DIRTY mark records the local inode and may clear uncertainty
+  only if the current cache inode matches, the local epoch is still that attempt''s
+  epoch, and no overlapping mutation remains. A failed mark, changed inode, superseded
+  epoch or overlap retains uncertainty. Deterministic scratch two-member regression
+  failed before recovery at refetch ENOENT after failed write, successful later write,
+  generation-checked B sync and clean eviction; it passed with the repair. On exact
+  code/test head 832571d, full nonmount revalidation 57/57, streaming 66/66 and 27
+  selected threading cases passed under the bounded scope. Root review is still pending;
+  do not close until accepted. Durable marker/restart and rename/unlink identity remain
+  separate slices.'
+type: bugfix
+component: fs
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-11T23:16:52-00:00
+references: []
+log_events:
+- time: 2026-11-11T23:16:52-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
