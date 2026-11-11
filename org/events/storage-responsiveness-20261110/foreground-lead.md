@@ -169,3 +169,15 @@
 - evidence: Python AST parse and `git diff --check` passed. Eighteen scratch regression sources and all gates UNRUN under source-only authority. No application edit, runtime probe, live-data work, paused Fleet request or #171 deployment.
 - boundary: Ted's splinter1 authorization is being exercised by Storage root only for accepted `81793ac` (#165/#166); separate restart-design Sol `%99` studies mount-preserving restart. Neither changes this branch's hold.
 - next: push clean frozen head, annotate draft PR and deliver exact-head checkpoint to root `%91`; await re-review before application/runtime work.
+
+## foreground-lead:17
+
+- kind: tracer-prerequisite-blocker
+- state: TRACER_RUNTIME_BLOCKED_CACHED_INPUTS; no application repair started
+- based_on: root and warm Sol CLEAN boundary decision at `07134bc9029a0e135f0c7dbb792765c1e8f03543`, `/home/tedks/.cache/storage-orgs-20261110/boundary-review-07134bc.md`; authority is one smallest coherent tracer with meaningful RED/GREEN and cached-only local nonmount run
+- applied_at: test/contract refinement `33dac384a62d6f9ca755786b48356f42a52733fa`
+- C3 refinement: B is now eligible through A-unavailable fallback after A debt exists and before mutation; the callback enters while `pwrite` is past bytes but before DIRTY, and debt/baseline are inspected before writer release without waiting for callback completion. This removes source-preference and old-token masking of the mutation guard.
+- capacity: framework0 recheck showed 106 GiB MemAvailable, full memory PSI avg10=0.00, vmstat zero swap in/out. Owned `storage171-red-20261111.scope` reported cgroup cpu.max `200000 100000`, memory.max `4294967296`, swap.max `0`; it ended inactive/dead. No peer holder was touched.
+- attempted RED: `timeout 600s nix develop --offline --command bazel --output_base=/tmp/storage171-tracer-ybuymvxe/bazel --batch test //tests:storage_test_fs_threading --repository_disable_download --jobs=2 --local_cpu_resources=2 --local_ram_resources=3500 --test_arg=-k --test_arg=racing_opener_cannot_select_stale_b_while_a_is_owed --test_output=errors` in that scope. Exit 1 after 6.8s, before any test: rules_python pip extension requested uncached PyPI metadata for nh3, idna, rich and others; no acquisition occurred. Exact log `/tmp/storage171-tracer-ybuymvxe/red.log` (5609 bytes).
+- evidence limit: no behavioral RED race, no GREEN, no application edit, no all-gates/council acceptance. Python AST and `git diff --check` passed for source refinement. This is a cached-input gate blocker, not a test result. Paused Fleet and live storage untouched.
+- next: push clean checkpoint and report blocker to root `%91`; stop runtime until a separately authorized cached-input solution fits the named envelope, then rerun meaningful RED before repair.
