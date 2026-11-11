@@ -96,6 +96,7 @@ class PathFreshness:
     local_epoch: int = 0
     active_mutations: int = 0
     uncertain_local: bool = False
+    mutation_group_failed: bool = False
     generations: Dict[str, int] = field(default_factory=dict)
     debts: Dict[str, FreshnessDebt] = field(default_factory=dict)
 
@@ -1271,29 +1272,35 @@ class StorageFS(Operations):
         """
         with self._member_checks_lock:
             state = self._freshness_for_path(canonical_path)
+            if state.active_mutations == 0:
+                # A later independent successful group may settle an older
+                # failed DIRTY publication for the same current inode.
+                state.mutation_group_failed = False
             if replacement:
                 self._next_freshness_identity += 1
                 state.identity = self._next_freshness_identity
             state.local_epoch += 1
             state.revision += 1
             state.active_mutations += 1
-            epoch = state.local_epoch
             self._member_checks.pop(canonical_path, None)
         published = {"dirty": False, "inode": None}
         try:
             yield published
         finally:
             with self._member_checks_lock:
-                # A later successful mark covers an earlier failed write only
-                # if it describes this same current inode and no overlapping
-                # mutation can still change its bytes after that mark.
+                # Every overlapping byte mutation has its own DIRTY mark
+                # after its bytes change. If all marks succeed on the current
+                # inode, at least one mark follows the last byte change,
+                # regardless of which mutation exits last. A failed mark or
+                # mismatched inode poisons the whole group; an old finalizer
+                # cannot clear a later participant's failure.
                 current = regular_file_stat(cache_path) if published["dirty"] else None
-                settled = (current is not None
-                           and published["inode"] == (current.st_dev, current.st_ino)
-                           and state.local_epoch == epoch
-                           and state.active_mutations == 1)
-                state.uncertain_local = not settled
+                if (current is None
+                        or published["inode"] != (current.st_dev, current.st_ino)):
+                    state.mutation_group_failed = True
                 state.active_mutations -= 1
+                state.uncertain_local = (state.active_mutations > 0
+                                         or state.mutation_group_failed)
 
     def _has_open_writer(self, canonical_path: str) -> bool:
         """Caller holds _fd_lock at a publication boundary."""
