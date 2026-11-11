@@ -266,17 +266,19 @@ class StorageFS(Operations):
         self._member_checks_lock = threading.RLock()
         self._freshness: Dict[str, PathFreshness] = {}
         self._next_freshness_identity = 0
+        # A failed stat of an owed member must not block every warm demand
+        # open until its I/O timeout. Keyed to that debt's generation, not
+        # MemberCheck.verified_at: a fresh B baseline cannot delay A's retry.
+        self._freshness_probe_retry: Dict[Tuple[str, str], Tuple[int, float, bool]] = {}
         # Members whose failed revalidation has been logged; cleared by the
         # member's next successful stat, so an outage is logged once.
         # Deliberately unlocked: with fuse_threads a race costs at most a
         # duplicate or missed log line.
         self._revalidate_outages: Set[str] = set()
-        # A check that found a change pins the refetch to the member it
-        # checked (read by _select_backend_for_read, dropped when open()
-        # ends). If that member is gone by then and another supplies the
-        # bytes, its name is kept in _recheck so its next check refetches
-        # again instead of adopting the change as a baseline. Both under
-        # _member_checks_lock.
+        # Shared freshness debt, above, owns the member choice across open
+        # callbacks and admission waits. These empty compatibility tables
+        # remain for existing diagnostics and namespace cleanup paths; no
+        # opener publishes a private pin into them.
         self._refetch_pins: Dict[str, Backend] = {}
         self._recheck: Dict[str, Set[str]] = {}
         # Paths whose holders were all unavailable at the last open past the
@@ -284,9 +286,8 @@ class StorageFS(Operations):
         # queries until one of those holders answers again or the age
         # passes. Under _member_checks_lock.
         self._revalidate_unreachable: Dict[str, Tuple[float, Tuple[str, ...]]] = {}
-        # The stat that found the change, kept with the pin so the refetch
-        # takes its baseline from it instead of stat-ing the member again.
-        # Same lifetime as the pin (dropped when open() ends).
+        # Checked stats now live on FreshnessDebt; this compatibility table
+        # is kept empty until namespace cleanup is consolidated.
         self._pinned_stats: Dict[str, Tuple[Backend, os.stat_result]] = {}
 
         # Background sync manager
@@ -1276,7 +1277,37 @@ class StorageFS(Operations):
             state.generations[backend.name] = generation
             state.debts[backend.name] = FreshnessDebt(generation, member_stat)
             state.revision += 1
+            self._freshness_probe_retry.pop((canonical_path, backend.name), None)
             self._recheck.setdefault(canonical_path, set()).add(backend.name)
+
+    def _defer_failed_owed_probe(self, canonical_path: str, backend: Backend):
+        """Throttle only a failed probe of this still-owed generation."""
+        available = backend.is_available()
+        delay = min(30.0, max(1.0, self._revalidate_after))
+        with self._member_checks_lock:
+            state = self._freshness.get(canonical_path)
+            debt = state.debts.get(backend.name) if state is not None else None
+            if debt is not None:
+                self._freshness_probe_retry[(canonical_path, backend.name)] = (
+                    debt.generation, time.monotonic() + delay, available,
+                )
+
+    def _owed_probe_is_deferred(self, canonical_path: str, backend: Backend) -> bool:
+        """Availability recovery or finite expiry permits another A stat."""
+        available = backend.is_available()
+        key = (canonical_path, backend.name)
+        with self._member_checks_lock:
+            state = self._freshness.get(canonical_path)
+            debt = state.debts.get(backend.name) if state is not None else None
+            retry = self._freshness_probe_retry.get(key)
+            if debt is None or retry is None:
+                return False
+            generation, deadline, was_available = retry
+            if (generation != debt.generation or time.monotonic() >= deadline
+                    or available and not was_available):
+                self._freshness_probe_retry.pop(key, None)
+                return False
+            return True
 
     def _owed_backend(self, canonical_path: str) -> Optional[Backend]:
         with self._member_checks_lock:
@@ -1287,18 +1318,7 @@ class StorageFS(Operations):
         return min(available, key=lambda b: (b.speed_priority, b.name), default=None)
 
     def _select_backend_for_read(self, canonical_path: str) -> Optional[Backend]:
-        """Pick a readable backend, preferring existing replication metadata.
-
-        A refetch after revalidation reads from the member that was checked
-        (see _revalidate_cached_file) while it is available. The pin stays
-        until open() ends, so selection is idempotent within one open: a
-        stream that bails out after selecting and the full-file fallback
-        both honour it. Within a streaming open the pinned member is the
-        only one tried: if its stream setup fails, the fallback fetch asks
-        it again rather than another holder, which keeps the guarantee that
-        a change seen on the checked member is never adopted unseen (the
-        non-streaming path always behaved so).
-        """
+        """Prefer an available member with shared debt over ordinary ranking."""
         owed = self._owed_backend(canonical_path)
         if owed is not None:
             return owed
@@ -1306,7 +1326,7 @@ class StorageFS(Operations):
         return backend
 
     def _pinned_stat(self, canonical_path: str, backend: Backend) -> Optional[os.stat_result]:
-        """The stat revalidation just took of backend, when this open is refetching from it."""
+        """The observed stat carried by this member's shared obligation."""
         with self._member_checks_lock:
             state = self._freshness.get(canonical_path)
             debt = state.debts.get(backend.name) if state is not None else None
@@ -1517,15 +1537,10 @@ class StorageFS(Operations):
                         member_stat: Optional[os.stat_result], token=None):
         """A full fetch from backend just finished; member_stat was taken before it.
 
-        Stat before copy: a change landing in between leaves a baseline older
-        than the copy, which costs one needless refetch at the next check;
-        the other order could pair a new baseline with old bytes and never
-        see the change.
-
-        Also called off the FUSE thread, from a stream's on_finalized. It can
-        then land after the FUSE thread's own refetch of the same path and
-        install the older stream-start baseline over the newer one. That is
-        conservative: the next check sees a difference and refetches once.
+        Stat before copy can cost one later refetch if the member changes
+        during transfer. A full fetch carries a token so a later observation
+        cannot be cleared by an older attempt. A stream without such a token
+        cannot settle any outstanding debt; its install guard is a later slice.
         """
         with self._member_checks_lock:
             state = self._freshness.get(canonical_path)
@@ -1551,6 +1566,7 @@ class StorageFS(Operations):
                 if debt is not None and token is not None and token[3] == debt.generation:
                     del state.debts[backend.name]
                     self._clear_recheck(canonical_path, backend.name)
+                    self._freshness_probe_retry.pop((canonical_path, backend.name), None)
                 state.revision += 1
             self._revalidate_unreachable.pop(canonical_path, None)
 
@@ -1750,13 +1766,11 @@ class StorageFS(Operations):
         for it (_listing_confirms_baseline); a listing is never used to
         decide that something changed.
 
-        A changed copy goes through _invalidate_file_cache, which keeps a
-        file that became DIRTY or has a writer open; whatever is no longer
-        cached is then fetched by the caller as usual, pinned to the member
-        that was checked (_select_backend_for_read). If that member is gone
-        by then, another supplies the bytes and the checked member is marked
-        for a forced refetch at its next check (_recheck), so the change is
-        never adopted as a baseline unseen. An unavailable member,
+        A changed copy publishes shared debt before _invalidate_file_cache,
+        which keeps a file that became DIRTY or has a writer open. The owed
+        available member takes precedence over ordinary fetch ranking. If
+        it is unavailable, another can supply bytes while its debt remains.
+        An unavailable member,
         a failed stat or a member that no longer has the file keeps the
         cached copy and its baselines: the open never fails here. Failures
         are logged once per member until it answers again.
@@ -1766,6 +1780,8 @@ class StorageFS(Operations):
         with self._member_checks_lock:
             check = self._member_checks.get(canonical_path)
         owed = self._owed_backend(canonical_path)
+        if owed is not None and self._owed_probe_is_deferred(canonical_path, owed):
+            return
         if (owed is None and check is not None
                 and time.monotonic() - check.verified_at < self._revalidate_after):
             return
@@ -1820,14 +1836,21 @@ class StorageFS(Operations):
             # may be the only one left, so it stays.
             self.logger.info("revalidate: %s no longer has %s; keeping the cached copy",
                              backend.label, canonical_path)
+            if owed is backend:
+                self._defer_failed_owed_probe(canonical_path, backend)
             self._store_member_check(canonical_path, cache_path, identity, {})
             return
         except Exception as exc:
-            # Counts as a check, so a member that fails without being marked
-            # unavailable is not stat'd at every open.
+            # A failed owed probe has its own bounded retry deadline; the
+            # ordinary check timestamp is not allowed to settle the debt.
             self._note_revalidation_outage(backend.name, f"stat failed: {exc!r}")
+            if owed is backend:
+                self._defer_failed_owed_probe(canonical_path, backend)
             self._store_member_check(canonical_path, cache_path, identity, {})
             return
+        if owed is backend:
+            with self._member_checks_lock:
+                self._freshness_probe_retry.pop((canonical_path, backend.name), None)
         if backend.name in self._revalidate_outages:
             self._revalidate_outages.discard(backend.name)
             self.logger.info("Revalidating cached files against %s again", backend.label)
