@@ -33,3 +33,13 @@ log_events:
   who: Ted Smith
   what: started
   comment: ""
+- time: 2026-11-11T23:30:42-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Root and warm Sol review of frozen 832571d returned FINDINGS: overlapping
+    successful W1/W2 marks with old W1 exiting last can leave uncertainty permanent.
+    At pushed 053b5d3, Event-gated same-schedule pre-fix RED failed actual refetch
+    ENOENT; group-based settlement GREEN passed both completion orders and later-failed-mark
+    guard, and forced exact-head nonmount revalidate 57/57, streaming 66/66, selected
+    threading 30/30. Three bounded invocations used, scopes inactive/dead. Remains
+    in progress pending root delta review; full acceptance is not claimed.'
