@@ -826,8 +826,11 @@ class TestSharedFreshnessObligation(ThreadingTestBase):
         self._change_a()
         self.assertEqual(self.OLD, self._read(self.PATH))
         self.assertIn("changedA", self._snapshot()["debts"])
-        # This token is valid after A's observation. Only the intervening
-        # local mutation may invalidate its attempt to publish B's baseline.
+        # Make B an eligible fallback before capturing its token. A remains
+        # owed while unavailable; only the later local mutation invalidates
+        # this B attempt, rather than A's already-published observation.
+        self.a.set_available(False)
+        self.assertIs(self.b, self.fs._select_backend_for_read(self.PATH))
         token = self.fs._freshness_token(self.PATH, "staleB")
         entered, resume = threading.Event(), threading.Event()
         self.addCleanup(resume.set)
@@ -856,6 +859,8 @@ class TestSharedFreshnessObligation(ThreadingTestBase):
                 # lock; it must not publish while the writer is paused.
                 callback.join(BLOCKED)
                 self.assertTrue(writer.is_alive())
+                self.assertIn("changedA", self._snapshot()["debts"])
+                self._assert_no_b_baseline()
                 resume.set()
                 self.assertEqual(5, writer.finish())
                 callback.finish()
@@ -864,6 +869,7 @@ class TestSharedFreshnessObligation(ThreadingTestBase):
             self._assert_no_b_baseline()
         finally:
             resume.set()
+            self.a.set_available(True)
             self.fs.release(self.PATH, fd)
         self._assert_slots_released()
 

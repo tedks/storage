@@ -136,9 +136,12 @@ test observations, not user APIs or a second authority. Root may choose an
 equivalent internal representation when reviewing the boundary, provided the
 same observable transitions remain testable.
 
-The write regression captures B's token after A debt exists, then gates after
-`pwrite` changes bytes but before DIRTY publication. It observes callback
-entry while the writer remains active; an early token rejection is valid.
+The write regression first makes B eligible by taking owed A offline, then
+captures B's token after A debt exists. It gates after `pwrite` changes bytes
+but before DIRTY publication. It observes callback entry while the writer
+remains active and reads the leaf-locked debt/baseline view before release;
+an early token rejection is valid. The callback cannot hold that leaf while
+waiting for the writer's index lock.
 It releases the writer before joining a callback that may need
 `metadata_lock`, then checks local
 bytes, DIRTY, A debt and absence of B baseline. Truncate and create hold their path-locked mutation
