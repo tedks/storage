@@ -1,0 +1,23 @@
+id: storage171-retired-private-pin-tests
+title: Migrate retired private-pin threading assertions to shared debt
+desc: 'PR #171 full test_fs_threading remains unclaimed. The extra TestOpenRaces.test_pin_survives_a_concurrent_revalidate
+  assertion expects _refetch_pins to hold a backend, but the shared-freshness implementation
+  no longer populates that legacy private map. In the namespace slice''s overbroad
+  selected run at d1a856d predecessor 8739e34, this assertion failed with expected
+  member versus actual None; static source shows no production _refetch_pins insertion,
+  so it is outside the namespace delta. Migrate the schedule to assert actual bytes,
+  shared debt and baseline before full threading can count as an acceptance gate;
+  do not silently delete coverage. Root decides next bounded package.'
+type: task
+component: tests
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-11T23:53:39-00:00
+references: []
+log_events:
+- time: 2026-11-11T23:53:39-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
