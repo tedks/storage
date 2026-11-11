@@ -83,6 +83,21 @@ class MemberCheck:
     members: Dict[str, Tuple[int, float]] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class FreshnessDebt:
+    generation: int
+    member_stat: os.stat_result
+
+
+@dataclass
+class PathFreshness:
+    identity: int
+    revision: int = 0
+    local_epoch: int = 0
+    generations: Dict[str, int] = field(default_factory=dict)
+    debts: Dict[str, FreshnessDebt] = field(default_factory=dict)
+
+
 class StorageFS(Operations):
     """
     Storage FUSE filesystem
@@ -248,7 +263,9 @@ class StorageFS(Operations):
         # cache, index and descriptor locks.
         self._revalidate_after = max(0.0, float(revalidate_after))
         self._member_checks: Dict[str, MemberCheck] = {}
-        self._member_checks_lock = threading.Lock()
+        self._member_checks_lock = threading.RLock()
+        self._freshness: Dict[str, PathFreshness] = {}
+        self._next_freshness_identity = 0
         # Members whose failed revalidation has been logged; cleared by the
         # member's next successful stat, so an outage is logged once.
         # Deliberately unlocked: with fuse_threads a race costs at most a
@@ -1221,6 +1238,54 @@ class StorageFS(Operations):
     def _partial_cache_path(self, cache_path: Path) -> Path:
         return self._streaming_manager._partial_cache_path(cache_path)
 
+    def _freshness_for_path(self, canonical_path: str) -> PathFreshness:
+        """Caller holds _member_checks_lock; the identity is never reused."""
+        state = self._freshness.get(canonical_path)
+        if state is None:
+            self._next_freshness_identity += 1
+            state = PathFreshness(identity=self._next_freshness_identity)
+            self._freshness[canonical_path] = state
+        return state
+
+    def _freshness_token(self, canonical_path: str, member_name: str):
+        with self._member_checks_lock:
+            state = self._freshness_for_path(canonical_path)
+            return (state.identity, state.revision, member_name,
+                    state.generations.get(member_name, 0), state.local_epoch)
+
+    def _freshness_snapshot(self, canonical_path: str):
+        with self._member_checks_lock:
+            state = self._freshness.get(canonical_path)
+            if state is None or not state.debts:
+                return None
+            debts = {name: (debt.generation,
+                            debt.member_stat.st_size, debt.member_stat.st_mtime)
+                     for name, debt in state.debts.items()}
+            owed = min(debts, key=lambda name: (self.backends[name].speed_priority, name))
+            return {"path_identity": state.identity, "publication_revision": state.revision,
+                    "local_epoch": state.local_epoch, "debts": debts,
+                    "owed_member": owed, "recheck_members": frozenset(debts),
+                    "state": "owed"}
+
+    def _observe_changed_member(self, canonical_path: str, backend: Backend,
+                                member_stat: os.stat_result):
+        """Publish the checked member's debt before its cached copy is removed."""
+        with self._member_checks_lock:
+            state = self._freshness_for_path(canonical_path)
+            generation = state.generations.get(backend.name, 0) + 1
+            state.generations[backend.name] = generation
+            state.debts[backend.name] = FreshnessDebt(generation, member_stat)
+            state.revision += 1
+            self._recheck.setdefault(canonical_path, set()).add(backend.name)
+
+    def _owed_backend(self, canonical_path: str) -> Optional[Backend]:
+        with self._member_checks_lock:
+            state = self._freshness.get(canonical_path)
+            names = tuple(state.debts) if state is not None else ()
+        available = [self.backends[name] for name in names
+                     if name in self.backends and self.backends[name].is_available()]
+        return min(available, key=lambda b: (b.speed_priority, b.name), default=None)
+
     def _select_backend_for_read(self, canonical_path: str) -> Optional[Backend]:
         """Pick a readable backend, preferring existing replication metadata.
 
@@ -1234,25 +1299,19 @@ class StorageFS(Operations):
         a change seen on the checked member is never adopted unseen (the
         non-streaming path always behaved so).
         """
-        with self._member_checks_lock:
-            pinned = self._refetch_pins.get(canonical_path)
-        if pinned is not None and pinned.is_available():
-            # The recheck mark stays until the bytes arrive (_record_fetched,
-            # for a full fetch or a finished stream); a transfer that fails
-            # after this leaves it owed.
-            return pinned
+        owed = self._owed_backend(canonical_path)
+        if owed is not None:
+            return owed
         backend = self._select_unpinned_backend_for_read(canonical_path)
-        if pinned is not None and backend is not pinned:
-            with self._member_checks_lock:
-                self._recheck.setdefault(canonical_path, set()).add(pinned.name)
         return backend
 
     def _pinned_stat(self, canonical_path: str, backend: Backend) -> Optional[os.stat_result]:
         """The stat revalidation just took of backend, when this open is refetching from it."""
         with self._member_checks_lock:
-            held = self._pinned_stats.get(canonical_path)
-        if held is not None and held[0] is backend:
-            return held[1]
+            state = self._freshness.get(canonical_path)
+            debt = state.debts.get(backend.name) if state is not None else None
+        if debt is not None:
+            return debt.member_stat
         return None
 
     def _clear_recheck(self, canonical_path: str, backend_name: str):
@@ -1455,7 +1514,7 @@ class StorageFS(Operations):
                     self.logger.debug("could not persist member baseline: %r", exc)
 
     def _record_fetched(self, canonical_path: str, cache_path: Path, backend: Backend,
-                        member_stat: Optional[os.stat_result]):
+                        member_stat: Optional[os.stat_result], token=None):
         """A full fetch from backend just finished; member_stat was taken before it.
 
         Stat before copy: a change landing in between leaves a baseline older
@@ -1468,17 +1527,31 @@ class StorageFS(Operations):
         install the older stream-start baseline over the newer one. That is
         conservative: the next check sees a difference and refetches once.
         """
-        try:
-            identity = self._cache_identity(os.lstat(str(cache_path)))
-        except OSError:
-            self._forget_member_check(canonical_path)
-            return
-        members = {}
-        if member_stat is not None:
-            members[backend.name] = (member_stat.st_size, member_stat.st_mtime)
-        self._store_member_check(canonical_path, cache_path, identity, members, replace=True)
-        self._clear_recheck(canonical_path, backend.name)
         with self._member_checks_lock:
+            state = self._freshness.get(canonical_path)
+            if token is not None and (state is None or token != (
+                    state.identity, state.revision, backend.name,
+                    state.generations.get(backend.name, 0), state.local_epoch)):
+                return
+            if token is None and state is not None and state.debts:
+                # An old stream without an observation token is not proof
+                # that it installed bytes for a newer obligation.
+                return
+            try:
+                identity = self._cache_identity(os.lstat(str(cache_path)))
+            except OSError:
+                self._forget_member_check(canonical_path)
+                return
+            members = {}
+            if member_stat is not None:
+                members[backend.name] = (member_stat.st_size, member_stat.st_mtime)
+            self._store_member_check(canonical_path, cache_path, identity, members, replace=True)
+            if state is not None:
+                debt = state.debts.get(backend.name)
+                if debt is not None and token is not None and token[3] == debt.generation:
+                    del state.debts[backend.name]
+                    self._clear_recheck(canonical_path, backend.name)
+                state.revision += 1
             self._revalidate_unreachable.pop(canonical_path, None)
 
     def _record_member_written(self, virtual_path: str, backend: Backend, cache_path: Path,
@@ -1692,9 +1765,11 @@ class StorageFS(Operations):
         cache_path = resolved.cache_path
         with self._member_checks_lock:
             check = self._member_checks.get(canonical_path)
-        if check is not None and time.monotonic() - check.verified_at < self._revalidate_after:
+        owed = self._owed_backend(canonical_path)
+        if (owed is None and check is not None
+                and time.monotonic() - check.verified_at < self._revalidate_after):
             return
-        if self._holders_still_unreachable(canonical_path):
+        if owed is None and self._holders_still_unreachable(canonical_path):
             return
 
         metadata = self.state_manager.get_file_metadata(canonical_path)
@@ -1711,6 +1786,8 @@ class StorageFS(Operations):
             members = self._load_persisted_members(cache_path, identity)
 
         backend, unavailable = self._member_for_revalidation(canonical_path)
+        if owed is not None:
+            backend = owed
         if backend is None:
             # Not recorded as checked: the first open after a holder
             # answers again must revalidate. Until then (or until the age
@@ -1758,8 +1835,9 @@ class StorageFS(Operations):
         observed = (member_stat.st_size, member_stat.st_mtime)
         baseline = members.get(backend.name)
         with self._member_checks_lock:
-            # The last refetch for a change here came from another member.
-            must_refetch = backend.name in self._recheck.get(canonical_path, ())
+            # A fallback copy never settles the checked member's debt.
+            state = self._freshness.get(canonical_path)
+            must_refetch = state is not None and backend.name in state.debts
         if must_refetch:
             changed = True
         elif baseline is not None:
@@ -1773,11 +1851,7 @@ class StorageFS(Operations):
             return
 
         self.logger.info("revalidate: %s changed on %s; refetching", canonical_path, backend.label)
-        with self._member_checks_lock:
-            # A recheck mark stays until this member supplies the bytes
-            # (_clear_recheck): the invalidation below may be refused.
-            self._refetch_pins[canonical_path] = backend
-            self._pinned_stats[canonical_path] = (backend, member_stat)
+        self._observe_changed_member(canonical_path, backend, member_stat)
         self._invalidate_file_cache(resolved.requested_path)
         if self.cache_manager.is_cached(resolved.requested_path):
             # Kept (a writer is open, or it turned out to be a lost write):
@@ -1787,9 +1861,6 @@ class StorageFS(Operations):
                 kept_identity = self._cache_identity(os.lstat(str(cache_path)))
             except OSError:
                 return
-            with self._member_checks_lock:
-                self._refetch_pins.pop(canonical_path, None)
-                self._pinned_stats.pop(canonical_path, None)
             if kept_identity == identity:
                 self._store_member_check(canonical_path, cache_path, identity, {})
         else:
@@ -1974,6 +2045,7 @@ class StorageFS(Operations):
         backend = self._select_backend_for_read(canonical_path)
 
         if backend:
+            token = self._freshness_token(canonical_path, backend.name)
             # The member's stat before the copy is the baseline for
             # revalidation (see _record_fetched); without it the fetch
             # still works, and the first check falls back to comparing the
@@ -1985,18 +2057,20 @@ class StorageFS(Operations):
                 except Exception:
                     member_stat = None
             # Download to cache
-            cached = self.cache_manager.cache_file(
+            cached, installed = self.cache_manager.cache_file(
                 resolved.requested_path,
                 backend,
                 source_virtual_path=canonical_path,
+                with_install_result=True,
             )
             if cached and self._drop_unindexed_prefix(canonical_path, cache_path):
                 # A failed stream's prefix was installed before this copy
                 # (whose link then found it): once more, for the whole file.
-                cached = self.cache_manager.cache_file(
+                cached, installed = self.cache_manager.cache_file(
                     resolved.requested_path,
                     backend,
                     source_virtual_path=canonical_path,
+                    with_install_result=True,
                 )
             if cached and self._is_unindexed_prefix(canonical_path, cache_path):
                 # Still a prefix (open elsewhere, or another one won again):
@@ -2006,7 +2080,9 @@ class StorageFS(Operations):
                 return True
             if cached:
                 # Fresh from the member: no check needed until revalidate_after.
-                self._record_fetched(canonical_path, cache_path, backend, member_stat)
+                if installed:
+                    self._record_fetched(canonical_path, cache_path, backend,
+                                         member_stat, token=token)
                 # Populate state metadata and locations if missing
                 try:
                     st = os.lstat(str(cache_path))
@@ -2315,37 +2391,15 @@ class StorageFS(Operations):
     def open(self, path, flags):
         """Open a file"""
         canonical_path = self._resolve_path(path).canonical_path
-        refetch_pin = None
-        pinned_stat = None
-        try:
-            while True:
-                with self._path_locked(canonical_path):
-                    # A revalidation pin belongs to this open. Keep it out
-                    # of the shared path table while ordinary admission is
-                    # pending; a concurrent open may use that table meanwhile.
-                    if (refetch_pin is not None
-                            and not self.cache_manager.is_cached(path)):
-                        with self._member_checks_lock:
-                            self._refetch_pins[canonical_path] = refetch_pin
-                            if pinned_stat is not None:
-                                self._pinned_stats[canonical_path] = pinned_stat
-                    try:
-                        return self._open(path, flags)
-                    except _RetryOpenAsOrdinary:
-                        with self._member_checks_lock:
-                            refetch_pin = self._refetch_pins.pop(canonical_path, None)
-                            pinned_stat = self._pinned_stats.pop(canonical_path, None)
-                # No path/namespace lock is held while this callback waits
-                # behind other ordinary work. The next pass sees the cache
-                # again, or fetches it while holding ordinary capacity.
-                self._foreground_admission.reclassify_current("ordinary")
-        finally:
-            # The pin belongs to this open (_select_backend_for_read): one
-            # that did not fetch must not steer a later fetch. Preserve it
-            # across the admission retry, then drop it on every exit path.
-            with self._member_checks_lock:
-                self._refetch_pins.pop(canonical_path, None)
-                self._pinned_stats.pop(canonical_path, None)
+        while True:
+            with self._path_locked(canonical_path):
+                try:
+                    return self._open(path, flags)
+                except _RetryOpenAsOrdinary:
+                    pass
+            # The obligation is shared across this lock-free admission wait.
+            # Re-resolve the path and obligation after capacity is granted.
+            self._foreground_admission.reclassify_current("ordinary")
 
     def _open(self, path, flags):
         """Open a file"""

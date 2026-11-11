@@ -308,7 +308,8 @@ class CacheManager:
         # Could not free enough space
         return False
 
-    def cache_file(self, virtual_path: str, backend: Backend, source_virtual_path: str = None) -> bool:
+    def cache_file(self, virtual_path: str, backend: Backend, source_virtual_path: str = None,
+                   *, with_install_result: bool = False):
         """
         Download a file from backend into cache
 
@@ -330,21 +331,22 @@ class CacheManager:
         source_virtual_path = source_virtual_path or virtual_path
         # Member probes: no lock, and their errors propagate as before.
         if not backend.exists(source_virtual_path):
-            return False
+            return (False, False) if with_install_result else False
         file_size = backend.get_size(source_virtual_path)
 
         with self._lock:
             if not self.ensure_space(file_size):
                 print(f"Warning: Insufficient cache space for {virtual_path}")
-                return False
+                return (False, False) if with_install_result else False
             self._reserved_bytes += file_size
         try:
-            self.fetch_into_cache(backend, source_virtual_path, self.get_cache_path(virtual_path))
+            installed = self.fetch_into_cache(
+                backend, source_virtual_path, self.get_cache_path(virtual_path))
             self.state_manager.update_access_time(virtual_path)
-            return True
+            return (True, installed) if with_install_result else True
         except Exception as e:
             print(f"Error caching {virtual_path} from {backend.name}: {e}")
-            return False
+            return (False, False) if with_install_result else False
         finally:
             with self._lock:
                 self._reserved_bytes -= file_size
