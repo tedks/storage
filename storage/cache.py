@@ -309,7 +309,8 @@ class CacheManager:
         return False
 
     def cache_file(self, virtual_path: str, backend: Backend, source_virtual_path: str = None,
-                   *, with_install_result: bool = False):
+                   *, with_install_result: bool = False, install_guard=None,
+                   on_installed=None):
         """
         Download a file from backend into cache
 
@@ -341,9 +342,11 @@ class CacheManager:
             self._reserved_bytes += file_size
         try:
             installed = self.fetch_into_cache(
-                backend, source_virtual_path, self.get_cache_path(virtual_path))
+                backend, source_virtual_path, self.get_cache_path(virtual_path),
+                install_guard=install_guard, on_installed=on_installed)
             self.state_manager.update_access_time(virtual_path)
-            return (True, installed) if with_install_result else True
+            cached = installed or regular_file_stat(self.get_cache_path(virtual_path)) is not None
+            return (cached, installed) if with_install_result else cached
         except Exception as e:
             print(f"Error caching {virtual_path} from {backend.name}: {e}")
             return (False, False) if with_install_result else False
@@ -351,7 +354,8 @@ class CacheManager:
             with self._lock:
                 self._reserved_bytes -= file_size
 
-    def fetch_into_cache(self, backend: Backend, source_virtual_path: str, cache_path: Path) -> bool:
+    def fetch_into_cache(self, backend: Backend, source_virtual_path: str, cache_path: Path,
+                         *, install_guard=None, on_installed=None) -> bool:
         """Copy a member file to cache_path through a temp file beside it.
 
         The copy runs without the cache lock into a fresh name that ends in
@@ -381,13 +385,31 @@ class CacheManager:
             _remove_prefix_marker(temp_path)
             size = os.lstat(temp_path).st_size
             with self._lock:
-                try:
-                    os.link(temp_path, cache_path)
-                except FileExistsError:
-                    if not (cache_path.is_file() and not cache_path.is_symlink()):
-                        raise
-                    return False
-                self._current_size_bytes += size
+                guard = install_guard(temp_path) if install_guard else nullcontext(True)
+                with guard as current:
+                    if current is False:
+                        return False
+                    try:
+                        os.link(temp_path, cache_path)
+                    except FileExistsError:
+                        if not (cache_path.is_file() and not cache_path.is_symlink()):
+                            raise
+                        return False
+                    self._current_size_bytes += size
+                    if on_installed is not None:
+                        try:
+                            on_installed(temp_path, cache_path)
+                        except BaseException:
+                            # A failed publication cannot leave its unindexed
+                            # stage visible as a completed cache copy.
+                            try:
+                                staged, final = os.lstat(temp_path), os.lstat(cache_path)
+                                if (staged.st_dev, staged.st_ino) == (final.st_dev, final.st_ino):
+                                    cache_path.unlink()
+                            except OSError:
+                                pass
+                            self._size_dirty = True
+                            raise
             return True
         except BaseException:
             # Whatever the copy wrote may have been counted by a rescan,

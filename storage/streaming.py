@@ -1185,8 +1185,9 @@ class StreamingReadManager:
             session.final_cache_path.parent.mkdir(parents=True, exist_ok=True)
             guard = (self.commit_guard(session) if self.commit_guard is not None
                      else self.state_manager.metadata_lock)
-            with guard:
-                outcome = self._install_partial(session)
+            with guard as current:
+                outcome = (self._install_partial(session) if current is not False
+                           else "stale")
                 if outcome == "installed":
                     staged = os.fstat(io_fd)
                     installed = os.lstat(session.final_cache_path)

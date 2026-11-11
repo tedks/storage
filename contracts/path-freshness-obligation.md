@@ -3,7 +3,9 @@
 Decision key: `foreground-open-pin-ownership`. Root adjudicated the intent at
 `0631a73bff98b7649b9d65c181b5fe04dcf72ff9`; this source contract is the
 responsiveness lead's application of that ruling at the `a95f6d6` checkpoint.
-It is review input, not authority to repair `storage/` code or run tests.
+It remains the review boundary for the staged implementation. The in-memory
+mutation and full-fetch publication slice is separate from the durable marker
+and namespace-identity slices, which remain unaccepted.
 
 ## Boundary and identity
 

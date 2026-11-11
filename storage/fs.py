@@ -94,6 +94,8 @@ class PathFreshness:
     identity: int
     revision: int = 0
     local_epoch: int = 0
+    active_mutations: int = 0
+    uncertain_local: bool = False
     generations: Dict[str, int] = field(default_factory=dict)
     debts: Dict[str, FreshnessDebt] = field(default_factory=dict)
 
@@ -1258,6 +1260,51 @@ class StorageFS(Operations):
             return (state.identity, state.revision, member_name,
                     state.generations.get(member_name, 0), state.local_epoch)
 
+    @contextlib.contextmanager
+    def _local_mutation(self, canonical_path: str, *, replacement: bool = False):
+        """Invalidate member stages before bytes change; retain uncertainty on failure.
+
+        The leaf is released before filesystem I/O and DIRTY publication. A
+        fetch holding the leaf may finish first, but then this mutation makes
+        its baseline obsolete before modifying that inode.
+        """
+        with self._member_checks_lock:
+            state = self._freshness_for_path(canonical_path)
+            if replacement:
+                self._next_freshness_identity += 1
+                state.identity = self._next_freshness_identity
+            state.local_epoch += 1
+            state.revision += 1
+            state.active_mutations += 1
+            self._member_checks.pop(canonical_path, None)
+        published = {"dirty": False}
+        try:
+            yield published
+        finally:
+            with self._member_checks_lock:
+                if not published["dirty"]:
+                    state.uncertain_local = True
+                state.active_mutations -= 1
+
+    def _has_open_writer(self, canonical_path: str) -> bool:
+        """Caller holds _fd_lock at a publication boundary."""
+        return any(entry.canonical_path == canonical_path and entry.backend_name is None
+                   and entry.prefetch_session is None
+                   and (entry.flags & os.O_ACCMODE) != os.O_RDONLY
+                   for entry in self._fd_map.values())
+
+    def _stage_current(self, canonical_path: str, backend: Backend, token) -> bool:
+        """Caller holds metadata, descriptor and freshness locks in that order."""
+        state = self._freshness.get(canonical_path)
+        if state is None or token != (
+                state.identity, state.revision, backend.name,
+                state.generations.get(backend.name, 0), state.local_epoch):
+            return False
+        if state.active_mutations or state.uncertain_local or self._has_open_writer(canonical_path):
+            return False
+        row = self.state_manager.get_file_metadata(canonical_path)
+        return row is None or row.sync_status != SyncStatus.DIRTY
+
     def _stream_freshness_valid(self, session: PrefetchSession) -> bool:
         """The stream still describes this path and member's current revision."""
         token = getattr(session, "freshness_token", None)
@@ -1265,7 +1312,7 @@ class StorageFS(Operations):
             return False
         with self._member_checks_lock:
             state = self._freshness.get(session.canonical_path)
-            return state is not None and token == (
+            return state is not None and not state.active_mutations and not state.uncertain_local and token == (
                 state.identity, state.revision, session.backend.name,
                 state.generations.get(session.backend.name, 0), state.local_epoch,
             )
@@ -1275,8 +1322,10 @@ class StorageFS(Operations):
         """Serialize validation, no-replace install and baseline publication."""
         with self._path_locked(session.canonical_path):
             with self.state_manager.metadata_lock:
-                with self._member_checks_lock:
-                    yield
+                with self._fd_lock:
+                    with self._member_checks_lock:
+                        yield self._stage_current(session.canonical_path, session.backend,
+                                                  session.freshness_token)
 
     @contextlib.contextmanager
     def _try_stream_commit_guard(self, session: PrefetchSession):
@@ -1286,8 +1335,10 @@ class StorageFS(Operations):
                 yield False
                 return
             with self.state_manager.metadata_lock:
-                with self._member_checks_lock:
-                    yield True
+                with self._fd_lock:
+                    with self._member_checks_lock:
+                        yield self._stage_current(session.canonical_path, session.backend,
+                                                  session.freshness_token)
 
     def _freshness_snapshot(self, canonical_path: str):
         with self._member_checks_lock:
@@ -2067,6 +2118,61 @@ class StorageFS(Operations):
             self.cache_manager.mark_cache_size_dirty()
         return removed
 
+    @contextlib.contextmanager
+    def _full_fetch_guard(self, canonical_path: str, backend: Backend, token):
+        """Validate a private copy immediately before its no-replace link.
+
+        The caller already holds the path lock. CacheManager holds its cache
+        lock, then this guard takes index, descriptor and freshness locks;
+        the callback publishes the row and baseline before they are released.
+        """
+        with self.state_manager.metadata_lock:
+            with self._fd_lock:
+                with self._member_checks_lock:
+                    yield self._stage_current(canonical_path, backend, token)
+
+    def _publish_full_fetch(self, canonical_path: str, staged: Path, cache_path: Path,
+                            backend: Backend, member_stat: Optional[os.stat_result], token):
+        """Publish only this stage's inode; caller holds the full-fetch guard."""
+        source, final = os.lstat(staged), os.lstat(cache_path)
+        if (source.st_dev, source.st_ino) != (final.st_dev, final.st_ino):
+            raise OSError(errno.ESTALE, "full fetch lost its installed inode")
+        if not self._stage_current(canonical_path, backend, token):
+            raise OSError(errno.ESTALE, "full fetch lost publication ownership")
+
+        metadata = self.state_manager.get_file_metadata(canonical_path)
+        if metadata is None:
+            config = self._get_config(canonical_path)
+            metadata = FileMetadata(
+                virtual_path=canonical_path, size=final.st_size, checksum=None,
+                last_access=time.time(), last_modified=final.st_mtime,
+                sync_status=SyncStatus.CLEAN,
+                replica_count=config.replica_count, recomputable=config.recomputable,
+                recompute_cmd=config.recompute_cmd, encrypted=config.encrypted,
+                encryption_key_id=None,
+            )
+            self.cache_manager.store_file_metadata(metadata, cache_path=cache_path)
+        else:
+            self.state_manager.record_cached_stat(
+                canonical_path, metadata.dirty_generation,
+                size=final.st_size, last_modified=final.st_mtime,
+                last_access=time.time(),
+            )
+            metadata = self.state_manager.get_file_metadata(canonical_path) or metadata
+            self.cache_manager.sync_cache_metadata(canonical_path, metadata,
+                                                   cache_path=cache_path)
+
+        for name, is_cached in ((backend.name, False), ("cache", True)):
+            try:
+                self.state_manager.add_file_location(FileLocation(
+                    virtual_path=canonical_path, backend_name=name,
+                    checksum=metadata.checksum or '', last_synced=time.time(),
+                    is_cached=is_cached,
+                ))
+            except Exception:
+                pass
+        self._record_fetched(canonical_path, cache_path, backend, member_stat, token=token)
+
     def _ensure_file_in_cache(self, resolved: ResolvedPath) -> bool:
         """
         Ensure a file is in the cache, downloading or recomputing if necessary
@@ -2139,6 +2245,9 @@ class StorageFS(Operations):
                 backend,
                 source_virtual_path=canonical_path,
                 with_install_result=True,
+                install_guard=lambda staged: self._full_fetch_guard(canonical_path, backend, token),
+                on_installed=lambda staged, final: self._publish_full_fetch(
+                    canonical_path, staged, final, backend, member_stat, token),
             )
             if cached and self._drop_unindexed_prefix(canonical_path, cache_path):
                 # A failed stream's prefix was installed before this copy
@@ -2148,6 +2257,9 @@ class StorageFS(Operations):
                     backend,
                     source_virtual_path=canonical_path,
                     with_install_result=True,
+                    install_guard=lambda staged: self._full_fetch_guard(canonical_path, backend, token),
+                    on_installed=lambda staged, final: self._publish_full_fetch(
+                        canonical_path, staged, final, backend, member_stat, token),
                 )
             if cached and self._is_unindexed_prefix(canonical_path, cache_path):
                 # Still a prefix (open elsewhere, or another one won again):
@@ -2156,96 +2268,8 @@ class StorageFS(Operations):
                 # fails: the dropped prefix is not served.)
                 return True
             if cached:
-                # Fresh from the member: no check needed until revalidate_after.
-                if installed:
-                    self._record_fetched(canonical_path, cache_path, backend,
-                                         member_stat, token=token)
-                # Populate state metadata and locations if missing
-                try:
-                    st = os.lstat(str(cache_path))
-                except OSError:
-                    return True
-
-                # Read before the lock (xattrs up the parents), and only
-                # for a path without a row, as before.
-                config = None
-                if self.state_manager.get_file_metadata(canonical_path) is None:
-                    config = self._get_config(canonical_path)
-                with self.state_manager.metadata_lock:
-                    # The check and the new row are one step under the lock
-                    # the promotion takes: a prefix installed meanwhile is
-                    # never indexed.
-                    if self._is_unindexed_prefix(canonical_path, cache_path):
-                        return True
-                    metadata = self.state_manager.get_file_metadata(canonical_path)
-                    if not metadata:
-                        if config is None:  # the row went meanwhile
-                            config = self._get_config(canonical_path)
-                        metadata = FileMetadata(
-                            virtual_path=canonical_path,
-                            size=st.st_size,
-                            checksum=None,
-                            last_access=time.time(),
-                            last_modified=st.st_mtime,
-                            sync_status=SyncStatus.CLEAN,
-                            replica_count=config.replica_count,
-                            recomputable=config.recomputable,
-                            recompute_cmd=config.recompute_cmd,
-                            encrypted=config.encrypted,
-                            encryption_key_id=None,
-                        )
-                        # Writes the row and mirrors it.
-                        self.cache_manager.store_file_metadata(metadata, cache_path=cache_path)
-                        created = True
-                    else:
-                        created = False
-                if not created:
-                    # A refetch after eviction: the member's copy is what the
-                    # row already calls synced, but the transfer does not keep
-                    # the mtime, so the row's stat must follow the new file or
-                    # heal_stale_clean would resync unchanged content. Only
-                    # the stat columns move, and only at the generation read
-                    # above; a write recorded since keeps its own stat. The
-                    # mirror rewrites the xattr the evicted file lost.
-                    with self.state_manager.metadata_lock:
-                        self.state_manager.record_cached_stat(
-                            canonical_path,
-                            metadata.dirty_generation,
-                            size=st.st_size,
-                            last_modified=st.st_mtime,
-                            last_access=time.time(),
-                        )
-                        metadata = self.state_manager.get_file_metadata(canonical_path) or metadata
-                        self.cache_manager.sync_cache_metadata(
-                            canonical_path, metadata, cache_path=cache_path,
-                        )
-
-                # Record locations
-                try:
-                    self.state_manager.add_file_location(
-                        FileLocation(
-                            virtual_path=canonical_path,
-                            backend_name=backend.name,
-                            checksum=metadata.checksum or '',
-                            last_synced=time.time(),
-                            is_cached=False,
-                        )
-                    )
-                except Exception:
-                    pass
-                try:
-                    self.state_manager.add_file_location(
-                        FileLocation(
-                            virtual_path=canonical_path,
-                            backend_name="cache",
-                            checksum=metadata.checksum or '',
-                            last_synced=time.time(),
-                            is_cached=True,
-                        )
-                    )
-                except Exception:
-                    pass
-
+                # The winning stage published its row and baseline inside
+                # the install guard. A loser never claims that source.
                 return True
 
         # File not in cache or backends - try recomputation
@@ -2437,9 +2461,9 @@ class StorageFS(Operations):
         except OSError as e:
             raise FuseOSError(e.errno)
 
-    def _mark_cache_file_dirty(self, canonical_path: str, cache_path: Path) -> None:
+    def _mark_cache_file_dirty(self, canonical_path: str, cache_path: Path) -> Optional[int]:
         """Record a modification of a cached file (see CacheManager.mark_file_dirty)."""
-        self.cache_manager.mark_file_dirty(canonical_path, cache_path)
+        return self.cache_manager.mark_file_dirty(canonical_path, cache_path)
 
     def truncate(self, path, length, fh=None):
         """Truncate a file"""
@@ -2452,13 +2476,16 @@ class StorageFS(Operations):
         cache_path = resolved.cache_path
 
         try:
-            with open(cache_path, 'r+b') as f:
-                f.truncate(length)
-            self.cache_manager.mark_cache_size_dirty()
+            mutation = (self._local_mutation(resolved.canonical_path)
+                        if not resolved.backend_name else contextlib.nullcontext(None))
+            with mutation as published:
+                with open(cache_path, 'r+b') as f:
+                    f.truncate(length)
+                self.cache_manager.mark_cache_size_dirty()
 
-            # Mark as dirty
-            if not resolved.backend_name:
-                self._mark_cache_file_dirty(resolved.canonical_path, cache_path)
+                if published is not None:
+                    published["dirty"] = (
+                        self._mark_cache_file_dirty(resolved.canonical_path, cache_path) is not None)
 
         except OSError as e:
             raise FuseOSError(e.errno)
@@ -2527,27 +2554,35 @@ class StorageFS(Operations):
             # Hold _fd_lock across os.open AND _fd_map registration so that
             # _invalidate_file_cache (which also holds _fd_lock) cannot
             # unlink the cache file between os.open and registration.
-            with self._fd_lock:
-                try:
-                    real_fd = os.open(str(cache_path), flags)
-                except FileNotFoundError:
-                    if prefetch_session is not None and prefetch_session.final_cache_path.exists():
-                        cache_path = prefetch_session.final_cache_path
+            mutation = (self._local_mutation(resolved.canonical_path)
+                        if flags & os.O_TRUNC and resolved.backend_name is None
+                        else contextlib.nullcontext(None))
+            with mutation as published:
+                with self._fd_lock:
+                    try:
                         real_fd = os.open(str(cache_path), flags)
-                    else:
-                        raise
+                    except FileNotFoundError:
+                        if prefetch_session is not None and prefetch_session.final_cache_path.exists():
+                            cache_path = prefetch_session.final_cache_path
+                            real_fd = os.open(str(cache_path), flags)
+                        else:
+                            raise
 
-                vfd = self._fd_counter
-                self._fd_counter += 1
-                self._fd_map[vfd] = FDEntry(
-                    virtual_path=resolved.requested_path,
-                    cache_path=cache_path,
-                    real_fd=real_fd,
-                    flags=flags,
-                    backend_name=resolved.backend_name,
-                    canonical_path=resolved.canonical_path,
-                    prefetch_session=prefetch_session,
-                )
+                    vfd = self._fd_counter
+                    self._fd_counter += 1
+                    self._fd_map[vfd] = FDEntry(
+                        virtual_path=resolved.requested_path,
+                        cache_path=cache_path,
+                        real_fd=real_fd,
+                        flags=flags,
+                        backend_name=resolved.backend_name,
+                        canonical_path=resolved.canonical_path,
+                        prefetch_session=prefetch_session,
+                    )
+                if published is not None:
+                    self.cache_manager.mark_cache_size_dirty()
+                    published["dirty"] = (
+                        self._mark_cache_file_dirty(resolved.canonical_path, cache_path) is not None)
 
             if resolved.backend_name is None:
                 self.cache_manager.mark_accessed(resolved.requested_path)
@@ -2567,39 +2602,43 @@ class StorageFS(Operations):
     def _create(self, path, mode, fi=None):
         """Create a file"""
         resolved = self._resolve_path(path)
-        cache_path = self.cache_manager.create_cached_file(resolved.requested_path)
-
         try:
-            with self._fd_lock:
-                real_fd = os.open(str(cache_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
-                vfd = self._fd_counter
-                self._fd_counter += 1
-                self._fd_map[vfd] = FDEntry(
-                    virtual_path=resolved.requested_path,
-                    cache_path=cache_path,
-                    real_fd=real_fd,
-                    flags=os.O_WRONLY,
-                    backend_name=resolved.backend_name,
-                    canonical_path=resolved.canonical_path,
-                    prefetch_session=None,
-                )
+            mutation = (self._local_mutation(resolved.canonical_path, replacement=True)
+                        if resolved.backend_name is None else contextlib.nullcontext(None))
+            with mutation as published:
+                cache_path = self.cache_manager.create_cached_file(resolved.requested_path)
+                with self._fd_lock:
+                    real_fd = os.open(str(cache_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+                    vfd = self._fd_counter
+                    self._fd_counter += 1
+                    self._fd_map[vfd] = FDEntry(
+                        virtual_path=resolved.requested_path,
+                        cache_path=cache_path,
+                        real_fd=real_fd,
+                        flags=os.O_WRONLY,
+                        backend_name=resolved.backend_name,
+                        canonical_path=resolved.canonical_path,
+                        prefetch_session=None,
+                    )
 
-            config = self._get_config(resolved.canonical_path)
-            metadata = FileMetadata(
-                virtual_path=resolved.canonical_path,
-                size=0,
-                checksum=None,
-                last_access=time.time(),
-                last_modified=time.time(),
-                sync_status=SyncStatus.DIRTY,
-                replica_count=config.replica_count,
-                recomputable=config.recomputable,
-                recompute_cmd=config.recompute_cmd,
-                encrypted=config.encrypted,
-                encryption_key_id=None
-            )
-            self.state_manager.set_file_metadata(metadata)
-            self._mark_cache_file_dirty(resolved.canonical_path, cache_path)
+                config = self._get_config(resolved.canonical_path)
+                metadata = FileMetadata(
+                    virtual_path=resolved.canonical_path,
+                    size=0,
+                    checksum=None,
+                    last_access=time.time(),
+                    last_modified=time.time(),
+                    sync_status=SyncStatus.DIRTY,
+                    replica_count=config.replica_count,
+                    recomputable=config.recomputable,
+                    recompute_cmd=config.recompute_cmd,
+                    encrypted=config.encrypted,
+                    encryption_key_id=None
+                )
+                self.state_manager.set_file_metadata(metadata)
+                generation = self._mark_cache_file_dirty(resolved.canonical_path, cache_path)
+                if published is not None:
+                    published["dirty"] = generation is not None
 
             parent_dir = resolved.parent_dir
             self._invalidate_dir_cache_entry(parent_dir)
@@ -2656,19 +2695,20 @@ class StorageFS(Operations):
         try:
             # Positional: a descriptor's offset is shared state, and
             # concurrent writes through one fh must not move each other's.
-            written = os.pwrite(entry.real_fd, data, offset)
-            self.cache_manager.mark_cache_size_dirty()
+            mutation = (self._local_mutation(entry.canonical_path)
+                        if entry.backend_name is None else contextlib.nullcontext(None))
+            with mutation as published:
+                written = os.pwrite(entry.real_fd, data, offset)
+                self.cache_manager.mark_cache_size_dirty()
 
-            if entry.backend_name is None:
-                self.cache_manager.mark_accessed(path)
-                # The path is read under the index lock, which a rename
-                # holds from the cache move until it has re-pointed the
-                # descriptors: the mark lands on the row that describes
-                # this file now, never on a path whose row has moved.
-                with self.state_manager.metadata_lock:
-                    with self._fd_lock:
-                        canonical_path, cache_path = entry.canonical_path, entry.cache_path
-                    self._mark_cache_file_dirty(canonical_path, cache_path)
+                if published is not None:
+                    self.cache_manager.mark_accessed(path)
+                    # Rename re-points descriptors under the index lock.
+                    with self.state_manager.metadata_lock:
+                        with self._fd_lock:
+                            canonical_path, cache_path = entry.canonical_path, entry.cache_path
+                        published["dirty"] = (
+                            self._mark_cache_file_dirty(canonical_path, cache_path) is not None)
 
             return written
 

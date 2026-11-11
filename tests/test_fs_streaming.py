@@ -551,9 +551,13 @@ class TestFSStreamingIntegration(unittest.TestCase):
     def test_full_fetch_prefix_retry_mutation_control(self):
         # Disabling the production loser-prefix drop/retry makes the same
         # full-open byte assertion fail on the first-link collision.
+        path = '/mutant-prefix-link.bin'
         with patch.object(self.fs, '_drop_unindexed_prefix', return_value=False):
-            with self.assertRaises(AssertionError):
-                self._assert_full_open_recovers_prefix_link_collision('/mutant-prefix-link.bin')
+            with self.assertRaises(AssertionError) as failed_bytes:
+                self._assert_full_open_recovers_prefix_link_collision(path)
+        self.assertIn(' != ', str(failed_bytes.exception))
+        self.assertEqual(4096, (self.cache_dir / path.lstrip('/')).stat().st_size)
+        self.assertIsNone(self.fs.state_manager.get_file_metadata(path))
 
     def test_cache_file_no_replace_keeps_prefix_winner_unindexed(self):
         from storage.cache_metadata import PREFIX_XATTR

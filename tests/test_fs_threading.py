@@ -1180,6 +1180,167 @@ class TestSharedFreshnessObligation(ThreadingTestBase):
             self.fs.release(self.PATH, fd)
         self._assert_slots_released()
 
+    def test_full_fetch_rejects_changed_epoch_with_final_path_absent(self):
+        # A write through an old descriptor can race a private B copy even
+        # when its cache name has been invalidated. No-replace alone cannot
+        # reject B here: the final name is absent at the commit boundary.
+        writer_fd = self.fs.open(self.PATH, os.O_RDWR)
+        self._change_a()
+        with self.fs._path_locked(self.PATH):
+            self.fs._observe_changed_member(self.PATH, self.a, self.a.stat(self.PATH))
+            self.fs._invalidate_file_cache(self.PATH)
+        self.a.set_available(False)
+        final = self.cache_dir / "f.txt"
+        final.unlink(missing_ok=True)
+        copied, resume = threading.Event(), threading.Event()
+        self.addCleanup(resume.set)
+        real_copy = self.b.copy_to_local
+
+        def pause_after_copy(path, destination):
+            real_copy(path, destination)
+            copied.set()
+            self.assertTrue(resume.wait(WAIT))
+
+        opener = Worker(self.fs.open, self.PATH, os.O_RDONLY)
+        try:
+            with patch.object(self.b, "copy_to_local", side_effect=pause_after_copy):
+                opener.start()
+                self.assertTrue(copied.wait(WAIT))
+                self.assertFalse(final.exists())
+                with self.assertRaises(FuseOSError):
+                    self.fs.write(self.PATH, b"local", 0, writer_fd)
+                with self.fs._fd_lock:
+                    local_fd = self.fs._fd_map[writer_fd].real_fd
+                self.assertEqual(b"local", os.pread(local_fd, 5, 0))
+                resume.set()
+                opener.join(WAIT)
+                self.assertFalse(opener.is_alive())
+            if opener.error is None:
+                fetched_fd = opener.result
+                try:
+                    fetched = self.fs.read(self.PATH, 4096, 0, fetched_fd)
+                finally:
+                    self.fs.release(self.PATH, fetched_fd)
+            else:
+                fetched = final.read_bytes() if final.exists() else None
+            self.assertNotEqual(self.OLD, fetched)
+            self.assertFalse(final.exists())
+            self.assertIn("changedA", self._snapshot()["debts"])
+            self._assert_no_b_baseline()
+        finally:
+            resume.set()
+            self.a.set_available(True)
+            self.fs.release(self.PATH, writer_fd)
+
+    def test_full_fetch_loses_to_local_write_and_returns_its_inode(self):
+        writer_fd = self.fs.open(self.PATH, os.O_RDWR)
+        self._change_a()
+        with self.fs._path_locked(self.PATH):
+            self.fs._observe_changed_member(self.PATH, self.a, self.a.stat(self.PATH))
+            self.fs._invalidate_file_cache(self.PATH)
+        self.a.set_available(False)
+        final = self.cache_dir / "f.txt"
+        held_inode = self.cache_dir / "f-held-inode"
+        os.link(final, held_inode)
+        final.unlink()
+        self.assertFalse(final.exists())
+        copied, resume = threading.Event(), threading.Event()
+        self.addCleanup(resume.set)
+        real_copy = self.b.copy_to_local
+
+        def pause_after_copy(path, destination):
+            real_copy(path, destination)
+            copied.set()
+            self.assertTrue(resume.wait(WAIT))
+
+        try:
+            with patch.object(self.b, "copy_to_local", side_effect=pause_after_copy):
+                opener = Worker(self.fs.open, self.PATH, os.O_RDONLY)
+                opener.start()
+                self.assertTrue(copied.wait(WAIT))
+                # The exact local inode is linked back while the staged B
+                # copy remains private; write() publishes its DIRTY row.
+                os.link(held_inode, final)
+                self.assertEqual(5, self.fs.write(self.PATH, b"local", 0, writer_fd))
+                with self.fs._fd_lock:
+                    local_inode = os.fstat(self.fs._fd_map[writer_fd].real_fd).st_ino
+                resume.set()
+                returned_fd = opener.finish()
+            try:
+                with self.fs._fd_lock:
+                    returned_inode = os.fstat(self.fs._fd_map[returned_fd].real_fd).st_ino
+                self.assertEqual(local_inode, returned_inode)
+                self.assertEqual(b"local" + self.OLD[5:],
+                                 self.fs.read(self.PATH, 4096, 0, returned_fd))
+                self._assert_local_dirty(b"local" + self.OLD[5:])
+                self.assertIn("changedA", self._snapshot()["debts"])
+                self._assert_no_b_baseline()
+            finally:
+                self.fs.release(self.PATH, returned_fd)
+        finally:
+            resume.set()
+            self.a.set_available(True)
+            held_inode.unlink(missing_ok=True)
+            self.fs.release(self.PATH, writer_fd)
+
+    def test_o_trunc_announces_mutation_before_dirty_publication(self):
+        writer_fd = self.fs.open(self.PATH, os.O_RDWR)
+        self._change_a()
+        self.assertEqual(self.OLD, self._read(self.PATH))
+        self.assertIn("changedA", self._snapshot()["debts"])
+        self.a.set_available(False)
+        token = self.fs._freshness_token(self.PATH, "staleB")
+        entered, resume = threading.Event(), threading.Event()
+        self.addCleanup(resume.set)
+        real_mark = self.fs._mark_cache_file_dirty
+
+        def hold_after_truncation(path, cache_path):
+            entered.set()
+            self.assertTrue(resume.wait(WAIT))
+            return real_mark(path, cache_path)
+
+        try:
+            with patch.object(self.fs, "_mark_cache_file_dirty", side_effect=hold_after_truncation):
+                opener = Worker(self.fs.open, self.PATH, os.O_RDWR | os.O_TRUNC)
+                opener.start()
+                self.assertTrue(entered.wait(WAIT))
+                self.assertEqual(b"", (self.cache_dir / "f.txt").read_bytes())
+                self.assertNotEqual(token, self.fs._freshness_token(self.PATH, "staleB"))
+                self.assertIn("changedA", self._snapshot()["debts"])
+                self._assert_no_b_baseline()
+                resume.set()
+                fd = opener.finish()
+            self._assert_local_dirty(b"")
+            self.fs.release(self.PATH, fd)
+        finally:
+            resume.set()
+            self.a.set_available(True)
+            self.fs.release(self.PATH, writer_fd)
+
+    def test_failed_dirty_publication_keeps_local_uncertainty(self):
+        fd = self.fs.open(self.PATH, os.O_RDWR)
+        self._change_a()
+        self.assertEqual(self.OLD, self._read(self.PATH))
+        self.a.set_available(False)
+        token = self.fs._freshness_token(self.PATH, "staleB")
+        try:
+            with patch.object(self.fs, "_mark_cache_file_dirty",
+                              side_effect=OSError(errno.EIO, "failed dirty row")):
+                with self.assertRaises(FuseOSError):
+                    self.fs.write(self.PATH, b"local", 0, fd)
+            self.assertEqual(b"local" + self.OLD[5:],
+                             (self.cache_dir / "f.txt").read_bytes())
+            self.assertNotEqual(token, self.fs._freshness_token(self.PATH, "staleB"))
+            with self.fs._member_checks_lock:
+                state = self.fs._freshness[self.PATH]
+                self.assertTrue(state.uncertain_local)
+                self.assertEqual(0, state.active_mutations)
+            self.assertIn("changedA", self._snapshot()["debts"])
+            self._assert_no_b_baseline()
+        finally:
+            self.a.set_available(True)
+            self.fs.release(self.PATH, fd)
+
     def test_restart_of_b_fallback_restores_a_debt_before_freshness_shortcut(self):
         self._change_a()
         real_stat = self.a.stat
