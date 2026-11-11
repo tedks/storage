@@ -22,3 +22,14 @@ log_events:
   who: Ted Smith
   what: created
   comment: ""
+- time: 2026-11-11T23:54:50-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Self-review blocker at pushed d1a856d after six of six focused runs: partial
+    rename onto an existing target can leave the moved source inode under the target''s
+    old CLEAN or DIRTY row. The namespace_uncertain _open branch calls heal_stale_clean;
+    a size/mtime mismatch can manufacture DIRTY and serve stale B bytes as a local
+    edit. The absent-target partial test did not expose this. No repair or runtime
+    remains authorized in the exhausted package. Root received a BLOCKED report; next
+    bounded fix needs inode/generation proof before serving local DIRTY, or conservative
+    EIO, plus target-present regression and affected rerun.'
