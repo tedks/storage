@@ -1313,8 +1313,28 @@ class StorageFS(Operations):
         with self._member_checks_lock:
             state = self._freshness.get(canonical_path)
             names = tuple(state.debts) if state is not None else ()
-        available = [self.backends[name] for name in names
-                     if name in self.backends and self.backends[name].is_available()]
+        available = []
+        observed_offline = []
+        for name in names:
+            backend = self.backends.get(name)
+            if backend is None:
+                continue
+            if backend.is_available():
+                available.append(backend)
+            else:
+                observed_offline.append(name)
+        if observed_offline:
+            with self._member_checks_lock:
+                state = self._freshness.get(canonical_path)
+                for name in observed_offline:
+                    debt = state.debts.get(name) if state is not None else None
+                    key = (canonical_path, name)
+                    retry = self._freshness_probe_retry.get(key)
+                    if debt is not None and retry is not None and retry[0] == debt.generation:
+                        # A failure recorded while available can be followed
+                        # by a separate open that observes it offline. Its
+                        # next observed return must bypass the old deadline.
+                        self._freshness_probe_retry[key] = (retry[0], retry[1], False)
         return min(available, key=lambda b: (b.speed_priority, b.name), default=None)
 
     def _select_backend_for_read(self, canonical_path: str) -> Optional[Backend]:
