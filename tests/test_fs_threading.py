@@ -529,6 +529,48 @@ class TestSharedFreshnessObligation(ThreadingTestBase):
             self.fs.state_manager.get_file_metadata(self.PATH).sync_status,
         )
 
+    def _late_callback_at_commit_entry(self, session):
+        """Reach baseline publication while the caller still holds its gate.
+
+        _record_fetched is the current stream-finalization publication entry.
+        A repair may reject the stale token earlier; the proposed boundary
+        keeps this observation seam so the rejected attempt is distinguishable
+        from a callback that never ran.
+        """
+        entered, resume = threading.Event(), threading.Event()
+        self.addCleanup(resume.set)
+        real = self.fs._record_fetched
+
+        def commit(*args, **kwargs):
+            entered.set()
+            self.assertTrue(resume.wait(WAIT))
+            return real(*args, **kwargs)
+
+        with patch.object(self.fs, "_record_fetched", side_effect=commit):
+            callback = Worker(self.fs._streaming_manager.on_finalized, session)
+            callback.start()
+            self.assertTrue(entered.wait(WAIT), "late callback missed commit entry")
+            resume.set()
+            callback.finish()
+
+    def _assert_no_b_baseline(self):
+        check = self.fs._member_checks.get(self.PATH)
+        if check is not None:
+            self.assertNotIn("staleB", check.members)
+
+    def _start_late_callback(self, session):
+        """Observe callback entry before a path-locked mutation finishes."""
+        entered = threading.Event()
+
+        def call():
+            entered.set()
+            return self.fs._streaming_manager.on_finalized(session)
+
+        worker = Worker(call)
+        worker.start()
+        self.assertTrue(entered.wait(WAIT))
+        return worker
+
     def _snapshot(self, path=PATH):
         return self.fs._freshness_snapshot(path)
 
@@ -773,6 +815,11 @@ class TestSharedFreshnessObligation(ThreadingTestBase):
             opener = Worker(self._read, self.PATH)
             opener.start()
             self.assertTrue(gate.waiting_for("ordinary", 1, WAIT))
+            current_token = self.fs._freshness_token(self.PATH, "staleB")
+            self.assertNotEqual(old_token[1], current_token[1])  # path revision
+            self.assertEqual(old_token[3], current_token[3])  # B generation
+            before = self._snapshot()
+            self.assertIn("changedA", before["debts"])
             final = self.cache_dir / "f.txt"
             self.assertFalse(final.exists())
             partial = self.cache_dir / "f.txt.storage.partial"
@@ -788,6 +835,9 @@ class TestSharedFreshnessObligation(ThreadingTestBase):
             outcome = self.fs._streaming_manager._install_partial(old_session)
             self.assertNotEqual("installed", outcome)
             self.assertFalse(final.exists())
+            after = self._snapshot()
+            self.assertEqual(before["publication_revision"], after["publication_revision"])
+            self.assertIn("changedA", after["debts"])
         self.assertEqual(self.NEW, opener.finish())
         self.assertEqual(self.NEW, final.read_bytes())
         self._assert_a_baseline()
@@ -796,6 +846,9 @@ class TestSharedFreshnessObligation(ThreadingTestBase):
     def test_write_byte_to_dirty_interval_rejects_late_stream_commit(self):
         token = self.fs._freshness_token(self.PATH, "staleB")
         fd = self.fs.open(self.PATH, os.O_RDWR)
+        self._change_a()
+        self.assertEqual(self.OLD, self._read(self.PATH))
+        self.assertIn("changedA", self._snapshot()["debts"])
         entered, resume = threading.Event(), threading.Event()
         self.addCleanup(resume.set)
         real_mark = self.fs._mark_cache_file_dirty
@@ -817,12 +870,13 @@ class TestSharedFreshnessObligation(ThreadingTestBase):
                 # The final inode belongs to the writer. No-replace must win
                 # even before its DIRTY row is published.
                 self.assertNotEqual("installed", self.fs._streaming_manager._install_partial(late))
-                callback = Worker(self.fs._streaming_manager.on_finalized, late)
-                callback.start()
+                self._late_callback_at_commit_entry(late)
+                self.assertIn("changedA", self._snapshot()["debts"])
+                self._assert_no_b_baseline()
                 resume.set()
                 self.assertEqual(5, writer.finish())
-                callback.finish()
             self._assert_local_dirty(b"local" + self.OLD[5:])
+            self.assertIn("changedA", self._snapshot()["debts"])
         finally:
             resume.set()
             self.fs.release(self.PATH, fd)
@@ -830,6 +884,13 @@ class TestSharedFreshnessObligation(ThreadingTestBase):
 
     def test_truncate_byte_to_dirty_interval_rejects_late_baseline(self):
         token = self.fs._freshness_token(self.PATH, "staleB")
+        writer_fd = self.fs.open(self.PATH, os.O_RDWR)
+        try:
+            self._change_a()
+            self.assertEqual(self.OLD, self._read(self.PATH))
+            self.assertIn("changedA", self._snapshot()["debts"])
+        finally:
+            self.fs.release(self.PATH, writer_fd)
         entered, resume = threading.Event(), threading.Event()
         self.addCleanup(resume.set)
         real_mark = self.fs._mark_cache_file_dirty
@@ -844,12 +905,13 @@ class TestSharedFreshnessObligation(ThreadingTestBase):
             truncater.start()
             self.assertTrue(entered.wait(WAIT))
             self.assertEqual(b"old", (self.cache_dir / "f.txt").read_bytes())
-            late = Worker(self.fs._streaming_manager.on_finalized, self._late_b_session(token))
-            late.start()
+            late = self._start_late_callback(self._late_b_session(token))
             resume.set()
             truncater.finish()
             late.finish()
         self._assert_local_dirty(b"old")
+        self.assertIn("changedA", self._snapshot()["debts"])
+        self._assert_no_b_baseline()
         self._assert_slots_released()
 
     def test_create_replacement_rejects_old_stream_and_keeps_dirty_bytes(self):
@@ -868,14 +930,15 @@ class TestSharedFreshnessObligation(ThreadingTestBase):
             creator.start()
             self.assertTrue(entered.wait(WAIT))
             self.assertEqual(b"", (self.cache_dir / "f.txt").read_bytes())
-            late = Worker(self.fs._streaming_manager.on_finalized, self._late_b_session(token))
-            late.start()
+            late = self._start_late_callback(self._late_b_session(token))
             resume.set()
             fd = creator.finish()
             late.finish()
         try:
+            self.assertNotEqual(token[0], self.fs._freshness_token(self.PATH, "staleB")[0])
             self.assertEqual(5, self.fs.write(self.PATH, b"local", 0, fd))
             self._assert_local_dirty(b"local")
+            self._assert_no_b_baseline()
         finally:
             self.fs.release(self.PATH, fd)
         self._assert_slots_released()
@@ -905,7 +968,42 @@ class TestSharedFreshnessObligation(ThreadingTestBase):
         self.assertIsNone(self._snapshot())
         self._assert_slots_released()
 
-    def test_restart_with_missing_cache_reprobes_a_not_stale_b(self):
+    def test_valid_restarted_warm_open_keeps_demand_slot_under_cold_copy(self):
+        (self.member_dir / "cold.txt").write_bytes(b"slow cold bytes")
+        self._restart_fs()
+        gate = self.fs._foreground_admission
+        self.assertEqual("demand", self.fs._foreground_class("open", (self.PATH, os.O_RDONLY)))
+        copy = self.gate(self.a, "copy_to_local", only=lambda path, _dest: path == "/cold.txt")
+        cold = Worker(self._read, "/cold.txt")
+        cold.start()
+        self.assertTrue(copy.started.wait(WAIT))
+        real_a_stat, real_b_stat = self.a.stat, self.b.stat
+
+        def a_stat(path):
+            if path == self.PATH:
+                raise AssertionError("valid restarted cache did member I/O")
+            return real_a_stat(path)
+
+        def b_stat(path):
+            if path == self.PATH:
+                raise AssertionError("valid restarted cache did member I/O")
+            return real_b_stat(path)
+
+        try:
+            with patch.object(self.a, "stat", side_effect=a_stat), \
+                    patch.object(self.b, "stat", side_effect=b_stat):
+                warm = Worker(self._read, self.PATH)
+                warm.start()
+                self.assertEqual(self.OLD, warm.finish())
+                self.assertEqual(0, gate.waiting_count("ordinary"))
+                self.assertLessEqual(gate.peak_active, 3)
+            self.assertTrue(cold.is_alive())
+        finally:
+            copy.opened.set()
+            cold.finish()
+        self._assert_slots_released()
+
+    def test_restart_with_missing_cache_rejects_ambiguous_a_b_copies(self):
         self._change_a()
         gate = self.fs._foreground_admission
         with gate.admit("ordinary"):
@@ -919,9 +1017,11 @@ class TestSharedFreshnessObligation(ThreadingTestBase):
             self.assertIsInstance(opener.error, FuseOSError)
         self._restart_fs()
         with patch.object(self.fs, "_select_unpinned_backend_for_read", return_value=self.b):
-            self.assertEqual(self.NEW, self._read(self.PATH))
-        self._assert_a_baseline()
-        self.assertIsNone(self._snapshot())
+            with self.assertRaises(FuseOSError) as raised:
+                self._read(self.PATH)
+        self.assertEqual(errno.EIO, raised.exception.errno)
+        self.assertFalse((self.cache_dir / "f.txt").exists())
+        self.assertEqual("reprobe", self._snapshot()["state"])
         self._assert_slots_released()
 
     def test_c_completion_cannot_clear_independent_a_debt(self):

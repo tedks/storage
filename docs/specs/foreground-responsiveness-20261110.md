@@ -13,6 +13,15 @@ F2 to durable cache-xattr debt plus conservative restart reprobe; and F3 to
 per-member debts and generation checks. The threading test source adds
 Event-gated write/truncate/create, two restart, and A-then-C completion
 sequences. These are proposed acceptance tests, still unrun.
+The `baa66ed` convergence review returned C1-C3 findings. Contract v3 adds a
+path-wide publication revision that invalidates old B after changed A while
+retaining per-member debts; keeps locally verifiable post-restart cached opens
+in demand admission; and specifies validation during the write byte-to-DIRTY
+window. Regression source adds an absent-final-path token check with debt and
+revision assertions, a restarted warm-open/cold-copy saturation schedule, and
+commit-entry, baseline and debt assertions for local mutations. Missing-cache
+restart ambiguity now fails conservatively instead of choosing a holder by
+rank. This correction is source-only and unrun.
 
 ## Intent and limits
 
