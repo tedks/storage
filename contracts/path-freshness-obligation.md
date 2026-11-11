@@ -100,8 +100,12 @@ B's staged inode; no-replace link and parent-directory sync precede a CLEAN
 index/baseline claim. A crash between these steps leaves either a marked cache
 or an uncertain path. On mount restart, the first CLEAN cached open stays in
 the protected demand class while it checks only local xattr, row and inode
-identity. A valid marker restores all debts without member I/O or loss of
-warm-open admission. If local evidence is uncertain, record that state, drop
+identity. A valid marker restores local identity and debts but **does not**
+certify remote freshness or reset `verified_at`: the ordinary
+`revalidate_after` rule still permits or requires a member stat on that same
+demand-class open. An unchanged stat completes in demand; a changed stat
+publishes debt and transfers before any full fetch. If local evidence is
+uncertain, record that state, drop
 namespace/path locks, release demand and wait for ordinary capacity before
 any member probe or bulk transfer. Reacquire locks and recheck identity,
 revision and debt after admission; no local uncertainty is silently treated
@@ -132,11 +136,12 @@ test observations, not user APIs or a second authority. Root may choose an
 equivalent internal representation when reviewing the boundary, provided the
 same observable transitions remain testable.
 
-The write regression gates the existing `_record_fetched` publication entry
-after `pwrite` has changed bytes but before DIRTY publication, and requires
-the old B callback to finish its validation before the writer resumes. It
-checks that B's baseline was not installed and A's debt was not cleared while
-the cache bytes are local. Truncate and create hold their path-locked mutation
+The write regression captures B's token after A debt exists, then gates after
+`pwrite` changes bytes but before DIRTY publication. It observes callback
+entry while the writer remains active; an early token rejection is valid.
+It releases the writer before joining a callback that may need
+`metadata_lock`, then checks local
+bytes, DIRTY, A debt and absence of B baseline. Truncate and create hold their path-locked mutation
 boundaries, then check the late callback after release. The separate
 final-path-absent stream test checks token rejection when no-replace alone
 cannot save the file. A missing diagnostic method is only a setup failure;

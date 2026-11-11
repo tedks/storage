@@ -22,6 +22,14 @@ revision assertions, a restarted warm-open/cold-copy saturation schedule, and
 commit-entry, baseline and debt assertions for local mutations. Missing-cache
 restart ambiguity now fails conservatively instead of choosing a holder by
 rank. This correction is source-only and unrun.
+The `7b1f5e6` review found test integration and recovery wording corrections:
+the write schedule now captures B's token after A debt, starts the callback
+while the writer holds its mark boundary, then releases the writer before
+joining the callback and checking bytes/DIRTY/debt/baseline. The restart
+contract verifies local identity/debt without refreshing remote freshness;
+the warm saturation test permits normal demand-class stat, and a second test
+changes A while stopped to force demand-to-ordinary transfer. Both remain
+unrun source proposals.
 
 ## Intent and limits
 

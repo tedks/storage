@@ -498,9 +498,11 @@ class TestSharedFreshnessObligation(ThreadingTestBase):
                     check, verified_at=check.verified_at - 3600,
                 )
 
-    def _restart_fs(self):
+    def _restart_fs(self, after_stop=None):
         """Close the mount instance, retaining only scratch cache/member state."""
         self.fs.destroy("/")
+        if after_stop is not None:
+            after_stop()
         self.fs = StorageFS(
             cache_root=self.cache_dir, state_db=self.temp_dir / "state.db",
             backends={"changedA": self.a, "staleB": self.b},
@@ -528,30 +530,6 @@ class TestSharedFreshnessObligation(ThreadingTestBase):
             SyncStatus.DIRTY,
             self.fs.state_manager.get_file_metadata(self.PATH).sync_status,
         )
-
-    def _late_callback_at_commit_entry(self, session):
-        """Reach baseline publication while the caller still holds its gate.
-
-        _record_fetched is the current stream-finalization publication entry.
-        A repair may reject the stale token earlier; the proposed boundary
-        keeps this observation seam so the rejected attempt is distinguishable
-        from a callback that never ran.
-        """
-        entered, resume = threading.Event(), threading.Event()
-        self.addCleanup(resume.set)
-        real = self.fs._record_fetched
-
-        def commit(*args, **kwargs):
-            entered.set()
-            self.assertTrue(resume.wait(WAIT))
-            return real(*args, **kwargs)
-
-        with patch.object(self.fs, "_record_fetched", side_effect=commit):
-            callback = Worker(self.fs._streaming_manager.on_finalized, session)
-            callback.start()
-            self.assertTrue(entered.wait(WAIT), "late callback missed commit entry")
-            resume.set()
-            callback.finish()
 
     def _assert_no_b_baseline(self):
         check = self.fs._member_checks.get(self.PATH)
@@ -844,11 +822,13 @@ class TestSharedFreshnessObligation(ThreadingTestBase):
         self._assert_slots_released()
 
     def test_write_byte_to_dirty_interval_rejects_late_stream_commit(self):
-        token = self.fs._freshness_token(self.PATH, "staleB")
         fd = self.fs.open(self.PATH, os.O_RDWR)
         self._change_a()
         self.assertEqual(self.OLD, self._read(self.PATH))
         self.assertIn("changedA", self._snapshot()["debts"])
+        # This token is valid after A's observation. Only the intervening
+        # local mutation may invalidate its attempt to publish B's baseline.
+        token = self.fs._freshness_token(self.PATH, "staleB")
         entered, resume = threading.Event(), threading.Event()
         self.addCleanup(resume.set)
         real_mark = self.fs._mark_cache_file_dirty
@@ -870,20 +850,24 @@ class TestSharedFreshnessObligation(ThreadingTestBase):
                 # The final inode belongs to the writer. No-replace must win
                 # even before its DIRTY row is published.
                 self.assertNotEqual("installed", self.fs._streaming_manager._install_partial(late))
-                self._late_callback_at_commit_entry(late)
-                self.assertIn("changedA", self._snapshot()["debts"])
-                self._assert_no_b_baseline()
+                callback = self._start_late_callback(late)
+                # write() holds metadata_lock through mark_file_dirty. A
+                # correct callback may reject the token now, or wait for that
+                # lock; it must not publish while the writer is paused.
+                callback.join(BLOCKED)
+                self.assertTrue(writer.is_alive())
                 resume.set()
                 self.assertEqual(5, writer.finish())
+                callback.finish()
             self._assert_local_dirty(b"local" + self.OLD[5:])
             self.assertIn("changedA", self._snapshot()["debts"])
+            self._assert_no_b_baseline()
         finally:
             resume.set()
             self.fs.release(self.PATH, fd)
         self._assert_slots_released()
 
     def test_truncate_byte_to_dirty_interval_rejects_late_baseline(self):
-        token = self.fs._freshness_token(self.PATH, "staleB")
         writer_fd = self.fs.open(self.PATH, os.O_RDWR)
         try:
             self._change_a()
@@ -891,6 +875,7 @@ class TestSharedFreshnessObligation(ThreadingTestBase):
             self.assertIn("changedA", self._snapshot()["debts"])
         finally:
             self.fs.release(self.PATH, writer_fd)
+        token = self.fs._freshness_token(self.PATH, "staleB")
         entered, resume = threading.Event(), threading.Event()
         self.addCleanup(resume.set)
         real_mark = self.fs._mark_cache_file_dirty
@@ -977,30 +962,56 @@ class TestSharedFreshnessObligation(ThreadingTestBase):
         cold = Worker(self._read, "/cold.txt")
         cold.start()
         self.assertTrue(copy.started.wait(WAIT))
-        real_a_stat, real_b_stat = self.a.stat, self.b.stat
+        real_a_stat = self.a.stat
+        stat_paths = []
 
         def a_stat(path):
-            if path == self.PATH:
-                raise AssertionError("valid restarted cache did member I/O")
+            stat_paths.append(path)
             return real_a_stat(path)
 
-        def b_stat(path):
-            if path == self.PATH:
-                raise AssertionError("valid restarted cache did member I/O")
-            return real_b_stat(path)
-
         try:
-            with patch.object(self.a, "stat", side_effect=a_stat), \
-                    patch.object(self.b, "stat", side_effect=b_stat):
+            with patch.object(self.a, "stat", side_effect=a_stat):
                 warm = Worker(self._read, self.PATH)
                 warm.start()
                 self.assertEqual(self.OLD, warm.finish())
+                # Local marker verification did not forge a fresh member
+                # timestamp: normal first-open revalidation still stat-ed A.
+                self.assertIn(self.PATH, stat_paths)
                 self.assertEqual(0, gate.waiting_count("ordinary"))
                 self.assertLessEqual(gate.peak_active, 3)
             self.assertTrue(cold.is_alive())
         finally:
             copy.opened.set()
             cold.finish()
+        self._assert_slots_released()
+
+    def test_changed_a_while_stopped_transfers_after_demand_revalidation(self):
+        (self.member_dir / "cold.txt").write_bytes(b"slow cold bytes")
+
+        def change_while_stopped():
+            (self.member_dir / "f.txt").write_bytes(self.NEW)
+            os.utime(self.member_dir / "f.txt", (1_700_000_100, 1_700_000_100))
+
+        self._restart_fs(after_stop=change_while_stopped)
+        gate = self.fs._foreground_admission
+        self.assertEqual("demand", self.fs._foreground_class("open", (self.PATH, os.O_RDONLY)))
+        copy = self.gate(self.a, "copy_to_local", only=lambda path, _dest: path == "/cold.txt")
+        cold = Worker(self._read, "/cold.txt")
+        cold.start()
+        self.assertTrue(copy.started.wait(WAIT))
+        warm = Worker(self._read, self.PATH)
+        warm.start()
+        try:
+            # The local marker did not certify A. Its changed stat makes the
+            # full fetch ordinary; that wait must not retain the path lock.
+            self.assertTrue(gate.waiting_for("ordinary", 1, WAIT))
+            with self.fs._path_locks._mutex:
+                self.assertNotIn(self.PATH, self.fs._path_locks._entries)
+        finally:
+            copy.opened.set()
+            cold.finish()
+        self.assertEqual(self.NEW, warm.finish())
+        self._assert_a_baseline()
         self._assert_slots_released()
 
     def test_restart_with_missing_cache_rejects_ambiguous_a_b_copies(self):
