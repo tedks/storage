@@ -410,6 +410,7 @@ class StorageFS(Operations):
             freshness_token=self._freshness_token,
             freshness_valid=self._stream_freshness_valid,
             commit_guard=self._stream_commit_guard,
+            try_commit_guard=self._try_stream_commit_guard,
             partial_suffix=self._PARTIAL_SUFFIX,
             stream_state_xattr=self._STREAM_STATE_XATTR,
         )
@@ -1276,6 +1277,17 @@ class StorageFS(Operations):
             with self.state_manager.metadata_lock:
                 with self._member_checks_lock:
                     yield
+
+    @contextlib.contextmanager
+    def _try_stream_commit_guard(self, session: PrefetchSession):
+        """Failed-prefix retention is optional when its path is busy."""
+        with self._try_path_locked(session.canonical_path) as held:
+            if not held:
+                yield False
+                return
+            with self.state_manager.metadata_lock:
+                with self._member_checks_lock:
+                    yield True
 
     def _freshness_snapshot(self, canonical_path: str):
         with self._member_checks_lock:

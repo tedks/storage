@@ -183,6 +183,7 @@ class StreamingReadManager:
         freshness_token: Optional[Callable[[str, str], object]] = None,
         freshness_valid: Optional[Callable[["PrefetchSession"], bool]] = None,
         commit_guard: Optional[Callable[["PrefetchSession"], object]] = None,
+        try_commit_guard: Optional[Callable[["PrefetchSession"], object]] = None,
     ):
         self.cache_manager = cache_manager
         # Called once the complete file is in the cache (StorageFS records
@@ -191,6 +192,7 @@ class StreamingReadManager:
         self.freshness_token = freshness_token
         self.freshness_valid = freshness_valid
         self.commit_guard = commit_guard
+        self.try_commit_guard = try_commit_guard
         self.state_manager = state_manager
         self.logger = logger
         self.get_config = get_config
@@ -1084,10 +1086,13 @@ class StreamingReadManager:
             # install refuses; a full fetch that loses the race to this
             # install finds the marker and fetches again instead of indexing
             # the prefix.
-            guard = (self.commit_guard(session) if self.commit_guard is not None
+            guard = (self.try_commit_guard(session) if self.try_commit_guard is not None
+                     else self.commit_guard(session) if self.commit_guard is not None
                      else self.state_manager.metadata_lock)
-            with guard:
-                if self.state_manager.get_file_metadata(session.canonical_path) is not None:
+            with guard as held:
+                if self.try_commit_guard is not None and not held:
+                    outcome = "contended"
+                elif self.state_manager.get_file_metadata(session.canonical_path) is not None:
                     outcome = "indexed"
                 else:
                     outcome = self._install_partial(session)
