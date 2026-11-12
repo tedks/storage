@@ -1,4 +1,5 @@
 import concurrent.futures
+from dataclasses import dataclass, field
 import contextvars
 import errno
 import os
@@ -39,6 +40,20 @@ DEFAULT_STAT_MEMO_LIMIT = 8192
 # Child names remembered per directory while a listing of it is in flight
 # (see _note_child_race_locked); past this the listing is dropped instead.
 _MAX_CHILD_RACES = 1024
+
+
+@dataclass
+class RenameProgress:
+    """Local and member progress of one rename, including an escaping failure."""
+
+    cache_moved: bool = False
+    index_moved: bool = False
+    callback_done: bool = False
+    intended: Set[str] = field(default_factory=set)
+    attempted: Set[str] = field(default_factory=set)
+    confirmed: Set[str] = field(default_factory=set)
+    failed: Set[str] = field(default_factory=set)
+    unknown: Set[str] = field(default_factory=set)
 
 
 class _ListingTicket(NamedTuple):
@@ -514,12 +529,15 @@ class NamespaceService:
         backend_hint: Optional[str] = None,
         new_path: Optional[str] = None,
         backend_names: Optional[Set[str]] = None,
+        progress: Optional[RenameProgress] = None,
     ) -> List[str]:
         """Best-effort synchronous propagation; returns backend names that failed."""
         failures: List[str] = []
         for backend in self._get_target_backends(backend_hint, backend_names=backend_names):
             if not backend:
                 continue
+            if progress is not None:
+                progress.attempted.add(backend.name)
             try:
                 if operation == DirOperation.MKDIR:
                     backend.mkdir(path)
@@ -529,8 +547,12 @@ class NamespaceService:
                     if not new_path:
                         raise ValueError("rename requires new_path")
                     backend.rename(path, new_path)
+                if progress is not None:
+                    progress.confirmed.add(backend.name)
             except Exception as exc:
                 failures.append(backend.name)
+                if progress is not None:
+                    progress.failed.add(backend.name)
                 self.logger.debug(
                     "dir op %s failed for %s on %s: %s",
                     operation.value,
@@ -1455,7 +1477,8 @@ class NamespaceService:
             raise FuseOSError(exc.errno)
 
     def rename(self, old: str, new: str,
-               on_local_moved: Optional[Callable[[List[Tuple[str, str]]], None]] = None):
+               on_local_moved: Optional[Callable[[List[Tuple[str, str]]], None]] = None,
+               progress: Optional[RenameProgress] = None):
         """Rename a file or directory.
 
         The local move (the cache rename, the index rewrite and the metadata
@@ -1487,6 +1510,8 @@ class NamespaceService:
                     raise OSError(errno.ENOTEMPTY, os.strerror(errno.ENOTEMPTY), new)
                 new_cache.parent.mkdir(parents=True, exist_ok=True)
                 old_cache.rename(new_cache)
+                if progress is not None:
+                    progress.cache_moved = True
 
                 # A link (even to a directory) moves on its own members.
                 if new_cache.is_dir() and not new_cache.is_symlink():
@@ -1500,12 +1525,24 @@ class NamespaceService:
                     old_resolved.canonical_path,
                     new_resolved.canonical_path,
                 )
+                if progress is not None:
+                    progress.index_moved = True
                 for _, updated in renamed_entries:
                     metadata = self.state_manager.get_file_metadata(updated)
                     if metadata:
                         self.cache_manager.sync_cache_metadata(updated, metadata)
                 if on_local_moved is not None:
                     on_local_moved(renamed_entries)
+                if progress is not None:
+                    progress.callback_done = True
+
+            if progress is not None:
+                progress.intended = {
+                    backend.name for backend in self._get_target_backends(
+                        old_resolved.backend_name,
+                        backend_names=rename_backend_names if not old_resolved.backend_name else None,
+                    )
+                }
 
             failures = self._propagate_dir_operation(
                 DirOperation.RENAME,
@@ -1513,7 +1550,11 @@ class NamespaceService:
                 backend_hint=old_resolved.backend_name,
                 new_path=new_resolved.canonical_path,
                 backend_names=rename_backend_names if not old_resolved.backend_name else None,
+                progress=progress,
             )
+            if progress is not None:
+                progress.failed.update(failures)
+                progress.unknown = progress.intended - progress.confirmed - progress.failed
 
             self.invalidate_dir_cache_entry(old_resolved.parent_dir)
             self.invalidate_dir_cache_entry(new_resolved.parent_dir)
@@ -1541,4 +1582,8 @@ class NamespaceService:
                     force=True,
                 )
         except OSError as exc:
+            if progress is not None:
+                progress.unknown = progress.intended - progress.confirmed - progress.failed
             raise FuseOSError(exc.errno)
+
+        return progress

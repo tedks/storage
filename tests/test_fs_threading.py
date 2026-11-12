@@ -23,6 +23,7 @@ from fuse import FuseOSError
 from storage.backends.local import LocalBackend
 from storage.backends.base import is_interactive_request
 from storage.fs import StorageFS, mount_storage
+from storage.streaming import PrefetchSession
 from storage.models import FileLocation, SyncStatus
 
 WAIT = 5.0
@@ -1088,6 +1089,252 @@ class TestSharedFreshnessObligation(ThreadingTestBase):
         for path in ("/moved/first.txt", "/moved/nest/deep.txt"):
             self.assertEqual(SyncStatus.DIRTY,
                              self.fs.state_manager.get_file_metadata(path).sync_status)
+
+    def test_failed_directory_move_covers_child_without_freshness_object(self):
+        self.fs.mkdir("/dir", 0o755)
+        for directory in (self.member_dir, self.b_dir):
+            (directory / "dir" / "child.txt").write_bytes(b"uncertified child")
+        self.assertEqual(b"uncertified child", self._read("/dir/child.txt"))
+        self._restart_fs()
+        with self.fs._member_checks_lock:
+            self.assertNotIn("/dir/child.txt", self.fs._freshness)
+            self.assertNotIn("/moved/child.txt", self.fs._freshness)
+        with patch.object(self.fs.namespace, "_propagate_dir_operation",
+                          side_effect=OSError(errno.EIO, "member move failed")):
+            with self.assertRaises(OSError):
+                self.fs.rename("/dir", "/moved")
+        with self.fs._member_checks_lock:
+            self.assertNotIn("/moved/child.txt", self.fs._freshness)
+        with self.assertRaises(FuseOSError) as raised:
+            self._read("/moved/child.txt", direct=True)
+        self.assertEqual(errno.EIO, raised.exception.errno)
+        self.assertEqual(b"uncertified child", (self.cache_dir / "moved" / "child.txt").read_bytes())
+        # A test-local disabled negative guard demonstrates the actual
+        # stale canonical-byte exposure, independent of a diagnostic seam.
+        with patch.object(self.fs, "_namespace_covered_locked", return_value=False):
+            self.assertEqual(b"uncertified child", self._read("/moved/child.txt", direct=True))
+
+    def test_returned_member_failure_covers_absent_state_and_records_progress(self):
+        self.fs.mkdir("/dir", 0o755)
+        for directory in (self.member_dir, self.b_dir):
+            (directory / "dir" / "child.txt").write_bytes(b"old local")
+        self.assertEqual(b"old local", self._read("/dir/child.txt"))
+        self._restart_fs()
+        with self.fs._member_checks_lock:
+            self.assertNotIn("/dir/child.txt", self.fs._freshness)
+        with patch.object(self.b, "rename", side_effect=OSError(errno.EIO, "B offline")):
+            self.fs.rename("/dir", "/moved")
+        record = self.fs._namespace_uncertainties[-1]
+        self.assertEqual({"changedA", "staleB"}, record.progress.intended)
+        self.assertEqual(record.progress.intended, record.progress.attempted)
+        self.assertEqual({"changedA"}, record.progress.confirmed)
+        self.assertEqual({"staleB"}, record.progress.failed)
+        self.assertEqual(set(), record.progress.unknown)
+        with self.fs._member_checks_lock:
+            self.assertNotIn("/moved/child.txt", self.fs._freshness)
+        with self.assertRaises(FuseOSError) as raised:
+            self._read("/moved/child.txt", direct=True)
+        self.assertEqual(errno.EIO, raised.exception.errno)
+
+    def test_failed_subtree_covers_evicted_and_later_lazy_children_but_not_sibling(self):
+        self.fs.mkdir("/dir", 0o755)
+        self.fs.mkdir("/dir/nest", 0o755)
+        self.fs.mkdir("/dir2", 0o755)
+        for directory in (self.member_dir, self.b_dir):
+            (directory / "dir" / "nest" / "evicted.txt").write_bytes(b"evicted bytes")
+            (directory / "dir2" / "sibling.txt").write_bytes(b"unrelated")
+        self.assertEqual(b"evicted bytes", self._read("/dir/nest/evicted.txt"))
+        self._restart_fs()
+        self.fs.cache_manager.evict_lru_files(1 << 20)
+        self.assertFalse((self.cache_dir / "dir" / "nest" / "evicted.txt").exists())
+        with patch.object(self.fs.namespace, "_propagate_dir_operation",
+                          side_effect=OSError(errno.EIO, "member move failed")):
+            with self.assertRaises(OSError):
+                self.fs.rename("/dir", "/moved")
+        (self.member_dir / "moved").mkdir(exist_ok=True)
+        (self.member_dir / "moved" / "lazy.txt").write_bytes(b"later member bytes")
+        for path in ("/moved/nest/evicted.txt", "/moved/lazy.txt"):
+            with self.assertRaises(FuseOSError) as raised:
+                self._read(path, direct=True)
+            self.assertEqual(errno.EIO, raised.exception.errno)
+        self.assertEqual(b"unrelated", self._read("/dir2/sibling.txt", direct=True))
+
+    def test_failed_replace_keeps_same_member_debts_by_origin(self):
+        target = "/target.txt"
+        for directory in (self.member_dir, self.b_dir):
+            (directory / "target.txt").write_bytes(b"target old")
+        self.assertEqual(b"target old", self._read(target))
+        self._change_a()
+        (self.member_dir / "target.txt").write_bytes(b"target changed separately")
+        self.fs._observe_changed_member(self.PATH, self.a, self.a.stat(self.PATH))
+        self.fs._observe_changed_member(target, self.a, self.a.stat(target))
+        with patch.object(self.fs.namespace, "_propagate_dir_operation",
+                          side_effect=OSError(errno.EIO, "member move failed")):
+            with self.assertRaises(OSError):
+                self.fs.rename(self.PATH, target)
+        record = self.fs._namespace_uncertainties[-1]
+        source = record.source_debts[self.PATH]["changedA"]
+        replaced = record.target_debts[target]["changedA"]
+        self.assertNotEqual(source.member_stat.st_size, replaced.member_stat.st_size)
+        self.assertTrue(record.covers(self.PATH))
+        self.assertTrue(record.covers(target))
+
+    def test_failed_subtree_blocks_heal_and_both_eviction_paths(self):
+        self.fs.mkdir("/dir", 0o755)
+        for directory in (self.member_dir, self.b_dir):
+            (directory / "dir" / "plain.txt").write_bytes(b"plain local")
+            (directory / "dir" / "recompute.txt").write_bytes(b"recompute local")
+        for path in ("/dir/plain.txt", "/dir/recompute.txt"):
+            self._read(path)
+        self._restart_fs()
+        with patch.object(self.fs.namespace, "_propagate_dir_operation",
+                          side_effect=OSError(errno.EIO, "member move failed")):
+            with self.assertRaises(OSError):
+                self.fs.rename("/dir", "/moved")
+        plain = "/moved/plain.txt"
+        recompute = "/moved/recompute.txt"
+        row = self.fs.state_manager.get_file_metadata(recompute)
+        row.recomputable = True
+        self.fs.state_manager.set_file_metadata(row)
+        plain_cache = self.cache_dir / "moved" / "plain.txt"
+        recompute_cache = self.cache_dir / "moved" / "recompute.txt"
+        os.utime(plain_cache, ns=(plain_cache.stat().st_atime_ns,
+                                  plain_cache.stat().st_mtime_ns + 1_000_000_000))
+        self.fs.sweep_stale_cache_metadata()
+        self.assertEqual(SyncStatus.CLEAN,
+                         self.fs.state_manager.get_file_metadata(plain).sync_status)
+        self.fs.cache_manager.evict_lru_files(1 << 20)
+        self.fs.cache_manager.evict_recomputable_files(1 << 20)
+        self.assertEqual(b"plain local", plain_cache.read_bytes())
+        self.assertEqual(b"recompute local", recompute_cache.read_bytes())
+        self.assertEqual(SyncStatus.CLEAN,
+                         self.fs.state_manager.get_file_metadata(recompute).sync_status)
+
+    def test_eviction_during_cache_move_cannot_erase_unpublished_child(self):
+        self.fs.mkdir("/dir", 0o755)
+        for directory in (self.member_dir, self.b_dir):
+            (directory / "dir" / "child.txt").write_bytes(b"local child")
+        self._read("/dir/child.txt")
+        self._restart_fs()
+        entered = threading.Event()
+        evict_entered = threading.Event()
+        resume = threading.Event()
+        self.addCleanup(resume.set)
+        real_rename = self.fs.state_manager.rename_path
+        real_lru = self.fs.state_manager.get_lru_files
+
+        def paused_index_move(old, new):
+            entered.set()  # cache directory has moved, index has not
+            self.assertTrue(resume.wait(WAIT))
+            return real_rename(old, new)
+
+        def observed_lru(*args, **kwargs):
+            evict_entered.set()
+            return real_lru(*args, **kwargs)
+
+        with patch.object(self.fs.state_manager, "rename_path", side_effect=paused_index_move), \
+                patch.object(self.fs.state_manager, "get_lru_files", side_effect=observed_lru), \
+                patch.object(self.fs.namespace, "_propagate_dir_operation",
+                             side_effect=OSError(errno.EIO, "member move failed")):
+            mover = Worker(self.fs.rename, "/dir", "/moved")
+            mover.start()
+            self.assertTrue(entered.wait(WAIT))
+            try:
+                evict = Worker(self.fs.cache_manager.evict_lru_files, 1 << 20)
+                evict.start()
+                self.assertTrue(evict_entered.wait(WAIT))
+                self.assertEqual(b"local child", (self.cache_dir / "moved" / "child.txt").read_bytes())
+            finally:
+                resume.set()
+            mover.join(WAIT)
+            self.assertFalse(mover.is_alive())
+            self.assertIsInstance(mover.error, OSError)
+            self.assertFalse(evict.finish())
+        self.fs.cache_manager.evict_lru_files(1 << 20)
+        self.assertEqual(b"local child", (self.cache_dir / "moved" / "child.txt").read_bytes())
+
+    def test_nested_move_keeps_every_covering_record(self):
+        self.fs.mkdir("/dir", 0o755)
+        self.fs.mkdir("/dir/nest", 0o755)
+        for directory in (self.member_dir, self.b_dir):
+            (directory / "dir" / "nest" / "child.txt").write_bytes(b"nested child")
+        self._read("/dir/nest/child.txt")
+        self._restart_fs()
+        with patch.object(self.fs.namespace, "_propagate_dir_operation",
+                          side_effect=OSError(errno.EIO, "member move failed")):
+            with self.assertRaises(OSError):
+                self.fs.rename("/dir", "/moved")
+            with self.assertRaises(OSError):
+                self.fs.rename("/moved/nest", "/elsewhere")
+        self.assertEqual(2, len(self.fs._namespace_uncertainties))
+        self.assertTrue(all(record.covers("/moved/nest/child.txt") or
+                            record.covers("/elsewhere/child.txt")
+                            for record in self.fs._namespace_uncertainties))
+        with self.assertRaises(FuseOSError) as raised:
+            self._read("/elsewhere/child.txt", direct=True)
+        self.assertEqual(errno.EIO, raised.exception.errno)
+
+    def test_explicit_unlink_create_proves_only_new_local_dirty_inode(self):
+        self.fs.mkdir("/dir", 0o755)
+        for directory in (self.member_dir, self.b_dir):
+            (directory / "dir" / "child.txt").write_bytes(b"old child")
+        self._read("/dir/child.txt")
+        self._restart_fs()
+        with patch.object(self.fs.namespace, "_propagate_dir_operation",
+                          side_effect=OSError(errno.EIO, "member move failed")):
+            with self.assertRaises(OSError):
+                self.fs.rename("/dir", "/moved")
+        child = "/moved/child.txt"
+        self.fs.unlink(child)
+        fd = self.fs.create(child, 0o644)
+        try:
+            self.fs.write(child, b"new local", 0, fd)
+        finally:
+            self.fs.release(child, fd)
+        self.assertEqual(b"new local", self._read(child, direct=True))
+        row = self.fs.state_manager.get_file_metadata(child)
+        self.assertEqual(SyncStatus.DIRTY, row.sync_status)
+        self.assertTrue(self.fs._namespace_covered(child))
+        self.assertFalse(self.fs._should_sync_path(child))
+        (self.member_dir / "moved").mkdir(exist_ok=True)
+        (self.member_dir / "moved" / "lazy.txt").write_bytes(b"member only")
+        with self.assertRaises(FuseOSError) as raised:
+            self._read("/moved/lazy.txt", direct=True)
+        self.assertEqual(errno.EIO, raised.exception.errno)
+
+    def test_failed_subtree_rejects_absent_final_full_and_stream_publication(self):
+        self.fs.mkdir("/dir", 0o755)
+        self._restart_fs()
+        with patch.object(self.fs.namespace, "_propagate_dir_operation",
+                          side_effect=OSError(errno.EIO, "member move failed")):
+            with self.assertRaises(OSError):
+                self.fs.rename("/dir", "/moved")
+        path = "/moved/lazy.txt"
+        payload = b"uncertified remote bytes"
+        (self.member_dir / "moved").mkdir(exist_ok=True)
+        (self.member_dir / "moved" / "lazy.txt").write_bytes(payload)
+        resolved = self.fs._resolve_path(path)
+        self.assertFalse(resolved.cache_path.exists())
+        with self.assertRaises(FuseOSError) as raised:
+            self.fs._ensure_file_in_cache(resolved)
+        self.assertEqual(errno.EIO, raised.exception.errno)
+        self.assertFalse(resolved.cache_path.exists())
+        partial = self.cache_dir / "moved" / "lazy.txt.storage-partial"
+        real_fd = os.open(partial, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+        os.write(real_fd, payload)
+        session = PrefetchSession(
+            canonical_path=path, virtual_path=path, backend=self.a,
+            file_size=len(payload), final_cache_path=resolved.cache_path,
+            partial_cache_path=partial, chunk_size=4096, io_fd=real_fd,
+            available_ranges=[(0, len(payload))], refcount=0,
+            member_stat=self.a.stat(path),
+            freshness_token=self.fs._freshness_token(path, self.a.name),
+        )
+        self.addCleanup(self.fs._streaming_manager._close_streaming_session_resources, session)
+        self.fs._finalize_streaming_session(session)
+        self.assertFalse(resolved.cache_path.exists())
+        self.assertIsNone(self.fs.state_manager.get_file_metadata(path))
+        self.assertNotIn(path, self.fs._member_checks)
 
     def test_writer_across_completed_local_move_retains_inode_proof(self):
         self._prime_owed_a_with_b_cached()

@@ -101,6 +101,7 @@ class CacheManager:
         # path the evicting thread holds itself is not). None (no
         # StorageFS) means no contention.
         self.path_guard: Optional[Callable[[str], ContextManager[bool]]] = None
+        self.namespace_covered: Optional[Callable[[str], bool]] = None
         self.state_manager = state_manager
         self.max_size_bytes = max_size_bytes
         self._lock = threading.RLock()
@@ -217,7 +218,10 @@ class CacheManager:
                 # Evict this file
                 cache_path = self.get_cache_path(metadata.virtual_path)
                 with self._path_guard(metadata.virtual_path) as free:
-                    if not free or regular_file_stat(cache_path) is None:
+                    if (not free or self.namespace_covered and
+                            self.namespace_covered(metadata.virtual_path)):
+                        continue
+                    if regular_file_stat(cache_path) is None:
                         continue
                     try:
                         freed += self._evict_if_still_clean(metadata.virtual_path, cache_path)
@@ -246,6 +250,8 @@ class CacheManager:
 
                 cache_path = self.get_cache_path(metadata.virtual_path)
                 with self._path_guard(metadata.virtual_path) as free:
+                    if free and self.namespace_covered and self.namespace_covered(metadata.virtual_path):
+                        continue
                     st = regular_file_stat(cache_path) if free else None
                     if st is None:
                         # Gone, or not a regular file: never truncate
@@ -520,18 +526,21 @@ class CacheManager:
         them bumps the generation, and mark_file_dirty's own bump keeps the
         row at the newer write. Returns True when the file was marked.
         """
-        row = self.state_manager.get_file_metadata(virtual_path)
-        if row is None or row.sync_status != SyncStatus.CLEAN:
-            return False
-        if stat_size is None or stat_mtime is None:
-            try:
-                st = os.lstat(str(cache_path))
-            except OSError:
+        with self._path_guard(virtual_path) as held:
+            if not held or self.namespace_covered and self.namespace_covered(virtual_path):
                 return False
-            stat_size, stat_mtime = st.st_size, st.st_mtime
-        if stat_size == row.size and stat_mtime == row.last_modified:
-            return False
-        return self.mark_file_dirty(virtual_path, cache_path) is not None
+            row = self.state_manager.get_file_metadata(virtual_path)
+            if row is None or row.sync_status != SyncStatus.CLEAN:
+                return False
+            if stat_size is None or stat_mtime is None:
+                try:
+                    st = os.lstat(str(cache_path))
+                except OSError:
+                    return False
+                stat_size, stat_mtime = st.st_size, st.st_mtime
+            if stat_size == row.size and stat_mtime == row.last_modified:
+                return False
+            return self.mark_file_dirty(virtual_path, cache_path) is not None
 
     def store_file_metadata(
         self,

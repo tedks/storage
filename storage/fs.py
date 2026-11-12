@@ -22,9 +22,10 @@ import json
 import concurrent.futures
 import contextlib
 import signal
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from fuse import FUSE, FuseOSError, Operations
 from pathlib import Path
+from types import MappingProxyType
 from typing import Dict, Optional, Set, List, Tuple
 
 from .backends.base import Backend, ChecksumUnavailable, interactive_request
@@ -45,7 +46,7 @@ from .checksum_queue import DEFAULT_CHECKSUM_REVERIFY_INTERVAL, MemberHashQueues
 from .checksums import ChecksumBasis, ChecksumRecord
 from .pathing import ResolvedPath, resolve_path
 from .links import LinkRefused, intermediate_paths, link_checksum, resolve_link_target
-from .namespace import DEFAULT_LISTING_MAX_STALE, NamespaceService
+from .namespace import DEFAULT_LISTING_MAX_STALE, NamespaceService, RenameProgress
 from .streaming import PrefetchSession, StreamingReadManager
 
 
@@ -111,6 +112,24 @@ class PathFreshness:
     uncertain_move_inode: Optional[Tuple[int, int]] = None
     generations: Dict[str, int] = field(default_factory=dict)
     debts: Dict[str, FreshnessDebt] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class NamespaceUncertainty:
+    """An incomplete move denies member authority at both names and descendants."""
+
+    old: str
+    new: str
+    directory: bool
+    # Separate immutable-by-convention snapshots; identical member IDs at
+    # the two origins are different obligations until reconciliation.
+    source_debts: Dict[str, Dict[str, FreshnessDebt]]
+    target_debts: Dict[str, Dict[str, FreshnessDebt]]
+    progress: RenameProgress
+
+    def covers(self, path: str) -> bool:
+        return any(path == root or self.directory and path.startswith(root.rstrip("/") + "/")
+                   for root in (self.old, self.new))
 
 
 class StorageFS(Operations):
@@ -280,6 +299,7 @@ class StorageFS(Operations):
         self._member_checks: Dict[str, MemberCheck] = {}
         self._member_checks_lock = threading.RLock()
         self._freshness: Dict[str, PathFreshness] = {}
+        self._namespace_uncertainties: List[NamespaceUncertainty] = []
         self._next_freshness_identity = 0
         # A failed stat of an owed member must not block every warm demand
         # open until its I/O timeout. Keyed to that debt's generation, not
@@ -407,6 +427,7 @@ class StorageFS(Operations):
         )
         self.cache_manager.forget_listed_attrs = self._forget_cached_copy_attrs
         self.cache_manager.path_guard = self._try_path_locked
+        self.cache_manager.namespace_covered = self._namespace_covered
 
         self._streaming_manager = StreamingReadManager(
             cache_manager=self.cache_manager,
@@ -533,12 +554,23 @@ class StorageFS(Operations):
                     if named is None or self._fd_owns_cache_path(entry.real_fd, cache_path):
                         return False
             with self._member_checks_lock:
+                if self._namespace_covered_locked(virtual_path):
+                    return False
                 state = self._freshness.get(virtual_path)
                 if state is not None and (state.namespace_uncertain
                                           or state.active_mutations
                                           or state.uncertain_local):
                     return False
         return True
+
+    def _namespace_covered_locked(self, canonical_path: str) -> bool:
+        """Caller holds the freshness leaf; every unresolved record counts."""
+        return any(record.covers(canonical_path)
+                   for record in self._namespace_uncertainties)
+
+    def _namespace_covered(self, canonical_path: str) -> bool:
+        with self._member_checks_lock:
+            return self._namespace_covered_locked(canonical_path)
 
     def _backend_availability(self) -> Tuple[List[str], List[str]]:
         """Return backend names split by current availability."""
@@ -588,6 +620,11 @@ class StorageFS(Operations):
         # path (/foo), so we need to resolve it.
         resolved = self._resolve_path(virtual_path)
         canonical_path = resolved.canonical_path
+        # Production callers hold the path lock (open revalidation or watcher).
+        # A member notification cannot identify the owner of a quarantined
+        # name, so it must not discard its only locally proved bytes.
+        if resolved.backend_name is None and self._namespace_covered(canonical_path):
+            return
         # Records are keyed (canonical_path, backend), so clear both the
         # virtual_path (which may be suffixed) and the canonical_path to
         # cover conflict-view caches like /foo.remote0 whose checksums
@@ -1343,7 +1380,8 @@ class StorageFS(Operations):
                 state.identity, state.revision, backend.name,
                 state.generations.get(backend.name, 0), state.local_epoch):
             return False
-        if (state.active_mutations or state.uncertain_local or state.namespace_uncertain
+        if (self._namespace_covered_locked(canonical_path)
+                or state.active_mutations or state.uncertain_local or state.namespace_uncertain
                 or self._has_open_writer(canonical_path)):
             return False
         row = self.state_manager.get_file_metadata(canonical_path)
@@ -1356,7 +1394,7 @@ class StorageFS(Operations):
             return False
         with self._member_checks_lock:
             state = self._freshness.get(session.canonical_path)
-            return state is not None and not state.active_mutations and not state.uncertain_local and not state.namespace_uncertain and token == (
+            return state is not None and not self._namespace_covered_locked(session.canonical_path) and not state.active_mutations and not state.uncertain_local and not state.namespace_uncertain and token == (
                 state.identity, state.revision, session.backend.name,
                 state.generations.get(session.backend.name, 0), state.local_epoch,
             )
@@ -1614,7 +1652,8 @@ class StorageFS(Operations):
                 del self._freshness_probe_retry[key]
 
     def _mark_namespace_uncertain(self, old: str, new: str, prior_debts,
-                                  move_witnesses=None, proven_dirty=None):
+                                  move_witnesses=None, proven_dirty=None,
+                                  *, directory: bool, progress: RenameProgress):
         """A partial local move leaves both possible names requiring proof.
 
         This in-memory slice cannot certify which member still owns either
@@ -1623,8 +1662,24 @@ class StorageFS(Operations):
         old_prefix = old.rstrip("/") + "/"
         new_prefix = new.rstrip("/") + "/"
         with self._member_checks_lock:
+            self._namespace_uncertainties.append(NamespaceUncertainty(
+                old, new, directory,
+                MappingProxyType({
+                    path: MappingProxyType(dict(state.debts))
+                    for path, state in prior_debts.items()
+                    if path == old or path.startswith(old_prefix)
+                }),
+                MappingProxyType({
+                    path: MappingProxyType(dict(state.debts))
+                    for path, state in prior_debts.items()
+                    if path == new or path.startswith(new_prefix)
+                }),
+                replace(progress, intended=set(progress.intended), attempted=set(progress.attempted),
+                        confirmed=set(progress.confirmed), failed=set(progress.failed),
+                        unknown=set(progress.unknown)),
+            ))
             suffixes = {""}
-            for path in set(prior_debts) | set(self._freshness):
+            for path in set(prior_debts) | set(self._freshness) | set(proven_dirty or {}):
                 if path == old or path.startswith(old_prefix):
                     suffixes.add(path[len(old):])
                 if path == new or path.startswith(new_prefix):
@@ -2012,6 +2067,8 @@ class StorageFS(Operations):
         canonical_path = resolved.canonical_path
         cache_path = resolved.cache_path
         with self._member_checks_lock:
+            if self._namespace_covered_locked(canonical_path):
+                raise FuseOSError(errno.EIO)
             check = self._member_checks.get(canonical_path)
         owed = self._owed_backend(canonical_path)
         if owed is not None and self._owed_probe_is_deferred(canonical_path, owed):
@@ -2311,6 +2368,9 @@ class StorageFS(Operations):
         """
         canonical_path = resolved.canonical_path
         cache_path = resolved.cache_path
+        if (resolved.backend_name is None and self._namespace_covered(canonical_path)
+                and not self.cache_manager.is_cached(resolved.requested_path)):
+            raise FuseOSError(errno.EIO)
 
         # Check if already cached
         if self.cache_manager.is_cached(resolved.requested_path):
@@ -2320,7 +2380,8 @@ class StorageFS(Operations):
                 # was lost; the file is dirty whatever the row says.
                 with self._member_checks_lock:
                     state = self._freshness.get(canonical_path)
-                    uncertain = state is not None and state.namespace_uncertain
+                    uncertain = (self._namespace_covered_locked(canonical_path)
+                                 or state is not None and state.namespace_uncertain)
                 if not uncertain:
                     self.cache_manager.heal_stale_clean(canonical_path, cache_path)
             return True
@@ -2523,13 +2584,13 @@ class StorageFS(Operations):
             if is_dir:
                 with self._upload_locks.drain(old_resolved.canonical_path, new_canonical):
                     with self._namespace_lock.exclusive():
-                        return self._rename(old, new)
+                        return self._rename(old, new, directory=True)
             with self._path_locked(old_resolved.canonical_path, new_canonical):
                 with self._upload_locks.hold(old_resolved.canonical_path, new_canonical):
                     if not os.path.isdir(cache_path) or os.path.islink(cache_path):
-                        return self._rename(old, new)
+                        return self._rename(old, new, directory=False)
 
-    def _rename(self, old, new):
+    def _rename(self, old, new, *, directory=False):
         old_canonical = self._resolve_path(old).canonical_path
         new_canonical = self._resolve_path(new).canonical_path
         # A source the cache never held cannot have moved into the target:
@@ -2543,14 +2604,25 @@ class StorageFS(Operations):
         except OSError:
             source_inode = None
         with self._member_checks_lock:
+            covered_before = (self._namespace_covered_locked(old_canonical)
+                              or self._namespace_covered_locked(new_canonical))
             prior_obligations = {
-                path: state for path, state in self._freshness.items()
+                path: replace(state, debts=dict(state.debts),
+                              generations=dict(state.generations))
+                for path, state in self._freshness.items()
                 if path in (old_canonical, new_canonical)
                 or path.startswith(old_canonical.rstrip("/") + "/")
                 or path.startswith(new_canonical.rstrip("/") + "/")
             }
         local_moved = False
         move_witnesses = {}
+        progress = RenameProgress()
+        if directory:
+            progress.intended = set(self.backends)
+        else:
+            backend_name = self._resolve_path(old).backend_name
+            progress.intended = ({backend_name} if backend_name else
+                                 set(self.state_manager.get_location_backends(old_canonical)))
 
         def publish_local_move(renamed_entries):
             nonlocal local_moved
@@ -2565,9 +2637,7 @@ class StorageFS(Operations):
                         move_witnesses[moved_path] = (moved.st_dev, moved.st_ino)
                 local_moved = True
 
-        try:
-            self.namespace.rename(old, new, on_local_moved=publish_local_move)
-        except BaseException:
+        def quarantine_partial_move():
             # A failure before the local move leaves the old evidence alone.
             # A failure after it (including between cache and index moves)
             # cannot certify member names, so both possibilities retain debt
@@ -2577,8 +2647,9 @@ class StorageFS(Operations):
                 same_inode_moved = source_inode == (moved_stat.st_dev, moved_stat.st_ino)
             except OSError:
                 same_inode_moved = False
-            if local_moved or (old_was_cached and same_inode_moved
-                               and not os.path.lexists(old_cache)):
+            if (local_moved or progress.cache_moved
+                    or (old_was_cached and same_inode_moved
+                        and not os.path.lexists(old_cache))):
                 # Only the callback after the index rewrite certifies that
                 # the target row belongs to the moved source. A cache-only
                 # move leaves the old target row behind, regardless of its
@@ -2600,15 +2671,28 @@ class StorageFS(Operations):
                 self._mark_namespace_uncertain(old_canonical, new_canonical,
                                                prior_obligations,
                                                move_witnesses if local_moved and same_inode_moved else {},
-                                               proven_dirty)
+                                               proven_dirty, directory=directory,
+                                               progress=progress)
                 self._drop_persisted_baselines(new_canonical)
                 self._drop_persisted_baselines(old_canonical)
+
+        try:
+            self.namespace.rename(old, new, on_local_moved=publish_local_move,
+                                  progress=progress)
+        except BaseException:
+            progress.unknown = progress.intended - progress.confirmed - progress.failed
+            quarantine_partial_move()
             raise
         finally:
             # Records are keyed by path, so neither name's records (nor, for a
             # directory, its children's) describe what is there now. Dropping
             # them is always safe, so a failed rename drops them too.
             self._forget_checksums({old_canonical, new_canonical}, subtree=True)
+        if progress.failed or progress.unknown or covered_before:
+            # Returned best-effort failures are incomplete despite a normal
+            # rename return. The outer namespace/path lock remains held here;
+            # queued sync work cannot pass the upload drain before this record.
+            quarantine_partial_move()
         # The local move callback already published identity and baselines
         # before member propagation and before any writer could use a moved fd.
 
@@ -2752,9 +2836,10 @@ class StorageFS(Operations):
             with self.state_manager.metadata_lock:
                 with self._member_checks_lock:
                     state = self._freshness.get(resolved.canonical_path)
-                    uncertain = state is not None and state.namespace_uncertain
-                    proof = state.uncertain_dirty_proof if uncertain else None
-                    busy = (state.active_mutations or state.uncertain_local) if uncertain else False
+                    uncertain = (self._namespace_covered_locked(resolved.canonical_path)
+                                 or state is not None and state.namespace_uncertain)
+                    proof = state.uncertain_dirty_proof if state is not None and uncertain else None
+                    busy = (state.active_mutations or state.uncertain_local) if state is not None and uncertain else False
                 if uncertain:
                     row = self.state_manager.get_file_metadata(resolved.canonical_path)
                     current = regular_file_stat(cache_path)
@@ -2866,6 +2951,7 @@ class StorageFS(Operations):
     def _create(self, path, mode, fi=None):
         """Create a file"""
         resolved = self._resolve_path(path)
+        new_local_identity = not os.path.lexists(resolved.cache_path)
         attempt_real_fd = None
         attempt_entry = None
         attempt_vfd = None
@@ -2893,6 +2979,14 @@ class StorageFS(Operations):
                     )
                     self._fd_map[vfd] = attempt_entry
                     registered = True
+
+                if (published is not None and new_local_identity
+                        and self._namespace_covered(resolved.canonical_path)):
+                    current = os.fstat(attempt_real_fd)
+                    with self._member_checks_lock:
+                        state = self._freshness[resolved.canonical_path]
+                        state.namespace_uncertain = True
+                        state.uncertain_move_inode = (current.st_dev, current.st_ino)
 
                 config = self._get_config(resolved.canonical_path)
                 metadata = FileMetadata(
@@ -3444,19 +3538,15 @@ class StorageFS(Operations):
         """
         marked = 0
         for entry in scan_cache_entries(self.cache_manager.cache_root):
-            with self._member_checks_lock:
-                state = self._freshness.get(entry.virtual_path)
-                if state is not None and state.namespace_uncertain:
-                    # A prior name's row/xattr cannot turn a cache-only move
-                    # into a local edit, even during the post-crash sweep.
+            # The namespace lock spans the denial check and the possible
+            # DIRTY row mutation. A scan stat collected before a rename is
+            # never reused after acquiring this lock.
+            with self._path_locked(entry.virtual_path):
+                if self._namespace_covered(entry.virtual_path):
                     continue
-            if self.cache_manager.heal_stale_clean(
-                entry.virtual_path,
-                entry.cache_path,
-                stat_size=entry.stat_size,
-                stat_mtime=entry.stat_mtime,
-            ):
-                marked += 1
+                if self.cache_manager.heal_stale_clean(entry.virtual_path,
+                                                       entry.cache_path):
+                    marked += 1
         if marked:
             self.logger.warning("Marked %d cached files dirty after an unclean shutdown", marked)
         return marked
