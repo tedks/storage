@@ -620,3 +620,11 @@
 - proposal: one new contract `contracts/durable-freshness-restart.md` recommends v3's versioned CLEAN-inode marker plus a narrow root-local manifest for absent-path debt and old/new prefix intent, durable before invalidation/local move and replay before open/sync/watcher/heal/sweep. Conservative union preserves all origin debts; missing/corrupt preexisting authority stops startup, preserving bytes. It explicitly does not retire guards, restrict external writers, implement member service or make normal rename after restart shippable. Five deterministic scratch schedules include the two deferred restart cases and lazy descendants; all remain UNWRITTEN/UNRUN. Process restart is not power-loss certification.
 - tracker/product: `storage171-namespace-guard-restart` commented twice and synced. `oq-durable-freshness-legacy-cache` filed under open-questions with options A refuse startup, B restricted read-only inspection, C unsafe automatic adoption; recommendation A, Ted decides migration availability before rollout. Existing collision/partial-result/writer-ownership questions remain open. No other new product choice inferred.
 - resource/limits: no application or test source edit, Nix/Bazel/test/runtime/probe/download, live mount/backing/cache inspection, SSH/FUSE/Docker/Fleet, full gates/CLI, restart/deploy/merge. Prior four-run repair budget remains exhausted; no scope/client/fixture/lease acquired. Root boundary and necessity review precede any implementation/runtime.
+
+## foreground-lead:60
+
+- kind: delivery-receipt
+- state: DURABLE_RESTART_BOUNDARY_SUBMITTED_TO_ROOT; lane idle, review pending
+- refs: foreground-lead:59
+- applied_at: clean pushed proposal/status receipt `355e41bb7cdbb5453f244d83b40cd25a518391c1`, source/test unchanged from scoped CLEAN `bcf062a`.
+- delivery: exact `%91` was re-pinned as `storage:codex` on `/tmp/tmux-1000/default`; shared `tmux-message` returned `status=delivered`, `receipt=submitted`, one paste and Enter for the source-only contract checkpoint. Delivery is not design approval, implementation/runtime authority or PR acceptance. No owned process, fixture or lease exists from this phase.
