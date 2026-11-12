@@ -1,0 +1,24 @@
+id: pr175-base-ssh-mux-fastgate
+title: Investigate unchanged ssh mux test failure in PR175 fast gate
+desc: On PR175 rebased source 50418327de1af6822955d6d72b138753c591ec34 against published
+  master 66c640a, forced unfiltered //:storage_tests_fast_gate executed 40 targets,
+  39 pass and //tests:storage_test_ssh_mux fails test_a_replaced_socket_directory_is_not_trusted.
+  assertLogs captures no warning; a warning from ControlSockets.close appears later
+  in teardown. Neither tests/test_ssh_mux.py nor storage/backends/ssh_mux.py differs
+  from master. Investigate and repair on an authorized gate prerequisite branch; rerun
+  exact-head gate. PR175 owner cannot edit those files under current narrow scope.
+  Log /tmp/storage-channel-reserve-5Ra6HI/fastbase.log SHA256 ca49a9338cc86fac1eafa946e85d0a75ddbf122e4a54b02d6ab5797e92619ba8.
+  No waiver.
+type: bugfix
+component: gates
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-12T04:08:51-00:00
+references: []
+log_events:
+- time: 2026-11-12T04:08:51-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
