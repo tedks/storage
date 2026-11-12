@@ -1,0 +1,23 @@
+id: oq-namespace-rename-collision
+title: Decide failed-rename replay when member target has unrelated data
+desc: 'PR #171 member-name reconciliation: a failed/late directory or file rename
+  may encounter an unrelated object at the member target. Existing LocalBackend and
+  SSHBackend rename can replace an occupied target. Options: (1) refuse replacement,
+  preserve both objects and expose a conflict; (2) automatically overwrite; (3) place
+  one object under a conflict suffix. Recommendation: (1), with no destructive replay
+  absent a lineage-safe conditional operation. Ted decides the product policy; it
+  blocks collided-name recovery/release behavior, not the narrow empty-target synthetic
+  tracer. Related: sync-member-reconcile, oq-unlink-member-copies, contracts/namespace-reconciliation.md.'
+type: task
+component: open-questions
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-12T01:24:38-00:00
+references: []
+log_events:
+- time: 2026-11-12T01:24:38-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
