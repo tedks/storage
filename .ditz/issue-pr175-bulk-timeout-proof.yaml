@@ -13,7 +13,7 @@ type: task
 component: storage
 release:
 reporter: Ted Smith <tedks@riseup.net>
-status: unstarted
+status: in_progress
 disposition:
 creation_time: 2026-11-12T04:16:36-00:00
 references: []
@@ -48,3 +48,7 @@ log_events:
     Bazel Java PID 3482627; no peer mutation or bypass. Cache production blob restored
     d0cd68b; 0/3 runtime invocations spent. PR175 comment 6814629125 records the blocker.
     Await serialized runtime availability/root disposition; formal council still FINDINGS.
+- time: 2026-11-12T04:40:12-00:00
+  who: Ted Smith
+  what: started
+  comment: ""
