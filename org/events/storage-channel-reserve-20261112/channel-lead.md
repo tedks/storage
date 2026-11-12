@@ -115,3 +115,19 @@
   three production blobs. New-base fast gate ran 40 targets, 39 passed and
   unchanged SSH mux test failed; CLI build passed. The gate failure is filed
   as `pr175-base-ssh-mux-fastgate`, not waived or repaired outside scope.
+
+## channel-lead:9
+
+- kind: review-finding
+- based_on: `16fa46dda7e608a22f2c4eb9d3576cf0a0977d94`
+- applied_at: pending causal-proof checkpoint
+- refs: `channel-lead:8`, PR #175 formal round 2, root/warm Sol disposition
+- state: Round 2 remains FINDINGS: Anthropic requested positive proof that a
+  healthy existing file reached bulk-capacity denial, plus a same-test
+  disabled-classification negative control. Google was EMPTY. The narrow
+  test now observes a successful stat and invokes the original pool decision
+  unchanged, then reads exact bytes through the spare interactive channel
+  while three holders remain. Contract names current ENOENT as observed and
+  unruled; eager-listing error prose was corrected. No production edit or
+  runtime outcome is claimed by this event. Three-invocation evidence budget
+  starts at zero; the shared mux flock is mandatory.

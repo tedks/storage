@@ -30,7 +30,7 @@ and bulk leases, and `NamespaceService.readdir` already returns a list.
   in their original order. Metadata and range reads remain interactive.
 - `StorageFS.readdir` evaluates the concrete namespace list while its existing
   FUSE dispatch context is active. Listing errors now pass through the existing
-  `StorageFS.__call__` error path before a generator is returned. Background
+  `StorageFS.__call__` error path rather than during later iteration. Background
   listing context remains as it was.
 
 This introduces no new lock acquisition. A copy may still wait for bulk
@@ -52,6 +52,10 @@ fast gate ran 40 targets with one unrelated, unchanged SSH mux test failing;
 the CLI build passed. Exact commands and hashes are in PR #175's evidence
 comment. This one-member test does not show namespace-executor
 contention; the separate context test checks error restoration.
+
+The synthetic timeout test currently observes `ENOENT` for an existing file
+on a healthy member after bulk capacity expires. That mapping is not an
+accepted product choice; `oq-pr175-bulk-timeout-errno` remains open.
 
 This does not enable FUSE threads or cap libfuse native threads. A single
 SFTP channel has no reserve; other interactive work can fill it; reentrant
