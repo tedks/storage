@@ -1058,7 +1058,9 @@ class TestSharedFreshnessObligation(ThreadingTestBase):
             (directory / "dir" / "clean.txt").write_bytes(b"clean sibling")
         self.assertEqual(b"clean sibling", self._read("/dir/clean.txt"))
         before = self._snapshot("/dir/first.txt")["debts"]
-        deep_before = self._snapshot(deep)["debts"]
+        # create/write need no preexisting freshness object; the completed
+        # index move itself must still witness this descendant's inode.
+        self.assertIsNone(self._snapshot(deep))
         self.assertEqual(SyncStatus.CLEAN,
                          self.fs.state_manager.get_file_metadata("/dir/clean.txt").sync_status)
         with patch.object(self.fs.namespace, "_propagate_dir_operation",
@@ -1068,7 +1070,7 @@ class TestSharedFreshnessObligation(ThreadingTestBase):
         self.assertEqual(b"local first", self._read("/moved/first.txt", direct=True)[:11])
         self.assertEqual(b"local deep", self._read("/moved/nest/deep.txt", direct=True))
         self.assertEqual(before, self._snapshot("/moved/first.txt")["debts"])
-        self.assertEqual(deep_before, self._snapshot("/moved/nest/deep.txt")["debts"])
+        self.assertEqual({}, self._snapshot("/moved/nest/deep.txt")["debts"])
         with self.assertRaises(FuseOSError) as raised:
             self._read("/moved/clean.txt", direct=True)
         self.assertEqual(errno.EIO, raised.exception.errno)
