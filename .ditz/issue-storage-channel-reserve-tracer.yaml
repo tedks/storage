@@ -12,7 +12,7 @@ type: task
 component: storage
 release:
 reporter: Ted Smith <tedks@riseup.net>
-status: unstarted
+status: in_progress
 disposition:
 creation_time: 2026-11-12T03:42:27-00:00
 references: []
@@ -31,3 +31,7 @@ log_events:
     invocations spent, scopes inactive and growth below threshold. This is scoped
     verification only. Full four gates, CLI build, formal council, independent lead
     review, PR170 incident/integration clearance remain open; no merge/deploy.'
+- time: 2026-11-12T03:56:49-00:00
+  who: Ted Smith
+  what: started
+  comment: ""
