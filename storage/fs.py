@@ -539,7 +539,10 @@ class StorageFS(Operations):
         result stays valid through the member call because a new rename must
         acquire the outer serializer before publishing a guard.
         """
-        canonical = tuple(self._resolve_path(path).canonical_path for path in paths)
+        # DirSyncTask endpoints are already canonical. Resolving them as
+        # public conflict-view names again would strip another member suffix
+        # and fence different paths from those the backend will mutate.
+        canonical = paths
         with self._retry_rename_serialized():
             with self._upload_locks.drain(*canonical):
                 with self._path_locked(*canonical):

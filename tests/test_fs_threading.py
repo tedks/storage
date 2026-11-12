@@ -2806,22 +2806,44 @@ class TestRenameRaces(ThreadingTestBase):
         self.assertEqual(b"slow", opener.finish())
 
     def test_opposite_renames_wait_on_the_sorted_first_path(self):
-        # x -> y and y -> x name the same two locks in opposite argument
-        # order; the second waits on /x.txt, the path that sorts first, so
-        # neither can hold one lock while waiting for the other. (Onto an
-        # existing file a rename fails in the index today, ditz
-        # rename-onto-existing-unique, so y starts absent.)
+        # Opposite arguments must serialize before either namespace/path
+        # lock. Onto an existing file the index currently fails (ditz
+        # rename-onto-existing-unique), so y starts absent.
         self.cache("x.txt", b"x")
         gate = self.gate(self.fs.state_manager, "rename_path")
         first = Worker(self.fs.rename, "/x.txt", "/y.txt")
         first.start()
         self.assertTrue(gate.started.wait(WAIT))
         second = Worker(self.fs.rename, "/y.txt", "/x.txt")
-        second.start()
-        self.wait_for_path_waiter("/x.txt")
-        gate.opened.set()
-        first.finish()
-        second.finish()
+        entered = threading.Event()
+        original = self.fs._retry_rename_serialized
+
+        @contextmanager
+        def observed_serializer():
+            entered.set()
+            with original():
+                yield
+
+        try:
+            with patch.object(self.fs, "_retry_rename_serialized", observed_serializer):
+                second.start()
+                self.assertTrue(entered.wait(WAIT))
+                second.join(BLOCKED)
+                self.assertTrue(second.is_alive())
+                with self.fs._path_locks._mutex:
+                    self.assertEqual(
+                        {"/x.txt": 1, "/y.txt": 1},
+                        {name: entry.refs for name, entry in self.fs._path_locks._entries.items()
+                         if name in ("/x.txt", "/y.txt")},
+                    )
+                with self.fs._namespace_lock._cond:
+                    self.assertEqual(1, self.fs._namespace_lock._readers)
+                    self.assertEqual(0, self.fs._namespace_lock._writers_waiting)
+                gate.opened.set()
+                first.finish()
+                second.finish()
+        finally:
+            gate.opened.set()
         self.assertEqual(b"x", self.open_read_release("/x.txt"))
         self.assertFalse((self.cache_dir / "y.txt").exists())
 

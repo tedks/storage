@@ -9,7 +9,7 @@ import os
 import time
 from unittest.mock import patch
 
-from storage.models import SyncStatus
+from storage.models import FileLocation, FileMetadata, SyncStatus
 from storage.sync_executor import SyncExecutor
 from storage.sync_tasks import DirOperation
 from tests.test_fs_threading import BLOCKED, WAIT, ThreadingTestBase, Worker
@@ -239,18 +239,75 @@ class TestDirectoryRetries(SyncRaceTestBase):
         self.assertEqual(["d"], self.member_names())
 
     def test_rename_retry_applies_while_the_old_name_is_in_use_again(self):
-        """The member still holds the renamed directory under the old name;
-        only the rename moves it, even though /d exists again."""
+        """Old-name reuse does not make an incomplete member move safe to replay."""
         self.fs.mkdir("/d", 0o755)
-        (self.member_dir / "d" / "kept.txt").write_text("k")
-        self.fail_member_once("rename")
+        (self.member_dir / "d" / "kept.txt").write_bytes(b"k")
+        self.assertEqual(b"k", self.open_read_release("/d/kept.txt"))
+        (self.member_dir / "d" / "kept.txt").write_bytes(b"changed k")
+        self.fs._observe_changed_member(
+            "/d/kept.txt", self.member, self.member.stat("/d/kept.txt"))
+        calls = self.fail_member_once("rename")
         self.fs.rename("/d", "/e")
         self.assertEqual([(DirOperation.RENAME, "/d")], self.queued_dir_ops())
+        task = next(t for t in self.fs.sync_manager.task_queue.queue
+                    if hasattr(t, "operation") and t.operation == DirOperation.RENAME)
+        before = tuple(self.fs._namespace_uncertainties)
+        self.assertIn("member", before[-1].source_debts["/d/kept.txt"])
         self.fs.mkdir("/d", 0o755)
 
+        self.fs.sync_manager.config.retry_delay = 0
         self.start_sync()
         self.wait_idle()
-        self.assertEqual(["kept.txt"], self.member_names("e"))
+        self.assertEqual(self.fs.sync_manager.config.max_retries, task.retry_count)
+        self.assertEqual([("/d", "/e")], calls)
+        self.assertEqual(["kept.txt"], self.member_names("d"))
+        self.assertEqual(b"changed k", (self.member_dir / "d" / "kept.txt").read_bytes())
+        self.assertNotIn("e", self.member_names())
+        self.assertEqual(before, tuple(self.fs._namespace_uncertainties))
+        self.assertIn("member", before[-1].source_debts["/d/kept.txt"])
+        self.assertTrue(self.fs._namespace_covered("/e/kept.txt"))
+
+    def test_suffixed_public_rename_retry_uses_queued_canonical_names(self):
+        # The public name loses exactly one suffix. The queued names still
+        # end in ".member" and must not be interpreted as public names again.
+        (self.member_dir / "f.member").write_bytes(b"original member bytes")
+        # A suffixed conflict-view open populates its own requested cache
+        # path. This fixture provides the canonical cached source and row
+        # that the public rename requires; rename and retry remain real.
+        (self.cache_dir / "f.member").write_bytes(b"original member bytes")
+        now = time.time()
+        self.fs.state_manager.set_file_metadata(FileMetadata(
+            virtual_path="/f.member", size=len(b"original member bytes"),
+            checksum=None, last_access=now, last_modified=now,
+            sync_status=SyncStatus.CLEAN, replica_count=1,
+            recomputable=False, recompute_cmd=None, encrypted=False,
+            encryption_key_id=None,
+        ))
+        self.fs.state_manager.add_file_location(FileLocation(
+            virtual_path="/f.member", backend_name="member", checksum="",
+            last_synced=now, is_cached=True,
+        ))
+        calls = self.fail_member_once("rename")
+        self.fs.rename("/f.member.member", "/g.member.member")
+        tasks = [task for task in self.fs.sync_manager.task_queue.queue
+                 if hasattr(task, "operation") and task.operation == DirOperation.RENAME]
+        self.assertEqual(1, len(tasks))
+        self.assertEqual(("/f.member", "/g.member"),
+                         (tasks[0].virtual_path, tasks[0].new_path))
+        self.assertTrue(self.fs._namespace_covered("/g.member"))
+        before = tuple(self.fs._namespace_uncertainties)
+
+        self.fs.sync_manager.config.retry_delay = 0
+        self.start_sync()
+        self.wait_idle()
+        # A second member rename would make these assertions fail on bytes
+        # and names, even if the task later reports a failed retry.
+        self.assertEqual(b"original member bytes",
+                         (self.member_dir / "f.member").read_bytes())
+        self.assertFalse((self.member_dir / "g.member").exists())
+        self.assertEqual([("/f.member", "/g.member")], calls)
+        self.assertEqual(before, tuple(self.fs._namespace_uncertainties))
+        self.assertTrue(self.fs._namespace_covered("/g.member"))
 
     def test_rename_retry_whose_destination_is_gone_is_dropped(self):
         self.fs.mkdir("/d", 0o755)
@@ -270,15 +327,25 @@ class TestDirectoryRetries(SyncRaceTestBase):
         self.wait_synced("/a.txt")
         self.wait_idle()
         self.fs.sync_manager.stop()
-        self.fail_member_once("rename")
+        calls = self.fail_member_once("rename")
         self.fs.rename("/a.txt", "/b.txt")
-        # Stands in for cache pressure evicting the renamed, CLEAN file.
+        task = next(t for t in self.fs.sync_manager.task_queue.queue
+                    if hasattr(t, "operation") and t.operation == DirOperation.RENAME)
+        before = tuple(self.fs._namespace_uncertainties)
+        # Private fixture setup stands in for a missing canonical cache file;
+        # it is not a claim that public eviction is allowed under quarantine.
         cache_path = self.fs.cache_manager.get_cache_path("/b.txt")
         self.assertGreater(self.fs.cache_manager._evict_if_still_clean("/b.txt", cache_path), 0)
 
+        self.fs.sync_manager.config.retry_delay = 0
         self.start_sync()
         self.wait_idle()
-        self.assertEqual(["b.txt"], self.member_names())
+        self.assertEqual(self.fs.sync_manager.config.max_retries, task.retry_count)
+        self.assertEqual([("/a.txt", "/b.txt")], calls)
+        self.assertEqual(["a.txt"], self.member_names())
+        self.assertEqual(b"payload", (self.member_dir / "a.txt").read_bytes())
+        self.assertEqual(before, tuple(self.fs._namespace_uncertainties))
+        self.assertTrue(self.fs._namespace_covered("/b.txt"))
 
     def test_retry_for_a_member_known_down_is_not_tried_under_the_guard(self):
         self.fail_member_once("mkdir")
