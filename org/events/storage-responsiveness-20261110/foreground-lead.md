@@ -520,3 +520,23 @@
 - refs: foreground-lead:47, foreground-lead:48
 - applied_at: revised contract `c35b8e7cabcc298c1ac716ed23f9ab1e9ea397a7`, clean pushed receipt `34c42b8782276fdc451c36a6ff474da4c4632674`.
 - delivery: exact `%91` resolved as `storage:codex` on `/tmp/tmux-1000/default`; shared `tmux-message` returned `status=delivered`, `receipt=submitted`, one paste and one Enter for the source-only contract/test-plan checkpoint. Delivery proves neither root acceptance nor implementation/runtime authority. No owned process, fixture or lease remains from this phase.
+
+## foreground-lead:50
+
+- kind: state-change
+- state: NARROW_RETRY_FENCE_IMPLEMENT_ACTIVE; scoped code/test/runtime authority, not PR acceptance
+- refs: foreground-lead:47, foreground-lead:48, foreground-lead:49
+- based_on: scoped design CLEAN at `c35b8e7cabcc298c1ac716ed23f9ab1e9ea397a7` and root/warm Sol review `/home/tedks/.cache/storage-orgs-20261110/narrow-fence-review-c35b8e7.md`; fresh Luna necessity PROCEED.
+- applied_at: clean pushed `0c82a2f6795c5860d72aa84de9c4b96116e6c63e`; native session compaction visible in the resumed handoff. No code or runtime work started before this reconciliation.
+- assumptions/order: FS-bound directory retries alone receive the new callback, while standalone executor fixtures retain their primitive guard. Serializer precedes both public rename branches and retry upload drain, namespace shared and endpoint path locks. A blocked overlap fails before current-destination success-drop or member I/O. No recovery, guard retirement, writer restriction or product change.
+- envelope: 0/6 focused Bazel invocations used, <=600s each and <=40min total under owned 2CPU/4GiB/swap0 scope, offline Nix and owned scratch; all current-head tests UNRUN. No process/lease/fixture acquired yet.
+
+## foreground-lead:51
+
+- kind: implementation-tracer-evidence
+- state: NARROW_RETRY_FENCE_CODE_PUSH_PENDING_FINAL_SUITES; no PR acceptance
+- refs: foreground-lead:50
+- based_on: clean pushed `0c82a2f6795c5860d72aa84de9c4b96116e6c63e`, scoped design CLEAN `c35b8e7`; applied_at code/test commit `54a7812081cbd602b5426997df97c36521284c4b`, strengthened test-only assertion commit `4c771882f7707c6bd2d60cd778a58c0373205b83`.
+- implementation: `storage/fs.py` serializes both public rename branches and FS-wired directory retries before namespace/path/upload locks. Retry drains affected canonical upload roots, holds namespace shared and endpoint path locks, compares all unresolved old/new roots in both segment directions, and explicitly defers before `_dir_task_current` or member I/O. `storage/sync.py` carries the callback to workers; `storage/sync_executor.py` retains standalone primitive guard semantics. No tag, lineage proof, guard/debt retirement, baseline, CLEAN or recovery added.
+- evidence: six scratch LocalBackend schedules in `tests/test_fs_threading.py`. The disabled-fence final schedule in `retry-red3.log` failed at actual stale bytes: B `/b/old.txt` was `b'original B'`, expected absent; the old destination-present check passed. Earlier `retry-red.log` failed at a diagnostic before member behavior; `retry-red2.log` reached member I/O but a nonempty directory prevented byte replacement. Focused `retry-green.log` passed five and found a fixture auto-sync status error; after patching queue before release, `retry-green2.log` passed all six. Later `4c77188` strengthened debt/baseline and local-DIRTY assertions are UNRUN pending the final suite. All used `/tmp/storage171-tracer-ybuymvxe/run-retry.sh` SHA-256 `25a589dd4ad57170f26464171ca3847498ab7124c9bb5e025ab8505b300f096a` in separate `storage171-retry-*.scope` units with verified 2 CPU/4 GiB/swap0, `nix develop --offline`, Bazel batch/owned base, no cache results, monitored growth. Five invocations used; total wall under 75s, no abort; observed incremental growth at most 442,368 bytes at focused GREEN, free scratch at least 181,056,950,272 bytes. No downloads measured; pinned graph only.
+- next: commit/push coherent docs, then one exact pushed-head invocation for eight affected nonmount targets with only two deferred restart cases excluded. Final suite result, resource release and untested scope still pending. No full gates/CLI/FUSE/Docker/SSH/live data/Fleet/deploy/merge.

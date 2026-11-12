@@ -1,12 +1,13 @@
 # Proposed member-name reconciliation boundary for PR #171
 
-Status: source-only narrow-fence correction to proposal `923feac`, reconciled
-against clean pushed `44c6d6b`. Root REJECTED its coarse namespace-exclusive
-background-I/O fence; warm Sol offered an outer retry-versus-rename serializer;
-fresh Luna changed from STOP_AND_ESCALATE on the coarse version to PROCEED for
-this **design refinement only**. No implementation or runtime clearance. This
-contract neither retires a current guard nor makes the in-memory tracer
-shippable. Stable member IDs, never display names, key receipts and debts.
+Status: narrow-fence design `c35b8e7` was scoped CLEAN by root/warm Sol and
+fresh Luna necessity PROCEED. The bounded pre-I/O implementation is at
+`54a7812`, with strengthened debt/local-DIRTY assertions at `4c77188`.
+Focused nonmount schedules passed before those final assertions and before
+the affected-suite run. Root REJECTED the earlier global namespace-exclusive background-I/O
+fence. This contract neither retires a current guard nor makes the in-memory
+tracer shippable. Stable member IDs, never display names, key receipts and
+debts. Full PR gates, council and independent acceptance remain outstanding.
 
 ## Assumptions and current path
 
@@ -193,11 +194,14 @@ Cache-file xattrs miss absent/lazy descendants; SQLite alone is rebuildable.
 Missing/corrupt intent with possible partial move fails closed. Current code
 has no such durable store, so even a safe in-memory retry fence is unshippable.
 
-Future deterministic **nonmount** schedules, all **UNRUN**, use the actual
+Deterministic **nonmount** schedules, implemented in
+`TestNarrowRetryFence` and focused GREEN at code commit `54a7812` (the later
+`4c77188` assertions are pending the final suite run), use the actual
 FS-wired `SyncManager -> SyncExecutor.process_dir_task -> LocalBackend`
 path with scratch members. A missing helper or a timeout is setup failure;
 RED must be wrong remote bytes/names, false publication, or blocked unrelated
-request on the identical Event-gated schedule:
+request on the identical Event-gated schedule. The full affected suites are
+still pending at this contract checkpoint:
 
 1. `test_old_retry_blocked_by_newer_guard`: queue an untagged `/a -> /b` retry,
    then make `/b -> /c` incomplete and create a distinct local `/b` before
@@ -215,7 +219,7 @@ request on the identical Event-gated schedule:
    still call the real member. Assert exact local DIRTY bytes, lazy-child EIO
    and unchanged debts/baselines.
 3. `test_retry_first_keeps_unrelated_reads_responsive`: pause a real member
-   RENAME at backend I/O;
+   MKDIR retry at backend I/O;
    start a file rename below its destination and separately a directory
    rename. Both wait *outside* namespace/path locks. Before releasing the
    backend, an unrelated warm read and `readdir` complete with correct bytes
