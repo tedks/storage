@@ -1,0 +1,34 @@
+id: oq-durable-freshness-legacy-cache
+title: Choose first upgrade behavior for cache roots without durable freshness authority
+desc: 'Decision needed for PR #171 durable restart release. A preexisting cache root
+  lacking the proposed root manifest can be a legacy installation or a previously
+  initialized root whose authoritative file was lost. Existing cache-file xattrs and
+  rebuildable SQLite cannot reveal an incomplete old/new subtree move or a debt for
+  an evicted path.
+
+
+  Options: (A) refuse mount/startup without mutating cache and require an explicit
+  operator recovery/migration path; (B) permit a conservative read-only inspection
+  mode that blocks all canonical CLEAN/member adoption and upload while preserving
+  local bytes, then require explicit recovery; (C) automatically adopt cache/index
+  or probe members and infer an empty guard set. C is unsafe because absent/lazy descendant
+  history is unobservable.
+
+
+  Recommendation: A for the first shipping boundary; develop B only if Ted requires
+  recovery access without a separate offline tool. Do not use C. Decider: Ted (product
+  migration and availability policy). Blocks safe rollout of PR #171 onto preexisting
+  or damaged cache roots; does not block the source-only audit or scratch tracer.'
+type: task
+component: open-questions
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-12T02:30:22-00:00
+references: []
+log_events:
+- time: 2026-11-12T02:30:22-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
