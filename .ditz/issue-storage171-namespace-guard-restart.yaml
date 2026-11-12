@@ -26,3 +26,11 @@ log_events:
     members and observed source IDs before local destructive move; reconstruct negative
     coverage before open/sweep/sync after restart. Cache-file xattrs alone miss absent/lazy
     descendants. No durable code or runtime performed; issue remains open and release-blocking.'
+- time: 2026-11-12T01:35:25-00:00
+  who: Ted Smith
+  what: commented
+  comment: Feasibility correction retains durable intent-before-local-move and restart
+    negative-prefix reconstruction as release prerequisite. Member source identity/operation
+    proof must be durably captured when available; bare Local inode may be reused,
+    and cache-file xattrs/SQLite rows cannot cover lazy or absent descendants. No
+    durable implementation/runtime authorized or performed.
