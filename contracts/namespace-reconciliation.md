@@ -6,9 +6,9 @@ fresh Luna necessity PROCEED. The bounded pre-I/O implementation is at
 Root/warm Sol review of frozen `83b26ab` found retry re-resolution of
 already-canonical task endpoints and three older assertion conflicts. Bounded
 repair `bcf062a` passed the exact pushed-code forced eight-target nonmount run
-(469 passed, two named deferred restart cases deselected); its root fix-delta
-review remains pending. Issue `storage171-retry-fence-suite-migration` remains
-open until review. Root REJECTED the earlier global namespace-exclusive background-I/O
+ (469 passed, two named deferred restart cases deselected); root/warm Sol
+subsequently marked that bounded fix delta scoped CLEAN, and
+`storage171-retry-fence-suite-migration` closed for that scope. Root REJECTED the earlier global namespace-exclusive background-I/O
 fence. This contract neither retires a current guard nor makes the in-memory
 tracer shippable. Stable member IDs, never display names, key receipts and
 debts. Full PR gates, council and independent acceptance remain outstanding.
@@ -51,7 +51,14 @@ only its name movement, **not** descendant byte freshness or debt settlement.
    current-inode/generation DIRTY local proof. Intersecting later moves add
    coverage (`fs.py:2623-2713`), not reconciliation.
 
-For **recovery**, a move ID/guard revision and per-member lineage receipt
+This lack of lineage proof applies to **recovery of a previously unknown or
+partial move**, including an untagged queued retry. A separately durable
+COMPLETED terminal for a *new* rename whose local callback and every intended
+member return are confirmed before success preserves that operation's
+existing normal live disposition across restart; it does not reconcile an
+older guard, settle origin debts, or certify a later external writer's state.
+See `durable-freshness-restart.md`. For recovery, a move ID/guard revision and
+per-member lineage receipt
 would be indispensable for both the initial operation and later retries:
 `(move ID, member ID, expected source object ID, old/new identities,
 conditional outcome)`. A synthetic member with an in-process lock can test
@@ -198,9 +205,12 @@ Before the first destructive local cache/index move, persist and sync an
 intent containing move ID, old/new segment-bounded roots, source and target
 local identities, separate origin debt generations, intended member IDs,
 member lineage evidence **when actually available**, and unknown outcomes.
-Persist local progress and each proven member result before guard retirement;
-durably retire before CLEAN/upload admission. On restart, reconstruct all
-unretired and translated negative prefixes before open/sweep/heal/sync.
+Persist local progress and each proven member result before **retiring a
+prior ambiguous guard**; durably retire it before CLEAN/upload admission.
+A new fully confirmed operation may separately durably complete only its own
+provisional intent, retaining every older guard and translated domain. On
+restart, reconstruct all unresolved and translated negative prefixes before
+open/sweep/heal/sync.
 Cache-file xattrs miss absent/lazy descendants; SQLite alone is rebuildable.
 Missing/corrupt intent with possible partial move fails closed. Current code
 has no such durable store, so even a safe in-memory retry fence is unshippable.
