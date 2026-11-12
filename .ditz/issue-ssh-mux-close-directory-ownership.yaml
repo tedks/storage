@@ -1,0 +1,22 @@
+id: ssh-mux-close-directory-ownership
+title: 'Track close() replacement-directory ownership separately from directory type
+  fix.  retains only the path and calls shutil.rmtree; if an entry is replaced by
+  a different real directory before close, cleanup may delete that replacement tree.
+  Recommend capture/revalidate ownership identity and define a safe cleanup response.
+  Decision owner: storage maintainer. Blocks expanding cleanup behavior in the current
+  type-confusion repair; not needed to fix a substituted symlink or prevent that symlink
+  target from being traversed by rmtree.'
+desc: ""
+type: task
+component: ssh
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-12T04:30:33-00:00
+references: []
+log_events:
+- time: 2026-11-12T04:30:33-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
