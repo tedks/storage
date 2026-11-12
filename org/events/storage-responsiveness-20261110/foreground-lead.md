@@ -704,3 +704,13 @@
 - conclusion: [`contracts/responsiveness-separation.md`](../../../contracts/responsiveness-separation.md) maps two candidate cuts with exact commits/surfaces. Foreground admission/channel classification preserves browsing/warm read slots but its early private-pin form loses changed-A obligation across an admission wait; the later shared freshness, stream/full-fetch mutation and namespace safety are coupled, and durable debt/guard replay plus member-name reconciliation remain absent. Sync worker growth is independently reviewable only as sync capacity; #167 `d61bdb1` stays draft and the scoped-reviewed retry fence `bcf062a` is not landed. Neither cut is presently demonstrated as a safe smaller completion of Ted's foreground goal. Recommended next bounded package is exact-base source/test planning; rollback of any later opt-in extraction is to drop its new commits before release. Root must separately dispose implementation/runtime.
 - tracker: `storage171-stage1-read-boundary` received the S1 Important finding: `os.path.lexists` may suppress EACCES/EIO as absence and permit SQLite effects before refusal. Uncorrected and unverified; `ditz sync` succeeded. Existing durability/reconciliation/product questions remain open, no Ted ruling inferred.
 - evidence/limits: source and git-object reads only; no application/test/BUILD changes, cherry-pick/rebase/branch creation, Nix/Bazel/tests/gates/CLI, host probe, live data/mount, SSH/FUSE/Docker/Fleet, deploy or merge. No performance measurement or new runtime evidence. No owned scope, client, fixture or lease acquired. PR #171 and frozen Stage1 refusal gate remain unaccepted and unshippable.
+
+## foreground-lead:68
+
+- kind: pushed-delivery-receipt
+- state: RESPONSIVENESS_SEPARATION_AUDIT_SUBMITTED_TO_ROOT; lane IDLE for root disposition
+- refs: foreground-lead:67
+- applied_at: clean pushed proposal/status head `cc12c12554d5cc7cd89daa58d1c2d4099146d75e`; application/test bytes unchanged from `b0c0c4fef0819642bce528dd4e063216fadef73a`.
+- tracker: `storage171-stage1-read-boundary` comment with S1 Important verified present and `ditz sync` succeeded. No other issue closed or product ruling inferred.
+- delivery: exact `%91` pinned on `/tmp/tmux-1000/default` as storage Codex; shared `tmux-message` returned `status=delivered`, `receipt=submitted`, one paste/Enter. This proves message delivery, not root review, implementation clearance or PR acceptance.
+- resource: source-only; no client, scope, fixture or lease was acquired. No test, gate, CLI, council, deployment or merge evidence added.
