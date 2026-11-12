@@ -99,3 +99,19 @@
   gives a five-commit range-diff with equal patches and no conflict. New-base
   fast gate, CLI and formal council are pending; PR170 incident and full
   release gates remain open.
+
+## channel-lead:8
+
+- kind: review-finding
+- based_on: `50418327de1af6822955d6d72b138753c591ec34`
+- applied_at: pending council fix delta
+- refs: `channel-lead:7`, PR #175 formal round `50418327de1a-20261112T040721Z-589e74`
+- state: Frozen formal round received OpenAI native gpt-6-sol CLEAN;
+  Anthropic Opus FINDINGS (one Important: bulk timeout on a foreground cold
+  open lacked contract/test evidence; four Nits: stale base/gate wording,
+  eager-list error path wording, private pool test coupling, deadline relation).
+  Google seat EMPTY at usage limit; no substitute. This is not council
+  convergence. In-scope test/contract repairs are underway, preserving the
+  three production blobs. New-base fast gate ran 40 targets, 39 passed and
+  unchanged SSH mux test failed; CLI build passed. The gate failure is filed
+  as `pr175-base-ssh-mux-fastgate`, not waived or repaired outside scope.

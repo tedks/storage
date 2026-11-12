@@ -2,10 +2,13 @@
 
 - State: draft PR #175; root/warm Sol T1 delta review at `a006e6b` is scoped
   CLEAN. The branch is rebased onto published master `66c640a` from accepted
-  source `81793ac`; range-diff preserves all five prior commits. A test-only
-  safety timer now exceeds the sequential schedule bounds. New-base fast
-  gate, CLI build, and formal council are pending. No release acceptance,
-  deploy or merge.
+  source `81793ac`; range-diff preserved five patches before the test timer
+  nit change. New-base CLI build passed. Forced fast gate executed 40 targets:
+  39 passed, unchanged SSH mux test failed (ditz
+  `pr175-base-ssh-mux-fastgate`). Formal round at `5041832`: OpenAI CLEAN,
+  Anthropic one Important and four Nits, Google EMPTY due quota. The
+  in-scope timeout assertion and contract/test nits are being repaired;
+  council convergence and release acceptance remain pending. No deploy or merge.
 - Owner: channel Sol lead; worktree
   `/home/tedks/Projects/storage/foreground-channel-reserve-20261112`, branch
   `fix/foreground-channel-reserve-20261112`.
