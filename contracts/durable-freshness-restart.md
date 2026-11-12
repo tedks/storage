@@ -1,6 +1,6 @@
 # Proposed durable freshness and restart boundary for PR #171
 
-Status: SOURCE-ONLY Stage 1 boundary refinement at clean pushed `19521d7888cf3190e146343bf0740745a5bf0496`, based on root/warm Sol review at frozen `c7c842d`; Luna PROCEED for this design refinement only. Nothing here is implemented or tested.
+Status: Stage 1 implementation boundary amended from root/warm Sol readiness review of frozen `391936df7e1ea7204fb2fab787e58a4377a1214a` (contract `5100e166127be5f2591dc4349dae09d7b9199b6e`), reconciled against clean pushed `c23bacf2c4d4a8468801fa9c4c6f01bdd5542c83`. Luna PROCEED only for the bounded scratch-root prototype after this amendment. The implementation and tests remain separate evidence.
 Root/warm Sol scoped CLEAN at code/test `bcf062a` closes the narrow retry
 finding, not this boundary. No implementation or runtime evidence exists for
 the proposal below. Decision keys remain `foreground-open-pin-ownership` and
@@ -188,14 +188,17 @@ marker and must not fsync inside the leaf locks. A minimal Stage 1 split is:
    same source generation/file revision token. On stale token or mismatch,
    do not certify it. Conditionally remove only this linked inode if safe;
    otherwise keep it pending/uncertain for replay, never overwrite a local
-   writer or another winner. For B fallback, only this verified stage may
-   publish its CLEAN row/baseline now; its marker and manifest still owe A.
-   A checked A stage waits for step 4 before CLEAN publication. A late B
-   stage cannot clear newer A/C obligations.
-4. For a checked A fetch, under the held path lock and after exact installed
-   inode/token validation, write and fsync a new marker on **that inode** with
-   only matching A generation removed and file revision advanced. This fsync
-   occurs outside index/descriptor/freshness leaves. Then, under the root
+   writer or another winner. Leave the guard and cache/index/descriptor/
+   freshness leaves while retaining the path lock. Write and fsync one common
+   **PENDING -> COMMITTED** marker on that exact inode before *any* CLEAN row
+   or baseline, including first no-debt fetch and B fallback. The B marker
+   retains every owed generation. For checked A, the marker removes only its
+   matching A generation and advances file revision. Reenter the guard at
+   final publication and revalidate exact inode, token, marker and debt.
+   A failed or stale transition remains pending or conservatively owed.
+   A late B stage cannot clear newer A/C obligations.
+4. For a checked A fetch, after the common committed marker transition in
+   step 3 and still under the held path lock, under the root
    publication mutex, read the latest manifest revision and conditionally
    remove only that matching `(file ID,member A,generation)` debt; preserve
    B/C and any newer A, other roots and guards. Revalidate token/current
@@ -214,7 +217,9 @@ marker and must not fsync inside the leaf locks. A minimal Stage 1 split is:
 Crash cuts: before marker fsync, private copy is disposable; after marker but
 before link, no canonical bytes changed; after link but before parent fsync,
 the name may or may not survive and remains pending; after parent fsync but
-before CLEAN publication, the exact inode is present but untrusted; after
+before CLEAN publication, the exact inode is present but untrusted; a
+committed marker before row/baseline publication proves only that inode's
+durable stage and debts, subject to replay validation; after
 CLEAN publication with B, A remains owed in both authorities; after A marker
 clear but before manifest clear, A remains owed conservatively; after both
 matching clears, A bytes and revision are durable and only A's observed
