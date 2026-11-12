@@ -1,0 +1,28 @@
+id: oq-listing-cold-partial-result
+title: Cold union listing when one member is empty and another unavailable
+desc: 'PR178 council exposed a policy gap: on a fresh directory with no cache, reachable
+  A returns empty while B times out. Empty A is valid but the union is not certified
+  empty. POSIX readdir cannot label a result partial; automatic later updates depend
+  on an unproven client transport.
+
+  Options: (A) wait for all required members up to a bounded deadline, then explicit
+  retryable error if incomplete; (B) expose available partial entries immediately
+  and accept that a normal UI may appear complete; (C) permit partial populated results
+  only with a proven update transport, but return retryable error for empty plus unknown.
+  Recommendation: evaluate C after the scratch transport proof; until ruled, no new
+  public cold-partial policy is implemented. Decides: Ted. Blocks: cold-partial integration,
+  not internal snapshot/cache correctness tests or complete-member operation. Separate
+  from normal reachable empty-member union semantics and from cached stale-first browsing.'
+type: task
+component: open-questions
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-12T21:41:59-00:00
+references: []
+log_events:
+- time: 2026-11-12T21:41:59-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
