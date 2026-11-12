@@ -27,5 +27,15 @@ log_events:
   who: Ted Smith
   what: blocked by field-listing-downloads-to-hash
   comment: ""
+- time: 2026-11-12T19:21:19-00:00
+  who: Ted Smith
+  what: commented
+  comment: '2026-11-12 splinter1 field (81793ac, PR #177 REPORT.md): cold readdir
+    of untouched directories took up to 1.7 s for one entry and 2.1 s for 179, against
+    11-77 ms on chunk0 over GVFS SFTP; lookup and lstat were small. Foreground _list_members
+    waits for all three members with no deadline. raid and chunk1 were not inspected;
+    which member or queue dominates is unverified. Next: per-member listing timing
+    at debug, or a read-only ps on drynwyn during a cold listing, to check for checksum
+    processes.'
 blocked_by:
 - field-listing-downloads-to-hash
