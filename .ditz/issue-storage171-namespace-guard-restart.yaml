@@ -68,3 +68,17 @@ log_events:
     durability, existing-root migration and reconciliation remain release blockers.
     Five schedules are design only, unwritten/unrun. No app/test edits or runtime
     authorization; issue stays open.'
+- time: 2026-11-12T02:57:53-00:00
+  who: Ted Smith
+  what: commented
+  comment: Root/warm Sol review of frozen c7c842d found prior conceptual fixes adequate
+    but Stage1 execution/publication boundary incomplete; Luna PROCEED for source-only
+    refinement only. Revised existing durable contract now specifies internal scratch-only
+    provenance and validation BEFORE StateManager/CacheManager effects, default-entry
+    refusal for marked Stage1 roots, a strict read-only callback/worker/maintenance
+    boundary, real CacheManager pre-link pending marker/fsync then no-replace link
+    and parent fsync before CLEAN publication, and matching A-generation inode-marker
+    clear before conditional manifest clear. Five scratch schedules are proposed but
+    UNWRITTEN/UNRUN. No app/test edits, runtime, live-root adoption or product migration.
+    Issue remains open and release-blocking; oq-durable-freshness-legacy-cache still
+    has no Ted ruling.
