@@ -62,3 +62,11 @@ sanitized: no user file names or private paths.
   oq-listing-stale-serve-dir-mtime and field-gio-content-sniff-per-entry
   reworded (no policy decision), a correction comment on
   field-listing-stalls-under-load; synced.
+- field-browse:12 correction. refs field-browse:11. Root delta review of
+  a64050c: the channel model now separates the configured interactive
+  reserve from effective classification. In 81793ac, foreground readdir
+  runs outside the interactive context (lazy generator, fs.py:126-130,
+  2076-2079; context copied at namespace.py:1105-1108), and cold copies
+  keep it. #175 fixes both. Also: GIO ran as a direct subprocess; the
+  heading no longer claims size independence; "metadata only" is scoped to
+  the bounded probes. Field attribution is still unverified.
