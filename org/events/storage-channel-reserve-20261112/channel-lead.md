@@ -131,3 +131,20 @@
   unruled; eager-listing error prose was corrected. No production edit or
   runtime outcome is claimed by this event. Three-invocation evidence budget
   starts at zero; the shared mux flock is mandatory.
+
+## channel-lead:10
+
+- kind: state-change
+- based_on: `9c3e2aa8e0c179c9543e80d1bfe50aeb3adc19d9`
+- applied_at: runtime-blocked checkpoint; final receipts on PR #175
+- refs: `channel-lead:9`, `pr175-bulk-timeout-proof`, PR #175 comment 6814629125
+- state: The corrected test and two documentation nits are pushed without
+  production changes. Two attempts waited 60 seconds each on the required
+  mux flock; both timed out before `systemd-run` or Bazel. An exact-path
+  read-only holder check found peer Bazel Java PID 3482627 from the isolated
+  mux worktree retaining the lock descriptor. No peer process was stopped or
+  lock bypassed. The temporary disabled-classification cache edit was
+  restored byte-for-byte to blob `d0cd68b`; causal RED/GREEN and whole-module
+  evidence remain UNRUN, 0/3 invocations spent. Owned causalred scope is
+  inactive; no owned Bazel client, fixture or lease remains. Formal council
+  remains FINDINGS, and observed ENOENT remains an open product question.
