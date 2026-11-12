@@ -28,5 +28,17 @@ log_events:
   who: Ted Smith
   what: blocks storage171-namespace-reconciliation
   comment: ""
+- time: 2026-11-12T02:20:10-00:00
+  who: Ted Smith
+  what: commented
+  comment: At pushed code/test bcf062a3356d3f99fe09a2f303120d9dce2bc155, the canonical
+    queued-endpoint defect and three prior suite assertion conflicts are repaired.
+    Behavioral pre-fix worker RED was physical /f.member disappearance in retry-canonical-red2.log;
+    focused repaired selection passed. Forced actual final eight nonmount targets
+    all passed (174 namespace integration, 21 namespace, 57 revalidate, 66 streaming,
+    25 sync executor, 23 sync manager, 14 sync races, 89 threading; two named deferred
+    restart cases deselected). Retry still terminates unresolved under bounded policy;
+    no guard retirement/recovery claim. Root fix-delta review pending; issue retained
+    open until review.
 blocks:
 - storage171-namespace-reconciliation
