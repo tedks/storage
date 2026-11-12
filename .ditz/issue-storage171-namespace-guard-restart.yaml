@@ -82,3 +82,14 @@ log_events:
     UNWRITTEN/UNRUN. No app/test edits, runtime, live-root adoption or product migration.
     Issue remains open and release-blocking; oq-durable-freshness-legacy-cache still
     has no Ted ruling.
+- time: 2026-11-12T03:16:05-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Stage1 bounded implementation stopped at the contract fallback: contract
+    amendment a0de364; pre-constructor scratch provenance/verification/default refusal
+    at pushed 37d671b. Behavioral pre-gate RED showed default construction of a marked
+    root created SQLite; focused GREEN and full nonmount revalidation/cache metadata/cache/fs-core
+    targets passed on 37d671b. Restricted Stage1 read/fetch/replay remains disabled
+    because direct callback/cache/worker mutators cannot be fenced by one local gate;
+    see storage171-stage1-read-boundary. Namespace durable intent, existing-root migration
+    and reconciliation remain open/unshippable.'
