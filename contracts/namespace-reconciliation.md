@@ -3,8 +3,10 @@
 Status: narrow-fence design `c35b8e7` was scoped CLEAN by root/warm Sol and
 fresh Luna necessity PROCEED. The bounded pre-I/O implementation is at
 `54a7812`, with strengthened debt/local-DIRTY assertions at `4c77188`.
-Focused nonmount schedules passed before those final assertions and before
-the affected-suite run. Root REJECTED the earlier global namespace-exclusive background-I/O
+The six new schedules pass at pushed `83b26ab`, but its eight-target affected
+nonmount run has three older test failures (threading path-lock timing and two
+retry-success assumptions); issue `storage171-retry-fence-suite-migration`
+tracks root review and repair. Root REJECTED the earlier global namespace-exclusive background-I/O
 fence. This contract neither retires a current guard nor makes the in-memory
 tracer shippable. Stable member IDs, never display names, key receipts and
 debts. Full PR gates, council and independent acceptance remain outstanding.
@@ -195,13 +197,13 @@ Missing/corrupt intent with possible partial move fails closed. Current code
 has no such durable store, so even a safe in-memory retry fence is unshippable.
 
 Deterministic **nonmount** schedules, implemented in
-`TestNarrowRetryFence` and focused GREEN at code commit `54a7812` (the later
-`4c77188` assertions are pending the final suite run), use the actual
+`TestNarrowRetryFence` and all six GREEN at pushed `83b26ab`, use the actual
 FS-wired `SyncManager -> SyncExecutor.process_dir_task -> LocalBackend`
 path with scratch members. A missing helper or a timeout is setup failure;
 RED must be wrong remote bytes/names, false publication, or blocked unrelated
-request on the identical Event-gated schedule. The full affected suites are
-still pending at this contract checkpoint:
+request on the identical Event-gated schedule. The final affected-suite run
+executed all eight targets at that head, with six targets passing and three
+older assertions failing in two targets; no full-suite pass is claimed:
 
 1. `test_old_retry_blocked_by_newer_guard`: queue an untagged `/a -> /b` retry,
    then make `/b -> /c` incomplete and create a distinct local `/b` before
