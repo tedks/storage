@@ -1284,6 +1284,12 @@ class TestSharedFreshnessObligation(ThreadingTestBase):
             (directory / "parentish" / "sibling.txt").write_bytes(b"unrelated")
         self.assertEqual(b"uncertified child", self._read("/parent/child/known.txt"))
         self.assertEqual(b"old owed", self._read("/parent/child/owed.txt"))
+        local = "/parent/child/local.txt"
+        fd = self.fs.create(local, 0o644)
+        try:
+            self.fs.write(local, b"proved local", 0, fd)
+        finally:
+            self.fs.release(local, fd)
         self._restart_fs()
         (self.member_dir / "parent" / "child" / "owed.txt").write_bytes(b"changed owed")
         self.fs._observe_changed_member("/parent/child/owed.txt", self.a,
@@ -1314,6 +1320,10 @@ class TestSharedFreshnessObligation(ThreadingTestBase):
         self.assertTrue(self.fs._namespace_covered("/elsewhere/other/known.txt"))
         self.assertIn("changedA", self.fs._freshness_snapshot(
             "/elsewhere/other/owed.txt")["debts"])
+        local_moved = "/elsewhere/other/local.txt"
+        self.assertEqual(b"proved local", self._read(local_moved, direct=True))
+        self.assertEqual(SyncStatus.DIRTY,
+                         self.fs.state_manager.get_file_metadata(local_moved).sync_status)
         # The later member name was never in a leaf map, row or cache. It
         # cannot acquire member authority from the successful parent move.
         for directory in (self.member_dir, self.b_dir):
@@ -1362,10 +1372,12 @@ class TestSharedFreshnessObligation(ThreadingTestBase):
             self.fs.sync_manager.max_workers = 1
             self.fs.sync_manager.start()
             self.addCleanup(self.fs.sync_manager.stop)
-            self.fs.sync_manager.queue_sync("/elsewhere/other/owed.txt", force=True)
+            self.fs.sync_manager.queue_sync(local_moved, force=True)
             self.assertTrue(self.fs.sync_manager.wait_for_completion(timeout=WAIT))
             upload_a.assert_not_called()
             upload_b.assert_not_called()
+        self.assertEqual(SyncStatus.DIRTY,
+                         self.fs.state_manager.get_file_metadata(local_moved).sync_status)
         self.assertFalse(self.fs._namespace_covered("/parentish/sibling.txt"))
         self.assertEqual(b"unrelated", self._read("/parentish/sibling.txt", direct=True))
         before_unrelated = len(self.fs._namespace_uncertainties)
