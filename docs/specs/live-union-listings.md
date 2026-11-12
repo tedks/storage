@@ -88,8 +88,10 @@ not authoritative absence. Keep existing conflict/virtual-name policy and stable
 
 Each FUSE directory handle enumerates one revision with stable offsets. Do not
 append late results behind an EOF already delivered, or change the meaning of
-an offset midway through a scan. Later revisions require a new enumeration
-triggered by a real client notification. The current high-level binding may
+an offset midway through a scan. A later explicit opendir or manual refresh
+can enumerate a newer revision. Automatically updating an already-open view
+requires a new enumeration triggered by a proven client notification.
+The current high-level binding may
 provide buffering/offset handling itself; audit that path before adding any
 duplicate buffering. Pinned snapshots count against resource limits.
 A cold directory waits a bounded interval for member observations; with no successful observation and no cache,

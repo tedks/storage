@@ -12,7 +12,17 @@
 - **Outputs:** immutable snapshot with revision, per-member observation status,
   observation ages, local-overlay revision and merged entries. Each entry
   carries its name, type/available metadata, contributing member IDs and a
-  coordinator-issued incarnation token plus entry revision. These tokens fence
+  coordinator-issued incarnation token plus entry revision. The incarnation
+  belongs to the merged entry, not an individual member contribution; losing
+  one contributor alone does not recreate an entry still present in the union.
+  Revisions strictly increase within an incarnation on each committed visible
+  entry change, including remote metadata changes and local overlay mutations.
+  Unchanged observations keep the revision; an old revision is never reused.
+  Publication serializes revision assignment with the visible state change.
+  Events carry (mount generation, incarnation, revision); a consumer rejects
+  old generations/incarnations and revisions older than the current entry,
+  and handles a duplicate current revision idempotently. Incarnations are
+  never reused within a mount generation. These tokens fence
   observations/events inside one mount generation; they do not claim a stable
   remote inode identity. Observed disappearance/recreation or type replacement
   gets a new incarnation; an unchanged observation preserves it. A detectable
@@ -58,7 +68,8 @@
 - **Boundary tests (planned, UNWRITTEN):** empty A + populated B; failed A
   retaining stale evidence; empty A + failed/slow B without cache; partial page
   failure; all-failed/no-cache; continuous local creates while a remote add
-  still publishes; event identity after delete/recreate; stale
+  still publishes; event identity after delete/recreate or contributor loss;
+  older remote-change event after newer local mutation and duplicate events; stale
   response after local rename/unlink; slow A while B publishes; cancelled old
   refresh; capacity saturation; stable offsets under background publication;
   cache eviction and file/directory/type conflicts.
