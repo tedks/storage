@@ -1,8 +1,9 @@
 # Foreground channel reserve: current state
 
-- State: implementation delivered as draft PR #175; focused synthetic tests
-  and the fast gate verified on clean pushed code head `8f1bc3d3a3923ccde1d166d1ffb6dc38ccb12e65`.
-  Scoped review and release acceptance are pending. No deploy or merge.
+- State: draft PR #175; root/warm Sol review at `844684b` found the three
+  production hunks scoped CLEAN and test schedule T1 FINDINGS. Test-only
+  correction is prepared; final exact-head fast gate and root delta review
+  remain pending. No deploy or merge.
 - Owner: channel Sol lead; worktree
   `/home/tedks/Projects/storage/foreground-channel-reserve-20261112`, branch
   `fix/foreground-channel-reserve-20261112`.
@@ -15,6 +16,13 @@
   30-minute limit. No invocation remains. Scratch:
   `/tmp/storage-channel-reserve-5Ra6HI`; only the prior owned pinned
   repository cache was reused. No prior PR #171 process or scope was active.
+- T1 repair budget: 2/3 new invocations spent. First stopped at Bazel analysis
+  because this baseline has no `//tests:storage_test_ssh_backend` target;
+  it ran no test. Second ran the corrected same-schedule test with only the
+  `bulk_request` use disabled in `storage/cache.py`: one selected test failed
+  on actual `bulk_leased=0` versus 3 before timeout (985 deselected). The
+  owned source control was restored byte-for-byte. One invocation remains
+  for the unfiltered fast gate on the committed test correction.
 - RED: first baseline run failed because listing waited for a cold copy;
   strengthened same-schedule baseline on `81793ac` plus test blob
   `e7e02f6a` failed on actual `bulk_leased=0` versus expected 3 before
