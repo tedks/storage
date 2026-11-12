@@ -66,3 +66,11 @@ log_events:
     1 Important/2 Nits; Google EMPTY. Council check is NOT clean. Runtime envelope
     4/4 spent. Followups pr175-bulk-timeout-proof, pr175-base-ssh-mux-fastgate, oq-pr175-bulk-timeout-errno.
     No merge/release claim.'
+- time: 2026-11-12T04:40:14-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'At exact pushed 7a5c3db, causal timeout negative-control RED and 117/117
+    SSH backend GREEN are recorded in PR175 comment 6814714217. Production unchanged;
+    third invocation unused, owned scopes inactive, shared flock released. Formal
+    council still FINDINGS pending finder re-verification; unrelated mux fast-gate
+    failure, full gates, ENOENT ruling and #170 incident remain open.'
