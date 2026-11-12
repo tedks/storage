@@ -391,8 +391,10 @@ class TestRevalidateOnOpen(RevalidateTestBase):
         self.assertEqual(b"ORIGINAL", self.read_through("/f.txt"))
 
     def test_rename_failing_after_the_cache_moved_drops_baselines(self):
-        def move_cache_then_fail(old, new, on_local_moved=None):
+        def move_cache_then_fail(old, new, on_local_moved=None, progress=None):
             os.rename(self.cache_dir / "f.txt", self.cache_dir / "g.txt")
+            if progress is not None:
+                progress.cache_moved = True
             raise OSError(5, "I/O error")
 
         with patch.object(self.fs.namespace, "rename", side_effect=move_cache_then_fail):
@@ -402,6 +404,9 @@ class TestRevalidateOnOpen(RevalidateTestBase):
             os.getxattr(self.cache_dir / "g.txt", StorageFS.MEMBER_STAT_XATTR)
         self.assertNotIn("/f.txt", self.fs._member_checks)
         self.assertNotIn("/g.txt", self.fs._member_checks)
+        self.assertEqual(b"original", (self.cache_dir / "g.txt").read_bytes())
+        with self.assertRaises(OSError):
+            self.read_through("/g.txt")
 
     def test_failed_rename_from_a_never_cached_source_keeps_the_targets_baselines(self):
         before = os.getxattr(self.cache_dir / "f.txt", StorageFS.MEMBER_STAT_XATTR)

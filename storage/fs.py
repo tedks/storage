@@ -131,6 +131,20 @@ class NamespaceUncertainty:
         return any(path == root or self.directory and path.startswith(root.rstrip("/") + "/")
                    for root in (self.old, self.new))
 
+    def intersects_move(self, old: str, new: str, *, directory: bool) -> bool:
+        """Whether a rename can carry any part of this unresolved domain.
+
+        Endpoint coverage alone misses a record nested below the moved root.
+        A directory move conservatively carries the entire parent domain;
+        no leaf inventory can establish which lazy descendants were affected.
+        """
+        if self.covers(old) or self.covers(new):
+            return True
+        if not directory:
+            return False
+        return any(root.startswith(path.rstrip("/") + "/")
+                   for path in (old, new) for root in (self.old, self.new))
+
 
 class StorageFS(Operations):
     """
@@ -2604,8 +2618,15 @@ class StorageFS(Operations):
         except OSError:
             source_inode = None
         with self._member_checks_lock:
-            covered_before = (self._namespace_covered_locked(old_canonical)
-                              or self._namespace_covered_locked(new_canonical))
+            # Both directions of segment-bounded intersection matter: a
+            # covered ancestor contains an endpoint, while an unresolved
+            # descendant lies *inside* a directory being moved. On either
+            # side, the later successful move does not reconcile the prior
+            # member-name ambiguity. The outer namespace/path lock keeps
+            # this snapshot valid through local move and publication.
+            covered_before = any(record.intersects_move(
+                old_canonical, new_canonical, directory=directory)
+                for record in self._namespace_uncertainties)
             prior_obligations = {
                 path: replace(state, debts=dict(state.debts),
                               generations=dict(state.generations))
@@ -2690,8 +2711,10 @@ class StorageFS(Operations):
             self._forget_checksums({old_canonical, new_canonical}, subtree=True)
         if progress.failed or progress.unknown or covered_before:
             # Returned best-effort failures are incomplete despite a normal
-            # rename return. The outer namespace/path lock remains held here;
-            # queued sync work cannot pass the upload drain before this record.
+            # rename return. An intersecting old record also requires a new
+            # conservative old/new root domain after a successful move; keep
+            # that old record and its origin debts. The outer namespace/path
+            # lock remains held; queued sync cannot pass the upload drain.
             quarantine_partial_move()
         # The local move callback already published identity and baselines
         # before member propagation and before any writer could use a moved fd.

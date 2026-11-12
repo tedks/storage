@@ -299,13 +299,13 @@ class TestForegroundAdmission(ThreadingTestBase):
         self.assertEqual(0, self.fs._foreground_admission.active_count)
 
     def test_changed_open_drops_path_lock_before_ordinary_admission(self):
+        self.cache("changed", b"old")
         (self.member_dir / "changed").write_bytes(b"fresh bytes")
-        (self.cache_dir / "changed").write_bytes(b"old")
+        self.fs._observe_changed_member("/changed", self.member,
+                                        self.member.stat("/changed"))
 
         def invalidate_changed(resolved):
             if resolved.requested_path == "/changed":
-                with self.fs._member_checks_lock:
-                    self.fs._refetch_pins["/changed"] = self.member
                 (self.cache_dir / "changed").unlink()
 
         with patch.object(self.fs, "_revalidate_cached_file", side_effect=invalidate_changed):
@@ -316,7 +316,7 @@ class TestForegroundAdmission(ThreadingTestBase):
                 with self.fs._path_locks._mutex:
                     self.assertNotIn("/changed", self.fs._path_locks._entries)
                 with self.fs._member_checks_lock:
-                    self.assertNotIn("/changed", self.fs._refetch_pins)
+                    self.assertIn("member", self.fs._freshness["/changed"].debts)
             fd = changed.finish()
             try:
                 self.assertEqual(b"fresh bytes", self.fs.__call__("read", "/changed", 32, 0, fd))
@@ -1273,6 +1273,110 @@ class TestSharedFreshnessObligation(ThreadingTestBase):
         with self.assertRaises(FuseOSError) as raised:
             self._read("/elsewhere/child.txt", direct=True)
         self.assertEqual(errno.EIO, raised.exception.errno)
+
+    def test_successful_ancestor_move_retains_absent_child_quarantine(self):
+        self.fs.mkdir("/parent", 0o755)
+        self.fs.mkdir("/parent/child", 0o755)
+        self.fs.mkdir("/parentish", 0o755)
+        for directory in (self.member_dir, self.b_dir):
+            (directory / "parent" / "child" / "known.txt").write_bytes(b"uncertified child")
+            (directory / "parent" / "child" / "owed.txt").write_bytes(b"old owed")
+            (directory / "parentish" / "sibling.txt").write_bytes(b"unrelated")
+        self.assertEqual(b"uncertified child", self._read("/parent/child/known.txt"))
+        self.assertEqual(b"old owed", self._read("/parent/child/owed.txt"))
+        self._restart_fs()
+        (self.member_dir / "parent" / "child" / "owed.txt").write_bytes(b"changed owed")
+        self.fs._observe_changed_member("/parent/child/owed.txt", self.a,
+                                        self.a.stat("/parent/child/owed.txt"))
+        with self.fs._member_checks_lock:
+            self.assertNotIn("/parent/child/known.txt", self.fs._freshness)
+        with patch.object(self.fs.namespace, "_propagate_dir_operation",
+                          side_effect=OSError(errno.EIO, "child member move failed")):
+            with self.assertRaises(OSError):
+                self.fs.rename("/parent/child", "/parent/other")
+        first = self.fs._namespace_uncertainties[-1]
+        old_source_debts = first.source_debts
+        old_target_debts = first.target_debts
+        self.assertIn("changedA", old_source_debts["/parent/child/owed.txt"])
+        self.fs.rename("/parent", "/elsewhere")
+        with self.fs._member_checks_lock:
+            self.assertNotIn("/elsewhere/other/known.txt", self.fs._freshness)
+        # The local cache and row moved twice, but neither completed member
+        # rename certified the first ambiguous child name.
+        self.assertEqual(b"uncertified child",
+                         (self.cache_dir / "elsewhere" / "other" / "known.txt").read_bytes())
+        with self.assertRaises(FuseOSError) as raised:
+            self._read("/elsewhere/other/known.txt", direct=True)
+        self.assertEqual(errno.EIO, raised.exception.errno)
+        self.assertIs(first, self.fs._namespace_uncertainties[0])
+        self.assertEqual(old_source_debts, first.source_debts)
+        self.assertEqual(old_target_debts, first.target_debts)
+        self.assertTrue(self.fs._namespace_covered("/elsewhere/other/known.txt"))
+        self.assertIn("changedA", self.fs._freshness_snapshot(
+            "/elsewhere/other/owed.txt")["debts"])
+        # The later member name was never in a leaf map, row or cache. It
+        # cannot acquire member authority from the successful parent move.
+        for directory in (self.member_dir, self.b_dir):
+            (directory / "elsewhere" / "other").mkdir(exist_ok=True)
+            (directory / "elsewhere" / "other" / "lazy.txt").write_bytes(b"lazy wrong bytes")
+        lazy = "/elsewhere/other/lazy.txt"
+        resolved = self.fs._resolve_path(lazy)
+        with self.assertRaises(FuseOSError) as raised:
+            self._read(lazy, direct=True)
+        self.assertEqual(errno.EIO, raised.exception.errno)
+        with self.assertRaises(FuseOSError) as raised:
+            self.fs._ensure_file_in_cache(resolved)
+        self.assertEqual(errno.EIO, raised.exception.errno)
+        self.assertFalse(resolved.cache_path.exists())
+        partial = self.cache_dir / "elsewhere" / "other" / "lazy.txt.storage-partial"
+        real_fd = os.open(partial, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+        os.write(real_fd, b"lazy wrong bytes")
+        session = PrefetchSession(
+            canonical_path=lazy, virtual_path=lazy, backend=self.a,
+            file_size=len(b"lazy wrong bytes"), final_cache_path=resolved.cache_path,
+            partial_cache_path=partial, chunk_size=4096, io_fd=real_fd,
+            available_ranges=[(0, len(b"lazy wrong bytes"))], refcount=0,
+            member_stat=self.a.stat(lazy),
+            freshness_token=self.fs._freshness_token(lazy, self.a.name),
+        )
+        self.addCleanup(self.fs._streaming_manager._close_streaming_session_resources, session)
+        self.fs._finalize_streaming_session(session)
+        self.assertFalse(resolved.cache_path.exists())
+        known = "/elsewhere/other/known.txt"
+        known_cache = self.cache_dir / "elsewhere" / "other" / "known.txt"
+        row = self.fs.state_manager.get_file_metadata(known)
+        self.assertEqual(SyncStatus.CLEAN, row.sync_status)
+        row.recomputable = True
+        self.fs.state_manager.set_file_metadata(row)
+        os.utime(known_cache, ns=(known_cache.stat().st_atime_ns,
+                                  known_cache.stat().st_mtime_ns + 1_000_000_000))
+        self.fs.sweep_stale_cache_metadata()
+        self.fs.cache_manager.evict_lru_files(1 << 20)
+        self.fs.cache_manager.evict_recomputable_files(1 << 20)
+        self.assertEqual(b"uncertified child", known_cache.read_bytes())
+        self.assertEqual(SyncStatus.CLEAN,
+                         self.fs.state_manager.get_file_metadata(known).sync_status)
+        with patch.object(self.a, "copy_from_local", wraps=self.a.copy_from_local) as upload_a, \
+                patch.object(self.b, "copy_from_local", wraps=self.b.copy_from_local) as upload_b:
+            self.fs.sync_manager.num_workers = 1
+            self.fs.sync_manager.max_workers = 1
+            self.fs.sync_manager.start()
+            self.addCleanup(self.fs.sync_manager.stop)
+            self.fs.sync_manager.queue_sync("/elsewhere/other/owed.txt", force=True)
+            self.assertTrue(self.fs.sync_manager.wait_for_completion(timeout=WAIT))
+            upload_a.assert_not_called()
+            upload_b.assert_not_called()
+        self.assertFalse(self.fs._namespace_covered("/parentish/sibling.txt"))
+        self.assertEqual(b"unrelated", self._read("/parentish/sibling.txt", direct=True))
+        before_unrelated = len(self.fs._namespace_uncertainties)
+        self.fs.rename("/parentish", "/unrelated")
+        self.assertEqual(before_unrelated, len(self.fs._namespace_uncertainties))
+        self.assertEqual(b"unrelated", self._read("/unrelated/sibling.txt", direct=True))
+        # Disabled-guard control: the same canonical bytes become visible
+        # when the prefix denial is deliberately bypassed.
+        with patch.object(self.fs, "_namespace_covered_locked", return_value=False):
+            self.assertEqual(b"uncertified child",
+                             self._read("/elsewhere/other/known.txt", direct=True))
 
     def test_explicit_unlink_create_proves_only_new_local_dirty_inode(self):
         self.fs.mkdir("/dir", 0o755)
@@ -2462,7 +2566,7 @@ class TestOpenRaces(ThreadingTestBase):
         copy.opened.set()
         self.assertEqual(b"s" * 4096, slow.finish())
 
-    def test_pin_survives_a_concurrent_revalidate(self):
+    def test_shared_debt_survives_a_concurrent_revalidate(self):
         self.cache("f.txt", b"original")
         (self.member_dir / "f.txt").write_bytes(b"changed and longer")
         with self.fs._member_checks_lock:
@@ -2470,15 +2574,16 @@ class TestOpenRaces(ThreadingTestBase):
                 self.fs._member_checks[path] = dataclasses.replace(
                     check, verified_at=check.verified_at - 3600,
                 )
-        # Pause the first opener after its check pinned the refetch and
-        # before its fetch consumed the pin.
+        # Pause the first opener after its check published shared debt and
+        # before its fetch consumes that obligation.
         invalidate = self.gate(self.fs, "_invalidate_file_cache")
-        pins_at_select = []
+        debts_at_select = []
         real_select = self.fs._select_backend_for_read
 
         def select(canonical_path):
             with self.fs._member_checks_lock:
-                pins_at_select.append(self.fs._refetch_pins.get(canonical_path))
+                state = self.fs._freshness.get(canonical_path)
+                debts_at_select.append(frozenset(state.debts) if state else frozenset())
             return real_select(canonical_path)
 
         copies = self.gate(self.member, "copy_to_local", only=lambda *a: False)
@@ -2493,11 +2598,11 @@ class TestOpenRaces(ThreadingTestBase):
             invalidate.opened.set()
             self.assertEqual(b"changed and longer", first.finish())
             self.assertEqual(b"changed and longer", second.finish())
-        # The first opener's fetch found its pin (the second opener's
-        # revalidate did not pop it), and the second did not fetch again.
-        self.assertEqual([self.member], pins_at_select)
+        # The first selection sees the observed member's shared debt;
+        # the second opener does not lose it or fetch again.
+        self.assertEqual([frozenset({"member"})], debts_at_select)
         self.assertEqual(1, len(copies.calls))
-        self.assertEqual({}, self.fs._refetch_pins)
+        self.assertIsNone(self.fs._freshness_snapshot("/f.txt"))
 
     def test_open_of_a_cached_file_is_not_undercut_by_eviction(self):
         self.cache("f.txt", b"cached")
