@@ -4,12 +4,11 @@ Status: narrow-fence design `c35b8e7` was scoped CLEAN by root/warm Sol and
 fresh Luna necessity PROCEED. The bounded pre-I/O implementation is at
 `54a7812`, with strengthened debt/local-DIRTY assertions at `4c77188`.
 Root/warm Sol review of frozen `83b26ab` found retry re-resolution of
-already-canonical task endpoints and three older assertion conflicts. A
-bounded repair is in progress; its final affected-suite result is pending.
-The six new schedules pass at pushed `83b26ab`, but its eight-target affected
-nonmount run has three older test failures (threading path-lock timing and two
-retry-success assumptions); issue `storage171-retry-fence-suite-migration`
-tracks root review and repair. Root REJECTED the earlier global namespace-exclusive background-I/O
+already-canonical task endpoints and three older assertion conflicts. Bounded
+repair `bcf062a` passed the exact pushed-code forced eight-target nonmount run
+(469 passed, two named deferred restart cases deselected); its root fix-delta
+review remains pending. Issue `storage171-retry-fence-suite-migration` remains
+open until review. Root REJECTED the earlier global namespace-exclusive background-I/O
 fence. This contract neither retires a current guard nor makes the in-memory
 tracer shippable. Stable member IDs, never display names, key receipts and
 debts. Full PR gates, council and independent acceptance remain outstanding.
