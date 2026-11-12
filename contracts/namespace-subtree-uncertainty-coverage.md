@@ -1,12 +1,40 @@
-# Proposal: namespace-subtree-uncertainty-coverage
+# Adjudicated in-memory tracer: namespace-subtree-uncertainty-coverage
 
-Decision key: `namespace-subtree-uncertainty-coverage`. This is a source-only
-boundary audit for Storage root, based on frozen code/test
-`75b2efa240df5a7df0e7b849a1dd58475797727f`, application `e757c2a`,
-and review `proof-review-75b2efa.md`. It is **not** an adjudicated contract,
-implementation clearance, runtime result, or remote reconciliation policy.
+Decision key: `namespace-subtree-uncertainty-coverage`. Root adjudicated the
+bounded in-memory approach based on source proposal `63f22f8`, after
+`proof-review-75b2efa.md`, warm Sol review and a Luna necessity critique.
+The owner reconciled that decision against clean `2a9c88a` before editing.
+This is implementation clearance for the in-memory tracer only, not full-PR
+acceptance or a remote reconciliation policy.
 The v3 `path-freshness-obligation` contract remains the higher-level byte and
 debt boundary.
+
+## Release barrier and atomicity amendment
+
+The negative record covers every descendant regardless of whether a freshness
+object, row, inode or prior open exists. Its positive DIRTY witness is only
+local inode and generation evidence. The record stays even if an existing
+queued rename retry runs; no retry presently proves both member namespaces or
+settles source and target debts. Consequently a normal rename return with a
+member failure can leave canonical CLEAN opens at either prefix returning EIO
+and can defer uploads indefinitely. **That behavior is unshippable.** Before
+PR #171 can be accepted, namespace reconciliation must resolve every intended
+member and origin debt, and a durable restart marker/recovery rule must prevent
+lost in-memory denial after a crash. The tracer does not claim bounded lifetime
+or memory for unresolved records.
+
+The rename holds its existing directory-exclusive namespace lock or sorted
+file path locks through local cache/index move, member propagation and record
+publication. An upload drain or file upload lock keeps queued sync from
+starting in that interval. Eviction takes its existing nonblocking namespace
+and path guard and checks coverage while holding it through unlink or
+recomputable truncation. Healing takes that guard across check and DIRTY mark;
+the stale sweep also takes it and re-stats after acquisition. Thus no sweep or
+LRU mutation can act between the first cache move and failure publication.
+The member operations remain outside the freshness leaf; no admission waits
+inside namespace/path locks. A narrow rename receipt records local cache,
+index and callback phases plus intended, attempted, confirmed, failed and
+unknown stable member IDs. Callback completion alone cannot certify a member.
 
 ## Assumption and smallest complete domain
 
@@ -110,7 +138,7 @@ also proves no descendant and no outstanding member name/debt on both sides;
 current `rmdir` does not make that proof. Durable restart recovery remains a
 separate unimplemented boundary.
 
-Proposed scratch-only deterministic tests, all **UNRUN**:
+Original audit test plan, retained for comparison with tracer evidence:
 
 1. Materialize a cached indexed source child through normal operations,
    restart the scratch `StorageFS` so its in-memory freshness map is actually
@@ -131,8 +159,8 @@ Proposed scratch-only deterministic tests, all **UNRUN**:
    sibling and an active writer; fail propagation by both a raised exception
    and the normal returned failed-member list. Check exact local bytes,
    inode/generation proof, retained independent debts, failed-mark EIO,
-   no upload and no CLEAN claim. The existing 75b2efa test correction is
-   unrun and does not establish an absent-state child.
+   no upload and no CLEAN claim. The corrected 75b2efa assertion by itself
+   did not establish an absent-state child; the tracer checks map membership.
 5. Force pre-move failure with a nonempty target directory or injected early
    error. Assert old/target identities, debts and normal access unchanged.
    Force a nested move intersecting a quarantined prefix, then late fetch and
@@ -145,17 +173,15 @@ Each new test needs a same-schedule behavioral pre-fix failure in bytes,
 `copy_from_local`, row status or inode ownership, then post-fix success.
 `_freshness_snapshot(path) is None` alone is not the absent-object setup;
 inspect the actual map under its lock after constructing scratch fixtures.
-No tests or application edits were authorized or run during this audit.
+No tests or application edits were authorized or run during the source-only
+audit. The later adjudicated tracer has separate, recorded test receipts.
 
 ## Root decision and interface limit
 
-Recommendation: use the two-prefix negative guard plus a narrow rename
-outcome receipt and per-inode positive witness. Enumerating all current rows
-or cache files alone cannot cover lazy descendants. This is a technical
-boundary decision for Storage root, not a Ted product ruling. The current
-`NamespaceService.rename` return/callback interface does not report the
-normal failed-member list to `StorageFS`; current `PathFreshness.debts` keyed
-only by member cannot alone preserve two ambiguous origin identities' debts.
-Those are real interface changes to review before application repair. The
-proposal does not decide remote conflict/deletion policy or when queued
-remote operations count as reconciliation.
+Root selected two-prefix negative coverage plus a narrow rename progress
+receipt and exact local DIRTY witness for the tracer. Enumerating current
+rows or cache files alone cannot cover lazy descendants. The progress receipt
+exposes returned failed members and partial exception progress; the separate
+record preserves two origins' debts even if they share a member ID. The
+tracer does not decide remote conflict/deletion policy or when queued remote
+operations count as reconciliation.

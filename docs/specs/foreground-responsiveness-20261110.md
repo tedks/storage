@@ -2,6 +2,17 @@
 
 State: draft on `66c640a`; Ted's 2026-11-10 ruling includes reads and browsing.
 
+Current acceptance boundary for the namespace tracer: root adjudicated paired
+old/new negative subtree coverage for incomplete moves in
+[`namespace-subtree-uncertainty-coverage`](../../contracts/namespace-subtree-uncertainty-coverage.md).
+This is mount-lifetime byte protection only. A normal rename return with a
+failed member may leave canonical CLEAN reads returning EIO and uploads held
+indefinitely. That is **not an accepted release behavior**. PR acceptance
+requires a separate member-name reconciliation transition that settles
+origin-specific debts, plus durable guard/restart recovery. Queued rename
+retries alone establish neither. The bounded tracer may be reviewed and
+tested without treating those later phases as complete.
+
 The review stop at `0631a73` is governed by the proposed
 [`path-freshness-obligation`](../../contracts/path-freshness-obligation.md)
 contract and huddle key `foreground-open-pin-ownership`. Two-member Event-gated
