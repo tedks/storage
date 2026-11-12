@@ -21,3 +21,12 @@ log_events:
   who: Ted Smith
   what: created
   comment: ""
+- time: 2026-11-12T00:54:01-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Exact pushed head 670c6e8 full-near threading run selected81 (three known
+    exclusions): 80 passed; TestForegroundAdmission.test_changed_open_drops_path_lock_before_ordinary_admission
+    failed because it manually injects _refetch_pins and then asserts that same entry
+    is absent. This is a retired private-pin test assumption, not proof of current
+    path-lock behavior; needs migration preserving the lock/admission assertion. Runtime
+    envelope exhausted; no test edit this phase.'
