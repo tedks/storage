@@ -590,3 +590,11 @@
 - identities: runner SHA-256 `25a589dd4ad57170f26464171ca3847498ab7124c9bb5e025ab8505b300f096a`; `storage/fs.py` `b1d14f521450f9ee9b85008a37855c44c533340bc4492d2348bffb3990977c7b`; `storage/sync.py` `68be7f6146539f7a68f858db141de4117d74d79b4974a26815c8d77521830775`; `storage/sync_executor.py` `6409a0fd807bb6b58392c70e57f9e453eb6f75c06263520f2161e3c75611813f`; `tests/test_fs_threading.py` `5cbc88fdbe43d11116f2cc0badf45632354c5c4e239ae5a0829f17aa5a559200`; `tests/test_sync_races.py` `591fa35c30c64751967e38fad5f7fdb1d2e56622e47571d2d28a6bc13635d198`.
 - resource/limit: 4/4 authorized sequential Bazel invocations, each <600s, cumulative under two minutes. Final preflight MemAvailable 100,737,691,648 bytes, scratch free 181,007,114,240 bytes, no pswpout advance; final monitor abort0, owned scratch size 1,760,305,152 bytes versus baseline 1,724,944,384 (+35,360,768 bytes), free 181,007,544,320 bytes. Exact four owned `storage171-retry-canonical-*.scope` units no longer listed active; no owned runner/Bazel process, fixture, lease or live mount. Network bytes unmeasured; pinned graph only.
 - tracker: `storage171-retry-fence-suite-migration` received exact-head comment and `ditz sync` succeeded; left open for root fix-delta review. Full gates, CLI, formal council, durable guard/recovery, member-name reconciliation, merge and deployment remain unverified/unaccepted. No later phase self-started.
+
+## foreground-lead:57
+
+- kind: delivery-receipt
+- state: CANONICAL_RETRY_FIX_DELTA_SUBMITTED_TO_ROOT; lane idle, root review pending
+- refs: foreground-lead:56
+- applied_at: clean pushed docs receipt `dad3b25127c6804760f9b29bb7ac5ec441676d5b`, code/test unchanged from `bcf062a3356d3f99fe09a2f303120d9dce2bc155`.
+- delivery: GitHub connector posted PR #171 evidence comment ID `6812490176`; exact `%91` was re-pinned as `storage:codex` on `/tmp/tmux-1000/default` and shared `tmux-message` returned `status=delivered`, `receipt=submitted`, one paste/Enter for the fix-delta checkpoint. Delivery proves neither root review nor scoped/full acceptance. All four owned `storage171-retry-canonical-*.scope` units exited; no owned client, fixture or lease.
