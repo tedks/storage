@@ -1,0 +1,28 @@
+id: oq-member-namespace-writer-ownership
+title: Decide whether Storage may require exclusive member namespace writers for rename
+  recovery
+desc: 'PR #171 member-name reconciliation: current Local and SSH rename APIs have
+  no atomic source-identity condition/operation receipt. A real Local recovery candidate
+  based on stat identities and mount namespace locks would require every writer of
+  a member namespace to coordinate through this mount, contradicting existing watcher/external-change
+  use unless Ted explicitly changes that product contract. Options: (1) retain external
+  member writers and require a real member-side conditional identity/move service,
+  leaving ambiguous cases blocked meanwhile; (2) declare member namespace exclusively
+  owned by Storage and provide enforcement/documentation; (3) give up automatic recovery
+  and surface partial completion/conflicts. Recommendation: (1), preserving current
+  external-writer behavior. Ted decides; blocks choosing a production Local stat-based
+  reconciliation implementation, not a pre-I/O retry safety fence or this source-only
+  audit. Related: storage171-namespace-reconciliation, contracts/namespace-reconciliation.md.'
+type: task
+component: open-questions
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-12T01:34:47-00:00
+references: []
+log_events:
+- time: 2026-11-12T01:34:47-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
