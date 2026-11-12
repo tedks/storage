@@ -41,3 +41,17 @@ log_events:
     and actual member-side lineage or an explicit exclusive-writer contract. New product
     question oq-member-namespace-writer-ownership filed; existing collision and partial-result
     questions remain open pending Ted.
+- time: 2026-11-12T01:46:02-00:00
+  who: Ted Smith
+  what: commented
+  comment: Root reviewed 923feac/13c0ee5 and rejected the coarse namespace-exclusive
+    background-I/O fence; warm Sol found no direct cycle but found unrelated foreground
+    blocking, Luna STOP_AND_ESCALATE there. Root's narrower outer retry-versus-rename
+    serializer received Luna PROCEED for source-only refinement only. The contract
+    now proposes one serializer before existing locks on both StorageFS.rename branches
+    and every FS-bound directory retry, with affected upload drain then existing namespace
+    shared/path locks for retries. All old/new prefix intersections and MKDIR/RMDIR/RENAME
+    are checked before backend I/O, including legacy/stale tasks. This is non-shipping
+    containment, not guard retirement or restored recovery; no app/test edits or runtime.
+    Ted collision/partial-result questions remain open; root retains external-writer
+    support.
