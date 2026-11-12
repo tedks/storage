@@ -105,6 +105,10 @@ class PathFreshness:
     # Only a completed local cache+index move may establish this proof.
     # An old target row, even DIRTY with matching size and mtime, cannot.
     uncertain_dirty_proof: Optional[Tuple[int, int, int]] = None
+    # A completed cache+index move of this source row, before a writer has
+    # finished DIRTY publication. This is local-read eligibility, never sync
+    # or member-name authority.
+    uncertain_move_inode: Optional[Tuple[int, int]] = None
     generations: Dict[str, int] = field(default_factory=dict)
     debts: Dict[str, FreshnessDebt] = field(default_factory=dict)
 
@@ -1610,7 +1614,7 @@ class StorageFS(Operations):
                 del self._freshness_probe_retry[key]
 
     def _mark_namespace_uncertain(self, old: str, new: str, prior_debts,
-                                  proven_dirty=None):
+                                  move_witnesses=None, proven_dirty=None):
         """A partial local move leaves both possible names requiring proof.
 
         This in-memory slice cannot certify which member still owns either
@@ -1636,13 +1640,23 @@ class StorageFS(Operations):
                         for member, generation in state.generations.items():
                             generations[member] = max(generations.get(member, 0), generation)
                 for path in (old + suffix, new + suffix):
+                    witness = (move_witnesses or {}).get(path)
+                    # The completed callback rekeyed the source state. Keep
+                    # that object so an in-flight writer's finalizer still
+                    # settles the current inode rather than a detached one.
+                    state = self._freshness.get(path) if witness is not None else None
+                    if state is None:
+                        state = PathFreshness(identity=0, current_path=path)
                     self._next_freshness_identity += 1
-                    self._freshness[path] = PathFreshness(
-                        identity=self._next_freshness_identity, current_path=path,
-                        revision=1, generations=dict(generations), debts=dict(debts),
-                        namespace_uncertain=True,
-                        uncertain_dirty_proof=(proven_dirty or {}).get(path),
-                    )
+                    state.identity = self._next_freshness_identity
+                    state.current_path = path
+                    state.revision += 1
+                    state.generations = dict(generations)
+                    state.debts = dict(debts)
+                    state.namespace_uncertain = True
+                    state.uncertain_move_inode = witness
+                    state.uncertain_dirty_proof = (proven_dirty or {}).get(path)
+                    self._freshness[path] = state
                     self._member_checks.pop(path, None)
                     self._revalidate_unreachable.pop(path, None)
                     self._refetch_pins.pop(path, None)
@@ -2536,14 +2550,19 @@ class StorageFS(Operations):
                 or path.startswith(new_canonical.rstrip("/") + "/")
             }
         local_moved = False
+        move_witnesses = {}
 
-        def publish_local_move():
+        def publish_local_move(renamed_entries):
             nonlocal local_moved
             # NamespaceService holds metadata here. Serialize descriptor
             # ownership and freshness rekeying with write's byte boundary.
             with self._fd_lock:
                 self._move_member_checks(old_canonical, new_canonical)
                 self._repoint_descriptors(old, new)
+                for _old_path, moved_path in renamed_entries:
+                    moved = regular_file_stat(self.cache_manager.get_cache_path(moved_path))
+                    if moved is not None:
+                        move_witnesses[moved_path] = (moved.st_dev, moved.st_ino)
                 local_moved = True
 
         try:
@@ -2565,18 +2584,23 @@ class StorageFS(Operations):
                 # move leaves the old target row behind, regardless of its
                 # status or stat coincidence.
                 proven_dirty = {}
-                if local_moved and source_inode is not None and same_inode_moved:
+                if local_moved and same_inode_moved:
                     with self.state_manager.metadata_lock:
-                        row = self.state_manager.get_file_metadata(new_canonical)
-                        with self._member_checks_lock:
-                            state = self._freshness.get(new_canonical)
-                            stable = (state is not None and not state.active_mutations
-                                      and not state.uncertain_local)
-                        if stable and row is not None and row.sync_status == SyncStatus.DIRTY:
-                            proven_dirty[new_canonical] = (
-                                source_inode[0], source_inode[1], row.dirty_generation)
+                        for moved_path, inode in move_witnesses.items():
+                            row = self.state_manager.get_file_metadata(moved_path)
+                            current = regular_file_stat(self.cache_manager.get_cache_path(moved_path))
+                            with self._member_checks_lock:
+                                state = self._freshness.get(moved_path)
+                                stable = (state is None or not state.active_mutations
+                                          and not state.uncertain_local)
+                            if (stable and current is not None
+                                    and inode == (current.st_dev, current.st_ino)
+                                    and row is not None and row.sync_status == SyncStatus.DIRTY):
+                                proven_dirty[moved_path] = (*inode, row.dirty_generation)
                 self._mark_namespace_uncertain(old_canonical, new_canonical,
-                                               prior_obligations, proven_dirty)
+                                               prior_obligations,
+                                               move_witnesses if local_moved and same_inode_moved else {},
+                                               proven_dirty)
                 self._drop_persisted_baselines(new_canonical)
                 self._drop_persisted_baselines(old_canonical)
             raise
@@ -2648,8 +2672,7 @@ class StorageFS(Operations):
                 with self._member_checks_lock:
                     state = self._freshness.get(canonical_path)
                     if (state is not None and state.namespace_uncertain
-                            and state.uncertain_dirty_proof is not None
-                            and state.uncertain_dirty_proof[:2] == published["inode"]):
+                            and state.uncertain_move_inode == published["inode"]):
                         state.uncertain_dirty_proof = (*published["inode"], generation)
         return generation
 

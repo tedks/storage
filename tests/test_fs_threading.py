@@ -1038,6 +1038,136 @@ class TestSharedFreshnessObligation(ThreadingTestBase):
                          self._read("/moved.txt", direct=True))
         self.assertIn("changedA", self._snapshot("/moved.txt")["debts"])
 
+    def test_failed_directory_member_move_proves_only_dirty_descendants(self):
+        self._prime_owed_a_with_b_cached()
+        self.a.set_available(False)
+        try:
+            fd = self.fs.open(self.PATH, os.O_RDWR)
+            self.fs.write(self.PATH, b"local first", 0, fd)
+            self.fs.release(self.PATH, fd)
+        finally:
+            self.a.set_available(True)
+        self.fs.mkdir("/dir", 0o755)
+        self.fs.mkdir("/dir/nest", 0o755)
+        self.fs.rename(self.PATH, "/dir/first.txt")
+        deep = "/dir/nest/deep.txt"
+        fd = self.fs.create(deep, 0o644)
+        self.fs.write(deep, b"local deep", 0, fd)
+        self.fs.release(deep, fd)
+        for directory in (self.member_dir, self.b_dir):
+            (directory / "dir" / "clean.txt").write_bytes(b"clean sibling")
+        self.assertEqual(b"clean sibling", self._read("/dir/clean.txt"))
+        before = self._snapshot("/dir/first.txt")["debts"]
+        deep_before = self._snapshot(deep)["debts"]
+        self.assertEqual(SyncStatus.CLEAN,
+                         self.fs.state_manager.get_file_metadata("/dir/clean.txt").sync_status)
+        with patch.object(self.fs.namespace, "_propagate_dir_operation",
+                          side_effect=OSError(errno.EIO, "member move failed")):
+            with self.assertRaises(OSError):
+                self.fs.rename("/dir", "/moved")
+        self.assertEqual(b"local first", self._read("/moved/first.txt", direct=True)[:11])
+        self.assertEqual(b"local deep", self._read("/moved/nest/deep.txt", direct=True))
+        self.assertEqual(before, self._snapshot("/moved/first.txt")["debts"])
+        self.assertEqual(deep_before, self._snapshot("/moved/nest/deep.txt")["debts"])
+        with self.assertRaises(FuseOSError) as raised:
+            self._read("/moved/clean.txt", direct=True)
+        self.assertEqual(errno.EIO, raised.exception.errno)
+        with patch.object(self.a, "copy_from_local", wraps=self.a.copy_from_local) as upload_a, \
+                patch.object(self.b, "copy_from_local", wraps=self.b.copy_from_local) as upload_b:
+            self.fs.sync_manager.num_workers = 1
+            self.fs.sync_manager.max_workers = 1
+            self.fs.sync_manager.start()
+            self.addCleanup(self.fs.sync_manager.stop)
+            self.fs.sync_manager.queue_sync("/moved/first.txt", force=True)
+            self.fs.sync_manager.queue_sync("/moved/nest/deep.txt", force=True)
+            self.assertTrue(self.fs.sync_manager.wait_for_completion(timeout=WAIT))
+            upload_a.assert_not_called()
+            upload_b.assert_not_called()
+        for path in ("/moved/first.txt", "/moved/nest/deep.txt"):
+            self.assertEqual(SyncStatus.DIRTY,
+                             self.fs.state_manager.get_file_metadata(path).sync_status)
+
+    def test_writer_across_completed_local_move_retains_inode_proof(self):
+        self._prime_owed_a_with_b_cached()
+        self.a.set_available(False)
+        try:
+            fd = self.fs.open(self.PATH, os.O_RDWR)
+        finally:
+            self.a.set_available(True)
+        original = os.pwrite
+        entered = threading.Event()
+        resume = threading.Event()
+        self.addCleanup(resume.set)
+
+        def paused_write(real_fd, data, offset):
+            entered.set()
+            self.assertTrue(resume.wait(WAIT))
+            return original(real_fd, data, offset)
+
+        try:
+            with patch("storage.fs.os.pwrite", side_effect=paused_write):
+                writer = Worker(self.fs.write, self.PATH, b"local after move", 0, fd)
+                writer.start()
+                self.assertTrue(entered.wait(WAIT))
+                with patch.object(self.fs.namespace, "_propagate_dir_operation",
+                                  side_effect=OSError(errno.EIO, "member move failed")):
+                    with self.assertRaises(OSError):
+                        self.fs.rename(self.PATH, "/moved.txt")
+                resume.set()
+                self.assertEqual(len(b"local after move"), writer.finish())
+            self.assertEqual(SyncStatus.DIRTY,
+                             self.fs.state_manager.get_file_metadata("/moved.txt").sync_status)
+            self.assertEqual(b"local after move", self._read("/moved.txt", direct=True))
+            self.assertIn("changedA", self._snapshot("/moved.txt")["debts"])
+        finally:
+            resume.set()
+            self.fs.release("/moved.txt", fd)
+
+    def test_failed_dirty_mark_after_completed_move_keeps_bytes_unproven(self):
+        self._prime_owed_a_with_b_cached()
+        self.a.set_available(False)
+        try:
+            fd = self.fs.open(self.PATH, os.O_RDWR)
+        finally:
+            self.a.set_available(True)
+        entered = threading.Event()
+        resume = threading.Event()
+        self.addCleanup(resume.set)
+        original = os.pwrite
+
+        def paused_write(real_fd, data, offset):
+            entered.set()
+            self.assertTrue(resume.wait(WAIT))
+            return original(real_fd, data, offset)
+
+        try:
+            with patch("storage.fs.os.pwrite", side_effect=paused_write), \
+                    patch.object(self.fs, "_mark_cache_file_dirty",
+                                 side_effect=OSError(errno.EIO, "dirty mark failed")):
+                writer = Worker(self.fs.write, self.PATH, b"unmarked local", 0, fd)
+                writer.start()
+                self.assertTrue(entered.wait(WAIT))
+                with patch.object(self.fs.namespace, "_propagate_dir_operation",
+                                  side_effect=OSError(errno.EIO, "member move failed")):
+                    with self.assertRaises(OSError):
+                        self.fs.rename(self.PATH, "/moved.txt")
+                resume.set()
+                with self.assertRaises(FuseOSError):
+                    writer.finish()
+            with self.assertRaises(FuseOSError) as raised:
+                self._read("/moved.txt", direct=True)
+            self.assertEqual(errno.EIO, raised.exception.errno)
+            self.assertTrue((self.cache_dir / "moved.txt").read_bytes().startswith(b"unmarked local"))
+            self.assertIn("changedA", self._snapshot("/moved.txt")["debts"])
+            self.fs.write("/moved.txt", b"recovered bytes", 0, fd)
+            self.assertTrue(self._read("/moved.txt", direct=True).startswith(b"recovered bytes"))
+            self.assertEqual(SyncStatus.DIRTY,
+                             self.fs.state_manager.get_file_metadata("/moved.txt").sync_status)
+            self.assertIn("changedA", self._snapshot("/moved.txt")["debts"])
+        finally:
+            resume.set()
+            self.fs.release("/moved.txt", fd)
+
     def test_replaced_target_descriptor_does_not_block_current_inode_sync(self):
         target = "/target.txt"
         fd = self.fs.create(target, 0o644)

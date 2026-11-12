@@ -1454,12 +1454,13 @@ class NamespaceService:
         except OSError as exc:
             raise FuseOSError(exc.errno)
 
-    def rename(self, old: str, new: str, on_local_moved: Optional[Callable[[], None]] = None):
+    def rename(self, old: str, new: str,
+               on_local_moved: Optional[Callable[[List[Tuple[str, str]]], None]] = None):
         """Rename a file or directory.
 
         The local move (the cache rename, the index rewrite and the metadata
         xattrs) is one critical section under the index lock, and
-        on_local_moved runs at its end, before the members are renamed:
+        on_local_moved receives the index rows moved at its end, before the members are renamed:
         StorageFS re-points open descriptors there, so a write recording
         itself (under the same lock) sees either the old row at the old path
         or the moved row at the new one, never a path whose row is gone.
@@ -1504,7 +1505,7 @@ class NamespaceService:
                     if metadata:
                         self.cache_manager.sync_cache_metadata(updated, metadata)
                 if on_local_moved is not None:
-                    on_local_moved()
+                    on_local_moved(renamed_entries)
 
             failures = self._propagate_dir_operation(
                 DirOperation.RENAME,
