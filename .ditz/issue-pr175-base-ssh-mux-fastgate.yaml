@@ -57,3 +57,16 @@ log_events:
     monitor, `--batch`, and owned output roots are specified. This is source review
     only, not test evidence. Scheduling HOLD: PR175 has the runtime turn. Root explicitly
     requires a next-slot message before any run.'
+- time: 2026-11-12T04:43:31-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Scheduled runtime slot completed and released. At clean pushed head `ba554cc57cbe7b966ca9bfec75d7e1e4f853793f`,
+    reviewed wrapper `/tmp/storage-mux-type-cFiKLLHr/bounded/run.sh` SHA256 `146536312faf5af3758d066bb80530e1e6b33a4b841d37efc6ed30f9634ec6c4`:
+    full `//tests:storage_test_ssh_mux` passed (log SHA256 `1e56791ffc4a0330330cc694e2286f6c731ae859be3cbe58486962ea03f1819e`;
+    growth 542732288 bytes); combined `//tests:storage_test_ssh_mux //tests:storage_test_ssh_backend`
+    both passed (log SHA256 `e770cc8a735f6cf346babf9e23cbbec57127001c0d21a8f6679ac609141c9688`;
+    growth 66285568 bytes). Both ran in verified 2CPU/4GiB/swap0 scopes with `--batch`,
+    private output roots, resource admission and growth monitoring. Exact scopes inactive
+    after runs; no task-owned client/server or shared-lock holder remains. Third call
+    unused. This is bounded local evidence only; full gate, acceptance and merge remain
+    pending.'
