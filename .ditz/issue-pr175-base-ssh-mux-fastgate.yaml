@@ -46,3 +46,14 @@ log_events:
     PID/fd/lock release. Focused green attempts reached no Nix/Bazel client. Root
     has the corrected wrapper for review and has instructed no more runtime until
     a scheduled turn. No acceptance or gate waiver is claimed.'
+- time: 2026-11-12T04:39:54-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Corrected wrapper handoff: task-owned `/tmp/storage-mux-type-cFiKLLHr/bounded/run.sh`,
+    SHA256 `146536312faf5af3758d066bb80530e1e6b33a4b841d37efc6ed30f9634ec6c4`; `bash
+    -n` passes. Root reviewed the exact bytes/hash CLEAN for the bounded envelope;
+    it differs from the reviewed PR175 wrapper only in task-owned scratch paths. `flock
+    --close`, systemd scope limits, inner cgroup/resource checks, 600s timeout, growth/free-space
+    monitor, `--batch`, and owned output roots are specified. This is source review
+    only, not test evidence. Scheduling HOLD: PR175 has the runtime turn. Root explicitly
+    requires a next-slot message before any run.'
