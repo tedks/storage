@@ -661,3 +661,13 @@
 - Stage 1: internal scratch-only initializer claims a previously absent root via sibling provenance before root creation, matching UUID/root inode and manifest; non-mutating constructor gate precedes `StateManager` SQLite and `CacheManager` mkdir/scan. Default entry encountering any Stage 1 authority refuses before effects; missing authority on existing roots is not adopted and default legacy behavior is not changed by this proposal. Strict canonical read-only callback/worker/cache allowlist rejects unjournaled mutation/sync/stream/maintenance paths before effects; if that boundary is broad in implementation, shrink to constructor gate and return for review.
 - publication: current `CacheManager.fetch_into_cache` calls `on_installed` after `os.link` under cache+index+descriptor+freshness locks. Proposed `prepare_stage` writes/fsyncs pending marker before install guard/link; leave inner locks after no-replace link, fsync parent under caller path lock, then reenter guard for exact inode/token verification and CLEAN publication. Checked A fetch durably clears matching generation on installed inode marker first, manifest second, preserving newer/other debts. Failure/collision/crash cuts and five scratch schedules are specified in the existing durable contract, UNWRITTEN/UNRUN.
 - disposition: no actual new product question. `oq-durable-freshness-legacy-cache` remains open; Stage 1 cannot ship alone. No app/test edit, Nix/Bazel/runtime/probe/download, live data/mount, SSH/FUSE/Docker/Fleet, full gates/CLI, restart/deploy/merge. Prior budget exhausted; no owned process/scope/fixture/lease.
+
+## foreground-lead:64
+
+- kind: pushed-delivery-receipt
+- state: DURABLE_STAGE1_BOUNDARY_SUBMITTED_TO_ROOT; lane idle, review pending
+- refs: foreground-lead:63
+- applied_at: clean pushed status/docs head `391936df7e1ea7204fb2fab787e58a4377a1214a`, contract `5100e166127be5f2591dc4349dae09d7b9199b6e`; application/test bytes unchanged from `bcf062a`.
+- tracker: `storage171-namespace-guard-restart` received Stage 1 FINDINGS/refinement comment and `ditz sync` succeeded. No new issue needed; Ted legacy question remains open.
+- delivery: exact `%91` re-pinned as `storage:codex` on `/tmp/tmux-1000/default`; shared `tmux-message` returned `status=delivered`, `receipt=submitted`, one paste/Enter. Delivery is neither root review nor application/runtime clearance.
+- resource: no owned client, scope, fixture, lease or runtime work in this phase; five schedules remain UNWRITTEN/UNRUN. Full gates/CLI/formal council, merge and deployment remain outstanding.
