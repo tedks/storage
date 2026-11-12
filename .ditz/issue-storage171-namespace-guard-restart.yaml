@@ -44,3 +44,12 @@ log_events:
     Proposed contract contracts/durable-freshness-restart.md, tests unwritten/unrun.
     Legacy or lost root authority cannot be inferred empty; Ted migration question
     oq-durable-freshness-legacy-cache filed. Root review pending.
+- time: 2026-11-12T02:31:27-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Committed source-only proposal contracts/durable-freshness-restart.md
+    at 03a344e650472b8f34885f02de4e12ed6a065a30. This is design only: no app/test
+    edit or runtime. Root must review xattr-plus-root-manifest ordering and latency,
+    startup before sync/sweep, and conservative legacy refusal. Two deferred restart
+    tests and prefix/lazy child schedules remain UNRUN. Member reconciliation still
+    release-blocking.'
