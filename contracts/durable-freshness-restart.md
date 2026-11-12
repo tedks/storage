@@ -1,6 +1,6 @@
 # Proposed durable freshness and restart boundary for PR #171
 
-Status: SOURCE-ONLY revision of the audit at clean pushed `31c55cfeaf8038e7e9bfa8760d0d31b48925d673`, based on root/warm Sol FINDINGS at frozen `355e41b`; Luna STOP_AND_ESCALATE for implementation on existing roots. Nothing here is implemented or tested.
+Status: SOURCE-ONLY Stage 1 boundary refinement at clean pushed `19521d7888cf3190e146343bf0740745a5bf0496`, based on root/warm Sol review at frozen `c7c842d`; Luna PROCEED for this design refinement only. Nothing here is implemented or tested.
 Root/warm Sol scoped CLEAN at code/test `bcf062a` closes the narrow retry
 finding, not this boundary. No implementation or runtime evidence exists for
 the proposal below. Decision keys remain `foreground-open-pin-ownership` and
@@ -93,6 +93,135 @@ or B baseline clear A. A normal first-open member revalidation still runs:
 restoring a local marker never forges `verified_at`. The local marker check
 remains demand class; an uncertain cached open drops namespace/path locks and
 reclassifies to ordinary only for member probe/bulk fetch, as v3 requires.
+
+### Stage 1 restricted scratch-root execution boundary
+
+This is an internal opt-in mode of **real** `StorageFS`, `StateManager` and
+`CacheManager`, not a fake persistence service, mount/CLI setting, or default
+behavior change. A scratch-only initializer must claim a previously absent
+path: create a deterministic sibling provenance record with exclusive create
+and a fresh root UUID, sync it and its parent, then create the root exclusively
+and commit its empty versioned manifest with the same UUID and root
+`(dev,ino)` (no symlink). Creating the
+provenance record first ensures a crash during initialization cannot leave an
+apparently legacy root at that path. It may leave an unusable scratch claim;
+the initializer must not silently adopt or overwrite it. Reopen requires the
+explicit internal Stage 1 mode and expected UUID, and accepts only matching
+provenance, manifest version/revision and live root identity. Missing/corrupt data
+fails before effects. Total loss of both independent records remains locally
+indistinguishable and requires separate authority; the scratch tracer does
+not claim to solve that or select Ted's pending legacy migration policy.
+
+At the *first instruction* of `StorageFS` construction, before today's
+`StateManager(str(state_db))` opens/creates SQLite and before `CacheManager`
+mkdir/scans, perform a non-mutating mode/provenance check. An ordinary/default
+constructor aimed at a Stage 1 path with either sibling provenance or a root
+manifest must fail before constructor effects, so it cannot silently bypass
+the unfinished contract. A Stage 1 reopen parses and validates authority
+before those constructors, then restores debts before any partial cleanup,
+worker, watcher, open, sweep or maintenance effect. Initializing an existing
+root is unavailable. Default handling of existing roots lacking Stage 1
+authority remains **unchanged** in this phase; no deployed refusal, CLI option
+or migration is proposed. Direct constructor, `init` and `destroy` paths
+must obey the same gate and teardown only owned scratch resources. The
+internal reopen rejects constructor options that would start sync, streaming,
+watchers, checksum/recompute work or a sweep; it does not silently turn a
+requested effect off and claim the caller's requested mode ran.
+
+Stage 1's only positive operations are read-only canonical file open/read/
+release, local marker validation, required member stat/revalidation, guarded
+full-copy fetch, and cache accounting/eviction **after** debt is durable and
+held through the destructive action. `open` accepts only exact `O_RDONLY`
+without `O_CREAT`/`O_TRUNC` or other write intent; no writable descriptor can
+exist. Metadata lookup needed by those reads may run only if it cannot
+publish an uncertified CLEAN row/baseline. Public `getattr`/`readdir` and
+explicit member-suffix paths are unavailable until their publication paths
+are audited; Stage 1 tests use canonical file opens. All other callbacks
+that can mutate local bytes/names/policy, including `write`, `truncate`,
+`create`, `unlink`, `rename`, `mkdir`, `rmdir`, `chmod`, `chown`, `setxattr`,
+`removexattr`, `symlink`, `utimens` and writable `open`, reject at their
+entry **before any cache, index or backend effect**. Sync/upload/retry workers,
+watchers, streaming/prefix promotion, checksum/recompute workers, sweep,
+partial cleanup, rebuild/debug and direct cache mutators that bypass the
+guard are unavailable. The constructor cannot start them; `init` cannot
+enable them later. A release/fsync of a read-only descriptor cannot enqueue
+sync. `heal_stale_clean` cannot manufacture DIRTY from an unverified marker:
+an inode/row/stat mismatch stays uncertain until the Stage 1 marker rule
+proves it. An LRU eviction may remove only a path whose surviving debt is
+already in the manifest and whose path guard is held through unlink. Any
+private/direct callback route around this narrow allowlist must
+also reject, including a direct `CacheManager` install/eviction without the
+Stage 1 publication guard. A state produced by an unimplemented mutator is
+never accepted as certified on reopen. If the existing constructor/callback
+surfaces cannot enforce this without a broad mode framework, the first
+implementation package must shrink to pre-constructor authority validation
+and refusal tests, then return for boundary review; do not implement a
+half-gated read mode.
+
+### Stage 1 full-fetch and debt-clear order
+
+Today `CacheManager.fetch_into_cache` copies to a private partial, then under
+its cache lock enters `install_guard` (index -> descriptor -> freshness),
+links no-replace, and calls `on_installed` **after** the link inside those
+locks. `StorageFS._publish_full_fetch` then writes the CLEAN row/baseline and
+calls `_record_fetched`. That callback cannot supply a pre-link durable
+marker and must not fsync inside the leaf locks. A minimal Stage 1 split is:
+
+1. After the member copy and prefix-marker removal, a new `prepare_stage`
+   hook writes a versioned **pending** marker with the latest manifest debt
+   set (including A for B fallback) on the private stage and fsyncs that
+   file **before** the cache install lock/guard. The caller holds the canonical
+   path lock, but no cache/index/descriptor/freshness leaf. Manifest RMW uses
+   the root publication mutex and matching revision; its A debt was already
+   durable before invalidation. The marker itself grants no CLEAN authority.
+2. Existing install guard checks token, path revision, active mutation/DIRTY
+   exclusion and no-replace ownership, then links the staged inode. Exit the
+   guard and cache lock without calling the old `on_installed`; retain the
+   caller's path lock. Fsync the parent directory outside all those leaf
+   locks. A pending marker plus absent CLEAN row denies an unrelated direct
+   observer; ordinary same-path opens wait on the path lock. Direct cache
+   access in Stage 1 is disallowed as above. If the link loses, leave the
+   winner intact, discard only this stage, and neither publish its source
+   baseline nor clear its debt.
+3. Reenter the existing guarded publication boundary; verify the **exact**
+   staged inode owns the final path, the pending marker/root UUID, and the
+   same source generation/file revision token. On stale token or mismatch,
+   do not certify it. Conditionally remove only this linked inode if safe;
+   otherwise keep it pending/uncertain for replay, never overwrite a local
+   writer or another winner. For B fallback, only this verified stage may
+   publish its CLEAN row/baseline now; its marker and manifest still owe A.
+   A checked A stage waits for step 4 before CLEAN publication. A late B
+   stage cannot clear newer A/C obligations.
+4. For a checked A fetch, under the held path lock and after exact installed
+   inode/token validation, write and fsync a new marker on **that inode** with
+   only matching A generation removed and file revision advanced. This fsync
+   occurs outside index/descriptor/freshness leaves. Then, under the root
+   publication mutex, read the latest manifest revision and conditionally
+   remove only that matching `(file ID,member A,generation)` debt; preserve
+   B/C and any newer A, other roots and guards. Revalidate token/current
+   inode again at final guarded row/baseline publication. If the manifest
+   write fails, retain extra A debt (conservative); it does not resurrect A
+   forever after a **successful** matching clear, because replay unions the
+   advanced inode revision with the manifest's conditional generation state.
+   Replay considers only the current exact inode's highest valid marker for
+   that file ID; an older staged/orphan inode marker cannot re-add A. When
+   both current marker and manifest record the matching clear revision, A is
+   settled; if either still owes A, a later checked A read may repeat the
+   conditional clear rather than treating the debt as permanent.
+   A newer A generation wins over an older marker or clear. Manifest updates
+   are serialized RMW, never unconditional map replacement.
+
+Crash cuts: before marker fsync, private copy is disposable; after marker but
+before link, no canonical bytes changed; after link but before parent fsync,
+the name may or may not survive and remains pending; after parent fsync but
+before CLEAN publication, the exact inode is present but untrusted; after
+CLEAN publication with B, A remains owed in both authorities; after A marker
+clear but before manifest clear, A remains owed conservatively; after both
+matching clears, A bytes and revision are durable and only A's observed
+generation is settled. A stale token or lost no-replace race never publishes
+the loser's row/baseline. Stage 1 uses the normal read admission rule and
+keeps remote copy outside freshness locks; it does not claim physical
+power-loss qualification from process-restart tests.
 
 Before `NamespaceService.rename` makes its **first local destructive move**,
 persist a provisional old/new intent, its operation ID and source/target
@@ -218,58 +347,55 @@ storage-device behavior need separate qualification.
 ## Proposed real-path tracer, not authorized implementation
 
 Stage 1, **for explicitly initialized scratch roots only**, would prove real
-debt replay across a surviving CLEAN inode and across cache inode loss through
-the root manifest. It would wire a bootstrap barrier before open/sync/watcher/
-heal/sweep, changed-A publication before invalidation, B-stage marker before
-no-replace install, and generation-specific replay. Candidate source paths:
-`storage/fs.py`, `storage/cache.py`, `storage/cache_metadata.py`, and existing
-`tests/test_fs_threading.py`/`tests/test_fs_revalidate.py`; startup callers in
-`storage/fs.py` must not start effects until replay. This is one bounded
-boundary, not the prior nine-module persistence plan. It cannot ship alone:
-namespace intent/COMPLETED records, local-write prepare/checkpoint, existing
-root migration, physical durability qualification and member-name
-reconciliation remain unimplemented. Stage 2 would separately prove
-pre-move intent/terminal/replay, with source likely in `storage/fs.py` and
-`storage/namespace.py`; Stage 3 would separately prove the mutation protocol.
-Neither later stage is authorized here. Root boundary and necessity review
-precede any implementation/runtime grant.
+debt replay across a surviving CLEAN inode and across cache inode loss. The
+smallest coherent package is a pre-constructor provenance/manifest gate and
+replay in `storage/fs.py`; versioned marker parse/write in
+`storage/cache_metadata.py`; a pre-link stage hook and split post-link
+publication in `storage/cache.py` and `storage/fs.py`; and direct-constructor,
+callback and restart schedules in existing `tests/test_fs_threading.py` and
+`tests/test_fs_revalidate.py`. It must keep the existing no-replace and
+token/inode guard. The package is conditional on a small auditable refusal
+boundary; if direct callbacks or cache helpers bypass it, stop after the
+pre-constructor gate rather than expanding to a broad mode framework. No
+backend adapter, CLI, BUILD file or new persistence service is proposed.
+This is one bounded boundary, not the prior nine-module persistence plan.
+Namespace intent/COMPLETED records, local-write prepare/checkpoint,
+existing-root migration, physical durability qualification and member-name
+reconciliation remain unimplemented and unshippable. Root boundary/necessity
+review precedes any implementation/runtime grant.
 
 Deterministic scratch schedules (proposed, **unwritten/unrun**):
 
-1. On an explicitly initialized scratch root, activate the two deferred
-   `test_restart_of_b_fallback_restores_a_debt_before_freshness_shortcut` and
-   `test_restart_with_missing_cache_rejects_ambiguous_a_b_copies` schedules in
-   `tests/test_fs_threading.py`. Changed A, stale B fallback and a cancelled
-   missing-cache open must replay A's exact owed generation before demand
-   selection; B bytes never settle A debt or install a false baseline. A
-   matching later A fetch may settle only A. Fail marker publication before
-   install and assert no certified B CLEAN bytes.
-2. In `tests/test_fs_namespace_integration.py`, complete a real new rename
-   with callback and the explicit intended member set all confirmed. Restart
-   after durable COMPLETED: normal path access returns exact source bytes and
-   no new guard. Inject a crash before terminal fsync after returns: replay
-   provisional denial. Seed an independent older intersecting guard/debt and
-   prove it survives the new COMPLETED record. This is not a retry proof.
-3. There, fail/raise a member after a directory callback, then perform an
-   intersecting ancestor move and restart. Exact and translated old/new
-   prefixes still deny an absent `_freshness` lazy descendant, stale B fetch,
-   upload and destructive eviction; only a matching DIRTY child inode may be
-   read locally. Queue completion does not retire any record.
-4. In scratch startup/rebuild fixtures (`tests/test_fs_threading.py` and
-   `tests/test_index_audit.py`), corrupt/remove the root anchor/manifest or
-   supply an unknown version, including an otherwise empty existing root.
-   Assert zero background/member effects and preserved local bytes, rather
-   than inferred first use. Separately create a root with explicit provenance
-   and assert its initial empty authority is accepted. Physical power loss
-   remains outside this evidence.
-5. In `tests/test_fs_threading.py`, Event-gate W1 prepare, rename/repoint,
-   W2 write and opposite DIRTY completions; checkpoint or inject terminal
-   failure. Assert actual current-inode bytes, generation/debt, no stale CLEAN
-   or false upload, and that a failed later mark survives an older finalizer.
-   Create without a prior inode must have path intent before O_TRUNC/bytes.
-   This schedule belongs to later Stage 3, not Stage 1.
+1. Activate `test_restart_of_b_fallback_restores_a_debt_before_freshness_shortcut`
+   with explicit scratch provenance: changed A, stale B fallback, process
+   restart and A return. Assert B bytes only while A unavailable, exact A
+   generation replay before first-open selection, then A bytes/baseline and
+   only matching A debt clear. B/C and newer A remain owed.
+2. Activate `test_restart_with_missing_cache_rejects_ambiguous_a_b_copies`:
+   cancel ordinary admission after A observation invalidates the inode,
+   restart and assert manifest A debt prevents stale B CLEAN adoption without
+   a cache xattr. Verify demand/ordinary slot cleanup and later A recovery.
+3. Directly call construction and public/private mutation callbacks in
+   Stage 1: writable open, O_TRUNC, create, write, rename/unlink/mkdir,
+   xattr/policy mutation, streaming, sync/retry and direct cache install/
+   eviction must refuse before inode, index, member or queue effects. A
+   read-only open/read/release and safe cache accounting still work; `init`
+   cannot start disabled workers, and `destroy` closes only owned resources.
+4. Corrupt/remove/unknown-version manifest while retaining sibling
+   provenance; then point a default constructor at a valid Stage 1 root.
+   Each must fail before SQLite create/open, cache mkdir/scan, partial
+   cleanup or worker effects. A separately explicitly initialized fresh
+   scratch root reopens. Existing empty root without provenance is not
+   adopted by Stage 1; default legacy behavior is unchanged.
+5. Event-gate `prepare_stage` marker fsync, no-replace link, parent fsync,
+   checked A marker clear and conditional manifest clear. Inject failed
+   pre-link publication, stale token and lost link races, and a crash between
+   A marker and manifest clear. Assert exact canonical inode bytes, no
+   loser's baseline/CLEAN, A extra debt after interrupted clear, preservation
+   of B/C/new A debts and eventual matching A clear after retry. No marker
+   or manifest I/O runs under index/descriptor/freshness leaves.
 
-These process-restart schedules need same-schedule pre-fix behavioral RED
+These scratch schedules need same-schedule pre-fix behavioral RED
 (stale bytes, false upload/CLEAN, lost debt/guard, or unsafe startup), then
 GREEN after separately authorized implementation. The existing two restart
 tests are currently excluded from the narrow fence suite. Even if Stage 1
