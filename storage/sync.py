@@ -57,6 +57,7 @@ class SyncWorker(threading.Thread):
                  member_written_cb: Optional[Callable[[str, Backend, Path, Optional[str]], None]] = None,
                  upload_guard: Optional[Callable[[str], ContextManager]] = None,
                  path_guard: Optional[Callable[..., ContextManager]] = None,
+                 dir_retry_guard: Optional[Callable[..., ContextManager]] = None,
                  idle_timeout: float = 30.0,
                  retire_cb: Optional[Callable[['SyncWorker'], bool]] = None,
                  demand_changed_cb: Optional[Callable[[], None]] = None):
@@ -77,6 +78,7 @@ class SyncWorker(threading.Thread):
             member_written_cb=member_written_cb,
             upload_guard=upload_guard,
             path_guard=path_guard,
+            dir_retry_guard=dir_retry_guard,
         )
         self._stop_event = threading.Event()
         self._active_task: Optional[str] = None
@@ -184,6 +186,7 @@ class SyncManager:
                  member_written_cb: Optional[Callable[[str, Backend, Path, Optional[str]], None]] = None,
                  upload_guard: Optional[Callable[[str], ContextManager]] = None,
                  path_guard: Optional[Callable[..., ContextManager]] = None,
+                 dir_retry_guard: Optional[Callable[..., ContextManager]] = None,
                  max_workers: Optional[int] = None, idle_timeout: float = 30.0):
         """
         Initialize sync manager
@@ -205,6 +208,8 @@ class SyncManager:
                 task (StorageFS's upload lock for the path)
             path_guard: Context manager factory over paths, held across
                 each directory retry (StorageFS's path locks)
+            dir_retry_guard: FS-owned context yielding whether a directory
+                retry may mutate a member, held through the member call
         """
         self.state_manager = state_manager
         self.cache_manager = cache_manager
@@ -225,6 +230,7 @@ class SyncManager:
         self._member_written_cb = member_written_cb
         self._upload_guard = upload_guard
         self._path_guard = path_guard
+        self._dir_retry_guard = dir_retry_guard
 
         # Task queue (priority queue)
         self.task_queue = queue.PriorityQueue()
@@ -283,6 +289,7 @@ class SyncManager:
             member_written_cb=self._member_written_cb,
             upload_guard=self._upload_guard,
             path_guard=self._path_guard,
+            dir_retry_guard=self._dir_retry_guard,
             idle_timeout=self.idle_timeout,
             retire_cb=self._retire_idle,
             demand_changed_cb=self._maybe_grow,

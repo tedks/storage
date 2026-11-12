@@ -299,6 +299,10 @@ class StorageFS(Operations):
         # has the full lock order. Under nothreads they are never contended.
         self._namespace_lock = NamespaceLock()
         self._path_locks = PathLocks()
+        # Orders namespace retries with both kinds of rename before either
+        # side takes its ordinary namespace/path/upload locks.
+        self._retry_rename_lock = threading.RLock()
+        self._retry_rename_owner = threading.local()
         # Held by a sync upload; rename and unlink wait for it (locks.py).
         self._upload_locks = UploadLocks()
 
@@ -350,6 +354,7 @@ class StorageFS(Operations):
             member_written_cb=self._record_member_written,
             upload_guard=self._upload_locks.hold_for_upload,
             path_guard=self._path_locked,
+            dir_retry_guard=self._dir_retry_guard,
         )
         self._sync_started = False
         if start_sync:
@@ -512,6 +517,41 @@ class StorageFS(Operations):
         """Hold the namespace lock shared and the given canonical paths' locks."""
         with self._namespace_lock.shared(), self._path_locks.hold(*paths):
             yield
+
+    @contextlib.contextmanager
+    def _retry_rename_serialized(self):
+        # A member callback must not re-enter public rename under its inner
+        # locks (a shared-to-exclusive namespace upgrade would fail).
+        if getattr(self._retry_rename_owner, "active", False):
+            raise RuntimeError("nested rename or directory retry")
+        with self._retry_rename_lock:
+            self._retry_rename_owner.active = True
+            try:
+                yield
+            finally:
+                self._retry_rename_owner.active = False
+
+    @contextlib.contextmanager
+    def _dir_retry_guard(self, *paths: str):
+        """Fence a queued member mutation against every unresolved move.
+
+        A retry drains uploads before taking namespace shared. The coverage
+        result stays valid through the member call because a new rename must
+        acquire the outer serializer before publishing a guard.
+        """
+        canonical = tuple(self._resolve_path(path).canonical_path for path in paths)
+        with self._retry_rename_serialized():
+            with self._upload_locks.drain(*canonical):
+                with self._path_locked(*canonical):
+                    with self._member_checks_lock:
+                        blocked = any(
+                            task == root or task.startswith(root.rstrip("/") + "/")
+                            or root.startswith(task.rstrip("/") + "/")
+                            for record in self._namespace_uncertainties
+                            for root in (record.old, record.new)
+                            for task in canonical
+                        )
+                    yield not blocked
 
     @contextlib.contextmanager
     def _try_path_locked(self, canonical_path: str):
@@ -2581,6 +2621,11 @@ class StorageFS(Operations):
         locks; a directory rename drains both subtrees before it takes the
         namespace lock, so it does not stall other paths while it waits.
         """
+        with self._retry_rename_serialized():
+            return self._rename_serialized(old, new)
+
+    def _rename_serialized(self, old, new):
+        """Existing rename lock order, under the retry-versus-rename fence."""
         old_resolved = self._resolve_path(old)
         new_canonical = self._resolve_path(new).canonical_path
         cache_path = old_resolved.canonical_cache_path

@@ -25,6 +25,7 @@ from storage.backends.base import is_interactive_request
 from storage.fs import StorageFS, mount_storage
 from storage.streaming import PrefetchSession
 from storage.models import FileLocation, SyncStatus
+from storage.sync_tasks import DirOperation, DirSyncTask
 
 WAIT = 5.0
 # How long a thread that should be blocked is given to (wrongly) finish.
@@ -2839,6 +2840,252 @@ class TestRenameRaces(ThreadingTestBase):
         self.assertEqual(b"inside", opener.finish())
         renamer.finish()
         self.assertEqual(b"inside", self.open_read_release("/e/f.txt"))
+
+
+class TestNarrowRetryFence(ThreadingTestBase):
+    """FS-wired retry executor against two scratch LocalBackend members."""
+
+    def setUp(self):
+        super().setUp()
+        self.fs.destroy("/")
+        self.a = self.member
+        self.b_dir = self.temp_dir / "other-member"
+        self.b_dir.mkdir()
+        self.b = LocalBackend("other", str(self.b_dir))
+        self.fs = StorageFS(
+            cache_root=self.cache_dir, state_db=self.temp_dir / "state.db",
+            backends={"member": self.a, "other": self.b},
+            cache_size=10 * 1024 * 1024, num_sync_workers=0,
+            start_sync=False,
+        )
+
+    def executor(self):
+        manager = self.fs.sync_manager
+        if not manager.workers:
+            manager.num_workers = manager.max_workers = 1
+            manager.start()
+        executor = manager.workers[0].executor
+        self.assertIs(executor.dir_retry_guard.__self__, self.fs)
+        return executor
+
+    def incomplete_dir_move(self, old, new, *, failed=None):
+        failed = failed or self.b
+        with patch.object(failed, "rename", side_effect=OSError(errno.EIO, "missed move")), \
+                patch.object(self.fs.sync_manager, "queue_dir_sync"):
+            self.fs.rename(old, new)
+        self.assertTrue(self.fs._namespace_covered(new))
+        return self.fs._namespace_uncertainties[-1]
+
+    def test_old_retry_blocked_by_newer_guard(self):
+        self.fs.mkdir("/a", 0o755)
+        (self.member_dir / "a" / "old.txt").write_bytes(b"original A")
+        (self.b_dir / "a" / "old.txt").write_bytes(b"original B")
+        self.assertEqual(b"original A", self.open_read_release("/a/old.txt"))
+        (self.member_dir / "a" / "old.txt").write_bytes(b"changed A")
+        self.fs._observe_changed_member("/a/old.txt", self.a,
+                                        self.a.stat("/a/old.txt"))
+        first = self.incomplete_dir_move("/a", "/b")
+        self.assertIn("member", first.source_debts["/a/old.txt"])
+        self.fs.rename("/b", "/c")
+        self.fs.mkdir("/b", 0o755)
+        self.assertTrue((self.cache_dir / "b").is_dir())  # old currency check passes
+        before = tuple(self.fs._namespace_uncertainties)
+        executor = self.executor()
+        for hint in ("other", None):
+            # A legacy untagged task is also fenced. The old B /a contains
+            # bytes; the new B /b is empty and can be replaced by os.replace.
+            task = DirSyncTask("/a", DirOperation.RENAME, new_path="/b",
+                               backend_hint=hint)
+            with patch.object(self.b, "rename", wraps=self.b.rename) as remote:
+                failure = None
+                try:
+                    executor.process_dir_task(task)
+                except RuntimeError as exc:
+                    failure = exc
+                # The old executor reaches LocalBackend.rename and replaces
+                # the distinct /b before any diagnostic assertion can pass.
+                stale = self.b_dir / "b" / "old.txt"
+                self.assertIsNone(stale.read_bytes() if stale.exists() else None)
+                self.assertIsNotNone(failure)
+                self.assertIn("deferred by unresolved", str(failure))
+                remote.assert_not_called()
+        self.assertEqual(b"original B", (self.b_dir / "a" / "old.txt").read_bytes())
+        self.assertEqual([], list((self.b_dir / "b").iterdir()))
+        self.assertEqual(before, tuple(self.fs._namespace_uncertainties))
+        self.assertIs(first, before[0])
+        self.assertIn("member", first.source_debts["/a/old.txt"])
+        self.assertIn("member", self.fs._freshness_snapshot("/c/old.txt")["debts"])
+
+    def test_retry_prefix_intersections_both_directions(self):
+        self.fs.mkdir("/parent", 0o755)
+        self.fs.mkdir("/parent/child", 0o755)
+        self.incomplete_dir_move("/parent/child", "/parent/other")
+        for path in ("/elsewhere", "/destination", "/parentish", "/separate"):
+            self.fs.mkdir(path, 0o755)
+        (self.b_dir / "parent" / "other" / "deep").mkdir(parents=True, exist_ok=True)
+        tasks = (
+            DirSyncTask("/parent", DirOperation.RENAME, new_path="/elsewhere", backend_hint="other"),
+            DirSyncTask("/parent/other/deep", DirOperation.RENAME,
+                        new_path="/destination", backend_hint="other"),
+        )
+        for task in tasks:
+            self.assertTrue(self.executor()._dir_task_current(task))
+            with patch.object(self.b, "rename", wraps=self.b.rename) as remote:
+                with self.assertRaisesRegex(RuntimeError, "deferred by unresolved"):
+                    self.executor().process_dir_task(task)
+                remote.assert_not_called()
+        # Segment boundaries matter: /parentish is unrelated to /parent.
+        task = DirSyncTask("/parentish", DirOperation.RENAME,
+                           new_path="/separate", backend_hint="other")
+        with patch.object(self.b, "rename", wraps=self.b.rename) as remote:
+            self.assertTrue(self.executor().process_dir_task(task))
+            remote.assert_called_once_with("/parentish", "/separate")
+        self.assertTrue((self.b_dir / "separate").is_dir())
+
+    def test_retry_first_keeps_unrelated_reads_responsive(self):
+        self.fs.mkdir("/slow", 0o755)
+        self.fs.mkdir("/unrelated", 0o755)
+        (self.member_dir / "warm.txt").write_bytes(b"warm bytes")
+        self.assertEqual(b"warm bytes", self.open_read_release("/warm.txt"))
+        sync_queue = patch.object(self.fs.sync_manager, "queue_sync")
+        sync_queue.start()
+        self.addCleanup(sync_queue.stop)
+        fd = self.fs.create("/slow/child.txt", 0o644)
+        self.fs.write("/slow/child.txt", b"local child", 0, fd)
+        self.fs.release("/slow/child.txt", fd)
+        executor = self.executor()
+        gate = self.gate(self.b, "mkdir", only=lambda path: path == "/slow")
+        retry = Worker(executor.process_dir_task,
+                       DirSyncTask("/slow", DirOperation.MKDIR, backend_hint="other"))
+        file_move = Worker(self.fs.rename, "/slow/child.txt", "/slow/renamed.txt")
+        dir_move = Worker(self.fs.rename, "/unrelated", "/moved")
+        retry.start()
+        self.assertTrue(gate.started.wait(WAIT))
+        try:
+            file_move.start()
+            dir_move.start()
+            warm = Worker(self.open_read_release, "/warm.txt")
+            listing = Worker(lambda: set(self.fs.readdir("/", None)))
+            warm.start()
+            listing.start()
+            self.assertEqual(b"warm bytes", warm.finish())
+            self.assertIn("warm.txt", listing.finish())
+            self.assertTrue(file_move.is_alive())
+            self.assertTrue(dir_move.is_alive())
+        finally:
+            gate.opened.set()
+        self.assertTrue(retry.finish())
+        file_move.finish()
+        dir_move.finish()
+        self.assertEqual(b"local child", (self.cache_dir / "slow" / "renamed.txt").read_bytes())
+        self.assertEqual(SyncStatus.DIRTY,
+                         self.fs.state_manager.get_file_metadata("/slow/renamed.txt").sync_status)
+        self.assertEqual([], self.fs._namespace_uncertainties)
+
+    def test_rename_first_denies_queued_retry(self):
+        self.fs.mkdir("/folder", 0o755)
+        def missed(_old, _new):
+            raise OSError(errno.EIO, "member missed rename")
+
+        gate = Gate(missed, only=lambda old, new: old == "/folder")
+        self.gates.append(gate)
+        patcher = patch.object(self.b, "rename", side_effect=gate)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        dir_queue = patch.object(self.fs.sync_manager, "queue_dir_sync")
+        dir_queue.start()
+        self.addCleanup(dir_queue.stop)
+        mover = Worker(self.fs.rename, "/folder", "/moved")
+        mover.start()
+        self.assertTrue(gate.started.wait(WAIT))
+        retry = Worker(self.executor().process_dir_task,
+                       DirSyncTask("/folder", DirOperation.RENAME,
+                                   new_path="/moved", backend_hint="other"))
+        retry.start()
+        try:
+            self.assertTrue(retry.is_alive())
+        finally:
+            gate.opened.set()
+        mover.finish()
+        self.assertTrue(self.fs._namespace_covered("/moved"))
+        retry.join(WAIT)
+        self.assertFalse(retry.is_alive())
+        self.assertIsInstance(retry.error, RuntimeError)
+        self.assertIn("deferred by unresolved", str(retry.error))
+
+    def test_mkdir_rmdir_retry_covered_by_guard(self):
+        self.fs.mkdir("/a", 0o755)
+        self.incomplete_dir_move("/a", "/b")
+        self.fs.mkdir("/b/child", 0o755)
+        executor = self.executor()
+        for task, operation in (
+            (DirSyncTask("/b/child", DirOperation.MKDIR, backend_hint="other"), "mkdir"),
+            (DirSyncTask("/a/gone", DirOperation.RMDIR, backend_hint="other"), "rmdir"),
+        ):
+            self.assertTrue(executor._dir_task_current(task))
+            with patch.object(self.b, operation, wraps=getattr(self.b, operation)) as remote:
+                with self.assertRaisesRegex(RuntimeError, "deferred by unresolved"):
+                    executor.process_dir_task(task)
+                remote.assert_not_called()
+        self.assertTrue((self.b_dir / "a").is_dir())
+        self.assertTrue((self.b_dir / "b" / "child").is_dir())
+        self.fs.mkdir("/outside", 0o755)
+        self.fs.mkdir("/gone", 0o755)
+        self.fs.rmdir("/gone")
+        for task, operation in (
+            (DirSyncTask("/outside", DirOperation.MKDIR, backend_hint="other"), "mkdir"),
+            (DirSyncTask("/gone", DirOperation.RMDIR, backend_hint="other"), "rmdir"),
+        ):
+            with patch.object(self.b, operation, wraps=getattr(self.b, operation)) as remote:
+                self.assertTrue(executor.process_dir_task(task))
+                remote.assert_called_once()
+
+    def test_file_rename_first_denies_queued_retry(self):
+        sync_queue = patch.object(self.fs.sync_manager, "queue_sync")
+        sync_queue.start()
+        self.addCleanup(sync_queue.stop)
+        fd = self.fs.create("/file.txt", 0o644)
+        self.fs.write("/file.txt", b"local file bytes", 0, fd)
+        self.fs.release("/file.txt", fd)
+        (self.member_dir / "file.txt").write_bytes(b"member file bytes")
+        self.fs.state_manager.add_file_location(FileLocation(
+            virtual_path="/file.txt", backend_name="member", checksum="",
+            last_synced=time.time(), is_cached=False,
+        ))
+        dir_queue = patch.object(self.fs.sync_manager, "queue_dir_sync")
+        dir_queue.start()
+        self.addCleanup(dir_queue.stop)
+
+        def missed(_old, _new):
+            raise OSError(errno.EIO, "member missed file move")
+
+        gate = Gate(missed, only=lambda old, new: old == "/file.txt")
+        self.gates.append(gate)
+        patcher = patch.object(self.a, "rename", side_effect=gate)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        mover = Worker(self.fs.rename, "/file.txt", "/new.txt")
+        mover.start()
+        self.assertTrue(gate.started.wait(WAIT))
+        retry = Worker(self.executor().process_dir_task,
+                       DirSyncTask("/file.txt", DirOperation.RENAME,
+                                   new_path="/new.txt", backend_hint="member"))
+        retry.start()
+        try:
+            self.assertTrue(retry.is_alive())
+        finally:
+            gate.opened.set()
+        mover.finish()
+        retry.join(WAIT)
+        self.assertFalse(retry.is_alive())
+        self.assertIsInstance(retry.error, RuntimeError)
+        self.assertIn("deferred by unresolved", str(retry.error))
+        self.assertEqual(1, len(gate.calls))
+        self.assertEqual(b"member file bytes", (self.member_dir / "file.txt").read_bytes())
+        self.assertEqual(b"local file bytes", (self.cache_dir / "new.txt").read_bytes())
+        self.assertEqual(SyncStatus.DIRTY,
+                         self.fs.state_manager.get_file_metadata("/new.txt").sync_status)
+        self.assertTrue(self.fs._namespace_covered("/new.txt"))
 
 
 class TestWatcherInvalidation(ThreadingTestBase):
