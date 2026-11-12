@@ -3,7 +3,9 @@
 - **Owner:** Storage desktop integration owner. **Consumers:** GIO/Nautilus
   monitor and the filesystem's metadata/content invalidation path.
 - **Inputs:** committed previous/new union revisions and local mutation
-  observations; per-path identity and revision, not bare reusable filenames.
+  observations; per-entry incarnation token and revision from the snapshot
+  contract, scoped to the mount generation, not bare reusable filenames or an
+  inferred stable remote inode.
 - **Outputs:** detected added/removed/metadata-changed observations and a
   capability result for the actual client URI/versions. Notification must
   follow snapshot commit: a consumer reacting immediately can enumerate the
@@ -26,7 +28,8 @@
 - **Failure semantics:** unsupported notification transport is explicit, never
   reported as live updates working. Overflow, dropped connection and sequence
   gaps require bounded resnapshot/reconciliation, not speculative deletions.
-  Notification callbacks run outside namespace/path locks and may not recurse
+  Notification callbacks run on separate delivery work, never on a FUSE
+  request-handler thread, outside namespace/path locks, and may not recurse
   into a blocking refresh. Unmount cancels subscription work and prevents
   late delivery to a new mount generation.
 - **Resource policy:** cap subscribers/active directories, queued events and
