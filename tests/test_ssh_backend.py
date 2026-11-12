@@ -1673,7 +1673,9 @@ class TestSSHBackendOnThePool(_BackendTestCase):
         failure = None
         try:
             self.assertTrue(held.wait(3), "three bulk leases did not start")
-            self.assertEqual(3, backend._pool.snapshot()["bulk_leased"])
+            lease_state = backend._pool.snapshot()
+            self.assertEqual(3, lease_state["bulk_leased"])
+            self.assertLessEqual(lease_state["sftp_open"], lease_state["sftp_cap"])
             self.assertNotIn("/data/cold", self.server.missing)
             with (patch.object(backend, "stat", side_effect=record_successful_stat),
                   patch.object(backend._pool, "_can_open_locked",
@@ -1713,7 +1715,9 @@ class TestSSHBackendOnThePool(_BackendTestCase):
         self.assertTrue(all(joins), f"bulk holders leaked: {joins}")
         for holder in holders:
             self.assertIsNone(holder.error)
-        self.assertEqual(0, backend._pool.snapshot()["bulk_leased"])
+        lease_state = backend._pool.snapshot()
+        self.assertEqual(0, lease_state["bulk_leased"])
+        self.assertEqual(lease_state["sftp_open"], lease_state["idle"])
         if failure is not None:
             raise failure
 
