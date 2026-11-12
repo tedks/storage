@@ -20,3 +20,15 @@ log_events:
   who: Ted Smith
   what: created
   comment: ""
+- time: 2026-11-12T03:30:40-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Root/warm Sol review of frozen b0c0c4f versus c23bacf is FINDINGS, not
+    acceptance. Important S1 remains uncorrected and unverified: cache_metadata.stage1_authority_present
+    uses os.path.lexists, which can turn EACCES/EIO into apparent absence. With an
+    inaccessible marked cache root and an independently writable state-db path, default
+    StorageFS construction may open/create SQLite before CacheManager fails, violating
+    pre-effect refusal. Future bounded repair: non-mutating lstat where only ENOENT
+    means absent, plus scratch permission/error-injection behavioral test. No repair
+    or runtime authorized in the responsiveness-separation source-only audit; Stage1
+    remains disabled.'
