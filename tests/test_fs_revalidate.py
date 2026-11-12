@@ -8,6 +8,7 @@ checks instead of sleeping.
 """
 
 import dataclasses
+import json
 import logging
 import os
 import shutil
@@ -20,6 +21,7 @@ from unittest.mock import patch
 
 from storage.backends.local import LocalBackend
 from storage.fs import StorageFS
+from storage.cache_metadata import STAGE1_MANIFEST, stage1_claim_path
 from storage.models import SyncStatus
 
 
@@ -34,6 +36,85 @@ class NoMtimeBackend(LocalBackend):
         real_path = self._resolve_path(virtual_path)
         real_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(local_path, real_path)
+
+
+class TestStage1ConstructorGate(unittest.TestCase):
+    """The incomplete scratch mode cannot fall through to legacy startup."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name) / "cache"
+        self.db = Path(self.temp.name) / "state.db"
+
+    def _construct(self, **kwargs):
+        return StorageFS(self.root, self.db, {}, 1024, start_sync=False, **kwargs)
+
+    def test_default_marked_root_refuses_before_sqlite_or_cache_effects(self):
+        # Fixture markers are deliberately created without the new helper so
+        # this same test is behavioral RED against the pre-gate application.
+        self.root.mkdir()
+        (self.root / STAGE1_MANIFEST).write_text(json.dumps({"version": 1}))
+        before = sorted(p.name for p in self.root.iterdir())
+        constructed = None
+        try:
+            with self.assertRaisesRegex(ValueError, "Stage1 scratch root"):
+                constructed = self._construct()
+        finally:
+            if constructed is not None:
+                constructed.destroy("/")
+        self.assertFalse(self.db.exists())
+        self.assertEqual(before, sorted(p.name for p in self.root.iterdir()))
+
+    def test_initialized_root_requires_explicit_reopen_and_does_not_start_yet(self):
+        root_uuid = StorageFS.initialize_stage1_scratch_root(self.root, self.db)
+        self.assertTrue(stage1_claim_path(self.root).is_file())
+        with self.assertRaisesRegex(ValueError, "requires restricted reopen"):
+            self._construct()
+        with self.assertRaisesRegex(NotImplementedError, "boundary is incomplete"):
+            self._construct(stage1_scratch_uuid=root_uuid)
+        self.assertFalse(self.db.exists())
+
+    def test_missing_corrupt_and_unknown_authority_refuse_before_state_open(self):
+        root_uuid = StorageFS.initialize_stage1_scratch_root(self.root, self.db)
+        manifest = self.root / STAGE1_MANIFEST
+        original = manifest.read_bytes()
+        for payload in (b"not-json", b'{"version":99}', None):
+            with self.subTest(payload=payload):
+                if payload is None:
+                    manifest.unlink(missing_ok=True)
+                else:
+                    manifest.write_bytes(payload)
+                with self.assertRaises((OSError, ValueError)):
+                    self._construct(stage1_scratch_uuid=root_uuid)
+                self.assertFalse(self.db.exists())
+        manifest.write_bytes(original)
+        with self.assertRaises(ValueError):
+            self._construct(stage1_scratch_uuid="wrong-uuid")
+        self.assertFalse(self.db.exists())
+
+    def test_interrupted_claim_denies_legacy_root_creation(self):
+        stage1_claim_path(self.root).write_text("incomplete")
+        with self.assertRaisesRegex(ValueError, "Stage1 scratch root"):
+            self._construct()
+        self.assertFalse(self.root.exists())
+        self.assertFalse(self.db.exists())
+
+    def test_unmarked_legacy_root_keeps_existing_constructor_behavior(self):
+        self.root.mkdir()
+        fs = self._construct()
+        try:
+            self.assertTrue(self.db.exists())
+        finally:
+            fs.destroy("/")
+
+    def test_initializer_does_not_adopt_existing_cache_or_index(self):
+        self.root.mkdir()
+        (self.root / "local.txt").write_bytes(b"existing")
+        with self.assertRaises(ValueError):
+            StorageFS.initialize_stage1_scratch_root(self.root, self.db)
+        self.assertFalse(stage1_claim_path(self.root).exists())
+        self.assertEqual(b"existing", (self.root / "local.txt").read_bytes())
 
 
 class RevalidateTestBase(unittest.TestCase):

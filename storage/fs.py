@@ -33,7 +33,10 @@ from .backends.ssh_mux import close_shared_control_sockets
 from .backends.ssh_pool import is_connection_error
 from .cache import PARTIAL_SUFFIX, CacheManager
 from .locks import NamespaceLock, PathLocks, UploadLocks
-from .cache_metadata import PREFIX_XATTR, XATTR_CACHE_METADATA_NAME, regular_file_stat, scan_cache_entries
+from .cache_metadata import (PREFIX_XATTR, XATTR_CACHE_METADATA_NAME,
+                             initialize_stage1_scratch_root, regular_file_stat,
+                             scan_cache_entries, stage1_authority_present,
+                             verify_stage1_scratch_root)
 from .file_config import FileConfig, get_inherited_config
 from .foreground_admission import AdmissionClosed, ForegroundAdmission
 from .models import FileLocation, FileMetadata, StreamingKeepAfterClose, SyncStatus
@@ -179,6 +182,11 @@ class StorageFS(Operations):
         ".storage.mount.",         # mount lock files (.storage.mount.*.lock)
     )
 
+    @staticmethod
+    def initialize_stage1_scratch_root(cache_root: Path, state_db: Path) -> str:
+        """Provision an absent scratch root; restricted reads are not yet enabled."""
+        return initialize_stage1_scratch_root(cache_root, state_db)
+
     @classmethod
     def _is_hidden_entry(cls, name: str) -> bool:
         """Return True if name is an internal artifact that should be hidden from listings."""
@@ -236,7 +244,8 @@ class StorageFS(Operations):
                  listing_max_stale: float = DEFAULT_LISTING_MAX_STALE,
                  checksum_reverify_interval: float = DEFAULT_CHECKSUM_REVERIFY_INTERVAL,
                  max_foreground_operations: Optional[int] = None,
-                 max_sync_workers: Optional[int] = None):
+                 max_sync_workers: Optional[int] = None,
+                 stage1_scratch_uuid: Optional[str] = None):
         """
         Initialize Storage filesystem
 
@@ -277,7 +286,21 @@ class StorageFS(Operations):
                 whose hash worker is idle hashes again the one file whose
                 persisted hash was checked longest ago (and over
                 CHECKSUM_REVERIFY_MIN_AGE ago); 0 turns it off
+            stage1_scratch_uuid: Internal scratch-root authority to verify
+                before any constructor effects. The restricted read mode is
+                not yet enabled, so verified roots still refuse construction.
         """
+        # This gate must precede StateManager's SQLite open/create and
+        # CacheManager's mkdir/scan. The read-only Stage1 callback boundary
+        # is not yet small enough to enable safely; a marked root cannot be
+        # opened through the legacy constructor in the meantime.
+        if stage1_scratch_uuid is None:
+            if stage1_authority_present(Path(cache_root)):
+                raise ValueError("Stage1 scratch root requires restricted reopen")
+        else:
+            verify_stage1_scratch_root(cache_root, state_db, stage1_scratch_uuid)
+            raise NotImplementedError("Stage1 restricted read boundary is incomplete")
+
         self.state_manager = StateManager(str(state_db))
         self.cache_manager = CacheManager(cache_root, self.state_manager, cache_size)
         self.cache_manager.descriptor_guard = self._descriptor_guard
