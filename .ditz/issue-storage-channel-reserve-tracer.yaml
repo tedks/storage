@@ -1,0 +1,23 @@
+id: storage-channel-reserve-tracer
+title: Classify foreground cold copies as bulk while preserving listing reserve
+desc: Independent bounded channel-classification tracer from accepted release base
+  81793ac. Cold whole-file copies inherit the FUSE interactive context, and StorageFS.readdir
+  defers the concrete NamespaceService listing until after that context exits. Add
+  a reversible bulk scope around only copy_to_local and evaluate readdir during dispatch;
+  prove real fake SSH pool reserve and bytes under Event-gated copies. This is a draft
+  partial behavior package, not full foreground admission, dynamic worker growth,
+  durability/reconciliation, or release acceptance. Full four gates, CLI, formal council
+  and lead review remain integration requirements.
+type: task
+component: storage
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-12T03:42:27-00:00
+references: []
+log_events:
+- time: 2026-11-12T03:42:27-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
