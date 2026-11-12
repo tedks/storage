@@ -48,3 +48,11 @@ log_events:
     passed 986 sandboxed, 8 resilience and build source check. Three renewed invocations
     spent, all scopes inactive. Root delta review and all release gates remain pending;
     do not close.
+- time: 2026-11-12T04:08:52-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'T1 review at a006e6b scoped CLEAN. PR175 rebased cleanly to published
+    master 66c640a; five prior patches range-diff equal, test-only safety timer 5->30
+    seconds, pushed head 50418327de1af6822955d6d72b138753c591ec34. New-base forced
+    fast gate ran 40 targets: 39 pass, unchanged ssh_mux test fails (tracked as pr175-base-ssh-mux-fastgate);
+    CLI build passes. Formal council round opened. No gate waiver or merge acceptance.'
