@@ -44,3 +44,16 @@ log_events:
   who: Ted Smith
   what: updated description
   comment: ""
+- time: 2026-11-12T21:39:47-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'STORAGE-LIVE-UNION-SPEC-20261112: Ted requested a spec for stale-first
+    union listings that update an open Nautilus view, including writes to existing
+    files. Draft PR178 at e1cba4d saves the proposal/contracts. Successful reachable
+    empty chunk1 contributes no names; errors are separate. Time-based reconciliation
+    plus watcher hints is the proposed scheduler, not directory-mtime certification
+    (parent mtime need not change on child overwrite). Numeric freshness/active polling/resource
+    bounds and stale/error UI policy remain unresolved; recommend choosing them after
+    a scratch client-notification capability proof, without live mounts. Existing
+    60s/3600s values are reference only. No runtime implementation or deployment is
+    claimed. This records new intent, not ratification of values or notification feasibility.'
