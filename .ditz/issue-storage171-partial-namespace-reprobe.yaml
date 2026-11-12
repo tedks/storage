@@ -69,3 +69,14 @@ log_events:
     Cache/index/freshness enumeration alone cannot cover future/lazy descendants.
     No application/test edit or runtime in this audit. Prior test correction and deferred
     restart cases remain unrun; root design decision and new authority required.'
+- time: 2026-11-12T00:51:11-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Root adjudicated namespace-subtree-uncertainty-coverage based_on63f22f8
+    and owner reconciled at 2a9c88a. In-memory tracer uses paired segment-bounded
+    old/new negative domains, narrow rename progress receipt and exact local DIRTY
+    proof. Raised and returned member failures remain quarantined. This is still FINDINGS/in
+    progress: normal returned failure may leave EIO/no upload until reconciliation,
+    durable restart recovery is absent. Release blockers tracked by storage171-namespace-reconciliation
+    and storage171-namespace-guard-restart. Scoped RED/GREEN and final suite evidence
+    to follow; no PR acceptance.'
