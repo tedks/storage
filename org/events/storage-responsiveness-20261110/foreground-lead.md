@@ -640,3 +640,13 @@
 - concurrency: proposed root manifest publication mutex before descriptor/freshness/metadata leaves, pre-byte file/path intent, token/epoch/current-inode revalidation, live DIRTY publication under existing order and later explicit durability checkpoint. Opposite-order writers, writer/rename repointing, absent-path create and post-effect terminal failure have explicit invariants; ordinary pwrite does not gain data fsync. Manifest RMW preserves independent obligations. This is proposal only; no code correctness or performance is claimed.
 - staging: first possible tracer is exact A-debt/B-fallback and missing-inode replay on explicitly initialized scratch roots. Namespace intent/terminal, local-write persistence, existing-root migration and member reconciliation are later/unshippable blockers. Five proposed schedules are UNWRITTEN/UNRUN. `contracts/namespace-reconciliation.md` clarifies new completion versus prior ambiguity and scoped retry review closure.
 - scope/resource: source/docs/tracker reads only; no application/test edit, Bazel/Nix/runtime/probe/download, live mount/data, SSH/FUSE/Docker/Fleet, full gates/CLI, deployment or merge. Prior 4/4 runtime envelope exhausted; no owned client/scope/fixture/lease acquired.
+
+## foreground-lead:62
+
+- kind: pushed-delivery-receipt
+- state: DURABLE_RESTART_BOUNDARY_REVISION_SUBMITTED_TO_ROOT; lane idle, review pending
+- refs: foreground-lead:61
+- applied_at: clean pushed docs/status head `c7c842da09db7eb3131786596983f6a71f52a995`, contract/consumed prose `b15e1d76699677451c76b9a111578c3b9ebcf227`; code/test unchanged from `bcf062a`.
+- tracker: `storage171-namespace-guard-restart` commented with FINDINGS/staging and `ditz sync` succeeded. `oq-durable-freshness-legacy-cache` remains open; no new product ruling inferred.
+- delivery: exact `%91` re-pinned as `storage:codex` on `/tmp/tmux-1000/default`; shared `tmux-message` returned `status=delivered`, `receipt=submitted`, one paste/Enter. Delivery is not root review, implementation/runtime clearance or PR acceptance.
+- resource: no owned process, client, scope, fixture or lease from this source-only phase. No new gate, CLI, full council, merge or deployment evidence.
