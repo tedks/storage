@@ -30,3 +30,12 @@ log_events:
     raise inside StorageFS.__call__ rather than before generator return. Resolve or
     file rationale in the same future authorized fix delta. Product errno choice is
     separate oq-pr175-bulk-timeout-errno; do not change policy without Ted.'
+- time: 2026-11-12T04:31:40-00:00
+  who: Ted Smith
+  what: commented
+  comment: At bec7d1d test/contract source, added successful member-stat, original
+    pool denial observer, same-file interactive-capacity control, and bounded joins.
+    First negative-control attempt waited 60s on shared mux runtime flock and timed
+    out before systemd/Bazel; 0/3 invocations spent. Temporary cache.py mutation was
+    restored to blob d0cd68b; runtime proof remains pending. No formal council rerun
+    or policy choice.
