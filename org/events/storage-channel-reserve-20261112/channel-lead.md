@@ -84,3 +84,18 @@
   disabled the copy's `bulk_request`, then restored production bytes. T1
   evidence is ready for root delta review, not formal council, full gates,
   CLI, merge or deployment.
+
+## channel-lead:7
+
+- kind: lead-review
+- based_on: `a006e6b97f9bf9be3a0a82480b172b908c8d074c`
+- applied_at: pending rebased checkpoint
+- refs: `channel-lead:6`, root/warm Sol `channel-reserve-t1-review-a006e6b.md`
+- state: T1 test delta scoped CLEAN; three production hunks unchanged. This
+  closes the schedule finding only. Nit disposition: extend the gated copy's
+  test-only safety wait from 5 to 30 seconds so it cannot expire before the
+  sequential readiness and browser bounds; finally still releases the gate.
+  Published master remains `66c640a`; branch rebase from accepted `81793ac`
+  gives a five-commit range-diff with equal patches and no conflict. New-base
+  fast gate, CLI and formal council are pending; PR170 incident and full
+  release gates remain open.

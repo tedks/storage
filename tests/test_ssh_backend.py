@@ -1540,7 +1540,7 @@ class TestSSHBackendOnThePool(_BackendTestCase):
                 calls.append(path)
                 if len(calls) >= 3:
                     entered.set()
-            if not release.wait(5):
+            if not release.wait(30):
                 raise AssertionError("copy gate was not released")
 
         self.server.hooks["get"] = hold_copy

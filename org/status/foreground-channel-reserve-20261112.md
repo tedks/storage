@@ -1,10 +1,11 @@
 # Foreground channel reserve: current state
 
-- State: draft PR #175; root/warm Sol review at `844684b` found the three
-  production hunks scoped CLEAN and test schedule T1 FINDINGS. Test-only
-  correction is pushed at `4fe8fb14d715ba080cb756bcd58c8ff3dd053ec0`
-  (tree `8629c026f6095ef89e85bf8fa9584e2eaab931e4`); its forced fast
-  gate passed. Root delta review remains pending. No deploy or merge.
+- State: draft PR #175; root/warm Sol T1 delta review at `a006e6b` is scoped
+  CLEAN. The branch is rebased onto published master `66c640a` from accepted
+  source `81793ac`; range-diff preserves all five prior commits. A test-only
+  safety timer now exceeds the sequential schedule bounds. New-base fast
+  gate, CLI build, and formal council are pending. No release acceptance,
+  deploy or merge.
 - Owner: channel Sol lead; worktree
   `/home/tedks/Projects/storage/foreground-channel-reserve-20261112`, branch
   `fix/foreground-channel-reserve-20261112`.
@@ -41,7 +42,7 @@
   plus reused repository cache was 755,671,040 bytes, about 665 MiB above
   the first baseline, below the 2 GiB abort threshold. No download was
   reported in these logs; network byte count is unknown.
-- Remaining: four full local gates, CLI build, formal council fixpoint, root review,
+- Remaining: new-base fast gate, CLI build, four full local gates, formal council fixpoint, root review,
   PR #170 incident clearance and merge-gated normal merge are later gates.
   Known baseline freshness/namespace defects are unchanged and unaccepted.
 - Tracker: `storage-channel-reserve-tracer` (ditz); metadata sync succeeded.
