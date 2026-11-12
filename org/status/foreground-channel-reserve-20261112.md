@@ -1,14 +1,12 @@
 # Foreground channel reserve: current state
 
-- State: draft PR #175; root/warm Sol T1 delta review at `a006e6b` is scoped
-  CLEAN. The branch is rebased onto published master `66c640a` from accepted
-  source `81793ac`; range-diff preserved five patches before the test timer
-  nit change. New-base CLI build passed. Forced fast gate executed 40 targets:
-  39 passed, unchanged SSH mux test failed (ditz
-  `pr175-base-ssh-mux-fastgate`). Formal round at `5041832`: OpenAI CLEAN,
-  Anthropic one Important and four Nits, Google EMPTY due quota. The
-  in-scope timeout assertion and contract/test nits are being repaired;
-  council convergence and release acceptance remain pending. No deploy or merge.
+- State: draft PR #175 at reviewed code head `16fa46d`; formal round 2 is
+  FINDINGS, with Anthropic's causal timeout proof Important outstanding.
+  Google remains EMPTY due quota. The present evidence-only package adds a
+  successful member-stat observation, the real pool denial, and a same-file
+  interactive-capacity control to that test. Production changes are forbidden.
+  Final SHA-specific control/module receipts belong in the PR and tracker.
+  Council convergence and release acceptance remain pending. No deploy or merge.
 - Owner: channel Sol lead; worktree
   `/home/tedks/Projects/storage/foreground-channel-reserve-20261112`, branch
   `fix/foreground-channel-reserve-20261112`.
@@ -21,6 +19,10 @@
   30-minute limit. No invocation remains. Scratch:
   `/tmp/storage-channel-reserve-5Ra6HI`; only the prior owned pinned
   repository cache was reused. No prior PR #171 process or scope was active.
+- Current causal-proof budget: 0/3 new focused invocations spent at this
+  checkpoint, limited to a disabled-classification control, whole SSH backend
+  module, and one repair reserve. The mux lane's shared flock is required
+  before every capacity check and held through client exit.
 - T1 repair budget: 3/3 new invocations spent. First stopped at Bazel analysis
   because this baseline has no `//tests:storage_test_ssh_backend` target;
   it ran no test. Second ran the corrected same-schedule test with only the
@@ -45,8 +47,10 @@
   plus reused repository cache was 755,671,040 bytes, about 665 MiB above
   the first baseline, below the 2 GiB abort threshold. No download was
   reported in these logs; network byte count is unknown.
-- Remaining: new-base fast gate, CLI build, four full local gates, formal council fixpoint, root review,
-  PR #170 incident clearance and merge-gated normal merge are later gates.
+- Remaining: unchanged SSH mux fast-gate failure, four full local gates,
+  formal council fixpoint, root review, PR #170 incident clearance and
+  merge-gated normal merge are later gates. Ted has not ruled on the observed
+  ENOENT mapping for bulk-wait expiry; `oq-pr175-bulk-timeout-errno` is open.
   Known baseline freshness/namespace defects are unchanged and unaccepted.
 - Tracker: `storage-channel-reserve-tracer` (ditz); metadata sync succeeded.
 - Resource state: RED, RED2, GREEN and FAST scopes inactive after exit;

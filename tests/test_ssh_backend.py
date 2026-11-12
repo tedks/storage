@@ -1,4 +1,5 @@
 import concurrent.futures
+from contextlib import nullcontext
 import errno
 import contextvars
 import os
@@ -1625,6 +1626,8 @@ class TestSSHBackendOnThePool(_BackendTestCase):
         """Bulk contention can make a foreground cold open fail before copy."""
         from storage.fs import StorageFS
 
+        payload = b"existing-cold-file"
+        self.server.payload = payload
         backend = self._new_backend(connect_timeout=0.15)
         backend._pool.bulk_wait = 0.2
         root = Path(tempfile.mkdtemp(prefix="storage-channel-timeout-"))
@@ -1638,6 +1641,21 @@ class TestSSHBackendOnThePool(_BackendTestCase):
         release = threading.Event()
         lock = threading.Lock()
         count = 0
+        successful_stats = []
+        denied_bulk = threading.Event()
+        original_stat = backend.stat
+        original_can_open = backend._pool._can_open_locked
+
+        def record_successful_stat(path):
+            result = original_stat(path)
+            successful_stats.append((path, result.st_size))
+            return result
+
+        def observe_real_pool_decision(interactive):
+            allowed = original_can_open(interactive)
+            if not interactive and not allowed:
+                denied_bulk.set()
+            return allowed
 
         def hold_bulk():
             nonlocal count
@@ -1647,22 +1665,47 @@ class TestSSHBackendOnThePool(_BackendTestCase):
                         count += 1
                         if count == 3:
                             held.set()
-                    if not release.wait(5):
+                    if not release.wait(30):
                         raise AssertionError("bulk holder was not released")
 
         holders = [_InThread(hold_bulk) for _ in range(3)]
         joins = []
+        failure = None
         try:
             self.assertTrue(held.wait(3), "three bulk leases did not start")
             self.assertEqual(3, backend._pool.snapshot()["bulk_leased"])
-            with self.assertRaises(OSError) as raised:
-                fs("open", "/cold", os.O_RDONLY)
-            self.assertEqual(errno.ENOENT, raised.exception.errno)
-            self.assertTrue(backend.is_available())
-            self.assertEqual(3, backend._pool.snapshot()["bulk_leased"])
-            self.assertFalse(fs.cache_manager.is_cached("/cold"))
-            self.assertIsNone(fs.state_manager.get_file_metadata("/cold"))
-            self.assertFalse(any(name == "get" for name, *_ in self.server.requests))
+            self.assertNotIn("/data/cold", self.server.missing)
+            with (patch.object(backend, "stat", side_effect=record_successful_stat),
+                  patch.object(backend._pool, "_can_open_locked",
+                               side_effect=observe_real_pool_decision)):
+                with self.assertRaises(OSError) as raised:
+                    fs("open", "/cold", os.O_RDONLY)
+                # The stat returned a real size before the copy encountered
+                # the unchanged pool decision; a missing file cannot pass.
+                self.assertIn(("/cold", len(payload)), successful_stats)
+                self.assertTrue(denied_bulk.is_set(), "copy did not reach the bulk cap")
+                self.assertEqual(errno.ENOENT, raised.exception.errno)
+                self.assertTrue(backend.is_available())
+                self.assertEqual(3, backend._pool.snapshot()["bulk_leased"])
+                self.assertFalse(fs.cache_manager.is_cached("/cold"))
+                self.assertIsNone(fs.state_manager.get_file_metadata("/cold"))
+                self.assertFalse(any(name == "get" for name, *_ in self.server.requests))
+
+                # The failed open installed no cache entry. With only the
+                # copy's bulk scope disabled, the same file uses the spare
+                # interactive channel while all three holders remain gated.
+                with patch("storage.cache.bulk_request", new=nullcontext):
+                    fd = fs("open", "/cold", os.O_RDONLY)
+                    try:
+                        self.assertEqual(payload, fs("read", "/cold", 1024, 0, fd))
+                    finally:
+                        fs("release", "/cold", fd)
+                self.assertEqual(3, backend._pool.snapshot()["bulk_leased"])
+                self.assertEqual(1, sum(name == "get" for name, *_ in self.server.requests))
+                self.assertTrue(fs.cache_manager.is_cached("/cold"))
+                self.assertIsNotNone(fs.state_manager.get_file_metadata("/cold"))
+        except BaseException as exc:
+            failure = exc
         finally:
             release.set()
             for holder in holders:
@@ -1671,6 +1714,8 @@ class TestSSHBackendOnThePool(_BackendTestCase):
         for holder in holders:
             self.assertIsNone(holder.error)
         self.assertEqual(0, backend._pool.snapshot()["bulk_leased"])
+        if failure is not None:
+            raise failure
 
 
     def test_parallel_operations_share_one_connection(self):
