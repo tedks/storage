@@ -37,5 +37,14 @@ log_events:
     which member or queue dominates is unverified. Next: per-member listing timing
     at debug, or a read-only ps on drynwyn during a cold listing, to check for checksum
     processes.'
+- time: 2026-11-12T19:27:37-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Correction 2026-11-12 (root review of PR #177 at 93ed39f): the slow readdir
+    was first observed, not proven cold, and its time is not attributed to raid, chunk1
+    or channel queueing; those, checksum scheduling, the merge and Python/FUSE overhead
+    are unmeasured hypotheses. 81793ac already reserves 1 SFTP channel per member
+    for interactive requests; unaccepted #175 fixes cold copies holding interactive
+    leases.'
 blocked_by:
 - field-listing-downloads-to-hash
