@@ -1,2 +1,5 @@
+# Drop-in hook, docs/specs/drop-in-infrastructure.md D2 (tedks): the org hosts'
+# ambient profile. The file exists only on org hosts; this workspace's own
+# lines below and .bazelrc.local (last) override it.
 try-import /etc/tedks/infra.bazelrc
 try-import %workspace%/.bazelrc.local
