@@ -103,3 +103,13 @@ log_events:
     fix; exact-head eight nonmount targets pass, including 83 threading selected.
     This fixes the ancestor escape only. Member-name reconciliation and durable guard
     recovery remain open and the in-memory tracer remains unshippable.'
+- time: 2026-11-12T01:17:09-00:00
+  who: Ted Smith
+  what: commented
+  comment: Root/warm Sol reviewed ancestor code delta d79b785 against 19dc97c as scoped
+    CLEAN, not formal PR acceptance. Evidence-only test f6c4605 captures progress
+    from the real second /parent -> /elsewhere NamespaceService.rename, asserts intended
+    exactly {changedA, staleB}, confirmed==intended and failed/unknown empty before
+    quarantine/byte controls. One focused exact pushed-head test passed with 84 deselected;
+    no application edit. In-memory namespace reconciliation and durable restart remain
+    release blockers; this issue stays open.
