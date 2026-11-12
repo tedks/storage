@@ -15,8 +15,8 @@ type: task
 component: foreground-responsiveness
 release:
 reporter: Ted Smith <tedks@riseup.net>
-status: unstarted
-disposition:
+status: closed
+disposition: fixed
 creation_time: 2026-11-12T02:05:24-00:00
 references: []
 log_events:
@@ -40,5 +40,12 @@ log_events:
     restart cases deselected). Retry still terminates unresolved under bounded policy;
     no guard retirement/recovery claim. Root fix-delta review pending; issue retained
     open until review.
+- time: 2026-11-12T02:26:12-00:00
+  who: Ted Smith
+  what: 'closed: fixed'
+  comment: Root and warm Sol scoped CLEAN at bcf062a against 83b26ab; exact-head 8/8
+    affected nonmount targets actually executed and passed, with only two named deferred
+    restart exclusions. This closes retry-fence test migration only, not namespace
+    reconciliation or PR acceptance.
 blocks:
 - storage171-namespace-reconciliation
