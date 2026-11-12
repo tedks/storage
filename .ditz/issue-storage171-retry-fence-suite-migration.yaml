@@ -1,0 +1,26 @@
+id: storage171-retry-fence-suite-migration
+title: Migrate retry and rename race tests for the unresolved-domain fence
+desc: Reconcile three exact-head nonmount suite failures after the bounded pre-I/O
+  retry fence. At pushed 83b26ab, test_fs_threading.TestRenameRaces.test_opposite_renames_wait_on_the_sorted_first_path
+  assumes the second rename waits on a path lock; it now waits on the deliberately
+  earlier outer serializer. test_sync_races.TestDirectoryRetries.test_rename_retry_applies_while_the_old_name_is_in_use_again
+  and test_rename_retry_for_an_evicted_file_still_applies expect an incomplete move
+  retry to mutate a member, contrary to the approved unresolved-domain fence; both
+  now reach explicit deferred failure with guard/debt retained. Review and migrate
+  the old assertions to preserve original byte/no-deadlock intent under the new safety
+  boundary, and rerun exact-head affected suites under a fresh explicit envelope.
+  Do not waive an application defect if investigation finds one. No runtime budget
+  remains from STORAGE171-NARROW-RETRY-FENCE-IMPLEMENT.
+type: task
+component: foreground-responsiveness
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-12T02:05:24-00:00
+references: []
+log_events:
+- time: 2026-11-12T02:05:24-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
