@@ -1,0 +1,20 @@
+id: storage171-retry-test-names
+title: Rename historical retry and serializer test names
+desc: After the scoped canonical retry repair, three migrated tests retain historical
+  names saying applies or sorted first path even though they now assert terminal deferral
+  and outer serializer waiting. Rename them on the next relevant test-source edit;
+  do not spend a runtime cycle solely on names. Root/warm Sol review canonical-retry-review-bcf062a
+  scoped CLEAN and noted this nit.
+type: task
+component: foreground-responsiveness
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-12T02:26:12-00:00
+references: []
+log_events:
+- time: 2026-11-12T02:26:12-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
