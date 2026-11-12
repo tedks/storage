@@ -53,3 +53,18 @@ log_events:
     startup before sync/sweep, and conservative legacy refusal. Two deferred restart
     tests and prefix/lazy child schedules remain UNRUN. Member reconciliation still
     release-blocking.'
+- time: 2026-11-12T02:44:28-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Root/warm Sol FINDINGS on frozen durable proposal 355e41b and Luna STOP_AND_ESCALATE
+    for implementation on existing roots. Source-only correction at current branch
+    (contract commit pending): a fully confirmed NEW rename gets a durable operation-specific
+    COMPLETED outcome before success, preserving older/translated guards and origin
+    debts; prior unknown/partial moves still need member lineage reconciliation. Existing
+    empty root is not first-use evidence; explicitly initialized scratch-root provenance
+    is the only proposed Stage 1 scope. Pre-byte mutation intent, live DIRTY publication
+    and later ordered checkpoint are separated without per-pwrite data fsync. Stage
+    1 proposes A-debt/B-fallback and missing-inode replay only; namespace/mutation
+    durability, existing-root migration and reconciliation remain release blockers.
+    Five schedules are design only, unwritten/unrun. No app/test edits or runtime
+    authorization; issue stays open.'
