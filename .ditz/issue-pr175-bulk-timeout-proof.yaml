@@ -22,3 +22,11 @@ log_events:
   who: Ted Smith
   what: created
   comment: ""
+- time: 2026-11-12T04:17:07-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Round2 also left two nits: contract should state observed ENOENT for healthy
+    existing cold file when bulk wait expires; and readdir prose should say errors
+    raise inside StorageFS.__call__ rather than before generator return. Resolve or
+    file rationale in the same future authorized fix delta. Product errno choice is
+    separate oq-pr175-bulk-timeout-errno; do not change policy without Ted.'
