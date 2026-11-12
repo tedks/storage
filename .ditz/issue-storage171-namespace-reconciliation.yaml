@@ -19,3 +19,13 @@ log_events:
   who: Ted Smith
   what: created
   comment: ""
+- time: 2026-11-12T01:25:55-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Source-only design checkpoint at a2f0268: contracts/namespace-reconciliation.md
+    proposes a move-generation and per-member lineage receipt, fences legacy unconditional
+    retries, preserves separate origin debts/overlapping prefix guards, and gives
+    an empty-target two-member synthetic recovery tracer. No implementation or runtime
+    authorized. Production conditional lineage and durable intent/restart remain release
+    blockers; collision and partial-result choices filed as oq-namespace-rename-collision
+    and oq-namespace-partial-rename-result. Root review pending.'
