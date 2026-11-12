@@ -1530,6 +1530,8 @@ class TestSSHBackendOnThePool(_BackendTestCase):
         entered = threading.Event()
         release = threading.Event()
         listing = threading.Event()
+        fourth_waiting_for_bulk = threading.Event()
+        fourth_start = threading.Event()
         calls = []
         lock = threading.Lock()
 
@@ -1545,6 +1547,16 @@ class TestSSHBackendOnThePool(_BackendTestCase):
         self.server.hooks["listdir_attr"] = lambda _client, _path: listing.set()
         workers = []
         browser = None
+        joins = []
+        original_can_open = backend._pool._can_open_locked
+
+        def observe_real_pool_decision(interactive):
+            allowed = original_can_open(interactive)
+            if (len(workers) == 4
+                    and threading.current_thread() is workers[3].thread
+                    and not interactive and not allowed):
+                fourth_waiting_for_bulk.set()
+            return allowed
 
         def open_read(path):
             fd = fs("open", path, os.O_RDONLY)
@@ -1553,29 +1565,49 @@ class TestSSHBackendOnThePool(_BackendTestCase):
             finally:
                 fs("release", path, fd)
 
+        def fourth_open():
+            if not fourth_start.wait(5):
+                raise AssertionError("fourth worker never started")
+            return open_read("/f3")
+
         try:
-            for i in range(4):
-                worker = _InThread(lambda path=f"/f{i}": open_read(path))
-                workers.append(worker)
-            self.assertTrue(entered.wait(3), "three cold copies did not acquire")
-            # This is an actual pool lease state, before any timeout: the
-            # first three copies must be bulk, leaving the fourth channel.
-            lease_state = backend._pool.snapshot()
-            self.assertEqual(3, lease_state["bulk_leased"])
-            self.assertEqual(3, lease_state["sftp_open"])
-            browser = _InThread(lambda: list(fs("readdir", "/", None)))
-            self.assertTrue(browser.join(2), "listing waited for a cold copy")
-            self.assertIsNone(browser.error)
-            self.assertIn("a", browser.result)
-            self.assertTrue(listing.is_set(), "listing did not reach the member")
-            with lock:
-                self.assertEqual(3, len(calls), "a fourth copy used the reserve")
+            with patch.object(backend._pool, "_can_open_locked",
+                              side_effect=observe_real_pool_decision):
+                for i in range(3):
+                    worker = _InThread(lambda path=f"/f{i}": open_read(path))
+                    workers.append(worker)
+                self.assertTrue(entered.wait(3), "three cold copies did not acquire")
+                lease_state = backend._pool.snapshot()
+                self.assertEqual(3, lease_state["bulk_leased"])
+                self.assertLessEqual(lease_state["sftp_open"], backend._pool._sftp_cap)
+
+                # The fourth reaches the real pool capacity check. A prior
+                # metadata lease may have opened the reserved channel; its
+                # total channel count need not equal the bulk lease count.
+                workers.append(_InThread(fourth_open))
+                fourth_start.set()
+                self.assertTrue(fourth_waiting_for_bulk.wait(3),
+                                "fourth copy never waited for bulk capacity")
+                self.assertEqual(3, backend._pool.snapshot()["bulk_leased"])
+                with lock:
+                    self.assertEqual(3, len(calls), "fourth copy entered get")
+
+                browser = _InThread(lambda: list(fs("readdir", "/", None)))
+                self.assertTrue(browser.join(2), "listing waited for a cold copy")
+                self.assertIsNone(browser.error)
+                self.assertIn("a", browser.result)
+                self.assertTrue(listing.is_set(), "listing did not reach the member")
+                with lock:
+                    self.assertEqual(3, len(calls), "a fourth copy used the reserve")
         finally:
+            fourth_start.set()
             release.set()
             for worker in workers:
-                self.assertTrue(worker.join(5), "cold-copy worker leaked")
+                joins.append(("cold-copy", worker.join(5)))
             if browser is not None:
-                self.assertTrue(browser.join(5), "browser worker leaked")
+                joins.append(("browser", browser.join(5)))
+        self.assertTrue(all(finished for _, finished in joins),
+                        f"workers leaked: {joins}")
         for worker in workers:
             self.assertIsNone(worker.error)
             self.assertEqual(payload, worker.result)
