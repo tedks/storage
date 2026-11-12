@@ -123,7 +123,7 @@ class ControlSockets:
         self.logger = logger or logging.getLogger(__name__)
         self._lock = threading.Lock()
         self._dir: Optional[Path] = None
-        self._dir_identity = None  # (st_dev, st_ino) of _dir as mkdtemp made it
+        self._dir_identity = None  # (st_dev, st_ino, file type) of _dir
         self._keys: Dict[Path, _SocketKey] = {}
         self._atexit_registered = False
         self._warned_unusable = False
@@ -190,7 +190,7 @@ class ControlSockets:
             except OSError:
                 continue
             identity = _identity(directory, follow=False)
-            if identity is None:  # gone already
+            if identity is None or identity[2] != stat.S_IFDIR:  # gone or replaced
                 continue
             self._dir = directory
             self._dir_identity = identity
@@ -268,7 +268,7 @@ def _identity(path: Path, follow: bool = True):
         info = os.stat(path) if follow else os.lstat(path)
     except OSError:
         return None
-    return (info.st_dev, info.st_ino)
+    return (info.st_dev, info.st_ino, stat.S_IFMT(info.st_mode))
 
 
 _shared: Optional[ControlSockets] = None
