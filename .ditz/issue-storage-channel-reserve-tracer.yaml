@@ -56,3 +56,13 @@ log_events:
     seconds, pushed head 50418327de1af6822955d6d72b138753c591ec34. New-base forced
     fast gate ran 40 targets: 39 pass, unchanged ssh_mux test fails (tracked as pr175-base-ssh-mux-fastgate);
     CLI build passes. Formal council round opened. No gate waiver or merge acceptance.'
+- time: 2026-11-12T04:16:37-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Formal PR175 round1 at 5041832: OpenAI CLEAN, Anthropic 1 Important/4
+    Nits, Google EMPTY usage limit. Fix delta 16fa46d documented timeout tradeoff,
+    added test, and addressed nits; forced fast gate 40 targets 39 pass/1 unchanged
+    ssh_mux fail, SSH backend 117 pass, CLI pass. Round2: OpenAI CLEAN, Anthropic
+    1 Important/2 Nits; Google EMPTY. Council check is NOT clean. Runtime envelope
+    4/4 spent. Followups pr175-bulk-timeout-proof, pr175-base-ssh-mux-fastgate, oq-pr175-bulk-timeout-errno.
+    No merge/release claim.'
