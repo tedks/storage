@@ -34,3 +34,15 @@ log_events:
     identity and rejects non-directory identity at initial mkdtemp capture. Focused
     green remains pending because the shared runtime lock is held by another storage
     Bazel lane. No behavioral fix claim or gate waiver.'
+- time: 2026-11-12T04:37:11-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Correction to the prior pending-green note: the control-red used flock
+    but omitted the required `--batch` and bounded systemd-run CPU/memory/swap scope
+    and used default output_user_root. Its persistent Bazel server (PID 3482627, my
+    output base `/tmp/storage-mux-type-cFiKLLHr/output`) retained fd3 on the shared
+    lock after the client exited, causing later lock waits to queue. I confirmed it
+    was my idle server, shut it down gracefully via that exact output base, and verified
+    PID/fd/lock release. Focused green attempts reached no Nix/Bazel client. Root
+    has the corrected wrapper for review and has instructed no more runtime until
+    a scheduled turn. No acceptance or gate waiver is claimed.'
