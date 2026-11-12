@@ -155,6 +155,10 @@ not reproduce in this scope. No remount was done.
   the event shard. It is the strongest lead for the GUI latency, but it is
   one sample. It has not been repeated, and which part dominates is not
   known.
+- It also fits the reported Nautilus "directory hangs before anything
+  appears": GIO's enumerator returns infos in batches, so the first batch
+  waits for its sniffs, after a cold listing that can itself take up to
+  2 s (section 1).
 
 ### 4. Freshness: no directory-mtime check
 
@@ -203,6 +207,10 @@ Recommended follow-ups. These are code changes, so root decides release.
    costs one stat per member per visit, in exchange for never serving a
    stale listing. Another option is a shorter `readdir_ttl` for this
    profile, or watchers.
+
+Tracked: ditz `field-gio-content-sniff-per-entry`,
+`oq-listing-stale-serve-dir-mtime` (open question for Ted), and comments on
+`field-listing-stalls-under-load` and `field-listing-downloads-to-hash`.
 
 ## Limits
 
