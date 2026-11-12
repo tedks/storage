@@ -10,8 +10,9 @@ merge-gate incident or depend on unaccepted #171/#175 behavior.
 
 Show a useful union quickly, then update an already-open Nautilus directory
 when the union changes. Ted's reachable-but-empty chunk1 contributes no paths;
-it must not hide chunk0's paths. Freshness scheduling is time based, with
-watcher hints accelerating it. Directory mtime alone cannot certify freshness.
+it must not hide chunk0's observed paths. This is a requirement to prove, not
+a claim that the field audit reproduced a missing-name regression.
+Freshness scheduling is time based, with watcher hints accelerating it. Directory mtime alone cannot certify freshness.
 
 Assume one process owns each cache root; members may be slow, absent, empty,
 or modified by other programs. Listings are not atomic across members.
@@ -75,19 +76,34 @@ explicitly stale; local cached/dirty entries remain under existing namespace
 policy. This proposal never deletes file bytes because a listing omitted them.
 
 Completed member results may publish successive union revisions. A response
-must be fenced against newer scans, member configuration changes and local
-namespace mutations. A slow scan cannot resurrect a locally deleted name or
-undo a completed rename. Partial pages are staging state, not authoritative
-absence. Keep existing conflict/virtual-name policy and stable member IDs.
+must be fenced against newer scans and changes to member configuration or
+directory identity. Merge a valid observation with the current local overlay,
+using per-name mutation revisions: do not discard the entire member result
+because an unrelated local name changed. Preserve newer local creates,
+renames and deletion tombstones under the existing namespace contract, while
+allowing untouched remote additions to publish during continuous local churn.
+If that merge cannot be made safe, stop at the mutation boundary; do not fall
+back to unbounded whole-directory retries. Partial pages are staging state,
+not authoritative absence. Keep existing conflict/virtual-name policy and stable member IDs.
 
 Each FUSE directory handle enumerates one revision with stable offsets. Do not
 append late results behind an EOF already delivered, or change the meaning of
 an offset midway through a scan. Later revisions require a new enumeration
-triggered by a real client notification. A cold directory waits a bounded
-interval for member observations; with no successful observation and no cache,
+triggered by a real client notification. The current high-level binding may
+provide buffering/offset handling itself; audit that path before adding any
+duplicate buffering. Pinned snapshots count against resource limits.
+A cold directory waits a bounded interval for member observations; with no successful observation and no cache,
 return an explicit unavailable error, never a successful empty directory.
-If only some members finish, the snapshot is partial and must remain so in
-internal status; completing its missing members schedules a client update.
+If only some members finish, the candidate snapshot is partial. In particular,
+empty A plus failed/slow B does not certify an empty union. POSIX readdir has
+no partial-result flag. Whether to expose such a candidate, wait within a
+bound, or return a retryable error is a product decision recorded in
+`oq-listing-cold-partial-result`; no cold-partial public behavior is selected
+by this spec. Any permitted partial publication must keep internal status
+partial and may not claim that a future automatic update is guaranteed
+unless the client transport has been proven. Cached known names remain a
+separate stale-first case. This policy blocks cold-partial integration, not
+the internal union/cache tracer.
 
 Use monotonic time for in-process TTLs. Watcher hints invalidate freshness but
 never disable periodic reconciliation: disconnect, overflow and missed events
@@ -178,15 +194,18 @@ Do not implement an unbounded compatibility layer to rescue a failed premise.
 4. **Existing-file tracer:** changed remote metadata reaches the consumer;
    local ongoing copy and remote refresh race without losing bytes/DIRTY;
    temp rename, delete/recreate, dropped watcher, coalescing and reconnect run.
-5. **Integration:** only after the transport and numeric policy are settled,
-   compose the boundaries. Run applicable exact-head gates, CLI build, formal
-   council and lead review; normal gated merge. Deployment is a separate
+5. **Integration:** snapshot/cache improvements can ship independently after
+   their numeric and cold-partial policy is settled and safety proven; report
+   live desktop updates unsupported if transport is unsupported. Combining
+   change delivery requires its capability proof. Run applicable exact-head
+   gates, CLI build, formal council and lead review; normal gated merge. Deployment is a separate
    explicit action with rollback, not an implication of spec acceptance.
 
-Stop on unsupported client-event transport, an unsafe content/namespace
-invalidation dependency, unbounded remote work, changes to URI/client/kernel
-scope, or three unsuccessful attempts at the same approach. Escalate the
-specific boundary; do not import PR171 wholesale or weaken freshness claims.
+An unsupported client-event transport stops only the change-delivery slice,
+not independent snapshot correctness or stale-first work. Stop the affected
+slice on an unsafe content/namespace invalidation dependency, unbounded remote
+work, changes to URI/client/kernel scope, or three unsuccessful attempts at
+the same approach. Escalate the specific boundary; do not import PR171 wholesale or weaken freshness claims.
 
 ## Evidence and interpretations
 
@@ -206,5 +225,6 @@ specific boundary; do not import PR171 wholesale or weaken freshness claims.
 
 Interpretations promote into this document and both contracts. Open numeric
 and stale-visibility policy remains in `oq-listing-stale-serve-dir-mtime`.
+Cold-partial exposure is tracked separately in `oq-listing-cold-partial-result`.
 Transport feasibility is engineering evidence to obtain, not a presumed
 product ruling to ask Ted to make without results.
