@@ -80,3 +80,16 @@ log_events:
     durable restart recovery is absent. Release blockers tracked by storage171-namespace-reconciliation
     and storage171-namespace-guard-restart. Scoped RED/GREEN and final suite evidence
     to follow; no PR acceptance.'
+- time: 2026-11-12T00:54:00-00:00
+  who: Ted Smith
+  what: commented
+  comment: Exact pushed head 670c6e8 tracer reached final sixth focused run. New absent-state
+    child behavioral RED before fix; post-fix selected 60/60 before final receipt
+    cleanup. On exact pushed head, full namespace integration174, namespace21, streaming66,
+    sync executor25, sync manager23 and sync races13 pass. Revalidate56/57 fails only
+    at old monkeypatch move_cache_then_fail rejecting new progress keyword before
+    behavior. Threading80/81 (3 known exclusions) fails old TestForegroundAdmission
+    private _refetch_pins assertion. These are current failures, not waived. Envelope6/6
+    exhausted; owner stops app/test edits and runtime. Root must review corrected
+    fixture and retired-pin migration route with renewed bounded validation. Reconciliation/durable
+    issues remain release blockers.
