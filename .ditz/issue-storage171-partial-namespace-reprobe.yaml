@@ -33,3 +33,13 @@ log_events:
     remains authorized in the exhausted package. Root received a BLOCKED report; next
     bounded fix needs inode/generation proof before serving local DIRTY, or conservative
     EIO, plus target-present regression and affected rerun.'
+- time: 2026-11-12T00:08:59-00:00
+  who: Ted Smith
+  what: commented
+  comment: Root FINDINGS at d1a856d confirmed target-present partial rename and extended
+    the current repair boundary to SyncExecutor upload/CLEAN publication. Scoped code
+    5454f1d now rejects unproved target CLEAN/DIRTY opens by inode+generation, skips
+    uncertain-path heal/sweep, and quarantines uncertain paths from sync while retaining
+    bytes and A debt. Exact-head suites and a test-local bypass control verify this
+    boundary; the issue stays open for later member-name reprobe and durable reconciliation,
+    and root delta review is pending.
