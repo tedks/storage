@@ -2,8 +2,9 @@
 
 - State: draft PR #175; root/warm Sol review at `844684b` found the three
   production hunks scoped CLEAN and test schedule T1 FINDINGS. Test-only
-  correction is prepared; final exact-head fast gate and root delta review
-  remain pending. No deploy or merge.
+  correction is pushed at `4fe8fb14d715ba080cb756bcd58c8ff3dd053ec0`
+  (tree `8629c026f6095ef89e85bf8fa9584e2eaab931e4`); its forced fast
+  gate passed. Root delta review remains pending. No deploy or merge.
 - Owner: channel Sol lead; worktree
   `/home/tedks/Projects/storage/foreground-channel-reserve-20261112`, branch
   `fix/foreground-channel-reserve-20261112`.
@@ -16,13 +17,16 @@
   30-minute limit. No invocation remains. Scratch:
   `/tmp/storage-channel-reserve-5Ra6HI`; only the prior owned pinned
   repository cache was reused. No prior PR #171 process or scope was active.
-- T1 repair budget: 2/3 new invocations spent. First stopped at Bazel analysis
+- T1 repair budget: 3/3 new invocations spent. First stopped at Bazel analysis
   because this baseline has no `//tests:storage_test_ssh_backend` target;
   it ran no test. Second ran the corrected same-schedule test with only the
   `bulk_request` use disabled in `storage/cache.py`: one selected test failed
   on actual `bulk_leased=0` versus 3 before timeout (985 deselected). The
-  owned source control was restored byte-for-byte. One invocation remains
-  for the unfiltered fast gate on the committed test correction.
+  owned source control was restored byte-for-byte. Third forced the unfiltered
+  `//:storage_tests_fast_gate` on clean pushed `4fe8fb1`: all three Bazel
+  targets passed, 986 sandboxed tests, 8 resilience tests and build source
+  check. This includes focused GREEN for the corrected schedule, but there
+  was no separate focused GREEN invocation.
 - RED: first baseline run failed because listing waited for a cold copy;
   strengthened same-schedule baseline on `81793ac` plus test blob
   `e7e02f6a` failed on actual `bulk_leased=0` versus expected 3 before
@@ -43,3 +47,14 @@
 - Tracker: `storage-channel-reserve-tracer` (ditz); metadata sync succeeded.
 - Resource state: RED, RED2, GREEN and FAST scopes inactive after exit;
   no Bazel client, fixture, socket, daemon, mount or lease remains.
+- T1 receipts: test blob `4893a78c313d9c4693539d3fb894c0e3f04c3cf2`;
+  control cache SHA256 `f1474a6a02942d680ccbeec6de42b880a712c645dc9b5a53abb06b3023d8aa34`,
+  restored production cache blob `d0cd68b72bc3a5492d22d93d6ad1e0cc1dc6bce0`;
+  control log SHA256 `c7577531f25e6af793dbe2fbda8d165f2bd92287185b291b3f2955ae18987906`,
+  fast log SHA256 `ef296993cc6f2c823c42e81a7a20f82d1ba7f72a0b2f21209116212f78449aac`,
+  unchanged wrapper SHA256 `9b978124a64216acb46107d9133c8e885a41b9b5115b19e3e4eb3c5ee0be76e3`.
+  Both control scopes and fast scope inactive; final monitored owned scratch
+  plus reused cache 775,176,192 bytes (up 19,505,152 bytes from this
+  repair's first baseline), under +2 GiB. No download reported; bytes
+  unknown. `nix develop --offline`, batch Bazel and 2 CPU/4 GiB/swap 0
+  systemd scopes were used. No live or remote fixture ran.

@@ -68,3 +68,19 @@
   control source was restored and hashes match the pre-control production
   blobs. Both owned scopes are inactive. One invocation remains for the
   clean exact-head fast gate; no focused GREEN is claimed yet.
+
+## channel-lead:6
+
+- kind: state-change
+- based_on: `844684bc02cdd66b7bf4a60deada64acdec6cc19`
+- applied_at: `4fe8fb14d715ba080cb756bcd58c8ff3dd053ec0`
+- refs: `channel-lead:5`
+- state: Test-only correction pushed; production blobs remain byte-identical
+  to `cb9e66a`. Unfiltered `//:storage_tests_fast_gate` was forced on clean
+  pushed `4fe8fb1`, executed and passed 986 sandboxed plus 8 resilience tests
+  and build source check, including corrected cold-open schedule. All three
+  renewed invocations spent; owned control/control2/fast2 scopes inactive.
+  Control RED and GREEN use the same test blob; the reversible control only
+  disabled the copy's `bulk_request`, then restored production bytes. T1
+  evidence is ready for root delta review, not formal council, full gates,
+  CLI, merge or deployment.
