@@ -96,17 +96,18 @@ exclusive lock (or sorted file path locks) before releasing it after any
 ambiguous move. The cache+index callback records moved-row witnesses under
 metadata -> descriptor -> freshness order. A failed rename after cache move
 must publish quarantine even if the callback never ran. Do not wait for
-foreground admission or perform member I/O under a path or freshness lock.
+foreground admission under namespace/path locks or perform member I/O under
+the freshness leaf. Existing rename propagation keeps namespace/path
+serialization across member I/O; reconciliation must retain that ordering.
 A normal backend failure returned by `_propagate_dir_operation` is an
 incomplete outcome, even when `NamespaceService.rename` queues a retry and
-returns normally: `StorageFS._rename` currently receives neither the failed
-member list nor an explicit all-members-complete receipt. The smallest
-interface addition is an outcome receipt to its sole callback/caller boundary
-that says cache move reached, index commit/callback reached, moved rows, and
-failed intended member IDs. Exception paths need a progress flag captured
-before each transition; no inference from absence of an exception. A queued
+returns normally. The tracer now passes `RenameProgress` to
+`StorageFS._rename`, recording local phases and intended, attempted,
+confirmed, failed and unknown member IDs, including exception progress.
+It does not prove member object lineage or settle a later retry. A queued
 `DirSyncTask` or its later success does not by itself settle all prior
-old/new names or generations.
+old/new names or generations. See `namespace-reconciliation` for the
+proposed additional proof boundary.
 
 | Path | Check required at the existing boundary |
 | --- | --- |
