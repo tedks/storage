@@ -43,3 +43,16 @@ log_events:
     bytes and A debt. Exact-head suites and a test-local bypass control verify this
     boundary; the issue stays open for later member-name reprobe and durable reconciliation,
     and root delta review is pending.
+- time: 2026-11-12T00:22:48-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Root/warm Sol 5454f1d review FINDINGS: completed directory cache+index
+    move lost DIRTY descendant proof, and a writer active across the move was detached
+    by uncertain-state replacement. Repair committed e757c2a; test-only assertion
+    correction 75b2efa. Pre-repair behavioral RED for directory read and completed
+    writer read EIO; focused 7/7 GREEN on pre-correction test bytes; seven affected
+    nonmount suites passed at e757c2a. Fifth of five runs selected 53 threading, 50
+    passed, new descendant test fixture assumed a preexisting state and two known
+    deferred restart tests failed. Corrected fixture is UNRUN. Sync stays quarantined;
+    root review and runtime allowance required before scoped closure. This is not
+    PR acceptance.'
