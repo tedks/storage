@@ -485,3 +485,11 @@
 - refs: foreground-lead:44
 - based_on: clean pushed `f5f9330f43bc6216f6e6646df2c4375697354d35`; applied_at correction `923feac38bf3a9ab593f23d5ca5be138a288ec0f`.
 - receipt: only `contracts/namespace-reconciliation.md` and this lane's unique status/ledger changed. `git diff --cached --check` passed; commit/push succeeded and `git pull --rebase` reported up to date. Ditz new `oq-member-namespace-writer-ownership` and reconciliation/restart comments synced; prior Ted questions remain open. No app/test edits, tests, Nix/Bazel/runtime, resource, live member probe or paused-liaison contact. All proposed schedules UNRUN. Root review and technical/product decisions remain pending; no formal council/full-PR acceptance, gates, merge or deploy.
+
+## foreground-lead:46
+
+- kind: delivery-receipt
+- state: FEASIBILITY_CORRECTION_SUBMITTED_TO_ROOT; lane idle, adjudication pending
+- refs: foreground-lead:44, foreground-lead:45
+- applied_at: correction `923feac38bf3a9ab593f23d5ca5be138a288ec0f`, clean pushed checkpoint `13c0ee50f129213b04afd4f30ab24eeab3fced31`.
+- delivery: `%91` was pinned as `storage:codex` on `/tmp/tmux-1000/default`. Shared `tmux-message` returned `status=delivered`, `receipt=submitted`, one paste and one Enter for the exact source-only checkpoint and review request. Delivery is not root review, implementation/runtime grant or acceptance. No owned process, fixture or lease exists from this audit.
