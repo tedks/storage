@@ -91,6 +91,11 @@ class TestStage1ConstructorGate(unittest.TestCase):
         manifest.write_bytes(original)
         with self.assertRaises(ValueError):
             self._construct(stage1_scratch_uuid="wrong-uuid")
+        wrong_inode = json.loads(original)
+        wrong_inode["root_ino"] = -1
+        manifest.write_text(json.dumps(wrong_inode))
+        with self.assertRaises(ValueError):
+            self._construct(stage1_scratch_uuid=root_uuid)
         self.assertFalse(self.db.exists())
 
     def test_interrupted_claim_denies_legacy_root_creation(self):

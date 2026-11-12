@@ -55,7 +55,7 @@ def _stage1_write_new(path: Path, payload: dict) -> None:
 
 
 def _stage1_read(path: Path) -> dict:
-    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise ValueError(f"Stage1 authority is not a regular file: {path}")
@@ -94,6 +94,11 @@ def initialize_stage1_scratch_root(cache_root: Path, state_db: Path) -> str:
     finally:
         os.close(parent_fd)
     cache_root.mkdir()
+    parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
     root_stat = os.lstat(cache_root)
     _stage1_write_new(cache_root / STAGE1_MANIFEST, {
         "version": STAGE1_VERSION, "uuid": root_uuid,
