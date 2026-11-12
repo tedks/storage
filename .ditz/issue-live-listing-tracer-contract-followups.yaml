@@ -1,0 +1,28 @@
+id: live-listing-tracer-contract-followups
+title: Resolve live-listing tracer token, tombstone and wording details
+desc: 'PR178 formal Anthropic delta review at a35baea is CLEAN with three nonblocking
+  nits. Before implementing the tracer: N5 clarify that incarnation identity applies
+  to the merged entry, including one contribution disappearing while another remains.
+  N6 specify bounded pending-delete/tombstone lifetime spanning scans begun before
+  deletion and later scans before propagation; retain the no-resurrection invariant,
+  do not treat a member scan as sync confirmation, and account for pending mutations
+  separately from evictable listing snapshots. This detail must be reviewed with the
+  existing namespace owner before implementation; if existing contracts do not provide
+  it, stop at that boundary. N7 rewrap long Markdown lines when next editing the spec.
+  Deferral rationale: current PR is a proposed spec with explicit mutation boundary
+  stop and no implementation; keep the reviewed head frozen instead of changing it
+  for cosmetic cleanup. Root owns follow-up assignment; no code authority or live
+  work granted by this issue.'
+type: task
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-12T21:43:25-00:00
+references: []
+log_events:
+- time: 2026-11-12T21:43:25-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
