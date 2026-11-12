@@ -19,10 +19,15 @@
   entry change, including remote metadata changes and local overlay mutations.
   Unchanged observations keep the revision; an old revision is never reused.
   Publication serializes revision assignment with the visible state change.
+  A committed removal advances the removed incarnation's revision and emits
+  an explicit removal observation. New creation uses a new incarnation.
   Events carry (mount generation, incarnation, revision); a consumer rejects
-  old generations/incarnations and revisions older than the current entry,
+  old generations/incarnations and revisions older than the current entry or
+  removal observation,
   and handles a duplicate current revision idempotently. Incarnations are
-  never reused within a mount generation. These tokens fence
+  never reused within a mount generation. If removal/history evidence was
+  evicted, require a current resnapshot instead of trusting a delayed event.
+  These tokens fence
   observations/events inside one mount generation; they do not claim a stable
   remote inode identity. Observed disappearance/recreation or type replacement
   gets a new incarnation; an unchanged observation preserves it. A detectable
