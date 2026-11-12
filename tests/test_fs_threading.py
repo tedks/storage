@@ -2890,6 +2890,8 @@ class TestNarrowRetryFence(ThreadingTestBase):
         self.fs.mkdir("/b", 0o755)
         self.assertTrue((self.cache_dir / "b").is_dir())  # old currency check passes
         before = tuple(self.fs._namespace_uncertainties)
+        with self.fs._member_checks_lock:
+            baseline_before = dict(self.fs._member_checks)
         executor = self.executor()
         for hint in ("other", None):
             # A legacy untagged task is also fenced. The old B /a contains
@@ -2913,6 +2915,8 @@ class TestNarrowRetryFence(ThreadingTestBase):
         self.assertEqual([], list((self.b_dir / "b").iterdir()))
         self.assertEqual(before, tuple(self.fs._namespace_uncertainties))
         self.assertIs(first, before[0])
+        with self.fs._member_checks_lock:
+            self.assertEqual(baseline_before, self.fs._member_checks)
         self.assertIn("member", first.source_debts["/a/old.txt"])
         self.assertIn("member", self.fs._freshness_snapshot("/c/old.txt")["debts"])
 
@@ -3029,6 +3033,13 @@ class TestNarrowRetryFence(ThreadingTestBase):
                 remote.assert_not_called()
         self.assertTrue((self.b_dir / "a").is_dir())
         self.assertTrue((self.b_dir / "b" / "child").is_dir())
+        local = "/b/child/local.txt"
+        fd = self.fs.create(local, 0o644)
+        self.fs.write(local, b"current local bytes", 0, fd)
+        self.fs.release(local, fd)
+        self.assertEqual(b"current local bytes", self.open_read_release(local))
+        self.assertEqual(SyncStatus.DIRTY,
+                         self.fs.state_manager.get_file_metadata(local).sync_status)
         self.fs.mkdir("/outside", 0o755)
         self.fs.mkdir("/gone", 0o755)
         self.fs.rmdir("/gone")
