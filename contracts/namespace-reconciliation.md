@@ -1,8 +1,10 @@
 # Proposed member-name reconciliation boundary for PR #171
 
-Status: source-only feasibility correction to proposal `88c3982`, reconciled
-against clean pushed `f5f9330`. Root/warm Sol review: FINDINGS; fresh Luna
-necessity critique: SIMPLIFY. No implementation or runtime clearance. This
+Status: source-only narrow-fence correction to proposal `923feac`, reconciled
+against clean pushed `44c6d6b`. Root REJECTED its coarse namespace-exclusive
+background-I/O fence; warm Sol offered an outer retry-versus-rename serializer;
+fresh Luna changed from STOP_AND_ESCALATE on the coarse version to PROCEED for
+this **design refinement only**. No implementation or runtime clearance. This
 contract neither retires a current guard nor makes the in-memory tracer
 shippable. Stable member IDs, never display names, key receipts and debts.
 
@@ -18,8 +20,8 @@ only its name movement, **not** descendant byte freshness or debt settlement.
 | Boundary | Current guarantee | Stronger guarantee a recovery path would need |
 | --- | --- | --- |
 | `Backend.rename` (`storage/backends/base.py:256`) | `None` or exception; no operation ID, source identity, conditional outcome or postcondition. | One generation-bound, member-authoritative source/target lineage receipt for initial propagation **and** retry. Do not add an optional Backend API until a concrete adapter can provide it. |
-| Local (`storage/backends/local.py:216-230`) | `lstat` can observe `(dev, ino)` at an instant; absent old returns success; `os.replace` can destroy an occupied target. | Atomic source-identity check plus target disposition under a stated writer-ownership regime, or member-side service. `renameat2` no-replace alone does not atomically test source identity. |
-| SSH (`storage/backends/ssh.py:550-580`) | `posix_rename` replaces; fallback SFTP rename may fail on occupied target; missing old is swallowed. Standard SFTP stat has no portable stable inode/operation ID. | Server-side compare-and-move receipt or equivalent durable operation service. SFTP pre/post stat cannot supply it against unrelated writers. |
+| Local (`storage/backends/local.py:216-230`) | `lstat` can observe `(dev, ino)` at an instant; absent old returns success; `os.replace` can destroy an occupied target. | Atomic source-identity check plus target disposition from actual filesystem authority. `renameat2` no-replace alone does not atomically test source identity; a service mutex around separate stat/rename calls cannot exclude unrelated POSIX writers. |
+| SSH (`storage/backends/ssh.py:550-580`) | `posix_rename` replaces; fallback SFTP rename may fail on occupied target; missing old is swallowed. Standard SFTP stat has no portable stable inode/operation ID. | Server-side operation with filesystem-enforced identity/target preconditions and a durable receipt, or another authority that excludes unrelated writers. SFTP pre/post stat cannot supply it. |
 
 1. `StorageFS.rename/_rename` (`storage/fs.py:2561-2720`) holds directory
    namespace exclusion or sorted file path locks plus upload serialization.
@@ -54,7 +56,7 @@ precondition nor a durable operation receipt. No new protocol or synthetic
 experiment is proposed for this phase. Legacy untagged retries are still
 capable of remote mutation and must be fenced before backend I/O.
 
-## Production retry fence: the next bounded safety slice
+## Proposed narrow retry fence: pre-I/O safety containment
 
 The immediate realizable slice is **pre-I/O containment**, not recovery. At
 `SyncExecutor.process_dir_task` (`storage/sync_executor.py:455-487`), before
@@ -71,35 +73,73 @@ directions: equal, task ancestor of guard root, or guard ancestor of task.
 unresolved `/b -> /c`, and an ancestor retry over `/parent/child`.
 
 The existing `path_guard=self._path_locked` (`storage/fs.py:352,511-514`)
-holds namespace **shared** plus exact endpoint locks. It cannot serialize a
-directory retry at `/b` with a file rename beneath `/b/child`, because the
-two exact locks differ. For a minimal conservative fence, make directory-task
-admission acquire `UploadLocks.drain` on task roots **before** the namespace
-exclusive lock, as foreground directory rename does (`fs.py:2598-2601`),
-then check all covering records and local task currency while holding
-exclusive through any backend call and its result. This orders an already
-admitted retry before a future directory **or file** guard publication:
-every path-locked handler needs namespace shared, so it waits for the retry;
-if publication won first, retry sees the guard and never enters backend I/O.
-The drain blocks concurrent uploads at either subtree without waiting while
-holding namespace. No foreground admission wait occurs inside locks; member
-I/O remains outside the freshness leaf. A blocked overlap returns an
-explicit deferred/failure result, **not** `_dir_task_current`'s successful
-drop. Existing retry exhaustion may still lose the queued attempt; the
-negative record and debts persist and must be reported unresolved. No
-quarantine retirement, baseline change or member deletion follows a fence.
-The fence can govern only tasks that enter through the new guard; any
-already-running old-code worker would need a quiescent handoff before a
-deployment. This audit authorizes no worker interruption or deployment.
+holds namespace **shared** plus exact endpoint locks. By itself it cannot
+serialize a directory retry at `/b` with a file rename beneath `/b/child`.
+Root rejects the earlier proposal to take namespace exclusive during every
+background retry's member I/O: repeated retries would stall unrelated
+browsing. The revised candidate uses **one outer retry-versus-rename
+serializer** (a per-StorageFS reentrant mutex) acquired at two public entry
+points, before either side takes namespace, path, upload or freshness locks:
 
-This coarse exclusive lock can hold browsing behind a slow background member
-call and violates the final responsiveness aim if used as a release policy.
-It is acceptable only as a bounded **non-shipping safety tracer** with a
-specified member timeout and latency measurement in a later authorized
-phase. A later narrow in-flight subtree-domain registry could avoid a global
-exclusive call, but that is additional machinery requiring its own lock-order
-review; this audit does not design or authorize it. The fence must not be
-described as restored read/upload responsiveness.
+| Entry | Proposed order, held through |
+| --- | --- |
+| `StorageFS.rename` (`fs.py:2561-2607`), file **and** directory paths | outer serializer -> existing file `NamespaceLock.shared -> sorted PathLocks -> UploadLocks.hold`, or existing directory `UploadLocks.drain -> NamespaceLock.exclusive`. Hold through `_rename`, local cache/index callback, all member propagation and negative-record publication at `fs.py:2692-2713`. Acquire before its cache/getattr classification and `while True` retry, not inside `_rename`. |
+| `SyncExecutor.process_dir_task` (`sync_executor.py:455-487`) for MKDIR/RMDIR/RENAME | outer serializer -> affected `UploadLocks.drain` -> existing `_path_locked` (`NamespaceLock.shared -> sorted endpoint PathLocks`) -> coverage/currency check -> `_process_dir_task` and member operation/result. `SyncManager` passes the FS-owned guarded callback through its existing `path_guard` wiring (`fs.py:352`, `sync.py:70-79,282-285`) to every worker. The current `hinted.is_available()` fast check may remain before the outer mutex because it performs no member mutation; any availability/currency decision used to authorize I/O must be rechecked inside. |
+
+The FS callback would yield an explicit allowed/blocked result while keeping
+the ordered locks; `process_dir_task` treats blocked as deferred before its
+existing current-path check. Standalone executor fixtures can still supply
+their simple guard, but a production FS-bound executor must have this
+callback and may not silently fall back to `nullcontext`.
+
+No nested acquisition is needed: `StorageFS._rename` and
+`NamespaceService.rename` (`namespace.py:1479-1590`) are only reached from
+the public FS wrapper in production; the local callback does not reacquire
+the outer mutex. `SyncExecutor._process_dir_task` (`:507-551`) is reached
+only from `process_dir_task`; the guard callback owns one outer acquisition.
+The reentrant mutex permits same-thread instrumentation inside the boundary,
+but a nested **public** rename from a member callback while inner locks are
+held must fail fast at entry, rather than try to upgrade namespace shared to
+exclusive. No helper acquires the serializer after an inner lock. A direct
+private-helper call cannot claim this safety boundary: FS-bound production
+helpers should assert the outer owner, while standalone `SyncExecutor` unit
+fixtures without an FS callback remain primitive tests and must not be used
+as fence evidence. Existing direct `Backend.rename` and external member
+writers are outside StorageFS coordination. Source search found no other
+production callers of `_rename`, `NamespaceService.rename`, or
+`_process_dir_task`; `NamespaceService.mkdir/rmdir` enqueue retries but do
+not publish rename guards. They remain outside this narrow serializer and
+cannot be claimed as general remote namespace reconciliation.
+
+When retry owns the serializer first, later `StorageFS.rename` waits **before**
+its namespace/path/upload locks, so it cannot publish a new guard during
+retry member I/O. If rename owns it first, its guard is published before
+retry can enter; retry checks every record immediately before I/O while
+holding the serializer and existing shared namespace/path guard. The
+affected upload drain begins before namespace shared, as in the existing
+directory-rename order; file rename's `UploadLocks.hold` is inside its outer
+serializer and ignores drains, so no opposing serializer holder can hold
+one while waiting for the other. Sync queue locks are released before a
+worker enters this guard; a rename may queue its retry while holding the
+serializer, but the worker waits outside the queue lock. Member I/O remains
+outside cache/index/freshness leaf locks. A foreground rename enters through
+ordinary admission before this serializer; its wait uses ordinary capacity,
+leaving protected demand and metadata slots available. A retry holds only
+namespace shared plus its endpoint path locks during member I/O, so an
+unrelated warm cached read and metadata browsing can progress. Same-path
+work and other renames may wait; that limit needs deterministic evidence.
+
+A blocked overlap returns an explicit deferred/failure result **before**
+`_dir_task_current` or any backend I/O; it may not use that helper's
+successful-drop path. Under existing `handle_task_failure` max retries the
+queue item may eventually leave the queue, but that must be an explicit
+terminal unresolved failure, never a success or silent task drop. The guard
+and both origin debts stay.
+Neither unknown nor matching tags bypass the check. No retirement, baseline,
+CLEAN, upload or remote deletion is inferred from fencing. An old-code worker
+already in a backend call would need a quiescent handoff before deployment;
+this audit authorizes no worker interruption or deployment. This slice is
+**non-shipping safety containment**, not useful read/upload recovery.
 
 ## Recovery feasibility and state
 
@@ -107,15 +147,15 @@ described as restored read/upload responsiveness.
 | --- | --- |
 | Read-only reconciliation | A proved pre-move failure needs no new guard. For an incomplete move, current `RenameProgress`, cache/index rows, per-file hashes and member listings cannot certify a directory's old/new lineage or all lazy descendants. Read-only checks could retire a guard only if a **previously durable, member-authoritative operation ID/identity receipt** already exists; none does today. |
 | Conditional retry | Local Linux could add no-replace semantics, but that alone does not atomically compare the source identity; current `os.replace` does neither. SSH SFTP's plain rename can refuse an occupied target but has no portable source identity or operation receipt. A real production recovery path needs an actual member-side compare-and-move service, including the initial A operation, not a synthetic-only Backend option. |
-| Coordinated writer ownership | If Ted explicitly made a member namespace exclusively writable by this mount, a real Local adapter could use pre-move `(dev, ino)` observations and the existing namespace lock to order all *cooperating* writes; a guarded no-replace move and postcondition could then be a candidate end-to-end slice. Durable recovery would also need a persistent unique member marker/operation ID: bare inode numbers can be reused after deletion. Current external-member changes/watchers contradict assuming exclusive ownership silently. An in-process helper lock or two stats do not bind unrelated writers. SSH would still need reliable member identity or a server-side service. |
+| Coordinated writer ownership | A hypothetical exclusive member namespace could let a Local adapter order cooperating writes with durable member/local lineage. Ted has **not** authorized that restriction and root retains external-writer support. Bare inode numbers can be reused after deletion, so crash recovery still needs a persistent unique member marker/operation ID. A service or helper mutex around stat/rename does not bind unrelated POSIX writers. |
 
 Thus **no useful production guard-retirement tracer is justified on the
-current Local/SSH API and external-writer contract**. The smallest real
-candidate is Local under an explicit exclusive-writer ruling plus durable
-pre-mutation member/local lineage and an inode-reuse-safe marker; otherwise a
-member-side conditional operation service is needed. If neither is available,
-leave ambiguous moves guarded and expose partial completion under Ted's
-pending result ruling.
+current Local/SSH API and external-writer contract**. Root retains external
+writer support; no writer restriction or remote service is authorized. A
+hypothetical future implementation would need filesystem-enforced conditional
+lineage or a separately approved change in writer authority, plus durable
+pre-mutation evidence. If unavailable, leave ambiguous moves guarded and
+expose partial completion under Ted's pending result ruling.
 Do not implement a new optional Backend capability merely to make synthetic
 tests pass.
 
@@ -153,34 +193,51 @@ Cache-file xattrs miss absent/lazy descendants; SQLite alone is rebuildable.
 Missing/corrupt intent with possible partial move fails closed. Current code
 has no such durable store, so even a safe in-memory retry fence is unshippable.
 
-Focused future schedules, all **UNRUN**; the first three fit the proposed
-fence slice and must fail pre-fix on observable remote/local effects, not a
-missing seam or timeout:
+Future deterministic **nonmount** schedules, all **UNRUN**, use the actual
+FS-wired `SyncManager -> SyncExecutor.process_dir_task -> LocalBackend`
+path with scratch members. A missing helper or a timeout is setup failure;
+RED must be wrong remote bytes/names, false publication, or blocked unrelated
+request on the identical Event-gated schedule:
 
-1. Gate an old untagged `/a -> /b` retry; complete newer incomplete
-   `/b -> /c`, then release it. Existing path-current check can allow the
-   old member operation; assert exact B member bytes/names are unchanged by
-   the fenced retry, no false CLEAN/upload and both origin debts/guards stay.
-2. Repeat with a retry whose root is an ancestor of `/parent/child` guard,
-   then reverse ancestor/descendant roles; include `/parentish` nonintersecting
-   control. Assert actual member rename call count zero only for overlap,
-   current local DIRTY bytes preserved and lazy child still denied.
-3. Pause an already-admitted directory retry immediately before backend I/O;
-   race file rename under its destination subtree. Assert exclusive ordering:
-   either retry completes before guard publication or the guard wins and no
-   member I/O occurs. No stale remote bytes, false baseline or lost debt.
-4. Recovery phase only: two real Local members with proved initial and retry
-   lineage under an approved ownership contract; B first fails, then returns.
-   Assert exact child bytes and useful read/upload after guard retirement,
-   with independent source/target debts still owed until generation proof.
-5. Durable phase only: crash after local move and after partial member result;
-   restart before workers, assert lazy descendants remain guarded and current
-   DIRTY witness bytes survive. No xattr-only or row-only certification.
+1. `test_old_retry_blocked_by_newer_guard`: queue an untagged `/a -> /b` retry,
+   then make `/b -> /c` incomplete and create a distinct local `/b` before
+   it executes, so the existing `_dir_task_current` destination check really
+   passes; repeat with a stale tag. The old retry must make zero backend
+   mutation calls after the new guard, preserve exact bytes/names at A and B,
+   both origin debt generations
+   and no new CLEAN/baseline. The pre-fence executor's destination-presence
+   check can allow the destructive old call.
+2. `test_retry_prefix_intersections_both_directions`: make an unresolved
+   `/parent/child` move; queue ancestor and descendant RENAME roots on either side,
+   including a root that contains the guard root. Give each retry a current
+   destination so the old executor would reach member I/O. All intersecting
+   tasks make zero backend calls; `/parentish` and another nonintersecting task
+   still call the real member. Assert exact local DIRTY bytes, lazy-child EIO
+   and unchanged debts/baselines.
+3. `test_retry_first_keeps_unrelated_reads_responsive`: pause a real member
+   RENAME at backend I/O;
+   start a file rename below its destination and separately a directory
+   rename. Both wait *outside* namespace/path locks. Before releasing the
+   backend, an unrelated warm read and `readdir` complete with correct bytes
+   and names. After release, rename publishes any required guard; check
+   exact member/local bytes, no false CLEAN and no lost debt. The rejected
+   global-exclusive design would fail the unrelated-progress assertion.
+4. `test_rename_first_denies_queued_retry`: gate a real file and then directory rename
+   before their incomplete-move guard publication; queue an older retry.
+   Once the rename releases, retry rechecks coverage and makes zero backend
+   mutation calls. Assert old/new canonical bytes or EIO, origin debts and
+   absence of stale baseline. Include an already-queued task with no tag.
+5. `test_mkdir_rmdir_retry_covered_by_guard`: queue MKDIR and RMDIR retries whose path
+   is inside or an ancestor of an unresolved old/new domain; assert no
+   unexpected member creation/deletion, no CLEAN/UPLOAD or debt clearing.
+   Nonintersecting operations still run. Use a current-inode DIRTY child to
+   prove the local read exception remains intact.
 
 `sync-member-reconcile` tracks missed chains; `oq-unlink-member-copies` the
 deletion policy. `oq-namespace-rename-collision` and
 `oq-namespace-partial-rename-result` are pending Ted rulings, not authority
 for overwrite or success-with-EIO. `oq-member-namespace-writer-ownership`
-records whether member namespace writers may be restricted; recommend retaining
-external-writer support and requiring a real conditional member service (or
-keeping ambiguous moves blocked). No ruling is inferred from this audit.
+remains a filed question, but root's current boundary retains external-writer
+support. A service mutex does not change that contract or supply linearizable
+lineage; watcher/revalidation only detect later changes. No ruling on the
+other questions is inferred.
