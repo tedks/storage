@@ -33,5 +33,11 @@ log_events:
   who: Ted Smith
   what: blocks field-listing-stalls-under-load
   comment: ""
+- time: 2026-11-12T19:21:20-00:00
+  who: Ted Smith
+  what: commented
+  comment: '2026-11-12 splinter1 field (PR #177): still a candidate source of the
+    congestion behind slow cold listings (directory checksum tasks queued by each
+    listing share member transports and server disks). Not verified in this lane.'
 blocks:
 - field-listing-stalls-under-load
