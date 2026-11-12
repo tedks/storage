@@ -18,3 +18,11 @@ log_events:
   who: Ted Smith
   what: created
   comment: ""
+- time: 2026-11-12T01:25:56-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'The source-only reconciliation proposal identifies a durable prerequisite:
+    sync a versioned move intent with old/new prefix, origin identities/debts, intended
+    members and observed source IDs before local destructive move; reconstruct negative
+    coverage before open/sweep/sync after restart. Cache-file xattrs alone miss absent/lazy
+    descendants. No durable code or runtime performed; issue remains open and release-blocking.'
