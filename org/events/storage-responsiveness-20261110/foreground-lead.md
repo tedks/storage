@@ -559,3 +559,22 @@
 - refs: foreground-lead:51, foreground-lead:52
 - applied_at: clean pushed code/test `83b26ab90f359fb8725fcdbc81e196ac7b112d39`, evidence checkpoint `3cfc4a369d978b28074ee7031385f870b5ec997f`.
 - delivery: GitHub connector posted PR #171 evidence comment ID `6812259234`, describing behavioral RED, six new GREEN cases, exact-head six passing targets and three old assertion failures, exhausted budget and non-shipping limits. Exact `%91` was pinned as `storage:codex` on `/tmp/tmux-1000/default`; shared `tmux-message` returned `status=delivered`, `receipt=submitted`, one paste and one Enter for root checkpoint. Delivery is not root review, application repair clearance or PR acceptance. No owned process, fixture or lease remains; source/runtime stop persists pending root assignment.
+## foreground-lead:54
+
+- kind: review-finding
+- state: CANONICAL_RETRY_REPAIR_ACTIVE; scoped code/test/runtime authority, not acceptance
+- refs: foreground-lead:53
+- based_on: root/warm Sol FINDINGS at frozen code/test `83b26ab90f359fb8725fcdbc81e196ac7b112d39`, `/home/tedks/.cache/storage-orgs-20261110/narrow-fence-review-83b26ab.md`.
+- applied_at: clean pushed docs checkpoint `29316c6650b7da0731104ea8639780022f36dc69`; native compaction completed before this resumed bounded assignment.
+- assumptions: `NamespaceService` queues canonical task endpoints and `SyncExecutor` sends those literals to Backend; `_dir_retry_guard` must consume them verbatim. Existing retry exhaustion is an unresolved failure, not successful reconciliation. Outer serializer is the intended wait point for opposite renames. Four new sequential focused runs are the entire envelope; no run has started.
+- scope: repair retry endpoint use and three affected tests, behavioral suffixed-name RED then GREEN and exact-head eight affected nonmount targets. No durable/recovery/retirement or full-PR acceptance authority.
+
+## foreground-lead:55
+
+- kind: implementation-tracer-evidence
+- state: CANONICAL_RETRY_CODE_PUSH_PENDING_FINAL_SUITES; not accepted
+- refs: foreground-lead:54
+- based_on: clean pushed `29316c6650b7da0731104ea8639780022f36dc69`; applied_at source/test commit `e87487b` plus pending strengthened test assertions.
+- behavioral evidence: first `retry-canonical-red.log` failed fixture setup because a conflict-view open populated only the requested cache path. After explicit canonical scratch cache/index fixture setup, `retry-canonical-red2.log` failed on actual member bytes: real queued worker moved `/f.member` after the initial failed public rename, so the source file disappeared. This is the pre-fix application at `29316c6` with the new test only. `retry-canonical-green.log` passed the four selected migrated/new cases after the one-line guard correction; final exact-head suites remain UNRUN.
+- implementation: `storage/fs.py` consumes FS-bound queued canonical endpoints verbatim for drain, path locks and coverage. Opposite rename test now observes the serializer wait without inner lock acquisition; two actual-worker retry tests assert terminal retry count, no second backend rename, member bytes, guard and source debt. Suffixed fixture assertion was further strengthened after focused GREEN to observe exact drain/path names and source debt; that assertion awaits final run.
+- envelope: 3/4 focused invocations, each <600s, cumulative under one minute, in owned 2CPU/4GiB/swap0 scopes with verified preflight/monitor and offline Nix. No abort; max observed owned growth 35,790,848 bytes; runner SHA-256 `25a589dd4ad57170f26464171ca3847498ab7124c9bb5e025ab8505b300f096a`. Final full affected-suite run is the remaining invocation; no full gates/CLI or live activity.

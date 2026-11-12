@@ -3,6 +3,9 @@
 Status: narrow-fence design `c35b8e7` was scoped CLEAN by root/warm Sol and
 fresh Luna necessity PROCEED. The bounded pre-I/O implementation is at
 `54a7812`, with strengthened debt/local-DIRTY assertions at `4c77188`.
+Root/warm Sol review of frozen `83b26ab` found retry re-resolution of
+already-canonical task endpoints and three older assertion conflicts. A
+bounded repair is in progress; its final affected-suite result is pending.
 The six new schedules pass at pushed `83b26ab`, but its eight-target affected
 nonmount run has three older test failures (threading path-lock timing and two
 retry-success assumptions); issue `storage171-retry-fence-suite-migration`
@@ -88,6 +91,13 @@ points, before either side takes namespace, path, upload or freshness locks:
 | --- | --- |
 | `StorageFS.rename` (`fs.py:2561-2607`), file **and** directory paths | outer serializer -> existing file `NamespaceLock.shared -> sorted PathLocks -> UploadLocks.hold`, or existing directory `UploadLocks.drain -> NamespaceLock.exclusive`. Hold through `_rename`, local cache/index callback, all member propagation and negative-record publication at `fs.py:2692-2713`. Acquire before its cache/getattr classification and `while True` retry, not inside `_rename`. |
 | `SyncExecutor.process_dir_task` (`sync_executor.py:455-487`) for MKDIR/RMDIR/RENAME | outer serializer -> affected `UploadLocks.drain` -> existing `_path_locked` (`NamespaceLock.shared -> sorted endpoint PathLocks`) -> coverage/currency check -> `_process_dir_task` and member operation/result. `SyncManager` passes the FS-owned guarded callback through its existing `path_guard` wiring (`fs.py:352`, `sync.py:70-79,282-285`) to every worker. The current `hinted.is_available()` fast check may remain before the outer mutex because it performs no member mutation; any availability/currency decision used to authorize I/O must be rechecked inside. |
+
+At this callback boundary, task endpoints are already canonical literals from
+`NamespaceService` (or caller-created `DirSyncTask`). The backend mutates
+those exact names. The guard must drain, lock and compare those same literals;
+it must not pass them through public conflict-suffix resolution again. For
+example, a public `/f.member.member -> /g.member.member` queues
+`/f.member -> /g.member`; another suffix parse would guard `/f -> /g`.
 
 The FS callback would yield an explicit allowed/blocked result while keeping
 the ordered locks; `process_dir_task` treats blocked as deferred before its

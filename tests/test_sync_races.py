@@ -287,6 +287,8 @@ class TestDirectoryRetries(SyncRaceTestBase):
             virtual_path="/f.member", backend_name="member", checksum="",
             last_synced=now, is_cached=True,
         ))
+        self.fs._observe_changed_member(
+            "/f.member", self.member, self.member.stat("/f.member"))
         calls = self.fail_member_once("rename")
         self.fs.rename("/f.member.member", "/g.member.member")
         tasks = [task for task in self.fs.sync_manager.task_queue.queue
@@ -296,10 +298,18 @@ class TestDirectoryRetries(SyncRaceTestBase):
                          (tasks[0].virtual_path, tasks[0].new_path))
         self.assertTrue(self.fs._namespace_covered("/g.member"))
         before = tuple(self.fs._namespace_uncertainties)
+        self.assertIn("member", before[-1].source_debts["/f.member"])
 
         self.fs.sync_manager.config.retry_delay = 0
-        self.start_sync()
-        self.wait_idle()
+        drain = self.fs._upload_locks.drain
+        path_locked = self.fs._path_locked
+        with patch.object(self.fs._upload_locks, "drain", wraps=drain) as drained, \
+                patch.object(self.fs, "_path_locked", wraps=path_locked) as locked:
+            self.start_sync()
+            self.wait_idle()
+        exact = ("/f.member", "/g.member")
+        self.assertIn(exact, [call.args for call in drained.call_args_list])
+        self.assertIn(exact, [call.args for call in locked.call_args_list])
         # A second member rename would make these assertions fail on bytes
         # and names, even if the task later reports a failed retry.
         self.assertEqual(b"original member bytes",
@@ -308,6 +318,7 @@ class TestDirectoryRetries(SyncRaceTestBase):
         self.assertEqual([("/f.member", "/g.member")], calls)
         self.assertEqual(before, tuple(self.fs._namespace_uncertainties))
         self.assertTrue(self.fs._namespace_covered("/g.member"))
+        self.assertIn("member", before[-1].source_debts["/f.member"])
 
     def test_rename_retry_whose_destination_is_gone_is_dropped(self):
         self.fs.mkdir("/d", 0o755)
