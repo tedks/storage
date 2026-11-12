@@ -69,5 +69,11 @@ log_events:
   who: Ted Smith
   what: blocked by storage171-retry-fence-suite-migration
   comment: ""
+- time: 2026-11-12T02:05:26-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Correction to my immediately preceding comment: the issue creation command
+    failed before sync; storage171-retry-fence-suite-migration is now created and
+    blocks this task. The test outcomes and exhausted-envelope report were accurate.'
 blocked_by:
 - storage171-retry-fence-suite-migration
