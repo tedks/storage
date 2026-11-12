@@ -1,6 +1,6 @@
 # Proposed durable freshness and restart boundary for PR #171
 
-Status: Stage 1 implementation boundary amended from root/warm Sol readiness review of frozen `391936df7e1ea7204fb2fab787e58a4377a1214a` (contract `5100e166127be5f2591dc4349dae09d7b9199b6e`), reconciled against clean pushed `c23bacf2c4d4a8468801fa9c4c6f01bdd5542c83`. Luna PROCEED only for the bounded scratch-root prototype after this amendment. The implementation and tests remain separate evidence.
+Status: Stage 1 implementation boundary amended from root/warm Sol readiness review of frozen `391936df7e1ea7204fb2fab787e58a4377a1214a` (contract `5100e166127be5f2591dc4349dae09d7b9199b6e`), reconciled against clean pushed `c23bacf2c4d4a8468801fa9c4c6f01bdd5542c83`. Luna PROCEED was conditional on a small auditable refusal boundary. The first bounded code slice at `37d671b` implements only scratch authority initialization, verification and pre-constructor refusal; Stage 1 reads, fetch publication and replay remain unimplemented and unavailable.
 Root/warm Sol scoped CLEAN at code/test `bcf062a` closes the narrow retry
 finding, not this boundary. No implementation or runtime evidence exists for
 the proposal below. Decision keys remain `foreground-open-pin-ownership` and
@@ -95,6 +95,22 @@ remains demand class; an uncertain cached open drops namespace/path locks and
 reclassifies to ordinary only for member probe/bulk fetch, as v3 requires.
 
 ### Stage 1 restricted scratch-root execution boundary
+
+**Implementation stop at the pre-constructor slice.** Source review found
+that a narrow `StorageFS.__call__` check cannot enforce the allowlist:
+tests and internal callers invoke `open`, `init`, namespace callbacks and
+sync manager methods directly. `CacheManager.cache_file` calls `ensure_space`
+(which may evict) and updates SQLite access before returning; direct
+`fetch_into_cache`, eviction and `heal_stale_clean` routes bypass a FUSE
+callback gate. `_open` itself can write member-baseline xattrs before any
+durable marker path exists. Making the present read path safe therefore
+requires a reviewed shared refusal/publication boundary across these routes,
+not a single local guard. Under the Stage 1 stop rule, the implemented
+constructor always refuses a marked root, even when its explicit UUID
+validates. It does so before SQLite/cache construction. No Stage 1 operation
+is enabled; this source slice is a prerequisite, not debt replay or release
+evidence. The later package must first prove a small auditable before-effect
+boundary or return for scope review.
 
 This is an internal opt-in mode of **real** `StorageFS`, `StateManager` and
 `CacheManager`, not a fake persistence service, mount/CLI setting, or default
