@@ -1,66 +1,95 @@
 # splinter1 browse latency and missing-entry field report (2026-11-12)
 
 Lane: field-browse (STORAGE-SPLINTER1-BROWSE-20261112). Base 81793ac.
+Corrected at root review of 93ed39f (one feedback round); see Corrections.
 Aggregated and anonymized: directories are labelled by subtree and
 selection order; no file names or private paths. Raw per-name evidence
-stays in the lane's private scratch.
+and the historical probe scripts are kept private with a sha256 manifest.
 
 ## What was running
 
 - Mount PID 357705 on splinter1, started 13:55:17 local, running the
   flake-built package whose `storage/*.py` are sha256-identical to
-  81793ac. It runs in an interactive terminal (no tmux), so its log was
-  not readable.
-- Profile: three SSH members (raid, chunk1, chunk0) on one drynwyn host by
-  LAN IP; `workers = 2`; `fuse_threads = true`; streaming reads, 1 MiB
-  chunks, 8 sessions; cache 50G. `enable_watchers` and `readdir_ttl` are
-  unset.
+  81793ac. It runs in an interactive terminal (no tmux); its log was not
+  readable.
+- Profile: three SSH members (raid, chunk1, chunk0) on one drynwyn host
+  by LAN IP; `workers = 2`; `fuse_threads = true`; streaming reads,
+  1 MiB chunks, 8 sessions; cache 50G. `enable_watchers` and
+  `readdir_ttl` are unset.
 - Host: about 2 GiB available RAM, 1.8 GiB swap in use, load 1 to 3. The
   wired NIC is down; traffic goes over Wi-Fi.
 
 ### Thread and channel model (three separate things)
 
 1. **FUSE request threads**: `fuse_threads = true` runs libfuse's
-   multithreaded loop. It starts request threads on demand (27 threads
-   observed), so this part is already dynamic.
-2. **Sync workers**: fixed at 2 (`workers = 2`). 81793ac has no adaptive
-   sync workers, no foreground-priority scheduling and no
-   foreground-channel reservation feature. `grep -ri adaptive storage/`
-   is empty, and the adaptive-workers and foreground-channel-reserve work
-   is not in 81793ac.
+   multithreaded loop, which starts request threads on demand (27 threads
+   observed).
+2. **Sync workers**: fixed at 2. 81793ac has no adaptive sync-worker
+   growth; that and foreground request admission are in unaccepted #171.
 3. **SSH channels**: one paramiko transport per member (three TCP
-   connections to the same host). Each has 4 SFTP channels, 1 of them
-   reserved for interactive requests, and 2 exec channels
-   (`ssh_pool.MemberConnection` defaults). Every member also gets a
-   single-thread listing executor.
+   connections to one host). Each has 4 SFTP channels and 2 exec
+   channels; one listing executor thread runs per member.
+   - 81793ac already keeps **1 SFTP channel per member reserved for
+     interactive requests**: the FUSE thread and directory listings
+     (`ssh_pool.MemberConnection`, `interactive_reserve=1`).
+   - What 81793ac lacks is the classification fix in unaccepted #175. In
+     the deployed build, cold whole-file cache copies run as interactive
+     requests and can hold interactive leases, so the reserve can be in
+     use by a copy when a listing needs it.
+   - Whether that happened during these measurements is not known.
 
 ## Method
 
-- `scripts/field/browse_probe.py` is fed over ssh stdin, so nothing is
-  written on splinter1. It ran serially and took 37 s.
-- It selected 9 directories under Videos and 8 under Music on chunk0 (via
-  the GVFS POSIX bridge), up to depth 2:
-  - each subtree root;
+The historical helpers were removed from this branch after review. They
+did not enforce the bounds they advertised:
+
+- the 10000-entry cap was checked only after a full enumeration, and only
+  skipped lstat;
+- explicit directory lists bypassed the depth, count and symlink checks;
+- the phase probe's `os.access` follows symlinks;
+- the summarizer would have shown a missing operation as 0 ms.
+
+None of these affected this data set: no run exceeded 700 names, and no
+operation errored or was missing. The scripts and raw evidence are kept
+privately, with hashes. What was run, as commands:
+
+- **GIO listing**: `gio list -n -h -a standard::name,standard::type,standard::size,standard::is-hidden,standard::is-symlink,standard::fast-content-type,time::modified,unix::mode,access::can-read URI`.
+  Storage is queried as `file://MOUNT/DIR`, chunk0 as
+  `sftp://HOST/MEMBER_ROOT/DIR`.
+- **POSIX**: `os.listdir(DIR)` on each tree, then `os.lstat` of the
+  same common names (at most 200, an evenly spaced sample in sorted
+  order).
+- **Per-operation child processes**: each operation ran in its own
+  `python3 -I -S -c` child with a 30 s timeout. The driver was fed over
+  ssh stdin, so nothing was written on splinter1. The run was serial and
+  took 37 s.
+- **Selection**: on chunk0 via the GVFS POSIX bridge, from each subtree
+  root:
+  - the root itself;
   - the 4 most recently modified children, from a spread sample of at
     most 200 entries;
   - the 3 densest of 8 sampled children;
-  - a most-recent descendant chain.
-- Three runs per directory, alternating which side goes first. Run 1
+  - one most-recent descendant chain.
+
+  This gave 9 directories under Videos and 8 under Music, at depth 2 or
+  less.
+- **Runs**: three per directory, alternating which side goes first; run 1
   starts with GIO on Storage.
-- Operations on each side:
-  - `gio list -n -h` with listing-level attributes (`standard::name,type,size,is-hidden,is-symlink,fast-content-type`,
-    `time::modified`, `unix::mode`, `access::can-read`). Storage is
-    queried through `file://`, chunk0 through `sftp://` (what a GUI uses).
-  - POSIX `os.listdir`.
-  - `os.lstat` of the same common names, at most 200.
-- **"Run 1" means first observed in this probe, not proven cold.** The
-  mount had been up about 18 minutes and the subtree roots had been
-  listed earlier. Selection warmed chunk0's GVFS side before run 1.
-- `scripts/field/cold_phase_probe.py` split one visit into lookup,
-  readdir, lstat and access for 2 more untouched Music directories.
-- Metadata only. No content-read throughput was measured.
+- **Phase split**: for 2 Music directories not otherwise touched, one
+  child each measured `lstat(dir)`, `listdir(dir)`, then `lstat` and
+  `access(R_OK)` of each entry. Each directory was visited in the order
+  Storage, chunk0, Storage.
+- **Syscall count**: `strace -f -c` of the GIO listing above on the
+  700-entry Music root of Storage.
+- **"Run 1" is first observed in this probe, not proven cold.** The mount
+  had been up about 18 minutes and the subtree roots had been listed
+  before. Selection warmed chunk0's GVFS side before run 1. The same
+  applies to the phase split's "first" visit: those directories were not
+  touched by this lane before, but may have been by others.
+- Metadata only; no content-read throughput was measured.
 
 ## Results (milliseconds)
+
 
 | dir | entries S/M | GIO S run1 | GIO M run1 | GIO S warm med | GIO M warm med | listdir S run1 / warm | listdir M warm | lstat S warm (n) | lstat M warm |
 |---|---|---|---|---|---|---|---|---|---|
@@ -85,136 +114,153 @@ stays in the lane's private scratch.
 Totals over 17 dirs, ms: GIO Storage run1 8594, GIO member run1 1176; GIO Storage run3 1701, GIO member run3 793
 absent total: 0 conflict total: 0 hidden: 0 dirs with storage-only names: 4
 
-Run 2 and 3 medians are "warm". S = Storage, M = chunk0 over GVFS SFTP.
+Run 2 and 3 medians are "warm" (later observations, not a proven steady state). S = Storage, M = chunk0 over GVFS SFTP.
 
 ### Missing entries
 
-No repro. Every name chunk0 listed was in Storage's listing, in all 17
-directories, all 3 runs, by both GIO and POSIX: 0 absent, 0 conflict
-splits (`name.remoteN`), 0 hidden internal names. Storage listed 1 to 3
-extra names in 4 directories; that is expected, since Storage shows the
-union of all three members. Scope searched: the 17 directories above
-plus 2 more for phase timing, all at most depth 2. Ted's example path was
-not available. This does not show the problem is fixed, only that it did
-not reproduce in this scope. No remount was done.
+No repro. Every name chunk0 listed was in Storage's listing in all 17
+directories, all 3 runs, by both GIO and POSIX: 102 paired checks, with 0
+absent, 0 conflict splits (`name.remoteN`) and 0 hidden internal names.
+Storage listed 1 to 3 extra names in 4 directories; that is expected,
+since it shows the union of three members.
+
+Scope searched: the 17 directories above plus 2 more for phase timing,
+all at most depth 2. No example path from Ted was available. This does
+not show that anything is fixed, only that it did not reproduce in this
+scope. No remount was done.
 
 ## Diagnosis
 
-### 1. Cold directory listing costs 0.1 to 2 s, independent of size
+### 1. A first-observed listing can take 0.1 to 2 s, independent of size
 
-- Phase split on untouched directories:
+- Phase split, Storage first visit:
   - 1 entry: lookup 3.6 ms, **readdir 1667 ms**, lstat 3.7 ms.
-  - 2 entries: lookup 1.6 ms, readdir 72 ms, lstat 5.3 ms.
-- chunk0 itself: readdir 11 to 13 ms.
-- In run 1, GIO on Storage took 0.75 s for a 2-entry directory and 2.1 s
-  for 179 entries, against 38 to 77 ms over GIO SFTP to chunk0.
-- From source (`NamespaceService._list_members`), a foreground listing:
+  - 2 entries: lookup 1.6 ms, readdir 72 ms.
+- The same directories on chunk0: readdir 11 to 13 ms.
+- Storage second visit: readdir 3.4 ms.
+- In run 1, GIO on Storage took up to 2.1 s, against at most 0.35 s on
+  chunk0.
+- The time is in readdir, and the next visit is fast. Beyond that, this
+  lane did not isolate where it goes.
+- From source, a foreground listing (`NamespaceService._list_members`):
   - lists the cache directory and all three members concurrently;
-  - waits for every member with no deadline (only background refreshes
-    use the 60 s member timeout);
-  - then merges the results and queues directory checksum tasks.
-- So a cold listing costs as much as the slowest of raid, chunk1 and
-  chunk0, plus the wait for that member's single-thread listing executor
-  and an SFTP channel on its transport.
-- chunk0 alone answers in about 10 to 50 ms. The excess is therefore in
-  raid or chunk1 (possibly spun-down disks, or disks busy with server-side
-  hashing that the checksum queue starts), or in channel and executor
-  queueing behind streaming, sync and checksum work on the same
-  transports.
-- This lane was not authorized to inspect raid or chunk1 and could not
-  read the mount's log, so it cannot say which. **This attribution is
-  unverified.**
+  - waits for every member with no deadline (only background refreshes use
+    the 60 s member timeout);
+  - then merges the results, queues directory checksum tasks and computes
+    the conflict view.
+- Hypotheses, none measured here:
+  - member-side listing time on raid or chunk1;
+  - waiting for a member's listing executor or an SFTP channel, including
+    the deployed interactive-lease classification described above;
+  - checksum scheduling, the merge, or Python and FUSE overhead.
+- chunk0's GVFS answer time does not bound Storage's chunk0 listing,
+  which goes over a different client and connection.
 
-### 2. Warm GIO on Storage pays one FUSE round trip per entry, twice
+### 2. A later GIO listing on Storage costs more per entry than on chunk0
 
-- On the 700-entry Music root, warm GIO took 0.87 to 1.23 s on Storage
-  against 0.19 s on chunk0.
-- Under strace, GIO on `file://` issues one `statx` and one `access`
-  per entry: 700 and 703 calls, 5 `getdents64`.
-- `attr_timeout = 0` (by design: `fs.KERNEL_ATTR_TIMEOUT`, see
-  `fuse_mount_options`), so every `statx` reaches the Python daemon.
-  Warm `lstat` costs about 0.5 to 0.8 ms per entry there.
-- GVFS SFTP gets the attributes in the READDIR replies and answers
-  `access::can-read` from the mode bits, so it does one batched exchange.
-- POSIX `listdir` on Storage is fast (2 to 31 ms warm): the listing
-  snapshot is fine. The cost is per-entry getattr and access.
+- On the 700-entry Music root, GIO took 0.87 to 1.23 s on Storage
+  against 0.19 s on chunk0 (later runs).
+- strace of the Storage listing: 700 `statx`, 703 `access` and 5
+  `getdents64` calls.
+- `attr_timeout` is 0 by design (`fs.KERNEL_ATTR_TIMEOUT`; see
+  `fuse_mount_options`), so each `statx` reaches the daemon. Measured
+  later-run `lstat` costs about 0.5 to 0.8 ms per entry there.
+  `access` cost was not measured separately on the 700-entry root.
+- POSIX `listdir` on Storage is fast in later runs (2 to 31 ms).
+- **Qualified, not verified in this lane:** the SFTP protocol returns
+  attributes with each READDIR reply, and GVFS's SFTP backend is
+  expected to answer this attribute set from those replies, without a
+  round trip per entry. Neither GVFS's source nor its traffic was
+  checked here.
 
-### 3. A Nautilus-like attribute set is far slower (one measurement, unplanned)
+### 3. A wider, Nautilus-like attribute set took 94 s (unplanned, one sample)
 
-- One `gio list` of the Music root with `standard::*,time::*,unix::*,access::*`
-  took **94 s** warm on Storage.
-- `standard::*` includes `standard::content-type`. Over `file://`, GIO
-  may sniff the first bytes of each regular file to get it. About 16% of
-  the sampled entries in that directory are regular files.
-- Each sniff is an open plus a small read of a file that is probably not
-  cached. Through Storage that means an open-time member stat and a
-  streaming session.
-- The same request over `sftp://` guesses from the file name. It was not
-  measured here.
-- This run exceeded the lane's content-read bound; see the deviation in
-  the event shard. It is the strongest lead for the GUI latency, but it is
-  one sample. It has not been repeated, and which part dominates is not
-  known.
-- It also fits the reported Nautilus "directory hangs before anything
-  appears": GIO's enumerator returns infos in batches, so the first batch
-  waits for its sniffs, after a cold listing that can itself take up to
-  2 s (section 1).
+- One `gio list` of the Music root on Storage with
+  `standard::*,time::*,unix::*,access::*` took 94 s.
+- It was run outside the harness. It exceeded both the 30 s per-operation
+  bound and the content-prefix bound (at most one 64 KiB prefix per
+  directory); see the deviation in the event shard.
+- **What it read, wrote or cached is unknown.** A flat `write_bytes` on
+  the mount process over 5 s afterwards does not bound the I/O during the
+  94 s.
+- **Qualified hypothesis:** `standard::*` includes
+  `standard::content-type`, which GIO's local backend may compute by
+  reading the start of each regular file; about 16% of the sampled
+  entries there are regular files. Neither GLib's behaviour on this mount
+  nor the number of opens was verified.
+- The same attribute set was not run over `sftp://`, so there is no
+  comparison.
+- This is a lead for the reported Nautilus delay before a directory shows
+  anything, together with section 1. It is not a diagnosis.
 
-### 4. Freshness: no directory-mtime check
+### 4. Freshness: a stale listing is served without checking the directory
 
 - Watchers are off (default), so a listing is fresh for 60 s
   (`revalidate_after` default; `readdir_ttl` is unset).
-- After that it is **served stale** while one background refresh runs,
-  until `listing_max_stale` (3600 s); past that it is relisted in the
-  foreground.
-- Nothing compares a directory's mtime before serving a stale listing.
-  The first visit to a directory more than 60 s after its last listing
-  shows the old contents, and the next visit shows the refreshed ones.
-- A file added on a member within the last hour can therefore be missing
-  from one view of a directory last listed more than 60 s earlier. This
-  fits "fresh files not shown" in a mount that is new but has already been
-  browsed; it did not reproduce in this probe.
-- A brand-new mount starts with empty listing state, so the very first
-  listing of each directory is complete, unless a member's listing fails.
-  A failed member falls back to that member's earlier names, which a
-  fresh mount does not have.
-- Nautilus also keeps its own directory model and gets no file-monitor
-  events for changes made on a member, so an open window does not update
-  by itself.
+- After that, an access serves the old listing and schedules one
+  background refresh, until `listing_max_stale` (3600 s); past that the
+  directory is relisted in the foreground.
+- Nothing compares the members' directory mtime first. So a visit more
+  than 60 s after the last listing can lack names added since.
+- **The refresh is asynchronous.** The next visit sees new names only if
+  the refresh has finished and published. It may still be running,
+  waiting on a member, or have failed, so the next visit is not
+  guaranteed to be current.
+- A brand-new mount starts with empty listing state, so its first
+  listing of a directory comes from the members. A member whose listing
+  fails falls back to its earlier names, which a fresh mount does not
+  have.
+- Nautilus keeps its own directory model; whether it gets change events
+  for this FUSE mount was not checked.
 
 ## Remedy
 
-No restart was done. The running build is the accepted latest, and
-nothing showed that a same-version restart would change any measurement.
+No restart: the running build is the accepted latest, and no measurement
+showed that a same-version restart would change anything. The follow-ups
+below are code or policy changes, so release disposition belongs to
+root, and policy to Ted.
 
-Recommended follow-ups. These are code changes, so root decides release.
-
-1. **Find out where the cold readdir time goes.** Log per-member listing
-   duration and the wait for the executor and channel at debug level, or
-   take a one-off read-only `ps` on drynwyn during a cold listing (for
-   example, for checksum processes). Then decide between a foreground
-   member deadline with fallback, deferring directory checksum scheduling
-   while foreground listings wait, or a dedicated listing channel.
-2. **Cut the per-entry cost of GIO and Nautilus.** First confirm, with a
-   bounded and authorized test, whether content-type sniffing is what
-   makes Nautilus slow on Storage. If it is, options are: make small
-   opens of uncached files cheap, or check whether a FUSE subtype or
-   mount option makes GIO treat the mount as remote and guess from file
-   names. Separately, profile the warm per-call cost of getattr and
-   access in the daemon.
-3. **Freshness** is a product tradeoff and is filed as an open question:
-   revalidating a stale listing against the members' directory mtime
-   costs one stat per member per visit, in exchange for never serving a
-   stale listing. Another option is a shorter `readdir_ttl` for this
-   profile, or watchers.
+1. **Find where first-observed readdir time goes.** Per-member listing
+   duration plus executor and channel wait, at debug level, under a
+   separately authorized runtime budget.
+2. **Measure the wide attribute set safely** (opens and bytes per
+   listing, time to first batch, the same set over `sftp://`) before
+   choosing a remedy for GIO and Nautilus.
+3. **Freshness is an open product question** (ditz
+   `oq-listing-stale-serve-dir-mtime`). The candidate options trade
+   latency for fewer stale views; none guarantees a listing is never
+   stale:
+   - a directory-mtime check has a check-to-use race, coarse timestamp
+     granularity on some filesystems, sees only direct entries, and
+     cannot check a member that is failing;
+   - a shorter fresh window keeps the same 3600 s stale window, so a
+     stale first view remains;
+   - the per-member stat latency such a check would add is unmeasured.
 
 Tracked: ditz `field-gio-content-sniff-per-entry`,
-`oq-listing-stale-serve-dir-mtime` (open question for Ted), and comments on
+`oq-listing-stale-serve-dir-mtime`, and comments on
 `field-listing-stalls-under-load` and `field-listing-downloads-to-hash`.
+
+## Corrections (root review of 93ed39f)
+
+- Run 1 and the phase split's first visits are "first observed", not
+  cold.
+- The first-observed readdir excess is no longer attributed to raid,
+  chunk1 or channel queueing; those are listed as unmeasured hypotheses.
+- The channel model now states that 81793ac has the interactive reserve;
+  what it lacks is #175's classification fix.
+- The 94 s run exceeded both the 30 s bound and the prefix bound. Its
+  I/O is unknown, and the "no bulk fetch" claim is withdrawn.
+- The next visit after a stale serve is not guaranteed fresh, and no
+  freshness option guarantees a listing is never stale.
+- GIO, GVFS and SFTP implementation claims are qualified as unverified.
+- The runnable helpers were removed and are preserved privately with
+  hashes; their bound defects did not affect this data set.
 
 ## Limits
 
 - One host, one time window; only a sample of each subtree was covered.
-- Not true cold. The mount log was not visible. raid and chunk1 were not
-  inspected. No content throughput was measured. Run counts are small,
-  so the numbers are indicative, not a benchmark.
+- Nothing was proven cold. The mount log was not visible, and raid and
+  chunk1 were not inspected.
+- No content throughput was measured. Run counts are small, so the
+  numbers are indicative, not a benchmark.
