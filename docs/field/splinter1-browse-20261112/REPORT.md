@@ -29,14 +29,26 @@ and the historical probe scripts are kept private with a sha256 manifest.
 3. **SSH channels**: one paramiko transport per member (three TCP
    connections to one host). Each has 4 SFTP channels and 2 exec
    channels; one listing executor thread runs per member.
-   - 81793ac already keeps **1 SFTP channel per member reserved for
-     interactive requests**: the FUSE thread and directory listings
-     (`ssh_pool.MemberConnection`, `interactive_reserve=1`).
-   - What 81793ac lacks is the classification fix in unaccepted #175. In
-     the deployed build, cold whole-file cache copies run as interactive
-     requests and can hold interactive leases, so the reserve can be in
-     use by a copy when a listing needs it.
-   - Whether that happened during these measurements is not known.
+   - **Configured:** 81793ac keeps 1 SFTP channel per member reserved for
+     interactive requests (`ssh_pool.MemberConnection`,
+     `interactive_reserve=1`).
+   - **Effective, for ordinary foreground readdir: not interactive.**
+     - `StorageFS.__call__` (`storage/fs.py:126-130`) sets the interactive
+       context only around the call that returns `StorageFS.readdir`'s
+       generator (`storage/fs.py:2076-2079`).
+     - The listing runs when fusepy iterates that generator, after the
+       context has ended.
+     - `_submit_member_listings` (`storage/namespace.py:1105-1108`) then
+       copies that now non-interactive context into the member's listing
+       executor.
+     - So a foreground listing competes for channels as background work
+       and does not use the reserve.
+   - **Cold whole-file copies:** they keep the interactive class of the
+     FUSE request that starts them, so they can hold interactive leases.
+   - Unaccepted #175 fixes both: it evaluates readdir eagerly inside the
+     request, and it classifies cold full-file copies as bulk.
+   - Whether either effect contributed to the field timings is
+     unverified.
 
 ## Method
 
@@ -59,8 +71,9 @@ privately, with hashes. What was run, as commands:
 - **POSIX**: `os.listdir(DIR)` on each tree, then `os.lstat` of the
   same common names (at most 200, an evenly spaced sample in sorted
   order).
-- **Per-operation child processes**: each operation ran in its own
-  `python3 -I -S -c` child with a 30 s timeout. The driver was fed over
+- **Per-operation child processes**: each POSIX operation ran in its own
+  `python3 -I -S -c` child, and each GIO listing ran `gio` directly as a
+  subprocess; both had a 30 s timeout. The driver was fed over
   ssh stdin, so nothing was written on splinter1. The run was serial and
   took 37 s.
 - **Selection**: on chunk0 via the GVFS POSIX bridge, from each subtree
@@ -86,7 +99,9 @@ privately, with hashes. What was run, as commands:
   before. Selection warmed chunk0's GVFS side before run 1. The same
   applies to the phase split's "first" visit: those directories were not
   touched by this lane before, but may have been by others.
-- Metadata only; no content-read throughput was measured.
+- The bounded scripted probes were metadata only; the 94 s wide-attribute
+  run in Diagnosis 3 was outside them. No content-read throughput was
+  measured.
 
 ## Results (milliseconds)
 
@@ -131,7 +146,7 @@ scope. No remount was done.
 
 ## Diagnosis
 
-### 1. A first-observed listing can take 0.1 to 2 s, independent of size
+### 1. A first-observed listing can take 0.1 to 2 s, and can be large even for small directories (not a controlled size comparison)
 
 - Phase split, Storage first visit:
   - 1 entry: lookup 3.6 ms, **readdir 1667 ms**, lstat 3.7 ms.
@@ -150,8 +165,9 @@ scope. No remount was done.
     the conflict view.
 - Hypotheses, none measured here:
   - member-side listing time on raid or chunk1;
-  - waiting for a member's listing executor or an SFTP channel, including
-    the deployed interactive-lease classification described above;
+  - waiting for a member's listing executor or an SFTP channel. In the
+    deployed build a foreground listing is not classified interactive, and
+    cold copies can hold interactive leases (see the channel model);
   - checksum scheduling, the merge, or Python and FUSE overhead.
 - chunk0's GVFS answer time does not bound Storage's chunk0 listing,
   which goes over a different client and connection.
@@ -247,8 +263,9 @@ Tracked: ditz `field-gio-content-sniff-per-entry`,
   cold.
 - The first-observed readdir excess is no longer attributed to raid,
   chunk1 or channel queueing; those are listed as unmeasured hypotheses.
-- The channel model now states that 81793ac has the interactive reserve;
-  what it lacks is #175's classification fix.
+- The channel model separates the configured interactive reserve from
+  effective classification. In 81793ac, foreground readdir runs outside
+  the interactive context, and cold copies keep it. #175 fixes both.
 - The 94 s run exceeded both the 30 s bound and the prefix bound. Its
   I/O is unknown, and the "no bulk fetch" claim is withdrawn.
 - The next visit after a stale serve is not guaranteed fresh, and no
