@@ -1,0 +1,26 @@
+id: oq-namespace-partial-rename-result
+title: Decide caller-visible result for incomplete namespace rename
+desc: 'PR #171 currently may return success from rename when one member failed, then
+  hold canonical CLEAN reads/uploads under an unresolved guard indefinitely. Ted ruled
+  that this is not an accepted release behavior. Options: (1) report explicit partial
+  failure to the caller while preserving the completed local move and exposing a repair
+  state; (2) block the rename until every member confirms or timeout, then report
+  partial failure; (3) return success with a bounded background recovery guarantee,
+  if a safe guarantee can actually be implemented. Recommendation: (1) for failures
+  that cannot be proved recoverable immediately; no rollback or remote deletion inferred.
+  Ted decides the user-visible API behavior. Blocks release semantics for unavailable/ambiguous
+  member moves; it does not block a narrow two-member proof tracer. Related: storage171-namespace-reconciliation,
+  contracts/namespace-reconciliation.md.'
+type: task
+component: open-questions
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-12T01:25:48-00:00
+references: []
+log_events:
+- time: 2026-11-12T01:25:48-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
