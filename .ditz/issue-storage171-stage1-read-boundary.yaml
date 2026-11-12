@@ -1,0 +1,22 @@
+id: storage171-stage1-read-boundary
+title: Complete the Stage1 scratch read boundary and debt replay
+desc: 'PR #171 scratch-only durable Stage1 remains unavailable after the pre-constructor
+  authority gate at 37d671b. A small auditable before-effect refusal/publication boundary
+  is required across direct StorageFS callbacks/init, CacheManager cache_file/ensure_space/fetch/eviction/heal,
+  and sync/namespace entry routes. Then implement marker/manifest debt replay and
+  pre-link PENDING to COMMITTED publication under contracts/durable-freshness-restart.md,
+  with two restart tests and failure cuts. Do not enable on existing roots or claim
+  shipping; root review and a new bounded grant precede work.'
+type: task
+component: foreground-responsiveness
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-12T03:16:04-00:00
+references: []
+log_events:
+- time: 2026-11-12T03:16:04-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
