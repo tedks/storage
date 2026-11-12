@@ -22,3 +22,15 @@ log_events:
   who: Ted Smith
   what: created
   comment: ""
+- time: 2026-11-12T04:31:16-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Implementation lane on fix/ssh-mux-directory-type-20261112 at base 66c640a.
+    Deterministic regression now forces the replacement symlink''s lstat result to
+    reuse the original directory''s device/inode while retaining symlink mode. Control-red
+    evidence: `//tests:storage_test_ssh_mux --test_arg=-k --test_arg=test_a_replaced_socket_directory_is_not_trusted
+    --test_output=errors` failed as intended because no warning was captured; cleanup
+    emitted the symlink-root rmtree warning. Production change adds file type to mux
+    identity and rejects non-directory identity at initial mkdtemp capture. Focused
+    green remains pending because the shared runtime lock is held by another storage
+    Bazel lane. No behavioral fix claim or gate waiver.'
