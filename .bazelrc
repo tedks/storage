@@ -1,1 +1,2 @@
+try-import /etc/tedks/infra.bazelrc
 try-import %workspace%/.bazelrc.local
