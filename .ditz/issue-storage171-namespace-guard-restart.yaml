@@ -34,3 +34,13 @@ log_events:
     proof must be durably captured when available; bare Local inode may be reused,
     and cache-file xattrs/SQLite rows cannot cover lazy or absent descendants. No
     durable implementation/runtime authorized or performed.
+- time: 2026-11-12T02:30:23-00:00
+  who: Ted Smith
+  what: commented
+  comment: Source-only durable boundary audit at clean pushed c6fc138 proposes a versioned
+    per-CLEAN-inode debt marker plus a cache-root authority for missing-cache obligations
+    and exact/segment-bounded old/new rename domains. Persist intent before local
+    move and restore denial before sync/open/watchers/sweep; no guard retirement.
+    Proposed contract contracts/durable-freshness-restart.md, tests unwritten/unrun.
+    Legacy or lost root authority cannot be inferred empty; Ted migration question
+    oq-durable-freshness-legacy-cache filed. Root review pending.
