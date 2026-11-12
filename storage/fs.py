@@ -102,6 +102,9 @@ class PathFreshness:
     uncertain_local: bool = False
     mutation_group_failed: bool = False
     namespace_uncertain: bool = False
+    # Only a completed local cache+index move may establish this proof.
+    # An old target row, even DIRTY with matching size and mtime, cannot.
+    uncertain_dirty_proof: Optional[Tuple[int, int, int]] = None
     generations: Dict[str, int] = field(default_factory=dict)
     debts: Dict[str, FreshnessDebt] = field(default_factory=dict)
 
@@ -510,14 +513,26 @@ class StorageFS(Operations):
             return is_open
 
     def _should_sync_path(self, virtual_path: str) -> bool:
-        """Only sync paths that do not currently have an open writer."""
+        """Only sync a proved namespace inode without a current writer."""
         with self._fd_lock:
+            cache_path = self.cache_manager.get_cache_path(virtual_path)
+            named = regular_file_stat(cache_path)
             for entry in self._fd_map.values():
                 if entry.canonical_path != virtual_path:
                     continue
                 if entry.prefetch_session is not None:
                     continue
                 if (entry.flags & os.O_ACCMODE) != os.O_RDONLY:
+                    # A replaced target descriptor carries the new path but
+                    # still owns its old inode. It cannot delay the new
+                    # source's upload; a genuine current writer still does.
+                    if named is None or self._fd_owns_cache_path(entry.real_fd, cache_path):
+                        return False
+            with self._member_checks_lock:
+                state = self._freshness.get(virtual_path)
+                if state is not None and (state.namespace_uncertain
+                                          or state.active_mutations
+                                          or state.uncertain_local):
                     return False
         return True
 
@@ -1285,6 +1300,7 @@ class StorageFS(Operations):
             if replacement:
                 self._next_freshness_identity += 1
                 state.identity = self._next_freshness_identity
+                state.uncertain_dirty_proof = None
             state.local_epoch += 1
             state.revision += 1
             state.active_mutations += 1
@@ -1593,7 +1609,8 @@ class StorageFS(Operations):
             for key in [k for k in self._freshness_probe_retry if k[0] == path]:
                 del self._freshness_probe_retry[key]
 
-    def _mark_namespace_uncertain(self, old: str, new: str, prior_debts):
+    def _mark_namespace_uncertain(self, old: str, new: str, prior_debts,
+                                  proven_dirty=None):
         """A partial local move leaves both possible names requiring proof.
 
         This in-memory slice cannot certify which member still owns either
@@ -1624,6 +1641,7 @@ class StorageFS(Operations):
                         identity=self._next_freshness_identity, current_path=path,
                         revision=1, generations=dict(generations), debts=dict(debts),
                         namespace_uncertain=True,
+                        uncertain_dirty_proof=(proven_dirty or {}).get(path),
                     )
                     self._member_checks.pop(path, None)
                     self._revalidate_unreachable.pop(path, None)
@@ -2286,7 +2304,11 @@ class StorageFS(Operations):
                 self.cache_manager.mark_accessed(resolved.requested_path)
                 # A CLEAN row older than the file means a write's row update
                 # was lost; the file is dirty whatever the row says.
-                self.cache_manager.heal_stale_clean(canonical_path, cache_path)
+                with self._member_checks_lock:
+                    state = self._freshness.get(canonical_path)
+                    uncertain = state is not None and state.namespace_uncertain
+                if not uncertain:
+                    self.cache_manager.heal_stale_clean(canonical_path, cache_path)
             return True
 
         # A cached open may have lost its entry during revalidation or
@@ -2538,8 +2560,23 @@ class StorageFS(Operations):
                 same_inode_moved = False
             if local_moved or (old_was_cached and same_inode_moved
                                and not os.path.lexists(old_cache)):
+                # Only the callback after the index rewrite certifies that
+                # the target row belongs to the moved source. A cache-only
+                # move leaves the old target row behind, regardless of its
+                # status or stat coincidence.
+                proven_dirty = {}
+                if local_moved and source_inode is not None and same_inode_moved:
+                    with self.state_manager.metadata_lock:
+                        row = self.state_manager.get_file_metadata(new_canonical)
+                        with self._member_checks_lock:
+                            state = self._freshness.get(new_canonical)
+                            stable = (state is not None and not state.active_mutations
+                                      and not state.uncertain_local)
+                        if stable and row is not None and row.sync_status == SyncStatus.DIRTY:
+                            proven_dirty[new_canonical] = (
+                                source_inode[0], source_inode[1], row.dirty_generation)
                 self._mark_namespace_uncertain(old_canonical, new_canonical,
-                                               prior_obligations)
+                                               prior_obligations, proven_dirty)
                 self._drop_persisted_baselines(new_canonical)
                 self._drop_persisted_baselines(old_canonical)
             raise
@@ -2608,6 +2645,12 @@ class StorageFS(Operations):
             if current is not None:
                 published["inode"] = (current.st_dev, current.st_ino)
                 published["dirty"] = True
+                with self._member_checks_lock:
+                    state = self._freshness.get(canonical_path)
+                    if (state is not None and state.namespace_uncertain
+                            and state.uncertain_dirty_proof is not None
+                            and state.uncertain_dirty_proof[:2] == published["inode"]):
+                        state.uncertain_dirty_proof = (*published["inode"], generation)
         return generation
 
     @staticmethod
@@ -2680,21 +2723,23 @@ class StorageFS(Operations):
         resolved = self._resolve_path(path)
         cache_path = resolved.cache_path
         prefetch_session: Optional[PrefetchSession] = None
+        uncertain = False
 
         if resolved.backend_name is None:
-            with self._member_checks_lock:
-                state = self._freshness.get(resolved.canonical_path)
-                uncertain = state is not None and state.namespace_uncertain
-            if uncertain:
-                # A partial namespace move has no certified CLEAN source at
-                # either name. Preserve a local DIRTY inode, but never pick a
-                # ranked member merely because it has a copy there.
-                if self.cache_manager.is_cached(resolved.requested_path):
-                    self.cache_manager.heal_stale_clean(resolved.canonical_path, cache_path)
-                row = self.state_manager.get_file_metadata(resolved.canonical_path)
-                if (row is None or row.sync_status != SyncStatus.DIRTY
-                        or regular_file_stat(cache_path) is None):
-                    raise FuseOSError(errno.EIO)
+            with self.state_manager.metadata_lock:
+                with self._member_checks_lock:
+                    state = self._freshness.get(resolved.canonical_path)
+                    uncertain = state is not None and state.namespace_uncertain
+                    proof = state.uncertain_dirty_proof if uncertain else None
+                    busy = (state.active_mutations or state.uncertain_local) if uncertain else False
+                if uncertain:
+                    row = self.state_manager.get_file_metadata(resolved.canonical_path)
+                    current = regular_file_stat(cache_path)
+                    if (busy or proof is None or current is None or row is None
+                            or row.sync_status != SyncStatus.DIRTY
+                            or proof != (current.st_dev, current.st_ino,
+                                         row.dirty_generation)):
+                        raise FuseOSError(errno.EIO)
 
         # Before the streaming decision: a copy dropped here is refetched
         # like any uncached file, streamed if streaming is on.
@@ -2702,6 +2747,7 @@ class StorageFS(Operations):
         if (
             resolved.backend_name is None
             and not flags & os.O_TRUNC
+            and not uncertain
             and self.cache_manager.is_cached(resolved.requested_path)
         ):
             self._revalidate_cached_file(resolved)
@@ -3375,6 +3421,12 @@ class StorageFS(Operations):
         """
         marked = 0
         for entry in scan_cache_entries(self.cache_manager.cache_root):
+            with self._member_checks_lock:
+                state = self._freshness.get(entry.virtual_path)
+                if state is not None and state.namespace_uncertain:
+                    # A prior name's row/xattr cannot turn a cache-only move
+                    # into a local edit, even during the post-crash sweep.
+                    continue
             if self.cache_manager.heal_stale_clean(
                 entry.virtual_path,
                 entry.cache_path,

@@ -941,6 +941,141 @@ class TestSharedFreshnessObligation(ThreadingTestBase):
             self.assertEqual(self.OLD, (self.cache_dir / "moved.txt").read_bytes())
         self._assert_slots_released()
 
+    def test_partial_replace_cannot_turn_old_target_row_into_local_authority(self):
+        self._prime_owed_a_with_b_cached()
+        target = "/target.txt"
+        for directory in (self.member_dir, self.b_dir):
+            (directory / "target.txt").write_bytes(b"different clean target")
+        self.assertEqual(b"different clean target", self._read(target))
+        target_row = self.fs.state_manager.get_file_metadata(target)
+        self.assertEqual(SyncStatus.CLEAN, target_row.sync_status)
+        with patch.object(self.fs.state_manager, "rename_path",
+                          side_effect=OSError(errno.EIO, "index move failed")):
+            with self.assertRaises(OSError):
+                self.fs.rename(self.PATH, target)
+        self.assertEqual(self.OLD, (self.cache_dir / "target.txt").read_bytes())
+        self.fs.sweep_stale_cache_metadata()
+        self.assertEqual(SyncStatus.CLEAN,
+                         self.fs.state_manager.get_file_metadata(target).sync_status)
+        with self.assertRaises(FuseOSError) as raised:
+            self._read(target, direct=True)
+        self.assertEqual(errno.EIO, raised.exception.errno)
+        self.assertIn("changedA", self._snapshot(target)["debts"])
+        self.assertNotIn("staleB", self.fs._member_checks.get(target, SimpleNamespace(members={})).members)
+
+    def test_partial_replace_equal_size_mtime_still_lacks_inode_authority(self):
+        self._prime_owed_a_with_b_cached()
+        target = "/target.txt"
+        source_stat = (self.cache_dir / "f.txt").stat()
+        for directory in (self.member_dir, self.b_dir):
+            path = directory / "target.txt"
+            path.write_bytes(b"x" * len(self.OLD))
+            os.utime(path, ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns))
+        self.assertEqual(b"x" * len(self.OLD), self._read(target))
+        target_stat = (self.cache_dir / "target.txt").stat()
+        self.assertEqual((source_stat.st_size, source_stat.st_mtime_ns),
+                         (target_stat.st_size, target_stat.st_mtime_ns))
+        with patch.object(self.fs.state_manager, "rename_path",
+                          side_effect=OSError(errno.EIO, "index move failed")):
+            with self.assertRaises(OSError):
+                self.fs.rename(self.PATH, target)
+        with self.assertRaises(FuseOSError) as raised:
+            self._read(target, direct=True)
+        self.assertEqual(errno.EIO, raised.exception.errno)
+        self.assertEqual(self.OLD, (self.cache_dir / "target.txt").read_bytes())
+        self.assertIn("changedA", self._snapshot(target)["debts"])
+
+    def test_partial_replace_dirty_target_never_uploads_moved_source(self):
+        self._prime_owed_a_with_b_cached()
+        target = "/target.txt"
+        fd = self.fs.create(target, 0o644)
+        self.fs.write(target, b"local target", 0, fd)
+        self.fs.release(target, fd)
+        self.assertEqual(SyncStatus.DIRTY,
+                         self.fs.state_manager.get_file_metadata(target).sync_status)
+        with patch.object(self.fs.state_manager, "rename_path",
+                          side_effect=OSError(errno.EIO, "index move failed")):
+            with self.assertRaises(OSError):
+                self.fs.rename(self.PATH, target)
+        moved = (self.cache_dir / "target.txt").read_bytes()
+        self.assertEqual(self.OLD, moved)
+        with patch.object(self.a, "copy_from_local", wraps=self.a.copy_from_local) as upload_a, \
+                patch.object(self.b, "copy_from_local", wraps=self.b.copy_from_local) as upload_b:
+            self.fs.sync_manager.num_workers = 1
+            self.fs.sync_manager.max_workers = 1
+            self.fs.sync_manager.start()
+            self.addCleanup(self.fs.sync_manager.stop)
+            self.fs.sync_manager.queue_sync(target, force=True)
+            self.assertTrue(self.fs.sync_manager.wait_for_completion(timeout=WAIT))
+            upload_a.assert_not_called()
+            upload_b.assert_not_called()
+        self.assertEqual(SyncStatus.DIRTY,
+                         self.fs.state_manager.get_file_metadata(target).sync_status)
+        self.assertEqual(moved, (self.cache_dir / "target.txt").read_bytes())
+        self.assertIn("changedA", self._snapshot(target)["debts"])
+        with self.assertRaises(FuseOSError) as raised:
+            self._read(target, direct=True)
+        self.assertEqual(errno.EIO, raised.exception.errno)
+
+    def test_failed_member_rename_keeps_proven_dirty_source_access(self):
+        self._prime_owed_a_with_b_cached()
+        self.a.set_available(False)
+        try:
+            fd = self.fs.open(self.PATH, os.O_RDWR)
+            self.fs.write(self.PATH, b"local source", 0, fd)
+            self.fs.release(self.PATH, fd)
+        finally:
+            self.a.set_available(True)
+        self.assertIn("changedA", self._snapshot()["debts"])
+        with patch.object(self.fs.namespace, "_propagate_dir_operation",
+                          side_effect=OSError(errno.EIO, "member move failed")):
+            with self.assertRaises(OSError):
+                self.fs.rename(self.PATH, "/moved.txt")
+        self.assertEqual("reprobe", self._snapshot("/moved.txt")["state"])
+        self.assertEqual(SyncStatus.DIRTY,
+                         self.fs.state_manager.get_file_metadata("/moved.txt").sync_status)
+        self.assertEqual((self.cache_dir / "moved.txt").read_bytes(),
+                         self._read("/moved.txt", direct=True))
+        self.assertIn("changedA", self._snapshot("/moved.txt")["debts"])
+
+    def test_replaced_target_descriptor_does_not_block_current_inode_sync(self):
+        target = "/target.txt"
+        fd = self.fs.create(target, 0o644)
+        self.fs.write(target, b"old target", 0, fd)
+        self.fs.release(target, fd)
+        old_fd = self.fs.open(target, os.O_RDWR)
+        source_fd = self.fs.create("/source.txt", 0o644)
+        self.fs.write("/source.txt", b"new source", 0, source_fd)
+        self.fs.release("/source.txt", source_fd)
+        self.fs.rename("/source.txt", target)
+        try:
+            with self.assertRaises(FuseOSError) as raised:
+                self.fs.write(target, b"wrong", 0, old_fd)
+            self.assertEqual(errno.ESTALE, raised.exception.errno)
+            self.assertTrue(self.fs._should_sync_path(target))
+            current_fd = self.fs.open(target, os.O_RDWR)
+            try:
+                self.assertFalse(self.fs._should_sync_path(target))
+            finally:
+                self.fs.release(target, current_fd)
+            with patch.object(self.a, "copy_from_local", wraps=self.a.copy_from_local) as upload_a, \
+                    patch.object(self.b, "copy_from_local", wraps=self.b.copy_from_local) as upload_b:
+                self.fs.sync_manager.num_workers = 1
+                self.fs.sync_manager.max_workers = 1
+                self.fs.sync_manager.start()
+                self.addCleanup(self.fs.sync_manager.stop)
+                self.fs.sync_manager.queue_sync(target, force=True)
+                self.assertTrue(self.fs.sync_manager.wait_for_completion(timeout=WAIT))
+                self.assertGreaterEqual(upload_a.call_count + upload_b.call_count, 1)
+            uploaded = [(directory / "target.txt").read_bytes()
+                        for directory in (self.member_dir, self.b_dir)
+                        if (directory / "target.txt").exists()]
+            self.assertIn(b"new source", uploaded)
+            self.assertEqual(SyncStatus.CLEAN,
+                             self.fs.state_manager.get_file_metadata(target).sync_status)
+        finally:
+            self.fs.release(target, old_fd)
+
     def test_replacement_retires_target_and_source_stages_and_descriptor(self):
         self._prime_owed_a_with_b_cached()
         target = "/target.txt"
