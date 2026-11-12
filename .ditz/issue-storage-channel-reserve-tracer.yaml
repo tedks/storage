@@ -35,3 +35,16 @@ log_events:
   who: Ted Smith
   what: started
   comment: ""
+- time: 2026-11-12T03:56:50-00:00
+  who: Ted Smith
+  what: commented
+  comment: T1 feedback correction pushed at 4fe8fb14d715ba080cb756bcd58c8ff3dd053ec0.
+    Root/warm Sol found production hunks scoped CLEAN but the first test schedule
+    overconstrained total channels. Corrected test stages three gated get calls, observes
+    the fourth thread denied by the real bulk pool capacity decision, then confirms
+    listing uses the reserve and all bytes/joins. Reversible control disabling only
+    the copy bulk context failed before timeout on bulk_leased=0 versus 3 (1 selected/985
+    deselected); production blob restored exactly. Forced clean pushed-head fast gate
+    passed 986 sandboxed, 8 resilience and build source check. Three renewed invocations
+    spent, all scopes inactive. Root delta review and all release gates remain pending;
+    do not close.
