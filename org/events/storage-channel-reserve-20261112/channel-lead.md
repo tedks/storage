@@ -24,3 +24,18 @@
   Source/test commit pushed, draft PR #175 opened. RED/GREEN logs and scoped
   resource monitors are in the owned scratch path named in status. This is
   verification of the tracer, not release acceptance.
+
+## channel-lead:3
+
+- kind: state-change
+- based_on: `8f1bc3d3a3923ccde1d166d1ffb6dc38ccb12e65`
+- applied_at: evidence-only successor to the same source/test tree
+- refs: `channel-lead:2`
+- state: Clean pushed head ran `//:storage_tests_fast_gate` without test
+  filters and with forced test execution. All three Bazel targets passed:
+  986 sandboxed tests, 8 resilience tests and build source coverage. Four of
+  four authorized focused invocations are spent; scope cgroups verified and
+  all owned scopes inactive. Monitored combined scratch/reused cache growth
+  stayed below 2 GiB; acquisition bytes unknown. Self-review found only the
+  owned three application hunks, one existing test module and own documents.
+  No full gate, CLI, council, root acceptance, merge or deploy is claimed.
