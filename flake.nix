@@ -2,10 +2,11 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     nixpkgs-fuse2.url = "github:NixOS/nixpkgs/nixos-23.05";
+    nixpkgs-bazel.url = "github:NixOS/nixpkgs/56c02bc00adcf003215cc4bd996d6efaf4cff188";
     flake-utils.url = "github:numtide/flake-utils";
   };
 
-  outputs = { self, nixpkgs, nixpkgs-fuse2, flake-utils }:
+  outputs = { self, nixpkgs, nixpkgs-fuse2, nixpkgs-bazel, flake-utils }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import nixpkgs { inherit system; };
@@ -89,8 +90,8 @@
         devShells.default = pkgs.mkShell {
           JAVA_HOME = pkgs.jdk21_headless.home;
           packages = [
-            pkgs.bazel_7
-            # Bazel 7.6.0 needs a Java 21 runtime (class-file version 65).
+            nixpkgs-bazel.legacyPackages.${system}.bazel_8
+            # Bazel 8.7.0 needs a Java 21 runtime (class-file version 65).
             pkgs.jdk21_headless
             pkgs.git
             pkgs.direnv
