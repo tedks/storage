@@ -1,0 +1,39 @@
+id: oq-listing-stale-serve-dir-mtime
+title: Serve a stale listing only after checking the members' directory mtime?
+desc: 'Context: with watchers off (the SSH profiles, splinter1 included), a listing
+  is fresh for 60 s (revalidate_after), then served stale while one background refresh
+  runs, until listing_max_stale (3600 s). Nothing compares the directory''s mtime
+  before serving it, so the first visit after 60 s can lack files added on a member
+  since; the next visit shows them. Ted reported "fresh files not included" (2026-11-12);
+  not reproduced in 17 sampled directories (REPORT.md, PR #177).
+
+  Options:
+
+  A. Keep stale-while-refresh (fastest; one stale view per directory per change).
+
+  B. On a stale hit, stat the directory on each member (one round trip each, concurrent)
+  and serve the snapshot only if every mtime is unchanged, else list in the foreground.
+  Cost: a member round trip on every visit past 60 s; on these members it is the slowest
+  member''s stat latency.
+
+  C. Profile-level: shorter readdir_ttl, or enable watchers where inotify is available.
+
+  Recommendation: B, behind the existing fresh window; measure the stat cost on splinter1
+  first. Caveat: directory mtime changes on add, remove and rename in that directory
+  only, which is what a listing needs.
+
+  Decides: Ted (freshness versus latency product call). Blocks: any change to the
+  stale-serve path.'
+type: task
+component: open-questions
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-12T19:21:18-00:00
+references: []
+log_events:
+- time: 2026-11-12T19:21:18-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
