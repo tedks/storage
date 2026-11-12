@@ -39,3 +39,8 @@ sanitized: no user file names or private paths.
 - field-browse:7 decision. No restart: same accepted build, and no
   measurement shows a restart would help. Remedy: follow-ups filed (see the
   report); the freshness tradeoff goes to open-questions.
+- field-browse:8 state-change DELIVERED. Draft PR #177. ditz:
+  field-gio-content-sniff-per-entry (new), oq-listing-stale-serve-dir-mtime
+  (new, open-questions), comments on field-listing-stalls-under-load and
+  field-listing-downloads-to-hash; ditz sync OK. Resources: no processes
+  left on splinter1 or framework0; no mount lifecycle action.
