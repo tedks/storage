@@ -93,3 +93,13 @@ log_events:
     exhausted; owner stops app/test edits and runtime. Root must review corrected
     fixture and retired-pin migration route with renewed bounded validation. Reconciliation/durable
     issues remain release blockers.
+- time: 2026-11-12T01:09:14-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Ancestor-coverage repair at pushed d79b785: nested old/new prefix records
+    now intersect later directory source/target subtrees in both directions; a successful
+    ancestor move publishes conservative new old/new parent denial while preserving
+    old record and origin debts. Same-schedule absent-state child was served before
+    fix; exact-head eight nonmount targets pass, including 83 threading selected.
+    This fixes the ancestor escape only. Member-name reconciliation and durable guard
+    recovery remain open and the in-memory tracer remains unshippable.'
