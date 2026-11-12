@@ -2075,8 +2075,9 @@ class StorageFS(Operations):
 
     def readdir(self, path, fh):
         """Read directory contents"""
-        for entry in self.namespace.readdir(path):
-            yield entry
+        # NamespaceService returns a concrete list. Resolve it before the
+        # enclosing FUSE dispatch leaves its interactive request context.
+        return self.namespace.readdir(path)
 
     def mkdir(self, path, mode):
         """Create a directory"""

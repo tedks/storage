@@ -1,18 +1,24 @@
 import concurrent.futures
 import errno
 import contextvars
+import os
+import shutil
 import socket
 import stat
 import subprocess
+import tempfile
 import threading
 import time
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from storage.backends import ssh as ssh_module
 from storage.backends import ssh_pool
-from storage.backends.base import ChecksumUnavailable, interactive_request, is_interactive_request
+from storage.backends.base import (
+    ChecksumUnavailable, bulk_request, interactive_request, is_interactive_request,
+)
 from storage.backends.ssh import SSHBackend
 from storage.backends.ssh_pool import (
     CommandTimeout, MemberConnection, MemberUnavailable, is_connection_error,
@@ -451,6 +457,25 @@ class _Holder:
 # --------------------------------------------------------------------------- #
 
 class TestMemberConnectionPool(unittest.TestCase):
+
+    def test_bulk_context_nests_and_does_not_reclassify_a_held_lease(self):
+        server = _FakeServer()
+        pool = _pool(server)
+        try:
+            with interactive_request():
+                self.assertTrue(is_interactive_request())
+                with pool.sftp(1.0) as held:
+                    with bulk_request():
+                        self.assertFalse(is_interactive_request())
+                        with pool.sftp(1.0) as nested:
+                            self.assertIs(held, nested)
+                            self.assertEqual(0, pool.snapshot()["bulk_leased"])
+                        with interactive_request():
+                            self.assertTrue(is_interactive_request())
+                    self.assertTrue(is_interactive_request())
+            self.assertFalse(is_interactive_request())
+        finally:
+            pool.close()
 
     def test_many_threads_share_one_connect_and_at_most_pool_size_channels(self):
         server = _FakeServer()
@@ -1443,6 +1468,120 @@ class TestSSHBackendLinks(_BackendTestCase):
 
 
 class TestSSHBackendOnThePool(_BackendTestCase):
+    def test_bulk_copy_and_eager_readdir_restore_context_on_error(self):
+        from storage.fs import StorageFS
+
+        backend = self._new_backend()
+        root = Path(tempfile.mkdtemp(prefix="storage-channel-context-"))
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        fs = StorageFS(root / "cache", root / "state.db", {"ssh0": backend},
+                       1024 * 1024, start_sync=False)
+        self.addCleanup(fs.state_manager.close)
+        self.addCleanup(fs.sync_manager.stop)
+        observed = []
+
+        def copy_ok(_source, dest):
+            observed.append(is_interactive_request())
+            dest.write_bytes(b"exact bytes")
+
+        def copy_error(_source, _dest):
+            observed.append(is_interactive_request())
+            raise RuntimeError("copy failed")
+
+        with interactive_request():
+            with patch.object(backend, "copy_to_local", side_effect=copy_ok):
+                self.assertTrue(fs.cache_manager.fetch_into_cache(
+                    backend, "/a", root / "cache" / "a"))
+            self.assertTrue(is_interactive_request())
+            with patch.object(backend, "copy_to_local", side_effect=copy_error):
+                with self.assertRaisesRegex(RuntimeError, "copy failed"):
+                    fs.cache_manager.fetch_into_cache(
+                        backend, "/b", root / "cache" / "b")
+            self.assertTrue(is_interactive_request())
+        self.assertEqual([False, False], observed)
+        self.assertEqual(b"exact bytes", (root / "cache" / "a").read_bytes())
+        self.assertFalse(is_interactive_request())
+
+        def fail_listing(_path):
+            observed.append(is_interactive_request())
+            raise RuntimeError("listing failed")
+
+        with patch.object(fs.namespace, "readdir", side_effect=fail_listing):
+            with self.assertRaisesRegex(RuntimeError, "listing failed"):
+                fs("readdir", "/", None)
+        self.assertTrue(observed[-1])
+        self.assertFalse(is_interactive_request())
+
+    def test_cold_opens_leave_a_channel_for_fuse_directory_listing(self):
+        """A fourth copy waits while a listing uses the reserved channel."""
+        from storage.fs import StorageFS
+
+        payload = b"cold-copy-bytes"
+        self.server.payload = payload
+        backend = self._new_backend(connect_timeout=0.3)
+        backend._pool.bulk_wait = 5.0
+        root = Path(tempfile.mkdtemp(prefix="storage-channel-reserve-"))
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        fs = StorageFS(root / "cache", root / "state.db", {"ssh0": backend},
+                       1024 * 1024, start_sync=False)
+        self.addCleanup(fs.state_manager.close)
+        self.addCleanup(fs.sync_manager.stop)
+
+        entered = threading.Event()
+        release = threading.Event()
+        listing = threading.Event()
+        calls = []
+        lock = threading.Lock()
+
+        def hold_copy(_client, path):
+            with lock:
+                calls.append(path)
+                if len(calls) >= 3:
+                    entered.set()
+            if not release.wait(5):
+                raise AssertionError("copy gate was not released")
+
+        self.server.hooks["get"] = hold_copy
+        self.server.hooks["listdir_attr"] = lambda _client, _path: listing.set()
+        workers = []
+        browser = None
+
+        def open_read(path):
+            fd = fs("open", path, os.O_RDONLY)
+            try:
+                return fs("read", path, 1024, 0, fd)
+            finally:
+                fs("release", path, fd)
+
+        try:
+            for i in range(4):
+                worker = _InThread(lambda path=f"/f{i}": open_read(path))
+                workers.append(worker)
+            self.assertTrue(entered.wait(3), "three cold copies did not acquire")
+            # This is an actual pool lease state, before any timeout: the
+            # first three copies must be bulk, leaving the fourth channel.
+            lease_state = backend._pool.snapshot()
+            self.assertEqual(3, lease_state["bulk_leased"])
+            self.assertEqual(3, lease_state["sftp_open"])
+            browser = _InThread(lambda: list(fs("readdir", "/", None)))
+            self.assertTrue(browser.join(2), "listing waited for a cold copy")
+            self.assertIsNone(browser.error)
+            self.assertIn("a", browser.result)
+            self.assertTrue(listing.is_set(), "listing did not reach the member")
+            with lock:
+                self.assertEqual(3, len(calls), "a fourth copy used the reserve")
+        finally:
+            release.set()
+            for worker in workers:
+                self.assertTrue(worker.join(5), "cold-copy worker leaked")
+            if browser is not None:
+                self.assertTrue(browser.join(5), "browser worker leaked")
+        for worker in workers:
+            self.assertIsNone(worker.error)
+            self.assertEqual(payload, worker.result)
+        self.assertEqual(0, backend._pool.snapshot()["bulk_leased"])
+        self.assertFalse(is_interactive_request())
+
 
     def test_parallel_operations_share_one_connection(self):
         self.server.delay = 0.002
