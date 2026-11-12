@@ -12,8 +12,8 @@ type: task
 component: tests
 release:
 reporter: Ted Smith <tedks@riseup.net>
-status: unstarted
-disposition:
+status: closed
+disposition: fixed
 creation_time: 2026-11-11T23:53:39-00:00
 references: []
 log_events:
@@ -30,3 +30,11 @@ log_events:
     is absent. This is a retired private-pin test assumption, not proof of current
     path-lock behavior; needs migration preserving the lock/admission assertion. Runtime
     envelope exhausted; no test edit this phase.'
+- time: 2026-11-12T01:09:15-00:00
+  who: Ted Smith
+  what: 'closed: fixed'
+  comment: At pushed d79b785 both legacy schedules use shared debt instead of injecting
+    or requiring _refetch_pins. Exact-head threading 83 passed with only the two named
+    deferred restart cases excluded; the admission test still checks path-lock release,
+    correct bytes and no slot leak, and the two-opener test checks debt at selection,
+    exact bytes and one copy.
