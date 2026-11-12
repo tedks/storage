@@ -29,3 +29,15 @@ log_events:
     authorized. Production conditional lineage and durable intent/restart remain release
     blockers; collision and partial-result choices filed as oq-namespace-rename-collision
     and oq-namespace-partial-rename-result. Root review pending.'
+- time: 2026-11-12T01:35:24-00:00
+  who: Ted Smith
+  what: commented
+  comment: Root/warm Sol review of 88c3982 returned FINDINGS; Luna necessity SIMPLIFY.
+    Source-only feasibility correction on current branch now separates current Local/SSH
+    Backend guarantees from hypothetical conditional lineage, rejects synthetic-only
+    recovery as production evidence, and proposes only a non-shipping pre-I/O retry-fence
+    slice across legacy/untagged/stale tasks and overlapping guards. No app/test code
+    or runtime. Production useful guard retirement remains blocked by durable intent
+    and actual member-side lineage or an explicit exclusive-writer contract. New product
+    question oq-member-namespace-writer-ownership filed; existing collision and partial-result
+    questions remain open pending Ted.
