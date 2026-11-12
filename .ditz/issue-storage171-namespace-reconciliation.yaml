@@ -1,0 +1,21 @@
+id: storage171-namespace-reconciliation
+title: 'Reconcile incomplete namespace moves before PR #171 acceptance'
+desc: 'PR #171 release blocker after in-memory subtree quarantine: specify and implement
+  a verified reconciliation transition for both old/new member namespaces, every intended
+  member, and origin-distinct debts. A queued directory retry is not completion evidence.
+  Normal rename success with a failed member must not leave permanent EIO/no upload.
+  Root owns the technical boundary and any product ambiguity. No acceptance from the
+  tracer.'
+type: task
+component: foreground-responsiveness
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-12T00:51:01-00:00
+references: []
+log_events:
+- time: 2026-11-12T00:51:01-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
