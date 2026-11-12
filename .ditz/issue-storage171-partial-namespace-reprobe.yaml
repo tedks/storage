@@ -56,3 +56,16 @@ log_events:
     deferred restart tests failed. Corrected fixture is UNRUN. Sync stays quarantined;
     root review and runtime allowance required before scoped closure. This is not
     PR acceptance.'
+- time: 2026-11-12T00:31:02-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'namespace-subtree-uncertainty-coverage: root/warm Sol 75b2efa review FINDINGS,
+    third namespace convergence gap and approach stop. A cached/indexed child without
+    a PathFreshness object is omitted from partial directory rename suffix enumeration;
+    parent uncertain state is not checked by child open/sync. The existing _snapshot(None)
+    test assertion does not prove absent object. Source-only audit proposal f12d89f
+    recommends old/new segment-bounded prefix quarantine, separate exact DIRTY inode
+    witnesses, and a NamespaceService outcome receipt for normal returned member failures.
+    Cache/index/freshness enumeration alone cannot cover future/lazy descendants.
+    No application/test edit or runtime in this audit. Prior test correction and deferred
+    restart cases remain unrun; root design decision and new authority required.'
