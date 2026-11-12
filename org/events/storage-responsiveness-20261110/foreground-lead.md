@@ -598,3 +598,25 @@
 - refs: foreground-lead:56
 - applied_at: clean pushed docs receipt `dad3b25127c6804760f9b29bb7ac5ec441676d5b`, code/test unchanged from `bcf062a3356d3f99fe09a2f303120d9dce2bc155`.
 - delivery: GitHub connector posted PR #171 evidence comment ID `6812490176`; exact `%91` was re-pinned as `storage:codex` on `/tmp/tmux-1000/default` and shared `tmux-message` returned `status=delivered`, `receipt=submitted`, one paste/Enter for the fix-delta checkpoint. Delivery proves neither root review nor scoped/full acceptance. All four owned `storage171-retry-canonical-*.scope` units exited; no owned client, fixture or lease.
+
+## foreground-lead:58
+
+- kind: state-change
+- state: DURABLE_FRESHNESS_BOUNDARY_AUDIT_ACTIVE; source-only, <=20 minutes
+- refs: foreground-lead:57
+- based_on: root/warm Sol scoped CLEAN of code/test `bcf062a3356d3f99fe09a2f303120d9dce2bc155` against `83b26ab`, review `/home/tedks/.cache/storage-orgs-20261110/canonical-retry-review-bcf062a.md`.
+- applied_at: clean pushed owned head `c6fc1382bbd58042cd01c3f2cc9057ad6041d249`; later docs-only receipts were reconciled against frozen code/test. Four-run envelope is exhausted, no runtime carries forward.
+- intent/assumptions: closure is only narrow retry safety and suite migration. In-memory freshness and subtree guards have no proved crash authority today; a missing marker cannot imply no debt. Preserve local DIRTY bytes, warm cached-open demand admission and external member writers. Audit exact publication/startup ordering before proposing persistence.
+- scope: read current source/spec/contracts; propose one concise durable boundary and scratch-only acceptance schedules, update own status/ledger/ditz. No application/test edit, runtime, live data, restart or deployment.
+
+## foreground-lead:59
+
+- kind: pushed-source-only-checkpoint
+- state: DURABLE_RESTART_BOUNDARY_PROPOSED_FOR_ROOT_REVIEW; lane idle, no implementation/runtime authority
+- refs: foreground-lead:58
+- based_on: clean pushed `c6fc1382bbd58042cd01c3f2cc9057ad6041d249` and scoped CLEAN review of frozen code/test `bcf062a` at `/home/tedks/.cache/storage-orgs-20261110/canonical-retry-review-bcf062a.md`; applied_at proposal commit `03a344e650472b8f34885f02de4e12ed6a065a30`.
+- closure: root/warm Sol found no new Critical/Important in canonical queued-name repair; exact pushed-head eight affected nonmount targets actually executed/pass, 469 cases with two named deferred restart exclusions. Ditz `storage171-retry-fence-suite-migration` closed fixed for this scope only and synced. Historical migrated test-name nit filed as `storage171-retry-test-names`, deferred to next relevant test edit without another runtime cycle.
+- source audit: `StorageFS.__init__` can start sync before namespace initialization/bootstrap; `init` starts sync before unclean sweep/watchers. `_freshness` and `_namespace_uncertainties` are memory only; `user.storage.member_stat` is best-effort baseline, not debt authority; `user.storage.metadata` lacks dirty generation. Cache eviction removes an inode xattr, while an incomplete directory move must cover absent/lazy descendants. Existing rebuildable SQLite cannot be sole authority. Current code neither restores debt nor negative guard before background effects.
+- proposal: one new contract `contracts/durable-freshness-restart.md` recommends v3's versioned CLEAN-inode marker plus a narrow root-local manifest for absent-path debt and old/new prefix intent, durable before invalidation/local move and replay before open/sync/watcher/heal/sweep. Conservative union preserves all origin debts; missing/corrupt preexisting authority stops startup, preserving bytes. It explicitly does not retire guards, restrict external writers, implement member service or make normal rename after restart shippable. Five deterministic scratch schedules include the two deferred restart cases and lazy descendants; all remain UNWRITTEN/UNRUN. Process restart is not power-loss certification.
+- tracker/product: `storage171-namespace-guard-restart` commented twice and synced. `oq-durable-freshness-legacy-cache` filed under open-questions with options A refuse startup, B restricted read-only inspection, C unsafe automatic adoption; recommendation A, Ted decides migration availability before rollout. Existing collision/partial-result/writer-ownership questions remain open. No other new product choice inferred.
+- resource/limits: no application or test source edit, Nix/Bazel/test/runtime/probe/download, live mount/backing/cache inspection, SSH/FUSE/Docker/Fleet, full gates/CLI, restart/deploy/merge. Prior four-run repair budget remains exhausted; no scope/client/fixture/lease acquired. Root boundary and necessity review precede any implementation/runtime.

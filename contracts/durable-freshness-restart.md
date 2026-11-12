@@ -103,6 +103,12 @@ retry, all returned successes, or a post-hoc stat do not retire a guard under
 the current external-writer contract. This means even fully returned renames
 may be conservatively blocked after restart until separate reconciliation;
 the tracer is not shippable as a recovered namespace service.
+The prepared intent is provisional while the originating rename holds its
+current locks: a fully returned in-process rename can retain today's normal
+access path, but the durable intent cannot be erased as if those returns
+proved post-crash lineage. Startup activates its conservative coverage unless
+separately approved reconciliation evidence exists. A failed or unknown
+member result activates coverage before releasing rename serialization.
 
 Replay must finish **before** any `SyncManager.start`, `StreamingReadManager.init`,
 watcher, stale partial cleanup, sweep, FUSE open or debug rebuild action that
