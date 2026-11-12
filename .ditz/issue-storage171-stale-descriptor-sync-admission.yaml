@@ -1,0 +1,20 @@
+id: storage171-stale-descriptor-sync-admission
+title: Ignore replaced target descriptor for new inode sync
+desc: After successful rename over a target with its old O_RDWR descriptor open, the
+  descriptor still names the target but owns the retired inode. _should_sync_path
+  previously blocked current source sync. The 5454f1d repair compares descriptor and
+  current cache inode, retains genuine writer exclusion, and an exact-head test observes
+  actual upload/CLEAN while old fd remains ESTALE.
+type: bugfix
+component: fs
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-12T00:09:00-00:00
+references: []
+log_events:
+- time: 2026-11-12T00:09:00-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
