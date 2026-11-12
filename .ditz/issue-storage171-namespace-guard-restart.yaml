@@ -1,0 +1,20 @@
+id: storage171-namespace-guard-restart
+title: 'Recover namespace quarantine safely after restart before PR #171 acceptance'
+desc: 'PR #171 release blocker: persist versioned namespace uncertainty and per-origin
+  freshness debt or conservatively recover it after crash/restart. An in-memory old/new
+  prefix record disappears at restart and cannot certify CLEAN/member bytes. Test
+  cached, missing-cache, lazy and DIRTY-local recovery; root reviews before application
+  authority. This is separate from the bounded in-memory subtree tracer.'
+type: task
+component: foreground-responsiveness
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-12T00:51:05-00:00
+references: []
+log_events:
+- time: 2026-11-12T00:51:05-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
