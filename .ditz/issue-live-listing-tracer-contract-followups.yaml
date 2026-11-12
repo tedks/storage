@@ -26,3 +26,15 @@ log_events:
   who: Ted Smith
   what: created
   comment: ""
+- time: 2026-11-12T21:45:56-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'PR178 convergence at 758411b: N5 merged-entry incarnation fixed and reviewed.
+    N6/N7 remain filed. New nonblocking N8: unknown incarnation at a consumer must
+    trigger current resnapshot unless a separately specified ordering proves it newer;
+    recommend resnapshot to avoid extra ordering machinery. N9: explicitly define
+    rename as removal at old name plus creation/new incarnation at new name (including
+    atomic replacement), or document another reviewed mapping. Both are pre-implementation
+    tracer details, not permission to guess; current proposal is not runtime acceptance.
+    Deferral preserves the frozen reviewed spec head while keeping implementation
+    obligations explicit.'
