@@ -6,6 +6,10 @@ cache = "/home/user/.cache/storage/media"
 cache_size = "50G"
 database = "/home/user/.cache/storage/media/.storage.db"
 workers = 2
+# Optional: grow background sync workers when distinct tasks queue, then
+# return to `workers` after 30 idle seconds. Leave unset for the historical
+# fixed pool. Maximum: 8 with SSH members, 32 with local members only.
+# max_sync_workers = 8
 key_file = "/home/user/.ssh/id_ed25519"
 # Host keys are not configurable yet (#107, #30). SFTP (paramiko) trusts any
 # key and remembers none. rsync uploads and the remote watcher (when
@@ -46,6 +50,10 @@ listing_max_stale = 3600
 # does not hold up listings, stats and reads of others. Off by default until
 # it has been field-tested.
 # fuse_threads = true
+# Active Python FUSE callbacks, 3-128; setting this enables fuse_threads.
+# Native libfuse 2 threads are not capped. A threaded mount without this key
+# uses 32 active callbacks, with protected slots for metadata and reads.
+# max_foreground_operations = 32
 # Seconds between re-verifications of the conflict view's recorded hashes:
 # each interval, every member whose hash queue is idle hashes again the one
 # file checked longest ago (and over an hour ago). 0 turns it off.

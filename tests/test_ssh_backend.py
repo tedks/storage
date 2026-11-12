@@ -12,7 +12,9 @@ from unittest.mock import patch
 
 from storage.backends import ssh as ssh_module
 from storage.backends import ssh_pool
-from storage.backends.base import ChecksumUnavailable, interactive_request, is_interactive_request
+from storage.backends.base import (
+    ChecksumUnavailable, bulk_request, interactive_request, is_interactive_request,
+)
 from storage.backends.ssh import SSHBackend
 from storage.backends.ssh_pool import (
     CommandTimeout, MemberConnection, MemberUnavailable, is_connection_error,
@@ -500,6 +502,50 @@ class TestMemberConnectionPool(unittest.TestCase):
                 holder.release()
         self.assertTrue(pool.available())
         pool.close()
+
+    def test_foreground_bulk_copy_does_not_consume_metadata_or_read_reserve(self):
+        server = _FakeServer()
+        pool = _pool(server, connect_timeout=0.3)
+        release = threading.Event()
+        entered = [threading.Event() for _ in range(3)]
+        workers = []
+
+        def full_copy(index):
+            with interactive_request():
+                with bulk_request():
+                    with pool.sftp(1.0):
+                        entered[index].set()
+                        self.assertTrue(release.wait(5.0))
+
+        try:
+            for index in range(3):
+                worker = _InThread(lambda index=index: full_copy(index))
+                workers.append(worker)
+            self.assertTrue(all(event.wait(5.0) for event in entered))
+            snapshot = pool.snapshot()
+            self.assertEqual(3, snapshot["bulk_leased"])
+            self.assertEqual(3, snapshot["sftp_open"])
+
+            for operation in ("metadata browse", "demand read"):
+                started = time.monotonic()
+
+                def request():
+                    with pool.sftp(1.0):
+                        return operation
+
+                waiter = _InThread(request, interactive=True)
+                self.assertTrue(waiter.join(2.0))
+                self.assertIsNone(waiter.error)
+                self.assertEqual(operation, waiter.result)
+                self.assertLess(time.monotonic() - started, 2.0)
+                self.assertEqual(3, pool.snapshot()["bulk_leased"])
+            self.assertLessEqual(server.transport.max_open_seen, 4)
+        finally:
+            release.set()
+            for worker in workers:
+                self.assertTrue(worker.join(5.0))
+                self.assertIsNone(worker.error)
+            pool.close()
 
     def test_lease_wait_times_out_without_marking_the_member_down(self):
         server = _FakeServer()
