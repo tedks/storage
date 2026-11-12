@@ -55,3 +55,13 @@ log_events:
     containment, not guard retirement or restored recovery; no app/test edits or runtime.
     Ted collision/partial-result questions remain open; root retains external-writer
     support.
+- time: 2026-11-12T02:05:11-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'At 83b26ab the six bounded focused invocations are exhausted. Real disabled-fence
+    RED at B /b/old.txt stale bytes, six focused GREEN. Exact-head eight-target nonmount
+    run executed all targets: six pass, threading 88 pass/1 fail/2 deferred restart
+    deselected, sync_races 11 pass/2 fail. Failures are three old assertions that
+    conflict with outer-serializer placement and no-replay under unresolved guard;
+    issue storage171-retry-fence-suite-migration filed for root review and bounded
+    repair. Fence remains unaccepted and non-shipping; no further runtime grant inferred.'
