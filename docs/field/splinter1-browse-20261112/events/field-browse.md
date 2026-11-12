@@ -44,3 +44,21 @@ sanitized: no user file names or private paths.
   (new, open-questions), comments on field-listing-stalls-under-load and
   field-listing-downloads-to-hash; ditz sync OK. Resources: no processes
   left on splinter1 or framework0; no mount lifecycle action.
+- field-browse:9 review-finding received. refs field-browse:8. Root
+  review of 93ed39f: FINDINGS F1-F6 (helper bounds, summary 0 ms for
+  missing data, attribution and cold claims, 94 s deviation scope, channel
+  reserve, freshness wording). One source-only correction round; no live
+  host access.
+- field-browse:10 correction. refs field-browse:6, field-browse:9.
+  field-browse:6's "no bulk fetch was seen" is withdrawn: a flat
+  write_bytes over 5 s afterwards does not bound the 94 s run's I/O, which
+  is unknown. That run exceeded both the 30 s per-operation bound and the
+  prefix bound.
+- field-browse:11 state-change. Report corrected; the three helpers were
+  removed by exact path (list reviewed, `git rm` of those three entries).
+  They are preserved privately with the raw evidence in root's private
+  evidence dir under field-browse-evidence/, with a sha256 manifest;
+  run1/cold1/strace hashes match root's receipt. ditz:
+  oq-listing-stale-serve-dir-mtime and field-gio-content-sniff-per-entry
+  reworded (no policy decision), a correction comment on
+  field-listing-stalls-under-load; synced.
