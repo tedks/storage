@@ -37,14 +37,16 @@ claimed here.
 
 ## Evidence boundary and limits
 
-The test drives real `StorageFS.__call__`, `NamespaceService` member listing,
-`SSHBackend` and `MemberConnection` with a fake local transport. Four cold
-opens are gated at SFTP `get`; three hold the bulk limit, and a member listing
-uses the reserved fourth channel before release. It checks returned bytes,
-pool state, context reset and worker cleanup. The baseline run failed on
-`bulk_leased=0` before a timeout; this pins a real misclassified lease. The
-focused repaired run passed all three selected tests. Exact commands and
-hashes are in the unique status/ledger.
+The test drives real `StorageFS.__call__`, inline one-member
+`NamespaceService` listing, `SSHBackend` and `MemberConnection` with a fake
+local transport. Three cold opens are gated at SFTP `get`; a fourth reaches
+the pool's real bulk-capacity denial before a member listing uses the reserve.
+It checks returned bytes, pool state, context reset and worker cleanup. A
+control disabling only the copy's bulk context failed on `bulk_leased=0`
+versus 3 before timeout. The corrected test passed in the forced, unfiltered
+fast gate on the clean pushed code head. Exact commands and hashes are in the
+unique status/ledger. This one-member test does not show namespace-executor
+contention; the separate context test checks error restoration.
 
 This does not enable FUSE threads or cap libfuse native threads. A single
 SFTP channel has no reserve; other interactive work can fill it; reentrant
