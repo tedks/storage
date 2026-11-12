@@ -1304,7 +1304,19 @@ class TestSharedFreshnessObligation(ThreadingTestBase):
         old_source_debts = first.source_debts
         old_target_debts = first.target_debts
         self.assertIn("changedA", old_source_debts["/parent/child/owed.txt"])
-        self.fs.rename("/parent", "/elsewhere")
+        # Observe the receipt passed to the real second rename. A normal
+        # return alone can hide best-effort member failures and still cause
+        # quarantine; this schedule must cover a fully confirmed move.
+        with patch.object(self.fs.namespace, "rename",
+                          wraps=self.fs.namespace.rename) as ancestor_rename:
+            self.fs.rename("/parent", "/elsewhere")
+        ancestor_rename.assert_called_once()
+        self.assertEqual(("/parent", "/elsewhere"), ancestor_rename.call_args.args)
+        progress = ancestor_rename.call_args.kwargs["progress"]
+        self.assertEqual({"changedA", "staleB"}, progress.intended)
+        self.assertEqual(progress.intended, progress.confirmed)
+        self.assertEqual(set(), progress.failed)
+        self.assertEqual(set(), progress.unknown)
         with self.fs._member_checks_lock:
             self.assertNotIn("/elsewhere/other/known.txt", self.fs._freshness)
         # The local cache and row moved twice, but neither completed member
