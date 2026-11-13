@@ -41,3 +41,16 @@ log_events:
   who: Ted Smith
   what: updated description
   comment: ""
+- time: 2026-11-13T20:48:30-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Ted ruling 2026-11-13: "let''s test rsync options and reject if rsync
+    doesn''t meet our contract on startup." Implement startup validation of the actual
+    configured rsync option behavior against Storage''s selected-upload contract,
+    with clear rejection before serving the mount when validation fails. This supersedes
+    the proposed static allowlist as the chosen policy. Scratch probes must not touch
+    user member paths; a finite passing probe must not be represented as proof for
+    arbitrary path-dependent filters. Any unsupported/unprovable configuration must
+    fail clearly rather than permit false CLEAN. Root will review the coverage boundary.
+    Product question answered; implementation and release gates remain outstanding.
+    No deployment authorized by this record.'
