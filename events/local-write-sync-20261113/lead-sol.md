@@ -118,3 +118,24 @@
   based_on: 26b55adffa4a83854138c771796f715b6d7e0250
   state: STARTED
   note: Formal PR179 round 26b55adffa4a-20261113T211421Z-b3687b reviewed the frozen full diff. Native Sol CLEAN 0/0/0, foreign Opus CLEAN 0 Critical/0 Important/5 Nits, Google EMPTY usage-limit; round records and findings are on PR. Fixed three nits in fb5030c (redundant test, missing-rsync/timeout messages, transfer-I/O comment). Filed docs-rsync-upload-contract spelling detail and pr179-record-artifact-placement for root decision. The fix delta and release gates are pending; no acceptance claim.
+
+- id: lead-sol:18
+  kind: review-seat-outcome
+  refs: [lead-sol:17]
+  based_on: 00082c4ce4e3c821db6b161221434bd9bf529cfd
+  state: VERIFIED
+  note: Formal PR179 fix-delta round at pushed 00082c4 was CLEAN for native Sol and foreign Opus (zero Critical, Important or Nits); Google remained EMPTY on known quota. Root independently checked the formal helper result and reviewed the full source/test diff plus fix delta CLEAN. This was review evidence, not release acceptance.
+
+- id: lead-sol:19
+  kind: state-change
+  refs: [lead-sol:18]
+  based_on: 00082c4ce4e3c821db6b161221434bd9bf529cfd
+  state: BLOCKED
+  note: Release invocation 1 proved actual Bazel test-child PATH inherited the owned capped Docker shim; invocation 3 built //:storage_cli successfully. Invocation 4 ran no-args all-gates on frozen 00082c4; unchanged LocalBackend sync_system module had two ENOENT failures (24/26 pass), then the external wrapper fail-closed stopped the incomplete remote gate after 312.43s on a generic scratch/free-space monitor read failure. No full-gate receipt. Four of four invocations and 343/1800 seconds spent, with last scanner total 1689MiB (not reliable as owned scratch), host free 3858265MiB and pids peak227 under observed 2CPU/8GiB/2GiBswap/1024 limits. Monitor recursively included active FUSE test mounts; exact failed branch not logged. No attribution to PR179, PR173 or field reports. Root withheld runtime/rebase/production changes.
+
+- id: lead-sol:20
+  kind: resource-release
+  refs: [lead-sol:19]
+  based_on: 00082c4ce4e3c821db6b161221434bd9bf529cfd
+  state: BLOCKED
+  note: Three exact owned synthetic Docker containers and network were stopped/removed; one owned test mount detached, but PID2033064 remained D/request_wait_answer in the release scope with /dev/fuse FD18 connection97. Root independently attributed and authorized one connection-scoped abort. Complete boot/PID-start/cgroup/namespace/FD identity was revalidated before and after opening exact abort handle; one byte was written once. Within 1s PID and connection97 were absent, cgroup.procs empty, systemd scope inactive/dead and empty ControlGroup. Root and PR174 owner received submitted release receipts. The failed run and abort are detailed in docs/pr179_release_blocker_20261113.md; no scratch deletion or new build/test followed.
