@@ -77,5 +77,20 @@ log_events:
     analysis on the same PyPI simple metadata before tests. One invocation remains;
     no further acquisition authorized. No production fix or green/mutation result.
     Follow-ups: bazel-simpleapi-cache-only-rerun and oq-rsync-upload-selection-args.'
+- time: 2026-11-13T09:17:08-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'STORAGE-LOCAL-WRITE-SYNC-20261113 integrated result: on unchanged production
+    rsync.py, focused Bazel invocation 4/7 proved a synthetic false-CLEAN path with
+    the real no-prior-baseline conflict guard, real local rsync subprocess, SyncExecutor
+    settlement and StorageFS callback: cache held new bytes, member stayed old, status
+    became CLEAN, persisted member hash was inferred from the cache, and reverify
+    detected the mismatch without a remote rewrite. A distinct genuine-rewrite control
+    and failure-not-CLEAN passed after the draft upload-only --ignore-times fix in
+    invocation 5/7; all five integration cases and the default direct upload case
+    passed. Caller rsync_args=[--size-only] still skipped and failed; this is not
+    full GREEN. Ted''s decision is tracked in oq-rsync-upload-selection-args; root
+    holds the last two focused invocations for that ruling. Field cause remains unproven;
+    no live data/profile inspected and no merge/release gates run.'
 blocks:
 - gh-112
