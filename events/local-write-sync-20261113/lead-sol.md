@@ -83,3 +83,17 @@
   based_on: 34931d6b29c092d99e54589fd9e609673d1f6b0c
   state: STARTED
   note: Ted ruled behavioral startup validation of configured rsync options; root assigned this same PR179 lane the startup hook/config scope and six new focused invocations, replacing the prior two-run hold. Wrote assumptions, source boundary, argv confinement and failure behavior before probe implementation. Selected existing rsync_backend and allow_other test modules; no runtime or live member access yet.
+
+- id: lead-sol:13
+  kind: state-change
+  refs: [lead-sol:12]
+  based_on: 87cc102
+  state: STARTED
+  note: Root's design review found that _run_rsync can consult/reset ControlSockets even for local operands. Revised the plan before probe implementation: pure shared transfer-argument builder, separate local subprocess path with no SSH state access, immutable snapshot of caller rsync_args, and strict argv spelling grammar with negative spies. No new product boundary or runtime grant.
+
+- id: lead-sol:14
+  kind: state-change
+  refs: [lead-sol:13]
+  based_on: 87cc102
+  state: VERIFIED
+  note: Scoped startup invocation 1 failed behaviorally on unchanged mount hook. Draft validator uses actual local rsync with frozen caller options and never enters SSH/control-socket/member paths; invocation 2 passed new cases but exposed an older direct --size-only test expectation. After changing that expectation to startup rejection, invocation 3 passed all three affected modules. A controlled deletion of the byte comparison in invocation 4 produced seven test failures, and the check was restored. All four scopes inactive/dead; network bytes UNKNOWN. This is local synthetic verification, not pushed-head or release acceptance.
