@@ -49,5 +49,19 @@ log_events:
     checksum evidence, not an automatic repair/resync. Prioritize synthetic end-to-end
     skip->false baseline->reverify regression with the fix; do not dismiss these as
     routine INFO noise.'
+- time: 2026-11-13T09:02:15-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'STORAGE-LOCAL-WRITE-SYNC-20261113: source trace confirms a possible false-CLEAN
+    path: SyncExecutor treats successful copy_from_local as uploaded bytes and the
+    StorageFS callback persists the source checksum with the member stat; the member
+    hash is inferred, not measured then. Draft local-rsync and real sync-settlement
+    regression added on diag/local-write-sync-20261113, but no test executed. Focused
+    Bazel attempt 1/4 in a 2-CPU/4-GiB scoped, cache-only owned base stopped in rules_python
+    analysis because PyPI simple metadata (including nh3, idna, rich, twine) was absent.
+    No package acquisition, live inspection, or production fix; field cause remains
+    unproven. Recommendation after a cached route exists: obtain red behavior on unchanged
+    source, apply upload-only --ignore-times after caller args, mutation-check, and
+    resolve caller options that can still skip selected uploads before merge.'
 blocks:
 - gh-112
