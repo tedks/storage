@@ -119,5 +119,21 @@ log_events:
     recorded in PR body/docs. Local probe cannot establish remote executable compatibility
     or field cause. CLI build, four release gates, formal council, root review and
     merge remain outstanding.'
+- time: 2026-11-13T21:49:25-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'PR #179 formal council is CLEAN for native Sol and foreign Opus at pushed
+    00082c4; Google seat EMPTY on quota. The exact-head focused startup/upload tests
+    and CLI build passed, but the first no-args all-gates run on 00082c4 did not pass:
+    two unchanged LocalBackend FUSE tests in sync_system got ENOENT, and the external
+    resource monitor stopped the incomplete remote module on an unclassified measurement
+    read failure. Four release invocations are spent; no all-gates receipt, merge
+    or field attribution. The monitor recursively included live synthetic FUSE mount
+    trees, which is a monitor defect but not proven to cause either failure. Root
+    authorized one exact connection-scoped abort for the stranded owned test request;
+    PID, FUSE connection, containers, network and mount are released. Full diagnosis
+    and evidence hashes are in docs/pr179_release_blocker_20261113.md. Root holds
+    further runtime and rebase pending a reviewed monitor correction and final-base
+    sequence.'
 blocks:
 - gh-112
