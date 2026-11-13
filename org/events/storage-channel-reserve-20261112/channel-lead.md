@@ -211,3 +211,26 @@
   scratch mounts were unmounted; no resource lease remains. Real caller
   interruption, plain/lazy unmount and full gate/CLI/council are unproved.
   This is a draft checkpoint, not scoped acceptance or release clearance.
+
+## channel-lead:14
+
+- kind: bounded-evidence-repair
+- based_on: `55065aaba022113c31bd44666976cfcb01849397`
+- applied_at: pending exact-head affected-module run
+- refs: `channel-lead:13`, root
+  `STORAGE175-CANCELLATION-EVIDENCE-DISPOSITION-20261113`,
+  `pr175-default-capacity-unmount-cancel`
+- state: Root narrowed the unmount claim: the old fixture tried normal `-u`
+  then lazy `-uz` without preserving individual return codes, and lazy
+  detachment of a busy filesystem is not session cancellation. No new
+  production code was needed. The corrected explicit native session-exit
+  positive and disabled-probe control passed on frozen `55065aa` under an
+  owned 2 CPU/4 GiB/swap 0 scope. A separate focused test with an isolated
+  FUSE daemon passed real caller interruption (SIGKILL, native `request`
+  observation) and owned daemon SIGTERM (native `session` observation,
+  callback before `destroy()` while three bulk holders stayed gated).
+  Test-only cleanup now records exact unmount attempts, requires owned
+  processes and mount gone before scratch deletion, and reports cleanup
+  failures. Two of four invocations spent; both scopes inactive, no mount or
+  lock holder remains. Final affected modules and full release gates remain
+  pending; this event does not assert acceptance.

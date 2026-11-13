@@ -100,13 +100,26 @@ No native context pointer is kept after a callback. The source boundary is
 [fuse_loop_mt.c](https://github.com/libfuse/libfuse/blob/fuse-2.9.9/lib/fuse_loop_mt.c)
 and the pinned fusepy 3.0.1 wrapper.
 
-The targeted mounted session-exit case passed with three gated holders still
-alive before `destroy()`. Its disabled-probe control reached a blocking
-trigger syscall, but an early assertion prevented it from checking the held
-worker; that test-only assertion is corrected and **unrun**. A separate real
-mount detach did not make `fuse_exited()` visible before the holders were
-released. Thus plain/lazy unmount and real caller interruption remain unproved;
-no broad unmount guarantee or release acceptance follows from session exit.
+The mounted explicit-`fuse_exit()` positive and disabled-probe control pass on
+`55065aa`: the control holds the callback until lease release, while the
+positive reaches `destroy()` with all three holders gated. A later scratch
+test uses an isolated FUSE daemon and a separate caller. A fatal signal to
+that caller yields a real `fuse_interrupted()` observation and releases its
+callback while the holders remain gated. SIGTERM to the exact owned daemon
+yields a real `fuse_exited()` observation; the queued callback exits before
+`destroy()`, also while holders remain gated. These are distinct cancellation
+causes, not ordinary capacity drain. The final committed-head module run is
+still required to bind the test source to a pushed revision.
+
+The earlier unmount fixture tried `fusermount -u` and then `-uz` after a
+failure; it did not retain the individual return codes. That observation
+cannot be called a successful plain unmount. On Linux, `MNT_DETACH` removes
+the busy mount from the namespace immediately but completes unmount only when
+references drain ([umount(2)](https://man7.org/linux/man-pages/man2/umount.2.html)).
+A lazy detach is therefore not evidence of session exit or request
+interruption. The revised fixture records each exact attempt, verifies the
+owned mount and processes are gone, and retains scratch evidence if cleanup
+fails. No universal unmount completion guarantee or release acceptance follows.
 
 This does not enable FUSE threads or cap libfuse native threads. A single
 SFTP channel has no reserve; other interactive work can fill it; reentrant

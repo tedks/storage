@@ -1,5 +1,19 @@
 # Foreground channel reserve: current state
 
+- Cancellation evidence package (2026-11-13): root narrowed the test to
+  actual caller interruption and isolated daemon session exit; lazy detach
+  alone is not cancellation. Two of four new Bazel invocations used under the
+  shared lock and owned 2 CPU/4 GiB/swap 0 scopes. Frozen `55065aa` mounted
+  positive plus disabled-probe control passed. A focused source test then
+  passed real caller SIGKILL and isolated daemon SIGTERM schedules: native
+  request/session reason observed, callback finished before holder release,
+  daemon `destroy()` followed callback while holders stayed gated. That test
+  source is not yet committed or run as a full affected module. Cleanup now
+  records exact `fusermount -u`/`-uz` attempts, checks mount/process exit and
+  retains scratch on failure. Both scopes exited; no owned mount remains;
+  monitor growth +65,536 and +159,744 bytes, no abort, >150 GiB free.
+  Final affected modules on a clean pushed head, all four gates, CLI and
+  council/root acceptance remain pending. PR #175 is draft and unaccepted.
 - Latest cancellation checkpoint (2026-11-13): root narrowed the unmount
   blocker to callback lifetime cancellation. A draft libfuse2 callback probe
   now lets pool waits detect a real request interrupt or session exit and
