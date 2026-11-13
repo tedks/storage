@@ -96,5 +96,16 @@ log_events:
   who: Ted Smith
   what: started
   comment: ""
+- time: 2026-11-13T21:04:36-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'PR #179 draft implementation at 4cc7f6f: upload appends --ignore-times;
+    mount startup probes the effective frozen rsync_args with real local rsync and
+    exact destination-byte checks, rejecting observed --size-only/update/dry-run/skip
+    options and statically rejecting path/size-affecting options that a finite safe
+    probe cannot certify. Scoped startup tests: unchanged-hook RED, full three-module
+    GREEN on uncommitted code, byte-comparison mutation RED. Exact pushed-head focused
+    verification, root review, all release gates, council, merge and remote compatibility
+    remain outstanding. Field cause unproven; no live profile/data inspected.'
 blocks:
 - gh-112
