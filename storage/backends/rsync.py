@@ -231,7 +231,15 @@ class RsyncBackend(SSHBackend):
                         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                         timeout=10,
                     )
-                except (OSError, subprocess.TimeoutExpired) as exc:
+                except FileNotFoundError as exc:
+                    raise RsyncUploadContractError(
+                        f"rsync member {self.name}: local rsync executable unavailable"
+                    ) from exc
+                except subprocess.TimeoutExpired as exc:
+                    raise RsyncUploadContractError(
+                        f"rsync member {self.name}: upload probe {name} timed out"
+                    ) from exc
+                except OSError as exc:
                     raise RsyncUploadContractError(
                         f"rsync member {self.name}: upload probe {name} could not complete"
                     ) from exc
@@ -326,7 +334,8 @@ class RsyncBackend(SSHBackend):
         try:
             # Storage has already selected this file for upload. Rsync's
             # size/mtime quick check can otherwise report success without
-            # replacing different bytes on the member.
+            # replacing different bytes on the member. Rechecking an identical
+            # file may add source/destination I/O; rsync still uses wire deltas.
             self._run_rsync(str(local_path), remote, extra_args=["--ignore-times"])
         except subprocess.TimeoutExpired as exc:
             self.logger.warning("rsync copy_from_local timed out for %s", virtual_path)

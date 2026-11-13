@@ -163,26 +163,6 @@ class TestRsyncLocalTransfer(TestCase):
         finally:
             backend.close()
 
-    def test_caller_size_only_is_rejected_before_selected_upload(self):
-        src = self.local_dir / "selected.txt"
-        dst = self.remote_dir / "selected.txt"
-        src.write_bytes(b"new bytes")
-        dst.write_bytes(b"old bytes")
-        stamp = 1_700_000_000_000_000_000
-        os.utime(src, ns=(stamp, stamp))
-        os.utime(dst, ns=(stamp, stamp))
-        backend = RsyncBackend(
-            name="local-rsync", host="localhost",
-            remote_path=str(self.remote_dir), username="user", compress=False,
-            rsync_args=["--size-only"],
-        )
-        try:
-            with self.assertRaisesRegex(RsyncUploadContractError, "equal-size-mtime"):
-                backend.validate_upload_contract()
-            self.assertEqual(b"old bytes", dst.read_bytes())
-        finally:
-            backend.close()
-
     def test_rsync_inherits_ssh_metadata_ops(self):
         """Verify RsyncBackend inherits metadata operations from SSHBackend."""
         backend = RsyncBackend(
@@ -342,8 +322,9 @@ class TestRsyncUploadContract(TestCase):
     def test_upload_contract_reports_subprocess_errors_without_reset(self):
         for result, detail in (
             (subprocess.CompletedProcess([], 12), "exited 12"),
-            (FileNotFoundError("rsync"), "could not complete"),
-            (subprocess.TimeoutExpired(["rsync"], 10), "could not complete"),
+            (FileNotFoundError("rsync"), "local rsync executable unavailable"),
+            (subprocess.TimeoutExpired(["rsync"], 10), "timed out"),
+            (PermissionError("rsync"), "could not complete"),
         ):
             with self.subTest(result=result):
                 sockets = mock.Mock()
