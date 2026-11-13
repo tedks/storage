@@ -166,3 +166,22 @@
   implementation boundary, not a test or acceptance of new code; the new
   six-invocation nonmount budget starts at zero. Physical unmount is outside
   this phase and requires mounted gate evidence later.
+
+## channel-lead:12
+
+- kind: implementation-stop
+- based_on: `0e95b83e9e87966d408c6805918e8270bb4fc8d3`
+- applied_at: `7907eea` application/test checkpoint
+- refs: `channel-lead:11`, `pr175-default-capacity-unmount-cancel`
+- state: Implemented the ruled optional bulk-capacity deadline through
+  CLI/profile, SSH pool, cache and open, preserving separate connection and
+  operation timeouts. The first focused run failed two old tests that assumed
+  an implicit timeout; after making those tests opt in, the second run passed
+  all 120 SSH, 59 profile and 32 CLI tests. Both owned scopes exited and the
+  mux lock was released; 2/6 focused invocations used. Source review exposed
+  an unmount contract collision: libfuse joins callbacks before `destroy()`
+  can close the pool, while an untimed capacity waiter needs holder release.
+  A progressing transfer has no total duration bound. Synthetic close proves
+  cancellation after close, not mounted unmount completion. Root `%91` has a
+  submitted blocker receipt. No further source/runtime phase is inferred;
+  draft PR #175 remains unaccepted and full gates/council pending.

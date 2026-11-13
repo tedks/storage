@@ -80,6 +80,19 @@ eventually release a lease; pool close is the explicit cancellation path.
 The nonmount proof will exercise it. Mounted unmount behavior is reserved
 for the later mounted gate and must not be inferred from synthetic tests.
 
+### Unmount boundary found during implementation
+
+The nonmount test proves that `MemberConnection.close()` wakes a default
+capacity waiter, including one reached through `StorageFS.destroy()`. It does
+not prove that a mounted unmount reaches `destroy()`: `mount_storage` documents
+that libfuse joins active callbacks first. If all bulk holders continue to
+hold leases, a queued cold-open callback has no capacity deadline by default
+and can delay that join indefinitely. SSH channel inactivity timeouts do not
+bound an otherwise progressing whole-file transfer. This is open as
+`pr175-default-capacity-unmount-cancel`; the draft package is blocked on a
+pre-destroy cancellation or equivalent bounded-holder proof. No mounted test
+was authorized or run in this phase.
+
 This does not enable FUSE threads or cap libfuse native threads. A single
 SFTP channel has no reserve; other interactive work can fill it; reentrant
 leases are not reclassified; member timeouts still bound waits. A cold open
