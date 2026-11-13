@@ -1,0 +1,24 @@
+id: pr175-default-capacity-unmount-cancel
+title: Bound default bulk-capacity queue wait before FUSE unmount join
+desc: 'PR #175 draft option package makes SSH bulk SFTP capacity wait indefinitely
+  by default under Ted''s queue-drain ruling. fs.py mount_storage documents that libfuse
+  joins active worker callbacks before StorageFS.destroy(), but destroy() is where
+  backend.close() wakes pool waiters. A cold open waiting for capacity can therefore
+  delay unmount without an intrinsic bound if all holders keep leases. Nonmount pool.close/destroy
+  tests prove wake after close, not that a mounted unmount reaches close. Determine
+  a narrow pre-destroy cancellation boundary or a bounded holder guarantee; do not
+  claim mounted unmount safety from the synthetic test. No live mount or deployment
+  authorized in the current package. Root adjudication pending; PR175 remains draft/unaccepted.'
+type: bugfix
+component: ssh
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-13T21:01:41-00:00
+references: []
+log_events:
+- time: 2026-11-13T21:01:41-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
