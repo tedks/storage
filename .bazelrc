@@ -1,0 +1,5 @@
+try-import /etc/tedks/infra.bazelrc
+# Drop-in hook, docs/specs/drop-in-infrastructure.md D2 (tedks): the org-host
+# ambient profile. Add workspace overrides between the imports when needed;
+# .bazelrc.local (last) can override them locally.
+try-import %workspace%/.bazelrc.local

@@ -6,5 +6,7 @@ filegroup(
     srcs = glob(
         ["**/*"],
         exclude = ["BUILD"],
+        # Bazel 8 rejects an empty glob; this placeholder package has no files.
+        allow_empty = True,
     ),
 )
