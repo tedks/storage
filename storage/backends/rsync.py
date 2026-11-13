@@ -228,7 +228,10 @@ class RsyncBackend(SSHBackend):
 
         remote = self._remote_spec(virtual_path)
         try:
-            self._run_rsync(str(local_path), remote)
+            # Storage has already selected this file for upload. Rsync's
+            # size/mtime quick check can otherwise report success without
+            # replacing different bytes on the member.
+            self._run_rsync(str(local_path), remote, extra_args=["--ignore-times"])
         except subprocess.TimeoutExpired as exc:
             self.logger.warning("rsync copy_from_local timed out for %s", virtual_path)
             # rsync runs over its own ssh; probe the member's transport rather
