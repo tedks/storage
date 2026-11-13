@@ -55,6 +55,9 @@ class LocalRsyncTransport(RsyncBackend):
     def is_available(self):
         return True
 
+    def exists_or_raise(self, virtual_path):
+        return Path(self._resolve_path(virtual_path)).exists()
+
     def stat(self, virtual_path):
         st = os.stat(self._resolve_path(virtual_path))
         # SFTP stat does not publish ctime, as on the deployed rsync member.
@@ -63,6 +66,13 @@ class LocalRsyncTransport(RsyncBackend):
 
     def get_fast_checksum(self, virtual_path, allow_download=False):
         return fast_checksum_file(self._resolve_path(virtual_path))
+
+
+class LegacyLocalRsyncTransport(LocalRsyncTransport):
+    """Control: old upload selection, still using the real rsync subprocess."""
+
+    def copy_from_local(self, local_path, virtual_path):
+        self._run_rsync(str(local_path), self._remote_spec(virtual_path))
 
 
 class TestLocalRsyncSyncSettlement(unittest.TestCase):
@@ -107,13 +117,21 @@ class TestLocalRsyncSyncSettlement(unittest.TestCase):
                          self.fs.state_manager.get_file_metadata("/file.txt").sync_status)
         return cache_path, member_path
 
-    def _sync(self):
+    def _sync(self, backend=None):
+        backend = backend or self.member
         with patch.object(self.fs.replication_manager, "select_backends_for_file",
-                          return_value=[self.member]), \
-                patch.object(self.executor.conflict_detector, "check_conflict",
-                             return_value=None):
+                          return_value=[backend]):
             self.executor.process_file_task(SyncTask("/file.txt"))
         return self.fs.state_manager.get_file_metadata("/file.txt")
+
+    def _reverify(self, backend, persisted):
+        result = self.fs._reverify_member_copy(backend, "/file.txt", persisted.basis)
+        self.assertIsNotNone(result)
+        with self.assertLogs("storage.fs", level="INFO") as logged:
+            with self.fs._checksum_lock:
+                self.fs._settle_reverify(("/file.txt", "member"), persisted, result)
+        self.assertTrue(any("re-verification found a copy" in line for line in logged.output))
+        return result[0]
 
     def test_changed_size_upload_settles_clean_with_measured_member_bytes(self):
         cache_path, member_path = self._write_through_fs(b"new longer bytes", b"old bytes")
@@ -134,20 +152,33 @@ class TestLocalRsyncSyncSettlement(unittest.TestCase):
         record = self.fs.state_manager.get_member_checksum("/file.txt", "member")
         self.assertEqual(fast_checksum_file(member_path), record.checksum)
 
+    def test_legacy_skip_reports_clean_then_reverify_without_remote_rewrite(self):
+        cache_path, member_path = self._write_through_fs(b"new bytes", b"old bytes")
+        legacy = LegacyLocalRsyncTransport("member", str(self.member_dir))
+        try:
+            metadata = self._sync(legacy)
+            self.assertEqual(SyncStatus.CLEAN, metadata.sync_status)
+            self.assertEqual(b"old bytes", member_path.read_bytes())
+            persisted = self.fs.state_manager.get_member_checksum("/file.txt", "member")
+            self.assertEqual(fast_checksum_file(cache_path), persisted.checksum)
+            self.assertNotEqual(fast_checksum_file(member_path), persisted.checksum)
+            measured = self._reverify(legacy, persisted)
+            self.assertEqual(fast_checksum_file(member_path), measured)
+        finally:
+            legacy.close()
+
     def test_genuine_same_basis_member_rewrite_is_detected(self):
-        _, member_path = self._write_through_fs(b"new bytes", b"old bytes")
+        cache_path, member_path = self._write_through_fs(b"new bytes", b"old bytes")
         self.assertEqual(SyncStatus.CLEAN, self._sync().sync_status)
         persisted = self.fs.state_manager.get_member_checksum("/file.txt", "member")
         self.assertIsNotNone(persisted)
+        self.assertEqual(cache_path.read_bytes(), member_path.read_bytes())
+        self.assertEqual(fast_checksum_file(member_path), persisted.checksum)
         member_path.write_bytes(b"bad bytes")
         os.utime(member_path, (persisted.basis[1], persisted.basis[1]))
-        result = self.fs._reverify_member_copy(self.member, "/file.txt", persisted.basis)
-        self.assertNotEqual(persisted.checksum, result[0])
-        with self.assertLogs("storage.fs", level="INFO") as logged:
-            with self.fs._checksum_lock:
-                self.fs._settle_reverify(("/file.txt", "member"), persisted, result)
-        self.assertTrue(any("re-verification found a copy" in line for line in logged.output))
-        self.assertEqual(result[0],
+        measured = self._reverify(self.member, persisted)
+        self.assertNotEqual(persisted.checksum, measured)
+        self.assertEqual(measured,
                          self.fs.state_manager.get_member_checksum("/file.txt", "member").checksum)
 
     def test_failed_rsync_does_not_settle_clean(self):
