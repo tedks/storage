@@ -11,8 +11,8 @@ type: task
 component: docs
 release:
 reporter: Ted Smith <tedks@riseup.net>
-status: unstarted
-disposition:
+status: closed
+disposition: fixed
 creation_time: 2026-11-13T21:18:17-00:00
 references: []
 log_events:
@@ -30,3 +30,8 @@ log_events:
     churn without changing the upload fix. This is an explicit scoped repository placement
     decision, not Ted product approval or release acceptance. Future convention cleanup,
     if needed across all lanes, is separate.'
+- time: 2026-11-13T21:24:49-00:00
+  who: Ted Smith
+  what: 'closed: fixed'
+  comment: Root decided to retain current reviewed unique evidence paths for PR179;
+    see rationale.
