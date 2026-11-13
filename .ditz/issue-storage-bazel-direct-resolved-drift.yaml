@@ -1,0 +1,24 @@
+id: storage-bazel-direct-resolved-drift
+title: Assess declared versus resolved Bazel module versions
+desc: 'At Storage #173 head 4cb451d, MODULE.bazel directly declares bazel_skylib 1.8.1
+  and bazel_features 1.21.0 while the Bazel 8 lock resolves 1.8.2 and 1.30.0. Formal
+  Opus source review flagged possible direct-dependency warnings or failure under
+  --check_direct_dependencies=error. This is a nonblocking review nit: C5''s one-version
+  rule compares modules shared with the parent, and these two are not parent direct
+  dependencies; do not change approved version choices inside #173 merely to silence
+  a warning. Reproduce the warning after the baseline stack lands, decide whether
+  to align declarations, and review any dependency change separately. Owner: Storage
+  controller.'
+type: task
+component: build
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-13T21:02:27-00:00
+references: []
+log_events:
+- time: 2026-11-13T21:02:27-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
