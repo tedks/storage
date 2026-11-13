@@ -35,3 +35,15 @@ log_events:
     assertion corrected but unrun at 6/6 phase budget. Caller-interrupt path, normal/lazy
     unmount distinction and full mounted suite remain unverified. The issue remains
     open; draft PR175 is not accepted.'
+- time: 2026-11-13T21:21:14-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Root frozen delta disposition at55065aa: not accepted. Linux lazy detach
+    is not cancellation while references remain; no requirement to force cancel merely
+    because namespace detached. Must prove actual request interruption and production
+    daemon shutdown release queued capacity callbacks before destroy/pool.close, and
+    rerun corrected negative control. Narrow evidence package4focusedruns<=20min,
+    max3exact-owned scratchFUSE, noDocker/live data. Fix cleanup to check unmount
+    return/mount absence before removing scratch. Existing optionoff/EAGAIN ruling
+    unchanged. Source reference https://man7.org/linux/man-pages/man2/umount.2.html
+    .'
