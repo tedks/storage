@@ -1,6 +1,41 @@
 # Foreground channel reserve: current state
 
-- Current option-package checkpoint (2026-11-13): draft implementation and
+- Latest cancellation checkpoint (2026-11-13): root narrowed the unmount
+  blocker to callback lifetime cancellation. A draft libfuse2 callback probe
+  now lets pool waits detect a real request interrupt or session exit and
+  report `EINTR` without changing the default unlimited capacity wait.
+  Native `fuse_interrupted`/`fuse_exited` symbols were verified in the pinned
+  libfuse2; fusepy 3.0.1 enters the new thread-local scope only from its
+  native callback wrapper. Direct synthetic FS calls and copied background
+  contexts do not enter this native path. Code remains unaccepted.
+- Exact new runtime: all 6/6 option-package invocations spent, under the
+  same shared flock and owned 2 CPU/4 GiB/swap 0 scopes. Third run passed
+  `storage_test_ssh_backend`, `storage_test_allow_other` and
+  `storage_test_mount_sigpipe`; the new pool cancellation control passed.
+  Fourth mounted run failed at collection because this target does not list
+  `tests/fuse_mount.py`; it ran no mounted test. The fixture was made
+  self-contained without a BUILD edit. Fifth mounted run executed two cases:
+  the disabled-probe control passed; plain mount detach did **not** reach
+  `destroy()` with holders held (1 fail/1 pass). Sixth mounted run used an
+  explicit native `fuse_exit()` from a second real callback: the positive
+  session-exit case passed while all three holders remained gated; the
+  disabled-probe control failed at an early assertion because the triggering
+  stat itself stayed blocked. That assertion was corrected after the budget
+  and is UNRUN. No caller-interruption case or full mounted suite ran.
+  All six scopes exited; the latest monitored growth was +86,016 bytes,
+  no abort, >150 GiB free. No mount, fixture, Bazel client or owned lock
+  holder remains. Network bytes unobserved. Wrapper SHA256 remains
+  `8b44672260c56fe5bfd0d8dc79fe3866db261d2d388f9ac9e0f3eda21e605ce5`.
+- Remaining gate: plain/lazy unmount did not expose a session exit to the
+  callback in the tested schedule. Session-exit cancellation is narrower
+  than a general unmount guarantee; request interruption, corrected negative
+  control, exact-head affected suites, all four gates, CLI build, council
+  fixpoint and root review remain pending. PR #175 stays draft. Root owns
+  the next disposition; no runtime or broader lifecycle change is inferred.
+
+## Earlier option checkpoint
+
+- Prior option-package checkpoint (2026-11-13): draft implementation and
   focused tests are green but **BLOCKED for review** at the mounted unmount
   boundary. Ted's ruled default waits for capacity to drain; an opt-in finite
   timeout maps an existing cold file's capacity expiry to `EAGAIN`.
@@ -8,8 +43,8 @@
   wakes it. `storage/fs.py:mount_storage` documents that libfuse joins workers
   before `destroy()` closes the pool, so the synthetic close test cannot prove
   an unmount finishes when a holder keeps a lease. Root `%91` received the
-  blocker; `pr175-default-capacity-unmount-cancel` tracks it. No new runtime
-  or application repair starts before adjudication. PR #175 remains draft,
+  blocker; `pr175-default-capacity-unmount-cancel` tracks it. The subsequent
+  root adjudication authorized the narrow callback repair above. PR #175 remains draft,
   with no mounted/full gates, CLI build, council convergence, acceptance,
   merge or deployment on this option delta.
 - Option package resources/evidence: 2/6 focused nonmount invocations used.
