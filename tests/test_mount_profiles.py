@@ -320,6 +320,31 @@ readdir_ttl = 5.0
     def test_revalidate_after_defaults_to_60(self):
         self.assertEqual(60.0, self._resolve().revalidate_after)
 
+    def test_bulk_capacity_wait_defaults_off_and_cli_overrides_profile(self):
+        self.assertIsNone(self._resolve().bulk_capacity_wait_timeout)
+        profile = self._profile("bulk_capacity_wait_timeout = 2.5\n")
+        from_profile = self._resolve(
+            mount_target="prof", backing_paths=[], config_path=profile,
+        )
+        self.assertEqual(2.5, from_profile.bulk_capacity_wait_timeout)
+        self.assertEqual(0.0, self._resolve(
+            mount_target="prof", backing_paths=[], config_path=profile,
+            bulk_capacity_wait_timeout=0,
+        ).bulk_capacity_wait_timeout)
+        self.assertEqual(0.25, self._resolve(
+            mount_target="prof", backing_paths=[], config_path=profile,
+            bulk_capacity_wait_timeout=0.25,
+        ).bulk_capacity_wait_timeout)
+
+    def test_bulk_capacity_wait_rejects_invalid_values(self):
+        for bad in (-1.0, float("nan"), float("inf")):
+            with self.subTest(cli=bad), self.assertRaises(click.ClickException):
+                self._resolve(bulk_capacity_wait_timeout=bad)
+        for bad in ('-1', 'nan', 'inf', 'true', '"5"'):
+            profile = self._profile(f"bulk_capacity_wait_timeout = {bad}\n")
+            with self.subTest(profile=bad), self.assertRaises(click.ClickException):
+                self._resolve(mount_target="prof", backing_paths=[], config_path=profile)
+
     def test_revalidate_after_from_profile_and_cli_override(self):
         toml_content = '''
 [mounts.prof]

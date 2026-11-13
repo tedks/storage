@@ -29,7 +29,7 @@ from typing import Dict, Optional, Set, List, Tuple
 
 from .backends.base import Backend, ChecksumUnavailable, interactive_request
 from .backends.ssh_mux import close_shared_control_sockets
-from .backends.ssh_pool import is_connection_error
+from .backends.ssh_pool import BulkCapacityTimeout, is_connection_error
 from .cache import PARTIAL_SUFFIX, CacheManager
 from .locks import NamespaceLock, PathLocks, UploadLocks
 from .cache_metadata import PREFIX_XATTR, XATTR_CACHE_METADATA_NAME, regular_file_stat, scan_cache_entries
@@ -1909,6 +1909,8 @@ class StorageFS(Operations):
                         resolved.requested_path, backend, source_virtual_path=canonical_path,
                     ):
                         return True
+                except BulkCapacityTimeout:
+                    raise
                 except Exception:
                     pass
 
@@ -2269,6 +2271,8 @@ class StorageFS(Operations):
         with self._path_locked(canonical_path):
             try:
                 return self._open(path, flags)
+            except BulkCapacityTimeout as exc:
+                raise FuseOSError(errno.EAGAIN) from exc
             finally:
                 # The pin belongs to this open (_select_backend_for_read):
                 # one no fetch used (the open attached to a running stream,

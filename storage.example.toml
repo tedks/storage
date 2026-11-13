@@ -46,6 +46,11 @@ listing_max_stale = 3600
 # does not hold up listings, stats and reads of others. Off by default until
 # it has been field-tested.
 # fuse_threads = true
+# Bulk SSH copies wait for SFTP channel capacity as the queue drains. A
+# positive finite value opts into a capacity deadline; an existing cold file
+# whose copy times out then reports EAGAIN. Unset or 0 leaves it off. SSH
+# connection and transfer timeouts remain separate.
+# bulk_capacity_wait_timeout = 30
 # Seconds between re-verifications of the conflict view's recorded hashes:
 # each interval, every member whose hash queue is idle hashes again the one
 # file checked longest ago (and over an hour ago). 0 turns it off.

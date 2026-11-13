@@ -35,6 +35,7 @@ import errno
 import heapq
 import itertools
 import logging
+import math
 import os
 import socket
 import threading
@@ -61,6 +62,10 @@ class MemberUnavailable(ConnectionError):
     Raised before any request reaches the member, so it says nothing about a
     channel; it does mean the member could not be asked.
     """
+
+
+class BulkCapacityTimeout(MemberUnavailable):
+    """A bulk SFTP lease waited for capacity until its configured deadline."""
 
 
 _TRANSIENT_ERRNOS = frozenset({
@@ -378,6 +383,7 @@ class MemberConnection:
         connect_timeout: float,
         retry_interval: float,
         bulk_wait: Optional[float] = None,
+        bulk_capacity_wait_timeout: Optional[float] = None,
         sftp_channels: int = 4,
         interactive_reserve: int = 1,
         exec_channels: int = 2,
@@ -394,9 +400,11 @@ class MemberConnection:
                 interactive request waits for a channel or a connect.
             retry_interval: how long the member stays down after a failed
                 connect before one caller may try again.
-            bulk_wait: how long a background request waits for a channel
-                (connect_timeout by default). Nobody is waiting on these, and
-                a channel can stay busy for a whole transfer.
+            bulk_wait: bound while a background request waits for a transport
+                connection or exec channel (connect_timeout by default).
+            bulk_capacity_wait_timeout: optional capacity-only deadline for
+                bulk SFTP leases; None or zero waits for channel capacity.
+                Connect and operation timeouts remain separate.
             stall_limit: consecutive timed-out SFTP requests on one transport
                 that still answers probes before the member is marked down.
                 Exec commands do not count: a checksum of a large file may
@@ -410,6 +418,14 @@ class MemberConnection:
         self.retry_interval = float(retry_interval)
         self.bulk_wait = max(self.connect_timeout,
                              float(bulk_wait) if bulk_wait is not None else 0.0)
+        if bulk_capacity_wait_timeout is not None:
+            if (isinstance(bulk_capacity_wait_timeout, bool)
+                    or not math.isfinite(float(bulk_capacity_wait_timeout))
+                    or bulk_capacity_wait_timeout < 0):
+                raise ValueError("bulk capacity wait timeout must be finite and nonnegative")
+        self.bulk_capacity_wait_timeout = (
+            float(bulk_capacity_wait_timeout) if bulk_capacity_wait_timeout else None
+        )
         self._interactive_reserve = max(0, interactive_reserve)
         self._stall_limit = max(1, stall_limit)
         self._on_availability = on_availability
@@ -805,6 +821,7 @@ class MemberConnection:
 
     def _acquire_new_sftp(self, interactive: bool, owner: int) -> SFTPLease:
         deadline = self._deadline(interactive)
+        capacity_deadline = None
         # Transports this acquisition may see installed before giving up: a
         # server that drops every new connection must not loop forever.
         connects_left = 2
@@ -822,6 +839,20 @@ class MemberConnection:
                 if lease is not None:
                     return lease
                 if not self._can_open_locked(interactive):
+                    if not interactive:
+                        if self.bulk_capacity_wait_timeout is None:
+                            self._cond.wait()
+                        else:
+                            if capacity_deadline is None:
+                                capacity_deadline = (
+                                    time.monotonic() + self.bulk_capacity_wait_timeout
+                                )
+                            remaining = capacity_deadline - time.monotonic()
+                            if remaining <= 0:
+                                raise BulkCapacityTimeout(
+                                    f"SSH member {self.name}: no bulk SFTP capacity came free")
+                            self._cond.wait(remaining)
+                        continue
                     remaining = deadline - time.monotonic()
                     if remaining <= 0 or not self._cond.wait(remaining):
                         if not self._can_open_locked(interactive) \
