@@ -97,3 +97,10 @@
   based_on: 87cc102
   state: VERIFIED
   note: Scoped startup invocation 1 failed behaviorally on unchanged mount hook. Draft validator uses actual local rsync with frozen caller options and never enters SSH/control-socket/member paths; invocation 2 passed new cases but exposed an older direct --size-only test expectation. After changing that expectation to startup rejection, invocation 3 passed all three affected modules. A controlled deletion of the byte comparison in invocation 4 produced seven test failures, and the check was restored. All four scopes inactive/dead; network bytes UNKNOWN. This is local synthetic verification, not pushed-head or release acceptance.
+
+- id: lead-sol:15
+  kind: state-change
+  refs: [lead-sol:14]
+  based_on: 5869948
+  state: VERIFIED
+  note: Pushed implementation and record. On pushed 5869948, invocation 5's two focused Bazel targets passed, but the wrapper returned 90 when its du scratch read raced Bazel deleting a sandbox and stopped the scope during cleanup. Scope is inactive/dead. Changed the external monitor to retry the transient read at most three times, retaining fail-closed stop on repeated failure. Final full affected-module run remains as invocation 6/6; no clean wrapper receipt is claimed for invocation 5.
