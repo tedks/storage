@@ -111,3 +111,10 @@
   based_on: 27c3ca96c66573be12c4c6eba5692a3c24231c7c
   state: STARTED
   note: Invocation 6/6 on exact pushed head passed three affected nonmount modules; wrapper exit 0 after 14 seconds, scope inactive/dead and empty control group. Root reviewed full diff and run receipts, with an independent native Sol source/test reviewer CLEAN, then retained this lane for formal council and release preparation. New bounded authority is four build/test invocations, 30 minutes combined, client 2 CPU/8 GiB/2 GiB swap/256 tasks, new owned scratch <=10 GiB, and bounded synthetic Docker fixtures. No council, full release gate, CLI build, merge, or deployment evidence yet.
+
+- id: lead-sol:17
+  kind: review-seat-outcome
+  refs: [lead-sol:16]
+  based_on: 26b55adffa4a83854138c771796f715b6d7e0250
+  state: STARTED
+  note: Formal PR179 round 26b55adffa4a-20261113T211421Z-b3687b reviewed the frozen full diff. Native Sol CLEAN 0/0/0, foreign Opus CLEAN 0 Critical/0 Important/5 Nits, Google EMPTY usage-limit; round records and findings are on PR. Fixed three nits in fb5030c (redundant test, missing-rsync/timeout messages, transfer-I/O comment). Filed docs-rsync-upload-contract spelling detail and pr179-record-artifact-placement for root decision. The fix delta and release gates are pending; no acceptance claim.
