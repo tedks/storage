@@ -47,3 +47,23 @@ log_events:
     return/mount absence before removing scratch. Existing optionoff/EAGAIN ruling
     unchanged. Source reference https://man7.org/linux/man-pages/man2/umount.2.html
     .'
+- time: 2026-11-13T21:30:20-00:00
+  who: Ted Smith
+  what: commented
+  comment: '2026-11-13 scoped cancellation evidence at pushed PR175 head 36fb7b7bef6ec4906f3a0af1dc2cf6882809fff6.
+    Root narrowed the earlier detach claim: old helper tried fusermount -u then -uz
+    without retaining individual codes; lazy detach alone is not session exit. New
+    helper records exact flag/return/stderr on attempted owned cleanup, checks mount
+    and process absence before scratch deletion, and fails/retains scratch on cleanup
+    error. Frozen 55065aa positive explicit fuse_exit plus disabled-probe control
+    passed. New isolated-daemon tests (same source later committed as 36fb7b7) passed
+    fatal caller interruption with native request observation and SIGTERM daemon shutdown
+    with native session observation; callback exit preceded destroy while three bulk
+    holders were still gated. Exact clean pushed head forced six affected targets:
+    9 fuse-thread, 121 SSH, 59 profiles, 32 CLI mount, 12 allow-other, 5 mount-sigpipe
+    = 238 passed; seven fusepy utimens deprecation warnings, no worker-thread warning.
+    Four of four authorized Bazel invocations spent (third failed at target analysis
+    before tests); all scopes inactive, no owned mount/client/fixture or lock holder.
+    No full four gates/CLI build/formal council/root acceptance/merge/deploy is claimed.
+    Issue remains open for release verification and no universal lazy-unmount guarantee
+    is asserted.'
