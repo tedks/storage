@@ -185,3 +185,29 @@
   cancellation after close, not mounted unmount completion. Root `%91` has a
   submitted blocker receipt. No further source/runtime phase is inferred;
   draft PR #175 remains unaccepted and full gates/council pending.
+
+## channel-lead:13
+
+- kind: bounded-repair-checkpoint
+- based_on: `1f3b896822dc89ede9e272041a5b2dd4f1970e86`
+- applied_at: `d84ee40` application/test checkpoint
+- refs: `channel-lead:12`, root `STORAGE175-PREDESTROY-ADJUDICATION-20261113`,
+  `pr175-default-capacity-unmount-cancel`
+- state: Root authorized a native callback-only cancellation boundary. The
+  pinned libfuse2 exports `fuse_interrupted` and `fuse_exited`; fusepy's
+  wrapper and `fuse_loop_mt` were inspected. A thread-local probe is installed
+  only during native callbacks; pool capacity waits sample it every 0.1 s
+  and map cancellation to `EINTR`, while ordinary wait remains unlimited.
+  The nonmount cancellation unit and affected SSH/allow-other/mount-sigpipe
+  targets passed. First mounted attempt was collection-only failure due a
+  helper absent from this target's BUILD srcs; the fixture was made
+  self-contained. Next mounted run had 1 pass/1 fail: real detach did not
+  expose session exit before held leases were released. Final mounted run
+  had 1 pass/1 fail: explicit native session exit released the queued
+  callback and reached destroy with three holders still held; the
+  disabled-probe control hit an early assertion while its trigger syscall
+  remained blocked. The assertion was corrected after all 6/6 invocations
+  were spent and is UNRUN. Every owned scope and client exited and all
+  scratch mounts were unmounted; no resource lease remains. Real caller
+  interruption, plain/lazy unmount and full gate/CLI/council are unproved.
+  This is a draft checkpoint, not scoped acceptance or release clearance.

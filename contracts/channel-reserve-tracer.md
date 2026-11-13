@@ -89,9 +89,24 @@ that libfuse joins active callbacks first. If all bulk holders continue to
 hold leases, a queued cold-open callback has no capacity deadline by default
 and can delay that join indefinitely. SSH channel inactivity timeouts do not
 bound an otherwise progressing whole-file transfer. This is open as
-`pr175-default-capacity-unmount-cancel`; the draft package is blocked on a
-pre-destroy cancellation or equivalent bounded-holder proof. No mounted test
-was authorized or run in this phase.
+`pr175-default-capacity-unmount-cancel`. The approved follow-up adds a
+thread-local probe only inside fusepy's native callback wrapper. The pinned
+libfuse2 exports `fuse_interrupted()` and `fuse_exited()`; a capacity waiter
+polls those while the callback is alive, returns `EINTR` on cancellation, and
+does not turn an ordinary capacity wait into an elapsed timeout. A copied
+background context and a direct `StorageFS` call do not carry that probe.
+No native context pointer is kept after a callback. The source boundary is
+[libfuse 2.9.9 fuse.h](https://github.com/libfuse/libfuse/blob/fuse-2.9.9/include/fuse.h),
+[fuse_loop_mt.c](https://github.com/libfuse/libfuse/blob/fuse-2.9.9/lib/fuse_loop_mt.c)
+and the pinned fusepy 3.0.1 wrapper.
+
+The targeted mounted session-exit case passed with three gated holders still
+alive before `destroy()`. Its disabled-probe control reached a blocking
+trigger syscall, but an early assertion prevented it from checking the held
+worker; that test-only assertion is corrected and **unrun**. A separate real
+mount detach did not make `fuse_exited()` visible before the holders were
+released. Thus plain/lazy unmount and real caller interruption remain unproved;
+no broad unmount guarantee or release acceptance follows from session exit.
 
 This does not enable FUSE threads or cap libfuse native threads. A single
 SFTP channel has no reserve; other interactive work can fill it; reentrant
