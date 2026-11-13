@@ -1,0 +1,37 @@
+id: storage-mounted-readiness-initial-members
+title: Make mounted test readiness and initial member visibility deterministic
+desc: 'Fresh root/Sol source audit at PR174 f9b99305982a64d298b4817ae3aec60e160bb8de
+  and PR179 00082c4ce4e3c821db6b161221434bd9bf529cfd found an Important fixture-evidence
+  gap. tests/test_sync_system.py _MountedCase precreates mount directory, sleeps one
+  second, and checks exists; mount exceptions are printed, not propagated. TestKernelCacheRefetchThreaded.test_shrunk_file_reads_short
+  and TestMemberSymlinks.test_member_only_link_is_a_link_through_the_mount create
+  initial member content after mount, then immediately look it up. A fresh parent
+  listing may legitimately return ENOENT without probing new member names, and readiness
+  is unproved. Existing logs show initial ENOENT, not which hypothesis caused it.
+  Both use LocalBackend/direct StorageFS, bypassing PR179 rsync/startup changes. PR174
+  removes only WORKSPACE. Neither application regression nor contention attribution
+  is established.
+
+
+  Acceptance: bounded actual mount/callback readiness with error propagation and ismount
+  proof; deterministic initial content seeded before mount for refetch/symlink tests;
+  separate controlled root-list-before-member-create schedule that verifies the existing
+  fresh-listing/invalidation contract. Capture callback/listing generation and direct-member
+  lstat on failure. No sleeps or retries to hide failures, no changes to cache semantics
+  in this fixture fix. Separate follow-up from build-only PR174 and upload PR179;
+  root owns assignment. Fresh native Sol reviewer mounted_gate_failure_review retained
+  for re-verification of the bounded fix proposal/evidence. No implementation or runtime
+  in initial audit.'
+type: bugfix
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-13T21:55:37-00:00
+references: []
+log_events:
+- time: 2026-11-13T21:55:37-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
