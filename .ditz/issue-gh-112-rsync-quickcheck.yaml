@@ -30,5 +30,24 @@ log_events:
   who: Ted Smith
   what: blocks gh-112
   comment: ""
+- time: 2026-11-13T02:01:49-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'STORAGE-REVERIFY-LOG-AUDIT-20261112: Ted supplied repeated storage.fs
+    re-verification mismatch messages on remote2, roughly minute-aligned over several
+    hours. Source-only audit at deployed-source81793ac: _reverify_tick hashes one
+    oldest eligible row/member per60s, min verified age3600s. _reverify_member_copy
+    compares size/mtime/available ctime before/after remote hash. _settle_reverify
+    logs any digest mismatch against persisted record as rewritten, then replaces
+    member hash. Upload path sync_executor.py170-206 can seed this persisted record
+    from local checksum after copy_from_local success; RsyncBackend uses -a without
+    --ignore-times or --checksum by default. Thus this known quick-check bug can produce
+    the reported message without an actual remote rewrite: skipped stale remote bytes
+    versus locally assumed uploaded digest. Field cause remains UNPROVEN: no paths,
+    digests/provenance or deployed rsync_args in supplied lines; no live mount/backing
+    files/cache DB inspected, no runtime reproduction. Reverification updates member
+    checksum evidence, not an automatic repair/resync. Prioritize synthetic end-to-end
+    skip->false baseline->reverify regression with the fix; do not dismiss these as
+    routine INFO noise.'
 blocks:
 - gh-112
