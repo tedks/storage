@@ -162,6 +162,27 @@ class TestRsyncLocalTransfer(TestCase):
         finally:
             backend.close()
 
+    def test_caller_size_only_cannot_skip_selected_upload(self):
+        src = self.local_dir / "selected.txt"
+        dst = self.remote_dir / "selected.txt"
+        src.write_bytes(b"new bytes")
+        dst.write_bytes(b"old bytes")
+        stamp = 1_700_000_000_000_000_000
+        os.utime(src, ns=(stamp, stamp))
+        os.utime(dst, ns=(stamp, stamp))
+        backend = RsyncBackend(
+            name="local-rsync", host="localhost",
+            remote_path=str(self.remote_dir), username="user", compress=False,
+            rsync_args=["--size-only"],
+        )
+        try:
+            with mock.patch.object(backend, "_with_sftp", return_value=None), \
+                    mock.patch.object(backend, "_remote_spec", return_value=str(dst)):
+                backend.copy_from_local(src, "/selected.txt")
+            self.assertEqual(src.read_bytes(), dst.read_bytes())
+        finally:
+            backend.close()
+
     def test_rsync_inherits_ssh_metadata_ops(self):
         """Verify RsyncBackend inherits metadata operations from SSHBackend."""
         backend = RsyncBackend(
