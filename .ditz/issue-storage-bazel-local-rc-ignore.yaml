@@ -1,0 +1,21 @@
+id: storage-bazel-local-rc-ignore
+title: Ignore local Bazel rc overrides in Storage
+desc: 'Storage #173 adds an optional try-import of %workspace%/.bazelrc.local, but
+  .gitignore does not ignore that file. An untracked local override makes scripts/run-gates.sh
+  refuse an exact-head receipt; credentials or host endpoints should never be tracked.
+  This is outside the C5 harmonization diff allowlist, so keep #173 scoped and add
+  a separate Storage-owned documentation/config fix. No local rc file exists in the
+  #173 worktree at the review checkpoint.'
+type: task
+component: build
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-13T21:02:27-00:00
+references: []
+log_events:
+- time: 2026-11-13T21:02:27-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
