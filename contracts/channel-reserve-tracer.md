@@ -53,16 +53,37 @@ the CLI build passed. Exact commands and hashes are in PR #175's evidence
 comment. This one-member test does not show namespace-executor
 contention; the separate context test checks error restoration.
 
-The synthetic timeout test currently observes `ENOENT` for an existing file
-on a healthy member after bulk capacity expires. That mapping is not an
-accepted product choice; `oq-pr175-bulk-timeout-errno` remains open.
+At `7a5c3db`, the synthetic timeout test observed `ENOENT` for an existing
+file on a healthy member after bulk capacity expired. Ted subsequently ruled
+that expiry should be opt-in per mount, default off, and report `EAGAIN`.
+The prior observation is evidence of the defect, not the desired behavior.
+
+## Opt-in capacity expiry implementation boundary
+
+`bulk_capacity_wait_timeout` is absent by default; explicit zero also means
+off, and a positive finite number of seconds enables expiry. CLI and TOML
+profile values resolve before mountpoint/cache creation, then
+`create_storage_members` passes the value only to SSH backends. The SSH pool
+uses it only while a bulk SFTP request waits for channel capacity. Its
+existing connection, SFTP operation and exec deadlines remain finite and
+separate. An available channel wakes a queued waiter; closing the pool wakes
+all waiters. A capacity-only expiry raises a distinct member exception,
+which cache fetch must preserve through its current catch and `StorageFS.open`
+maps to `EAGAIN`. Missing files, down members, failed operations and other
+fetch failures keep their current error paths. No new admission class,
+worker count or pool cap is introduced.
+
+This is the smallest needed addition: without a distinct capacity result,
+`CacheManager.cache_file` turns the failed fetch into false and `open` reports
+`ENOENT` for an existing file. With no capacity expiry, queue drain must
+eventually release a lease; pool close is the explicit cancellation path.
+The nonmount proof will exercise it. Mounted unmount behavior is reserved
+for the later mounted gate and must not be inferred from synthetic tests.
 
 This does not enable FUSE threads or cap libfuse native threads. A single
 SFTP channel has no reserve; other interactive work can fill it; reentrant
 leases are not reclassified; member timeouts still bound waits. A cold open
-now queues behind sync and other bulk leases for up to `bulk_wait`; when that
-wait expires, the existing fetch-failure path can fail the open even though
-the member remains connected. Local cached
+now queues behind sync and other bulk leases. Local cached
 reads usually need no SSH channel. Rsync and local transfers have no new SFTP
 capacity. Background worker growth is separate (#167) and does not fulfill
 Ted's broader foreground request. PR #170's build-merge incident and all

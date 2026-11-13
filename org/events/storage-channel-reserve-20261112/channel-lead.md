@@ -148,3 +148,21 @@
   evidence remain UNRUN, 0/3 invocations spent. Owned causalred scope is
   inactive; no owned Bazel client, fixture or lease remains. Formal council
   remains FINDINGS, and observed ENOENT remains an open product question.
+
+## channel-lead:11
+
+- kind: state-change
+- based_on: `7a5c3db38ad69525509630c4509a9536af1fbd89`
+- applied_at: opt-in timeout design checkpoint
+- refs: `channel-lead:10`, PR #175 comment 6814714217, Ted's timeout ruling
+- state: The mux owner released the inherited lock holder; our shared-lock
+  control failed behaviorally before timeout, and the clean SSH backend
+  target executed 117/117 pass. Both owned scopes ended; 2/3 causal-proof
+  invocations were used. Ted then selected an opt-in per-mount capacity wait
+  timeout, default off, returning EAGAIN on expiry. The proposed path is
+  CLI/profile resolution -> SSH member factory/backend -> pool capacity
+  wait -> distinct expiry -> cache pass-through -> FUSE open EAGAIN. Existing
+  connection and operation timeouts remain bounded. This is a proposed
+  implementation boundary, not a test or acceptance of new code; the new
+  six-invocation nonmount budget starts at zero. Physical unmount is outside
+  this phase and requires mounted gate evidence later.
