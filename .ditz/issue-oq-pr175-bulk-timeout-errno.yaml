@@ -44,3 +44,14 @@ log_events:
   what: 'closed: fixed'
   comment: Ted ruled 2026-11-13; see preceding exact ruling and implementation limits.
     Closing the question, not the implementation.
+- time: 2026-11-13T21:03:38-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'STORAGE175-PREDESTROY-ADJUDICATION-20261113: Ted option ruling unchanged
+    (default unlimited capacity wait, opt-in expiry EAGAIN). Worker found libfuse
+    joins callbacks before destroy; closing pools only in destroy cannot prove queued
+    callbacks cancel. Root authorizes narrow callback-lifetime request/session-exit
+    cancellation boundary plus targeted synthetic mounted proof; no universal guarantee
+    for unrelated uninterruptible active I/O. 2/6 focused runs used, remaining4 may
+    include at most2 exact-owned scratch FUSE tests, no live data/Docker. No implementation
+    or release acceptance yet.'
