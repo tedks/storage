@@ -32,3 +32,17 @@ log_events:
   who: Ted Smith
   what: created
   comment: ""
+- time: 2026-11-13T22:07:46-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Root source review of candidate runner144d50e9/scannerffdd7b19: FINDINGS,
+    runtime remains unrun. Initial root os.open(path) then fstat precedes identity
+    check and bypasses child NO_XDEV guards; require trusted pre-workload pinned root
+    FDs and avoid path re-resolution in samples/free-space checks. Scanner failure
+    still starts df and discards its possible residual PID; retain every helper failure/stop
+    receipt and unexpected-exception final record. Symlink mutation plan must account
+    for retained O_PATH|O_NOFOLLOW. Source-only <=20 minute repair granted, no tests
+    yet. Root resource clarification for fixed reviewed synthetic fixtures: 10GiB
+    is sampled named-allocation stop threshold with disclosed open-unlinked/empty-underlay
+    limits, not a hard aggregate quota; no quota engineering required. Final CPU/RAM/Docker/wall
+    bounds and zero FUSE traversal remain required.'
