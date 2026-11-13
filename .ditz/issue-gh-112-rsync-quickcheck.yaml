@@ -107,5 +107,17 @@ log_events:
     GREEN on uncommitted code, byte-comparison mutation RED. Exact pushed-head focused
     verification, root review, all release gates, council, merge and remote compatibility
     remain outstanding. Field cause unproven; no live profile/data inspected.'
+- time: 2026-11-13T21:07:36-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'PR #179 final scoped receipt: exact pushed head 27c3ca96c66573be12c4c6eba5692a3c24231c7c
+    passed Bazel //tests:storage_test_rsync_backend //tests:storage_test_allow_other
+    //tests:storage_test_fs_revalidate under invocation 6/6 (wrapper exit 0, 14s,
+    scope inactive/dead, empty cgroup). Phase total 76/1800s; active 2CPU/4GiB/swap0,
+    max sampled owned scratch 482MiB, host free >10GiB, network bytes UNKNOWN. Unchanged-code
+    integrated false-CLEAN RED and startup-hook RED plus byte-check mutation RED are
+    recorded in PR body/docs. Local probe cannot establish remote executable compatibility
+    or field cause. CLI build, four release gates, formal council, root review and
+    merge remain outstanding.'
 blocks:
 - gh-112
