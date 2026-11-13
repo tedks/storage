@@ -16,6 +16,7 @@ from contextlib import nullcontext
 from typing import Callable, ContextManager, Optional, List, Set
 
 from .backends.base import Backend, bulk_request
+from .backends.ssh_pool import BulkCapacityTimeout
 from .cache_metadata import PARTIAL_SUFFIX, PREFIX_XATTR, regular_file_stat, write_cache_metadata
 from .models import FileMetadata, SyncStatus
 from .state import StateManager
@@ -342,6 +343,8 @@ class CacheManager:
             self.fetch_into_cache(backend, source_virtual_path, self.get_cache_path(virtual_path))
             self.state_manager.update_access_time(virtual_path)
             return True
+        except BulkCapacityTimeout:
+            raise
         except Exception as e:
             print(f"Error caching {virtual_path} from {backend.name}: {e}")
             return False

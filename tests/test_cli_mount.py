@@ -43,6 +43,47 @@ backends = [
         self.assertEqual("Second root (remote1)", backends["remote1"].label)
         self.assertIn("Added SSH storage member: Archive (remote0)", result.output)
 
+    def test_bulk_capacity_wait_reaches_only_ssh_member_and_defaults_off(self):
+        profile = self.temp_dir / "storage.toml"
+        profile.write_text(f'''
+[mounts.named]
+mountpoint = "{self.temp_dir / "mount"}"
+cache = "{self.temp_dir / "cache"}"
+bulk_capacity_wait_timeout = 3.5
+backends = ["ssh://u@host.example:/one"]
+''')
+        with patch("storage.cli_mount.mount_storage") as mock_mount, \
+             patch("storage.cli_mount.shared_filesystems", return_value=[]):
+            result = self.runner.invoke(main, ["mount", "--config", str(profile), "named"])
+        self.assertEqual(0, result.exit_code, result.output)
+        backend = mock_mount.call_args.args[3]["remote0"]
+        self.assertEqual(3.5, backend._pool.bulk_capacity_wait_timeout)
+        backend.close()
+
+        with patch("storage.cli_mount.mount_storage") as mock_mount, \
+             patch("storage.cli_mount.shared_filesystems", return_value=[]):
+            result = self.runner.invoke(main, [
+                "mount", "--config", str(profile), "--bulk-capacity-wait-timeout", "0", "named",
+            ])
+        self.assertEqual(0, result.exit_code, result.output)
+        backend = mock_mount.call_args.args[3]["remote0"]
+        self.assertIsNone(backend._pool.bulk_capacity_wait_timeout)
+        backend.close()
+
+    def test_invalid_bulk_capacity_wait_fails_before_mount_side_effects(self):
+        cache = self.temp_dir / "never-created-cache"
+        mountpoint = self.temp_dir / "never-created-mount"
+        for value in ("-1", "nan", "inf"):
+            with self.subTest(value=value), patch("storage.cli_mount.mount_storage") as mock_mount:
+                result = self.runner.invoke(main, [
+                    "mount", str(mountpoint), "-c", str(cache),
+                    "--bulk-capacity-wait-timeout", value,
+                ])
+                self.assertNotEqual(0, result.exit_code)
+                mock_mount.assert_not_called()
+                self.assertFalse(cache.exists())
+                self.assertFalse(mountpoint.exists())
+
     def test_mount_uses_named_profile_from_toml_config(self):
         config_path = self.temp_dir / "storage.toml"
         config_path.write_text(

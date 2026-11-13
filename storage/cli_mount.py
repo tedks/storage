@@ -129,6 +129,14 @@ def shared_filesystems(backends: Dict[str, Backend]) -> List[List[str]]:
     ),
 )
 @click.option(
+    "--bulk-capacity-wait-timeout",
+    type=float,
+    help=(
+        "Seconds a bulk SSH copy waits for SFTP channel capacity before a cold open "
+        "returns EAGAIN (default off; 0 = off). Connection and transfer timeouts remain."
+    ),
+)
+@click.option(
     "--checksum-reverify-interval",
     type=float,
     help=(
@@ -158,6 +166,7 @@ def mount(
     enable_watchers,
     revalidate_after,
     fuse_threads,
+    bulk_capacity_wait_timeout,
     checksum_reverify_interval,
 ):
     """
@@ -208,6 +217,7 @@ def mount(
         streaming_keep_after_close=streaming_keep_after_close,
         revalidate_after=revalidate_after,
         fuse_threads=fuse_threads,
+        bulk_capacity_wait_timeout=bulk_capacity_wait_timeout,
         checksum_reverify_interval=checksum_reverify_interval,
     )
 
@@ -242,6 +252,7 @@ def mount(
     backends = create_storage_members(
         resolved.member_specs, resolved.key_file,
         display_names=resolved.member_display_names,
+        bulk_capacity_wait_timeout=resolved.bulk_capacity_wait_timeout,
     )
     for names in shared_filesystems(backends):
         click.echo(
@@ -297,6 +308,11 @@ def mount(
         f"attributes {kernel['attr_timeout']}s, pages kept while unchanged"
     )
     click.echo(f"  FUSE loop: {'multithreaded' if resolved.fuse_threads else 'single-threaded'}")
+    capacity_wait = (
+        f"{resolved.bulk_capacity_wait_timeout}s"
+        if resolved.bulk_capacity_wait_timeout else "no deadline"
+    )
+    click.echo(f"  Bulk SSH capacity wait: {capacity_wait}")
     if resolved.checksum_reverify_interval > 0:
         click.echo(
             f"  Hash re-verification: one file per idle member every "

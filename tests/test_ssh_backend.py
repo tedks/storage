@@ -22,7 +22,8 @@ from storage.backends.base import (
 )
 from storage.backends.ssh import SSHBackend
 from storage.backends.ssh_pool import (
-    CommandTimeout, MemberConnection, MemberUnavailable, is_connection_error,
+    BulkCapacityTimeout, CommandTimeout, MemberConnection, MemberUnavailable,
+    is_connection_error,
 )
 
 
@@ -459,6 +460,55 @@ class _Holder:
 
 class TestMemberConnectionPool(unittest.TestCase):
 
+    def test_default_bulk_capacity_wait_drains_past_old_transfer_wait(self):
+        server = _FakeServer()
+        pool = _pool(server, connect_timeout=0.1, bulk_wait=0.1)
+        holders = [_Holder(pool) for _ in range(3)]
+        waiter = _InThread(lambda: pool.acquire_sftp(1.0))
+        try:
+            self.assertIsNone(pool.bulk_capacity_wait_timeout)
+            self.assertFalse(waiter.done.wait(0.3), "default bulk wait expired")
+            self.assertEqual(3, pool.snapshot()["bulk_leased"])
+            holders[0].release()
+            self.assertTrue(waiter.join(3), "queued lease did not drain")
+            self.assertIsNone(waiter.error)
+            pool.release(waiter.result)
+        finally:
+            pool.close()
+            for holder in holders:
+                holder.release()
+            waiter.join(3)
+        self.assertEqual(0, pool.snapshot()["bulk_leased"])
+
+    def test_bulk_capacity_timeout_is_distinct_and_close_cancels_default_wait(self):
+        server = _FakeServer()
+        pool = _pool(server, bulk_capacity_wait_timeout=0.1)
+        holders = [_Holder(pool) for _ in range(3)]
+        try:
+            waiter = _InThread(lambda: pool.acquire_sftp(1.0))
+            self.assertTrue(waiter.join(3))
+            self.assertIsInstance(waiter.error, BulkCapacityTimeout)
+            self.assertTrue(pool.available())
+        finally:
+            pool.close()
+            for holder in holders:
+                holder.release()
+        self.assertEqual(0, pool.snapshot()["bulk_leased"])
+
+        pool = _pool(_FakeServer())
+        holders = [_Holder(pool) for _ in range(3)]
+        waiter = _InThread(lambda: pool.acquire_sftp(1.0))
+        try:
+            self.assertFalse(waiter.done.wait(0.1))
+            pool.close()
+            self.assertTrue(waiter.join(3), "close left a waiter blocked")
+            self.assertIsInstance(waiter.error, MemberUnavailable)
+            self.assertNotIsInstance(waiter.error, BulkCapacityTimeout)
+        finally:
+            pool.close()
+            for holder in holders:
+                holder.release()
+
     def test_bulk_context_nests_and_does_not_reclassify_a_held_lease(self):
         server = _FakeServer()
         pool = _pool(server)
@@ -508,13 +558,14 @@ class TestMemberConnectionPool(unittest.TestCase):
 
     def test_saturated_background_pool_still_serves_an_interactive_request(self):
         server = _FakeServer()
-        pool = _pool(server, connect_timeout=0.3)
+        pool = _pool(server, connect_timeout=0.3,
+                     bulk_capacity_wait_timeout=0.3)
         held = [_Holder(pool) for _ in range(3)]  # the bulk limit
         try:
             started = time.monotonic()
             bulk = _InThread(lambda: pool.acquire_sftp(1.0))
             self.assertTrue(bulk.join())
-            self.assertIsInstance(bulk.error, ConnectionError)
+            self.assertIsInstance(bulk.error, BulkCapacityTimeout)
             self.assertLess(time.monotonic() - started, 2.0)
             interactive = _InThread(lambda: pool.acquire_sftp(1.0), interactive=True)
             self.assertTrue(interactive.join())
@@ -529,11 +580,12 @@ class TestMemberConnectionPool(unittest.TestCase):
 
     def test_lease_wait_times_out_without_marking_the_member_down(self):
         server = _FakeServer()
-        pool = _pool(server, connect_timeout=0.2, sftp_channels=1)
+        pool = _pool(server, connect_timeout=0.2, sftp_channels=1,
+                     bulk_capacity_wait_timeout=0.2)
         holder = _Holder(pool)
         waiter = _InThread(lambda: pool.acquire_sftp(1.0))
         self.assertTrue(waiter.join())
-        self.assertIsInstance(waiter.error, ConnectionError)
+        self.assertIsInstance(waiter.error, BulkCapacityTimeout)
         self.assertTrue(pool.available())
         holder.release()
         with pool.sftp(1.0) as sftp:
@@ -1469,6 +1521,45 @@ class TestSSHBackendLinks(_BackendTestCase):
 
 
 class TestSSHBackendOnThePool(_BackendTestCase):
+    def test_destroy_wakes_default_capacity_waiting_open(self):
+        from storage.fs import StorageFS
+
+        backend = self._new_backend(connect_timeout=0.15)
+        root = Path(tempfile.mkdtemp(prefix="storage-channel-shutdown-"))
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        fs = StorageFS(root / "cache", root / "state.db", {"ssh0": backend},
+                       1024 * 1024, start_sync=False)
+        self.addCleanup(fs.state_manager.close)
+        self.addCleanup(fs.sync_manager.stop)
+        holders = [_Holder(backend._pool) for _ in range(3)]
+        denied = threading.Event()
+        original_can_open = backend._pool._can_open_locked
+
+        def observe(interactive):
+            allowed = original_can_open(interactive)
+            if not interactive and not allowed:
+                denied.set()
+            return allowed
+
+        with patch.object(backend._pool, "_can_open_locked", side_effect=observe):
+            opener = _InThread(lambda: fs("open", "/cold", os.O_RDONLY))
+            shutdown = None
+            try:
+                self.assertTrue(denied.wait(3), "open did not enter capacity wait")
+                shutdown = _InThread(lambda: fs.destroy("/"))
+                self.assertTrue(shutdown.join(15), "destroy did not finish")
+                self.assertIsNone(shutdown.error)
+                self.assertTrue(opener.join(3), "open outlived member shutdown")
+                self.assertIsInstance(opener.error, OSError)
+                self.assertFalse(fs.cache_manager.is_cached("/cold"))
+            finally:
+                backend.close()
+                for holder in holders:
+                    holder.release()
+                opener.join(3)
+                if shutdown is not None:
+                    shutdown.join(3)
+
     def test_bulk_copy_and_eager_readdir_restore_context_on_error(self):
         from storage.fs import StorageFS
 
@@ -1622,14 +1713,14 @@ class TestSSHBackendOnThePool(_BackendTestCase):
         self.assertEqual(0, backend._pool.snapshot()["bulk_leased"])
         self.assertFalse(is_interactive_request())
 
-    def test_cold_open_bulk_timeout_keeps_member_healthy_and_cache_empty(self):
+    def test_cold_open_opt_in_bulk_timeout_is_eagain_and_keeps_member_healthy(self):
         """Bulk contention can make a foreground cold open fail before copy."""
         from storage.fs import StorageFS
 
         payload = b"existing-cold-file"
         self.server.payload = payload
-        backend = self._new_backend(connect_timeout=0.15)
-        backend._pool.bulk_wait = 0.2
+        backend = self._new_backend(connect_timeout=0.15,
+                                    bulk_capacity_wait_timeout=0.2)
         root = Path(tempfile.mkdtemp(prefix="storage-channel-timeout-"))
         self.addCleanup(shutil.rmtree, root, ignore_errors=True)
         fs = StorageFS(root / "cache", root / "state.db", {"ssh0": backend},
@@ -1686,7 +1777,7 @@ class TestSSHBackendOnThePool(_BackendTestCase):
                 # the unchanged pool decision; a missing file cannot pass.
                 self.assertIn(("/cold", len(payload)), successful_stats)
                 self.assertTrue(denied_bulk.is_set(), "copy did not reach the bulk cap")
-                self.assertEqual(errno.ENOENT, raised.exception.errno)
+                self.assertEqual(errno.EAGAIN, raised.exception.errno)
                 self.assertTrue(backend.is_available())
                 self.assertEqual(3, backend._pool.snapshot()["bulk_leased"])
                 self.assertFalse(fs.cache_manager.is_cached("/cold"))
