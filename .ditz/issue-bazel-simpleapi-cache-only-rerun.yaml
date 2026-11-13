@@ -1,0 +1,26 @@
+id: bazel-simpleapi-cache-only-rerun
+title: Bazel cache-only rerun re-fetches rules_python PyPI simple metadata
+desc: In storage local-write-sync diagnosis, an owned Bazel output base with an existing
+  shared content-addressable repository cache ran two named nonmount targets successfully
+  through analysis when dependency resolution was allowed. A subsequent unchanged
+  MODULE/locks invocation in the same owned output base with --repository_disable_download
+  stopped before tests in rules_python simpleapi_download, requesting the same PyPI
+  simple metadata for nh3, idna, rich, twine and others. The one-off acquisition did
+  not create a repeatable cache-only route. Reproduce with the exact focused commands
+  in docs/local_write_sync_diagnosis_20261113.md and determine a bounded, documented
+  cache-only route without editing manifests merely to evade the issue. This blocks
+  repeatable local diagnostic regression under the current runtime envelope; it is
+  not evidence about rsync behavior.
+type: bugfix
+component: build
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-13T09:09:27-00:00
+references: []
+log_events:
+- time: 2026-11-13T09:09:27-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
