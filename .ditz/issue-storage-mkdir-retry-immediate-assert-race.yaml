@@ -1,0 +1,24 @@
+id: storage-mkdir-retry-immediate-assert-race
+title: Make mkdir retry integration test wait for replication without an immediate
+  absence race
+desc: 'At Storage #173 frozen 9b889c2, the first bounded no-args all-gates run failed
+  tests/test_fs_namespace_integration.py::TestFSNamespaceIntegration::test_mkdir_retry_eventually_replicates
+  at line 3036: after the injected first mkdir failure, the background retry had already
+  succeeded before assertFalse(backend2.isdir(path)). The later unchanged-source run
+  passed. Replace this timing-sensitive immediate-absence assertion with a deterministic
+  synchronization or an assertion about retry ordering in a separate test-owned change;
+  preserve the eventual replication behavior. Do not expand the Bazel harmonization
+  build-only PR. Exact first-run log: /home/tedks/.local/state/storage-173-bounded-20261113T2106Z/storage173-all-gates-20261113.scope.log.'
+type: task
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-13T21:29:13-00:00
+references: []
+log_events:
+- time: 2026-11-13T21:29:13-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
