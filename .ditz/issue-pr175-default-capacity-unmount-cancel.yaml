@@ -22,3 +22,16 @@ log_events:
   who: Ted Smith
   what: created
   comment: ""
+- time: 2026-11-13T21:17:43-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Root authorized a narrow libfuse2 callback-lifetime probe after the first
+    checkpoint. Actual mounted test with three held synthetic bulk leases: explicit
+    fuse_exit() from another callback let the queued cold-open callback leave and
+    destroy run before holder release (optionmount3, one selected pass). A preceding
+    plain mount detach did not expose a session exit to the callback before holder
+    release (optionmount2, behavioral fail). The disabled-probe control in optionmount3
+    stopped at an early test assertion because the trigger stat itself remained blocked;
+    assertion corrected but unrun at 6/6 phase budget. Caller-interrupt path, normal/lazy
+    unmount distinction and full mounted suite remain unverified. The issue remains
+    open; draft PR175 is not accepted.'
