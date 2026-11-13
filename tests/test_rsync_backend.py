@@ -135,6 +135,33 @@ class TestRsyncLocalTransfer(TestCase):
         # Actually, local rsync doesn't need -e at all. Let's test differently.
         backend.close()
 
+    def test_upload_selection_uses_bytes_when_size_and_mtime_match(self):
+        """An upload selected by Storage must replace a quick-check match."""
+        src = self.local_dir / "file.txt"
+        dst = self.remote_dir / "file.txt"
+        src.write_bytes(b"new bytes")
+        dst.write_bytes(b"old bytes")
+        stamp = 1_700_000_000_000_000_000
+        os.utime(src, ns=(stamp, stamp))
+        os.utime(dst, ns=(stamp, stamp))
+        self.assertEqual(src.stat().st_size, dst.stat().st_size)
+        self.assertEqual(src.stat().st_mtime_ns, dst.stat().st_mtime_ns)
+        self.assertNotEqual(src.read_bytes(), dst.read_bytes())
+
+        backend = RsyncBackend(
+            name="local-rsync", host="localhost",
+            remote_path=str(self.remote_dir), username="user", compress=False,
+        )
+        try:
+            # Only the metadata/remote-spec transport is local. Upload uses
+            # production copy_from_local and its real rsync subprocess.
+            with mock.patch.object(backend, "_with_sftp", return_value=None), \
+                    mock.patch.object(backend, "_remote_spec", return_value=str(dst)):
+                backend.copy_from_local(src, "/file.txt")
+            self.assertEqual(src.read_bytes(), dst.read_bytes())
+        finally:
+            backend.close()
+
     def test_rsync_inherits_ssh_metadata_ops(self):
         """Verify RsyncBackend inherits metadata operations from SSHBackend."""
         backend = RsyncBackend(
