@@ -1,0 +1,22 @@
+id: pr179-record-artifact-placement
+title: Decide PR179 lane record placement before merge
+desc: 'Formal PR179 Opus review nit: PR diff carries lane bookkeeping in events/local-write-sync-20261113/lead-sol.md
+  and status/local-write-sync-20261113.md, plus per-invocation details in docs reports.
+  Root should decide before merge whether these belong on master, should be trimmed,
+  or should be split to private task records. Keep the substantive diagnosis and startup
+  contract evidence reviewable. This is a repository record-placement decision, not
+  a reason to alter the application fix; root is decider. Current root scoped source/test
+  review included all docs and records but did not make merge acceptance.'
+type: task
+component: docs
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-13T21:18:17-00:00
+references: []
+log_events:
+- time: 2026-11-13T21:18:17-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
