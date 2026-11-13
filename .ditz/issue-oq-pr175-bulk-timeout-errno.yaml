@@ -28,3 +28,14 @@ log_events:
   comment: PR175 9c3e2aa contract names current synthetic ENOENT mapping as observed
     and unruled; Ted decision remains pending. No errno implementation change or acceptance
     inferred.
+- time: 2026-11-13T20:48:32-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Ted ruling 2026-11-13: "EAGAIN is a good pick, but this should be a mount
+    option and I''d like it to default to off so we can just let the queue drain."
+    Root interpretation: bulk-capacity wait expiry is opt-in via a mount option; default
+    timeout disabled means wait for queue capacity, with cancellation/shutdown still
+    effective. Enabled timeout expires with EAGAIN, never ENOENT. This is a queue-admission
+    policy, not removal of underlying SSH operation/network timeouts. Product question
+    answered; config plumbing, tests, reviews and release gates remain outstanding.
+    No deployment claimed.'
