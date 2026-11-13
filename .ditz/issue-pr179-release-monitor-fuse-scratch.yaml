@@ -88,3 +88,24 @@ log_events:
     v3/v4 filenames, no reset. Plain fuse+StorageFS is accepted alongside fuse.* only
     after NO_XDEV refusal; root replacement fixture uses an empty mountpoint. No app/fixture
     source change in PR179, no acceptance/merge/deploy.'
+- time: 2026-11-13T22:41:29-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'PR179 renewed monitor controls passed at v4 hashes runner bd221a94/scanner
+    2d100bd0: //monitor_control_v4:scanner_control 3/3 (real FUSE ready mounts, before/after
+    root pin, child NO_XDEV refusal, direct no-follow mutation, zero extra callbacks,
+    fstatvfs) and runner_control 2/2. Scope inactive/dead/empty, no control mount/process.
+    Combined budget carried 3 controls/53s. First release preflight then stopped before
+    gates because Nix banner was included in Bazel info stdout; that outer invocation
+    was retained as environment-preflight event, making 4/55s. Corrected parser reached
+    exact output base and Docker shim and launched no-args scripts/run-gates.sh, but
+    v4 monitor stopped it during Bazel analysis after ~8.6s: actual Bazel 8 helper
+    is output/sandbox/inaccessibleHelperDir, mode044,size0,blocks0, with EACCES. The
+    narrow v4 exception expected output/bazel/sandbox/inaccessibleHelperDir. Scanner
+    reported directory-open errno13 and stopped scope once; 5/6 total invocations,64/1800s.
+    No test target completed, no gate receipt or CLI build. Docker shim logged only
+    docker info, no container create. Scope inactive/dead/empty, no owned mount or
+    storage-test container/network. Source-only v5 candidate retains both exact helper
+    paths with size0/blocks0 guard; AST only, no behavioral claim. One total invocation
+    remains, insufficient for both mandatory all-four gates and CLI; runtime stopped
+    for new root disposition. App PR head fc3e28d unchanged/pushed, no field attribution.'
