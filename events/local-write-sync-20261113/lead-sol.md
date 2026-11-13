@@ -76,3 +76,10 @@
   based_on: f294de9
   state: DELIVERED
   note: Prepared the coherent draft checkpoint: production-change commit f294de9 contains only upload-only --ignore-times; the report and status separate original-source integrated RED, focused default-path GREEN, caller --size-only RED, and the held product question. No full module or exact pushed-head GREEN is claimed. Remaining two scoped invocations are unused and all prior owned scopes are inactive/dead.
+
+- id: lead-sol:12
+  kind: state-change
+  refs: [lead-sol:11]
+  based_on: 34931d6b29c092d99e54589fd9e609673d1f6b0c
+  state: STARTED
+  note: Ted ruled behavioral startup validation of configured rsync options; root assigned this same PR179 lane the startup hook/config scope and six new focused invocations, replacing the prior two-run hold. Wrote assumptions, source boundary, argv confinement and failure behavior before probe implementation. Selected existing rsync_backend and allow_other test modules; no runtime or live member access yet.
