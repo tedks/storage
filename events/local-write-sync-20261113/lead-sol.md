@@ -104,3 +104,10 @@
   based_on: 5869948
   state: VERIFIED
   note: Pushed implementation and record. On pushed 5869948, invocation 5's two focused Bazel targets passed, but the wrapper returned 90 when its du scratch read raced Bazel deleting a sandbox and stopped the scope during cleanup. Scope is inactive/dead. Changed the external monitor to retry the transient read at most three times, retaining fail-closed stop on repeated failure. Final full affected-module run remains as invocation 6/6; no clean wrapper receipt is claimed for invocation 5.
+
+- id: lead-sol:16
+  kind: state-change
+  refs: [lead-sol:15]
+  based_on: 27c3ca96c66573be12c4c6eba5692a3c24231c7c
+  state: STARTED
+  note: Invocation 6/6 on exact pushed head passed three affected nonmount modules; wrapper exit 0 after 14 seconds, scope inactive/dead and empty control group. Root reviewed full diff and run receipts, with an independent native Sol source/test reviewer CLEAN, then retained this lane for formal council and release preparation. New bounded authority is four build/test invocations, 30 minutes combined, client 2 CPU/8 GiB/2 GiB swap/256 tasks, new owned scratch <=10 GiB, and bounded synthetic Docker fixtures. No council, full release gate, CLI build, merge, or deployment evidence yet.
