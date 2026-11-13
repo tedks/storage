@@ -11,6 +11,7 @@ from unittest.mock import patch, mock_open, MagicMock
 from storage.fs import mount_storage
 from storage.backends.local import LocalBackend
 from storage.backends.ssh import SSHBackend
+from storage.backends.rsync import RsyncBackend, RsyncUploadContractError
 
 
 class TestAllowOther(unittest.TestCase):
@@ -227,6 +228,67 @@ class TestAllowOther(unittest.TestCase):
     @patch('os.geteuid', return_value=1000)
     def test_local_only_mount_requests_no_subtype(self, mock_geteuid, mock_fuse):
         self.assertNotIn('subtype', self._mount_with(self.backends, mock_fuse))
+
+    def test_rsync_validation_rejects_before_mount_lock(self):
+        member = RsyncBackend('remote0', 'host.invalid', '/unused', 'user')
+        try:
+            with patch.object(member, 'validate_upload_contract', create=True,
+                              side_effect=RuntimeError('unsafe rsync options')) as validate, \
+                    patch('storage.fs._acquire_mount_lock_ex',
+                          return_value=(MagicMock(), False)) as lock, \
+                    patch('storage.fs.StorageFS') as fs, \
+                    patch('storage.fs.FUSE') as fuse:
+                with self.assertRaisesRegex(RuntimeError, 'unsafe rsync options'):
+                    mount_storage(
+                        str(self.mount_point), self.cache_root, self.state_db,
+                        {'remote0': member}, 1024 * 1024, allow_other=False,
+                    )
+            validate.assert_called_once_with()
+            lock.assert_not_called()
+            fs.assert_not_called()
+            fuse.assert_not_called()
+            self.assertFalse(self.state_db.exists())
+        finally:
+            member.close()
+
+    def test_rsync_validation_default_passes_before_mount_serves(self):
+        member = RsyncBackend('remote0', 'host.invalid', '/unused', 'user')
+        try:
+            with patch('storage.fs._acquire_mount_lock_ex',
+                       return_value=(MagicMock(), False)) as lock, \
+                    patch('storage.fs.StorageFS') as fs, \
+                    patch('storage.fs.FUSE') as fuse:
+                mount_storage(
+                    str(self.mount_point), self.cache_root, self.state_db,
+                    {'remote0': member}, 1024 * 1024, allow_other=False,
+                )
+            lock.assert_called_once()
+            fs.assert_called_once()
+            fuse.assert_called_once()
+        finally:
+            member.close()
+
+    def test_rsync_unsafe_options_reject_before_mount_lock(self):
+        member = RsyncBackend(
+            'remote0', 'host.invalid', '/unused', 'user',
+            rsync_args=['--size-only'],
+        )
+        try:
+            with patch('storage.fs._acquire_mount_lock_ex') as lock, \
+                    patch('storage.fs.StorageFS') as fs, \
+                    patch('storage.fs.FUSE') as fuse:
+                with self.assertRaisesRegex(RsyncUploadContractError,
+                                            'equal-size-mtime'):
+                    mount_storage(
+                        str(self.mount_point), self.cache_root, self.state_db,
+                        {'remote0': member}, 1024 * 1024, allow_other=False,
+                    )
+            lock.assert_not_called()
+            fs.assert_not_called()
+            fuse.assert_not_called()
+            self.assertFalse(self.state_db.exists())
+        finally:
+            member.close()
 
 class TestMountKernelCacheOptions(unittest.TestCase):
     """mount_storage hands fuse_mount_options to FUSE, and rejects bad timeouts first."""
