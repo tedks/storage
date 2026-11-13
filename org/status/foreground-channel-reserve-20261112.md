@@ -1,17 +1,13 @@
 # Foreground channel reserve: current state
 
-- State: draft PR #175; formal round 2 at `16fa46d` is
-  FINDINGS, with Anthropic's causal timeout proof Important outstanding.
-  Google remains EMPTY due quota. The present evidence-only package adds a
-  successful member-stat observation, the real pool denial, and a same-file
-  interactive-capacity control to that test. Pushed source head `9c3e2aa`
-  is clean and production blobs are unchanged. Runtime is blocked: the shared
-  mux flock remained held by a peer Bazel Java process through two bounded
-  60-second waits. Neither wait started systemd/Bazel, so 0/3 invocations
-  were spent and RED/GREEN/whole-module evidence remains pending. The
-  temporary disabled-classification mutation was restored byte-for-byte.
-  Exact source/blocker receipt is on PR #175 and in the tracker.
-  Council convergence and release acceptance remain pending. No deploy or merge.
+- State: draft PR #175, source head `7a5c3db` before the new option package.
+  Its causal timeout control failed as intended and the clean SSH backend
+  module passed 117/117; exact receipts are on PR #175 comment 6814714217.
+  Formal council remains FINDINGS, Google EMPTY. Ted ruled that bulk capacity
+  expiry is a mount option, default off, with opt-in expiry returning EAGAIN.
+  This checkpoint records the concrete CLI/profile -> SSH member -> pool ->
+  cache -> FUSE open path before implementation. No new code outcome is
+  claimed. PR #171 remains frozen; no merge or deploy.
 - Owner: channel Sol lead; worktree
   `/home/tedks/Projects/storage/foreground-channel-reserve-20261112`, branch
   `fix/foreground-channel-reserve-20261112`.
@@ -24,14 +20,11 @@
   30-minute limit. No invocation remains. Scratch:
   `/tmp/storage-channel-reserve-5Ra6HI`; only the prior owned pinned
   repository cache was reused. No prior PR #171 process or scope was active.
-- Current causal-proof budget: 0/3 new focused invocations spent at this
-  checkpoint, limited to a disabled-classification control, whole SSH backend
-  module, and one repair reserve. The mux lane's shared flock is required
-  before every capacity check and held through client exit.
-- Current blocker: `/home/tedks/.cache/storage-orgs-20261110/storage175-mux-runtime-20261112.lock`
-  held by peer Bazel Java PID 3482627 at checkpoint; no owned scope/client is
-  active. The holder is not ours to stop. Resume only after serialized lock
-  acquisition and a renewed root disposition if the assignment is paused.
+- Causal-proof budget: 2/3 spent; unused third slot did not carry forward.
+  The peer lock was released by its owner, and our RED/GREEN scopes exited.
+- New option-package budget: 0/6 focused nonmount invocations spent, up to
+  30 minutes total. Own batch base and shared mux flock remain mandatory;
+  no full gates, Docker, FUSE mount or live data in this phase.
 - T1 repair budget: 3/3 new invocations spent. First stopped at Bazel analysis
   because this baseline has no `//tests:storage_test_ssh_backend` target;
   it ran no test. Second ran the corrected same-schedule test with only the
