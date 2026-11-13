@@ -46,3 +46,16 @@ log_events:
     is sampled named-allocation stop threshold with disclosed open-unlinked/empty-underlay
     limits, not a hard aggregate quota; no quota engineering required. Final CPU/RAM/Docker/wall
     bounds and zero FUSE traversal remain required.'
+- time: 2026-11-13T22:19:36-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Root v3 source delta review at runner77682b9a/scanner9cd717fa/plan0e770aba
+    clears F1/F2 under explicit stable ancestry and owner-controlled executable/log
+    paths; runtime unverified. New aggregate package: up to2 Bazel utility-control
+    invocations in isolated scratch, then up to4 release invocations only after controls
+    pass; <=30min combined, client2CPU/8GiB/2GiBswap/1024 tasks and existing per-container
+    limits. No app/fixture repair in this package, no deployment. Controls require
+    FUSE callback proof for root pinning/crossing refusal, no-follow mutation, errors/timeouts/residual
+    receipts. Final gates remain all four via no-args run-gates plus CLI on exact
+    pushed PR179 head. Monitor tests run under independent finite scope; monitored
+    output base must match effective Bazel output. Old failure evidence preserved.'
