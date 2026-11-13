@@ -1,0 +1,24 @@
+id: docs-rsync-upload-contract
+title: Document rsync upload option validation and profile exposure
+desc: 'Documentation gap found while tracing PR #179: public RsyncBackend(rsync_args)
+  accepts caller options, while create_storage_members in storage/mount_profiles.py
+  currently passes none from the mount profile. The new mount startup validator accepts
+  only options it can safely probe and whose local scratch transfer yields exact selected
+  bytes; path filters and size limits are rejected. Document this effective constructor
+  contract, the CLI profile exposure boundary, clear startup failure, and that a local
+  probe does not certify remote rsync availability/version. Do not suggest live profile
+  inspection or imply the field re-verification cause is known. Source: docs/rsync_startup_validation_plan_20261113.md;
+  PR #179.'
+type: task
+component: docs
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-13T21:02:45-00:00
+references: []
+log_events:
+- time: 2026-11-13T21:02:45-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
