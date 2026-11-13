@@ -1,5 +1,30 @@
 # Foreground channel reserve: current state
 
+- Current option-package checkpoint (2026-11-13): draft implementation and
+  focused tests are green but **BLOCKED for review** at the mounted unmount
+  boundary. Ted's ruled default waits for capacity to drain; an opt-in finite
+  timeout maps an existing cold file's capacity expiry to `EAGAIN`.
+  `storage/backends/ssh_pool.py` waits indefinitely by default and pool close
+  wakes it. `storage/fs.py:mount_storage` documents that libfuse joins workers
+  before `destroy()` closes the pool, so the synthetic close test cannot prove
+  an unmount finishes when a holder keeps a lease. Root `%91` received the
+  blocker; `pr175-default-capacity-unmount-cancel` tracks it. No new runtime
+  or application repair starts before adjudication. PR #175 remains draft,
+  with no mounted/full gates, CLI build, council convergence, acceptance,
+  merge or deployment on this option delta.
+- Option package resources/evidence: 2/6 focused nonmount invocations used.
+  First actual run: 2 old tests failed because they assumed the former
+  implicit timeout; 118/120 SSH passed, profile and CLI targets passed.
+  Second after explicit opt-in correction: SSH 120/120, profiles 59/59, CLI
+  32/32 passed. Commands used one batch Bazel client via offline Nix under
+  the shared mux flock and owned 2 CPU/4 GiB/swap 0 scopes. Scope IDs
+  `storage-channel-option-focus` and `storage-channel-option-focus2` exited;
+  second monitor reports +65,536 bytes owned growth, no abort, >150 GiB free.
+  Wrapper SHA256 `8b44672260c56fe5bfd0d8dc79fe3866db261d2d388f9ac9e0f3eda21e605ce5`.
+  Logs: `/tmp/storage-channel-reserve-5Ra6HI/optionfocus{,2}.log` and
+  matching `-monitor.log`. Network bytes unobserved; no acquisition was
+  reported. No peer scope or fixture was touched.
+
 - State: draft PR #175, source head `7a5c3db` before the new option package.
   Its causal timeout control failed as intended and the clean SSH backend
   module passed 117/117; exact receipts are on PR #175 comment 6814714217.
