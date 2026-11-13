@@ -1,0 +1,20 @@
+id: storage-bazel-agent-instructions-refresh
+title: Refresh Storage Bazel agent instructions after baseline stack
+desc: 'After Storage Bazel baseline child PRs #173/#174 land, update AGENTS.md wording
+  that still says Bazel 7 and lists WORKSPACE as an active root Bazel file. Keep this
+  documentation follow-up outside the ratified C5 build-only harmonization allowlist.
+  Owner: Storage controller. Evidence: #173/#174 frozen source audit; no application
+  behavior change.'
+type: task
+component: build
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-13T21:02:27-00:00
+references: []
+log_events:
+- time: 2026-11-13T21:02:27-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
