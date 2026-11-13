@@ -59,3 +59,21 @@ log_events:
     receipts. Final gates remain all four via no-args run-gates plus CLI on exact
     pushed PR179 head. Monitor tests run under independent finite scope; monitored
     output base must match effective Bazel output. Old failure evidence preserved.'
+- time: 2026-11-13T22:29:35-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'PR179 monitor validation stopped before release. Two authorized Bazel
+    control invocations spent, combined 37s/1800s: first failed before analysis because
+    private outer wrapper put --repository_cache among Bazel startup flags; second
+    executed both utility targets. Runner control passed 2/2, including scanner output/deadline/CPU/AS
+    and isolated fake-systemd stop/final/unexpected/residual receipt branches. Scanner
+    control passed its nonmount error branch but failed two real FUSE controls: mountinfo
+    reports `fuse` with source `StorageFS`, while scanner v3 approves only `fuse.*`;
+    separate pin fixture mounted over a deliberately nonempty output directory and
+    libfuse refused it. Neither failure proves pinning. Final v3 runner/scanner hashes
+    77682b9a/9cd717fa and all logs/JSON are retained in private state; outer scopes
+    inactive/dead/empty, no control mount remains. No release gate or CLI run started,
+    no app source edited. Source-only v4 candidate accepts exact `fuse` or `fuse.*`
+    plus source StorageFS and corrects the disposable fixture to mount an empty root;
+    it has only AST review, no runtime proof. Additional monitor-control authority
+    is required before any release invocation.'
