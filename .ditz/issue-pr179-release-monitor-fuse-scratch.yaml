@@ -77,3 +77,14 @@ log_events:
     plus source StorageFS and corrects the disposable fixture to mount an empty root;
     it has only AST review, no runtime proof. Additional monitor-control authority
     is required before any release invocation.'
+- time: 2026-11-13T22:31:39-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Root reviewed v4 runnerbd221a94/scanner2d100bd0 and controlda5262a7: narrow
+    source delta CLEAN for validation, behavioral proof still outstanding. Existing
+    six-invocation/1800s envelope reallocated without expansion: two/37s spent, four/1763s
+    remain; up to two corrected monitor-control invocations, then two for no-args
+    all-four gates and CLI only after controls pass. Carry combined budget across
+    v3/v4 filenames, no reset. Plain fuse+StorageFS is accepted alongside fuse.* only
+    after NO_XDEV refusal; root replacement fixture uses an empty mountpoint. No app/fixture
+    source change in PR179, no acceptance/merge/deploy.'
