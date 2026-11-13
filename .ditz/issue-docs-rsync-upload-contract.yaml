@@ -22,3 +22,12 @@ log_events:
   who: Ted Smith
   what: created
   comment: ""
+- time: 2026-11-13T21:18:17-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Formal PR179 Opus review nit: document the deliberately narrow accepted
+    spellings precisely. Current grammar accepts exact --bwlimit=N with optional single
+    k/K/m/M/g/G suffix, not --bwlimit=1.5m, --bwlimit=1000KiB or the -I alias for
+    --ignore-times. Rejection is visible/fail-closed; do not imply all valid rsync
+    spellings are supported. Also state that missing local rsync now prevents mount
+    startup, and that the local probe does not certify the remote executable.'
