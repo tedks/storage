@@ -45,7 +45,7 @@ from typing import Callable, Dict, Iterator, List, Optional, Tuple
 
 import paramiko
 
-from .base import is_interactive_request
+from .base import current_capacity_cancel_probe, is_interactive_request
 
 
 class CommandTimeout(socket.timeout):
@@ -66,6 +66,10 @@ class MemberUnavailable(ConnectionError):
 
 class BulkCapacityTimeout(MemberUnavailable):
     """A bulk SFTP lease waited for capacity until its configured deadline."""
+
+
+class BulkCapacityCancelled(MemberUnavailable):
+    """A native FUSE request or session ended while waiting for bulk capacity."""
 
 
 _TRANSIENT_ERRNOS = frozenset({
@@ -822,6 +826,7 @@ class MemberConnection:
     def _acquire_new_sftp(self, interactive: bool, owner: int) -> SFTPLease:
         deadline = self._deadline(interactive)
         capacity_deadline = None
+        cancel_probe = current_capacity_cancel_probe() if not interactive else None
         # Transports this acquisition may see installed before giving up: a
         # server that drops every new connection must not loop forever.
         connects_left = 2
@@ -835,13 +840,20 @@ class MemberConnection:
                     if connects_left < 0:
                         raise MemberUnavailable(
                             f"SSH member {self.name}: the connection keeps dropping")
+                if cancel_probe:
+                    reason = cancel_probe()
+                    if reason:
+                        raise BulkCapacityCancelled(
+                            f"SSH member {self.name}: {reason} ended during bulk capacity wait")
                 lease = self._take_idle_locked(interactive, owner)
                 if lease is not None:
                     return lease
                 if not self._can_open_locked(interactive):
                     if not interactive:
                         if self.bulk_capacity_wait_timeout is None:
-                            self._cond.wait()
+                            # Poll only inside an actual FUSE callback: libfuse
+                            # cannot run destroy until that callback returns.
+                            self._cond.wait(0.1 if cancel_probe else None)
                         else:
                             if capacity_deadline is None:
                                 capacity_deadline = (
@@ -851,7 +863,7 @@ class MemberConnection:
                             if remaining <= 0:
                                 raise BulkCapacityTimeout(
                                     f"SSH member {self.name}: no bulk SFTP capacity came free")
-                            self._cond.wait(remaining)
+                            self._cond.wait(min(remaining, 0.1) if cancel_probe else remaining)
                         continue
                     remaining = deadline - time.monotonic()
                     if remaining <= 0 or not self._cond.wait(remaining):

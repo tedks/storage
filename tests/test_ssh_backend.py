@@ -18,11 +18,13 @@ from unittest.mock import patch
 from storage.backends import ssh as ssh_module
 from storage.backends import ssh_pool
 from storage.backends.base import (
-    ChecksumUnavailable, bulk_request, interactive_request, is_interactive_request,
+    ChecksumUnavailable, bulk_request, capacity_wait_cancellation,
+    interactive_request, is_interactive_request,
 )
 from storage.backends.ssh import SSHBackend
 from storage.backends.ssh_pool import (
-    BulkCapacityTimeout, CommandTimeout, MemberConnection, MemberUnavailable,
+    BulkCapacityCancelled, BulkCapacityTimeout, CommandTimeout,
+    MemberConnection, MemberUnavailable,
     is_connection_error,
 )
 
@@ -508,6 +510,42 @@ class TestMemberConnectionPool(unittest.TestCase):
             pool.close()
             for holder in holders:
                 holder.release()
+
+    def test_callback_cancel_probe_interrupts_untimed_capacity_wait(self):
+        pool = _pool(_FakeServer())
+        holders = [_Holder(pool) for _ in range(3)]
+        cancelled = threading.Event()
+        denied = threading.Event()
+        original_can_open = pool._can_open_locked
+
+        def observe(interactive):
+            allowed = original_can_open(interactive)
+            if not interactive and not allowed:
+                denied.set()
+            return allowed
+
+        def wait():
+            with capacity_wait_cancellation(
+                lambda: "request" if cancelled.is_set() else None
+            ):
+                return pool.acquire_sftp(1.0)
+
+        waiter = None
+        try:
+            with patch.object(pool, "_can_open_locked", side_effect=observe):
+                waiter = _InThread(wait)
+                self.assertTrue(denied.wait(3))
+                self.assertFalse(waiter.done.is_set())
+                cancelled.set()
+                self.assertTrue(waiter.join(3))
+                self.assertIsInstance(waiter.error, BulkCapacityCancelled)
+                self.assertEqual(3, pool.snapshot()["bulk_leased"])
+        finally:
+            pool.close()
+            for holder in holders:
+                holder.release()
+            if waiter is not None:
+                waiter.join(3)
 
     def test_bulk_context_nests_and_does_not_reclassify_a_held_lease(self):
         server = _FakeServer()

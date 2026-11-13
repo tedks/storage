@@ -23,8 +23,12 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from fuse import FUSE, FuseOSError, Operations
+from storage.backends.local import LocalBackend
+from storage.backends.ssh_pool import MemberConnection
+from storage.fs import FUSE as StorageFUSE, StorageFS, fuse_mount_options
 
 
 class _ProbeOperations(Operations):
@@ -187,6 +191,248 @@ class TestFuseThreadState(unittest.TestCase):
                   if sum(1 for o in calls if o["ident"] == c["ident"]) > 1]
         self.assertTrue(reused, "no worker thread served two callbacks")
         self.assertFalse(any(c["local_survived"] for c in calls))
+
+
+class _Channel:
+    def __init__(self):
+        self.timeout = None
+
+    def invoke_subsystem(self, name):
+        assert name == "sftp"
+
+    def gettimeout(self):
+        return self.timeout
+
+    def settimeout(self, timeout):
+        self.timeout = timeout
+
+    def close(self):
+        pass
+
+
+class _SFTP:
+    def __init__(self, channel):
+        self.channel = channel
+
+    def get_channel(self):
+        return self.channel
+
+    def close(self):
+        self.channel.close()
+
+
+class _Transport:
+    def __init__(self):
+        self.active = True
+
+    def is_active(self):
+        return self.active
+
+    def open_session(self, timeout=None):
+        return _Channel()
+
+    def close(self):
+        self.active = False
+
+
+class _Client:
+    def __init__(self):
+        self.transport = _Transport()
+
+    def get_transport(self):
+        return self.transport
+
+    def close(self):
+        self.transport.close()
+
+
+class _CapacityMember(LocalBackend):
+    """Scratch local bytes, with the real SFTP pool around each full copy."""
+
+    def __init__(self, root):
+        super().__init__("member0", str(root))
+        self.pool = MemberConnection(
+            self.name, _Client, connect_timeout=0.2, retry_interval=1,
+            sftp_client_factory=_SFTP,
+        )
+
+    def copy_to_local(self, virtual_path, local_path):
+        with self.pool.sftp(1.0):
+            return super().copy_to_local(virtual_path, local_path)
+
+    def close(self):
+        self.pool.close()
+
+
+class TestMountedCapacityCancellation(unittest.TestCase):
+    """A real libfuse2 worker must leave the capacity wait before destroy."""
+
+    def _exercise_session_exit(self, disable_cancel):
+        root = Path(tempfile.mkdtemp(prefix="storage-capacity-unmount-"))
+        mount = root / "mount"
+        member_root = root / "member"
+        mount.mkdir()
+        member_root.mkdir()
+        (member_root / "cold").write_bytes(b"exact-cold-bytes")
+        backend = _CapacityMember(member_root)
+        fs = StorageFS(root / "cache", root / "state.db", {backend.name: backend},
+                       1024 * 1024, start_sync=False)
+        fs.destroy_entered = threading.Event()
+        real_destroy = fs.destroy
+
+        def record_destroy(path):
+            fs.destroy_entered.set()
+            return real_destroy(path)
+
+        fs.destroy = record_destroy
+        real_getattr = fs.getattr
+        exit_requested = threading.Event()
+
+        def getattr_with_exit(path, fh=None):
+            if path == "/exit-trigger":
+                from fuse import fuse_exit
+                fuse_exit()  # from a real second libfuse callback
+                exit_requested.set()
+                return {"st_mode": stat.S_IFREG | 0o444, "st_nlink": 1,
+                        "st_size": 0}
+            return real_getattr(path, fh)
+
+        fs.getattr = getattr_with_exit
+        held_release = threading.Event()
+        held_ready = [threading.Event() for _ in range(3)]
+        holder_errors = []
+        holders = []
+        mount_errors = []
+        mount_thread = None
+        opener = None
+        trigger = None
+        open_done = threading.Event()
+        denied = threading.Event()
+        original_can_open = backend.pool._can_open_locked
+
+        def observe(interactive):
+            allowed = original_can_open(interactive)
+            if not interactive and not allowed:
+                denied.set()
+            return allowed
+
+        backend.pool._can_open_locked = observe
+
+        def hold(ready):
+            try:
+                with backend.pool.sftp(1.0):
+                    ready.set()
+                    held_release.wait(90)
+            except BaseException as exc:
+                holder_errors.append(exc)
+                ready.set()
+
+        def serve():
+            try:
+                StorageFUSE(
+                    fs, str(mount), nothreads=False, foreground=True, allow_other=False,
+                    **fuse_mount_options(
+                        fs.backends, enable_watchers=False,
+                        fresh_window=fs._revalidate_after,
+                    ),
+                )
+            except BaseException as exc:
+                mount_errors.append(exc)
+
+        def unmount_owned():
+            errors = []
+            for flag in ("-u", "-uz"):
+                result = subprocess.run(
+                    ["fusermount", flag, str(mount)], capture_output=True,
+                    text=True, timeout=10,
+                )
+                if result.returncode == 0:
+                    return ("normal" if flag == "-u" else "lazy"), errors
+                errors.append(result.stderr.strip())
+            return "failed", errors
+
+        def open_file():
+            try:
+                (mount / "cold").read_bytes()
+            except OSError:
+                pass  # the kernel may detach before replying to the open
+            finally:
+                open_done.set()
+
+        try:
+            for ready in held_ready:
+                holder = threading.Thread(target=hold, args=(ready,), daemon=True)
+                holders.append(holder)
+                holder.start()
+            self.assertTrue(all(ready.wait(3) for ready in held_ready))
+            self.assertEqual([], holder_errors)
+            self.assertEqual(3, backend.pool.snapshot()["bulk_leased"])
+
+            mount_thread = threading.Thread(target=serve, daemon=True)
+            mount_thread.start()
+            deadline = time.monotonic() + 10
+            while not os.path.ismount(mount) and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertTrue(os.path.ismount(mount), mount_errors)
+
+            opener = threading.Thread(target=open_file, daemon=True)
+            opener.start()
+            self.assertTrue(denied.wait(5), "mounted open missed the real pool cap")
+            self.assertFalse(open_done.is_set())
+            self.assertEqual(3, backend.pool.snapshot()["bulk_leased"])
+            def request_exit():
+                try:
+                    os.stat(mount / "exit-trigger")
+                except OSError:
+                    pass  # session teardown may reject the triggering stat
+
+            trigger = threading.Thread(target=request_exit, daemon=True)
+            trigger.start()
+            self.assertTrue(exit_requested.wait(5), "second callback did not exit session")
+            trigger.join(5)
+            if not disable_cancel:
+                self.assertFalse(trigger.is_alive(), "exit-trigger stat did not finish")
+            if disable_cancel:
+                self.assertFalse(fs.destroy_entered.wait(0.5),
+                                 "disabled cancellation let destroy pass the held waiter")
+            else:
+                self.assertTrue(fs.destroy_entered.wait(5),
+                                "session exit did not release queued callback")
+                mount_thread.join(5)
+                self.assertFalse(mount_thread.is_alive(), "libfuse did not finish destroy")
+                self.assertFalse(held_release.is_set())
+                self.assertTrue(all(holder.is_alive() for holder in holders))
+        finally:
+            held_release.set()
+            for holder in holders:
+                holder.join(5)
+            if os.path.ismount(mount):
+                unmount_owned()
+            if mount_thread is not None and mount_thread.is_alive():
+                mount_thread.join(10)
+            if opener is not None:
+                opener.join(5)
+            if trigger is not None:
+                trigger.join(5)
+            backend.close()
+            if mount_thread is None or not mount_thread.is_alive():
+                shutil.rmtree(root, ignore_errors=True)
+            signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+            if mount_thread is not None and mount_thread.is_alive():
+                self.fail("owned FUSE callback did not exit after holder release")
+        self.assertTrue(open_done.is_set())
+        self.assertEqual([], holder_errors)
+        self.assertEqual([], mount_errors)
+        self.assertFalse(any(t.is_alive() for t in holders))
+        self.assertFalse(mount_thread.is_alive())
+        self.assertFalse(trigger.is_alive())
+
+    def test_session_exit_releases_capacity_wait_before_destroy(self):
+        self._exercise_session_exit(disable_cancel=False)
+
+    def test_without_native_cancel_probe_waiter_blocks_until_holder_release(self):
+        with patch("storage.fs._native_capacity_cancel_reason", return_value=None):
+            self._exercise_session_exit(disable_cancel=True)
 
 
 if __name__ == "__main__":
