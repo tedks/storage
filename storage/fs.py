@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Dict, Optional, Set, List, Tuple
 
 from .backends.base import Backend, ChecksumUnavailable, interactive_request
+from .backends.rsync import RsyncBackend
 from .backends.ssh_mux import close_shared_control_sockets
 from .backends.ssh_pool import is_connection_error
 from .cache import PARTIAL_SUFFIX, CacheManager
@@ -3318,6 +3319,13 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
                 "allow_other=True requires either root privileges or 'user_allow_other' "
                 "to be set in /etc/fuse.conf (file not found)"
             )
+
+    # A successful rsync exit can skip a Storage-selected upload when caller
+    # options change selection. Reject that configuration before the mount
+    # lock, state DB, workers, or FUSE loop can serve a false CLEAN.
+    for backend in backends.values():
+        if isinstance(backend, RsyncBackend):
+            backend.validate_upload_contract()
 
     # Prevent duplicate mounts on the same cache/mountpoint
     mount_hash = hashlib.sha256(str(mountpoint).encode('utf-8')).hexdigest()[:12]

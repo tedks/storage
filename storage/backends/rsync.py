@@ -16,6 +16,7 @@ Rsync advantages over pure SFTP:
 
 import logging
 import os
+import re
 import shlex
 import subprocess
 import tempfile
@@ -37,6 +38,15 @@ _PARTIAL_DIR = ".storage.rsync-tmp"
 # a fresh one.
 _CONNECTION_EXIT_CODES = frozenset({12, 255})
 
+# These options cannot redirect a scratch probe or change its file list.
+# This is a safety boundary for the probe, not a claim that the options
+# satisfy Storage's upload contract: the byte checks decide that.
+_PROBE_SAFE_FLAGS = frozenset({
+    "--size-only", "--ignore-times", "--ignore-existing",
+    "--ignore-non-existing", "--existing", "--update", "-u",
+    "--dry-run", "-n",
+})
+
 
 class RsyncError(RuntimeError):
     """rsync exited non-zero."""
@@ -44,6 +54,10 @@ class RsyncError(RuntimeError):
     def __init__(self, message: str, returncode: int):
         super().__init__(message)
         self.returncode = returncode
+
+
+class RsyncUploadContractError(RuntimeError):
+    """The configured rsync command cannot be proved safe for selected uploads."""
 
 
 class RsyncBackend(SSHBackend):
@@ -75,7 +89,9 @@ class RsyncBackend(SSHBackend):
     connect_timeout : float
         SSH connection timeout for metadata operations.
     rsync_args : list, optional
-        Extra arguments passed to rsync (e.g. ['--bwlimit=1000']).
+        Extra arguments passed to rsync (e.g. ['--bwlimit=1000']). A mount
+        validates their upload behavior and rejects options it cannot
+        safely probe.
     compress : bool
         Enable rsync compression (-z). Default True for remote transfers.
     control_sockets : ControlSockets, optional
@@ -104,7 +120,9 @@ class RsyncBackend(SSHBackend):
             connect_timeout=connect_timeout,
         )
         self.backend_type = BackendType.RSYNC
-        self._rsync_args = rsync_args or []
+        # A later mutation of the caller's list must not change the options
+        # after startup has validated them.
+        self._rsync_args = tuple(rsync_args or ())
         self._compress = compress
         self._control_sockets = control_sockets
         self.logger = logging.getLogger(__name__)
@@ -145,6 +163,89 @@ class RsyncBackend(SSHBackend):
             return f"{self.username}@{self.host}:{remote_path}"
         return f"{self.host}:{remote_path}"
 
+    def _rsync_argv(self, src: str, dst: str, *,
+                    extra_args=(), ssh_cmd: Optional[str] = None) -> List[str]:
+        """Pure argv construction shared by remote uploads and local probes."""
+        cmd = ["rsync", "-a", f"--partial-dir={_PARTIAL_DIR}", "-s"]
+        if self._compress:
+            cmd.append("-z")
+        if ssh_cmd is not None:
+            cmd.extend(["-e", ssh_cmd])
+        cmd.extend(self._rsync_args)
+        cmd.extend(extra_args)
+        cmd.extend([src, dst])
+        return cmd
+
+    def _check_probe_argv(self) -> None:
+        """Reject options that cannot be safely tested in isolated scratch."""
+        for index, arg in enumerate(self._rsync_args, start=1):
+            if isinstance(arg, str) and arg in _PROBE_SAFE_FLAGS:
+                continue
+            if isinstance(arg, str) and re.fullmatch(r"--bwlimit=[0-9]+[kKmMgG]?", arg):
+                continue
+            # Do not include values or unknown token text in a mount error:
+            # they may contain private paths or credentials.
+            label = ""
+            if isinstance(arg, str) and arg.startswith("--"):
+                name = arg.partition("=")[0]
+                if re.fullmatch(r"--[a-z][a-z-]*", name):
+                    label = f" ({name})"
+            raise RsyncUploadContractError(
+                f"rsync member {self.name}: argument {index}{label} cannot be "
+                "safely validated for selected uploads"
+            )
+
+    def validate_upload_contract(self) -> None:
+        """Probe configured upload options locally before a mount can serve.
+
+        Only probe-safe arguments are executed. The command never builds an
+        SSH command, addresses the member, or resets a shared connection.
+        A local passing probe checks selection semantics, not remote host
+        availability or remote rsync compatibility.
+        """
+        self._check_probe_argv()
+        stamp = 1_700_000_000_000_000_000
+        cases = (
+            ("equal-size-mtime", b"new bytes", b"old bytes", stamp, stamp),
+            ("missing-destination", b"new bytes", None, stamp, None),
+            ("destination-newer", b"new bytes", b"old bytes", stamp, stamp + 10_000_000_000),
+            ("changed-size", b"new longer bytes", b"old", stamp, stamp),
+        )
+        with tempfile.TemporaryDirectory(prefix="storage-rsync-probe-") as tmp:
+            root = Path(tmp)
+            for name, intended, prior, source_time, dest_time in cases:
+                case_dir = root / name
+                case_dir.mkdir()
+                src, dst = case_dir / "src", case_dir / "dst"
+                src.write_bytes(intended)
+                os.utime(src, ns=(source_time, source_time))
+                if prior is not None:
+                    dst.write_bytes(prior)
+                    os.utime(dst, ns=(dest_time, dest_time))
+                cmd = self._rsync_argv(
+                    str(src), str(dst), extra_args=("--ignore-times",),
+                )
+                try:
+                    result = subprocess.run(
+                        cmd, stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                        timeout=10,
+                    )
+                except (OSError, subprocess.TimeoutExpired) as exc:
+                    raise RsyncUploadContractError(
+                        f"rsync member {self.name}: upload probe {name} could not complete"
+                    ) from exc
+                if result.returncode != 0:
+                    raise RsyncUploadContractError(
+                        f"rsync member {self.name}: upload probe {name} "
+                        f"exited {result.returncode}"
+                    )
+                if not dst.is_file() or dst.read_bytes() != intended:
+                    raise RsyncUploadContractError(
+                        f"rsync member {self.name}: upload probe {name} "
+                        "did not write the selected file's bytes"
+                    )
+
     def _run_rsync(self, src: str, dst: str, extra_args: Optional[List[str]] = None) -> subprocess.CompletedProcess:
         """
         Run an rsync command and return the result.
@@ -157,15 +258,10 @@ class RsyncBackend(SSHBackend):
 
         Raises RuntimeError on non-zero exit code.
         """
-        cmd = ["rsync", "-a", f"--partial-dir={_PARTIAL_DIR}", "-s"]
-        if self._compress:
-            cmd.append("-z")
-        cmd.extend(["-e", self._build_rsync_ssh_cmd()])
-        if self._rsync_args:
-            cmd.extend(self._rsync_args)
-        if extra_args:
-            cmd.extend(extra_args)
-        cmd.extend([src, dst])
+        cmd = self._rsync_argv(
+            src, dst, extra_args=extra_args or (),
+            ssh_cmd=self._build_rsync_ssh_cmd(),
+        )
 
         self.logger.debug("rsync: %s", " ".join(cmd))
 

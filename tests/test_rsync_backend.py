@@ -9,11 +9,12 @@ works without requiring a real SSH connection).
 import os
 import shlex
 import shutil
+import subprocess
 import tempfile
 from pathlib import Path
 from unittest import TestCase, mock
 
-from storage.backends.rsync import RsyncBackend
+from storage.backends.rsync import RsyncBackend, RsyncUploadContractError
 from storage.backends.base import BackendType
 
 
@@ -162,7 +163,7 @@ class TestRsyncLocalTransfer(TestCase):
         finally:
             backend.close()
 
-    def test_caller_size_only_cannot_skip_selected_upload(self):
+    def test_caller_size_only_is_rejected_before_selected_upload(self):
         src = self.local_dir / "selected.txt"
         dst = self.remote_dir / "selected.txt"
         src.write_bytes(b"new bytes")
@@ -176,10 +177,9 @@ class TestRsyncLocalTransfer(TestCase):
             rsync_args=["--size-only"],
         )
         try:
-            with mock.patch.object(backend, "_with_sftp", return_value=None), \
-                    mock.patch.object(backend, "_remote_spec", return_value=str(dst)):
-                backend.copy_from_local(src, "/selected.txt")
-            self.assertEqual(src.read_bytes(), dst.read_bytes())
+            with self.assertRaisesRegex(RsyncUploadContractError, "equal-size-mtime"):
+                backend.validate_upload_contract()
+            self.assertEqual(b"old bytes", dst.read_bytes())
         finally:
             backend.close()
 
@@ -256,6 +256,109 @@ class TestRsyncLocalTransfer(TestCase):
 
         backend_z.close()
         backend_no_z.close()
+
+
+class TestRsyncUploadContract(TestCase):
+    """Startup checks use real local rsync, never an SSH/member path."""
+
+    def _backend(self, args=(), control_sockets=None):
+        backend = RsyncBackend(
+            name="probe", host="host.invalid", remote_path="/unused",
+            username="user", rsync_args=args, compress=False,
+            control_sockets=control_sockets,
+        )
+        self.addCleanup(backend.close)
+        return backend
+
+    def test_upload_contract_default_passes_without_remote_state(self):
+        sockets = mock.Mock()
+        backend = self._backend(control_sockets=sockets)
+        real_run = subprocess.run
+        with mock.patch.object(backend, "_build_rsync_ssh_cmd",
+                               side_effect=AssertionError("SSH command built")) as ssh, \
+                mock.patch.object(backend, "_reset_shared_connection",
+                                  side_effect=AssertionError("connection reset")) as reset, \
+                mock.patch.object(backend, "_remote_spec",
+                                  side_effect=AssertionError("member path used")) as remote, \
+                mock.patch("storage.backends.rsync.subprocess.run",
+                           side_effect=real_run) as run:
+            backend.validate_upload_contract()
+        self.assertEqual(4, run.call_count)
+        for call in run.call_args_list:
+            argv = call.args[0]
+            self.assertEqual("rsync", argv[0])
+            self.assertIn("--ignore-times", argv)
+            self.assertNotIn("-e", argv)
+            self.assertEqual(Path(argv[-2]).parent, Path(argv[-1]).parent)
+            self.assertTrue(Path(argv[-2]).is_absolute())
+        ssh.assert_not_called()
+        reset.assert_not_called()
+        remote.assert_not_called()
+        sockets.options.assert_not_called()
+        sockets.reset.assert_not_called()
+
+    def test_upload_contract_benign_bandwidth_option_passes(self):
+        self._backend(["--bwlimit=1000"]).validate_upload_contract()
+
+    def test_upload_contract_rejects_observed_skips(self):
+        for args, case in (
+            (["--size-only"], "equal-size-mtime"),
+            (["--ignore-existing"], "equal-size-mtime"),
+            (["--existing"], "missing-destination"),
+            (["--ignore-non-existing"], "missing-destination"),
+            (["--update"], "destination-newer"),
+            (["-u"], "destination-newer"),
+            (["--dry-run"], "equal-size-mtime"),
+            (["-n"], "equal-size-mtime"),
+        ):
+            with self.subTest(args=args):
+                with self.assertRaisesRegex(RsyncUploadContractError, case):
+                    self._backend(args).validate_upload_contract()
+
+    def test_upload_contract_rejects_unprovable_or_unsafe_argv_before_execution(self):
+        for arg in (
+            "--exclude=*.tmp", "--filter=- *.tmp", "--max-size=1G",
+            "--min-size=1", "--temp-dir=/outside", "--backup-dir=/outside",
+            "--partial-dir=/outside", "--remove-source-files", "--delete",
+            "--files-from=/outside", "-e", "--upda", "-un",
+            "--dry-run=true", "--size-only=true", "--bwlimit",
+            "--bwlimit=oops", "not-an-option",
+        ):
+            with self.subTest(arg=arg), \
+                    mock.patch("storage.backends.rsync.subprocess.run") as run:
+                with self.assertRaises(RsyncUploadContractError):
+                    self._backend([arg]).validate_upload_contract()
+                run.assert_not_called()
+
+    def test_upload_contract_uses_snapshot_of_caller_options(self):
+        options = ["--bwlimit=1000"]
+        backend = self._backend(options)
+        options.append("--dry-run")
+        self.assertEqual(("--bwlimit=1000",), backend._rsync_args)
+        backend.validate_upload_contract()
+        argv = backend._rsync_argv("/src", "/dst", extra_args=("--ignore-times",))
+        self.assertNotIn("--dry-run", argv)
+
+    def test_upload_contract_reports_subprocess_errors_without_reset(self):
+        for result, detail in (
+            (subprocess.CompletedProcess([], 12), "exited 12"),
+            (FileNotFoundError("rsync"), "could not complete"),
+            (subprocess.TimeoutExpired(["rsync"], 10), "could not complete"),
+        ):
+            with self.subTest(result=result):
+                sockets = mock.Mock()
+                backend = self._backend(control_sockets=sockets)
+                with mock.patch("storage.backends.rsync.subprocess.run",
+                                side_effect=result if isinstance(result, Exception) else None,
+                                return_value=result if not isinstance(result, Exception) else None) as run, \
+                        mock.patch.object(backend, "_reset_shared_connection") as reset:
+                    with self.assertRaisesRegex(RsyncUploadContractError, detail):
+                        backend.validate_upload_contract()
+                scratch = Path(run.call_args.args[0][-2]).parent.parent
+                self.assertFalse(scratch.exists())
+                sockets.options.assert_not_called()
+                sockets.reset.assert_not_called()
+                reset.assert_not_called()
 
 
 class TestCLIRsyncParsing(TestCase):
