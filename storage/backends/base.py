@@ -5,6 +5,7 @@ Defines the interface and capability surface all storage transports must follow.
 """
 
 import contextvars
+import threading
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from enum import Enum
@@ -19,6 +20,9 @@ from dataclasses import dataclass, replace
 # directory listing started by one. Members with a connection pool keep a
 # channel for these, so background transfers cannot starve them.
 _INTERACTIVE_REQUEST = contextvars.ContextVar("storage_interactive_request", default=False)
+# Unlike the interactive class, native FUSE request state must never be
+# copied into a listing/background executor's context or another thread.
+_CAPACITY_CANCEL_PROBE = threading.local()
 
 
 @contextmanager
@@ -31,8 +35,33 @@ def interactive_request():
         _INTERACTIVE_REQUEST.reset(token)
 
 
+@contextmanager
+def bulk_request():
+    """Use bulk channel admission for a transfer, restoring the caller on exit."""
+    token = _INTERACTIVE_REQUEST.set(False)
+    try:
+        yield
+    finally:
+        _INTERACTIVE_REQUEST.reset(token)
+
+
 def is_interactive_request() -> bool:
     return _INTERACTIVE_REQUEST.get()
+
+
+@contextmanager
+def capacity_wait_cancellation(probe):
+    """Expose a cancellation probe only for this native callback's lifetime."""
+    previous = getattr(_CAPACITY_CANCEL_PROBE, "probe", None)
+    _CAPACITY_CANCEL_PROBE.probe = probe
+    try:
+        yield
+    finally:
+        _CAPACITY_CANCEL_PROBE.probe = previous
+
+
+def current_capacity_cancel_probe():
+    return getattr(_CAPACITY_CANCEL_PROBE, "probe", None)
 
 
 class ChecksumUnavailable(OSError):

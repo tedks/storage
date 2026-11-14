@@ -15,7 +15,8 @@ from pathlib import Path
 from contextlib import nullcontext
 from typing import Callable, ContextManager, Optional, List, Set
 
-from .backends.base import Backend
+from .backends.base import Backend, bulk_request
+from .backends.ssh_pool import BulkCapacityCancelled, BulkCapacityTimeout
 from .cache_metadata import PARTIAL_SUFFIX, PREFIX_XATTR, regular_file_stat, write_cache_metadata
 from .models import FileMetadata, SyncStatus
 from .state import StateManager
@@ -342,6 +343,8 @@ class CacheManager:
             self.fetch_into_cache(backend, source_virtual_path, self.get_cache_path(virtual_path))
             self.state_manager.update_access_time(virtual_path)
             return True
+        except (BulkCapacityCancelled, BulkCapacityTimeout):
+            raise
         except Exception as e:
             print(f"Error caching {virtual_path} from {backend.name}: {e}")
             return False
@@ -372,7 +375,8 @@ class CacheManager:
         with self._lock:
             scans = self._scan_count
         try:
-            backend.copy_to_local(source_virtual_path, temp_path)
+            with bulk_request():
+                backend.copy_to_local(source_virtual_path, temp_path)
             # A whole file is never a streaming prefix, whatever xattrs the
             # member's copy came with.
             _remove_prefix_marker(temp_path)

@@ -21,15 +21,21 @@ import yaml
 import json
 import concurrent.futures
 import contextlib
+import ctypes
 import signal
 from dataclasses import dataclass, field
-from fuse import FUSE, FuseOSError, Operations
+import fuse as fusepy
+from fuse import FUSE as _FusePyFUSE, FuseOSError, Operations
 from pathlib import Path
 from typing import Dict, Optional, Set, List, Tuple
 
-from .backends.base import Backend, ChecksumUnavailable, interactive_request
+from .backends.base import (
+    Backend, ChecksumUnavailable, capacity_wait_cancellation, interactive_request,
+)
 from .backends.ssh_mux import close_shared_control_sockets
-from .backends.ssh_pool import is_connection_error
+from .backends.ssh_pool import (
+    BulkCapacityCancelled, BulkCapacityTimeout, is_connection_error,
+)
 from .cache import PARTIAL_SUFFIX, CacheManager
 from .locks import NamespaceLock, PathLocks, UploadLocks
 from .cache_metadata import PREFIX_XATTR, XATTR_CACHE_METADATA_NAME, regular_file_stat, scan_cache_entries
@@ -1909,6 +1915,8 @@ class StorageFS(Operations):
                         resolved.requested_path, backend, source_virtual_path=canonical_path,
                     ):
                         return True
+                except (BulkCapacityCancelled, BulkCapacityTimeout):
+                    raise
                 except Exception:
                     pass
 
@@ -2075,8 +2083,9 @@ class StorageFS(Operations):
 
     def readdir(self, path, fh):
         """Read directory contents"""
-        for entry in self.namespace.readdir(path):
-            yield entry
+        # NamespaceService returns a concrete list. Resolve it before the
+        # enclosing FUSE dispatch leaves its interactive request context.
+        return self.namespace.readdir(path)
 
     def mkdir(self, path, mode):
         """Create a directory"""
@@ -2268,6 +2277,10 @@ class StorageFS(Operations):
         with self._path_locked(canonical_path):
             try:
                 return self._open(path, flags)
+            except BulkCapacityCancelled as exc:
+                raise FuseOSError(errno.EINTR) from exc
+            except BulkCapacityTimeout as exc:
+                raise FuseOSError(errno.EAGAIN) from exc
             finally:
                 # The pin belongs to this open (_select_backend_for_read):
                 # one no fetch used (the open attached to a running stream,
@@ -3192,6 +3205,37 @@ def fuse_mount_options(backends: Dict[str, Backend], *, enable_watchers: bool,
 
 def _discard_sigpipe(signum, frame) -> None:
     """A SIGPIPE handler that does nothing: the failed write raises EPIPE."""
+
+
+_FUSE_INTERRUPTED = ctypes.CFUNCTYPE(ctypes.c_int)(
+    ("fuse_interrupted", fusepy._libfuse)
+)
+_FUSE_EXITED = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p)(
+    ("fuse_exited", fusepy._libfuse)
+)
+
+
+def _native_capacity_cancel_reason():
+    """Read libfuse2 state only on the thread of a live native callback."""
+    context = fusepy._libfuse.fuse_get_context().contents
+    if not context.fuse:
+        return None
+    if _FUSE_INTERRUPTED():
+        return "request"
+    if _FUSE_EXITED(ctypes.c_void_p(context.fuse)):
+        return "session"
+    return None
+
+
+class FUSE(_FusePyFUSE):
+    """Give pool waits a same-thread cancellation probe during callbacks."""
+
+    @staticmethod
+    def _wrapper(func, *args, **kwargs):
+        # fusepy enters here directly from libfuse. A thread-local scope keeps
+        # the probe out of copied contextvars and direct StorageFS calls.
+        with capacity_wait_cancellation(_native_capacity_cancel_reason):
+            return _FusePyFUSE._wrapper(func, *args, **kwargs)
 
 
 @contextlib.contextmanager

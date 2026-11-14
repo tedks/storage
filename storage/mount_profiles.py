@@ -56,6 +56,8 @@ class ResolvedMountConfig:
     # Run the FUSE loop multithreaded (storage.fs.mount_storage). Off by
     # default until the field test (docs/browsing_latency_plan.md D6).
     fuse_threads: bool = False
+    # None or zero: wait for bulk SFTP capacity to drain without a deadline.
+    bulk_capacity_wait_timeout: Optional[float] = None
     # Seconds a listing past its fresh window is still served while a
     # background refresh runs (profile only).
     listing_max_stale: float = DEFAULT_LISTING_MAX_STALE
@@ -373,6 +375,7 @@ def create_storage_members(
     announce: bool = True,
     member_names: Optional[Sequence[str]] = None,
     display_names: Optional[Sequence[Optional[str]]] = None,
+    bulk_capacity_wait_timeout: Optional[float] = None,
 ):
     backends = {}
     resolved_names = tuple(member_names) if member_names is not None else _default_member_names(member_specs)
@@ -433,6 +436,7 @@ def create_storage_members(
                         username=username,
                         key_filename=key_file,
                         speed_priority=priority,
+                        bulk_capacity_wait_timeout=bulk_capacity_wait_timeout,
                     )
                     backend.display_name = labels[index]
                     if announce:
@@ -584,6 +588,9 @@ def _load_mount_profile_settings(config_path: Path, profile_name: str) -> Dict[s
             for key in KERNEL_TIMEOUT_KEYS
         },
         "fuse_threads": _optional_profile_bool(config_profile, "fuse_threads", profile_name),
+        "bulk_capacity_wait_timeout": _optional_profile_float(
+            config_profile, "bulk_capacity_wait_timeout", profile_name
+        ),
         "checksum_reverify_interval": _optional_profile_float(
             config_profile, "checksum_reverify_interval", profile_name
         ),
@@ -623,6 +630,7 @@ def _can_auto_load_mount_profile(
     revalidate_after: Optional[float] = None,
     fuse_threads: Optional[bool] = None,
     checksum_reverify_interval: Optional[float] = None,
+    bulk_capacity_wait_timeout: Optional[float] = None,
 ) -> bool:
     if not _target_looks_like_profile_name(mount_target):
         return False
@@ -646,6 +654,7 @@ def _can_auto_load_mount_profile(
         revalidate_after is not None,
         fuse_threads is not None,
         checksum_reverify_interval is not None,
+        bulk_capacity_wait_timeout is not None,
     ))
 
 
@@ -671,6 +680,7 @@ def resolve_mount_configuration(
     revalidate_after: Optional[float] = None,
     fuse_threads: Optional[bool] = None,
     checksum_reverify_interval: Optional[float] = None,
+    bulk_capacity_wait_timeout: Optional[float] = None,
 ) -> ResolvedMountConfig:
     config_values = {
         "mountpoint": None,
@@ -692,6 +702,7 @@ def resolve_mount_configuration(
         "listing_max_stale": None,
         **{key: None for key in KERNEL_TIMEOUT_KEYS},
         "fuse_threads": None,
+        "bulk_capacity_wait_timeout": None,
         "checksum_reverify_interval": None,
         "backing_paths": (),
         "remote": (),
@@ -726,6 +737,7 @@ def resolve_mount_configuration(
         revalidate_after,
         fuse_threads,
         checksum_reverify_interval,
+        bulk_capacity_wait_timeout,
     ):
         available_configs = [candidate for candidate in default_mount_config_paths() if candidate.exists()]
         if available_configs:
@@ -819,6 +831,12 @@ def resolve_mount_configuration(
             config_values["fuse_threads"]
             if config_values["fuse_threads"] is not None
             else False
+        ),
+        bulk_capacity_wait_timeout=_validated_seconds(
+            "bulk_capacity_wait_timeout",
+            bulk_capacity_wait_timeout if bulk_capacity_wait_timeout is not None else (
+                config_values["bulk_capacity_wait_timeout"]
+            ),
         ),
         listing_max_stale=_validated_seconds(
             "listing_max_stale", config_values["listing_max_stale"]
