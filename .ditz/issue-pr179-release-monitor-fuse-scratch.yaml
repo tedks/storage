@@ -109,3 +109,16 @@ log_events:
     paths with size0/blocks0 guard; AST only, no behavioral claim. One total invocation
     remains, insufficient for both mandatory all-four gates and CLI; runtime stopped
     for new root disposition. App PR head fc3e28d unchanged/pushed, no field attribution.'
+- time: 2026-11-15T01:32:23-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Root 2026-11-14 coordination correction: latest artifact supersedes stale
+    2/2-control receipt. V4 controls passed5/5; release preflight/parser and zero-block
+    helper layout failures consumed total5/64s, no new gate receipt. V5 exact-helper
+    path delta source reviewed CLEAN, utility control required before use. Removed
+    controller-created per-invocation approval/count ceilings; preserve aggregate1800s
+    including64spent, all hard client/Docker/helper limits, sampled scratch threshold,
+    exact owned cleanup and mandatory all4 no-args gates+CLI. Sole owner may complete
+    narrow environment/monitor repairs and evidence-driven retries within remaining1736s
+    without another slot request. No app/fixture scope expansion, live data/deploy
+    or weakened gates. Root final merge authority unchanged.'
