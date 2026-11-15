@@ -13,14 +13,19 @@ import tempfile
 import threading
 import time
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from fuse import FuseOSError
 
 from storage.backends.local import LocalBackend
-from storage.fs import StorageFS
-from storage.models import SyncStatus
+from storage.backends.base import is_interactive_request
+from storage.fs import StorageFS, mount_storage
+from storage.streaming import PrefetchSession
+from storage.models import FileLocation, SyncStatus
+from storage.sync_tasks import DirOperation, DirSyncTask
 
 WAIT = 5.0
 # How long a thread that should be blocked is given to (wrongly) finish.
@@ -153,6 +158,2385 @@ class ThreadingTestBase(unittest.TestCase):
         )
 
 
+class TestForegroundTransferClass(ThreadingTestBase):
+    def test_cold_full_copy_is_bulk_but_browsing_remains_interactive(self):
+        (self.member_dir / "cold.bin").write_bytes(b"cold bytes")
+        observed = []
+        real_copy = self.member.copy_to_local
+        real_list = self.member.listdir_attrs
+
+        def copy(path, target):
+            observed.append(("copy", is_interactive_request()))
+            return real_copy(path, target)
+
+        def listing(path):
+            observed.append(("listing", is_interactive_request()))
+            return real_list(path)
+
+        with patch.object(self.member, "copy_to_local", side_effect=copy), \
+                patch.object(self.member, "listdir_attrs", side_effect=listing):
+            fd = self.fs.__call__("open", "/cold.bin", os.O_RDONLY)
+            self.assertEqual(b"cold bytes", self.fs.__call__("read", "/cold.bin", 32, 0, fd))
+            self.fs.__call__("release", "/cold.bin", fd)
+            self.assertIn("cold.bin", self.fs.__call__("readdir", "/", 0))
+
+        self.assertIn(("copy", False), observed)
+        self.assertIn(("listing", True), observed)
+        self.assertFalse(is_interactive_request())
+
+
+class TestForegroundAdmission(ThreadingTestBase):
+    def setUp(self):
+        super().setUp()
+        self.fs.destroy('/')
+        self.fs = StorageFS(
+            cache_root=self.cache_dir,
+            state_db=self.temp_dir / "state.db",
+            backends={"member": self.member},
+            cache_size=10 * 1024 * 1024,
+            num_sync_workers=0,
+            start_sync=False,
+            max_foreground_operations=3,
+        )
+
+    def test_foreground_admission_keeps_browsing_and_reads_moving(self):
+        entered = threading.Event()
+        release = threading.Event()
+        second_entered = threading.Event()
+
+        def blocked_open(path, flags):
+            if path == "/first":
+                entered.set()
+                self.assertTrue(release.wait(WAIT))
+            else:
+                second_entered.set()
+            return path
+
+        with patch.object(self.fs, "open", side_effect=blocked_open), \
+                patch.object(self.fs, "getattr", return_value={"st_mode": 0}), \
+                patch.object(self.fs, "read", return_value=b"demand bytes"):
+            first = Worker(self.fs.__call__, "open", "/first", os.O_RDONLY)
+            second = Worker(self.fs.__call__, "open", "/second", os.O_RDONLY)
+            first.start()
+            self.assertTrue(entered.wait(WAIT))
+            second.start()
+            try:
+                self.assertTrue(self.fs._foreground_admission.waiting_for("ordinary", 1, WAIT))
+                self.assertFalse(second_entered.is_set())
+                self.assertEqual({"st_mode": 0}, self.fs.__call__("getattr", "/", None))
+                self.assertEqual(b"demand bytes", self.fs.__call__("read", "/first", 12, 0, 0))
+                self.assertLessEqual(self.fs._foreground_admission.peak_active, 3)
+            finally:
+                release.set()
+                first.finish()
+                second.finish()
+            self.assertTrue(second_entered.is_set())
+            self.assertEqual(0, self.fs._foreground_admission.active_count)
+
+    def test_warm_open_and_directory_handles_progress_while_cold_open_waits(self):
+        (self.cache_dir / "warm").write_bytes(b"cached")
+        self.assertEqual("demand", self.fs._foreground_class("open", ("/warm", os.O_RDONLY)))
+        cold_entered = threading.Event()
+        cold_release = threading.Event()
+        warm_entered = threading.Event()
+
+        def opened(path, flags):
+            if path == "/cold":
+                cold_entered.set()
+                self.assertTrue(cold_release.wait(WAIT))
+            if path == "/warm":
+                warm_entered.set()
+            return path
+
+        with patch.object(self.fs, "open", side_effect=opened), \
+                patch.object(self.fs, "opendir", return_value=17, create=True), \
+                patch.object(self.fs, "releasedir", return_value=0, create=True):
+            cold = Worker(self.fs.__call__, "open", "/cold", os.O_RDONLY)
+            cold.start()
+            self.assertTrue(cold_entered.wait(WAIT))
+            try:
+                self.assertEqual(17, self.fs.__call__("opendir", "/", 0))
+                self.assertEqual(0, self.fs.__call__("releasedir", "/", 17))
+                self.assertEqual("/warm", self.fs.__call__("open", "/warm", os.O_RDONLY))
+                self.assertTrue(warm_entered.is_set())
+                self.assertLessEqual(self.fs._foreground_admission.peak_active, 3)
+            finally:
+                cold_release.set()
+                cold.finish()
+
+    def test_changed_cached_open_releases_demand_slot_before_full_copy(self):
+        (self.member_dir / "changed").write_bytes(b"new contents")
+        (self.cache_dir / "changed").write_bytes(b"old")
+        self.assertEqual("demand", self.fs._foreground_class("open", ("/changed", os.O_RDONLY)))
+        (self.member_dir / "ready").write_bytes(b"ready bytes")
+        ready_fd = self.fs.__call__("open", "/ready", os.O_RDONLY)
+        copy = self.gate(self.member, "copy_to_local",
+                         only=lambda path, _dest: path == "/changed")
+
+        def invalidate_changed(resolved):
+            if resolved.requested_path == "/changed":
+                (self.cache_dir / "changed").unlink()
+
+        with patch.object(self.fs, "_revalidate_cached_file", side_effect=invalidate_changed), \
+                patch.object(self.fs._foreground_admission, "reclassify_current",
+                             wraps=self.fs._foreground_admission.reclassify_current) as moved:
+            changed = Worker(self.fs.__call__, "open", "/changed", os.O_RDONLY)
+            changed.start()
+            self.assertTrue(copy.started.wait(WAIT))
+            read = Worker(self.fs.__call__, "read", "/ready", 32, 0, ready_fd)
+            read.start()
+            try:
+                read.join(BLOCKED)
+                self.assertFalse(read.is_alive(), "a full copy held the demand slot")
+                self.assertEqual(b"ready bytes", read.finish())
+                self.assertLessEqual(self.fs._foreground_admission.peak_active, 3)
+            finally:
+                copy.opened.set()
+                changed_fd = changed.finish()
+                self.fs.__call__("release", "/changed", changed_fd)
+                self.fs.__call__("release", "/ready", ready_fd)
+                read.finish()
+            self.assertEqual(1, moved.call_count)
+        self.assertEqual(0, self.fs._foreground_admission.active_count)
+
+    def test_changed_open_drops_path_lock_before_ordinary_admission(self):
+        self.cache("changed", b"old")
+        (self.member_dir / "changed").write_bytes(b"fresh bytes")
+        self.fs._observe_changed_member("/changed", self.member,
+                                        self.member.stat("/changed"))
+
+        def invalidate_changed(resolved):
+            if resolved.requested_path == "/changed":
+                (self.cache_dir / "changed").unlink()
+
+        with patch.object(self.fs, "_revalidate_cached_file", side_effect=invalidate_changed):
+            with self.fs._foreground_admission.admit("ordinary"):
+                changed = Worker(self.fs.__call__, "open", "/changed", os.O_RDONLY)
+                changed.start()
+                self.assertTrue(self.fs._foreground_admission.waiting_for("ordinary", 1, WAIT))
+                with self.fs._path_locks._mutex:
+                    self.assertNotIn("/changed", self.fs._path_locks._entries)
+                with self.fs._member_checks_lock:
+                    self.assertIn("member", self.fs._freshness["/changed"].debts)
+            fd = changed.finish()
+            try:
+                self.assertEqual(b"fresh bytes", self.fs.__call__("read", "/changed", 32, 0, fd))
+            finally:
+                self.fs.__call__("release", "/changed", fd)
+        self.assertEqual(0, self.fs._foreground_admission.active_count)
+
+    def test_invalid_direct_sync_limit_fails_before_mount_lock(self):
+        for workers, maximum in ((-1, None), (2, 1), (1, 33)):
+            with self.subTest(workers=workers, maximum=maximum), \
+                    patch("storage.fs._acquire_mount_lock_ex") as acquire:
+                with self.assertRaises(ValueError):
+                    mount_storage(
+                        str(self.temp_dir / "mount"), self.cache_dir,
+                        self.temp_dir / "state.db", {"member": self.member},
+                        1024, allow_other=False, num_sync_workers=workers,
+                        max_sync_workers=maximum,
+                    )
+                acquire.assert_not_called()
+
+    def test_reclassification_cancel_releases_both_slots(self):
+        from storage.foreground_admission import AdmissionClosed, ForegroundAdmission
+
+        gate = ForegroundAdmission(3)
+        with gate.admit("ordinary"):
+            moved = Worker(lambda: self._move_admission(gate))
+            moved.start()
+            self.assertTrue(gate.waiting_for("ordinary", 1, WAIT))
+            self.assertEqual(1, gate.active_count)
+            gate.close()
+            moved.join(WAIT)
+            self.assertFalse(moved.is_alive())
+            self.assertIsInstance(moved.error, AdmissionClosed)
+            self.assertEqual(0, gate.waiting_count("ordinary"))
+            self.assertEqual(1, gate.active_count)
+        self.assertEqual(0, gate.active_count)
+
+    @staticmethod
+    def _move_admission(gate):
+        with gate.admit("demand"):
+            gate.reclassify_current("ordinary")
+
+    def test_class_reserves_fifo_and_queued_cancellation(self):
+        from storage.foreground_admission import AdmissionClosed
+
+        gate = self.fs._foreground_admission
+        release = threading.Event()
+        started = [threading.Event() for _ in range(3)]
+        order = []
+
+        def hold(kind, index):
+            with gate.admit(kind):
+                started[index].set()
+                order.append(index)
+                self.assertTrue(release.wait(WAIT))
+
+        holders = [Worker(hold, kind, index) for index, kind in enumerate(
+            ("ordinary", "metadata", "demand")
+        )]
+        for holder in holders:
+            holder.start()
+        try:
+            self.assertTrue(all(event.wait(WAIT) for event in started))
+            self.assertEqual(3, gate.active_count)
+            queued_order = []
+
+            def queued(index):
+                with gate.admit("ordinary"):
+                    queued_order.append(index)
+
+            first = Worker(queued, 1)
+            second = Worker(queued, 2)
+            first.start()
+            self.assertTrue(gate.waiting_for("ordinary", 1, WAIT))
+            second.start()
+            self.assertTrue(gate.waiting_for("ordinary", 2, WAIT))
+            self.assertEqual([], queued_order)
+        finally:
+            release.set()
+            for holder in holders:
+                holder.finish()
+        first.finish()
+        second.finish()
+        self.assertEqual([1, 2], queued_order)
+        self.assertEqual(3, gate.peak_active)
+
+        cancel = threading.Event()
+        with gate.admit("ordinary"):
+            waiter = Worker(lambda: self._admit_once(gate, cancel))
+            waiter.start()
+            self.assertTrue(gate.waiting_for("ordinary", 1, WAIT))
+            cancel.set()
+            waiter.join(WAIT)
+            self.assertFalse(waiter.is_alive())
+            self.assertIsInstance(waiter.error, AdmissionClosed)
+            self.assertEqual(0, gate.waiting_count("ordinary"))
+
+        with gate.admit("ordinary"):
+            waiter = Worker(lambda: self._admit_once(gate))
+            waiter.start()
+            self.assertTrue(gate.waiting_for("ordinary", 1, WAIT))
+            gate.close()
+            waiter.join(WAIT)
+            self.assertFalse(waiter.is_alive())
+            self.assertIsInstance(waiter.error, AdmissionClosed)
+            self.assertEqual(1, gate.active_count)  # close did not interrupt us
+        self.assertEqual(0, gate.active_count)
+        self.assertEqual(0, gate.waiting_count("ordinary"))
+
+    @staticmethod
+    def _admit_once(gate, cancel=None):
+        with gate.admit("ordinary", cancel=cancel):
+            pass
+
+
+class TestSharedFreshnessObligation(ThreadingTestBase):
+    """Two-member schedules for shared freshness and later contract slices.
+
+    _freshness_snapshot and _freshness_token are internal diagnostic seams
+    specified in contracts/path-freshness-obligation.md.
+    """
+
+    OLD = b"old on both"
+    NEW = b"new bytes from changed A"
+    PATH = "/f.txt"
+
+    def setUp(self):
+        super().setUp()
+        self.fs.destroy("/")
+        self.a = LocalBackend("changedA", str(self.member_dir))
+        self.b_dir = self.temp_dir / "staleB"
+        self.b_dir.mkdir()
+        self.b = LocalBackend("staleB", str(self.b_dir))
+        self.a.speed_priority = 0
+        self.b.speed_priority = 50
+        self.fs = StorageFS(
+            cache_root=self.cache_dir, state_db=self.temp_dir / "state.db",
+            backends={"changedA": self.a, "staleB": self.b},
+            cache_size=10 * 1024 * 1024, num_sync_workers=0,
+            start_sync=False, revalidate_after=60.0,
+            max_foreground_operations=3,
+        )
+        # Force the member stat boundary on every aged open. A fresh parent
+        # listing must not short-circuit the observation under test.
+        listing = patch.object(self.fs, "_listing_confirms_baseline", return_value=None)
+        listing.start()
+        self.addCleanup(listing.stop)
+        for directory in (self.member_dir, self.b_dir):
+            (directory / "f.txt").write_bytes(self.OLD)
+            os.utime(directory / "f.txt", (1_700_000_000, 1_700_000_000))
+        self.assertEqual(self.OLD, self._read(self.PATH))
+        for member in (self.a, self.b):
+            self.fs.state_manager.add_file_location(FileLocation(
+                virtual_path=self.PATH, backend_name=member.name, checksum="",
+                last_synced=time.time(), is_cached=False,
+            ))
+
+    def _read(self, path, *, direct=False):
+        call = getattr(self.fs, "__call__") if not direct else None
+        fd = call("open", path, os.O_RDONLY) if call else self.fs.open(path, os.O_RDONLY)
+        try:
+            return (call("read", path, 4096, 0, fd) if call else
+                    self.fs.read(path, 4096, 0, fd))
+        finally:
+            if call:
+                call("release", path, fd)
+            else:
+                self.fs.release(path, fd)
+
+    def _change_a(self):
+        (self.member_dir / "f.txt").write_bytes(self.NEW)
+        os.utime(self.member_dir / "f.txt", (1_700_000_100, 1_700_000_100))
+        self._age_checks()
+
+    def _age_checks(self):
+        with self.fs._member_checks_lock:
+            for path, check in list(self.fs._member_checks.items()):
+                self.fs._member_checks[path] = dataclasses.replace(
+                    check, verified_at=check.verified_at - 3600,
+                )
+
+    def _restart_fs(self, after_stop=None):
+        """Close the mount instance, retaining only scratch cache/member state."""
+        self.fs.destroy("/")
+        if after_stop is not None:
+            after_stop()
+        self.fs = StorageFS(
+            cache_root=self.cache_dir, state_db=self.temp_dir / "state.db",
+            backends={"changedA": self.a, "staleB": self.b},
+            cache_size=10 * 1024 * 1024, num_sync_workers=0,
+            start_sync=False, revalidate_after=60.0,
+            max_foreground_operations=3,
+        )
+        listing = patch.object(self.fs, "_listing_confirms_baseline", return_value=None)
+        listing.start()
+        self.addCleanup(listing.stop)
+
+    def _late_b_session(self, token, partial=None):
+        return SimpleNamespace(
+            canonical_path=self.PATH,
+            final_cache_path=self.cache_dir / "f.txt",
+            partial_cache_path=partial,
+            backend=self.b,
+            member_stat=self.b.stat(self.PATH),
+            freshness_token=token,
+        )
+
+    def _assert_local_dirty(self, expected):
+        self.assertEqual(expected, (self.cache_dir / "f.txt").read_bytes())
+        self.assertEqual(
+            SyncStatus.DIRTY,
+            self.fs.state_manager.get_file_metadata(self.PATH).sync_status,
+        )
+
+    def _assert_no_b_baseline(self):
+        check = self.fs._member_checks.get(self.PATH)
+        if check is not None:
+            self.assertNotIn("staleB", check.members)
+
+    def _fail_dirty_after_registration(self, error, keep_fd):
+        captured = {"close_calls": 0}
+
+        def fail(path, cache_path):
+            with self.fs._fd_lock:
+                attempts = [(vfd, entry) for vfd, entry in self.fs._fd_map.items()
+                            if vfd != keep_fd]
+                self.assertEqual(1, len(attempts))
+                vfd, entry = attempts[0]
+                captured.update(vfd=vfd, entry=entry, real_fd=entry.real_fd)
+                os.fstat(entry.real_fd)
+            raise error
+
+        return fail, captured
+
+    @staticmethod
+    def _count_failed_attempt_closes(captured):
+        real_close = os.close
+
+        def close(fd):
+            if fd == captured.get("real_fd"):
+                captured["close_calls"] += 1
+            return real_close(fd)
+
+        return patch("storage.fs.os.close", side_effect=close)
+
+    def _assert_failed_attempt_closed(self, captured, keep_fd, keep_real_fd):
+        with self.fs._fd_lock:
+            self.assertNotIn(captured["vfd"], self.fs._fd_map)
+            self.assertEqual(keep_real_fd, self.fs._fd_map[keep_fd].real_fd)
+        with self.assertRaises(OSError) as closed:
+            os.fstat(captured["real_fd"])
+        self.assertEqual(errno.EBADF, closed.exception.errno)
+        self.assertEqual(1, captured["close_calls"])
+        os.fstat(keep_real_fd)
+        with self.fs._member_checks_lock:
+            state = self.fs._freshness[self.PATH]
+            self.assertTrue(state.uncertain_local)
+            self.assertEqual(0, state.active_mutations)
+        self.assertIn("changedA", self._snapshot()["debts"])
+        self._assert_no_b_baseline()
+
+    def _start_late_callback(self, session):
+        """Observe callback entry before a path-locked mutation finishes."""
+        entered = threading.Event()
+
+        def call():
+            entered.set()
+            return self.fs._streaming_manager.on_finalized(session)
+
+        worker = Worker(call)
+        worker.start()
+        self.assertTrue(entered.wait(WAIT))
+        return worker
+
+    def _snapshot(self, path=PATH):
+        return self.fs._freshness_snapshot(path)
+
+    def _assert_a_baseline(self, path=PATH):
+        check = self.fs._member_checks[path]
+        self.assertEqual((len(self.NEW), 1_700_000_100.0), check.members["changedA"])
+        self.assertNotIn(path, self.fs._refetch_pins)
+        self.assertNotIn(path, self.fs._pinned_stats)
+
+    def _assert_slots_released(self):
+        self.assertEqual(0, self.fs._foreground_admission.active_count)
+        for kind in self.fs._foreground_admission.CLASSES:
+            self.assertEqual(0, self.fs._foreground_admission.waiting_count(kind))
+
+    def _hold_after_invalidation(self):
+        dropped = threading.Event()
+        resume = threading.Event()
+        self.addCleanup(resume.set)
+        real = self.fs._invalidate_file_cache
+
+        def invalidate(path):
+            result = real(path)
+            dropped.set()
+            if not resume.wait(WAIT):
+                raise AssertionError("invalidation gate was not released")
+            return result
+
+        return dropped, resume, patch.object(self.fs, "_invalidate_file_cache", side_effect=invalidate)
+
+    def test_racing_opener_cannot_select_stale_b_while_a_is_owed(self):
+        self._change_a()
+        # First open has observed changed A and invalidated the old cache,
+        # then drops the path lock to transfer to ordinary admission. Hold it
+        # at that boundary so a second opener can choose from the members.
+        paused = threading.Event()
+        resume = threading.Event()
+        self.addCleanup(resume.set)
+        gate = self.fs._foreground_admission
+        real_reclassify = gate.reclassify_current
+        first = None
+
+        def hold_first_reclassify(kind):
+            if threading.current_thread() is first:
+                paused.set()
+                if not resume.wait(WAIT):
+                    raise AssertionError("first opener admission gate was not released")
+            return real_reclassify(kind)
+
+        # A fourth slot lets the second demand request enter while the first
+        # still owns its demand slot at this deterministic handoff barrier.
+        with patch.object(gate, "cap", 4), \
+                patch.object(gate, "reclassify_current", side_effect=hold_first_reclassify), \
+                patch.object(self.fs, "_select_unpinned_backend_for_read", return_value=self.b), \
+                patch.object(self.a, "copy_to_local", wraps=self.a.copy_to_local) as a_copy, \
+                patch.object(self.b, "copy_to_local", wraps=self.b.copy_to_local) as b_copy:
+            first = Worker(self._read, self.PATH)
+            first.start()
+            self.assertTrue(paused.wait(WAIT))
+            try:
+                second_bytes = self._read(self.PATH)
+            finally:
+                resume.set()
+                first.join(WAIT)
+                self.assertFalse(first.is_alive())
+            # The byte assertion comes before diagnostics: a missing proposed
+            # snapshot method is not the red signal for this regression.
+            self.assertEqual(self.NEW, second_bytes)
+            self.assertEqual(self.NEW, first.finish())
+            self.assertGreaterEqual(a_copy.call_count, 1)
+            b_copy.assert_not_called()
+        self._assert_a_baseline()
+        self.assertIsNone(self._snapshot())
+        self._assert_slots_released()
+
+    def test_old_open_exit_cannot_erase_newer_observation(self):
+        # First opener pauses after releasing the path lock but before its
+        # former private-pin cleanup point. The second opener then publishes
+        # A's newer observation; first's exit cannot clear the shared debt.
+        released = threading.Event()
+        first_resume = threading.Event()
+        self.addCleanup(first_resume.set)
+        dropped, second_resume, hold_invalidation = self._hold_after_invalidation()
+        real_path_locked = self.fs._path_locked
+        first = None
+
+        @contextmanager
+        def hold_after_path_lock(*paths):
+            with real_path_locked(*paths):
+                yield
+            if threading.current_thread() is first:
+                released.set()
+                if not first_resume.wait(WAIT):
+                    raise AssertionError("first opener exit gate was not released")
+
+        with patch.object(self.fs, "_path_locked", side_effect=hold_after_path_lock), \
+                patch.object(self.fs, "_select_unpinned_backend_for_read", return_value=self.b), \
+                hold_invalidation:
+            first = Worker(self.fs.open, self.PATH, os.O_RDONLY)
+            first.start()
+            self.assertTrue(released.wait(WAIT))
+            self._change_a()
+            second = Worker(self._read, self.PATH)
+            second.start()
+            self.assertTrue(dropped.wait(WAIT))
+            first_fd = None
+            try:
+                first_resume.set()
+                first_fd = first.finish()
+                second_resume.set()
+                self.assertEqual(self.NEW, second.finish())
+                self.assertEqual(self.OLD, self.fs.read(self.PATH, 4096, 0, first_fd))
+            finally:
+                first_resume.set()
+                second_resume.set()
+                if first_fd is not None:
+                    self.fs.release(self.PATH, first_fd)
+        self._assert_a_baseline()
+        self._assert_slots_released()
+
+    def test_cancelled_admission_leaves_a_owed_for_next_opener(self):
+        self._change_a()
+        gate = self.fs._foreground_admission
+        with patch.object(self.fs, "_select_unpinned_backend_for_read", return_value=self.b):
+            with gate.admit("ordinary"):
+                first = Worker(self._read, self.PATH)
+                first.start()
+                self.assertTrue(gate.waiting_for("ordinary", 1, WAIT))
+                gate.close()
+                first.join(WAIT)
+                self.assertFalse(first.is_alive())
+                self.assertIsInstance(first.error, FuseOSError)
+                self.assertEqual(errno.EINTR, first.error.errno)
+            self.assertEqual("changedA", self._snapshot()["owed_member"])
+            # Direct StorageFS call bypasses the now-closed FUSE gate; the
+            # shared freshness obligation still controls member selection.
+            self.assertEqual(self.NEW, self._read(self.PATH, direct=True))
+        self._assert_a_baseline()
+        self._assert_slots_released()
+
+    def test_failed_a_fetch_keeps_obligation_and_never_accepts_stale_b(self):
+        self._change_a()
+        with patch.object(self.fs, "_select_unpinned_backend_for_read", return_value=self.b):
+            with patch.object(self.a, "copy_to_local", side_effect=OSError(errno.EIO, "A failed")):
+                with self.assertRaises((OSError, FuseOSError)):
+                    self._read(self.PATH)
+            self.assertEqual("changedA", self._snapshot()["owed_member"])
+            self.assertEqual(self.NEW, self._read(self.PATH, direct=True))
+        self._assert_a_baseline()
+        self._assert_slots_released()
+
+    def test_unavailable_a_fallback_keeps_recheck_debt_until_a_returns(self):
+        self._change_a()
+        real_stat = self.a.stat
+
+        def stat_then_drop(path):
+            result = real_stat(path)
+            self.a.set_available(False)
+            return result
+
+        try:
+            with patch.object(self.a, "stat", side_effect=stat_then_drop), \
+                    patch.object(self.fs, "_select_unpinned_backend_for_read", return_value=self.b):
+                self.assertEqual(self.OLD, self._read(self.PATH))
+            debt = self._snapshot()
+            self.assertEqual("changedA", debt["owed_member"])
+            self.assertIn("changedA", debt["recheck_members"])
+        finally:
+            self.a.set_available(True)
+        self.assertEqual(self.NEW, self._read(self.PATH))
+        self.assertIsNone(self._snapshot())
+        self._assert_a_baseline()
+        self._assert_slots_released()
+
+    def _prime_owed_a_with_b_cached(self):
+        """Observe changed A, then make its copy unavailable so B fills cache."""
+        self._change_a()
+        real_stat = self.a.stat
+
+        def stat_then_drop(path):
+            result = real_stat(path)
+            self.a.set_available(False)
+            return result
+
+        self.addCleanup(self.a.set_available, True)
+        with patch.object(self.a, "stat", side_effect=stat_then_drop), \
+                patch.object(self.fs, "_select_unpinned_backend_for_read", return_value=self.b):
+            self.assertEqual(self.OLD, self._read(self.PATH))
+        self.a.set_available(True)
+        self.assertEqual("changedA", self._snapshot()["owed_member"])
+
+    def _expire_owed_probe(self):
+        key = (self.PATH, "changedA")
+        with self.fs._member_checks_lock:
+            generation, _deadline, was_available = self.fs._freshness_probe_retry[key]
+            self.fs._freshness_probe_retry[key] = (
+                generation, time.monotonic() - 1.0, was_available,
+            )
+
+    def test_owed_available_stat_failure_is_throttled_until_expiry(self):
+        self._prime_owed_a_with_b_cached()
+        with patch.object(self.a, "stat", side_effect=OSError(errno.EIO, "slow member")) as probe:
+            for _ in range(4):
+                self.assertEqual(self.OLD, self._read(self.PATH))
+            self.assertEqual(1, probe.call_count)
+        self.assertEqual("changedA", self._snapshot()["owed_member"])
+        # A fresh successful B baseline must not extend A's retry deadline.
+        cache_path = self.cache_dir / "f.txt"
+        identity = self.fs._cache_identity(os.lstat(cache_path))
+        b_stat = self.b.stat(self.PATH)
+        self.fs._store_member_check(self.PATH, cache_path, identity,
+                                    {"staleB": (b_stat.st_size, b_stat.st_mtime)})
+        self._expire_owed_probe()
+        self.assertEqual(self.NEW, self._read(self.PATH))
+        self._assert_a_baseline()
+        self.assertIsNone(self._snapshot())
+        self._assert_slots_released()
+
+    def test_owed_missing_file_probe_is_throttled_while_member_reports_available(self):
+        self._prime_owed_a_with_b_cached()
+        with patch.object(self.a, "stat", side_effect=FileNotFoundError(self.PATH)) as probe:
+            for _ in range(4):
+                self.assertEqual(self.OLD, self._read(self.PATH))
+            self.assertEqual(1, probe.call_count)
+        self.assertTrue(self.a.is_available())
+        self.assertEqual("changedA", self._snapshot()["owed_member"])
+        self._expire_owed_probe()
+        self.assertEqual(self.NEW, self._read(self.PATH))
+        self._assert_a_baseline()
+        self._assert_slots_released()
+
+    def test_owed_failed_probe_retries_when_member_becomes_available(self):
+        self._prime_owed_a_with_b_cached()
+
+        def fail_and_drop(_path):
+            self.a.set_available(False)
+            raise OSError(errno.EIO, "member went away")
+
+        with patch.object(self.a, "stat", side_effect=fail_and_drop) as probe:
+            self.assertEqual(self.OLD, self._read(self.PATH))
+            self.assertEqual(self.OLD, self._read(self.PATH))
+            self.assertEqual(1, probe.call_count)
+        self.assertEqual("changedA", self._snapshot()["owed_member"])
+        self.a.set_available(True)
+        self.assertEqual(self.NEW, self._read(self.PATH))
+        self._assert_a_baseline()
+        self._assert_slots_released()
+
+    def test_owed_failed_probe_recovers_after_later_offline_observation(self):
+        self._prime_owed_a_with_b_cached()
+        with patch.object(self.a, "stat", side_effect=OSError(errno.EIO, "stat failed")) as probe:
+            self.assertEqual(self.OLD, self._read(self.PATH))
+            self.assertEqual(1, probe.call_count)
+        self.assertEqual("changedA", self._snapshot()["owed_member"])
+
+        # The failure happened while A reported available. A later open
+        # actually observes it offline; its return before the retry deadline
+        # must recheck immediately rather than serve B for the full delay.
+        self.a.set_available(False)
+        seen_available = []
+        real_available = self.a.is_available
+
+        def observe_available():
+            value = real_available()
+            seen_available.append(value)
+            return value
+
+        with patch.object(self.a, "is_available", side_effect=observe_available):
+            self.assertEqual(self.OLD, self._read(self.PATH))
+        self.assertIn(False, seen_available)
+        self.assertEqual("changedA", self._snapshot()["owed_member"])
+
+        self.a.set_available(True)
+        self.assertEqual(self.NEW, self._read(self.PATH))
+        self._assert_a_baseline()
+        self.assertIsNone(self._snapshot())
+        self._assert_slots_released()
+
+    def test_rename_during_admission_wait_moves_or_preserves_debt(self):
+        # Leave B's CLEAN cache inode in place with A still owed. The older
+        # uncached setup made the real rename fail ENOENT before any move.
+        self._prime_owed_a_with_b_cached()
+        old_identity = self._snapshot()["path_identity"]
+        gate = self.fs._foreground_admission
+        with patch.object(self.fs, "_select_unpinned_backend_for_read", return_value=self.b):
+            with gate.admit("demand"):
+                first = Worker(self._read, self.PATH)
+                first.start()
+                self.assertTrue(gate.waiting_for("demand", 1, WAIT))
+                self.fs.rename(self.PATH, "/moved.txt")
+                moved_debt = self._snapshot("/moved.txt")
+            first.join(WAIT)
+            self.assertFalse(first.is_alive())
+            self.assertIsNotNone(first.error)  # old name no longer resolves
+            self.assertEqual(self.NEW, self._read("/moved.txt", direct=True))
+        self.assertIsNone(self._snapshot(self.PATH))
+        self.assertIsNotNone(moved_debt)
+        self.assertEqual("changedA", moved_debt["owed_member"])
+        self.assertEqual(old_identity, moved_debt["path_identity"])
+        self._assert_a_baseline("/moved.txt")
+        self._assert_slots_released()
+
+    def test_failed_rename_during_wait_keeps_old_identity_and_debt(self):
+        self._prime_owed_a_with_b_cached()
+        before = self._snapshot()
+        old_token = self.fs._freshness_token(self.PATH, "staleB")
+        gate = self.fs._foreground_admission
+        with patch.object(self.fs, "_select_unpinned_backend_for_read", return_value=self.b):
+            with gate.admit("demand"):
+                first = Worker(self._read, self.PATH)
+                first.start()
+                self.assertTrue(gate.waiting_for("demand", 1, WAIT))
+                with patch.object(self.fs.namespace, "rename", side_effect=OSError(errno.EIO, "rename failed")):
+                    with self.assertRaises(OSError):
+                        self.fs.rename(self.PATH, "/moved.txt")
+                self.assertEqual(before, self._snapshot())
+                self.assertEqual(old_token, self.fs._freshness_token(self.PATH, "staleB"))
+                self.assertEqual(self.OLD, (self.cache_dir / "f.txt").read_bytes())
+            self.assertEqual(self.NEW, first.finish())
+        self._assert_a_baseline()
+        self._assert_slots_released()
+
+    def test_partial_failed_rename_during_wait_requires_reprobe(self):
+        self._prime_owed_a_with_b_cached()
+        old_token = self.fs._freshness_token(self.PATH, "staleB")
+        gate = self.fs._foreground_admission
+        with patch.object(self.fs, "_select_unpinned_backend_for_read", return_value=self.b):
+            with gate.admit("demand"):
+                first = Worker(self._read, self.PATH)
+                first.start()
+                self.assertTrue(gate.waiting_for("demand", 1, WAIT))
+                # The real namespace path has already moved the cache inode
+                # when its index rewrite fails. Members still have old names.
+                with patch.object(self.fs.state_manager, "rename_path",
+                                  side_effect=OSError(errno.EIO, "index move failed")):
+                    with self.assertRaises(OSError):
+                        self.fs.rename(self.PATH, "/moved.txt")
+                self.assertEqual("reprobe", self._snapshot(self.PATH)["state"])
+                self.assertEqual("reprobe", self._snapshot("/moved.txt")["state"])
+                for name in (self.PATH, "/moved.txt"):
+                    self.assertIn("changedA", self._snapshot(name)["debts"])
+                self.assertNotEqual(old_token, self.fs._freshness_token(self.PATH, "staleB"))
+            first.join(WAIT)
+            self.assertFalse(first.is_alive())
+            self.assertIsInstance(first.error, FuseOSError)
+            self.assertEqual(errno.EIO, first.error.errno)
+            with self.assertRaises(FuseOSError) as raised:
+                self._read("/moved.txt", direct=True)
+            self.assertEqual(errno.EIO, raised.exception.errno)
+            self.assertEqual(self.OLD, (self.cache_dir / "moved.txt").read_bytes())
+        self._assert_slots_released()
+
+    def test_partial_replace_cannot_turn_old_target_row_into_local_authority(self):
+        self._prime_owed_a_with_b_cached()
+        target = "/target.txt"
+        for directory in (self.member_dir, self.b_dir):
+            (directory / "target.txt").write_bytes(b"different clean target")
+        self.assertEqual(b"different clean target", self._read(target))
+        target_row = self.fs.state_manager.get_file_metadata(target)
+        self.assertEqual(SyncStatus.CLEAN, target_row.sync_status)
+        with patch.object(self.fs.state_manager, "rename_path",
+                          side_effect=OSError(errno.EIO, "index move failed")):
+            with self.assertRaises(OSError):
+                self.fs.rename(self.PATH, target)
+        self.assertEqual(self.OLD, (self.cache_dir / "target.txt").read_bytes())
+        self.fs.sweep_stale_cache_metadata()
+        self.assertEqual(SyncStatus.CLEAN,
+                         self.fs.state_manager.get_file_metadata(target).sync_status)
+        with self.assertRaises(FuseOSError) as raised:
+            self._read(target, direct=True)
+        self.assertEqual(errno.EIO, raised.exception.errno)
+        self.assertIn("changedA", self._snapshot(target)["debts"])
+        self.assertNotIn("staleB", self.fs._member_checks.get(target, SimpleNamespace(members={})).members)
+
+    def test_partial_replace_equal_size_mtime_still_lacks_inode_authority(self):
+        self._prime_owed_a_with_b_cached()
+        target = "/target.txt"
+        source_stat = (self.cache_dir / "f.txt").stat()
+        for directory in (self.member_dir, self.b_dir):
+            path = directory / "target.txt"
+            path.write_bytes(b"x" * len(self.OLD))
+            os.utime(path, ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns))
+        self.assertEqual(b"x" * len(self.OLD), self._read(target))
+        target_stat = (self.cache_dir / "target.txt").stat()
+        self.assertEqual((source_stat.st_size, source_stat.st_mtime_ns),
+                         (target_stat.st_size, target_stat.st_mtime_ns))
+        with patch.object(self.fs.state_manager, "rename_path",
+                          side_effect=OSError(errno.EIO, "index move failed")):
+            with self.assertRaises(OSError):
+                self.fs.rename(self.PATH, target)
+        with self.assertRaises(FuseOSError) as raised:
+            self._read(target, direct=True)
+        self.assertEqual(errno.EIO, raised.exception.errno)
+        self.assertEqual(self.OLD, (self.cache_dir / "target.txt").read_bytes())
+        self.assertIn("changedA", self._snapshot(target)["debts"])
+
+    def test_partial_replace_dirty_target_never_uploads_moved_source(self):
+        self._prime_owed_a_with_b_cached()
+        target = "/target.txt"
+        fd = self.fs.create(target, 0o644)
+        self.fs.write(target, b"local target", 0, fd)
+        self.fs.release(target, fd)
+        self.assertEqual(SyncStatus.DIRTY,
+                         self.fs.state_manager.get_file_metadata(target).sync_status)
+        with patch.object(self.fs.state_manager, "rename_path",
+                          side_effect=OSError(errno.EIO, "index move failed")):
+            with self.assertRaises(OSError):
+                self.fs.rename(self.PATH, target)
+        moved = (self.cache_dir / "target.txt").read_bytes()
+        self.assertEqual(self.OLD, moved)
+        with patch.object(self.a, "copy_from_local", wraps=self.a.copy_from_local) as upload_a, \
+                patch.object(self.b, "copy_from_local", wraps=self.b.copy_from_local) as upload_b:
+            self.fs.sync_manager.num_workers = 1
+            self.fs.sync_manager.max_workers = 1
+            self.fs.sync_manager.start()
+            self.addCleanup(self.fs.sync_manager.stop)
+            self.fs.sync_manager.queue_sync(target, force=True)
+            self.assertTrue(self.fs.sync_manager.wait_for_completion(timeout=WAIT))
+            upload_a.assert_not_called()
+            upload_b.assert_not_called()
+        self.assertEqual(SyncStatus.DIRTY,
+                         self.fs.state_manager.get_file_metadata(target).sync_status)
+        self.assertEqual(moved, (self.cache_dir / "target.txt").read_bytes())
+        self.assertIn("changedA", self._snapshot(target)["debts"])
+        with self.assertRaises(FuseOSError) as raised:
+            self._read(target, direct=True)
+        self.assertEqual(errno.EIO, raised.exception.errno)
+
+    def test_failed_member_rename_keeps_proven_dirty_source_access(self):
+        self._prime_owed_a_with_b_cached()
+        self.a.set_available(False)
+        try:
+            fd = self.fs.open(self.PATH, os.O_RDWR)
+            self.fs.write(self.PATH, b"local source", 0, fd)
+            self.fs.release(self.PATH, fd)
+        finally:
+            self.a.set_available(True)
+        self.assertIn("changedA", self._snapshot()["debts"])
+        with patch.object(self.fs.namespace, "_propagate_dir_operation",
+                          side_effect=OSError(errno.EIO, "member move failed")):
+            with self.assertRaises(OSError):
+                self.fs.rename(self.PATH, "/moved.txt")
+        self.assertEqual("reprobe", self._snapshot("/moved.txt")["state"])
+        self.assertEqual(SyncStatus.DIRTY,
+                         self.fs.state_manager.get_file_metadata("/moved.txt").sync_status)
+        self.assertEqual((self.cache_dir / "moved.txt").read_bytes(),
+                         self._read("/moved.txt", direct=True))
+        self.assertIn("changedA", self._snapshot("/moved.txt")["debts"])
+
+    def test_failed_directory_member_move_proves_only_dirty_descendants(self):
+        self._prime_owed_a_with_b_cached()
+        self.a.set_available(False)
+        try:
+            fd = self.fs.open(self.PATH, os.O_RDWR)
+            self.fs.write(self.PATH, b"local first", 0, fd)
+            self.fs.release(self.PATH, fd)
+        finally:
+            self.a.set_available(True)
+        self.fs.mkdir("/dir", 0o755)
+        self.fs.mkdir("/dir/nest", 0o755)
+        self.fs.rename(self.PATH, "/dir/first.txt")
+        deep = "/dir/nest/deep.txt"
+        fd = self.fs.create(deep, 0o644)
+        self.fs.write(deep, b"local deep", 0, fd)
+        self.fs.release(deep, fd)
+        for directory in (self.member_dir, self.b_dir):
+            (directory / "dir" / "clean.txt").write_bytes(b"clean sibling")
+        self.assertEqual(b"clean sibling", self._read("/dir/clean.txt"))
+        before = self._snapshot("/dir/first.txt")["debts"]
+        # create/write need no preexisting freshness object; the completed
+        # index move itself must still witness this descendant's inode.
+        self.assertIsNone(self._snapshot(deep))
+        self.assertEqual(SyncStatus.CLEAN,
+                         self.fs.state_manager.get_file_metadata("/dir/clean.txt").sync_status)
+        with patch.object(self.fs.namespace, "_propagate_dir_operation",
+                          side_effect=OSError(errno.EIO, "member move failed")):
+            with self.assertRaises(OSError):
+                self.fs.rename("/dir", "/moved")
+        self.assertEqual(b"local first", self._read("/moved/first.txt", direct=True)[:11])
+        self.assertEqual(b"local deep", self._read("/moved/nest/deep.txt", direct=True))
+        self.assertEqual(before, self._snapshot("/moved/first.txt")["debts"])
+        self.assertEqual({}, self._snapshot("/moved/nest/deep.txt")["debts"])
+        with self.assertRaises(FuseOSError) as raised:
+            self._read("/moved/clean.txt", direct=True)
+        self.assertEqual(errno.EIO, raised.exception.errno)
+        with patch.object(self.a, "copy_from_local", wraps=self.a.copy_from_local) as upload_a, \
+                patch.object(self.b, "copy_from_local", wraps=self.b.copy_from_local) as upload_b:
+            self.fs.sync_manager.num_workers = 1
+            self.fs.sync_manager.max_workers = 1
+            self.fs.sync_manager.start()
+            self.addCleanup(self.fs.sync_manager.stop)
+            self.fs.sync_manager.queue_sync("/moved/first.txt", force=True)
+            self.fs.sync_manager.queue_sync("/moved/nest/deep.txt", force=True)
+            self.assertTrue(self.fs.sync_manager.wait_for_completion(timeout=WAIT))
+            upload_a.assert_not_called()
+            upload_b.assert_not_called()
+        for path in ("/moved/first.txt", "/moved/nest/deep.txt"):
+            self.assertEqual(SyncStatus.DIRTY,
+                             self.fs.state_manager.get_file_metadata(path).sync_status)
+
+    def test_failed_directory_move_covers_child_without_freshness_object(self):
+        self.fs.mkdir("/dir", 0o755)
+        for directory in (self.member_dir, self.b_dir):
+            (directory / "dir" / "child.txt").write_bytes(b"uncertified child")
+        self.assertEqual(b"uncertified child", self._read("/dir/child.txt"))
+        self._restart_fs()
+        with self.fs._member_checks_lock:
+            self.assertNotIn("/dir/child.txt", self.fs._freshness)
+            self.assertNotIn("/moved/child.txt", self.fs._freshness)
+        with patch.object(self.fs.namespace, "_propagate_dir_operation",
+                          side_effect=OSError(errno.EIO, "member move failed")):
+            with self.assertRaises(OSError):
+                self.fs.rename("/dir", "/moved")
+        with self.fs._member_checks_lock:
+            self.assertNotIn("/moved/child.txt", self.fs._freshness)
+        with self.assertRaises(FuseOSError) as raised:
+            self._read("/moved/child.txt", direct=True)
+        self.assertEqual(errno.EIO, raised.exception.errno)
+        self.assertEqual(b"uncertified child", (self.cache_dir / "moved" / "child.txt").read_bytes())
+        # A test-local disabled negative guard demonstrates the actual
+        # stale canonical-byte exposure, independent of a diagnostic seam.
+        with patch.object(self.fs, "_namespace_covered_locked", return_value=False):
+            self.assertEqual(b"uncertified child", self._read("/moved/child.txt", direct=True))
+
+    def test_returned_member_failure_covers_absent_state_and_records_progress(self):
+        self.fs.mkdir("/dir", 0o755)
+        for directory in (self.member_dir, self.b_dir):
+            (directory / "dir" / "child.txt").write_bytes(b"old local")
+        self.assertEqual(b"old local", self._read("/dir/child.txt"))
+        self._restart_fs()
+        with self.fs._member_checks_lock:
+            self.assertNotIn("/dir/child.txt", self.fs._freshness)
+        with patch.object(self.b, "rename", side_effect=OSError(errno.EIO, "B offline")):
+            self.fs.rename("/dir", "/moved")
+        record = self.fs._namespace_uncertainties[-1]
+        self.assertEqual({"changedA", "staleB"}, record.progress.intended)
+        self.assertEqual(record.progress.intended, record.progress.attempted)
+        self.assertEqual({"changedA"}, record.progress.confirmed)
+        self.assertEqual({"staleB"}, record.progress.failed)
+        self.assertEqual(set(), record.progress.unknown)
+        with self.fs._member_checks_lock:
+            self.assertNotIn("/moved/child.txt", self.fs._freshness)
+        with self.assertRaises(FuseOSError) as raised:
+            self._read("/moved/child.txt", direct=True)
+        self.assertEqual(errno.EIO, raised.exception.errno)
+
+    def test_failed_subtree_covers_evicted_and_later_lazy_children_but_not_sibling(self):
+        self.fs.mkdir("/dir", 0o755)
+        self.fs.mkdir("/dir/nest", 0o755)
+        self.fs.mkdir("/dir2", 0o755)
+        for directory in (self.member_dir, self.b_dir):
+            (directory / "dir" / "nest" / "evicted.txt").write_bytes(b"evicted bytes")
+            (directory / "dir2" / "sibling.txt").write_bytes(b"unrelated")
+        self.assertEqual(b"evicted bytes", self._read("/dir/nest/evicted.txt"))
+        self._restart_fs()
+        self.fs.cache_manager.evict_lru_files(1 << 20)
+        self.assertFalse((self.cache_dir / "dir" / "nest" / "evicted.txt").exists())
+        with patch.object(self.fs.namespace, "_propagate_dir_operation",
+                          side_effect=OSError(errno.EIO, "member move failed")):
+            with self.assertRaises(OSError):
+                self.fs.rename("/dir", "/moved")
+        (self.member_dir / "moved").mkdir(exist_ok=True)
+        (self.member_dir / "moved" / "lazy.txt").write_bytes(b"later member bytes")
+        for path in ("/moved/nest/evicted.txt", "/moved/lazy.txt"):
+            with self.assertRaises(FuseOSError) as raised:
+                self._read(path, direct=True)
+            self.assertEqual(errno.EIO, raised.exception.errno)
+        self.assertEqual(b"unrelated", self._read("/dir2/sibling.txt", direct=True))
+
+    def test_failed_replace_keeps_same_member_debts_by_origin(self):
+        target = "/target.txt"
+        for directory in (self.member_dir, self.b_dir):
+            (directory / "target.txt").write_bytes(b"target old")
+        self.assertEqual(b"target old", self._read(target))
+        self._change_a()
+        (self.member_dir / "target.txt").write_bytes(b"target changed separately")
+        self.fs._observe_changed_member(self.PATH, self.a, self.a.stat(self.PATH))
+        self.fs._observe_changed_member(target, self.a, self.a.stat(target))
+        with patch.object(self.fs.namespace, "_propagate_dir_operation",
+                          side_effect=OSError(errno.EIO, "member move failed")):
+            with self.assertRaises(OSError):
+                self.fs.rename(self.PATH, target)
+        record = self.fs._namespace_uncertainties[-1]
+        source = record.source_debts[self.PATH]["changedA"]
+        replaced = record.target_debts[target]["changedA"]
+        self.assertNotEqual(source.member_stat.st_size, replaced.member_stat.st_size)
+        self.assertTrue(record.covers(self.PATH))
+        self.assertTrue(record.covers(target))
+
+    def test_failed_subtree_blocks_heal_and_both_eviction_paths(self):
+        self.fs.mkdir("/dir", 0o755)
+        for directory in (self.member_dir, self.b_dir):
+            (directory / "dir" / "plain.txt").write_bytes(b"plain local")
+            (directory / "dir" / "recompute.txt").write_bytes(b"recompute local")
+        for path in ("/dir/plain.txt", "/dir/recompute.txt"):
+            self._read(path)
+        self._restart_fs()
+        with patch.object(self.fs.namespace, "_propagate_dir_operation",
+                          side_effect=OSError(errno.EIO, "member move failed")):
+            with self.assertRaises(OSError):
+                self.fs.rename("/dir", "/moved")
+        plain = "/moved/plain.txt"
+        recompute = "/moved/recompute.txt"
+        row = self.fs.state_manager.get_file_metadata(recompute)
+        row.recomputable = True
+        self.fs.state_manager.set_file_metadata(row)
+        plain_cache = self.cache_dir / "moved" / "plain.txt"
+        recompute_cache = self.cache_dir / "moved" / "recompute.txt"
+        os.utime(plain_cache, ns=(plain_cache.stat().st_atime_ns,
+                                  plain_cache.stat().st_mtime_ns + 1_000_000_000))
+        self.fs.sweep_stale_cache_metadata()
+        self.assertEqual(SyncStatus.CLEAN,
+                         self.fs.state_manager.get_file_metadata(plain).sync_status)
+        self.fs.cache_manager.evict_lru_files(1 << 20)
+        self.fs.cache_manager.evict_recomputable_files(1 << 20)
+        self.assertEqual(b"plain local", plain_cache.read_bytes())
+        self.assertEqual(b"recompute local", recompute_cache.read_bytes())
+        self.assertEqual(SyncStatus.CLEAN,
+                         self.fs.state_manager.get_file_metadata(recompute).sync_status)
+
+    def test_eviction_during_cache_move_cannot_erase_unpublished_child(self):
+        self.fs.mkdir("/dir", 0o755)
+        for directory in (self.member_dir, self.b_dir):
+            (directory / "dir" / "child.txt").write_bytes(b"local child")
+        self._read("/dir/child.txt")
+        self._restart_fs()
+        entered = threading.Event()
+        evict_entered = threading.Event()
+        resume = threading.Event()
+        self.addCleanup(resume.set)
+        real_rename = self.fs.state_manager.rename_path
+        real_lru = self.fs.state_manager.get_lru_files
+
+        def paused_index_move(old, new):
+            entered.set()  # cache directory has moved, index has not
+            self.assertTrue(resume.wait(WAIT))
+            return real_rename(old, new)
+
+        def observed_lru(*args, **kwargs):
+            evict_entered.set()
+            return real_lru(*args, **kwargs)
+
+        with patch.object(self.fs.state_manager, "rename_path", side_effect=paused_index_move), \
+                patch.object(self.fs.state_manager, "get_lru_files", side_effect=observed_lru), \
+                patch.object(self.fs.namespace, "_propagate_dir_operation",
+                             side_effect=OSError(errno.EIO, "member move failed")):
+            mover = Worker(self.fs.rename, "/dir", "/moved")
+            mover.start()
+            self.assertTrue(entered.wait(WAIT))
+            try:
+                evict = Worker(self.fs.cache_manager.evict_lru_files, 1 << 20)
+                evict.start()
+                self.assertTrue(evict_entered.wait(WAIT))
+                self.assertEqual(b"local child", (self.cache_dir / "moved" / "child.txt").read_bytes())
+            finally:
+                resume.set()
+            mover.join(WAIT)
+            self.assertFalse(mover.is_alive())
+            self.assertIsInstance(mover.error, OSError)
+            self.assertFalse(evict.finish())
+        self.fs.cache_manager.evict_lru_files(1 << 20)
+        self.assertEqual(b"local child", (self.cache_dir / "moved" / "child.txt").read_bytes())
+
+    def test_nested_move_keeps_every_covering_record(self):
+        self.fs.mkdir("/dir", 0o755)
+        self.fs.mkdir("/dir/nest", 0o755)
+        for directory in (self.member_dir, self.b_dir):
+            (directory / "dir" / "nest" / "child.txt").write_bytes(b"nested child")
+        self._read("/dir/nest/child.txt")
+        self._restart_fs()
+        with patch.object(self.fs.namespace, "_propagate_dir_operation",
+                          side_effect=OSError(errno.EIO, "member move failed")):
+            with self.assertRaises(OSError):
+                self.fs.rename("/dir", "/moved")
+            with self.assertRaises(OSError):
+                self.fs.rename("/moved/nest", "/elsewhere")
+        self.assertEqual(2, len(self.fs._namespace_uncertainties))
+        self.assertTrue(all(record.covers("/moved/nest/child.txt") or
+                            record.covers("/elsewhere/child.txt")
+                            for record in self.fs._namespace_uncertainties))
+        with self.assertRaises(FuseOSError) as raised:
+            self._read("/elsewhere/child.txt", direct=True)
+        self.assertEqual(errno.EIO, raised.exception.errno)
+
+    def test_successful_ancestor_move_retains_absent_child_quarantine(self):
+        self.fs.mkdir("/parent", 0o755)
+        self.fs.mkdir("/parent/child", 0o755)
+        self.fs.mkdir("/parentish", 0o755)
+        for directory in (self.member_dir, self.b_dir):
+            (directory / "parent" / "child" / "known.txt").write_bytes(b"uncertified child")
+            (directory / "parent" / "child" / "owed.txt").write_bytes(b"old owed")
+            (directory / "parentish" / "sibling.txt").write_bytes(b"unrelated")
+        self.assertEqual(b"uncertified child", self._read("/parent/child/known.txt"))
+        self.assertEqual(b"old owed", self._read("/parent/child/owed.txt"))
+        local = "/parent/child/local.txt"
+        fd = self.fs.create(local, 0o644)
+        try:
+            self.fs.write(local, b"proved local", 0, fd)
+        finally:
+            self.fs.release(local, fd)
+        self._restart_fs()
+        (self.member_dir / "parent" / "child" / "owed.txt").write_bytes(b"changed owed")
+        self.fs._observe_changed_member("/parent/child/owed.txt", self.a,
+                                        self.a.stat("/parent/child/owed.txt"))
+        with self.fs._member_checks_lock:
+            self.assertNotIn("/parent/child/known.txt", self.fs._freshness)
+        with patch.object(self.fs.namespace, "_propagate_dir_operation",
+                          side_effect=OSError(errno.EIO, "child member move failed")):
+            with self.assertRaises(OSError):
+                self.fs.rename("/parent/child", "/parent/other")
+        first = self.fs._namespace_uncertainties[-1]
+        old_source_debts = first.source_debts
+        old_target_debts = first.target_debts
+        self.assertIn("changedA", old_source_debts["/parent/child/owed.txt"])
+        # Observe the receipt passed to the real second rename. A normal
+        # return alone can hide best-effort member failures and still cause
+        # quarantine; this schedule must cover a fully confirmed move.
+        with patch.object(self.fs.namespace, "rename",
+                          wraps=self.fs.namespace.rename) as ancestor_rename:
+            self.fs.rename("/parent", "/elsewhere")
+        ancestor_rename.assert_called_once()
+        self.assertEqual(("/parent", "/elsewhere"), ancestor_rename.call_args.args)
+        progress = ancestor_rename.call_args.kwargs["progress"]
+        self.assertEqual({"changedA", "staleB"}, progress.intended)
+        self.assertEqual(progress.intended, progress.confirmed)
+        self.assertEqual(set(), progress.failed)
+        self.assertEqual(set(), progress.unknown)
+        with self.fs._member_checks_lock:
+            self.assertNotIn("/elsewhere/other/known.txt", self.fs._freshness)
+        # The local cache and row moved twice, but neither completed member
+        # rename certified the first ambiguous child name.
+        self.assertEqual(b"uncertified child",
+                         (self.cache_dir / "elsewhere" / "other" / "known.txt").read_bytes())
+        with self.assertRaises(FuseOSError) as raised:
+            self._read("/elsewhere/other/known.txt", direct=True)
+        self.assertEqual(errno.EIO, raised.exception.errno)
+        self.assertIs(first, self.fs._namespace_uncertainties[0])
+        self.assertEqual(old_source_debts, first.source_debts)
+        self.assertEqual(old_target_debts, first.target_debts)
+        self.assertTrue(self.fs._namespace_covered("/elsewhere/other/known.txt"))
+        self.assertIn("changedA", self.fs._freshness_snapshot(
+            "/elsewhere/other/owed.txt")["debts"])
+        local_moved = "/elsewhere/other/local.txt"
+        self.assertEqual(b"proved local", self._read(local_moved, direct=True))
+        self.assertEqual(SyncStatus.DIRTY,
+                         self.fs.state_manager.get_file_metadata(local_moved).sync_status)
+        # The later member name was never in a leaf map, row or cache. It
+        # cannot acquire member authority from the successful parent move.
+        for directory in (self.member_dir, self.b_dir):
+            (directory / "elsewhere" / "other").mkdir(exist_ok=True)
+            (directory / "elsewhere" / "other" / "lazy.txt").write_bytes(b"lazy wrong bytes")
+        lazy = "/elsewhere/other/lazy.txt"
+        resolved = self.fs._resolve_path(lazy)
+        with self.assertRaises(FuseOSError) as raised:
+            self._read(lazy, direct=True)
+        self.assertEqual(errno.EIO, raised.exception.errno)
+        with self.assertRaises(FuseOSError) as raised:
+            self.fs._ensure_file_in_cache(resolved)
+        self.assertEqual(errno.EIO, raised.exception.errno)
+        self.assertFalse(resolved.cache_path.exists())
+        partial = self.cache_dir / "elsewhere" / "other" / "lazy.txt.storage-partial"
+        real_fd = os.open(partial, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+        os.write(real_fd, b"lazy wrong bytes")
+        session = PrefetchSession(
+            canonical_path=lazy, virtual_path=lazy, backend=self.a,
+            file_size=len(b"lazy wrong bytes"), final_cache_path=resolved.cache_path,
+            partial_cache_path=partial, chunk_size=4096, io_fd=real_fd,
+            available_ranges=[(0, len(b"lazy wrong bytes"))], refcount=0,
+            member_stat=self.a.stat(lazy),
+            freshness_token=self.fs._freshness_token(lazy, self.a.name),
+        )
+        self.addCleanup(self.fs._streaming_manager._close_streaming_session_resources, session)
+        self.fs._finalize_streaming_session(session)
+        self.assertFalse(resolved.cache_path.exists())
+        known = "/elsewhere/other/known.txt"
+        known_cache = self.cache_dir / "elsewhere" / "other" / "known.txt"
+        row = self.fs.state_manager.get_file_metadata(known)
+        self.assertEqual(SyncStatus.CLEAN, row.sync_status)
+        row.recomputable = True
+        self.fs.state_manager.set_file_metadata(row)
+        os.utime(known_cache, ns=(known_cache.stat().st_atime_ns,
+                                  known_cache.stat().st_mtime_ns + 1_000_000_000))
+        self.fs.sweep_stale_cache_metadata()
+        self.fs.cache_manager.evict_lru_files(1 << 20)
+        self.fs.cache_manager.evict_recomputable_files(1 << 20)
+        self.assertEqual(b"uncertified child", known_cache.read_bytes())
+        self.assertEqual(SyncStatus.CLEAN,
+                         self.fs.state_manager.get_file_metadata(known).sync_status)
+        with patch.object(self.a, "copy_from_local", wraps=self.a.copy_from_local) as upload_a, \
+                patch.object(self.b, "copy_from_local", wraps=self.b.copy_from_local) as upload_b:
+            self.fs.sync_manager.num_workers = 1
+            self.fs.sync_manager.max_workers = 1
+            self.fs.sync_manager.start()
+            self.addCleanup(self.fs.sync_manager.stop)
+            self.fs.sync_manager.queue_sync(local_moved, force=True)
+            self.assertTrue(self.fs.sync_manager.wait_for_completion(timeout=WAIT))
+            upload_a.assert_not_called()
+            upload_b.assert_not_called()
+        self.assertEqual(SyncStatus.DIRTY,
+                         self.fs.state_manager.get_file_metadata(local_moved).sync_status)
+        self.assertFalse(self.fs._namespace_covered("/parentish/sibling.txt"))
+        self.assertEqual(b"unrelated", self._read("/parentish/sibling.txt", direct=True))
+        before_unrelated = len(self.fs._namespace_uncertainties)
+        self.fs.rename("/parentish", "/unrelated")
+        self.assertEqual(before_unrelated, len(self.fs._namespace_uncertainties))
+        self.assertEqual(b"unrelated", self._read("/unrelated/sibling.txt", direct=True))
+        # Disabled-guard control: the same canonical bytes become visible
+        # when the prefix denial is deliberately bypassed.
+        with patch.object(self.fs, "_namespace_covered_locked", return_value=False):
+            self.assertEqual(b"uncertified child",
+                             self._read("/elsewhere/other/known.txt", direct=True))
+
+    def test_explicit_unlink_create_proves_only_new_local_dirty_inode(self):
+        self.fs.mkdir("/dir", 0o755)
+        for directory in (self.member_dir, self.b_dir):
+            (directory / "dir" / "child.txt").write_bytes(b"old child")
+        self._read("/dir/child.txt")
+        self._restart_fs()
+        with patch.object(self.fs.namespace, "_propagate_dir_operation",
+                          side_effect=OSError(errno.EIO, "member move failed")):
+            with self.assertRaises(OSError):
+                self.fs.rename("/dir", "/moved")
+        child = "/moved/child.txt"
+        self.fs.unlink(child)
+        fd = self.fs.create(child, 0o644)
+        try:
+            self.fs.write(child, b"new local", 0, fd)
+        finally:
+            self.fs.release(child, fd)
+        self.assertEqual(b"new local", self._read(child, direct=True))
+        row = self.fs.state_manager.get_file_metadata(child)
+        self.assertEqual(SyncStatus.DIRTY, row.sync_status)
+        self.assertTrue(self.fs._namespace_covered(child))
+        self.assertFalse(self.fs._should_sync_path(child))
+        (self.member_dir / "moved").mkdir(exist_ok=True)
+        (self.member_dir / "moved" / "lazy.txt").write_bytes(b"member only")
+        with self.assertRaises(FuseOSError) as raised:
+            self._read("/moved/lazy.txt", direct=True)
+        self.assertEqual(errno.EIO, raised.exception.errno)
+
+    def test_failed_subtree_rejects_absent_final_full_and_stream_publication(self):
+        self.fs.mkdir("/dir", 0o755)
+        self._restart_fs()
+        with patch.object(self.fs.namespace, "_propagate_dir_operation",
+                          side_effect=OSError(errno.EIO, "member move failed")):
+            with self.assertRaises(OSError):
+                self.fs.rename("/dir", "/moved")
+        path = "/moved/lazy.txt"
+        payload = b"uncertified remote bytes"
+        (self.member_dir / "moved").mkdir(exist_ok=True)
+        (self.member_dir / "moved" / "lazy.txt").write_bytes(payload)
+        resolved = self.fs._resolve_path(path)
+        self.assertFalse(resolved.cache_path.exists())
+        with self.assertRaises(FuseOSError) as raised:
+            self.fs._ensure_file_in_cache(resolved)
+        self.assertEqual(errno.EIO, raised.exception.errno)
+        self.assertFalse(resolved.cache_path.exists())
+        partial = self.cache_dir / "moved" / "lazy.txt.storage-partial"
+        real_fd = os.open(partial, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+        os.write(real_fd, payload)
+        session = PrefetchSession(
+            canonical_path=path, virtual_path=path, backend=self.a,
+            file_size=len(payload), final_cache_path=resolved.cache_path,
+            partial_cache_path=partial, chunk_size=4096, io_fd=real_fd,
+            available_ranges=[(0, len(payload))], refcount=0,
+            member_stat=self.a.stat(path),
+            freshness_token=self.fs._freshness_token(path, self.a.name),
+        )
+        self.addCleanup(self.fs._streaming_manager._close_streaming_session_resources, session)
+        self.fs._finalize_streaming_session(session)
+        self.assertFalse(resolved.cache_path.exists())
+        self.assertIsNone(self.fs.state_manager.get_file_metadata(path))
+        self.assertNotIn(path, self.fs._member_checks)
+
+    def test_writer_across_completed_local_move_retains_inode_proof(self):
+        self._prime_owed_a_with_b_cached()
+        self.a.set_available(False)
+        try:
+            fd = self.fs.open(self.PATH, os.O_RDWR)
+        finally:
+            self.a.set_available(True)
+        original = os.pwrite
+        entered = threading.Event()
+        resume = threading.Event()
+        self.addCleanup(resume.set)
+
+        def paused_write(real_fd, data, offset):
+            entered.set()
+            self.assertTrue(resume.wait(WAIT))
+            return original(real_fd, data, offset)
+
+        try:
+            with patch("storage.fs.os.pwrite", side_effect=paused_write):
+                writer = Worker(self.fs.write, self.PATH, b"local after move", 0, fd)
+                writer.start()
+                self.assertTrue(entered.wait(WAIT))
+                with patch.object(self.fs.namespace, "_propagate_dir_operation",
+                                  side_effect=OSError(errno.EIO, "member move failed")):
+                    with self.assertRaises(OSError):
+                        self.fs.rename(self.PATH, "/moved.txt")
+                resume.set()
+                self.assertEqual(len(b"local after move"), writer.finish())
+            self.assertEqual(SyncStatus.DIRTY,
+                             self.fs.state_manager.get_file_metadata("/moved.txt").sync_status)
+            self.assertEqual(b"local after move", self._read("/moved.txt", direct=True))
+            self.assertIn("changedA", self._snapshot("/moved.txt")["debts"])
+        finally:
+            resume.set()
+            self.fs.release("/moved.txt", fd)
+
+    def test_failed_dirty_mark_after_completed_move_keeps_bytes_unproven(self):
+        self._prime_owed_a_with_b_cached()
+        self.a.set_available(False)
+        try:
+            fd = self.fs.open(self.PATH, os.O_RDWR)
+        finally:
+            self.a.set_available(True)
+        entered = threading.Event()
+        resume = threading.Event()
+        self.addCleanup(resume.set)
+        original = os.pwrite
+
+        def paused_write(real_fd, data, offset):
+            entered.set()
+            self.assertTrue(resume.wait(WAIT))
+            return original(real_fd, data, offset)
+
+        try:
+            with patch("storage.fs.os.pwrite", side_effect=paused_write), \
+                    patch.object(self.fs, "_mark_cache_file_dirty",
+                                 side_effect=OSError(errno.EIO, "dirty mark failed")):
+                writer = Worker(self.fs.write, self.PATH, b"unmarked local", 0, fd)
+                writer.start()
+                self.assertTrue(entered.wait(WAIT))
+                with patch.object(self.fs.namespace, "_propagate_dir_operation",
+                                  side_effect=OSError(errno.EIO, "member move failed")):
+                    with self.assertRaises(OSError):
+                        self.fs.rename(self.PATH, "/moved.txt")
+                resume.set()
+                with self.assertRaises(FuseOSError):
+                    writer.finish()
+            with self.assertRaises(FuseOSError) as raised:
+                self._read("/moved.txt", direct=True)
+            self.assertEqual(errno.EIO, raised.exception.errno)
+            self.assertTrue((self.cache_dir / "moved.txt").read_bytes().startswith(b"unmarked local"))
+            self.assertIn("changedA", self._snapshot("/moved.txt")["debts"])
+            self.fs.write("/moved.txt", b"recovered bytes", 0, fd)
+            self.assertTrue(self._read("/moved.txt", direct=True).startswith(b"recovered bytes"))
+            self.assertEqual(SyncStatus.DIRTY,
+                             self.fs.state_manager.get_file_metadata("/moved.txt").sync_status)
+            self.assertIn("changedA", self._snapshot("/moved.txt")["debts"])
+        finally:
+            resume.set()
+            self.fs.release("/moved.txt", fd)
+
+    def test_replaced_target_descriptor_does_not_block_current_inode_sync(self):
+        target = "/target.txt"
+        fd = self.fs.create(target, 0o644)
+        self.fs.write(target, b"old target", 0, fd)
+        self.fs.release(target, fd)
+        old_fd = self.fs.open(target, os.O_RDWR)
+        source_fd = self.fs.create("/source.txt", 0o644)
+        self.fs.write("/source.txt", b"new source", 0, source_fd)
+        self.fs.release("/source.txt", source_fd)
+        self.fs.rename("/source.txt", target)
+        try:
+            with self.assertRaises(FuseOSError) as raised:
+                self.fs.write(target, b"wrong", 0, old_fd)
+            self.assertEqual(errno.ESTALE, raised.exception.errno)
+            self.assertTrue(self.fs._should_sync_path(target))
+            current_fd = self.fs.open(target, os.O_RDWR)
+            try:
+                self.assertFalse(self.fs._should_sync_path(target))
+            finally:
+                self.fs.release(target, current_fd)
+            with patch.object(self.a, "copy_from_local", wraps=self.a.copy_from_local) as upload_a, \
+                    patch.object(self.b, "copy_from_local", wraps=self.b.copy_from_local) as upload_b:
+                self.fs.sync_manager.num_workers = 1
+                self.fs.sync_manager.max_workers = 1
+                self.fs.sync_manager.start()
+                self.addCleanup(self.fs.sync_manager.stop)
+                self.fs.sync_manager.queue_sync(target, force=True)
+                self.assertTrue(self.fs.sync_manager.wait_for_completion(timeout=WAIT))
+                self.assertGreaterEqual(upload_a.call_count + upload_b.call_count, 1)
+            uploaded = [(directory / "target.txt").read_bytes()
+                        for directory in (self.member_dir, self.b_dir)
+                        if (directory / "target.txt").exists()]
+            self.assertIn(b"new source", uploaded)
+            self.assertEqual(SyncStatus.CLEAN,
+                             self.fs.state_manager.get_file_metadata(target).sync_status)
+        finally:
+            self.fs.release(target, old_fd)
+
+    def test_replacement_retires_target_and_source_stages_and_descriptor(self):
+        self._prime_owed_a_with_b_cached()
+        target = "/target.txt"
+        for directory in (self.member_dir, self.b_dir):
+            (directory / "target.txt").write_bytes(b"old target inode")
+        self.assertEqual(b"old target inode", self._read(target))
+        old_target_fd = self.fs.open(target, os.O_RDWR)
+        target_token = self.fs._freshness_token(target, "staleB")
+        source_token = self.fs._freshness_token(self.PATH, "staleB")
+        source_identity = self._snapshot()["path_identity"]
+        try:
+            self.fs.rename(self.PATH, target)
+            moved = self._snapshot(target)
+            self.assertEqual(source_identity, moved["path_identity"])
+            self.assertIn("changedA", moved["debts"])
+            self.assertIsNone(self._snapshot(self.PATH))
+            with self.assertRaises(FuseOSError) as stale:
+                self.fs.write(target, b"wrong", 0, old_target_fd)
+            self.assertEqual(errno.ESTALE, stale.exception.errno)
+            self.assertEqual(self.OLD, (self.cache_dir / "target.txt").read_bytes())
+
+            # Both late streams reach the real guarded install boundary.
+            for path, token, final in (
+                (target, target_token, self.cache_dir / "target.txt"),
+                (self.PATH, source_token, self.cache_dir / "f.txt"),
+            ):
+                partial = Path(str(final) + ".storage.partial")
+                partial.write_bytes(b"stale stage")
+                session = SimpleNamespace(canonical_path=path, final_cache_path=final,
+                                          partial_cache_path=partial, backend=self.b,
+                                          member_stat=self.b.stat(target),
+                                          freshness_token=token)
+                self.assertNotEqual("installed", self.fs._streaming_manager._install_partial(session))
+                self.assertEqual(moved["debts"], self._snapshot(target)["debts"])
+                self.fs._streaming_manager.on_finalized(session)
+                self.assertEqual(moved["debts"], self._snapshot(target)["debts"])
+        finally:
+            self.fs.release(target, old_target_fd)
+        self.assertEqual(self.NEW, self._read(target, direct=True))
+        self._assert_a_baseline(target)
+
+    def test_directory_move_preserves_descendant_debt_and_retires_old_token(self):
+        self._prime_owed_a_with_b_cached()
+        self.fs.mkdir("/dir", 0o755)
+        self.fs.rename(self.PATH, "/dir/f.txt")
+        before = self._snapshot("/dir/f.txt")
+        token = self.fs._freshness_token("/dir/f.txt", "staleB")
+        self.fs.rename("/dir", "/moved")
+        after = self._snapshot("/moved/f.txt")
+        self.assertIsNone(self._snapshot("/dir/f.txt"))
+        self.assertEqual(before["path_identity"], after["path_identity"])
+        self.assertEqual(before["debts"], after["debts"])
+        self.assertNotEqual(token, self.fs._freshness_token("/moved/f.txt", "staleB"))
+        self.assertEqual(self.NEW, self._read("/moved/f.txt", direct=True))
+        self._assert_a_baseline("/moved/f.txt")
+
+    def test_unlink_retires_only_removed_identity_and_late_callback(self):
+        self._prime_owed_a_with_b_cached()
+        other = "/keep.txt"
+        for directory in (self.member_dir, self.b_dir):
+            (directory / "keep.txt").write_bytes(self.OLD)
+        self.assertEqual(self.OLD, self._read(other))
+        (self.member_dir / "keep.txt").write_bytes(self.NEW)
+        with self.fs._path_locked(other):
+            self.fs._observe_changed_member(other, self.a, self.a.stat(other))
+        other_debt = self._snapshot(other)
+        token = self.fs._freshness_token(self.PATH, "staleB")
+        old_identity = self._snapshot()["path_identity"]
+        self.fs.unlink(self.PATH)
+        self.assertIsNone(self._snapshot())
+        fd = self.fs.create(self.PATH, 0o644)
+        try:
+            self.assertEqual(5, self.fs.write(self.PATH, b"local", 0, fd))
+        finally:
+            self.fs.release(self.PATH, fd)
+        self.assertNotEqual(old_identity, self.fs._freshness_token(self.PATH, "staleB")[0])
+        late = SimpleNamespace(canonical_path=self.PATH,
+                               final_cache_path=self.cache_dir / "f.txt",
+                               backend=self.b, member_stat=self.b.stat(self.PATH),
+                               freshness_token=token)
+        self.fs._streaming_manager.on_finalized(late)
+        self._assert_local_dirty(b"local")
+        self._assert_no_b_baseline()
+        self.assertEqual(other_debt, self._snapshot(other))
+
+    def test_failed_unlink_preserves_identity_debt_and_cache(self):
+        self._prime_owed_a_with_b_cached()
+        before = self._snapshot()
+        token = self.fs._freshness_token(self.PATH, "staleB")
+        with patch.object(self.fs.namespace, "unlink", side_effect=OSError(errno.EIO, "unlink failed")):
+            with self.assertRaises(OSError):
+                self.fs.unlink(self.PATH)
+        self.assertEqual(before, self._snapshot())
+        self.assertEqual(token, self.fs._freshness_token(self.PATH, "staleB"))
+        self.assertEqual(self.OLD, (self.cache_dir / "f.txt").read_bytes())
+        late = self._late_b_session(token)
+        self.fs._streaming_manager.on_finalized(late)
+        self.assertIn("changedA", self._snapshot()["debts"])
+        self.assertEqual(self.OLD, (self.cache_dir / "f.txt").read_bytes())
+
+    def test_write_crossing_local_move_keeps_inode_dirty_and_a_debt(self):
+        fd = self.fs.open(self.PATH, os.O_RDWR)
+        self._change_a()
+        with self.fs._path_locked(self.PATH):
+            self.fs._observe_changed_member(self.PATH, self.a, self.a.stat(self.PATH))
+            self.fs._invalidate_file_cache(self.PATH)  # writer keeps its inode
+        before = self._snapshot()
+        move = self.gate(self.fs.state_manager, "rename_path")
+        renamer = Worker(self.fs.rename, self.PATH, "/moved.txt")
+        renamer.start()
+        self.assertTrue(move.started.wait(WAIT))
+        writer = Worker(self.fs.write, self.PATH, b"local", 0, fd)
+        writer.start()
+        deadline = time.monotonic() + WAIT
+        while (self.cache_dir / "moved.txt").read_bytes()[:5] != b"local":
+            self.assertLess(time.monotonic(), deadline, "write did not land in moved inode")
+            time.sleep(0.01)
+        move.opened.set()
+        renamer.finish()
+        self.assertEqual(5, writer.finish())
+        self.fs.release("/moved.txt", fd)
+        self.assertIsNone(self._snapshot(self.PATH))
+        after = self._snapshot("/moved.txt")
+        self.assertEqual(before["path_identity"], after["path_identity"])
+        self.assertEqual(before["debts"], after["debts"])
+        self.assertEqual(SyncStatus.DIRTY,
+                         self.fs.state_manager.get_file_metadata("/moved.txt").sync_status)
+        self.assertEqual(b"local", (self.cache_dir / "moved.txt").read_bytes()[:5])
+        with self.fs._member_checks_lock:
+            self.assertFalse(self.fs._freshness["/moved.txt"].uncertain_local)
+
+    def test_late_stream_callback_cannot_replace_newer_a_baseline(self):
+        # A session started on stale B before A's changed generation existed.
+        # Its callback arrives after A bytes and baseline have committed.
+        old_token = self.fs._freshness_token(self.PATH, "staleB")
+        old_session = SimpleNamespace(
+            canonical_path=self.PATH,
+            final_cache_path=self.cache_dir / "f.txt",
+            backend=self.b,
+            member_stat=self.b.stat(self.PATH),
+            freshness_token=old_token,
+        )
+        self._change_a()
+        with patch.object(self.fs, "_select_unpinned_backend_for_read", return_value=self.b):
+            self.assertEqual(self.NEW, self._read(self.PATH))
+        self._assert_a_baseline()
+        late = Worker(self.fs._streaming_manager.on_finalized, old_session)
+        late.finish_started()
+        self.assertEqual(self.NEW, (self.cache_dir / "f.txt").read_bytes())
+        self._assert_a_baseline()
+        self.assertIsNone(self._snapshot())
+        self._assert_slots_released()
+
+    def test_late_stream_partial_cannot_install_stale_b_bytes(self):
+        # Model a B stream that began before A's newer observation. The
+        # actual no-replace install boundary must reject its old token even
+        # while the final cache path is temporarily absent.
+        old_token = self.fs._freshness_token(self.PATH, "staleB")
+        self._change_a()
+        gate = self.fs._foreground_admission
+        with gate.admit("ordinary"):
+            opener = Worker(self._read, self.PATH)
+            opener.start()
+            self.assertTrue(gate.waiting_for("ordinary", 1, WAIT))
+            current_token = self.fs._freshness_token(self.PATH, "staleB")
+            self.assertNotEqual(old_token[1], current_token[1])  # path revision
+            self.assertEqual(old_token[3], current_token[3])  # B generation
+            before = self._snapshot()
+            self.assertIn("changedA", before["debts"])
+            final = self.cache_dir / "f.txt"
+            self.assertFalse(final.exists())
+            partial = self.cache_dir / "f.txt.storage.partial"
+            partial.write_bytes(self.OLD)
+            old_session = SimpleNamespace(
+                canonical_path=self.PATH,
+                final_cache_path=final,
+                partial_cache_path=partial,
+                backend=self.b,
+                member_stat=self.b.stat(self.PATH),
+                freshness_token=old_token,
+            )
+            outcome = self.fs._streaming_manager._install_partial(old_session)
+            self.assertNotEqual("installed", outcome)
+            self.assertFalse(final.exists())
+            after = self._snapshot()
+            self.assertEqual(before["publication_revision"], after["publication_revision"])
+            self.assertIn("changedA", after["debts"])
+        self.assertEqual(self.NEW, opener.finish())
+        self.assertEqual(self.NEW, final.read_bytes())
+        self._assert_a_baseline()
+        self._assert_slots_released()
+
+    def _prepared_stream(self, backend):
+        """Start a real session, then supply its complete scratch-owned bytes."""
+        manager = self.fs._streaming_manager
+        with patch.object(manager, "select_backend_for_read", return_value=backend):
+            session = manager._create_or_attach_prefetch_session(self.PATH, self.PATH)
+        self.assertIsNotNone(session)
+        data = (self.member_dir if backend is self.a else self.b_dir) / "f.txt"
+        payload = data.read_bytes()
+        os.pwrite(session.io_fd, payload, 0)
+        with session.lock:
+            session.available_ranges = [(0, len(payload))]
+        return session
+
+    def test_current_a_stream_commits_baseline_and_its_debt(self):
+        self._change_a()
+        with self.fs._path_locked(self.PATH):
+            self.fs._observe_changed_member(self.PATH, self.a, self.a.stat(self.PATH))
+            self.fs._invalidate_file_cache(self.PATH)
+        session = self._prepared_stream(self.a)
+        self.fs._finalize_streaming_session(session)
+        self.assertEqual(self.NEW, (self.cache_dir / "f.txt").read_bytes())
+        self._assert_a_baseline()
+        self.assertIsNone(self._snapshot())
+
+    def test_old_b_stream_cannot_install_after_a_observation(self):
+        final = self.cache_dir / "f.txt"
+        final.unlink()
+        session = self._prepared_stream(self.b)
+        self._change_a()
+        with self.fs._path_locked(self.PATH):
+            self.fs._observe_changed_member(self.PATH, self.a, self.a.stat(self.PATH))
+        before = self._snapshot()
+        self.fs._finalize_streaming_session(session)
+        self.assertFalse(final.exists())
+        self.assertEqual(before["debts"], self._snapshot()["debts"])
+        self.assertEqual(before["publication_revision"], self._snapshot()["publication_revision"])
+
+    def test_old_b_stream_cannot_publish_over_occupied_final_path(self):
+        final = self.cache_dir / "f.txt"
+        final.unlink()
+        session = self._prepared_stream(self.b)
+        self._change_a()
+        with self.fs._path_locked(self.PATH):
+            self.fs._observe_changed_member(self.PATH, self.a, self.a.stat(self.PATH))
+        final.write_bytes(self.NEW)
+        before = self._snapshot()
+        self.fs._finalize_streaming_session(session)
+        self.assertEqual(self.NEW, final.read_bytes())
+        self.assertEqual(before["debts"], self._snapshot()["debts"])
+        self._assert_no_b_baseline()
+
+    def test_failed_and_cancelled_a_streams_keep_debt(self):
+        self._change_a()
+        with self.fs._path_locked(self.PATH):
+            self.fs._observe_changed_member(self.PATH, self.a, self.a.stat(self.PATH))
+            self.fs._invalidate_file_cache(self.PATH)
+        manager = self.fs._streaming_manager
+        failed = self._prepared_stream(self.a)
+        with failed.lock:
+            failed.error = OSError(5, "failed member read")
+            failed.available_ranges = []
+            failed.condition.notify_all()
+        manager._finalize_streaming_session(failed)
+        manager._release_prefetch_session(failed)
+        failed.worker.join(WAIT)
+        self.assertFalse(failed.worker.is_alive())
+        self.assertFalse((self.cache_dir / "f.txt").exists())
+        self.assertIn("changedA", self._snapshot()["debts"])
+        cancelled = self._prepared_stream(self.a)
+        manager._release_prefetch_session(cancelled)
+        cancelled.worker.join(WAIT)
+        self.assertFalse(cancelled.worker.is_alive())
+        self.assertFalse((self.cache_dir / "f.txt").exists())
+        self.assertIn("changedA", self._snapshot()["debts"])
+        self._assert_no_b_baseline()
+
+    def test_stale_b_prefix_rejected_before_install(self):
+        final = self.cache_dir / "f.txt"
+        final.unlink()
+        self.fs.state_manager.delete_file(self.PATH)
+        session = self._prepared_stream(self.b)
+        self._change_a()
+        with self.fs._path_locked(self.PATH):
+            self.fs._observe_changed_member(self.PATH, self.a, self.a.stat(self.PATH))
+        before = self._snapshot()
+        self.assertFalse(self.fs._promote_failed_session_cache_prefix(session))
+        self.assertFalse(final.exists())
+        self.assertEqual(before["debts"], self._snapshot()["debts"])
+        self.fs._streaming_manager._cleanup_prefetch_session(session, "failed")
+
+    def test_b_stream_commit_leaves_independent_a_debt(self):
+        self._change_a()
+        with self.fs._path_locked(self.PATH):
+            self.fs._observe_changed_member(self.PATH, self.a, self.a.stat(self.PATH))
+            self.fs._invalidate_file_cache(self.PATH)
+        (self.b_dir / "f.txt").write_bytes(b"independent B change")
+        os.utime(self.b_dir / "f.txt", (1_700_000_200, 1_700_000_200))
+        with self.fs._path_locked(self.PATH):
+            self.fs._observe_changed_member(self.PATH, self.b, self.b.stat(self.PATH))
+        session = self._prepared_stream(self.b)
+        self.fs._finalize_streaming_session(session)
+        self.assertEqual(b"independent B change", (self.cache_dir / "f.txt").read_bytes())
+        debt = self._snapshot()["debts"]
+        self.assertIn("changedA", debt)
+        self.assertNotIn("staleB", debt)
+        self.assertIn("staleB", self.fs._member_checks[self.PATH].members)
+
+    def test_b_stream_fallback_keeps_a_debt(self):
+        self._change_a()
+        with self.fs._path_locked(self.PATH):
+            self.fs._observe_changed_member(self.PATH, self.a, self.a.stat(self.PATH))
+            self.fs._invalidate_file_cache(self.PATH)
+        self.a.set_available(False)
+        session = self._prepared_stream(self.b)
+        self.fs._finalize_streaming_session(session)
+        self.assertEqual(self.OLD, (self.cache_dir / "f.txt").read_bytes())
+        self.assertIn("changedA", self._snapshot()["debts"])
+        check = self.fs._member_checks[self.PATH]
+        self.assertIn("staleB", check.members)
+        self.assertNotIn("changedA", check.members)
+
+    def test_write_byte_to_dirty_interval_rejects_late_stream_commit(self):
+        fd = self.fs.open(self.PATH, os.O_RDWR)
+        self._change_a()
+        self.assertEqual(self.OLD, self._read(self.PATH))
+        self.assertIn("changedA", self._snapshot()["debts"])
+        # Make B an eligible fallback before capturing its token. A remains
+        # owed while unavailable; only the later local mutation invalidates
+        # this B attempt, rather than A's already-published observation.
+        self.a.set_available(False)
+        self.assertIs(self.b, self.fs._select_backend_for_read(self.PATH))
+        token = self.fs._freshness_token(self.PATH, "staleB")
+        entered, resume = threading.Event(), threading.Event()
+        self.addCleanup(resume.set)
+        real_mark = self.fs._mark_cache_file_dirty
+
+        def mark_after_bytes(path, cache_path):
+            entered.set()
+            self.assertTrue(resume.wait(WAIT))
+            return real_mark(path, cache_path)
+
+        partial = self.cache_dir / "write-race.storage.partial"
+        partial.write_bytes(self.OLD)
+        try:
+            with patch.object(self.fs, "_mark_cache_file_dirty", side_effect=mark_after_bytes):
+                writer = Worker(self.fs.write, self.PATH, b"local", 0, fd)
+                writer.start()
+                self.assertTrue(entered.wait(WAIT))
+                self.assertEqual(b"local", (self.cache_dir / "f.txt").read_bytes()[:5])
+                late = self._late_b_session(token, partial)
+                # The final inode belongs to the writer. No-replace must win
+                # even before its DIRTY row is published.
+                self.assertNotEqual("installed", self.fs._streaming_manager._install_partial(late))
+                callback = self._start_late_callback(late)
+                # write() holds metadata_lock through mark_file_dirty. A
+                # correct callback may reject the token now, or wait for that
+                # lock; it must not publish while the writer is paused.
+                callback.join(BLOCKED)
+                self.assertTrue(writer.is_alive())
+                self.assertIn("changedA", self._snapshot()["debts"])
+                self._assert_no_b_baseline()
+                resume.set()
+                self.assertEqual(5, writer.finish())
+                callback.finish()
+            self._assert_local_dirty(b"local" + self.OLD[5:])
+            self.assertIn("changedA", self._snapshot()["debts"])
+            self._assert_no_b_baseline()
+        finally:
+            resume.set()
+            self.a.set_available(True)
+            self.fs.release(self.PATH, fd)
+        self._assert_slots_released()
+
+    def test_truncate_byte_to_dirty_interval_rejects_late_baseline(self):
+        writer_fd = self.fs.open(self.PATH, os.O_RDWR)
+        try:
+            self._change_a()
+            self.assertEqual(self.OLD, self._read(self.PATH))
+            self.assertIn("changedA", self._snapshot()["debts"])
+        finally:
+            self.fs.release(self.PATH, writer_fd)
+        token = self.fs._freshness_token(self.PATH, "staleB")
+        entered, resume = threading.Event(), threading.Event()
+        self.addCleanup(resume.set)
+        real_mark = self.fs._mark_cache_file_dirty
+
+        def mark_after_truncate(path, cache_path):
+            entered.set()
+            self.assertTrue(resume.wait(WAIT))
+            return real_mark(path, cache_path)
+
+        with patch.object(self.fs, "_mark_cache_file_dirty", side_effect=mark_after_truncate):
+            truncater = Worker(self.fs.truncate, self.PATH, 3)
+            truncater.start()
+            self.assertTrue(entered.wait(WAIT))
+            self.assertEqual(b"old", (self.cache_dir / "f.txt").read_bytes())
+            late = self._start_late_callback(self._late_b_session(token))
+            resume.set()
+            truncater.finish()
+            late.finish()
+        self._assert_local_dirty(b"old")
+        self.assertIn("changedA", self._snapshot()["debts"])
+        self._assert_no_b_baseline()
+        self._assert_slots_released()
+
+    def test_create_replacement_rejects_old_stream_and_keeps_dirty_bytes(self):
+        token = self.fs._freshness_token(self.PATH, "staleB")
+        entered, resume = threading.Event(), threading.Event()
+        self.addCleanup(resume.set)
+        real_set = self.fs.state_manager.set_file_metadata
+
+        def set_after_truncation(metadata):
+            entered.set()
+            self.assertTrue(resume.wait(WAIT))
+            return real_set(metadata)
+
+        with patch.object(self.fs.state_manager, "set_file_metadata", side_effect=set_after_truncation):
+            creator = Worker(self.fs.create, self.PATH, 0o600)
+            creator.start()
+            self.assertTrue(entered.wait(WAIT))
+            self.assertEqual(b"", (self.cache_dir / "f.txt").read_bytes())
+            late = self._start_late_callback(self._late_b_session(token))
+            resume.set()
+            fd = creator.finish()
+            late.finish()
+        try:
+            self.assertNotEqual(token[0], self.fs._freshness_token(self.PATH, "staleB")[0])
+            self.assertEqual(5, self.fs.write(self.PATH, b"local", 0, fd))
+            self._assert_local_dirty(b"local")
+            self._assert_no_b_baseline()
+        finally:
+            self.fs.release(self.PATH, fd)
+        self._assert_slots_released()
+
+    def test_full_fetch_rejects_changed_epoch_with_final_path_absent(self):
+        # A write through an old descriptor can race a private B copy even
+        # when its cache name has been invalidated. No-replace alone cannot
+        # reject B here: the final name is absent at the commit boundary.
+        writer_fd = self.fs.open(self.PATH, os.O_RDWR)
+        self._change_a()
+        with self.fs._path_locked(self.PATH):
+            self.fs._observe_changed_member(self.PATH, self.a, self.a.stat(self.PATH))
+            self.fs._invalidate_file_cache(self.PATH)
+        self.a.set_available(False)
+        final = self.cache_dir / "f.txt"
+        final.unlink(missing_ok=True)
+        copied, resume = threading.Event(), threading.Event()
+        self.addCleanup(resume.set)
+        real_copy = self.b.copy_to_local
+
+        def pause_after_copy(path, destination):
+            real_copy(path, destination)
+            copied.set()
+            self.assertTrue(resume.wait(WAIT))
+
+        opener = Worker(self.fs.open, self.PATH, os.O_RDONLY)
+        try:
+            with patch.object(self.b, "copy_to_local", side_effect=pause_after_copy):
+                opener.start()
+                self.assertTrue(copied.wait(WAIT))
+                self.assertFalse(final.exists())
+                with self.assertRaises(FuseOSError):
+                    self.fs.write(self.PATH, b"local", 0, writer_fd)
+                with self.fs._fd_lock:
+                    local_fd = self.fs._fd_map[writer_fd].real_fd
+                self.assertEqual(b"local", os.pread(local_fd, 5, 0))
+                resume.set()
+                opener.join(WAIT)
+                self.assertFalse(opener.is_alive())
+            if opener.error is None:
+                fetched_fd = opener.result
+                try:
+                    fetched = self.fs.read(self.PATH, 4096, 0, fetched_fd)
+                finally:
+                    self.fs.release(self.PATH, fetched_fd)
+            else:
+                fetched = final.read_bytes() if final.exists() else None
+            self.assertNotEqual(self.OLD, fetched)
+            self.assertFalse(final.exists())
+            self.assertIn("changedA", self._snapshot()["debts"])
+            self._assert_no_b_baseline()
+        finally:
+            resume.set()
+            self.a.set_available(True)
+            self.fs.release(self.PATH, writer_fd)
+
+    def test_full_fetch_loses_to_local_write_and_returns_its_inode(self):
+        writer_fd = self.fs.open(self.PATH, os.O_RDWR)
+        self._change_a()
+        with self.fs._path_locked(self.PATH):
+            self.fs._observe_changed_member(self.PATH, self.a, self.a.stat(self.PATH))
+            self.fs._invalidate_file_cache(self.PATH)
+        self.a.set_available(False)
+        final = self.cache_dir / "f.txt"
+        held_inode = self.cache_dir / "f-held-inode"
+        os.link(final, held_inode)
+        final.unlink()
+        self.assertFalse(final.exists())
+        copied, resume = threading.Event(), threading.Event()
+        self.addCleanup(resume.set)
+        real_copy = self.b.copy_to_local
+
+        def pause_after_copy(path, destination):
+            real_copy(path, destination)
+            copied.set()
+            self.assertTrue(resume.wait(WAIT))
+
+        try:
+            with patch.object(self.b, "copy_to_local", side_effect=pause_after_copy):
+                opener = Worker(self.fs.open, self.PATH, os.O_RDONLY)
+                opener.start()
+                self.assertTrue(copied.wait(WAIT))
+                # The exact local inode is linked back while the staged B
+                # copy remains private; write() publishes its DIRTY row.
+                os.link(held_inode, final)
+                self.assertEqual(5, self.fs.write(self.PATH, b"local", 0, writer_fd))
+                with self.fs._fd_lock:
+                    local_inode = os.fstat(self.fs._fd_map[writer_fd].real_fd).st_ino
+                resume.set()
+                returned_fd = opener.finish()
+            try:
+                with self.fs._fd_lock:
+                    returned_inode = os.fstat(self.fs._fd_map[returned_fd].real_fd).st_ino
+                self.assertEqual(local_inode, returned_inode)
+                self.assertEqual(b"local" + self.OLD[5:],
+                                 self.fs.read(self.PATH, 4096, 0, returned_fd))
+                self._assert_local_dirty(b"local" + self.OLD[5:])
+                self.assertIn("changedA", self._snapshot()["debts"])
+                self._assert_no_b_baseline()
+            finally:
+                self.fs.release(self.PATH, returned_fd)
+        finally:
+            resume.set()
+            self.a.set_available(True)
+            held_inode.unlink(missing_ok=True)
+            self.fs.release(self.PATH, writer_fd)
+
+    def test_o_trunc_announces_mutation_before_dirty_publication(self):
+        writer_fd = self.fs.open(self.PATH, os.O_RDWR)
+        self._change_a()
+        self.assertEqual(self.OLD, self._read(self.PATH))
+        self.assertIn("changedA", self._snapshot()["debts"])
+        self.a.set_available(False)
+        token = self.fs._freshness_token(self.PATH, "staleB")
+        entered, resume = threading.Event(), threading.Event()
+        self.addCleanup(resume.set)
+        real_mark = self.fs._mark_cache_file_dirty
+
+        def hold_after_truncation(path, cache_path):
+            entered.set()
+            self.assertTrue(resume.wait(WAIT))
+            return real_mark(path, cache_path)
+
+        try:
+            with patch.object(self.fs, "_mark_cache_file_dirty", side_effect=hold_after_truncation):
+                opener = Worker(self.fs.open, self.PATH, os.O_RDWR | os.O_TRUNC)
+                opener.start()
+                self.assertTrue(entered.wait(WAIT))
+                self.assertEqual(b"", (self.cache_dir / "f.txt").read_bytes())
+                self.assertNotEqual(token, self.fs._freshness_token(self.PATH, "staleB"))
+                self.assertIn("changedA", self._snapshot()["debts"])
+                self._assert_no_b_baseline()
+                resume.set()
+                fd = opener.finish()
+            self._assert_local_dirty(b"")
+            self.fs.release(self.PATH, fd)
+        finally:
+            resume.set()
+            self.a.set_available(True)
+            self.fs.release(self.PATH, writer_fd)
+
+    def test_failed_dirty_publication_keeps_local_uncertainty(self):
+        fd = self.fs.open(self.PATH, os.O_RDWR)
+        self._change_a()
+        self.assertEqual(self.OLD, self._read(self.PATH))
+        self.a.set_available(False)
+        token = self.fs._freshness_token(self.PATH, "staleB")
+        try:
+            with patch.object(self.fs, "_mark_cache_file_dirty",
+                              side_effect=OSError(errno.EIO, "failed dirty row")):
+                with self.assertRaises(FuseOSError):
+                    self.fs.write(self.PATH, b"local", 0, fd)
+            self.assertEqual(b"local" + self.OLD[5:],
+                             (self.cache_dir / "f.txt").read_bytes())
+            self.assertNotEqual(token, self.fs._freshness_token(self.PATH, "staleB"))
+            with self.fs._member_checks_lock:
+                state = self.fs._freshness[self.PATH]
+                self.assertTrue(state.uncertain_local)
+                self.assertEqual(0, state.active_mutations)
+            self.assertIn("changedA", self._snapshot()["debts"])
+            self._assert_no_b_baseline()
+        finally:
+            self.a.set_available(True)
+            self.fs.release(self.PATH, fd)
+
+    def test_successful_dirty_publication_recovers_failed_mutation_for_refetch(self):
+        fd = self.fs.open(self.PATH, os.O_RDWR)
+        self._change_a()
+        self.assertEqual(self.OLD, self._read(self.PATH))
+        self.a.set_available(False)
+        cache_path = self.cache_dir / "f.txt"
+        try:
+            with patch.object(self.fs, "_mark_cache_file_dirty",
+                              side_effect=OSError(errno.EIO, "failed dirty row")):
+                with self.assertRaises(FuseOSError):
+                    self.fs.write(self.PATH, b"first", 0, fd)
+            self.assertEqual(b"first" + self.OLD[5:], cache_path.read_bytes())
+            self.assertEqual(5, self.fs.write(self.PATH, b"local", 0, fd))
+            self._assert_local_dirty(b"local" + self.OLD[5:])
+        finally:
+            self.fs.release(self.PATH, fd)
+
+        # Model a completed, generation-checked upload to the available B
+        # member without a live sync worker. The independently owed A debt
+        # cannot be cleared by B's copy or by this CLEAN row.
+        self.b.copy_from_local(cache_path, self.PATH)
+        row = self.fs.state_manager.get_file_metadata(self.PATH)
+        self.assertTrue(self.fs.state_manager.publish_sync_status(
+            self.PATH, row.dirty_generation, SyncStatus.CLEAN))
+        row = self.fs.state_manager.get_file_metadata(self.PATH)
+        self.fs.cache_manager.sync_cache_metadata(self.PATH, row, cache_path=cache_path)
+        self.fs.cache_manager._evict_if_still_clean(self.PATH, cache_path)
+        self.assertFalse(cache_path.exists())
+
+        try:
+            # The old code keeps uncertain_local forever, rejects this
+            # private B stage and cannot return the bytes it just synced.
+            self.assertEqual(b"local" + self.OLD[5:], self._read(self.PATH))
+            self.assertIn("changedA", self._snapshot()["debts"])
+            self.assertIn("staleB", self.fs._member_checks[self.PATH].members)
+            with self.fs._member_checks_lock:
+                self.assertFalse(self.fs._freshness[self.PATH].uncertain_local)
+        finally:
+            self.a.set_available(True)
+
+    def _overlapping_writes_then_refetch(self, first_to_finish):
+        fd = self.fs.open(self.PATH, os.O_RDWR)
+        self._change_a()
+        self.assertEqual(self.OLD, self._read(self.PATH))
+        self.a.set_available(False)
+        cache_path = self.cache_dir / "f.txt"
+        entered = [threading.Event(), threading.Event()]
+        resume = [threading.Event(), threading.Event()]
+        for gate in resume:
+            self.addCleanup(gate.set)
+        real_pwrite = os.pwrite
+        workers = []
+
+        def pause_before_bytes(real_fd, data, offset):
+            for index, worker in enumerate(workers):
+                if threading.current_thread() is worker:
+                    entered[index].set()
+                    self.assertTrue(resume[index].wait(WAIT))
+                    break
+            return real_pwrite(real_fd, data, offset)
+
+        workers.extend((Worker(self.fs.write, self.PATH, b"first", 0, fd),
+                        Worker(self.fs.write, self.PATH, b"later", 0, fd)))
+        try:
+            with patch("storage.fs.os.pwrite", side_effect=pause_before_bytes):
+                workers[0].start()
+                self.assertTrue(entered[0].wait(WAIT))
+                workers[1].start()
+                self.assertTrue(entered[1].wait(WAIT))
+                resume[first_to_finish].set()
+                self.assertEqual(5, workers[first_to_finish].finish())
+                resume[1 - first_to_finish].set()
+                self.assertEqual(5, workers[1 - first_to_finish].finish())
+            expected = (b"first" if first_to_finish == 1 else b"later") + self.OLD[5:]
+            self._assert_local_dirty(expected)
+            self.assertIn("changedA", self._snapshot()["debts"])
+            self._assert_no_b_baseline()
+        finally:
+            for gate in resume:
+                gate.set()
+            for worker in workers:
+                if worker.ident is not None:
+                    worker.join(WAIT)
+            self.fs.release(self.PATH, fd)
+
+        # This is the behavioral assertion: permanent uncertainty makes the
+        # correctly uploaded bytes unreachable after clean eviction.
+        self._sync_evict_and_refetch_local_bytes(expected)
+
+    def _sync_evict_and_refetch_local_bytes(self, expected):
+        cache_path = self.cache_dir / "f.txt"
+        self.b.copy_from_local(cache_path, self.PATH)
+        row = self.fs.state_manager.get_file_metadata(self.PATH)
+        self.assertTrue(self.fs.state_manager.publish_sync_status(
+            self.PATH, row.dirty_generation, SyncStatus.CLEAN))
+        row = self.fs.state_manager.get_file_metadata(self.PATH)
+        self.fs.cache_manager.sync_cache_metadata(self.PATH, row, cache_path=cache_path)
+        self.fs.cache_manager._evict_if_still_clean(self.PATH, cache_path)
+        self.assertFalse(cache_path.exists())
+        try:
+            self.assertEqual(expected, self._read(self.PATH))
+            self.assertIn("changedA", self._snapshot()["debts"])
+            self.assertIn("staleB", self.fs._member_checks[self.PATH].members)
+            with self.fs._member_checks_lock:
+                self.assertFalse(self.fs._freshness[self.PATH].uncertain_local)
+        finally:
+            self.a.set_available(True)
+
+    def test_overlapping_successful_writes_older_finishes_last_refetches(self):
+        self._overlapping_writes_then_refetch(first_to_finish=1)
+
+    def test_overlapping_successful_writes_newer_finishes_last_refetches(self):
+        self._overlapping_writes_then_refetch(first_to_finish=0)
+
+    def test_later_failed_dirty_mark_survives_old_successful_finalizer(self):
+        fd = self.fs.open(self.PATH, os.O_RDWR)
+        self._change_a()
+        self.assertEqual(self.OLD, self._read(self.PATH))
+        self.a.set_available(False)
+        marked, resume = threading.Event(), threading.Event()
+        self.addCleanup(resume.set)
+        real_mutation = self.fs._local_mutation
+        real_mark = self.fs._mark_cache_file_dirty
+        workers = []
+
+        @contextmanager
+        def pause_after_first_mark(path, cache_path, **kwargs):
+            with real_mutation(path, cache_path, **kwargs) as published:
+                yield published
+                if threading.current_thread() is workers[0]:
+                    marked.set()
+                    self.assertTrue(resume.wait(WAIT))
+
+        def fail_later_mark(path, cache_path):
+            if threading.current_thread() is workers[1]:
+                raise OSError(errno.EIO, "later DIRTY publication failed")
+            return real_mark(path, cache_path)
+
+        workers.extend((Worker(self.fs.write, self.PATH, b"first", 0, fd),
+                        Worker(self.fs.write, self.PATH, b"later", 0, fd)))
+        try:
+            with patch.object(self.fs, "_local_mutation", side_effect=pause_after_first_mark), \
+                    patch.object(self.fs, "_mark_cache_file_dirty", side_effect=fail_later_mark):
+                workers[0].start()
+                self.assertTrue(marked.wait(WAIT))
+                workers[1].start()
+                workers[1].join(WAIT)
+                self.assertFalse(workers[1].is_alive())
+                self.assertIsInstance(workers[1].error, FuseOSError)
+                self.assertEqual(errno.EIO, workers[1].error.errno)
+                resume.set()
+                self.assertEqual(5, workers[0].finish())
+            self._assert_local_dirty(b"later" + self.OLD[5:])
+            with self.fs._member_checks_lock:
+                state = self.fs._freshness[self.PATH]
+                self.assertTrue(state.uncertain_local)
+                self.assertEqual(0, state.active_mutations)
+            self.assertIn("changedA", self._snapshot()["debts"])
+            self._assert_no_b_baseline()
+        finally:
+            resume.set()
+            for worker in workers:
+                if worker.ident is not None:
+                    worker.join(WAIT)
+            self.fs.release(self.PATH, fd)
+
+        token = self.fs._freshness_token(self.PATH, "staleB")
+        self.assertFalse(self.fs._stream_freshness_valid(self._late_b_session(token)))
+        recovery_fd = self.fs.open(self.PATH, os.O_RDWR)
+        try:
+            self.assertEqual(5, self.fs.write(self.PATH, b"valid", 0, recovery_fd))
+            self._assert_local_dirty(b"valid" + self.OLD[5:])
+        finally:
+            self.fs.release(self.PATH, recovery_fd)
+        self._sync_evict_and_refetch_local_bytes(b"valid" + self.OLD[5:])
+
+    def test_o_trunc_dirty_failure_closes_only_attempt_descriptor(self):
+        keep_fd = self.fs.open(self.PATH, os.O_RDWR)
+        with self.fs._fd_lock:
+            keep_real_fd = self.fs._fd_map[keep_fd].real_fd
+        self._change_a()
+        self.assertEqual(self.OLD, self._read(self.PATH))
+        self.a.set_available(False)
+        fail, captured = self._fail_dirty_after_registration(
+            OSError(errno.EIO, "dirty publication failed"), keep_fd)
+        try:
+            with self._count_failed_attempt_closes(captured), \
+                    patch.object(self.fs, "_mark_cache_file_dirty", side_effect=fail):
+                with self.assertRaises(FuseOSError) as error:
+                    self.fs.open(self.PATH, os.O_RDWR | os.O_TRUNC)
+            self.assertEqual(errno.EIO, error.exception.errno)
+            self.assertEqual(b"", (self.cache_dir / "f.txt").read_bytes())
+            self._assert_failed_attempt_closed(captured, keep_fd, keep_real_fd)
+        finally:
+            self.a.set_available(True)
+            self.fs.release(self.PATH, keep_fd)
+
+    def test_create_dirty_failure_closes_only_attempt_descriptor(self):
+        keep_fd = self.fs.open(self.PATH, os.O_RDWR)
+        with self.fs._fd_lock:
+            keep_real_fd = self.fs._fd_map[keep_fd].real_fd
+        self._change_a()
+        self.assertEqual(self.OLD, self._read(self.PATH))
+        self.a.set_available(False)
+        fail, captured = self._fail_dirty_after_registration(
+            RuntimeError("dirty publication failed"), keep_fd)
+        try:
+            with self._count_failed_attempt_closes(captured), \
+                    patch.object(self.fs, "_mark_cache_file_dirty", side_effect=fail):
+                with self.assertRaisesRegex(RuntimeError, "dirty publication failed"):
+                    self.fs.create(self.PATH, 0o600)
+            self.assertEqual(b"", (self.cache_dir / "f.txt").read_bytes())
+            self._assert_failed_attempt_closed(captured, keep_fd, keep_real_fd)
+        finally:
+            self.a.set_available(True)
+            self.fs.release(self.PATH, keep_fd)
+
+    def test_restart_of_b_fallback_restores_a_debt_before_freshness_shortcut(self):
+        self._change_a()
+        real_stat = self.a.stat
+
+        def stat_then_drop(path):
+            result = real_stat(path)
+            self.a.set_available(False)
+            return result
+
+        try:
+            with patch.object(self.a, "stat", side_effect=stat_then_drop), \
+                    patch.object(self.fs, "_select_unpinned_backend_for_read", return_value=self.b):
+                self.assertEqual(self.OLD, self._read(self.PATH))
+            self.assertEqual(self.OLD, (self.cache_dir / "f.txt").read_bytes())
+            self._restart_fs()
+            self.assertEqual(self.OLD, self._read(self.PATH))
+            self.assertIn("changedA", self._snapshot()["debts"])
+        finally:
+            self.a.set_available(True)
+        with patch.object(self.fs, "_select_unpinned_backend_for_read", return_value=self.b):
+            self.assertEqual(self.NEW, self._read(self.PATH))
+        self._assert_a_baseline()
+        self.assertIsNone(self._snapshot())
+        self._assert_slots_released()
+
+    def test_valid_restarted_warm_open_keeps_demand_slot_under_cold_copy(self):
+        (self.member_dir / "cold.txt").write_bytes(b"slow cold bytes")
+        self._restart_fs()
+        gate = self.fs._foreground_admission
+        self.assertEqual("demand", self.fs._foreground_class("open", (self.PATH, os.O_RDONLY)))
+        copy = self.gate(self.a, "copy_to_local", only=lambda path, _dest: path == "/cold.txt")
+        cold = Worker(self._read, "/cold.txt")
+        cold.start()
+        self.assertTrue(copy.started.wait(WAIT))
+        real_a_stat = self.a.stat
+        stat_paths = []
+
+        def a_stat(path):
+            stat_paths.append(path)
+            return real_a_stat(path)
+
+        try:
+            with patch.object(self.a, "stat", side_effect=a_stat):
+                warm = Worker(self._read, self.PATH)
+                warm.start()
+                self.assertEqual(self.OLD, warm.finish())
+                # Local marker verification did not forge a fresh member
+                # timestamp: normal first-open revalidation still stat-ed A.
+                self.assertIn(self.PATH, stat_paths)
+                self.assertEqual(0, gate.waiting_count("ordinary"))
+                self.assertLessEqual(gate.peak_active, 3)
+            self.assertTrue(cold.is_alive())
+        finally:
+            copy.opened.set()
+            cold.finish()
+        self._assert_slots_released()
+
+    def test_changed_a_while_stopped_transfers_after_demand_revalidation(self):
+        (self.member_dir / "cold.txt").write_bytes(b"slow cold bytes")
+
+        def change_while_stopped():
+            (self.member_dir / "f.txt").write_bytes(self.NEW)
+            os.utime(self.member_dir / "f.txt", (1_700_000_100, 1_700_000_100))
+
+        self._restart_fs(after_stop=change_while_stopped)
+        gate = self.fs._foreground_admission
+        self.assertEqual("demand", self.fs._foreground_class("open", (self.PATH, os.O_RDONLY)))
+        copy = self.gate(self.a, "copy_to_local", only=lambda path, _dest: path == "/cold.txt")
+        cold = Worker(self._read, "/cold.txt")
+        cold.start()
+        self.assertTrue(copy.started.wait(WAIT))
+        warm = Worker(self._read, self.PATH)
+        warm.start()
+        try:
+            # The local marker did not certify A. Its changed stat makes the
+            # full fetch ordinary; that wait must not retain the path lock.
+            self.assertTrue(gate.waiting_for("ordinary", 1, WAIT))
+            with self.fs._path_locks._mutex:
+                self.assertNotIn(self.PATH, self.fs._path_locks._entries)
+        finally:
+            copy.opened.set()
+            cold.finish()
+        self.assertEqual(self.NEW, warm.finish())
+        self._assert_a_baseline()
+        self._assert_slots_released()
+
+    def test_restart_with_missing_cache_rejects_ambiguous_a_b_copies(self):
+        self._change_a()
+        gate = self.fs._foreground_admission
+        with gate.admit("ordinary"):
+            opener = Worker(self._read, self.PATH)
+            opener.start()
+            self.assertTrue(gate.waiting_for("ordinary", 1, WAIT))
+            self.assertFalse((self.cache_dir / "f.txt").exists())
+            gate.close()
+            opener.join(WAIT)
+            self.assertFalse(opener.is_alive())
+            self.assertIsInstance(opener.error, FuseOSError)
+        self._restart_fs()
+        with patch.object(self.fs, "_select_unpinned_backend_for_read", return_value=self.b):
+            with self.assertRaises(FuseOSError) as raised:
+                self._read(self.PATH)
+        self.assertEqual(errno.EIO, raised.exception.errno)
+        self.assertFalse((self.cache_dir / "f.txt").exists())
+        self.assertEqual("reprobe", self._snapshot()["state"])
+        self._assert_slots_released()
+
+    def test_c_completion_cannot_clear_independent_a_debt(self):
+        self._change_a()
+        real_stat = self.a.stat
+
+        def stat_then_drop(path):
+            result = real_stat(path)
+            self.a.set_available(False)
+            return result
+
+        try:
+            with patch.object(self.a, "stat", side_effect=stat_then_drop), \
+                    patch.object(self.fs, "_select_unpinned_backend_for_read", return_value=self.b):
+                self.assertEqual(self.OLD, self._read(self.PATH))
+            self.assertIn("changedA", self._snapshot()["debts"])
+            c_dir = self.temp_dir / "changedC"
+            c_dir.mkdir()
+            c_bytes = b"C has an independent change"
+            (c_dir / "f.txt").write_bytes(c_bytes)
+            os.utime(c_dir / "f.txt", (1_700_000_200, 1_700_000_200))
+            c = LocalBackend("changedC", str(c_dir))
+            c.speed_priority = -10
+            self.fs.backends[c.name] = c
+            self.fs.replication_manager.backends[c.name] = c
+            self.fs.state_manager.add_file_location(FileLocation(
+                virtual_path=self.PATH, backend_name=c.name, checksum="",
+                last_synced=time.time(), is_cached=False,
+            ))
+            self._age_checks()
+            self.assertEqual(c_bytes, self._read(self.PATH))
+            after_c = self._snapshot()
+            self.assertIn("changedA", after_c["debts"])
+            self.assertNotIn("changedC", after_c["debts"])
+            self.assertEqual((len(c_bytes), 1_700_000_200.0),
+                             self.fs._member_checks[self.PATH].members["changedC"])
+        finally:
+            self.a.set_available(True)
+        self.assertEqual(self.NEW, self._read(self.PATH))
+        self._assert_a_baseline()
+        self.assertIsNone(self._snapshot())
+        self._assert_slots_released()
+
+
 class TestOpenRaces(ThreadingTestBase):
     def test_two_opens_of_one_uncached_path_fetch_once(self):
         payload = os.urandom(256 * 1024)
@@ -207,7 +2591,7 @@ class TestOpenRaces(ThreadingTestBase):
         copy.opened.set()
         self.assertEqual(b"s" * 4096, slow.finish())
 
-    def test_pin_survives_a_concurrent_revalidate(self):
+    def test_shared_debt_survives_a_concurrent_revalidate(self):
         self.cache("f.txt", b"original")
         (self.member_dir / "f.txt").write_bytes(b"changed and longer")
         with self.fs._member_checks_lock:
@@ -215,15 +2599,16 @@ class TestOpenRaces(ThreadingTestBase):
                 self.fs._member_checks[path] = dataclasses.replace(
                     check, verified_at=check.verified_at - 3600,
                 )
-        # Pause the first opener after its check pinned the refetch and
-        # before its fetch consumed the pin.
+        # Pause the first opener after its check published shared debt and
+        # before its fetch consumes that obligation.
         invalidate = self.gate(self.fs, "_invalidate_file_cache")
-        pins_at_select = []
+        debts_at_select = []
         real_select = self.fs._select_backend_for_read
 
         def select(canonical_path):
             with self.fs._member_checks_lock:
-                pins_at_select.append(self.fs._refetch_pins.get(canonical_path))
+                state = self.fs._freshness.get(canonical_path)
+                debts_at_select.append(frozenset(state.debts) if state else frozenset())
             return real_select(canonical_path)
 
         copies = self.gate(self.member, "copy_to_local", only=lambda *a: False)
@@ -238,11 +2623,11 @@ class TestOpenRaces(ThreadingTestBase):
             invalidate.opened.set()
             self.assertEqual(b"changed and longer", first.finish())
             self.assertEqual(b"changed and longer", second.finish())
-        # The first opener's fetch found its pin (the second opener's
-        # revalidate did not pop it), and the second did not fetch again.
-        self.assertEqual([self.member], pins_at_select)
+        # The first selection sees the observed member's shared debt;
+        # the second opener does not lose it or fetch again.
+        self.assertEqual([frozenset({"member"})], debts_at_select)
         self.assertEqual(1, len(copies.calls))
-        self.assertEqual({}, self.fs._refetch_pins)
+        self.assertIsNone(self.fs._freshness_snapshot("/f.txt"))
 
     def test_open_of_a_cached_file_is_not_undercut_by_eviction(self):
         self.cache("f.txt", b"cached")
@@ -421,22 +2806,44 @@ class TestRenameRaces(ThreadingTestBase):
         self.assertEqual(b"slow", opener.finish())
 
     def test_opposite_renames_wait_on_the_sorted_first_path(self):
-        # x -> y and y -> x name the same two locks in opposite argument
-        # order; the second waits on /x.txt, the path that sorts first, so
-        # neither can hold one lock while waiting for the other. (Onto an
-        # existing file a rename fails in the index today, ditz
-        # rename-onto-existing-unique, so y starts absent.)
+        # Opposite arguments must serialize before either namespace/path
+        # lock. Onto an existing file the index currently fails (ditz
+        # rename-onto-existing-unique), so y starts absent.
         self.cache("x.txt", b"x")
         gate = self.gate(self.fs.state_manager, "rename_path")
         first = Worker(self.fs.rename, "/x.txt", "/y.txt")
         first.start()
         self.assertTrue(gate.started.wait(WAIT))
         second = Worker(self.fs.rename, "/y.txt", "/x.txt")
-        second.start()
-        self.wait_for_path_waiter("/x.txt")
-        gate.opened.set()
-        first.finish()
-        second.finish()
+        entered = threading.Event()
+        original = self.fs._retry_rename_serialized
+
+        @contextmanager
+        def observed_serializer():
+            entered.set()
+            with original():
+                yield
+
+        try:
+            with patch.object(self.fs, "_retry_rename_serialized", observed_serializer):
+                second.start()
+                self.assertTrue(entered.wait(WAIT))
+                second.join(BLOCKED)
+                self.assertTrue(second.is_alive())
+                with self.fs._path_locks._mutex:
+                    self.assertEqual(
+                        {"/x.txt": 1, "/y.txt": 1},
+                        {name: entry.refs for name, entry in self.fs._path_locks._entries.items()
+                         if name in ("/x.txt", "/y.txt")},
+                    )
+                with self.fs._namespace_lock._cond:
+                    self.assertEqual(1, self.fs._namespace_lock._readers)
+                    self.assertEqual(0, self.fs._namespace_lock._writers_waiting)
+                gate.opened.set()
+                first.finish()
+                second.finish()
+        finally:
+            gate.opened.set()
         self.assertEqual(b"x", self.open_read_release("/x.txt"))
         self.assertFalse((self.cache_dir / "y.txt").exists())
 
@@ -455,6 +2862,263 @@ class TestRenameRaces(ThreadingTestBase):
         self.assertEqual(b"inside", opener.finish())
         renamer.finish()
         self.assertEqual(b"inside", self.open_read_release("/e/f.txt"))
+
+
+class TestNarrowRetryFence(ThreadingTestBase):
+    """FS-wired retry executor against two scratch LocalBackend members."""
+
+    def setUp(self):
+        super().setUp()
+        self.fs.destroy("/")
+        self.a = self.member
+        self.b_dir = self.temp_dir / "other-member"
+        self.b_dir.mkdir()
+        self.b = LocalBackend("other", str(self.b_dir))
+        self.fs = StorageFS(
+            cache_root=self.cache_dir, state_db=self.temp_dir / "state.db",
+            backends={"member": self.a, "other": self.b},
+            cache_size=10 * 1024 * 1024, num_sync_workers=0,
+            start_sync=False,
+        )
+
+    def executor(self):
+        manager = self.fs.sync_manager
+        if not manager.workers:
+            manager.num_workers = manager.max_workers = 1
+            manager.start()
+        executor = manager.workers[0].executor
+        self.assertIs(executor.dir_retry_guard.__self__, self.fs)
+        return executor
+
+    def incomplete_dir_move(self, old, new, *, failed=None):
+        failed = failed or self.b
+        with patch.object(failed, "rename", side_effect=OSError(errno.EIO, "missed move")), \
+                patch.object(self.fs.sync_manager, "queue_dir_sync"):
+            self.fs.rename(old, new)
+        self.assertTrue(self.fs._namespace_covered(new))
+        return self.fs._namespace_uncertainties[-1]
+
+    def test_old_retry_blocked_by_newer_guard(self):
+        self.fs.mkdir("/a", 0o755)
+        (self.member_dir / "a" / "old.txt").write_bytes(b"original A")
+        (self.b_dir / "a" / "old.txt").write_bytes(b"original B")
+        self.assertEqual(b"original A", self.open_read_release("/a/old.txt"))
+        (self.member_dir / "a" / "old.txt").write_bytes(b"changed A")
+        self.fs._observe_changed_member("/a/old.txt", self.a,
+                                        self.a.stat("/a/old.txt"))
+        first = self.incomplete_dir_move("/a", "/b")
+        self.assertIn("member", first.source_debts["/a/old.txt"])
+        self.fs.rename("/b", "/c")
+        self.fs.mkdir("/b", 0o755)
+        self.assertTrue((self.cache_dir / "b").is_dir())  # old currency check passes
+        before = tuple(self.fs._namespace_uncertainties)
+        with self.fs._member_checks_lock:
+            baseline_before = dict(self.fs._member_checks)
+        executor = self.executor()
+        for hint in ("other", None):
+            # A legacy untagged task is also fenced. The old B /a contains
+            # bytes; the new B /b is empty and can be replaced by os.replace.
+            task = DirSyncTask("/a", DirOperation.RENAME, new_path="/b",
+                               backend_hint=hint)
+            with patch.object(self.b, "rename", wraps=self.b.rename) as remote:
+                failure = None
+                try:
+                    executor.process_dir_task(task)
+                except RuntimeError as exc:
+                    failure = exc
+                # The old executor reaches LocalBackend.rename and replaces
+                # the distinct /b before any diagnostic assertion can pass.
+                stale = self.b_dir / "b" / "old.txt"
+                self.assertIsNone(stale.read_bytes() if stale.exists() else None)
+                self.assertIsNotNone(failure)
+                self.assertIn("deferred by unresolved", str(failure))
+                remote.assert_not_called()
+        self.assertEqual(b"original B", (self.b_dir / "a" / "old.txt").read_bytes())
+        self.assertEqual([], list((self.b_dir / "b").iterdir()))
+        self.assertEqual(before, tuple(self.fs._namespace_uncertainties))
+        self.assertIs(first, before[0])
+        with self.fs._member_checks_lock:
+            self.assertEqual(baseline_before, self.fs._member_checks)
+        self.assertIn("member", first.source_debts["/a/old.txt"])
+        self.assertIn("member", self.fs._freshness_snapshot("/c/old.txt")["debts"])
+
+    def test_retry_prefix_intersections_both_directions(self):
+        self.fs.mkdir("/parent", 0o755)
+        self.fs.mkdir("/parent/child", 0o755)
+        self.incomplete_dir_move("/parent/child", "/parent/other")
+        for path in ("/elsewhere", "/destination", "/parentish", "/separate"):
+            self.fs.mkdir(path, 0o755)
+        (self.b_dir / "parent" / "other" / "deep").mkdir(parents=True, exist_ok=True)
+        tasks = (
+            DirSyncTask("/parent", DirOperation.RENAME, new_path="/elsewhere", backend_hint="other"),
+            DirSyncTask("/parent/other/deep", DirOperation.RENAME,
+                        new_path="/destination", backend_hint="other"),
+        )
+        for task in tasks:
+            self.assertTrue(self.executor()._dir_task_current(task))
+            with patch.object(self.b, "rename", wraps=self.b.rename) as remote:
+                with self.assertRaisesRegex(RuntimeError, "deferred by unresolved"):
+                    self.executor().process_dir_task(task)
+                remote.assert_not_called()
+        # Segment boundaries matter: /parentish is unrelated to /parent.
+        task = DirSyncTask("/parentish", DirOperation.RENAME,
+                           new_path="/separate", backend_hint="other")
+        with patch.object(self.b, "rename", wraps=self.b.rename) as remote:
+            self.assertTrue(self.executor().process_dir_task(task))
+            remote.assert_called_once_with("/parentish", "/separate")
+        self.assertTrue((self.b_dir / "separate").is_dir())
+
+    def test_retry_first_keeps_unrelated_reads_responsive(self):
+        self.fs.mkdir("/slow", 0o755)
+        self.fs.mkdir("/unrelated", 0o755)
+        (self.member_dir / "warm.txt").write_bytes(b"warm bytes")
+        self.assertEqual(b"warm bytes", self.open_read_release("/warm.txt"))
+        sync_queue = patch.object(self.fs.sync_manager, "queue_sync")
+        sync_queue.start()
+        self.addCleanup(sync_queue.stop)
+        fd = self.fs.create("/slow/child.txt", 0o644)
+        self.fs.write("/slow/child.txt", b"local child", 0, fd)
+        self.fs.release("/slow/child.txt", fd)
+        executor = self.executor()
+        gate = self.gate(self.b, "mkdir", only=lambda path: path == "/slow")
+        retry = Worker(executor.process_dir_task,
+                       DirSyncTask("/slow", DirOperation.MKDIR, backend_hint="other"))
+        file_move = Worker(self.fs.rename, "/slow/child.txt", "/slow/renamed.txt")
+        dir_move = Worker(self.fs.rename, "/unrelated", "/moved")
+        retry.start()
+        self.assertTrue(gate.started.wait(WAIT))
+        try:
+            file_move.start()
+            dir_move.start()
+            warm = Worker(self.open_read_release, "/warm.txt")
+            listing = Worker(lambda: set(self.fs.readdir("/", None)))
+            warm.start()
+            listing.start()
+            self.assertEqual(b"warm bytes", warm.finish())
+            self.assertIn("warm.txt", listing.finish())
+            self.assertTrue(file_move.is_alive())
+            self.assertTrue(dir_move.is_alive())
+        finally:
+            gate.opened.set()
+        self.assertTrue(retry.finish())
+        file_move.finish()
+        dir_move.finish()
+        self.assertEqual(b"local child", (self.cache_dir / "slow" / "renamed.txt").read_bytes())
+        self.assertEqual(SyncStatus.DIRTY,
+                         self.fs.state_manager.get_file_metadata("/slow/renamed.txt").sync_status)
+        self.assertEqual([], self.fs._namespace_uncertainties)
+
+    def test_rename_first_denies_queued_retry(self):
+        self.fs.mkdir("/folder", 0o755)
+        def missed(_old, _new):
+            raise OSError(errno.EIO, "member missed rename")
+
+        gate = Gate(missed, only=lambda old, new: old == "/folder")
+        self.gates.append(gate)
+        patcher = patch.object(self.b, "rename", side_effect=gate)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        dir_queue = patch.object(self.fs.sync_manager, "queue_dir_sync")
+        dir_queue.start()
+        self.addCleanup(dir_queue.stop)
+        mover = Worker(self.fs.rename, "/folder", "/moved")
+        mover.start()
+        self.assertTrue(gate.started.wait(WAIT))
+        retry = Worker(self.executor().process_dir_task,
+                       DirSyncTask("/folder", DirOperation.RENAME,
+                                   new_path="/moved", backend_hint="other"))
+        retry.start()
+        try:
+            self.assertTrue(retry.is_alive())
+        finally:
+            gate.opened.set()
+        mover.finish()
+        self.assertTrue(self.fs._namespace_covered("/moved"))
+        retry.join(WAIT)
+        self.assertFalse(retry.is_alive())
+        self.assertIsInstance(retry.error, RuntimeError)
+        self.assertIn("deferred by unresolved", str(retry.error))
+
+    def test_mkdir_rmdir_retry_covered_by_guard(self):
+        self.fs.mkdir("/a", 0o755)
+        self.incomplete_dir_move("/a", "/b")
+        self.fs.mkdir("/b/child", 0o755)
+        executor = self.executor()
+        for task, operation in (
+            (DirSyncTask("/b/child", DirOperation.MKDIR, backend_hint="other"), "mkdir"),
+            (DirSyncTask("/a/gone", DirOperation.RMDIR, backend_hint="other"), "rmdir"),
+        ):
+            self.assertTrue(executor._dir_task_current(task))
+            with patch.object(self.b, operation, wraps=getattr(self.b, operation)) as remote:
+                with self.assertRaisesRegex(RuntimeError, "deferred by unresolved"):
+                    executor.process_dir_task(task)
+                remote.assert_not_called()
+        self.assertTrue((self.b_dir / "a").is_dir())
+        self.assertTrue((self.b_dir / "b" / "child").is_dir())
+        local = "/b/child/local.txt"
+        fd = self.fs.create(local, 0o644)
+        self.fs.write(local, b"current local bytes", 0, fd)
+        self.fs.release(local, fd)
+        self.assertEqual(b"current local bytes", self.open_read_release(local))
+        self.assertEqual(SyncStatus.DIRTY,
+                         self.fs.state_manager.get_file_metadata(local).sync_status)
+        self.fs.mkdir("/outside", 0o755)
+        self.fs.mkdir("/gone", 0o755)
+        self.fs.rmdir("/gone")
+        for task, operation in (
+            (DirSyncTask("/outside", DirOperation.MKDIR, backend_hint="other"), "mkdir"),
+            (DirSyncTask("/gone", DirOperation.RMDIR, backend_hint="other"), "rmdir"),
+        ):
+            with patch.object(self.b, operation, wraps=getattr(self.b, operation)) as remote:
+                self.assertTrue(executor.process_dir_task(task))
+                remote.assert_called_once()
+
+    def test_file_rename_first_denies_queued_retry(self):
+        sync_queue = patch.object(self.fs.sync_manager, "queue_sync")
+        sync_queue.start()
+        self.addCleanup(sync_queue.stop)
+        fd = self.fs.create("/file.txt", 0o644)
+        self.fs.write("/file.txt", b"local file bytes", 0, fd)
+        self.fs.release("/file.txt", fd)
+        (self.member_dir / "file.txt").write_bytes(b"member file bytes")
+        self.fs.state_manager.add_file_location(FileLocation(
+            virtual_path="/file.txt", backend_name="member", checksum="",
+            last_synced=time.time(), is_cached=False,
+        ))
+        dir_queue = patch.object(self.fs.sync_manager, "queue_dir_sync")
+        dir_queue.start()
+        self.addCleanup(dir_queue.stop)
+
+        def missed(_old, _new):
+            raise OSError(errno.EIO, "member missed file move")
+
+        gate = Gate(missed, only=lambda old, new: old == "/file.txt")
+        self.gates.append(gate)
+        patcher = patch.object(self.a, "rename", side_effect=gate)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        mover = Worker(self.fs.rename, "/file.txt", "/new.txt")
+        mover.start()
+        self.assertTrue(gate.started.wait(WAIT))
+        retry = Worker(self.executor().process_dir_task,
+                       DirSyncTask("/file.txt", DirOperation.RENAME,
+                                   new_path="/new.txt", backend_hint="member"))
+        retry.start()
+        try:
+            self.assertTrue(retry.is_alive())
+        finally:
+            gate.opened.set()
+        mover.finish()
+        retry.join(WAIT)
+        self.assertFalse(retry.is_alive())
+        self.assertIsInstance(retry.error, RuntimeError)
+        self.assertIn("deferred by unresolved", str(retry.error))
+        self.assertEqual(1, len(gate.calls))
+        self.assertEqual(b"member file bytes", (self.member_dir / "file.txt").read_bytes())
+        self.assertEqual(b"local file bytes", (self.cache_dir / "new.txt").read_bytes())
+        self.assertEqual(SyncStatus.DIRTY,
+                         self.fs.state_manager.get_file_metadata("/new.txt").sync_status)
+        self.assertTrue(self.fs._namespace_covered("/new.txt"))
 
 
 class TestWatcherInvalidation(ThreadingTestBase):

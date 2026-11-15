@@ -31,6 +31,20 @@ def interactive_request():
         _INTERACTIVE_REQUEST.reset(token)
 
 
+@contextmanager
+def bulk_request():
+    """Classify a long transfer as bulk even inside a foreground request.
+
+    The prior interactive classification is restored on exit, including on
+    exceptions, so the caller's later metadata or range I/O keeps its reserve.
+    """
+    token = _INTERACTIVE_REQUEST.set(False)
+    try:
+        yield
+    finally:
+        _INTERACTIVE_REQUEST.reset(token)
+
+
 def is_interactive_request() -> bool:
     return _INTERACTIVE_REQUEST.get()
 

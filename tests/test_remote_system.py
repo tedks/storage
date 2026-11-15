@@ -287,6 +287,7 @@ def cluster(tmp_path_factory):
     _require_docker()
     work = tmp_path_factory.mktemp("remote-gate")
     run_id = f"storage-test-{os.getpid()}-{secrets.token_hex(3)}"
+    print(f"storage test owned run: {run_id}", flush=True)
     created_containers: List[str] = []
     created_network = None
     old_path = os.environ.get("PATH", "")
@@ -300,6 +301,7 @@ def cluster(tmp_path_factory):
         network = _create_network(run_id)
         if network != "bridge":
             created_network = network
+        print(f"storage test network: {network} (owned={created_network is not None})", flush=True)
 
         force_published = os.environ.get(FORCE_PUBLISHED_ENV) == "1"
 
@@ -313,9 +315,11 @@ def cluster(tmp_path_factory):
             # returns, so only a container this run made is ever removed.
             container_id = _docker(
                 "create", "--pull=never", "--name", container, "--network", network,
-                "--label", "storage-test=1", "-p", "127.0.0.1::22",
+                "--label", "storage-test=1", "--cpus=0.5", "--memory=512m",
+                "--memory-swap=512m", "--pids-limit=128", "-p", "127.0.0.1::22",
                 "-v", f"{keys}:/keys:ro", image, *sshd_args).stdout.strip()
             created_containers.append(container_id)
+            print(f"storage test container: {container} id={container_id}", flush=True)
             _docker("start", container)
             ip = _docker("inspect", "-f",
                          "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}",

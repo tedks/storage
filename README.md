@@ -103,6 +103,8 @@ Required:
 Options:
   -s, --cache-size SIZE    Cache size (e.g., 10G, 500M) [default: 10G]
   -d, --database PATH      State database path [default: cache/.storage.db]
+  -w, --workers N          Minimum background sync workers [default: 2]
+  --max-sync-workers N     Grow sync workers on queued tasks up to N
   -f, --foreground         Run in foreground
 ```
 
@@ -121,6 +123,8 @@ cache = "/home/user/.cache/storage/media"
 cache_size = "50G"
 key_file = "/home/user/.ssh/id_ed25519"
 foreground = true
+workers = 2
+# max_sync_workers = 8
 backends = [
   { spec = "ssh://user@storage-host.example:/srv/raid/media/", name = "RAID media" },
   { spec = "ssh://user@storage-host.example:/srv/chunk0/media/", name = "Chunk 0 media" },
@@ -143,6 +147,26 @@ Save that as `~/.config/storage/storage.toml` to auto-load by name:
 ```bash
 storage mount example-media
 ```
+
+`workers` controls background file and directory sync, not foreground FUSE
+requests or streaming prefetch. By default it stays a fixed pool of two, as
+before. Set `max_sync_workers` in a profile (or `--max-sync-workers` on the
+CLI) to add workers when distinct tasks wait behind busy workers. Excess
+workers exit after 30 seconds idle. The configured maximum must be at least
+`workers`; it can be at most 8 with any SSH member or 32 with local members
+only. The SSH limit leaves room under the usual ten-session OpenSSH limit for
+the remote watcher and another operation on the shared rsync connection.
+Foreground reads and streaming prefetch use a separate Paramiko connection
+with an SFTP channel reserved for interactive calls. Servers configured with
+a lower session limit may need a lower maximum. CPU
+load average is not used: sync spends most of its time waiting for member I/O,
+so CPU load is a poor guide to useful concurrency.
+
+Stopping a sync pool gives all its workers a shared five-second grace period
+to finish current tasks and leaves queued tasks for a later start. If a
+worker is still finishing after that period, the pool refuses a restart until
+it exits. This applies to fixed and adaptive pools alike; it prevents two
+generations from syncing the same path concurrently.
 
 Or mount from an explicit TOML path (`storage.example.toml` in this repo
 is a fuller version of the same profile):
@@ -569,6 +593,7 @@ Implemented:
 - Remote inotify watchers that invalidate the cache when a member changes
 - TOML mount profiles with optional display names for members; numbered member IDs remain stable when labels change
 - A multithreaded FUSE loop (`fuse_threads`, off by default until field-tested), so a slow member call for one file does not hold up listings, stats and reads of others
+- Opt-in bounded active FUSE callback admission (`max_foreground_operations`, default 32 when `fuse_threads` is enabled), with protected metadata, demand-I/O and ordinary slots. Directory handles use metadata capacity; warm cached opens and range reads use demand capacity; cold full-file opens use ordinary capacity and bulk SSH channels. A cached open still holds demand capacity during a member freshness stat, so at cap 3 a slow stat can delay another demand read until its I/O timeout. The cap limits active Python callbacks, not libfuse 2's native thread count; waiting callbacks may still cause native thread growth. Normal unmount can drain queued callbacks before libfuse calls `destroy`, so its duration still depends on member I/O timeouts.
 - Cache metadata xattrs, with `storage debug rebuild-index`, `reprobe-locations` and `verify-index`
 - File recomputation
 - Symbolic links: made through the mount, replicated to the members holding their target; links already on members show as links

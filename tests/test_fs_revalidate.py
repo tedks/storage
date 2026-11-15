@@ -8,9 +8,11 @@ checks instead of sleeping.
 """
 
 import dataclasses
+import json
 import logging
 import os
 import shutil
+import threading
 import tempfile
 import time
 import unittest
@@ -19,6 +21,7 @@ from unittest.mock import patch
 
 from storage.backends.local import LocalBackend
 from storage.fs import StorageFS
+from storage.cache_metadata import STAGE1_MANIFEST, stage1_claim_path
 from storage.models import SyncStatus
 
 
@@ -33,6 +36,90 @@ class NoMtimeBackend(LocalBackend):
         real_path = self._resolve_path(virtual_path)
         real_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(local_path, real_path)
+
+
+class TestStage1ConstructorGate(unittest.TestCase):
+    """The incomplete scratch mode cannot fall through to legacy startup."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name) / "cache"
+        self.db = Path(self.temp.name) / "state.db"
+
+    def _construct(self, **kwargs):
+        return StorageFS(self.root, self.db, {}, 1024, start_sync=False, **kwargs)
+
+    def test_default_marked_root_refuses_before_sqlite_or_cache_effects(self):
+        # Fixture markers are deliberately created without the new helper so
+        # this same test is behavioral RED against the pre-gate application.
+        self.root.mkdir()
+        (self.root / STAGE1_MANIFEST).write_text(json.dumps({"version": 1}))
+        before = sorted(p.name for p in self.root.iterdir())
+        constructed = None
+        try:
+            with self.assertRaisesRegex(ValueError, "Stage1 scratch root"):
+                constructed = self._construct()
+        finally:
+            if constructed is not None:
+                constructed.destroy("/")
+        self.assertFalse(self.db.exists())
+        self.assertEqual(before, sorted(p.name for p in self.root.iterdir()))
+
+    def test_initialized_root_requires_explicit_reopen_and_does_not_start_yet(self):
+        root_uuid = StorageFS.initialize_stage1_scratch_root(self.root, self.db)
+        self.assertTrue(stage1_claim_path(self.root).is_file())
+        with self.assertRaisesRegex(ValueError, "requires restricted reopen"):
+            self._construct()
+        with self.assertRaisesRegex(NotImplementedError, "boundary is incomplete"):
+            self._construct(stage1_scratch_uuid=root_uuid)
+        self.assertFalse(self.db.exists())
+
+    def test_missing_corrupt_and_unknown_authority_refuse_before_state_open(self):
+        root_uuid = StorageFS.initialize_stage1_scratch_root(self.root, self.db)
+        manifest = self.root / STAGE1_MANIFEST
+        original = manifest.read_bytes()
+        for payload in (b"not-json", b'{"version":99}', None):
+            with self.subTest(payload=payload):
+                if payload is None:
+                    manifest.unlink(missing_ok=True)
+                else:
+                    manifest.write_bytes(payload)
+                with self.assertRaises((OSError, ValueError)):
+                    self._construct(stage1_scratch_uuid=root_uuid)
+                self.assertFalse(self.db.exists())
+        manifest.write_bytes(original)
+        with self.assertRaises(ValueError):
+            self._construct(stage1_scratch_uuid="wrong-uuid")
+        wrong_inode = json.loads(original)
+        wrong_inode["root_ino"] = -1
+        manifest.write_text(json.dumps(wrong_inode))
+        with self.assertRaises(ValueError):
+            self._construct(stage1_scratch_uuid=root_uuid)
+        self.assertFalse(self.db.exists())
+
+    def test_interrupted_claim_denies_legacy_root_creation(self):
+        stage1_claim_path(self.root).write_text("incomplete")
+        with self.assertRaisesRegex(ValueError, "Stage1 scratch root"):
+            self._construct()
+        self.assertFalse(self.root.exists())
+        self.assertFalse(self.db.exists())
+
+    def test_unmarked_legacy_root_keeps_existing_constructor_behavior(self):
+        self.root.mkdir()
+        fs = self._construct()
+        try:
+            self.assertTrue(self.db.exists())
+        finally:
+            fs.destroy("/")
+
+    def test_initializer_does_not_adopt_existing_cache_or_index(self):
+        self.root.mkdir()
+        (self.root / "local.txt").write_bytes(b"existing")
+        with self.assertRaises(ValueError):
+            StorageFS.initialize_stage1_scratch_root(self.root, self.db)
+        self.assertFalse(stage1_claim_path(self.root).exists())
+        self.assertEqual(b"existing", (self.root / "local.txt").read_bytes())
 
 
 class RevalidateTestBase(unittest.TestCase):
@@ -390,8 +477,10 @@ class TestRevalidateOnOpen(RevalidateTestBase):
         self.assertEqual(b"ORIGINAL", self.read_through("/f.txt"))
 
     def test_rename_failing_after_the_cache_moved_drops_baselines(self):
-        def move_cache_then_fail(old, new, on_local_moved=None):
+        def move_cache_then_fail(old, new, on_local_moved=None, progress=None):
             os.rename(self.cache_dir / "f.txt", self.cache_dir / "g.txt")
+            if progress is not None:
+                progress.cache_moved = True
             raise OSError(5, "I/O error")
 
         with patch.object(self.fs.namespace, "rename", side_effect=move_cache_then_fail):
@@ -401,6 +490,9 @@ class TestRevalidateOnOpen(RevalidateTestBase):
             os.getxattr(self.cache_dir / "g.txt", StorageFS.MEMBER_STAT_XATTR)
         self.assertNotIn("/f.txt", self.fs._member_checks)
         self.assertNotIn("/g.txt", self.fs._member_checks)
+        self.assertEqual(b"original", (self.cache_dir / "g.txt").read_bytes())
+        with self.assertRaises(OSError):
+            self.read_through("/g.txt")
 
     def test_failed_rename_from_a_never_cached_source_keeps_the_targets_baselines(self):
         before = os.getxattr(self.cache_dir / "f.txt", StorageFS.MEMBER_STAT_XATTR)
@@ -623,36 +715,32 @@ class TestRevalidateTwoMembers(RevalidateTestBase):
     def test_recheck_mark_survives_a_failed_pinned_transfer(self):
         self.test_checks_the_member_a_refetch_reads()
         fast, fast_dir = self.fast, self.fast_dir
-        with self.fs._member_checks_lock:
-            self.fs._recheck["/f.txt"] = {"fast"}
+        (fast_dir / "f.txt").write_bytes(b"CHANGED ON FAST")
         self.age_checks()
         with patch.object(fast, "copy_to_local", side_effect=OSError(5, "I/O error")):
             with self.assertRaises(Exception):
                 self.read_through("/f.txt")
-        # Selected but never delivered: the forced refetch is still owed.
-        self.assertEqual({"fast"}, self.fs._recheck["/f.txt"])
-        (fast_dir / "f.txt").write_bytes(b"CHANGED ON FAST")
+        # Observation survives a selected transfer that delivered no bytes.
+        self.assertIn("fast", self.fs._freshness_snapshot("/f.txt")["debts"])
         self.assertEqual(b"CHANGED ON FAST", self.read_through("/f.txt"))
-        self.assertNotIn("/f.txt", self.fs._recheck)
+        self.assertIsNone(self.fs._freshness_snapshot("/f.txt"))
 
     def test_recheck_mark_survives_a_refused_invalidation(self):
         self.test_checks_the_member_a_refetch_reads()
         fast, fast_dir = self.fast, self.fast_dir
-        with self.fs._member_checks_lock:
-            self.fs._recheck["/f.txt"] = {"fast"}
         writer = self.fs.open("/f.txt", os.O_RDWR)
         try:
+            (fast_dir / "f.txt").write_bytes(b"CHANGED ON FAST")
             self.age_checks()
             # The forced refetch is refused (a writer is open): the copy and
             # the mark both stay.
             self.assertEqual(b"changed on fast", self.read_through("/f.txt"))
-            self.assertEqual({"fast"}, self.fs._recheck["/f.txt"])
+            self.assertIn("fast", self.fs._freshness_snapshot("/f.txt")["debts"])
         finally:
             self.fs.release("/f.txt", writer)
-        (fast_dir / "f.txt").write_bytes(b"CHANGED ON FAST")
         self.age_checks()
         self.assertEqual(b"CHANGED ON FAST", self.read_through("/f.txt"))
-        self.assertNotIn("/f.txt", self.fs._recheck)
+        self.assertIsNone(self.fs._freshness_snapshot("/f.txt"))
 
 
 
@@ -772,23 +860,41 @@ class TestRevalidateStreamBail(RevalidateTestBase):
 
     def test_selection_is_idempotent_within_one_open(self):
         self._cached_on_both()
-        with self.fs._member_checks_lock:
-            self.fs._refetch_pins["/f.txt"] = self.member
-        # The stream's selection and the fallback's both see the pin, even
-        # though the unpinned order would prefer "fast".
-        self.assertIs(self.member, self.fs._select_backend_for_read("/f.txt"))
-        self.assertIs(self.member, self.fs._select_backend_for_read("/f.txt"))
-        self.fs.release("/f.txt", self.fs.open("/f.txt", os.O_RDONLY))
-        self.assertNotIn("/f.txt", self.fs._refetch_pins)
+        writer = self.fs.open("/f.txt", os.O_RDWR)
+        try:
+            (self.fast_dir / "f.txt").write_bytes(b"changed on fast")
+            self.age_checks()
+            self.assertEqual(b"original", self.read_through("/f.txt"))
+            self.assertIn("fast", self.fs._freshness_snapshot("/f.txt")["debts"])
+            self.assertIs(self.fast, self.fs._select_backend_for_read("/f.txt"))
+            self.assertIs(self.fast, self.fs._select_backend_for_read("/f.txt"))
+        finally:
+            self.fs.release("/f.txt", writer)
 
     def test_a_pin_no_fetch_used_does_not_outlive_the_open(self):
         self._cached_on_both()
-        # Fresh check, cached file: this open revalidates nothing and fetches
-        # nothing, so only open()'s own cleanup can drop a pin left behind.
-        with self.fs._member_checks_lock:
-            self.fs._refetch_pins["/f.txt"] = self.fast
-        self.fs.release("/f.txt", self.fs.open("/f.txt", os.O_RDONLY))
-        self.assertNotIn("/f.txt", self.fs._refetch_pins)
+        # A cached open that transfers nothing does not erase a later
+        # observation; the obligation lasts until matching bytes commit.
+        writer = self.fs.open("/f.txt", os.O_RDWR)
+        try:
+            (self.fast_dir / "f.txt").write_bytes(b"changed on fast")
+            self.age_checks()
+            self.assertEqual(b"original", self.read_through("/f.txt"))
+            self.assertIn("fast", self.fs._freshness_snapshot("/f.txt")["debts"])
+        finally:
+            self.fs.release("/f.txt", writer)
+        finalized = threading.Event()
+        manager = self.fs._streaming_manager
+        real_finalized = manager.on_finalized
+
+        def record_finalized(session):
+            real_finalized(session)
+            finalized.set()
+
+        with patch.object(manager, "on_finalized", side_effect=record_finalized):
+            self.assertEqual(b"changed on fast", self.read_through("/f.txt"))
+            self.assertTrue(finalized.wait(timeout=10.0))
+        self.assertIsNone(self.fs._freshness_snapshot("/f.txt"))
 
     def test_stream_bailing_to_the_fallback_still_fetches_from_the_pinned_member(self):
         self._cached_on_both()
@@ -817,16 +923,15 @@ class TestRevalidateStreamBail(RevalidateTestBase):
                 patch.object(self.member, "supports_range_reads", return_value=False):
             # The slower member supplies its older bytes through the fallback.
             self.assertEqual(b"original", self.read_through("/f.txt"))
-        self.assertEqual({"fast"}, self.fs._recheck["/f.txt"])
-        self.assertNotIn("/f.txt", self.fs._refetch_pins)
+        self.assertIn("fast", self.fs._freshness_snapshot("/f.txt")["debts"])
         self.fast.set_available(True)
         self.age_checks()
         self.assertEqual(b"changed on fast", self.read_through("/f.txt"))
         # Streamed this time: the mark clears when the stream finishes.
         deadline = time.monotonic() + 10
-        while "/f.txt" in self.fs._recheck and time.monotonic() < deadline:
+        while self.fs._freshness_snapshot("/f.txt") is not None and time.monotonic() < deadline:
             time.sleep(0.05)
-        self.assertNotIn("/f.txt", self.fs._recheck)
+        self.assertIsNone(self.fs._freshness_snapshot("/f.txt"))
 
 
 class TestRevalidateFromListing(RevalidateTestBase):

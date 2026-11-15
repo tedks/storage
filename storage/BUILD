@@ -17,6 +17,7 @@ py_library(
         "conflicts.py",
         "crypto.py",
         "fs.py",
+        "foreground_admission.py",
         "index_audit.py",
         "links.py",
         "locks.py",

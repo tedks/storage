@@ -37,6 +37,7 @@ class SyncExecutor:
         member_written_cb: Optional[Callable[[str, Backend, Path, Optional[str]], None]] = None,
         upload_guard: Optional[Callable[[str], ContextManager]] = None,
         path_guard: Optional[Callable[..., ContextManager]] = None,
+        dir_retry_guard: Optional[Callable[..., ContextManager]] = None,
     ):
         self.worker_id = worker_id
         self.state_manager = state_manager
@@ -56,10 +57,10 @@ class SyncExecutor:
         # member never gets the bytes under a name the namespace has just
         # given up (StorageFS: UploadLocks.hold_for_upload).
         self.upload_guard = upload_guard
-        # Held across a directory retry (StorageFS: the namespace lock shared
-        # and the paths' locks), so the check that the namespace still wants
-        # the operation and the member call are one step against handlers.
+        # Primitive directory guard for standalone users. StorageFS supplies
+        # dir_retry_guard as the stronger pre-I/O fence for its workers.
         self.path_guard = path_guard
+        self.dir_retry_guard = dir_retry_guard
         self._stats = {
             "synced": 0,
             "failed": 0,
@@ -461,9 +462,9 @@ class SyncExecutor:
         sync-namespace-orphans). The cache holds every directory made, and
         drops every directory removed or renamed, through the mount, so it
         says whether the operation still applies; the check and the member
-        call run under the path guard. The guard includes the namespace
-        lock, which a directory rename waits for, so a member known to be
-        down is not tried under it: the task fails and is retried later.
+        call run under the guard. StorageFS's guard also orders file renames
+        and refuses every unresolved old/new subtree before the currency
+        check; a down member is not tried while holding it.
         """
         # Only a hinted retry (one member, the one that missed it) can name a
         # member that is down: without a hint the members are chosen from
@@ -474,8 +475,14 @@ class SyncExecutor:
                 f"Dir op {task.operation.value} for {task.virtual_path} waits for {hinted.name}"
             )
         paths = [task.virtual_path] + ([task.new_path] if task.new_path else [])
-        guard = self.path_guard(*paths) if self.path_guard else contextlib.nullcontext()
-        with guard:
+        guard = (self.dir_retry_guard(*paths) if self.dir_retry_guard else
+                 self.path_guard(*paths) if self.path_guard else contextlib.nullcontext())
+        with guard as allowed:
+            if self.dir_retry_guard and not allowed:
+                raise RuntimeError(
+                    f"Dir op {task.operation.value} for {task.virtual_path} "
+                    "deferred by unresolved namespace move"
+                )
             if not self._dir_task_current(task):
                 logger.info(
                     "Dropping %s retry for %s: the namespace no longer has it",

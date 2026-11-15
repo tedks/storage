@@ -15,7 +15,7 @@ from pathlib import Path
 from contextlib import nullcontext
 from typing import Callable, ContextManager, Optional, List, Set
 
-from .backends.base import Backend
+from .backends.base import Backend, bulk_request
 from .cache_metadata import PARTIAL_SUFFIX, PREFIX_XATTR, regular_file_stat, write_cache_metadata
 from .models import FileMetadata, SyncStatus
 from .state import StateManager
@@ -101,6 +101,7 @@ class CacheManager:
         # path the evicting thread holds itself is not). None (no
         # StorageFS) means no contention.
         self.path_guard: Optional[Callable[[str], ContextManager[bool]]] = None
+        self.namespace_covered: Optional[Callable[[str], bool]] = None
         self.state_manager = state_manager
         self.max_size_bytes = max_size_bytes
         self._lock = threading.RLock()
@@ -217,7 +218,10 @@ class CacheManager:
                 # Evict this file
                 cache_path = self.get_cache_path(metadata.virtual_path)
                 with self._path_guard(metadata.virtual_path) as free:
-                    if not free or regular_file_stat(cache_path) is None:
+                    if (not free or self.namespace_covered and
+                            self.namespace_covered(metadata.virtual_path)):
+                        continue
+                    if regular_file_stat(cache_path) is None:
                         continue
                     try:
                         freed += self._evict_if_still_clean(metadata.virtual_path, cache_path)
@@ -246,6 +250,8 @@ class CacheManager:
 
                 cache_path = self.get_cache_path(metadata.virtual_path)
                 with self._path_guard(metadata.virtual_path) as free:
+                    if free and self.namespace_covered and self.namespace_covered(metadata.virtual_path):
+                        continue
                     st = regular_file_stat(cache_path) if free else None
                     if st is None:
                         # Gone, or not a regular file: never truncate
@@ -308,7 +314,9 @@ class CacheManager:
         # Could not free enough space
         return False
 
-    def cache_file(self, virtual_path: str, backend: Backend, source_virtual_path: str = None) -> bool:
+    def cache_file(self, virtual_path: str, backend: Backend, source_virtual_path: str = None,
+                   *, with_install_result: bool = False, install_guard=None,
+                   on_installed=None):
         """
         Download a file from backend into cache
 
@@ -330,26 +338,30 @@ class CacheManager:
         source_virtual_path = source_virtual_path or virtual_path
         # Member probes: no lock, and their errors propagate as before.
         if not backend.exists(source_virtual_path):
-            return False
+            return (False, False) if with_install_result else False
         file_size = backend.get_size(source_virtual_path)
 
         with self._lock:
             if not self.ensure_space(file_size):
                 print(f"Warning: Insufficient cache space for {virtual_path}")
-                return False
+                return (False, False) if with_install_result else False
             self._reserved_bytes += file_size
         try:
-            self.fetch_into_cache(backend, source_virtual_path, self.get_cache_path(virtual_path))
+            installed = self.fetch_into_cache(
+                backend, source_virtual_path, self.get_cache_path(virtual_path),
+                install_guard=install_guard, on_installed=on_installed)
             self.state_manager.update_access_time(virtual_path)
-            return True
+            cached = installed or regular_file_stat(self.get_cache_path(virtual_path)) is not None
+            return (cached, installed) if with_install_result else cached
         except Exception as e:
             print(f"Error caching {virtual_path} from {backend.name}: {e}")
-            return False
+            return (False, False) if with_install_result else False
         finally:
             with self._lock:
                 self._reserved_bytes -= file_size
 
-    def fetch_into_cache(self, backend: Backend, source_virtual_path: str, cache_path: Path) -> bool:
+    def fetch_into_cache(self, backend: Backend, source_virtual_path: str, cache_path: Path,
+                         *, install_guard=None, on_installed=None) -> bool:
         """Copy a member file to cache_path through a temp file beside it.
 
         The copy runs without the cache lock into a fresh name that ends in
@@ -372,19 +384,38 @@ class CacheManager:
         with self._lock:
             scans = self._scan_count
         try:
-            backend.copy_to_local(source_virtual_path, temp_path)
+            with bulk_request():
+                backend.copy_to_local(source_virtual_path, temp_path)
             # A whole file is never a streaming prefix, whatever xattrs the
             # member's copy came with.
             _remove_prefix_marker(temp_path)
             size = os.lstat(temp_path).st_size
             with self._lock:
-                try:
-                    os.link(temp_path, cache_path)
-                except FileExistsError:
-                    if not (cache_path.is_file() and not cache_path.is_symlink()):
-                        raise
-                    return False
-                self._current_size_bytes += size
+                guard = install_guard(temp_path) if install_guard else nullcontext(True)
+                with guard as current:
+                    if current is False:
+                        return False
+                    try:
+                        os.link(temp_path, cache_path)
+                    except FileExistsError:
+                        if not (cache_path.is_file() and not cache_path.is_symlink()):
+                            raise
+                        return False
+                    self._current_size_bytes += size
+                    if on_installed is not None:
+                        try:
+                            on_installed(temp_path, cache_path)
+                        except BaseException:
+                            # A failed publication cannot leave its unindexed
+                            # stage visible as a completed cache copy.
+                            try:
+                                staged, final = os.lstat(temp_path), os.lstat(cache_path)
+                                if (staged.st_dev, staged.st_ino) == (final.st_dev, final.st_ino):
+                                    cache_path.unlink()
+                            except OSError:
+                                pass
+                            self._size_dirty = True
+                            raise
             return True
         except BaseException:
             # Whatever the copy wrote may have been counted by a rescan,
@@ -495,18 +526,21 @@ class CacheManager:
         them bumps the generation, and mark_file_dirty's own bump keeps the
         row at the newer write. Returns True when the file was marked.
         """
-        row = self.state_manager.get_file_metadata(virtual_path)
-        if row is None or row.sync_status != SyncStatus.CLEAN:
-            return False
-        if stat_size is None or stat_mtime is None:
-            try:
-                st = os.lstat(str(cache_path))
-            except OSError:
+        with self._path_guard(virtual_path) as held:
+            if not held or self.namespace_covered and self.namespace_covered(virtual_path):
                 return False
-            stat_size, stat_mtime = st.st_size, st.st_mtime
-        if stat_size == row.size and stat_mtime == row.last_modified:
-            return False
-        return self.mark_file_dirty(virtual_path, cache_path) is not None
+            row = self.state_manager.get_file_metadata(virtual_path)
+            if row is None or row.sync_status != SyncStatus.CLEAN:
+                return False
+            if stat_size is None or stat_mtime is None:
+                try:
+                    st = os.lstat(str(cache_path))
+                except OSError:
+                    return False
+                stat_size, stat_mtime = st.st_size, st.st_mtime
+            if stat_size == row.size and stat_mtime == row.last_modified:
+                return False
+            return self.mark_file_dirty(virtual_path, cache_path) is not None
 
     def store_file_metadata(
         self,

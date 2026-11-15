@@ -4,6 +4,7 @@ import errno
 import json
 import os
 import stat
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator, List, Optional
@@ -20,7 +21,118 @@ _INTERNAL_CACHE_NAMES = frozenset({
     ".storage.db",
     ".storage.db-shm",
     ".storage.db-wal",
+    ".storage.stage1-manifest",
 })
+
+STAGE1_MANIFEST = ".storage.stage1-manifest"
+STAGE1_VERSION = 1
+
+
+def stage1_claim_path(cache_root: Path) -> Path:
+    """Deterministic claim beside an explicitly created scratch cache root."""
+    return cache_root.parent / f".{cache_root.name}.storage-stage1-claim"
+
+
+def stage1_authority_present(cache_root: Path) -> bool:
+    """Detect either marker, including a dangling symlink, without creating state."""
+    return (os.path.lexists(stage1_claim_path(cache_root))
+            or os.path.lexists(cache_root / STAGE1_MANIFEST))
+
+
+def _stage1_write_new(path: Path, payload: dict) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags, 0o600)
+    try:
+        data = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        while data:
+            written = os.write(fd, data)
+            if written <= 0:
+                raise OSError(errno.EIO, "short Stage1 authority write")
+            data = data[written:]
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _stage1_read(path: Path) -> dict:
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ValueError(f"Stage1 authority is not a regular file: {path}")
+        data = os.read(fd, 1024 * 1024 + 1)
+        if len(data) > 1024 * 1024:
+            raise ValueError("Stage1 authority is too large")
+        result = json.loads(data)
+        if not isinstance(result, dict):
+            raise ValueError("Stage1 authority is not an object")
+        return result
+    finally:
+        os.close(fd)
+
+
+def initialize_stage1_scratch_root(cache_root: Path, state_db: Path) -> str:
+    """Claim an absent scratch root; never adopt or clean up an existing one.
+
+    This provisions authority only. The restricted Stage1 read mode remains
+    unavailable until its callback and direct-cache refusal boundary exists.
+    An interrupted claim intentionally remains for diagnosis, not adoption.
+    """
+    cache_root, state_db = Path(cache_root).absolute(), Path(state_db).absolute()
+    parent = cache_root.parent
+    if (not stat.S_ISDIR(os.lstat(parent).st_mode)
+            or state_db.is_relative_to(cache_root)
+            or os.path.lexists(cache_root) or os.path.lexists(state_db)):
+        raise ValueError("Stage1 needs absent cache and index under an existing scratch parent")
+    root_uuid = str(uuid.uuid4())
+    _stage1_write_new(stage1_claim_path(cache_root), {
+        "version": STAGE1_VERSION, "uuid": root_uuid,
+        "cache_root": str(cache_root), "state_db": str(state_db),
+    })
+    parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
+    cache_root.mkdir()
+    parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
+    root_stat = os.lstat(cache_root)
+    _stage1_write_new(cache_root / STAGE1_MANIFEST, {
+        "version": STAGE1_VERSION, "uuid": root_uuid,
+        "root_dev": root_stat.st_dev, "root_ino": root_stat.st_ino,
+        "revision": 0, "debts": {},
+    })
+    root_fd = os.open(cache_root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(root_fd)
+    finally:
+        os.close(root_fd)
+    return root_uuid
+
+
+def verify_stage1_scratch_root(cache_root: Path, state_db: Path, expected_uuid: str) -> dict:
+    """Read-only pre-constructor authority check; absence is never empty debt."""
+    cache_root, state_db = Path(cache_root).absolute(), Path(state_db).absolute()
+    claim = _stage1_read(stage1_claim_path(cache_root))
+    root_stat = os.lstat(cache_root)
+    if not stat.S_ISDIR(root_stat.st_mode):
+        raise ValueError("Stage1 cache root is not a directory")
+    manifest = _stage1_read(cache_root / STAGE1_MANIFEST)
+    if (claim.get("version") != STAGE1_VERSION
+            or manifest.get("version") != STAGE1_VERSION
+            or claim.get("uuid") != expected_uuid
+            or manifest.get("uuid") != expected_uuid
+            or claim.get("cache_root") != str(cache_root)
+            or claim.get("state_db") != str(state_db)
+            or manifest.get("root_dev") != root_stat.st_dev
+            or manifest.get("root_ino") != root_stat.st_ino
+            or not isinstance(manifest.get("revision"), int)
+            or not isinstance(manifest.get("debts"), dict)):
+        raise ValueError("Stage1 scratch authority mismatch")
+    return manifest
 _INTERNAL_CACHE_PREFIXES = (
     ".storage.mount.",
     ".storage.db-",
