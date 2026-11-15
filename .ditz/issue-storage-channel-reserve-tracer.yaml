@@ -91,3 +91,17 @@ log_events:
   what: commented
   comment: 'Correction to prior comment: the exact receipt path is .gates/5f45cc660a9246d9ab4537e1d869446c813cb9fa.json
     (full SHA filename).'
+- time: 2026-11-15T20:36:08-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'PR175 pushed 81efd835ce761b23123c1b87e6849450806c8b78 on published master
+    181102496b37240d5cef4496e21b48c46359037f. Resolved fuse_threads=True enables bulk
+    whole-file copy; default/false preserves incoming foreground/background class.
+    Exact no-args scripts/run-gates.sh passed 45/45 targets and wrote matching SHA/tree
+    receipt; CLI //:storage_cli build passed in separately bounded scope. Formal council
+    check on this head reports CLEAN: OpenAI and Anthropic CLEAN, Google EMPTY due
+    usage limit, no standing findings. Root independent audit/merge/deploy pending.
+    Two nonblocking council nits filed as pr175-conflict-suffix-capacity-race and
+    ssh-pool-connect-deadline-after-capacity-wait. No live mount/data/profile touched.
+    Synthetic resource scopes exited inactive/dead; owned fixture cleanup to be verified
+    separately.'
