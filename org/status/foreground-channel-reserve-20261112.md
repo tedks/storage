@@ -1,14 +1,17 @@
 # Foreground channel reserve: current state
 
-- 2026-11-15 finish mission STARTED from clean pushed `36fb7b7` on the sole
-  PR #175 worktree. Root requested rebase onto published master `1811024`,
-  affected tests, exact-head all four gates and CLI, and formal council to
-  fixpoint before independent root review. Previous exact-head affected
-  evidence is PR comment 6865400265: six targets/238 cases passed, including
-  real caller interrupt and isolated daemon exit. The prose below contains
-  earlier checkpoints, not current gate state. No new workload has started;
-  the 60-minute bounded release envelope begins at zero. PR remains draft,
-  unaccepted and undeployed; PR #171 and #167 are untouched.
+- 2026-11-15 current finish mission: rebased the sole PR #175 branch onto
+  fetched published master `181102496b37240d5cef4496e21b48c46359037f`.
+  Seventeen old commits replayed; range-diff shows fifteen equal patches and
+  only two `fs.py` import-context changes, manually combining the inherited
+  rsync import with this package's pool imports. Prior affected evidence is
+  PR comment 6865400265: six targets/238 cases passed on old `36fb7b7`,
+  including real caller interrupt and isolated daemon exit. New-base affected
+  tests, exact-head all four gates and CLI, formal council fixpoint and
+  independent root review are PENDING. The prose below is historical. No
+  new runtime has started; the 60-minute bounded release envelope begins at
+  zero. PR remains draft, unaccepted and undeployed; PR #171 and #167 are
+  untouched. The current flake now pins Bazel 8 through merged master.
 - Cancellation evidence package (2026-11-13): root narrowed the test to
   actual caller interruption and isolated daemon session exit; lazy detach
   alone is not cancellation. Two of four new Bazel invocations used under the

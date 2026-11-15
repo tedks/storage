@@ -250,3 +250,17 @@
   started at this event. Default infinite capacity queue wait, opt-in EAGAIN
   and callback-local EINTR remain the product behavior; lazy detach alone is
   not session exit. PR #171 and #167 remain untouched.
+
+## channel-lead:16
+
+- kind: state-change
+- based_on: `5b764f5146ebc184b13f524b9b0daceaf8742847`
+- applied_at: rebased PR #175 worktree on `181102496b37240d5cef4496e21b48c46359037f`
+- refs: `channel-lead:15`, fetched `origin/master`
+- state: Rebased the seventeen-commit PR #175 series onto exact published
+  master. Range-diff found fifteen equal patches and two import-context
+  adjustments where inherited PR #179 added `RsyncBackend` to `fs.py`; both
+  imports were preserved. No sibling branch was edited and no runtime was
+  used. Current master changes the actual pinned flake to Bazel 8; the
+  new-base tests/gates/CLI and council remain pending. The old 238-case
+  receipt is historical, not a new-base pass.

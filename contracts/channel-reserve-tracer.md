@@ -2,7 +2,8 @@
 
 Package: `STORAGE-CHANNEL-RESERVE-TRACER-20261112`. Original source base:
 `81793ac27b70f82c231bf607b55e775d2b905974` (accepted release
-baseline); current PR merge-base: published master `66c640aec005feccd0bd585f3355295c3bb772ba`.
+baseline); current PR merge-base: published master
+`181102496b37240d5cef4496e21b48c46359037f`.
 This contract describes the independent draft PR #175, not PR #171 or its
 later freshness and namespace machinery.
 
@@ -108,8 +109,9 @@ that caller yields a real `fuse_interrupted()` observation and releases its
 callback while the holders remain gated. SIGTERM to the exact owned daemon
 yields a real `fuse_exited()` observation; the queued callback exits before
 `destroy()`, also while holders remain gated. These are distinct cancellation
-causes, not ordinary capacity drain. The final committed-head module run is
-still required to bind the test source to a pushed revision.
+causes, not ordinary capacity drain. The unfiltered six-module affected run
+passed 238 cases on the prior pushed head `36fb7b7`; the rebase onto
+`1811024` requires fresh exact-head evidence.
 
 The earlier unmount fixture tried `fusermount -u` and then `-uz` after a
 failure; it did not retain the individual return codes. That observation
@@ -127,5 +129,5 @@ leases are not reclassified; member timeouts still bound waits. A cold open
 now queues behind sync and other bulk leases. Local cached
 reads usually need no SSH channel. Rsync and local transfers have no new SFTP
 capacity. Background worker growth is separate (#167) and does not fulfill
-Ted's broader foreground request. PR #170's build-merge incident and all
-integration gates remain open. This draft is not accepted for release.
+Ted's broader foreground request. PR #170's historical build-merge incident
+is not a substitute for current gates. This draft is not accepted for release.
