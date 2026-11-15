@@ -122,3 +122,26 @@ log_events:
     narrow environment/monitor repairs and evidence-driven retries within remaining1736s
     without another slot request. No app/fixture scope expansion, live data/deploy
     or weakened gates. Root final merge authority unchanged.'
+- time: 2026-11-15T01:47:43-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Verified PR179 monitor release path on pushed fc3e28dad72f776b2eca529afcf61b53617d1d4b
+    (tree 480ddefefe22ab2ada78fab1131470d8ccbfb77a). Isolated Bazel v5 helper control
+    passed: preserved v4 scanner rejects actual zero-block output/sandbox/inaccessibleHelperDir;
+    v5 accepts only exact zero-block helper and rejects nonzero or unrelated unreadable
+    directories. Earlier v4 scanner 3/3 real FUSE pin/crossing/no-follow controls
+    and runner 2/2 failure/stop controls passed. V5 scanner SHA256 1b21590fe42a7a730ce9472a280a7bd1198237b0e9fa2780b25daa1db83cfcf8;
+    v5b runner SHA256 1c97f99f79c9da76a745cec3e2992a9093e34741b0934f3be18c4e24cd499d36.
+    Private state retains exact sources, controls, and v1-v5 logs.
+
+
+    No-args scripts/run-gates.sh passed 45/45 Bazel targets and wrote exact-head .gates
+    receipt; //:storage_cli build passed separately. Combined runtime ledger 438/1800s,
+    9 invocations audit count only. Gate and CLI scopes inactive/dead/empty; no matching
+    Docker containers/networks or owned FUSE mounts remained. Gate three synthetic
+    containers were verified at 0.5CPU/512MiB/no-extra-swap/128PIDs each. Scanner
+    traversed named scratch without descending mounted trees; peak sampled named allocation
+    1098MiB, minimum host free 3762480MiB. Named allocation sampling excludes open-unlinked
+    and hidden mount-underlay bytes, as documented. No application/fixture/BUILD changes,
+    no field-cause attribution, and no PR merge/deploy claim. Root acceptance remains
+    pending.'
