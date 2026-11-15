@@ -1,0 +1,22 @@
+id: ssh-pool-connect-deadline-after-capacity-wait
+title: Review SSH connect deadline after an untimed bulk capacity queue
+desc: 'PR175 council Nit N-b at 2b1d1eb: acquire_sftp computes a connection deadline
+  before an untimed bulk-capacity wait; if that wait outlives it and transport reconnect
+  starts afterward, _transport_locked may fail immediately rather than waiting for
+  the new connection. The prior finite capacity wait also expired earlier, so this
+  is not a new PR175 regression. Reproduce with an Event-gated transport transition
+  and preserve independent connection/capacity timeout semantics before changing the
+  pool.'
+type: bugfix
+component: storage
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-15T20:20:35-00:00
+references: []
+log_events:
+- time: 2026-11-15T20:20:35-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
