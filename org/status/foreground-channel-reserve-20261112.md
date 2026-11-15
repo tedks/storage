@@ -1,5 +1,14 @@
 # Foreground channel reserve: current state
 
+- 2026-11-15 final fixture-alignment candidate: no-args gate 45/45 also
+  passed on pushed `6b2b06a`, with matching tree receipt and owned scope
+  inactive/dead. Anthropic's warm test-only delta review identified that
+  `tests/fuse_mount.py` now mirrors threaded copy classification but still
+  used plain fusepy rather than Storage's callback cancellation wrapper.
+  The helper is aligned with production FUSE before further exact-head
+  tests; this one-line change is UNTESTED/UNPUSHED at this line. The two
+  source mutations remain restored. Four gates, CLI build, and council
+  convergence must bind to the next final pushed head. PR remains draft.
 - 2026-11-15 formal fix-delta council at pushed `2b1d1eb`: OpenAI CLEAN
   (0/0/0), Anthropic no Critical/Important with four Nits, Google EMPTY
   (usage limit). Anthropic I1-I4 were re-examined; I2's replica-loop premise

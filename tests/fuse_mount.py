@@ -18,7 +18,7 @@ import traceback
 from pathlib import Path
 from typing import List, Union
 
-from storage.fs import StorageFS, fuse_mount_options
+from storage.fs import FUSE, StorageFS, fuse_mount_options
 
 FUSE_THREAD_MODES = (False, True)
 
@@ -37,8 +37,6 @@ def run_fuse(fs: StorageFS, mountpoint: Union[str, Path], *, fuse_threads: bool,
     fuse_threads, libfuse joins its workers before calling destroy, so an
     unmount returns only after every request in flight has.
     """
-    from fuse import FUSE
-
     # Directly constructed test filesystems must use the same resolved copy
     # class as mount_storage before the first FUSE callback runs.
     fs.cache_manager.bulk_cold_copies = fuse_threads

@@ -384,3 +384,20 @@
   both have specific open tracker follow-ups. No production change from
   `2b1d1eb` is planned. The next head needs all gates, CLI and formal
   convergence before any release claim.
+
+## channel-lead:23
+
+- kind: fixture-alignment-checkpoint
+- based_on: pushed `6b2b06a48ae937e943b6eb72094e39b77e9542e4`
+- applied_at: Anthropic warm delta review, pending fixture-alignment commit
+- state: An owned one-line test-local mutant removed only
+  `MemberConnection.release`'s condition notification. The selected discard
+  test failed on its waiter-entry assertion before cleanup and the exact
+  original `ssh_pool.py` blob was restored. No-args four gates on `6b2b06a`
+  then passed 45/45; the owned scope exited inactive/dead, pids peak 306,
+  named scratch peak 1487 MiB. Anthropic returned 0 Critical/0 Important/
+  1 Nit, because shared `run_fuse` set threaded copy class but used plain
+  fusepy rather than the production cancellation wrapper. This helper now
+  imports Storage's FUSE wrapper; no production blob changes. The new head
+  needs fresh gates, CLI and formal fix-delta review. N-a/N-b remain filed
+  as follow-ups, not waived byte-safety regressions.
