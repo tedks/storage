@@ -427,6 +427,7 @@ backends = ["{self.temp_dir}"]
 mountpoint = "{mountpoint}"
 cache = "{cache}"
 backends = ["{member}"]
+streaming_reads = false
 {setting}
 ''')
                 classes = []

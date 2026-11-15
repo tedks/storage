@@ -1626,9 +1626,9 @@ class TestSSHBackendOnThePool(_BackendTestCase):
                 self.assertIsNone(shutdown.error)
                 self.assertTrue(opener.join(3), "open outlived member shutdown")
                 self.assertIsInstance(opener.error, OSError)
-                # Direct synthetic destroy closes the pool, not a native
-                # request: its existing fallback currently reports ENOENT.
-                self.assertEqual(errno.ENOENT, opener.error.errno)
+                # Direct synthetic destroy closes the member, not a native
+                # request: this path reports the member unavailable.
+                self.assertEqual(errno.EHOSTUNREACH, opener.error.errno)
                 self.assertFalse(fs.cache_manager.is_cached("/cold"))
             finally:
                 backend.close()
