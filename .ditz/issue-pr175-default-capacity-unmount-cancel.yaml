@@ -13,8 +13,8 @@ type: bugfix
 component: ssh
 release:
 reporter: Ted Smith <tedks@riseup.net>
-status: unstarted
-disposition:
+status: closed
+disposition: fixed
 creation_time: 2026-11-13T21:01:41-00:00
 references: []
 log_events:
@@ -88,3 +88,11 @@ log_events:
     Lazy MNT_DETACH is not a session exit and no universal unmount completion is claimed.
     All four local gates and CLI passed at the exact head; formal council check CLEAN
     with Google EMPTY. Keep root independent acceptance and merge pending.
+- time: 2026-11-15T20:42:12-00:00
+  who: Ted Smith
+  what: 'closed: fixed'
+  comment: Accepted and normal-merged PR175 as5f3dbb318d83c4764911c1878cbfb5356e444d16
+    from exact81efd83. All45 targets executed and passed; CLI pass; formal Anthropic/OpenAI
+    CLEAN GoogleEMPTY; independent root/fresh lead CLEAN; matching merged tree. Cancellation
+    scope is real native request/session exit while capacity queued, not universal
+    lazy-detach or path-lock cancellation. Remaining narrow races tracked separately.
