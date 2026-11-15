@@ -264,3 +264,25 @@
   used. Current master changes the actual pinned flake to Bazel 8; the
   new-base tests/gates/CLI and council remain pending. The old 238-case
   receipt is historical, not a new-base pass.
+
+## channel-lead:17
+
+- kind: bounded-validation
+- based_on: `683a0ec8cedcdebf0645e99d1c8e4699fb774503`
+- applied_at: affected-test checkpoint before exact-head gates
+- refs: `channel-lead:16`, owned resource receipts
+  `storage175-finish-affected-20261115.scope.json` and
+  `storage175-finish-affected2-20261115.scope.json`
+- state: First new-base affected attempt was stopped after 25.3 seconds by
+  the owned scanner when a legitimate `_ProbeOperations` scratch FUSE mount
+  was not recognized. The exact owned PID, `/dev/fuse` fd and connection 64
+  were matched before aborting that connection; its process and scope then
+  exited. The scanner was narrowly corrected outside project source. A
+  second run forced six affected Bazel targets: 241 cases passed, including
+  caller interrupt and daemon session-exit controls; 7 fusepy deprecation
+  warnings, no worker-thread warning. Scope 2 CPU/8 GiB/2 GiB swap/1024
+  tasks was observed, pids.peak 296 and no cap hit; sampled named scratch
+  peaked 463 MiB. Both runs count 57 seconds of the 3600-second workload
+  envelope. Local Unix Docker endpoint and exact cached synthetic image were
+  verified read-only; no Docker fixture has started. Full gates and CLI are
+  still pending, with no release acceptance inferred.

@@ -111,7 +111,13 @@ yields a real `fuse_exited()` observation; the queued callback exits before
 `destroy()`, also while holders remain gated. These are distinct cancellation
 causes, not ordinary capacity drain. The unfiltered six-module affected run
 passed 238 cases on the prior pushed head `36fb7b7`; the rebase onto
-`1811024` requires fresh exact-head evidence.
+`1811024` then passed six affected targets/241 cases on source head
+`683a0ec`. The first new-base attempt was stopped by an owned scratch
+monitor that recognized `StorageFS` FUSE mounts but omitted the existing
+`_ProbeOperations` test mount; no test pass was claimed from that abort.
+After adding only that exact test source to the owned monitor and cleaning
+the detached owned connection, the affected run passed. Full gates on a
+frozen pushed head remain required.
 
 The earlier unmount fixture tried `fusermount -u` and then `-uz` after a
 failure; it did not retain the individual return codes. That observation

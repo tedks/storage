@@ -4,14 +4,23 @@
   fetched published master `181102496b37240d5cef4496e21b48c46359037f`.
   Seventeen old commits replayed; range-diff shows fifteen equal patches and
   only two `fs.py` import-context changes, manually combining the inherited
-  rsync import with this package's pool imports. Prior affected evidence is
-  PR comment 6865400265: six targets/238 cases passed on old `36fb7b7`,
-  including real caller interrupt and isolated daemon exit. New-base affected
-  tests, exact-head all four gates and CLI, formal council fixpoint and
-  independent root review are PENDING. The prose below is historical. No
-  new runtime has started; the 60-minute bounded release envelope begins at
-  zero. PR remains draft, unaccepted and undeployed; PR #171 and #167 are
-  untouched. The current flake now pins Bazel 8 through merged master.
+  rsync import with this package's pool imports. The six new-base affected
+  targets executed/pass on source head `683a0ec`: 241 pytest cases, including
+  the real caller/session cancellation controls. The first attempt was
+  monitor-aborted at 25.3 seconds because the owned scratch scanner omitted
+  the existing `_ProbeOperations` FUSE mount source. Its exact connection 64
+  was aborted only after matching `/proc` fd ownership; owned PID 3592804 and
+  scope exited. The corrected monitor allowed that source, then the second
+  attempt passed in 30.8 seconds. Total counted workload 57/3600 seconds;
+  named scratch peaked 463 MiB, pids.peak 296, pids.events max 0, no second
+  abort, all owned scopes inactive and no mount remains. Docker endpoint is
+  local Unix and exact cached synthetic image ID `sha256:0f7e761...` exists
+  (95,680,856 bytes); the owned shim forbids builds and caps each fixture
+  container. The prior old-base 238-case receipt is PR comment 6865400265.
+  Exact-head all four gates and CLI, formal council fixpoint and independent
+  root review remain PENDING. The prose below is historical. PR remains
+  draft, unaccepted and undeployed; PR #171 and #167 are untouched. The
+  current flake pins Bazel 8 through merged master.
 - Cancellation evidence package (2026-11-13): root narrowed the test to
   actual caller interruption and isolated daemon session exit; lazy detach
   alone is not cancellation. Two of four new Bazel invocations used under the
