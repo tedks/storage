@@ -17,8 +17,8 @@ type: bugfix
 component: sync
 release:
 reporter: Ted Smith <tedks@riseup.net>
-status: in_progress
-disposition:
+status: closed
+disposition: fixed
 creation_time: 2026-10-24T21:35:41-00:00
 references: []
 log_events:
@@ -135,5 +135,14 @@ log_events:
     and evidence hashes are in docs/pr179_release_blocker_20261113.md. Root holds
     further runtime and rebase pending a reviewed monitor correction and final-base
     sequence.'
+- time: 2026-11-15T01:52:23-00:00
+  who: Ted Smith
+  what: 'closed: fixed'
+  comment: 'Fixed by normal merge PR179 181102496b37240d5cef4496e21b48c46359037f from
+    exact tested fc3e28dad72f776b2eca529afcf61b53617d1d4b: all45 executed gates and
+    CLI pass, formal Sol CLEAN foreign EMPTY, independent root review CLEAN, gated
+    merge success and matching tree. Synthetic false-CLEAN RED and startup option
+    validation covered. No field-cause or deployment claim; docs follow-up and GH112
+    umbrella remain separate.'
 blocks:
 - gh-112
