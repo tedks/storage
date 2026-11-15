@@ -1,0 +1,22 @@
+id: storage175-retirement-native-binding
+title: Finish PR175 lane retirement after native session binding is available
+desc: PR175 is accepted and merged as5f3dbb3. Owner thanked. Shared retire-agent existing
+  attempt reports pinned Codex native session binding unavailable (codex_rollout_unavailable)
+  for the still-running agent. No retirement offer or exit was sent by that failed
+  attempt, and no process was stopped. Root retains exact private state/identity in
+  dispatch record. Resolve through canonical native binding or approved private recovery
+  continuation; do not infer session identity from cwd/newest files or bypass exit
+  verification. This is closeout only, not authority to resume frozen PR171.
+type: task
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-15T20:43:14-00:00
+references: []
+log_events:
+- time: 2026-11-15T20:43:14-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
