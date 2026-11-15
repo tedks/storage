@@ -1,5 +1,18 @@
 # Foreground channel reserve: current state
 
+- 2026-11-15 gate repair in progress: exact no-args all-four run on `0040e0f`
+  executed 45 targets; 44 passed, including remote and mounted gates. The
+  one failure was `test_mkdir_retry_eventually_replicates`: the asynchronous
+  retry completed before its immediate absence assertion. The test now gates
+  the real second `mkdir` attempt, asserts absence before release, then
+  confirms eventual replication and exactly two calls. Focused proof and
+  rerun on the new committed head are PENDING; no gate receipt exists for
+  `0040e0f`. Owned Docker fixture ID trio and network were verified absent.
+  Gate scope exited cleanly after 402 seconds, sampled named scratch peaked
+  1,108 MiB, pids.peak 325 with no cap event. Cumulative bounded workload
+  is 459/3600 seconds. No mount, container, client or lock holder remains.
+  This test-only bend is necessary to make the required full gate reliable;
+  rollback is this one test change.
 - 2026-11-15 current finish mission: rebased the sole PR #175 branch onto
   fetched published master `181102496b37240d5cef4496e21b48c46359037f`.
   Seventeen old commits replayed; range-diff shows fifteen equal patches and

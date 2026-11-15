@@ -286,3 +286,21 @@
   envelope. Local Unix Docker endpoint and exact cached synthetic image were
   verified read-only; no Docker fixture has started. Full gates and CLI are
   still pending, with no release acceptance inferred.
+
+## channel-lead:18
+
+- kind: deviation
+- based_on: `0040e0f2ee47733cfe6549d93679a3b7d9c93a9a`
+- applied_at: first full-gate failure repair
+- refs: `channel-lead:17`, owned gate log
+  `storage175-finish-gates-20261115.scope.log`
+- state: The no-args four-gate run executed all 45 targets, 44 pass and one
+  namespace integration test fail. Its first backend mkdir was deliberately
+  failed, but the background retry could complete before the immediate
+  absence assertion. To serve the required full-gate evidence, the narrow
+  test scope bends to an Event-gated real retry: inspect absence before
+  releasing it, then assert eventual replication and two calls. No namespace
+  application behavior changes. Rollback is the single test hunk. Exact
+  source and gate head must advance and rerun. The Docker trio and network
+  were verified absent; the owned scope exited, with 1,108 MiB sampled named
+  scratch and no pids cap hit. Formal council and CLI remain pending.

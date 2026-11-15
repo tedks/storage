@@ -3022,24 +3022,33 @@ class TestFSNamespaceIntegration(unittest.TestCase):
         backend2 = self.backends['backend2']
         call_count = {'n': 0}
         original = backend2.mkdir
+        retry_entered = threading.Event()
+        release_retry = threading.Event()
 
         def flaky_mkdir(target):
             call_count['n'] += 1
             if call_count['n'] == 1:
                 raise RuntimeError("transient failure")
+            retry_entered.set()
+            if not release_retry.wait(10):
+                raise AssertionError("test did not release the directory retry")
             return original(target)
 
         backend2.mkdir = flaky_mkdir
         try:
             self.fs.mkdir(path, 0o755)
-            # Should not exist on backend2 immediately
+            self.assertTrue(retry_entered.wait(5), "failed member was not retried")
+            # Inspect the failed first attempt while the actual retry is gated.
             self.assertFalse(backend2.isdir(path))
+            release_retry.set()
 
             def replicated():
                 return backend2.isdir(path)
 
             self.assertTrue(self._wait_for(replicated, timeout=5.0))
+            self.assertEqual(2, call_count['n'])
         finally:
+            release_retry.set()
             backend2.mkdir = original
 
 
