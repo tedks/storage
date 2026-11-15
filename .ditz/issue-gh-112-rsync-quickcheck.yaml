@@ -144,5 +144,18 @@ log_events:
     merge success and matching tree. Synthetic false-CLEAN RED and startup option
     validation covered. No field-cause or deployment claim; docs follow-up and GH112
     umbrella remain separate.'
+- time: 2026-11-15T19:16:51-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'STORAGE179-SPLINTER1-ROLLOUT-20261115: Ted authorized rollout. Installed
+    exact normal merge181102496b37240d5cef4496e21b48c46359037f as Nix profile element
+    storage-1 priority3; existing81793ac storage element priority4 retained for rollback.
+    New package fs.py and backends/rsync.py SHA256 match merged source; CLI help succeeds.
+    Normal fusermount -u returned0; old mount PID441998 exited. Existing terminal
+    then launched PID462453 from the new package using the unchanged drynwyn-warez-lan-ip.toml
+    profile; controller detected it and did not start a second mount. Exactly one
+    StorageFS mount observed through /proc/self/mountinfo. No user files, mount contents
+    or live cache/index read; no live write correctness benchmark or field-cause attribution.
+    PR175/171 remain undeployed.'
 blocks:
 - gh-112
