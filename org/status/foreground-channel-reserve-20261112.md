@@ -1,5 +1,14 @@
 # Foreground channel reserve: current state
 
+- 2026-11-15 finish mission STARTED from clean pushed `36fb7b7` on the sole
+  PR #175 worktree. Root requested rebase onto published master `1811024`,
+  affected tests, exact-head all four gates and CLI, and formal council to
+  fixpoint before independent root review. Previous exact-head affected
+  evidence is PR comment 6865400265: six targets/238 cases passed, including
+  real caller interrupt and isolated daemon exit. The prose below contains
+  earlier checkpoints, not current gate state. No new workload has started;
+  the 60-minute bounded release envelope begins at zero. PR remains draft,
+  unaccepted and undeployed; PR #171 and #167 are untouched.
 - Cancellation evidence package (2026-11-13): root narrowed the test to
   actual caller interruption and isolated daemon session exit; lazy detach
   alone is not cancellation. Two of four new Bazel invocations used under the

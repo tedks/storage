@@ -234,3 +234,19 @@
   failures. Two of four invocations spent; both scopes inactive, no mount or
   lock holder remains. Final affected modules and full release gates remain
   pending; this event does not assert acceptance.
+
+## channel-lead:15
+
+- kind: state-change
+- based_on: `36fb7b7bef6ec4906f3a0af1dc2cf6882809fff6`
+- applied_at: 2026-11-15 finish mission start
+- refs: `channel-lead:14`, root `STORAGE175-FINISH-20261115`, PR #175
+  comment 6865400265
+- state: Resumed in the sole PR #175 worktree. Prior scoped evidence is the
+  pushed 238-case affected run and real callback cancellation tests; this
+  does not attest the new master. The authorized next boundary is rebase to
+  published `1811024`, affected tests, exact-head all-four-gate and CLI
+  evidence, formal council, then independent root review. No new workload
+  started at this event. Default infinite capacity queue wait, opt-in EAGAIN
+  and callback-local EINTR remain the product behavior; lazy detach alone is
+  not session exit. PR #171 and #167 remain untouched.
