@@ -1,5 +1,15 @@
 # Foreground channel reserve: current state
 
+- 2026-11-15 threaded-mode repair checkpoint: code/test head `a3d5223`
+  passed all six affected nonmount/mounted synthetic targets in owned
+  `storage175-finish-affected5-20261115.scope` (34 seconds, 2 CPU/8 GiB/2 GiB
+  swap/1024 tasks; inactive/dead afterward). A temporary one-line source
+  control made the whole-file bulk scope unconditional; the real CLI profile
+  test failed on three false-mode observations (`True` expected, `False`
+  observed) while the threaded case passed. The committed cache source blob
+  `d8269572d10f83992f13efc7f90f935d4cdccb25` was restored and matched
+  HEAD afterward. Full all-four gates, CLI build and formal fix-delta council
+  are PENDING on the eventual final head. PR remains draft and unaccepted.
 - 2026-11-15 formal review fix delta in progress: no-args all four gates
   passed 45/45 targets and CLI build passed on pushed `5f45cc6` (tree
   `eeac92b5545be78b203d7284ade7cf4ec9bd1622`); exact commands, wrapper

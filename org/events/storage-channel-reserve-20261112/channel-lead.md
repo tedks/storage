@@ -346,3 +346,22 @@
   tests and reviewer re-verification. I2 and I3 require source call-path
   disposition; I4 requires notification/lock proof. No runtime gate or
   acceptance has been transferred to the untested delta.
+
+## channel-lead:21
+
+- kind: scoped-test-evidence
+- based_on: formal `5f45cc6` finding I1 and root threaded-mode adjudication
+- applied_at: source/test commits `d3235cb`, `a3d5223`
+- state: Mount/profile resolution now sets the internal copy-class flag before
+  FUSE starts. The false branch retains the incoming foreground/background
+  context; the true branch reclassifies only `copy_to_local`. First affected
+  run failed on two test assumptions: the real CLI profile defaults to
+  streaming, and synthetic pool close reported `EHOSTUNREACH`. Narrow test
+  correction enabled whole-file mode and asserted that observed result.
+  The second owned affected run executed all six targets and passed. One
+  temporary source mutant removed the conditional copy guard; the real
+  CLI-to-cache test failed behaviorally in default, explicit-off and
+  override-off cases before timeout. Committed cache blob was restored
+  byte-identically. Owned scopes exited inactive/dead, pids.events max zero,
+  named scratch peak 1308 MiB. Full gates/CLI/council remain required on the
+  final pushed head; this is not release acceptance.
