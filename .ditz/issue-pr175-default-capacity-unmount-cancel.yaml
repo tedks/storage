@@ -78,3 +78,13 @@ log_events:
     opt-in EAGAIN controls are included. This does not prove that lazy detach alone
     finishes an active session. Formal council and independent root acceptance remain
     pending; issue stays open until disposition. PR evidence comment 6900303138.'
+- time: 2026-11-15T20:36:09-00:00
+  who: Ted Smith
+  what: commented
+  comment: At PR175 pushed 81efd835ce761b23123c1b87e6849450806c8b78, real scratch
+    FUSE tests cover native caller interruption and isolated daemon session exit while
+    bulk holders remain gated; callback exits before destroy, and pool close is separately
+    tested. Default capacity deadline remains off, finite opt-in expiry reports EAGAIN.
+    Lazy MNT_DETACH is not a session exit and no universal unmount completion is claimed.
+    All four local gates and CLI passed at the exact head; formal council check CLEAN
+    with Google EMPTY. Keep root independent acceptance and merge pending.
