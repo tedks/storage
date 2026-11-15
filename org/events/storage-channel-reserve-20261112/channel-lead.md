@@ -324,3 +324,25 @@
   This ledger/status commit advances HEAD, so all gates, CLI and formal
   council must bind to the later pushed final head. No release acceptance,
   merge or deployment is claimed.
+
+## channel-lead:20
+
+- kind: review-finding-and-adjudication
+- based_on: `5f45cc660a9246d9ab4537e1d869446c813cb9fa`
+- applied_at: root `STORAGE175-I1-DISPOSITION-20261115`, pending fix delta
+- refs: `channel-lead:19`, formal round
+  `5f45cc660a92-20261115T195127Z-e81f3b`, PR #175 findings comment
+  6900414982
+- state: The first current-base formal round has Anthropic 4 Important/7
+  Nits, OpenAI 0 Important/1 Nit, Google EMPTY (usage limit). Both old
+  Anthropic Important findings were re-examined by present seats; no new
+  council CLEAN is claimed. I1 identifies the mismatch between unconditional
+  cold-copy bulk classification and the spec's default single-threaded
+  behavior. Root decided on one internal resolved `fuse_threads` flag from
+  mount construction through StorageFS to CacheManager; false preserves the
+  incoming class, true reclassifies only the established copy boundary.
+  Rollback is the small flag/wiring delta, with old source behavior retained
+  at false. The source/test/contract implementation is pending exact-head
+  tests and reviewer re-verification. I2 and I3 require source call-path
+  disposition; I4 requires notification/lock proof. No runtime gate or
+  acceptance has been transferred to the untested delta.

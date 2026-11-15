@@ -47,8 +47,10 @@ listing_max_stale = 3600
 # it has been field-tested.
 # fuse_threads = true
 # Bulk SSH copies wait for SFTP channel capacity as the queue drains. A
-# positive finite value opts into a capacity deadline; an existing cold file
-# whose copy times out then reports EAGAIN. Unset or 0 leaves it off. SSH
+# positive finite value opts into a capacity deadline; on a threaded mount,
+# an existing cold file whose bulk copy times out then reports EAGAIN.
+# Single-threaded foreground copies keep their interactive class. Unset or 0
+# leaves the deadline off. SSH
 # connection and transfer timeouts remain separate.
 # bulk_capacity_wait_timeout = 30
 # Seconds between re-verifications of the conflict view's recorded hashes:

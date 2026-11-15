@@ -145,7 +145,8 @@ class StorageFS(Operations):
                  streaming_keep_after_close: Optional[StreamingKeepAfterClose] = None,
                  revalidate_after: float = 60.0,
                  listing_max_stale: float = DEFAULT_LISTING_MAX_STALE,
-                 checksum_reverify_interval: float = DEFAULT_CHECKSUM_REVERIFY_INTERVAL):
+                 checksum_reverify_interval: float = DEFAULT_CHECKSUM_REVERIFY_INTERVAL,
+                 bulk_cold_copies: bool = False):
         """
         Initialize Storage filesystem
 
@@ -185,9 +186,15 @@ class StorageFS(Operations):
                 whose hash worker is idle hashes again the one file whose
                 persisted hash was checked longest ago (and over
                 CHECKSUM_REVERIFY_MIN_AGE ago); 0 turns it off
+            bulk_cold_copies: Use bulk member admission for whole-file copies
+                when the mount runs threaded FUSE callbacks. Off for direct
+                construction and the default single-threaded mount.
         """
         self.state_manager = StateManager(str(state_db))
-        self.cache_manager = CacheManager(cache_root, self.state_manager, cache_size)
+        self.cache_manager = CacheManager(
+            cache_root, self.state_manager, cache_size,
+            bulk_cold_copies=bulk_cold_copies,
+        )
         self.cache_manager.descriptor_guard = self._descriptor_guard
         self.replication_manager = ReplicationManager(self.state_manager, backends)
         self.backends = backends
@@ -3235,6 +3242,10 @@ class FUSE(_FusePyFUSE):
     def _wrapper(func, *args, **kwargs):
         # fusepy enters here directly from libfuse. A thread-local scope keeps
         # the probe out of copied contextvars and direct StorageFS calls.
+        # init/destroy are not request callbacks and may lack a request
+        # pointer; neither acquires a cold-copy lease during teardown.
+        if getattr(func, "__name__", None) in ("init", "destroy"):
+            return _FusePyFUSE._wrapper(func, *args, **kwargs)
         with capacity_wait_cancellation(_native_capacity_cancel_reason):
             return _FusePyFUSE._wrapper(func, *args, **kwargs)
 
@@ -3397,6 +3408,7 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
         revalidate_after=revalidate_after,
         listing_max_stale=listing_max_stale,
         checksum_reverify_interval=checksum_reverify_interval,
+        bulk_cold_copies=fuse_threads,
     )
     fs.mount_lock_file = lock_file
     if unclean_shutdown:

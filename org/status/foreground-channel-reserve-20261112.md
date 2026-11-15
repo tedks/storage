@@ -1,5 +1,20 @@
 # Foreground channel reserve: current state
 
+- 2026-11-15 formal review fix delta in progress: no-args all four gates
+  passed 45/45 targets and CLI build passed on pushed `5f45cc6` (tree
+  `eeac92b5545be78b203d7284ade7cf4ec9bd1622`); exact commands, wrapper
+  settings, fixture IDs and limits are PR #175 comment 6900303138. Formal
+  round `5f45cc660a92-20261115T195127Z-e81f3b` recorded Anthropic
+  4 Important/7 Nits, OpenAI 0 Important/1 Nit, Google EMPTY (usage limit),
+  with two older Anthropic findings re-examined. Root adjudicated I1:
+  whole-file copy reclassification is enabled only by resolved
+  `fuse_threads=True`, preserving the default single-threaded incoming
+  class. Narrow source/tests/contract repairs for that boundary and an
+  error-path lease wake test are in the worktree but UNTESTED/UNPUSHED at
+  this line. I2/I3 are being checked against the unique cache_file/open
+  call path; I4 against pool notify/lock order. No new head is yet attested
+  by gates, CLI or council. PR stays draft and unaccepted; root owns
+  independent acceptance/normal merge/deployment. PR171/#167 untouched.
 - 2026-11-15 release validation checkpoint: tested pushed code head
   `2f273d582656a25f741daa19c4826d09d1af7169` is based on published
   master `181102496b37240d5cef4496e21b48c46359037f`.

@@ -1,3 +1,4 @@
+import os
 import shutil
 import threading
 import tempfile
@@ -9,6 +10,7 @@ from unittest.mock import patch
 from click.testing import CliRunner
 
 from storage.backends.local import LocalBackend
+from storage.backends.base import is_interactive_request
 from storage.backends.ssh import SSHBackend
 from storage.cli import main
 from storage.cli_mount import shared_filesystems
@@ -404,6 +406,55 @@ backends = ["{self.temp_dir}"]
     def test_flags_override_the_profile(self):
         self.assertIs(False, self._mount("fuse_threads = true", ["--no-fuse-threads"])[1])
         self.assertIs(True, self._mount("", ["--fuse-threads"])[1])
+
+    def test_resolved_loop_mode_reaches_real_cache_copy_class(self):
+        real_copy = LocalBackend.copy_to_local
+        for name, setting, flags, expected_class in (
+            ("default", "", (), True),
+            ("explicit-off", "fuse_threads = false", (), True),
+            ("threaded", "fuse_threads = true", (), False),
+            ("override-off", "fuse_threads = true", ("--no-fuse-threads",), True),
+        ):
+            with self.subTest(name=name):
+                root = self.temp_dir / name
+                member, cache, mountpoint = (root / part for part in ("member", "cache", "mount"))
+                for path in (member, cache, mountpoint):
+                    path.mkdir(parents=True)
+                (member / "cold").write_bytes(b"exact-mounted-copy")
+                profile = root / "storage.toml"
+                profile.write_text(f'''
+[mounts.copy]
+mountpoint = "{mountpoint}"
+cache = "{cache}"
+backends = ["{member}"]
+{setting}
+''')
+                classes = []
+                returned = []
+
+                def observe_copy(backend, virtual_path, local_path):
+                    classes.append(is_interactive_request())
+                    return real_copy(backend, virtual_path, local_path)
+
+                def fake_fuse(fs, _mountpoint, **kwargs):
+                    self.assertEqual(expected_class, kwargs["nothreads"])
+                    try:
+                        fd = fs("open", "/cold", os.O_RDONLY)
+                        try:
+                            returned.append(fs("read", "/cold", 1024, 0, fd))
+                        finally:
+                            fs("release", "/cold", fd)
+                    finally:
+                        fs.destroy("/")
+
+                with patch.object(LocalBackend, "copy_to_local", new=observe_copy), \
+                     patch("storage.fs.FUSE", side_effect=fake_fuse):
+                    result = self.runner.invoke(
+                        main, ["mount", "--config", str(profile), *flags, "copy"]
+                    )
+                self.assertEqual(0, result.exit_code, result.output)
+                self.assertEqual([expected_class], classes)
+                self.assertEqual([b"exact-mounted-copy"], returned)
 
 
 class TestMountChecksumReverify(unittest.TestCase):

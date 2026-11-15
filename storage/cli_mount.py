@@ -132,8 +132,9 @@ def shared_filesystems(backends: Dict[str, Backend]) -> List[List[str]]:
     "--bulk-capacity-wait-timeout",
     type=float,
     help=(
-        "Seconds a bulk SSH copy waits for SFTP channel capacity before a cold open "
-        "returns EAGAIN (default off; 0 = off). Connection and transfer timeouts remain."
+        "Seconds a bulk SSH copy waits for SFTP channel capacity before a threaded "
+        "cold open returns EAGAIN (default off; 0 = off). Connection and transfer "
+        "timeouts remain."
     ),
 )
 @click.option(

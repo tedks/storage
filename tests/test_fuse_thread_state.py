@@ -280,7 +280,7 @@ def _capacity_signal_daemon(root, release, observed, ready, denied, request_seen
     holder_errors = []
     try:
         fs = StorageFS(root / "cache", root / "state.db", {backend.name: backend},
-                       1024 * 1024, start_sync=False)
+                       1024 * 1024, start_sync=False, bulk_cold_copies=True)
         real_can_open = backend.pool._can_open_locked
         real_probe = fs_module._native_capacity_cancel_reason
         real_open = fs.open
@@ -379,7 +379,7 @@ class TestMountedCapacityCancellation(unittest.TestCase):
         (member_root / "cold").write_bytes(b"exact-cold-bytes")
         backend = _CapacityMember(member_root)
         fs = StorageFS(root / "cache", root / "state.db", {backend.name: backend},
-                       1024 * 1024, start_sync=False)
+                       1024 * 1024, start_sync=False, bulk_cold_copies=True)
         fs.destroy_entered = threading.Event()
         real_destroy = fs.destroy
 
@@ -484,7 +484,7 @@ class TestMountedCapacityCancellation(unittest.TestCase):
             if not disable_cancel:
                 self.assertFalse(trigger.is_alive(), "exit-trigger stat did not finish")
             if disable_cancel:
-                self.assertFalse(fs.destroy_entered.wait(0.5),
+                self.assertFalse(fs.destroy_entered.wait(2),
                                  "disabled cancellation let destroy pass the held waiter")
             else:
                 self.assertTrue(fs.destroy_entered.wait(5),
