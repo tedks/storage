@@ -15,11 +15,16 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from storage.backends.local import LocalBackend
+from storage.backends.rsync import RsyncBackend, RsyncError
+from storage.checksums import fast_checksum_file
 from storage.fs import StorageFS
 from storage.models import SyncStatus
+from storage.sync_executor import SyncExecutor
+from storage.sync_tasks import SyncConfig, SyncTask
 
 
 class NoMtimeBackend(LocalBackend):
@@ -33,6 +38,155 @@ class NoMtimeBackend(LocalBackend):
         real_path = self._resolve_path(virtual_path)
         real_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(local_path, real_path)
+
+
+class LocalRsyncTransport(RsyncBackend):
+    """Use production rsync upload with local-only metadata transport."""
+
+    def __init__(self, name, root_path):
+        super().__init__(name, "localhost", root_path, "user", compress=False)
+
+    def _with_sftp(self, operation, path, fn, retry=False):
+        return None  # parent already exists in this local fixture
+
+    def _remote_spec(self, virtual_path):
+        return str(self._resolve_path(virtual_path))
+
+    def is_available(self):
+        return True
+
+    def exists_or_raise(self, virtual_path):
+        return Path(self._resolve_path(virtual_path)).exists()
+
+    def stat(self, virtual_path):
+        st = os.stat(self._resolve_path(virtual_path))
+        # SFTP stat does not publish ctime, as on the deployed rsync member.
+        return SimpleNamespace(st_mode=st.st_mode, st_size=st.st_size,
+                               st_mtime=st.st_mtime)
+
+    def get_fast_checksum(self, virtual_path, allow_download=False):
+        return fast_checksum_file(self._resolve_path(virtual_path))
+
+
+class LegacyLocalRsyncTransport(LocalRsyncTransport):
+    """Control: old upload selection, still using the real rsync subprocess."""
+
+    def copy_from_local(self, local_path, virtual_path):
+        self._run_rsync(str(local_path), self._remote_spec(virtual_path))
+
+
+class TestLocalRsyncSyncSettlement(unittest.TestCase):
+    """Mount handlers, real sync settlement/callback, and local rsync upload."""
+
+    def setUp(self):
+        self.temp_dir = Path(tempfile.mkdtemp())
+        self.cache_dir = self.temp_dir / "cache"
+        self.cache_dir.mkdir()
+        self.member_dir = self.temp_dir / "member"
+        self.member_dir.mkdir()
+        self.member = LocalRsyncTransport("member", str(self.member_dir))
+        self.fs = StorageFS(
+            cache_root=self.cache_dir, state_db=self.temp_dir / "state.db",
+            backends={"member": self.member}, cache_size=10 * 1024 * 1024,
+            start_sync=False,
+        )
+        self.executor = SyncExecutor(
+            worker_id=0, state_manager=self.fs.state_manager,
+            cache_manager=self.fs.cache_manager,
+            replication_manager=self.fs.replication_manager,
+            config=SyncConfig(), member_written_cb=self.fs._record_member_written,
+        )
+
+    def tearDown(self):
+        self.fs.sync_manager.stop()
+        self.fs.state_manager.close()
+        self.member.close()
+        shutil.rmtree(self.temp_dir)
+
+    def _write_through_fs(self, content, previous):
+        member_path = self.member_dir / "file.txt"
+        member_path.write_bytes(previous)
+        stamp = 1_700_000_000
+        os.utime(member_path, (stamp, stamp))
+        fd = self.fs.create("/file.txt", 0o644)
+        self.fs.write("/file.txt", content, 0, fd)
+        self.fs.release("/file.txt", fd)
+        self.fs.utimens("/file.txt", (stamp, stamp))
+        cache_path = self.cache_dir / "file.txt"
+        self.assertEqual(SyncStatus.DIRTY,
+                         self.fs.state_manager.get_file_metadata("/file.txt").sync_status)
+        return cache_path, member_path
+
+    def _sync(self, backend=None):
+        backend = backend or self.member
+        with patch.object(self.fs.replication_manager, "select_backends_for_file",
+                          return_value=[backend]):
+            self.executor.process_file_task(SyncTask("/file.txt"))
+        return self.fs.state_manager.get_file_metadata("/file.txt")
+
+    def _reverify(self, backend, persisted):
+        result = self.fs._reverify_member_copy(backend, "/file.txt", persisted.basis)
+        self.assertIsNotNone(result)
+        with self.assertLogs("storage.fs", level="INFO") as logged:
+            with self.fs._checksum_lock:
+                self.fs._settle_reverify(("/file.txt", "member"), persisted, result)
+        self.assertTrue(any("re-verification found a copy" in line for line in logged.output))
+        return result[0]
+
+    def test_changed_size_upload_settles_clean_with_measured_member_bytes(self):
+        cache_path, member_path = self._write_through_fs(b"new longer bytes", b"old bytes")
+        metadata = self._sync()
+        self.assertEqual(SyncStatus.CLEAN, metadata.sync_status)
+        self.assertEqual(cache_path.read_bytes(), member_path.read_bytes())
+        record = self.fs.state_manager.get_member_checksum("/file.txt", "member")
+        self.assertEqual(fast_checksum_file(member_path), record.checksum)
+
+    def test_same_size_mtime_upload_does_not_falsely_settle_clean(self):
+        cache_path, member_path = self._write_through_fs(b"new bytes", b"old bytes")
+        self.assertEqual(cache_path.stat().st_size, member_path.stat().st_size)
+        self.assertEqual(cache_path.stat().st_mtime_ns, member_path.stat().st_mtime_ns)
+        self.assertNotEqual(cache_path.read_bytes(), member_path.read_bytes())
+        metadata = self._sync()
+        self.assertEqual(SyncStatus.CLEAN, metadata.sync_status)
+        self.assertEqual(cache_path.read_bytes(), member_path.read_bytes())
+        record = self.fs.state_manager.get_member_checksum("/file.txt", "member")
+        self.assertEqual(fast_checksum_file(member_path), record.checksum)
+
+    def test_legacy_skip_reports_clean_then_reverify_without_remote_rewrite(self):
+        cache_path, member_path = self._write_through_fs(b"new bytes", b"old bytes")
+        legacy = LegacyLocalRsyncTransport("member", str(self.member_dir))
+        try:
+            metadata = self._sync(legacy)
+            self.assertEqual(SyncStatus.CLEAN, metadata.sync_status)
+            self.assertEqual(b"old bytes", member_path.read_bytes())
+            persisted = self.fs.state_manager.get_member_checksum("/file.txt", "member")
+            self.assertEqual(fast_checksum_file(cache_path), persisted.checksum)
+            self.assertNotEqual(fast_checksum_file(member_path), persisted.checksum)
+            measured = self._reverify(legacy, persisted)
+            self.assertEqual(fast_checksum_file(member_path), measured)
+        finally:
+            legacy.close()
+
+    def test_genuine_same_basis_member_rewrite_is_detected(self):
+        cache_path, member_path = self._write_through_fs(b"new bytes", b"old bytes")
+        self.assertEqual(SyncStatus.CLEAN, self._sync().sync_status)
+        persisted = self.fs.state_manager.get_member_checksum("/file.txt", "member")
+        self.assertIsNotNone(persisted)
+        self.assertEqual(cache_path.read_bytes(), member_path.read_bytes())
+        self.assertEqual(fast_checksum_file(member_path), persisted.checksum)
+        member_path.write_bytes(b"bad bytes")
+        os.utime(member_path, (persisted.basis[1], persisted.basis[1]))
+        measured = self._reverify(self.member, persisted)
+        self.assertNotEqual(persisted.checksum, measured)
+        self.assertEqual(measured,
+                         self.fs.state_manager.get_member_checksum("/file.txt", "member").checksum)
+
+    def test_failed_rsync_does_not_settle_clean(self):
+        self._write_through_fs(b"new bytes", b"old bytes")
+        with patch.object(self.member, "_run_rsync", side_effect=RsyncError("failed", 23)):
+            metadata = self._sync()
+        self.assertEqual(SyncStatus.ERROR, metadata.sync_status)
+        self.assertIsNone(self.fs.state_manager.get_member_checksum("/file.txt", "member"))
 
 
 class RevalidateTestBase(unittest.TestCase):
