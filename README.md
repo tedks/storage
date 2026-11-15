@@ -569,6 +569,7 @@ Implemented:
 - Remote inotify watchers that invalidate the cache when a member changes
 - TOML mount profiles with optional display names for members; numbered member IDs remain stable when labels change
 - A multithreaded FUSE loop (`fuse_threads`, off by default until field-tested), so a slow member call for one file does not hold up listings, stats and reads of others
+- On a threaded mount, whole-file SSH cache copies use bulk SFTP channel capacity while directory listing keeps the interactive reserve. `bulk_capacity_wait_timeout` optionally bounds that bulk-capacity queue (off by default); an existing cold open reports `EAGAIN` on its expiry, and an interrupted native FUSE request reports `EINTR`. Single-threaded foreground copies keep their interactive class.
 - Cache metadata xattrs, with `storage debug rebuild-index`, `reprobe-locations` and `verify-index`
 - File recomputation
 - Symbolic links: made through the mount, replicated to the members holding their target; links already on members show as links

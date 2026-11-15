@@ -21,16 +21,22 @@ import yaml
 import json
 import concurrent.futures
 import contextlib
+import ctypes
 import signal
 from dataclasses import dataclass, field
-from fuse import FUSE, FuseOSError, Operations
+import fuse as fusepy
+from fuse import FUSE as _FusePyFUSE, FuseOSError, Operations
 from pathlib import Path
 from typing import Dict, Optional, Set, List, Tuple
 
-from .backends.base import Backend, ChecksumUnavailable, interactive_request
+from .backends.base import (
+    Backend, ChecksumUnavailable, capacity_wait_cancellation, interactive_request,
+)
 from .backends.rsync import RsyncBackend
 from .backends.ssh_mux import close_shared_control_sockets
-from .backends.ssh_pool import is_connection_error
+from .backends.ssh_pool import (
+    BulkCapacityCancelled, BulkCapacityTimeout, is_connection_error,
+)
 from .cache import PARTIAL_SUFFIX, CacheManager
 from .locks import NamespaceLock, PathLocks, UploadLocks
 from .cache_metadata import PREFIX_XATTR, XATTR_CACHE_METADATA_NAME, regular_file_stat, scan_cache_entries
@@ -139,7 +145,8 @@ class StorageFS(Operations):
                  streaming_keep_after_close: Optional[StreamingKeepAfterClose] = None,
                  revalidate_after: float = 60.0,
                  listing_max_stale: float = DEFAULT_LISTING_MAX_STALE,
-                 checksum_reverify_interval: float = DEFAULT_CHECKSUM_REVERIFY_INTERVAL):
+                 checksum_reverify_interval: float = DEFAULT_CHECKSUM_REVERIFY_INTERVAL,
+                 bulk_cold_copies: bool = False):
         """
         Initialize Storage filesystem
 
@@ -179,9 +186,15 @@ class StorageFS(Operations):
                 whose hash worker is idle hashes again the one file whose
                 persisted hash was checked longest ago (and over
                 CHECKSUM_REVERIFY_MIN_AGE ago); 0 turns it off
+            bulk_cold_copies: Use bulk member admission for whole-file copies
+                when the mount runs threaded FUSE callbacks. Off for direct
+                construction and the default single-threaded mount.
         """
         self.state_manager = StateManager(str(state_db))
-        self.cache_manager = CacheManager(cache_root, self.state_manager, cache_size)
+        self.cache_manager = CacheManager(
+            cache_root, self.state_manager, cache_size,
+            bulk_cold_copies=bulk_cold_copies,
+        )
         self.cache_manager.descriptor_guard = self._descriptor_guard
         self.replication_manager = ReplicationManager(self.state_manager, backends)
         self.backends = backends
@@ -1910,6 +1923,8 @@ class StorageFS(Operations):
                         resolved.requested_path, backend, source_virtual_path=canonical_path,
                     ):
                         return True
+                except (BulkCapacityCancelled, BulkCapacityTimeout):
+                    raise
                 except Exception:
                     pass
 
@@ -2076,8 +2091,9 @@ class StorageFS(Operations):
 
     def readdir(self, path, fh):
         """Read directory contents"""
-        for entry in self.namespace.readdir(path):
-            yield entry
+        # NamespaceService returns a concrete list. Resolve it before the
+        # enclosing FUSE dispatch leaves its interactive request context.
+        return self.namespace.readdir(path)
 
     def mkdir(self, path, mode):
         """Create a directory"""
@@ -2269,6 +2285,10 @@ class StorageFS(Operations):
         with self._path_locked(canonical_path):
             try:
                 return self._open(path, flags)
+            except BulkCapacityCancelled as exc:
+                raise FuseOSError(errno.EINTR) from exc
+            except BulkCapacityTimeout as exc:
+                raise FuseOSError(errno.EAGAIN) from exc
             finally:
                 # The pin belongs to this open (_select_backend_for_read):
                 # one no fetch used (the open attached to a running stream,
@@ -3195,6 +3215,41 @@ def _discard_sigpipe(signum, frame) -> None:
     """A SIGPIPE handler that does nothing: the failed write raises EPIPE."""
 
 
+_FUSE_INTERRUPTED = ctypes.CFUNCTYPE(ctypes.c_int)(
+    ("fuse_interrupted", fusepy._libfuse)
+)
+_FUSE_EXITED = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p)(
+    ("fuse_exited", fusepy._libfuse)
+)
+
+
+def _native_capacity_cancel_reason():
+    """Read libfuse2 state only on the thread of a live native callback."""
+    context = fusepy._libfuse.fuse_get_context().contents
+    if not context.fuse:
+        return None
+    if _FUSE_INTERRUPTED():
+        return "request"
+    if _FUSE_EXITED(ctypes.c_void_p(context.fuse)):
+        return "session"
+    return None
+
+
+class FUSE(_FusePyFUSE):
+    """Give pool waits a same-thread cancellation probe during callbacks."""
+
+    @staticmethod
+    def _wrapper(func, *args, **kwargs):
+        # fusepy enters here directly from libfuse. A thread-local scope keeps
+        # the probe out of copied contextvars and direct StorageFS calls.
+        # init/destroy are not request callbacks and may lack a request
+        # pointer; neither acquires a cold-copy lease during teardown.
+        if getattr(func, "__name__", None) in ("init", "destroy"):
+            return _FusePyFUSE._wrapper(func, *args, **kwargs)
+        with capacity_wait_cancellation(_native_capacity_cancel_reason):
+            return _FusePyFUSE._wrapper(func, *args, **kwargs)
+
+
 @contextlib.contextmanager
 def _sigpipe_survives_fuse():
     """Keep a write to a dead socket an EPIPE error through FUSE()'s teardown.
@@ -3353,6 +3408,7 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
         revalidate_after=revalidate_after,
         listing_max_stale=listing_max_stale,
         checksum_reverify_interval=checksum_reverify_interval,
+        bulk_cold_copies=fuse_threads,
     )
     fs.mount_lock_file = lock_file
     if unclean_shutdown:

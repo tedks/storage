@@ -15,7 +15,8 @@ from pathlib import Path
 from contextlib import nullcontext
 from typing import Callable, ContextManager, Optional, List, Set
 
-from .backends.base import Backend
+from .backends.base import Backend, bulk_request
+from .backends.ssh_pool import BulkCapacityCancelled, BulkCapacityTimeout
 from .cache_metadata import PARTIAL_SUFFIX, PREFIX_XATTR, regular_file_stat, write_cache_metadata
 from .models import FileMetadata, SyncStatus
 from .state import StateManager
@@ -69,7 +70,8 @@ class CacheManager:
     Access (read or write) updates the LRU timestamp.
     """
 
-    def __init__(self, cache_root: Path, state_manager: StateManager, max_size_bytes: int):
+    def __init__(self, cache_root: Path, state_manager: StateManager,
+                 max_size_bytes: int, bulk_cold_copies: bool = False):
         """
         Initialize cache manager
 
@@ -77,6 +79,7 @@ class CacheManager:
             cache_root: Root directory for cache storage
             state_manager: State manager instance
             max_size_bytes: Maximum cache size in bytes
+            bulk_cold_copies: Reclassify whole-file copies on a threaded mount
         """
         self.cache_root = cache_root
         # Set by StorageFS: a context manager that holds the descriptor
@@ -102,6 +105,7 @@ class CacheManager:
         # StorageFS) means no contention.
         self.path_guard: Optional[Callable[[str], ContextManager[bool]]] = None
         self.state_manager = state_manager
+        self.bulk_cold_copies = bulk_cold_copies
         self.max_size_bytes = max_size_bytes
         self._lock = threading.RLock()
         # Bytes promised to fetches in flight (cache_file): counted against
@@ -342,6 +346,8 @@ class CacheManager:
             self.fetch_into_cache(backend, source_virtual_path, self.get_cache_path(virtual_path))
             self.state_manager.update_access_time(virtual_path)
             return True
+        except (BulkCapacityCancelled, BulkCapacityTimeout):
+            raise
         except Exception as e:
             print(f"Error caching {virtual_path} from {backend.name}: {e}")
             return False
@@ -372,7 +378,8 @@ class CacheManager:
         with self._lock:
             scans = self._scan_count
         try:
-            backend.copy_to_local(source_virtual_path, temp_path)
+            with bulk_request() if self.bulk_cold_copies else nullcontext():
+                backend.copy_to_local(source_virtual_path, temp_path)
             # A whole file is never a streaming prefix, whatever xattrs the
             # member's copy came with.
             _remove_prefix_marker(temp_path)
