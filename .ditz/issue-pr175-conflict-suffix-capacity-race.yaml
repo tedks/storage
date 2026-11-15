@@ -1,0 +1,23 @@
+id: pr175-conflict-suffix-capacity-race
+title: Recheck conflict-suffix local fallback after bulk capacity expiry
+desc: 'PR175 council Nit N-a at 2b1d1eb: _ensure_file_in_cache first returns for a
+  cached regular file. A conflict-suffix cache inode that appears only after that
+  initial check but before an opted-in bulk copy expires may have been served by the
+  old exception fallback; the new capacity exception returns EAGAIN. The FS path lock
+  serializes normal same-path operations, so the exact reachable producer and whether
+  the fallback is safe need an Event-gated investigation. Do not alter the published
+  EAGAIN-on-expiry policy or serve unverified bytes. This follow-up does not assert
+  a current release blocker without such a schedule.'
+type: bugfix
+component: storage
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-15T20:20:35-00:00
+references: []
+log_events:
+- time: 2026-11-15T20:20:35-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
