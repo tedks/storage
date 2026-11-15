@@ -1,6 +1,22 @@
 # Foreground channel reserve: current state
 
-- 2026-11-15 gate repair in progress: exact no-args all-four run on `0040e0f`
+- 2026-11-15 release validation checkpoint: tested pushed code head
+  `2f273d582656a25f741daa19c4826d09d1af7169` is based on published
+  master `181102496b37240d5cef4496e21b48c46359037f`.
+  The corrected namespace retry test passed its focused run. Exact-head,
+  no-args `scripts/run-gates.sh` then executed all 45 Bazel targets with
+  45 passes, including the mounted, resilience and remote gates; receipt
+  `.gates/2f273d582656a25f741daa19c4826d09d1af7169.json` records tree
+  `52298a92cdbc09a6a84f200a195f86f8bca319a8`. The second run's
+  three capped synthetic containers and exact network are absent by Docker
+  inspect; its client scope is inactive/dead, pids.peak 318 with no cap
+  event, sampled named scratch peaked 1,210 MiB. The preceding failed gate
+  and monitor abort are retained below as distinct evidence. This status
+  commit will advance HEAD, so these gates do not attest the new head:
+  rerun exact-head gates, CLI and formal council after pushing. PR #175
+  remains draft, unaccepted, unmerged and undeployed. PR #171/#167 are
+  untouched; root owns independent review, merge and deployment.
+- 2026-11-15 historical first gate failure: exact no-args all-four run on `0040e0f`
   executed 45 targets; 44 passed, including remote and mounted gates. The
   one failure was `test_mkdir_retry_eventually_replicates`: the asynchronous
   retry completed before its immediate absence assertion. The test now gates

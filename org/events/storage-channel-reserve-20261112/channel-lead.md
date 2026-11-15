@@ -304,3 +304,23 @@
   source and gate head must advance and rerun. The Docker trio and network
   were verified absent; the owned scope exited, with 1,108 MiB sampled named
   scratch and no pids cap hit. Formal council and CLI remain pending.
+
+## channel-lead:19
+
+- kind: bounded-validation
+- based_on: `2f273d582656a25f741daa19c4826d09d1af7169`
+- applied_at: exact-head second all-gates receipt, before status commit
+- refs: `channel-lead:18`,
+  `.gates/2f273d582656a25f741daa19c4826d09d1af7169.json`,
+  owned `storage175-finish-gates2-20261115.scope.json`
+- state: The Event-gated namespace retry case passed in a focused run.
+  The next clean, no-args `scripts/run-gates.sh` executed and passed all 45
+  Bazel targets at the pushed code head, tree
+  `52298a92cdbc09a6a84f200a195f86f8bca319a8`. The exact three capped
+  synthetic Docker containers and run network were verified absent; the
+  owned 2 CPU/8 GiB/2 GiB swap/1024 task client exited inactive/dead,
+  pids.peak 318 and no cap event. Sampled named scratch peaked 1,210 MiB;
+  open-unlinked and hidden mount-underlay bytes remain outside that sample.
+  This ledger/status commit advances HEAD, so all gates, CLI and formal
+  council must bind to the later pushed final head. No release acceptance,
+  merge or deployment is claimed.
