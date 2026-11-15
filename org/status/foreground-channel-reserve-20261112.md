@@ -1,5 +1,17 @@
 # Foreground channel reserve: current state
 
+- 2026-11-15 formal fix-delta council at pushed `2b1d1eb`: OpenAI CLEAN
+  (0/0/0), Anthropic no Critical/Important with four Nits, Google EMPTY
+  (usage limit). Anthropic I1-I4 were re-examined; I2's replica-loop premise
+  was withdrawn. The exact no-args all-four gate ran 45/45 at `2b1d1eb`
+  with matching tree receipt, scope inactive/dead. Nits N-c/N-d led to a
+  further test-only delta: discard channel closure is asserted, native
+  init/destroy probe exclusion is tested, and threaded scratch `run_fuse`
+  exercises the matching copy class. N-a/N-b have specific open follow-ups
+  `pr175-conflict-suffix-capacity-race` and
+  `ssh-pool-connect-deadline-after-capacity-wait`; neither is claimed as an
+  accepted behavior change. The test-only delta and final exact head remain
+  UNTESTED/UNPUSHED at this line; fresh gates, CLI and council are required.
 - 2026-11-15 threaded-mode repair checkpoint: code/test head `a3d5223`
   passed all six affected nonmount/mounted synthetic targets in owned
   `storage175-finish-affected5-20261115.scope` (34 seconds, 2 CPU/8 GiB/2 GiB

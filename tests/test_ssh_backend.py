@@ -507,6 +507,8 @@ class TestMemberConnectionPool(unittest.TestCase):
                 # A non-timeout channel error discards this exact lease.
                 # Its release must notify a waiter that has no deadline.
                 holders[0].release(ValueError("discard this SFTP reply"))
+                self.assertTrue(holders[0].lease.client.closed,
+                                "error release returned the channel as healthy")
                 self.assertTrue(entered.wait(3), "discard did not wake waiter")
                 self.assertTrue(waiter.join(3))
                 self.assertIsNone(waiter.error)

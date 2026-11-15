@@ -365,3 +365,22 @@
   byte-identically. Owned scopes exited inactive/dead, pids.events max zero,
   named scratch peak 1308 MiB. Full gates/CLI/council remain required on the
   final pushed head; this is not release acceptance.
+
+## channel-lead:22
+
+- kind: formal-fix-delta-and-test-repair
+- based_on: pushed `2b1d1eb7fffa88621cf2ed007409bc7e59ecb149`
+- applied_at: PR formal round
+  `2b1d1eb7fffa-20261115T201145Z-5f034c`, pending test-only commit
+- state: OpenAI native warm seat CLEAN 0/0/0; Anthropic warm seat CLEAN at
+  code level 0 Critical/0 Important/4 Nits and withdrew its mistaken
+  multi-replica fallback premise. Google foreign seat EMPTY at usage limit.
+  No-args all-four gate passed 45/45 on this exact pushed head; receipt
+  tree `485d06576b76e7536363224b02cfe15658191c9a`, scope exited
+  inactive/dead, pids peak 315, named scratch peak 1409 MiB. Nits N-c/N-d
+  prompted only test assertions/fixture alignment. N-a is a concurrent
+  cache-appearance edge after the first `is_cached` check, rather than the
+  stated ordinary cached fallback, and N-b is an old connect-deadline edge;
+  both have specific open tracker follow-ups. No production change from
+  `2b1d1eb` is planned. The next head needs all gates, CLI and formal
+  convergence before any release claim.

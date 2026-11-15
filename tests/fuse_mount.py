@@ -39,6 +39,9 @@ def run_fuse(fs: StorageFS, mountpoint: Union[str, Path], *, fuse_threads: bool,
     """
     from fuse import FUSE
 
+    # Directly constructed test filesystems must use the same resolved copy
+    # class as mount_storage before the first FUSE callback runs.
+    fs.cache_manager.bulk_cold_copies = fuse_threads
     _record_fuse_pointer(fs)
     FUSE(
         fs,

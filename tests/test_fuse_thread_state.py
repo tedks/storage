@@ -29,6 +29,7 @@ from unittest.mock import patch
 
 from fuse import FUSE, FuseOSError, Operations
 from storage.backends.local import LocalBackend
+from storage.backends.base import current_capacity_cancel_probe
 from storage.backends.ssh_pool import MemberConnection
 from storage.fs import FUSE as StorageFUSE, StorageFS, fuse_mount_options
 
@@ -369,6 +370,23 @@ def _unmount_capacity_mount(mount):
 
 class TestMountedCapacityCancellation(unittest.TestCase):
     """A real libfuse2 worker must leave the capacity wait before destroy."""
+
+    def test_init_and_destroy_have_no_request_cancel_probe(self):
+        def init():
+            pass
+
+        def destroy():
+            pass
+
+        def open():
+            pass
+
+        with patch("storage.fs._FusePyFUSE._wrapper",
+                   side_effect=lambda _func: current_capacity_cancel_probe()):
+            self.assertIsNone(StorageFUSE._wrapper(init))
+            self.assertIsNone(StorageFUSE._wrapper(destroy))
+            self.assertIsNotNone(StorageFUSE._wrapper(open))
+        self.assertIsNone(current_capacity_cancel_probe())
 
     def _exercise_session_exit(self, disable_cancel):
         root = Path(tempfile.mkdtemp(prefix="storage-capacity-unmount-"))
