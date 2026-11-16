@@ -1,0 +1,73 @@
+id: protocol-coldstart-20261116
+title: 'Cold-start audit 2026-11-16: protocol defects in the storage record'
+desc: 'Filed by the incoming Storage CTO during the cold-start audit of 2026-11-16
+  (UTC), before any other action. The audit reconstructed state from the predecessor''s
+  private retirement shard and committed artifacts. The git claims in the shard all
+  verified: both merge commits and trees, and the six preserved branch heads (clean,
+  equal to upstream). The defects below are in the record, not in the code. All Storage
+  product work stays paused; this issue authorizes nothing.
+
+
+  D1. Committed roster is stale and unmerged. org/ROSTER.md exists only on chore/orgs-integration-20261110
+  (draft PR #168, head 2a51f83). Its current-state header still shows the parent coordinator
+  and the responsiveness lead as active, cites a superseded PR #171 head (3f982b1;
+  the branch is at 7284ad1), and predates the merges of #175 and #179 and the 2026-11-15
+  wind-down pause. Doctrine: the roster never goes stale before a compaction or retirement.
+  Master carries no roster at all.
+
+
+  D2. Current state is recoverable only from the private shard plus uncommitted host-local
+  files. The shard''s evidence list points at host cache/state paths outside any repository.
+  They are present on this host today, but a different host or a cache cleanup loses
+  them. The pause itself is recorded nowhere in the public tracker or the repo.
+
+
+  D3. Shard worktree inventory is partial. It dispositions six worktrees. The project
+  has nine more that it does not mention: four with unmerged heads behind open draft
+  PRs (#167, #172, #176, #178), four whose heads are already merged, and one detached
+  validation checkout outside the project tree with three uncommitted entries. No
+  owner or disposition is recorded for any of them. The local master worktree is 68
+  commits behind origin/master.
+
+
+  D4. Open decisions are not linked to tracker issues from the shard. Matching issues
+  exist for the keep threshold (oq-streaming-fleet-keep-threshold), fallback bounds
+  (oq-conflict-fallback-limits) and the PR #171 policy set (oq-durable-freshness-legacy-cache,
+  oq-member-namespace-writer-ownership, oq-namespace-partial-rename-result, oq-namespace-rename-collision),
+  but "any Storage product resumption" and the splinter1 install-record custody question
+  have no issue.
+
+
+  D5. Successor authority conflicts with the shard as written. The shard says "no
+  successor" three times and doctrine holds a CTO''s own migration on orgs-cto-self-migration-approver.
+  This seat was launched on a relayed CEO instruction dated 2026-11-16, which outranks
+  both, but the instruction reached the seat by relay and no committed artifact in
+  this project records it.
+
+
+  D6. Two tracker issues are still in_progress although every lane is retired and
+  all work is paused.
+
+
+  Not a storage defect, noted for the orgs repo: the Claude Code binding''s tier table
+  names an older Frontier model than the one launched, and still describes harness
+  self-control as pending.
+
+
+  Proposed repairs (records only, none started): a current roster header on a records
+  branch; an open-questions issue for product resumption; dispositions for the nine
+  unlisted worktrees. Each waits on the CEO lifting or scoping the pause where it
+  touches product state.'
+type: task
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-16T04:14:58-00:00
+references: []
+log_events:
+- time: 2026-11-16T04:14:58-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
