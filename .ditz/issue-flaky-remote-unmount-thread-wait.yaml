@@ -1,0 +1,23 @@
+id: flaky-remote-unmount-thread-wait
+title: 'Remote gate: test_unmount_stops_background_work_and_frees_the_mount_lock[threads]
+  times out under host load'
+desc: 'run-gates.sh at 5ca1b5a (PR178, docs-only; no storage/ or tests/ change vs
+  master 0953369) failed only this test: ''after unmount: threads [checksum-reverify,
+  readdir-remote0_0, readdir-remote1_0, checksum-remote0, checksum-remote1], lock
+  held'' from _wait_for(remount_ready, timeout=2.0). framework0 load average ~19 from
+  other projects'' Bazel runs at the time. 53 passed, 1 xfailed. Either the 2 s budget
+  is too tight under load for threaded unmount (which waits for in-flight member calls),
+  or background workers genuinely outlive unmount; check against field-daemon-outlives-unmount.'
+type: bugfix
+component: tests
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-18T04:51:08-00:00
+references: []
+log_events:
+- time: 2026-11-18T04:51:08-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
