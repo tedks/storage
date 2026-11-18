@@ -3,8 +3,8 @@
 Status: proposed design, 2026-11-12; cold-partial ruling folded in
 2026-11-17. Owner: Storage root. No implementation, release acceptance or
 deployment is implied. Source baseline: master
-0953369de47a7e9b46a0edca8facfee99d6bb490 (code as of 5f3dbb3; #177 added only
-the field report); deployed application findings refer
+f9fe107a09ec246c1ec9e6ca7c31e64fcb313415 (code as of 5f3dbb3; #177 added the
+field report and #172 the mounted-restart design, both docs only); deployed application findings refer
 to accepted 81793ac27b70f82c231bf607b55e775d2b905974. #175 (interactive SFTP
 reserve for listings) is on that baseline; nothing here depends on unmerged
 #171 behavior or resolves the #170 merge-gate incident.
