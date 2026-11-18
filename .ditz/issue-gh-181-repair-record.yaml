@@ -79,5 +79,19 @@ log_events:
     be stranded. Cover bounded resource use on a burst and stop/restart accounting;
     verify unrelated member bytes before retry release. #167 corrects a four-caller/three-party
     rendezvous separately.'
+- time: 2026-11-18T07:07:57-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'CTO at 816fab8: accept actual cache metadata exhaustion after successful
+    conflict-view flush as a narrow residual, with exact local bytes retained at a
+    logged recovery path and member untouched. Excludes representation limits, metadata-only
+    dedup of different bytes and avoidable alias overwrite. Preserve valid rename
+    paths beyond 3584 serialized bytes using versioned carrier storage with compact
+    xattr and compatible reads; account for oversized view-write metadata without
+    displacing user bytes. C3 stands for supported queued RENAME: order publication
+    with overlapping member calls, preserve disjoint progress, and fix the split snapshot
+    of durable and pending repairs across handoff. Require barrier, long-path/rebuild
+    and fault regressions. Scheduler changes received; final council, lead and full
+    gates pending.'
 blocks:
 - gh-181
