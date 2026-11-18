@@ -132,17 +132,36 @@ warning log is the operator's signal. Concretely:
   later; they appear at the next enumeration of a newer revision. Automatic
   updates of an open view remain the separate change-delivery slice.
 
+"Missing" means any non-success member result: failed, timed out,
+cancelled (including by shutdown) or root unverified (below). A missing
+member never counts as a successful empty observation.
+
+A failed disk can look empty. Today `LocalBackend.listdir` returns `[]` for a
+path that does not exist, and `SSHBackend.listdir` maps `FileNotFoundError`
+to `[]`; neither rechecks that the member root is still the configured
+storage once the backend is constructed. A member whose disk died and left an
+empty mountpoint would therefore report successful-empty: nothing is logged,
+and on a warm directory its retained names are replaced by an empty set.
+The member-observation owner must tell "directory absent under a verified
+member root" apart from "member root missing or replaced" on each refresh
+(for example by checking the root's identity, such as its device, against
+the one recorded at startup or in member configuration). An unverified root
+is a missing member: logged, retained names kept, never confirmed absence.
+ENOENT for a subdirectory under a verified root stays successful-empty;
+sparse placement depends on it.
+
 The no-success case stays narrow and explicit. It applies only when every
-configured member failed or timed out for this listing, no member has a
+configured member is missing for this listing, no member has a
 retained last-known observation of the directory, and the local namespace
 contributes no names. Then readdir returns an explicit unavailable error,
 never a successful empty directory. If the local namespace does contribute
 names in that state, they are served and every member is logged missing
-(assumption: local dirty files must stay discoverable during a total
-outage; flagged for confirmation). A single-member mount whose one member
+(this follows the ruling's "preserve local names": local dirty files stay
+discoverable during a total outage). A single-member mount whose one member
 fails follows these all-failed rules, not the partial case. A member with a
-retained observation whose snapshot expired is not cold: its last-known
-names are served as stale under the rules below.
+retained observation whose snapshot expired is not cold: when every
+member fails, the retained last-known names (with local names) are served
+as stale, not an error.
 
 Cached known names remain the separate stale-first case (see the start of
 this section): a directory
@@ -151,10 +170,13 @@ member's last-known names as stale, as before.
 
 Current code (master 5f3dbb3, `NamespaceService._list_members`) already
 serves the available union when some members fail, but differs from this
-section in three ways the snapshot tracer must close: missing members are
+section in ways the snapshot tracer must close: missing members are
 logged only at debug level; when every member fails and nothing is cached it
-returns a successful empty listing; and a partial listing is published with
-the same freshness timestamp as a complete one.
+returns a successful empty listing; a partial listing is published with the
+same freshness timestamp as a complete one; a missing or replaced member
+root lists as successful-empty (above); and a foreground cold listing has no
+deadline of its own (`deadline=None`), bounded only by each member's
+transport timeout. The cold-wait bound is one of the pending numeric limits.
 
 ### Freshness and refresh limits
 

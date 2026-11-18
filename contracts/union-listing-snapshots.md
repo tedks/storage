@@ -5,7 +5,9 @@
 - **Inputs:** member ID/configuration generation, canonical directory identity,
   refresh generation, local namespace revision, and either a complete set of
   validated immediate children or a typed unavailable/timeout/cancelled result.
-  Absence confirmed by a reachable backend is successful empty. Partial reads
+  Absence confirmed by a reachable backend under a verified member root is
+  successful empty; a missing or replaced member root (for example a failed
+  disk leaving an empty mountpoint) is unavailable, not empty. Partial reads
   and permission failures are not confirmed absence. Do not follow a supplied
   child name outside its parent; reject invalid or colliding backend entries
   according to existing conflict policy rather than fabricating completeness.
@@ -40,7 +42,8 @@
   prior set, including empty. Failure preserves last-known evidence with its
   age/status; it never renews freshness or proves deletion. Enumeration handles
   pin one revision/offset mapping. Successful results publish independently;
-  incomplete pages never remove unseen names. Cached requests do not wait on
+  a member whose enumeration fails midway publishes none of its staged
+  pages and removes no names. Cached requests do not wait on
   remote I/O. At most one current refresh per directory/member; newer
   configuration/refresh generations reject stale publication. A directory
   identity change rejects its old scan. Local mutations are fenced per name:
@@ -48,12 +51,15 @@
   create/rename/deletion revisions, preserving newer local authority while
   publishing unaffected remote names. Unrelated local churn must not force
   whole-directory refresh rejection forever.
-- **Failure semantics:** the no-success case is narrow: every configured
-  member failed or timed out, none has a retained observation of the
-  directory, and the local namespace contributes no names. It returns an
+- **Failure semantics:** a missing member is any non-success result
+  (unavailable, timeout, cancelled, unverified root). The no-success case is
+  narrow: every configured member is missing, none has a retained
+  observation of the directory, and the local namespace contributes no
+  names. It returns an
   explicit unavailable error, never success-empty. Otherwise (ruled
-  2026-11-17, `oq-listing-cold-partial-result`) a cold listing returns the
-  available union of successful members and local names, even when empty:
+  2026-11-17, `oq-listing-cold-partial-result`) a listing returns the
+  available union of successful members, retained stale observations of
+  missing members and local names, even when empty:
   empty A plus unavailable B with nothing local is a successful empty
   readdir. The snapshot stays internally partial, B's status stays
   unavailable rather than empty, and it is never fresh. Each missing member
@@ -83,7 +89,11 @@
   empty, B logged, status partial, not fresh, B's later empty or populated
   result replaces only B); the same with a local dirty name (listed); partial
   page failure; all-failed/no-cache (error) and all-failed with local names
-  (listed); single-member failure; continuous local creates while a remote add
+  (listed); all-failed with retained observations (stale names listed);
+  all members cancelled/no-cache (error, not success-empty); member root
+  unmounted or replaced by an empty directory (unavailable, retained names
+  kept, warning logged) versus ENOENT subdirectory on a verified root
+  (successful empty); single-member failure; continuous local creates while a remote add
   still publishes; event identity after delete/recreate or contributor loss;
   older remote-change event after newer local mutation and duplicate events; stale
   response after local rename/unlink; slow A while B publishes; cancelled old
