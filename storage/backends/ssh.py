@@ -598,6 +598,11 @@ class SSHBackend(Backend):
                 except FileNotFoundError:
                     raise MemberSourceMissing(
                         errno.ENOENT, "no source on this member", old_remote) from exc
+                except OSError as diagnostic:
+                    # The check itself failed: no evidence either way. The
+                    # rename's own error stands, with the failed check noted.
+                    exc.add_note(f"source check failed: {diagnostic!r}")
+                    raise exc from None
                 raise
 
         self._with_sftp("rename", old_virtual_path, rename)

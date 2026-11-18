@@ -618,7 +618,6 @@ Implemented:
 - File recomputation
 - Symbolic links: made through the mount, replicated to the members holding their target; links already on members show as links
 - Transparent encryption (implemented; one test covers `storage/crypto.py`, so treat it as unverified)
-
 - The first member rename never replaces an object the namespace did not mean to replace: only a member whose copy at the new name is recorded gets a replacing rename; any other gets a rename the member refuses if the name is taken (renameat2 `RENAME_NOREPLACE` on local members), or none. SSH and rsync members have no such operation, so a rename onto a fresh name is never made on them: it becomes an open member repair, the member keeps showing the old name, and it gets no uploads at either name until the repair is settled by hand (`storage debug member-repairs`). A directory is never moved onto an existing directory on any member, local ones included, and a member that has no source at the old name is recorded too, so those also leave repairs
 
 Not implemented:

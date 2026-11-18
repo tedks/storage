@@ -116,9 +116,18 @@ destination appeared.
   - `SSHBackend` and the others inherit the base method, which always
     raises `ENOTSUP`. SFTP offers no operation the client can verify as
     atomic and non-replacing for every server and type.
-  - A missing source (`FileNotFoundError`) is never reported as a move.
-    It is recorded too, with its own reason, since the member may hold an
-    unrelated object at the new name that must stay fenced.
+  - On both member renames, the replacing one and the no-replace one, a
+    missing source is never reported as a move. It is
+    `MemberSourceMissing`, recorded with its own reason, since the member
+    may hold an unrelated object, or the replaced one, at the new name,
+    and that must stay fenced. Only positive evidence earns that reason:
+    - on a local member, an `lstat` of the source that fails with
+      ENOENT (a dangling link counts as present);
+    - on SSH, a source `lstat` after the rename's ENOENT that also fails
+      with ENOENT.
+
+    A permission or I/O error, or a failed check, keeps its own cause
+    (CTO-183-ERRNO).
   - A refusal (`EEXIST`) or `ENOTSUP` is a missed member. The member
     keeps the source and any object at the new name, and the rename's
     intent settles into an open repair for it (docs/member-rename-

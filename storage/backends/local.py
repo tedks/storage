@@ -37,6 +37,23 @@ _RENAMEAT2 = _load_renameat2()
 NOREPLACE_UNSUPPORTED = frozenset({errno.EINVAL, errno.ENOSYS, errno.EOPNOTSUPP, errno.ENOTSUP})
 
 
+# Seams for the member's own calls (tests patch these, not os.*).
+_lstat = os.lstat
+_replace = os.replace
+
+
+def _source_present(path) -> bool:
+    """Whether the member holds something at path, on positive evidence: an
+    lstat that succeeds (a dangling link counts as present) or fails with
+    ENOENT. Any other lookup error (EACCES, EIO) is raised as it is, never
+    taken for a missing source."""
+    try:
+        _lstat(path)
+    except FileNotFoundError:
+        return False
+    return True
+
+
 def rename_noreplace(src, dst) -> bool:
     """rename(src, dst) unless dst exists: True if renamed, False if dst exists.
 
@@ -253,12 +270,12 @@ class LocalBackend(Backend):
         """Rename a file or directory on the backend."""
         old_path = self._resolve_path(old_virtual_path)
         new_path = self._resolve_path(new_virtual_path)
-        # lexists: a link whose target is elsewhere is still renamed.
-        if not os.path.lexists(old_path):
+        # lstat, not exists: a link whose target is elsewhere is still renamed.
+        if not _source_present(old_path):
             # Nothing moved: never reported as a move.
             raise MemberSourceMissing(errno.ENOENT, "no source on this member", str(old_path))
         new_path.parent.mkdir(parents=True, exist_ok=True)
-        os.replace(old_path, new_path)
+        _replace(old_path, new_path)
 
     def rename_noreplace(self, old_virtual_path: str, new_virtual_path: str):
         """renameat2(RENAME_NOREPLACE): the kernel refuses atomically when
@@ -268,9 +285,8 @@ class LocalBackend(Backend):
         A missing source raises MemberSourceMissing, never a silent success."""
         old_path = self._resolve_path(old_virtual_path)
         new_path = self._resolve_path(new_virtual_path)
-        if not os.path.lexists(old_path):
-            # Nothing moved: never reported as a move (the caller decides
-            # whether this member was expected to hold the source).
+        if not _source_present(old_path):
+            # Nothing moved: never reported as a move.
             raise MemberSourceMissing(errno.ENOENT, "no source on this member", str(old_path))
         new_path.parent.mkdir(parents=True, exist_ok=True)
         try:

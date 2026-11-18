@@ -2066,7 +2066,7 @@ class TestFirstMemberRenameTarget(SyncRaceTestBase):
         recorded with that error, not as a missing source."""
         self.synced("/a.txt", b"renamed bytes")
         self.synced("/b.txt", b"replaced bytes")
-        with patch("storage.backends.local.os.replace",
+        with patch("storage.backends.local._replace",
                    side_effect=FileNotFoundError(errno.ENOENT, "parent went away")):
             self.fs.rename("/a.txt", "/b.txt")
         [record] = MemberRepairs(self.cache_dir).list()
@@ -2074,6 +2074,37 @@ class TestFirstMemberRenameTarget(SyncRaceTestBase):
         self.assertIn("parent went away", record.reason)
         self.assertEqual(b"renamed bytes", (self.member_dir / "a.txt").read_bytes())
         self.assertEqual(b"replaced bytes", (self.member_dir / "b.txt").read_bytes())
+
+    def test_a_source_that_cannot_be_inspected_is_not_called_missing(self):
+        """The member's lstat of the source fails with EACCES or EIO: that is
+        no evidence the source is gone. The rename is a miss carrying that
+        error, not "no source", and both objects stay (CTO-183-ERRNO)."""
+        self.synced("/a.txt", b"renamed bytes")
+        self.synced("/b.txt", b"replaced bytes")
+        self.synced("/c.txt", b"free target source")
+        for err, old, new in ((errno.EACCES, "/a.txt", "/b.txt"), (errno.EIO, "/c.txt", "/d.txt")):
+            with self.subTest(errno=err), patch(
+                    "storage.backends.local._lstat",
+                    side_effect=OSError(err, os.strerror(err))):
+                self.fs.rename(old, new)
+        reasons = {r.old_path: r.reason for r in MemberRepairs(self.cache_dir).list()}
+        self.assertEqual({"/a.txt", "/c.txt"}, set(reasons))
+        for old, text in (("/a.txt", os.strerror(errno.EACCES)), ("/c.txt", os.strerror(errno.EIO))):
+            self.assertNotIn("no source", reasons[old])
+            self.assertIn(text, reasons[old])
+        self.assertEqual(b"renamed bytes", (self.member_dir / "a.txt").read_bytes())
+        self.assertEqual(b"replaced bytes", (self.member_dir / "b.txt").read_bytes())
+        self.assertEqual(b"free target source", (self.member_dir / "c.txt").read_bytes())
+        self.assertFalse((self.member_dir / "d.txt").exists())
+
+    def test_a_dangling_link_is_a_present_source(self):
+        """A link whose target is gone is still a source: it is renamed."""
+        self.synced("/a.txt", b"x")
+        (self.member_dir / "a.txt").unlink()
+        os.symlink("nowhere", self.member_dir / "a.txt")
+        self.fs.rename("/a.txt", "/b.txt")
+        self.assertTrue(os.path.islink(self.member_dir / "b.txt"))
+        self.assertEqual([], self.repairs())
 
     def test_known_intended_replacement_still_replaces(self):
         """Control: /b.txt is the namespace's own, synced to the member;
