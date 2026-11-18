@@ -598,9 +598,15 @@ class SSHBackend(Backend):
                 except FileNotFoundError:
                     raise MemberSourceMissing(
                         errno.ENOENT, "no source on this member", old_remote) from exc
-                except OSError as diagnostic:
-                    # The check itself failed: no evidence either way. The
-                    # rename's own error stands, with the failed check noted.
+                except BaseException as diagnostic:
+                    if is_connection_error(diagnostic) or not isinstance(diagnostic, Exception):
+                        # The member could not be asked (a timeout, a lost
+                        # connection), or an interrupt: raised as it is, for
+                        # the pool to see, with the rename's error noted.
+                        diagnostic.add_note(f"after the rename failed: {exc!r}")
+                        raise
+                    # A path answer (EACCES, say): no evidence either way.
+                    # The rename's own error stands, with the check noted.
                     exc.add_note(f"source check failed: {diagnostic!r}")
                     raise exc from None
                 raise

@@ -598,7 +598,10 @@ class NamespaceService:
             except Exception as exc:
                 failures.append(backend.name)
                 if errors is not None:
-                    errors[backend.name] = f"{type(exc).__name__}: {exc}"
+                    # Notes (a failed source check, say) reach the repair.
+                    notes = "; ".join(getattr(exc, "__notes__", ()))
+                    errors[backend.name] = (f"{type(exc).__name__}: {exc}"
+                                            + (f" ({notes})" if notes else ""))
                 if raised is not None:
                     raised[backend.name] = exc
                 self.logger.debug(

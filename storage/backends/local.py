@@ -43,8 +43,8 @@ _replace = os.replace
 
 
 def _source_present(path) -> bool:
-    """Whether the member holds something at path, on positive evidence: an
-    lstat that succeeds (a dangling link counts as present) or fails with
+    """Whether the member holds something at path: True when lstat succeeds
+    (a dangling link counts as present), False only when it fails with
     ENOENT. Any other lookup error (EACCES, EIO) is raised as it is, never
     taken for a missing source."""
     try:

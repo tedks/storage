@@ -2019,6 +2019,22 @@ class TestSSHBackendOnThePool(_BackendTestCase):
         self.assertTrue(any("source check failed" in note
                             for note in getattr(raised.exception, "__notes__", [])))
 
+    def test_a_lost_connection_during_the_source_check_reaches_the_pool(self):
+        """A timeout or a dropped connection in the diagnostic lstat is raised
+        as it is, so the pool sees the stall, with the rename's error noted."""
+        def enoent(client, path):
+            raise FileNotFoundError(errno.ENOENT, "parent gone")
+        for failure in (socket.timeout(), EOFError("connection dropped")):
+            with self.subTest(failure=type(failure).__name__):
+                def lost(client, path, failure=failure):
+                    raise failure
+                self.server.hooks["posix_rename"] = enoent
+                self.server.hooks["lstat"] = lost
+                with self.assertRaises(type(failure)) as raised:
+                    self._new_backend().rename("/a", "/b")
+                self.assertTrue(any("after the rename failed" in note
+                                    for note in getattr(raised.exception, "__notes__", [])))
+
     def test_rename_enoent_with_the_source_present_keeps_its_own_error(self):
         def enoent(client, path):
             raise FileNotFoundError(errno.ENOENT, "parent gone")

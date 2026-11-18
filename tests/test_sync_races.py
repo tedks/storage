@@ -2106,6 +2106,29 @@ class TestFirstMemberRenameTarget(SyncRaceTestBase):
         self.assertTrue(os.path.islink(self.member_dir / "b.txt"))
         self.assertEqual([], self.repairs())
 
+    def test_a_dangling_link_replaces_a_recorded_target(self):
+        """The replacing path also counts a dangling link as a present source."""
+        self.synced("/a.txt", b"x")
+        self.synced("/b.txt", b"replaced bytes")
+        (self.member_dir / "a.txt").unlink()
+        os.symlink("nowhere", self.member_dir / "a.txt")
+        self.fs.rename("/a.txt", "/b.txt")
+        self.assertTrue(os.path.islink(self.member_dir / "b.txt"))
+        self.assertEqual([], self.repairs())
+
+    def test_a_noted_cause_reaches_the_repair_reason(self):
+        """Notes on a member's error (a failed source check) are kept in the
+        durable repair, not only on the exception."""
+        self.synced("/a.txt", b"renamed bytes")
+        self.synced("/b.txt", b"replaced bytes")
+        failure = FileNotFoundError(errno.ENOENT, "parent gone")
+        failure.add_note("source check failed: PermissionError(13, 'denied')")
+        with patch("storage.backends.local._replace", side_effect=failure):
+            self.fs.rename("/a.txt", "/b.txt")
+        [record] = MemberRepairs(self.cache_dir).list()
+        self.assertIn("source check failed", record.reason)
+        self.assertNotIn("no source at the old name", record.reason)
+
     def test_known_intended_replacement_still_replaces(self):
         """Control: /b.txt is the namespace's own, synced to the member;
         renaming /a.txt over it replaces it there, as rename(2) does."""
