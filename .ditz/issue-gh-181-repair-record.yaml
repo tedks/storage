@@ -7,8 +7,8 @@ type: bugfix
 component: sync
 release:
 reporter: Ted Smith <tedks@riseup.net>
-status: in_progress
-disposition:
+status: closed
+disposition: fixed
 creation_time: 2026-11-18T05:00:07-00:00
 references: []
 log_events:
@@ -137,5 +137,11 @@ log_events:
   comment: 'PR #182 final head 2940dbe (tree de6edaba) passed all gates 48/48 (receipt
     07:46:49Z), council clean:true (round 0a2483), lead CLEAN. Awaiting CTO acceptance;
     not merged.'
+- time: 2026-11-18T07:49:33-00:00
+  who: Ted Smith
+  what: 'closed: fixed'
+  comment: 'Landed PR #182 in normal merge 777b993 on master. Exact tree de6edaba
+    matched gated head 2940dbe; 48/48 gates and CLI build/smoke passed. The first
+    synchronous member rename is tracked separately in #183.'
 blocks:
 - gh-181
