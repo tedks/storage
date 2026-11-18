@@ -13,8 +13,8 @@ type: task
 component: open-questions
 release:
 reporter: Ted Smith <tedks@riseup.net>
-status: unstarted
-disposition:
+status: closed
+disposition: fixed
 creation_time: 2026-11-18T05:09:24-00:00
 references: []
 log_events:
@@ -36,5 +36,10 @@ log_events:
     moves will require manual repair even without a collision. Preserve intentional
     replacement and distinguish incomplete member knowledge from observed absence.
     The decision clears the PR167 merge hold and authorizes PR183 implementation.'
+- time: 2026-11-18T20:32:22-00:00
+  who: Ted Smith
+  what: 'closed: fixed'
+  comment: 'Ruled by Ted: skip and durably report an unprotected member move; implementation
+    tracked by gh-181-sync-rename-noreplace.'
 blocks:
 - gh-181-sync-rename-noreplace
