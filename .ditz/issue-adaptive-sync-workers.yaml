@@ -116,3 +116,10 @@ log_events:
   comment: PR167 landed via normal merge 60b4b6a91a923df39244b652a0475f5bf9c2232f
     after Ted approved the first-rename fallback. Remote merge tree equals the accepted
     1ae2f40 tree.
+- time: 2026-11-18T20:33:47-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Landed: #167 normal-merged 60b4b6a (parents 777b993 + 1ae2f40, tree 1529835
+    = gated head). Rebased onto #180/#182; CTO rulings: fixed-pool master stop waits,
+    explicit-mode SFTP-capacity ceiling (sync_worker_limit), on_deliver growth for
+    RetryScheduler deliveries. Gate 48/48 at 1ae2f40. Follow-up: adaptive-sync-test-unused-done-at.'
