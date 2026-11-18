@@ -3,7 +3,8 @@
 Status: proposed design, 2026-11-12; cold-partial ruling folded in
 2026-11-17. Owner: Storage root. No implementation, release acceptance or
 deployment is implied. Source baseline: master
-5f3dbb318d83c4764911c1878cbfb5356e444d16; deployed application findings refer
+0953369de47a7e9b46a0edca8facfee99d6bb490 (code as of 5f3dbb3; #177 added only
+the field report); deployed application findings refer
 to accepted 81793ac27b70f82c231bf607b55e775d2b905974. #175 (interactive SFTP
 reserve for listings) is on that baseline; nothing here depends on unmerged
 #171 behavior or resolves the #170 merge-gate incident.
@@ -267,7 +268,8 @@ the same approach. Escalate the specific boundary; do not import PR171 wholesale
   available union even if empty and log the missing members; no partial UI
   flag or notification transport is needed. Recorded in ditz
   `oq-listing-cold-partial-result` by the CTO.
-- PR177 report at 01386e6: slow first-observed readdir and warm per-entry cost;
+- [PR177 field report](../field/splinter1-browse-20261112/REPORT.md), merged
+  at 0953369 (reviewed at 01386e6): slow first-observed readdir and warm per-entry cost;
   no missing entries reproduced; no attribution of latency to chunk1.
 - [Nautilus monitor implementation](https://github.com/GNOME/nautilus/blob/master/src/nautilus-monitor.c):
   GIO directory monitoring and changed-event handling.
