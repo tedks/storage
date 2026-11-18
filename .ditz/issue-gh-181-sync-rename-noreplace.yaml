@@ -74,6 +74,13 @@ log_events:
     failure. Distinguish confirmed absence from uninspectable source in the durable
     repair reason; regress on injected errors. Final exact-head review and full gates
     pending.'
+- time: 2026-11-18T20:56:12-00:00
+  who: Ted Smith
+  what: commented
+  comment: CTO verified the errno fix at 3ed6eb4. Local lstat preserves access and
+    I/O errors and recognizes dangling links; SSH retains the original rename error
+    when diagnostic lookup fails. Fast gates reported 42/42. Awaiting exact-head round
+    43f6e7 and lead review, then full gates and CLI under the existing reservation.
 blocks:
 - gh-181
 blocked_by:
