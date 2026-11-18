@@ -50,6 +50,18 @@ log_events:
     output and CommandTimeout, any other non-connection exception from run_command
     also becomes ChecksumUnavailable under allow_download=False (storage/backends/ssh.py:750-779);
     the conclusion stands: never map ChecksumUnavailable wholesale to the fallback.'
+- time: 2026-11-18T05:41:33-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'PR 169 merged ebcbdf0 (CTO accept at cee0a13, 2026-11-18): docs/performance_backlog_2026-11-10.md
+    package 5 records Ted''s two rulings as ''Ruled limits'' (64 MiB, 60 s total,
+    one per mount/member, 1 s slot wait, 1 MiB reads, no user override; unknown/oversize/growth/timeout/cancel/failure
+    => member unverified, upload blocked) and separates ''Proposed enforcement'' (re-stat
+    inside 60 s, per-op timeout capping, bulk classification, channel-wait bound,
+    path-level DIRTY/ERROR/no-CLEAN aggregate, test-only bound injection) needing
+    acceptance at decomposition. Still blocked by gh-74-fast-checksum. Left for a
+    future ruling: fallback after malformed remote output, and after a canceled remote-hash
+    timeout (both unverified by default).'
 blocks:
 - gh-74
 - gh-74-tests
