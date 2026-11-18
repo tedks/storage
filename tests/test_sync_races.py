@@ -16,6 +16,7 @@ from fuse import FuseOSError
 
 from storage.backends.local import LocalBackend
 from storage.fs import StorageFS
+import storage.namespace as storage_namespace
 from storage.models import SyncStatus
 from storage.index_audit import rebuild_index_from_cache
 from storage.member_repairs import CorruptRepairRecord, MemberRepairs
@@ -513,19 +514,23 @@ class TestDirectoryRetries(SyncRaceTestBase):
         self.assertEqual([], self.repairs())
 
     def test_failed_settle_leaves_the_intent_for_every_member(self):
-        """The member rename failed, and rewriting the intent as an open
-        repair fails too: the intent stays, naming every target member."""
+        """The member rename failed, and writing its open record fails too:
+        the intent stays, naming every target member."""
         self.fs.mkdir("/d", 0o755)
         self.fail_member_once("rename")
-        real_setxattr = os.setxattr
+        repairs = self.fs.cache_manager.member_repairs
+        real_write = repairs._write_new
+        writes = []
 
-        def refusing_replace(target, name, value, flags=0, **kwargs):
-            if name == "user.storage.member_repair" and flags == os.XATTR_REPLACE:
+        def failing_after_the_intent(record):
+            writes.append(record.state)
+            if record.state != "intent":
                 raise OSError(errno.EIO, "injected")
-            return real_setxattr(target, name, value, flags, **kwargs)
+            return real_write(record)
 
-        with patch("storage.member_repairs.os.setxattr", side_effect=refusing_replace):
+        with patch.object(repairs, "_write_new", side_effect=failing_after_the_intent):
             self.fs.rename("/d", "/e")
+        self.assertEqual(["intent", "open"], writes)
         [record] = MemberRepairs(self.cache_dir).list()
         self.assertEqual(("intent", ("member",), "/d", "/e"),
                          (record.state, record.members, record.old_path, record.new_path))
@@ -880,6 +885,22 @@ class TestRepairsOutliveTheIndex(SyncRaceTestBase):
         with patch.object(self.member, "rename", side_effect=resolve_intent_then_fail):
             self.fs.rename("/d", "/e")
         [record] = MemberRepairs(self.cache_dir).list()
+        self.assertEqual({"member"}, self.fs.cache_manager.member_repairs.backends_for(["/e"]))
+
+    def test_an_intent_resolved_while_its_rename_runs_survives_a_concurrent_reload(self):
+        """As above, with a lookup (a sync worker, an eviction) reloading
+        the registry between the resolve and the settle."""
+        self.fs.mkdir("/d", 0o755)
+
+        def resolve_intent_reload_then_fail(*_args):
+            [intent] = MemberRepairs(self.cache_dir).list()
+            self.assertTrue(MemberRepairs(self.cache_dir).resolve(intent.id))
+            self.assertEqual([], self.fs.cache_manager.member_repairs.list())
+            raise OSError("member unreachable")
+
+        with patch.object(self.member, "rename", side_effect=resolve_intent_reload_then_fail):
+            self.fs.rename("/d", "/e")
+        [record] = MemberRepairs(self.cache_dir).list()
         self.assertEqual(("open", ("member",), "/d", "/e"),
                          (record.state, record.members, record.old_path, record.new_path))
         self.assertEqual({"member"}, self.fs.cache_manager.member_repairs.backends_for(["/e"]))
@@ -921,3 +942,28 @@ class TestRepairsOutliveTheIndex(SyncRaceTestBase):
         self.assertEqual([], renames)
         [record] = MemberRepairs(self.cache_dir).list()
         self.assertEqual(("intent", ("member",)), (record.state, record.members))
+
+    def test_directories_the_move_creates_are_made_durable_before_any_member_call(self):
+        """Moving /d to /x/y/d makes /x and /x/y in the cache: each is
+        fsynced in its own parent before the member is called."""
+        self.fs.mkdir("/d", 0o755)
+        self.fs.mkdir("/x", 0o755)
+        self.fs.mkdir("/x/y", 0o755)
+        import shutil as _shutil
+        _shutil.rmtree(self.cache_dir / "x")  # as if never cached
+        synced, calls = [], []
+        real = storage_namespace.fsync_directories
+
+        def recording(*paths):
+            synced.extend(str(p) for p in paths)
+            return real(*paths)
+
+        real_rename = self.member.rename
+        patch.object(self.member, "rename",
+                     side_effect=lambda *a: (calls.append(list(synced)), real_rename(*a))).start()
+        self.addCleanup(patch.stopall)
+        with patch("storage.namespace.fsync_directories", side_effect=recording):
+            self.fs.rename("/d", "/x/y/d")
+        [before_member] = calls
+        for directory in (self.cache_dir, self.cache_dir / "x", self.cache_dir / "x" / "y"):
+            self.assertIn(str(directory), before_member)

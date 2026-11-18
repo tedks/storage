@@ -135,6 +135,24 @@ def _fsync(path: Path, directory: bool = False):
         os.close(fd)
 
 
+FLOCK_WAIT = 5.0
+
+
+def _flock_bounded(fd: int, wait: Optional[float] = None):
+    """flock(LOCK_EX) for at most wait seconds; raises OSError(EWOULDBLOCK)
+    after. Callers that hold namespace locks must not wait without bound on
+    another process (a resolve stopped in a terminal, say)."""
+    deadline = time.monotonic() + (FLOCK_WAIT if wait is None else wait)
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                raise OSError(errno.EWOULDBLOCK, "member repair carrier is busy")
+            time.sleep(0.01)
+
+
 def fsync_directories(*paths: Path):
     """Make renames within these directories durable (each once)."""
     for path in dict.fromkeys(str(p) for p in paths):
@@ -213,19 +231,48 @@ class MemberRepairs:
                     self._seen = stamp
                     return False
                 if record.state == RESOLVED and owner:
-                    # Its resolution was durable; only the unlink was lost.
-                    try:
-                        path.unlink()
-                    except FileNotFoundError:
-                        pass
-                    continue
+                    # Its resolution was written; finish it under the same
+                    # flock a live resolve holds, making the state durable
+                    # first in case that resolve died before its fsync.
+                    if self._finish_resolution(path):
+                        continue
                 records[name] = record
             if owner:
                 _fsync(self.dir, directory=True)
-            stamp = self._dir_stamp()
+                # The owner's own unlinks changed the directory; nothing
+                # else writes it during the open.
+                stamp = self._dir_stamp()
+        # Otherwise the stamp from before the listing: a change made while
+        # listing shows as a mismatch at the next lookup, which reloads.
         self._records = records
         self._seen = stamp
         return True
+
+    @staticmethod
+    def _finish_resolution(path: Path) -> bool:
+        """Unlink a resolved carrier; False (keep enforcing it) if it is
+        busy or no longer resolved."""
+        try:
+            fd = os.open(str(path), os.O_RDONLY)
+        except FileNotFoundError:
+            return True
+        try:
+            try:
+                _flock_bounded(fd)
+            except OSError:
+                return False
+            if os.fstat(fd).st_nlink == 0:
+                return True
+            if MemberRepair.from_json(os.getxattr(fd, RECORD_XATTR), path.name).state != RESOLVED:
+                return False
+            os.fsync(fd)
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            return True
+        finally:
+            os.close(fd)
 
     def _refresh(self):
         with self._lock:
@@ -316,65 +363,59 @@ class MemberRepairs:
         )
         return record.id
 
-    def settle(self, repair_id: str, missed: Dict[str, str]):
-        """Settle an intent: drop it if no member missed the move, else
-        rewrite it as an open repair for the members that did.
+    def settle(self, repair_id: str, old_path: str, new_path: str, missed: Dict[str, str]):
+        """Settle an intent once every member call has returned.
 
-        Ordered against a resolution in another process by flock on the
-        carrier. If the intent was resolved meanwhile, the members that
-        missed the move get a new open record: a resolution of an intent
-        cannot cover what the rename had not yet done. A failure leaves the
-        intent, which fences every target member: more than needed, never
-        less. It is logged, not raised; the evidence is already durable.
+        The members that missed the move get a new open record, under a new
+        id, made durable first; only then is the intent removed. A
+        resolution of the intent id, before or after, therefore never
+        covers the miss: before, the intent is gone or resolved and the new
+        record still follows; after, the id names nothing and the resolve
+        fails. The paths come from the caller, not from memory, which a
+        concurrent reload may have changed. With no miss, the intent is
+        simply removed.
+
+        The intent is changed under an exclusive flock on its carrier,
+        which resolution in another process takes too; settle waits at most
+        FLOCK_WAIT seconds for it, and then leaves the intent (over-fencing,
+        never under). Any failure leaves the intent likewise; it is logged,
+        not raised: the evidence is already durable.
         """
         reasons = "; ".join(f"{m}: {missed[m]}" for m in sorted(missed))[:MAX_REASON_CHARS]
         with self._write_lock:
-            intent = self._records.get(repair_id)
-            carrier = self.dir / repair_id
             try:
-                fd = os.open(str(carrier), os.O_RDONLY)
-            except FileNotFoundError:
-                fd = None
-            try:
-                current = None
-                if fd is not None:
-                    fcntl.flock(fd, fcntl.LOCK_EX)
-                    if os.fstat(fd).st_nlink > 0:
-                        current = MemberRepair.from_json(
-                            os.getxattr(fd, RECORD_XATTR), repair_id)
-                if current is None or current.state != INTENT:
-                    # Resolved by someone else before the rename settled.
-                    if missed and intent is not None:
-                        self._write_new(self._make(intent.old_path, intent.new_path,
-                                                   missed, OPEN, reasons))
-                elif not missed:
-                    carrier.unlink()
-                    _fsync(self.dir, directory=True)
-                else:
-                    settled = MemberRepair(
-                        id=repair_id, old_path=current.old_path, new_path=current.new_path,
-                        members=tuple(sorted(missed)), state=OPEN,
-                        reason=reasons, recorded=current.recorded,
-                    )
-                    payload = settled.to_json()
-                    if len(payload) > MAX_RECORD_BYTES:
-                        raise OSError(errno.ENAMETOOLONG, "settled record too large")
-                    os.setxattr(fd, RECORD_XATTR, payload, os.XATTR_REPLACE)
-                    os.fsync(fd)
                 if missed:
+                    self._write_new(self._make(old_path, new_path, missed, OPEN, reasons))
                     logger.warning(
-                        "Member(s) %s missed a rename, which is not replayed; repair recorded "
-                        "(storage debug member-repairs): %s", ", ".join(sorted(missed)), reasons,
+                        "Member(s) %s missed the rename %s -> %s, which is not replayed; repair "
+                        "recorded (storage debug member-repairs): %s",
+                        ", ".join(sorted(missed)), old_path, new_path, reasons,
                     )
+                self._drop_intent(repair_id)
             except (OSError, CorruptRepairRecord):
                 logger.exception(
                     "Could not settle member repair %s; it stays an intent for every member",
                     repair_id,
                 )
-            finally:
-                if fd is not None:
-                    os.close(fd)
             self._after_write(lambda records: None)
+
+    def _drop_intent(self, repair_id: str):
+        carrier = self.dir / repair_id
+        try:
+            fd = os.open(str(carrier), os.O_RDONLY)
+        except FileNotFoundError:
+            return  # resolved by someone else meanwhile
+        try:
+            _flock_bounded(fd)
+            if os.fstat(fd).st_nlink == 0:
+                return
+            current = MemberRepair.from_json(os.getxattr(fd, RECORD_XATTR), repair_id)
+            if current.state != INTENT:
+                return  # being resolved: that resolution finishes it
+            carrier.unlink()
+        finally:
+            os.close(fd)
+        _fsync(self.dir, directory=True)
 
     def resolve(self, repair_id: str) -> bool:
         """Drop a repair once someone has settled the members by hand.
@@ -397,7 +438,7 @@ class MemberRepairs:
                 self._after_write(lambda records: records.pop(repair_id, None))
                 return False
             try:
-                fcntl.flock(fd, fcntl.LOCK_EX)
+                _flock_bounded(fd)
                 if os.fstat(fd).st_nlink == 0:
                     found = False
                 else:
@@ -409,7 +450,10 @@ class MemberRepairs:
                     )
                     os.setxattr(fd, RECORD_XATTR, resolved.to_json(), os.XATTR_REPLACE)
                     os.fsync(fd)
-                    carrier.unlink()
+                    try:
+                        carrier.unlink()
+                    except FileNotFoundError:
+                        pass  # the owner finished it: still this resolution
                     found = True
             finally:
                 os.close(fd)

@@ -1519,6 +1519,8 @@ class NamespaceService:
                                 new_resolved.canonical_path, excluding=old_resolved.canonical_path
                             )):
                         raise OSError(errno.ENOTEMPTY, os.strerror(errno.ENOTEMPTY), new)
+                    created = [p for p in [new_cache.parent, *new_cache.parent.parents]
+                               if not p.exists()]
                     new_cache.parent.mkdir(parents=True, exist_ok=True)
                     old_cache.rename(new_cache)
                     moved = True
@@ -1536,14 +1538,18 @@ class NamespaceService:
             except BaseException:
                 if intent is not None and not moved:
                     # Nothing moved and no member was called.
-                    repairs.settle(intent, {})
+                    repairs.settle(intent, old_resolved.canonical_path,
+                                   new_resolved.canonical_path, {})
                 raise
             if intent is not None:
                 # The local move is durable before any member is called, so
                 # no power loss can undo it after a member took the move and
                 # its intent was dropped. A failure here leaves the intent,
                 # with no member called.
-                fsync_directories(old_cache.parent, new_cache.parent)
+                # Directories the move made (mkdir parents) are made durable
+                # in their own parents too.
+                fsync_directories(*(p.parent for p in reversed(created)),
+                                  old_cache.parent, new_cache.parent)
 
             errors: Dict[str, str] = {}
             failures = self._propagate_dir_operation(
@@ -1571,7 +1577,8 @@ class NamespaceService:
                 for name in fenced
             })
             if intent is not None:
-                repairs.settle(intent, missed)
+                repairs.settle(intent, old_resolved.canonical_path,
+                               new_resolved.canonical_path, missed)
 
             self.invalidate_dir_cache_entry(old_resolved.parent_dir)
             self.invalidate_dir_cache_entry(new_resolved.parent_dir)

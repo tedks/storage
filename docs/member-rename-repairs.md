@@ -80,29 +80,43 @@ durable record of it.
    changed: no cache move, no index change, no member call. A rename with no
    target members writes no record.
 2. **Local move.** The cache rename, the index rewrite and the metadata
-   xattrs, as before. Then both cache parent directories are fsynced, so
-   no power loss can undo the local move after a member has taken it and
-   its intent has been dropped. If that fsync fails, the rename returns
-   the error with the intent kept and no member called.
+   xattrs, as before. Then the cache tree's part of the move is made
+   durable:
+   - every directory the move created for the new path (`mkdir` of its
+     parents) is fsynced in its own parent;
+   - both cache parent directories are fsynced.
+
+   So no power loss can undo the cache move after a member has taken it
+   and its intent has been dropped. The cache tree is the authority. The
+   index commit (`synchronous=NORMAL`) and the metadata xattrs are not
+   fsynced here, and can be rebuilt. If an fsync fails, no member is
+   called and the intent is kept. The rename still returns the error,
+   even though the local move has already happened.
 3. **Member renames.** These skip any member that already had an open
    repair overlapping either path. Those members are added to the failed
    set, and none of them is called.
 4. **Settle.**
-   - If every member succeeded, the carrier is unlinked and the directory
-     fsynced.
-   - Otherwise the xattr is replaced, in one setxattr, by an `open` record
-     naming only the failed members, with the reasons, and the file is
-     fsynced.
+   - If some members missed the move, they first get a new `open` record
+     under a new id, written durably like any record, with the reasons.
+   - Then the intent's carrier is unlinked and the directory fsynced.
+
+   The paths come from the rename itself, not from the registry, which a
+   concurrent reload may have changed.
 
    If settling fails, the `intent` record stays. It names every target
    member, so it over-fences, but nothing is lost. The rename still returns
    success, because its evidence is durable.
 
-   Settle takes an exclusive `flock` on the carrier, as resolution does.
-   If it finds the intent already resolved or gone (someone resolved it
-   from the CLI while the rename was running), the members that missed
-   the move get a new `open` record. Resolving an intent cannot cover what
-   the rename had not done yet.
+   Settle changes the intent only under an exclusive `flock` on its
+   carrier, the same lock resolution takes. Because the miss always lands
+   under a new id, a resolution of the intent id never covers it, whether
+   that resolution comes before the settle or after it. A late resolve of
+   the intent id names nothing and fails.
+
+   Settle waits at most 5 seconds for the lock. It runs under the rename's
+   path and namespace locks, so it must not wait without bound on another
+   process, such as a resolve stopped at a terminal. After the wait it
+   leaves the intent in place: that over-fences, never under-fences.
 
 What a crash at each point leaves:
 
@@ -142,9 +156,16 @@ removal by another process, so missing it keeps a protection longer and
 never drops one.
 
 Two locks are involved. One guards the in-memory records and is never held
-across an fsync. The other orders this process's writers across their I/O.
-Neither is held while any other lock is taken. Opening the cache with more
-than 1000 open repairs logs a warning, since every lookup scans them all.
+across an fsync. The other orders this process's writers across their I/O,
+and is taken under the rename's path and namespace locks. A writer then
+takes a carrier's `flock` only for a bounded wait. Opening the cache with
+more than 1000 open repairs logs a warning, since every lookup scans them
+all.
+
+Cost: a rename with member targets makes about five fsyncs (the intent, the
+cache directories, and the settle) plus two reloads of the carrier
+directory, each one listdir and one getxattr per open repair. A rename with
+no member target pays nothing.
 
 Members are identified by their stable member IDs. A member whose ID
 changes in the configuration no longer matches its repairs: settle those
@@ -165,9 +186,11 @@ works in two steps, under an exclusive `flock` on the carrier:
    is durable.
 
 If a crash comes between the two steps, the carrier is left `resolved`. It
-stays enforced until the cache's owner (the mount) next opens the cache,
-which finishes the resolution. A mount sees a completed resolution at its
-next lookup.
+stays enforced until the cache's owner (the mount) next opens the cache.
+The owner finishes the resolution under the same `flock`, fsyncing the
+record first, and leaves a carrier it cannot lock in place. A resolve
+that finds its carrier already finished by the owner still succeeds. A
+mount sees a completed resolution at its next lookup.
 
 The id is the carrier's random name, so it survives index loss. A stale or
 mistyped id names no carrier and is an error. Resolving the same id twice is
@@ -207,6 +230,11 @@ and the CLI cases in `tests/test_cli_debug.py`:
   - a resolution made by another process during a rename's member call
     still reaches the mount;
   - an intent resolved while its rename runs still records the members
-    that missed the move;
+    that missed the move, including when a concurrent lookup reloads in
+    between;
+  - a late resolve of the intent id fails, and the miss survives it;
+  - a busy carrier: settle leaves the intent in place, and the owner
+    leaves a resolved carrier it cannot lock;
+  - directories created by the move are fsynced before any member call;
   - an interrupted resolution stays enforced until the next open;
   - a failed fsync of the local move calls no member.

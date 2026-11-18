@@ -1,6 +1,7 @@
 """Unit tests for storage/member_repairs.py (docs/member-rename-repairs.md)."""
 
 import errno
+import fcntl
 import json
 import logging
 import os
@@ -136,16 +137,68 @@ class TestRecords(MemberRepairsTestBase):
         repairs = MemberRepairs(self.cache)
         rid = repairs.begin("/a", "/b", ["m0", "m1"])
         self.assertEqual({"m0", "m1"}, repairs.backends_for(["/b"]))
-        repairs.settle(rid, {})
+        repairs.settle(rid, "/a", "/b", {})
         self.assertEqual([], MemberRepairs(self.cache).list())
 
     def test_settle_keeps_exactly_the_members_that_missed(self):
         repairs = MemberRepairs(self.cache)
         rid = repairs.begin("/a", "/b", ["m0", "m1"])
-        repairs.settle(rid, {"m1": "unreachable"})
+        repairs.settle(rid, "/a", "/b", {"m1": "unreachable"})
         [record] = MemberRepairs(self.cache).list()
-        self.assertEqual((rid, ("m1",), "open"), (record.id, record.members, record.state))
+        # A new id: a late resolve of the intent id cannot drop the miss.
+        self.assertNotEqual(rid, record.id)
+        self.assertEqual((("m1",), "open", "/a", "/b"),
+                         (record.members, record.state, record.old_path, record.new_path))
         self.assertIn("unreachable", record.reason)
+        self.assertFalse(MemberRepairs(self.cache).resolve(rid))
+        self.assertEqual([record.id], [r.id for r in MemberRepairs(self.cache).list()])
+
+    def test_settle_uses_the_callers_paths_after_a_reload_dropped_the_intent(self):
+        """Another process resolves the intent and a lookup reloads before
+        settle runs: settle still records the miss from the paths given."""
+        repairs = MemberRepairs(self.cache)
+        rid = repairs.begin("/a", "/b", ["m"])
+        self.assertTrue(MemberRepairs(self.cache).resolve(rid))
+        self.assertEqual(set(), repairs.backends_for(["/b"]))  # the reload
+        repairs.settle(rid, "/a", "/b", {"m": "unreachable"})
+        [record] = MemberRepairs(self.cache).list()
+        self.assertEqual((("m",), "open", "/a", "/b"),
+                         (record.members, record.state, record.old_path, record.new_path))
+
+    def test_settle_leaves_a_busy_intent_in_place(self):
+        """The intent's flock is held elsewhere (a resolve stopped mid-way):
+        settle gives up after its bound and leaves the intent, over-fencing,
+        with the miss recorded beside it."""
+        repairs = MemberRepairs(self.cache)
+        rid = repairs.begin("/a", "/b", ["m0", "m1"])
+        fd = os.open(str(self.carriers / rid), os.O_RDONLY)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            with patch("storage.member_repairs.FLOCK_WAIT", 0.05):
+                repairs.settle(rid, "/a", "/b", {"m1": "unreachable"})
+        finally:
+            os.close(fd)
+        states = sorted((r.state, r.members) for r in MemberRepairs(self.cache).list())
+        self.assertEqual([("intent", ("m0", "m1")), ("open", ("m1",))], states)
+
+    def test_the_owner_finishes_a_resolution_only_when_it_is_free(self):
+        repairs = MemberRepairs(self.cache)
+        rid = repairs.record("/a", "/b", ["m"], "missed")
+        carrier = self.carriers / rid
+        record = json.loads(os.getxattr(str(carrier), RECORD_XATTR))
+        os.setxattr(str(carrier), RECORD_XATTR, json.dumps({**record, "state": "resolved"}).encode())
+        # Not the owner: still enforced and listed.
+        self.assertEqual({"m"}, MemberRepairs(self.cache).backends_for(["/b"]))
+        fd = os.open(str(carrier), os.O_RDONLY)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            with patch("storage.member_repairs.FLOCK_WAIT", 0.05):
+                busy = MemberRepairs(self.cache, sweep_new=True)
+            self.assertEqual({"m"}, busy.backends_for(["/b"]))
+        finally:
+            os.close(fd)
+        MemberRepairs(self.cache, sweep_new=True)
+        self.assertFalse(carrier.exists())
 
     def test_begin_with_no_members_records_nothing(self):
         repairs = MemberRepairs(self.cache)
