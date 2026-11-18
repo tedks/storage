@@ -30,3 +30,10 @@ log_events:
   who: Ted Smith
   what: created
   comment: ""
+- time: 2026-11-18T05:46:39-00:00
+  who: Ted Smith
+  what: commented
+  comment: '4. (council round 96f0f1c3f93c-20261118T054517Z-e7951c, Anthropic seat)
+    tests/test_ssh_mux.py replaced-directory test: count hits of the faked lstat branch
+    for ''first'' and assert it fired, so a production change that stops calling os.lstat
+    cannot silently drop the test back to nondeterministic coverage.'
