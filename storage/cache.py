@@ -6,6 +6,7 @@ Files are cached on first access and evicted using LRU when space is needed.
 """
 
 import errno
+import logging
 import os
 import stat as stat_module
 import secrets
@@ -18,7 +19,9 @@ from typing import Callable, ContextManager, Optional, List, Set
 from .backends.base import Backend, bulk_request
 from .backends.ssh_pool import BulkCapacityCancelled, BulkCapacityTimeout
 from .cache_metadata import PARTIAL_SUFFIX, PREFIX_XATTR, regular_file_stat, write_cache_metadata
-from .member_repairs import MemberRepairs
+from .member_repairs import VIEW_WRITE, MemberRepairs
+
+logger = logging.getLogger(__name__)
 from .models import FileMetadata, SyncStatus
 from .state import StateManager
 
@@ -88,6 +91,8 @@ class CacheManager:
         # fences a member or pins a file asks this (storage/member_repairs.py).
         # An unreadable carrier raises CorruptRepairRecord: no open.
         self.member_repairs = MemberRepairs(Path(cache_root), sweep_new=True)
+        self._break_kept_aliases()
+        self._keep_fenced_views()
         # Set by StorageFS: a context manager that holds the descriptor
         # table lock and yields whether the path has an open descriptor.
         # Eviction stats and unlinks inside it, so no descriptor can be
@@ -148,6 +153,64 @@ class CacheManager:
             self._current_size_bytes = self._scan_total_cache_size()
             self._size_dirty = False
             self._scan_count += 1
+
+    def _break_kept_aliases(self):
+        """Unlink every conflict-view cache name that still links to bytes
+        a view-write repair keeps: release unlinks it after the record is
+        durable, but a crash or a failed unlink can leave it, and a cache
+        name may later be written in place."""
+        for record in self.member_repairs.list():
+            if record.kind != VIEW_WRITE:
+                continue
+            for member in record.members:
+                alias = self.get_cache_path(f"{record.new_path}.{member}")
+                try:
+                    if self.member_repairs.break_alias(alias):
+                        logger.warning("Removed a cache alias of the bytes kept by repair %s",
+                                       record.id)
+                except OSError as exc:
+                    logger.error("Could not remove the cache alias %s of repair %s: %s",
+                                 alias, record.id, exc)
+
+    def _keep_fenced_views(self):
+        """Keep, as view-write repairs, the cached conflict views of members
+        that a repair fences at those names, when the cache opens.
+
+        A write through a view goes to its member at release, after a
+        successful flush. If a repair appeared in between and the process
+        died before the release, nothing recorded it. Any such view is kept
+        here, before anything can evict or refetch it: conservatively, since
+        an unwritten view is indistinguishable, so an extra record to
+        resolve is the cost (CTO RRS-CTO-FLUSH-RELEASE).
+        """
+        repairs = self.member_repairs
+        for record in repairs.list():
+            for member in record.members:
+                suffix = f".{member}"
+                for root in {record.old_path, record.new_path}:
+                    candidates = [self.get_cache_path(root + suffix)]
+                    tree = self.get_cache_path(root)
+                    if tree.is_dir() and not tree.is_symlink():
+                        for dirpath, _dirs, files in os.walk(tree):
+                            candidates.extend(Path(dirpath) / name for name in files
+                                              if name.endswith(suffix))
+                    for view in candidates:
+                        try:
+                            st = os.lstat(view)
+                        except FileNotFoundError:
+                            continue
+                        if not stat_module.S_ISREG(st.st_mode) or repairs.kept_inode(view):
+                            continue
+                        relative = "/" + str(view.relative_to(self.cache_root))
+                        canonical = relative[:-len(suffix)]
+                        try:
+                            repairs.preserve_view_write(
+                                canonical, member, view, f"{st.st_dev}:{st.st_ino}",
+                                "conflict view of a fenced member found when the cache "
+                                "opened; it may hold a write never sent")
+                        except OSError as exc:
+                            logger.error("Could not keep the conflict view %s of fenced member "
+                                         "%s: %s", view, member, exc)
 
     def get_cache_path(self, virtual_path: str) -> Path:
         """Get the local cache path for a virtual file"""

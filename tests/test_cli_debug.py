@@ -1671,6 +1671,18 @@ class TestMemberRepairsCommand(unittest.TestCase):
                          (payload[kept]["kind"], payload[kept]["carrier"]))
         self.assertEqual(b"edited", Path(payload[kept]["carrier"]).read_bytes())
 
+    def test_a_view_write_whose_bytes_are_gone_is_listed_missing(self):
+        view = self.temp_dir / "view2"
+        view.write_bytes(b"edited")
+        repairs = MemberRepairs(self.cache)
+        st = os.lstat(view)
+        kept = repairs.preserve_view_write("/g.txt", "remote1", view, f"{st.st_dev}:{st.st_ino}", "kept")
+        repairs.carrier_path(kept).unlink()
+        result = self.invoke()
+        self.assertIn(f"BYTES {repairs.carrier_path(kept)} (MISSING)", result.output)
+        payload = {r["id"]: r for r in json.loads(self.invoke("--json-output").output)}
+        self.assertTrue(payload[kept]["bytes_missing"])
+
     def test_resolve_drops_only_that_repair_and_a_replay_fails(self):
         result = self.invoke("--resolve", self.first)
         self.assertEqual(0, result.exit_code, result.output)

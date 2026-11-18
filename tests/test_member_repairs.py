@@ -343,6 +343,31 @@ class TestRecords(MemberRepairsTestBase):
         self.assertEqual({b"AAAA", b"BBBB"},
                          {repairs.carrier_path(r.id).read_bytes() for r in repairs.list()})
 
+    def test_missing_view_bytes_are_reported_and_the_fence_kept(self):
+        view = self.cache / "view"
+        view.write_bytes(b"edited")
+        repairs = MemberRepairs(self.cache)
+        kept = repairs.preserve_view_write("/f", "m", view, self.inode(view), "r")
+        (self.carriers / (kept + ".bytes")).unlink()
+        reopened = MemberRepairs(self.cache, sweep_new=True)
+        self.assertEqual([kept], [r.id for r in reopened.list()])
+        self.assertEqual(self.carriers / (kept + ".bytes"), reopened.carrier_path(kept))
+        self.assertTrue(reopened.bytes_missing(kept))
+        self.assertEqual({"m"}, reopened.backends_for(["/f"]))
+
+    def test_a_version_1_view_write_record_keeps_its_bytes_in_the_carrier(self):
+        """Before version 2 a view-write record's carrier data was the bytes,
+        with the full record in the xattr."""
+        good = {"v": 1, "id": "f" * 32, "old": "/f", "new": "/f", "members": ["m"],
+                "state": "open", "reason": "r", "recorded": 1.0,
+                "kind": "view-write", "source": "1:2"}
+        path = self.write_raw("f" * 32, json.dumps(good).encode())
+        path.write_bytes(b"old-format bytes")
+        repairs = MemberRepairs(self.cache)
+        self.assertEqual(path, repairs.carrier_path("f" * 32))
+        self.assertFalse(repairs.bytes_missing("f" * 32))
+        self.assertEqual(b"old-format bytes", repairs.carrier_path("f" * 32).read_bytes())
+
     def test_a_view_write_is_copied_where_the_cache_cannot_link(self):
         view = self.cache / "view"
         view.write_bytes(b"edited")

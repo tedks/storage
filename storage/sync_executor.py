@@ -16,6 +16,7 @@ from .cache import CacheManager
 from .conflicts import ConflictDetector
 from .file_config import get_inherited_config
 from .links import LinkRefused, find_holders, link_checksum, resolve_link_target
+from . import member_repairs
 from .models import FileLocation, SyncStatus
 from .replication import ReplicationManager
 from .state import StateManager
@@ -662,6 +663,12 @@ class SyncExecutor:
         # sees the fence. The record is written only after that.
         if task.pending_fence is None:
             task.pending_fence = repairs.publish_pending(task.virtual_path, task.new_path, names)
+        if not repairs.await_pending(task.pending_fence, member_repairs.PUBLISH_WAIT):
+            # Overlapping member work is still running (a slow member call):
+            # back off without holding this worker; the fence stays.
+            raise RuntimeError(
+                f"Waiting for member work overlapping {task.virtual_path} -> {task.new_path}"
+            )
         try:
             repairs.record(
                 task.virtual_path, task.new_path, names, "queued member rename, not replayed",

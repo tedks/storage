@@ -210,6 +210,9 @@ def _fsync(path: Path, directory: bool = False):
 
 
 FLOCK_WAIT = 5.0
+# How long a queued rename's fence publication waits for overlapping member
+# work before the task backs off and tries again (freeing its worker).
+PUBLISH_WAIT = 5.0
 
 
 def _write_all(fd: int, data: bytes):
@@ -285,6 +288,9 @@ class MemberRepairs:
         self._mutation_seq = 0
         self._write_lock = threading.Lock()
         self._records: Dict[str, MemberRepair] = {}
+        # Format version of each record (read_record), which decides where a
+        # view-write's bytes are.
+        self._versions: Dict[str, int] = {}
         self._seen: Optional[tuple] = None
         # Descriptors of this process's in-flight intents, flock held.
         self._held: Dict[str, int] = {}
@@ -293,6 +299,7 @@ class MemberRepairs:
         # In memory only; the task that holds one is what retries it.
         self._pending: Dict[int, Tuple[str, str, Tuple[str, ...]]] = {}
         self._pending_seq = 0
+        self._pending_order: Dict[int, int] = {}
         self._dir_durable = False
         with self._lock:
             self._reload_locked(strict=True, owner=sweep_new)
@@ -315,6 +322,7 @@ class MemberRepairs:
         a carrier cannot be read outside strict mode."""
         stamp = self._dir_stamp()
         records: Dict[str, MemberRepair] = {}
+        versions: Dict[str, int] = {}
         if stamp is not None:
             byte_files = set()
             for name in sorted(os.listdir(self.dir)):
@@ -341,7 +349,7 @@ class MemberRepairs:
                         raise CorruptRepairRecord(f"{name}: not a record id")
                     fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW)
                     try:
-                        record, _version = read_record(fd, name)
+                        record, version = read_record(fd, name)
                     finally:
                         os.close(fd)
                 except FileNotFoundError:
@@ -372,6 +380,7 @@ class MemberRepairs:
                     if finished:
                         continue
                 records[name] = record
+                versions[name] = version
             if owner:
                 # Bytes whose record was never named (the view's own name
                 # still holds them) or was resolved: nothing refers to them.
@@ -387,6 +396,7 @@ class MemberRepairs:
         # such as a live resolve's unlink, shows as a mismatch at the next
         # lookup, which reloads.
         self._records = records
+        self._versions = versions
         self._seen = stamp
         return True
 
@@ -714,11 +724,60 @@ class MemberRepairs:
                     pass
             raise
 
+    def _version_of(self, repair_id: str) -> int:
+        with self._lock:
+            version = self._versions.get(repair_id)
+            record = self._records.get(repair_id)
+        if version is None and record is not None:
+            # Written by this instance since the last reload.
+            version = (DATA_VERSION if record.kind == VIEW_WRITE
+                       or len(record.to_json()) > MAX_RECORD_BYTES else RECORD_VERSION)
+        return version or RECORD_VERSION
+
     def carrier_path(self, repair_id: str) -> Path:
-        """Where a record's bytes are: <id>.bytes for a view-write record
-        (its data), else the carrier itself."""
-        kept = self.dir / (repair_id + _BYTES_SUFFIX)
-        return kept if kept.exists() else self.dir / repair_id
+        """Where a record's bytes are, by its kind and format: <id>.bytes
+        for a version-2 view-write record, the carrier itself for a
+        version-1 one (whose data was the bytes) and for a rename record.
+        Never chosen by which files exist: see bytes_missing."""
+        with self._lock:
+            record = self._records.get(repair_id)
+        if (record is not None and record.kind == VIEW_WRITE
+                and self._version_of(repair_id) == DATA_VERSION):
+            return self.dir / (repair_id + _BYTES_SUFFIX)
+        return self.dir / repair_id
+
+    def bytes_missing(self, repair_id: str) -> bool:
+        """Whether a view-write record's bytes are gone. The record, and its
+        fence, stay: an operator must see it, and settle the member."""
+        with self._lock:
+            record = self._records.get(repair_id)
+        return (record is not None and record.kind == VIEW_WRITE
+                and not self.carrier_path(repair_id).exists())
+
+    def kept_inode(self, path: Path) -> Optional[str]:
+        """The id of the view-write record whose kept bytes are path's inode
+        (a view cache name that still aliases them), else None."""
+        try:
+            st = os.lstat(path)
+        except FileNotFoundError:
+            return None
+        inode = f"{st.st_dev}:{st.st_ino}"
+        for record in self._refresh().values():
+            if record.kind == VIEW_WRITE and record.source == inode:
+                return record.id
+        return None
+
+    def break_alias(self, path: Path) -> bool:
+        """Unlink path if it is a name for kept bytes, so nothing writing
+        to that name in place can reach them; True when it was one."""
+        if self.kept_inode(path) is None:
+            return False
+        try:
+            os.unlink(path)
+            _fsync(path.parent, directory=True)
+        except FileNotFoundError:
+            pass
+        return True
 
     def settle(self, repair_id: str, old_path: str, new_path: str, missed: Dict[str, str]):
         """Settle an intent once every member call has returned.
@@ -857,35 +916,54 @@ class MemberRepairs:
         return self._pending_seq
 
     def publish_pending(self, old_path: str, new_path: str, members: Iterable[str]) -> int:
-        """Fence the names on members, ordered against member mutations.
+        """Fence the names on members now, ordered against member mutations.
 
         For a queued rename's record, published outside the namespace's
         path locks. The fence is active at once: a mutation that registers
-        after this (start_mutation) sees it and skips those members. Then
-        this waits, before the caller writes the durable record, for every
-        overlapping mutation on those members that registered before it.
-        So each overlapping mutation either finished before the fence took
-        effect, or skipped the fenced members; none can call a member past
-        it. Only overlapping mutations are waited for (names at, above or
-        below either name, on a shared member): unrelated member I/O goes
-        on. Returns the key for release_pending.
+        after this (start_mutation) sees it and skips those members. Before
+        writing the durable record the caller waits (await_pending) for
+        every overlapping mutation on those members that registered before
+        it, so each one either finished before the fence took effect or
+        skipped the fenced members; none can call a member past it. Only
+        overlapping mutations are waited for: unrelated member I/O goes on.
+        Returns the key for await_pending and release_pending.
         """
-        members = set(members)
-        with self._cond:
+        with self._lock:
             key = self._add_pending_locked(old_path, new_path, members)
-            earlier = {
-                token for token, (mutating, paths) in self._mutations.items()
-                if mutating & members
-                and any(paths_overlap(path, name) for path in paths for name in (old_path, new_path))
-            }
-            while earlier & set(self._mutations):
-                self._cond.wait()
+            self._mutation_seq += 1
+            self._pending_order[key] = self._mutation_seq
             return key
+
+    def await_pending(self, key: int, timeout: float) -> bool:
+        """Wait, up to timeout, until no overlapping mutation registered
+        before the pending fence key is still running; False on timeout
+        (the fence stays, and the caller retries later)."""
+        deadline = time.monotonic() + timeout
+        with self._cond:
+            while True:
+                fence = self._pending.get(key)
+                if fence is None:
+                    return True
+                old_path, new_path, members = fence
+                order = self._pending_order.get(key, 0)
+                running = any(
+                    token < order and mutating & set(members)
+                    and any(paths_overlap(path, name)
+                            for path in paths for name in (old_path, new_path))
+                    for token, (mutating, paths) in self._mutations.items()
+                )
+                if not running:
+                    return True
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._cond.wait(remaining)
 
     def release_pending(self, key: int):
         """Drop a pending fence, once its record is durable (or moot)."""
         with self._lock:
             self._pending.pop(key, None)
+            self._pending_order.pop(key, None)
 
     def _fences_locked(self):
         """(old, new, members) for every durable record and pending fence,
@@ -919,7 +997,10 @@ class MemberRepairs:
         with self._lock:
             fenced = self._members_fenced(self._fences_locked(), paths)
             self._mutation_seq += 1
-            self._mutations[self._mutation_seq] = (frozenset(set(members) - fenced), paths)
+            # Every member the operation may touch, fenced now or not: a
+            # fence lifted later (a resolve) must not leave a member it then
+            # calls unregistered for a publication to wait on.
+            self._mutations[self._mutation_seq] = (frozenset(members), paths)
             return self._mutation_seq, fenced
 
     def end_mutation(self, token: int):

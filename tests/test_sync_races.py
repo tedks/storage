@@ -1000,6 +1000,84 @@ class TestFencePublicationOrder(SyncRaceTestBase):
         self.assertEqual(sorted([("member", "/p", "/p2"), ("member", "/p/q", "/p/r")]),
                          self.repairs())
 
+    def test_a_fence_lifted_after_registration_keeps_the_member_registered(self):
+        """Repair A fences the member at /d when a mkdir of /d/sub registers;
+        A is resolved before the mkdir looks the fence up again; repair B
+        (/d -> /e) is then published while the member call runs. B must
+        wait for it: the mutation registered the member for its whole
+        life, not just the members unfenced at registration (CTO-182-DELTA)."""
+        self.fs.mkdir("/d", 0o755)
+        repairs = self.fs.cache_manager.member_repairs
+        repair_a = repairs.record("/d", "/x", ["member"], "repair A")
+        real_lookup = repairs.backends_for
+        registered, resolved = threading.Event(), threading.Event()
+
+        def lookup_after_resolve(paths):
+            if not registered.is_set():
+                registered.set()
+                assert resolved.wait(WAIT)
+            return real_lookup(paths)
+
+        gate = self.gate(self.member, "mkdir")
+        with patch.object(repairs, "backends_for", side_effect=lookup_after_resolve):
+            maker = Worker(self.fs.mkdir, "/d/sub", 0o755)
+            maker.start()
+            self.assertTrue(registered.wait(WAIT))
+            self.assertTrue(repairs.resolve(repair_a))
+            resolved.set()
+            self.assertTrue(gate.started.wait(WAIT))     # in its member call
+        publisher = self.publish("/d", "/e")
+        publisher.join(BLOCKED)
+        self.assertTrue(publisher.is_alive(), "B did not wait for the running member call")
+        gate.opened.set()
+        maker.finish()
+        self.assertTrue(publisher.finish())
+        self.assertEqual(["sub"], self.member_names("d"))
+        self.assertEqual([("member", "/d", "/e")], self.repairs())
+
+    def test_a_publication_stalled_by_member_work_frees_its_only_worker(self):
+        """One worker. A queued rename's fence waits for an overlapping
+        foreground file rename stuck in its member call; past the bound the
+        task backs off with the fence still active, an unrelated file syncs
+        on the same worker meanwhile, and the record is written once the
+        call ends. (A stuck directory rename holds the namespace lock
+        exclusive, which stalls every sync by design.)"""
+        self.write_file("/f.txt", b"file")
+        self.start_sync()
+        self.wait_synced("/f.txt")
+        self.wait_idle()
+        self.fs.sync_manager.stop()
+        gate = self.gate(self.member, "rename")
+        renamer = Worker(self.fs.rename, "/f.txt", "/g.txt")
+        renamer.start()
+        self.assertTrue(gate.started.wait(WAIT))
+        self.fs.sync_manager.config.retry_delay = 3600.0
+        with patch("storage.member_repairs.PUBLISH_WAIT", 0.2):
+            self.fs.sync_manager.queue_dir_sync("/g.txt", DirOperation.RENAME, new_path="/h.txt",
+                                                backend_hint="member", force=True)
+            self.start_sync()
+            scheduler = RetryScheduler.for_queue(self.fs.sync_manager.task_queue)
+            deadline = time.monotonic() + WAIT
+            while scheduler.pending() != 1 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertEqual(1, scheduler.pending())
+            self.assertEqual({"member"},
+                             self.fs.cache_manager.member_repairs.backends_for(["/h.txt"]))
+            self.write_file("/c.txt", b"unrelated")
+            self.wait_synced("/c.txt")
+            self.assertEqual(b"unrelated", (self.member_dir / "c.txt").read_bytes())
+            # Only the running rename's own intent: the queued record waits.
+            self.assertNotIn(("member", "/g.txt", "/h.txt"), self.repairs())
+            gate.opened.set()
+            renamer.finish()
+            scheduler.deliver_all_now()
+            deadline = time.monotonic() + WAIT
+            while not self.repairs() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.wait_idle()
+        self.assertEqual([("member", "/g.txt", "/h.txt")], self.repairs())
+        self.assertEqual(["c.txt", "g.txt"], self.member_names())
+
     def test_a_snapshot_is_never_between_a_pending_fence_and_its_record(self):
         """The handoff from a pending fence to its durable record cannot
         land between the snapshot's two reads: a snapshot in progress holds
@@ -1321,7 +1399,7 @@ class TestRepairsOutliveTheIndex(SyncRaceTestBase):
                 self.assertEqual([], [n for n in os.listdir(self.cache_dir / ".storage.repairs")
                                       if n.endswith((".bytes", ".new"))])
                 message = "\n".join(logged.output)
-                for needle in ("ENOSPC", "member", "/e/f.txt", str(kept_view)):
+                for needle in ("ENOSPC", "on member member", "/e/f.txt", str(kept_view)):
                     self.assertIn(needle, message)
 
     def tearDown_view_case(self):
@@ -1335,6 +1413,46 @@ class TestRepairsOutliveTheIndex(SyncRaceTestBase):
                     shutil.rmtree(target)
         self.fs.state_manager.delete_file("/d/f.txt")
         self.fs.state_manager.delete_file("/e/f.txt")
+
+    def test_a_surviving_alias_of_kept_bytes_cannot_change_them(self):
+        """The view's cache name could not be unlinked after its bytes were
+        kept, so it still links to them: a truncate through the view is
+        refused, a read sees the kept bytes, a refetch does not touch them,
+        and the next open of the cache removes the alias (CTO-182-DELTA)."""
+        view, fh = self.open_edited_view()
+        self.fail_member_once("rename")
+        self.fs.rename("/d", "/e")
+        alias = self.fs.cache_manager.get_cache_path("/e/f.txt.member")
+        with patch("storage.member_repairs.os.unlink", side_effect=OSError(errno.EIO, "x")):
+            self.fs.release("/e/f.txt.member", fh)
+        [(members, path, kept)] = self.view_writes()
+        self.assertEqual(b"EDITEDytes", kept)
+        self.assertTrue(alias.exists())
+        with self.assertRaises(FuseOSError) as raised:
+            self.fs.truncate("/e/f.txt.member", 0)
+        self.assertEqual(errno.EBUSY, raised.exception.errno)
+        rh = self.fs.open("/e/f.txt.member", os.O_RDONLY)
+        self.assertEqual(b"EDITEDytes", self.fs.read("/e/f.txt.member", 64, 0, rh))
+        self.fs.release("/e/f.txt.member", rh)
+        self.assertEqual([(("member",), "/e/f.txt", b"EDITEDytes")], self.view_writes())
+        self.reopen()
+        self.assertFalse(os.path.lexists(alias))
+        self.assertEqual([(("member",), "/e/f.txt", b"EDITEDytes")], self.view_writes())
+        self.assertEqual(b"sole bytes", (self.member_dir / "d" / "f.txt").read_bytes())
+
+    def test_a_crash_between_flush_and_release_still_keeps_the_view(self):
+        """flush succeeded, a missed rename fenced the member, and the
+        process died before the release: the next open of the cache keeps
+        the view's bytes as a view-write repair, never sent to the member."""
+        view, fh = self.open_edited_view()
+        self.fail_member_once("rename")
+        self.fs.rename("/d", "/e")
+        self.reopen()          # no release: the descriptor dies with the process
+        self.assertEqual([(("member",), "/e/f.txt", b"EDITEDytes")], self.view_writes())
+        self.assertFalse(os.path.lexists(self.fs.cache_manager.get_cache_path("/e/f.txt.member")))
+        self.assertEqual(b"sole bytes", (self.member_dir / "d" / "f.txt").read_bytes())
+        self.reopen(rebuild=True)
+        self.assertEqual([(("member",), "/e/f.txt", b"EDITEDytes")], self.view_writes())
 
     def offline_rename_of_an_uncached_directory(self):
         """/d/f.txt's only bytes are on the member, the file is not cached,

@@ -322,7 +322,8 @@ def debug_member_repairs(cache: Path, resolve_id: str | None, json_output: bool)
 
     if json_output:
         click.echo(json.dumps(
-            [dict(asdict(r), carrier=str(repairs.carrier_path(r.id))) for r in records],
+            [dict(asdict(r), carrier=str(repairs.carrier_path(r.id)),
+                  bytes_missing=repairs.bytes_missing(r.id)) for r in records],
             sort_keys=True, indent=2,
         ))
         return
@@ -336,7 +337,8 @@ def debug_member_repairs(cache: Path, resolve_id: str | None, json_output: bool)
         if record.kind == VIEW_WRITE:
             click.echo(
                 f"  {record.id} [{record.state}] {', '.join(record.members)}: "
-                f"view-write {record.new_path}, BYTES {repairs.carrier_path(record.id)} "
+                f"view-write {record.new_path}, BYTES {repairs.carrier_path(record.id)}"
+                f"{' (MISSING)' if repairs.bytes_missing(record.id) else ''} "
                 f"({record.reason})"
             )
             continue

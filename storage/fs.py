@@ -2366,6 +2366,14 @@ class StorageFS(Operations):
         """Truncate a file"""
         resolved = self._resolve_path(path)
         cache_path = resolved.cache_path
+        if resolved.backend_name:
+            # As _write_view (truncate holds the same path lock): a view whose
+            # member is fenced is not changed, and a cache name that still
+            # aliases kept view-write bytes is never truncated in place.
+            repairs = self.cache_manager.member_repairs
+            if (resolved.backend_name in repairs.backends_for([resolved.canonical_path])
+                    or repairs.kept_inode(cache_path) is not None):
+                raise FuseOSError(errno.EBUSY)
 
         try:
             with open(cache_path, 'r+b') as f:

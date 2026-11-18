@@ -32,9 +32,17 @@ rebuilt index must lose none of the protections.
 ## Carrier and format
 
 The cache root holds one cache-internal directory, `.storage.repairs`. It is
-created on first use with mode 0700. Each repair record is one empty regular
-file in it, named by the record id (32 lowercase hex characters, a random
-UUID). The record itself is the file's xattr `user.storage.member_repair`.
+created on first use with mode 0700. Each repair record is one regular file
+in it, the carrier, named by the record id (32 lowercase hex characters, a
+random UUID). It always has the xattr `user.storage.member_repair`. In
+version 1 the xattr is the whole record and the file is empty. In version 2
+the xattr is only `{"v": 2, "state": ...}`, and the record's JSON is the
+file's data; see below. A `view-write` record also has `<id>.bytes` beside
+it, holding the kept bytes. Where a record's bytes are is decided by its
+kind and version, never by which files happen to exist. A version-2
+view-write record whose `.bytes` file is missing stays loaded and keeps
+fencing, and it is listed as `BYTES ... (MISSING)`. A version-1 view-write
+record, from before version 2, kept its bytes in the carrier's own data.
 
 The cache root's own inode is not used as the carrier. On ext4 without the
 `ea_inode` feature, all xattrs of one inode share a single block of about
@@ -195,6 +203,15 @@ overlapping mutation either finished before the fence took effect, or
 skipped the member. None calls a member past the fence. Mutations on
 other members or other names never wait.
 
+A mutation registers every member it may touch for its whole life,
+including members fenced when it registered. A fence lifted meanwhile (a
+resolve) cannot leave a member the operation then calls unregistered for a
+publication to wait on. The publication's wait is bounded (`PUBLISH_WAIT`,
+5 s). Past it, the fence stays active and the queued rename backs off on
+the retry scheduler, so a member call stuck in overlapping foreground work
+does not hold the only sync worker. A directory rename holds the namespace
+lock exclusive, and that stalls every sync by design, not this wait.
+
 A lookup reads the durable records and the pending fences in one hold of
 the registry lock. A pending fence that is handed off to its durable
 record therefore shows up as one or the other, never as neither.
@@ -336,9 +353,22 @@ The repair fences this at each step:
     names the errno, the member, the canonical path and the view's
     cache path to recover the bytes from. Nothing is promised across a
     crash in that state.
-  - **A crash between a successful flush and the release** loses the
-    write to the member for any conflict view, repaired or not. That is
-    how conflict views already work, and it is outside this change.
+  - **A surviving alias.** If the view's cache name could not be
+    unlinked, or a crash came between the record and that unlink, the name
+    still links to the kept bytes. Nothing rewrites them through it:
+    - writes and truncates through a view of a fenced member fail with
+      `EBUSY`, and so does any truncate of a name that aliases kept bytes;
+    - a refetch writes to a temporary file and renames it into place, so
+      it never touches the old inode;
+    - the next open of the cache unlinks every such alias
+      (`CacheManager._break_kept_aliases`).
+  - **A crash between a successful flush and the release.** When the cache
+    opens, and before anything can evict or refetch, every cached
+    conflict view of a member that a repair fences at those names is kept
+    as a `view-write` repair (`CacheManager._keep_fenced_views`). So the
+    unsent bytes become a discoverable repair, never sent to the member.
+    This is conservative: a view that was never written cannot be told
+    apart, so it costs one more record to resolve.
 
 The mount never retries delivery of the bytes to the member, and a
 `view-write` repair never moves bytes there by itself.
