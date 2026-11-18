@@ -508,8 +508,9 @@ Configuration is hierarchical - child directories inherit from parents, with the
 **Write Path:**
 1. Write to local cache first (ensure at least one copy)
 2. Mark file as dirty in state database
-3. Background sync to configured replicas (directory operations run best-effort synchronously and queue member-specific retries when any replica is offline)
+3. Background sync to configured replicas (directory operations run best-effort synchronously; a mkdir or rmdir that a member misses is retried on that member)
 4. A rename or unlink of a file waits for its upload if one is in flight, and a directory rename for the uploads under it, so a member never receives a file under a name it no longer has
+5. A rename a member misses is never replayed on it later: by then nothing on the member proves the object at the old name is still the one renamed, or that the new name is free, and member renames replace their target. The member keeps both names as they are, and the index records the missed move; `storage debug member-repairs -d DB` lists these (and `--resolve ID` drops one once the member is settled by hand). Until then the member's copy shows under the old name
 
 **Cache Management:**
 1. Track file access times for LRU
@@ -584,6 +585,7 @@ Not implemented:
   describes the intent, not the code.
 - Deleting member copies: an unlink through the mount removes the cached copy and the index row, but a file that has synced stays on its members and is listed again.
 - Event-driven sync scheduling ([#17](https://github.com/tedks/storage/issues/17)); the sync monitor polls.
+- Settling a rename a member missed: it is recorded for repair (`storage debug member-repairs`), never replayed, and the member keeps the old name until someone settles it by hand.
 
 ## Requirements
 
