@@ -510,7 +510,9 @@ class TestDirectoryRetries(SyncRaceTestBase):
     def test_open_repair_refuses_a_conflict_view_write_on_that_member(self):
         """Closing a conflict view written through the mount copies it to
         that member at the canonical name; under an open repair that would
-        replace the member's object, so the copy is not made."""
+        replace the member's object, so opening or creating the view for
+        writing is refused with EBUSY, before any write is accepted. Reading
+        it still works."""
         self.fs.mkdir("/d", 0o755)
         self.write_file("/d/f.txt", b"sole bytes")
         self.start_sync()
@@ -526,7 +528,17 @@ class TestDirectoryRetries(SyncRaceTestBase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-        self.write_file("/d/f.txt.member", b"overwrite")
+        with self.assertRaises(FuseOSError) as raised:
+            self.write_file("/d/f.txt.member", b"overwrite")
+        self.assertEqual(errno.EBUSY, raised.exception.errno)
+        view = self.fs.cache_manager.get_cache_path("/d/f.txt.member")
+        view.parent.mkdir(parents=True, exist_ok=True)
+        view.write_bytes(b"sole bytes")
+        with self.assertRaises(FuseOSError) as raised:
+            self.fs.open("/d/f.txt.member", os.O_WRONLY)
+        self.assertEqual(errno.EBUSY, raised.exception.errno)
+        fh = self.fs.open("/d/f.txt.member", os.O_RDONLY)
+        self.fs.release("/d/f.txt.member", fh)
         self.assertEqual([], copies)
         self.assertEqual(b"sole bytes", (self.member_dir / "d" / "f.txt").read_bytes())
 

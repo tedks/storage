@@ -14,7 +14,8 @@ name is free. Instead the missed move becomes a repair. While a repair is
 open, three protections apply:
 
 - the member is fenced from renames, mkdir, rmdir, file and link uploads,
-  and deletes through a conflict view (refused with `EBUSY`), at names
+  and writes and deletes through a conflict view (refused with `EBUSY`
+  when the view is opened for writing or unlinked), at names
   overlapping either path;
 - cached files under the new name are pinned against eviction;
 - the repair is listed for someone to settle by hand.

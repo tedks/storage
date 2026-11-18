@@ -2398,9 +2398,21 @@ class StorageFS(Operations):
                     self._refetch_pins.pop(canonical_path, None)
                     self._pinned_stats.pop(canonical_path, None)
 
+    def _refuse_fenced_view_write(self, resolved: ResolvedPath):
+        """A write through a conflict view goes to that member on release,
+        replacing its object; under an open member repair that object may
+        hold the only copy of renamed bytes, so the write is refused up
+        front (EBUSY), as an unlink of the view is."""
+        if resolved.backend_name and resolved.backend_name in (
+            self.cache_manager.member_repairs.backends_for([resolved.canonical_path])
+        ):
+            raise FuseOSError(errno.EBUSY)
+
     def _open(self, path, flags):
         """Open a file"""
         resolved = self._resolve_path(path)
+        if not self._is_read_only_open(flags):
+            self._refuse_fenced_view_write(resolved)
         cache_path = resolved.cache_path
         prefetch_session: Optional[PrefetchSession] = None
 
@@ -2487,6 +2499,7 @@ class StorageFS(Operations):
     def _create(self, path, mode, fi=None):
         """Create a file"""
         resolved = self._resolve_path(path)
+        self._refuse_fenced_view_write(resolved)
         cache_path = self.cache_manager.create_cached_file(resolved.requested_path)
 
         try:
@@ -2650,7 +2663,9 @@ class StorageFS(Operations):
                     self.cache_manager.member_repairs.backends_for([entry.canonical_path])
                 ):
                     # A write through a conflict view would replace that
-                    # member's object, which an open repair protects.
+                    # member's object, which an open repair protects. Open
+                    # and create refuse it; this covers a repair recorded
+                    # while the view was open.
                     self.logger.error(
                         "direct sync of %s to %s refused: it has an open member repair",
                         entry.canonical_path, entry.backend_name,
