@@ -110,3 +110,9 @@ log_events:
     executed), CLI build OK, council and independent review clean with Google unavailable.
     Marked ready for review, shared gate slot released. Merge awaits the first-rename
     disposition tracked by oq-first-rename-unprotected-member.'
+- time: 2026-11-18T20:33:13-00:00
+  who: Ted Smith
+  what: commented
+  comment: PR167 landed via normal merge 60b4b6a91a923df39244b652a0475f5bf9c2232f
+    after Ted approved the first-rename fallback. Remote merge tree equals the accepted
+    1ae2f40 tree.
