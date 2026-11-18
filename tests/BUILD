@@ -43,6 +43,7 @@ storage_test("links")
 storage_test("local_backend", tags = ["no-remote"])
 storage_test("locks")
 storage_test("member_capabilities")
+storage_test("member_repairs", tags = ["no-remote"])
 storage_test("merge_gated", data = ["//:scripts/merge-gated.sh", "//:scripts/run-gates.sh"])
 storage_test("models")
 storage_test("mount_lock")
@@ -102,6 +103,5 @@ storage_test(
     tags = ["local", "manual"],
     timeout = "long",
 )
-storage_test("member_repairs")
 storage_test("sync_tasks")
 storage_test("watcher")

@@ -1470,6 +1470,14 @@ class NamespaceService:
     def unlink(self, path: str):
         """Remove a file."""
         resolved = self.resolve_path(path)
+        if resolved.backend_name and resolved.backend_name in (
+            self.cache_manager.member_repairs.backends_for([resolved.canonical_path])
+        ):
+            # A conflict view's unlink deletes that member's object, which
+            # under an open repair may be the only copy of renamed bytes.
+            self.logger.warning("Refusing to delete %s on %s: it has an open member repair",
+                           resolved.canonical_path, resolved.backend_name)
+            raise FuseOSError(errno.EBUSY)
 
         try:
             resolved.cache_path.unlink()
@@ -1574,9 +1582,14 @@ class NamespaceService:
                     if moved or attempted:
                         repairs.abandon(intent)
                     else:
-                        # Nothing moved and no member was called.
-                        repairs.settle(intent, old_resolved.canonical_path,
-                                       new_resolved.canonical_path, {})
+                        # Nothing moved and no member was called. A settle
+                        # failure leaves the intent (over-fencing) and must
+                        # not hide the error that stopped the rename.
+                        try:
+                            repairs.settle(intent, old_resolved.canonical_path,
+                                           new_resolved.canonical_path, {})
+                        except Exception:
+                            self.logger.exception("Could not settle the intent %s", intent)
                 raise
             if intent is not None:
                 # The local move is durable before any member is called, so

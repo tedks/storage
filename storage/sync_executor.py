@@ -320,6 +320,17 @@ class SyncExecutor:
                 if not location.is_cached
             }
         holders, unsure = find_holders(target_path, self.replication_manager.backends, located)
+        # As for a file upload: a member with an open repair around the
+        # link's name is left out until the repair is resolved, and the link
+        # stays DIRTY if that leaves it nowhere to go.
+        fenced = self.cache_manager.member_repairs.backends_for([task.virtual_path])
+        if fenced and any(backend.name in fenced for backend in holders):
+            holders = [backend for backend in holders if backend.name not in fenced]
+            if not holders:
+                logger.warning("Not linking %s: every member holding its target has an "
+                               "open member repair", task.virtual_path)
+                self._publish(task, generation, SyncStatus.DIRTY, cache_path)
+                return True
         identity = link_checksum(target)
         if not holders:
             target_row = self.state_manager.get_file_metadata(target_path)
@@ -531,6 +542,10 @@ class SyncExecutor:
         names = [task.backend_hint] if task.backend_hint else sorted(
             self.replication_manager.backends
         )
+        if not names:
+            logger.warning("Dropping a rename task for %s -> %s: no member to record it for",
+                           task.virtual_path, task.new_path)
+            return True
         try:
             self.cache_manager.member_repairs.record(
                 task.virtual_path, task.new_path, names, "queued member rename, not replayed",

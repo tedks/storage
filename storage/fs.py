@@ -2646,6 +2646,16 @@ class StorageFS(Operations):
 
             if entry.backend_name:
                 backend = self.backends.get(entry.backend_name)
+                if backend and entry.backend_name in (
+                    self.cache_manager.member_repairs.backends_for([entry.canonical_path])
+                ):
+                    # A write through a conflict view would replace that
+                    # member's object, which an open repair protects.
+                    self.logger.error(
+                        "direct sync of %s to %s refused: it has an open member repair",
+                        entry.canonical_path, entry.backend_name,
+                    )
+                    backend = None
                 if backend:
                     try:
                         backend.copy_from_local(entry.cache_path, entry.canonical_path)

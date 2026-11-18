@@ -85,6 +85,9 @@ class MemberRepair:
     def from_json(cls, raw: bytes, carrier_name: str) -> "MemberRepair":
         try:
             data = json.loads(raw.decode("utf-8"))
+            if not isinstance(data["members"], list):
+                # tuple() of a string would fence its characters.
+                raise TypeError("members is not a list")
             record = cls(
                 id=data["id"],
                 old_path=data["old"],
@@ -181,6 +184,7 @@ class MemberRepairs:
         self._seen: Optional[tuple] = None
         # Descriptors of this process's in-flight intents, flock held.
         self._held: Dict[str, int] = {}
+        self._dir_durable = False
         with self._lock:
             self._reload_locked(strict=True, owner=sweep_new)
         if len(self._records) > GROWTH_WARNING:
@@ -299,9 +303,14 @@ class MemberRepairs:
 
     # -- writing ---------------------------------------------------------
     def _ensure_dir(self):
+        # The cache root is fsynced once per instance, not only when this
+        # instance made the directory: an earlier process may have crashed
+        # between its mkdir and that fsync.
         if not self.dir.is_dir():
             self.dir.mkdir(mode=0o700, exist_ok=True)
+        if not self._dir_durable:
             _fsync(self.dir.parent, directory=True)
+            self._dir_durable = True
 
     def _write_new(self, record: MemberRepair, hold: bool = False) -> Optional[int]:
         """Create a carrier durably. With hold, return its descriptor with
@@ -386,8 +395,16 @@ class MemberRepairs:
             self._held[record.id] = held
         return record.id
 
-    def record(self, old_path: str, new_path: str, members: Iterable[str], reason: str) -> str:
-        """Durably record an open repair; raises OSError when it cannot."""
+    def record(self, old_path: str, new_path: str, members: Iterable[str],
+               reason: str) -> Optional[str]:
+        """Durably record an open repair; raises OSError when it cannot.
+
+        Returns the record id, or None when there are no members: a record
+        with none would refuse the next open, and fences nothing.
+        """
+        members = set(members)
+        if not members:
+            return None
         record = self._make(old_path, new_path, members, OPEN, reason)
         with self._write_lock:
             self._write_new(record)
@@ -524,8 +541,9 @@ class MemberRepairs:
 
     def backends_for(self, virtual_paths: Iterable[str]) -> Set[str]:
         """The members with a repair at, above or below any of virtual_paths
-        (either name counts). Nothing the namespace does at those names is
-        sent to them until the repair is resolved. A scan of every open
+        (either name counts). Renames, mkdir, rmdir, file and link uploads
+        and conflict-view deletes at those names are not sent to them until
+        the repair is resolved. A scan of every open
         repair, expected to be few."""
         paths = list(virtual_paths)
         return {

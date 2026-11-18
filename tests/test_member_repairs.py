@@ -95,6 +95,8 @@ class TestRecords(MemberRepairsTestBase):
             json.dumps({**good, "id": "b" * 32}).encode(),
             json.dumps({**good, "state": "done"}).encode(),
             json.dumps({**good, "members": []}).encode(),
+            json.dumps({**good, "members": "m"}).encode(),
+            json.dumps({**good, "members": {"m": 1}}).encode(),
             json.dumps({**good, "old": "relative"}).encode(),
             json.dumps({k: v for k, v in good.items() if k != "new"}).encode(),
         ]
@@ -220,6 +222,13 @@ class TestRecords(MemberRepairsTestBase):
             os.close(fd)
         MemberRepairs(self.cache, sweep_new=True)
         self.assertFalse(carrier.exists())
+
+    def test_record_with_no_members_records_nothing(self):
+        """A record for no member would refuse the next open."""
+        repairs = MemberRepairs(self.cache)
+        self.assertIsNone(repairs.record("/a", "/b", [], "r"))
+        self.assertFalse(self.carriers.exists())
+        MemberRepairs(self.cache)
 
     def test_begin_with_no_members_records_nothing(self):
         repairs = MemberRepairs(self.cache)

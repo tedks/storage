@@ -451,6 +451,97 @@ class TestDirectoryRetries(SyncRaceTestBase):
         self.assertEqual(SyncStatus.DIRTY,
                          self.fs.state_manager.get_file_metadata("/e/f.txt").sync_status)
 
+    def test_open_repair_fences_link_uploads_at_those_names(self):
+        """A link made through the mount at /e/l, after the member missed
+        /d -> /e, must not be made on that member: there /e is not the
+        namespace's /e. The link stays DIRTY, as a fenced file does."""
+        self.write_file("/t.txt", b"target")
+        self.fs.mkdir("/d", 0o755)
+        self.start_sync()
+        self.wait_synced("/t.txt")
+        self.wait_idle()
+        self.fs.sync_manager.stop()
+        self.fail_member_once("rename")
+        self.fs.rename("/d", "/e")
+        (self.member_dir / "e").mkdir()
+        links = []
+        patcher = patch.object(self.member, "symlink", side_effect=lambda *a: links.append(a))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        self.fs.symlink("/e/l", "../t.txt")
+        self.write_file("/c.txt", b"elsewhere")
+        self.start_sync()
+        self.wait_synced("/c.txt")
+        self.wait_idle()
+        self.fs.sync_manager.stop()
+        self.assertEqual([], links)
+        self.assertEqual([], self.member_names("e"))
+        self.assertEqual(SyncStatus.DIRTY,
+                         self.fs.state_manager.get_file_metadata("/e/l").sync_status)
+
+    def test_open_repair_refuses_a_conflict_view_unlink_on_that_member(self):
+        """After the member missed /d -> /e, its /d/f.txt may hold the only
+        copy of the renamed bytes. Removing the conflict view /d/f.txt.member
+        would delete exactly that object: it is refused, before any effect."""
+        self.fs.mkdir("/d", 0o755)
+        self.write_file("/d/f.txt", b"sole bytes")
+        self.start_sync()
+        self.wait_synced("/d/f.txt")
+        self.wait_idle()
+        self.fs.sync_manager.stop()
+        self.fail_member_once("rename")
+        self.fs.rename("/d", "/e")
+        view = self.fs.cache_manager.get_cache_path("/d/f.txt.member")
+        view.parent.mkdir(parents=True, exist_ok=True)
+        view.write_bytes(b"sole bytes")
+        deletes = []
+        patcher = patch.object(self.member, "delete_file", side_effect=lambda *a: deletes.append(a))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        with self.assertRaises(FuseOSError) as raised:
+            self.fs.unlink("/d/f.txt.member")
+        self.assertEqual(errno.EBUSY, raised.exception.errno)
+        self.assertEqual([], deletes)
+        self.assertTrue(view.exists())
+        self.assertEqual(b"sole bytes", (self.member_dir / "d" / "f.txt").read_bytes())
+
+    def test_open_repair_refuses_a_conflict_view_write_on_that_member(self):
+        """Closing a conflict view written through the mount copies it to
+        that member at the canonical name; under an open repair that would
+        replace the member's object, so the copy is not made."""
+        self.fs.mkdir("/d", 0o755)
+        self.write_file("/d/f.txt", b"sole bytes")
+        self.start_sync()
+        self.wait_synced("/d/f.txt")
+        self.wait_idle()
+        self.fs.sync_manager.stop()
+        self.fail_member_once("rename")
+        self.fs.rename("/d", "/e")
+        self.fs.mkdir("/d", 0o755)
+        copies = []
+        patcher = patch.object(self.member, "copy_from_local",
+                               side_effect=lambda *a: copies.append(a))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        self.write_file("/d/f.txt.member", b"overwrite")
+        self.assertEqual([], copies)
+        self.assertEqual(b"sole bytes", (self.member_dir / "d" / "f.txt").read_bytes())
+
+    def test_a_member_known_down_during_a_rename_gets_a_repair(self):
+        """A member that is unavailable when the rename runs has missed it
+        like one whose call failed: it must not drop out of the record."""
+        self.fs.mkdir("/d", 0o755)
+        self.member.set_available(False)
+        self.addCleanup(self.member.set_available, True)
+        calls = self.fail_member_once("rename")  # as an offline member's call fails
+        self.fs.rename("/d", "/e")
+        self.assertEqual([("/d", "/e")], calls)
+        self.assertEqual([("member", "/d", "/e")], self.repairs())
+        self.assertEqual(["d"], self.member_names())
+
     def test_a_dirty_rename_onto_a_new_member_target_is_a_conflict(self):
         """Where the member does have a location row for the file, the
         conflict check already refuses to replace an unrelated copy that
