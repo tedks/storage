@@ -17,8 +17,8 @@ type: task
 component: open-questions
 release:
 reporter: Ted Smith <tedks@riseup.net>
-status: unstarted
-disposition:
+status: closed
+disposition: fixed
 creation_time: 2026-11-12T21:41:59-00:00
 references: []
 log_events:
@@ -26,3 +26,11 @@ log_events:
   who: Ted Smith
   what: created
   comment: ""
+- time: 2026-11-18T04:39:23-00:00
+  who: Ted Smith
+  what: 'closed: fixed'
+  comment: Ted ruling on Storage resumption, 2026-11-17. On a cold listing, expose
+    the available union even when a member fails and the result is empty. Include
+    available local names. Log missing members and retain internal failure information.
+    No partial UI indicator or proven desktop notification is required. This ruling
+    addresses partial availability.
