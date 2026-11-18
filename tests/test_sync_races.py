@@ -766,9 +766,9 @@ class TestDirectoryRetries(SyncRaceTestBase):
         takes the record there is exactly one, and the member was never
         renamed (CTO RRS-CTO-BACKOFF). The backoff ends only when the test
         ends it, so nothing depends on timing."""
-        self.assertEqual(1, len(self.fs.sync_manager.workers or [None]))
         failing, attempts, renames = self.flaky_rename_record()
         self.start_sync()
+        self.assertEqual(1, len(self.fs.sync_manager.workers))
         self.wait_until(lambda: self.scheduler().pending() == 1, "deferred the retry")
         self.assertEqual(1, len(attempts))
 

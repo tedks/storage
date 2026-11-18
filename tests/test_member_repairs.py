@@ -290,6 +290,24 @@ class TestRecords(MemberRepairsTestBase):
         self.assertIsNone(repairs.preserve_view_write("/f", "m", view, "1:2", "r"))
         self.assertEqual([], repairs.list())
 
+    def test_non_ascii_and_undecodable_names_cost_their_own_bytes(self):
+        """A CJK name costs its UTF-8 bytes against the bound (not a 6-byte
+        escape each), and a name that is not valid UTF-8 round-trips."""
+        cjk = "/" + "\u97f3" * 500           # 1500 UTF-8 bytes; 3000 escaped
+        odd = "/bad-\udcff-name"             # os.fsdecode of b"/bad-\xff-name"
+        repairs = MemberRepairs(self.cache)
+        first = repairs.record(cjk, cjk + "2", ["m"], "r")
+        second = repairs.record(odd, odd + "2", ["m"], "r")
+        reopened = {r.id: r for r in MemberRepairs(self.cache).list()}
+        self.assertEqual((cjk, cjk + "2"), (reopened[first].old_path, reopened[first].new_path))
+        self.assertEqual((odd, odd + "2"), (reopened[second].old_path, reopened[second].new_path))
+
+    def test_a_durable_record_whose_reload_fails_is_not_reported_failed(self):
+        repairs = MemberRepairs(self.cache)
+        with patch.object(repairs, "_reload_locked", side_effect=OSError(errno.EIO, "x")):
+            kept = repairs.record("/a", "/b", ["m"], "r")
+        self.assertEqual([kept], [r.id for r in MemberRepairs(self.cache).list()])
+
     def test_record_with_no_members_records_nothing(self):
         """A record for no member would refuse the next open."""
         repairs = MemberRepairs(self.cache)

@@ -96,12 +96,16 @@ class MemberRepair:
             "state": self.state,
             "reason": self.reason,
             "recorded": self.recorded,
-        }, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        }, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        ).encode("utf-8", "surrogateescape")
+        # Raw UTF-8, not \u escapes: a non-ASCII path costs its own bytes
+        # against MAX_RECORD_BYTES (3 for CJK, not 6), as an ASCII one does.
+        # surrogateescape carries a name that is not valid UTF-8 through.
 
     @classmethod
     def from_json(cls, raw: bytes, carrier_name: str) -> "MemberRepair":
         try:
-            data = json.loads(raw.decode("utf-8"))
+            data = json.loads(raw.decode("utf-8", "surrogateescape"))
             if not isinstance(data["members"], list):
                 # tuple() of a string would fence its characters.
                 raise TypeError("members is not a list")
@@ -454,7 +458,15 @@ class MemberRepairs:
         record = self._make(old_path, new_path, members, OPEN, reason)
         with self._write_lock:
             self._write_new(record)
-            self._after_write(lambda records: records.__setitem__(record.id, record))
+            try:
+                self._after_write(lambda records: records.__setitem__(record.id, record))
+            except OSError as exc:
+                # The record is durable: reporting a failure would make the
+                # queued rename retry and write a second one.
+                logger.warning("Could not reload the member repairs after writing %s: %s",
+                               record.id, exc)
+                with self._lock:
+                    self._records[record.id] = record
         logger.warning(
             "Member(s) %s missed the rename %s -> %s, which is not replayed; repair %s "
             "(storage debug member-repairs): %s",

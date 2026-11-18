@@ -63,10 +63,11 @@ The value is UTF-8 JSON with these fields:
 A record larger than 3584 bytes is refused before it is written, with
 ENAMETOOLONG. That keeps the bound independent of the filesystem and inside
 ext4's per-inode xattr block. The cost is that a rename whose two paths
-together exceed about 3.3 KiB of encoded JSON fails, on any mount with at
-least one member. The record escapes non-ASCII characters (6 bytes each, 12
-outside the Basic Multilingual Plane), so for such names the bound in
-characters is several times lower. Resolving rewrites the state as
+together exceed about 3.3 KiB fails, on any mount with at least one
+member. The record is raw UTF-8, so a path costs its own encoded bytes:
+3 for a CJK character, 4 outside the Basic Multilingual Plane, 1 for
+ASCII. A name that is not valid UTF-8 is carried through with
+surrogateescape. Resolving rewrites the state as
 `resolved`, 4 bytes longer than `open`, which stays well under the 4 KiB
 block. This is a stated bound, not widened scope. A filesystem that refuses `user.*`
 xattrs (ENOTSUP) fails the rename the same way. The cache already depends on
