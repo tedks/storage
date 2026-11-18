@@ -1686,6 +1686,14 @@ class TestMemberRepairsCommand(unittest.TestCase):
         self.assertNotIn("Traceback", result.output)
         self.assertEqual(2, len(json.loads(self.invoke("--json-output").output)))
 
+    def test_an_unreadable_carrier_directory_is_a_clean_error(self):
+        from unittest import mock as _mock
+        with _mock.patch("storage.member_repairs.os.listdir", side_effect=OSError(13, "denied")):
+            result = self.invoke()
+        self.assertNotEqual(0, result.exit_code)
+        self.assertIn("Could not read the member repairs", result.output)
+        self.assertNotIn("Traceback", result.output)
+
     def test_a_corrupt_carrier_is_reported(self):
         carrier = self.cache / ".storage.repairs" / self.first
         os.setxattr(str(carrier), "user.storage.member_repair", b"{not json")

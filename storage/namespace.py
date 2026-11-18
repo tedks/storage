@@ -1522,7 +1522,11 @@ class NamespaceService:
             # crash from here on leaves this intent, open for every target.
             # If it cannot be written, the rename fails and nothing changed.
             intent = repairs.begin(old_resolved.canonical_path, new_resolved.canonical_path, targets)
-            moved = False
+            # attempted: the cache rename may have taken effect. It is cleared
+            # only when rename(2) itself fails, which has no effect; any other
+            # interruption from here on (even an asynchronous one before
+            # moved is set) keeps the intent.
+            attempted = moved = False
             try:
                 with self.state_manager.metadata_lock:
                     # A directory whose files were all evicted is empty in the
@@ -1535,7 +1539,12 @@ class NamespaceService:
                             )):
                         raise OSError(errno.ENOTEMPTY, os.strerror(errno.ENOTEMPTY), new)
                     new_cache.parent.mkdir(parents=True, exist_ok=True)
-                    old_cache.rename(new_cache)
+                    attempted = True
+                    try:
+                        old_cache.rename(new_cache)
+                    except OSError:
+                        attempted = False
+                        raise
                     moved = True
 
                     renamed_entries = self.state_manager.rename_path(
@@ -1550,7 +1559,7 @@ class NamespaceService:
                         on_local_moved()
             except BaseException:
                 if intent is not None:
-                    if moved:
+                    if moved or attempted:
                         repairs.abandon(intent)
                     else:
                         # Nothing moved and no member was called.

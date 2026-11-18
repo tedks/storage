@@ -298,8 +298,8 @@ def debug_member_repairs(cache: Path, resolve_id: str | None, json_output: bool)
     """
     try:
         repairs = MemberRepairs(cache.resolve())
-    except CorruptRepairRecord as exc:
-        raise click.ClickException(str(exc)) from exc
+    except (OSError, CorruptRepairRecord) as exc:
+        raise click.ClickException(f"Could not read the member repairs in {cache}: {exc}") from exc
     if resolve_id is not None:
         try:
             resolved = repairs.resolve(resolve_id)

@@ -936,6 +936,42 @@ class TestRepairsOutliveTheIndex(SyncRaceTestBase):
         self.assertEqual([], os.listdir(carriers))
         self.assertEqual(set(), self.fs.cache_manager.member_repairs.backends_for(["/d"]))
 
+    def test_an_interruption_right_after_the_cache_rename_keeps_the_intent(self):
+        """An exception (here KeyboardInterrupt) after the cache rename took
+        effect but before the rename noted it: the intent stays."""
+        self.fs.mkdir("/d", 0o755)
+        real_rename = Path.rename
+
+        def rename_then_interrupt(path, target):
+            result = real_rename(path, target)
+            if Path(target) == self.cache_dir / "e":
+                raise KeyboardInterrupt
+            return result
+
+        with patch.object(Path, "rename", rename_then_interrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.fs.rename("/d", "/e")
+        self.assertTrue((self.cache_dir / "e").is_dir())
+        [record] = MemberRepairs(self.cache_dir).list()
+        self.assertEqual(("intent", ("member",)), (record.state, record.members))
+
+    def test_a_failed_cache_rename_drops_its_intent(self):
+        """rename(2) failing has no effect: nothing moved, no member called,
+        and no intent left."""
+        self.fs.mkdir("/d", 0o755)
+        real_rename = Path.rename
+
+        def failing(path, target):
+            if Path(target) == self.cache_dir / "e":
+                raise OSError(errno.EIO, "injected")
+            return real_rename(path, target)
+
+        with patch.object(Path, "rename", failing):
+            with self.assertRaises(FuseOSError):
+                self.fs.rename("/d", "/e")
+        self.assertTrue((self.cache_dir / "d").is_dir())
+        self.assertEqual([], MemberRepairs(self.cache_dir).list())
+
     def test_the_local_move_is_made_durable_before_any_member_call(self):
         """If the cache directories cannot be fsynced after the local move,
         no member is called and the intent stays."""
