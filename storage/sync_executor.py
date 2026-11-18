@@ -149,10 +149,24 @@ class SyncExecutor:
             return True
 
         config = get_inherited_config(cache_path)
+        # A member with an open repair at or around this name holds names
+        # the namespace does not describe there (see
+        # StateManager.member_repair_backends): it is left out, as a member
+        # that is down is, until the repair is resolved.
+        fenced = self.state_manager.member_repair_backends([task.virtual_path])
         target_backends = self.replication_manager.select_backends_for_file(
             task.virtual_path,
             config,
+            exclude=fenced,
         )
+
+        if not target_backends and fenced:
+            # Only fenced members could take it: the file stays DIRTY, so the
+            # monitor syncs it once the repair is resolved.
+            logger.warning("Not syncing %s: every member for it has an open member repair",
+                           task.virtual_path)
+            self._publish(task, generation, SyncStatus.DIRTY, cache_path)
+            return True
 
         if not target_backends:
             logger.warning("No backends available for %s", task.virtual_path)
@@ -169,21 +183,8 @@ class SyncExecutor:
             hashed_identity = None
         checksum = self.state_manager.compute_checksum(cache_path)
 
-        # A member with an open repair at or around this name holds names
-        # the namespace does not describe there (see
-        # StateManager.member_repair_backends): it is treated as unavailable
-        # for this file until the repair is resolved.
-        fenced = self.state_manager.member_repair_backends([task.virtual_path])
         sync_results: Dict[str, bool] = {}
         for backend in target_backends:
-            if backend.name in fenced:
-                logger.warning(
-                    "Not syncing %s to %s: it has an open member repair at this name",
-                    task.virtual_path,
-                    backend.label,
-                )
-                sync_results[backend.name] = False
-                continue
             try:
                 conflict = self.conflict_detector.check_conflict(
                     task.virtual_path,
@@ -429,8 +430,14 @@ class SyncExecutor:
     ) -> bool:
         """Handle failed sync task execution."""
         task.retry_count += 1
+        # A rename task only writes its repair record (_fence_rename_task):
+        # dropping it would lose the only sign of what the member missed, so
+        # it is retried until the record is written, at the longest delay.
+        never_drop = isinstance(task, DirSyncTask) and task.operation == DirOperation.RENAME
+        if never_drop:
+            task.retry_count = min(task.retry_count, max(1, self.config.max_retries))
 
-        if task.retry_count < self.config.max_retries:
+        if task.retry_count < self.config.max_retries or never_drop:
             task.priority -= 10
             logger.info(
                 "Re-queueing %s (retry %s/%s)",
@@ -513,9 +520,10 @@ class SyncExecutor:
         the member, whatever the task's age or origin. Without a hint the
         task stands for every configured member, including any that never
         held the names: a record too many costs a look, one too few a
-        replay. A record that cannot be written fails the task, so it is
-        tried again; a task with no new name cannot be recorded and is
-        dropped, logged, as no caller makes one.
+        replay. A record that cannot be written fails the task, which
+        handle_task_failure retries without limit (at its longest delay
+        after max_retries); a task with no new name cannot be recorded and
+        is dropped, logged, as no caller makes one.
         """
         if not task.new_path:
             logger.error("Dropping a rename task for %s with no new name", task.virtual_path)
@@ -564,9 +572,18 @@ class SyncExecutor:
                 f"No backends available for dir operation {task.operation.value}"
             )
 
+        # A member with an open repair at or around this name keeps what it
+        # has there (see StateManager.member_repair_backends).
+        fenced = self.state_manager.member_repair_backends([task.virtual_path])
         success = True
         for backend in backends:
             if not backend:
+                continue
+            if backend.name in fenced:
+                logger.warning(
+                    "Not retrying %s of %s on %s: it has an open member repair at this name",
+                    task.operation.value, task.virtual_path, backend.name,
+                )
                 continue
             try:
                 if task.operation == DirOperation.MKDIR:

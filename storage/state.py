@@ -899,6 +899,9 @@ class StateManager:
         namespace does not describe there (the object it did not move, or
         whatever took the other name since), so nothing the namespace does
         at those names is sent to it until the repair is resolved.
+
+        A scan of the whole table: it holds the repairs not yet resolved,
+        expected to be few. Each upload and each eviction candidate runs it.
         """
         paths = list(virtual_paths)
         return {
@@ -914,6 +917,8 @@ class StateManager:
 
         The member that missed the move may hold that file's bytes only under
         the old name, so the cached copy is the one the namespace can read.
+        Any member's repair counts, including for files that member never
+        held: conservative, it can only keep more cached.
         """
         return any(
             _is_at_or_under(virtual_path, repair.new_path)

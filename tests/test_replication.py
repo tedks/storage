@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 
 from storage.backends.local import LocalBackend
+from storage.file_config import FileConfig
 from storage.replication import ReplicationManager
 from storage.state import StateManager
 
@@ -43,6 +44,19 @@ class TestReplicationManager(unittest.TestCase):
 
         self.assertTrue(results["backend2"])
         self.assertTrue((self.backend2_dir / path.lstrip("/")).exists())
+
+    def test_excluded_members_are_left_out_as_if_down(self):
+        """An excluded member is not selected, even when preferred, and the
+        replica count is filled from the others, as for a member that is
+        down."""
+        for replica_count, preferred in ((1, ["backend1"]), (1, None), (-1, None)):
+            config = FileConfig(replica_count=replica_count, preferred_backends=preferred)
+            selected = self.replication_manager.select_backends_for_file(
+                "/f.txt", config, exclude={"backend1"})
+            self.assertEqual(["backend2"], [b.name for b in selected], (replica_count, preferred))
+        config = FileConfig(replica_count=1)
+        self.assertEqual([], self.replication_manager.select_backends_for_file(
+            "/f.txt", config, exclude={"backend1", "backend2"}))
 
 
 if __name__ == "__main__":

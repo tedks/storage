@@ -5,17 +5,20 @@ Event gate in the member's copy_from_local holds the upload mid-transfer,
 so each interleaving is forced. Every wait has a timeout.
 """
 
+import errno
 import multiprocessing
 import os
 import time
 from unittest.mock import patch
+
+from fuse import FuseOSError
 
 from storage.backends.local import LocalBackend
 from storage.fs import StorageFS
 from storage.models import SyncStatus
 from storage.state import StateManager
 from storage.sync_executor import SyncExecutor
-from storage.sync_tasks import DirOperation
+from storage.sync_tasks import DirOperation, DirSyncTask
 from tests.test_fs_threading import BLOCKED, WAIT, ThreadingTestBase, Worker
 
 
@@ -440,8 +443,9 @@ class TestDirectoryRetries(SyncRaceTestBase):
         self.fs.sync_manager.stop()
         self.assertEqual(["/c.txt"], uploads)
         self.assertEqual(b"unrelated writer", (self.member_dir / "e" / "f.txt").read_bytes())
-        self.assertNotEqual(SyncStatus.CLEAN,
-                            self.fs.state_manager.get_file_metadata("/e/f.txt").sync_status)
+        # DIRTY, not ERROR: the monitor syncs it once the repair is resolved.
+        self.assertEqual(SyncStatus.DIRTY,
+                         self.fs.state_manager.get_file_metadata("/e/f.txt").sync_status)
 
     def test_a_dirty_rename_onto_a_new_member_target_is_a_conflict(self):
         """Where the member does have a location row for the file, the
@@ -462,26 +466,33 @@ class TestDirectoryRetries(SyncRaceTestBase):
         self.assertEqual(b"unrelated writer", (self.member_dir / "b.txt").read_bytes())
         self.assertEqual(b"old bytes", (self.member_dir / "a.txt").read_bytes())
 
-    def test_a_record_that_cannot_be_written_is_retried_by_the_worker(self):
-        """The index refuses the rename's record once (a busy or full
-        database): the rename queues the record as a task, the worker's
-        first try fails too, and its retry writes it; no member call."""
+    def test_a_record_that_cannot_be_written_is_retried_until_it_is(self):
+        """The index refuses the rename's record (a busy or full database)
+        more times than max_retries. The local move stands and the caller
+        gets EIO, a partial rename; the move is queued as a rename task,
+        whose worker retries the record until it is written, with no member
+        call."""
         self.fs.mkdir("/d", 0o755)
         self.fail_member_once("rename")
         real_record = self.fs.state_manager.record_member_rename_repair
         attempts = []
+        refusals = self.fs.sync_manager.config.max_retries + 3
 
-        def failing_twice(*args):
+        def failing(*args):
             attempts.append(args)
-            if len(attempts) <= 2:
+            if len(attempts) <= refusals:
                 raise OSError("database is locked")
             return real_record(*args)
 
         patcher = patch.object(self.fs.state_manager, "record_member_rename_repair",
-                               side_effect=failing_twice)
+                               side_effect=failing)
         patcher.start()
         self.addCleanup(patcher.stop)
-        self.fs.rename("/d", "/e")
+        with self.assertRaises(FuseOSError) as raised:
+            self.fs.rename("/d", "/e")
+        self.assertEqual(errno.EIO, raised.exception.errno)
+        self.assertTrue(self.fs.cache_manager.get_cache_path("/e").is_dir())
+        self.assertFalse(os.path.lexists(self.fs.cache_manager.get_cache_path("/d")))
         self.assertEqual([], self.repairs())
         self.assertEqual([(DirOperation.RENAME, "/d")], self.queued_dir_ops())
 
@@ -496,9 +507,45 @@ class TestDirectoryRetries(SyncRaceTestBase):
             time.sleep(0.02)
         self.wait_idle()
         self.assertEqual([("member", "/d", "/e")], self.repairs())
-        self.assertEqual(3, len(attempts))
+        self.assertEqual(refusals + 1, len(attempts))
         self.assertEqual([], renames)
         self.assertEqual(["d"], self.member_names())
+
+    def test_open_repair_fences_rmdir_of_a_reused_source(self):
+        """The member missed an empty /d -> /e; /d was made again and is
+        now removed through the mount. The member's /d is the one the
+        missed rename left there, so it stays."""
+        self.fs.mkdir("/d", 0o755)
+        self.fail_member_once("rename")
+        self.fs.rename("/d", "/e")
+        self.fs.mkdir("/d", 0o755)
+        self.fs.rmdir("/d")
+        self.assertEqual(["d"], self.member_names())
+
+    def test_open_repair_fences_rmdir_of_a_new_target_occupant(self):
+        """Another writer made an empty /e on the member after it missed
+        /d -> /e; removing /e through the mount leaves it there."""
+        self.fs.mkdir("/d", 0o755)
+        self.fail_member_once("rename")
+        self.fs.rename("/d", "/e")
+        (self.member_dir / "e").mkdir()
+        self.fs.rmdir("/e")
+        self.assertEqual(["d", "e"], self.member_names())
+
+    def test_open_repair_fences_a_queued_rmdir_retry(self):
+        """An rmdir retry that still applies (the cache has no /e) is not
+        run on a member with an open repair at /e: its empty /e may be the
+        object that repair is about."""
+        (self.member_dir / "e").mkdir()
+        self.fs.state_manager.record_member_rename_repair("member", "/d", "/e", "missed")
+        self.assertFalse(os.path.lexists(self.fs.cache_manager.get_cache_path("/e")))
+        executor = SyncExecutor(
+            worker_id=9, state_manager=self.fs.state_manager, cache_manager=self.fs.cache_manager,
+            replication_manager=self.fs.replication_manager, config=self.fs.sync_manager.config,
+        )
+        self.assertTrue(executor.process_dir_task(
+            DirSyncTask("/e", DirOperation.RMDIR, backend_hint="member")))
+        self.assertEqual(["e"], self.member_names())
 
     def test_repair_is_on_disk_when_the_rename_returns(self):
         """A process that dies right after the rename returns, closing
@@ -507,6 +554,10 @@ class TestDirectoryRetries(SyncRaceTestBase):
         child = ctx.Process(target=_rename_then_die, args=(self.temp_dir,))
         child.start()
         child.join(WAIT)
+        if child.exitcode is None:
+            child.kill()
+            child.join()
+            self.fail("the child neither renamed nor exited")
         self.assertEqual(0, child.exitcode)
         reopened = StateManager(str(self.temp_dir / "crash" / "state.db"))
         self.addCleanup(reopened.close)
