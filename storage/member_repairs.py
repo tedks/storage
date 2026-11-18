@@ -47,7 +47,9 @@ RESOLVED = "resolved"
 # succeeded (StorageFS._release): old and new are both the canonical path.
 RENAME = "rename"
 VIEW_WRITE = "view-write"
-_COPY_ATTEMPTS = 3
+# A cache filesystem that cannot hard-link the view into the carrier
+# directory: copy instead.
+_NO_LINK = frozenset({errno.EXDEV, errno.EPERM, errno.EMLINK, errno.ENOTSUP, errno.EOPNOTSUPP})
 # Past this many open repairs, opening the cache warns: every fence and pin
 # lookup scans them all.
 GROWTH_WARNING = 1000
@@ -172,12 +174,6 @@ def _copy_into(source: Path, fd: int):
             view = memoryview(chunk)
             while view:
                 view = view[os.write(fd, view):]
-
-
-def file_identity(path: Path) -> str:
-    """device:inode:size:mtime_ns of path: changes with any write to it."""
-    st = os.stat(path)
-    return f"{st.st_dev}:{st.st_ino}:{st.st_size}:{st.st_mtime_ns}"
 
 
 def _flock_bounded(fd: int, wait: Optional[float] = None):
@@ -467,49 +463,95 @@ class MemberRepairs:
         return record.id
 
     def preserve_view_write(self, canonical_path: str, member: str, view_path: Path,
-                            reason: str) -> Optional[str]:
+                            inode: str, reason: str) -> Optional[str]:
         """Durably keep a conflict view's bytes that a repair kept off member.
 
-        Called at release for a write that close() already reported as
-        done. The carrier holds an exact copy of view_path's bytes, so they
-        outlive the view's cache file (eviction, a refetch, an index
-        rebuild) and are listed until resolved; the member is not touched.
-        A copy whose source changed while it was made (another descriptor
-        still writing) is made again, up to a bound. The same bytes are
-        recorded once: a release of another descriptor of the view, or a
-        retry, finds the record by the view file's identity and returns its
-        id. Returns the record id, or None when view_path is gone. Raises
-        OSError when the copy cannot be made durable.
+        Called at release for a write that close() already reported done.
+        inode is "dev:ino" of the descriptor's file, taken before it was
+        closed. The view's inode itself becomes the carrier: hard-linked
+        under a temporary name, given its record and fsynced, then named,
+        and only then is the view's cache name unlinked. So the bytes are
+        exactly what the descriptor wrote, no space or copy time is needed,
+        and nothing that later rewrites the view's cache file in place can
+        reach them. They outlive eviction, a refetch, a reopen and an
+        index rebuild, and are listed until resolved; the member is not
+        touched. Every descriptor of that inode shares one record: a second
+        release finds it by inode. Where the cache filesystem refuses the
+        link, the bytes are copied instead (and then deduplicated by inode,
+        size and mtime). Returns the record id, or None when the view's
+        cache name no longer holds that inode. Raises OSError when the
+        bytes cannot be made durable.
         """
         with self._write_lock:
-            for _attempt in range(_COPY_ATTEMPTS):
-                try:
-                    before = file_identity(view_path)
-                except FileNotFoundError:
-                    return None
+            for existing in self._refresh().values():
+                if (existing.kind == VIEW_WRITE and existing.new_path == canonical_path
+                        and existing.members == (member,) and existing.source == inode):
+                    return existing.id
+            try:
+                st = os.lstat(view_path)
+            except FileNotFoundError:
+                return None
+            if f"{st.st_dev}:{st.st_ino}" != inode:
+                return None
+            record = dataclasses.replace(
+                self._make(canonical_path, canonical_path, [member], OPEN, reason),
+                kind=VIEW_WRITE, source=inode,
+            )
+            try:
+                self._link_new(record, view_path)
+                moved = True
+            except OSError as exc:
+                if exc.errno not in _NO_LINK:
+                    raise
+                moved = False
+                copied = f"{inode}:{st.st_size}:{st.st_mtime_ns}"
                 for existing in self._refresh().values():
-                    if (existing.kind == VIEW_WRITE and existing.new_path == canonical_path
-                            and existing.members == (member,) and existing.source == before):
+                    if existing.kind == VIEW_WRITE and existing.source == copied:
                         return existing.id
-                record = dataclasses.replace(
-                    self._make(canonical_path, canonical_path, [member], OPEN, reason),
-                    kind=VIEW_WRITE, source=before,
-                )
+                record = dataclasses.replace(record, source=copied)
                 self._write_new(record, content=view_path)
-                if file_identity(view_path) == before:
-                    self._after_write(lambda records: records.__setitem__(record.id, record))
-                    logger.error(
-                        "A write through the conflict view of %s on %s was kept off that "
-                        "member by an open repair; its bytes are kept in %s, repair %s "
-                        "(storage debug member-repairs)",
-                        canonical_path, member, self.dir / record.id, record.id,
-                    )
-                    return record.id
-                # Torn: drop this copy and make another of the new bytes.
-                (self.dir / record.id).unlink()
-                _fsync(self.dir, directory=True)
-            raise OSError(errno.EAGAIN,
-                          f"conflict view of {canonical_path} kept changing while it was copied")
+            self._after_write(lambda records: records.__setitem__(record.id, record))
+        if moved:
+            try:
+                if os.lstat(view_path).st_ino == st.st_ino:
+                    os.unlink(view_path)
+                    _fsync(view_path.parent, directory=True)
+            except OSError as exc:
+                logger.warning("Kept the bytes of %s in %s, but its view cache name %s stays: %s",
+                               canonical_path, self.dir / record.id, view_path, exc)
+        logger.error(
+            "A write through the conflict view of %s on %s was kept off that member by an "
+            "open repair; its bytes are kept in %s, repair %s (storage debug member-repairs)",
+            canonical_path, member, self.dir / record.id, record.id,
+        )
+        return record.id
+
+    def _link_new(self, record: MemberRepair, source: Path):
+        """Make source's inode a carrier, durably: link, record, fsync, name."""
+        payload = record.to_json()
+        if len(payload) > MAX_RECORD_BYTES:
+            raise OSError(errno.ENAMETOOLONG,
+                          f"member repair record is {len(payload)} bytes, over {MAX_RECORD_BYTES}")
+        self._ensure_dir()
+        temp = self.dir / (record.id + _NEW_SUFFIX)
+        final = self.dir / record.id
+        os.link(source, temp)
+        try:
+            fd = os.open(str(temp), os.O_RDONLY)
+            try:
+                os.setxattr(fd, RECORD_XATTR, payload)
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            os.rename(temp, final)
+            _fsync(self.dir, directory=True)
+        except BaseException:
+            for leftover in (temp, final):
+                try:
+                    leftover.unlink()
+                except OSError:
+                    pass
+            raise
 
     def carrier_path(self, repair_id: str) -> Path:
         """Where a record lives; a VIEW_WRITE record's bytes are its data."""

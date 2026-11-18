@@ -1659,7 +1659,8 @@ class TestMemberRepairsCommand(unittest.TestCase):
         view = self.temp_dir / "view"
         view.write_bytes(b"edited")
         repairs = MemberRepairs(self.cache)
-        kept = repairs.preserve_view_write("/f.txt", "remote1", view, "kept")
+        st = os.lstat(view)
+        kept = repairs.preserve_view_write("/f.txt", "remote1", view, f"{st.st_dev}:{st.st_ino}", "kept")
         carrier = repairs.carrier_path(kept)
         result = self.invoke()
         self.assertEqual(0, result.exit_code, result.output)

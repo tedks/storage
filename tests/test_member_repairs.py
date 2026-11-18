@@ -11,7 +11,6 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-import storage.member_repairs as member_repairs_module
 from storage.member_repairs import (
     VIEW_WRITE,
     CARRIER_DIR,
@@ -230,48 +229,65 @@ class TestRecords(MemberRepairsTestBase):
         MemberRepairs(self.cache, sweep_new=True)
         self.assertFalse(carrier.exists())
 
-    def test_a_view_write_keeps_exact_bytes_once_per_identity(self):
+    @staticmethod
+    def inode(path):
+        st = os.lstat(path)
+        return f"{st.st_dev}:{st.st_ino}"
+
+    def test_a_view_write_moves_the_inode_and_is_kept_once(self):
+        view = self.cache / "view"
+        view.write_bytes(b"edited")
+        inode = self.inode(view)
+        repairs = MemberRepairs(self.cache)
+        kept = repairs.preserve_view_write("/f", "m", view, inode, "r")
+        carrier = repairs.carrier_path(kept)
+        self.assertEqual(inode, self.inode(carrier))       # the same inode: no copy
+        self.assertFalse(view.exists())                    # nothing can rewrite it in place
+        self.assertEqual(b"edited", carrier.read_bytes())
+        # Another descriptor of the same inode: the same record.
+        self.assertEqual(kept, repairs.preserve_view_write("/f", "m", view, inode, "r"))
+        # A new view file (a refetch) is a different inode, not this record.
+        view.write_bytes(b"refetched")
+        self.assertIsNone(repairs.preserve_view_write("/f", "m", view, inode + "x", "r"))
+        self.assertEqual(b"edited", carrier.read_bytes())
+        reopened = MemberRepairs(self.cache)
+        [record] = reopened.list()
+        self.assertEqual((VIEW_WRITE, "/f", "/f", ("m",), inode),
+                         (record.kind, record.new_path, record.old_path, record.members,
+                          record.source))
+        self.assertEqual({"m"}, reopened.backends_for(["/f"]))
+        self.assertTrue(reopened.resolve(kept))
+        self.assertFalse(carrier.exists())
+        self.assertEqual([], MemberRepairs(self.cache).list())
+
+    def test_a_view_write_is_copied_where_the_cache_cannot_link(self):
+        view = self.cache / "view"
+        view.write_bytes(b"edited")
+        inode = self.inode(view)
+        repairs = MemberRepairs(self.cache)
+        with patch("storage.member_repairs.os.link", side_effect=OSError(errno.EPERM, "no")):
+            kept = repairs.preserve_view_write("/f", "m", view, inode, "r")
+            self.assertEqual(kept, repairs.preserve_view_write("/f", "m", view, inode, "r"))
+        self.assertEqual(b"edited", repairs.carrier_path(kept).read_bytes())
+        self.assertNotEqual(inode, self.inode(repairs.carrier_path(kept)))
+        self.assertTrue(view.exists())
+
+    def test_a_view_write_that_cannot_be_kept_leaves_nothing(self):
         view = self.cache / "view"
         view.write_bytes(b"edited")
         repairs = MemberRepairs(self.cache)
-        first = repairs.preserve_view_write("/f", "m", view, "r")
-        self.assertEqual(first, repairs.preserve_view_write("/f", "m", view, "r"))
-        self.assertEqual(b"edited", repairs.carrier_path(first).read_bytes())
-        os.utime(view, ns=(1, 1))
-        view.write_bytes(b"edited again")
-        second = repairs.preserve_view_write("/f", "m", view, "r")
-        self.assertNotEqual(first, second)
-        reopened = MemberRepairs(self.cache)
-        kept = sorted((r.kind, r.new_path, r.old_path, r.members,
-                       reopened.carrier_path(r.id).read_bytes()) for r in reopened.list())
-        self.assertEqual([(VIEW_WRITE, "/f", "/f", ("m",), b"edited"),
-                          (VIEW_WRITE, "/f", "/f", ("m",), b"edited again")], kept)
-        self.assertEqual({"m"}, reopened.backends_for(["/f"]))
-        self.assertTrue(reopened.resolve(first))
-        self.assertFalse(reopened.carrier_path(first).exists())
-        self.assertEqual([second], [r.id for r in MemberRepairs(self.cache).list()])
+        with patch("storage.member_repairs.os.setxattr", side_effect=OSError(errno.ENOSPC, "x")):
+            with self.assertRaises(OSError):
+                repairs.preserve_view_write("/f", "m", view, self.inode(view), "r")
+        self.assertEqual([], os.listdir(self.carriers))
+        self.assertEqual(b"edited", view.read_bytes())
 
-    def test_a_view_write_copied_while_it_changes_is_copied_again(self):
+    def test_a_missing_or_replaced_view_keeps_nothing(self):
+        repairs = MemberRepairs(self.cache)
+        self.assertIsNone(repairs.preserve_view_write("/f", "m", self.cache / "gone", "1:2", "r"))
         view = self.cache / "view"
-        view.write_bytes(b"v1")
-        repairs = MemberRepairs(self.cache)
-        real = member_repairs_module._copy_into
-        calls = []
-
-        def copy_then_change(source, fd):
-            real(source, fd)
-            calls.append(1)
-            if len(calls) == 1:
-                view.write_bytes(b"v2, longer")
-        with patch("storage.member_repairs._copy_into", side_effect=copy_then_change):
-            kept = repairs.preserve_view_write("/f", "m", view, "r")
-        self.assertEqual(2, len(calls))
-        self.assertEqual(b"v2, longer", repairs.carrier_path(kept).read_bytes())
-        self.assertEqual([kept], os.listdir(self.carriers))
-
-    def test_a_missing_view_keeps_nothing(self):
-        repairs = MemberRepairs(self.cache)
-        self.assertIsNone(repairs.preserve_view_write("/f", "m", self.cache / "gone", "r"))
+        view.write_bytes(b"other inode")
+        self.assertIsNone(repairs.preserve_view_write("/f", "m", view, "1:2", "r"))
         self.assertEqual([], repairs.list())
 
     def test_record_with_no_members_records_nothing(self):

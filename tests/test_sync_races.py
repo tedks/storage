@@ -8,6 +8,8 @@ so each interleaving is forced. Every wait has a timeout.
 import errno
 import multiprocessing
 import os
+import queue
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -22,8 +24,8 @@ from storage.models import SyncStatus
 from storage.index_audit import rebuild_index_from_cache
 from storage.member_repairs import VIEW_WRITE, CorruptRepairRecord, MemberRepairs
 from storage.state import StateManager
-from storage.sync_executor import SyncExecutor
-from storage.sync_tasks import DirOperation, DirSyncTask
+from storage.sync_executor import RetryScheduler, SyncExecutor
+from storage.sync_tasks import DirOperation, DirSyncTask, SyncConfig
 from tests.test_fs_threading import BLOCKED, WAIT, ThreadingTestBase, Worker
 
 
@@ -720,13 +722,10 @@ class TestDirectoryRetries(SyncRaceTestBase):
         self.assertEqual([], renames)
         self.assertEqual(["d"], self.member_names())
 
-    def test_healthy_sync_runs_while_a_failing_rename_record_backs_off(self):
-        """One worker. A queued rename's record keeps failing and its retry
-        is backing off: an unrelated file still syncs meanwhile, and an
-        upload at the rename's new name is still kept off the member, as
-        the record would. Once the cache takes the record there is exactly
-        one, and the member was never renamed (CTO RRS-CTO-BACKOFF)."""
-        self.assertEqual(1, len(self.fs.sync_manager.workers or [None]))
+    def flaky_rename_record(self):
+        """A queued /d -> /e rename for the member whose record the cache
+        refuses until failing[0] is cleared; returns (failing, attempts,
+        renames). Its retry backs off for an hour unless the test ends it."""
         self.fs.mkdir("/d", 0o755)
         self.fs.mkdir("/e", 0o755)
         repairs = self.fs.cache_manager.member_repairs
@@ -735,7 +734,7 @@ class TestDirectoryRetries(SyncRaceTestBase):
         attempts = []
 
         def flaky(*args):
-            attempts.append(time.monotonic())
+            attempts.append(args)
             if failing[0]:
                 raise OSError(errno.ENOSPC, "injected")
             return real_record(*args)
@@ -744,40 +743,77 @@ class TestDirectoryRetries(SyncRaceTestBase):
         renames = []
         patch.object(self.member, "rename", side_effect=lambda *a: renames.append(a)).start()
         self.addCleanup(patch.stopall)
-        self.fs.sync_manager.config.retry_delay = 2.0
+        self.fs.sync_manager.config.retry_delay = 3600.0
         self.fs.sync_manager.queue_dir_sync("/d", DirOperation.RENAME, new_path="/e",
                                             backend_hint="member", force=True)
-        self.start_sync()
+        return failing, attempts, renames
+
+    def scheduler(self):
+        return RetryScheduler.for_queue(self.fs.sync_manager.task_queue)
+
+    def wait_until(self, condition, what):
         deadline = time.monotonic() + WAIT
-        while not attempts and time.monotonic() < deadline:
+        while not condition():
+            if time.monotonic() > deadline:
+                self.fail(f"never {what}")
             time.sleep(0.01)
+
+    def test_healthy_sync_runs_while_a_failing_rename_record_backs_off(self):
+        """One worker. A queued rename's record keeps failing and its retry
+        is backing off: an unrelated file still syncs meanwhile, with its
+        bytes on the member, and an upload at the rename's new name is still
+        kept off the member, as the record would keep it. Once the cache
+        takes the record there is exactly one, and the member was never
+        renamed (CTO RRS-CTO-BACKOFF). The backoff ends only when the test
+        ends it, so nothing depends on timing."""
+        self.assertEqual(1, len(self.fs.sync_manager.workers or [None]))
+        failing, attempts, renames = self.flaky_rename_record()
+        self.start_sync()
+        self.wait_until(lambda: self.scheduler().pending() == 1, "deferred the retry")
         self.assertEqual(1, len(attempts))
 
-        # The first retry is due 2 s after that failure.
         self.write_file("/c.txt", b"unrelated")
         self.write_file("/e/x.txt", b"under the new name")
-        deadline = attempts[0] + 1.5
-        synced = None
-        while time.monotonic() < deadline:
-            row = self.fs.state_manager.get_file_metadata("/c.txt")
-            if row is not None and row.sync_status == SyncStatus.CLEAN:
-                synced = time.monotonic()
-                break
-            time.sleep(0.02)
-        self.assertIsNotNone(synced, "unrelated sync waited for the backoff")
-        self.assertEqual(1, len(attempts), "the retry ran before its backoff ended")
+        self.wait_synced("/c.txt")
+        # Both files' tasks have run (the deferred retry is not queued).
+        manager = self.fs.sync_manager
+        self.wait_until(lambda: manager.task_queue.qsize() == 0 and all(
+            w.get_active_task() is None for w in manager.workers), "run the queued tasks")
+        self.assertEqual(b"unrelated", (self.member_dir / "c.txt").read_bytes())
+        self.assertEqual(1, len(attempts))
+        self.assertEqual(1, self.scheduler().pending())
         self.assertFalse((self.member_dir / "e" / "x.txt").exists())
+        self.assertFalse(self.fs.sync_manager.wait_for_completion(timeout=0.2))
 
         failing[0] = False
-        deadline = time.monotonic() + WAIT
-        while not self.repairs() and time.monotonic() < deadline:
-            time.sleep(0.02)
+        self.scheduler().deliver_all_now()
+        self.wait_until(lambda: self.repairs(), "wrote the record")
         self.wait_idle()
+        self.assertEqual(2, len(attempts))
         self.assertEqual([("member", "/d", "/e")], self.repairs())
         self.assertEqual([], renames)
+        self.assertEqual(["c.txt", "d", "e"], self.member_names())
         self.assertFalse((self.member_dir / "e" / "x.txt").exists())
         self.assertEqual(SyncStatus.DIRTY,
                          self.fs.state_manager.get_file_metadata("/e/x.txt").sync_status)
+
+    def test_a_deferred_rename_retry_survives_stop_and_restart(self):
+        """A retry deferred when the workers stop stays counted as
+        unfinished, and the restarted workers run it."""
+        failing, attempts, renames = self.flaky_rename_record()
+        self.start_sync()
+        self.wait_until(lambda: self.scheduler().pending() == 1, "deferred the retry")
+        self.fs.sync_manager.stop()
+        self.assertFalse(self.fs.sync_manager.wait_for_completion(timeout=0.2))
+        failing[0] = False
+        self.start_sync()
+        self.scheduler().deliver_all_now()
+        self.wait_until(lambda: self.repairs(), "wrote the record")
+        self.wait_idle()
+        self.assertEqual([("member", "/d", "/e")], self.repairs())
+        self.assertEqual([], renames)
+        self.assertEqual(0, self.fs.sync_manager.task_queue.unfinished_tasks)
+
 
     def test_open_repair_fences_rmdir_of_a_reused_source(self):
         """The member missed an empty /d -> /e; /d was made again and is
@@ -852,6 +888,58 @@ class TestDirectoryRetries(SyncRaceTestBase):
         self.member.set_available(True)
         self.assertTrue(executor.process_dir_task(task))
         self.assertEqual(["d"], self.member_names())
+
+
+class TestRetryScheduler(unittest.TestCase):
+    """The rename retry backoff: bounded threads, nothing stranded."""
+
+    def task(self, name):
+        return DirSyncTask(name, DirOperation.RENAME, new_path=name + "-new")
+
+    def scheduler_threads(self):
+        return [t for t in threading.enumerate() if t.name == "sync-retry-scheduler"]
+
+    def test_a_burst_of_retries_uses_one_thread_and_delivers_each_once(self):
+        q = queue.PriorityQueue()
+        scheduler = RetryScheduler.for_queue(q)
+        for i in range(50):
+            self.assertTrue(scheduler.defer(self.task(f"/t{i}"), 3600.0))
+        self.assertLessEqual(len(self.scheduler_threads()), 1)
+        self.assertEqual(50, q.unfinished_tasks)
+        self.assertEqual(0, q.qsize())
+        scheduler.deliver_all_now()
+        deadline = time.monotonic() + WAIT
+        while q.qsize() < 50 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(50, q.qsize())
+        self.assertEqual(50, q.unfinished_tasks)  # each counted once
+        self.assertEqual(sorted(f"/t{i}" for i in range(50)),
+                         sorted(q.get_nowait().virtual_path for _ in range(50)))
+        deadline = time.monotonic() + WAIT
+        while self.scheduler_threads() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual([], self.scheduler_threads())  # exits when idle
+
+    def test_a_scheduler_that_cannot_start_holds_and_counts_nothing(self):
+        q = queue.PriorityQueue()
+        scheduler = RetryScheduler.for_queue(q)
+        with patch("storage.sync_executor.threading.Thread.start",
+                   side_effect=RuntimeError("can't start new thread")):
+            self.assertFalse(scheduler.defer(self.task("/t"), 3600.0))
+        self.assertEqual(0, q.unfinished_tasks)
+        self.assertEqual(0, scheduler.pending())
+
+    def test_a_rename_retry_that_cannot_be_deferred_is_requeued_inline(self):
+        q = queue.PriorityQueue()
+        executor = SyncExecutor(worker_id=0, state_manager=None, cache_manager=None,
+                                replication_manager=None,
+                                config=SyncConfig(retry_delay=0.0, max_retries=3))
+        task = self.task("/t")
+        with patch("storage.sync_executor.threading.Thread.start",
+                   side_effect=RuntimeError("can't start new thread")):
+            self.assertFalse(executor.handle_task_failure(task, "injected", q))
+        self.assertIs(task, q.get_nowait())
+        self.assertEqual(1, q.unfinished_tasks)
 
 
 def _die_after_member_rename(temp_dir):
@@ -951,9 +1039,9 @@ class TestRepairsOutliveTheIndex(SyncRaceTestBase):
         expected = [(("member",), "/e/f.txt", b"EDITEDytes")]
         self.assertEqual(expected, self.view_writes())
         # The open view followed the rename, so its write is recorded at
-        # the name it then had; its cache copy is derived state: evicted.
-        view = self.fs.cache_manager.get_cache_path("/e/f.txt.member")
-        view.unlink()
+        # the name it then had. Its inode moved into the carrier: the view's
+        # cache name is gone, so neither eviction nor a refetch reaches it.
+        self.assertFalse(os.path.lexists(self.fs.cache_manager.get_cache_path("/e/f.txt.member")))
         self.reopen()
         self.assertEqual(expected, self.view_writes())
         self.reopen(rebuild=True)
@@ -976,13 +1064,29 @@ class TestRepairsOutliveTheIndex(SyncRaceTestBase):
         self.assertEqual([(("member",), "/e/f.txt", b"EDITEDytes")], self.view_writes())
         self.assertEqual(b"sole bytes", (self.member_dir / "d" / "f.txt").read_bytes())
 
+    def test_two_descriptors_with_equal_size_writes_keep_the_last_bytes(self):
+        """Two descriptors of the view write different bytes of the same
+        size, and the mtime is reset: the record holds the bytes the view
+        last had, which both descriptors share, not an earlier version
+        (Codex C2 at c75d1a7)."""
+        view, fh = self.open_edited_view()
+        fh2 = self.fs.open("/d/f.txt.member", os.O_WRONLY)
+        self.fs.write("/d/f.txt.member", b"SECOND", 0, fh2)
+        self.assertEqual(0, self.fs.flush("/d/f.txt.member", fh2))
+        os.utime(view, ns=(1, 1))
+        self.fail_member_once("rename")
+        self.fs.rename("/d", "/e")
+        self.fs.release("/e/f.txt.member", fh)
+        self.fs.release("/e/f.txt.member", fh2)
+        self.assertEqual([(("member",), "/e/f.txt", b"SECONDytes")], self.view_writes())
+
     def test_a_view_write_that_cannot_be_kept_leaves_no_partial_record(self):
         """An injected failure while copying the bytes leaves no carrier
         (nothing half-written is listed later) and the member untouched."""
         view, fh = self.open_edited_view()
         self.fail_member_once("rename")
         self.fs.rename("/d", "/e")
-        with patch("storage.member_repairs._copy_into",
+        with patch("storage.member_repairs.os.link",
                    side_effect=OSError(errno.ENOSPC, "injected")):
             self.fs.release("/d/f.txt.member", fh)
         self.assertEqual([], self.view_writes())

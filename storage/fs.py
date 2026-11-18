@@ -2641,6 +2641,13 @@ class StorageFS(Operations):
             return 0
 
         close_error: Optional[OSError] = None
+        inode: Optional[str] = None
+        if entry.backend_name:
+            try:
+                st = os.fstat(entry.real_fd)
+                inode = f"{st.st_dev}:{st.st_ino}"
+            except OSError:
+                pass
         try:
             os.close(entry.real_fd)
         except OSError as exc:
@@ -2673,11 +2680,19 @@ class StorageFS(Operations):
                     # read-only view wrote nothing, so nothing is kept.
                     if (entry.flags & os.O_ACCMODE) != os.O_RDONLY:
                         try:
-                            self.cache_manager.member_repairs.preserve_view_write(
-                                entry.canonical_path, entry.backend_name, entry.cache_path,
+                            kept = inode is not None and self.cache_manager.member_repairs.preserve_view_write(
+                                entry.canonical_path, entry.backend_name, entry.cache_path, inode,
                                 "write through a conflict view after close(), kept off "
                                 "the member by an open repair",
                             )
+                            if kept:
+                                self.cache_manager.mark_cache_size_dirty()
+                            else:
+                                self.logger.error(
+                                    "direct sync of %s to %s refused by an open member repair, "
+                                    "and the descriptor's bytes are no longer at %s",
+                                    entry.canonical_path, entry.backend_name, entry.cache_path,
+                                )
                         except Exception as exc:  # noqa: BLE001 - release cannot fail usefully
                             self.logger.error(
                                 "direct sync of %s to %s refused by an open member repair, "

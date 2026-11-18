@@ -148,8 +148,13 @@ What a crash at each point leaves:
 A queued `DirSyncTask` RENAME, from a direct caller, never runs either. The
 worker writes an `open` record for its member, or for every member when the
 task has no hint. It retries without limit while the write fails. Each
-retry backs off on a timer, not on the worker, so other sync work goes
-on meanwhile, even with one worker. From the first failure until the
+retry backs off in the queue's retry scheduler (`RetryScheduler`, one
+thread at most, which exits when nothing is deferred), not on the
+worker. Other sync work therefore goes on meanwhile, even with one
+worker. A deferred retry counts as unfinished work until it is back on
+the queue, and the queue outlives a stop and restart of the workers. If
+the scheduler's thread cannot start, the retry falls back to the old
+inline backoff. Ordinary file retries are unchanged. From the first failure until the
 record is written, the task's names are fenced in memory
 (`MemberRepairs.fence_pending`), exactly as the record would fence them.
 Once the write succeeds, the record replaces that fence. A fence held in
@@ -238,31 +243,39 @@ The repair fences this at each step:
   `close()` can wait for a demand slot first. `release` is never admitted.
 - **At release.** A repair recorded after a successful flush is caught
   here, when the caller has already been told the write succeeded. Release
-  sends nothing to the member. Instead the view's bytes are copied into a
-  carrier of their own, a `view-write` repair (`MemberRepairs.preserve_view_write`).
+  sends nothing to the member. Instead the view's inode becomes the
+  carrier of a `view-write` repair (`MemberRepairs.preserve_view_write`).
   - **The record.** Its old and new paths are both the canonical name at
     release time. An open descriptor follows a rename, so after a missed
     `/d -> /e` this is `/e/...`. The record also names the member and
-    the view file's identity (device, inode, size and mtime).
-  - **The bytes.** They are the carrier file's data, created, filled and
-    fsynced before the carrier is named, like any carrier. So they
-    survive eviction of the view's cache copy, a reopen and a rebuilt
-    index.
+    the inode (device and number) the descriptor wrote, taken before the
+    descriptor was closed.
+  - **The bytes.** The inode is hard-linked under a temporary name in the
+    carrier directory. It gets its record and is fsynced, then it is
+    named. Only after that is the view's cache name unlinked. So the
+    carrier holds exactly what the descriptors wrote, with no copy and no
+    extra space. Nothing that later rewrites a view cache file in place
+    (a truncate by path, a refetch) can reach it, and it survives
+    eviction, a reopen and a rebuilt index.
   - **Visibility.** `storage debug member-repairs` lists the record with
     the path of its bytes. Resolving it deletes them, so copy them where
     they belong first.
   - **Fencing.** The record fences the member at that name until it is
     resolved. Copying the bytes to their destination is left to the
     operator.
-  - **One record per version.** A second release of the same bytes, from
-    another descriptor of the view or a retry, finds the record by that
-    identity and writes no second one. A copy whose source changed while
-    it was made is discarded and made again, up to three times.
-  - **If the copy fails** (`ENOSPC`, an injected error), no partial
-    carrier is left. The failure is logged, with the bytes still in the
-    view's cache copy, which is then the only copy. This is the one case
-    where the bytes are not kept durably, and it needs the cache
-    filesystem itself to refuse the copy.
+  - **One record per inode.** Every descriptor of the view shares the
+    inode, so a second release, a dup'd close or a concurrent release
+    finds the record by inode and writes no second one. The carrier then
+    holds the last bytes any of them wrote.
+  - **If the link fails.** A cache filesystem that refuses the link
+    (`EXDEV`, `EPERM`, `EMLINK`, `ENOTSUP`) gets a copy instead. That
+    copy is deduplicated by inode, size and mtime, and it shares the
+    repo's same-tick limit for dirty detection.
+  - **If the carrier fails.** If the carrier cannot be made durable at
+    all, for example `ENOSPC` while linking or `setxattr` failing, no
+    partial carrier is left. The failure is logged, with the bytes still
+    under the view's cache name, which is then the only copy. This is the
+    one case where they are not kept durably.
 
 The mount never retries delivery of the bytes to the member, and a
 `view-write` repair never moves bytes there by itself.

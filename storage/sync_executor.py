@@ -4,9 +4,11 @@ import contextlib
 import errno
 import logging
 import os
+import heapq
 import queue
 import threading
 import time
+import weakref
 from pathlib import Path
 from typing import Callable, ContextManager, Dict, List, Optional, Union
 
@@ -21,6 +23,96 @@ from .state import StateManager
 from .sync_tasks import DirOperation, DirSyncTask, SyncConfig, SyncTask
 
 logger = logging.getLogger(__name__)
+
+
+class RetryScheduler:
+    """Puts deferred retries back on one queue when they are due.
+
+    One per queue, with at most one thread, which exits when nothing is
+    deferred: the threads used do not grow with the number of failing
+    tasks. A deferred task counts as unfinished on its queue from the
+    moment it is held here until it is back on the queue, so
+    wait_for_completion (and Queue.join) still waits for it. The queue
+    outlives SyncManager.stop and start, so a retry deferred before a stop
+    is delivered to the restarted workers. Used only for rename retries,
+    which retry without limit; ordinary retries keep sleeping inline.
+    """
+
+    _registry: "weakref.WeakKeyDictionary[queue.Queue, RetryScheduler]" = None
+    _registry_lock = threading.Lock()
+
+    def __init__(self, task_queue: queue.Queue):
+        self._queue = task_queue
+        self._cond = threading.Condition()
+        self._heap: list = []
+        self._seq = 0
+        self._thread: Optional[threading.Thread] = None
+
+    @classmethod
+    def for_queue(cls, task_queue: queue.Queue) -> "RetryScheduler":
+        with cls._registry_lock:
+            if cls._registry is None:
+                cls._registry = weakref.WeakKeyDictionary()
+            scheduler = cls._registry.get(task_queue)
+            if scheduler is None:
+                scheduler = cls._registry[task_queue] = cls(task_queue)
+            return scheduler
+
+    def defer(self, task, delay: float) -> bool:
+        """Hold task for delay seconds, then put it on the queue.
+
+        Returns False, holding nothing and counting nothing, when the
+        delivery thread cannot be started; the caller then retries inline.
+        """
+        with self._cond:
+            if self._thread is None or not self._thread.is_alive():
+                thread = threading.Thread(target=self._run, name="sync-retry-scheduler",
+                                          daemon=True)
+                try:
+                    thread.start()
+                except RuntimeError:
+                    logger.warning("Could not start the retry scheduler; retrying %s inline",
+                                   getattr(task, "virtual_path", task))
+                    return False
+                self._thread = thread
+            with self._queue.all_tasks_done:
+                self._queue.unfinished_tasks += 1
+            self._seq += 1
+            heapq.heappush(self._heap, (time.monotonic() + max(delay, 0.0), self._seq, task))
+            self._cond.notify()
+        return True
+
+    def pending(self) -> int:
+        with self._cond:
+            return len(self._heap)
+
+    def deliver_all_now(self):
+        """Make every deferred retry due now (tests use it to end a backoff
+        at a moment of their choosing)."""
+        with self._cond:
+            self._heap = [(0.0, seq, task) for _due, seq, task in self._heap]
+            heapq.heapify(self._heap)
+            self._cond.notify()
+
+    def _run(self):
+        while True:
+            with self._cond:
+                while True:
+                    if not self._heap:
+                        # Nothing deferred: exit; the next defer starts a thread.
+                        if self._thread is threading.current_thread():
+                            self._thread = None
+                        return
+                    due, _seq, task = self._heap[0]
+                    wait = due - time.monotonic()
+                    if wait <= 0:
+                        heapq.heappop(self._heap)
+                        break
+                    self._cond.wait(wait)
+            try:
+                self._queue.put(task)
+            finally:
+                self._queue.task_done()  # the count defer took
 
 
 class SyncExecutor:
@@ -434,32 +526,6 @@ class SyncExecutor:
             return False
         return True
 
-    @staticmethod
-    def _requeue_after(task_queue: queue.Queue, task, delay: float):
-        """Put task back after delay, without holding this worker.
-
-        The worker goes on with other tasks while the retry backs off: with
-        one worker, a task whose cause persists (a rename record the cache
-        keeps refusing) must not stall unrelated syncs. The retry counts as
-        unfinished from now until it is back in the queue, so
-        wait_for_completion still waits for it.
-        """
-        if delay <= 0:
-            task_queue.put(task)
-            return
-        with task_queue.all_tasks_done:
-            task_queue.unfinished_tasks += 1
-
-        def deliver():
-            try:
-                task_queue.put(task)
-            finally:
-                task_queue.task_done()
-
-        timer = threading.Timer(delay, deliver)
-        timer.daemon = True
-        timer.start()
-
     def handle_task_failure(
         self,
         task: Union[SyncTask, DirSyncTask],
@@ -483,10 +549,17 @@ class SyncExecutor:
                 task.retry_count,
                 self.config.max_retries,
             )
+            delay = self.config.retry_delay * task.retry_count
             # The retry reads the row afresh; a refused publish of this
             # attempt needs no extra pass after it.
             task.requeue = False
-            self._requeue_after(task_queue, task, self.config.retry_delay * task.retry_count)
+            if never_drop and RetryScheduler.for_queue(task_queue).defer(task, delay):
+                # A rename task retries without limit: its backoff must not
+                # hold this worker, or one record the cache keeps refusing
+                # stalls every other sync (CTO RRS-CTO-BACKOFF).
+                return False
+            time.sleep(delay)
+            task_queue.put(task)
             return False
 
         logger.error("Max retries exceeded for %s: %s", task.virtual_path, error)
@@ -573,22 +646,22 @@ class SyncExecutor:
                            task.virtual_path, task.new_path)
             return True
         repairs = self.cache_manager.member_repairs
+        # Fenced in memory from before the first attempt until the record is
+        # durable, so work done meanwhile (by other workers, or while a
+        # failed attempt backs off) stays off the names.
+        if task.pending_fence is None:
+            task.pending_fence = repairs.fence_pending(task.virtual_path, task.new_path, names)
         try:
             repairs.record(
                 task.virtual_path, task.new_path, names, "queued member rename, not replayed",
             )
         except OSError as exc:
-            # Until the record is written, the names are fenced in memory,
-            # so work done while the retry backs off stays off them.
-            if getattr(task, "pending_fence", None) is None:
-                task.pending_fence = repairs.fence_pending(task.virtual_path, task.new_path, names)
             raise RuntimeError(
                 f"Could not record the rename {task.virtual_path} -> {task.new_path} "
                 f"for {', '.join(names)}: {exc}"
             ) from exc
-        if getattr(task, "pending_fence", None) is not None:
-            repairs.release_pending(task.pending_fence)
-            task.pending_fence = None
+        repairs.release_pending(task.pending_fence)
+        task.pending_fence = None
         return True
 
     def _dir_task_current(self, task: DirSyncTask) -> bool:
