@@ -14,3 +14,30 @@ log_events:
   who: Ted Smith
   what: created
   comment: ""
+- time: 2026-11-18T07:04:42-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'From the lead review at c75d1a7 (PR #182):
+
+    - N4: _reload_locked non-strict lets listdir and _dir_stamp OSErrors other than
+    ENOENT escape into release, flush, eviction and sync.
+
+    - N5: fsync_directories needs O_RDONLY on every cache ancestor, so a 0300 directory
+    set through the mount fails the rename with EACCES after the local move; the intent
+    then fences every target.
+
+    - N6: an O_RDWR view that never wrote still gets a view-write record; track a
+    written flag.
+
+    - N7: evict_recomputable_files does not consult covers().
+
+    - N8: view-write carriers count toward cache size and are never evicted.
+
+    - N10: .storage.repairs is hidden at any depth, while only the root one is refused
+    (same as the .storage.db precedent).
+
+    - N11: E302 in test_remote_system.py:540.
+
+    - Untested: a system-level torn copy; a real filesystem refusing user.* xattrs;
+    conflict-view flush and release on an SSH member; re-replication after resolve;
+    a downgrade ignoring .storage.repairs.'
