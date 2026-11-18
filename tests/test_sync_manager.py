@@ -581,6 +581,134 @@ class TestSyncManager(unittest.TestCase):
         self.assertIn(updated_metadata.sync_status, [SyncStatus.CLEAN, SyncStatus.SYNCING])
 
 
+class TestGrowthWithFailingRenameRecords(unittest.TestCase):
+    """Saturate a grown pool with rename tasks whose repair record fails.
+
+    #182 never replays a queued member rename: it records it for repair,
+    and retries a task whose record cannot be written without dropping it.
+    With max_sync_workers such tasks (each holding its worker in the
+    retry backoff), an unrelated file sync must still finish while the
+    writes are failing; once they succeed, each task leaves one record, no
+    member is renamed, and the pool returns to its floor.
+    """
+
+    FLOOR, CEILING = 1, 3
+
+    # The same members, cache and index as TestSyncManager, without
+    # rerunning its tests.
+    setUp = TestSyncManager.setUp
+    tearDown = TestSyncManager.tearDown
+
+    def test_healthy_sync_finishes_while_records_fail_then_pool_settles(self):
+        import errno
+        from storage.backends.local import LocalBackend as _Local
+        from storage.member_repairs import MemberRepairs
+
+        self.sync_manager = SyncManager(
+            self.state_manager, self.cache_manager, self.replication_manager,
+            num_workers=self.FLOOR, max_workers=self.CEILING, idle_timeout=0.1,
+            config=SyncConfig(monitor_interval=30.0, retry_delay=0.2, max_retries=3),
+        )
+        repairs = self.cache_manager.member_repairs
+        names = [(f"/old-{i}", f"/new-{i}") for i in range(self.CEILING)]
+        for old, _new in names:
+            for directory in (self.backend1_dir, self.backend2_dir):
+                (directory / old.lstrip("/")).write_bytes(b"member bytes " + old.encode())
+
+        failing = threading.Event()
+        failing.set()
+        failures = []
+        lock = threading.Lock()
+        # Every failing task is inside record() at once, in its own worker:
+        # the pool is at its ceiling and every worker holds a failing task.
+        saturated = threading.Barrier(self.CEILING, timeout=10.0)
+        first_pass = set()
+        real_record, real_write = MemberRepairs.record, MemberRepairs._write_new
+
+        def record(repairs_self, old_path, *args, **kwargs):
+            with lock:
+                first = old_path not in first_pass
+                first_pass.add(old_path)
+            if first:
+                saturated.wait()
+            return real_record(repairs_self, old_path, *args, **kwargs)
+
+        def write_new(repairs_self, *args, **kwargs):
+            if failing.is_set():
+                with lock:
+                    failures.append(time.monotonic())
+                raise OSError(errno.ENOSPC, "injected: repair store full")
+            return real_write(repairs_self, *args, **kwargs)
+
+        renamed = []
+
+        def no_rename(backend, old, new):
+            renamed.append((backend.name, old, new))
+            raise AssertionError("a member rename was replayed")
+
+        healthy = "/healthy.txt"
+        payload = b"healthy bytes \x00\x01 " * 64
+        cache_path = self.cache_manager.get_cache_path(healthy)
+        cache_path.write_bytes(payload)
+        self.state_manager.set_file_metadata(FileMetadata(
+            virtual_path=healthy, size=len(payload), checksum=None,
+            last_access=time.time(), last_modified=time.time(),
+            sync_status=SyncStatus.DIRTY, replica_count=1, recomputable=False,
+            recompute_cmd=None, encrypted=False, encryption_key_id=None,
+        ))
+        set_file_config(cache_path, FileConfig(replica_count=1))
+
+        def on_members():
+            return [d for d in (self.backend1_dir, self.backend2_dir)
+                    if (d / "healthy.txt").exists()]
+
+        with patch.object(MemberRepairs, "record", record), \
+                patch.object(MemberRepairs, "_write_new", write_new), \
+                patch.object(_Local, "rename", no_rename):
+            self.sync_manager.start()
+            for old, new in names:
+                self.sync_manager.queue_dir_sync(old, DirOperation.RENAME, new_path=new)
+            saturated.wait()          # every worker now holds a failing task
+            self.assertEqual(self.CEILING, len(self.sync_manager.workers))
+
+            self.sync_manager.queue_sync(healthy, priority=100)
+            deadline = time.monotonic() + 10.0
+            while not on_members() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            members = on_members()
+            self.assertEqual(1, len(members), "the healthy sync never finished")
+            self.assertEqual(payload, (members[0] / "healthy.txt").read_bytes())
+            # Still failing: no record was written, and the tasks keep
+            # retrying after the healthy sync finished.
+            done_at = time.monotonic()
+            self.assertTrue(failing.is_set())
+            self.assertEqual([], repairs.list())
+            deadline = time.monotonic() + 10.0
+            while not any(t > done_at for t in failures) and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertTrue(any(t > done_at for t in failures))
+
+            failing.clear()
+            self.assertTrue(self.sync_manager.wait_for_completion(timeout=15.0))
+
+        records = repairs.list()
+        self.assertEqual(sorted(names), sorted((r.old_path, r.new_path) for r in records))
+        self.assertEqual(len(names), len(records))      # one per task
+        for r in records:
+            self.assertEqual(("backend1", "backend2"), tuple(sorted(r.members)))
+        self.assertEqual([], renamed)
+        for old, new in names:
+            for directory in (self.backend1_dir, self.backend2_dir):
+                self.assertEqual(b"member bytes " + old.encode(),
+                                 (directory / old.lstrip("/")).read_bytes())
+                self.assertFalse((directory / new.lstrip("/")).exists())
+        deadline = time.monotonic() + 5.0
+        while len(self.sync_manager.workers) != self.FLOOR and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertEqual(self.FLOOR, len(self.sync_manager.workers))
+        self.sync_manager.stop()
+
+
 class TestSyncConflicts(unittest.TestCase):
     """Tests for conflict detection during sync"""
 
