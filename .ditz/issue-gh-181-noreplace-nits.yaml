@@ -14,3 +14,22 @@ log_events:
   who: Ted Smith
   what: created
   comment: ""
+- time: 2026-11-18T20:52:15-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Anthropic seat, round a587b97ca79b-...-791ca1 (CLEAN):
+
+    (1) base.py blank lines around MemberSourceMissing (E303/E302); README blank line
+    splitting the new Status bullet from the list.
+
+    (2) The ENOENT-cause test patches os.replace process-wide; wrap the member''s
+    rename instead.
+
+    (3) The design doc states the missing-source rule only under no-replace, as FileNotFoundError;
+    state it for both paths, as MemberSourceMissing.
+
+    (4) In SSHBackend.rename, a failed lstat other than FileNotFoundError (e.g. EACCES)
+    replaces the original rename error; re-raise the original instead.
+
+    Untested: an SSH ENOENT with the source present; a connection error on a no-replace
+    member; rsync inheriting the SSH handling.'
