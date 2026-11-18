@@ -120,7 +120,8 @@ class ForegroundAdmission:
     def admit(self, kind: str, cancel_probe: Optional[Callable[[], Optional[str]]] = None):
         """Hold one slot of kind for the body.
 
-        cancel_probe, when given, is polled while waiting; a truthy result
+        cancel_probe, when given, is polled while waiting (never before the
+        first entry attempt, so a callback with a free slot always runs); a truthy result
         (the native request was interrupted, or the session exited) cancels
         the wait. Without it the wait ends only by entry or close().
         """
@@ -133,14 +134,19 @@ class ForegroundAdmission:
             # on another class's queue growing.
             self._cond.notify_all()
         entered = False
+        # The probe is polled only after a failed entry attempt: a callback
+        # that finds a free slot runs, as it would uncapped, even if its
+        # request was interrupted or its session exited.
+        probe_due = False
         try:
             while True:
-                # Outside the gate's lock: a slow probe delays its own waiter
-                # and, by FIFO, the later waiters of its class; never another
-                # class, a slot release or close().
-                reason = cancel_probe() if cancel_probe is not None else None
-                if reason:
-                    raise AdmissionClosed(f"{reason} ended while waiting for admission")
+                if probe_due:
+                    # Outside the gate's lock: a slow probe delays its own
+                    # waiter and, by FIFO, the later waiters of its class;
+                    # never another class, a slot release or close().
+                    reason = cancel_probe()
+                    if reason:
+                        raise AdmissionClosed(f"{reason} ended while waiting for admission")
                 with self._cond:
                     if self._closed:
                         raise AdmissionClosed("foreground admission closed")
@@ -153,7 +159,13 @@ class ForegroundAdmission:
                         # The next in this class may be able to enter too.
                         self._cond.notify_all()
                         break
-                    self._cond.wait(PROBE_INTERVAL if cancel_probe is not None else None)
+                    if cancel_probe is None:
+                        self._cond.wait()
+                    elif not probe_due:
+                        # First failed attempt: poll the probe before waiting.
+                        probe_due = True
+                    else:
+                        self._cond.wait(PROBE_INTERVAL)
         except BaseException:
             if not entered:
                 with self._cond:

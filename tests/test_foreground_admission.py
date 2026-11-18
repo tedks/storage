@@ -758,6 +758,34 @@ class TestQueuedCancellation(CappedFSBase):
         self.assertEqual(0, gate.active_count)
         self.assertEqual(0, gate.waiting_count("ordinary"))
 
+    def test_a_callback_with_a_free_slot_runs_despite_the_probe(self):
+        # Uncapped, an interrupted request or one arriving as the session
+        # exits still runs; the gate must not cancel a callback it does not
+        # make wait.
+        gate = ForegroundAdmission(4)
+        calls = []
+
+        def probe():
+            calls.append(1)
+            return "session"
+
+        ran = []
+        with gate.admit("ordinary", cancel_probe=probe):
+            ran.append(1)
+        self.assertEqual([1], ran)
+        self.assertEqual([], calls)
+        self.assertEqual(0, gate.active_count)
+
+    def test_fs_runs_an_uncontended_callback_whose_session_exited(self):
+        from storage.backends.base import capacity_wait_cancellation
+
+        ran = []
+        with patch.object(self.fs, "getattr", side_effect=lambda *a: ran.append(a) or {}):
+            with capacity_wait_cancellation(lambda: "session"):
+                self.assertEqual({}, self.call("getattr", "/", None))
+        self.assertEqual([("/", None)], ran)
+        self.assertEqual(0, self.gate_.active_count)
+
 
 if __name__ == "__main__":
     unittest.main()

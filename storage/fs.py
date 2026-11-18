@@ -175,7 +175,11 @@ class StorageFS(Operations):
             # request or an exited session (FUSE._wrapper below), so a queued
             # callback ends with EINTR instead of running after its caller
             # gave up or while libfuse waits to unmount. Direct calls have
-            # no probe and wait for entry or close().
+            # no probe and wait for entry or close(). The hidden-name form
+            # never gets the probe, which also matters at teardown: libfuse
+            # 2.9's fuse_destroy unlinks still-hidden nodes with no request
+            # (a zeroed context), where fuse_interrupted() would dereference
+            # NULL. Keep that if the name match or probe polling changes.
             probe = None if self._is_libfuse_hidden_unlink(op, args) \
                 else current_capacity_cancel_probe()
             with gate.admit(self._foreground_class(op, args), cancel_probe=probe):
