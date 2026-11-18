@@ -321,7 +321,7 @@ class RsyncBackend(SSHBackend):
     def sync_upload_capacity(self) -> Optional[int]:
         # The transfer runs over the OpenSSH master, not the SFTP pool; only
         # the brief parent mkdir takes a background SFTP lease. The 8-worker
-        # remote limit (storage.sync.sync_worker_ceiling) covers it.
+        # remote limit (storage.sync.sync_worker_limit) covers it.
         return None
 
     def copy_from_local(self, local_path: Path, virtual_path: str):
