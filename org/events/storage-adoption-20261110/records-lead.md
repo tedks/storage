@@ -75,3 +75,18 @@
 - authority: the CTO's reply to the records-lead:2 report accepted
   redaction of the current files with the historical commits retained, and
   forbade any history rewrite.
+
+## records-lead:5
+
+- kind: state-change
+- refs: records-lead:4
+- based_on: `4989ba74a4ec5ff346649988742a23af80a3e821`
+- state: Council converged and the independent lead review was CLEAN at
+  `6826f35` (round `6826f35b4300-20261118T055636Z-883fd9`; Anthropic and
+  OpenAI clean, Google EMPTY for usage limit). A full gate run started on
+  that head was stopped before completion when #176 merged, because its
+  receipt would not cover the new head; its synthetic fixtures were
+  removed. Master `4989ba7` was merged in with a normal merge, and the
+  header now names it, adds the #176 row and refreshes the #180 head.
+  Exact-head council, lead review and full gates are required again on
+  the resulting head.

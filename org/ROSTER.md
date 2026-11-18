@@ -1,6 +1,6 @@
 # Storage Orgs adoption roster, 2026-11-10
 
-## Current state (2026-11-18, against master `ebcbdf0`)
+## Current state (2026-11-18, against master `4989ba7`)
 
 This record is documentation only. It audits the adoption of three PRs that
 were implemented before the Orgs workflow was used here (#165, #166, #167),
@@ -10,20 +10,21 @@ ran (see Inherited process debt). Lane identities, session and pane ids,
 host names and host details are kept in a private roster outside this public
 repo.
 
-Heads of open drafts are as observed at 2026-11-18 05:50Z; they may have
+Heads of open drafts are as observed at 2026-11-18 06:03Z; they may have
 moved since, so check GitHub before relying on one.
 
 | PR | State on 2026-11-18 | Notes |
 | --- | --- | --- |
 | #165 | MERGED 2026-11-10 at `38c3bdb` | Accepted at source head `64c04d6` (A165) |
 | #166 | MERGED 2026-11-10 at `81793ac` | Accepted at source head `4ca26cd` (A166) |
-| #167 | OPEN, draft, head `d61bdb1` (unchanged since 2026-11-09) | Not accepted (A167). Background sync only; `git merge-tree` against `ebcbdf0` conflicts in `storage/cli_mount.py`, `storage/fs.py`, `storage/mount_profiles.py` |
+| #167 | OPEN, draft, head `d61bdb1` (unchanged since 2026-11-09) | Not accepted (A167). Background sync only; `git merge-tree` against `4989ba7` conflicts in `storage/cli_mount.py`, `storage/fs.py`, `storage/mount_profiles.py` |
 | #169 | MERGED 2026-11-18 at `ebcbdf0` (second parent `cee0a13`) | Performance and correctness backlog, `docs/performance_backlog_2026-11-10.md` |
 | #170 | MERGED 2026-11-10 at `66c640a` | Bazel source/test package split |
 | #171 | OPEN, draft, head `01a7edf` | Foreground responsiveness planning; kept as namespace/freshness evidence |
 | #175 | MERGED 2026-11-15 at `5f3dbb3` | Reserves an SSH channel for foreground listing during threaded cold copies; supersedes #171's channel tracer |
 | #179 | MERGED 2026-11-15 at `1811024` | Rsync upload `--ignore-times` guard; closes `gh-112-rsync-quickcheck` |
-| #180 | OPEN, draft, head `d3fa883` (under active development) | Slice S1 of #171: opt-in foreground admission cap |
+| #176 | MERGED 2026-11-18 at `4989ba7` | Rejects substituted SSH mux directory types; touches only `storage/backends/ssh_mux.py` and its test |
+| #180 | OPEN, draft, head `edebc55` (under active development) | Slice S1 of #171: opt-in foreground admission cap |
 
 Successor order, as recorded in #180's description: #180 (S1) first; #167
 after it, with its retry-safety prerequisite handled separately; #171 stays
