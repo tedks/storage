@@ -27,3 +27,9 @@ log_events:
   comment: 'Correction (CTO): host load is a hypothesis only, not an established cause.
     Unconfirmed whether this is a flake or a real teardown regression; reproduce before
     attributing.'
+- time: 2026-11-18T05:11:30-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Rerun at PR178 b2705fe (same storage/ and tests/ bytes as 5ca1b5a): storage_tests_remote_system
+    passed, 54 passed 1 xfailed. One failure, one pass on identical code: consistent
+    with a timing flake, not proven.'
