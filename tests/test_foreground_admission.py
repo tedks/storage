@@ -20,7 +20,7 @@ from storage.foreground_admission import (
 from storage.fs import StorageFS
 from storage.models import SyncStatus
 
-from tests.test_fs_threading import WAIT, ThreadingTestBase, Worker
+from tests.test_fs_threading import BLOCKED, WAIT, ThreadingTestBase, Worker
 
 
 class Holder:
@@ -215,6 +215,7 @@ class TestGate(unittest.TestCase):
 
 class CappedFSBase(ThreadingTestBase):
     cap = 4
+    streaming_reads = False
 
     def setUp(self):
         super().setUp()
@@ -229,6 +230,7 @@ class CappedFSBase(ThreadingTestBase):
             start_sync=False,
             revalidate_after=self.revalidate_after,
             max_foreground_operations=self.cap,
+            streaming_reads=self.streaming_reads,
         )
         self.gate_ = self.fs._foreground_admission
         self.blockers = []
@@ -306,7 +308,7 @@ class TestFixedClassAndCompetingRead(CappedFSBase):
         with self.fs._path_locks._mutex:
             self.assertIn("/a.txt", self.fs._path_locks._entries)
 
-        # Saturate metadata and ordinary, reserve and shared slots alike.
+        # Saturate metadata and ordinary (cap 4 has no shared slots).
         self.saturate("metadata", "statfs", "/")
         self.saturate("ordinary", "mkdir", "/d", 0o755)
 
@@ -337,6 +339,59 @@ class TestFixedClassAndCompetingRead(CappedFSBase):
             self.call("release", path, fd)
 
 
+class TestStreamingReadClass(CappedFSBase):
+    streaming_reads = True
+
+    def test_streaming_reads_cannot_take_the_demand_reserve(self):
+        # A warm file: written through the mount, so its bytes are local.
+        fd_w = self.call("create", "/warm.bin", 0o644)
+        warm = os.urandom(32 * 1024)
+        self.assertEqual(len(warm), self.call("write", "/warm.bin", warm, 0, fd_w))
+        self.call("release", "/warm.bin", fd_w)
+        fd_warm = self.call("open", "/warm.bin", os.O_RDONLY)
+
+        # Two uncached files stream; every member range read blocks.
+        for name in ("s1.bin", "s2.bin"):
+            (self.member_dir / name).write_bytes(os.urandom(4 << 20))
+        go = threading.Event()
+        real_read = self.member.read_file
+
+        def blocked_read(path, offset, size):
+            assert go.wait(WAIT), "range read never released"
+            return real_read(path, offset, size)
+
+        self.addCleanup(go.set)
+        with patch.object(self.member, "read_file", side_effect=blocked_read):
+            streams = {}
+            for name in ("/s1.bin", "/s2.bin"):
+                fd = self.call("open", name, os.O_RDONLY)
+                with self.fs._fd_lock:
+                    self.assertIsNotNone(self.fs._fd_map[fd].prefetch_session)
+                streams[name] = fd
+            readers = [Worker(self.call, "read", name, 4096, 2 << 20, fd)
+                       for name, fd in streams.items()]
+            for reader in readers:
+                reader.start()
+            # One holds the ordinary reserve (no shared at cap 4); one queues.
+            self.assertTrue(self.gate_.waiting_for("ordinary", 1, WAIT))
+            self.assertEqual(1, self.gate_.active("ordinary"))
+            self.assertEqual(0, self.gate_.active("demand"))
+            got = Worker(self.call, "read", "/warm.bin", len(warm), 0, fd_warm)
+            got.start()
+            self.assertEqual(warm, got.finish())
+            go.set()
+            for reader, name in zip(readers, streams):
+                data = reader.finish()
+                self.assertEqual(
+                    (self.member_dir / name.lstrip("/")).read_bytes()[2 << 20:(2 << 20) + 4096],
+                    data,
+                )
+        for name, fd in streams.items():
+            self.call("release", name, fd)
+        self.call("release", "/warm.bin", fd_warm)
+        self.assertEqual(0, self.gate_.active_count)
+
+
 class TestClasses(CappedFSBase):
     def test_entry_classes(self):
         self.cache("warm.txt", b"warm")
@@ -354,21 +409,39 @@ class TestClasses(CappedFSBase):
         self.assertEqual({"metadata": 0, "demand": 1, "ordinary": 0}, seen["/warm.txt"])
         self.assertEqual({"metadata": 0, "demand": 0, "ordinary": 1}, seen["/cold.txt"])
 
-        classes = {}
-        for op, args in (("getattr", ("/warm.txt", None)), ("readdir", ("/", 0)),
-                         ("opendir", ("/",)), ("statfs", ("/",)), ("access", ("/", 0)),
-                         ("read", ("/warm.txt", 1, 0, 0)), ("write", ("/x", b"", 0, 0)),
-                         ("flush", ("/x", 0)), ("fsync", ("/x", 0, 0)),
-                         ("create", ("/x", 0o644)), ("mkdir", ("/x", 0o755)),
-                         ("rename", ("/x", "/y")), ("unlink", ("/x",))):
-            classes[op] = self.fs._foreground_class(op, args)
-        self.assertEqual({
-            "getattr": "metadata", "readdir": "metadata", "opendir": "metadata",
-            "statfs": "metadata", "access": "metadata",
-            "read": "demand", "write": "demand", "flush": "demand", "fsync": "demand",
-            "create": "ordinary", "mkdir": "ordinary", "rename": "ordinary",
-            "unlink": "ordinary",
-        }, classes)
+        cached_fd = self.call("open", "/warm.txt", os.O_RDONLY)
+        table = {
+            ("getattr", ("/warm.txt", None)): "metadata",
+            ("readdir", ("/", 0)): "metadata",
+            ("opendir", ("/",)): "metadata",
+            ("statfs", ("/",)): "metadata",
+            ("access", ("/", 0)): "metadata",
+            ("readlink", ("/l",)): "metadata",
+            ("getxattr", ("/warm.txt", "user.x")): "metadata",
+            ("listxattr", ("/warm.txt",)): "metadata",
+            ("read", ("/warm.txt", 1, 0, cached_fd)): "demand",
+            ("read", ("/warm.txt", 1, 0, 999999)): "demand",   # unknown fd
+            ("write", ("/x", b"", 0, 0)): "demand",
+            ("fsync", ("/x", 0, 0)): "demand",
+            ("open", ("/warm.txt", os.O_RDWR | os.O_TRUNC)): "demand",
+            ("open", ("/warm.txt.member", os.O_RDONLY)): "ordinary",
+            ("open", ("/never-cached.txt", os.O_RDONLY)): "ordinary",
+            ("create", ("/x", 0o644)): "ordinary",
+            ("mkdir", ("/x", 0o755)): "ordinary",
+            ("rename", ("/x", "/y")): "ordinary",
+            ("unlink", ("/x",)): "ordinary",
+            ("truncate", ("/x", 0)): "ordinary",
+            ("chmod", ("/x", 0o644)): "ordinary",
+            ("utimens", ("/x", None)): "ordinary",
+            ("setxattr", ("/x", "user.x", b"", 0)): "ordinary",
+            ("removexattr", ("/x", "user.x")): "ordinary",
+        }
+        for (op, args), expected in table.items():
+            with self.subTest(op=op, args=args):
+                self.assertEqual(expected, self.fs._foreground_class(op, args))
+        self.call("release", "/warm.txt", cached_fd)
+        for op in ("init", "destroy", "release", "releasedir", "flush"):
+            self.assertIn(op, StorageFS._ADMISSION_EXEMPT)
         # A failing preflight falls back to ordinary; the open reports its own error.
         with patch.object(self.fs.cache_manager, "is_cached", side_effect=RuntimeError):
             self.assertEqual("ordinary", self.fs._foreground_class("open", ("/warm.txt", 0)))
@@ -485,13 +558,20 @@ class TestCleanupThroughShutdown(CappedFSBase):
                 pass
         self.assertEqual(["close", "streaming"], order[:2])
 
-    def test_slot_holder_waiting_on_a_closing_path_does_not_deadlock(self):
-        # A path-locked close (member-copy upload) is not admitted, so slot
-        # holders that wait for its path lock cannot starve it.
+    def test_close_runs_while_every_slot_waits_on_a_path_lock(self):
+        # One member-copy close holds /f.txt's path lock in its upload. Every
+        # slot is then held: both demand slots by cached opens of /f.txt
+        # waiting for that lock, metadata and ordinary by blocked callbacks.
+        # Another close still runs at once, and the first close finishing
+        # lets every waiter through. (No lock-order cycle exists either way;
+        # the gate takes no slot under a lock. This pins that closes do not
+        # queue behind slot holders.)
         self.cache("f.txt", b"canonical")
+        self.cache("g.txt", b"other")
         (self.member_dir / "f.txt").write_bytes(b"member copy")
         fd = self.call("open", "/f.txt.member", os.O_RDWR)
         self.call("write", "/f.txt.member", b"edited", 0, fd)
+        fd_g = self.call("open", "/g.txt", os.O_RDONLY)
         upload = self.gate(self.member, "copy_from_local")
         releaser = Worker(self.call, "release", "/f.txt.member", fd)
         releaser.start()
@@ -499,12 +579,80 @@ class TestCleanupThroughShutdown(CappedFSBase):
         openers = [Worker(self.call, "open", "/f.txt", os.O_RDONLY) for _ in range(3)]
         for opener in openers:
             opener.start()
-        self.wait_for_path_waiter("/f.txt")
+        self.assertTrue(self.gate_.waiting_for("demand", 1, WAIT))
+        self.assertEqual(2, self.gate_.active("demand"))
+        self.saturate("metadata", "statfs", "/")
+        self.saturate("ordinary", "mkdir", "/d", 0o755)
+        self.assertEqual(self.cap, self.gate_.active_count)
+        self.assertEqual(0, Worker(self.call, "release", "/g.txt", fd_g).finish_started())
         upload.opened.set()
         self.assertEqual(0, releaser.finish())
         for opener in openers:
             self.call("release", "/f.txt", opener.finish())
+        self._release_blockers()
         self.assertEqual(0, self.gate_.active_count)
+        self.assertEqual(b"edited copy", (self.member_dir / "f.txt").read_bytes())
+
+    def test_flush_is_the_fusepy_no_op_and_never_waits(self):
+        # flush is exempt only while it does nothing; an override must
+        # reclassify it (fs.py _ADMISSION_EXEMPT).
+        from fuse import Operations
+        self.assertIs(Operations.flush, type(self.fs).flush)
+        self.saturate_all()
+        self.assertEqual(0, Worker(self.call, "flush", "/x", 0).finish_started())
+        self.gate_.close()
+        self.assertEqual(0, self.call("flush", "/x", 0))
+
+
+class TestQueuedCancellation(CappedFSBase):
+    """A queued callback ends with EINTR when its native request is cancelled."""
+
+    def test_probe_cancels_only_the_waiting_callback(self):
+        from storage.backends.base import capacity_wait_cancellation
+
+        self.saturate("metadata", "statfs", "/")
+        cancelled = threading.Event()
+        ran = []
+
+        def probe():
+            return "session" if cancelled.is_set() else None
+
+        def queued_getattr():
+            with capacity_wait_cancellation(probe):
+                return self.call("getattr", "/", None)
+
+        with patch.object(self.fs, "getattr", side_effect=lambda *a: ran.append(a) or {}):
+            waiter = Worker(queued_getattr)
+            waiter.start()
+            self.assertTrue(self.gate_.waiting_for("metadata", 2, WAIT))
+            waiter.join(BLOCKED)
+            self.assertTrue(waiter.is_alive())     # a quiet probe keeps it queued
+            cancelled.set()
+            waiter.join(WAIT)
+        self.assertFalse(waiter.is_alive())
+        self.assertIsInstance(waiter.error, FuseOSError)
+        self.assertEqual(errno.EINTR, waiter.error.errno)
+        self.assertEqual([], ran)
+        # The gate stays open: the blocked statfs and the queued one still run.
+        self.assertFalse(self.gate_._closed)
+        self.assertEqual(1, self.gate_.waiting_count("metadata"))
+        self._release_blockers()
+        self.assertEqual(0, self.gate_.active_count)
+        self.assertEqual(0, self.gate_.waiting_count("metadata"))
+
+    def test_gate_level_probe(self):
+        gate = ForegroundAdmission(4)
+        with gate.admit("ordinary"):
+            reasons = iter([None, None, "request"])
+            waiter = Worker(lambda: gate.admit("ordinary", cancel_probe=lambda: next(reasons))
+                            .__enter__())
+            waiter.start()
+            waiter.join(WAIT)
+            self.assertFalse(waiter.is_alive())
+            self.assertIsInstance(waiter.error, AdmissionClosed)
+            self.assertIn("request", str(waiter.error))
+        self.assertEqual(0, gate.active_count)
+        self.assertEqual(0, gate.waiting_count("ordinary"))
 
 
 if __name__ == "__main__":

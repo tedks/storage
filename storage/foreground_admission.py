@@ -3,8 +3,8 @@
 `ForegroundAdmission` decides only when an admitted callback may start. It
 never interrupts a running callback and never changes what it returns.
 
-What the bound counts: callbacks that have entered `admit` and not yet left
-it. At most `cap` run at once. Each class keeps its reserved slots
+What the bound counts: callbacks admitted and not yet finished. At most
+`cap` run at once. Each class keeps its reserved slots
 (`RESERVED`: two for demand I/O, one for metadata, one for everything else);
 only `cap - 4` slots are shared. Waiting callbacks are not counted, and they
 still occupy a native libfuse thread: libfuse 2's multithreaded loop has no
@@ -21,11 +21,14 @@ edge: a slot holder can wait on a path lock, never the reverse.
 import threading
 from collections import deque
 from contextlib import contextmanager
-from typing import Dict
+from typing import Callable, Dict, Optional
+
+# How often a waiter with a cancellation probe checks it.
+PROBE_INTERVAL = 0.1
 
 
 class AdmissionClosed(InterruptedError):
-    """The gate closed while a callback was waiting to enter."""
+    """The gate closed, or the waiting request was cancelled, before entry."""
 
 
 MIN_CAP = 4
@@ -90,20 +93,32 @@ class ForegroundAdmission:
         return over < self.shared
 
     @contextmanager
-    def admit(self, kind: str):
+    def admit(self, kind: str, cancel_probe: Optional[Callable[[], Optional[str]]] = None):
+        """Hold one slot of kind for the body.
+
+        cancel_probe, when given, is polled while waiting; a truthy result
+        (the native request was interrupted, or the session exited) cancels
+        the wait. Without it the wait ends only by entry or close().
+        """
         if kind not in self._active:
             raise ValueError(f"unknown foreground class: {kind}")
         ticket = object()
         with self._cond:
             self._waiting[kind].append(ticket)
+            # Wakes waiting_for() observers; admission itself never waits
+            # on another class's queue growing.
+            self._cond.notify_all()
             try:
                 while True:
                     if self._closed:
                         raise AdmissionClosed("foreground admission closed")
+                    reason = cancel_probe() if cancel_probe is not None else None
+                    if reason:
+                        raise AdmissionClosed(f"{reason} ended while waiting for admission")
                     # FIFO within a class: only the head may enter.
                     if self._waiting[kind][0] is ticket and self._can_enter(kind):
                         break
-                    self._cond.wait()
+                    self._cond.wait(PROBE_INTERVAL if cancel_probe is not None else None)
             except BaseException:
                 self._waiting[kind].remove(ticket)
                 self._cond.notify_all()

@@ -30,7 +30,8 @@ from pathlib import Path
 from typing import Dict, Optional, Set, List, Tuple
 
 from .backends.base import (
-    Backend, ChecksumUnavailable, capacity_wait_cancellation, interactive_request,
+    Backend, ChecksumUnavailable, capacity_wait_cancellation, current_capacity_cancel_probe,
+    interactive_request,
 )
 from .backends.rsync import RsyncBackend
 from .backends.ssh_mux import close_shared_control_sockets
@@ -136,12 +137,15 @@ class StorageFS(Operations):
     # admitted open made: they must run exactly once even after the gate
     # closes (a member-copy close uploads, a canonical close queues its
     # sync), so they are neither queued nor cancelled, and not counted.
-    _ADMISSION_EXEMPT = frozenset({"init", "destroy", "release", "releasedir"})
+    # flush is fusepy's no-op (StorageFS does not override it; a test pins
+    # that), so close(2), which sends it synchronously, never waits for a
+    # slot. An override that does work must move flush to _DEMAND_OPS.
+    _ADMISSION_EXEMPT = frozenset({"init", "destroy", "release", "releasedir", "flush"})
     _METADATA_OPS = frozenset({
         "getattr", "opendir", "readdir", "access", "readlink",
         "getxattr", "listxattr", "statfs",
     })
-    _DEMAND_OPS = frozenset({"read", "write", "flush", "fsync"})
+    _DEMAND_OPS = frozenset({"read", "write", "fsync"})
 
     def __call__(self, op, *args):
         gate = self._foreground_admission
@@ -151,7 +155,13 @@ class StorageFS(Operations):
             with interactive_request():
                 return super().__call__(op, *args)
         try:
-            with gate.admit(self._foreground_class(op, args)):
+            # Inside a native callback the probe reports an interrupted
+            # request or an exited session (FUSE._wrapper below), so a queued
+            # callback ends with EINTR instead of running after its caller
+            # gave up or while libfuse waits to unmount. Direct calls have
+            # no probe and wait for entry or close().
+            with gate.admit(self._foreground_class(op, args),
+                            cancel_probe=current_capacity_cancel_probe()):
                 with interactive_request():
                     return super().__call__(op, *args)
         except AdmissionClosed as exc:
@@ -169,11 +179,22 @@ class StorageFS(Operations):
         """
         if op in self._METADATA_OPS:
             return "metadata"
+        if op == "read" and len(args) >= 4:
+            # A read on a streaming descriptor may wait on member range
+            # fetches; it is ordinary, so it cannot hold the demand reserve
+            # that reads of cached bytes rely on.
+            with self._fd_lock:
+                entry = self._fd_map.get(args[3])
+            if entry is not None and entry.prefetch_session is not None:
+                return "ordinary"
         if op in self._DEMAND_OPS:
             return "demand"
         # An open whose cache file exists serves a read from local bytes in
         # the common case; a cold open copies the whole file. This runs
         # before admission, unbounded: one local lstat, no member, no lock.
+        # It uses the raw path, as _open's cache lookup does (get_cache_path
+        # of the requested path); a member-copy name has no cache file of
+        # its own and is ordinary.
         # Metadata writes (setxattr, removexattr, chmod, utimens) are
         # changes, not reads, and stay ordinary.
         if op == "open" and args:
@@ -3013,8 +3034,10 @@ class StorageFS(Operations):
 
     def destroy(self, path):
         """Cleanup on unmount"""
-        # libfuse joins its handlers before destroy, so normally nothing is
-        # queued here; a callback still waiting fails with EINTR unrun.
+        # libfuse joins its handlers before destroy, and a queued native
+        # callback already ended with EINTR when the session exited (its
+        # cancel probe), so in a mount nothing is normally queued here. For
+        # direct callers this cancels any waiter, which fails with EINTR unrun.
         if self._foreground_admission is not None:
             self._foreground_admission.close()
         self._destroying.set()

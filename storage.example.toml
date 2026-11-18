@@ -47,8 +47,9 @@ listing_max_stale = 3600
 # it has been field-tested.
 # fuse_threads = true
 # Cap concurrent FUSE callbacks, 4-128 (setting it turns on fuse_threads).
-# Two slots are kept for reads and writes (and opens of cached files), one
-# for metadata reads and one for everything else; the rest are shared. Closes are
+# Two slots are kept for reads and writes of cached files (and their opens),
+# one for metadata reads and one for everything else, including streaming
+# reads of uncached files; the rest are shared. Closes never wait and are
 # not counted, and libfuse's own threads are not capped. Unset: no cap.
 # max_foreground_operations = 8
 # Bulk SSH copies wait for SFTP channel capacity as the queue drains. A

@@ -25,7 +25,9 @@ import pytest
 from storage.backends.local import LocalBackend
 from storage.fs import StorageFS
 
-from tests.fuse_mount import FUSE_THREAD_MODES, fuse_mode_id, run_fuse, stop_fuse
+from tests.fuse_mount import (
+    FUSE_THREAD_MODES, fuse_mode_id, native_thread_state, run_fuse, stop_fuse,
+)
 
 WAIT = 10.0
 
@@ -136,14 +138,19 @@ def test_each_close_runs_once_through_unmount(mounted):
     with open(mount_dir / "f.txt.member", "r+b") as handle:
         handle.write(b"edited")
     assert upload_started.wait(WAIT), "the member-copy close never reached release"
-    result = subprocess.run(["fusermount", "-u", str(mount_dir)],
+    # The close is already in the daemon (upload_started), so detach it
+    # lazily: a plain -u can report busy while that release is in flight.
+    # No descriptor is open, so no close can arrive after the detach.
+    result = subprocess.run(["fusermount", "-uz", str(mount_dir)],
                             capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stderr
     assert not os.path.ismount(mount_dir)
     assert thread.is_alive() and not fs.destroy_entered.is_set()
     upload_go.set()
-    thread.join(WAIT)
-    assert not thread.is_alive()
+    # libfuse ends the loop once the detached connection goes; allow what
+    # stop_fuse allows under load.
+    thread.join(30.0)
+    assert not thread.is_alive(), native_thread_state(thread, mount_dir)
     assert fs.destroy_entered.is_set()
 
     opened, released = record["opened"], record["released"]
