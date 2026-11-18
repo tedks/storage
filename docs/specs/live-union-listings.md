@@ -160,43 +160,61 @@ empty mountpoint would therefore report successful-empty: nothing is logged,
 and on a warm directory its retained names are replaced by an empty set.
 The member-observation owner must tell "directory absent under a verified
 member root" apart from "member root missing or replaced". One rule, the
-same for every observation, cold or warm, empty or not:
+same for every observation, cold or warm, empty or not, for every member
+with a configured marker (members without one: see below):
 
 - A member's observation is accepted only after a root check that started
   after the observation was read. There is no cached verification and no
   silent window: a root replaced after a check (for example by a failed
   disk, exposing an empty or stale underlying mountpoint) cannot publish
   its names or its emptiness as that member's.
-- The check is one small request on the same path and class as the listing
-  it verifies: for a local member, one `stat` of the root comparing its
-  device (`st_dev`, as `filesystem_identity` reads it) with the expected
-  identity; for an SSH or rsync member, whose SFTP attributes carry no
-  device id, one `stat` of a root marker file on the same SFTP lease as the
-  listing. A foreground listing's check therefore uses the interactive
-  reserve with it, so cold listings do not queue behind bulk copies (the
-  #175 stall); a background refresh's check uses the background class.
-  Today's `SSHBackend.filesystem_identity` (a fresh connection per call,
-  written to run before FUSE's daemonizing fork) is not this check.
-- Checks coalesce per member: one check covers every observation of that
-  member read before it started, so concurrent listings share a request.
-  The added latency (one round trip per cold remote listing, less when
-  coalesced) is for the snapshot tracer to measure against the PR177 field
+- The check is one `stat` of the member's root marker: a file whose name
+  carries a per-member unique id recorded in member configuration, at the
+  member root. The same mechanism serves local, SSH and rsync members (SFTP
+  attributes carry no device id or inode, and a raw `st_dev` is not stable
+  across reboots, device-mapper or USB renumbering, so it is never stored in
+  configuration). A local member may additionally record `st_dev` at mount,
+  after its marker verifies, and compare it within that mount only. A
+  shared marker name, or a check that only tests for "a marker", is not
+  enough: the unique name is what keeps a stale marker of another member
+  from matching. The marker name is an internal entry, hidden from listings
+  and lookups like the existing hidden entries (`is_hidden_entry`), and
+  never replicated or synced as user data.
+- The check runs on the same path and at the same class as the listing it
+  verifies: a foreground listing's check uses the interactive reserve with
+  it, so cold listings do not queue behind bulk copies (the #175 stall); a
+  background refresh's check uses the background class. Today's
+  `SSHBackend.filesystem_identity` (a fresh connection per call, written to
+  run before FUSE's daemonizing fork) is not this check.
+- Checks coalesce per member only within a class: a check covers an
+  observation if it started after that observation was read and runs at the
+  observation's class or a more interactive one. A foreground listing never
+  waits on a background-class check; it issues its own. With one listing
+  worker per member, coalescing mostly joins consecutive listings.
+- Cost: every accepted observation pays one check, background refreshes
+  included; the user-visible part is the foreground round trip on a cold
+  listing. The snapshot tracer measures it against the PR177 field
   baseline; if it is too costly, relaxing this rule is a ruling, not an
   implementation choice.
 - A pending check is internal state, not a warning. A check that fails,
-  returns `None`, finds a different identity or misses the whole-request
+  finds no marker with this member's id, or misses the whole-request
   deadline makes the member missing with failure class unverified-root:
   logged at warning level, retained names kept, never confirmed absence.
-  (The current `filesystem_identity` contract treats `None` as "no
-  information"; this check must not.)
 - ENOENT for a subdirectory under a verified root stays successful-empty
   (sparse placement depends on it).
 
-The expected identity or marker comes from member configuration or a marker
-written with the member, since an identity recorded only at startup cannot
-catch a disk already missing at mount time. A member with neither has no
-root check; that limitation is reported (at mount and in status), not
-hidden.
+Members without a marker. No member has a configured marker today. Such a
+member's observations are accepted unchecked under an explicit exception:
+it is reported at mount and in status as "root unchecked" (one warning per
+member, not per listing), and its failed-disk case keeps today's behavior.
+This is the only exception to the post-read check, and the contract states
+it. Writing markers is a separate, explicit member-setup step (ditz
+`listing-member-root-marker-setup`), not part of this slice: it writes the
+marker only to a root the operator names, refuses a root that is not a
+separate mount when the member configuration says it should be, and
+records the id in member configuration. A marker written to the underlying
+directory while the disk was unmounted would be a setup error; the setup
+step's refusal is what guards it.
 
 The no-success case stays narrow and explicit. It applies only when every
 configured member is missing for this listing, no member has a

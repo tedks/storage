@@ -69,9 +69,12 @@
   (its failure class) rather than empty, and it is never complete for B. B
   is retried on its own bounded backoff, independent of the serving TTL. A
   member's observation, of any kind, is accepted only after a root check
-  started after it was read, on the same path and class as the listing
-  (coalesced per member); a failed or late check makes the member
-  unverified-root, logged; a pending check is not logged. Retry backoff resets on the member's next success. Each
+  (a stat of the member's uniquely named root marker) started after it was
+  read, at the observation's class or a more interactive one (coalesced per
+  member within that constraint); a failed, unmatched or late check makes
+  the member unverified-root, logged; a pending check is not logged. Sole
+  exception: a member with no configured marker is accepted unchecked and
+  reported once as root unchecked. Retry backoff resets on the member's next success. Each
   missing member is logged at warning level (member ID, failure class,
   directory), rate limited per member, on cold and warm listings alike. The
   foreground wait for members is bounded, also for an expired directory
