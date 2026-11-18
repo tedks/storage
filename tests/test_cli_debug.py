@@ -1671,6 +1671,21 @@ class TestMemberRepairsCommand(unittest.TestCase):
             self.assertNotEqual(0, result.exit_code, bad)
         self.assertEqual(2, len(json.loads(self.invoke("--json-output").output)))
 
+    def test_a_busy_carrier_is_a_clean_error(self):
+        import fcntl
+        from unittest import mock as _mock
+        fd = os.open(str(self.cache / ".storage.repairs" / self.first), os.O_RDONLY)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            with _mock.patch("storage.member_repairs.FLOCK_WAIT", 0.05):
+                result = self.invoke("--resolve", self.first)
+        finally:
+            os.close(fd)
+        self.assertNotEqual(0, result.exit_code)
+        self.assertIn(f"Could not resolve member repair {self.first}", result.output)
+        self.assertNotIn("Traceback", result.output)
+        self.assertEqual(2, len(json.loads(self.invoke("--json-output").output)))
+
     def test_a_corrupt_carrier_is_reported(self):
         carrier = self.cache / ".storage.repairs" / self.first
         os.setxattr(str(carrier), "user.storage.member_repair", b"{not json")

@@ -158,6 +158,9 @@ class TestRecords(MemberRepairsTestBase):
         settle runs: settle still records the miss from the paths given."""
         repairs = MemberRepairs(self.cache)
         rid = repairs.begin("/a", "/b", ["m"])
+        # Only possible once the holder's lock is gone (as after its crash);
+        # this keeps settle's fallback covered.
+        os.close(repairs._held.pop(rid))
         self.assertTrue(MemberRepairs(self.cache).resolve(rid))
         self.assertEqual(set(), repairs.backends_for(["/b"]))  # the reload
         repairs.settle(rid, "/a", "/b", {"m": "unreachable"})
@@ -165,12 +168,22 @@ class TestRecords(MemberRepairsTestBase):
         self.assertEqual((("m",), "open", "/a", "/b"),
                          (record.members, record.state, record.old_path, record.new_path))
 
+    def test_an_in_flight_intent_cannot_be_resolved(self):
+        repairs = MemberRepairs(self.cache)
+        rid = repairs.begin("/a", "/b", ["m"])
+        with patch("storage.member_repairs.FLOCK_WAIT", 0.05):
+            with self.assertRaises(OSError):
+                MemberRepairs(self.cache).resolve(rid)
+        repairs.settle(rid, "/a", "/b", {})
+        self.assertEqual([], MemberRepairs(self.cache).list())
+
     def test_settle_leaves_a_busy_intent_in_place(self):
-        """The intent's flock is held elsewhere (a resolve stopped mid-way):
-        settle gives up after its bound and leaves the intent, over-fencing,
-        with the miss recorded beside it."""
+        """An intent begun by another instance whose flock is held elsewhere
+        (a resolve stopped mid-way): settle gives up after its bound and
+        leaves the intent, over-fencing, with the miss recorded beside it."""
         repairs = MemberRepairs(self.cache)
         rid = repairs.begin("/a", "/b", ["m0", "m1"])
+        os.close(repairs._held.pop(rid))
         fd = os.open(str(self.carriers / rid), os.O_RDONLY)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)

@@ -42,6 +42,18 @@ DEFAULT_STAT_MEMO_LIMIT = 8192
 _MAX_CHILD_RACES = 1024
 
 
+def _cache_ancestors(cache_root: Path, directory: Path) -> List[Path]:
+    """The cache root, then each directory down to and including directory."""
+    root = Path(cache_root)
+    chain = [directory]
+    for parent in directory.parents:
+        if parent == root or root not in parent.parents:
+            break
+        chain.append(parent)
+    chain.append(root)
+    return list(reversed(dict.fromkeys(chain)))
+
+
 class _ListingTicket(NamedTuple):
     """What a listing must match to be published (see _begin_listing)."""
 
@@ -1519,8 +1531,6 @@ class NamespaceService:
                                 new_resolved.canonical_path, excluding=old_resolved.canonical_path
                             )):
                         raise OSError(errno.ENOTEMPTY, os.strerror(errno.ENOTEMPTY), new)
-                    created = [p for p in [new_cache.parent, *new_cache.parent.parents]
-                               if not p.exists()]
                     new_cache.parent.mkdir(parents=True, exist_ok=True)
                     old_cache.rename(new_cache)
                     moved = True
@@ -1536,20 +1546,29 @@ class NamespaceService:
                     if on_local_moved is not None:
                         on_local_moved()
             except BaseException:
-                if intent is not None and not moved:
-                    # Nothing moved and no member was called.
-                    repairs.settle(intent, old_resolved.canonical_path,
-                                   new_resolved.canonical_path, {})
+                if intent is not None:
+                    if moved:
+                        repairs.abandon(intent)
+                    else:
+                        # Nothing moved and no member was called.
+                        repairs.settle(intent, old_resolved.canonical_path,
+                                       new_resolved.canonical_path, {})
                 raise
             if intent is not None:
                 # The local move is durable before any member is called, so
                 # no power loss can undo it after a member took the move and
                 # its intent was dropped. A failure here leaves the intent,
                 # with no member called.
-                # Directories the move made (mkdir parents) are made durable
-                # in their own parents too.
-                fsync_directories(*(p.parent for p in reversed(created)),
-                                  old_cache.parent, new_cache.parent)
+                # Every directory from the cache root down to both parents,
+                # so an entry made earlier and never synced (by this move's
+                # mkdir, an earlier mkdir or a fetch) cannot be lost with it.
+                try:
+                    fsync_directories(
+                        *_cache_ancestors(self.cache_manager.cache_root, old_cache.parent),
+                        *_cache_ancestors(self.cache_manager.cache_root, new_cache.parent))
+                except BaseException:
+                    repairs.abandon(intent)
+                    raise
 
             errors: Dict[str, str] = {}
             failures = self._propagate_dir_operation(

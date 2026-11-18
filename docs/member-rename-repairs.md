@@ -82,9 +82,10 @@ durable record of it.
 2. **Local move.** The cache rename, the index rewrite and the metadata
    xattrs, as before. Then the cache tree's part of the move is made
    durable:
-   - every directory the move created for the new path (`mkdir` of its
-     parents) is fsynced in its own parent;
-   - both cache parent directories are fsynced.
+   - every directory from the cache root down to the old and the new
+     parent is fsynced. That includes directories this move created
+     (`mkdir` of the new path's parents) and ones made earlier and never
+     synced.
 
    So no power loss can undo the cache move after a member has taken it
    and its intent has been dropped. The cache tree is the authority. The
@@ -107,16 +108,22 @@ durable record of it.
    member, so it over-fences, but nothing is lost. The rename still returns
    success, because its evidence is durable.
 
-   Settle changes the intent only under an exclusive `flock` on its
-   carrier, the same lock resolution takes. Because the miss always lands
-   under a new id, a resolution of the intent id never covers it, whether
-   that resolution comes before the settle or after it. A late resolve of
-   the intent id names nothing and fails.
+   The rename holds an exclusive `flock` on its intent from `begin` until
+   settle has finished. The lock is taken on the temp file, before the
+   carrier has its final name. Resolution takes the same lock with a
+   bounded wait, so an intent can never be resolved while its rename is
+   running: the resolve fails as busy and changes nothing. That makes the
+   miss record durable before the intent can go. When the process dies,
+   its locks go with it, so an intent left by a crash can be resolved.
 
-   Settle waits at most 5 seconds for the lock. It runs under the rename's
-   path and namespace locks, so it must not wait without bound on another
-   process, such as a resolve stopped at a terminal. After the wait it
-   leaves the intent in place: that over-fences, never under-fences.
+   If the rename fails after its local move, the intent is kept and its
+   lock released.
+
+   Because the miss always lands under a new id, a late resolve of the
+   intent id names nothing and fails. Settle on an intent it does not hold
+   (another instance's) waits at most 5 seconds for the lock, since it
+   runs under the rename's path and namespace locks, and then leaves the
+   intent in place, which over-fences.
 
 What a crash at each point leaves:
 
@@ -229,12 +236,14 @@ and the CLI cases in `tests/test_cli_debug.py`:
 - **Races and ordering:**
   - a resolution made by another process during a rename's member call
     still reaches the mount;
-  - an intent resolved while its rename runs still records the members
-    that missed the move, including when a concurrent lookup reloads in
-    between;
+  - a resolve of an in-flight intent fails as busy, and the miss is still
+    recorded, including when a concurrent lookup reloads in between;
+  - an intent left by a move that failed after the local move is released
+    and can be resolved;
   - a late resolve of the intent id fails, and the miss survives it;
   - a busy carrier: settle leaves the intent in place, and the owner
     leaves a resolved carrier it cannot lock;
-  - directories created by the move are fsynced before any member call;
+  - every cache directory down to both parents is fsynced before any
+    member call;
   - an interrupted resolution stays enforced until the next open;
   - a failed fsync of the local move calls no member.

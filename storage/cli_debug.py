@@ -301,7 +301,11 @@ def debug_member_repairs(cache: Path, resolve_id: str | None, json_output: bool)
     except CorruptRepairRecord as exc:
         raise click.ClickException(str(exc)) from exc
     if resolve_id is not None:
-        if not repairs.resolve(resolve_id):
+        try:
+            resolved = repairs.resolve(resolve_id)
+        except (OSError, CorruptRepairRecord) as exc:
+            raise click.ClickException(f"Could not resolve member repair {resolve_id}: {exc}") from exc
+        if not resolved:
             raise click.ClickException(f"No member repair {resolve_id}")
         if not json_output:
             click.echo(f"Resolved member repair {resolve_id}.")

@@ -179,6 +179,8 @@ class MemberRepairs:
         self._write_lock = threading.Lock()
         self._records: Dict[str, MemberRepair] = {}
         self._seen: Optional[tuple] = None
+        # Descriptors of this process's in-flight intents, flock held.
+        self._held: Dict[str, int] = {}
         with self._lock:
             self._reload_locked(strict=True, owner=sweep_new)
         if len(self._records) > GROWTH_WARNING:
@@ -234,16 +236,22 @@ class MemberRepairs:
                     # Its resolution was written; finish it under the same
                     # flock a live resolve holds, making the state durable
                     # first in case that resolve died before its fsync.
-                    if self._finish_resolution(path):
+                    try:
+                        finished = self._finish_resolution(path)
+                    except (OSError, CorruptRepairRecord) as exc:
+                        raise CorruptRepairRecord(
+                            f"Could not finish the resolution of {path}: {exc}. Inspect or "
+                            "remove it by hand."
+                        ) from exc
+                    if finished:
                         continue
                 records[name] = record
             if owner:
                 _fsync(self.dir, directory=True)
-                # The owner's own unlinks changed the directory; nothing
-                # else writes it during the open.
-                stamp = self._dir_stamp()
-        # Otherwise the stamp from before the listing: a change made while
-        # listing shows as a mismatch at the next lookup, which reloads.
+        # The stamp from before the listing, also for the owner (whose own
+        # unlinks then cost one extra reload): a change made while listing,
+        # such as a live resolve's unlink, shows as a mismatch at the next
+        # lookup, which reloads.
         self._records = records
         self._seen = stamp
         return True
@@ -295,7 +303,10 @@ class MemberRepairs:
             self.dir.mkdir(mode=0o700, exist_ok=True)
             _fsync(self.dir.parent, directory=True)
 
-    def _write_new(self, record: MemberRepair):
+    def _write_new(self, record: MemberRepair, hold: bool = False) -> Optional[int]:
+        """Create a carrier durably. With hold, return its descriptor with
+        an exclusive flock taken before the carrier had its final name, so
+        no resolve can ever act on it until the caller closes it."""
         payload = record.to_json()
         if len(payload) > MAX_RECORD_BYTES:
             raise OSError(errno.ENAMETOOLONG,
@@ -306,12 +317,23 @@ class MemberRepairs:
         fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         try:
             try:
+                if hold:
+                    fcntl.flock(fd, fcntl.LOCK_EX)
                 os.setxattr(fd, RECORD_XATTR, payload)
                 os.fsync(fd)
-            finally:
+            except BaseException:
                 os.close(fd)
-            os.rename(temp, final)
-            _fsync(self.dir, directory=True)
+                raise
+            if not hold:
+                os.close(fd)
+            try:
+                os.rename(temp, final)
+                _fsync(self.dir, directory=True)
+            except BaseException:
+                if hold:
+                    os.close(fd)
+                raise
+            return fd if hold else None
         except BaseException:
             # Not durable: the caller is told it failed, so nothing of it
             # may be left to be read later either.
@@ -346,7 +368,9 @@ class MemberRepairs:
         record = self._make(old_path, new_path, members, INTENT,
                             "rename interrupted before every member's outcome was recorded")
         with self._write_lock:
-            self._write_new(record)
+            # Held until settle: a resolve while the rename is running
+            # waits for it, so an in-flight intent is never resolved.
+            self._held[record.id] = self._write_new(record, hold=True)
             self._after_write(lambda records: records.__setitem__(record.id, record))
         return record.id
 
@@ -375,14 +399,17 @@ class MemberRepairs:
         concurrent reload may have changed. With no miss, the intent is
         simply removed.
 
-        The intent is changed under an exclusive flock on its carrier,
-        which resolution in another process takes too; settle waits at most
-        FLOCK_WAIT seconds for it, and then leaves the intent (over-fencing,
-        never under). Any failure leaves the intent likewise; it is logged,
+        The intent's flock, taken by begin before the carrier had its name,
+        is held from begin until here, so no resolve can remove the intent
+        while the rename runs (it times out as busy) and the miss is always
+        durable before the intent goes. An intent begun by another instance
+        is locked with a bounded wait; past it, the intent stays
+        (over-fencing, never under). Any failure leaves the intent likewise; it is logged,
         not raised: the evidence is already durable.
         """
         reasons = "; ".join(f"{m}: {missed[m]}" for m in sorted(missed))[:MAX_REASON_CHARS]
         with self._write_lock:
+            held = self._held.pop(repair_id, None)
             try:
                 if missed:
                     self._write_new(self._make(old_path, new_path, missed, OPEN, reasons))
@@ -391,22 +418,37 @@ class MemberRepairs:
                         "recorded (storage debug member-repairs): %s",
                         ", ".join(sorted(missed)), old_path, new_path, reasons,
                     )
-                self._drop_intent(repair_id)
+                self._drop_intent(repair_id, held)
             except (OSError, CorruptRepairRecord):
                 logger.exception(
                     "Could not settle member repair %s; it stays an intent for every member",
                     repair_id,
                 )
+            finally:
+                if held is not None:
+                    os.close(held)
             self._after_write(lambda records: None)
 
-    def _drop_intent(self, repair_id: str):
+    def abandon(self, repair_id: str):
+        """Keep an intent as it is and release its flock: the rename failed
+        after its local move, so the intent stands for every target."""
+        with self._write_lock:
+            held = self._held.pop(repair_id, None)
+            if held is not None:
+                os.close(held)
+
+    def _drop_intent(self, repair_id: str, held: Optional[int] = None):
         carrier = self.dir / repair_id
+        if held is not None:
+            fd = os.dup(held)  # already locked: same open file description
+        else:
+            try:
+                fd = os.open(str(carrier), os.O_RDONLY)
+            except FileNotFoundError:
+                return  # resolved by someone else meanwhile
         try:
-            fd = os.open(str(carrier), os.O_RDONLY)
-        except FileNotFoundError:
-            return  # resolved by someone else meanwhile
-        try:
-            _flock_bounded(fd)
+            if held is None:
+                _flock_bounded(fd)
             if os.fstat(fd).st_nlink == 0:
                 return
             current = MemberRepair.from_json(os.getxattr(fd, RECORD_XATTR), repair_id)

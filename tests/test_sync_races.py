@@ -522,11 +522,11 @@ class TestDirectoryRetries(SyncRaceTestBase):
         real_write = repairs._write_new
         writes = []
 
-        def failing_after_the_intent(record):
+        def failing_after_the_intent(record, **kwargs):
             writes.append(record.state)
             if record.state != "intent":
                 raise OSError(errno.EIO, "injected")
-            return real_write(record)
+            return real_write(record, **kwargs)
 
         with patch.object(repairs, "_write_new", side_effect=failing_after_the_intent):
             self.fs.rename("/d", "/e")
@@ -871,39 +871,45 @@ class TestRepairsOutliveTheIndex(SyncRaceTestBase):
         self.assertEqual([], self.fs.cache_manager.member_repairs.list())
         self.assertEqual(set(), self.fs.cache_manager.member_repairs.backends_for(["/old", "/older"]))
 
-    def test_an_intent_resolved_while_its_rename_runs_still_records_the_miss(self):
-        """Someone resolves the in-flight intent from another process, then
-        the member misses the move: the miss gets a new open record."""
+    def test_an_intent_cannot_be_resolved_while_its_rename_runs(self):
+        """Someone tries to resolve the in-flight intent from another
+        process during the member call: the rename holds the intent's flock,
+        so the resolve fails as busy and changes nothing; the member then
+        misses the move, and the miss is recorded."""
         self.fs.mkdir("/d", 0o755)
+        attempts = []
 
-        def resolve_intent_then_fail(*_args):
+        def try_resolve_then_fail(*_args):
             [intent] = MemberRepairs(self.cache_dir).list()
             self.assertEqual("intent", intent.state)
-            self.assertTrue(MemberRepairs(self.cache_dir).resolve(intent.id))
+            with patch("storage.member_repairs.FLOCK_WAIT", 0.05):
+                with self.assertRaises(OSError) as raised:
+                    MemberRepairs(self.cache_dir).resolve(intent.id)
+            attempts.append(raised.exception.errno)
+            # A lookup reloads meanwhile; settle does not depend on it.
+            self.assertEqual({"member"}, self.fs.cache_manager.member_repairs.backends_for(["/e"]))
             raise OSError("member unreachable")
 
-        with patch.object(self.member, "rename", side_effect=resolve_intent_then_fail):
+        with patch.object(self.member, "rename", side_effect=try_resolve_then_fail):
             self.fs.rename("/d", "/e")
-        [record] = MemberRepairs(self.cache_dir).list()
-        self.assertEqual({"member"}, self.fs.cache_manager.member_repairs.backends_for(["/e"]))
-
-    def test_an_intent_resolved_while_its_rename_runs_survives_a_concurrent_reload(self):
-        """As above, with a lookup (a sync worker, an eviction) reloading
-        the registry between the resolve and the settle."""
-        self.fs.mkdir("/d", 0o755)
-
-        def resolve_intent_reload_then_fail(*_args):
-            [intent] = MemberRepairs(self.cache_dir).list()
-            self.assertTrue(MemberRepairs(self.cache_dir).resolve(intent.id))
-            self.assertEqual([], self.fs.cache_manager.member_repairs.list())
-            raise OSError("member unreachable")
-
-        with patch.object(self.member, "rename", side_effect=resolve_intent_reload_then_fail):
-            self.fs.rename("/d", "/e")
+        self.assertEqual([errno.EWOULDBLOCK], attempts)
         [record] = MemberRepairs(self.cache_dir).list()
         self.assertEqual(("open", ("member",), "/d", "/e"),
                          (record.state, record.members, record.old_path, record.new_path))
         self.assertEqual({"member"}, self.fs.cache_manager.member_repairs.backends_for(["/e"]))
+
+    def test_an_intent_left_by_a_failed_move_is_released_and_resolvable(self):
+        """The rename fails after its local move (here: the index rewrite):
+        the intent stays for every target, and its flock is released, so it
+        can be resolved."""
+        self.fs.mkdir("/d", 0o755)
+        with patch.object(self.fs.state_manager, "rename_path", side_effect=OSError(errno.EIO, "injected")):
+            with self.assertRaises(FuseOSError):
+                self.fs.rename("/d", "/e")
+        [record] = MemberRepairs(self.cache_dir).list()
+        self.assertEqual(("intent", ("member",)), (record.state, record.members))
+        with patch("storage.member_repairs.FLOCK_WAIT", 0.05):
+            self.assertTrue(MemberRepairs(self.cache_dir).resolve(record.id))
 
     def test_an_interrupted_resolution_still_fences_until_the_cache_finishes_it(self):
         """A resolution that wrote its durable resolved state but did not get
