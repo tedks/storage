@@ -1,0 +1,19 @@
+id: member-attribute-copy-policy
+title: Configure attribute copying with full metadata preservation by default
+desc: Configure which member attributes are copied. Default to copying everything
+  supported, including arbitrary xattrs and ACLs. Specify per-backend capabilities,
+  how to handle unsupported attributes, and how mount-internal metadata and identity
+  translation are kept separate.
+type: feature
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-18T23:59:09-00:00
+references: []
+log_events:
+- time: 2026-11-18T23:59:09-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
