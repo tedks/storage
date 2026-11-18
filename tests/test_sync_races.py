@@ -415,9 +415,38 @@ class TestDirectoryRetries(SyncRaceTestBase):
         self.assertEqual([("member", "/d", "/e")], self.repairs())
 
     def test_open_repair_fences_uploads_at_those_names(self):
-        """A write to /b.txt after the member missed /a.txt -> /b.txt is not
-        uploaded to that member, which gained an unrelated /b.txt; the file
-        stays dirty, as for a member that is down."""
+        """/d/f.txt was written but never synced when the member missed
+        /d -> /e, and something else then put an /e/f.txt there. The member
+        has no location row for it, so the conflict check would let the
+        upload replace it: the open repair keeps the upload off that member,
+        and the file stays dirty, as for a member that is down."""
+        self.fs.mkdir("/d", 0o755)
+        self.write_file("/d/f.txt", b"new bytes")
+        self.fail_member_once("rename")
+        self.fs.rename("/d", "/e")
+        (self.member_dir / "e").mkdir()
+        (self.member_dir / "e" / "f.txt").write_bytes(b"unrelated writer")
+        uploads = []
+        real_copy = self.member.copy_from_local
+        patcher = patch.object(self.member, "copy_from_local",
+                               side_effect=lambda *a: (uploads.append(a[1]), real_copy(*a)))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        self.write_file("/c.txt", b"elsewhere")
+        self.start_sync()
+        self.wait_synced("/c.txt")
+        self.wait_idle()
+        self.fs.sync_manager.stop()
+        self.assertEqual(["/c.txt"], uploads)
+        self.assertEqual(b"unrelated writer", (self.member_dir / "e" / "f.txt").read_bytes())
+        self.assertNotEqual(SyncStatus.CLEAN,
+                            self.fs.state_manager.get_file_metadata("/e/f.txt").sync_status)
+
+    def test_a_dirty_rename_onto_a_new_member_target_is_a_conflict(self):
+        """Where the member does have a location row for the file, the
+        conflict check already refuses to replace an unrelated copy that
+        appeared at the new name; the open repair fences it as well."""
         self.write_file("/a.txt", b"old bytes")
         self.start_sync()
         self.wait_synced("/a.txt")
@@ -426,23 +455,12 @@ class TestDirectoryRetries(SyncRaceTestBase):
         self.fail_member_once("rename")
         self.fs.rename("/a.txt", "/b.txt")
         (self.member_dir / "b.txt").write_bytes(b"unrelated writer")
-        uploads = []
-        real_copy = self.member.copy_from_local
-        patcher = patch.object(self.member, "copy_from_local",
-                               side_effect=lambda *a: (uploads.append(a[1]), real_copy(*a)))
-        patcher.start()
-        self.addCleanup(patcher.stop)
-
         self.write_file("/b.txt", b"new bytes")
-        self.write_file("/c.txt", b"elsewhere")
         self.start_sync()
-        self.wait_synced("/c.txt")
         self.wait_idle()
         self.fs.sync_manager.stop()
-        self.assertEqual(["/c.txt"], uploads)
         self.assertEqual(b"unrelated writer", (self.member_dir / "b.txt").read_bytes())
         self.assertEqual(b"old bytes", (self.member_dir / "a.txt").read_bytes())
-        self.assertNotEqual(SyncStatus.CLEAN, self.fs.state_manager.get_file_metadata("/b.txt").sync_status)
 
     def test_a_record_that_cannot_be_written_is_retried_by_the_worker(self):
         """The index refuses the rename's record once (a busy or full
