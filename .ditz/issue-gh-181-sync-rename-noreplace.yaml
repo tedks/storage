@@ -56,6 +56,15 @@ log_events:
     identities and contents. Also verify that a recorded local source missing at propagation
     cannot report a successful move. Align repair reasons with what the listing actually
     proves.'
+- time: 2026-11-18T20:48:40-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'At 96313bf the per-member destination classification is fixed. Remaining
+    case: both source and destination recorded on one member, source disappears, normal
+    replacement path locally returns and SSH swallows FileNotFoundError. The final
+    intent can clear despite no member move. Require the namespace to record this
+    partial failure, preserve destination bytes, and retain the actual failing operation/error
+    when ENOENT is ambiguous. Local and SSH regression coverage requested.'
 blocks:
 - gh-181
 blocked_by:
