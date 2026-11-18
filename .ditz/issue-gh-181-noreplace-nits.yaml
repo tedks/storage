@@ -43,5 +43,13 @@ log_events:
   comment: 'Nits 1-4 fixed in the CTO-183-ERRNO commit (blank lines, test seam, doc
     wording, SSH lstat failure keeps the rename error). Still untested: a connection
     error on a no-replace member; rsync inheriting the SSH handling.'
+- time: 2026-11-18T20:58:39-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Round 3a2333b1a38b-...-0b6581 (CLEAN), Anthropic nits: (5) ssh.py source-check
+    handler sends non-OSError, non-connection exceptions (TypeError, unexpected paramiko)
+    into the path-answer branch, so the pool rates the channel healthy where _verdict
+    would DISCARD; restrict the branch to non-connection OSError. (6) test_a_lost_connection_during_the_source_check_reaches_the_pool
+    asserts the exception and note only, not lease/pool state.'
 blocks:
 - gh-181
