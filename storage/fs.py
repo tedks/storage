@@ -148,7 +148,9 @@ class StorageFS(Operations):
     _DEMAND_OPS = frozenset({"read", "write", "fsync"})
 
     def __call__(self, op, *args):
-        gate = self._foreground_admission
+        # getattr: subclasses and test probes may skip __init__ (one in
+        # test_ssh_backend does); with no gate they keep master's dispatch.
+        gate = getattr(self, "_foreground_admission", None)
         if gate is None or op in self._ADMISSION_EXEMPT:
             # Every FUSE operation has a caller waiting on it: members with a
             # connection pool serve it from the channel kept for that.
