@@ -37,17 +37,16 @@
   Anthropic (Opus, native) 0 Critical, 3 Important, 6 Nits; Google EMPTY
   (usage limit). Independent lead review (fresh Opus): NOT CLEAN, 2
   Important (both also raised by the Anthropic seat), 6 Nits.
-- dispositions, all fixed in the same commit as this entry: lane worktrees replaced by
-  role and PR in the 2026-11-10 lane table; message-transport details and
-  the assignment label removed from the current files, with redaction
-  markers on the edited events; the full `oq-conflict-fallback-limits`
-  ruling recorded; the 2026-11-18 form ruling on
-  `oq-streaming-fleet-keep-threshold` recorded; the #180 head refreshed,
-  with a note that heads of open drafts move; the PR description rewritten
-  to the current header without host details; the remaining nits applied
-  (successor wording, #179 row, `gh-74-fast-checksum` blocker, dated
-  checks on A165/A166, #171 description note, pointer in the dated
-  backlog).
+- dispositions, all fixed in the same commit as this entry: lane worktrees
+  replaced by role and PR in the 2026-11-10 lane table; message-transport
+  details and the assignment label removed from the current files, with
+  redaction markers on the edited events; the full `oq-conflict-fallback-
+  limits` ruling recorded; the 2026-11-18 form ruling on `oq-streaming-
+  fleet-keep-threshold` recorded; the #180 head refreshed, with a note that
+  heads of open drafts move; the PR description rewritten to the current
+  header without host details; the remaining nits applied (successor
+  wording, #179 row, `gh-74-fast-checksum` blocker, dated checks on
+  A165/A166, #171 description note, pointer in the dated backlog).
 
 ## records-lead:4
 
@@ -57,11 +56,19 @@
 - round: `e0f2ec7bb51b-20261118T055100Z-2519dd`, warm delta from `5b46c31`.
 - outcomes: OpenAI (gpt-6-sol, ask-agent, warm) 1 Critical: the
   responsiveness lead's worktree name remained in integration-lead:18.
-  Google EMPTY (usage limit).
-- disposition: fixed in the same commit as this entry; the worktree name moved to the
-  private roster. A sweep of the current files finds no other lane worktree
-  name (`descriptive-remote-names` in A166 and integration-lead:12 is the
-  public ditz issue id).
+  Anthropic (Opus, native, warm) 0 Critical, 1 Important (the same
+  finding), 5 Nits. Google EMPTY (usage limit). Independent lead
+  re-review: NOT CLEAN, 1 Important (the same finding), 3 Nits. All three
+  found the round 1 fixes holding.
+- disposition: fixed in the same commit as this entry; the worktree name
+  moved to the private roster. The nits were applied except the model and
+  mechanism names in records-lead:3, kept because the PR's round records
+  already publish them. Apart from the marked redactions, the only in-place
+  edits to published entries are records-lead:3's wording ("next commit"
+  became "same commit as this entry") and records-lead:2, restored to its
+  original wording. A sweep of the current files finds no other lane
+  worktree name (`descriptive-remote-names` in A166 and integration-lead:12
+  is the public ditz issue id).
 - authority: the CTO's reply to the records-lead:2 report accepted
   redaction of the current files with the historical commits retained, and
   forbade any history rewrite.

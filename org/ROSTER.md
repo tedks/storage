@@ -115,8 +115,7 @@ sync, cache, rsync, namespace and conflict suites; any new top-level module
 requires manifest coordination. #17 scheduler design waits for #167's
 interface. Exact heads and this contract were sent to the parent
 coordinator before any merge (transport details redacted; see
-records-lead:2-4). No onboarding code is
-in this package.
+records-lead:2-4). No onboarding code is in this package.
 
 Responsiveness PR #171 added one explicit `storage/BUILD` source entry,
 `foreground_admission.py`, at reported pushed head `2a5490c8d50b436843710fa698d9cd326221b33a`.
