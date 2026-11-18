@@ -289,7 +289,11 @@ def debug_member_repairs(database: Path, resolve_id: int | None, json_output: bo
 
     For each one, the member may still hold the object at OLD, or the rename
     may have taken effect there; look at both names on the member before
-    moving anything, then --resolve the repair.
+    moving anything, then --resolve the repair. Until then the member gets no
+    rename or upload at names overlapping either path, and cached files
+    under NEW stay cached. A later move of NEW through the mount is recorded
+    as its own repair; one row may stand for the same names missed twice
+    (see "seen Nx").
     """
     state_manager = StateManager(str(database.resolve()))
     try:
