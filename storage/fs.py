@@ -30,7 +30,8 @@ from pathlib import Path
 from typing import Dict, Optional, Set, List, Tuple
 
 from .backends.base import (
-    Backend, ChecksumUnavailable, capacity_wait_cancellation, interactive_request,
+    Backend, ChecksumUnavailable, capacity_wait_cancellation,
+    interactive_request,
 )
 from .backends.rsync import RsyncBackend
 from .backends.ssh_mux import close_shared_control_sockets
@@ -38,6 +39,7 @@ from .backends.ssh_pool import (
     BulkCapacityCancelled, BulkCapacityTimeout, is_connection_error,
 )
 from .cache import PARTIAL_SUFFIX, CacheManager
+from .foreground_admission import AdmissionClosed, ForegroundAdmission, validate_cap
 from .locks import NamespaceLock, PathLocks, UploadLocks
 from .cache_metadata import PREFIX_XATTR, XATTR_CACHE_METADATA_NAME, regular_file_stat, scan_cache_entries
 from .file_config import FileConfig, get_inherited_config
@@ -130,11 +132,91 @@ class StorageFS(Operations):
                 return True
         return False
 
+    # Operations that never wait for foreground admission. init and destroy
+    # bracket the loop. release and releasedir end a descriptor that an
+    # admitted open made: they must run exactly once even after the gate
+    # closes (a member-copy close uploads, a canonical close queues its
+    # sync), so they are neither queued nor cancelled, and not counted.
+    # flush is fusepy's no-op (StorageFS does not override it; a test pins
+    # that), so close(2), which sends it synchronously, never waits for a
+    # slot. An override that does work must move flush to _DEMAND_OPS.
+    _ADMISSION_EXEMPT = frozenset({"init", "destroy", "release", "releasedir", "flush"})
+    _METADATA_OPS = frozenset({
+        "getattr", "opendir", "readdir", "access", "readlink",
+        "getxattr", "listxattr", "statfs",
+    })
+    _DEMAND_OPS = frozenset({"read", "write", "fsync"})
+    # Without hard_remove, libfuse 2 renames a file unlinked while open to
+    # .fuse_hidden<16 hex> and, at its last close, unlinks that name from
+    # inside the RELEASE request (fuse_do_release). Every unlink, that one
+    # included, is admitted as ordinary and counted (CTO ruling
+    # STORAGE-180-HIDDEN-B), so the last close of a file unlinked while
+    # open can wait for an ordinary slot.
+
     def __call__(self, op, *args):
-        # Every FUSE operation has a caller waiting on it: members with a
-        # connection pool serve it from the channel kept for that.
-        with interactive_request():
-            return super().__call__(op, *args)
+        # getattr: subclasses and test probes may skip __init__ (one in
+        # test_ssh_backend does); with no gate they keep master's dispatch.
+        gate = getattr(self, "_foreground_admission", None)
+        if gate is None or op in self._ADMISSION_EXEMPT:
+            # Every FUSE operation has a caller waiting on it: members with a
+            # connection pool serve it from the channel kept for that.
+            with interactive_request():
+                return super().__call__(op, *args)
+        try:
+            # A queued callback waits for its slot even when its native
+            # request was interrupted or the session exited (CTO ruling
+            # STORAGE-180-ESC-I1-C). One libfuse request can make several
+            # callbacks (a rename onto an open target hides the target
+            # first; mkdir and create look the new entry up after it is
+            # made), so cancelling a later one would report EINTR for a
+            # request whose earlier step already happened. Uncapped, none
+            # of them is cancelled either. Only an explicit close() (destroy,
+            # or a direct caller) cancels waiters.
+            with gate.admit(self._foreground_class(op, args)):
+                with interactive_request():
+                    return super().__call__(op, *args)
+        except AdmissionClosed as exc:
+            # Raised only while waiting to enter (no callback raises it):
+            # the callback never ran, so nothing it would have done happened.
+            raise FuseOSError(errno.EINTR) from exc
+
+    def _foreground_class(self, op: str, args: tuple) -> str:
+        """The admission class, fixed before the callback runs.
+
+        A callback keeps this class to the end, even if it turns out to do
+        other work (a cached open whose revalidation refetches keeps its
+        demand slot and its path lock). Classification only schedules: it
+        never changes what the callback does or returns.
+        """
+        if op in self._METADATA_OPS:
+            return "metadata"
+        if op == "read" and len(args) >= 4:
+            # A read on a streaming descriptor may wait on member range
+            # fetches; it is ordinary, so it cannot hold the demand reserve
+            # that reads of cached bytes rely on. _fd_lock is held only over
+            # the descriptor table and local cache-file calls, never member
+            # I/O, so this lookup before admission stays short.
+            with self._fd_lock:
+                entry = self._fd_map.get(args[3])
+            if entry is not None and entry.prefetch_session is not None:
+                return "ordinary"
+        if op in self._DEMAND_OPS:
+            return "demand"
+        # An open whose cache file exists serves a read from local bytes in
+        # the common case; a cold open copies the whole file. This runs
+        # before admission, unbounded: one local lstat, no member, no lock.
+        # It uses the raw path, as _open's cache lookup does (get_cache_path
+        # of the requested path); a member-copy name has no cache file of
+        # its own and is ordinary.
+        # Metadata writes (setxattr, removexattr, chmod, utimens) are
+        # changes, not reads, and stay ordinary.
+        if op == "open" and args:
+            try:
+                if self.cache_manager.is_cached(args[0]):
+                    return "demand"
+            except Exception:  # noqa: BLE001 - the callback reports its own error
+                pass
+        return "ordinary"
 
     def __init__(self, cache_root: Path, state_db: Path, backends: Dict[str, Backend],
                  cache_size: int, num_sync_workers: int = 2, start_sync: bool = True,
@@ -146,7 +228,8 @@ class StorageFS(Operations):
                  revalidate_after: float = 60.0,
                  listing_max_stale: float = DEFAULT_LISTING_MAX_STALE,
                  checksum_reverify_interval: float = DEFAULT_CHECKSUM_REVERIFY_INTERVAL,
-                 bulk_cold_copies: bool = False):
+                 bulk_cold_copies: bool = False,
+                 max_foreground_operations: Optional[int] = None):
         """
         Initialize Storage filesystem
 
@@ -189,7 +272,15 @@ class StorageFS(Operations):
             bulk_cold_copies: Use bulk member admission for whole-file copies
                 when the mount runs threaded FUSE callbacks. Off for direct
                 construction and the default single-threaded mount.
+            max_foreground_operations: Cap on admitted FUSE callbacks
+                (foreground_admission.py); None, the default, admits
+                every callback at once as before.
         """
+        # Validate first: a rejected cap has no side effects.
+        self._foreground_admission = (
+            ForegroundAdmission(max_foreground_operations)
+            if max_foreground_operations is not None else None
+        )
         self.state_manager = StateManager(str(state_db))
         self.cache_manager = CacheManager(
             cache_root, self.state_manager, cache_size,
@@ -2956,6 +3047,13 @@ class StorageFS(Operations):
 
     def destroy(self, path):
         """Cleanup on unmount"""
+        # libfuse joins its handlers before destroy, and a queued native
+        # callback is never cancelled by the session exit: it runs once a
+        # slot frees, so in a mount nothing is queued here. For direct
+        # callers this cancels any waiter, which fails with EINTR unrun,
+        # and a closed gate rejects any later call.
+        if self._foreground_admission is not None:
+            self._foreground_admission.close()
         self._destroying.set()
         self._streaming_manager.destroy()
         self._stop_watchers()
@@ -3295,7 +3393,8 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
                  entry_timeout: Optional[float] = None,
                  negative_timeout: Optional[float] = None,
                  fuse_threads: bool = False,
-                 checksum_reverify_interval: float = DEFAULT_CHECKSUM_REVERIFY_INTERVAL):
+                 checksum_reverify_interval: float = DEFAULT_CHECKSUM_REVERIFY_INTERVAL,
+                 max_foreground_operations: Optional[int] = None):
     """
     Mount a Storage filesystem
 
@@ -3331,6 +3430,11 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
             (ditz threading-fuse-worker-cap). On unmount libfuse joins every
             worker before destroy, so an unmount waits for the slowest member
             call in flight.
+        max_foreground_operations: Cap on admitted FUSE callbacks, 4-128,
+            with two demand, one metadata and one ordinary slot reserved
+            (storage/foreground_admission.py). Requires fuse_threads. It
+            does not cap libfuse's native threads. None admits every
+            callback at once, as before.
 
     Raises:
         PermissionError: If allow_other=True but not running as root and user_allow_other not set
@@ -3340,6 +3444,12 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
     logger = logging.getLogger(__name__)
+
+    # Before the mount lock, so a bad cap fails without side effects.
+    if max_foreground_operations is not None:
+        if not fuse_threads:
+            raise ValueError("max_foreground_operations requires fuse_threads")
+        validate_cap(max_foreground_operations)
 
     # Before the mount lock, so a bad timeout fails without side effects.
     fuse_options = fuse_mount_options(
@@ -3409,6 +3519,7 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
         listing_max_stale=listing_max_stale,
         checksum_reverify_interval=checksum_reverify_interval,
         bulk_cold_copies=fuse_threads,
+        max_foreground_operations=max_foreground_operations,
     )
     fs.mount_lock_file = lock_file
     if unclean_shutdown:

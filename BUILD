@@ -29,6 +29,10 @@ alias(
     actual = "//tests:storage_tests_conflicts_integration",
 )
 alias(
+    name = "storage_tests_foreground_admission_mounted",
+    actual = "//tests:storage_tests_foreground_admission_mounted",
+)
+alias(
     name = "storage_tests_fuse_thread_state",
     actual = "//tests:storage_tests_fuse_thread_state",
 )
@@ -67,6 +71,7 @@ test_suite(
         "cli_mount",
         "crypto",
         "file_config",
+        "foreground_admission",
         "fs_core_integration",
         "fs_namespace_integration",
         "fs_revalidate",
@@ -103,7 +108,7 @@ test_suite(
 # The check sees sources under the nonmounting, mounted, and remote gates.
 genquery(
     name = "build_srcs",
-    expression = "labels(srcs, tests(//:storage_tests_nonmounting) + //tests:storage_tests_resilience_gradient + //tests:storage_tests_conflicts_integration + //tests:storage_tests_fuse_thread_state + //tests:storage_tests_streaming_system + //tests:storage_tests_sync_system + //tests:storage_tests_remote_system + //storage:storage_lib + //storage:storage_core + //storage/backends:storage_backends)",
+    expression = "labels(srcs, tests(//:storage_tests_nonmounting) + //tests:storage_tests_resilience_gradient + //tests:storage_tests_conflicts_integration + //tests:storage_tests_foreground_admission_mounted + //tests:storage_tests_fuse_thread_state + //tests:storage_tests_streaming_system + //tests:storage_tests_sync_system + //tests:storage_tests_remote_system + //storage:storage_lib + //storage:storage_core + //storage/backends:storage_backends)",
     scope = [
         "//storage:storage_lib",
         "//storage:storage_core",
@@ -111,6 +116,7 @@ genquery(
         ":storage_tests_nonmounting",
         "//tests:storage_tests_resilience_gradient",
         "//tests:storage_tests_conflicts_integration",
+        "//tests:storage_tests_foreground_admission_mounted",
         "//tests:storage_tests_fuse_thread_state",
         "//tests:storage_tests_streaming_system",
         "//tests:storage_tests_sync_system",
@@ -138,6 +144,7 @@ test_suite(
     name = "storage_tests_mounted_system_gate",
     tests = [
         "//tests:storage_tests_conflicts_integration",
+        "//tests:storage_tests_foreground_admission_mounted",
         "//tests:storage_tests_fuse_thread_state",
         "//tests:storage_tests_streaming_system",
         "//tests:storage_tests_sync_system",

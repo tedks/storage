@@ -22,6 +22,13 @@ storage_test(
 )
 storage_test("crypto")
 storage_test("file_config")
+storage_test("foreground_admission", extra_srcs = ["test_fs_threading.py"])
+storage_test(
+    "foreground_admission_mounted",
+    target = "storage_tests_foreground_admission_mounted",
+    extra_srcs = ["fuse_mount.py"],
+    tags = ["local", "manual"],
+)
 storage_test("fs_core_integration", tags = ["no-remote"])
 storage_test("fs_namespace_integration", tags = ["no-remote"])
 storage_test("fs_revalidate", tags = ["no-remote"])

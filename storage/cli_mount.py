@@ -138,6 +138,16 @@ def shared_filesystems(backends: Dict[str, Backend]) -> List[List[str]]:
     ),
 )
 @click.option(
+    "--max-foreground-operations",
+    type=int,
+    help=(
+        "Cap admitted FUSE callbacks at this number (4-128; turns on --fuse-threads). "
+        "Two read/write, one metadata and one other slot are reserved; the rest are "
+        "shared. init, destroy, release, releasedir and flush are not admitted; "
+        "libfuse's native threads are not capped (default off: no cap)."
+    ),
+)
+@click.option(
     "--checksum-reverify-interval",
     type=float,
     help=(
@@ -168,6 +178,7 @@ def mount(
     revalidate_after,
     fuse_threads,
     bulk_capacity_wait_timeout,
+    max_foreground_operations,
     checksum_reverify_interval,
 ):
     """
@@ -219,6 +230,7 @@ def mount(
         revalidate_after=revalidate_after,
         fuse_threads=fuse_threads,
         bulk_capacity_wait_timeout=bulk_capacity_wait_timeout,
+        max_foreground_operations=max_foreground_operations,
         checksum_reverify_interval=checksum_reverify_interval,
     )
 
@@ -309,6 +321,11 @@ def mount(
         f"attributes {kernel['attr_timeout']}s, pages kept while unchanged"
     )
     click.echo(f"  FUSE loop: {'multithreaded' if resolved.fuse_threads else 'single-threaded'}")
+    if resolved.max_foreground_operations is not None:
+        click.echo(
+            f"  FUSE callback cap: {resolved.max_foreground_operations} "
+            "(2 read/write, 1 metadata, 1 other reserved; libfuse threads not capped)"
+        )
     capacity_wait = (
         f"{resolved.bulk_capacity_wait_timeout}s"
         if resolved.bulk_capacity_wait_timeout else "no deadline"
@@ -347,6 +364,7 @@ def mount(
             entry_timeout=resolved.entry_timeout,
             negative_timeout=resolved.negative_timeout,
             fuse_threads=resolved.fuse_threads,
+            max_foreground_operations=resolved.max_foreground_operations,
             checksum_reverify_interval=resolved.checksum_reverify_interval,
         )
     except PermissionError as exc:
