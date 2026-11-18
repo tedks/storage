@@ -105,7 +105,10 @@ waits a bounded interval for member observations. Ted ruled the case where
 at least one member succeeds and another fails or times out: return the
 union that is available, even when it is empty, and log each missing member.
 No partial-result UI flag and no working notification transport are
-required for this. Concretely:
+required for this. The ruling accepts the known risk: POSIX readdir cannot
+mark a result partial, so a normal client shows it as complete, and names
+held only by B stay hidden until a later enumeration after B answers. The
+warning log is the operator's signal. Concretely:
 
 - The public result is the union of the successful members' observations
   and the local namespace, under the existing conflict/virtual-name policy.

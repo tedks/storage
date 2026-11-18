@@ -59,7 +59,8 @@
   unavailable rather than empty, and it is never fresh. Each missing member
   is logged at warning level (member ID, failure class, directory), rate
   limited per member. No public partial flag or notification transport is
-  implied. A failed member cannot veto collection or publication of healthy
+  implied; a client may present the result as complete (risk accepted by
+  the ruling). A failed member cannot veto collection or publication of healthy
   member observations. Retained stale
   names may fail at open; listing is not proof of readable bytes. Deadline and
   cancellation do not allow abandoned workers to publish later. If transport
