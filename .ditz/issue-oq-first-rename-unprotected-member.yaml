@@ -1,0 +1,24 @@
+id: oq-first-rename-unprotected-member
+title: First rename when a member cannot guarantee destination protection
+desc: 'On first synchronous propagation, the mount may have observed a free destination
+  while an external writer has since claimed it. The local move may already have completed.
+  Should Storage skip a member mutation whenever it cannot guarantee destination protection,
+  preserve both names and report partial failure with a durable repair? This may affect
+  ordinary SSH directory moves on servers without an atomic primitive. Alternative:
+  retain the existing first-attempt behavior for now and document the overwrite risk.
+  Ted decides. Existing policy covers replay and reconciliation. Preserve normal replacement
+  of an intended existing target as a distinct case, and distinguish absent from unknown
+  in best-effort listings.'
+type: task
+component: open-questions
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-18T05:09:24-00:00
+references: []
+log_events:
+- time: 2026-11-18T05:09:24-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
