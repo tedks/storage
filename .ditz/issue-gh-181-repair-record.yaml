@@ -51,5 +51,15 @@ log_events:
     4989ba7 as 3a2123a with a byte-identical PR diff. Final gates wait for #168, then
     a rebase, then a formal round on the exact head and an independent lead review
     (CTO STORAGE-182-FULL-I).'
+- time: 2026-11-18T06:33:34-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Integration with #180: its admission bypass for flush was approved only
+    for the inherited fusepy no-op. The #182 change at 010b498 defines a stateful
+    StorageFS.flush for fenced writable conflict views. On the combined head classify
+    the real handler as demand, retain the exact close error and cleanup semantics,
+    and replace the inherited-no-op premise with a cap-enabled contention/error regression.
+    Verify cap-off behavior as well. #180 can integrate independently on its reviewed
+    base.'
 blocks:
 - gh-181
