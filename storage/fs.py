@@ -146,12 +146,22 @@ class StorageFS(Operations):
         "getxattr", "listxattr", "statfs",
     })
     _DEMAND_OPS = frozenset({"read", "write", "fsync"})
+    # Without hard_remove, libfuse 2 renames a file unlinked while open to
+    # .fuse_hidden<hex> and, at its last close, unlinks that name from
+    # inside the RELEASE request (fuse_do_release). That unlink is part of
+    # a close: exempt like release, so a close never queues for a slot and
+    # teardown cannot leave the hidden file behind. Scheduling only: a
+    # user file with this prefix just skips the gate.
+    _LIBFUSE_HIDDEN_PREFIX = ".fuse_hidden"
 
     def __call__(self, op, *args):
         # getattr: subclasses and test probes may skip __init__ (one in
         # test_ssh_backend does); with no gate they keep master's dispatch.
         gate = getattr(self, "_foreground_admission", None)
-        if gate is None or op in self._ADMISSION_EXEMPT:
+        if gate is None or op in self._ADMISSION_EXEMPT or (
+            op == "unlink" and args
+            and os.path.basename(str(args[0])).startswith(self._LIBFUSE_HIDDEN_PREFIX)
+        ):
             # Every FUSE operation has a caller waiting on it: members with a
             # connection pool serve it from the channel kept for that.
             with interactive_request():

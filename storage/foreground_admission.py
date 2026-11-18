@@ -5,8 +5,10 @@ never interrupts a running callback and never changes what it returns.
 
 What the bound counts: callbacks admitted and not yet finished. At most
 `cap` run at once. StorageFS admits every FUSE operation except init,
-destroy, release, releasedir and flush (fs.py _ADMISSION_EXEMPT): those are
-not counted and may run alongside `cap` admitted callbacks. flush is exempt
+destroy, release, releasedir and flush (fs.py _ADMISSION_EXEMPT), and the
+unlink of a libfuse .fuse_hidden name that libfuse runs inside the last
+close of a file unlinked while open: those are not counted and may run
+alongside `cap` admitted callbacks. flush is exempt
 only while StorageFS inherits fusepy's immediate-success no-op, which a test
 pins; a flush that does work or can block must be reclassified, and fsync
 is never exempt. So the cap bounds admitted work only: callback

@@ -131,6 +131,19 @@ def test_each_close_runs_once_through_unmount(mounted):
     assert (mount_dir / "f.txt").read_bytes() == b"canonical"
     assert sorted(os.listdir(mount_dir))  # opendir, readdir, releasedir
     (mount_dir / "new.txt").write_bytes(b"new bytes")
+    # Unlinked while open: libfuse hides it as .fuse_hidden* and removes
+    # that name inside the last close's RELEASE (no hard_remove).
+    (mount_dir / "gone.txt").write_bytes(b"short-lived")
+    fd = os.open(mount_dir / "gone.txt", os.O_RDONLY)
+    os.unlink(mount_dir / "gone.txt")
+    assert os.read(fd, 64) == b"short-lived"
+    os.close(fd)
+    deadline = time.monotonic() + WAIT
+    while any(name.startswith(".fuse_hidden") for name in os.listdir(mount_dir)):
+        assert time.monotonic() < deadline, "libfuse's hidden name was never removed"
+        time.sleep(0.05)
+    assert not any(p.name.startswith(".fuse_hidden")
+                   for p in fs.cache_manager.cache_root.iterdir())
     # The member's copy changes; its conflict-qualified name is a member copy.
     (member_dir / "f.txt").write_bytes(b"member copy")
 

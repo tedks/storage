@@ -605,6 +605,23 @@ class TestCleanupThroughShutdown(CappedFSBase):
         self.assertEqual(0, self.gate_.active_count)
         self.assertEqual(b"edited copy", (self.member_dir / "f.txt").read_bytes())
 
+    def test_libfuse_hidden_unlink_is_part_of_a_close(self):
+        # libfuse runs this unlink inside the RELEASE of a file unlinked
+        # while open (no hard_remove): it must neither queue nor be
+        # cancelled. Other unlinks stay ordinary.
+        ran = []
+        self.saturate_all()
+        with patch.object(self.fs, "unlink", side_effect=lambda path: ran.append(path) or 0):
+            for path in ("/.fuse_hidden0000000a00000001", "/d/.fuse_hidden000000ff00000002"):
+                self.assertEqual(0, Worker(self.call, "unlink", path).finish_started())
+            self.gate_.close()
+            self.assertEqual(0, self.call("unlink", "/.fuse_hidden0000000b00000003"))
+            with self.assertRaises(FuseOSError) as caught:
+                self.call("unlink", "/plain.txt")
+            self.assertEqual(errno.EINTR, caught.exception.errno)
+        self.assertEqual(["/.fuse_hidden0000000a00000001", "/d/.fuse_hidden000000ff00000002",
+                          "/.fuse_hidden0000000b00000003"], ran)
+
     def test_flush_is_the_fusepy_no_op_and_never_waits(self):
         # flush is exempt only while it does nothing; an override must
         # reclassify it (fs.py _ADMISSION_EXEMPT).
