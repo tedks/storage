@@ -46,11 +46,14 @@ listing_max_stale = 3600
 # does not hold up listings, stats and reads of others. Off by default until
 # it has been field-tested.
 # fuse_threads = true
-# Cap concurrent FUSE callbacks, 4-128 (setting it turns on fuse_threads).
+# Cap admitted FUSE callbacks, 4-128 (setting it turns on fuse_threads).
 # Two slots are kept for reads and writes of cached files (and their opens),
 # one for metadata reads and one for everything else, including streaming
-# reads of uncached files; the rest are shared. Closes never wait and are
-# not counted, and libfuse's own threads are not capped. Unset: no cap.
+# reads of uncached files and every unlink; the rest are shared. init,
+# destroy, release, releasedir and flush are not admitted and run alongside
+# the cap. The last close of a file unlinked while open can still wait: libfuse
+# unlinks its hidden name inside that close, and the unlink takes an
+# ordinary slot. libfuse's own threads are not capped. Unset: no cap.
 # max_foreground_operations = 8
 # Bulk SSH copies wait for SFTP channel capacity as the queue drains. A
 # positive finite value opts into a capacity deadline; on a threaded mount,

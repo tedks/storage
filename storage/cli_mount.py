@@ -141,9 +141,10 @@ def shared_filesystems(backends: Dict[str, Backend]) -> List[List[str]]:
     "--max-foreground-operations",
     type=int,
     help=(
-        "Cap concurrent FUSE callbacks at this number (4-128; turns on --fuse-threads). "
+        "Cap admitted FUSE callbacks at this number (4-128; turns on --fuse-threads). "
         "Two read/write, one metadata and one other slot are reserved; the rest are "
-        "shared. Does not cap libfuse's native threads (default off: no cap)."
+        "shared. init, destroy, release, releasedir and flush are not admitted; "
+        "libfuse's native threads are not capped (default off: no cap)."
     ),
 )
 @click.option(

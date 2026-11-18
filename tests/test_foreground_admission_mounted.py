@@ -330,9 +330,12 @@ def test_user_lookalike_is_admitted_like_any_unlink(capped):
 
 
 def test_queued_cleanup_runs_before_destroy_across_unmount(capped):
-    # The unmount ends the session while the cleanup is queued: the exit
-    # probe is ignored for that unlink, it runs once the slot frees, and
-    # libfuse joins it before destroy closes the gate.
+    # Unmount while the cleanup is queued: it runs once the slot frees, and
+    # libfuse joins it before destroy closes the gate. This proves that
+    # ordering only. Whether the session has exited (so the exit probe would
+    # fire) while the cleanup waits is not established here; the unit test
+    # test_queued_hidden_form_unlink_ignores_the_probe_and_runs_once pins
+    # the probe exemption.
     fs, member_dir, mount_dir, thread, record, cap = capped
     gate = fs._foreground_admission
     fd, hidden = _unlinked_while_open(fs, mount_dir)
