@@ -9,14 +9,19 @@ the daemon at all, with or without the cap (ditz lazy-unmount-late-release);
 nothing here claims it. Both loop modes without a cap are the baseline the
 capped threaded mount must match. This is an integration check: it never
 fills the gate, so it would pass with release admitted too; the exemption
-itself is pinned by tests/test_foreground_admission.py, which also covers
-queued cancellation with a stand-in probe (the native probe is #175's,
-exercised by its own mounted tests).
+itself is pinned by tests/test_foreground_admission.py.
+
+The capped tests after it fill the gate: the cleanup of a file unlinked
+while open waits for an ordinary slot, a queued callback survives a real
+session exit and a request interrupt (rename onto an open target, mkdir's
+lookup), and an unmount waits for the queue to drain before destroy.
 """
 
 import os
 import shutil
+import signal
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -332,9 +337,9 @@ def test_user_lookalike_is_admitted_like_any_unlink(capped):
 def test_queued_cleanup_runs_before_destroy_across_unmount(capped):
     # The slot is held from a plain thread, not a syscall on the mount, so
     # nothing pins the mount: the lazy detach ends the session while the
-    # cleanup is queued. The exit probe is then live, the hidden-form
-    # unlink ignores it, runs once the slot frees, and libfuse joins it
-    # before destroy closes the gate.
+    # cleanup is queued. The queued unlink is not cancelled by that exit:
+    # it runs once the slot frees, and libfuse joins it before destroy
+    # closes the gate.
     fs, member_dir, mount_dir, thread, record, cap = capped
     gate = fs._foreground_admission
     fd, hidden = _unlinked_while_open(fs, mount_dir)
@@ -350,7 +355,7 @@ def test_queued_cleanup_runs_before_destroy_across_unmount(capped):
     assert held.wait(WAIT)
     # The kernel's fusectl entry for this connection goes away when the
     # superblock is killed; libfuse's reader then gets ENODEV and exits the
-    # session, which is what the exit probe reports.
+    # session (what #175's native probe would report as "session").
     connections = Path("/sys/fs/fuse/connections")
     assert connections.is_dir(), "fusectl is not mounted; cannot observe the session end"
     connection = connections / str(os.minor(os.stat(mount_dir).st_dev))
@@ -362,7 +367,7 @@ def test_queued_cleanup_runs_before_destroy_across_unmount(capped):
                                 capture_output=True, text=True, timeout=30)
         assert result.returncode == 0, result.stderr
         _wait(lambda: not connection.exists(), "the connection outlived the detach")
-        time.sleep(0.5)    # several probe intervals with the session exited
+        time.sleep(0.5)    # well past the old gate's 0.1 s probe interval, session exited
         assert thread.is_alive() and not fs.destroy_entered.is_set()
         assert gate.waiting_count("ordinary") == 1
         assert _hidden_unlinks(record, hidden) == []
@@ -375,6 +380,132 @@ def test_queued_cleanup_runs_before_destroy_across_unmount(capped):
     assert _hidden_unlinks(record, hidden) == [(hidden, False)]
     assert not _hidden_in(fs.cache_manager.cache_root)
     assert gate._closed and gate.active_count == 0
+
+
+# A child that makes one raw syscall (no PEP 475 retry on EINTR), after
+# installing a SIGUSR1 handler so the signal interrupts its FUSE request
+# (the kernel sends FUSE_INTERRUPT) without killing it. Prints the errno.
+_RAW_SYSCALL = """
+import ctypes, signal, sys
+signal.signal(signal.SIGUSR1, lambda *a: None)
+libc = ctypes.CDLL(None, use_errno=True)
+args = [a.encode() for a in sys.argv[2:]]
+print("ready", flush=True)
+if sys.argv[1] == "rename":
+    rc = libc.rename(*args)
+else:
+    rc = libc.mkdir(args[0], 0o755)
+print(0 if rc == 0 else ctypes.get_errno(), flush=True)
+"""
+
+
+def _raw_syscall(*argv):
+    child = subprocess.Popen([sys.executable, "-c", _RAW_SYSCALL, *map(str, argv)],
+                             stdout=subprocess.PIPE, text=True)
+    assert child.stdout.readline().strip() == "ready"
+    return child
+
+
+def _raw_result(child):
+    out, _ = child.communicate(timeout=WAIT)
+    return int(out.strip())
+
+
+def _assert_still_waiting(child, mount_dir):
+    if child.poll() is not None:
+        pytest.fail(f"the request ended while its callback waited: errno "
+                    f"{_raw_result(child)}, names {sorted(os.listdir(mount_dir))}")
+
+
+class _SlotTakenAfter:
+    """Wrap fs.<name>: after a matching call, take one slot of kind.
+
+    The holder queues while the matching callback still holds its own
+    slot, so it is ahead (FIFO) of the request's next callback, which then
+    waits behind it: a deterministic barrier between two callbacks of one
+    libfuse request.
+    """
+
+    def __init__(self, fs, name, matches, kind):
+        self.gate, self.kind = fs._foreground_admission, kind
+        self.held, self.go = threading.Event(), threading.Event()
+        self.thread = threading.Thread(target=self._hold, daemon=True)
+        real = getattr(fs, name)
+
+        def wrapper(*args):
+            result = real(*args)
+            if matches(*args) and not self.thread.is_alive():
+                self.thread.start()
+                _wait(lambda: self.gate.waiting_count(kind) >= 1 or self.held.is_set(),
+                      "the holder never queued")
+            return result
+
+        setattr(fs, name, wrapper)
+
+    def _hold(self):
+        with self.gate.admit(self.kind):
+            self.held.set()
+            self.go.wait(WAIT)
+
+    def wait_until_next_callback_queues(self):
+        _wait(self.held.is_set, "the holder never entered")
+        _wait(lambda: self.gate.waiting_count(self.kind) >= 1,
+              "the request's next callback never queued")
+
+    def release(self):
+        self.go.set()
+        self.thread.join(WAIT)
+
+
+def test_rename_onto_open_target_completes_after_an_interrupt_in_the_wait(capped):
+    # libfuse renames an open target to a hidden name, then makes the main
+    # rename as a second callback. Interrupting the request while that
+    # second callback waits for a slot must not cancel it: the hide has
+    # already happened, and cancelling would leave the target name gone and
+    # the source unmoved.
+    fs, member_dir, mount_dir, thread, record, cap = capped
+    (mount_dir / "source.txt").write_bytes(b"source bytes")
+    (mount_dir / "target.txt").write_bytes(b"target bytes")
+    fd = os.open(mount_dir / "target.txt", os.O_RDONLY)
+    barrier = _SlotTakenAfter(
+        fs, "rename", lambda old, new: Path(new).name.startswith(HIDDEN_PREFIX), "ordinary")
+    child = _raw_syscall("rename", mount_dir / "source.txt", mount_dir / "target.txt")
+    try:
+        barrier.wait_until_next_callback_queues()
+        child.send_signal(signal.SIGUSR1)
+        time.sleep(0.5)    # well past the old gate's 0.1 s probe interval
+        _assert_still_waiting(child, mount_dir)
+        barrier.release()
+        assert _raw_result(child) == 0
+        names = sorted(os.listdir(mount_dir))
+        assert "source.txt" not in names and "target.txt" in names
+        assert (mount_dir / "target.txt").read_bytes() == b"source bytes"
+        assert os.pread(fd, 64, 0) == b"target bytes"    # the open handle keeps the old file
+        assert len(_hidden_in(mount_dir)) == 1
+    finally:
+        barrier.release()
+        os.close(fd)
+    _wait(lambda: not _hidden_in(mount_dir) and not _hidden_in(fs.cache_manager.cache_root),
+          "the hidden target was never removed")
+    assert (fs.cache_manager.cache_root / "target.txt").read_bytes() == b"source bytes"
+
+
+def test_mkdir_succeeds_when_its_lookup_waits_through_an_interrupt(capped):
+    # libfuse looks up a new directory (getattr, metadata) after mkdir
+    # succeeds. Interrupting the request while that lookup waits must not
+    # turn the completed mkdir into EINTR.
+    fs, member_dir, mount_dir, thread, record, cap = capped
+    barrier = _SlotTakenAfter(fs, "mkdir", lambda path, mode: path == "/made", "metadata")
+    child = _raw_syscall("mkdir", mount_dir / "made")
+    try:
+        barrier.wait_until_next_callback_queues()
+        child.send_signal(signal.SIGUSR1)
+        time.sleep(0.5)
+        _assert_still_waiting(child, mount_dir)
+    finally:
+        barrier.release()
+    assert _raw_result(child) == 0
+    assert (mount_dir / "made").is_dir()
 
 
 if __name__ == "__main__":
