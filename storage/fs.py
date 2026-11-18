@@ -182,7 +182,9 @@ class StorageFS(Operations):
         if op == "read" and len(args) >= 4:
             # A read on a streaming descriptor may wait on member range
             # fetches; it is ordinary, so it cannot hold the demand reserve
-            # that reads of cached bytes rely on.
+            # that reads of cached bytes rely on. _fd_lock is held only over
+            # the descriptor table and local cache-file calls, never member
+            # I/O, so this lookup before admission stays short.
             with self._fd_lock:
                 entry = self._fd_map.get(args[3])
             if entry is not None and entry.prefetch_session is not None:

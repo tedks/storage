@@ -14,7 +14,8 @@ still occupy a native libfuse thread: libfuse 2's multithreaded loop has no
 thread cap, so this does not bound process threads. Work outside FUSE
 callbacks (sync workers, streaming prefetch, watchers) is not counted, and
 neither is StorageFS's classification step before admission (for an open,
-one local lstat of the cache path: no member call, no lock).
+one local lstat of the cache path; for a read, one descriptor-table lookup
+under the fd lock; never a member call).
 
 A callback takes its slot before it runs and therefore before it holds any
 lock, and it never waits for a second slot, so the gate adds no lock-order
