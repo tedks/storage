@@ -32,3 +32,12 @@ log_events:
     from lookups/mutations through the mount and from sync, replication, rebuild-index,
     reprobe and conflict scans. Whether Ted wants this inside the cold-partial slice
     is a ruling for the CTO.'
+- time: 2026-11-18T05:05:57-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'CTO accepted deferral from PR178. Ship the best-effort cold-listing contract
+    for observable member results: log observed errors, retain the distinction between
+    failed and successful empty observations. A readable empty directory beneath a
+    missing member mount can appear as success-empty. Document that limit. Member
+    identity verification, provisioning, and any marker rollout require separate design;
+    the listing spec makes no failed-disk detection guarantee.'
