@@ -1,6 +1,8 @@
 # splinter1 browse latency and missing-entry field report (2026-11-12)
 
-Lane: field-browse (STORAGE-SPLINTER1-BROWSE-20261112). Base 81793ac.
+Lane: field-browse (STORAGE-SPLINTER1-BROWSE-20261112). Measured build
+and source references: 81793ac. See Status after the run for what has
+changed since.
 Corrected at root review of 93ed39f (one feedback round); see Corrections.
 Aggregated and anonymized: directories are labelled by subtree and
 selection order; no file names or private paths. Raw per-name evidence
@@ -30,10 +32,11 @@ and the historical probe scripts are kept private with a sha256 manifest.
    connections to one host). Each has 4 SFTP channels and 2 exec
    channels; one listing executor thread runs per member.
    - **Configured:** 81793ac keeps 1 SFTP channel per member reserved for
-     interactive requests (`ssh_pool.MemberConnection`,
+     interactive requests (`storage/backends/ssh_pool.py`,
+     `MemberConnection`,
      `interactive_reserve=1`).
    - **Effective, for ordinary foreground readdir: not interactive.**
-     - `StorageFS.__call__` (`storage/fs.py:126-130`) sets the interactive
+     - `StorageFS.__call__` (`storage/fs.py:126-129`) sets the interactive
        context only around the call that returns `StorageFS.readdir`'s
        generator (`storage/fs.py:2076-2079`).
      - The listing runs when fusepy iterates that generator, after the
@@ -45,7 +48,7 @@ and the historical probe scripts are kept private with a sha256 manifest.
        and does not use the reserve.
    - **Cold whole-file copies:** they keep the interactive class of the
      FUSE request that starts them, so they can hold interactive leases.
-   - Unaccepted #175 fixes both: it evaluates readdir eagerly inside the
+   - #175, unaccepted at the time of the run, fixes both: it evaluates readdir eagerly inside the
      request, and it classifies cold full-file copies as bulk.
    - Whether either effect contributed to the field timings is
      unverified.
@@ -273,6 +276,23 @@ Tracked: ditz `field-gio-content-sniff-per-entry`,
 - GIO, GVFS and SFTP implementation claims are qualified as unverified.
 - The runnable helpers were removed and are preserved privately with
   hashes; their bound defects did not affect this data set.
+
+## Status after the run (added 2026-11-17)
+
+The observations above are unchanged; this section records only what
+moved afterwards. Nothing was re-measured on splinter1.
+
+- #175 merged on 2026-11-15 as 5f3dbb3. On master, `StorageFS.readdir`
+  returns the namespace's concrete list inside the FUSE request, so a
+  foreground listing keeps the interactive class. Cold whole-file copies
+  are classified bulk when `fuse_threads` is on, which the splinter1
+  profile sets.
+- Whether splinter1 runs a build containing #175 was not checked by this
+  report, and its effect on the field timings is unmeasured.
+- #171 (foreground request admission and sync-worker growth) is still
+  open.
+- This branch was rebased onto 5f3dbb3; the report's source line
+  references still point at 81793ac.
 
 ## Limits
 
