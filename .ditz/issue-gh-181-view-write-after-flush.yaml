@@ -1,0 +1,17 @@
+id: gh-181-view-write-after-flush
+title: Conflict-view write stranded when a member repair is recorded between flush
+  and release
+desc: ""
+type: task
+component: storage
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-18T06:33:49-00:00
+references: []
+log_events:
+- time: 2026-11-18T06:33:49-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
