@@ -17,9 +17,10 @@ neither is StorageFS's classification step before admission (for an open,
 one local lstat of the cache path; for a read, one descriptor-table lookup
 under the fd lock; never a member call).
 
-A callback takes its slot before it runs and therefore before it holds any
-lock, and it never waits for a second slot, so the gate adds no lock-order
-edge: a slot holder can wait on a path lock, never the reverse.
+A callback waits for its slot before it runs, holding no lock while it
+waits (classification's brief fd-lock lookup is released first), and it
+never waits for a second slot, so the gate adds no lock-order edge: a slot
+holder can wait on a path lock, never the reverse.
 """
 
 import threading
@@ -115,8 +116,9 @@ class ForegroundAdmission:
         entered = False
         try:
             while True:
-                # Outside the gate's lock: a slow probe delays only its own
-                # waiter, never another waiter, a slot release or close().
+                # Outside the gate's lock: a slow probe delays its own waiter
+                # and, by FIFO, the later waiters of its class; never another
+                # class, a slot release or close().
                 reason = cancel_probe() if cancel_probe is not None else None
                 if reason:
                     raise AdmissionClosed(f"{reason} ended while waiting for admission")

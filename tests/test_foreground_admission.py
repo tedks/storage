@@ -669,7 +669,11 @@ class TestQueuedCancellation(CappedFSBase):
         self.assertTrue(probing.wait(WAIT))
         # The gate's lock is free while the probe runs: other classes enter
         # and leave, the holder releases, and close() returns.
-        self.assertEqual(None, Worker(self._admit_once, gate, "demand").finish_started())
+        demand = Worker(self._admit_once, gate, "demand")
+        demand.start()
+        demand.join(BLOCKED * 3)     # well inside the probe's WAIT
+        self.assertFalse(demand.is_alive(), "another class waited on the probe")
+        self.assertIsNone(demand.finish())
         holder.finish()
         Worker(gate.close).finish_started()
         unblock.set()
