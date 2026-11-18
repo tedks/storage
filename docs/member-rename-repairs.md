@@ -217,6 +217,24 @@ mistyped id names no carrier and is an error. Resolving the same id twice is
 an error the second time and changes nothing. No id taken from a rebuilt
 index can name a different repair.
 
+## Limits
+
+- **A conflict-view write racing a new repair.** A write through a
+  conflict view is sent to its member when the file is released, after
+  `close()` has returned. A view opened for writing after a repair is
+  recorded is refused when opened. A view already open when the repair is
+  recorded makes `close()` fail with `EBUSY`, through `flush`. The one
+  case left is a repair recorded between that flush and the release.
+  `close()` has then already succeeded, and FUSE has no later error
+  channel. The release still sends nothing to the member, so the
+  member's object stays protected. The write stays only in the view's
+  cache copy, with an error logged, and it is not queued for delivery
+  after the repair is resolved. A failed direct sync to a member that is
+  down is handled the same way. Closing this window would need a
+  durable pending-write queue for conflict views, or a different upload
+  point for every conflict-view write. Both are outside this change:
+  ditz `gh-181-view-write-after-flush`.
+
 ## Validation
 
 All of these run on scratch Local members. The system cases are in

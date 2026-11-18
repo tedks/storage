@@ -2664,12 +2664,17 @@ class StorageFS(Operations):
                 ):
                     # A write through a conflict view would replace that
                     # member's object, which an open repair protects. Open
-                    # and create refuse it; this covers a repair recorded
-                    # while the view was open.
-                    self.logger.error(
-                        "direct sync of %s to %s refused: it has an open member repair",
-                        entry.canonical_path, entry.backend_name,
-                    )
+                    # and create refuse it and flush reports it to close();
+                    # this covers a repair recorded after that flush. The
+                    # bytes stay in the view's cache file and are not queued
+                    # (docs/member-rename-repairs.md, Limits). A read-only
+                    # view wrote nothing, so it is skipped quietly.
+                    if (entry.flags & os.O_ACCMODE) != os.O_RDONLY:
+                        self.logger.error(
+                            "direct sync of %s to %s refused: it has an open member repair; "
+                            "the write stays only in the conflict view's cache copy",
+                            entry.canonical_path, entry.backend_name,
+                        )
                     backend = None
                 if backend:
                     try:
