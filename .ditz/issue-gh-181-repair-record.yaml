@@ -103,5 +103,16 @@ log_events:
     path truncate still opens it for mutation. Missing version-2 sidecar data currently
     makes carrier_path report metadata JSON as the recovery bytes. Cover ordering,
     alias survival and explicit missing-payload reporting on the final reviewed head.
+- time: 2026-11-18T07:32:52-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Review at fddd4f1: resolve/re-fence registration, missing recovery payload
+    display and truncate alias guard are implemented. Two open-time hazards remain:
+    check the live recovery payload and the alias refer to the same inode before unlinking;
+    stored dev/ino can be reused when the payload is missing. The sweep must distinguish
+    the correct conflict view from ordinary or differently resolved member-suffixed
+    files, preserve ambiguous names, and stay within the cache through changes in
+    ancestor type. Requested synthetic reopen coverage. PUBLISH_WAIT is per attempt,
+    not a queue latency guarantee.'
 blocks:
 - gh-181
