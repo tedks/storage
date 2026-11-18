@@ -18,8 +18,8 @@ type: task
 component: open-questions
 release:
 reporter: Ted Smith <tedks@riseup.net>
-status: unstarted
-disposition:
+status: closed
+disposition: fixed
 creation_time: 2026-11-11T20:58:23-00:00
 references: []
 log_events:
@@ -27,3 +27,9 @@ log_events:
   who: Ted Smith
   what: created
   comment: ""
+- time: 2026-11-18T04:39:29-00:00
+  who: Ted Smith
+  what: 'closed: fixed'
+  comment: Ted ruling on Storage resumption, 2026-11-17. Document the prototype cap-three
+    single-demand-slot limitation. Supporting responsive production use at that minimum
+    requires two demand slots and a tested competing-read case.
