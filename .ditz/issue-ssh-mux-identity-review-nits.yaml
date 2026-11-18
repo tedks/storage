@@ -1,0 +1,32 @@
+id: ssh-mux-identity-review-nits
+title: 'ssh_mux identity: PR176 review nits (post-mkdtemp test, warning wording, lstat
+  fake scope)'
+desc: 'Deferred nits from PR #176 review (council round 35c0eb266c58-20261118T054306Z-499973
+  Anthropic seat; independent lead review at 35c0eb2). Deferred to keep the reviewed
+  defensive diff minimal; none affects correctness.
+
+  1. storage/backends/ssh_mux.py `_ensure_dir_locked`: the new "non-directory right
+  after mkdtemp" branch (identity[2] != S_IFDIR) has no test. Add one that fakes lstat
+  to return S_IFLNK for the freshly made directory and asserts the next base is used
+  / sharing is off.
+
+  2. ssh_mux.py warning "ssh socket directory %s disappeared; making a new one" also
+  fires on replacement; reword to "disappeared or was replaced".
+
+  3. tests/test_ssh_mux.py test_a_replaced_socket_directory_is_not_trusted: the fake
+  patches the global os.lstat and calls Path(path), which would raise on an int fd
+  or bytes path; guard with isinstance(path, (str, os.PathLike)) or patch ssh_mux._identity''s
+  lstat more narrowly.'
+type: task
+component: ssh
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-18T05:45:10-00:00
+references: []
+log_events:
+- time: 2026-11-18T05:45:10-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
