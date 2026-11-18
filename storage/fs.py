@@ -139,15 +139,16 @@ class StorageFS(Operations):
     # admitted open made: they must run exactly once even after the gate
     # closes (a member-copy close uploads, a canonical close queues its
     # sync), so they are neither queued nor cancelled, and not counted.
-    # flush is fusepy's no-op (StorageFS does not override it; a test pins
-    # that), so close(2), which sends it synchronously, never waits for a
-    # slot. An override that does work must move flush to _DEMAND_OPS.
-    _ADMISSION_EXEMPT = frozenset({"init", "destroy", "release", "releasedir", "flush"})
+    # flush does work (StorageFS.flush reports a conflict-view write that a
+    # member repair now refuses), so it is admitted as demand, like fsync
+    # (CTO STORAGE-QUEUE-0645): close(2), which sends it synchronously, can
+    # wait for a demand slot. release still never waits.
+    _ADMISSION_EXEMPT = frozenset({"init", "destroy", "release", "releasedir"})
     _METADATA_OPS = frozenset({
         "getattr", "opendir", "readdir", "access", "readlink",
         "getxattr", "listxattr", "statfs",
     })
-    _DEMAND_OPS = frozenset({"read", "write", "fsync"})
+    _DEMAND_OPS = frozenset({"read", "write", "fsync", "flush"})
     # Without hard_remove, libfuse 2 renames a file unlinked while open to
     # .fuse_hidden<16 hex> and, at its last close, unlinks that name from
     # inside the RELEASE request (fuse_do_release). Every unlink, that one
@@ -2665,16 +2666,24 @@ class StorageFS(Operations):
                     # A write through a conflict view would replace that
                     # member's object, which an open repair protects. Open
                     # and create refuse it and flush reports it to close();
-                    # this covers a repair recorded after that flush. The
-                    # bytes stay in the view's cache file and are not queued
-                    # (docs/member-rename-repairs.md, Limits). A read-only
-                    # view wrote nothing, so it is skipped quietly.
+                    # this covers a repair recorded after that flush, when
+                    # close() has already succeeded: the view's bytes are
+                    # kept durably as a repair of their own, listed until
+                    # resolved (MemberRepairs.preserve_view_write). A
+                    # read-only view wrote nothing, so nothing is kept.
                     if (entry.flags & os.O_ACCMODE) != os.O_RDONLY:
-                        self.logger.error(
-                            "direct sync of %s to %s refused: it has an open member repair; "
-                            "the write stays only in the conflict view's cache copy",
-                            entry.canonical_path, entry.backend_name,
-                        )
+                        try:
+                            self.cache_manager.member_repairs.preserve_view_write(
+                                entry.canonical_path, entry.backend_name, entry.cache_path,
+                                "write through a conflict view after close(), kept off "
+                                "the member by an open repair",
+                            )
+                        except Exception as exc:  # noqa: BLE001 - release cannot fail usefully
+                            self.logger.error(
+                                "direct sync of %s to %s refused by an open member repair, "
+                                "and its bytes could not be kept: %s; they remain only in %s",
+                                entry.canonical_path, entry.backend_name, exc, entry.cache_path,
+                            )
                     backend = None
                 if backend:
                     try:
@@ -2709,9 +2718,11 @@ class StorageFS(Operations):
         Open and create refuse a write through a conflict view to a member
         with an open repair (_refuse_fenced_view_write); a repair recorded
         after the open is caught here, so the writer's close() fails with
-        EBUSY instead of succeeding while release skips the copy. Only a
-        repair recorded between this flush and the release is left to the
-        release check, which logs it.
+        EBUSY instead of succeeding while release skips the copy. A repair
+        recorded between this flush and the release is left to release,
+        which keeps the bytes durably as a view-write repair, since close()
+        has then already succeeded. Admitted as demand under the cap
+        (_DEMAND_OPS).
         """
         with self._fd_lock:
             entry = self._fd_map.get(fh)

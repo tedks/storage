@@ -13,6 +13,7 @@ record id, holding the record in its user.storage.member_repair xattr. See
 docs/member-rename-repairs.md for the format and the crash ordering.
 """
 
+import dataclasses
 import errno
 import fcntl
 import json
@@ -40,6 +41,13 @@ OPEN = "open"
 # Written durably by a resolution just before its carrier is unlinked; still
 # enforced while the carrier exists (see MemberRepairs.resolve).
 RESOLVED = "resolved"
+# What a record is for. A RENAME record is a missed or interrupted rename.
+# A VIEW_WRITE record holds, as its carrier file's bytes, a write through a
+# conflict view that a repair kept off its member after close() had already
+# succeeded (StorageFS._release): old and new are both the canonical path.
+RENAME = "rename"
+VIEW_WRITE = "view-write"
+_COPY_ATTEMPTS = 3
 # Past this many open repairs, opening the cache warns: every fence and pin
 # lookup scans them all.
 GROWTH_WARNING = 1000
@@ -68,9 +76,16 @@ class MemberRepair:
     state: str
     reason: str
     recorded: float
+    kind: str = RENAME
+    # For a VIEW_WRITE: the view file's identity when its bytes were
+    # copied (device, inode, size, mtime_ns), so a second release of the
+    # same bytes (another descriptor of the view) records nothing new.
+    source: str = ""
 
     def to_json(self) -> bytes:
         return json.dumps({
+            "kind": self.kind,
+            "source": self.source,
             "v": RECORD_VERSION,
             "id": self.id,
             "old": self.old_path,
@@ -96,9 +111,15 @@ class MemberRepair:
                 state=data["state"],
                 reason=data["reason"],
                 recorded=float(data["recorded"]),
+                kind=data.get("kind", RENAME),
+                source=data.get("source", ""),
             )
             valid = (
                 data["v"] == RECORD_VERSION
+                and record.kind in (RENAME, VIEW_WRITE)
+                and isinstance(record.source, str)
+                and (record.kind == RENAME
+                     or (record.old_path == record.new_path and len(record.members) == 1))
                 and record.id == carrier_name
                 and record.state in (INTENT, OPEN, RESOLVED)
                 and record.members
@@ -139,6 +160,24 @@ def _fsync(path: Path, directory: bool = False):
 
 
 FLOCK_WAIT = 5.0
+
+
+def _copy_into(source: Path, fd: int):
+    """Copy source's bytes into the empty file open at fd."""
+    with open(source, "rb") as src:
+        while True:
+            chunk = src.read(1 << 20)
+            if not chunk:
+                return
+            view = memoryview(chunk)
+            while view:
+                view = view[os.write(fd, view):]
+
+
+def file_identity(path: Path) -> str:
+    """device:inode:size:mtime_ns of path: changes with any write to it."""
+    st = os.stat(path)
+    return f"{st.st_dev}:{st.st_ino}:{st.st_size}:{st.st_mtime_ns}"
 
 
 def _flock_bounded(fd: int, wait: Optional[float] = None):
@@ -312,10 +351,14 @@ class MemberRepairs:
             _fsync(self.dir.parent, directory=True)
             self._dir_durable = True
 
-    def _write_new(self, record: MemberRepair, hold: bool = False) -> Optional[int]:
+    def _write_new(self, record: MemberRepair, hold: bool = False,
+                   content: Optional[Path] = None) -> Optional[int]:
         """Create a carrier durably. With hold, return its descriptor with
         an exclusive flock taken before the carrier had its final name, so
-        no resolve can ever act on it until the caller closes it."""
+        no resolve can ever act on it until the caller closes it. With
+        content, the carrier's bytes are a copy of that file, made durable
+        with the record (one fsync covers both) before the carrier is
+        named."""
         payload = record.to_json()
         if len(payload) > MAX_RECORD_BYTES:
             raise OSError(errno.ENAMETOOLONG,
@@ -328,6 +371,8 @@ class MemberRepairs:
             try:
                 if hold:
                     fcntl.flock(fd, fcntl.LOCK_EX)
+                if content is not None:
+                    _copy_into(content, fd)
                 os.setxattr(fd, RECORD_XATTR, payload)
                 os.fsync(fd)
             except BaseException:
@@ -415,6 +460,55 @@ class MemberRepairs:
             ", ".join(record.members), old_path, new_path, record.id, record.reason,
         )
         return record.id
+
+    def preserve_view_write(self, canonical_path: str, member: str, view_path: Path,
+                            reason: str) -> Optional[str]:
+        """Durably keep a conflict view's bytes that a repair kept off member.
+
+        Called at release for a write that close() already reported as
+        done. The carrier holds an exact copy of view_path's bytes, so they
+        outlive the view's cache file (eviction, a refetch, an index
+        rebuild) and are listed until resolved; the member is not touched.
+        A copy whose source changed while it was made (another descriptor
+        still writing) is made again, up to a bound. The same bytes are
+        recorded once: a release of another descriptor of the view, or a
+        retry, finds the record by the view file's identity and returns its
+        id. Returns the record id, or None when view_path is gone. Raises
+        OSError when the copy cannot be made durable.
+        """
+        with self._write_lock:
+            for _attempt in range(_COPY_ATTEMPTS):
+                try:
+                    before = file_identity(view_path)
+                except FileNotFoundError:
+                    return None
+                for existing in self._refresh().values():
+                    if (existing.kind == VIEW_WRITE and existing.new_path == canonical_path
+                            and existing.members == (member,) and existing.source == before):
+                        return existing.id
+                record = dataclasses.replace(
+                    self._make(canonical_path, canonical_path, [member], OPEN, reason),
+                    kind=VIEW_WRITE, source=before,
+                )
+                self._write_new(record, content=view_path)
+                if file_identity(view_path) == before:
+                    self._after_write(lambda records: records.__setitem__(record.id, record))
+                    logger.error(
+                        "A write through the conflict view of %s on %s was kept off that "
+                        "member by an open repair; its bytes are kept in %s, repair %s "
+                        "(storage debug member-repairs)",
+                        canonical_path, member, self.dir / record.id, record.id,
+                    )
+                    return record.id
+                # Torn: drop this copy and make another of the new bytes.
+                (self.dir / record.id).unlink()
+                _fsync(self.dir, directory=True)
+            raise OSError(errno.EAGAIN,
+                          f"conflict view of {canonical_path} kept changing while it was copied")
+
+    def carrier_path(self, repair_id: str) -> Path:
+        """Where a record lives; a VIEW_WRITE record's bytes are its data."""
+        return self.dir / repair_id
 
     def settle(self, repair_id: str, old_path: str, new_path: str, missed: Dict[str, str]):
         """Settle an intent once every member call has returned.
@@ -514,11 +608,7 @@ class MemberRepairs:
                     found = False
                 else:
                     current = MemberRepair.from_json(os.getxattr(fd, RECORD_XATTR), repair_id)
-                    resolved = MemberRepair(
-                        id=current.id, old_path=current.old_path, new_path=current.new_path,
-                        members=current.members, state=RESOLVED, reason=current.reason,
-                        recorded=current.recorded,
-                    )
+                    resolved = dataclasses.replace(current, state=RESOLVED)
                     os.setxattr(fd, RECORD_XATTR, resolved.to_json(), os.XATTR_REPLACE)
                     os.fsync(fd)
                     try:

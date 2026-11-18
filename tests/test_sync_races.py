@@ -20,7 +20,7 @@ from storage.fs import StorageFS
 import storage.namespace as storage_namespace
 from storage.models import SyncStatus
 from storage.index_audit import rebuild_index_from_cache
-from storage.member_repairs import CorruptRepairRecord, MemberRepairs
+from storage.member_repairs import VIEW_WRITE, CorruptRepairRecord, MemberRepairs
 from storage.state import StateManager
 from storage.sync_executor import SyncExecutor
 from storage.sync_tasks import DirOperation, DirSyncTask
@@ -842,6 +842,95 @@ class TestRepairsOutliveTheIndex(SyncRaceTestBase):
             cache_root=self.cache_dir, state_db=db, backends={"member": self.member},
             cache_size=10 * 1024 * 1024, num_sync_workers=1, start_sync=False,
         )
+
+    def open_edited_view(self):
+        """/d/f.txt is synced, and its conflict view /d/f.txt.member is
+        open for writing with edited bytes, flushed while no repair exists:
+        close() would report success from here on."""
+        self.fs.mkdir("/d", 0o755)
+        self.write_file("/d/f.txt", b"sole bytes")
+        self.start_sync()
+        self.wait_synced("/d/f.txt")
+        self.wait_idle()
+        self.fs.sync_manager.stop()
+        view = self.fs.cache_manager.get_cache_path("/d/f.txt.member")
+        view.write_bytes(b"sole bytes")
+        fh = self.fs.open("/d/f.txt.member", os.O_RDWR)
+        self.fs.write("/d/f.txt.member", b"EDITED", 0, fh)
+        self.assertEqual(0, self.fs.flush("/d/f.txt.member", fh))
+        self.assertEqual(0, self.fs.flush("/d/f.txt.member", fh))  # a dup'd close
+        return view, fh
+
+    def view_writes(self, cache_dir=None):
+        """(member, path, bytes) per open view-write repair, from disk."""
+        repairs = MemberRepairs(cache_dir or self.cache_dir)
+        return sorted(
+            (r.members, r.new_path, repairs.carrier_path(r.id).read_bytes())
+            for r in repairs.list() if r.kind == VIEW_WRITE
+        )
+
+    def test_a_view_write_kept_off_its_member_after_close_is_kept_durably(self):
+        """Barrier: the flush has succeeded, then a missed rename records a
+        repair, then the view is released. The member keeps its object,
+        and the exact edited bytes are kept as a repair that survives
+        eviction of the view, a fresh index and a rebuilt one, and is
+        listed (CTO RRS-CTO-FLUSH-RELEASE). The descriptor followed the
+        rename, so the record names /e/f.txt."""
+        view, fh = self.open_edited_view()
+        self.fail_member_once("rename")
+        self.fs.rename("/d", "/e")
+        copies = []
+        real_copy = self.member.copy_from_local
+        patcher = patch.object(self.member, "copy_from_local",
+                               side_effect=lambda *a: (copies.append(a), real_copy(*a)))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.fs.release("/d/f.txt.member", fh)
+
+        self.assertEqual([], copies)
+        self.assertEqual(b"sole bytes", (self.member_dir / "d" / "f.txt").read_bytes())
+        expected = [(("member",), "/e/f.txt", b"EDITEDytes")]
+        self.assertEqual(expected, self.view_writes())
+        # The open view followed the rename, so its write is recorded at
+        # the name it then had; its cache copy is derived state: evicted.
+        view = self.fs.cache_manager.get_cache_path("/e/f.txt.member")
+        view.unlink()
+        self.reopen()
+        self.assertEqual(expected, self.view_writes())
+        self.reopen(rebuild=True)
+        self.assertEqual(expected, self.view_writes())
+        self.assertEqual(b"sole bytes", (self.member_dir / "d" / "f.txt").read_bytes())
+        self.assertIn("member", self.fs.cache_manager.member_repairs.backends_for(["/e/f.txt"]))
+
+    def test_concurrent_releases_of_one_view_keep_its_bytes_once(self):
+        """Two descriptors of the same edited view, released at once after
+        the repair appeared: one record, not two."""
+        view, fh = self.open_edited_view()
+        fh2 = self.fs.open("/d/f.txt.member", os.O_WRONLY)
+        self.fail_member_once("rename")
+        self.fs.rename("/d", "/e")
+        workers = [Worker(self.fs.release, "/d/f.txt.member", h) for h in (fh, fh2)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.finish()
+        self.assertEqual([(("member",), "/e/f.txt", b"EDITEDytes")], self.view_writes())
+        self.assertEqual(b"sole bytes", (self.member_dir / "d" / "f.txt").read_bytes())
+
+    def test_a_view_write_that_cannot_be_kept_leaves_no_partial_record(self):
+        """An injected failure while copying the bytes leaves no carrier
+        (nothing half-written is listed later) and the member untouched."""
+        view, fh = self.open_edited_view()
+        self.fail_member_once("rename")
+        self.fs.rename("/d", "/e")
+        with patch("storage.member_repairs._copy_into",
+                   side_effect=OSError(errno.ENOSPC, "injected")):
+            self.fs.release("/d/f.txt.member", fh)
+        self.assertEqual([], self.view_writes())
+        self.assertEqual([("member", "/d", "/e")], self.repairs())
+        self.assertEqual(b"EDITEDytes",
+                         self.fs.cache_manager.get_cache_path("/e/f.txt.member").read_bytes())
+        self.assertEqual(b"sole bytes", (self.member_dir / "d" / "f.txt").read_bytes())
 
     def offline_rename_of_an_uncached_directory(self):
         """/d/f.txt's only bytes are on the member, the file is not cached,

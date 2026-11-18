@@ -11,7 +11,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import storage.member_repairs as member_repairs_module
 from storage.member_repairs import (
+    VIEW_WRITE,
     CARRIER_DIR,
     MAX_RECORD_BYTES,
     RECORD_XATTR,
@@ -96,6 +98,11 @@ class TestRecords(MemberRepairsTestBase):
             json.dumps({**good, "state": "done"}).encode(),
             json.dumps({**good, "members": []}).encode(),
             json.dumps({**good, "members": "m"}).encode(),
+            json.dumps({**good, "kind": "other"}).encode(),
+            json.dumps({**good, "kind": "view-write"}).encode(),   # old != new
+            json.dumps({**good, "kind": "view-write", "new": "/a",
+                        "members": ["m", "n"]}).encode(),
+            json.dumps({**good, "source": 3}).encode(),
             json.dumps({**good, "members": {"m": 1}}).encode(),
             json.dumps({**good, "old": "relative"}).encode(),
             json.dumps({k: v for k, v in good.items() if k != "new"}).encode(),
@@ -222,6 +229,50 @@ class TestRecords(MemberRepairsTestBase):
             os.close(fd)
         MemberRepairs(self.cache, sweep_new=True)
         self.assertFalse(carrier.exists())
+
+    def test_a_view_write_keeps_exact_bytes_once_per_identity(self):
+        view = self.cache / "view"
+        view.write_bytes(b"edited")
+        repairs = MemberRepairs(self.cache)
+        first = repairs.preserve_view_write("/f", "m", view, "r")
+        self.assertEqual(first, repairs.preserve_view_write("/f", "m", view, "r"))
+        self.assertEqual(b"edited", repairs.carrier_path(first).read_bytes())
+        os.utime(view, ns=(1, 1))
+        view.write_bytes(b"edited again")
+        second = repairs.preserve_view_write("/f", "m", view, "r")
+        self.assertNotEqual(first, second)
+        reopened = MemberRepairs(self.cache)
+        kept = sorted((r.kind, r.new_path, r.old_path, r.members,
+                       reopened.carrier_path(r.id).read_bytes()) for r in reopened.list())
+        self.assertEqual([(VIEW_WRITE, "/f", "/f", ("m",), b"edited"),
+                          (VIEW_WRITE, "/f", "/f", ("m",), b"edited again")], kept)
+        self.assertEqual({"m"}, reopened.backends_for(["/f"]))
+        self.assertTrue(reopened.resolve(first))
+        self.assertFalse(reopened.carrier_path(first).exists())
+        self.assertEqual([second], [r.id for r in MemberRepairs(self.cache).list()])
+
+    def test_a_view_write_copied_while_it_changes_is_copied_again(self):
+        view = self.cache / "view"
+        view.write_bytes(b"v1")
+        repairs = MemberRepairs(self.cache)
+        real = member_repairs_module._copy_into
+        calls = []
+
+        def copy_then_change(source, fd):
+            real(source, fd)
+            calls.append(1)
+            if len(calls) == 1:
+                view.write_bytes(b"v2, longer")
+        with patch("storage.member_repairs._copy_into", side_effect=copy_then_change):
+            kept = repairs.preserve_view_write("/f", "m", view, "r")
+        self.assertEqual(2, len(calls))
+        self.assertEqual(b"v2, longer", repairs.carrier_path(kept).read_bytes())
+        self.assertEqual([kept], os.listdir(self.carriers))
+
+    def test_a_missing_view_keeps_nothing(self):
+        repairs = MemberRepairs(self.cache)
+        self.assertIsNone(repairs.preserve_view_write("/f", "m", self.cache / "gone", "r"))
+        self.assertEqual([], repairs.list())
 
     def test_record_with_no_members_records_nothing(self):
         """A record for no member would refuse the next open."""

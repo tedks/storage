@@ -11,7 +11,7 @@ from .index_audit import (
     verify_index_against_cache,
 )
 from .mount_profiles import create_storage_members, resolve_member_configuration
-from .member_repairs import CorruptRepairRecord, MemberRepairs
+from .member_repairs import VIEW_WRITE, CorruptRepairRecord, MemberRepairs
 from .state import StateManager
 
 
@@ -295,6 +295,12 @@ def debug_member_repairs(cache: Path, resolve_id: str | None, json_output: bool)
     cached files under NEW stay cached. A running mount sees a resolution
     at its next lookup. Records are carriers under CACHE/.storage.repairs,
     not index rows, so they survive a fresh or rebuilt index.
+
+    A "view-write" repair holds a write made through a conflict view
+    (NAME.MEMBER) that an open repair kept off that member after close()
+    had already succeeded. Its bytes are the carrier file shown as BYTES:
+    copy them where they belong before resolving it, since resolving
+    deletes them.
     """
     try:
         repairs = MemberRepairs(cache.resolve())
@@ -315,7 +321,10 @@ def debug_member_repairs(cache: Path, resolve_id: str | None, json_output: bool)
         raise click.ClickException(f"Could not read the member repairs in {cache}: {exc}") from exc
 
     if json_output:
-        click.echo(json.dumps([asdict(r) for r in records], sort_keys=True, indent=2))
+        click.echo(json.dumps(
+            [dict(asdict(r), carrier=str(repairs.carrier_path(r.id))) for r in records],
+            sort_keys=True, indent=2,
+        ))
         return
     if resolve_id is not None:
         return
@@ -324,6 +333,13 @@ def debug_member_repairs(cache: Path, resolve_id: str | None, json_output: bool)
         return
     click.echo(f"{len(records)} member repair(s):")
     for record in records:
+        if record.kind == VIEW_WRITE:
+            click.echo(
+                f"  {record.id} [{record.state}] {', '.join(record.members)}: "
+                f"view-write {record.new_path}, BYTES {repairs.carrier_path(record.id)} "
+                f"({record.reason})"
+            )
+            continue
         click.echo(
             f"  {record.id} [{record.state}] {', '.join(record.members)}: "
             f"{record.old_path} -> {record.new_path} ({record.reason})"

@@ -1655,6 +1655,21 @@ class TestMemberRepairsCommand(unittest.TestCase):
         self.assertIn(f"{self.first} [open] remote1: /a -> /b (missed)", result.output)
         self.assertIn(f"{self.second} [open] local0, remote1: /d -> /e (missed too)", result.output)
 
+    def test_lists_a_view_write_with_where_its_bytes_are(self):
+        view = self.temp_dir / "view"
+        view.write_bytes(b"edited")
+        repairs = MemberRepairs(self.cache)
+        kept = repairs.preserve_view_write("/f.txt", "remote1", view, "kept")
+        carrier = repairs.carrier_path(kept)
+        result = self.invoke()
+        self.assertEqual(0, result.exit_code, result.output)
+        self.assertIn(f"{kept} [open] remote1: view-write /f.txt, BYTES {carrier} (kept)",
+                      result.output)
+        payload = {r["id"]: r for r in json.loads(self.invoke("--json-output").output)}
+        self.assertEqual(("view-write", str(carrier)),
+                         (payload[kept]["kind"], payload[kept]["carrier"]))
+        self.assertEqual(b"edited", Path(payload[kept]["carrier"]).read_bytes())
+
     def test_resolve_drops_only_that_repair_and_a_replay_fails(self):
         result = self.invoke("--resolve", self.first)
         self.assertEqual(0, result.exit_code, result.output)

@@ -217,23 +217,48 @@ mistyped id names no carrier and is an error. Resolving the same id twice is
 an error the second time and changes nothing. No id taken from a rebuilt
 index can name a different repair.
 
-## Limits
+## Conflict-view writes that a repair keeps off their member
 
-- **A conflict-view write racing a new repair.** A write through a
-  conflict view is sent to its member when the file is released, after
-  `close()` has returned. A view opened for writing after a repair is
-  recorded is refused when opened. A view already open when the repair is
-  recorded makes `close()` fail with `EBUSY`, through `flush`. The one
-  case left is a repair recorded between that flush and the release.
-  `close()` has then already succeeded, and FUSE has no later error
-  channel. The release still sends nothing to the member, so the
-  member's object stays protected. The write stays only in the view's
-  cache copy, with an error logged, and it is not queued for delivery
-  after the repair is resolved. A failed direct sync to a member that is
-  down is handled the same way. Closing this window would need a
-  durable pending-write queue for conflict views, or a different upload
-  point for every conflict-view write. Both are outside this change:
-  ditz `gh-181-view-write-after-flush`.
+A write through a conflict view (`NAME.MEMBER`) is sent to that member
+when the file is released, which happens after `close()` has returned.
+The repair fences this at each step:
+
+- **Before a write is accepted.** Opening a view for writing, or creating
+  one, on a member with an open repair at the name fails with `EBUSY`.
+- **At `close()`.** For a view that was already open when the repair was
+  recorded, `flush`, which `close()` sends, fails with `EBUSY`. With
+  `max_foreground_operations` set, `flush` is admitted as demand, so a
+  `close()` can wait for a demand slot first. `release` is never admitted.
+- **At release.** A repair recorded after a successful flush is caught
+  here, when the caller has already been told the write succeeded. Release
+  sends nothing to the member. Instead the view's bytes are copied into a
+  carrier of their own, a `view-write` repair (`MemberRepairs.preserve_view_write`).
+  - **The record.** Its old and new paths are both the canonical name at
+    release time. An open descriptor follows a rename, so after a missed
+    `/d -> /e` this is `/e/...`. The record also names the member and
+    the view file's identity (device, inode, size and mtime).
+  - **The bytes.** They are the carrier file's data, created, filled and
+    fsynced before the carrier is named, like any carrier. So they
+    survive eviction of the view's cache copy, a reopen and a rebuilt
+    index.
+  - **Visibility.** `storage debug member-repairs` lists the record with
+    the path of its bytes. Resolving it deletes them, so copy them where
+    they belong first.
+  - **Fencing.** The record fences the member at that name until it is
+    resolved. Copying the bytes to their destination is left to the
+    operator.
+  - **One record per version.** A second release of the same bytes, from
+    another descriptor of the view or a retry, finds the record by that
+    identity and writes no second one. A copy whose source changed while
+    it was made is discarded and made again, up to three times.
+  - **If the copy fails** (`ENOSPC`, an injected error), no partial
+    carrier is left. The failure is logged, with the bytes still in the
+    view's cache copy, which is then the only copy. This is the one case
+    where the bytes are not kept durably, and it needs the cache
+    filesystem itself to refuse the copy.
+
+The mount never retries delivery of the bytes to the member, and a
+`view-write` repair never moves bytes there by itself.
 
 ## Validation
 
