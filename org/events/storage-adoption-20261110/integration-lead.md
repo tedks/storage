@@ -250,11 +250,9 @@
 - state: Peer performance audit DONE/IDLE after GH #74 amendment. The peer
   reports docs-only diff check and 44 valid links; no tests or live access.
   Its 64 MiB, 60 second and one-active-per-mount limits remain proposals.
-  (Transport details redacted; see records-lead:2-4.) The peer reports
-  sending the cold-open finding to the responsiveness lead, which is not
-  acknowledgment or execution. Delivery of its message to the parent is
-  unconfirmed, so this record does not claim it. No source review or merge
-  claim follows.
+  Its cold-open channel finding is in the audit; this record claims no
+  action on it by another lane (coordination details redacted; see
+  records-lead:2-6). No source review or merge claim follows.
 
 ## integration-lead:22
 

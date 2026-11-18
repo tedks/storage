@@ -1,4 +1,4 @@
-# Storage Orgs adoption roster, 2026-11-10
+# Storage Orgs adoption roster (record of 2026-11-10; header current 2026-11-18)
 
 ## Current state (2026-11-18, against master `4989ba7`)
 
@@ -56,7 +56,7 @@ Open questions and rulings in ditz, as of 2026-11-18:
 - `oq-streaming-fleet-keep-threshold`: OPEN. Fleetwide scope was ruled on
   2026-11-10. On 2026-11-18 Ted chose the form: the greater of a byte floor
   above 8 MiB and about 30% of file size, applied to contiguous reads,
-  fleetwide; the open read-ahead window stays coupled to that threshold
+  fleetwide; read-ahead while a file is open stays coupled to that threshold
   (`oq-streaming-read-ahead-window`), with no independent cap. The exact
   byte floor is still pending. No rollout.
 
@@ -114,9 +114,9 @@ Heads #165/#166/#167 do not edit `BUILD`, `MODULE.bazel`, or `flake.nix`;
 performance audit lane proposes further test additions in streaming, remote,
 sync, cache, rsync, namespace and conflict suites; any new top-level module
 requires manifest coordination. #17 scheduler design waits for #167's
-interface. Exact heads and this contract were sent to the parent
-coordinator before any merge (transport details redacted; see
-records-lead:2-4). No onboarding code is in this package.
+interface. Exact heads and this contract went to the parent coordinator
+before any merge (coordination details redacted; see records-lead:2-6). No
+onboarding code is in this package.
 
 Responsiveness PR #171 added one explicit `storage/BUILD` source entry,
 `foreground_admission.py`, at reported pushed head `2a5490c8d50b436843710fa698d9cd326221b33a`.
@@ -183,9 +183,9 @@ live access, acceptance or merge are claimed. (#169 later merged at
 These are not authorized implementation packages in this lane. #17 scheduler
 work waits for #167's implementation interface; the scope ruling is settled.
 The full source and boundary test proposals live in the peer audit document,
-not this summary. The peer reports sending its cold-open channel finding to
-the responsiveness lead; that is not acknowledgment or execution. Delivery
-of its message to the parent is unconfirmed and not claimed.
+not this summary. Its cold-open channel finding is one of those proposals;
+this record claims no action on it by another lane (coordination details
+redacted; see records-lead:2-6).
 
 ## Handoff (2026-11-10)
 

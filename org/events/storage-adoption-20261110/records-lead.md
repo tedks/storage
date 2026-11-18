@@ -90,3 +90,24 @@
   header now names it, adds the #176 row and refreshes the #180 head.
   Exact-head council, lead review and full gates are required again on
   the resulting head.
+
+## records-lead:6
+
+- kind: review-seat-outcome
+- refs: records-lead:5
+- based_on: `5498c3530957ce2f3204da6be8afd15ad899aca2`
+- round: `5498c3530957-20261118T060415Z-b03770`, full scope from `4989ba7`
+  (the base changed, so both present seats reviewed fresh).
+- outcomes: OpenAI 1 Critical: the record still described message
+  history between lanes (a finding sent to another lane, a message's
+  delivery state). Anthropic CLEAN with 4 Nits. Google EMPTY (usage limit).
+  Independent lead review CLEAN at the same head.
+- disposition: fixed in the same commit as this entry. The message history
+  in the Bazel coordination and backlog paragraphs and in integration-lead:21
+  is removed, keeping the substance (the contract went to the parent before
+  any merge; the cold-open finding is in the audit) with redaction markers.
+  Nits: the title now says the header is current; "read-ahead while a file
+  is open" replaces "open read-ahead window". Rounds 3 and 4 each had one
+  Important, fixed as recorded in the PR's disposition comments. The fourth
+  nit concerns master files from #175, outside this PR, and is filed in
+  ditz.
