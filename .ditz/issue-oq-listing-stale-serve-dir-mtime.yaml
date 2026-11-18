@@ -57,3 +57,9 @@ log_events:
     a scratch client-notification capability proof, without live mounts. Existing
     60s/3600s values are reference only. No runtime implementation or deployment is
     claimed. This records new intent, not ratification of values or notification feasibility.'
+- time: 2026-11-18T04:39:33-00:00
+  who: Ted Smith
+  what: commented
+  comment: Ted retained stale-first cached browsing. For a cold listing, publish the
+    available union and log member failures per oq-listing-cold-partial-result. Numeric
+    refresh bounds remain open pending evidence.
