@@ -25,8 +25,7 @@
 - redaction: removed tmux session and pane ids, the field host name and its
   package hash from the current files; they are kept in the private roster.
   These values remain in this branch's earlier pushed commits. None is a
-  credential, key or token. This was reported to the CTO, who accepted
-  redacting the current files only; no history was rewritten.
+  credential, key or token; the CTO was told, and no history was rewritten.
 
 ## records-lead:3
 
@@ -38,7 +37,7 @@
   Anthropic (Opus, native) 0 Critical, 3 Important, 6 Nits; Google EMPTY
   (usage limit). Independent lead review (fresh Opus): NOT CLEAN, 2
   Important (both also raised by the Anthropic seat), 6 Nits.
-- dispositions, all fixed in the next commit: lane worktrees replaced by
+- dispositions, all fixed in the same commit as this entry: lane worktrees replaced by
   role and PR in the 2026-11-10 lane table; message-transport details and
   the assignment label removed from the current files, with redaction
   markers on the edited events; the full `oq-conflict-fallback-limits`
@@ -49,3 +48,20 @@
   (successor wording, #179 row, `gh-74-fast-checksum` blocker, dated
   checks on A165/A166, #171 description note, pointer in the dated
   backlog).
+
+## records-lead:4
+
+- kind: review-seat-outcome
+- refs: records-lead:3
+- based_on: `e0f2ec7bb51b6827c12d11eb38ce9b2f9ab15187`
+- round: `e0f2ec7bb51b-20261118T055100Z-2519dd`, warm delta from `5b46c31`.
+- outcomes: OpenAI (gpt-6-sol, ask-agent, warm) 1 Critical: the
+  responsiveness lead's worktree name remained in integration-lead:18.
+  Google EMPTY (usage limit).
+- disposition: fixed in the same commit as this entry; the worktree name moved to the
+  private roster. A sweep of the current files finds no other lane worktree
+  name (`descriptive-remote-names` in A166 and integration-lead:12 is the
+  public ditz issue id).
+- authority: the CTO's reply to the records-lead:2 report accepted
+  redaction of the current files with the historical commits retained, and
+  forbade any history rewrite.

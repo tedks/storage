@@ -88,8 +88,8 @@
 - state: REVIEWING. #165 advanced master, so #166 now needs a rebase,
   exact-head gates and renewed formal review before the scripted merge.
   The lead requested branch repair authority or reassignment from the
-  parent (transport details redacted per records-lead:3); no source branch
-  edit yet.
+  parent (transport details redacted; see records-lead:2-4); no source
+  branch edit yet.
 
 ## integration-lead:8
 
@@ -212,15 +212,16 @@
 - kind: state-change
 - refs: integration-lead:17
 - based_on: `81793ac27b70f82c231bf607b55e775d2b905974`
-- state: Parent assigned a separate Sol responsiveness lead in
-  `foreground-responsiveness-20261110`; worktree observed at `66c640a`.
-  This lane made no sibling edits. Parent also relayed a deployment
-  observation for one field host (redacted per records-lead:2): its
-  installed and running rsync, watcher and mount-profile hashes match `a7467c6` and differ from `81793ac`, so
-  #165/#166 are not rolled out there (host details in the private roster).
-  That host observation was not independently repeated by this lane. PR #170
-  remains under onboarding-root incident remediation without waiver or
-  acceptance. No merge, deployment or live inspection was performed here.
+- state: Parent assigned a separate Sol responsiveness lead, whose checkout
+  was observed at `66c640a` (worktree redacted; see records-lead:2-4). This
+  lane made no sibling edits. Parent also relayed a deployment observation
+  for one field host (redacted; see records-lead:2-4): its installed and
+  running rsync, watcher and mount-profile hashes match `a7467c6` and differ
+  from `81793ac`, so #165/#166 are not rolled out there (host details in the
+  private roster). That host observation was not independently repeated by
+  this lane. PR #170 remains under onboarding-root incident remediation
+  without waiver or acceptance. No merge, deployment or live inspection was
+  performed here.
 
 ## integration-lead:19
 
@@ -249,9 +250,11 @@
 - state: Peer performance audit DONE/IDLE after GH #74 amendment. The peer
   reports docs-only diff check and 44 valid links; no tests or live access.
   Its 64 MiB, 60 second and one-active-per-mount limits remain proposals.
-  (Transport details redacted per records-lead:3.) The peer reports
-  sending the cold-open finding to the responsiveness lead, which is not acknowledgment or execution. Delivery of its message to
-  the parent is unconfirmed, so this record does not claim it. No source review or merge claim follows.
+  (Transport details redacted; see records-lead:2-4.) The peer reports
+  sending the cold-open finding to the responsiveness lead, which is not
+  acknowledgment or execution. Delivery of its message to the parent is
+  unconfirmed, so this record does not claim it. No source review or merge
+  claim follows.
 
 ## integration-lead:22
 

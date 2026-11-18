@@ -4,10 +4,11 @@
 
 This record is documentation only. It audits the adoption of three PRs that
 were implemented before the Orgs workflow was used here (#165, #166, #167),
-records how #165 and #166 were accepted and integrated, and lists the
-related successor PRs (not every later PR). It does not claim that the full Orgs sprint ran (see
-Inherited process debt). Lane identities, session and pane ids, host names
-and host details are kept in a private roster outside this public repo.
+records how #165 and #166 were accepted and integrated, and lists related
+later PRs (not every later PR). It does not claim that the full Orgs sprint
+ran (see Inherited process debt). Lane identities, session and pane ids,
+host names and host details are kept in a private roster outside this public
+repo.
 
 Heads of open drafts are as observed at 2026-11-18 05:50Z; they may have
 moved since, so check GitHub before relying on one.
@@ -113,7 +114,8 @@ performance audit lane proposes further test additions in streaming, remote,
 sync, cache, rsync, namespace and conflict suites; any new top-level module
 requires manifest coordination. #17 scheduler design waits for #167's
 interface. Exact heads and this contract were sent to the parent
-coordinator before any merge (transport details redacted per records-lead:3). No onboarding code is
+coordinator before any merge (transport details redacted; see
+records-lead:2-4). No onboarding code is
 in this package.
 
 Responsiveness PR #171 added one explicit `storage/BUILD` source entry,
