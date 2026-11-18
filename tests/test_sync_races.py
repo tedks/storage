@@ -6,6 +6,7 @@ so each interleaving is forced. Every wait has a timeout.
 """
 
 import errno
+import json
 import multiprocessing
 import os
 import queue
@@ -1439,6 +1440,105 @@ class TestRepairsOutliveTheIndex(SyncRaceTestBase):
         self.assertFalse(os.path.lexists(alias))
         self.assertEqual([(("member",), "/e/f.txt", b"EDITEDytes")], self.view_writes())
         self.assertEqual(b"sole bytes", (self.member_dir / "d" / "f.txt").read_bytes())
+
+    def test_a_moved_alias_outside_every_fence_still_cannot_be_written(self):
+        """A surviving alias is moved by a directory rename, and the rename
+        repairs are resolved: no fence covers the alias's name now, but a
+        write open of it is still refused, since its file is kept bytes."""
+        view, fh = self.open_edited_view()
+        self.fail_member_once("rename")
+        self.fs.rename("/d", "/e")
+        with patch("storage.member_repairs.os.unlink", side_effect=OSError(errno.EIO, "x")):
+            self.fs.release("/e/f.txt.member", fh)
+        self.fs.rename("/e", "/k")
+        repairs = self.fs.cache_manager.member_repairs
+        for record in repairs.list():
+            if record.kind != VIEW_WRITE:
+                self.assertTrue(repairs.resolve(record.id))
+        self.assertNotIn("member", repairs.backends_for(["/k/f.txt"]))
+        with self.assertRaises(FuseOSError) as raised:
+            self.fs.open("/k/f.txt.member", os.O_WRONLY)
+        self.assertEqual(errno.EBUSY, raised.exception.errno)
+        with self.assertRaises(FuseOSError):
+            self.fs.truncate("/k/f.txt.member", 0)
+        self.assertEqual([(("member",), "/e/f.txt", b"EDITEDytes")], self.view_writes())
+
+    def kept_with_surviving_alias(self):
+        """A view-write kept while its view name could not be unlinked:
+        returns (record id, alias path)."""
+        view, fh = self.open_edited_view()
+        self.fail_member_once("rename")
+        self.fs.rename("/d", "/e")
+        with patch("storage.member_repairs.os.unlink", side_effect=OSError(errno.EIO, "x")):
+            self.fs.release("/e/f.txt.member", fh)
+        [kept] = [r.id for r in self.fs.cache_manager.member_repairs.list() if r.kind == VIEW_WRITE]
+        return kept, self.fs.cache_manager.get_cache_path("/e/f.txt.member")
+
+    def test_an_alias_of_missing_kept_bytes_survives_reopen(self):
+        """The payload is gone but the alias still has the bytes: reopening
+        never unlinks it (it may be the only copy), and the record stays
+        listed as missing, with its fence (CTO-182-REOPEN; OpenAI C1 at
+        fddd4f1)."""
+        kept, alias = self.kept_with_surviving_alias()
+        (self.cache_dir / ".storage.repairs" / (kept + ".bytes")).unlink()
+        self.reopen()
+        self.assertEqual(b"EDITEDytes", alias.read_bytes())
+        repairs = self.fs.cache_manager.member_repairs
+        self.assertTrue(repairs.bytes_missing(kept))
+        self.assertIn("member", repairs.backends_for(["/e/f.txt"]))
+        self.assertEqual([kept], [r.id for r in repairs.list() if r.kind == VIEW_WRITE])
+
+    def test_an_unrelated_file_with_a_reused_inode_number_survives_reopen(self):
+        """The payload and alias are gone and an unrelated file now holds the
+        view name with the inode number the record names: it is neither
+        unlinked nor taken for the lost bytes (CTO-182-REOPEN)."""
+        kept, alias = self.kept_with_surviving_alias()
+        carriers = self.cache_dir / ".storage.repairs"
+        (carriers / (kept + ".bytes")).unlink()
+        alias.unlink()
+        alias.write_bytes(b"unrelated replacement")
+        st = os.lstat(alias)
+        record = json.loads((carriers / kept).read_bytes())
+        record["source"] = f"{st.st_dev}:{st.st_ino}"       # as if the number were reused
+        (carriers / kept).write_bytes(json.dumps(record).encode())
+        self.reopen()
+        self.assertEqual(b"unrelated replacement", alias.read_bytes())
+        repairs = self.fs.cache_manager.member_repairs
+        self.assertEqual([kept], [r.id for r in repairs.list() if r.kind == VIEW_WRITE])
+        self.assertTrue(repairs.bytes_missing(kept))
+
+    def test_recovery_keeps_only_positive_views_of_the_fenced_member(self):
+        """With members "b.a" and "a" configured in that order, /x.b.a is
+        b.a's view, not a's; with "gone" no longer configured, /z/report.gone
+        is an ordinary file. Neither is kept or unlinked for a repair that
+        fences "a" or "gone"; a's own view is (CTO-182-REOPEN)."""
+        repairs = self.fs.cache_manager.member_repairs
+        repairs.record("/x", "/y", ["a"], "fences a")
+        repairs.record("/z", "/w", ["gone"], "fences a removed member")
+        cache = self.cache_dir
+        (cache / "x.b.a").write_bytes(b"b.a's view")
+        (cache / "x.a").write_bytes(b"a's view")
+        (cache / "z").mkdir()
+        (cache / "z" / "report.gone").write_bytes(b"an ordinary file")
+        self.fs.cache_manager.recover_views(["b.a", "a"])
+        self.assertEqual(b"b.a's view", (cache / "x.b.a").read_bytes())
+        self.assertEqual(b"an ordinary file", (cache / "z" / "report.gone").read_bytes())
+        self.assertFalse((cache / "x.a").exists())
+        self.assertEqual([(("a",), "/x", b"a's view")], self.view_writes())
+
+    def test_recovery_never_leaves_the_cache_through_a_symlinked_ancestor(self):
+        """An old path whose cache ancestor is now a symlink out of the cache:
+        nothing there is walked, kept or unlinked (CTO-182-REOPEN)."""
+        outside = self.temp_dir / "outside" / "t"
+        outside.mkdir(parents=True)
+        (outside / "f.member").write_bytes(b"outside the cache")
+        (outside.parent / "t.member").write_bytes(b"also outside")
+        os.symlink(outside.parent, self.cache_dir / "s")
+        self.fs.cache_manager.member_repairs.record("/s/t", "/u", ["member"], "fenced")
+        self.fs.cache_manager.recover_views(["member"])
+        self.assertEqual(b"outside the cache", (outside / "f.member").read_bytes())
+        self.assertEqual(b"also outside", (outside.parent / "t.member").read_bytes())
+        self.assertEqual([], self.view_writes())
 
     def test_a_crash_between_flush_and_release_still_keeps_the_view(self):
         """flush succeeded, a missed rename fenced the member, and the

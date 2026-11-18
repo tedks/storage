@@ -666,7 +666,7 @@ class SyncExecutor:
         if not repairs.await_pending(task.pending_fence, member_repairs.PUBLISH_WAIT):
             # Overlapping member work is still running (a slow member call):
             # back off without holding this worker; the fence stays.
-            raise RuntimeError(
+            raise member_repairs.PublicationPending(
                 f"Waiting for member work overlapping {task.virtual_path} -> {task.new_path}"
             )
         try:

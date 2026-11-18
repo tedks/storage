@@ -19,11 +19,13 @@ from typing import Callable, ContextManager, Optional, List, Set
 from .backends.base import Backend, bulk_request
 from .backends.ssh_pool import BulkCapacityCancelled, BulkCapacityTimeout
 from .cache_metadata import PARTIAL_SUFFIX, PREFIX_XATTR, regular_file_stat, write_cache_metadata
-from .member_repairs import VIEW_WRITE, MemberRepairs
+from .member_repairs import VIEW_WRITE, MemberRepairs, is_at_or_under
+from .pathing import resolve_path
 
-logger = logging.getLogger(__name__)
 from .models import FileMetadata, SyncStatus
 from .state import StateManager
+
+logger = logging.getLogger(__name__)
 
 
 def _remove_prefix_marker(path: Path):
@@ -91,8 +93,6 @@ class CacheManager:
         # fences a member or pins a file asks this (storage/member_repairs.py).
         # An unreadable carrier raises CorruptRepairRecord: no open.
         self.member_repairs = MemberRepairs(Path(cache_root), sweep_new=True)
-        self._break_kept_aliases()
-        self._keep_fenced_views()
         # Set by StorageFS: a context manager that holds the descriptor
         # table lock and yields whether the path has an open descriptor.
         # Eviction stats and unlinks inside it, so no descriptor can be
@@ -154,16 +154,50 @@ class CacheManager:
             self._size_dirty = False
             self._scan_count += 1
 
-    def _break_kept_aliases(self):
-        """Unlink every conflict-view cache name that still links to bytes
-        a view-write repair keeps: release unlinks it after the record is
-        durable, but a crash or a failed unlink can leave it, and a cache
-        name may later be written in place."""
+    def recover_views(self, member_names: List[str]):
+        """At mount start, before any worker, eviction or FUSE request: drop
+        surviving aliases of kept view bytes, then keep the cached conflict
+        views of fenced members (see the two methods). member_names are the
+        configured members in their order, which decides what a cache name
+        means, as in resolve_path."""
+        self._break_kept_aliases(member_names)
+        self._keep_fenced_views(member_names)
+
+    def _inside_cache(self, path: Path) -> bool:
+        """Whether path's directory is inside the cache with no symlinked
+        component: a name the sweep may read, link or unlink."""
+        try:
+            relative = path.parent.relative_to(self.cache_root)
+        except ValueError:
+            return False
+        root = Path(os.path.realpath(self.cache_root))
+        return Path(os.path.realpath(path.parent)) == root / relative
+
+    def _view_identity(self, cache_file: Path, member_names: List[str]):
+        """(member, canonical path) a cache file is a conflict view of, as
+        resolve_path reads its name with the configured members, or None
+        (an ordinary file, or a member no longer configured)."""
+        requested = "/" + str(cache_file.relative_to(self.cache_root))
+        resolved = resolve_path(requested, member_names, self.get_cache_path)
+        if resolved.backend_name is None:
+            return None
+        return resolved.backend_name, resolved.canonical_path
+
+    def _break_kept_aliases(self, member_names: List[str]):
+        """Unlink every conflict-view cache name that is still a second name
+        for bytes a view-write repair keeps: release unlinks it after the
+        record is durable, but a crash or a failed unlink can leave it, and
+        a cache name may later be written in place. Only a name whose inode
+        is the live payload's, inside the cache, and read as that member's
+        view of that path, is removed; anything else stays."""
         for record in self.member_repairs.list():
             if record.kind != VIEW_WRITE:
                 continue
             for member in record.members:
                 alias = self.get_cache_path(f"{record.new_path}.{member}")
+                if (not self._inside_cache(alias)
+                        or self._view_identity(alias, member_names) != (member, record.new_path)):
+                    continue
                 try:
                     if self.member_repairs.break_alias(alias):
                         logger.warning("Removed a cache alias of the bytes kept by repair %s",
@@ -172,16 +206,23 @@ class CacheManager:
                     logger.error("Could not remove the cache alias %s of repair %s: %s",
                                  alias, record.id, exc)
 
-    def _keep_fenced_views(self):
+    def _keep_fenced_views(self, member_names: List[str]):
         """Keep, as view-write repairs, the cached conflict views of members
-        that a repair fences at those names, when the cache opens.
+        that a repair fences at those names.
 
         A write through a view goes to its member at release, after a
         successful flush. If a repair appeared in between and the process
         died before the release, nothing recorded it. Any such view is kept
         here, before anything can evict or refetch it: conservatively, since
-        an unwritten view is indistinguishable, so an extra record to
-        resolve is the cost (CTO RRS-CTO-FLUSH-RELEASE).
+        an unwritten view is indistinguishable (CTO RRS-CTO-FLUSH-RELEASE).
+        A candidate is kept only with positive identity: resolve_path, with
+        the configured members in order, must read its name as that
+        member's view of a path at or under the repair's names. A file it
+        reads otherwise (an ordinary file, another member's view, a member
+        no longer configured) is left in place, untouched, with a warning
+        if its name ends like the fenced member's view. Nothing outside the
+        cache, or under a symlinked component, is walked, linked or
+        unlinked.
         """
         repairs = self.member_repairs
         for record in repairs.list():
@@ -190,27 +231,44 @@ class CacheManager:
                 for root in {record.old_path, record.new_path}:
                     candidates = [self.get_cache_path(root + suffix)]
                     tree = self.get_cache_path(root)
-                    if tree.is_dir() and not tree.is_symlink():
+                    if (tree.is_dir() and not tree.is_symlink()
+                            and self._inside_cache(tree / "x")):
                         for dirpath, _dirs, files in os.walk(tree):
                             candidates.extend(Path(dirpath) / name for name in files
                                               if name.endswith(suffix))
                     for view in candidates:
-                        try:
-                            st = os.lstat(view)
-                        except FileNotFoundError:
-                            continue
-                        if not stat_module.S_ISREG(st.st_mode) or repairs.kept_inode(view):
-                            continue
-                        relative = "/" + str(view.relative_to(self.cache_root))
-                        canonical = relative[:-len(suffix)]
-                        try:
-                            repairs.preserve_view_write(
-                                canonical, member, view, f"{st.st_dev}:{st.st_ino}",
-                                "conflict view of a fenced member found when the cache "
-                                "opened; it may hold a write never sent")
-                        except OSError as exc:
-                            logger.error("Could not keep the conflict view %s of fenced member "
-                                         "%s: %s", view, member, exc)
+                        self._keep_one_view(record, member, view, member_names)
+
+    def _keep_one_view(self, record, member: str, view: Path, member_names: List[str]):
+        repairs = self.member_repairs
+        try:
+            st = os.lstat(view)
+        except FileNotFoundError:
+            return
+        if not stat_module.S_ISREG(st.st_mode) or not self._inside_cache(view):
+            return
+        identity = self._view_identity(view, member_names)
+        if (identity is None or identity[0] != member
+                or not any(is_at_or_under(identity[1], name)
+                           for name in (record.old_path, record.new_path))):
+            logger.warning("Left %s in place: it is not %s's conflict view under repair %s",
+                           view, member, record.id)
+            return
+        if repairs.kept_inode(view):
+            return
+        missing = repairs.matches_missing_payload(view)
+        if missing is not None:
+            logger.warning("Left %s in place: repair %s's bytes are missing and this file "
+                           "cannot be proven to be them", view, missing)
+            return
+        try:
+            repairs.preserve_view_write(
+                identity[1], member, view, f"{st.st_dev}:{st.st_ino}",
+                "conflict view of a fenced member found when the cache "
+                "opened; it may hold a write never sent")
+        except OSError as exc:
+            logger.error("Could not keep the conflict view %s of fenced member %s: %s",
+                         view, member, exc)
 
     def get_cache_path(self, virtual_path: str) -> Path:
         """Get the local cache path for a virtual file"""

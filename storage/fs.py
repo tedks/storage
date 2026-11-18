@@ -290,6 +290,8 @@ class StorageFS(Operations):
             bulk_cold_copies=bulk_cold_copies,
         )
         self.cache_manager.descriptor_guard = self._descriptor_guard
+        # Before any worker, eviction or FUSE request (docs/member-rename-repairs.md).
+        self.cache_manager.recover_views(list(backends))
         self.replication_manager = ReplicationManager(self.state_manager, backends)
         self.backends = backends
 
@@ -2412,8 +2414,10 @@ class StorageFS(Operations):
         replacing its object; under an open member repair that object may
         hold the only copy of renamed bytes, so the write is refused up
         front (EBUSY), as an unlink of the view is."""
-        if resolved.backend_name and resolved.backend_name in (
-            self.cache_manager.member_repairs.backends_for([resolved.canonical_path])
+        repairs = self.cache_manager.member_repairs
+        if resolved.backend_name and (
+            resolved.backend_name in repairs.backends_for([resolved.canonical_path])
+            or repairs.kept_inode(resolved.cache_path) is not None
         ):
             raise FuseOSError(errno.EBUSY)
 
@@ -2636,8 +2640,11 @@ class StorageFS(Operations):
                 with self._fd_lock:
                     if entry.canonical_path != canonical:
                         continue  # re-pointed by a rename meanwhile
-                if entry.backend_name in self.cache_manager.member_repairs.backends_for(
-                        [canonical]):
+                repairs = self.cache_manager.member_repairs
+                if (entry.backend_name in repairs.backends_for([canonical])
+                        or repairs.kept_inode(entry.cache_path) is not None):
+                    # Fenced, or the descriptor's file is bytes a repair keeps
+                    # (an alias that survived, then moved out of the fence).
                     raise FuseOSError(errno.EBUSY)
                 try:
                     written = os.pwrite(entry.real_fd, data, offset)

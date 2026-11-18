@@ -206,10 +206,12 @@ other members or other names never wait.
 A mutation registers every member it may touch for its whole life,
 including members fenced when it registered. A fence lifted meanwhile (a
 resolve) cannot leave a member the operation then calls unregistered for a
-publication to wait on. The publication's wait is bounded (`PUBLISH_WAIT`,
-5 s). Past it, the fence stays active and the queued rename backs off on
-the retry scheduler, so a member call stuck in overlapping foreground work
-does not hold the only sync worker. A directory rename holds the namespace
+publication to wait on. Each publication attempt waits at most
+`PUBLISH_WAIT` (5 s). Past it, the fence stays active and the queued
+rename backs off on the retry scheduler, so a member call stuck in
+overlapping foreground work does not hold the only sync worker. A
+backlog of overlapping work can delay the record past one attempt; the
+fence holds throughout. A directory rename holds the namespace
 lock exclusive, and that stalls every sync by design, not this wait.
 
 A lookup reads the durable records and the pending fences in one hold of
@@ -360,15 +362,36 @@ The repair fences this at each step:
       `EBUSY`, and so does any truncate of a name that aliases kept bytes;
     - a refetch writes to a temporary file and renames it into place, so
       it never touches the old inode;
-    - the next open of the cache unlinks every such alias
-      (`CacheManager._break_kept_aliases`).
+    - the next mount start unlinks such an alias
+      (`CacheManager._break_kept_aliases`), but only when both names hold
+      the same inode, statted live. The recorded inode number is not
+      enough: if the payload is missing, that number may have been reused.
+      A name is never unlinked because it matches a missing payload's
+      recorded inode. It may be the only copy, or an unrelated file.
+      Instead it is left in place with a warning, and the record stays
+      listed as `(MISSING)` with its fence.
   - **A crash between a successful flush and the release.** When the cache
     opens, and before anything can evict or refetch, every cached
     conflict view of a member that a repair fences at those names is kept
-    as a `view-write` repair (`CacheManager._keep_fenced_views`). So the
+    as a `view-write` repair (`CacheManager._keep_fenced_views`, at mount start). So the
     unsent bytes become a discoverable repair, never sent to the member.
+    This runs at mount start (`CacheManager.recover_views`), where the
+    configured members are known in their order. A candidate is kept
+    only if `resolve_path` reads its name, with those members, as that
+    member's view of a path at or under the repair's names. Another
+    member's view (overlapping dotted names), an ordinary file, or a
+    member no longer configured is left in place, never kept or
+    unlinked. Nothing outside the cache, or under a symlinked component
+    of it, is walked, linked or unlinked.
     This is conservative: a view that was never written cannot be told
-    apart, so it costs one more record to resolve.
+    apart, so it costs one more record to resolve. While a repair stays
+    open the cost can repeat: a view read again after a restart is fetched
+    into a new inode, and the next open keeps that one too. The sweep
+    walks the cached subtree under each repair's names on every open, so
+    its cost follows the size of those subtrees.
+  - **A moved alias.** An alias whose fence was resolved after a directory
+    rename moved it is still refused: a write open, a write and a truncate
+    each check whether the file itself is kept bytes (`kept_inode`).
 
 The mount never retries delivery of the bytes to the member, and a
 `view-write` repair never moves bytes there by itself.

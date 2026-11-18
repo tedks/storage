@@ -13,6 +13,7 @@ import logging
 from pathlib import Path
 from typing import Callable, ContextManager, Optional, Set, Union, Tuple
 
+from .member_repairs import PublicationPending
 from .backends.base import Backend
 from .cache import CacheManager
 from .models import SyncStatus
@@ -97,7 +98,10 @@ class SyncWorker(threading.Thread):
                     if success:
                         self._notify_task_complete(task)
                 except Exception as e:
-                    logger.error(f"Error processing sync task {task.virtual_path}: {e}")
+                    if isinstance(e, PublicationPending):
+                        logger.info("Sync task %s backs off: %s", task.virtual_path, e)
+                    else:
+                        logger.error(f"Error processing sync task {task.virtual_path}: {e}")
                     completed = self.executor.handle_task_failure(
                         task,
                         str(e),

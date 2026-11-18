@@ -68,6 +68,11 @@ _NEW_SUFFIX = ".new"
 _ID_RE = re.compile(r"^[0-9a-f]{32}$")
 
 
+class PublicationPending(RuntimeError):
+    """A queued rename's fence is waiting on overlapping member work; the
+    task backs off and tries again (not a failure)."""
+
+
 class CorruptRepairRecord(RuntimeError):
     """A carrier whose record cannot be read: the cache is not opened."""
 
@@ -608,6 +613,14 @@ class MemberRepairs:
             for existing in self._refresh().values():
                 if (existing.kind == VIEW_WRITE and existing.new_path == canonical_path
                         and existing.members == (member,) and existing.source == inode):
+                    if self.bytes_missing(existing.id):
+                        # The recorded inode number may have been reused: never
+                        # take this file for the lost payload, nor unlink it.
+                        logger.error(
+                            "Left %s in place: its inode matches repair %s, whose kept "
+                            "bytes are missing, but cannot be proven to be them",
+                            view_path, existing.id)
+                        return None
                     fd = os.open(str(self.carrier_path(existing.id)), os.O_RDONLY)
                     try:
                         os.fsync(fd)
@@ -756,20 +769,46 @@ class MemberRepairs:
 
     def kept_inode(self, path: Path) -> Optional[str]:
         """The id of the view-write record whose kept bytes are path's inode
-        (a view cache name that still aliases them), else None."""
+        (a view cache name that still aliases them), else None.
+
+        Decided by statting the record's actual payload, never by the inode
+        number recorded when it was kept: a payload that is gone frees that
+        number for reuse, and an unrelated file must not be taken for it.
+        """
+        try:
+            st = os.lstat(path)
+        except FileNotFoundError:
+            return None
+        for record in self._refresh().values():
+            if record.kind != VIEW_WRITE:
+                continue
+            try:
+                kept = os.lstat(self.carrier_path(record.id))
+            except FileNotFoundError:
+                continue  # payload missing: reported, never matched
+            if (kept.st_dev, kept.st_ino) == (st.st_dev, st.st_ino):
+                return record.id
+        return None
+
+    def matches_missing_payload(self, path: Path) -> Optional[str]:
+        """The id of a view-write record whose payload is missing and whose
+        recorded inode is path's: such a file is left alone, since a reused
+        inode number cannot be told from the lost bytes."""
         try:
             st = os.lstat(path)
         except FileNotFoundError:
             return None
         inode = f"{st.st_dev}:{st.st_ino}"
         for record in self._refresh().values():
-            if record.kind == VIEW_WRITE and record.source == inode:
+            if (record.kind == VIEW_WRITE and record.source == inode
+                    and self.bytes_missing(record.id)):
                 return record.id
         return None
 
     def break_alias(self, path: Path) -> bool:
-        """Unlink path if it is a name for kept bytes, so nothing writing
-        to that name in place can reach them; True when it was one."""
+        """Unlink path if it is a second name for kept bytes (its inode is
+        the live payload's), so nothing writing to it in place can reach
+        them; True when it was one."""
         if self.kept_inode(path) is None:
             return False
         try:
