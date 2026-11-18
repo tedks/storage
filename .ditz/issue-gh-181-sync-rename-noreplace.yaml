@@ -34,6 +34,13 @@ log_events:
   who: Ted Smith
   what: blocked by oq-first-rename-unprotected-member
   comment: ""
+- time: 2026-11-18T05:21:20-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Draft PR #183 (stacked on #182), CTO RRS-CTO-20261118B: bounded design
+    (docs/first-member-rename-target.md) and synthetic RED (TestFirstMemberRenameTarget,
+    two expectedFailure cases, one passing control). Implementation waits on Ted''s
+    ruling on the fallback when no no-replace primitive is available.'
 blocks:
 - gh-181
 blocked_by:
