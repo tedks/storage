@@ -41,3 +41,9 @@ log_events:
     - Untested: a system-level torn copy; a real filesystem refusing user.* xattrs;
     conflict-view flush and release on an SSH member; re-replication after resolve;
     a downgrade ignoring .storage.repairs.'
+- time: 2026-11-18T07:04:44-00:00
+  who: Ted Smith
+  what: blocks gh-181
+  comment: ""
+blocks:
+- gh-181
