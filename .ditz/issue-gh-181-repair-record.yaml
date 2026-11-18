@@ -30,5 +30,18 @@ log_events:
   comment: 'Round 2 fixes at fd6dded on PR #182: rmdir/mkdir fence, exclusion before
     backend selection, never-drop record retries, EIO when a partial rename''s record
     is not yet written. Index-only record escalated to the CTO (MSG-rrs-20261118c).'
+- time: 2026-11-18T05:21:28-00:00
+  who: Ted Smith
+  what: commented
+  comment: CTO ruling C (2026-11-18). Authorize xattr metadata specifically for pending
+    member-rename repairs. SQLite is a rebuildable projection. Both endpoint names
+    and stable member/repair identity must survive fresh-index recovery with no cached
+    leaf and the member offline. Restore protections before any worker can upload,
+    rename or evict. Prove crash ordering, storage/capacity failure, durable resolution,
+    old-index handling and a fresh-index regression that loses these protections on
+    the index-only design. The earlier no-schema restriction is lifted only for this
+    feature. This neither selects future replication configuration nor settles first
+    synchronous member rename semantics. Required before accepting PR182; a bare journal
+    would require a separate change to the authority contract.
 blocks:
 - gh-181
