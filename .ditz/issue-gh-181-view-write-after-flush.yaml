@@ -15,3 +15,14 @@ log_events:
   who: Ted Smith
   what: created
   comment: ""
+- time: 2026-11-18T06:33:51-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'PR #182 round 010b498df605-...-2ba53d, OpenAI Important. A write through
+    a conflict view goes to its member at release, after close() returned. Open and
+    create refuse fenced views, and flush returns EBUSY for one that gained a repair
+    after it was opened. A repair recorded between flush and release still leaves
+    the write only in the view''s cache copy, with an error logged. The member''s
+    object is never touched. Options: a durable pending-write record for conflict
+    views, or move the member copy into flush under a lock that rename''s repair recording
+    also takes. Stated as a bound in docs/member-rename-repairs.md Limits.'
