@@ -14,7 +14,7 @@ from storage.models import FileLocation, FileMetadata, SyncStatus
 from storage.replication import ReplicationManager
 from storage.state import StateManager
 from storage.sync import DirOperation, DirSyncTask, SyncConfig, SyncManager, SyncTask, SyncWorker
-from storage.sync_executor import SyncExecutor
+from storage.sync_executor import RetryScheduler, SyncExecutor
 
 
 class TestSyncManager(unittest.TestCase):
@@ -585,11 +585,12 @@ class TestGrowthWithFailingRenameRecords(unittest.TestCase):
     """Saturate a grown pool with rename tasks whose repair record fails.
 
     #182 never replays a queued member rename: it records it for repair,
-    and retries a task whose record cannot be written without dropping it.
-    With max_sync_workers such tasks (each holding its worker in the
-    retry backoff), an unrelated file sync must still finish while the
-    writes are failing; once they succeed, each task leaves one record, no
-    member is renamed, and the pool returns to its floor.
+    and retries a task whose record cannot be written without dropping it,
+    its backoff held by the queue's RetryScheduler rather than a worker.
+    With max_sync_workers such tasks all in flight at once, an unrelated
+    file sync must still finish while the writes are failing; once they
+    succeed, each task leaves one record, no member is renamed, nothing
+    stays deferred, and the pool returns to its floor.
     """
 
     FLOOR, CEILING = 1, 3
@@ -710,10 +711,19 @@ class TestGrowthWithFailingRenameRecords(unittest.TestCase):
             while not any(t > done_at for t in failures) and time.monotonic() < deadline:
                 time.sleep(0.02)
             self.assertTrue(any(t > done_at for t in failures))
+            # The landed backoff holds failing rename retries in the queue's
+            # RetryScheduler, not in a worker (CTO RRS-CTO-BACKOFF).
+            scheduler = RetryScheduler.for_queue(self.sync_manager.task_queue)
+            deadline = time.monotonic() + 10.0
+            while not scheduler.pending() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertGreater(scheduler.pending(), 0)
 
             failing.clear()
+            scheduler.deliver_all_now()
             self.assertTrue(self.sync_manager.wait_for_completion(timeout=15.0))
         self.assertEqual([], barrier_errors)
+        self.assertEqual(0, scheduler.pending())
 
         records = repairs.list()
         self.assertEqual(sorted(names), sorted((r.old_path, r.new_path) for r in records))
