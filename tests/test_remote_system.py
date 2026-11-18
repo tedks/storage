@@ -41,6 +41,7 @@ import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List
+from unittest import mock
 
 import paramiko
 import pytest
@@ -50,6 +51,10 @@ from storage.backends.ssh import SSHBackend
 from storage.backends.ssh_mux import ControlSockets
 from storage.checksums import fast_checksum_bytes
 from storage.cli_mount import shared_filesystems
+from storage.fs import StorageFS
+from storage.models import SyncStatus
+from storage.state import StateManager
+from storage.sync_tasks import DirOperation
 from storage.watcher import RemoteWatcher
 from tests.fuse_mount import (
     FUSE_THREAD_MODES, ORPHAN_GRACE, _thread_stacks, fuse_mode_id, native_thread_state,
@@ -435,6 +440,104 @@ def test_ssh_backend_rename_replaces_an_existing_file(remote, ssh_backend, tmp_p
     ssh_backend.rename("/renames/save.tmp", "/renames/saved.txt")
     assert remote.read_remote(member, "renames/saved.txt") == new
     assert not ssh_backend.exists("/renames/save.tmp")
+
+
+@pytest.fixture
+def storage_over_ssh(ssh_backend, tmp_path):
+    """A StorageFS (not mounted) whose one member is the SSH member, with
+    its first member rename failing as an unreachable member's would."""
+    (tmp_path / "cache").mkdir()
+    fs = StorageFS(
+        cache_root=tmp_path / "cache",
+        state_db=tmp_path / "state.db",
+        backends={ssh_backend.name: ssh_backend},
+        cache_size=10 * 1024 * 1024,
+        num_sync_workers=1,
+        start_sync=False,
+    )
+    fs.sync_manager.config.monitor_interval = 0.1
+    real_rename, calls = ssh_backend.rename, []
+
+    def failing_once(*args):
+        calls.append(args)
+        if len(calls) == 1:
+            raise OSError("member unreachable")
+        return real_rename(*args)
+
+    with mock.patch.object(ssh_backend, "rename", side_effect=failing_once):
+        yield fs, calls
+    fs.sync_manager.stop()
+    fs.state_manager.close()
+
+
+def _write_through(fs, path: str, data: bytes):
+    fh = fs.create(path, 0o644)
+    fs.write(path, data, 0, fh)
+    fs.release(path, fh)
+
+
+def _wait_clean(fs, path: str):
+    assert _wait_for(lambda: getattr(fs.state_manager.get_file_metadata(path), "sync_status", None)
+                     == SyncStatus.CLEAN, timeout=30.0), f"{path} never synced"
+
+
+def _repairs(state_manager):
+    return [(r.backend_name, r.old_path, r.new_path)
+            for r in state_manager.list_member_rename_repairs()]
+
+
+def test_missed_rename_never_overwrites_a_new_target_on_an_ssh_member(
+        remote, ssh_backend, storage_over_ssh, tmp_path):
+    """The SSH member missed /a.txt -> /b.txt and gained an unrelated
+    /b.txt inside the container. SSHBackend.rename uses posix-rename, which
+    replaces its target, so a replay would destroy it: it is not replayed,
+    and both objects stay."""
+    fs, calls = storage_over_ssh
+    member = remote.members[0]
+    fs.sync_manager.start()
+    _write_through(fs, "/a.txt", b"old bytes")
+    _wait_clean(fs, "/a.txt")
+    assert fs.sync_manager.wait_for_completion(timeout=30.0)
+
+    fs.rename("/a.txt", "/b.txt")
+    remote.write_remote(member, "b.txt", b"unrelated writer")
+    # A retry queued by an older build carries only the two names.
+    fs.sync_manager.queue_dir_sync("/a.txt", DirOperation.RENAME, new_path="/b.txt",
+                                   backend_hint=ssh_backend.name, force=True)
+    assert fs.sync_manager.wait_for_completion(timeout=30.0)
+    fs.sync_manager.stop()
+
+    assert remote.read_remote(member, "b.txt") == b"unrelated writer"
+    assert remote.read_remote(member, "a.txt") == b"old bytes"
+    assert len(calls) == 1
+    reopened = StateManager(str(tmp_path / "state.db"))
+    try:
+        assert _repairs(reopened) == [(ssh_backend.name, "/a.txt", "/b.txt")]
+    finally:
+        reopened.close()
+
+
+def test_missed_rename_never_moves_a_reused_source_on_an_ssh_member(
+        remote, ssh_backend, storage_over_ssh):
+    """The SSH member missed /d -> /e; /d was made again through the mount
+    and gained a file inside the container. A replay would carry the new
+    /d's contents to /e."""
+    fs, calls = storage_over_ssh
+    member = remote.members[0]
+    fs.mkdir("/d", 0o755)
+    remote.write_remote(member, "d/kept.txt", b"k")
+    fs.rename("/d", "/e")
+    fs.mkdir("/d", 0o755)
+    remote.write_remote(member, "d/new.txt", b"n")
+
+    fs.sync_manager.start()
+    assert fs.sync_manager.wait_for_completion(timeout=30.0)
+    fs.sync_manager.stop()
+
+    assert sorted(ssh_backend.listdir("/d")) == ["kept.txt", "new.txt"]
+    assert not ssh_backend.exists("/e")
+    assert len(calls) == 1
+    assert _repairs(fs.state_manager) == [(ssh_backend.name, "/d", "/e")]
 
 def test_filesystem_identity_tells_same_and_different_filesystems_apart(remote):
     """Two roots in one container share a device unless one is its own mount."""
