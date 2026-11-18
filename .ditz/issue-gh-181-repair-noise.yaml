@@ -30,5 +30,14 @@ log_events:
   who: Ted Smith
   what: blocks gh-181
   comment: ""
+- time: 2026-11-18T06:28:24-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Round e426d2955daa-...-482ae5 Anthropic nits: (4) a conflict-view write
+    refused under a repair stays only in the view''s cache file and is not queued,
+    so nothing sends it after resolve (same as the ''direct sync failed'' branch);
+    doc the fence list to say so. (5) A link whose fenced holders were dropped goes
+    CLEAN on the others, and since link placement is not revisited the fenced member
+    never gets it after resolve; cover links as well as files here.'
 blocks:
 - gh-181
