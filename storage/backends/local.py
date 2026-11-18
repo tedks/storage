@@ -9,7 +9,7 @@ import stat
 from pathlib import Path
 from typing import List, Optional
 
-from .base import Backend, BackendType, StorageMemberCapabilities
+from .base import Backend, BackendType, MemberSourceMissing, StorageMemberCapabilities
 from ..checksums import fast_checksum_file
 from ..file_config import XATTR_CONFIG_NAME
 
@@ -253,10 +253,11 @@ class LocalBackend(Backend):
         """Rename a file or directory on the backend."""
         old_path = self._resolve_path(old_virtual_path)
         new_path = self._resolve_path(new_virtual_path)
-        new_path.parent.mkdir(parents=True, exist_ok=True)
         # lexists: a link whose target is elsewhere is still renamed.
         if not os.path.lexists(old_path):
-            return
+            # Nothing moved: never reported as a move.
+            raise MemberSourceMissing(errno.ENOENT, "no source on this member", str(old_path))
+        new_path.parent.mkdir(parents=True, exist_ok=True)
         os.replace(old_path, new_path)
 
     def rename_noreplace(self, old_virtual_path: str, new_virtual_path: str):
@@ -264,13 +265,13 @@ class LocalBackend(Backend):
         the new name is taken (FileExistsError). Where the filesystem has no
         such operation it raises OSError(ENOTSUP): no stat-then-rename or
         link-then-unlink fallback, which a concurrent writer could defeat.
-        A missing source raises FileNotFoundError, never a silent success."""
+        A missing source raises MemberSourceMissing, never a silent success."""
         old_path = self._resolve_path(old_virtual_path)
         new_path = self._resolve_path(new_virtual_path)
         if not os.path.lexists(old_path):
             # Nothing moved: never reported as a move (the caller decides
             # whether this member was expected to hold the source).
-            raise FileNotFoundError(errno.ENOENT, "no source on this member", str(old_path))
+            raise MemberSourceMissing(errno.ENOENT, "no source on this member", str(old_path))
         new_path.parent.mkdir(parents=True, exist_ok=True)
         try:
             renamed = rename_noreplace(old_path, new_path)

@@ -620,6 +620,24 @@ def test_first_rename_onto_an_occupied_ssh_directory_keeps_both(
     assert _repairs(fs.cache_manager.cache_root) == [(ssh_backend.name, "/d", "/e")]
 
 
+def test_an_intended_replacement_whose_ssh_source_vanished_keeps_the_target(
+        remote, ssh_backend, plain_storage_over_ssh):
+    """Both files are recorded on the SSH member, but its /a.txt was removed
+    inside the container: renaming /a.txt over /b.txt moves nothing there,
+    is recorded as a miss, and the member's /b.txt keeps its bytes
+    (CTO-183-SOURCE-OUTCOME)."""
+    fs = plain_storage_over_ssh
+    member = remote.members[0]
+    _synced_over_ssh(fs, "/a.txt", b"renamed bytes")
+    _synced_over_ssh(fs, "/b.txt", b"replaced bytes")
+    remote.exec(member, f"rm {REMOTE_ROOT}/a.txt")
+    fs.rename("/a.txt", "/b.txt")
+    assert remote.read_remote(member, "b.txt") == b"replaced bytes"
+    [record] = MemberRepairs(fs.cache_manager.cache_root).list()
+    assert (record.state, record.old_path, record.new_path) == ("open", "/a.txt", "/b.txt")
+    assert "no source" in record.reason
+
+
 def test_intended_replacement_still_replaces_on_an_ssh_member(
         remote, ssh_backend, plain_storage_over_ssh):
     """Control: /b.txt is the namespace's, synced to the SSH member;

@@ -2045,6 +2045,36 @@ class TestFirstMemberRenameTarget(SyncRaceTestBase):
         self.assertIn("no-replace rename unsupported", first.reason)
         self.assertIn("no-replace rename unsupported", second.reason)
 
+    def test_an_intended_replacement_whose_source_vanished_keeps_the_target(self):
+        """/a.txt and /b.txt are both recorded on the member, but the member's
+        /a.txt was removed behind the mount: renaming /a.txt over /b.txt moves
+        nothing there, so it is a miss, never a success. The member's /b.txt
+        keeps its bytes and an open repair remains (CTO-183-SOURCE-OUTCOME)."""
+        self.synced("/a.txt", b"renamed bytes")
+        self.synced("/b.txt", b"replaced bytes")
+        (self.member_dir / "a.txt").unlink()
+        self.fs.rename("/a.txt", "/b.txt")
+        self.assertEqual(b"replaced bytes", (self.member_dir / "b.txt").read_bytes())
+        [record] = MemberRepairs(self.cache_dir).list()
+        self.assertEqual(("open", ("member",), "/a.txt", "/b.txt"),
+                         (record.state, record.members, record.old_path, record.new_path))
+        self.assertIn("no source", record.reason)
+
+    def test_an_enoent_with_the_source_present_keeps_its_own_cause(self):
+        """An ENOENT from the member's rename call is not proof the source
+        vanished (a destination parent removed meanwhile, say): the miss is
+        recorded with that error, not as a missing source."""
+        self.synced("/a.txt", b"renamed bytes")
+        self.synced("/b.txt", b"replaced bytes")
+        with patch("storage.backends.local.os.replace",
+                   side_effect=FileNotFoundError(errno.ENOENT, "parent went away")):
+            self.fs.rename("/a.txt", "/b.txt")
+        [record] = MemberRepairs(self.cache_dir).list()
+        self.assertNotIn("no source", record.reason)
+        self.assertIn("parent went away", record.reason)
+        self.assertEqual(b"renamed bytes", (self.member_dir / "a.txt").read_bytes())
+        self.assertEqual(b"replaced bytes", (self.member_dir / "b.txt").read_bytes())
+
     def test_known_intended_replacement_still_replaces(self):
         """Control: /b.txt is the namespace's own, synced to the member;
         renaming /a.txt over it replaces it there, as rename(2) does."""

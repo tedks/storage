@@ -16,7 +16,14 @@ import paramiko
 from pathlib import Path, PurePosixPath
 from typing import Callable, List, Optional, TypeVar
 
-from .base import Backend, BackendType, ChecksumUnavailable, StorageMemberCapabilities, WatcherSpec
+from .base import (
+    Backend,
+    BackendType,
+    ChecksumUnavailable,
+    MemberSourceMissing,
+    StorageMemberCapabilities,
+    WatcherSpec,
+)
 from .ssh_pool import (
     CommandTimeout, MemberConnection, SFTPLease, is_connection_error, is_transient_oserror,
 )
@@ -582,9 +589,16 @@ class SSHBackend(Backend):
                             or is_connection_error(exc)):
                         raise
                     sftp.rename(old_remote, new_remote)
-            except FileNotFoundError:
-                # Nothing to rename; best-effort
-                pass
+            except FileNotFoundError as exc:
+                # Never reported as a move. Named a missing source only when
+                # the member says so; any other ENOENT (a destination parent
+                # gone, say) keeps its own cause.
+                try:
+                    sftp.lstat(old_remote)
+                except FileNotFoundError:
+                    raise MemberSourceMissing(
+                        errno.ENOENT, "no source on this member", old_remote) from exc
+                raise
 
         self._with_sftp("rename", old_virtual_path, rename)
 

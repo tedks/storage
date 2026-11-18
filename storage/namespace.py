@@ -11,7 +11,7 @@ from typing import Callable, Dict, List, NamedTuple, Optional, Set, Tuple
 
 from fuse import FuseOSError
 
-from .backends.base import Backend
+from .backends.base import Backend, MemberSourceMissing
 from .cache_metadata import regular_file_stat
 from .checksums import ChecksumBasis, ChecksumRecord
 from .models import SyncStatus
@@ -547,6 +547,18 @@ class NamespaceService:
                 if name in backend_names
             ]
         return list(self.backends.values())
+
+    @staticmethod
+    def _miss_reason(exc, error: str, replacing: bool) -> str:
+        """Why a member's rename was not made, by what the member reported."""
+        if isinstance(exc, MemberSourceMissing):
+            # Said apart: nothing to move. Still a repair, since the member
+            # may hold an unrelated object, or the replaced one, at the new
+            # name, which must stay fenced.
+            return "not renamed: the member has no source at the old name"
+        if replacing:
+            return f"member rename failed: {error}"
+        return f"not renamed, as nothing recorded this member's copy at the new name: {error}"
 
     def _propagate_dir_operation(
         self,
@@ -1673,19 +1685,9 @@ class NamespaceService:
             # change behind the mount), and an intended replacement's member
             # rename replaces its target. The member keeps both names as they are; the
             # intent becomes an open repair for exactly those members.
-            missed = {
-                name: (
-                    # Said apart: nothing to move. Still a repair, since the
-                    # member may hold an unrelated object at the new name,
-                    # which must stay fenced.
-                    "not renamed: the member has no source at the old name"
-                    if isinstance(raised.get(name), FileNotFoundError) else
-                    f"not renamed, as nothing recorded this member's copy at the new "
-                    f"name: {errors.get(name, 'unknown error')}"
-                       if name not in replace_ok else
-                       f"member rename failed: {errors.get(name, 'unknown error')}")
-                for name in failures
-            }
+            missed = {name: self._miss_reason(raised.get(name), errors.get(name, "unknown error"),
+                                              name in replace_ok)
+                      for name in failures}
             missed.update({
                 name: "not renamed: the member has an open repair at these names"
                 for name in fenced

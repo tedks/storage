@@ -3017,7 +3017,6 @@ class TestFSNamespaceIntegration(unittest.TestCase):
         identity and metadata."""
         self.fs.sync_manager.stop()       # keep the queued mkdir retry from running
         self.fs.mkdir("/a", 0o755)
-        real_mkdir = self.backends["backend2"].mkdir
         with patch.object(self.backends["backend2"], "mkdir",
                           side_effect=OSError("backend2 offline")):
             self.fs.mkdir("/b", 0o755)
@@ -3025,7 +3024,6 @@ class TestFSNamespaceIntegration(unittest.TestCase):
         (self.backend2_dir / "b").mkdir(mode=0o701)
         os.utime(self.backend2_dir / "b", ns=(1_000_000_000, 1_000_000_000))
         before = os.stat(self.backend2_dir / "b")
-        self.assertTrue(real_mkdir)
         self.fs.rename("/a", "/b")
         after = os.stat(self.backend2_dir / "b")
         self.assertEqual((before.st_ino, before.st_mode, before.st_mtime_ns),
