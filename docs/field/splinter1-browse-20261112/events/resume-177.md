@@ -37,3 +37,10 @@ historical and are not rewritten.
 - resume-177:6 correction. refs field-browse:12. Its context-copy range
   `namespace.py:1105-1108` is 1104-1107 at 81793ac. The report was
   corrected for all council findings (see its Corrections).
+- resume-177:7 review-finding received. Council round
+  6430a7ac3829-20261118T043406Z-0d74db at 6430a7a (delta from f8083ac):
+  anthropic 0/1/3, openai 0/1/1, google EMPTY (usage-limit). Both present
+  seats held every earlier disposition. New: "0.19 s on chunk0 in every
+  run" was not supported by the table; the council corrections sat under
+  Status after the run instead of Corrections; two Markdown spacing nits.
+  All fixed.

@@ -135,6 +135,7 @@ Totals over 17 dirs, ms: GIO Storage run1 8594, GIO member run1 1176; GIO Storag
 The totals sum the per-run timings, recorded at 0.1 ms; the rounded run 1
 Storage cells above sum to 8593. Run 3 is not tabulated per directory:
 the warm columns are medians of runs 2 and 3.
+
 absent total: 0 conflict total: 0 hidden: 0 dirs with storage-only names: 4
 
 Run 2 and 3 medians are "warm" (later observations, not a proven steady state). S = Storage, M = chunk0 over GVFS SFTP.
@@ -183,7 +184,8 @@ scope. No remount was done.
 ### 2. A later GIO listing on Storage costs more per entry than on chunk0
 
 - On the 700-entry Music root, GIO on Storage took a 0.93 s median in
-  later runs (1.23 s in run 1), against 0.19 s on chunk0 in every run.
+  later runs (1.23 s in run 1), against 0.19 s on chunk0 (195 ms in
+  run 1, 194 ms later-run median).
 - strace of the Storage listing: 700 `statx`, 703 `access` and 5
   `getdents64` calls.
 - `attr_timeout` is 0 by design (`fs.KERNEL_ATTR_TIMEOUT`; see
@@ -273,7 +275,6 @@ Tracked: ditz `field-gio-content-sniff-per-entry`,
 From root review of 93ed39f, and root delta review of a64050c for the
 channel model:
 
-
 - Run 1 and the phase split's first visits are "first observed", not
   cold.
 - The first-observed readdir excess is no longer attributed to raid,
@@ -289,10 +290,22 @@ channel model:
 - The runnable helpers were removed and are preserved privately with
   hashes; their bound defects did not affect this data set.
 
+From the PR #177 council (rounds at f8083ac and 6430a7a):
+
+- The 94 s run is no longer said to have exceeded the prefix bound, only
+  not to have been held to it; its I/O is unknown.
+- Diagnosis 2's ranges now match the table (Music root GIO median and
+  run 1; `listdir` medians; per-entry `lstat` there), and the Totals note
+  explains the 1 ms rounding difference and the untabulated run 3. The
+  chunk0 figure there is stated as the table gives it, run 1 and the
+  later-run median.
+- Diagnosis 1's heading says "up to 2 s"; a citation range and the host
+  memory figure were aligned with the source and the event shard.
+
 ## Status after the run (added 2026-11-17)
 
-The observations above are unchanged; this section records only what
-moved afterwards. Nothing was re-measured on splinter1.
+This section does not change the observations above; it records only
+what moved after the run. Nothing was re-measured on splinter1.
 
 - #175 merged on 2026-11-15 as 5f3dbb3. On master, `StorageFS.readdir`
   returns the namespace's concrete list inside the FUSE request, so a
@@ -305,16 +318,6 @@ moved afterwards. Nothing was re-measured on splinter1.
   open.
 - This branch was rebased onto 5f3dbb3; the report's source line
   references still point at 81793ac.
-
-From the PR #177 council (round at f8083ac):
-
-- The 94 s run is no longer said to have exceeded the prefix bound, only
-  not to have been held to it; its I/O is unknown.
-- Diagnosis 2's ranges now match the table (Music root GIO median and
-  run 1; `listdir` medians; per-entry `lstat` there), and the Totals note
-  explains the 1 ms rounding difference and the untabulated run 3.
-- Diagnosis 1's heading says "up to 2 s"; a citation range and the host
-  memory figure were aligned with the source and the event shard.
 
 ## Limits
 
