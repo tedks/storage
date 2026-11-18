@@ -318,6 +318,12 @@ class RsyncBackend(SSHBackend):
     # SSH handshake per file, progressive download).  rsync is only
     # beneficial for writes where delta compression matters.
 
+    def sync_upload_capacity(self) -> Optional[int]:
+        # The transfer runs over the OpenSSH master, not the SFTP pool; only
+        # the brief parent mkdir takes a background SFTP lease. The 8-worker
+        # remote limit (storage.sync.sync_worker_limit) covers it.
+        return None
+
     def copy_from_local(self, local_path: Path, virtual_path: str):
         """Upload a file to remote using rsync."""
         # Ensure remote parent directory exists (rsync doesn't create

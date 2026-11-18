@@ -4,14 +4,17 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from storage.backends.local import LocalBackend
+from storage.backends.base import BackendType
 from storage.cache import CacheManager
 from storage.file_config import FileConfig, set_file_config
 from storage.models import FileLocation, FileMetadata, SyncStatus
 from storage.replication import ReplicationManager
 from storage.state import StateManager
-from storage.sync import DirOperation, DirSyncTask, SyncConfig, SyncManager, SyncTask
+from storage.sync import DirOperation, DirSyncTask, SyncConfig, SyncManager, SyncTask, SyncWorker
+from storage.sync_executor import RetryScheduler, SyncExecutor
 
 
 class TestSyncManager(unittest.TestCase):
@@ -104,6 +107,307 @@ class TestSyncManager(unittest.TestCase):
             worker.executor.process = lambda task: done.set() or True
         self.sync_manager.queue_sync("/again.txt")
         self.assertTrue(done.wait(5.0))
+        self.sync_manager.stop()
+
+    def test_adaptive_workers_overlap_distinct_tasks_and_retire(self):
+        self.sync_manager = SyncManager(
+            self.state_manager, self.cache_manager, self.replication_manager,
+            num_workers=1, max_workers=4, idle_timeout=0.1,
+            config=SyncConfig(monitor_interval=30.0),
+        )
+        release = threading.Event()
+        entered = threading.Condition()
+        active = 0
+        peak = 0
+
+        def blocked_process(executor, _task):
+            nonlocal active, peak
+            with entered:
+                active += 1
+                peak = max(peak, active)
+                entered.notify_all()
+            try:
+                release.wait(5.0)
+                executor._stats['synced'] += 1
+                return True
+            finally:
+                with entered:
+                    active -= 1
+                    entered.notify_all()
+
+        with patch.object(SyncExecutor, "process", blocked_process):
+            self.sync_manager.start()
+            try:
+                for index in range(8):
+                    self.sync_manager.queue_sync(f"/queued-{index}")
+                self.sync_manager.queue_sync("/queued-0")
+                with entered:
+                    self.assertTrue(entered.wait_for(lambda: active == 4, timeout=5.0))
+                self.assertEqual(4, peak)
+                self.assertEqual(4, len(self.sync_manager.workers))
+            finally:
+                release.set()
+            self.assertTrue(self.sync_manager.wait_for_completion(timeout=5.0))
+            deadline = time.monotonic() + 3.0
+            while len(self.sync_manager.workers) != 1 and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertEqual(1, len(self.sync_manager.workers))
+            self.assertEqual(8, self.sync_manager.get_stats()['total_synced'])
+            self.sync_manager.stop()
+
+    def test_adaptive_growth_after_dequeue_accounting_gap(self):
+        self.sync_manager = SyncManager(
+            self.state_manager, self.cache_manager, self.replication_manager,
+            num_workers=1, max_workers=2,
+            config=SyncConfig(monitor_interval=30.0),
+        )
+        original_get = self.sync_manager.task_queue.get
+        taken = threading.Event()
+        allow_get_to_return = threading.Event()
+        release_work = threading.Event()
+        entered = threading.Condition()
+        active = 0
+
+        def held_get(*args, **kwargs):
+            task = original_get(*args, **kwargs)
+            if getattr(task, 'virtual_path', None) == '/first':
+                taken.set()
+                allow_get_to_return.wait(5.0)
+            return task
+
+        def blocked_process(_executor, _task):
+            nonlocal active
+            with entered:
+                active += 1
+                entered.notify_all()
+            release_work.wait(5.0)
+            return True
+
+        self.sync_manager.task_queue.get = held_get
+        with patch.object(SyncExecutor, "process", blocked_process):
+            self.sync_manager.start()
+            try:
+                self.sync_manager.queue_sync('/first')
+                self.assertTrue(taken.wait(5.0))
+                self.sync_manager.queue_sync('/second')
+                self.assertEqual(1, len(self.sync_manager.workers))
+                allow_get_to_return.set()
+                with entered:
+                    self.assertTrue(entered.wait_for(lambda: active == 2, timeout=5.0))
+            finally:
+                allow_get_to_return.set()
+                release_work.set()
+            self.assertTrue(self.sync_manager.wait_for_completion(timeout=5.0))
+            self.sync_manager.stop()
+
+    def test_fixed_pool_stays_fixed_under_queue_pressure(self):
+        self.sync_manager = SyncManager(
+            self.state_manager, self.cache_manager, self.replication_manager,
+            num_workers=2, idle_timeout=0.05,
+            config=SyncConfig(monitor_interval=30.0),
+        )
+        release = threading.Event()
+        entered = threading.Condition()
+        active = 0
+
+        def blocked_process(_executor, _task):
+            nonlocal active
+            with entered:
+                active += 1
+                entered.notify_all()
+            release.wait(5.0)
+            return True
+
+        with patch.object(SyncExecutor, "process", blocked_process):
+            self.sync_manager.start()
+            try:
+                for index in range(6):
+                    self.sync_manager.queue_sync(f'/fixed-{index}')
+                with entered:
+                    self.assertTrue(entered.wait_for(lambda: active == 2, timeout=5.0))
+                self.assertEqual(2, len(self.sync_manager.workers))
+                self.assertEqual(4, self.sync_manager.get_queue_size())
+            finally:
+                release.set()
+            self.assertTrue(self.sync_manager.wait_for_completion(timeout=5.0))
+            self.sync_manager.stop()
+
+    def test_adaptive_stop_preserves_queued_tasks_for_restart(self):
+        self.sync_manager = SyncManager(
+            self.state_manager, self.cache_manager, self.replication_manager,
+            num_workers=1, max_workers=2,
+            config=SyncConfig(monitor_interval=30.0),
+        )
+        release = threading.Event()
+        entered = threading.Condition()
+        active = 0
+
+        def blocked_process(_executor, _task):
+            nonlocal active
+            with entered:
+                active += 1
+                entered.notify_all()
+            release.wait(5.0)
+            return True
+
+        with patch.object(SyncExecutor, "process", blocked_process):
+            self.sync_manager.start()
+            for index in range(3):
+                self.sync_manager.queue_sync(f"/pending-{index}")
+            with entered:
+                self.assertTrue(entered.wait_for(lambda: active == 2, timeout=5.0))
+            workers = list(self.sync_manager.workers)
+            stopping = threading.Thread(target=self.sync_manager.stop)
+            stopping.start()
+            # Release the busy workers only once each has been told to stop
+            # (stop() clears _running before it signals the workers), so
+            # neither can dequeue the third task first.
+            deadline = time.monotonic() + 5.0
+            while (not all(w._stop_event.is_set() for w in workers)
+                   and time.monotonic() < deadline):
+                time.sleep(0.01)
+            self.assertTrue(all(w._stop_event.is_set() for w in workers))
+            release.set()
+            stopping.join(timeout=5.0)
+            self.assertFalse(stopping.is_alive())
+        self.assertEqual(1, self.sync_manager.get_queue_size())
+        self.sync_manager.start()
+        self.assertTrue(self.sync_manager.wait_for_completion(timeout=5.0))
+        self.sync_manager.stop()
+
+    def test_adaptive_worker_limits_are_bounded_before_start(self):
+        with self.assertRaisesRegex(ValueError, "at least 1"):
+            SyncManager(
+                self.state_manager, self.cache_manager, self.replication_manager,
+                num_workers=0, max_workers=0,
+            )
+        with self.assertRaisesRegex(ValueError, "cannot exceed 32"):
+            SyncManager(
+                self.state_manager, self.cache_manager, self.replication_manager,
+                num_workers=1, max_workers=33,
+            )
+        self.replication_manager.backends['remote'] = _ssh_member("remote")
+        with self.assertRaisesRegex(ValueError, "cannot exceed 3 .*background SFTP"):
+            SyncManager(
+                self.state_manager, self.cache_manager, self.replication_manager,
+                num_workers=1, max_workers=4,
+            )
+
+    def test_fixed_pool_above_the_limit_is_kept_when_the_option_is_unset(self):
+        self.replication_manager.backends['remote'] = _ssh_member("remote")
+        manager = SyncManager(
+            self.state_manager, self.cache_manager, self.replication_manager,
+            num_workers=16,
+        )
+        self.assertEqual(16, manager.max_workers)
+        self.assertFalse(manager._adaptive)
+
+    def _stop_waits(self, adaptive):
+        """The join timeouts stop() passes, each worker taken as never
+        finishing (the fake join spends its whole timeout on stop's clock)."""
+        self.sync_manager = SyncManager(
+            self.state_manager, self.cache_manager, self.replication_manager,
+            num_workers=2, max_workers=2 if adaptive else None,
+            config=SyncConfig(monitor_interval=30.0),
+        )
+        now = [100.0]
+        self.sync_manager._clock = lambda: now[0]
+        waits = []
+
+        def fake_join(label):
+            def join(timeout=None):
+                waits.append((label, timeout))
+                now[0] += timeout
+            return join
+
+        self.sync_manager.start()
+        workers = list(self.sync_manager.workers)
+        monitor = self.sync_manager._monitor_thread
+        real_joins = [(w, w.join) for w in workers] + [(monitor, monitor.join)]
+        for index, worker in enumerate(workers):
+            worker.join = fake_join(f"worker{index}")
+        monitor.join = fake_join("monitor")
+        try:
+            self.sync_manager.stop()
+        finally:
+            for thread, join in real_joins:
+                thread.join = join
+                join(5.0)
+        self.sync_manager._lingering_workers = []
+        return waits
+
+    def test_fixed_pool_stop_waits_five_seconds_per_worker_then_for_the_monitor(self):
+        self.assertEqual(
+            [("worker0", 5.0), ("worker1", 5.0), ("monitor", 5.0)],
+            self._stop_waits(adaptive=False),
+        )
+
+    def test_adaptive_pool_stop_shares_one_five_second_deadline(self):
+        self.assertEqual(
+            [("worker0", 5.0), ("worker1", 0.0), ("monitor", 0.0)],
+            self._stop_waits(adaptive=True),
+        )
+
+    def test_restart_waits_for_worker_that_outlived_stop(self):
+        self._restart_waits_for_worker_that_outlived_stop(max_workers=2)
+
+    def test_fixed_pool_restart_waits_for_worker_that_outlived_stop(self):
+        self._restart_waits_for_worker_that_outlived_stop(max_workers=None)
+
+    def _restart_waits_for_worker_that_outlived_stop(self, max_workers):
+        self.sync_manager = SyncManager(
+            self.state_manager, self.cache_manager, self.replication_manager,
+            num_workers=1, max_workers=max_workers,
+            config=SyncConfig(monitor_interval=30.0),
+        )
+        entered = threading.Event()
+        release = threading.Event()
+
+        def blocked_process(_executor, _task):
+            entered.set()
+            release.wait(5.0)
+            return True
+
+        with patch.object(SyncExecutor, "process", blocked_process):
+            self.sync_manager.start()
+            self.sync_manager.queue_sync("/busy")
+            self.assertTrue(entered.wait(5.0))
+            try:
+                # Simulate the five-second deadline without spending five
+                # seconds in this test; the worker remains in its task.
+                with patch.object(SyncWorker, "join"):
+                    self.sync_manager.stop()
+                with self.assertRaisesRegex(RuntimeError, "still finishing"):
+                    self.sync_manager.start()
+            finally:
+                release.set()
+            self.sync_manager._lingering_workers[0].join(timeout=5.0)
+        self.sync_manager.start()
+        self.sync_manager.stop()
+
+    def test_failed_initial_worker_start_cleans_up_partial_pool(self):
+        self.sync_manager = SyncManager(
+            self.state_manager, self.cache_manager, self.replication_manager,
+            num_workers=2, config=SyncConfig(monitor_interval=30.0),
+        )
+        original_start = SyncWorker.start
+        attempts = 0
+
+        def fail_second_start(worker):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 2:
+                raise RuntimeError('synthetic thread exhaustion')
+            return original_start(worker)
+
+        with patch.object(SyncWorker, 'start', fail_second_start):
+            with self.assertRaisesRegex(RuntimeError, 'synthetic thread exhaustion'):
+                self.sync_manager.start()
+        self.assertFalse(self.sync_manager._running)
+        self.assertEqual([], self.sync_manager.workers)
+        self.assertEqual(0, self.sync_manager.get_queue_size())
+        self.sync_manager.start()
+        self.assertEqual(2, len(self.sync_manager.workers))
         self.sync_manager.stop()
 
     def test_queue_sync(self):
@@ -338,6 +642,348 @@ class TestSyncManager(unittest.TestCase):
         updated_metadata = self.state_manager.get_file_metadata(test_file)
         # Should be either CLEAN or SYNCING
         self.assertIn(updated_metadata.sync_status, [SyncStatus.CLEAN, SyncStatus.SYNCING])
+
+
+class TestGrowthWithFailingRenameRecords(unittest.TestCase):
+    """Saturate a grown pool with rename tasks whose repair record fails.
+
+    #182 never replays a queued member rename: it records it for repair,
+    and retries a task whose record cannot be written without dropping it,
+    its backoff held by the queue's RetryScheduler rather than a worker.
+    With max_sync_workers such tasks all in flight at once, an unrelated
+    file sync must still finish while the writes are failing; once they
+    succeed, each task leaves one record, no member is renamed, nothing
+    stays deferred, and the pool returns to its floor.
+    """
+
+    FLOOR, CEILING = 1, 3
+
+    # The same members, cache and index as TestSyncManager, without
+    # rerunning its tests.
+    setUp = TestSyncManager.setUp
+    tearDown = TestSyncManager.tearDown
+
+    def test_healthy_sync_finishes_while_records_fail_then_pool_settles(self):
+        import errno
+        from storage.backends.local import LocalBackend as _Local
+        from storage.member_repairs import MemberRepairs
+
+        self.sync_manager = SyncManager(
+            self.state_manager, self.cache_manager, self.replication_manager,
+            num_workers=self.FLOOR, max_workers=self.CEILING, idle_timeout=0.1,
+            # A long backoff: were it held in a worker (not the scheduler),
+            # the healthy sync below could not finish inside its deadline.
+            config=SyncConfig(monitor_interval=30.0, retry_delay=30.0, max_retries=3),
+        )
+        repairs = self.cache_manager.member_repairs
+        names = [(f"/old-{i}", f"/new-{i}") for i in range(self.CEILING)]
+        for old, _new in names:
+            for directory in (self.backend1_dir, self.backend2_dir):
+                (directory / old.lstrip("/")).write_bytes(b"member bytes " + old.encode())
+
+        failing = threading.Event()
+        failing.set()
+        failures = []
+        lock = threading.Lock()
+        # Every failing task is inside record() at once, in its own worker,
+        # and the test thread is the last party: the pool is at its ceiling
+        # and every worker holds a distinct failing task. A broken barrier
+        # in a worker would otherwise vanish into the retry path, so it is
+        # kept and re-raised here.
+        first_pass, arrived, barrier_errors = set(), [], []
+        pool_at_rendezvous = []
+        # The action runs once every party has arrived and before any is
+        # released, so the pool size it reads is the size while all the
+        # workers are still inside record(); read later, idle workers may
+        # already have retired (idle_timeout is short).
+        saturated = threading.Barrier(
+            self.CEILING + 1, timeout=10.0,
+            action=lambda: pool_at_rendezvous.append(len(self.sync_manager.workers)),
+        )
+        real_record, real_write = MemberRepairs.record, MemberRepairs._write_new
+
+        def record(repairs_self, old_path, *args, **kwargs):
+            with lock:
+                first = old_path not in first_pass
+                first_pass.add(old_path)
+            if first:
+                with lock:
+                    arrived.append((old_path, threading.current_thread().name))
+                try:
+                    saturated.wait()
+                except threading.BrokenBarrierError as exc:
+                    with lock:
+                        barrier_errors.append(exc)
+                    raise
+            return real_record(repairs_self, old_path, *args, **kwargs)
+
+        def write_new(repairs_self, *args, **kwargs):
+            if failing.is_set():
+                record = args[0] if args else kwargs.get("record")
+                with lock:
+                    failures.append((time.monotonic(), record.old_path))
+                raise OSError(errno.ENOSPC, "injected: repair store full")
+            return real_write(repairs_self, *args, **kwargs)
+
+        renamed = []
+
+        def no_rename(backend, old, new):
+            renamed.append((backend.name, old, new))
+            raise AssertionError("a member rename was replayed")
+
+        healthy = "/healthy.txt"
+        payload = b"healthy bytes \x00\x01 " * 64
+
+        def on_members():
+            return [d for d in (self.backend1_dir, self.backend2_dir)
+                    if (d / "healthy.txt").exists()]
+
+        with patch.object(MemberRepairs, "record", record), \
+                patch.object(MemberRepairs, "_write_new", write_new), \
+                patch.object(_Local, "rename", no_rename):
+            self.sync_manager.start()
+            for old, new in names:
+                self.sync_manager.queue_dir_sync(old, DirOperation.RENAME, new_path=new)
+            saturated.wait()          # every worker now holds a failing task
+            self.assertEqual([], barrier_errors)
+            with lock:
+                self.assertEqual(sorted(old for old, _ in names),
+                                 sorted(old for old, _ in arrived))
+                self.assertEqual(self.CEILING, len({worker for _, worker in arrived}))
+            self.assertEqual([self.CEILING], pool_at_rendezvous)
+
+            # Only now is the healthy file made and marked dirty: the
+            # monitor's pass at start() cannot have synced it early.
+            self.assertEqual([], on_members())
+            cache_path = self.cache_manager.get_cache_path(healthy)
+            cache_path.write_bytes(payload)
+            self.state_manager.set_file_metadata(FileMetadata(
+                virtual_path=healthy, size=len(payload), checksum=None,
+                last_access=time.time(), last_modified=time.time(),
+                sync_status=SyncStatus.DIRTY, replica_count=1, recomputable=False,
+                recompute_cmd=None, encrypted=False, encryption_key_id=None,
+            ))
+            set_file_config(cache_path, FileConfig(replica_count=1))
+            self.sync_manager.queue_sync(healthy, priority=100)
+            def healthy_clean():
+                row = self.state_manager.get_file_metadata(healthy)
+                return row is not None and row.sync_status == SyncStatus.CLEAN
+
+            deadline = time.monotonic() + 10.0
+            while not healthy_clean() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertTrue(healthy_clean(), "the healthy sync never finished")
+            members = on_members()
+            self.assertEqual(1, len(members))
+            self.assertEqual(payload, (members[0] / "healthy.txt").read_bytes())
+            # Still failing: no record was written, and the failing
+            # retries are held in the queue's RetryScheduler, not in a
+            # worker (CTO RRS-CTO-BACKOFF).
+            done_at = time.monotonic()
+            self.assertTrue(failing.is_set())
+            self.assertEqual([], repairs.list())
+            scheduler = RetryScheduler.for_queue(self.sync_manager.task_queue)
+            deadline = time.monotonic() + 10.0
+            seen = scheduler.pending()
+            while seen != self.CEILING and time.monotonic() < deadline:
+                time.sleep(0.01)
+                seen = scheduler.pending()
+            self.assertEqual(self.CEILING, seen)
+            # A further round, delivered now, still fails, for every task.
+            redelivered_at = time.monotonic()
+            scheduler.deliver_all_now()
+
+            def failed_again():
+                with lock:
+                    return {old for t, old in failures if t > redelivered_at}
+
+            deadline = time.monotonic() + 10.0
+            while failed_again() != {old for old, _ in names} and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertEqual({old for old, _ in names}, failed_again())
+            # And every task back in the scheduler before the failure clears:
+            # each has failed again, so each entry is a fresh 60 s+ deferral,
+            # none can be handed out on its own, and none is between failing
+            # and being deferred. One deferred after the delivery below would
+            # sit out that backoff.
+            deadline = time.monotonic() + 10.0
+            seen = scheduler.pending()
+            while seen != self.CEILING and time.monotonic() < deadline:
+                time.sleep(0.01)
+                seen = scheduler.pending()
+            self.assertEqual(self.CEILING, seen)
+
+            failing.clear()
+            scheduler.deliver_all_now()
+            self.assertTrue(self.sync_manager.wait_for_completion(timeout=15.0))
+        self.assertEqual([], barrier_errors)
+        self.assertEqual(0, scheduler.pending())
+
+        records = repairs.list()
+        self.assertEqual(sorted(names), sorted((r.old_path, r.new_path) for r in records))
+        self.assertEqual(len(names), len(records))      # one per task
+        for r in records:
+            self.assertEqual(("backend1", "backend2"), tuple(sorted(r.members)))
+        self.assertEqual([], renamed)
+        for old, new in names:
+            for directory in (self.backend1_dir, self.backend2_dir):
+                self.assertEqual(b"member bytes " + old.encode(),
+                                 (directory / old.lstrip("/")).read_bytes())
+                self.assertFalse((directory / new.lstrip("/")).exists())
+        deadline = time.monotonic() + 5.0
+        while len(self.sync_manager.workers) != self.FLOOR and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertEqual(self.FLOOR, len(self.sync_manager.workers))
+        self.sync_manager.stop()
+
+    def test_a_delivered_rename_retry_starts_a_worker_with_a_zero_floor(self):
+        # workers = 0 is accepted with max_sync_workers: a retry delivered
+        # after the pool retired to nothing must start a worker.
+        self.sync_manager = SyncManager(
+            self.state_manager, self.cache_manager, self.replication_manager,
+            num_workers=0, max_workers=1, idle_timeout=0.1,
+            config=SyncConfig(monitor_interval=30.0, retry_delay=60.0, max_retries=3),
+        )
+        attempts, done = [], threading.Event()
+
+        def process(executor, task):
+            attempts.append(task.virtual_path)
+            if len(attempts) == 1:
+                raise RuntimeError("injected: repair store refused")
+            done.set()
+            return True
+
+        scheduler = RetryScheduler.for_queue(self.sync_manager.task_queue)
+        with patch.object(SyncExecutor, "process", process):
+            self.sync_manager.start()
+            self.sync_manager.queue_dir_sync("/old", DirOperation.RENAME, new_path="/new")
+            deadline = time.monotonic() + 5.0
+            while ((scheduler.pending() != 1 or self.sync_manager.workers)
+                   and time.monotonic() < deadline):
+                time.sleep(0.02)
+            self.assertEqual(1, scheduler.pending())
+            self.assertEqual([], self.sync_manager.workers)
+            scheduler.deliver_all_now()
+            self.assertTrue(done.wait(5.0), "the delivered retry found no worker")
+            self.assertTrue(self.sync_manager.wait_for_completion(timeout=5.0))
+            self.sync_manager.stop()
+
+    def test_a_delivered_rename_retry_grows_the_pool_past_a_busy_floor(self):
+        # The scheduler puts a deferred retry back from its own thread. With
+        # the only floor worker busy, the pool must grow for it then, not
+        # wait for some later queue event.
+        self.sync_manager = SyncManager(
+            self.state_manager, self.cache_manager, self.replication_manager,
+            num_workers=self.FLOOR, max_workers=2, idle_timeout=0.1,
+            config=SyncConfig(monitor_interval=30.0, retry_delay=60.0, max_retries=3),
+        )
+        release, blocked, blocker_done = threading.Event(), threading.Event(), threading.Event()
+        attempts, done = [], threading.Event()
+
+        def process(executor, task):
+            if task.virtual_path == "/blocker":
+                blocked.set()
+                # Held until the test releases it (the finally below), well
+                # past every wait in the test: the floor worker never frees
+                # up to run the retry itself.
+                release.wait(120.0)
+                blocker_done.set()
+                return True
+            attempts.append(threading.current_thread().name)
+            if len(attempts) == 1:
+                raise RuntimeError("injected: repair store refused")
+            done.set()
+            return True
+
+        scheduler = RetryScheduler.for_queue(self.sync_manager.task_queue)
+        with patch.object(SyncExecutor, "process", process):
+            self.sync_manager.start()
+            try:
+                self.sync_manager.queue_sync("/blocker")
+                self.assertTrue(blocked.wait(5.0))
+                self.sync_manager.queue_dir_sync("/old", DirOperation.RENAME, new_path="/new")
+                deadline = time.monotonic() + 5.0
+                while ((scheduler.pending() != 1 or len(self.sync_manager.workers) != self.FLOOR)
+                       and time.monotonic() < deadline):
+                    time.sleep(0.02)
+                # Deferred, and the grown worker has retired: only the busy
+                # floor worker is left.
+                self.assertEqual(1, scheduler.pending())
+                self.assertEqual(self.FLOOR, len(self.sync_manager.workers))
+                scheduler.deliver_all_now()
+                self.assertTrue(done.wait(5.0), "the delivered retry waited behind the busy floor")
+                self.assertFalse(blocker_done.is_set())
+                self.assertEqual(2, len(attempts))
+            finally:
+                release.set()
+            self.assertTrue(self.sync_manager.wait_for_completion(timeout=5.0))
+            self.sync_manager.stop()
+
+
+def _ssh_member(name, sftp_channels=None, interactive_reserve=1):
+    """An ssh:// member (constructed lazily: nothing connects), optionally
+    with a non-default SFTP pool configuration."""
+    from storage.backends.ssh import SSHBackend
+    from storage.backends.ssh_pool import MemberConnection
+
+    member = SSHBackend(name, f"{name}.example", "/srv/root", "u")
+    if sftp_channels is not None:
+        member._pool = MemberConnection(
+            name, lambda: None, connect_timeout=1.0, retry_interval=1.0,
+            sftp_channels=sftp_channels, interactive_reserve=interactive_reserve,
+        )
+    return member
+
+
+def _rsync_member(name):
+    from storage.backends.rsync import RsyncBackend
+    return RsyncBackend(name, f"{name}.example", "/srv/root", "u")
+
+
+class TestSyncWorkerLimit(unittest.TestCase):
+    """The explicit max_sync_workers limit: the minimum applicable one."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.temp_dir, True)
+
+    def local(self, name):
+        path = Path(self.temp_dir) / name
+        path.mkdir()
+        return LocalBackend(name, str(path))
+
+    def limit(self, *members):
+        from storage.sync import sync_worker_limit
+        return sync_worker_limit({m.name: m for m in members})
+
+    def test_local_only(self):
+        self.assertEqual(32, self.limit(self.local("a"), self.local("b"))[0])
+
+    def test_rsync_only_keeps_the_remote_limit(self):
+        self.assertEqual(8, self.limit(_rsync_member("r"))[0])
+        self.assertEqual(8, self.limit(self.local("a"), _rsync_member("r"))[0])
+
+    def test_default_ssh_member_allows_its_three_background_channels(self):
+        limit, reason = self.limit(_ssh_member("s"))
+        self.assertEqual(3, limit)
+        self.assertIn("member s's 3 background SFTP channel(s)", reason)
+
+    def test_mixed_members_take_the_smallest_limit(self):
+        members = (self.local("a"), _rsync_member("r"), _ssh_member("wide", 6, 2),
+                   _ssh_member("s"))
+        limit, reason = self.limit(*members)
+        self.assertEqual(3, limit)
+        self.assertIn("member s's", reason)
+
+    def test_non_default_reserve(self):
+        self.assertEqual(4, self.limit(_ssh_member("s", 6, 2))[0])
+        self.assertEqual(4, self.limit(_ssh_member("s", 4, 0))[0])
+        # Never below one, even when the reserve takes every channel.
+        self.assertEqual(1, self.limit(_ssh_member("s", 2, 2))[0])
+        # A wide pool is still held to the remote limit.
+        limit, reason = self.limit(_ssh_member("s", 12, 1))
+        self.assertEqual(8, limit)
+        self.assertIn("remote", reason)
 
 
 class TestSyncConflicts(unittest.TestCase):

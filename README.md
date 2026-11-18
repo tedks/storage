@@ -103,6 +103,8 @@ Required:
 Options:
   -s, --cache-size SIZE    Cache size (e.g., 10G, 500M) [default: 10G]
   -d, --database PATH      State database path [default: cache/.storage.db]
+  -w, --workers N          Sync workers: fixed pool size, or the minimum with --max-sync-workers [default: 2]
+  --max-sync-workers N     Grow sync workers on queued tasks up to N
   -f, --foreground         Run in foreground
 ```
 
@@ -121,6 +123,8 @@ cache = "/home/user/.cache/storage/media"
 cache_size = "50G"
 key_file = "/home/user/.ssh/id_ed25519"
 foreground = true
+workers = 2
+# max_sync_workers = 3
 backends = [
   { spec = "ssh://user@storage-host.example:/srv/raid/media/", name = "RAID media" },
   { spec = "ssh://user@storage-host.example:/srv/chunk0/media/", name = "Chunk 0 media" },
@@ -143,6 +147,42 @@ Save that as `~/.config/storage/storage.toml` to auto-load by name:
 ```bash
 storage mount example-media
 ```
+
+`workers` controls background file and directory sync, not foreground FUSE
+requests or streaming prefetch. By default it stays a fixed pool of two, as
+before. Set `max_sync_workers` in a profile (or `--max-sync-workers` on the
+CLI) to add workers when distinct tasks wait behind busy workers. Excess
+workers exit after 30 seconds idle. The configured maximum must be at least
+`workers`, and both must be within the smallest limit that applies: 32 with
+local members only; 8 when any member is remote (rsync uploads share one
+OpenSSH connection per host, which also carries the remote watcher, under
+the usual ten-session OpenSSH limit); and for each `ssh://` member, its
+background SFTP channels (the four SFTP channels each `ssh://` member opens
+at most, less the one kept for interactive calls: 3; neither is a mount
+option today). An `ssh://` member's uploads share those
+channels with its other background work, in the Paramiko connection that
+foreground reads also use, so more workers would only wait for a channel,
+each holding its file's upload lock. `rsync://` uploads use the separate
+OpenSSH connection. These limits come from configuration, not a probe of
+the server: one that grants fewer sessions, or other background calls on
+the same channels, can still make uploads wait, and servers configured with
+a lower session limit may need a lower maximum. A maximum or minimum outside
+them is refused with the limit and what sets it (for an `ssh://` limit, the
+member). The limits
+apply only with `max_sync_workers` set: a fixed pool keeps its configured
+size. CPU
+load average is not used: sync spends most of its time waiting for member I/O,
+so CPU load is a poor guide to useful concurrency.
+
+Stopping a sync pool waits for its workers to finish their current tasks and
+leaves queued tasks for a later start. A fixed pool waits up to five seconds
+for each worker, then five for the sync monitor, as before; with
+`max_sync_workers` set, the whole pool and the monitor share one five-second
+wait, however far the pool grew. These are waits, not a guarantee that every
+upload finished: a worker still in a member call when they end keeps running
+while the unmount continues. If a worker is still finishing, the pool
+refuses a restart until it exits, so two generations never sync the same
+path at once; this applies to fixed and adaptive pools alike.
 
 Or mount from an explicit TOML path (`storage.example.toml` in this repo
 is a fuller version of the same profile):
