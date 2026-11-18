@@ -6,8 +6,8 @@ type: task
 component: storage
 release:
 reporter: Ted Smith <tedks@riseup.net>
-status: unstarted
-disposition:
+status: closed
+disposition: fixed
 creation_time: 2026-11-18T06:33:49-00:00
 references: []
 log_events:
@@ -49,5 +49,9 @@ log_events:
     listed with BYTES <path>, and survives eviction, reopen and rebuild, deduplicated
     by view identity. Residual: when the cache refuses the copy itself (ENOSPC), the
     bytes stay only in the view cache, which is logged.'
+- time: 2026-11-18T06:45:02-00:00
+  who: Ted Smith
+  what: 'closed: fixed'
+  comment: 'Fixed in PR #182 435b958 (view-write repair keeps the bytes durably)'
 blocks:
 - gh-181
