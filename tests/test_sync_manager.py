@@ -719,8 +719,9 @@ class TestGrowthWithFailingRenameRecords(unittest.TestCase):
 
         def write_new(repairs_self, *args, **kwargs):
             if failing.is_set():
+                record = args[0] if args else kwargs.get("record")
                 with lock:
-                    failures.append(time.monotonic())
+                    failures.append((time.monotonic(), record.old_path))
                 raise OSError(errno.ENOSPC, "injected: repair store full")
             return real_write(repairs_self, *args, **kwargs)
 
@@ -788,16 +789,23 @@ class TestGrowthWithFailingRenameRecords(unittest.TestCase):
                 time.sleep(0.01)
                 seen = scheduler.pending()
             self.assertEqual(self.CEILING, seen)
-            # A further round, delivered now, still fails.
+            # A further round, delivered now, still fails, for every task.
+            redelivered_at = time.monotonic()
             scheduler.deliver_all_now()
+
+            def failed_again():
+                with lock:
+                    return {old for t, old in failures if t > redelivered_at}
+
             deadline = time.monotonic() + 10.0
-            while not any(t > done_at for t in failures) and time.monotonic() < deadline:
+            while failed_again() != {old for old, _ in names} and time.monotonic() < deadline:
                 time.sleep(0.02)
-            self.assertTrue(any(t > done_at for t in failures))
-            # Every task back in the scheduler before the failure clears: one
-            # deferred after the delivery below would wait its whole 30 s+
-            # backoff. Nothing is delivered on its own inside it, so this
-            # state is stable.
+            self.assertEqual({old for old, _ in names}, failed_again())
+            # And every task back in the scheduler before the failure clears:
+            # each has failed again, so each entry is a fresh 60 s+ deferral,
+            # none can be handed out on its own, and none is between failing
+            # and being deferred. One deferred after the delivery below would
+            # sit out that backoff.
             deadline = time.monotonic() + 10.0
             seen = scheduler.pending()
             while seen != self.CEILING and time.monotonic() < deadline:
