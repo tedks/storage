@@ -836,6 +836,9 @@ class TestRepairsOutliveTheIndex(SyncRaceTestBase):
             ("rmdir", ("/.storage.repairs",)),
             ("rename", ("/e", "/.storage.repairs/x")),
             ("setxattr", (f"/.storage.repairs/{record.id}", "user.storage.member_repair", b"{}", 0)),
+            ("removexattr", (f"/.storage.repairs/{record.id}", "user.storage.member_repair")),
+            ("chmod", (f"/.storage.repairs/{record.id}", 0o644)),
+            ("chown", (f"/.storage.repairs/{record.id}", os.getuid(), os.getgid())),
         ):
             with self.assertRaises(FuseOSError, msg=op) as raised:
                 getattr(self.fs, op)(*args)
@@ -843,3 +846,78 @@ class TestRepairsOutliveTheIndex(SyncRaceTestBase):
         self.assertEqual([record.id], [r.id for r in MemberRepairs(self.cache_dir).list()])
         self.reopen(rebuild=True)
         self.assertIsNone(self.fs.state_manager.get_file_metadata(f"/.storage.repairs/{record.id}"))
+
+    def test_a_resolution_during_a_rename_is_not_hidden_by_the_rename_s_own_write(self):
+        """Another process resolves repair R while a rename is in its member
+        call; the rename's own settle must not stamp over that removal."""
+        self.fs.mkdir("/old", 0o755)
+        self.fail_member_once("rename")
+        self.fs.rename("/old", "/older")
+        [earlier] = self.fs.cache_manager.member_repairs.list()
+        self.fs.mkdir("/d", 0o755)
+        real = self.member.rename
+
+        def resolve_elsewhere_then_rename(*args):
+            self.assertTrue(MemberRepairs(self.cache_dir).resolve(earlier.id))
+            return real(*args)
+
+        with patch.object(self.member, "rename", side_effect=resolve_elsewhere_then_rename):
+            self.fs.rename("/d", "/e")
+        self.assertEqual([], self.fs.cache_manager.member_repairs.list())
+        self.assertEqual(set(), self.fs.cache_manager.member_repairs.backends_for(["/old", "/older"]))
+
+    def test_an_intent_resolved_while_its_rename_runs_still_records_the_miss(self):
+        """Someone resolves the in-flight intent from another process, then
+        the member misses the move: the miss gets a new open record."""
+        self.fs.mkdir("/d", 0o755)
+
+        def resolve_intent_then_fail(*_args):
+            [intent] = MemberRepairs(self.cache_dir).list()
+            self.assertEqual("intent", intent.state)
+            self.assertTrue(MemberRepairs(self.cache_dir).resolve(intent.id))
+            raise OSError("member unreachable")
+
+        with patch.object(self.member, "rename", side_effect=resolve_intent_then_fail):
+            self.fs.rename("/d", "/e")
+        [record] = MemberRepairs(self.cache_dir).list()
+        self.assertEqual(("open", ("member",), "/d", "/e"),
+                         (record.state, record.members, record.old_path, record.new_path))
+        self.assertEqual({"member"}, self.fs.cache_manager.member_repairs.backends_for(["/e"]))
+
+    def test_an_interrupted_resolution_still_fences_until_the_cache_finishes_it(self):
+        """A resolution that wrote its durable resolved state but did not get
+        to unlink the carrier: open caches still enforce the carrier, and
+        the next open by the cache's owner finishes the resolution."""
+        self.offline_rename_of_an_uncached_directory()
+        [record] = self.fs.cache_manager.member_repairs.list()
+        carriers = self.cache_dir / ".storage.repairs"
+        real_unlink = Path.unlink
+
+        def refusing(path, *args, **kwargs):
+            if path.parent == carriers:
+                raise OSError(errno.EIO, "injected")
+            return real_unlink(path, *args, **kwargs)
+
+        with patch.object(Path, "unlink", refusing):
+            with self.assertRaises(OSError):
+                MemberRepairs(self.cache_dir).resolve(record.id)
+        [still] = MemberRepairs(self.cache_dir).list()
+        self.assertEqual("resolved", still.state)
+        self.assertEqual({"member"}, self.fs.cache_manager.member_repairs.backends_for(["/d"]))
+        self.reopen()
+        self.assertEqual([], os.listdir(carriers))
+        self.assertEqual(set(), self.fs.cache_manager.member_repairs.backends_for(["/d"]))
+
+    def test_the_local_move_is_made_durable_before_any_member_call(self):
+        """If the cache directories cannot be fsynced after the local move,
+        no member is called and the intent stays."""
+        self.fs.mkdir("/d", 0o755)
+        renames = []
+        patch.object(self.member, "rename", side_effect=lambda *a: renames.append(a)).start()
+        self.addCleanup(patch.stopall)
+        with patch("storage.namespace.fsync_directories", side_effect=OSError(errno.EIO, "injected")):
+            with self.assertRaises(FuseOSError):
+                self.fs.rename("/d", "/e")
+        self.assertEqual([], renames)
+        [record] = MemberRepairs(self.cache_dir).list()
+        self.assertEqual(("intent", ("member",)), (record.state, record.members))

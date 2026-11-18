@@ -82,6 +82,7 @@ test_suite(
         "locks",
         "member_capabilities",
         "models",
+        "member_repairs",
         "merge_gated",
         "mount_lock",
         "mount_sigpipe",

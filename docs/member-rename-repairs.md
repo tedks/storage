@@ -80,7 +80,10 @@ durable record of it.
    changed: no cache move, no index change, no member call. A rename with no
    target members writes no record.
 2. **Local move.** The cache rename, the index rewrite and the metadata
-   xattrs, as before.
+   xattrs, as before. Then both cache parent directories are fsynced, so
+   no power loss can undo the local move after a member has taken it and
+   its intent has been dropped. If that fsync fails, the rename returns
+   the error with the intent kept and no member called.
 3. **Member renames.** These skip any member that already had an open
    repair overlapping either path. Those members are added to the failed
    set, and none of them is called.
@@ -94,6 +97,12 @@ durable record of it.
    If settling fails, the `intent` record stays. It names every target
    member, so it over-fences, but nothing is lost. The rename still returns
    success, because its evidence is durable.
+
+   Settle takes an exclusive `flock` on the carrier, as resolution does.
+   If it finds the intent already resolved or gone (someone resolved it
+   from the CLI while the rename was running), the members that missed
+   the move get a new `open` record. Resolving an intent cannot cover what
+   the rename had not done yet.
 
 What a crash at each point leaves:
 
@@ -124,10 +133,22 @@ At load, it reads every carrier:
 - a `*.new` file is removed.
 
 Lookups (`backends_for(paths)` for the fences, `covers(path)` for the pin)
-use the in-memory records, and reload when the directory's stat changes. That
-is how a resolution made by the CLI reaches a live mount. A change the reload
-misses (two changes within one timestamp tick) can only be a removal by
-another process, so missing it keeps a protection longer and never drops one.
+use the in-memory records. They reload when the directory's stat changes,
+which is how a resolution made by the CLI reaches a live mount. Every write
+by the mount is followed by a full reload, so the mount's own new stamp
+never hides an external change made before or during that write. A change
+a lookup misses (two changes within one timestamp tick) can only be a
+removal by another process, so missing it keeps a protection longer and
+never drops one.
+
+Two locks are involved. One guards the in-memory records and is never held
+across an fsync. The other orders this process's writers across their I/O.
+Neither is held while any other lock is taken. Opening the cache with more
+than 1000 open repairs logs a warning, since every lookup scans them all.
+
+Members are identified by their stable member IDs. A member whose ID
+changes in the configuration no longer matches its repairs: settle those
+repairs before renaming a member.
 
 There is no SQLite projection. The table added earlier in this PR is
 removed, so no index row and no numeric id stands for a repair.
@@ -135,8 +156,17 @@ removed, so no index row and no numeric id stands for a repair.
 ## Resolution
 
 `storage debug member-repairs -c CACHE` lists the carriers. `--resolve ID`
-unlinks `.storage.repairs/ID` and fsyncs the directory. Until that removal is
-durable, nothing drops a protection, and a mount picks the removal up on its
+works in two steps, under an exclusive `flock` on the carrier:
+
+1. It rewrites the record with `state` `resolved` and fsyncs it. Readers
+   still enforce a carrier that exists, whatever its state.
+2. It unlinks the carrier and fsyncs the directory. The unlink is the only
+   change readers act on, and it becomes visible only after the resolution
+   is durable.
+
+If a crash comes between the two steps, the carrier is left `resolved`. It
+stays enforced until the cache's owner (the mount) next opens the cache,
+which finishes the resolution. A mount sees a completed resolution at its
 next lookup.
 
 The id is the carrier's random name, so it survives index loss. A stale or
@@ -146,9 +176,10 @@ index can name a different repair.
 
 ## Validation
 
-All of these run on scratch Local members, as unit and system tests in
-`tests/test_sync_races.py`, `tests/test_member_repairs.py` and
-`tests/test_cli_debug.py`:
+All of these run on scratch Local members. The system cases are in
+`tests/test_sync_races.py` (classes `TestRepairsOutliveTheIndex` and
+`TestDirectoryRetries`), the unit cases in `tests/test_member_repairs.py`,
+and the CLI cases in `tests/test_cli_debug.py`:
 
 - **Offline member with no cached leaf.** A member holds the only bytes of
   `/d/f.txt`, the file is not cached, and the member is offline during
@@ -169,5 +200,13 @@ All of these run on scratch Local members, as unit and system tests in
   - a forked child exits right after its member call, before settling: the
     intent is there after a reopen;
   - a corrupt carrier: the cache refuses to open.
-- **The carrier is protected.** Hidden from the root listing, refused
-  through the mount, and not indexed by rebuild-index.
+- **The carrier is protected.** Hidden from the root listing; refused
+  through the mount, including chmod, chown, setxattr and removexattr; and
+  not indexed by rebuild-index.
+- **Races and ordering:**
+  - a resolution made by another process during a rename's member call
+    still reaches the mount;
+  - an intent resolved while its rename runs still records the members
+    that missed the move;
+  - an interrupted resolution stays enforced until the next open;
+  - a failed fsync of the local move calls no member.

@@ -15,6 +15,7 @@ from .cache_metadata import regular_file_stat
 from .checksums import ChecksumBasis, ChecksumRecord
 from .models import SyncStatus
 from .pathing import ResolvedPath, canonicalize_virtual_path
+from .member_repairs import fsync_directories
 from .sync_tasks import DirOperation
 
 
@@ -1537,6 +1538,12 @@ class NamespaceService:
                     # Nothing moved and no member was called.
                     repairs.settle(intent, {})
                 raise
+            if intent is not None:
+                # The local move is durable before any member is called, so
+                # no power loss can undo it after a member took the move and
+                # its intent was dropped. A failure here leaves the intent,
+                # with no member called.
+                fsync_directories(old_cache.parent, new_cache.parent)
 
             errors: Dict[str, str] = {}
             failures = self._propagate_dir_operation(

@@ -2334,7 +2334,7 @@ class StorageFS(Operations):
 
     def chmod(self, path, mode):
         """Change file mode"""
-        cache_path = self.cache_manager.get_cache_path(path)
+        cache_path = self._resolve_path(path).cache_path
 
         try:
             os.chmod(cache_path, mode)
@@ -2343,7 +2343,7 @@ class StorageFS(Operations):
 
     def chown(self, path, uid, gid):
         """Change file owner"""
-        cache_path = self.cache_manager.get_cache_path(path)
+        cache_path = self._resolve_path(path).cache_path
 
         # lchown: the kernel sends chown -h for a link, which must change
         # the link, never its target. (chmod is never sent for a link.)
@@ -2758,7 +2758,7 @@ class StorageFS(Operations):
                     self.MEMBER_STAT_XATTR}:
             # Derived; ignore removals.
             return
-        cache_path = self.cache_manager.get_cache_path(path)
+        cache_path = self._resolve_path(path).cache_path
 
         try:
             os.removexattr(str(cache_path), name, follow_symlinks=False)

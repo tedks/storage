@@ -102,5 +102,6 @@ storage_test(
     tags = ["local", "manual"],
     timeout = "long",
 )
+storage_test("member_repairs")
 storage_test("sync_tasks")
 storage_test("watcher")

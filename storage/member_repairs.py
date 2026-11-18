@@ -14,6 +14,7 @@ docs/member-rename-repairs.md for the format and the crash ordering.
 """
 
 import errno
+import fcntl
 import json
 import logging
 import os
@@ -36,6 +37,12 @@ MAX_RECORD_BYTES = 3584
 MAX_REASON_CHARS = 256
 INTENT = "intent"
 OPEN = "open"
+# Written durably by a resolution just before its carrier is unlinked; still
+# enforced while the carrier exists (see MemberRepairs.resolve).
+RESOLVED = "resolved"
+# Past this many open repairs, opening the cache warns: every fence and pin
+# lookup scans them all.
+GROWTH_WARNING = 1000
 _NEW_SUFFIX = ".new"
 _ID_RE = re.compile(r"^[0-9a-f]{32}$")
 
@@ -90,7 +97,7 @@ class MemberRepair:
             valid = (
                 data["v"] == RECORD_VERSION
                 and record.id == carrier_name
-                and record.state in (INTENT, OPEN)
+                and record.state in (INTENT, OPEN, RESOLVED)
                 and record.members
                 and all(isinstance(m, str) and m for m in record.members)
                 and all(isinstance(p, str) and p.startswith("/")
@@ -128,6 +135,12 @@ def _fsync(path: Path, directory: bool = False):
         os.close(fd)
 
 
+def fsync_directories(*paths: Path):
+    """Make renames within these directories durable (each once)."""
+    for path in dict.fromkeys(str(p) for p in paths):
+        _fsync(Path(path), directory=True)
+
+
 class MemberRepairs:
     """The open repairs of one cache: the carriers are the authority.
 
@@ -140,11 +153,19 @@ class MemberRepairs:
 
     def __init__(self, cache_root: Path, *, sweep_new: bool = False):
         self.dir = Path(cache_root) / CARRIER_DIR
+        # _lock guards the in-memory records and is never held across an
+        # fsync; _write_lock orders this process's writers across their I/O.
+        # Another process's writer (the CLI) is ordered by flock on the
+        # carrier it changes.
         self._lock = threading.Lock()
+        self._write_lock = threading.Lock()
         self._records: Dict[str, MemberRepair] = {}
         self._seen: Optional[tuple] = None
         with self._lock:
-            self._reload_locked(strict=True, sweep_new=sweep_new)
+            self._reload_locked(strict=True, owner=sweep_new)
+        if len(self._records) > GROWTH_WARNING:
+            logger.warning("%d member repairs are open; each fence and pin lookup scans them all",
+                           len(self._records))
 
     # -- loading ---------------------------------------------------------
     def _dir_stamp(self) -> Optional[tuple]:
@@ -154,7 +175,11 @@ class MemberRepairs:
             return None
         return (st.st_ino, st.st_mtime_ns, st.st_ctime_ns, st.st_nlink, st.st_size)
 
-    def _reload_locked(self, *, strict: bool, sweep_new: bool = False):
+    def _reload_locked(self, *, strict: bool, owner: bool = False) -> bool:
+        """Read every carrier. The cache's owner (the mount, one per cache)
+        also removes unfinished .new files and finishes resolutions that a
+        crash interrupted. Returns False, keeping the previous records, when
+        a carrier cannot be read outside strict mode."""
         stamp = self._dir_stamp()
         records: Dict[str, MemberRepair] = {}
         if stamp is not None:
@@ -162,9 +187,7 @@ class MemberRepairs:
                 path = self.dir / name
                 if name.endswith(_NEW_SUFFIX) and _ID_RE.match(name[:-len(_NEW_SUFFIX)]):
                     # Never renamed into place: written before any effect.
-                    # Only the cache's owner removes one (another process may
-                    # be writing it).
-                    if sweep_new:
+                    if owner:
                         try:
                             path.unlink()
                         except FileNotFoundError:
@@ -174,24 +197,50 @@ class MemberRepairs:
                     if not _ID_RE.match(name):
                         raise CorruptRepairRecord(f"{name}: not a record id")
                     raw = os.getxattr(str(path), RECORD_XATTR, follow_symlinks=False)
-                    records[name] = MemberRepair.from_json(raw, name)
+                    record = MemberRepair.from_json(raw, name)
+                except FileNotFoundError:
+                    continue  # resolved while listing
                 except (OSError, CorruptRepairRecord) as exc:
                     if strict:
                         raise CorruptRepairRecord(
                             f"Unreadable member repair carrier {path}: {exc}. A repair that "
                             "cannot be read cannot be enforced; inspect or remove it by hand."
                         ) from exc
-                    logger.error("Keeping the previous member repairs: %s unreadable: %s", path, exc)
-                    return
+                    if stamp != self._seen:
+                        logger.error("Keeping the previous member repairs: %s unreadable: %s",
+                                     path, exc)
+                    # Not retried until the directory changes again.
+                    self._seen = stamp
+                    return False
+                if record.state == RESOLVED and owner:
+                    # Its resolution was durable; only the unlink was lost.
+                    try:
+                        path.unlink()
+                    except FileNotFoundError:
+                        pass
+                    continue
+                records[name] = record
+            if owner:
+                _fsync(self.dir, directory=True)
             stamp = self._dir_stamp()
         self._records = records
         self._seen = stamp
+        return True
 
     def _refresh(self):
         with self._lock:
             if self._dir_stamp() != self._seen:
                 self._reload_locked(strict=False)
             return dict(self._records)
+
+    def _after_write(self, update):
+        """Bring memory up to the disk after a write of ours: a full reload,
+        so an external change made before or during the write is never
+        hidden behind our own new stamp. If the reload cannot read a
+        carrier, apply our own change to the records kept."""
+        with self._lock:
+            if not self._reload_locked(strict=False):
+                update(self._records)
 
     # -- writing ---------------------------------------------------------
     def _ensure_dir(self):
@@ -217,10 +266,13 @@ class MemberRepairs:
             os.rename(temp, final)
             _fsync(self.dir, directory=True)
         except BaseException:
-            try:
-                temp.unlink()
-            except OSError:
-                pass
+            # Not durable: the caller is told it failed, so nothing of it
+            # may be left to be read later either.
+            for leftover in (temp, final):
+                try:
+                    leftover.unlink()
+                except OSError:
+                    pass
             raise
 
     def _make(self, old_path, new_path, members, state, reason) -> MemberRepair:
@@ -246,19 +298,17 @@ class MemberRepairs:
             return None
         record = self._make(old_path, new_path, members, INTENT,
                             "rename interrupted before every member's outcome was recorded")
-        with self._lock:
+        with self._write_lock:
             self._write_new(record)
-            self._records[record.id] = record
-            self._seen = self._dir_stamp()
+            self._after_write(lambda records: records.__setitem__(record.id, record))
         return record.id
 
     def record(self, old_path: str, new_path: str, members: Iterable[str], reason: str) -> str:
         """Durably record an open repair; raises OSError when it cannot."""
         record = self._make(old_path, new_path, members, OPEN, reason)
-        with self._lock:
+        with self._write_lock:
             self._write_new(record)
-            self._records[record.id] = record
-            self._seen = self._dir_stamp()
+            self._after_write(lambda records: records.__setitem__(record.id, record))
         logger.warning(
             "Member(s) %s missed the rename %s -> %s, which is not replayed; repair %s "
             "(storage debug member-repairs): %s",
@@ -270,72 +320,108 @@ class MemberRepairs:
         """Settle an intent: drop it if no member missed the move, else
         rewrite it as an open repair for the members that did.
 
-        A failure leaves the intent, which fences every target member: more
-        than needed, never less. It is logged, not raised; the evidence is
-        already durable.
+        Ordered against a resolution in another process by flock on the
+        carrier. If the intent was resolved meanwhile, the members that
+        missed the move get a new open record: a resolution of an intent
+        cannot cover what the rename had not yet done. A failure leaves the
+        intent, which fences every target member: more than needed, never
+        less. It is logged, not raised; the evidence is already durable.
         """
-        with self._lock:
+        reasons = "; ".join(f"{m}: {missed[m]}" for m in sorted(missed))[:MAX_REASON_CHARS]
+        with self._write_lock:
             intent = self._records.get(repair_id)
-            if intent is None:
-                return
             carrier = self.dir / repair_id
             try:
-                if not missed:
+                fd = os.open(str(carrier), os.O_RDONLY)
+            except FileNotFoundError:
+                fd = None
+            try:
+                current = None
+                if fd is not None:
+                    fcntl.flock(fd, fcntl.LOCK_EX)
+                    if os.fstat(fd).st_nlink > 0:
+                        current = MemberRepair.from_json(
+                            os.getxattr(fd, RECORD_XATTR), repair_id)
+                if current is None or current.state != INTENT:
+                    # Resolved by someone else before the rename settled.
+                    if missed and intent is not None:
+                        self._write_new(self._make(intent.old_path, intent.new_path,
+                                                   missed, OPEN, reasons))
+                elif not missed:
                     carrier.unlink()
                     _fsync(self.dir, directory=True)
-                    del self._records[repair_id]
                 else:
-                    reasons = "; ".join(f"{m}: {missed[m]}" for m in sorted(missed))
-                    record = MemberRepair(
-                        id=repair_id, old_path=intent.old_path, new_path=intent.new_path,
+                    settled = MemberRepair(
+                        id=repair_id, old_path=current.old_path, new_path=current.new_path,
                         members=tuple(sorted(missed)), state=OPEN,
-                        reason=reasons[:MAX_REASON_CHARS], recorded=intent.recorded,
+                        reason=reasons, recorded=current.recorded,
                     )
-                    payload = record.to_json()
+                    payload = settled.to_json()
                     if len(payload) > MAX_RECORD_BYTES:
                         raise OSError(errno.ENAMETOOLONG, "settled record too large")
-                    fd = os.open(str(carrier), os.O_RDONLY)
-                    try:
-                        os.setxattr(fd, RECORD_XATTR, payload, os.XATTR_REPLACE)
-                        os.fsync(fd)
-                    finally:
-                        os.close(fd)
-                    self._records[repair_id] = record
+                    os.setxattr(fd, RECORD_XATTR, payload, os.XATTR_REPLACE)
+                    os.fsync(fd)
+                if missed:
                     logger.warning(
-                        "Member(s) %s missed the rename %s -> %s, which is not replayed; "
-                        "repair %s (storage debug member-repairs): %s",
-                        ", ".join(record.members), record.old_path, record.new_path,
-                        repair_id, record.reason,
+                        "Member(s) %s missed a rename, which is not replayed; repair recorded "
+                        "(storage debug member-repairs): %s", ", ".join(sorted(missed)), reasons,
                     )
-            except OSError:
+            except (OSError, CorruptRepairRecord):
                 logger.exception(
                     "Could not settle member repair %s; it stays an intent for every member",
                     repair_id,
                 )
-            self._seen = self._dir_stamp()
+            finally:
+                if fd is not None:
+                    os.close(fd)
+            self._after_write(lambda records: None)
 
     def resolve(self, repair_id: str) -> bool:
         """Drop a repair once someone has settled the members by hand.
 
-        The carrier's removal is made durable before the record leaves
-        memory. Returns False when no carrier has that id. Changes no member.
+        Two steps, so no reader can act on a resolution that is not yet
+        durable: the record is first rewritten as resolved and fsynced
+        (readers still enforce it while the carrier exists), then the
+        carrier is unlinked, which is what readers act on. A crash after the
+        first step leaves a resolved carrier, which the next open of the
+        cache finishes. Returns False when no carrier has that id (a replay,
+        a typo, or an id from elsewhere). Changes no member.
         """
         if not _ID_RE.match(repair_id):
             return False
-        with self._lock:
+        carrier = self.dir / repair_id
+        with self._write_lock:
             try:
-                (self.dir / repair_id).unlink()
+                fd = os.open(str(carrier), os.O_RDONLY)
             except FileNotFoundError:
-                self._records.pop(repair_id, None)
+                self._after_write(lambda records: records.pop(repair_id, None))
                 return False
-            _fsync(self.dir, directory=True)
-            self._records.pop(repair_id, None)
-            self._seen = self._dir_stamp()
-        return True
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                if os.fstat(fd).st_nlink == 0:
+                    found = False
+                else:
+                    current = MemberRepair.from_json(os.getxattr(fd, RECORD_XATTR), repair_id)
+                    resolved = MemberRepair(
+                        id=current.id, old_path=current.old_path, new_path=current.new_path,
+                        members=current.members, state=RESOLVED, reason=current.reason,
+                        recorded=current.recorded,
+                    )
+                    os.setxattr(fd, RECORD_XATTR, resolved.to_json(), os.XATTR_REPLACE)
+                    os.fsync(fd)
+                    carrier.unlink()
+                    found = True
+            finally:
+                os.close(fd)
+            if found:
+                _fsync(self.dir, directory=True)
+            self._after_write(lambda records: records.pop(repair_id, None))
+        return found
 
     # -- reading ---------------------------------------------------------
     def list(self) -> List[MemberRepair]:
-        """Every open repair, oldest first."""
+        """Every repair still on disk, oldest first (a RESOLVED one only
+        while its resolution is being finished)."""
         return sorted(self._refresh().values(), key=lambda r: (r.recorded, r.id))
 
     def backends_for(self, virtual_paths: Iterable[str]) -> Set[str]:
