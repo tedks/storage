@@ -44,6 +44,10 @@ log_events:
   who: Ted Smith
   what: blocked by gh-181-view-write-after-flush
   comment: ""
+- time: 2026-11-18T07:04:44-00:00
+  who: Ted Smith
+  what: blocked by gh-181-repair-hardening
+  comment: ""
 blocked_by:
 - gh-181-repair-record
 - gh-181-sync-rename-noreplace
@@ -52,3 +56,4 @@ blocked_by:
 - gh-181-repairs-doc-local-fs
 - gh-181-repair-noise
 - gh-181-view-write-after-flush
+- gh-181-repair-hardening
