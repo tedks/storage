@@ -62,6 +62,9 @@ class DirSyncTask:
     priority: int = 0
     retry_count: int = 0
     queued_time: float = field(default_factory=time.time)
+    # A RENAME task whose repair record the cache refused holds an
+    # in-memory fence (MemberRepairs.fence_pending) until it is written.
+    pending_fence: Optional[int] = field(default=None, compare=False)
 
     def __lt__(self, other):
         return self.priority > other.priority

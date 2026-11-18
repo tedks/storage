@@ -720,6 +720,65 @@ class TestDirectoryRetries(SyncRaceTestBase):
         self.assertEqual([], renames)
         self.assertEqual(["d"], self.member_names())
 
+    def test_healthy_sync_runs_while_a_failing_rename_record_backs_off(self):
+        """One worker. A queued rename's record keeps failing and its retry
+        is backing off: an unrelated file still syncs meanwhile, and an
+        upload at the rename's new name is still kept off the member, as
+        the record would. Once the cache takes the record there is exactly
+        one, and the member was never renamed (CTO RRS-CTO-BACKOFF)."""
+        self.assertEqual(1, len(self.fs.sync_manager.workers or [None]))
+        self.fs.mkdir("/d", 0o755)
+        self.fs.mkdir("/e", 0o755)
+        repairs = self.fs.cache_manager.member_repairs
+        real_record = repairs.record
+        failing = [True]
+        attempts = []
+
+        def flaky(*args):
+            attempts.append(time.monotonic())
+            if failing[0]:
+                raise OSError(errno.ENOSPC, "injected")
+            return real_record(*args)
+
+        patch.object(repairs, "record", side_effect=flaky).start()
+        renames = []
+        patch.object(self.member, "rename", side_effect=lambda *a: renames.append(a)).start()
+        self.addCleanup(patch.stopall)
+        self.fs.sync_manager.config.retry_delay = 2.0
+        self.fs.sync_manager.queue_dir_sync("/d", DirOperation.RENAME, new_path="/e",
+                                            backend_hint="member", force=True)
+        self.start_sync()
+        deadline = time.monotonic() + WAIT
+        while not attempts and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(1, len(attempts))
+
+        # The first retry is due 2 s after that failure.
+        self.write_file("/c.txt", b"unrelated")
+        self.write_file("/e/x.txt", b"under the new name")
+        deadline = attempts[0] + 1.5
+        synced = None
+        while time.monotonic() < deadline:
+            row = self.fs.state_manager.get_file_metadata("/c.txt")
+            if row is not None and row.sync_status == SyncStatus.CLEAN:
+                synced = time.monotonic()
+                break
+            time.sleep(0.02)
+        self.assertIsNotNone(synced, "unrelated sync waited for the backoff")
+        self.assertEqual(1, len(attempts), "the retry ran before its backoff ended")
+        self.assertFalse((self.member_dir / "e" / "x.txt").exists())
+
+        failing[0] = False
+        deadline = time.monotonic() + WAIT
+        while not self.repairs() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.wait_idle()
+        self.assertEqual([("member", "/d", "/e")], self.repairs())
+        self.assertEqual([], renames)
+        self.assertFalse((self.member_dir / "e" / "x.txt").exists())
+        self.assertEqual(SyncStatus.DIRTY,
+                         self.fs.state_manager.get_file_metadata("/e/x.txt").sync_status)
+
     def test_open_repair_fences_rmdir_of_a_reused_source(self):
         """The member missed an empty /d -> /e; /d was made again and is
         now removed through the mount. The member's /d is the one the

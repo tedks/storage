@@ -147,7 +147,14 @@ What a crash at each point leaves:
 
 A queued `DirSyncTask` RENAME, from a direct caller, never runs either. The
 worker writes an `open` record for its member, or for every member when the
-task has no hint. It retries without limit while the write fails.
+task has no hint. It retries without limit while the write fails. Each
+retry backs off on a timer, not on the worker, so other sync work goes
+on meanwhile, even with one worker. From the first failure until the
+record is written, the task's names are fenced in memory
+(`MemberRepairs.fence_pending`), exactly as the record would fence them.
+Once the write succeeds, the record replaces that fence. A fence held in
+memory does not survive a restart, but neither does the queued task that
+holds it.
 
 ## The in-process registry
 

@@ -223,6 +223,11 @@ class MemberRepairs:
         self._seen: Optional[tuple] = None
         # Descriptors of this process's in-flight intents, flock held.
         self._held: Dict[str, int] = {}
+        # Fences for repairs not yet durable: a queued rename whose record
+        # the cache refused, while its retry backs off (fence_pending).
+        # In memory only; the task that holds one is what retries it.
+        self._pending: Dict[int, Tuple[str, str, Tuple[str, ...]]] = {}
+        self._pending_seq = 0
         self._dir_durable = False
         with self._lock:
             self._reload_locked(strict=True, owner=sweep_new)
@@ -629,6 +634,30 @@ class MemberRepairs:
         while its resolution is being finished)."""
         return sorted(self._refresh().values(), key=lambda r: (r.recorded, r.id))
 
+    def fence_pending(self, old_path: str, new_path: str, members: Iterable[str]) -> int:
+        """Fence old_path and new_path on members now, for a repair whose
+        record could not be written yet; returns a key for release_pending.
+
+        A queued rename's record can fail (the cache full, say) and its
+        retry back off; meanwhile other work goes on, and must be kept off
+        those names on those members as the record would keep it."""
+        with self._lock:
+            self._pending_seq += 1
+            self._pending[self._pending_seq] = (old_path, new_path, tuple(sorted(set(members))))
+            return self._pending_seq
+
+    def release_pending(self, key: int):
+        """Drop a pending fence, once its record is durable (or moot)."""
+        with self._lock:
+            self._pending.pop(key, None)
+
+    def _fenced_names(self):
+        """(old, new, members) for every durable record and pending fence."""
+        names = [(r.old_path, r.new_path, r.members) for r in self._refresh().values()]
+        with self._lock:
+            names.extend(self._pending.values())
+        return names
+
     def backends_for(self, virtual_paths: Iterable[str]) -> Set[str]:
         """The members with a repair at, above or below any of virtual_paths
         (either name counts). Renames, mkdir, rmdir, file and link uploads
@@ -638,15 +667,14 @@ class MemberRepairs:
         paths = list(virtual_paths)
         return {
             member
-            for record in self._refresh().values()
-            if any(paths_overlap(path, name)
-                   for path in paths for name in (record.old_path, record.new_path))
-            for member in record.members
+            for old, new, members in self._fenced_names()
+            if any(paths_overlap(path, name) for path in paths for name in (old, new))
+            for member in members
         }
 
     def covers(self, virtual_path: str) -> bool:
         """Whether virtual_path is at or under the new name of any repair: a
         member that missed the move may hold its bytes only under the old
         name, so the cached copy stays. Conservative: any member's repair."""
-        return any(is_at_or_under(virtual_path, record.new_path)
-                   for record in self._refresh().values())
+        return any(is_at_or_under(virtual_path, new)
+                   for _old, new, _members in self._fenced_names())

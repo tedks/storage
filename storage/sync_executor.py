@@ -5,6 +5,7 @@ import errno
 import logging
 import os
 import queue
+import threading
 import time
 from pathlib import Path
 from typing import Callable, ContextManager, Dict, List, Optional, Union
@@ -433,6 +434,32 @@ class SyncExecutor:
             return False
         return True
 
+    @staticmethod
+    def _requeue_after(task_queue: queue.Queue, task, delay: float):
+        """Put task back after delay, without holding this worker.
+
+        The worker goes on with other tasks while the retry backs off: with
+        one worker, a task whose cause persists (a rename record the cache
+        keeps refusing) must not stall unrelated syncs. The retry counts as
+        unfinished from now until it is back in the queue, so
+        wait_for_completion still waits for it.
+        """
+        if delay <= 0:
+            task_queue.put(task)
+            return
+        with task_queue.all_tasks_done:
+            task_queue.unfinished_tasks += 1
+
+        def deliver():
+            try:
+                task_queue.put(task)
+            finally:
+                task_queue.task_done()
+
+        timer = threading.Timer(delay, deliver)
+        timer.daemon = True
+        timer.start()
+
     def handle_task_failure(
         self,
         task: Union[SyncTask, DirSyncTask],
@@ -456,11 +483,10 @@ class SyncExecutor:
                 task.retry_count,
                 self.config.max_retries,
             )
-            time.sleep(self.config.retry_delay * task.retry_count)
             # The retry reads the row afresh; a refused publish of this
             # attempt needs no extra pass after it.
             task.requeue = False
-            task_queue.put(task)
+            self._requeue_after(task_queue, task, self.config.retry_delay * task.retry_count)
             return False
 
         logger.error("Max retries exceeded for %s: %s", task.virtual_path, error)
@@ -546,15 +572,23 @@ class SyncExecutor:
             logger.warning("Dropping a rename task for %s -> %s: no member to record it for",
                            task.virtual_path, task.new_path)
             return True
+        repairs = self.cache_manager.member_repairs
         try:
-            self.cache_manager.member_repairs.record(
+            repairs.record(
                 task.virtual_path, task.new_path, names, "queued member rename, not replayed",
             )
         except OSError as exc:
+            # Until the record is written, the names are fenced in memory,
+            # so work done while the retry backs off stays off them.
+            if getattr(task, "pending_fence", None) is None:
+                task.pending_fence = repairs.fence_pending(task.virtual_path, task.new_path, names)
             raise RuntimeError(
                 f"Could not record the rename {task.virtual_path} -> {task.new_path} "
                 f"for {', '.join(names)}: {exc}"
             ) from exc
+        if getattr(task, "pending_fence", None) is not None:
+            repairs.release_pending(task.pending_fence)
+            task.pending_fence = None
         return True
 
     def _dir_task_current(self, task: DirSyncTask) -> bool:
