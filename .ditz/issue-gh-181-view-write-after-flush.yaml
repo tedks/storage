@@ -30,5 +30,15 @@ log_events:
   who: Ted Smith
   what: blocks gh-181
   comment: ""
+- time: 2026-11-18T06:38:16-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'CTO disposition: an accepted conflict-view write stranded in a derived
+    cache with only a log message does not meet the no-silent-loss contract. Before
+    #182 acceptance, prevent the unsafe schedule or preserve both the member object
+    and the exact local edits as a durable, discoverable outstanding repair. Show
+    a forced repair between successful flush and release, including subsequent eviction/reopen
+    and index rebuild where preservation is the chosen solution. No automatic replay
+    or unbounded retry queue is required.'
 blocks:
 - gh-181
