@@ -256,12 +256,17 @@ class TestSyncManager(unittest.TestCase):
                 self.sync_manager.queue_sync(f"/pending-{index}")
             with entered:
                 self.assertTrue(entered.wait_for(lambda: active == 2, timeout=5.0))
+            workers = list(self.sync_manager.workers)
             stopping = threading.Thread(target=self.sync_manager.stop)
             stopping.start()
+            # Release the busy workers only once each has been told to stop
+            # (stop() clears _running before it signals the workers), so
+            # neither can dequeue the third task first.
             deadline = time.monotonic() + 5.0
-            while self.sync_manager._running and time.monotonic() < deadline:
+            while (not all(w._stop_event.is_set() for w in workers)
+                   and time.monotonic() < deadline):
                 time.sleep(0.01)
-            self.assertFalse(self.sync_manager._running)
+            self.assertTrue(all(w._stop_event.is_set() for w in workers))
             release.set()
             stopping.join(timeout=5.0)
             self.assertFalse(stopping.is_alive())

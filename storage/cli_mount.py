@@ -63,7 +63,7 @@ def shared_filesystems(backends: Dict[str, Backend]) -> List[List[str]]:
 @click.option("-c", "--cache", help="Local cache directory")
 @click.option("-s", "--cache-size", help="Cache size (e.g., 10G, 500M)")
 @click.option("-d", "--database", help="State database path (default: cache/.storage.db)")
-@click.option("-w", "--workers", type=int, help="Number of sync worker threads")
+@click.option("-w", "--workers", type=int, help="Sync worker threads: the fixed pool size, or the minimum with --max-sync-workers")
 @click.option(
     "--max-sync-workers", type=int,
     help="Grow background sync from --workers up to this limit when tasks queue (8 with SSH members, 32 local-only).",
