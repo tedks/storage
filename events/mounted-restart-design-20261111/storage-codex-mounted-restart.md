@@ -35,3 +35,15 @@ Rebased on master `0953369`. Folded in Ted's 2026-11-17 product rulings, accepte
 - based_on: 0953369de47a7e9b46a0edca8facfee99d6bb490
 - refs: storage-codex-mounted-restart:5; PR 172 council rounds 53f2d4152f72-20261118T044249Z-ef2e72 and bac65c285a16-20261118T044639Z-47467b
 Council findings changed the outcome semantics; no ruling changed. Completed now requires the new transport seen connected (the lazy-reconnect path is dropped); failed means retired and the new connect failed or missed a P1-enforced reconnect allowance, because the member's connect timeout is per phase and does not bound name lookup; incomplete covers a missed drain deadline or maintenance cancellation; maintenance is refused without a connected transport or while a connection attempt is installing one. Dispositions are on the PR. Google seat EMPTY both rounds (usage limit).
+
+## storage-codex-mounted-restart:7 · 2026-11-18T04:58:24Z · review-finding
+- actor: lead (Anthropic claude-opus-5-5), PR 172 owner
+- based_on: 0953369de47a7e9b46a0edca8facfee99d6bb490
+- refs: storage-codex-mounted-restart:6; PR 172 council rounds 085841b3cfdc-20261118T044927Z-2c849b, 9919998e8691-20261118T045122Z-591a95, 075321928dea-20261118T045334Z-46efb2, e1d25dcb1ffe-20261118T045447Z-3d8dcc
+Council rounds 3 to 6 refined the outcome model without changing a ruling: a late connect is serialized by the pool's single-flight CONNECTING state and epoch fence; a mid-drain transport loss or mark-down reports failed; whichever of deadline/cancellation or transport loss comes first decides; design decisions are labelled apart from ruling text. Round 6 at `e1d25dc` was CLEAN from the Anthropic and OpenAI seats; Google EMPTY (usage limit) in every round. Dispositions are on the PR.
+
+## storage-codex-mounted-restart:8 · 2026-11-18T04:58:24Z · lead-review
+- actor: lead (Anthropic claude-opus-5-5), PR 172 owner, recording a fresh-context lead review
+- based_on: e1d25dcb1ffe81ef4da95f554269ed3f6a693234
+- refs: storage-codex-mounted-restart:7; PR 172
+Fresh-context lead review at `e1d25dc`: FINDINGS 0/1/5. Important: the PR body said "drain ... connection attempts" where the doc refuses. Nits: cancellation after retirement unspecified; contract 5's refused list omitted an in-flight connect; item 2 lacked a ruling/reading marker and carried P1 mechanism (moved to a P1 subsection); ledger lagged; one fs.py range unlinked. All fixed in the next commit; a council delta and a lead re-review of that delta follow.
