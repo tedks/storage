@@ -10,6 +10,7 @@ import time
 from unittest.mock import patch
 
 from storage.models import SyncStatus
+from storage.state import StateManager
 from storage.sync_executor import SyncExecutor
 from storage.sync_tasks import DirOperation
 from tests.test_fs_threading import BLOCKED, WAIT, ThreadingTestBase, Worker
@@ -238,21 +239,7 @@ class TestDirectoryRetries(SyncRaceTestBase):
         self.wait_idle()
         self.assertEqual(["d"], self.member_names())
 
-    def test_rename_retry_applies_while_the_old_name_is_in_use_again(self):
-        """The member still holds the renamed directory under the old name;
-        only the rename moves it, even though /d exists again."""
-        self.fs.mkdir("/d", 0o755)
-        (self.member_dir / "d" / "kept.txt").write_text("k")
-        self.fail_member_once("rename")
-        self.fs.rename("/d", "/e")
-        self.assertEqual([(DirOperation.RENAME, "/d")], self.queued_dir_ops())
-        self.fs.mkdir("/d", 0o755)
-
-        self.start_sync()
-        self.wait_idle()
-        self.assertEqual(["kept.txt"], self.member_names("e"))
-
-    def test_rename_retry_whose_destination_is_gone_is_dropped(self):
+    def test_missed_rename_whose_destination_is_gone_leaves_the_member(self):
         self.fs.mkdir("/d", 0o755)
         self.fail_member_once("rename")
         self.fs.rename("/d", "/e")
@@ -263,8 +250,9 @@ class TestDirectoryRetries(SyncRaceTestBase):
         # The member keeps an empty /d: what a chain of missed operations
         # leaves is ditz sync-member-reconcile. It must not gain /e.
         self.assertNotIn("e", self.member_names())
+        self.assertEqual([("member", "/d", "/e")], self.repairs())
 
-    def test_rename_retry_for_an_evicted_file_still_applies(self):
+    def test_missed_rename_of_an_evicted_file_is_left_for_repair(self):
         self.write_file("/a.txt")
         self.start_sync()
         self.wait_synced("/a.txt")
@@ -278,7 +266,78 @@ class TestDirectoryRetries(SyncRaceTestBase):
 
         self.start_sync()
         self.wait_idle()
-        self.assertEqual(["b.txt"], self.member_names())
+        self.assertEqual(["a.txt"], self.member_names())
+        self.assertEqual([("member", "/a.txt", "/b.txt")], self.repairs())
+
+    def repairs(self, state_manager=None):
+        state_manager = state_manager or self.fs.state_manager
+        return [
+            (r.backend_name, r.old_path, r.new_path)
+            for r in state_manager.list_member_rename_repairs()
+        ]
+
+    def test_missed_rename_never_overwrites_a_newly_occupied_target(self):
+        """The member missed /a.txt -> /b.txt, then something else put a
+        /b.txt there (another writer of the member; members change behind
+        the mount). The missed move is not replayed over it: both objects
+        stay, and the missed move is recorded for repair."""
+        self.write_file("/a.txt", b"old bytes")
+        self.start_sync()
+        self.wait_synced("/a.txt")
+        self.wait_idle()
+        self.fail_member_once("rename")
+        self.fs.rename("/a.txt", "/b.txt")
+        (self.member_dir / "b.txt").write_bytes(b"unrelated writer")
+
+        self.wait_idle()
+        self.fs.sync_manager.stop()
+        self.assertEqual(b"unrelated writer", (self.member_dir / "b.txt").read_bytes())
+        self.assertEqual(b"old bytes", (self.member_dir / "a.txt").read_bytes())
+        self.assertEqual([("member", "/a.txt", "/b.txt")], self.repairs())
+
+    def test_missed_rename_never_moves_a_reused_source_name(self):
+        """The member missed /d -> /e; /d was then made again and gained a
+        file on the member. Replaying the move would carry the new /d's
+        contents to /e and take /d away from the namespace that has it."""
+        self.fs.mkdir("/d", 0o755)
+        (self.member_dir / "d" / "kept.txt").write_text("k")
+        self.fail_member_once("rename")
+        self.fs.rename("/d", "/e")
+        self.fs.mkdir("/d", 0o755)
+        (self.member_dir / "d" / "new.txt").write_text("n")
+
+        self.start_sync()
+        self.wait_idle()
+        self.fs.sync_manager.stop()
+        self.assertEqual(["kept.txt", "new.txt"], self.member_names("d"))
+        self.assertNotIn("e", self.member_names())
+        self.assertEqual([("member", "/d", "/e")], self.repairs())
+
+    def test_missed_rename_repair_survives_restart_and_retries(self):
+        """The repair record is in the index database, not the in-memory
+        queue: a restart keeps it, and a legacy queued retry (no record of
+        what the member held) is fenced to the same record, with no member
+        call."""
+        self.fs.mkdir("/d", 0o755)
+        self.fail_member_once("rename")
+        self.fs.rename("/d", "/e")
+        # A retry queued by an older build, carrying only the two names.
+        self.fs.sync_manager.queue_dir_sync(
+            "/d", DirOperation.RENAME, new_path="/e", backend_hint="member", force=True,
+        )
+        renames = []
+        patcher = patch.object(self.member, "rename", side_effect=lambda *a: renames.append(a))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.start_sync()
+        self.wait_idle()
+        self.fs.sync_manager.stop()
+        self.assertEqual([], renames)
+        self.assertEqual(["d"], self.member_names())
+
+        reopened = StateManager(str(self.temp_dir / "state.db"))
+        self.addCleanup(reopened.close)
+        self.assertEqual([("member", "/d", "/e")], self.repairs(reopened))
 
     def test_retry_for_a_member_known_down_is_not_tried_under_the_guard(self):
         self.fail_member_once("mkdir")

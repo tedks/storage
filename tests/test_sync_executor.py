@@ -484,18 +484,26 @@ class TestSyncExecutorDirTask(_ExecutorTestBase):
         self.assertTrue(result)
         self.mock_backend.rmdir.assert_called_once_with("/olddir")
 
-    def test_rename_calls_backend(self):
-        """DirSyncTask with RENAME and new_path -> backend.rename called."""
+    def test_rename_is_recorded_for_repair_not_called(self):
+        """DirSyncTask with RENAME -> no member call, one repair per member,
+        even with the member down; running it again keeps one record."""
         self.cache_manager.get_cache_path("/newname").mkdir()  # renamed through the mount
+        self.mock_backend.is_available.return_value = False
         task = DirSyncTask(
             virtual_path="/oldname",
             operation=DirOperation.RENAME,
             new_path="/newname",
+            backend_hint="test0",
         )
-        result = self.executor.process_dir_task(task)
+        self.assertTrue(self.executor.process_dir_task(task))
+        self.assertTrue(self.executor.process_dir_task(task))
 
-        self.assertTrue(result)
-        self.mock_backend.rename.assert_called_once_with("/oldname", "/newname")
+        self.mock_backend.rename.assert_not_called()
+        repairs = self.state_manager.list_member_rename_repairs()
+        self.assertEqual(
+            [("test0", "/oldname", "/newname", 2)],
+            [(r.backend_name, r.old_path, r.new_path, r.occurrences) for r in repairs],
+        )
 
     def test_dir_retries_the_namespace_moved_past_are_dropped(self):
         """A mkdir retry whose directory is gone from the cache, an rmdir retry

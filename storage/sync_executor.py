@@ -17,7 +17,7 @@ from .links import LinkRefused, find_holders, link_checksum, resolve_link_target
 from .models import FileLocation, SyncStatus
 from .replication import ReplicationManager
 from .state import StateManager
-from .sync_tasks import DirOperation, DirSyncTask, SyncConfig, SyncTask
+from .sync_tasks import DirOperation, DirSyncTask, SyncConfig, SyncTask, record_member_rename_repair
 
 logger = logging.getLogger(__name__)
 
@@ -464,7 +464,11 @@ class SyncExecutor:
         call run under the path guard. The guard includes the namespace
         lock, which a directory rename waits for, so a member known to be
         down is not tried under it: the task fails and is retried later.
+        A rename is never retried: it is recorded for repair, with no member
+        call (_fence_rename_task).
         """
+        if task.operation == DirOperation.RENAME:
+            return self._fence_rename_task(task)
         # Only a hinted retry (one member, the one that missed it) can name a
         # member that is down: without a hint the members are chosen from
         # the available ones, so a down member never holds up the others.
@@ -485,24 +489,40 @@ class SyncExecutor:
                 return True
             return self._process_dir_task(task)
 
+    def _fence_rename_task(self, task: DirSyncTask) -> bool:
+        """Record a queued member rename for repair; never run it.
+
+        A retry carries only the two names. Nothing on the member proves the
+        object at the old name is still the one the mount renamed (the name
+        may be in use again, through the mount or by another writer of the
+        member), or that the new name is free there, and the Local and SSH
+        renames replace their target. Both names are left as they are on
+        the member, whatever the task's age or origin. Without a hint the
+        task stands for every member.
+        """
+        if not task.new_path:
+            raise ValueError("Rename dir task missing new_path")
+        names = [task.backend_hint] if task.backend_hint else sorted(
+            self.replication_manager.backends
+        )
+        for backend_name in names:
+            record_member_rename_repair(
+                self.state_manager,
+                backend_name,
+                task.virtual_path,
+                task.new_path,
+                "queued member rename retry, not replayed",
+                logger,
+            )
+        return True
+
     def _dir_task_current(self, task: DirSyncTask) -> bool:
         cache_path = self.cache_manager.get_cache_path(task.virtual_path)
         if task.operation == DirOperation.MKDIR:
             return cache_path.is_dir()
         if task.operation == DirOperation.RMDIR:
             return not os.path.lexists(cache_path)
-        # RENAME: while the destination exists. The old name may be in use
-        # again (a new file or directory there): the member still holds the
-        # renamed copy under it, and only the rename moves it. A destination
-        # gone since (renamed on, which queues its own retry, or removed)
-        # must not be created on the member. Directories stay in the cache;
-        # a renamed file may have been evicted since, so its index row counts
-        # too. What the member holds after a chain of failed operations is
-        # not fully settled by single retries (ditz sync-member-reconcile).
-        return (
-            os.path.lexists(self.cache_manager.get_cache_path(task.new_path))
-            or self.state_manager.get_file_metadata(task.new_path) is not None
-        )
+        raise ValueError(f"No currency check for dir op {task.operation.value}")
 
     def _process_dir_task(self, task: DirSyncTask) -> bool:
         logger.debug(
@@ -527,10 +547,6 @@ class SyncExecutor:
                     backend.mkdir(task.virtual_path)
                 elif task.operation == DirOperation.RMDIR:
                     backend.rmdir(task.virtual_path)
-                elif task.operation == DirOperation.RENAME:
-                    if not task.new_path:
-                        raise ValueError("Rename dir task missing new_path")
-                    backend.rename(task.virtual_path, task.new_path)
                 logger.debug(
                     "Dir op %s succeeded for %s on %s",
                     task.operation.value,

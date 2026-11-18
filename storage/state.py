@@ -25,7 +25,7 @@ from .file_config import (
     get_inherited_config,
     set_file_config,
 )
-from .models import FileLocation, FileMetadata, SyncStatus
+from .models import FileLocation, FileMetadata, MemberRenameRepair, SyncStatus
 
 
 class StateManager:
@@ -204,6 +204,25 @@ class StateManager:
             );
             CREATE INDEX IF NOT EXISTS idx_member_checksums_verified
                 ON member_checksums(backend_name, verified_at);
+
+            -- Renames a member missed, recorded for repair instead of
+            -- replayed: nothing on a member proves the object at the old
+            -- name is still the one that was renamed, or that the new name
+            -- is free (other writers change members behind the mount), so
+            -- a replay could move the wrong object or replace another.
+            -- Created on open, so an older index gains it empty. Losing a
+            -- row loses no bytes: the member keeps both names as they are.
+            CREATE TABLE IF NOT EXISTS member_rename_repairs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                backend_name TEXT NOT NULL,
+                old_path TEXT NOT NULL,
+                new_path TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                first_recorded REAL NOT NULL,
+                last_recorded REAL NOT NULL,
+                occurrences INTEGER NOT NULL DEFAULT 1,
+                UNIQUE (backend_name, old_path, new_path)
+            );
         ''')
         # Indexes created before dirty_generation existed get the column
         # appended, at the same default a fresh schema holds.
@@ -801,6 +820,71 @@ class StateManager:
     def rename_file(self, old_virtual_path: str, new_virtual_path: str):
         """Rename a single file entry (alias for rename_path)."""
         self.rename_path(old_virtual_path, new_virtual_path)
+
+    # ------------------------------------------------------------------ #
+    # Member renames left for repair
+    # ------------------------------------------------------------------ #
+    def record_member_rename_repair(self, backend_name: str, old_path: str,
+                                    new_path: str, reason: str) -> int:
+        """Record that backend_name missed old_path -> new_path; return the row id.
+
+        Recording the same move again keeps one row, counts the occurrence
+        and keeps the latest reason. Committed before it returns, so the
+        record outlives a restart that drops the sync queue.
+        """
+        now = time.time()
+        with self._db_lock:
+            self.conn.execute(
+                '''
+                INSERT INTO member_rename_repairs
+                (backend_name, old_path, new_path, reason, first_recorded, last_recorded)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT (backend_name, old_path, new_path) DO UPDATE SET
+                    reason = excluded.reason,
+                    last_recorded = excluded.last_recorded,
+                    occurrences = occurrences + 1
+                ''',
+                (backend_name, old_path, new_path, reason, now, now),
+            )
+            row = self.conn.execute(
+                'SELECT id FROM member_rename_repairs '
+                'WHERE backend_name = ? AND old_path = ? AND new_path = ?',
+                (backend_name, old_path, new_path),
+            ).fetchone()
+            self.conn.commit()
+        return int(row['id'])
+
+    def list_member_rename_repairs(self) -> List[MemberRenameRepair]:
+        """Every recorded repair, oldest first."""
+        with self._db_lock:
+            rows = self.conn.execute(
+                'SELECT * FROM member_rename_repairs ORDER BY first_recorded, id'
+            ).fetchall()
+        return [
+            MemberRenameRepair(
+                id=row['id'],
+                backend_name=row['backend_name'],
+                old_path=row['old_path'],
+                new_path=row['new_path'],
+                reason=row['reason'],
+                first_recorded=row['first_recorded'],
+                last_recorded=row['last_recorded'],
+                occurrences=row['occurrences'],
+            )
+            for row in rows
+        ]
+
+    def resolve_member_rename_repair(self, repair_id: int) -> bool:
+        """Drop a repair once someone has settled the member by hand.
+
+        Returns whether a row was dropped. It changes nothing on a member.
+        """
+        with self._db_lock:
+            cursor = self.conn.execute(
+                'DELETE FROM member_rename_repairs WHERE id = ?', (repair_id,)
+            )
+            self.conn.commit()
+        return cursor.rowcount == 1
 
     # ------------------------------------------------------------------ #
     # Member checksums (the conflict view's persisted hashes)
