@@ -119,7 +119,7 @@ warning log is the operator's signal. Concretely:
   nothing: readdir succeeds with only `.` and `..`. If the local cache holds
   names (cached or dirty files), they are listed.
 - Internally the snapshot stays partial: per-member status records B as
-  unavailable/timeout/cancelled/unverified-root, distinct from A's
+  unavailable/timeout/cancelled, distinct from A's
   successful empty observation. "Never fresh" means a per-member
   completeness status, separate from the serving TTL: the partial snapshot is
   never reported complete or fresh for B, never becomes a confirmed-empty
@@ -149,7 +149,7 @@ warning log is the operator's signal. Concretely:
   updates of an open view remain the separate change-delivery slice.
 
 "Missing" means any non-success member result: failed, timed out,
-cancelled (including by shutdown) or root unverified (below). A missing
+cancelled (including by shutdown). A missing
 member never counts as a successful empty observation.
 
 A failed disk can look empty. Today `LocalBackend.listdir` returns `[]` for a
@@ -158,63 +158,36 @@ to `[]`; neither rechecks that the member root is still the configured
 storage once the backend is constructed. A member whose disk died and left an
 empty mountpoint would therefore report successful-empty: nothing is logged,
 and on a warm directory its retained names are replaced by an empty set.
-The member-observation owner must tell "directory absent under a verified
-member root" apart from "member root missing or replaced". One rule, the
-same for every observation, cold or warm, empty or not, for every member
-with a configured marker (members without one: see below):
+This slice does not detect that case. Ted's ruling says what to return once
+a member has failed; recognizing a failed disk that still lists as a
+failure needs member root verification, a separate capability not claimed
+here (if Ted wants it inside this slice, that is a ruling for the CTO to
+record). It is tracked separately (ditz `listing-member-root-marker-setup`, which
+owns its design and setup). Until it lands, a failed disk that leaves a
+readable mountpoint behaves exactly as today, the README must not claim
+failed-disk detection, and the warning-log rule above covers only members
+whose listing actually fails, times out or is cancelled. Review of earlier
+drafts of this spec established constraints that design must meet:
 
-- A member's observation is accepted only after a root check that started
-  after the observation was read. There is no cached verification and no
-  silent window: a root replaced after a check (for example by a failed
-  disk, exposing an empty or stale underlying mountpoint) cannot publish
-  its names or its emptiness as that member's.
-- The check is one `stat` of the member's root marker: a file whose name
-  carries a per-member unique id recorded in member configuration, at the
-  member root. The same mechanism serves local, SSH and rsync members (SFTP
-  attributes carry no device id or inode, and a raw `st_dev` is not stable
-  across reboots, device-mapper or USB renumbering, so it is never stored in
-  configuration). A local member may additionally record `st_dev` at mount,
-  after its marker verifies, and compare it within that mount only. A
-  shared marker name, or a check that only tests for "a marker", is not
-  enough: the unique name is what keeps a stale marker of another member
-  from matching. The marker name is an internal entry, hidden from listings
-  and lookups like the existing hidden entries (`is_hidden_entry`), and
-  never replicated or synced as user data.
-- The check runs on the same path and at the same class as the listing it
-  verifies: a foreground listing's check uses the interactive reserve with
-  it, so cold listings do not queue behind bulk copies (the #175 stall); a
-  background refresh's check uses the background class. Today's
-  `SSHBackend.filesystem_identity` (a fresh connection per call, written to
-  run before FUSE's daemonizing fork) is not this check.
-- Checks coalesce per member only within a class: a check covers an
-  observation if it started after that observation was read and runs at the
-  observation's class or a more interactive one. A foreground listing never
-  waits on a background-class check; it issues its own. With one listing
-  worker per member, coalescing mostly joins consecutive listings.
-- Cost: every accepted observation pays one check, background refreshes
-  included; the user-visible part is the foreground round trip on a cold
-  listing. The snapshot tracer measures it against the PR177 field
-  baseline; if it is too costly, relaxing this rule is a ruling, not an
-  implementation choice.
-- A pending check is internal state, not a warning. A check that fails,
-  finds no marker with this member's id, or misses the whole-request
-  deadline makes the member missing with failure class unverified-root:
-  logged at warning level, retained names kept, never confirmed absence.
-- ENOENT for a subdirectory under a verified root stays successful-empty
-  (sparse placement depends on it).
-
-Members without a marker. No member has a configured marker today. Such a
-member's observations are accepted unchecked under an explicit exception:
-it is reported at mount and in status as "root unchecked" (one warning per
-member, not per listing), and its failed-disk case keeps today's behavior.
-This is the only exception to the post-read check, and the contract states
-it. Writing markers is a separate, explicit member-setup step (ditz
-`listing-member-root-marker-setup`), not part of this slice: it writes the
-marker only to a root the operator names, refuses a root that is not a
-separate mount when the member configuration says it should be, and
-records the id in member configuration. A marker written to the underlying
-directory while the disk was unmounted would be a setup error; the setup
-step's refusal is what guards it.
+- Accept an observation only after a check that started after it was read;
+  a cached verification leaves a silent window.
+- Run the check on the listing's own path and class, so a foreground
+  listing's check uses the interactive reserve (a bulk-class check brings
+  back the #175 stall); coalesce only within a class.
+- Do not store a raw `st_dev` in configuration (unstable across reboots,
+  device-mapper, USB renumbering); SFTP attributes carry no device id or
+  inode, so remote members need something like a marker whose name carries
+  a per-member unique id from configuration.
+- A marker needs protection beyond `is_hidden_entry`, which filters
+  readdir listings only: lookups, opens, creates, unlinks, renames and
+  xattr changes of it through the mount, and sync, replication,
+  rebuild-index, reprobe and conflict scans, must all exclude it.
+- No member has a marker today, so a setup step must exist before the
+  check protects anything; members without one must be reported, not
+  silently treated as checked. A cheaper partial option for local members
+  needs no setup: record at mount whether the root is a separate mount
+  (its device differs from its parent's) and treat a root that falls back
+  to the parent filesystem as failed.
 
 The no-success case stays narrow and explicit. It applies only when every
 configured member is missing for this listing, no member has a
@@ -236,19 +209,20 @@ member's last-known names as stale, as before.
 
 Current code (master 5f3dbb3, `NamespaceService._list_members`) already
 serves the available union when some members fail, but differs from this
-section in ways the snapshot tracer must close: a missing member is logged
+section in ways the snapshot tracer must close (a missing or replaced
+member root listing as successful-empty is also current behavior, but it
+belongs to the separate root-verification work above): a missing member is logged
 only at debug level (a background refresh that gives up on a member logs a
 warning in `_abandon_listing`; a foreground failure does not); when every member fails and nothing is cached it
 returns a successful empty listing; a partial listing carries no
 per-member completeness status (its serving timestamp is correct and stays
-as it is); a missing or replaced member
-root lists as successful-empty (above); and a foreground cold listing has no
+as it is); and a foreground cold listing has no
 deadline of its own (`deadline=None`), bounded only by each member's
 transport timeout, and a local member has none, so a hung local disk blocks
 the listing without bound.
 
 Interim bounds. The cold-partial slice (warning logs, the narrow error,
-per-member completeness status, the root check) does not wait for the
+per-member completeness status) does not wait for the
 numeric ruling. Until `oq-listing-stale-serve-dir-mtime` sets numbers, it
 uses these interim values, each from existing defaults:
 
@@ -375,7 +349,7 @@ Do not implement an unbounded compatibility layer to rescue a failed premise.
    separation, fast cached return, cold A-empty + B-unavailable returning a
    successful empty union with B logged and internally partial, the
    all-failed/no-cache error, all-failed with local or retained names
-   (listed), a missing or replaced member root (missing, not empty),
+   (listed),
    publication fencing,
    bounded workers and immutable readdir offsets. Mutation-disable controls
    must demonstrate that the tests detect the promised failure.

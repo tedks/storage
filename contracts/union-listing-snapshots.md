@@ -4,11 +4,13 @@
   desktop change delivery. No consumer implementation acknowledged yet.
 - **Inputs:** member ID/configuration generation, canonical directory identity,
   refresh generation, local namespace revision, and either a complete set of
-  validated immediate children or a typed unavailable/timeout/cancelled/
-  unverified-root result.
-  Absence confirmed by a reachable backend under a verified member root is
-  successful empty; a missing or replaced member root (for example a failed
-  disk leaving an empty mountpoint) is an unverified-root result, not empty. Partial reads
+  validated immediate children or a typed unavailable/timeout/cancelled
+  result.
+  Absence confirmed by a reachable backend is successful empty. v0 does not
+  detect a missing or replaced member root that still lists (for example a
+  failed disk leaving an empty mountpoint); that is separate root
+  verification work (ditz `listing-member-root-marker-setup`), not claimed
+  here. Partial reads
   and permission failures are not confirmed absence. Do not follow a supplied
   child name outside its parent; reject invalid or colliding backend entries
   according to existing conflict policy rather than fabricating completeness.
@@ -56,7 +58,7 @@
   publishing unaffected remote names. Unrelated local churn must not force
   whole-directory refresh rejection forever.
 - **Failure semantics:** a missing member is any non-success result
-  (unavailable, timeout, cancelled, unverified root). The no-success case is
+  (unavailable, timeout, cancelled). The no-success case is
   narrow: every configured member is missing, none has a retained
   observation of the directory, and the local namespace contributes no
   names. It returns an
@@ -67,14 +69,8 @@
   empty A plus unavailable B with nothing local is a successful empty
   readdir. The snapshot stays internally partial, B's status stays missing
   (its failure class) rather than empty, and it is never complete for B. B
-  is retried on its own bounded backoff, independent of the serving TTL. A
-  member's observation, of any kind, is accepted only after a root check
-  (a stat of the member's uniquely named root marker) started after it was
-  read, at the observation's class or a more interactive one (coalesced per
-  member within that constraint); a failed, unmatched or late check makes
-  the member unverified-root, logged; a pending check is not logged. Sole
-  exception: a member with no configured marker is accepted unchecked and
-  reported once as root unchecked. Retry backoff resets on the member's next success. Each
+  is retried on its own bounded backoff, independent of the serving TTL.
+  Retry backoff resets on the member's next success. Each
   missing member is logged at warning level (member ID, failure class,
   directory), rate limited per member, on cold and warm listings alike. The
   foreground wait for members is bounded, also for an expired directory
@@ -92,7 +88,7 @@
   handles) and backoff are mandatory before implementation
   acceptance. Narrowed for the cold-partial slice only: it may integrate
   under the spec's interim values (whole-request deadline, retry backoff,
-  root check, per-member worker, per-directory refresh dedup, listing
+  per-member worker, per-directory refresh dedup, listing
   cache limit) without snapshot byte/entry limits, provided it adds no
   revisions, pinned snapshots, history or other per-entry state. Any of
   those requires the full limits. Do not hold global/namespace locks over remote I/O or admission.
@@ -110,13 +106,9 @@
   result replaces only B); the same with a local dirty name (listed); partial
   page failure; all-failed/no-cache (error) and all-failed with local names
   (listed); all-failed with retained observations (stale names listed);
-  all members cancelled/no-cache (error, not success-empty); member root
-  unmounted or replaced by an empty or populated directory after a
-  successful check (unverified-root, its names not published, retained
-  names kept, warning logged) versus ENOENT subdirectory on a verified root
-  (successful empty); cold empty remote listing during saturating bulk
-  copies (check completes on the interactive class, member not missing, no
-  warning); single-member failure; continuous local creates while a remote add
+  all members cancelled/no-cache (error, not success-empty); member that
+  fails only on the foreground listing while bulk copies saturate its
+  channels (logged missing within the deadline, not success-empty); single-member failure; continuous local creates while a remote add
   still publishes; event identity after delete/recreate or contributor loss;
   older remote-change event after newer local mutation and duplicate events; stale
   response after local rename/unlink; slow A while B publishes; cancelled old
