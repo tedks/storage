@@ -172,7 +172,10 @@ class StorageFS(Operations):
         if op in self._DEMAND_OPS:
             return "demand"
         # An open whose cache file exists serves a read from local bytes in
-        # the common case; a cold open copies the whole file.
+        # the common case; a cold open copies the whole file. This runs
+        # before admission, unbounded: one local lstat, no member, no lock.
+        # Metadata writes (setxattr, removexattr, chmod, utimens) are
+        # changes, not reads, and stay ordinary.
         if op == "open" and args:
             try:
                 if self.cache_manager.is_cached(args[0]):

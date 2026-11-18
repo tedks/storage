@@ -1,12 +1,13 @@
-"""Closes through a real mount and its unmount, with the callback cap on.
+"""Closes through a real mount and its unmount, with and without the cap.
 
 release and releasedir are not admitted (storage/foreground_admission.py),
-so each close the kernel sends reaches StorageFS exactly once, including a
-close still in its member upload when the unmount starts: libfuse joins it
-before destroy closes the gate. (A close made after a lazy unmount can fail
-to reach the daemon at all, with or without the cap; ditz
-lazy-unmount-late-release.) The single-threaded mode, without a cap, is the
-baseline the capped threaded mount must match.
+so every close the daemon receives before teardown runs exactly once,
+including one still in its member upload when the unmount starts: libfuse
+joins it before destroy closes the gate. Scope: closes delivered to the
+daemon before teardown. A close made after a lazy unmount can fail to reach
+the daemon at all, with or without the cap (ditz lazy-unmount-late-release);
+nothing here claims it. Both loop modes without a cap are the baseline the
+capped threaded mount must match.
 """
 
 import os
@@ -29,9 +30,14 @@ from tests.fuse_mount import FUSE_THREAD_MODES, fuse_mode_id, run_fuse, stop_fus
 WAIT = 10.0
 
 
-@pytest.fixture(params=FUSE_THREAD_MODES, ids=fuse_mode_id)
+# Both loop modes uncapped (the baseline), and the threaded mode capped.
+MODES = [(threads, None) for threads in FUSE_THREAD_MODES] + [(True, 4)]
+
+
+@pytest.fixture(params=MODES, ids=lambda mode: fuse_mode_id(mode[0]) + (
+    f"-cap{mode[1]}" if mode[1] else ""))
 def mounted(request):
-    fuse_threads = request.param
+    fuse_threads, cap = request.param
     root = Path(tempfile.mkdtemp())
     member_dir, cache_dir, mount_dir = root / "member", root / "cache", root / "mount"
     for path in (member_dir, cache_dir, mount_dir):
@@ -40,7 +46,7 @@ def mounted(request):
     fs = StorageFS(
         cache_dir, root / "state.db", {"member": member}, 10 * 1024 * 1024,
         num_sync_workers=0, start_sync=False,
-        max_foreground_operations=4 if fuse_threads else None,
+        max_foreground_operations=cap,
     )
     record = {
         "opened": Counter(), "released": Counter(), "releasedir": 0, "opendir": 0,
@@ -106,7 +112,7 @@ def mounted(request):
         assert time.monotonic() < deadline, "mount did not come up"
         time.sleep(0.05)
     try:
-        yield fs, member_dir, mount_dir, thread, record, fuse_threads
+        yield fs, member_dir, mount_dir, thread, record, cap
     finally:
         problems = stop_fuse(mount_dir, thread, fs=fs)
         shutil.rmtree(root, ignore_errors=True)
@@ -114,7 +120,7 @@ def mounted(request):
 
 
 def test_each_close_runs_once_through_unmount(mounted):
-    fs, member_dir, mount_dir, thread, record, fuse_threads = mounted
+    fs, member_dir, mount_dir, thread, record, cap = mounted
     (member_dir / "f.txt").write_bytes(b"canonical")
     assert (mount_dir / "f.txt").read_bytes() == b"canonical"
     assert sorted(os.listdir(mount_dir))  # opendir, readdir, releasedir
@@ -147,13 +153,13 @@ def test_each_close_runs_once_through_unmount(mounted):
     assert record["opendir"] >= 1 and record["releasedir"] == record["opendir"]
     assert record["uploads"] == ["/f.txt"]
     assert (member_dir / "f.txt").read_bytes() == b"edited copy"
-    assert "/new.txt" in record["queued"]
+    assert record["queued"].count("/new.txt") == 1, record["queued"]
     assert (fs.cache_manager.cache_root / "new.txt").read_bytes() == b"new bytes"
-    if fuse_threads:
+    if cap is not None:
         gate = fs._foreground_admission
         assert gate is not None and gate._closed
         assert gate.active_count == 0
-        assert 1 <= gate.peak_active <= 4
+        assert 1 <= gate.peak_active <= cap
         assert not any(record["gate_closed_before_release"])
     else:
         assert fs._foreground_admission is None

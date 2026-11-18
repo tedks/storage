@@ -9,7 +9,9 @@ it. At most `cap` run at once. Each class keeps its reserved slots
 only `cap - 4` slots are shared. Waiting callbacks are not counted, and they
 still occupy a native libfuse thread: libfuse 2's multithreaded loop has no
 thread cap, so this does not bound process threads. Work outside FUSE
-callbacks (sync workers, streaming prefetch, watchers) is not counted.
+callbacks (sync workers, streaming prefetch, watchers) is not counted, and
+neither is StorageFS's classification step before admission (for an open,
+one local lstat of the cache path: no member call, no lock).
 
 A callback takes its slot before it runs and therefore before it holds any
 lock, and it never waits for a second slot, so the gate adds no lock-order
