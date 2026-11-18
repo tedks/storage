@@ -1,0 +1,16 @@
+id: gh-181-noreplace-nits
+title: 'First member rename: review nits from #183 a587b97'
+desc: ""
+type: task
+component: storage
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-18T20:52:14-00:00
+references: []
+log_events:
+- time: 2026-11-18T20:52:14-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
