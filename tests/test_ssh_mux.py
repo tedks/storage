@@ -151,11 +151,24 @@ class TestControlSockets(unittest.TestCase):
     def test_a_replaced_socket_directory_is_not_trusted(self):
         sockets = self._sockets()
         first = self._control_path(sockets.options("u", "h", 22, None)).parent
+        original = os.lstat(first)
         shutil.rmtree(first)
         elsewhere = self.tmp / "elsewhere"
         elsewhere.mkdir()
         first.symlink_to(elsewhere)  # someone else's link under our name
-        with self.assertLogs(ssh_mux.__name__, level="WARNING"):
+        real_lstat = os.lstat
+
+        def reused_inode(path, *args, **kwargs):
+            info = real_lstat(path, *args, **kwargs)
+            if Path(path) == first:
+                return os.stat_result((info.st_mode, original.st_ino, original.st_dev,
+                                       info.st_nlink, info.st_uid, info.st_gid,
+                                       info.st_size, info.st_atime, info.st_mtime,
+                                       info.st_ctime))
+            return info
+
+        with patch.object(ssh_mux.os, "lstat", reused_inode), \
+                self.assertLogs(ssh_mux.__name__, level="WARNING"):
             second = self._control_path(sockets.options("u", "h", 22, None)).parent
         self.assertNotEqual(second, first)
         self.assertEqual(list(elsewhere.iterdir()), [])
