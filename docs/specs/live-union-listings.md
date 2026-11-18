@@ -101,10 +101,10 @@ duplicate buffering. Pinned snapshots count against resource limits.
 ### Cold listing with an unavailable member (ruled 2026-11-17)
 
 A cold directory (no listing snapshot and no retained member observation)
-waits a bounded interval for member observations. The same wait bound applies
-to every foreground listing without a servable snapshot, including an
-expired directory whose members still have retained observations; after
-the bound, the rules below decide what is served. Ted ruled the case where
+waits for member observations as today (see Interim bounds: no new
+deadline in this slice); an expired directory whose members still have
+retained observations is listed the same way. When the members have
+answered or failed, the rules below decide what is served. Ted ruled the case where
 at least one member succeeds and another fails or times out: return the
 union that is available, even when it is empty, and log each missing member.
 No partial-result UI flag and no working notification transport are
@@ -227,7 +227,8 @@ only at debug level (a background refresh that gives up on a member logs a
 warning in `_abandon_listing`; a foreground failure does not); when every member fails and nothing is cached it
 returns a successful empty listing; a partial listing carries no
 per-member completeness status (its serving timestamp is correct and stays
-as it is); and a foreground cold listing has no
+as it is). Unchanged by this slice (the bounded cold wait is deferred,
+below): a foreground cold listing has no
 deadline of its own (`deadline=None`), bounded only by each member's
 transport timeout, and a local member has none, so a hung local disk blocks
 the listing without bound; a single-member mount lists its member inline on
@@ -238,52 +239,31 @@ per-member completeness status) does not wait for the
 numeric ruling. Until `oq-listing-stale-serve-dir-mtime` sets numbers, it
 uses these interim values, each from existing defaults:
 
-- Foreground deadline: one whole-request deadline of `refresh_member_timeout`
-  (60 s) for a listing without a servable snapshot. Members are listed
-  concurrently on their per-member executors, so it bounds the request
-  rather than each member in turn; the single-member foreground path, which
-  today runs inline on the FUSE thread, must move onto its member's executor
-  for the deadline to apply. A member still running at the deadline is
-  missing for that response (logged), but its listing is not discarded: it
-  keeps running (a remote member's is bounded by its transport timeout; a
-  local member's has no bound, and is counted rather than unbounded only
-  because of the hung-member admission rule below) and its result is
-  merged when it finishes, so a slow but healthy member still appears at
-  the next enumeration instead of never. The fence that makes this safe:
-  - The directory stays counted in flight, keeping its listing generation
-    and child-race records, until the late worker ends, even though the
-    request has returned; today `_end_listing` drops both when the request
-    returns, after which invalidations bump nothing.
-  - A completion callback, not the returned request, merges the result
-    under `dir_cache_lock` then `listing_lock`, as a replacement of that
-    member's set only, into the snapshot current at that moment; it does
-    not republish the request's older view of the other members.
-  - It must publish unless an invalidation of the directory (or of a name
-    it read) raced it, or a newer observation of that same member was
-    published. Supersession is per member: a later refresh that skipped
-    the member as hung, or failed on it, does not supersede its late
-    success. A raced result is discarded and the member is retried under
-    the backoff below.
-  Cancellation (unmount, shutdown) fences the worker entirely.
-  Such a still-running foreground listing is interactive and keeps the
-  member's interactive SFTP reserve until it ends (the background
-  abandonment rationale, that refresh listings hold no reserved channel,
-  does not carry over); later foreground listings treat that member as
-  hung (below) rather than queueing behind it.
-  The README's statement that a member keeps its last names "until a
-  listing that waits for it completes" must be updated when this lands.
+- Foreground wait: unchanged from today. A foreground listing without a
+  servable snapshot waits for each member as it does now, bounded by the
+  member's own transport timeout (a local member has none); this slice
+  adds no whole-request deadline. A member whose listing fails, times out
+  or is cancelled within that wait is an observed failure and follows the
+  rules above. The bounded cold wait is deferred with the numeric limits
+  (below), because a deadline shorter than a slow member's listing needs a
+  late-result path that earlier drafts showed is not a small change.
 - Missing-member retry: per (directory, member) backoff, the first retry
   after 60 s, doubling to a cap of `listing_max_stale` (3,600 s); every
-  backoff of a member resets when that member next succeeds on any listing. This holds even when the serving TTL is infinite (watchers
-  on every member) or shorter. A retry relists the directory as today's
-  background refresh does; the tracer may narrow it to the missing member.
+  backoff of a member resets when that member next succeeds on any listing.
+  This holds even when the serving TTL is infinite (watchers on every
+  member) or shorter. A retry relists the directory as today's background
+  refresh does (giving up after `refresh_member_timeout`, as today); the
+  tracer may narrow it to the missing member. A member slower than that
+  timeout is therefore not recovered by background retries, only by the
+  next foreground listing that waits for it; that limit is today's
+  behavior, unchanged here.
 - Queued refreshes: the existing per-directory dedup
   (`_background_refreshes`, one queued or running refresh per directory)
   on the existing background executor, so at most one per cached
   directory.
-- Admission: the existing single listing worker per member. A member with a
-  listing already hung (`_hung_listings`) is treated as missing by
-  foreground listings too, instead of queueing behind it.
+- Admission: the existing single listing worker per member, with today's
+  hung-member skip for background refreshes only (`_hung_listings`);
+  foreground listings queue as today.
 - Active directories and cache size: the existing listing cache limit
   (`listing_limit`, 4,096 directories, least recently used). Retries run only
   for directories still in it.
@@ -297,8 +277,24 @@ These satisfy the contract's resource policy for this slice only, as the
 contract's narrowed requirement states. The numeric ruling replaces the
 values; it does not reopen the behavior. Other snapshot work (revisions,
 pinned handles and history, active-directory tracking for change delivery,
-refresh admission beyond one worker per member) still needs snapshot
+refresh admission beyond one worker per member, and the bounded cold wait)
+still needs snapshot
 byte/entry limits and the numbers.
+
+Inputs for the deferred bounded cold wait, from review of earlier drafts:
+a foreground deadline must not make a slow but healthy member invisible
+(today the foreground listing waits for it), so a member that misses the
+deadline needs a late result that still publishes. That late result must
+keep its directory's invalidation fencing alive after the request returns
+(today `_end_listing` drops the generation and child races), follow the
+existing child-race policy (raced names unknown, refusal only on a
+directory invalidation, a raced size-split name or race overflow), be
+superseded only by a newer observation of the same member, keep that
+member's own observation time for revalidation and negative-lookup
+evidence rather than inheriting a newer snapshot's, publish nothing when
+its snapshot is gone, and account for the interactive SFTP reserve a
+still-running foreground listing holds. The single-member foreground path
+also has to move off the FUSE thread for any deadline to apply.
 
 ### Freshness and refresh limits
 

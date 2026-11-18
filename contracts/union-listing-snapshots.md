@@ -76,27 +76,22 @@
   member resets on that member's next success. Each
   missing member is logged at warning level (member ID, failure class,
   directory), rate limited per member, on cold and warm listings alike. The
-  foreground wait for members is bounded, also for an expired directory
-  with retained observations; until the numeric ruling it uses the interim
-  reference values named in the spec. No public partial flag or notification transport is
+  foreground wait for members is today's (per-member transport timeouts);
+  a bounded cold wait is deferred with the numeric ruling, and must not
+  make a slow but healthy member invisible (spec, Interim bounds). No public partial flag or notification transport is
   implied; a client may present the result as complete (risk accepted by
   the ruling). A failed member cannot veto collection or publication of healthy
   member observations. Retained stale
-  names may fail at open; listing is not proof of readable bytes. A worker
-  that only missed the foreground deadline keeps running, its directory
-  stays counted in flight (generation and child races kept), and its
-  successful result must be merged, as a replacement of that member's set
-  only, into the then-current snapshot, unless an invalidation raced it or
-  a newer observation of the same member was published. Supersession is
-  per member: a refresh that skipped or failed on the member does not
-  supersede it. Cancelled workers never publish. If transport
+  names may fail at open; listing is not proof of readable bytes. Deadline and
+  cancellation do not allow abandoned or superseded workers to publish
+  later. If transport
   cancellation is unavailable, account for the still-running worker and keep
   concurrency bounded; never spawn replacements without admission.
 - **Resource policy:** limits on queued/running refreshes, active directories,
   snapshot bytes/entries (including revisions pinned by open directory
   handles) and backoff are mandatory before implementation
   acceptance. Narrowed for the cold-partial slice only: it may integrate
-  under the spec's interim values (whole-request deadline, retry backoff,
+  under the spec's interim values (today's foreground wait, retry backoff,
   per-member worker, per-directory refresh dedup, listing
   cache limit) without snapshot byte/entry limits, provided it adds no
   revisions, pinned snapshots, history or other per-entry state. Any of
@@ -117,10 +112,7 @@
   (listed); all-failed with retained observations (stale names listed);
   all members cancelled/no-cache (error, not success-empty); member that
   fails only on the foreground listing while bulk copies saturate its
-  channels (logged missing within the deadline, not success-empty); single-member failure; late foreground worker after the deadline: a
-  write through the mount before it completes (not published, member
-  retried) and a stale or retry refresh that skipped it as hung (late
-  success still published); continuous local creates while a remote add
+  channels (logged missing when it fails or times out, not success-empty); single-member failure; continuous local creates while a remote add
   still publishes; event identity after delete/recreate or contributor loss;
   older remote-change event after newer local mutation and duplicate events; stale
   response after local rename/unlink; slow A while B publishes; cancelled old
