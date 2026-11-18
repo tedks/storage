@@ -782,6 +782,12 @@ class MemberConnection:
     def _bulk_limit(self) -> int:
         return max(1, self._sftp_cap - self._interactive_reserve)
 
+    def nominal_bulk_capacity(self) -> int:
+        """Background SFTP channels by configuration (configured channels
+        less the interactive reserve, at least one). A server can negotiate
+        fewer (_sftp_cap), and other background callers share them."""
+        return max(1, self._sftp_channels - self._interactive_reserve)
+
     def _reserve_lost(self, cap: int) -> bool:
         """Whether, with cap SFTP channels, background transfers can hold them
         all: the bulk limit never goes below one."""

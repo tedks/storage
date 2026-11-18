@@ -25,10 +25,35 @@ from .sync_tasks import DirOperation, DirSyncTask, SyncConfig, SyncTask, dir_tas
 logger = logging.getLogger(__name__)
 
 
-def sync_worker_ceiling(backends) -> int:
-    """Conservative adaptive cap; rsync uploads share one SSH master per host."""
+# Seconds stop() waits (see SyncManager.stop): per worker for a fixed pool,
+# in all for an explicit adaptive one.
+STOP_WAIT = 5.0
+LOCAL_SYNC_WORKER_LIMIT = 32
+REMOTE_SYNC_WORKER_LIMIT = 8
+
+
+def sync_worker_limit(backends) -> Tuple[int, str]:
+    """The most workers an explicit max_sync_workers may set, and why.
+
+    The minimum of every applicable limit: 32 for local members; 8 when any
+    member is remote (rsync uploads share one OpenSSH master per host, and
+    the remote watcher needs a session); and for each member that reports
+    one, its configured upload capacity (an ssh:// member's background SFTP
+    channels, by configuration, not a live probe). A server that negotiates
+    fewer channels, or other background calls on them, can still make
+    uploads wait. Not applied to a fixed pool (max_sync_workers unset).
+    """
+    limit, reason = LOCAL_SYNC_WORKER_LIMIT, "the local limit"
     remote = (BackendType.SSH, BackendType.RSYNC)
-    return 8 if any(b.backend_type in remote for b in backends.values()) else 32
+    if any(b.backend_type in remote for b in backends.values()):
+        limit, reason = REMOTE_SYNC_WORKER_LIMIT, "the limit with remote members"
+    for name in sorted(backends):
+        capacity = backends[name].sync_upload_capacity()
+        if capacity is not None and capacity < limit:
+            limit = capacity
+            reason = (f"member {backends[name].label}'s {capacity} background SFTP "
+                      "channel(s) (SFTP channels less the interactive reserve)")
+    return limit, reason
 
 # Posted to the task queue by SyncManager.stop() so idle workers wake at once
 # instead of at the end of their poll. Sorts ahead of every real task (the
@@ -215,13 +240,19 @@ class SyncManager:
         self.replication_manager = replication_manager
         if num_workers < 0 or max_workers is not None and max_workers < num_workers:
             raise ValueError("sync worker limits must satisfy 0 <= workers <= max_workers")
-        ceiling = sync_worker_ceiling(replication_manager.backends)
-        if max_workers is not None and max_workers > ceiling:
-            raise ValueError(f"max sync workers cannot exceed {ceiling}")
+        if max_workers is not None:
+            ceiling, reason = sync_worker_limit(replication_manager.backends)
+            if max_workers > ceiling:
+                raise ValueError(f"max sync workers cannot exceed {ceiling} ({reason})")
         if idle_timeout <= 0:
             raise ValueError("sync worker idle timeout must be positive")
         self.num_workers = num_workers
         self.max_workers = num_workers if max_workers is None else max_workers
+        # An explicit max_sync_workers, even equal to workers, is adaptive
+        # mode: it changes the stop timing as well as allowing growth.
+        self._adaptive = max_workers is not None
+        # stop()'s clock, replaceable by tests that check its waits.
+        self._clock = time.monotonic
         self.idle_timeout = idle_timeout
         self.config = config or SyncConfig()
         self._should_sync_path_cb = should_sync_path_cb
@@ -345,11 +376,25 @@ class SyncManager:
             for _ in workers:
                 self.task_queue.put(_WAKE)
 
-            deadline = time.monotonic() + 5.0
-            for worker in workers:
-                worker.join(timeout=max(0.0, deadline - time.monotonic()))
-            if self._monitor_thread and self._monitor_thread.ident is not None:
-                self._monitor_thread.join(timeout=max(0.0, deadline - time.monotonic()))
+            # These are waits, not a guarantee: a worker still in a member
+            # call when they end keeps running, and the caller (destroy)
+            # goes on regardless.
+            monitor = self._monitor_thread
+            if self._adaptive:
+                # Explicit adaptive mode: one 5 s deadline for the pool and
+                # the monitor together, however far the pool grew.
+                deadline = self._clock() + STOP_WAIT
+                for worker in workers:
+                    worker.join(timeout=max(0.0, deadline - self._clock()))
+                if monitor and monitor.ident is not None:
+                    monitor.join(timeout=max(0.0, deadline - self._clock()))
+            else:
+                # A fixed pool keeps master's waits: up to 5 s per worker,
+                # then 5 s for the monitor.
+                for worker in workers:
+                    worker.join(timeout=STOP_WAIT)
+                if monitor and monitor.ident is not None:
+                    monitor.join(timeout=STOP_WAIT)
 
             with self._workers_lock:
                 self._lingering_workers = [w for w in workers if w.is_alive()]

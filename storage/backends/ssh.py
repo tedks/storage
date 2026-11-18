@@ -182,6 +182,12 @@ class SSHBackend(Backend):
             logger=self.logger,
         )
 
+    def sync_upload_capacity(self) -> Optional[int]:
+        # Uploads to an ssh:// member share this connection's background
+        # SFTP channels with every other background call (copy_from_local
+        # runs through _with_sftp).
+        return self._pool.nominal_bulk_capacity()
+
     # ------------------------------------------------------------------ #
     # Availability
     # ------------------------------------------------------------------ #

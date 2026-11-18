@@ -15,7 +15,7 @@ from .mount_profiles import (
     parse_size,
     resolve_mount_configuration,
 )
-from .sync import sync_worker_ceiling
+from .sync import sync_worker_limit
 
 
 def shared_filesystems(backends: Dict[str, Backend]) -> List[List[str]]:
@@ -66,7 +66,8 @@ def shared_filesystems(backends: Dict[str, Backend]) -> List[List[str]]:
 @click.option("-w", "--workers", type=int, help="Sync worker threads: the fixed pool size, or the minimum with --max-sync-workers")
 @click.option(
     "--max-sync-workers", type=int,
-    help="Grow background sync from --workers up to this limit when tasks queue (8 with SSH members, 32 local-only).",
+    help=("Grow background sync from --workers up to this limit when tasks queue "
+          "(at most 32 local-only, 8 with remote members, 3 per default ssh:// member)."),
 )
 @click.option("-r", "--remote", multiple=True, help="Remote storage member (ssh://user@host:/path)")
 @click.option("-k", "--key-file", help="SSH private key file")
@@ -251,7 +252,8 @@ def mount(
     if (resolved.max_sync_workers is not None
             and resolved.max_sync_workers < resolved.workers):
         raise click.ClickException(
-            f"max-sync-workers must be at least workers ({resolved.workers})"
+            f"max-sync-workers must be at least workers ({resolved.workers}); "
+            "raise max-sync-workers or lower workers"
         )
 
     try:
@@ -281,10 +283,20 @@ def mount(
         bulk_capacity_wait_timeout=resolved.bulk_capacity_wait_timeout,
     )
     if resolved.max_sync_workers is not None:
-        limit = sync_worker_ceiling(backends)
+        # Only an explicit maximum is limited: a fixed pool keeps any size.
+        limit, reason = sync_worker_limit(backends)
+        if resolved.workers > limit:
+            raise click.ClickException(
+                f"workers ({resolved.workers}) is above the {limit}-worker limit "
+                f"for max-sync-workers with these storage members ({reason}); "
+                f"lower workers to at most {limit}, or unset max-sync-workers "
+                "to keep a fixed pool of that size"
+            )
         if resolved.max_sync_workers > limit:
             raise click.ClickException(
-                f"max-sync-workers cannot exceed {limit} for these storage members"
+                f"max-sync-workers ({resolved.max_sync_workers}) is above the "
+                f"{limit}-worker limit for these storage members ({reason}); "
+                f"set it to at most {limit}"
             )
     cache_root.mkdir(parents=True, exist_ok=True)
     mountpoint_path.mkdir(parents=True, exist_ok=True)

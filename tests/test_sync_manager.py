@@ -281,20 +281,67 @@ class TestSyncManager(unittest.TestCase):
                 self.state_manager, self.cache_manager, self.replication_manager,
                 num_workers=1, max_workers=33,
             )
-        self.replication_manager.backends['remote'] = type(
-            'RemoteStub', (), {'backend_type': BackendType.SSH}
-        )()
-        with self.assertRaisesRegex(ValueError, "cannot exceed 8"):
+        self.replication_manager.backends['remote'] = _ssh_member("remote")
+        with self.assertRaisesRegex(ValueError, "cannot exceed 3 .*background SFTP"):
             SyncManager(
                 self.state_manager, self.cache_manager, self.replication_manager,
-                num_workers=1, max_workers=9,
+                num_workers=1, max_workers=4,
             )
-        self.replication_manager.backends['remote'].backend_type = BackendType.RSYNC
-        with self.assertRaisesRegex(ValueError, "cannot exceed 8"):
-            SyncManager(
-                self.state_manager, self.cache_manager, self.replication_manager,
-                num_workers=1, max_workers=9,
-            )
+
+    def test_fixed_pool_above_the_limit_is_kept_when_the_option_is_unset(self):
+        self.replication_manager.backends['remote'] = _ssh_member("remote")
+        manager = SyncManager(
+            self.state_manager, self.cache_manager, self.replication_manager,
+            num_workers=16,
+        )
+        self.assertEqual(16, manager.max_workers)
+        self.assertFalse(manager._adaptive)
+
+    def _stop_waits(self, adaptive):
+        """The join timeouts stop() passes, each worker taken as never
+        finishing (the fake join spends its whole timeout on stop's clock)."""
+        self.sync_manager = SyncManager(
+            self.state_manager, self.cache_manager, self.replication_manager,
+            num_workers=2, max_workers=2 if adaptive else None,
+            config=SyncConfig(monitor_interval=30.0),
+        )
+        now = [100.0]
+        self.sync_manager._clock = lambda: now[0]
+        waits = []
+
+        def fake_join(label):
+            def join(timeout=None):
+                waits.append((label, timeout))
+                now[0] += timeout
+            return join
+
+        self.sync_manager.start()
+        workers = list(self.sync_manager.workers)
+        monitor = self.sync_manager._monitor_thread
+        real_joins = [(w, w.join) for w in workers] + [(monitor, monitor.join)]
+        for index, worker in enumerate(workers):
+            worker.join = fake_join(f"worker{index}")
+        monitor.join = fake_join("monitor")
+        try:
+            self.sync_manager.stop()
+        finally:
+            for thread, join in real_joins:
+                thread.join = join
+                join(5.0)
+        self.sync_manager._lingering_workers = []
+        return waits
+
+    def test_fixed_pool_stop_waits_five_seconds_per_worker_then_for_the_monitor(self):
+        self.assertEqual(
+            [("worker0", 5.0), ("worker1", 5.0), ("monitor", 5.0)],
+            self._stop_waits(adaptive=False),
+        )
+
+    def test_adaptive_pool_stop_shares_one_five_second_deadline(self):
+        self.assertEqual(
+            [("worker0", 5.0), ("worker1", 0.0), ("monitor", 0.0)],
+            self._stop_waits(adaptive=True),
+        )
 
     def test_restart_waits_for_worker_that_outlived_stop(self):
         self.sync_manager = SyncManager(
@@ -838,6 +885,72 @@ class TestGrowthWithFailingRenameRecords(unittest.TestCase):
                 release.set()
             self.assertTrue(self.sync_manager.wait_for_completion(timeout=5.0))
             self.sync_manager.stop()
+
+
+def _ssh_member(name, sftp_channels=None, interactive_reserve=None):
+    """An ssh:// member (constructed lazily: nothing connects), optionally
+    with a non-default SFTP pool configuration."""
+    from storage.backends.ssh import SSHBackend
+    from storage.backends.ssh_pool import MemberConnection
+
+    member = SSHBackend(name, f"{name}.example", "/srv/root", "u")
+    if sftp_channels is not None:
+        member._pool = MemberConnection(
+            name, lambda: None, connect_timeout=1.0, retry_interval=1.0,
+            sftp_channels=sftp_channels, interactive_reserve=interactive_reserve,
+        )
+    return member
+
+
+def _rsync_member(name):
+    from storage.backends.rsync import RsyncBackend
+    return RsyncBackend(name, f"{name}.example", "/srv/root", "u")
+
+
+class TestSyncWorkerLimit(unittest.TestCase):
+    """The explicit max_sync_workers limit: the minimum applicable one."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.temp_dir, True)
+
+    def local(self, name):
+        path = Path(self.temp_dir) / name
+        path.mkdir()
+        return LocalBackend(name, str(path))
+
+    def limit(self, *members):
+        from storage.sync import sync_worker_limit
+        return sync_worker_limit({m.name: m for m in members})
+
+    def test_local_only(self):
+        self.assertEqual(32, self.limit(self.local("a"), self.local("b"))[0])
+
+    def test_rsync_only_keeps_the_remote_limit(self):
+        self.assertEqual(8, self.limit(_rsync_member("r"))[0])
+        self.assertEqual(8, self.limit(self.local("a"), _rsync_member("r"))[0])
+
+    def test_default_ssh_member_allows_its_three_background_channels(self):
+        limit, reason = self.limit(_ssh_member("s"))
+        self.assertEqual(3, limit)
+        self.assertIn("member s's 3 background SFTP channel(s)", reason)
+
+    def test_mixed_members_take_the_smallest_limit(self):
+        members = (self.local("a"), _rsync_member("r"), _ssh_member("wide", 6, 2),
+                   _ssh_member("s"))
+        limit, reason = self.limit(*members)
+        self.assertEqual(3, limit)
+        self.assertIn("member s's", reason)
+
+    def test_non_default_reserve(self):
+        self.assertEqual(4, self.limit(_ssh_member("s", 6, 2))[0])
+        self.assertEqual(4, self.limit(_ssh_member("s", 4, 0))[0])
+        # Never below one, even when the reserve takes every channel.
+        self.assertEqual(1, self.limit(_ssh_member("s", 2, 2))[0])
+        # A wide pool is still held to the remote limit.
+        limit, reason = self.limit(_ssh_member("s", 12, 1))
+        self.assertEqual(8, limit)
+        self.assertIn("remote", reason)
 
 
 class TestSyncConflicts(unittest.TestCase):

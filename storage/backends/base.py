@@ -137,6 +137,12 @@ class Backend(ABC):
         self.encrypt_all = False
         self._available = True
 
+    def sync_upload_capacity(self) -> Optional[int]:
+        """How many sync uploads this member can carry at once by its own
+        configuration, or None when it sets no such limit. Nominal, from
+        configuration: never a live probe."""
+        return None
+
     @property
     def label(self) -> str:
         """Human-facing member label with its stable backend identity."""

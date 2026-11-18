@@ -99,7 +99,7 @@ foreground = true
 streaming_reads = true
 streaming_chunk_size = "2M"
 max_streaming_sessions = 16
-max_sync_workers = 6
+max_sync_workers = 3
 backends = [
   "ssh://user@storage-host.example:/srv/raid/media/",
   "ssh://user@storage-host.example:/srv/chunk0/media/",
@@ -131,7 +131,7 @@ backends = [
         self.assertTrue(kwargs["streaming_reads"])
         self.assertEqual(2 * 1024 ** 2, kwargs["streaming_chunk_size"])
         self.assertEqual(16, kwargs["max_streaming_sessions"])
-        self.assertEqual(6, kwargs["max_sync_workers"])
+        self.assertEqual(3, kwargs["max_sync_workers"])
 
     def test_mount_auto_loads_default_storage_toml(self):
         home_dir = self.temp_dir / "home"
@@ -193,9 +193,9 @@ backends = [
                     "--cache-size",
                     "5G",
                     "--workers",
-                    "4",
+                    "3",
                     "--max-sync-workers",
-                    "7",
+                    "3",
                     "--foreground",
                     "--remote",
                     "ssh://user@mirror.example:/srv/cache/media/",
@@ -218,8 +218,8 @@ backends = [
         self.assertIsNone(args[3]["remote0"].display_name)
         self.assertEqual("/srv/cache/media", str(args[3]["remote0"].remote_path))
         self.assertTrue(kwargs["foreground"])
-        self.assertEqual(4, kwargs["num_sync_workers"])
-        self.assertEqual(7, kwargs["max_sync_workers"])
+        self.assertEqual(3, kwargs["num_sync_workers"])
+        self.assertEqual(3, kwargs["max_sync_workers"])
 
     def test_mount_rejects_ssh_worker_limit_above_session_budget(self):
         config_path = self.temp_dir / "storage.toml"
@@ -237,10 +237,60 @@ backends = ["ssh://user@storage-host.example:/srv/data/"]
                 main, ["mount", "--config", str(config_path), "too-many"]
             )
         self.assertNotEqual(0, result.exit_code)
-        self.assertIn("max-sync-workers cannot exceed 8", result.output)
+        self.assertIn("max-sync-workers (9) is above the 3-worker limit", result.output)
+        self.assertIn("3 background SFTP channel(s)", result.output)
+        self.assertIn("set it to at most 3", result.output)
         mock_mount.assert_not_called()
         self.assertFalse((self.temp_dir / 'cache').exists())
         self.assertFalse((self.temp_dir / 'mount').exists())
+
+    def _profile(self, name, body):
+        config_path = self.temp_dir / "storage.toml"
+        config_path.write_text(
+            f"""
+[mounts.{name}]
+mountpoint = "{self.temp_dir / 'mount'}"
+cache = "{self.temp_dir / 'cache'}"
+{body}
+""".strip()
+        )
+        return config_path
+
+    def test_mount_rejects_a_floor_above_the_explicit_ssh_limit(self):
+        config_path = self._profile("floor", """
+workers = 4
+max_sync_workers = 4
+backends = ["ssh://user@storage-host.example:/srv/data/"]
+""")
+        with patch("storage.cli_mount.mount_storage") as mock_mount:
+            result = self.runner.invoke(main, ["mount", "--config", str(config_path), "floor"])
+        self.assertNotEqual(0, result.exit_code)
+        self.assertIn("workers (4) is above the 3-worker limit", result.output)
+        self.assertIn("lower workers to at most 3, or unset max-sync-workers", result.output)
+        mock_mount.assert_not_called()
+        self.assertFalse((self.temp_dir / 'cache').exists())
+
+    def test_mount_keeps_a_fixed_pool_above_the_limit_when_the_option_is_unset(self):
+        config_path = self._profile("fixed", """
+workers = 16
+backends = ["ssh://user@storage-host.example:/srv/data/"]
+""")
+        with patch("storage.cli_mount.mount_storage") as mock_mount:
+            result = self.runner.invoke(main, ["mount", "--config", str(config_path), "fixed"])
+        self.assertEqual(0, result.exit_code, msg=result.output)
+        self.assertEqual(16, mock_mount.call_args.kwargs["num_sync_workers"])
+        self.assertIsNone(mock_mount.call_args.kwargs["max_sync_workers"])
+
+    def test_mount_allows_eight_workers_with_rsync_members_only(self):
+        config_path = self._profile("rsync", """
+workers = 1
+max_sync_workers = 8
+backends = ["rsync://user@storage-host.example:/srv/data/"]
+""")
+        with patch("storage.cli_mount.mount_storage") as mock_mount:
+            result = self.runner.invoke(main, ["mount", "--config", str(config_path), "rsync"])
+        self.assertEqual(0, result.exit_code, msg=result.output)
+        self.assertEqual(8, mock_mount.call_args.kwargs["max_sync_workers"])
 
     def test_mount_rejects_negative_or_reversed_sync_worker_limits(self):
         local_member = self.temp_dir / "member"
