@@ -30,5 +30,11 @@ log_events:
     retry distinct. Protect against new target creation atomically or obtain a ruling
     for unavailable protection; also account for source reuse. No global no-replace
     switch. Capture the disposition before #167 lands.'
+- time: 2026-11-18T05:09:28-00:00
+  who: Ted Smith
+  what: blocked by oq-first-rename-unprotected-member
+  comment: ""
 blocks:
 - gh-181
+blocked_by:
+- oq-first-rename-unprotected-member
