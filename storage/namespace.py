@@ -1,6 +1,7 @@
 import concurrent.futures
 import contextvars
 import errno
+import functools
 import os
 import stat
 import time
@@ -15,6 +16,7 @@ from .cache_metadata import regular_file_stat
 from .checksums import ChecksumBasis, ChecksumRecord
 from .models import SyncStatus
 from .pathing import ResolvedPath, canonicalize_virtual_path
+from .member_repairs import fsync_directories
 from .sync_tasks import DirOperation
 
 
@@ -41,12 +43,51 @@ DEFAULT_STAT_MEMO_LIMIT = 8192
 _MAX_CHILD_RACES = 1024
 
 
+# rename(2) errors that mean it refused and changed nothing.
+_RENAME_REFUSALS = frozenset({
+    errno.ENOENT, errno.ENOTDIR, errno.EISDIR, errno.ENOTEMPTY, errno.EEXIST,
+    errno.EXDEV, errno.EINVAL, errno.EACCES, errno.EPERM, errno.EBUSY,
+    errno.EROFS, errno.ENAMETOOLONG, errno.ELOOP, errno.EMLINK,
+})
+
+
+def _cache_ancestors(cache_root: Path, directory: Path) -> List[Path]:
+    """The cache root, then each directory down to and including directory."""
+    root = Path(os.path.realpath(cache_root))
+    directory = Path(os.path.realpath(directory))
+    try:
+        parts = directory.relative_to(root).parts
+    except ValueError:
+        # Not spelled under the root (a different form of the same path):
+        # every ancestor, which costs more and skips none.
+        return list(reversed([directory, *directory.parents]))
+    chain = [root]
+    for part in parts:
+        chain.append(chain[-1] / part)
+    return chain
+
+
 class _ListingTicket(NamedTuple):
     """What a listing must match to be published (see _begin_listing)."""
 
     generation: int
     child_seq: int
 
+
+
+def _member_mutation(path_args: int):
+    """Register the method's call as a member mutation at its first
+    path_args paths (MemberRepairs.start_mutation), so a queued rename's
+    fence publication is ordered against it: every fence lookup the method
+    makes, and every member call, happens inside the registration."""
+    def decorate(method):
+        @functools.wraps(method)
+        def wrapper(self, *args, **kwargs):
+            paths = [self.resolve_path(arg).canonical_path for arg in args[:path_args]]
+            with self.cache_manager.member_repairs.mutating(self.backends.keys(), paths):
+                return method(self, *args, **kwargs)
+        return wrapper
+    return decorate
 
 class NamespaceService:
     """Namespace and directory-view operations extracted from StorageFS."""
@@ -514,11 +555,17 @@ class NamespaceService:
         backend_hint: Optional[str] = None,
         new_path: Optional[str] = None,
         backend_names: Optional[Set[str]] = None,
+        exclude: Optional[Set[str]] = None,
+        errors: Optional[Dict[str, str]] = None,
     ) -> List[str]:
-        """Best-effort synchronous propagation; returns backend names that failed."""
+        """Best-effort synchronous propagation; returns backend names that failed.
+
+        Members named in exclude are not called and are not reported. With
+        errors, each failed member's exception is recorded there by name.
+        """
         failures: List[str] = []
         for backend in self._get_target_backends(backend_hint, backend_names=backend_names):
-            if not backend:
+            if not backend or (exclude and backend.name in exclude):
                 continue
             try:
                 if operation == DirOperation.MKDIR:
@@ -531,6 +578,8 @@ class NamespaceService:
                     backend.rename(path, new_path)
             except Exception as exc:
                 failures.append(backend.name)
+                if errors is not None:
+                    errors[backend.name] = f"{type(exc).__name__}: {exc}"
                 self.logger.debug(
                     "dir op %s failed for %s on %s: %s",
                     operation.value,
@@ -1370,6 +1419,7 @@ class NamespaceService:
             return self._served_snapshot(path, newer_snapshot)
         return ordered_entries
 
+    @_member_mutation(1)
     def mkdir(self, path: str, mode: int):
         """Create a directory."""
         resolved = self.resolve_path(path)
@@ -1383,6 +1433,7 @@ class NamespaceService:
                 DirOperation.MKDIR,
                 resolved.canonical_path,
                 backend_hint=resolved.backend_name,
+                exclude=self.cache_manager.member_repairs.backends_for([resolved.canonical_path]),
             )
 
             self.invalidate_dir_cache_entry(resolved.parent_dir)
@@ -1400,6 +1451,7 @@ class NamespaceService:
         except OSError as exc:
             raise FuseOSError(exc.errno)
 
+    @_member_mutation(1)
     def rmdir(self, path: str):
         """Remove a directory."""
         resolved = self.resolve_path(path)
@@ -1408,10 +1460,14 @@ class NamespaceService:
         try:
             cache_path.rmdir()
 
+            # A member with an open repair at or around this name keeps what
+            # it has there: its directory may be the one a missed rename left
+            # behind, or another writer's.
             failures = self._propagate_dir_operation(
                 DirOperation.RMDIR,
                 resolved.canonical_path,
                 backend_hint=resolved.backend_name,
+                exclude=self.cache_manager.member_repairs.backends_for([resolved.canonical_path]),
             )
 
             self.invalidate_dir_cache_entry(resolved.parent_dir)
@@ -1429,9 +1485,18 @@ class NamespaceService:
         except OSError as exc:
             raise FuseOSError(exc.errno)
 
+    @_member_mutation(1)
     def unlink(self, path: str):
         """Remove a file."""
         resolved = self.resolve_path(path)
+        if resolved.backend_name and resolved.backend_name in (
+            self.cache_manager.member_repairs.backends_for([resolved.canonical_path])
+        ):
+            # A conflict view's unlink deletes that member's object, which
+            # under an open repair may be the only copy of renamed bytes.
+            self.logger.warning("Refusing to delete %s on %s: it has an open member repair",
+                           resolved.canonical_path, resolved.backend_name)
+            raise FuseOSError(errno.EBUSY)
 
         try:
             resolved.cache_path.unlink()
@@ -1454,6 +1519,7 @@ class NamespaceService:
         except OSError as exc:
             raise FuseOSError(exc.errno)
 
+    @_member_mutation(2)
     def rename(self, old: str, new: str, on_local_moved: Optional[Callable[[], None]] = None):
         """Rename a file or directory.
 
@@ -1473,46 +1539,122 @@ class NamespaceService:
         old_cache = old_resolved.canonical_cache_path
         new_cache = new_resolved.canonical_cache_path
 
+        repairs = self.cache_manager.member_repairs
         try:
-            with self.state_manager.metadata_lock:
-                # A directory whose files were all evicted is empty in the
-                # cache, so the cache rename of a directory would replace
-                # it; its rows are the only record of those files. (A file
-                # onto a directory fails in the cache rename, EISDIR.)
-                if (old_cache.is_dir() and not old_cache.is_symlink()
-                        and self.state_manager.has_rows_below(
-                            new_resolved.canonical_path, excluding=old_resolved.canonical_path
-                        )):
-                    raise OSError(errno.ENOTEMPTY, os.strerror(errno.ENOTEMPTY), new)
-                new_cache.parent.mkdir(parents=True, exist_ok=True)
-                old_cache.rename(new_cache)
+            # The members the move will be sent to, known before any effect.
+            # A link (even to a directory) moves on its own members.
+            if old_resolved.backend_name:
+                targets = {old_resolved.backend_name} & set(self.backends)
+            elif old_cache.is_dir() and not old_cache.is_symlink():
+                targets = set(self.backends)
+            else:
+                targets = set(self.state_manager.get_location_backends(old_resolved.canonical_path))
+            # A member with an open repair at either name holds names the
+            # namespace does not describe there: renaming on it could move
+            # the object it never moved, or replace it. It is not called.
+            fenced = repairs.backends_for(
+                [old_resolved.canonical_path, new_resolved.canonical_path]
+            ) & targets
+            # Durable before any effect (docs/member-rename-repairs.md): a
+            # crash from here on leaves this intent, open for every target.
+            # If it cannot be written, the rename fails and nothing changed.
+            intent = repairs.begin(old_resolved.canonical_path, new_resolved.canonical_path, targets)
+            # attempted: the cache rename may have taken effect. It is cleared
+            # only when rename(2) itself fails, which has no effect; any other
+            # interruption from here on (even an asynchronous one before
+            # moved is set) keeps the intent.
+            attempted = moved = False
+            try:
+                with self.state_manager.metadata_lock:
+                    # A directory whose files were all evicted is empty in the
+                    # cache, so the cache rename of a directory would replace
+                    # it; its rows are the only record of those files. (A file
+                    # onto a directory fails in the cache rename, EISDIR.)
+                    if (old_cache.is_dir() and not old_cache.is_symlink()
+                            and self.state_manager.has_rows_below(
+                                new_resolved.canonical_path, excluding=old_resolved.canonical_path
+                            )):
+                        raise OSError(errno.ENOTEMPTY, os.strerror(errno.ENOTEMPTY), new)
+                    new_cache.parent.mkdir(parents=True, exist_ok=True)
+                    attempted = True
+                    try:
+                        old_cache.rename(new_cache)
+                    except OSError as exc:
+                        # Only a refusal is known to have changed nothing;
+                        # an I/O error (EIO, say) leaves the outcome unknown.
+                        if exc.errno in _RENAME_REFUSALS:
+                            attempted = False
+                        raise
+                    moved = True
 
-                # A link (even to a directory) moves on its own members.
-                if new_cache.is_dir() and not new_cache.is_symlink():
-                    rename_backend_names = set(self.backends.keys())
-                else:
-                    rename_backend_names = self.state_manager.get_location_backends(
-                        old_resolved.canonical_path
+                    renamed_entries = self.state_manager.rename_path(
+                        old_resolved.canonical_path,
+                        new_resolved.canonical_path,
                     )
+                    for _, updated in renamed_entries:
+                        metadata = self.state_manager.get_file_metadata(updated)
+                        if metadata:
+                            self.cache_manager.sync_cache_metadata(updated, metadata)
+                    if on_local_moved is not None:
+                        on_local_moved()
+            except BaseException:
+                if intent is not None:
+                    if moved or attempted:
+                        repairs.abandon(intent)
+                    else:
+                        # Nothing moved and no member was called. A settle
+                        # failure leaves the intent (over-fencing) and must
+                        # not hide the error that stopped the rename.
+                        try:
+                            repairs.settle(intent, old_resolved.canonical_path,
+                                           new_resolved.canonical_path, {})
+                        except Exception:
+                            self.logger.exception("Could not settle the intent %s", intent)
+                raise
+            if intent is not None:
+                # The local move is durable before any member is called, so
+                # no power loss can undo it after a member took the move and
+                # its intent was dropped. A failure here leaves the intent,
+                # with no member called.
+                # Every directory from the cache root down to both parents,
+                # so an entry made earlier and never synced (by this move's
+                # mkdir, an earlier mkdir or a fetch) cannot be lost with it.
+                try:
+                    fsync_directories(
+                        *_cache_ancestors(self.cache_manager.cache_root, old_cache.parent),
+                        *_cache_ancestors(self.cache_manager.cache_root, new_cache.parent))
+                except BaseException:
+                    repairs.abandon(intent)
+                    raise
 
-                renamed_entries = self.state_manager.rename_path(
-                    old_resolved.canonical_path,
-                    new_resolved.canonical_path,
-                )
-                for _, updated in renamed_entries:
-                    metadata = self.state_manager.get_file_metadata(updated)
-                    if metadata:
-                        self.cache_manager.sync_cache_metadata(updated, metadata)
-                if on_local_moved is not None:
-                    on_local_moved()
-
+            errors: Dict[str, str] = {}
             failures = self._propagate_dir_operation(
                 DirOperation.RENAME,
                 old_resolved.canonical_path,
                 backend_hint=old_resolved.backend_name,
                 new_path=new_resolved.canonical_path,
-                backend_names=rename_backend_names if not old_resolved.backend_name else None,
+                backend_names=targets if not old_resolved.backend_name else None,
+                exclude=fenced,
+                errors=errors,
             )
+
+            # A member that missed the move is never sent it later: by then
+            # nothing on it proves the object at the old name is still the
+            # one moved here, or that the new name is free there (members
+            # change behind the mount), and Local and SSH renames replace
+            # their target. The member keeps both names as they are; the
+            # intent becomes an open repair for exactly those members.
+            missed = {
+                name: f"member rename failed: {errors.get(name, 'unknown error')}"
+                for name in failures
+            }
+            missed.update({
+                name: "not renamed: the member has an open repair at these names"
+                for name in fenced
+            })
+            if intent is not None:
+                repairs.settle(intent, old_resolved.canonical_path,
+                               new_resolved.canonical_path, missed)
 
             self.invalidate_dir_cache_entry(old_resolved.parent_dir)
             self.invalidate_dir_cache_entry(new_resolved.parent_dir)
@@ -1529,15 +1671,5 @@ class NamespaceService:
                     # flight); nothing else would queue it again.
                     if metadata and metadata.sync_status in (SyncStatus.DIRTY, SyncStatus.SYNCING):
                         self.sync_manager.queue_sync(updated, priority=80, force=True)
-
-            for failed_backend in failures:
-                self.sync_manager.queue_dir_sync(
-                    old_resolved.canonical_path,
-                    DirOperation.RENAME,
-                    new_path=new_resolved.canonical_path,
-                    backend_hint=failed_backend,
-                    priority=90,
-                    force=True,
-                )
         except OSError as exc:
             raise FuseOSError(exc.errno)

@@ -1,3 +1,4 @@
+import os
 import shutil
 import tempfile
 import time
@@ -67,7 +68,9 @@ class TestDirSyncOperations(unittest.TestCase):
         self.assertTrue(self._wait_for(lambda: not (self.backend1_dir / 'toremove').exists()))
         self.assertTrue(self._wait_for(lambda: not (self.backend2_dir / 'toremove').exists()))
 
-    def test_rename_file_sync(self):
+    def test_queued_rename_is_recorded_for_repair_not_replayed(self):
+        """A queued rename names no member: it stands for every member, and
+        none is moved (the members may have changed since it was queued)."""
         self.sync_manager.start()
         old_path = "/oldname.txt"
         new_path = "/newname.txt"
@@ -81,9 +84,14 @@ class TestDirSyncOperations(unittest.TestCase):
 
         self.sync_manager.queue_dir_sync(old_path, DirOperation.RENAME, new_path=new_path, priority=100)
 
-        self.assertTrue(self._wait_for(lambda: (self.backend1_dir / new_path.lstrip('/')).exists()))
-        self.assertTrue(self._wait_for(lambda: (self.backend2_dir / new_path.lstrip('/')).exists()))
-        self.assertTrue(self._wait_for(lambda: not (self.backend1_dir / old_path.lstrip('/')).exists()))
+        self.assertTrue(self.sync_manager.wait_for_completion(timeout=5.0))
+        for backend_dir in (self.backend1_dir, self.backend2_dir):
+            self.assertEqual(["oldname.txt"], sorted(os.listdir(backend_dir)))
+        self.assertEqual(
+            [("backend1", old_path, new_path), ("backend2", old_path, new_path)],
+            sorted((m, r.old_path, r.new_path)
+                   for r in self.cache_manager.member_repairs.list() for m in r.members),
+        )
 
 
 

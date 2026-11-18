@@ -1,0 +1,1091 @@
+"""Durable records of renames that storage members missed.
+
+A member that misses a rename through the mount is never sent it again
+later: nothing on the member proves the object at the old name is still the
+one renamed, or that the new name is free (other writers change members
+behind the mount). The missed move becomes a repair instead. While it is
+open, the member gets no rename, mkdir, rmdir or upload at names overlapping
+either path, and cached files under the new name are not evicted.
+
+The records live in the cache, not the index (which is rebuildable): one
+empty carrier file per record under <cache>/.storage.repairs, named by the
+record id, holding the record in its user.storage.member_repair xattr. See
+docs/member-rename-repairs.md for the format and the crash ordering.
+"""
+
+import contextlib
+import dataclasses
+import errno
+import fcntl
+import json
+import logging
+import os
+import re
+import threading
+import time
+import uuid
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Set, Tuple
+
+logger = logging.getLogger(__name__)
+
+CARRIER_DIR = ".storage.repairs"
+RECORD_XATTR = "user.storage.member_repair"
+RECORD_VERSION = 1
+# Version 2 keeps the record in the carrier's data, with only this
+# discriminator in the xattr: {"v": 2, "state": ...}. It is used for a
+# record over MAX_RECORD_BYTES (a long rename pair) and for every
+# view-write record, whose bytes are a separate file, <id>.bytes. The state
+# stays in the xattr, so resolving rewrites one small xattr atomically and
+# never the data a reader is parsing. Version 1 records are read as before.
+DATA_VERSION = 2
+# A bound on a version-2 record's data, far above two PATH_MAX paths.
+MAX_DATA_BYTES = 1 << 20
+_BYTES_SUFFIX = ".bytes"
+# Inside ext4's per-inode xattr block on any filesystem: a larger record is
+# refused before anything is written (ENAMETOOLONG).
+MAX_RECORD_BYTES = 3584
+MAX_REASON_CHARS = 256
+INTENT = "intent"
+OPEN = "open"
+# Written durably by a resolution just before its carrier is unlinked; still
+# enforced while the carrier exists (see MemberRepairs.resolve).
+RESOLVED = "resolved"
+# What a record is for. A RENAME record is a missed or interrupted rename.
+# A VIEW_WRITE record holds, as its carrier file's bytes, a write through a
+# conflict view that a repair kept off its member after close() had already
+# succeeded (StorageFS._release): old and new are both the canonical path.
+RENAME = "rename"
+VIEW_WRITE = "view-write"
+# A cache filesystem that cannot hard-link the view into the carrier
+# directory: copy instead.
+_NO_LINK = frozenset({errno.EXDEV, errno.EPERM, errno.EMLINK, errno.ENOTSUP, errno.EOPNOTSUPP})
+# Past this many open repairs, opening the cache warns: every fence and pin
+# lookup scans them all.
+GROWTH_WARNING = 1000
+_NEW_SUFFIX = ".new"
+_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+
+
+class PublicationPending(RuntimeError):
+    """A queued rename's fence is waiting on overlapping member work; the
+    task backs off and tries again (not a failure)."""
+
+
+class CorruptRepairRecord(RuntimeError):
+    """A carrier whose record cannot be read: the cache is not opened."""
+
+
+@dataclass(frozen=True)
+class MemberRepair:
+    """A rename that the listed members missed, left for repair.
+
+    Each member may still hold the moved object at old_path, or the rename
+    may have taken effect there before the failure was seen. An INTENT
+    record is one whose rename was interrupted before it settled: whether
+    the local move or any member call happened is unknown.
+    """
+
+    id: str
+    old_path: str
+    new_path: str
+    members: Tuple[str, ...]
+    state: str
+    reason: str
+    recorded: float
+    kind: str = RENAME
+    # For a VIEW_WRITE: the view file's identity when its bytes were
+    # copied (device, inode, size, mtime_ns), so a second release of the
+    # same bytes (another descriptor of the view) records nothing new.
+    source: str = ""
+
+    def to_json(self, version: int = RECORD_VERSION) -> bytes:
+        return json.dumps({
+            "kind": self.kind,
+            "source": self.source,
+            "v": version,
+            "id": self.id,
+            "old": self.old_path,
+            "new": self.new_path,
+            "members": list(self.members),
+            "state": self.state,
+            "reason": self.reason,
+            "recorded": self.recorded,
+        }, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        ).encode("utf-8", "surrogateescape")
+        # Raw UTF-8, not \u escapes: a non-ASCII path costs its own bytes
+        # against MAX_RECORD_BYTES (3 for CJK, not 6), as an ASCII one does.
+        # surrogateescape carries a name that is not valid UTF-8 through.
+
+    @classmethod
+    def from_json(cls, raw: bytes, carrier_name: str,
+                  version: int = RECORD_VERSION) -> "MemberRepair":
+        try:
+            data = json.loads(raw.decode("utf-8", "surrogateescape"))
+            if not isinstance(data["members"], list):
+                # tuple() of a string would fence its characters.
+                raise TypeError("members is not a list")
+            record = cls(
+                id=data["id"],
+                old_path=data["old"],
+                new_path=data["new"],
+                members=tuple(data["members"]),
+                state=data["state"],
+                reason=data["reason"],
+                recorded=float(data["recorded"]),
+                kind=data.get("kind", RENAME),
+                source=data.get("source", ""),
+            )
+            valid = (
+                data["v"] == version
+                and record.kind in (RENAME, VIEW_WRITE)
+                and isinstance(record.source, str)
+                and (record.kind == RENAME
+                     or (record.old_path == record.new_path and len(record.members) == 1))
+                and record.id == carrier_name
+                and record.state in (INTENT, OPEN, RESOLVED)
+                and record.members
+                and all(isinstance(m, str) and m for m in record.members)
+                and all(isinstance(p, str) and p.startswith("/")
+                        for p in (record.old_path, record.new_path))
+                and isinstance(record.reason, str)
+            )
+        except (ValueError, KeyError, TypeError, AttributeError) as exc:
+            raise CorruptRepairRecord(f"{carrier_name}: {exc}") from exc
+        if not valid:
+            raise CorruptRepairRecord(f"{carrier_name}: not a valid version-{version} record")
+        return record
+
+
+def _discriminator(state: str) -> bytes:
+    return json.dumps({"state": state, "v": DATA_VERSION}, sort_keys=True,
+                      separators=(",", ":")).encode()
+
+
+def _read_all(fd: int) -> bytes:
+    chunks, offset = [], 0
+    while True:
+        chunk = os.pread(fd, 1 << 16, offset)
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+        offset += len(chunk)
+        if offset > MAX_DATA_BYTES:
+            raise CorruptRepairRecord(f"record data over {MAX_DATA_BYTES} bytes")
+
+
+def read_record(fd: int, carrier_name: str) -> Tuple[MemberRepair, int]:
+    """The record a carrier open at fd holds, and its format version."""
+    raw = os.getxattr(fd, RECORD_XATTR)
+    try:
+        head = json.loads(raw.decode("utf-8", "surrogateescape"))
+    except ValueError as exc:
+        raise CorruptRepairRecord(f"{carrier_name}: {exc}") from exc
+    if isinstance(head, dict) and head.get("v") == DATA_VERSION:
+        if set(head) != {"v", "state"} or head["state"] not in (INTENT, OPEN, RESOLVED):
+            raise CorruptRepairRecord(f"{carrier_name}: not a valid version-2 discriminator")
+        record = MemberRepair.from_json(_read_all(fd), carrier_name, DATA_VERSION)
+        return dataclasses.replace(record, state=head["state"]), DATA_VERSION
+    return MemberRepair.from_json(raw, carrier_name), RECORD_VERSION
+
+
+def is_at_or_under(path: str, root: str) -> bool:
+    """Segment-bounded: /ab is not under /a. Every path is under /."""
+    root = root.rstrip("/")
+    return root == "" or path == root or path.startswith(root + "/")
+
+
+def paths_overlap(a: str, b: str) -> bool:
+    """Whether one path is at, above or below the other."""
+    return is_at_or_under(a, b) or is_at_or_under(b, a)
+
+
+def is_carrier_path(canonical_path: str) -> bool:
+    """Whether a canonical virtual path is the carrier directory or under it."""
+    return canonical_path.lstrip("/").split("/", 1)[0] == CARRIER_DIR
+
+
+def _fsync(path: Path, directory: bool = False):
+    fd = os.open(str(path), os.O_RDONLY | (os.O_DIRECTORY if directory else 0))
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+FLOCK_WAIT = 5.0
+# How long a queued rename's fence publication waits for overlapping member
+# work before the task backs off and tries again (freeing its worker).
+PUBLISH_WAIT = 5.0
+
+
+def _write_all(fd: int, data: bytes):
+    view = memoryview(data)
+    while view:
+        view = view[os.write(fd, view):]
+
+
+def _copy_into(source: Path, fd: int):
+    """Copy source's bytes into the empty file open at fd."""
+    with open(source, "rb") as src:
+        while True:
+            chunk = src.read(1 << 20)
+            if not chunk:
+                return
+            _write_all(fd, chunk)
+
+
+def _same_bytes(a: Path, b: Path) -> bool:
+    """Whether two files hold the same bytes, read in full (filecmp's
+    cache would answer from size and mtime alone)."""
+    with open(a, "rb") as fa, open(b, "rb") as fb:
+        while True:
+            ca, cb = fa.read(1 << 20), fb.read(1 << 20)
+            if ca != cb:
+                return False
+            if not ca:
+                return True
+
+
+def _flock_bounded(fd: int, wait: Optional[float] = None):
+    """flock(LOCK_EX) for at most wait seconds; raises OSError(EWOULDBLOCK)
+    after. Callers that hold namespace locks must not wait without bound on
+    another process (a resolve stopped in a terminal, say)."""
+    deadline = time.monotonic() + (FLOCK_WAIT if wait is None else wait)
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                raise OSError(errno.EWOULDBLOCK, "member repair carrier is busy")
+            time.sleep(0.01)
+
+
+def fsync_directories(*paths: Path):
+    """Make renames within these directories durable (each once)."""
+    for path in dict.fromkeys(str(p) for p in paths):
+        _fsync(Path(path), directory=True)
+
+
+class MemberRepairs:
+    """The open repairs of one cache: the carriers are the authority.
+
+    Loaded when the cache opens, before anything can upload, rename, sweep
+    or evict. Lookups reload when the carrier directory changes, which is
+    how a resolution by another process (the CLI) reaches a mount; a change
+    missed within one timestamp tick can only be such a removal, so missing
+    it keeps a protection longer, never drops one.
+    """
+
+    def __init__(self, cache_root: Path, *, sweep_new: bool = False):
+        self.dir = Path(cache_root) / CARRIER_DIR
+        # _lock guards the in-memory records and is never held across an
+        # fsync; _write_lock orders this process's writers across their I/O.
+        # Another process's writer (the CLI) is ordered by flock on the
+        # carrier it changes.
+        self._lock = threading.Lock()
+        # Signalled when a member mutation ends (end_mutation), for a
+        # publication waiting on the overlapping ones (publish_pending).
+        self._cond = threading.Condition(self._lock)
+        self._mutations: Dict[int, Tuple[frozenset, Tuple[str, ...]]] = {}
+        self._mutation_seq = 0
+        self._write_lock = threading.Lock()
+        self._records: Dict[str, MemberRepair] = {}
+        # Format version of each record (read_record), which decides where a
+        # view-write's bytes are.
+        self._versions: Dict[str, int] = {}
+        self._seen: Optional[tuple] = None
+        # Descriptors of this process's in-flight intents, flock held.
+        self._held: Dict[str, int] = {}
+        # Fences for repairs not yet durable: a queued rename whose record
+        # the cache refused, while its retry backs off (fence_pending).
+        # In memory only; the task that holds one is what retries it.
+        self._pending: Dict[int, Tuple[str, str, Tuple[str, ...]]] = {}
+        self._pending_seq = 0
+        self._pending_order: Dict[int, int] = {}
+        self._dir_durable = False
+        with self._lock:
+            self._reload_locked(strict=True, owner=sweep_new)
+        if len(self._records) > GROWTH_WARNING:
+            logger.warning("%d member repairs are open; each fence and pin lookup scans them all",
+                           len(self._records))
+
+    # -- loading ---------------------------------------------------------
+    def _dir_stamp(self) -> Optional[tuple]:
+        try:
+            st = os.stat(self.dir)
+        except FileNotFoundError:
+            return None
+        return (st.st_ino, st.st_mtime_ns, st.st_ctime_ns, st.st_nlink, st.st_size)
+
+    def _reload_locked(self, *, strict: bool, owner: bool = False) -> bool:
+        """Read every carrier. The cache's owner (the mount, one per cache)
+        also removes unfinished .new files and finishes resolutions that a
+        crash interrupted. Returns False, keeping the previous records, when
+        a carrier cannot be read outside strict mode."""
+        stamp = self._dir_stamp()
+        records: Dict[str, MemberRepair] = {}
+        versions: Dict[str, int] = {}
+        if stamp is not None:
+            byte_files = set()
+            for name in sorted(os.listdir(self.dir)):
+                path = self.dir / name
+                base = name
+                for suffix in (_NEW_SUFFIX, _BYTES_SUFFIX + _NEW_SUFFIX):
+                    if name.endswith(suffix) and _ID_RE.match(name[:-len(suffix)]):
+                        base = None
+                if base is None:
+                    # Never renamed into place: written before any effect
+                    # (a view-write's view name is unlinked only after its
+                    # record is named).
+                    if owner:
+                        try:
+                            path.unlink()
+                        except FileNotFoundError:
+                            pass
+                    continue
+                if name.endswith(_BYTES_SUFFIX) and _ID_RE.match(name[:-len(_BYTES_SUFFIX)]):
+                    byte_files.add(name[:-len(_BYTES_SUFFIX)])
+                    continue
+                try:
+                    if not _ID_RE.match(name):
+                        raise CorruptRepairRecord(f"{name}: not a record id")
+                    fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW)
+                    try:
+                        record, version = read_record(fd, name)
+                    finally:
+                        os.close(fd)
+                except FileNotFoundError:
+                    continue  # resolved while listing
+                except (OSError, CorruptRepairRecord) as exc:
+                    if strict:
+                        raise CorruptRepairRecord(
+                            f"Unreadable member repair carrier {path}: {exc}. A repair that "
+                            "cannot be read cannot be enforced; inspect or remove it by hand."
+                        ) from exc
+                    if stamp != self._seen:
+                        logger.error("Keeping the previous member repairs: %s unreadable: %s",
+                                     path, exc)
+                    # Not retried until the directory changes again.
+                    self._seen = stamp
+                    return False
+                if record.state == RESOLVED and owner:
+                    # Its resolution was written; finish it under the same
+                    # flock a live resolve holds, making the state durable
+                    # first in case that resolve died before its fsync.
+                    try:
+                        finished = self._finish_resolution(path)
+                    except (OSError, CorruptRepairRecord) as exc:
+                        raise CorruptRepairRecord(
+                            f"Could not finish the resolution of {path}: {exc}. Inspect or "
+                            "remove it by hand."
+                        ) from exc
+                    if finished:
+                        continue
+                records[name] = record
+                versions[name] = version
+            if owner:
+                # Bytes whose record was never named (the view's own name
+                # still holds them) or was resolved: nothing refers to them.
+                for orphan in byte_files - set(records):
+                    if not (self.dir / orphan).exists():
+                        try:
+                            (self.dir / (orphan + _BYTES_SUFFIX)).unlink()
+                        except FileNotFoundError:
+                            pass
+                _fsync(self.dir, directory=True)
+        # The stamp from before the listing, also for the owner (whose own
+        # unlinks then cost one extra reload): a change made while listing,
+        # such as a live resolve's unlink, shows as a mismatch at the next
+        # lookup, which reloads.
+        self._records = records
+        self._versions = versions
+        self._seen = stamp
+        return True
+
+    @staticmethod
+    def _finish_resolution(path: Path) -> bool:
+        """Unlink a resolved carrier; False (keep enforcing it) if it is
+        busy or no longer resolved."""
+        try:
+            fd = os.open(str(path), os.O_RDONLY)
+        except FileNotFoundError:
+            return True
+        try:
+            try:
+                _flock_bounded(fd)
+            except OSError:
+                return False
+            if os.fstat(fd).st_nlink == 0:
+                return True
+            if read_record(fd, path.name)[0].state != RESOLVED:
+                return False
+            os.fsync(fd)
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            try:
+                path.with_name(path.name + _BYTES_SUFFIX).unlink()
+            except FileNotFoundError:
+                pass
+            return True
+        finally:
+            os.close(fd)
+
+    def _refresh(self):
+        with self._lock:
+            if self._dir_stamp() != self._seen:
+                self._reload_locked(strict=False)
+            return dict(self._records)
+
+    def _after_write(self, update):
+        """Bring memory up to the disk after a write of ours: a full reload,
+        so an external change made before or during the write is never
+        hidden behind our own new stamp. If the reload cannot read a
+        carrier, apply our own change to the records kept."""
+        with self._lock:
+            if not self._reload_locked(strict=False):
+                update(self._records)
+
+    # -- writing ---------------------------------------------------------
+    def _ensure_dir(self):
+        # The cache root is fsynced once per instance, not only when this
+        # instance made the directory: an earlier process may have crashed
+        # between its mkdir and that fsync.
+        if not self.dir.is_dir():
+            self.dir.mkdir(mode=0o700, exist_ok=True)
+        if not self._dir_durable:
+            _fsync(self.dir.parent, directory=True)
+            self._dir_durable = True
+
+    def _write_new(self, record: MemberRepair, hold: bool = False) -> Optional[int]:
+        """Create a carrier durably. With hold, return its descriptor with
+        an exclusive flock taken before the carrier had its final name, so
+        no resolve can ever act on it until the caller closes it. A record
+        over MAX_RECORD_BYTES, and every view-write record, is written in
+        version 2: its JSON as the carrier's data, made durable with the
+        discriminator xattr by the one fsync before the carrier is named."""
+        payload = record.to_json()
+        data = None
+        if record.kind == VIEW_WRITE or len(payload) > MAX_RECORD_BYTES:
+            data = record.to_json(DATA_VERSION)
+            if len(data) > MAX_DATA_BYTES:
+                raise OSError(errno.ENAMETOOLONG,
+                              f"member repair record is {len(data)} bytes, over {MAX_DATA_BYTES}")
+            payload = _discriminator(record.state)
+        self._ensure_dir()
+        temp = self.dir / (record.id + _NEW_SUFFIX)
+        final = self.dir / record.id
+        # O_RDWR: a held intent's descriptor is later read through (settle).
+        fd = os.open(str(temp), os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            try:
+                if hold:
+                    fcntl.flock(fd, fcntl.LOCK_EX)
+                if data is not None:
+                    _write_all(fd, data)
+                os.setxattr(fd, RECORD_XATTR, payload)
+                os.fsync(fd)
+            except BaseException:
+                os.close(fd)
+                raise
+            if not hold:
+                os.close(fd)
+            try:
+                os.rename(temp, final)
+                _fsync(self.dir, directory=True)
+            except BaseException:
+                if hold:
+                    os.close(fd)
+                raise
+            return fd if hold else None
+        except BaseException:
+            # Not durable: the caller is told it failed, so nothing of it
+            # may be left to be read later either.
+            for leftover in (temp, final):
+                try:
+                    leftover.unlink()
+                except OSError:
+                    pass
+            raise
+
+    def _make(self, old_path, new_path, members, state, reason) -> MemberRepair:
+        return MemberRepair(
+            id=uuid.uuid4().hex,
+            old_path=old_path,
+            new_path=new_path,
+            members=tuple(sorted(set(members))),
+            state=state,
+            reason=reason[:MAX_REASON_CHARS],
+            recorded=time.time(),
+        )
+
+    def begin(self, old_path: str, new_path: str, members: Iterable[str]) -> Optional[str]:
+        """Durably record an intent to rename on members, before any effect.
+
+        Returns the record id, or None when there are no members. Raises
+        OSError when the record cannot be made durable; then the rename
+        must not proceed.
+        """
+        members = set(members)
+        if not members:
+            return None
+        record = self._make(old_path, new_path, members, INTENT,
+                            "rename interrupted before every member's outcome was recorded")
+        with self._write_lock:
+            # Held until settle: a resolve while the rename is running
+            # waits for it, so an in-flight intent is never resolved.
+            held = self._write_new(record, hold=True)
+            try:
+                self._after_write(lambda records: records.__setitem__(record.id, record))
+            except BaseException:
+                # Nothing has happened yet: the intent goes, and its lock.
+                try:
+                    (self.dir / record.id).unlink()
+                    _fsync(self.dir, directory=True)
+                except OSError:
+                    logger.exception("Leaving intent %s after a failed reload", record.id)
+                finally:
+                    os.close(held)
+                raise
+            self._held[record.id] = held
+        return record.id
+
+    def record(self, old_path: str, new_path: str, members: Iterable[str],
+               reason: str) -> Optional[str]:
+        """Durably record an open repair; raises OSError when it cannot.
+
+        Returns the record id, or None when there are no members: a record
+        with none would refuse the next open, and fences nothing.
+        """
+        members = set(members)
+        if not members:
+            return None
+        record = self._make(old_path, new_path, members, OPEN, reason)
+        with self._write_lock:
+            self._write_new(record)
+            try:
+                self._after_write(lambda records: records.__setitem__(record.id, record))
+            except OSError as exc:
+                # The record is durable: reporting a failure would make the
+                # queued rename retry and write a second one.
+                logger.warning("Could not reload the member repairs after writing %s: %s",
+                               record.id, exc)
+                with self._lock:
+                    self._records[record.id] = record
+        logger.warning(
+            "Member(s) %s missed the rename %s -> %s, which is not replayed; repair %s "
+            "(storage debug member-repairs): %s",
+            ", ".join(record.members), old_path, new_path, record.id, record.reason,
+        )
+        return record.id
+
+    def preserve_view_write(self, canonical_path: str, member: str, view_path: Path,
+                            inode: str, reason: str) -> Optional[str]:
+        """Durably keep a conflict view's bytes that a repair kept off member.
+
+        Called at release, under the canonical path's lock, for a write
+        that close() already reported as done. inode is "dev:ino" of the
+        descriptor's file, taken before it was closed. Writes through the
+        view take the same lock and fail once the member is fenced
+        (StorageFS._write_view), so the bytes cannot change while, or
+        after, they are kept.
+
+        The view's inode is hard-linked as <id>.bytes and fsynced, then
+        the version-2 record naming it is written and named, and only then
+        is the view's cache name unlinked. So the bytes are exactly what the
+        descriptors wrote, with no copy and no extra space, and nothing
+        that later rewrites a view cache file in place can reach them. They
+        outlive eviction, a refetch, a reopen and an index rebuild, and are
+        listed until resolved. The member is not touched. Every descriptor
+        of the inode shares one record, which a second release finds by
+        inode (and fsyncs again). Where the cache filesystem cannot link,
+        the bytes are copied; a copy is shared only with a record holding
+        exactly the same bytes, never on an identity guess. Returns the
+        record id, or None when the view's cache name no longer holds that
+        inode. Raises OSError when the bytes cannot be made durable, leaving
+        the view's inode and name as they were.
+        """
+        with self._write_lock:
+            for existing in self._refresh().values():
+                if (existing.kind == VIEW_WRITE and existing.new_path == canonical_path
+                        and existing.members == (member,) and existing.source == inode):
+                    if self.bytes_missing(existing.id):
+                        # The recorded inode number may have been reused: never
+                        # take this file for the lost payload, nor unlink it.
+                        logger.error(
+                            "Left %s in place: its inode matches repair %s, whose kept "
+                            "bytes are missing, but cannot be proven to be them",
+                            view_path, existing.id)
+                        return None
+                    fd = os.open(str(self.carrier_path(existing.id)), os.O_RDONLY)
+                    try:
+                        os.fsync(fd)
+                    finally:
+                        os.close(fd)
+                    return existing.id
+            try:
+                st = os.lstat(view_path)
+            except FileNotFoundError:
+                return None
+            if f"{st.st_dev}:{st.st_ino}" != inode:
+                return None
+            record = dataclasses.replace(
+                self._make(canonical_path, canonical_path, [member], OPEN, reason),
+                kind=VIEW_WRITE, source=inode,
+            )
+            self._ensure_dir()
+            try:
+                self._link_bytes(record.id, view_path, st)
+                linked = True
+            except FileNotFoundError:
+                return None  # the view's name no longer holds this inode
+            except OSError as exc:
+                if exc.errno not in _NO_LINK:
+                    raise
+                linked = False
+                same = self._same_bytes_record(canonical_path, member, view_path)
+                if same is not None:
+                    return same
+                record = dataclasses.replace(record, source="copy:" + inode)
+                self._copy_bytes(record.id, view_path)
+            try:
+                self._write_new(record)
+            except BaseException:
+                try:
+                    (self.dir / (record.id + _BYTES_SUFFIX)).unlink()
+                    _fsync(self.dir, directory=True)
+                except OSError:
+                    pass
+                raise
+            self._after_write(lambda records: records.__setitem__(record.id, record))
+        if linked:
+            try:
+                if os.lstat(view_path).st_ino == st.st_ino:
+                    os.unlink(view_path)
+                    _fsync(view_path.parent, directory=True)
+            except OSError as exc:
+                logger.warning("Kept the bytes of %s in %s, but its view cache name %s stays: %s",
+                               canonical_path, self.carrier_path(record.id), view_path, exc)
+        logger.error(
+            "A write through the conflict view of %s on %s was kept off that member by an "
+            "open repair; its bytes are kept in %s, repair %s (storage debug member-repairs)",
+            canonical_path, member, self.carrier_path(record.id), record.id,
+        )
+        return record.id
+
+    def _same_bytes_record(self, canonical_path, member, view_path) -> Optional[str]:
+        """A copied view-write record for this name and member whose bytes
+        equal view_path's, compared byte for byte."""
+        for existing in self._refresh().values():
+            if (existing.kind == VIEW_WRITE and existing.new_path == canonical_path
+                    and existing.members == (member,) and existing.source.startswith("copy:")):
+                try:
+                    if _same_bytes(self.carrier_path(existing.id), view_path):
+                        return existing.id
+                except OSError:
+                    continue
+        return None
+
+    def _link_bytes(self, repair_id: str, source: Path, expected: os.stat_result):
+        """source's inode as <id>.bytes, durably: link under a temporary name,
+        check it is still the inode expected, fsync, name, fsync the dir."""
+        temp = self.dir / (repair_id + _BYTES_SUFFIX + _NEW_SUFFIX)
+        final = self.dir / (repair_id + _BYTES_SUFFIX)
+        os.link(source, temp)
+        try:
+            fd = os.open(str(temp), os.O_RDONLY)
+            try:
+                linked = os.fstat(fd)
+                if (linked.st_dev, linked.st_ino) != (expected.st_dev, expected.st_ino):
+                    raise FileNotFoundError(errno.ENOENT, "view replaced before it was kept",
+                                            str(source))
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            os.rename(temp, final)
+            _fsync(self.dir, directory=True)
+        except BaseException:
+            for leftover in (temp, final):
+                try:
+                    leftover.unlink()
+                except OSError:
+                    pass
+            raise
+
+    def _copy_bytes(self, repair_id: str, source: Path):
+        """A copy of source as <id>.bytes, durably."""
+        temp = self.dir / (repair_id + _BYTES_SUFFIX + _NEW_SUFFIX)
+        final = self.dir / (repair_id + _BYTES_SUFFIX)
+        fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            try:
+                _copy_into(source, fd)
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            os.rename(temp, final)
+            _fsync(self.dir, directory=True)
+        except BaseException:
+            for leftover in (temp, final):
+                try:
+                    leftover.unlink()
+                except OSError:
+                    pass
+            raise
+
+    def _version_of(self, repair_id: str) -> int:
+        with self._lock:
+            version = self._versions.get(repair_id)
+            record = self._records.get(repair_id)
+        if version is None and record is not None:
+            # Written by this instance since the last reload.
+            version = (DATA_VERSION if record.kind == VIEW_WRITE
+                       or len(record.to_json()) > MAX_RECORD_BYTES else RECORD_VERSION)
+        return version or RECORD_VERSION
+
+    def carrier_path(self, repair_id: str) -> Path:
+        """Where a record's bytes are, by its kind and format: <id>.bytes
+        for a version-2 view-write record, the carrier itself for a
+        version-1 one (whose data was the bytes) and for a rename record.
+        Never chosen by which files exist: see bytes_missing."""
+        with self._lock:
+            record = self._records.get(repair_id)
+        if (record is not None and record.kind == VIEW_WRITE
+                and self._version_of(repair_id) == DATA_VERSION):
+            return self.dir / (repair_id + _BYTES_SUFFIX)
+        return self.dir / repair_id
+
+    def bytes_missing(self, repair_id: str) -> bool:
+        """Whether a view-write record's bytes are gone. The record, and its
+        fence, stay: an operator must see it, and settle the member."""
+        with self._lock:
+            record = self._records.get(repair_id)
+        return (record is not None and record.kind == VIEW_WRITE
+                and not self.carrier_path(repair_id).exists())
+
+    def kept_fd(self, fd: int) -> Optional[str]:
+        """kept_inode for an open descriptor: its file, wherever (or whether)
+        it is named now."""
+        st = os.fstat(fd)
+        return self._kept_by_stat(st)
+
+    def _kept_by_stat(self, st: os.stat_result) -> Optional[str]:
+        for record in self._refresh().values():
+            if record.kind != VIEW_WRITE:
+                continue
+            try:
+                kept = os.lstat(self.carrier_path(record.id))
+            except FileNotFoundError:
+                continue
+            if (kept.st_dev, kept.st_ino) == (st.st_dev, st.st_ino):
+                return record.id
+        return None
+
+    def kept_inode(self, path: Path) -> Optional[str]:
+        """The id of the view-write record whose kept bytes are path's inode
+        (a view cache name that still aliases them), else None.
+
+        Decided by statting the record's actual payload, never by the inode
+        number recorded when it was kept: a payload that is gone frees that
+        number for reuse, and an unrelated file must not be taken for it.
+        """
+        try:
+            st = os.lstat(path)
+        except FileNotFoundError:
+            return None
+        for record in self._refresh().values():
+            if record.kind != VIEW_WRITE:
+                continue
+            try:
+                kept = os.lstat(self.carrier_path(record.id))
+            except FileNotFoundError:
+                continue  # payload missing: reported, never matched
+            if (kept.st_dev, kept.st_ino) == (st.st_dev, st.st_ino):
+                return record.id
+        return None
+
+    def matches_missing_payload(self, path: Path) -> Optional[str]:
+        """The id of a view-write record whose payload is missing and whose
+        recorded inode is path's: such a file is left alone, since a reused
+        inode number cannot be told from the lost bytes."""
+        try:
+            st = os.lstat(path)
+        except FileNotFoundError:
+            return None
+        inode = f"{st.st_dev}:{st.st_ino}"
+        for record in self._refresh().values():
+            if (record.kind == VIEW_WRITE and record.source == inode
+                    and self.bytes_missing(record.id)):
+                return record.id
+        return None
+
+    def break_alias(self, path: Path) -> bool:
+        """Unlink path if it is a second name for kept bytes (its inode is
+        the live payload's), so nothing writing to it in place can reach
+        them; True when it was one."""
+        if self.kept_inode(path) is None:
+            return False
+        try:
+            os.unlink(path)
+            _fsync(path.parent, directory=True)
+        except FileNotFoundError:
+            pass
+        return True
+
+    def settle(self, repair_id: str, old_path: str, new_path: str, missed: Dict[str, str]):
+        """Settle an intent once every member call has returned.
+
+        The members that missed the move get a new open record, under a new
+        id, made durable first; only then is the intent removed. A
+        resolution of the intent id, before or after, therefore never
+        covers the miss: before, the intent is gone or resolved and the new
+        record still follows; after, the id names nothing and the resolve
+        fails. The paths come from the caller, not from memory, which a
+        concurrent reload may have changed. With no miss, the intent is
+        simply removed.
+
+        The intent's flock, taken by begin before the carrier had its name,
+        is held from begin until here, so no resolve can remove the intent
+        while the rename runs (it times out as busy) and the miss is always
+        durable before the intent goes. An intent begun by another instance
+        is locked with a bounded wait; past it, the intent stays
+        (over-fencing, never under). Any failure leaves the intent likewise; it is logged,
+        not raised: the evidence is already durable.
+        """
+        reasons = "; ".join(f"{m}: {missed[m]}" for m in sorted(missed))[:MAX_REASON_CHARS]
+        with self._write_lock:
+            held = self._held.pop(repair_id, None)
+            try:
+                if missed:
+                    self._write_new(self._make(old_path, new_path, missed, OPEN, reasons))
+                    logger.warning(
+                        "Member(s) %s missed the rename %s -> %s, which is not replayed; repair "
+                        "recorded (storage debug member-repairs): %s",
+                        ", ".join(sorted(missed)), old_path, new_path, reasons,
+                    )
+                self._drop_intent(repair_id, held)
+            except (OSError, CorruptRepairRecord):
+                logger.exception(
+                    "Could not settle member repair %s; it stays an intent for every member",
+                    repair_id,
+                )
+            finally:
+                if held is not None:
+                    os.close(held)
+            self._after_write(lambda records: None)
+
+    def abandon(self, repair_id: str):
+        """Keep an intent as it is and release its flock: the rename failed
+        after its local move, so the intent stands for every target."""
+        with self._write_lock:
+            held = self._held.pop(repair_id, None)
+            if held is not None:
+                os.close(held)
+
+    def _drop_intent(self, repair_id: str, held: Optional[int] = None):
+        carrier = self.dir / repair_id
+        if held is not None:
+            fd = os.dup(held)  # already locked: same open file description
+        else:
+            try:
+                fd = os.open(str(carrier), os.O_RDONLY)
+            except FileNotFoundError:
+                return  # resolved by someone else meanwhile
+        try:
+            if held is None:
+                _flock_bounded(fd)
+            if os.fstat(fd).st_nlink == 0:
+                return
+            current = read_record(fd, repair_id)[0]
+            if current.state != INTENT:
+                return  # being resolved: that resolution finishes it
+            carrier.unlink()
+        finally:
+            os.close(fd)
+        _fsync(self.dir, directory=True)
+
+    def resolve(self, repair_id: str) -> bool:
+        """Drop a repair once someone has settled the members by hand.
+
+        Two steps, so no reader can act on a resolution that is not yet
+        durable: the record is first rewritten as resolved and fsynced
+        (readers still enforce it while the carrier exists), then the
+        carrier is unlinked, which is what readers act on. A crash after the
+        first step leaves a resolved carrier, which the next open of the
+        cache finishes. Returns False when no carrier has that id (a replay,
+        a typo, or an id from elsewhere). Changes no member.
+        """
+        if not _ID_RE.match(repair_id):
+            return False
+        carrier = self.dir / repair_id
+        with self._write_lock:
+            try:
+                fd = os.open(str(carrier), os.O_RDONLY)
+            except FileNotFoundError:
+                self._after_write(lambda records: records.pop(repair_id, None))
+                return False
+            try:
+                _flock_bounded(fd)
+                if os.fstat(fd).st_nlink == 0:
+                    found = False
+                else:
+                    current, version = read_record(fd, repair_id)
+                    resolved = dataclasses.replace(current, state=RESOLVED)
+                    os.setxattr(fd, RECORD_XATTR,
+                                _discriminator(RESOLVED) if version == DATA_VERSION
+                                else resolved.to_json(), os.XATTR_REPLACE)
+                    os.fsync(fd)
+                    try:
+                        carrier.unlink()
+                    except FileNotFoundError:
+                        pass  # the owner finished it: still this resolution
+                    try:
+                        (self.dir / (repair_id + _BYTES_SUFFIX)).unlink()
+                    except FileNotFoundError:
+                        pass
+                    found = True
+            finally:
+                os.close(fd)
+            if found:
+                _fsync(self.dir, directory=True)
+            self._after_write(lambda records: records.pop(repair_id, None))
+        return found
+
+    # -- reading ---------------------------------------------------------
+    def list(self) -> List[MemberRepair]:
+        """Every repair still on disk, oldest first (a RESOLVED one only
+        while its resolution is being finished)."""
+        return sorted(self._refresh().values(), key=lambda r: (r.recorded, r.id))
+
+    def fence_pending(self, old_path: str, new_path: str, members: Iterable[str]) -> int:
+        """Fence old_path and new_path on members now, for a repair whose
+        record is not written yet; returns a key for release_pending."""
+        with self._lock:
+            return self._add_pending_locked(old_path, new_path, members)
+
+    def _add_pending_locked(self, old_path, new_path, members) -> int:
+        self._pending_seq += 1
+        self._pending[self._pending_seq] = (old_path, new_path, tuple(sorted(set(members))))
+        return self._pending_seq
+
+    def publish_pending(self, old_path: str, new_path: str, members: Iterable[str]) -> int:
+        """Fence the names on members now, ordered against member mutations.
+
+        For a queued rename's record, published outside the namespace's
+        path locks. The fence is active at once: a mutation that registers
+        after this (start_mutation) sees it and skips those members. Before
+        writing the durable record the caller waits (await_pending) for
+        every overlapping mutation on those members that registered before
+        it, so each one either finished before the fence took effect or
+        skipped the fenced members; none can call a member past it. Only
+        overlapping mutations are waited for: unrelated member I/O goes on.
+        Returns the key for await_pending and release_pending.
+        """
+        with self._lock:
+            key = self._add_pending_locked(old_path, new_path, members)
+            self._mutation_seq += 1
+            self._pending_order[key] = self._mutation_seq
+            return key
+
+    def await_pending(self, key: int, timeout: float) -> bool:
+        """Wait, up to timeout, until no overlapping mutation registered
+        before the pending fence key is still running; False on timeout
+        (the fence stays, and the caller retries later)."""
+        deadline = time.monotonic() + timeout
+        with self._cond:
+            while True:
+                fence = self._pending.get(key)
+                if fence is None:
+                    return True
+                old_path, new_path, members = fence
+                order = self._pending_order.get(key, 0)
+                running = any(
+                    token < order and mutating & set(members)
+                    and any(paths_overlap(path, name)
+                            for path in paths for name in (old_path, new_path))
+                    for token, (mutating, paths) in self._mutations.items()
+                )
+                if not running:
+                    return True
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._cond.wait(remaining)
+
+    def release_pending(self, key: int):
+        """Drop a pending fence, once its record is durable (or moot)."""
+        with self._lock:
+            self._pending.pop(key, None)
+            self._pending_order.pop(key, None)
+
+    def _fences_locked(self):
+        """(old, new, members) for every durable record and pending fence,
+        read under one hold of _lock, so a pending fence handed off to its
+        durable record between two reads is never missed by both."""
+        if self._dir_stamp() != self._seen:
+            self._reload_locked(strict=False)
+        names = [(r.old_path, r.new_path, r.members) for r in self._records.values()]
+        names.extend(self._pending.values())
+        return names
+
+    def _fenced_names(self):
+        with self._lock:
+            return self._fences_locked()
+
+    @staticmethod
+    def _members_fenced(fences, paths) -> Set[str]:
+        return {
+            member
+            for old, new, members in fences
+            if any(paths_overlap(path, name) for path in paths for name in (old, new))
+            for member in members
+        }
+
+    def start_mutation(self, members: Iterable[str], paths: Iterable[str]) -> Tuple[int, Set[str]]:
+        """Register a member mutation at paths, for publish_pending to order
+        against; returns its token and the members fenced there now, read
+        in the same step. The caller calls no fenced member, and ends the
+        mutation (end_mutation) once its member calls are done."""
+        paths = tuple(paths)
+        with self._lock:
+            fenced = self._members_fenced(self._fences_locked(), paths)
+            self._mutation_seq += 1
+            # Every member the operation may touch, fenced now or not: a
+            # fence lifted later (a resolve) must not leave a member it then
+            # calls unregistered for a publication to wait on.
+            self._mutations[self._mutation_seq] = (frozenset(members), paths)
+            return self._mutation_seq, fenced
+
+    def end_mutation(self, token: int):
+        with self._cond:
+            self._mutations.pop(token, None)
+            self._cond.notify_all()
+
+    @contextlib.contextmanager
+    def mutating(self, members: Iterable[str], paths: Iterable[str]):
+        """start_mutation and end_mutation around a block; yields nothing:
+        every fence lookup made inside the block is ordered by it."""
+        token, _fenced = self.start_mutation(members, paths)
+        try:
+            yield
+        finally:
+            self.end_mutation(token)
+
+    def backends_for(self, virtual_paths: Iterable[str]) -> Set[str]:
+        """The members with a repair at, above or below any of virtual_paths
+        (either name counts). Renames, mkdir, rmdir, file and link uploads
+        and conflict-view deletes at those names are not sent to them until
+        the repair is resolved. A scan of every open
+        repair, expected to be few."""
+        return self._members_fenced(self._fenced_names(), list(virtual_paths))
+
+    def covers(self, virtual_path: str) -> bool:
+        """Whether virtual_path is at or under the new name of any repair: a
+        member that missed the move may hold its bytes only under the old
+        name, so the cached copy stays. Conservative: any member's repair."""
+        return any(is_at_or_under(virtual_path, new)
+                   for _old, new, _members in self._fenced_names())

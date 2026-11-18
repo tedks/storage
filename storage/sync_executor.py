@@ -4,7 +4,9 @@ import contextlib
 import errno
 import logging
 import os
+import heapq
 import queue
+import threading
 import time
 from pathlib import Path
 from typing import Callable, ContextManager, Dict, List, Optional, Union
@@ -14,12 +16,103 @@ from .cache import CacheManager
 from .conflicts import ConflictDetector
 from .file_config import get_inherited_config
 from .links import LinkRefused, find_holders, link_checksum, resolve_link_target
+from . import member_repairs
 from .models import FileLocation, SyncStatus
 from .replication import ReplicationManager
 from .state import StateManager
 from .sync_tasks import DirOperation, DirSyncTask, SyncConfig, SyncTask
 
 logger = logging.getLogger(__name__)
+
+
+class RetryScheduler:
+    """Puts deferred retries back on one queue when they are due.
+
+    One per queue, with at most one thread, which exits when nothing is
+    deferred: the threads used do not grow with the number of failing
+    tasks. A deferred task counts as unfinished on its queue from the
+    moment it is held here until it is back on the queue, so
+    wait_for_completion (and Queue.join) still waits for it. The queue
+    outlives SyncManager.stop and start, so a retry deferred before a stop
+    is delivered to the restarted workers. Used only for rename retries,
+    which retry without limit; ordinary retries keep sleeping inline.
+    """
+
+    _attach_lock = threading.Lock()
+
+    def __init__(self, task_queue: queue.Queue):
+        self._queue = task_queue
+        self._cond = threading.Condition()
+        self._heap: list = []
+        self._seq = 0
+        self._thread: Optional[threading.Thread] = None
+
+    @classmethod
+    def for_queue(cls, task_queue: queue.Queue) -> "RetryScheduler":
+        """The queue's scheduler, kept on the queue itself, so the two are
+        collected together (a registry would keep every queue alive)."""
+        with cls._attach_lock:
+            scheduler = getattr(task_queue, "_storage_retry_scheduler", None)
+            if scheduler is None:
+                scheduler = cls(task_queue)
+                task_queue._storage_retry_scheduler = scheduler
+            return scheduler
+
+    def defer(self, task, delay: float) -> bool:
+        """Hold task for delay seconds, then put it on the queue.
+
+        Returns False, holding nothing and counting nothing, when the
+        delivery thread cannot be started; the caller then retries inline.
+        """
+        with self._cond:
+            if self._thread is None or not self._thread.is_alive():
+                thread = threading.Thread(target=self._run, name="sync-retry-scheduler",
+                                          daemon=True)
+                try:
+                    thread.start()
+                except RuntimeError:
+                    logger.warning("Could not start the retry scheduler; retrying %s inline",
+                                   getattr(task, "virtual_path", task))
+                    return False
+                self._thread = thread
+            with self._queue.all_tasks_done:
+                self._queue.unfinished_tasks += 1
+            self._seq += 1
+            heapq.heappush(self._heap, (time.monotonic() + max(delay, 0.0), self._seq, task))
+            self._cond.notify()
+        return True
+
+    def pending(self) -> int:
+        with self._cond:
+            return len(self._heap)
+
+    def deliver_all_now(self):
+        """Make every deferred retry due now (tests use it to end a backoff
+        at a moment of their choosing)."""
+        with self._cond:
+            self._heap = [(0.0, seq, task) for _due, seq, task in self._heap]
+            heapq.heapify(self._heap)
+            self._cond.notify()
+
+    def _run(self):
+        while True:
+            with self._cond:
+                while True:
+                    if not self._heap:
+                        # Nothing deferred: exit; the next defer starts a thread.
+                        if self._thread is threading.current_thread():
+                            self._thread = None
+                        return
+                    due, _seq, task = self._heap[0]
+                    wait = due - time.monotonic()
+                    if wait <= 0:
+                        heapq.heappop(self._heap)
+                        break
+                    self._cond.wait(wait)
+            try:
+                self._queue.put(task)
+            finally:
+                self._queue.task_done()  # the count defer took
 
 
 class SyncExecutor:
@@ -75,6 +168,15 @@ class SyncExecutor:
         return self.upload_guard(virtual_path) if self.upload_guard else contextlib.nullcontext()
 
     def process_file_task(self, task: SyncTask) -> bool:
+        """Sync one file. Registered as a member mutation at its path for
+        the whole attempt (MemberRepairs.start_mutation), so a queued
+        rename's fence publication either waits for it or is seen by its
+        fence lookups."""
+        with self.cache_manager.member_repairs.mutating(
+                self.replication_manager.backends.keys(), [task.virtual_path]):
+            return self._guarded_file_task(task)
+
+    def _guarded_file_task(self, task: SyncTask) -> bool:
         """Process a single file sync task under the path's upload guard.
 
         A failed attempt is settled before the guard is released: once it
@@ -149,10 +251,24 @@ class SyncExecutor:
             return True
 
         config = get_inherited_config(cache_path)
+        # A member with an open repair at or around this name holds names
+        # the namespace does not describe there (see
+        # MemberRepairs.backends_for): it is left out, as a member
+        # that is down is, until the repair is resolved.
+        fenced = self.cache_manager.member_repairs.backends_for([task.virtual_path])
         target_backends = self.replication_manager.select_backends_for_file(
             task.virtual_path,
             config,
+            exclude=fenced,
         )
+
+        if not target_backends and fenced:
+            # Only fenced members could take it: the file stays DIRTY, so the
+            # monitor syncs it once the repair is resolved.
+            logger.warning("Not syncing %s: every member for it has an open member repair",
+                           task.virtual_path)
+            self._publish(task, generation, SyncStatus.DIRTY, cache_path)
+            return True
 
         if not target_backends:
             logger.warning("No backends available for %s", task.virtual_path)
@@ -306,6 +422,17 @@ class SyncExecutor:
                 if not location.is_cached
             }
         holders, unsure = find_holders(target_path, self.replication_manager.backends, located)
+        # As for a file upload: a member with an open repair around the
+        # link's name is left out until the repair is resolved, and the link
+        # stays DIRTY if that leaves it nowhere to go.
+        fenced = self.cache_manager.member_repairs.backends_for([task.virtual_path])
+        if fenced and any(backend.name in fenced for backend in holders):
+            holders = [backend for backend in holders if backend.name not in fenced]
+            if not holders:
+                logger.warning("Not linking %s: every member holding its target has an "
+                               "open member repair", task.virtual_path)
+                self._publish(task, generation, SyncStatus.DIRTY, cache_path)
+                return True
         identity = link_checksum(target)
         if not holders:
             target_row = self.state_manager.get_file_metadata(target_path)
@@ -416,8 +543,14 @@ class SyncExecutor:
     ) -> bool:
         """Handle failed sync task execution."""
         task.retry_count += 1
+        # A rename task only writes its repair record (_fence_rename_task):
+        # dropping it would lose the only sign of what the member missed, so
+        # it is retried until the record is written, at the longest delay.
+        never_drop = isinstance(task, DirSyncTask) and task.operation == DirOperation.RENAME
+        if never_drop:
+            task.retry_count = min(task.retry_count, max(1, self.config.max_retries))
 
-        if task.retry_count < self.config.max_retries:
+        if task.retry_count < self.config.max_retries or never_drop:
             task.priority -= 10
             logger.info(
                 "Re-queueing %s (retry %s/%s)",
@@ -425,10 +558,16 @@ class SyncExecutor:
                 task.retry_count,
                 self.config.max_retries,
             )
-            time.sleep(self.config.retry_delay * task.retry_count)
+            delay = self.config.retry_delay * task.retry_count
             # The retry reads the row afresh; a refused publish of this
             # attempt needs no extra pass after it.
             task.requeue = False
+            if never_drop and RetryScheduler.for_queue(task_queue).defer(task, delay):
+                # A rename task retries without limit: its backoff must not
+                # hold this worker, or one record the cache keeps refusing
+                # stalls every other sync (CTO RRS-CTO-BACKOFF).
+                return False
+            time.sleep(delay)
             task_queue.put(task)
             return False
 
@@ -464,7 +603,11 @@ class SyncExecutor:
         call run under the path guard. The guard includes the namespace
         lock, which a directory rename waits for, so a member known to be
         down is not tried under it: the task fails and is retried later.
+        A rename is never retried: it is recorded for repair, with no member
+        call (_fence_rename_task).
         """
+        if task.operation == DirOperation.RENAME:
+            return self._fence_rename_task(task)
         # Only a hinted retry (one member, the one that missed it) can name a
         # member that is down: without a hint the members are chosen from
         # the available ones, so a down member never holds up the others.
@@ -485,26 +628,74 @@ class SyncExecutor:
                 return True
             return self._process_dir_task(task)
 
+    def _fence_rename_task(self, task: DirSyncTask) -> bool:
+        """Record a queued member rename for repair; never run it.
+
+        A retry carries only the two names. Nothing on the member proves the
+        object at the old name is still the one the mount renamed (the name
+        may be in use again, through the mount or by another writer of the
+        member), or that the new name is free there, and the Local and SSH
+        renames replace their target. Both names are left as they are on
+        the member, whatever the task's age or origin. Without a hint the
+        task stands for every configured member, including any that never
+        held the names: a record too many costs a look, one too few a
+        replay. A record that cannot be written fails the task, which
+        handle_task_failure retries without limit (at its longest delay
+        after max_retries); a task with no new name cannot be recorded and
+        is dropped, logged, as no caller makes one.
+        """
+        if not task.new_path:
+            logger.error("Dropping a rename task for %s with no new name", task.virtual_path)
+            return True
+        names = [task.backend_hint] if task.backend_hint else sorted(
+            self.replication_manager.backends
+        )
+        if not names:
+            logger.warning("Dropping a rename task for %s -> %s: no member to record it for",
+                           task.virtual_path, task.new_path)
+            return True
+        repairs = self.cache_manager.member_repairs
+        # Fenced in memory from before the first attempt until the record is
+        # durable, so work done meanwhile (by other workers, or while a
+        # failed attempt backs off) stays off the names.
+        # Published in order with member mutations (publish_pending): an
+        # overlapping one already running finishes first; a later one
+        # sees the fence. The record is written only after that.
+        if task.pending_fence is None:
+            task.pending_fence = repairs.publish_pending(task.virtual_path, task.new_path, names)
+        if not repairs.await_pending(task.pending_fence, member_repairs.PUBLISH_WAIT):
+            # Overlapping member work is still running (a slow member call):
+            # back off without holding this worker; the fence stays.
+            raise member_repairs.PublicationPending(
+                f"Waiting for member work overlapping {task.virtual_path} -> {task.new_path}"
+            )
+        try:
+            repairs.record(
+                task.virtual_path, task.new_path, names, "queued member rename, not replayed",
+            )
+        except OSError as exc:
+            raise RuntimeError(
+                f"Could not record the rename {task.virtual_path} -> {task.new_path} "
+                f"for {', '.join(names)}: {exc}"
+            ) from exc
+        repairs.release_pending(task.pending_fence)
+        task.pending_fence = None
+        return True
+
     def _dir_task_current(self, task: DirSyncTask) -> bool:
         cache_path = self.cache_manager.get_cache_path(task.virtual_path)
         if task.operation == DirOperation.MKDIR:
             return cache_path.is_dir()
         if task.operation == DirOperation.RMDIR:
             return not os.path.lexists(cache_path)
-        # RENAME: while the destination exists. The old name may be in use
-        # again (a new file or directory there): the member still holds the
-        # renamed copy under it, and only the rename moves it. A destination
-        # gone since (renamed on, which queues its own retry, or removed)
-        # must not be created on the member. Directories stay in the cache;
-        # a renamed file may have been evicted since, so its index row counts
-        # too. What the member holds after a chain of failed operations is
-        # not fully settled by single retries (ditz sync-member-reconcile).
-        return (
-            os.path.lexists(self.cache_manager.get_cache_path(task.new_path))
-            or self.state_manager.get_file_metadata(task.new_path) is not None
-        )
+        raise ValueError(f"No currency check for dir op {task.operation.value}")
 
     def _process_dir_task(self, task: DirSyncTask) -> bool:
+        with self.cache_manager.member_repairs.mutating(
+                self.replication_manager.backends.keys(), [task.virtual_path]):
+            return self._process_dir_task_registered(task)
+
+    def _process_dir_task_registered(self, task: DirSyncTask) -> bool:
         logger.debug(
             "Worker %s processing dir op %s on %s",
             self.worker_id,
@@ -518,19 +709,24 @@ class SyncExecutor:
                 f"No backends available for dir operation {task.operation.value}"
             )
 
+        # A member with an open repair at or around this name keeps what it
+        # has there (see MemberRepairs.backends_for).
+        fenced = self.cache_manager.member_repairs.backends_for([task.virtual_path])
         success = True
         for backend in backends:
             if not backend:
+                continue
+            if backend.name in fenced:
+                logger.warning(
+                    "Not retrying %s of %s on %s: it has an open member repair at this name",
+                    task.operation.value, task.virtual_path, backend.name,
+                )
                 continue
             try:
                 if task.operation == DirOperation.MKDIR:
                     backend.mkdir(task.virtual_path)
                 elif task.operation == DirOperation.RMDIR:
                     backend.rmdir(task.virtual_path)
-                elif task.operation == DirOperation.RENAME:
-                    if not task.new_path:
-                        raise ValueError("Rename dir task missing new_path")
-                    backend.rename(task.virtual_path, task.new_path)
                 logger.debug(
                     "Dir op %s succeeded for %s on %s",
                     task.operation.value,

@@ -81,6 +81,7 @@ test_suite(
         "local_backend",
         "locks",
         "member_capabilities",
+        "member_repairs",
         "models",
         "merge_gated",
         "mount_lock",
