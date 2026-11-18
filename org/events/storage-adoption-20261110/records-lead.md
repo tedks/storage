@@ -40,13 +40,13 @@
 - dispositions, all fixed in the same commit as this entry: lane worktrees
   replaced by role and PR in the 2026-11-10 lane table; message-transport
   details and the assignment label removed from the current files, with
-  redaction markers on the edited events; the full `oq-conflict-fallback-
-  limits` ruling recorded; the 2026-11-18 form ruling on `oq-streaming-
-  fleet-keep-threshold` recorded; the #180 head refreshed, with a note that
-  heads of open drafts move; the PR description rewritten to the current
-  header without host details; the remaining nits applied (successor
-  wording, #179 row, `gh-74-fast-checksum` blocker, dated checks on
-  A165/A166, #171 description note, pointer in the dated backlog).
+  redaction markers on the edited events; the full
+  `oq-conflict-fallback-limits` ruling recorded; the 2026-11-18 form ruling
+  on `oq-streaming-fleet-keep-threshold` recorded; the #180 head refreshed,
+  with a note that heads of open drafts move; the PR description rewritten
+  to the current header without host details; the remaining nits applied
+  (successor wording, #179 row, `gh-74-fast-checksum` blocker, dated checks
+  on A165/A166, #171 description note, pointer in the dated backlog).
 
 ## records-lead:4
 
@@ -63,12 +63,15 @@
 - disposition: fixed in the same commit as this entry; the worktree name
   moved to the private roster. The nits were applied except the model and
   mechanism names in records-lead:3, kept because the PR's round records
-  already publish them. Apart from the marked redactions, the only in-place
-  edits to published entries are records-lead:3's wording ("next commit"
-  became "same commit as this entry") and records-lead:2, restored to its
-  original wording. A sweep of the current files finds no other lane
-  worktree name (`descriptive-remote-names` in A166 and integration-lead:12
-  is the public ditz issue id).
+  already publish them. Apart from the marked redactions, published entries
+  were edited in place only as follows: records-lead:1 lost the assignment
+  label (round 1); records-lead:2 was restored to its original wording;
+  records-lead:3's "next commit" became "same commit as this entry";
+  records-lead:3 and records-lead:4 were rewrapped, and records-lead:4 was
+  extended with the missing outcomes. None of these changes a fact. A sweep
+  of the current files finds no other lane worktree name
+  (`descriptive-remote-names` in A166 and integration-lead:12 is the public
+  ditz issue id).
 - authority: the CTO's reply to the records-lead:2 report accepted
   redaction of the current files with the historical commits retained, and
   forbade any history rewrite.
