@@ -13,8 +13,8 @@ type: task
 component: open-questions
 release:
 reporter: Ted Smith <tedks@riseup.net>
-status: unstarted
-disposition:
+status: closed
+disposition: fixed
 creation_time: 2026-11-11T21:30:00-00:00
 references: []
 log_events:
@@ -22,3 +22,9 @@ log_events:
   who: Ted Smith
   what: created
   comment: ""
+- time: 2026-11-18T04:39:30-00:00
+  who: Ted Smith
+  what: 'closed: fixed'
+  comment: Ted ruling on Storage resumption, 2026-11-17. Target one member connection
+    in the same daemon, preserving the mount and open handles. Whole-daemon replacement
+    requires a separate feasibility study.
