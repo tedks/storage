@@ -42,3 +42,11 @@ log_events:
     size, applied to contiguous reads, fleet-wide. Exact byte floor pending. Current
     comma-separated configuration uses the smaller threshold. Engineering must preserve
     compatibility and independently bound pre-close read-ahead. No rollout yet.
+- time: 2026-11-18T04:40:41-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Correction to the preceding engineering note: oq-streaming-read-ahead-window
+    explicitly keeps the open read-ahead window coupled to the threshold after the
+    one-chunk start. No independent cap was approved. Preserve that ruling unless
+    Ted changes it. For a 1 GiB file the 30% term can therefore allow about 307 MiB
+    of read-ahead while open as well as setting the after-close qualification.'
