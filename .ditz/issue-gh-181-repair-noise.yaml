@@ -15,3 +15,14 @@ log_events:
   who: Ted Smith
   what: created
   comment: ""
+- time: 2026-11-18T06:26:39-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'From PR #182 round 996cb199d00f-...-6d17e8 and the lead review at 996cb19:
+    (1) each queued RENAME run and each rename onto a fenced member writes another
+    OPEN record (bounded only by the 1000-record warning); (2) a file or link whose
+    only members are fenced is republished DIRTY and warns on every monitor pass;
+    (3) a mkdir/rmdir skipped for a fenced member is never retried after resolve,
+    and with replica_count=-1 an upload that excluded a fenced member still goes CLEAN,
+    so it stays under-replicated after resolve. Same as a down member today; README
+    states the mkdir/rmdir case.'
