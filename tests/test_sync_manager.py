@@ -619,10 +619,13 @@ class TestGrowthWithFailingRenameRecords(unittest.TestCase):
         failing.set()
         failures = []
         lock = threading.Lock()
-        # Every failing task is inside record() at once, in its own worker:
-        # the pool is at its ceiling and every worker holds a failing task.
-        saturated = threading.Barrier(self.CEILING, timeout=10.0)
-        first_pass = set()
+        # Every failing task is inside record() at once, in its own worker,
+        # and the test thread is the last party: the pool is at its ceiling
+        # and every worker holds a distinct failing task. A broken barrier
+        # in a worker would otherwise vanish into the retry path, so it is
+        # kept and re-raised here.
+        saturated = threading.Barrier(self.CEILING + 1, timeout=10.0)
+        first_pass, arrived, barrier_errors = set(), [], []
         real_record, real_write = MemberRepairs.record, MemberRepairs._write_new
 
         def record(repairs_self, old_path, *args, **kwargs):
@@ -630,7 +633,14 @@ class TestGrowthWithFailingRenameRecords(unittest.TestCase):
                 first = old_path not in first_pass
                 first_pass.add(old_path)
             if first:
-                saturated.wait()
+                with lock:
+                    arrived.append((old_path, threading.current_thread().name))
+                try:
+                    saturated.wait()
+                except threading.BrokenBarrierError as exc:
+                    with lock:
+                        barrier_errors.append(exc)
+                    raise
             return real_record(repairs_self, old_path, *args, **kwargs)
 
         def write_new(repairs_self, *args, **kwargs):
@@ -648,15 +658,6 @@ class TestGrowthWithFailingRenameRecords(unittest.TestCase):
 
         healthy = "/healthy.txt"
         payload = b"healthy bytes \x00\x01 " * 64
-        cache_path = self.cache_manager.get_cache_path(healthy)
-        cache_path.write_bytes(payload)
-        self.state_manager.set_file_metadata(FileMetadata(
-            virtual_path=healthy, size=len(payload), checksum=None,
-            last_access=time.time(), last_modified=time.time(),
-            sync_status=SyncStatus.DIRTY, replica_count=1, recomputable=False,
-            recompute_cmd=None, encrypted=False, encryption_key_id=None,
-        ))
-        set_file_config(cache_path, FileConfig(replica_count=1))
 
         def on_members():
             return [d for d in (self.backend1_dir, self.backend2_dir)
@@ -669,14 +670,36 @@ class TestGrowthWithFailingRenameRecords(unittest.TestCase):
             for old, new in names:
                 self.sync_manager.queue_dir_sync(old, DirOperation.RENAME, new_path=new)
             saturated.wait()          # every worker now holds a failing task
+            self.assertEqual([], barrier_errors)
+            with lock:
+                self.assertEqual(sorted(old for old, _ in names),
+                                 sorted(old for old, _ in arrived))
+                self.assertEqual(self.CEILING, len({worker for _, worker in arrived}))
             self.assertEqual(self.CEILING, len(self.sync_manager.workers))
 
+            # Only now is the healthy file made and marked dirty: the
+            # monitor's pass at start() cannot have synced it early.
+            self.assertEqual([], on_members())
+            cache_path = self.cache_manager.get_cache_path(healthy)
+            cache_path.write_bytes(payload)
+            self.state_manager.set_file_metadata(FileMetadata(
+                virtual_path=healthy, size=len(payload), checksum=None,
+                last_access=time.time(), last_modified=time.time(),
+                sync_status=SyncStatus.DIRTY, replica_count=1, recomputable=False,
+                recompute_cmd=None, encrypted=False, encryption_key_id=None,
+            ))
+            set_file_config(cache_path, FileConfig(replica_count=1))
             self.sync_manager.queue_sync(healthy, priority=100)
+            def healthy_clean():
+                row = self.state_manager.get_file_metadata(healthy)
+                return row is not None and row.sync_status == SyncStatus.CLEAN
+
             deadline = time.monotonic() + 10.0
-            while not on_members() and time.monotonic() < deadline:
+            while not healthy_clean() and time.monotonic() < deadline:
                 time.sleep(0.02)
+            self.assertTrue(healthy_clean(), "the healthy sync never finished")
             members = on_members()
-            self.assertEqual(1, len(members), "the healthy sync never finished")
+            self.assertEqual(1, len(members))
             self.assertEqual(payload, (members[0] / "healthy.txt").read_bytes())
             # Still failing: no record was written, and the tasks keep
             # retrying after the healthy sync finished.
@@ -690,6 +713,7 @@ class TestGrowthWithFailingRenameRecords(unittest.TestCase):
 
             failing.clear()
             self.assertTrue(self.sync_manager.wait_for_completion(timeout=15.0))
+        self.assertEqual([], barrier_errors)
 
         records = repairs.list()
         self.assertEqual(sorted(names), sorted((r.old_path, r.new_path) for r in records))
