@@ -88,7 +88,7 @@
 - state: REVIEWING. #165 advanced master, so #166 now needs a rebase,
   exact-head gates and renewed formal review before the scripted merge.
   The lead requested branch repair authority or reassignment from the
-  parent (transport details redacted; see records-lead:2-4); no source
+  parent (redacted; see records-lead:2-7); no source
   branch edit yet.
 
 ## integration-lead:8
@@ -213,9 +213,9 @@
 - refs: integration-lead:17
 - based_on: `81793ac27b70f82c231bf607b55e775d2b905974`
 - state: Parent assigned a separate Sol responsiveness lead, whose checkout
-  was observed at `66c640a` (worktree redacted; see records-lead:2-4). This
+  was observed at `66c640a` (redacted; see records-lead:2-7). This
   lane made no sibling edits. Parent also relayed a deployment observation
-  for one field host (redacted; see records-lead:2-4): its installed and
+  for one field host (redacted; see records-lead:2-7): its installed and
   running rsync, watcher and mount-profile hashes match `a7467c6` and differ
   from `81793ac`, so #165/#166 are not rolled out there (host details in the
   private roster). That host observation was not independently repeated by
@@ -250,9 +250,9 @@
 - state: Peer performance audit DONE/IDLE after GH #74 amendment. The peer
   reports docs-only diff check and 44 valid links; no tests or live access.
   Its 64 MiB, 60 second and one-active-per-mount limits remain proposals.
-  Its cold-open channel finding is in the audit; this record claims no
-  action on it by another lane (coordination details redacted; see
-  records-lead:2-6). No source review or merge claim follows.
+  Its cold-open channel finding is in the audit (item 4). As of this entry,
+  this record claimed no action on it by another lane (redacted; see
+  records-lead:2-7). No source review or merge claim follows.
 
 ## integration-lead:22
 

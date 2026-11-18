@@ -102,12 +102,35 @@
   history between lanes (a finding sent to another lane, a message's
   delivery state). Anthropic CLEAN with 4 Nits. Google EMPTY (usage limit).
   Independent lead review CLEAN at the same head.
-- disposition: fixed in the same commit as this entry. The message history
-  in the Bazel coordination and backlog paragraphs and in integration-lead:21
-  is removed, keeping the substance (the contract went to the parent before
-  any merge; the cold-open finding is in the audit) with redaction markers.
-  Nits: the title now says the header is current; "read-ahead while a file
-  is open" replaces "open read-ahead window". Rounds 3 and 4 each had one
-  Important, fixed as recorded in the PR's disposition comments. The fourth
-  nit concerns master files from #175, outside this PR, and is filed in
-  ditz.
+- disposition: fixed in the same commit as this entry. The delivery reports
+  in the backlog paragraph and in integration-lead:21 (a finding sent to
+  another lane, a message's delivery state) are redacted, with markers; what
+  remains is that the cold-open finding is in the audit. The Bazel
+  coordination paragraph's handoff wording was softened here and removed in
+  records-lead:7. Nits: the title now says the header is current;
+  "read-ahead while a file is open" replaces "open read-ahead window".
+  Council rounds `2177179cf51d-20261118T055328Z-ebd826` and
+  `a2f72081a323-20261118T055525Z-e45e30` each had one OpenAI Important,
+  fixed as recorded in the PR's disposition comments. The fourth nit
+  concerns master files from #175, outside this PR, and is filed as ditz
+  `org-records-175-redaction`.
+
+## records-lead:7
+
+- kind: review-seat-outcome
+- refs: records-lead:6
+- based_on: `67888b2d556cf3f843120cbd4de34eaeb7ee405b`
+- round: `67888b2d556c-20261118T060750Z-c6e878`, warm delta from `5498c35`.
+- outcomes: OpenAI 1 Critical (the Bazel paragraph still recorded a
+  handoff to the parent), 1 Important (records-lead:6 named rounds 3 and 4
+  ambiguously). Anthropic CLEAN with 2 Nits. Google EMPTY (usage limit).
+  Independent lead review CLEAN with 2 Nits.
+- disposition: fixed in the same commit as this entry. The handoff
+  sentence is removed from the Bazel paragraph. records-lead:6 was
+  corrected in place: it names the two council round ids, names the ditz
+  issue, and no longer says the delivery reports' substance was kept. The
+  backlog paragraph and integration-lead:21 now say the no-action statement
+  is as of 2026-11-10, with #175 in Current state. All redaction markers now
+  read "redacted; see records-lead:2-7". The remaining "requested from the
+  parent" and "parent relayed" wording records the source of an authority
+  request and of an observation, not message delivery, and is kept.

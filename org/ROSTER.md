@@ -114,8 +114,7 @@ Heads #165/#166/#167 do not edit `BUILD`, `MODULE.bazel`, or `flake.nix`;
 performance audit lane proposes further test additions in streaming, remote,
 sync, cache, rsync, namespace and conflict suites; any new top-level module
 requires manifest coordination. #17 scheduler design waits for #167's
-interface. Exact heads and this contract went to the parent coordinator
-before any merge (coordination details redacted; see records-lead:2-6). No
+interface. (Coordination details redacted; see records-lead:2-7.) No
 onboarding code is in this package.
 
 Responsiveness PR #171 added one explicit `storage/BUILD` source entry,
@@ -183,9 +182,10 @@ live access, acceptance or merge are claimed. (#169 later merged at
 These are not authorized implementation packages in this lane. #17 scheduler
 work waits for #167's implementation interface; the scope ruling is settled.
 The full source and boundary test proposals live in the peer audit document,
-not this summary. Its cold-open channel finding is one of those proposals;
-this record claims no action on it by another lane (coordination details
-redacted; see records-lead:2-6).
+not this summary. Its cold-open channel finding is one of those proposals
+(item 4 above). As of 2026-11-10 this record claimed no action on it by
+another lane; for #175 see Current state. (Coordination details redacted;
+see records-lead:2-7.)
 
 ## Handoff (2026-11-10)
 
