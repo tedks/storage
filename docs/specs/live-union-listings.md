@@ -1,10 +1,12 @@
 # Cached union listings and live desktop updates
 
-Status: proposed design, 2026-11-12. Owner: Storage root. No implementation,
-release acceptance or deployment is implied. Source baseline: published
-66c640aec005feccd0bd585f3355295c3bb772ba; deployed application findings refer to
-accepted 81793ac27b70f82c231bf607b55e775d2b905974. This does not resolve the #170
-merge-gate incident or depend on unaccepted #171/#175 behavior.
+Status: proposed design, 2026-11-12; cold-partial ruling folded in
+2026-11-17. Owner: Storage root. No implementation, release acceptance or
+deployment is implied. Source baseline: master
+5f3dbb318d83c4764911c1878cbfb5356e444d16; deployed application findings refer
+to accepted 81793ac27b70f82c231bf607b55e775d2b905974. #175 (interactive SFTP
+reserve for listings) is on that baseline; nothing here depends on unmerged
+#171 behavior or resolves the #170 merge-gate incident.
 
 ## Intent and assumptions
 
@@ -94,18 +96,63 @@ requires a new enumeration triggered by a proven client notification.
 The current high-level binding may
 provide buffering/offset handling itself; audit that path before adding any
 duplicate buffering. Pinned snapshots count against resource limits.
-A cold directory waits a bounded interval for member observations; with no successful observation and no cache,
-return an explicit unavailable error, never a successful empty directory.
-If only some members finish, the candidate snapshot is partial. In particular,
-empty A plus failed/slow B does not certify an empty union. POSIX readdir has
-no partial-result flag. Whether to expose such a candidate, wait within a
-bound, or return a retryable error is a product decision recorded in
-`oq-listing-cold-partial-result`; no cold-partial public behavior is selected
-by this spec. Any permitted partial publication must keep internal status
-partial and may not claim that a future automatic update is guaranteed
-unless the client transport has been proven. Cached known names remain a
-separate stale-first case. This policy blocks cold-partial integration, not
-the internal union/cache tracer.
+
+### Cold listing with an unavailable member (ruled 2026-11-17)
+
+A cold directory (no listing snapshot and no retained member observation)
+waits a bounded interval for member observations. Ted ruled the case where
+at least one member succeeds and another fails or times out: return the
+union that is available, even when it is empty, and log each missing member.
+No partial-result UI flag and no working notification transport are
+required for this. Concretely:
+
+- The public result is the union of the successful members' observations
+  and the local namespace, under the existing conflict/virtual-name policy.
+  Example: A is reachable and empty, B is unavailable, the local cache holds
+  nothing: readdir succeeds with only `.` and `..`. If the local cache holds
+  names (cached or dirty files), they are listed.
+- Internally the snapshot stays partial: per-member status records B as
+  unavailable/timeout/cancelled, distinct from A's successful empty
+  observation. The partial snapshot is never marked fresh, never becomes a
+  confirmed-empty observation for B, and never removes or hides a local name.
+  B's later successful observation (including an empty one) replaces only
+  B's set. A member whose enumeration fails midway counts as missing: its
+  staged pages are not published (assumption: a partial page is not a
+  member observation). Later readdirs serve the partial snapshot stale-first and
+  schedule B's refresh under bounded backoff, not a scan per readdir.
+- Each missing member is logged at warning level with its stable member ID,
+  the failure class and the directory, under the existing logging policy;
+  repeats for the same member are rate limited or coalesced so an outage
+  cannot flood the log. Debug-only logging does not satisfy the ruling.
+- The result does not promise that B's names will appear in an open view
+  later; they appear at the next enumeration of a newer revision. Automatic
+  updates of an open view remain the separate change-delivery slice.
+
+The no-success case stays narrow and explicit. It applies only when every
+configured member failed or timed out for this listing, no member has a
+retained last-known observation of the directory, and the local namespace
+contributes no names. Then readdir returns an explicit unavailable error,
+never a successful empty directory. If the local namespace does contribute
+names in that state, they are served and every member is logged missing
+(assumption: local dirty files must stay discoverable during a total
+outage; flagged for confirmation). A single-member mount whose one member
+fails follows these all-failed rules, not the partial case. A member with a
+retained observation whose snapshot expired is not cold: its last-known
+names are served as stale under the rules below.
+
+Cached known names remain the separate stale-first case (see the start of
+this section): a directory
+with a snapshot serves it without waiting, and a failed refresh retains each
+member's last-known names as stale, as before.
+
+Current code (master 5f3dbb3, `NamespaceService._list_members`) already
+serves the available union when some members fail, but differs from this
+section in three ways the snapshot tracer must close: missing members are
+logged only at debug level; when every member fails and nothing is cached it
+returns a successful empty listing; and a partial listing is published with
+the same freshness timestamp as a complete one.
+
+### Freshness and refresh limits
 
 Use monotonic time for in-process TTLs. Watcher hints invalidate freshness but
 never disable periodic reconciliation: disconnect, overflow and missed events
@@ -190,14 +237,17 @@ Do not implement an unbounded compatibility layer to rescue a failed premise.
 2. **Capability tracer:** separately assigned scratch-only experiment proves
    the actual event path, or closes it as unsupported with versioned evidence.
 3. **Snapshot tracer:** deterministic synthetic members prove empty/error
-   separation, fast cached return, partial/cold union, publication fencing,
+   separation, fast cached return, cold A-empty + B-unavailable returning a
+   successful empty union with B logged and internally partial, the
+   all-failed/no-cache error, publication fencing,
    bounded workers and immutable readdir offsets. Mutation-disable controls
    must demonstrate that the tests detect the promised failure.
 4. **Existing-file tracer:** changed remote metadata reaches the consumer;
    local ongoing copy and remote refresh race without losing bytes/DIRTY;
    temp rename, delete/recreate, dropped watcher, coalescing and reconnect run.
 5. **Integration:** snapshot/cache improvements can ship independently after
-   their numeric and cold-partial policy is settled and safety proven; report
+   their numeric refresh/active-directory limits are settled and safety
+   proven (the cold-partial policy is ruled above); report
    live desktop updates unsupported if transport is unsupported. Combining
    change delivery requires its capability proof. Run applicable exact-head
    gates, CLI build, formal council and lead review; normal gated merge. Deployment is a separate
@@ -213,6 +263,10 @@ the same approach. Escalate the specific boundary; do not import PR171 wholesale
 
 - Ted: reachable empty chunk1 contributes no names; union all results; desired
   stale-first browsing plus updates to an open Nautilus view. No cache purge.
+- Ted, 2026-11-17: with no cached listing and one member failed, return the
+  available union even if empty and log the missing members; no partial UI
+  flag or notification transport is needed. Recorded in ditz
+  `oq-listing-cold-partial-result` by the CTO.
 - PR177 report at 01386e6: slow first-observed readdir and warm per-entry cost;
   no missing entries reproduced; no attribution of latency to chunk1.
 - [Nautilus monitor implementation](https://github.com/GNOME/nautilus/blob/master/src/nautilus-monitor.c):
@@ -226,7 +280,10 @@ the same approach. Escalate the specific boundary; do not import PR171 wholesale
   background evidence, not proof of the versions installed on splinter1.
 
 Interpretations promote into this document and both contracts. Open numeric
-and stale-visibility policy remains in `oq-listing-stale-serve-dir-mtime`.
-Cold-partial exposure is tracked separately in `oq-listing-cold-partial-result`.
+and stale-visibility policy remains in `oq-listing-stale-serve-dir-mtime`,
+including the numeric active-refresh, active-directory and backoff limits.
+The cold-partial ruling is recorded in `oq-listing-cold-partial-result`. The
+scratch Nautilus capability proof (milestone 2) remains pending; neither it
+nor the numeric limits gate the cold-partial behavior above.
 Transport feasibility is engineering evidence to obtain, not a presumed
 product ruling to ask Ted to make without results.

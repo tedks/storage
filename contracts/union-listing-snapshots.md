@@ -48,12 +48,19 @@
   create/rename/deletion revisions, preserving newer local authority while
   publishing unaffected remote names. Unrelated local churn must not force
   whole-directory refresh rejection forever.
-- **Failure semantics:** no evidence plus all failures returns an explicit
-  error. Empty A plus unavailable B with no prior cache is an incomplete
-  candidate, not certified union emptiness. Public cold-partial behavior is
-  unresolved under `oq-listing-cold-partial-result`; integration cannot choose
-  success-empty by default. A failed member cannot veto collection or internal
-  publication of healthy member observations. Retained stale
+- **Failure semantics:** the no-success case is narrow: every configured
+  member failed or timed out, none has a retained observation of the
+  directory, and the local namespace contributes no names. It returns an
+  explicit unavailable error, never success-empty. Otherwise (ruled
+  2026-11-17, `oq-listing-cold-partial-result`) a cold listing returns the
+  available union of successful members and local names, even when empty:
+  empty A plus unavailable B with nothing local is a successful empty
+  readdir. The snapshot stays internally partial, B's status stays
+  unavailable rather than empty, and it is never fresh. Each missing member
+  is logged at warning level (member ID, failure class, directory), rate
+  limited per member. No public partial flag or notification transport is
+  implied. A failed member cannot veto collection or publication of healthy
+  member observations. Retained stale
   names may fail at open; listing is not proof of readable bytes. Deadline and
   cancellation do not allow abandoned workers to publish later. If transport
   cancellation is unavailable, account for the still-running worker and keep
@@ -71,8 +78,11 @@
   revision semantics require coordinated edits of both consumers; no hidden
   dependence on unmerged PR171 freshness structures.
 - **Boundary tests (planned, UNWRITTEN):** empty A + populated B; failed A
-  retaining stale evidence; empty A + failed/slow B without cache; partial page
-  failure; all-failed/no-cache; continuous local creates while a remote add
+  retaining stale evidence; empty A + failed/slow B without cache (success
+  empty, B logged, status partial, not fresh, B's later empty or populated
+  result replaces only B); the same with a local dirty name (listed); partial
+  page failure; all-failed/no-cache (error) and all-failed with local names
+  (listed); single-member failure; continuous local creates while a remote add
   still publishes; event identity after delete/recreate or contributor loss;
   older remote-change event after newer local mutation and duplicate events; stale
   response after local rename/unlink; slow A while B publishes; cancelled old
