@@ -41,6 +41,11 @@ log_events:
     (docs/first-member-rename-target.md) and synthetic RED (TestFirstMemberRenameTarget,
     two expectedFailure cases, one passing control). Implementation waits on Ted''s
     ruling on the fallback when no no-replace primitive is available.'
+- time: 2026-11-18T06:07:12-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'PR #183 restacked onto #182 3a2123a as 18859f7; backup ref backup/first-rename-noreplace-pre-restack-20261118
+    (c5bc85a).'
 blocks:
 - gh-181
 blocked_by:
