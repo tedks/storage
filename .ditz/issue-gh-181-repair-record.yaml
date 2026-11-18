@@ -123,5 +123,13 @@ log_events:
     an ordinary file, and when a surviving view descriptor points to kept bytes but
     its former pathname is detached/replaced. Cover ordinary open/truncate and fd
     write with exact recovery bytes. Full gate awaits clean review.'
+- time: 2026-11-18T07:43:10-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Identity ruling satisfied at 2940dbe: guards for writable names cover
+    ordinary aliases, and the view write checks the descriptor itself with fstat.
+    Both regressions reported RED on 7218e95. Reserved full gate and CLI authorized
+    on 2940dbe after exact-head council and independent lead clearance. Merge acceptance
+    remains pending.'
 blocks:
 - gh-181
