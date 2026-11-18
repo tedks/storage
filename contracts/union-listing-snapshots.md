@@ -107,7 +107,7 @@
   revision semantics require coordinated edits of both consumers; no hidden
   dependence on unmerged PR171 freshness structures.
 - **Boundary tests (planned, UNWRITTEN):** empty A + populated B; failed A
-  retaining stale evidence; empty A + failed/slow B without cache (success
+  retaining stale evidence; empty A + failed/timed-out B without cache (success
   empty, B logged, status partial, not fresh, B's later empty or populated
   result replaces only B); the same with a local dirty name (listed); partial
   page failure; all-failed/no-cache (error) and all-failed with local names
