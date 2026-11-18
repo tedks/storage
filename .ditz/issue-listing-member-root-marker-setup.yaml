@@ -41,3 +41,11 @@ log_events:
     missing member mount can appear as success-empty. Document that limit. Member
     identity verification, provisioning, and any marker rollout require separate design;
     the listing spec makes no failed-disk detection guarantee.'
+- time: 2026-11-18T05:10:02-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Supersedes the description: PR178 at b2705fe does NOT require a post-read
+    marker check. Root verification is deferred here entirely (CTO ruling 2026-11-18);
+    the spec documents a readable empty underlying mountpoint as an undetectable limit.
+    This issue owns the future design (constraints in the spec''s failed-disk paragraph)
+    and any setup step. No marker deployment without explicit authorization.'
