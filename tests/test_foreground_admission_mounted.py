@@ -69,6 +69,7 @@ def _serve(fuse_threads, cap):
         "unlinks": [],
     }
     lock = threading.Lock()
+    in_release = threading.local()
     real_open, real_create, real_release = fs.open, fs.create, fs._release
     real_opendir, real_releasedir = fs.opendir, fs.releasedir
     real_queue, real_upload = fs.sync_manager.queue_sync, member.copy_from_local
@@ -87,7 +88,11 @@ def _serve(fuse_threads, cap):
             gate = fs._foreground_admission
             if gate is not None:
                 record["gate_closed_before_release"].append(gate._closed)
-        return real_release(path, fh)
+        in_release.active = True
+        try:
+            return real_release(path, fh)
+        finally:
+            in_release.active = False
 
     def opendir(path):
         with lock:
@@ -100,8 +105,11 @@ def _serve(fuse_threads, cap):
         return real_releasedir(path, fh)
 
     def queue_sync(path, *args, **kwargs):
-        with lock:
-            record["queued"].append(path)
+        # Only release's own queueing: init starts the sync monitor, which
+        # re-queues every dirty file each monitor_interval (5 s).
+        if getattr(in_release, "active", False):
+            with lock:
+                record["queued"].append(path)
         return real_queue(path, *args, **kwargs)
 
     def upload(local_path, virtual_path):
