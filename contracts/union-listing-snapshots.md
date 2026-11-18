@@ -4,8 +4,8 @@
   desktop change delivery. No consumer implementation acknowledged yet.
 - **Inputs:** member ID/configuration generation, canonical directory identity,
   refresh generation, local namespace revision, and either a complete set of
-  validated immediate children or a typed unavailable/timeout/cancelled
-  result.
+  validated immediate children or a typed unavailable/failed/timeout/
+  cancelled result (failed includes permission and partial-read errors).
   Absence confirmed by a reachable backend is successful empty. v0 does not
   detect a missing or replaced member root that still lists (for example a
   failed disk leaving an empty mountpoint); that is separate root
@@ -59,19 +59,21 @@
   publishing unaffected remote names. Unrelated local churn must not force
   whole-directory refresh rejection forever.
 - **Failure semantics:** a missing member is any non-success result
-  (unavailable, timeout, cancelled). The no-success case is
+  (unavailable, failed, timeout, cancelled). The no-success case is
   narrow: every configured member is missing, none has a retained
   observation of the directory, and the local namespace contributes no
   names. It returns an
-  explicit unavailable error, never success-empty. Otherwise (ruled
+  explicit unavailable error (the errno is chosen by the snapshot tracer and
+  documented; never ENOENT and never success-empty). Otherwise (ruled
   2026-11-17, `oq-listing-cold-partial-result`) a listing returns the
   available union of successful members, retained stale observations of
   missing members and local names, even when empty:
   empty A plus unavailable B with nothing local is a successful empty
   readdir. The snapshot stays internally partial, B's status stays missing
   (its failure class) rather than empty, and it is never complete for B. B
-  is retried on its own bounded backoff, independent of the serving TTL.
-  Retry backoff resets on the member's next success. Each
+  is retried on its own per (directory, member) bounded backoff, independent
+  of the serving TTL; the backoff only adds retries, and every backoff of a
+  member resets on that member's next success. Each
   missing member is logged at warning level (member ID, failure class,
   directory), rate limited per member, on cold and warm listings alike. The
   foreground wait for members is bounded, also for an expired directory
@@ -80,8 +82,10 @@
   implied; a client may present the result as complete (risk accepted by
   the ruling). A failed member cannot veto collection or publication of healthy
   member observations. Retained stale
-  names may fail at open; listing is not proof of readable bytes. Deadline and
-  cancellation do not allow abandoned workers to publish later. If transport
+  names may fail at open; listing is not proof of readable bytes. A worker
+  that only missed the foreground deadline keeps running and may publish if
+  its generation is still current; superseded or cancelled workers never
+  publish. If transport
   cancellation is unavailable, account for the still-running worker and keep
   concurrency bounded; never spawn replacements without admission.
 - **Resource policy:** limits on queued/running refreshes, active directories,

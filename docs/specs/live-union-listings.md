@@ -1,7 +1,7 @@
 # Cached union listings and live desktop updates
 
 Status: proposed design, 2026-11-12; cold-partial ruling folded in
-2026-11-17. Owner: Storage root. No implementation, release acceptance or
+2026-11-17; root verification deferred by CTO ruling 2026-11-18. Owner: Storage root. No implementation, release acceptance or
 deployment is implied. Source baseline: master
 f9fe107a09ec246c1ec9e6ca7c31e64fcb313415 (code as of 5f3dbb3; #177 added the
 field report and #172 the mounted-restart design, both docs only); deployed application findings refer
@@ -137,7 +137,9 @@ warning log is the operator's signal. Concretely:
   B is retried on a schedule of its own, not by the serving TTL (which is
   infinite on a mount whose members all have watchers) and not per readdir:
   a background refresh of B for that directory under the interim backoff
-  below, while the directory stays in the listing cache.
+  below, while the directory stays in the listing cache. The backoff only
+  adds retries; a stale refresh scheduled by the serving TTL still lists B
+  as today.
 - Each missing member is logged at warning level with its stable member ID,
   the failure class and the directory, under the existing logging policy;
   repeats for the same member are rate limited or coalesced so an outage
@@ -148,13 +150,17 @@ warning log is the operator's signal. Concretely:
   later; they appear at the next enumeration of a newer revision. Automatic
   updates of an open view remain the separate change-delivery slice.
 
-"Missing" means any non-success member result: failed, timed out,
-cancelled (including by shutdown). A missing
+"Missing" means any non-success member result, in one shared list of
+failure classes used by the spec, the contract and the log: unavailable
+(the member reports itself unavailable), failed (any error, including
+permission and partial-read errors), timeout, and cancelled (including by
+shutdown). A missing
 member never counts as a successful empty observation.
 
-A failed disk can look empty. Today `LocalBackend.listdir` returns `[]` for a
-path that does not exist, and `SSHBackend.listdir` maps `FileNotFoundError`
-to `[]`; neither rechecks that the member root is still the configured
+A failed disk can look empty. Today `LocalBackend.listdir` and
+`listdir_attrs` return `[]` for a path that does not exist, and
+`SSHBackend.listdir_attrs` returns `None` on any error, after which
+`listdir` maps `FileNotFoundError` to `[]`; neither rechecks that the member root is still the configured
 storage once the backend is constructed. A member whose disk died and left an
 empty mountpoint would therefore report successful-empty: nothing is logged,
 and on a warm directory its retained names are replaced by an empty set.
@@ -170,7 +176,7 @@ owns its design and setup). Until it lands, a failed disk that leaves a
 readable mountpoint behaves exactly as today, the README must not claim
 failed-disk detection, and the warning-log rule above covers only members
 whose listing actually fails, times out or is cancelled. Review of earlier
-drafts of this spec established constraints that design must meet:
+drafts of this spec produced these inputs to that design:
 
 - Accept an observation only after a check that started after it was read;
   a cached verification leaves a silent window.
@@ -194,8 +200,9 @@ drafts of this spec established constraints that design must meet:
 The no-success case stays narrow and explicit. It applies only when every
 configured member is missing for this listing, no member has a
 retained last-known observation of the directory, and the local namespace
-contributes no names. Then readdir returns an explicit unavailable error,
-never a successful empty directory. If the local namespace does contribute
+contributes no names. Then readdir returns an explicit unavailable error
+(the snapshot tracer picks and documents the errno; never ENOENT), never a
+successful empty directory. If the local namespace does contribute
 names in that state, they are served and every member is logged missing
 (this follows the ruling's "preserve local names": local dirty files stay
 discoverable during a total outage). A single-member mount whose one member
@@ -209,7 +216,7 @@ this section): a directory
 with a snapshot serves it without waiting, and a failed refresh retains each
 member's last-known names as stale, as before.
 
-Current code (master 5f3dbb3, `NamespaceService._list_members`) already
+Current code (as of 5f3dbb3, unchanged at f9fe107; `NamespaceService._list_members`) already
 serves the available union when some members fail, but differs from this
 section in ways the snapshot tracer must close (a missing or replaced
 member root listing as successful-empty is also current behavior, but it
@@ -221,7 +228,8 @@ per-member completeness status (its serving timestamp is correct and stays
 as it is); and a foreground cold listing has no
 deadline of its own (`deadline=None`), bounded only by each member's
 transport timeout, and a local member has none, so a hung local disk blocks
-the listing without bound.
+the listing without bound; a single-member mount lists its member inline on
+the FUSE thread (`_submit_member_listings`), with no future to time out.
 
 Interim bounds. The cold-partial slice (warning logs, the narrow error,
 per-member completeness status) does not wait for the
@@ -230,14 +238,26 @@ uses these interim values, each from existing defaults:
 
 - Foreground deadline: one whole-request deadline of `refresh_member_timeout`
   (60 s) for a listing without a servable snapshot. Members are listed
-  concurrently, so it bounds the request rather than each member in turn.
-  A member still running at the deadline is missing, and its worker is
-  abandoned and accounted for as background refresh already does. A local
-  member therefore also needs an abandonable worker, since it has no
-  transport timeout.
-- Missing-member retry: the first retry after 60 s, doubling to a cap of
-  `listing_max_stale` (3,600 s), reset when that member next succeeds on
-  any listing. This holds even when the serving TTL is infinite (watchers
+  concurrently on their per-member executors, so it bounds the request
+  rather than each member in turn; the single-member foreground path, which
+  today runs inline on the FUSE thread, must move onto its member's executor
+  for the deadline to apply. A member still running at the deadline is
+  missing for that response (logged), but its listing is not discarded: it
+  keeps running, bounded by its own transport timeout, and publishes its
+  observation if its generation is still current when it finishes, so a
+  slow but healthy member still appears at the next enumeration instead of
+  never. Only superseded or cancelled workers are fenced from publishing.
+  Such a still-running foreground listing is interactive and keeps the
+  member's interactive SFTP reserve until it ends (the background
+  abandonment rationale, that refresh listings hold no reserved channel,
+  does not carry over); later foreground listings treat that member as
+  hung (below) rather than queueing behind it. A local member also needs
+  this worker, since it has no transport timeout.
+  The README's statement that a member keeps its last names "until a
+  listing that waits for it completes" must be updated when this lands.
+- Missing-member retry: per (directory, member) backoff, the first retry
+  after 60 s, doubling to a cap of `listing_max_stale` (3,600 s); every
+  backoff of a member resets when that member next succeeds on any listing. This holds even when the serving TTL is infinite (watchers
   on every member) or shorter. A retry relists the directory as today's
   background refresh does; the tracer may narrow it to the missing member.
 - Queued refreshes: the existing per-directory dedup
@@ -381,6 +401,11 @@ the same approach. Escalate the specific boundary; do not import PR171 wholesale
   available union even if empty and log the missing members; no partial UI
   flag or notification transport is needed. Recorded in ditz
   `oq-listing-cold-partial-result` by the CTO.
+- CTO, 2026-11-18: member root verification deferred to ditz
+  `listing-member-root-marker-setup`; best-effort union and logging apply to
+  observed failures; a readable empty underlying mountpoint is a documented,
+  undetectable limit (no marker deployment, no inferred disk-loss diagnosis,
+  no error on a successful empty listing).
 - [PR177 field report](../field/splinter1-browse-20261112/REPORT.md), merged
   at 0953369 (reviewed at 01386e6): slow first-observed readdir and warm per-entry cost;
   no missing entries reproduced; no attribution of latency to chunk1.
