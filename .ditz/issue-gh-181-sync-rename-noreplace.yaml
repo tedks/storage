@@ -65,6 +65,15 @@ log_events:
     intent can clear despite no member move. Require the namespace to record this
     partial failure, preserve destination bytes, and retain the actual failing operation/error
     when ENOENT is ambiguous. Local and SSH regression coverage requested.'
+- time: 2026-11-18T20:52:09-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'At a587b97 the missing-source silent-success defect is fixed on Local
+    and SSH. Preserve errors from source inspection too: local lexists collapses permission/I/O
+    errors into False, and a secondary SSH lstat error can mask the original rename
+    failure. Distinguish confirmed absence from uninspectable source in the durable
+    repair reason; regress on injected errors. Final exact-head review and full gates
+    pending.'
 blocks:
 - gh-181
 blocked_by:
