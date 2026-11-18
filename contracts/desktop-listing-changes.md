@@ -48,4 +48,5 @@
   remote refresh must preserve bytes and DIRTY. Test old-event rejection,
   delete/recreate, overlapping writers, completion coalescing, queue overflow,
   reconnect and unmount. Disabling delivery must fail the notification test.
-- **Interpretation register:** [spec](../docs/specs/live-union-listings.md).
+- **Interpretation register:** [spec](../docs/specs/live-union-listings.md),
+  `oq-listing-stale-serve-dir-mtime`, `oq-listing-cold-partial-result`.

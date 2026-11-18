@@ -4,10 +4,11 @@
   desktop change delivery. No consumer implementation acknowledged yet.
 - **Inputs:** member ID/configuration generation, canonical directory identity,
   refresh generation, local namespace revision, and either a complete set of
-  validated immediate children or a typed unavailable/timeout/cancelled result.
+  validated immediate children or a typed unavailable/timeout/cancelled/
+  unverified-root result.
   Absence confirmed by a reachable backend under a verified member root is
   successful empty; a missing or replaced member root (for example a failed
-  disk leaving an empty mountpoint) is unavailable, not empty. Partial reads
+  disk leaving an empty mountpoint) is an unverified-root result, not empty. Partial reads
   and permission failures are not confirmed absence. Do not follow a supplied
   child name outside its parent; reject invalid or colliding backend entries
   according to existing conflict policy rather than fabricating completeness.
@@ -36,7 +37,10 @@
   ambiguous identity change invalidates conservatively. Same-metadata unseen
   remote replacement remains an explicit detection limitation.
   A snapshot can be incomplete or stale; the internal status cannot say fresh
-  while any required member's observation is old or missing.
+  while any required member's observation is old or missing. This per-member
+  completeness status is separate from the serving TTL: it does not change
+  the fresh/stale/expired serving schedule or trigger per-access refresh,
+  and it leaves the `oq-listing-negative-lookup` ruling unchanged.
 - **Invariants:** union successful per-member observations and the local
   namespace under existing conflict rules. Success replaces only that member's
   prior set, including empty. Failure preserves last-known evidence with its
@@ -62,9 +66,12 @@
   missing members and local names, even when empty:
   empty A plus unavailable B with nothing local is a successful empty
   readdir. The snapshot stays internally partial, B's status stays
-  unavailable rather than empty, and it is never fresh. Each missing member
-  is logged at warning level (member ID, failure class, directory), rate
-  limited per member. No public partial flag or notification transport is
+  unavailable rather than empty, and it is never complete for B. Each
+  missing member is logged at warning level (member ID, failure class,
+  directory), rate limited per member, on cold and warm listings alike. The
+  foreground wait for members is bounded, also for an expired directory
+  with retained observations; until the numeric ruling it uses the interim
+  reference values named in the spec. No public partial flag or notification transport is
   implied; a client may present the result as complete (risk accepted by
   the ruling). A failed member cannot veto collection or publication of healthy
   member observations. Retained stale
@@ -75,7 +82,8 @@
 - **Resource policy:** limits on queued/running refreshes, active directories,
   snapshot bytes/entries (including revisions pinned by open directory
   handles) and backoff are mandatory before implementation
-  acceptance. Do not hold global/namespace locks over remote I/O or admission.
+  acceptance; the cold-partial slice may use the spec's interim reference
+  values until the numeric ruling. Do not hold global/namespace locks over remote I/O or admission.
   Cache eviction cannot erase dirty files or alter the independent byte cache.
 - **Intentionally unspecified:** numeric freshness/visibility policy pending
   the existing open question; order across member completions; content

@@ -101,7 +101,10 @@ duplicate buffering. Pinned snapshots count against resource limits.
 ### Cold listing with an unavailable member (ruled 2026-11-17)
 
 A cold directory (no listing snapshot and no retained member observation)
-waits a bounded interval for member observations. Ted ruled the case where
+waits a bounded interval for member observations. The same wait bound applies
+to every foreground listing without a servable snapshot, including an
+expired directory whose members still have retained observations; after
+the bound, the rules below decide what is served. Ted ruled the case where
 at least one member succeeds and another fails or times out: return the
 union that is available, even when it is empty, and log each missing member.
 No partial-result UI flag and no working notification transport are
@@ -116,18 +119,29 @@ warning log is the operator's signal. Concretely:
   nothing: readdir succeeds with only `.` and `..`. If the local cache holds
   names (cached or dirty files), they are listed.
 - Internally the snapshot stays partial: per-member status records B as
-  unavailable/timeout/cancelled, distinct from A's successful empty
-  observation. The partial snapshot is never marked fresh, never becomes a
-  confirmed-empty observation for B, and never removes or hides a local name.
+  unavailable/timeout/cancelled/unverified-root, distinct from A's
+  successful empty observation. "Never fresh" means a per-member
+  completeness status, separate from the serving TTL: the partial snapshot is
+  never reported complete or fresh for B, never becomes a confirmed-empty
+  observation for B, and never removes or hides a local name. It does not
+  change the serving schedule (the snapshot ages through fresh, stale and
+  expired as any other) and it does not trigger a refresh per access.
+  Negative lookups keep the `oq-listing-negative-lookup` ruling unchanged:
+  ENOENT comes from a fresh listing, a member whose listing failed already
+  withholds that shortcut (`_walk_listing_locked`), and a member reporting
+  itself unavailable is skipped as today. This spec does not change it.
   B's later successful observation (including an empty one) replaces only
   B's set. A member whose enumeration fails midway counts as missing: its
   staged pages are not published (assumption: a partial page is not a
-  member observation). Later readdirs serve the partial snapshot stale-first and
-  schedule B's refresh under bounded backoff, not a scan per readdir.
+  member observation). Later readdirs serve the partial snapshot stale-first;
+  B is retried by the normal stale refresh under bounded backoff, not a scan
+  per readdir.
 - Each missing member is logged at warning level with its stable member ID,
   the failure class and the directory, under the existing logging policy;
   repeats for the same member are rate limited or coalesced so an outage
   cannot flood the log. Debug-only logging does not satisfy the ruling.
+  This applies to every listing that serves without a member, warm refreshes
+  that keep retained names included, not only cold ones.
 - The result does not promise that B's names will appear in an open view
   later; they appear at the next enumeration of a newer revision. Automatic
   updates of an open view remain the separate change-delivery slice.
@@ -143,10 +157,18 @@ storage once the backend is constructed. A member whose disk died and left an
 empty mountpoint would therefore report successful-empty: nothing is logged,
 and on a warm directory its retained names are replaced by an empty set.
 The member-observation owner must tell "directory absent under a verified
-member root" apart from "member root missing or replaced" on each refresh
-(for example by checking the root's identity, such as its device, against
-the one recorded at startup or in member configuration). An unverified root
-is a missing member: logged, retained names kept, never confirmed absence.
+member root" apart from "member root missing or replaced". The check is per
+member, cached for a bounded recheck interval, not an extra round trip per
+directory listing. Acceptable mechanisms: a local member compares the root's
+device (`filesystem_identity`, `st_dev`) with the expected identity; an SSH
+or rsync member, whose SFTP attributes carry no device id, uses the existing
+exec-channel `stat -c %d` probe or a root marker file, outside the reserved
+interactive SFTP channel. An identity recorded only at startup cannot catch
+a disk already missing at mount time, so the expected identity (or marker)
+comes from member configuration or a marker written with the member; with
+neither, the limitation is reported, not hidden. An unverified root is a
+missing member with its own failure class: logged, retained names kept,
+never confirmed absence.
 ENOENT for a subdirectory under a verified root stays successful-empty;
 sparse placement depends on it.
 
@@ -170,13 +192,27 @@ member's last-known names as stale, as before.
 
 Current code (master 5f3dbb3, `NamespaceService._list_members`) already
 serves the available union when some members fail, but differs from this
-section in ways the snapshot tracer must close: missing members are
-logged only at debug level; when every member fails and nothing is cached it
+section in ways the snapshot tracer must close: a missing member is logged
+only at debug level (a background refresh that gives up on a member logs a
+warning in `_abandon_listing`; a foreground failure does not); when every member fails and nothing is cached it
 returns a successful empty listing; a partial listing is published with the
 same freshness timestamp as a complete one; a missing or replaced member
 root lists as successful-empty (above); and a foreground cold listing has no
 deadline of its own (`deadline=None`), bounded only by each member's
-transport timeout. The cold-wait bound is one of the pending numeric limits.
+transport timeout, and a local member has none, so a hung local disk blocks
+the listing without bound.
+
+Interim bounds. The cold-partial slice (warning logs, the narrow error,
+per-member completeness status, the root check) does not wait for the
+numeric ruling: until `oq-listing-stale-serve-dir-mtime` sets numbers, it
+uses the existing reference values, `refresh_member_timeout` (60 s) as the
+foreground per-member wait and the existing 60 s TTL / 3,600 s stale
+schedule as the retry cadence, with a root recheck interval no shorter than
+the TTL. A local member's wait needs a worker it can abandon (as background
+refresh already does), since it has no transport timeout. The numeric
+ruling replaces these values; it does not reopen the behavior. Other
+snapshot work (active-directory tracking, admission and cache limits) still
+waits for the numbers.
 
 ### Freshness and refresh limits
 
@@ -265,7 +301,9 @@ Do not implement an unbounded compatibility layer to rescue a failed premise.
 3. **Snapshot tracer:** deterministic synthetic members prove empty/error
    separation, fast cached return, cold A-empty + B-unavailable returning a
    successful empty union with B logged and internally partial, the
-   all-failed/no-cache error, publication fencing,
+   all-failed/no-cache error, all-failed with local or retained names
+   (listed), a missing or replaced member root (missing, not empty),
+   publication fencing,
    bounded workers and immutable readdir offsets. Mutation-disable controls
    must demonstrate that the tests detect the promised failure.
 4. **Existing-file tracer:** changed remote metadata reaches the consumer;
@@ -273,7 +311,8 @@ Do not implement an unbounded compatibility layer to rescue a failed premise.
    temp rename, delete/recreate, dropped watcher, coalescing and reconnect run.
 5. **Integration:** snapshot/cache improvements can ship independently after
    their numeric refresh/active-directory limits are settled and safety
-   proven (the cold-partial policy is ruled above); report
+   proven; the cold-partial slice may integrate earlier under the interim
+   bounds above; report
    live desktop updates unsupported if transport is unsupported. Combining
    change delivery requires its capability proof. Run applicable exact-head
    gates, CLI build, formal council and lead review; normal gated merge. Deployment is a separate
@@ -311,6 +350,7 @@ and stale-visibility policy remains in `oq-listing-stale-serve-dir-mtime`,
 including the numeric active-refresh, active-directory and backoff limits.
 The cold-partial ruling is recorded in `oq-listing-cold-partial-result`. The
 scratch Nautilus capability proof (milestone 2) remains pending; neither it
-nor the numeric limits gate the cold-partial behavior above.
+nor the numeric limits gate the cold-partial behavior above, which uses the
+interim bounds until the numbers are ruled.
 Transport feasibility is engineering evidence to obtain, not a presumed
 product ruling to ask Ted to make without results.
