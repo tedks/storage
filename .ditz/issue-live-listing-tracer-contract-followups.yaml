@@ -38,3 +38,14 @@ log_events:
     tracer details, not permission to guess; current proposal is not runtime acceptance.
     Deferral preserves the frozen reviewed spec head while keeping implementation
     obligations explicit.'
+- time: 2026-11-18T04:46:49-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'PR178 round 5ca1b5a9fe55-20261118T044530Z-c1eab1 anthropic nits (non-blocking,
+    for the snapshot tracer): N10 member-root verification over SFTP has no st_dev/st_ino
+    in paramiko stat; name the remote options (stat via the existing exec_command
+    path, or a root marker file; RsyncBackend inherits SSHBackend) and allow a per-member
+    check cached for a short interval rather than one extra round trip per directory
+    listing. N11 an identity recorded only at startup cannot catch a disk already
+    missing at mount time; require the expected identity from member configuration
+    (or a marker) for that case.'
