@@ -1925,3 +1925,63 @@ class TestCacheAncestors(unittest.TestCase):
     def test_a_path_not_spelled_under_the_root_gets_every_ancestor(self):
         self.assertEqual([Path("/"), Path("/other"), Path("/other/x")],
                          storage_namespace._cache_ancestors(Path("/c"), Path("/other/x")))
+
+
+class TestFirstMemberRenameTarget(SyncRaceTestBase):
+    """The mount's own member rename onto a name the namespace did not hold
+    (docs/first-member-rename-target.md, ditz gh-181-sync-rename-noreplace).
+
+    Synthetic RED: the member's rename is wrapped so that, just before the
+    real call, another writer puts an unrelated object at the target: the
+    window between the namespace decision and the member operation. The
+    expected failures turn into unexpected successes (which fail the run)
+    once the first member rename refuses to replace; remove the markers then.
+    """
+
+    def occupy_target_first(self, rel, data):
+        real = self.member.rename
+
+        def racing(old, new):
+            (self.member_dir / rel).write_bytes(data)
+            return real(old, new)
+
+        patcher = patch.object(self.member, "rename", side_effect=racing)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def synced(self, path, data):
+        self.write_file(path, data)
+        self.start_sync()
+        self.wait_synced(path)
+        self.wait_idle()
+        self.fs.sync_manager.stop()
+
+    @unittest.expectedFailure
+    def test_known_absent_target_created_during_the_rename_is_kept(self):
+        """The namespace had no /b.txt and the member's fresh listing had
+        none; another writer creates one during the rename."""
+        self.synced("/a.txt", b"renamed bytes")
+        self.assertEqual(["a.txt"], sorted(self.fs.readdir("/", None))[2:])
+        self.occupy_target_first("b.txt", b"unrelated writer")
+        self.fs.rename("/a.txt", "/b.txt")
+        self.assertEqual(b"unrelated writer", (self.member_dir / "b.txt").read_bytes())
+        self.assertEqual(b"renamed bytes", (self.member_dir / "a.txt").read_bytes())
+
+    @unittest.expectedFailure
+    def test_unknown_target_the_mount_never_listed_is_kept(self):
+        """The member already had a /b.txt the mount never listed (no
+        listing of / since it appeared); the namespace has none."""
+        self.synced("/a.txt", b"renamed bytes")
+        (self.member_dir / "b.txt").write_bytes(b"unrelated writer")
+        self.fs.rename("/a.txt", "/b.txt")
+        self.assertEqual(b"unrelated writer", (self.member_dir / "b.txt").read_bytes())
+        self.assertEqual(b"renamed bytes", (self.member_dir / "a.txt").read_bytes())
+
+    def test_known_intended_replacement_still_replaces(self):
+        """Control: /b.txt is the namespace's own, synced to the member;
+        renaming /a.txt over it replaces it there, as rename(2) does."""
+        self.synced("/a.txt", b"renamed bytes")
+        self.synced("/b.txt", b"replaced bytes")
+        self.fs.rename("/a.txt", "/b.txt")
+        self.assertEqual(b"renamed bytes", (self.member_dir / "b.txt").read_bytes())
+        self.assertFalse((self.member_dir / "a.txt").exists())
