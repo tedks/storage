@@ -93,5 +93,15 @@ log_events:
     of durable and pending repairs across handoff. Require barrier, long-path/rebuild
     and fault regressions. Scheduler changes received; final council, lead and full
     gates pending.'
+- time: 2026-11-18T07:23:30-00:00
+  who: Ted Smith
+  what: commented
+  comment: At dbeaa65, three remaining integration findings were sent to the lead.
+    An initially fenced member excluded from mutation registration can become eligible
+    after external resolve and miss a second fence before the member call. A failed
+    unlink or interrupted cleanup can leave a writable alias of the kept view bytes;
+    path truncate still opens it for mutation. Missing version-2 sidecar data currently
+    makes carrier_path report metadata JSON as the recovery bytes. Cover ordering,
+    alias survival and explicit missing-payload reporting on the final reviewed head.
 blocks:
 - gh-181
