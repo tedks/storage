@@ -7,7 +7,11 @@ What the bound counts: callbacks admitted and not yet finished. At most
 `cap` run at once. StorageFS admits every FUSE operation except init,
 destroy, release, releasedir and flush (fs.py _ADMISSION_EXEMPT): those are
 not counted and may run alongside `cap` admitted callbacks. flush is exempt
-only while it is fusepy's no-op, which a test pins. Each class keeps its reserved slots
+only while StorageFS inherits fusepy's immediate-success no-op, which a test
+pins; a flush that does work or can block must be reclassified, and fsync
+is never exempt. So the cap bounds admitted work only: callback
+invocations in flight (exempt ones and waiters) and native threads can
+exceed it. Each class keeps its reserved slots
 (`RESERVED`: two for demand I/O, one for metadata, one for everything else);
 only `cap - 4` slots are shared. Waiting callbacks are not counted, and they
 still occupy a native libfuse thread: libfuse 2's multithreaded loop has no
