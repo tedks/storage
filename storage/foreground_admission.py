@@ -4,7 +4,10 @@
 never interrupts a running callback and never changes what it returns.
 
 What the bound counts: callbacks admitted and not yet finished. At most
-`cap` run at once. Each class keeps its reserved slots
+`cap` run at once. StorageFS admits every FUSE operation except init,
+destroy, release, releasedir and flush (fs.py _ADMISSION_EXEMPT): those are
+not counted and may run alongside `cap` admitted callbacks. flush is exempt
+only while it is fusepy's no-op, which a test pins. Each class keeps its reserved slots
 (`RESERVED`: two for demand I/O, one for metadata, one for everything else);
 only `cap - 4` slots are shared. Waiting callbacks are not counted, and they
 still occupy a native libfuse thread: libfuse 2's multithreaded loop has no
@@ -108,26 +111,33 @@ class ForegroundAdmission:
             # Wakes waiting_for() observers; admission itself never waits
             # on another class's queue growing.
             self._cond.notify_all()
-            try:
-                while True:
+        entered = False
+        try:
+            while True:
+                # Outside the gate's lock: a slow probe delays only its own
+                # waiter, never another waiter, a slot release or close().
+                reason = cancel_probe() if cancel_probe is not None else None
+                if reason:
+                    raise AdmissionClosed(f"{reason} ended while waiting for admission")
+                with self._cond:
                     if self._closed:
                         raise AdmissionClosed("foreground admission closed")
-                    reason = cancel_probe() if cancel_probe is not None else None
-                    if reason:
-                        raise AdmissionClosed(f"{reason} ended while waiting for admission")
                     # FIFO within a class: only the head may enter.
                     if self._waiting[kind][0] is ticket and self._can_enter(kind):
+                        self._waiting[kind].popleft()
+                        self._active[kind] += 1
+                        self.peak_active = max(self.peak_active, sum(self._active.values()))
+                        entered = True
+                        # The next in this class may be able to enter too.
+                        self._cond.notify_all()
                         break
                     self._cond.wait(PROBE_INTERVAL if cancel_probe is not None else None)
-            except BaseException:
-                self._waiting[kind].remove(ticket)
-                self._cond.notify_all()
-                raise
-            self._waiting[kind].popleft()
-            self._active[kind] += 1
-            self.peak_active = max(self.peak_active, sum(self._active.values()))
-            # The next in this class may be able to enter too.
-            self._cond.notify_all()
+        except BaseException:
+            if not entered:
+                with self._cond:
+                    self._waiting[kind].remove(ticket)
+                    self._cond.notify_all()
+            raise
         try:
             yield
         finally:

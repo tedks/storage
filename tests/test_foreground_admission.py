@@ -245,6 +245,16 @@ class CappedFSBase(ThreadingTestBase):
     def call(self, op, *args):
         return self.fs(op, *args)
 
+    def wait_for_path_lock_refs(self, canonical_path, refs):
+        """Wait until refs holders and waiters share the path's lock."""
+        for _ in range(int(WAIT / 0.01)):
+            with self.fs._path_locks._mutex:
+                entry = self.fs._path_locks._entries.get(canonical_path)
+                if entry is not None and entry.refs >= refs:
+                    return
+            threading.Event().wait(0.01)
+        self.fail(f"fewer than {refs} on the lock of {canonical_path}")
+
     def saturate(self, kind, op, *args):
         """Fill every slot kind can use with callbacks blocked in op.
 
@@ -581,6 +591,8 @@ class TestCleanupThroughShutdown(CappedFSBase):
             opener.start()
         self.assertTrue(self.gate_.waiting_for("demand", 1, WAIT))
         self.assertEqual(2, self.gate_.active("demand"))
+        # Both admitted opens wait on the lock the close holds.
+        self.wait_for_path_lock_refs("/f.txt", 3)
         self.saturate("metadata", "statfs", "/")
         self.saturate("ordinary", "mkdir", "/d", 0o755)
         self.assertEqual(self.cap, self.gate_.active_count)
@@ -639,6 +651,38 @@ class TestQueuedCancellation(CappedFSBase):
         self._release_blockers()
         self.assertEqual(0, self.gate_.active_count)
         self.assertEqual(0, self.gate_.waiting_count("metadata"))
+
+    def test_a_blocked_probe_holds_up_only_its_own_waiter(self):
+        gate = ForegroundAdmission(4)
+        probing, unblock = threading.Event(), threading.Event()
+
+        def slow_probe():
+            probing.set()
+            assert unblock.wait(WAIT), "probe never released"
+            return None
+
+        self.addCleanup(unblock.set)
+        holder = Holder(gate, "ordinary").start()
+        self.assertTrue(holder.entered.wait(WAIT))
+        slow = Worker(lambda: gate.admit("ordinary", cancel_probe=slow_probe).__enter__())
+        slow.start()
+        self.assertTrue(probing.wait(WAIT))
+        # The gate's lock is free while the probe runs: other classes enter
+        # and leave, the holder releases, and close() returns.
+        self.assertEqual(None, Worker(self._admit_once, gate, "demand").finish_started())
+        holder.finish()
+        Worker(gate.close).finish_started()
+        unblock.set()
+        slow.join(WAIT)
+        self.assertFalse(slow.is_alive())
+        self.assertIsInstance(slow.error, AdmissionClosed)
+        self.assertEqual(0, gate.active_count)
+        self.assertEqual(0, gate.waiting_count("ordinary"))
+
+    @staticmethod
+    def _admit_once(gate, kind):
+        with gate.admit(kind):
+            return None
 
     def test_gate_level_probe(self):
         gate = ForegroundAdmission(4)
