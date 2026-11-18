@@ -43,7 +43,8 @@ class ReplicationManager:
         """Get list of currently available backends"""
         return [b for b in self.backends.values() if b.is_available()]
 
-    def select_backends_for_file(self, virtual_path: str, config: FileConfig) -> List[Backend]:
+    def select_backends_for_file(self, virtual_path: str, config: FileConfig,
+                                 exclude: Optional[Set[str]] = None) -> List[Backend]:
         """
         Select which backends should store a file
 
@@ -53,8 +54,11 @@ class ReplicationManager:
 
         Returns:
             List of backends to use for this file
+
+        Members named in exclude are left out as if they were unavailable.
         """
-        available = self.get_available_backends()
+        available = [b for b in self.get_available_backends()
+                     if not exclude or b.name not in exclude]
 
         if not available:
             return []
@@ -74,7 +78,8 @@ class ReplicationManager:
 
         if config.preferred_backends:
             for name in config.preferred_backends:
-                if name in self.backends and self.backends[name].is_available():
+                if (name in self.backends and self.backends[name].is_available()
+                        and not (exclude and name in exclude)):
                     selected.append(self.backends[name])
                     if len(selected) >= replica_count:
                         return selected

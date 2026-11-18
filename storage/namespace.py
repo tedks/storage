@@ -1391,6 +1391,7 @@ class NamespaceService:
                 DirOperation.MKDIR,
                 resolved.canonical_path,
                 backend_hint=resolved.backend_name,
+                exclude=self.state_manager.member_repair_backends([resolved.canonical_path]),
             )
 
             self.invalidate_dir_cache_entry(resolved.parent_dir)
@@ -1416,10 +1417,14 @@ class NamespaceService:
         try:
             cache_path.rmdir()
 
+            # A member with an open repair at or around this name keeps what
+            # it has there: its directory may be the one a missed rename left
+            # behind, or another writer's.
             failures = self._propagate_dir_operation(
                 DirOperation.RMDIR,
                 resolved.canonical_path,
                 backend_hint=resolved.backend_name,
+                exclude=self.state_manager.member_repair_backends([resolved.canonical_path]),
             )
 
             self.invalidate_dir_cache_entry(resolved.parent_dir)
@@ -1568,6 +1573,7 @@ class NamespaceService:
                 (name, "not renamed: the member has an open repair at these names")
                 for name in sorted(fenced)
             ]
+            unrecorded = False
             for missed_backend, reason in missed:
                 if not record_member_rename_repair(
                     self.state_manager,
@@ -1577,6 +1583,7 @@ class NamespaceService:
                     reason,
                     self.logger,
                 ):
+                    unrecorded = True
                     self.sync_manager.queue_dir_sync(
                         old_resolved.canonical_path,
                         DirOperation.RENAME,
@@ -1585,5 +1592,10 @@ class NamespaceService:
                         priority=90,
                         force=True,
                     )
+            if unrecorded:
+                # The local move stands; the caller learns it is partial
+                # (ruling oq-namespace-partial-rename-result), since the
+                # record of what the member missed is not yet on disk.
+                raise OSError(errno.EIO, "rename not recorded for every member", new)
         except OSError as exc:
             raise FuseOSError(exc.errno)
