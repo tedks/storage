@@ -2,6 +2,7 @@
 
 import errno
 import logging
+import ctypes
 import os
 import shutil
 import stat
@@ -17,6 +18,41 @@ from ..file_config import XATTR_CONFIG_NAME
 # is the user's and travels with the file.
 _INTERNAL_XATTR_PREFIX = "user.storage."
 
+
+
+_AT_FDCWD = -100
+_RENAME_NOREPLACE = 1
+
+
+def _load_renameat2():
+    try:
+        renameat2 = ctypes.CDLL(None, use_errno=True).renameat2
+    except (AttributeError, OSError):
+        return None
+    renameat2.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint)
+    return renameat2
+
+
+_RENAMEAT2 = _load_renameat2()
+# A filesystem or kernel without RENAME_NOREPLACE.
+NOREPLACE_UNSUPPORTED = frozenset({errno.EINVAL, errno.ENOSYS, errno.EOPNOTSUPP, errno.ENOTSUP})
+
+
+def rename_noreplace(src, dst) -> bool:
+    """rename(src, dst) unless dst exists: True if renamed, False if dst exists.
+
+    One renameat2(RENAME_NOREPLACE) call, atomic in the kernel. Raises
+    OSError, with ENOSYS where libc has no renameat2.
+    """
+    renameat2 = _RENAMEAT2
+    if renameat2 is None:
+        raise OSError(errno.ENOSYS, "renameat2 unavailable")
+    if renameat2(_AT_FDCWD, os.fsencode(src), _AT_FDCWD, os.fsencode(dst), _RENAME_NOREPLACE) == 0:
+        return True
+    err = ctypes.get_errno()
+    if err == errno.EEXIST:
+        return False
+    raise OSError(err, os.strerror(err), str(src))
 
 def _is_internal_xattr(name: str) -> bool:
     return name.startswith(_INTERNAL_XATTR_PREFIX) and name != XATTR_CONFIG_NAME
@@ -222,6 +258,28 @@ class LocalBackend(Backend):
         if not os.path.lexists(old_path):
             return
         os.replace(old_path, new_path)
+
+    def rename_noreplace(self, old_virtual_path: str, new_virtual_path: str):
+        """renameat2(RENAME_NOREPLACE): the kernel refuses atomically when
+        the new name is taken (FileExistsError). Where the filesystem has no
+        such operation it raises OSError(ENOTSUP): no stat-then-rename or
+        link-then-unlink fallback, which a concurrent writer could defeat."""
+        old_path = self._resolve_path(old_virtual_path)
+        new_path = self._resolve_path(new_virtual_path)
+        new_path.parent.mkdir(parents=True, exist_ok=True)
+        if not os.path.lexists(old_path):
+            return
+        try:
+            renamed = rename_noreplace(old_path, new_path)
+        except OSError as exc:
+            if exc.errno in NOREPLACE_UNSUPPORTED:
+                raise OSError(errno.ENOTSUP,
+                              f"no-replace rename unsupported here ({os.strerror(exc.errno)})",
+                              str(new_path)) from exc
+            raise
+        if not renamed:
+            raise FileExistsError(errno.EEXIST, "an object is already at the new name",
+                                  str(new_path))
 
     def get_free_space(self) -> Optional[int]:
         """Get free space in bytes"""

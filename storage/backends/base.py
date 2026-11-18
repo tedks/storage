@@ -278,6 +278,21 @@ class Backend(ABC):
         """Rename or move a path on this backend."""
         pass
 
+    def rename_noreplace(self, old_virtual_path: str, new_virtual_path: str):
+        """Rename a path only if nothing is at the new name, atomically.
+
+        For a rename onto a name the namespace did not hold, where an object
+        at the new name on this member would be one the mount never knew
+        (docs/first-member-rename-target.md). It must be a single operation
+        that the member itself refuses when the new name is taken: never a
+        check followed by a rename, nor a link followed by an unlink, both
+        of which a concurrent writer can slip between. Raises
+        FileExistsError when the new name is taken. A member with no such
+        operation raises OSError(ENOTSUP), and the namespace then leaves it
+        alone and records a repair.
+        """
+        raise OSError(errno.ENOTSUP, "no verified no-replace rename on this member")
+
     def filesystem_identity(self) -> Optional[Tuple[str, int, int]]:
         """(host, port, device id) of the filesystem holding this member's root.
 

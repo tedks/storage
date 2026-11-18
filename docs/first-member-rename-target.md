@@ -1,9 +1,8 @@
 # First member rename: do not replace a target the namespace did not intend
 
-Status: bounded design and synthetic RED only (CTO RRS-CTO-20261118B).
-The externally visible fallback when no protection is available waits for
-Ted's ruling; nothing here changes the first member rename yet. Tracking:
-GitHub #181, ditz `gh-181-sync-rename-noreplace`, stacked on PR #182.
+Status: implemented (PR #183) under Ted's ruling on #183
+(2026-11-18, CTO-183-IMPLEMENT-GO). Tracking: GitHub #181, ditz
+`gh-181-sync-rename-noreplace`.
 
 ## Purpose
 
@@ -83,27 +82,57 @@ reasonable attempt for regular files on OpenSSH, and is never treated as
 proof for every server or type. The `hardlink@openssh.com` extension gives
 the same no-replace link for regular files when the server advertises it.
 
-## The open ruling
+## The ruling, and what is built
 
-When neither primitive is available (a directory on SSH, a local filesystem
-without `renameat2`, an SFTP server without the extension), the mount has to
-choose. It can refuse the member rename and record it for repair, so the
-member keeps the old name and the user's rename still succeeds locally. Or it
-can replace on a best-effort basis, which is today's behavior. That choice is
-visible to users, so Ted decides it. Until he does, nothing in
-`NamespaceService.rename` or the backends changes.
+Ted approved the conservative fallback. When replacement was not the
+intent on a member, the move uses an operation with verified destination
+protection. Without that guarantee, the member move is skipped and
+reported as a partial failure, with a durable repair naming both paths.
+That covers ordinary SSH directory moves on servers without a suitable
+atomic operation. The namespace's own move, already committed, stays
+visible. A missing or stale member listing cannot establish absence.
+
+`NamespaceService.rename` decides each target member before any effect.
+
+- **Intended replacement.** The namespace holds a directory at the new
+  name, which rename(2) replaces only when it is empty, or a file there
+  whose copy on that member is recorded. The member rename is
+  `Backend.rename`, which replaces, as before.
+- **Every other target, absent or unknown.** The member rename is
+  `Backend.rename_noreplace`. It must be one operation that the member
+  itself refuses when the new name is taken. A check followed by a
+  rename does not qualify, and neither does a link followed by an
+  unlink: a concurrent writer can get between them.
+  - `LocalBackend` uses `renameat2(RENAME_NOREPLACE)`. Where the
+    filesystem or libc lacks it (`EINVAL`, `ENOSYS`, `EOPNOTSUPP`), it
+    raises `ENOTSUP`, with no fallback.
+  - `SSHBackend` and the others inherit the base method, which always
+    raises `ENOTSUP`. SFTP offers no operation the client can verify as
+    atomic and non-replacing for every server and type.
+  - A refusal (`EEXIST`) or `ENOTSUP` is a missed member. The member
+    keeps the source and any object at the new name, and the rename's
+    intent settles into an open repair for it (docs/member-rename-
+    repairs.md), with the reason.
+
+In practice a rename onto a fresh name on an SSH member is never made
+there. It is recorded for repair instead, which is the cost of the ruling.
 
 ## Validation
 
-`tests/test_sync_races.py::TestFirstMemberRenameTarget` holds the synthetic
-RED. One member is a real local directory, and its `rename` is wrapped so
-that an unrelated object appears at the target just before the real call:
-the window between the namespace decision and the member operation. The
-cases for a known absent target and an unknown target are
-`unittest.expectedFailure` today. They fail because `os.replace` destroys the
-object, and they will turn into unexpected successes, which fail the suite,
-once the fix lands; remove the markers then. The case for a known intended
-replacement passes today and must keep passing.
+`tests/test_sync_races.py::TestFirstMemberRenameTarget`, on a real local
+member:
+- the former synthetic REDs, now passing: an object created at the
+  target in the window before the member call, and one the mount never
+  listed;
+- a directory onto an occupied member directory;
+- a free target moved by the no-replace rename;
+- a filesystem without `RENAME_NOREPLACE`, where the member is skipped
+  and recorded;
+- the intended-replacement control.
+
+`tests/test_remote_system.py` covers SSH: an occupied file name, a free
+directory and a free file name, which are not moved and are recorded,
+and the intended-replacement control.
 
     cd <worktree>
     nix develop --command bazel test //tests:storage_test_sync_races --test_output=errors
@@ -112,12 +141,17 @@ replacement passes today and must keep passing.
 
 - [x] Classify the target cases and state what each primitive does not prove (2026-11-18).
 - [x] Synthetic RED for the known absent and unknown cases, and a control case for the intended replacement (2026-11-18).
-- [ ] Ted's ruling on the fallback when no protection is available.
-- [ ] Implement no-replace member rename per case, with a repair record on refusal (after the ruling).
-- [ ] SSH coverage in the remote gate: a regular file and a directory onto an occupied target.
+- [x] Ted's ruling on the fallback when no protection is available (2026-11-18).
+- [x] No-replace member rename for non-intended targets, with a repair record on refusal or when unsupported (2026-11-18).
+- [x] SSH coverage in the remote gate: an occupied file, free directory and file targets, and intended replacement (2026-11-18).
 
 ## Decision log
 
 - 2026-11-18, CTO RRS-CTO-20261118B: kept out of PR #182, which stays the
   missed-rename retry fence. Stacked follow-up, design and synthetic RED
   first. No blanket change to the foreground rename.
+- 2026-11-18, Ted on #183 and CTO-183-IMPLEMENT-GO: the conservative
+  fallback. A verified non-replacing primitive is used, or else the member
+  is skipped and recorded. Intended replacement is preserved. The absent
+  and unknown cases are handled the same way, since a listing cannot prove
+  absence.

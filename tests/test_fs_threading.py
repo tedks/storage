@@ -14,7 +14,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from fuse import FuseOSError
 
@@ -106,6 +106,26 @@ class ThreadingTestBase(unittest.TestCase):
         self.fs.sync_manager.stop()
         self.fs.state_manager.close()
         shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def patch_member_rename(self, side_effect):
+        """Patch both member rename entry points with side_effect: a
+        rename onto a name the namespace did not hold uses rename_noreplace
+        (docs/first-member-rename-target.md)."""
+        return patch.multiple(self.member, rename=Mock(side_effect=side_effect),
+                              rename_noreplace=Mock(side_effect=side_effect))
+
+    def gate_member_rename(self):
+        """A Gate pausing the first member rename, through either entry
+        point."""
+        gate = Gate(lambda fn, *args: fn(*args))
+        real_rename, real_noreplace = self.member.rename, self.member.rename_noreplace
+        patcher = patch.multiple(
+            self.member,
+            rename=Mock(side_effect=lambda *a: gate(real_rename, *a)),
+            rename_noreplace=Mock(side_effect=lambda *a: gate(real_noreplace, *a)))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return gate
 
     def gate(self, target, name, only=None):
         gate = Gate(getattr(target, name), only)
@@ -314,7 +334,7 @@ class TestOpenRaces(ThreadingTestBase):
 
 class TestRenameRaces(ThreadingTestBase):
     def _rename_gated_at_member(self, old, new):
-        member_rename = self.gate(self.member, "rename")
+        member_rename = self.gate_member_rename()
         renamer = Worker(self.fs.rename, old, new)
         renamer.start()
         self.assertTrue(member_rename.started.wait(WAIT))

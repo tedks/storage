@@ -2926,16 +2926,19 @@ class TestFSNamespaceIntegration(unittest.TestCase):
         remote_backend = remote_locations[0]
         untouched_backend = 'backend2' if remote_backend == 'backend1' else 'backend1'
 
-        original_remote_rename = self.backends[remote_backend].rename
+        # /final.txt is not the namespace's, so the member move refuses to
+        # replace (rename_noreplace); a member without the file gets neither.
+        original_remote_rename = self.backends[remote_backend].rename_noreplace
+        refuse = AssertionError("rename should not fan out to backends without the file")
 
         with patch.object(
             self.backends[remote_backend],
-            'rename',
+            'rename_noreplace',
             wraps=original_remote_rename,
         ) as rename_remote, patch.object(
-            self.backends[untouched_backend],
-            'rename',
-            side_effect=AssertionError("rename should not fan out to backends without the file"),
+            self.backends[untouched_backend], 'rename', side_effect=refuse,
+        ), patch.object(
+            self.backends[untouched_backend], 'rename_noreplace', side_effect=refuse,
         ):
             self.fs.rename('/staged.tmp', '/final.txt')
 
@@ -2999,18 +3002,18 @@ class TestFSNamespaceIntegration(unittest.TestCase):
         queued replay; the member that took it gets neither."""
         self.fs.mkdir('/orig', 0o755)
         target = '/renamed'
-        original = self.backends['backend2'].rename
+        original = self.backends['backend2'].rename_noreplace
 
         def failing_rename(old, new):
             raise RuntimeError("backend2 down")
 
-        self.backends['backend2'].rename = failing_rename
+        self.backends['backend2'].rename_noreplace = failing_rename
         try:
             with patch.object(self.fs.sync_manager, 'queue_dir_sync') as mock_queue:
                 self.fs.rename('/orig', target)
             mock_queue.assert_not_called()
         finally:
-            self.backends['backend2'].rename = original
+            self.backends['backend2'].rename_noreplace = original
         self.assertEqual(
             [(('backend2',), '/orig', target, 'open')],
             [(r.members, r.old_path, r.new_path, r.state)

@@ -1,4 +1,3 @@
-import ctypes
 import errno
 import json
 import os
@@ -61,37 +60,7 @@ STREAMING_MAX_TRACKED_READ_SPANS = 64
 # it has no RENAME_NOREPLACE either.
 _LINK_UNSUPPORTED = (errno.EPERM, errno.EOPNOTSUPP, errno.ENOTSUP, errno.ENOSYS, errno.EMLINK)
 _NOREPLACE_UNSUPPORTED = (errno.EINVAL, errno.ENOSYS, errno.EOPNOTSUPP, errno.ENOTSUP)
-_AT_FDCWD = -100
-
-_RENAME_NOREPLACE = 1
-
-
-def _load_renameat2():
-    try:
-        renameat2 = ctypes.CDLL(None, use_errno=True).renameat2
-    except (AttributeError, OSError):
-        return None
-    renameat2.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint)
-    return renameat2
-
-
-_RENAMEAT2 = _load_renameat2()
-
-
-def _rename_noreplace(src, dst) -> bool:
-    """rename(src, dst) unless dst exists: True if renamed, False if dst exists.
-
-    Raises OSError, with ENOSYS where libc has no renameat2.
-    """
-    renameat2 = _RENAMEAT2
-    if renameat2 is None:
-        raise OSError(errno.ENOSYS, "renameat2 unavailable")
-    if renameat2(_AT_FDCWD, os.fsencode(src), _AT_FDCWD, os.fsencode(dst), _RENAME_NOREPLACE) == 0:
-        return True
-    err = ctypes.get_errno()
-    if err == errno.EEXIST:
-        return False
-    raise OSError(err, os.strerror(err), str(src))
+from .backends.local import rename_noreplace as _rename_noreplace  # noqa: E402
 
 
 @dataclass
