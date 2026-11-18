@@ -1,0 +1,24 @@
+id: listing-member-root-marker-setup
+title: Member root marker setup step for listing root checks
+desc: 'Spec docs/specs/live-union-listings.md (PR178) requires each member observation
+  to be accepted only after a post-read stat of a per-member uniquely named root marker;
+  members without a marker are accepted unchecked and reported once as root unchecked.
+  This task: an explicit operator step (e.g. a storage CLI command) that writes the
+  marker only to a root the operator names, refuses a root that is not a separate
+  mount when member configuration says it should be, records the marker id in member
+  configuration, and keeps the marker hidden (is_hidden_entry) and out of replication/sync.
+  Not part of the cold-partial slice. Never run against live members without an explicit
+  authorization.'
+type: feature
+component: listing
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-18T05:02:41-00:00
+references: []
+log_events:
+- time: 2026-11-18T05:02:41-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
