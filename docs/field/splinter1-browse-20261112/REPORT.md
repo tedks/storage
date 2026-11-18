@@ -3,7 +3,8 @@
 Lane: field-browse (STORAGE-SPLINTER1-BROWSE-20261112). Measured build
 and source references: 81793ac. See Status after the run for what has
 changed since.
-Corrected at root review of 93ed39f (one feedback round); see Corrections.
+Corrected after root review of 93ed39f and root delta review of a64050c,
+and in the PR #177 council; see Corrections.
 Aggregated and anonymized: directories are labelled by subtree and
 selection order; no file names or private paths. Raw per-name evidence
 and the historical probe scripts are kept private with a sha256 manifest.
@@ -18,7 +19,7 @@ and the historical probe scripts are kept private with a sha256 manifest.
   by LAN IP; `workers = 2`; `fuse_threads = true`; streaming reads,
   1 MiB chunks, 8 sessions; cache 50G. `enable_watchers` and
   `readdir_ttl` are unset.
-- Host: about 2 GiB available RAM, 1.8 GiB swap in use, load 1 to 3. The
+- Host: about 2.3 GiB available RAM, 1.8 GiB swap in use, load 1 to 3. The
   wired NIC is down; traffic goes over Wi-Fi.
 
 ### Thread and channel model (three separate things)
@@ -41,7 +42,7 @@ and the historical probe scripts are kept private with a sha256 manifest.
        generator (`storage/fs.py:2076-2079`).
      - The listing runs when fusepy iterates that generator, after the
        context has ended.
-     - `_submit_member_listings` (`storage/namespace.py:1105-1108`) then
+     - `_submit_member_listings` (`storage/namespace.py:1104-1107`) then
        copies that now non-interactive context into the member's listing
        executor.
      - So a foreground listing competes for channels as background work
@@ -130,6 +131,10 @@ privately, with hashes. What was run, as commands:
 | Music#7(depth 1) | 3/3 | 346 | 35 | 20 | 31 | 3.6 / 1.6 | 12 | 1.1 (3) | 0.1 |
 
 Totals over 17 dirs, ms: GIO Storage run1 8594, GIO member run1 1176; GIO Storage run3 1701, GIO member run3 793
+
+The totals sum the per-run timings, recorded at 0.1 ms; the rounded run 1
+Storage cells above sum to 8593. Run 3 is not tabulated per directory:
+the warm columns are medians of runs 2 and 3.
 absent total: 0 conflict total: 0 hidden: 0 dirs with storage-only names: 4
 
 Run 2 and 3 medians are "warm" (later observations, not a proven steady state). S = Storage, M = chunk0 over GVFS SFTP.
@@ -149,7 +154,7 @@ scope. No remount was done.
 
 ## Diagnosis
 
-### 1. A first-observed listing can take 0.1 to 2 s, and can be large even for small directories (not a controlled size comparison)
+### 1. A first-observed listing can take up to 2 s, and can be large even for small directories (not a controlled size comparison)
 
 - Phase split, Storage first visit:
   - 1 entry: lookup 3.6 ms, **readdir 1667 ms**, lstat 3.7 ms.
@@ -177,15 +182,17 @@ scope. No remount was done.
 
 ### 2. A later GIO listing on Storage costs more per entry than on chunk0
 
-- On the 700-entry Music root, GIO took 0.87 to 1.23 s on Storage
-  against 0.19 s on chunk0 (later runs).
+- On the 700-entry Music root, GIO on Storage took a 0.93 s median in
+  later runs (1.23 s in run 1), against 0.19 s on chunk0 in every run.
 - strace of the Storage listing: 700 `statx`, 703 `access` and 5
   `getdents64` calls.
 - `attr_timeout` is 0 by design (`fs.KERNEL_ATTR_TIMEOUT`; see
   `fuse_mount_options`), so each `statx` reaches the daemon. Measured
-  later-run `lstat` costs about 0.5 to 0.8 ms per entry there.
+  later-run `lstat` costs about 0.8 ms per entry there (159 ms for 200
+  entries).
   `access` cost was not measured separately on the 700-entry root.
-- POSIX `listdir` on Storage is fast in later runs (2 to 31 ms).
+- POSIX `listdir` on Storage is fast in later runs (medians 1.1 to
+  29 ms).
 - **Qualified, not verified in this lane:** the SFTP protocol returns
   attributes with each READDIR reply, and GVFS's SFTP backend is
   expected to answer this attribute set from those replies, without a
@@ -196,9 +203,10 @@ scope. No remount was done.
 
 - One `gio list` of the Music root on Storage with
   `standard::*,time::*,unix::*,access::*` took 94 s.
-- It was run outside the harness. It exceeded both the 30 s per-operation
-  bound and the content-prefix bound (at most one 64 KiB prefix per
-  directory); see the deviation in the event shard.
+- It was run outside the harness. It exceeded the 30 s per-operation
+  bound. It was not held to the content-prefix bound (at most one 64 KiB
+  prefix per directory), and whether it read more than that is unknown;
+  see the deviation in the event shard.
 - **What it read, wrote or cached is unknown.** A flat `write_bytes` on
   the mount process over 5 s afterwards does not bound the I/O during the
   94 s.
@@ -260,7 +268,11 @@ Tracked: ditz `field-gio-content-sniff-per-entry`,
 `oq-listing-stale-serve-dir-mtime`, and comments on
 `field-listing-stalls-under-load` and `field-listing-downloads-to-hash`.
 
-## Corrections (root review of 93ed39f)
+## Corrections
+
+From root review of 93ed39f, and root delta review of a64050c for the
+channel model:
+
 
 - Run 1 and the phase split's first visits are "first observed", not
   cold.
@@ -269,8 +281,8 @@ Tracked: ditz `field-gio-content-sniff-per-entry`,
 - The channel model separates the configured interactive reserve from
   effective classification. In 81793ac, foreground readdir runs outside
   the interactive context, and cold copies keep it. #175 fixes both.
-- The 94 s run exceeded both the 30 s bound and the prefix bound. Its
-  I/O is unknown, and the "no bulk fetch" claim is withdrawn.
+- The 94 s run exceeded the 30 s bound and was not held to the prefix
+  bound. Its I/O is unknown, and the "no bulk fetch" claim is withdrawn.
 - The next visit after a stale serve is not guaranteed fresh, and no
   freshness option guarantees a listing is never stale.
 - GIO, GVFS and SFTP implementation claims are qualified as unverified.
@@ -293,6 +305,16 @@ moved afterwards. Nothing was re-measured on splinter1.
   open.
 - This branch was rebased onto 5f3dbb3; the report's source line
   references still point at 81793ac.
+
+From the PR #177 council (round at f8083ac):
+
+- The 94 s run is no longer said to have exceeded the prefix bound, only
+  not to have been held to it; its I/O is unknown.
+- Diagnosis 2's ranges now match the table (Music root GIO median and
+  run 1; `listdir` medians; per-entry `lstat` there), and the Totals note
+  explains the 1 ms rounding difference and the untabulated run 3.
+- Diagnosis 1's heading says "up to 2 s"; a citation range and the host
+  memory figure were aligned with the source and the event shard.
 
 ## Limits
 

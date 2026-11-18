@@ -20,3 +20,20 @@ historical and are not rewritten.
   open, nothing re-measured. Privacy rescan of the branch history,
   including the removed helpers: no user file names, private paths or
   addresses.
+- resume-177:4 review-finding received. Council round
+  f8083ac0a913-20261118T043117Z-c68244 at f8083ac: anthropic (native,
+  opus) 0/2/7, openai (ask-agent, gpt-6-sol) 0/2/1, google EMPTY
+  (usage-limit). Findings: Diagnosis 2 ranges mislabelled against the
+  table; the 94 s run's prefix-bound and no-write claims overstated;
+  totals rounding; citation, heading, provenance and host-figure nits.
+- resume-177:5 correction. refs field-browse:6, field-browse:10.
+  field-browse:6's "No user bytes or xattrs were edited" records that no
+  write or xattr change was requested; no side effects were measured, and
+  what the run read, wrote or cached is unknown. field-browse:6's
+  "exceeds the lane's one-prefix-per-dir bound" and field-browse:10's
+  "exceeded both ... the prefix bound" are narrowed: the run exceeded the
+  30 s bound and was not held to the prefix bound; whether it read more
+  than one prefix per directory is unknown.
+- resume-177:6 correction. refs field-browse:12. Its context-copy range
+  `namespace.py:1105-1108` is 1104-1107 at 81793ac. The report was
+  corrected for all council findings (see its Corrections).
