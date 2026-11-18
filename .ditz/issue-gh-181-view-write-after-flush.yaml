@@ -40,5 +40,14 @@ log_events:
     a forced repair between successful flush and release, including subsequent eviction/reopen
     and index rebuild where preservation is the chosen solution. No automatic replay
     or unbounded retry queue is required.'
+- time: 2026-11-18T06:45:00-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'CTO RRS-CTO-FLUSH-RELEASE upheld the Important; the docs-only bound in
+    54df248 was amended. Fixed in 435b958: at release, a write kept off its member
+    keeps its exact bytes as a view-write repair (a carrier data copy), which is durable,
+    listed with BYTES <path>, and survives eviction, reopen and rebuild, deduplicated
+    by view identity. Residual: when the cache refuses the copy itself (ENOSPC), the
+    bytes stay only in the view cache, which is logged.'
 blocks:
 - gh-181
