@@ -53,7 +53,9 @@ listing_max_stale = 3600
 # destroy, release, releasedir and flush are not admitted and run alongside
 # the cap. The last close of a file unlinked while open can still wait: libfuse
 # unlinks its hidden name inside that close, and the unlink takes an
-# ordinary slot. libfuse's own threads are not capped. Unset: no cap.
+# ordinary slot. A queued callback is not cancelled by an interrupt or an
+# unmount, so either can wait for the queue to drain. libfuse's own threads
+# are not capped. Unset: no cap.
 # max_foreground_operations = 8
 # Bulk SSH copies wait for SFTP channel capacity as the queue drains. A
 # positive finite value opts into a capacity deadline; on a threaded mount,

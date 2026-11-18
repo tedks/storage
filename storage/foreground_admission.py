@@ -40,19 +40,29 @@ A callback waits for its slot before it runs, holding no lock while it
 waits (classification's brief fd-lock lookup is released first), and it
 never waits for a second slot, so the gate adds no lock-order edge: a slot
 holder can wait on a path lock, never the reverse.
+
+Only close() ends a wait early. An interrupted native request, or an
+exited session, does not: one libfuse request can make several callbacks
+(a rename onto an open target first renames the target to a hidden name;
+mkdir and create look the new entry up afterwards), and cancelling a later
+one would fail a request whose earlier step already happened. So an
+interrupted caller, and an unmount, wait for queued callbacks to be
+admitted and finish. libfuse joins its workers before destroy (which calls
+close()), so a queued callback never runs against torn-down state. That
+wait has no wall-time bound: a backlog drains in as many waves as the cap
+needs, each as long as its slowest callback, and stalled member I/O
+extends it. Storage's member-transport capacity waits keep their own
+cancellation and deadlines (backends.base capacity_wait_cancellation).
 """
 
 import threading
 from collections import deque
 from contextlib import contextmanager
-from typing import Callable, Dict, Optional
-
-# How often a waiter with a cancellation probe checks it.
-PROBE_INTERVAL = 0.1
+from typing import Dict
 
 
 class AdmissionClosed(InterruptedError):
-    """The gate closed, or the waiting request was cancelled, before entry."""
+    """The gate closed before the waiting callback entered."""
 
 
 MIN_CAP = 4
@@ -117,13 +127,13 @@ class ForegroundAdmission:
         return over < self.shared
 
     @contextmanager
-    def admit(self, kind: str, cancel_probe: Optional[Callable[[], Optional[str]]] = None):
+    def admit(self, kind: str):
         """Hold one slot of kind for the body.
 
-        cancel_probe, when given, is polled while waiting (never before the
-        first entry attempt, so a callback with a free slot always runs); a truthy result
-        (the native request was interrupted, or the session exited) cancels
-        the wait. Without it the wait ends only by entry or close().
+        Waits until this callback is first in its class's queue and a slot
+        is free, or until close(), which raises AdmissionClosed. Nothing
+        else ends the wait: not an interrupt of the native request, not the
+        session's exit (CTO ruling STORAGE-180-ESC-I1-C).
         """
         if kind not in self._active:
             raise ValueError(f"unknown foreground class: {kind}")
@@ -133,45 +143,23 @@ class ForegroundAdmission:
             # Wakes waiting_for() observers; admission itself never waits
             # on another class's queue growing.
             self._cond.notify_all()
-        entered = False
-        # The probe is polled only after a failed entry attempt: a callback
-        # that finds a free slot runs, as it would uncapped, even if its
-        # request was interrupted or its session exited.
-        probe_due = False
-        try:
-            while True:
-                if probe_due:
-                    # Outside the gate's lock: a slow probe delays its own
-                    # waiter and, by FIFO, the later waiters of its class;
-                    # never another class, a slot release or close().
-                    reason = cancel_probe()
-                    if reason:
-                        raise AdmissionClosed(f"{reason} ended while waiting for admission")
-                with self._cond:
+            try:
+                while True:
                     if self._closed:
                         raise AdmissionClosed("foreground admission closed")
                     # FIFO within a class: only the head may enter.
                     if self._waiting[kind][0] is ticket and self._can_enter(kind):
-                        self._waiting[kind].popleft()
-                        self._active[kind] += 1
-                        self.peak_active = max(self.peak_active, sum(self._active.values()))
-                        entered = True
-                        # The next in this class may be able to enter too.
-                        self._cond.notify_all()
                         break
-                    if cancel_probe is None:
-                        self._cond.wait()
-                    elif not probe_due:
-                        # First failed attempt: poll the probe before waiting.
-                        probe_due = True
-                    else:
-                        self._cond.wait(PROBE_INTERVAL)
-        except BaseException:
-            if not entered:
-                with self._cond:
-                    self._waiting[kind].remove(ticket)
-                    self._cond.notify_all()
-            raise
+                    self._cond.wait()
+            except BaseException:
+                self._waiting[kind].remove(ticket)
+                self._cond.notify_all()
+                raise
+            self._waiting[kind].popleft()
+            self._active[kind] += 1
+            self.peak_active = max(self.peak_active, sum(self._active.values()))
+            # The next in this class may be able to enter too.
+            self._cond.notify_all()
         try:
             yield
         finally:

@@ -10,7 +10,6 @@ Main filesystem layer that provides:
 
 import os
 import errno
-import re
 import stat
 import threading
 import logging
@@ -31,7 +30,7 @@ from pathlib import Path
 from typing import Dict, Optional, Set, List, Tuple
 
 from .backends.base import (
-    Backend, ChecksumUnavailable, capacity_wait_cancellation, current_capacity_cancel_probe,
+    Backend, ChecksumUnavailable, capacity_wait_cancellation,
     interactive_request,
 )
 from .backends.rsync import RsyncBackend
@@ -149,17 +148,10 @@ class StorageFS(Operations):
     _DEMAND_OPS = frozenset({"read", "write", "fsync"})
     # Without hard_remove, libfuse 2 renames a file unlinked while open to
     # .fuse_hidden<16 hex> and, at its last close, unlinks that name from
-    # inside the RELEASE request (fuse_do_release). The callback sees only
-    # the path, so that cleanup cannot be told from a user unlink of the
-    # same name (CTO ruling STORAGE-180-HIDDEN-B). Every unlink is admitted
-    # as ordinary and counted; the last close of a file unlinked while open
-    # can therefore wait for an ordinary slot. Once queued, an unlink of
-    # exactly that form ignores the native interrupt/exit probe and runs
-    # when capacity frees, so an unmount does not cancel libfuse's cleanup
-    # and leave the hidden file behind; a user lookalike gets the same
-    # treatment and may complete after its caller was interrupted. An
-    # explicit close() still cancels it, and a closed gate rejects it.
-    _LIBFUSE_HIDDEN_NAME = re.compile(r"\.fuse_hidden[0-9a-f]{16}\Z")
+    # inside the RELEASE request (fuse_do_release). Every unlink, that one
+    # included, is admitted as ordinary and counted (CTO ruling
+    # STORAGE-180-HIDDEN-B), so the last close of a file unlinked while
+    # open can wait for an ordinary slot.
 
     def __call__(self, op, *args):
         # getattr: subclasses and test probes may skip __init__ (one in
@@ -171,29 +163,22 @@ class StorageFS(Operations):
             with interactive_request():
                 return super().__call__(op, *args)
         try:
-            # Inside a native callback the probe reports an interrupted
-            # request or an exited session (FUSE._wrapper below), so a queued
-            # callback ends with EINTR instead of running after its caller
-            # gave up or while libfuse waits to unmount. Direct calls have
-            # no probe and wait for entry or close(). The hidden-name form
-            # never gets the probe, which also matters at teardown: libfuse
-            # 2.9's fuse_destroy unlinks still-hidden nodes with no request
-            # (a zeroed context), where fuse_interrupted() would dereference
-            # NULL. Keep that if the name match or probe polling changes.
-            probe = None if self._is_libfuse_hidden_unlink(op, args) \
-                else current_capacity_cancel_probe()
-            with gate.admit(self._foreground_class(op, args), cancel_probe=probe):
+            # A queued callback waits for its slot even when its native
+            # request was interrupted or the session exited (CTO ruling
+            # STORAGE-180-ESC-I1-C). One libfuse request can make several
+            # callbacks (a rename onto an open target hides the target
+            # first; mkdir and create look the new entry up after it is
+            # made), so cancelling a later one would report EINTR for a
+            # request whose earlier step already happened. Uncapped, none
+            # of them is cancelled either. Only an explicit close() (destroy,
+            # or a direct caller) cancels waiters.
+            with gate.admit(self._foreground_class(op, args)):
                 with interactive_request():
                     return super().__call__(op, *args)
         except AdmissionClosed as exc:
             # Raised only while waiting to enter (no callback raises it):
             # the callback never ran, so nothing it would have done happened.
             raise FuseOSError(errno.EINTR) from exc
-
-    @classmethod
-    def _is_libfuse_hidden_unlink(cls, op: str, args: tuple) -> bool:
-        return (op == "unlink" and bool(args)
-                and cls._LIBFUSE_HIDDEN_NAME.match(os.path.basename(str(args[0]))) is not None)
 
     def _foreground_class(self, op: str, args: tuple) -> str:
         """The admission class, fixed before the callback runs.
@@ -3062,12 +3047,11 @@ class StorageFS(Operations):
 
     def destroy(self, path):
         """Cleanup on unmount"""
-        # libfuse joins its handlers before destroy: a queued native
-        # callback either ended with EINTR when the session exited (its
-        # cancel probe) or, for the libfuse hidden-name unlink, which has no
-        # probe, ran once a slot freed. So in a mount nothing is normally
-        # queued here. For direct callers this cancels any waiter, which
-        # fails with EINTR unrun.
+        # libfuse joins its handlers before destroy, and a queued native
+        # callback is never cancelled by the session exit: it runs once a
+        # slot frees, so in a mount nothing is queued here. For direct
+        # callers this cancels any waiter, which fails with EINTR unrun,
+        # and a closed gate rejects any later call.
         if self._foreground_admission is not None:
             self._foreground_admission.close()
         self._destroying.set()

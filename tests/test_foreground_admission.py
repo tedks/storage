@@ -616,122 +616,79 @@ class TestCleanupThroughShutdown(CappedFSBase):
         self.assertEqual(0, self.call("flush", "/x", 0))
 
 
-class TestQueuedCancellation(CappedFSBase):
-    """A queued callback ends with EINTR when its native request is cancelled."""
+class TestQueuedCallbacksIgnoreNativeCancellation(CappedFSBase):
+    """A queued callback waits through an interrupt or a session exit.
 
-    def test_probe_cancels_only_the_waiting_callback(self):
-        from storage.backends.base import capacity_wait_cancellation
-
-        self.saturate("metadata", "statfs", "/")
-        cancelled = threading.Event()
-        ran = []
-
-        def probe():
-            return "session" if cancelled.is_set() else None
-
-        def queued_getattr():
-            with capacity_wait_cancellation(probe):
-                return self.call("getattr", "/", None)
-
-        with patch.object(self.fs, "getattr", side_effect=lambda *a: ran.append(a) or {}):
-            waiter = Worker(queued_getattr)
-            waiter.start()
-            self.assertTrue(self.gate_.waiting_for("metadata", 2, WAIT))
-            waiter.join(BLOCKED)
-            self.assertTrue(waiter.is_alive())     # a quiet probe keeps it queued
-            cancelled.set()
-            waiter.join(WAIT)
-        self.assertFalse(waiter.is_alive())
-        self.assertIsInstance(waiter.error, FuseOSError)
-        self.assertEqual(errno.EINTR, waiter.error.errno)
-        self.assertEqual([], ran)
-        # The gate stays open: the blocked statfs and the queued one still run.
-        self.assertFalse(self.gate_._closed)
-        self.assertEqual(1, self.gate_.waiting_count("metadata"))
-        self._release_blockers()
-        self.assertEqual(0, self.gate_.active_count)
-        self.assertEqual(0, self.gate_.waiting_count("metadata"))
-
-    def test_a_blocked_probe_holds_up_only_its_own_waiter(self):
-        gate = ForegroundAdmission(4)
-        probing, unblock = threading.Event(), threading.Event()
-
-        def slow_probe():
-            probing.set()
-            assert unblock.wait(WAIT), "probe never released"
-            return None
-
-        self.addCleanup(unblock.set)
-        holder = Holder(gate, "ordinary").start()
-        self.assertTrue(holder.entered.wait(WAIT))
-        slow = Worker(lambda: gate.admit("ordinary", cancel_probe=slow_probe).__enter__())
-        slow.start()
-        self.assertTrue(probing.wait(WAIT))
-        # The gate's lock is free while the probe runs: other classes enter
-        # and leave, the holder releases, and close() returns.
-        demand = Worker(self._admit_once, gate, "demand")
-        demand.start()
-        demand.join(BLOCKED * 3)     # well inside the probe's WAIT
-        self.assertFalse(demand.is_alive(), "another class waited on the probe")
-        self.assertIsNone(demand.finish())
-        holder.finish()
-        Worker(gate.close).finish_started()
-        unblock.set()
-        slow.join(WAIT)
-        self.assertFalse(slow.is_alive())
-        self.assertIsInstance(slow.error, AdmissionClosed)
-        self.assertEqual(0, gate.active_count)
-        self.assertEqual(0, gate.waiting_count("ordinary"))
+    One libfuse request can make several callbacks, so cancelling a later
+    one would fail a request whose earlier step already happened (CTO
+    ruling STORAGE-180-ESC-I1-C). Only close() cancels a waiter.
+    """
 
     @staticmethod
-    def _admit_once(gate, kind):
-        with gate.admit(kind):
-            return None
+    def _native_cancelled(calls):
+        def probe():
+            calls.append(1)
+            return "session"
+        return probe
 
-    HIDDEN = "/d/.fuse_hidden0000000a00000001"
-
-    def _queued_unlink(self, path, probe):
+    def _queued(self, probe, op, *args):
         from storage.backends.base import capacity_wait_cancellation
 
         def call():
             with capacity_wait_cancellation(probe):
-                return self.call("unlink", path)
+                return self.call(op, *args)
         worker = Worker(call)
         worker.start()
         return worker
+
+    def test_a_queued_callback_waits_through_a_cancelled_native_request(self):
+        self.saturate("metadata", "statfs", "/")
+        ran, probed = [], []
+        with patch.object(self.fs, "getattr", side_effect=lambda *a: ran.append(a) or {}):
+            waiter = self._queued(self._native_cancelled(probed), "getattr", "/", None)
+            self.assertTrue(self.gate_.waiting_for("metadata", 2, WAIT))
+            waiter.join(BLOCKED)
+            self.assertTrue(waiter.is_alive())
+            self.assertEqual([], ran)
+            self._release_blockers()
+            self.assertEqual({}, waiter.finish())
+        self.assertEqual([("/", None)], ran)
+        self.assertEqual([], probed)       # admission never consults the probe
+        self.assertEqual(0, self.gate_.active_count)
+        self.assertEqual(0, self.gate_.waiting_count("metadata"))
+
+    HIDDEN = "/d/.fuse_hidden0000000a00000001"
 
     def test_every_unlink_is_admitted_ordinary(self):
         for path in (self.HIDDEN, "/plain.txt", "/.fuse_hiddenXYZ"):
             self.assertEqual("ordinary", self.fs._foreground_class("unlink", (path,)))
         self.assertNotIn("unlink", StorageFS._ADMISSION_EXEMPT)
 
-    def test_queued_hidden_form_unlink_ignores_the_probe_and_runs_once(self):
-        # libfuse's cleanup and a user lookalike share the exact form.
+    def test_queued_unlinks_of_any_name_wait_and_run_once(self):
+        # libfuse's cleanup, a user lookalike and a plain name are alike.
         hold = self.saturate("ordinary", "mkdir", "/d", 0o755)
-        ran = []
-        session_exited = lambda: "session"
+        ran, probed = [], []
+        paths = (self.HIDDEN, "/plain.txt", "/.fuse_hidden0000000a0000000")
         with patch.object(self.fs, "unlink", side_effect=lambda p: ran.append(p) or 0):
-            hidden = self._queued_unlink(self.HIDDEN, session_exited)
-            self.assertTrue(self.gate_.waiting_for("ordinary", 2, WAIT))
-            plain = self._queued_unlink("/plain.txt", session_exited)
-            plain.join(WAIT)
-            self.assertIsInstance(plain.error, FuseOSError)
-            self.assertEqual(errno.EINTR, plain.error.errno)
-            near = self._queued_unlink("/.fuse_hidden0000000a0000000", session_exited)
-            near.join(WAIT)          # 15 hex digits: not the exact form
-            self.assertIsInstance(near.error, FuseOSError)
-            hidden.join(BLOCKED)
-            self.assertTrue(hidden.is_alive())   # still queued, probe ignored
+            waiters = []
+            for count, path in enumerate(paths, start=2):
+                waiters.append(self._queued(self._native_cancelled(probed), "unlink", path))
+                self.assertTrue(self.gate_.waiting_for("ordinary", count, WAIT))
+            for waiter in waiters:
+                waiter.join(BLOCKED / len(paths))
+                self.assertTrue(waiter.is_alive())
             self.assertEqual([], ran)
             hold.set()
-            self.assertEqual(0, hidden.finish())
-        self.assertEqual([self.HIDDEN], ran)
+            for waiter in waiters:
+                self.assertEqual(0, waiter.finish())
+        self.assertEqual(list(paths), ran)     # FIFO, each once
+        self.assertEqual([], probed)
 
-    def test_explicit_close_cancels_hidden_form_and_rejects_new_requests(self):
+    def test_explicit_close_cancels_queued_callbacks_and_rejects_new_requests(self):
         self.saturate("ordinary", "mkdir", "/d", 0o755)
         ran = []
         with patch.object(self.fs, "unlink", side_effect=lambda p: ran.append(p) or 0):
-            hidden = self._queued_unlink(self.HIDDEN, lambda: None)
+            hidden = self._queued(lambda: None, "unlink", self.HIDDEN)
             self.assertTrue(self.gate_.waiting_for("ordinary", 2, WAIT))
             self.gate_.close()
             hidden.join(WAIT)
@@ -744,44 +701,26 @@ class TestQueuedCancellation(CappedFSBase):
                 self.assertEqual(errno.EINTR, caught.exception.errno)
         self.assertEqual([], ran)
 
-    def test_gate_level_probe(self):
+    def test_gate_close_cancels_a_waiter_and_rejects_later_ones(self):
         gate = ForegroundAdmission(4)
         with gate.admit("ordinary"):
-            reasons = iter([None, None, "request"])
-            waiter = Worker(lambda: gate.admit("ordinary", cancel_probe=lambda: next(reasons))
-                            .__enter__())
+            waiter = Worker(lambda: gate.admit("ordinary").__enter__())
             waiter.start()
+            self.assertTrue(gate.waiting_for("ordinary", 1, WAIT))
+            gate.close()
             waiter.join(WAIT)
-            self.assertFalse(waiter.is_alive())
             self.assertIsInstance(waiter.error, AdmissionClosed)
-            self.assertIn("request", str(waiter.error))
+        with self.assertRaises(AdmissionClosed):
+            with gate.admit("demand"):
+                pass
         self.assertEqual(0, gate.active_count)
         self.assertEqual(0, gate.waiting_count("ordinary"))
 
-    def test_a_callback_with_a_free_slot_runs_despite_the_probe(self):
-        # Uncapped, an interrupted request or one arriving as the session
-        # exits still runs; the gate must not cancel a callback it does not
-        # make wait.
-        gate = ForegroundAdmission(4)
-        calls = []
-
-        def probe():
-            calls.append(1)
-            return "session"
-
-        ran = []
-        with gate.admit("ordinary", cancel_probe=probe):
-            ran.append(1)
-        self.assertEqual([1], ran)
-        self.assertEqual([], calls)
-        self.assertEqual(0, gate.active_count)
-
     def test_fs_runs_an_uncontended_callback_whose_session_exited(self):
-        from storage.backends.base import capacity_wait_cancellation
-
-        ran = []
+        ran, probed = [], []
         with patch.object(self.fs, "getattr", side_effect=lambda *a: ran.append(a) or {}):
-            with capacity_wait_cancellation(lambda: "session"):
+            from storage.backends.base import capacity_wait_cancellation
+            with capacity_wait_cancellation(self._native_cancelled(probed)):
                 self.assertEqual({}, self.call("getattr", "/", None))
         self.assertEqual([("/", None)], ran)
         self.assertEqual(0, self.gate_.active_count)
