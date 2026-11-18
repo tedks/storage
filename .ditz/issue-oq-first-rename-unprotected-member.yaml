@@ -26,5 +26,15 @@ log_events:
   who: Ted Smith
   what: blocks gh-181-sync-rename-noreplace
   comment: ""
+- time: 2026-11-18T20:32:21-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Ted approved the conservative first-attempt fallback. For a member where
+    replacement was not intended, use a verified non-overwriting operation or skip
+    that member mutation, report partial failure and retain a durable repair via #182.
+    Both names and their bytes must survive a refusal. Some ordinary SSH directory
+    moves will require manual repair even without a collision. Preserve intentional
+    replacement and distinguish incomplete member knowledge from observed absence.
+    The decision clears the PR167 merge hold and authorizes PR183 implementation.'
 blocks:
 - gh-181-sync-rename-noreplace
