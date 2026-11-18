@@ -1,0 +1,27 @@
+id: foreground-admission-test-hygiene
+title: Foreground admission mounted-test hygiene (PR180 final-round nits)
+desc: 'Optional nits from council round cc4221af67f1 (Anthropic) and the independent
+  review on cc4221a, deferred to keep the gated head stable: (1) assert inside the
+  main rename / lookup getattr that _FUSE_INTERRUPTED() was true, so the tests prove
+  the interrupt reached libfuse in-tree, not only via the old-gate red run; (2) a
+  create variant of the post-create lookup case (fuse_lib_create releases the new
+  file on lookup failure); (3) _SlotTakenAfter.release joins a never-started thread
+  (RuntimeError masks the real failure) and a second match would start twice: add
+  a started flag; kill the raw-syscall child in finally; (4) holder timeout WAIT=10s
+  can free the slot early on a loaded host: lengthen; (5) wait_until_next_callback_queues
+  counts any waiter of the class; (6) assert probed==[] in test_fs_runs_an_uncontended_callback_whose_session_exited;
+  (7) drop the stale ''0.1 s probe interval'' comments; (8) CLI --help could mention
+  the delayed last close and interrupt/unmount drain; (9) fs.py import reflow noise.'
+type: task
+component: fs
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-18T06:31:36-00:00
+references: []
+log_events:
+- time: 2026-11-18T06:31:36-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
