@@ -1,6 +1,5 @@
 """Task and configuration models for background sync."""
 
-import logging
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -80,39 +79,3 @@ def dir_task_key(
     """Build the stable dedupe key for a queued directory operation."""
 
     return (operation.value, virtual_path, new_path or "", backend_hint or "*")
-
-
-def record_member_rename_repair(
-    state_manager,
-    backend_name: str,
-    old_path: str,
-    new_path: str,
-    reason: str,
-    logger: logging.Logger,
-) -> bool:
-    """Record a rename backend_name missed, for repair; never replay it.
-
-    The member may hold the moved object at old_path still, or the move may
-    have taken effect there before its failure was seen. A replay could move
-    a new object at old_path or replace one at new_path, so the record is
-    the whole response. Returns whether the record was written; one that
-    cannot be is logged, and the caller decides how to try again. The
-    member is left as it is either way.
-    """
-    try:
-        repair_id = state_manager.record_member_rename_repair(
-            backend_name, old_path, new_path, reason
-        )
-    except Exception:
-        logger.exception(
-            "Could not record the rename %s -> %s that %s missed; the member "
-            "is left as it is",
-            old_path, new_path, backend_name,
-        )
-        return False
-    logger.warning(
-        "Member %s missed the rename %s -> %s and it is not replayed; repair %d "
-        "(storage debug member-repairs): %s",
-        backend_name, old_path, new_path, repair_id, reason,
-    )
-    return True

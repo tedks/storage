@@ -21,6 +21,7 @@ from storage.index_audit import (
     reprobe_member_locations,
     verify_index_against_cache,
 )
+from storage.member_repairs import MemberRepairs
 from storage.models import FileLocation, FileMetadata, SyncStatus
 from storage.state import StateManager
 
@@ -1637,41 +1638,42 @@ class TestMemberRepairsCommand(unittest.TestCase):
     def setUp(self):
         self.temp_dir = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.temp_dir, ignore_errors=True)
-        self.database = self.temp_dir / "state.db"
-        state_manager = StateManager(str(self.database))
-        try:
-            self.first = state_manager.record_member_rename_repair("remote1", "/a", "/b", "missed")
-            state_manager.record_member_rename_repair("remote1", "/a", "/b", "missed again")
-            self.second = state_manager.record_member_rename_repair("local0", "/d", "/e", "missed")
-        finally:
-            state_manager.close()
+        self.cache = self.temp_dir / "cache"
+        self.cache.mkdir()
+        repairs = MemberRepairs(self.cache)
+        self.first = repairs.record("/a", "/b", ["remote1"], "missed")
+        self.second = repairs.record("/d", "/e", ["local0", "remote1"], "missed too")
         self.runner = CliRunner()
 
     def invoke(self, *args):
-        return self.runner.invoke(main, ["debug", "member-repairs", "-d", str(self.database), *args])
+        return self.runner.invoke(main, ["debug", "member-repairs", "-c", str(self.cache), *args])
 
-    def test_lists_repairs_with_their_occurrences(self):
+    def test_lists_repairs_from_the_cache_carriers(self):
         result = self.invoke()
         self.assertEqual(0, result.exit_code, result.output)
         self.assertIn("2 member repair(s):", result.output)
-        self.assertIn(f"{self.first}: remote1: /a -> /b (missed again; seen 2x)", result.output)
-        self.assertIn(f"{self.second}: local0: /d -> /e (missed; seen 1x)", result.output)
+        self.assertIn(f"{self.first} [open] remote1: /a -> /b (missed)", result.output)
+        self.assertIn(f"{self.second} [open] local0, remote1: /d -> /e (missed too)", result.output)
 
-    def test_resolve_drops_only_that_repair(self):
-        result = self.invoke("--resolve", str(self.first))
+    def test_resolve_drops_only_that_repair_and_a_replay_fails(self):
+        result = self.invoke("--resolve", self.first)
         self.assertEqual(0, result.exit_code, result.output)
         payload = json.loads(self.invoke("--json-output").output)
-        self.assertEqual([("local0", "/d", "/e")],
-                         [(r["backend_name"], r["old_path"], r["new_path"]) for r in payload])
+        self.assertEqual([self.second], [r["id"] for r in payload])
+        again = self.invoke("--resolve", self.first)
+        self.assertNotEqual(0, again.exit_code)
+        self.assertIn(f"No member repair {self.first}", again.output)
+        self.assertEqual([self.second], [r["id"] for r in json.loads(self.invoke("--json-output").output)])
 
-    def test_resolving_an_unknown_repair_fails(self):
-        result = self.invoke("--resolve", "999")
-        self.assertNotEqual(0, result.exit_code)
-        self.assertIn("No member repair 999", result.output)
+    def test_resolving_an_unknown_or_malformed_id_fails(self):
+        for bad in ("1", "0" * 32, "../" + self.first):
+            result = self.invoke("--resolve", bad)
+            self.assertNotEqual(0, result.exit_code, bad)
         self.assertEqual(2, len(json.loads(self.invoke("--json-output").output)))
 
-    def test_a_missing_database_is_not_created(self):
-        missing = self.temp_dir / "nope" / "state.db"
-        result = self.runner.invoke(main, ["debug", "member-repairs", "-d", str(missing)])
+    def test_a_corrupt_carrier_is_reported(self):
+        carrier = self.cache / ".storage.repairs" / self.first
+        os.setxattr(str(carrier), "user.storage.member_repair", b"{not json")
+        result = self.invoke()
         self.assertNotEqual(0, result.exit_code)
-        self.assertFalse(missing.parent.exists())
+        self.assertIn("Unreadable member repair carrier", result.output)

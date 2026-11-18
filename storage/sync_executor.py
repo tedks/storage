@@ -17,7 +17,7 @@ from .links import LinkRefused, find_holders, link_checksum, resolve_link_target
 from .models import FileLocation, SyncStatus
 from .replication import ReplicationManager
 from .state import StateManager
-from .sync_tasks import DirOperation, DirSyncTask, SyncConfig, SyncTask, record_member_rename_repair
+from .sync_tasks import DirOperation, DirSyncTask, SyncConfig, SyncTask
 
 logger = logging.getLogger(__name__)
 
@@ -151,9 +151,9 @@ class SyncExecutor:
         config = get_inherited_config(cache_path)
         # A member with an open repair at or around this name holds names
         # the namespace does not describe there (see
-        # StateManager.member_repair_backends): it is left out, as a member
+        # MemberRepairs.backends_for): it is left out, as a member
         # that is down is, until the repair is resolved.
-        fenced = self.state_manager.member_repair_backends([task.virtual_path])
+        fenced = self.cache_manager.member_repairs.backends_for([task.virtual_path])
         target_backends = self.replication_manager.select_backends_for_file(
             task.virtual_path,
             config,
@@ -531,23 +531,15 @@ class SyncExecutor:
         names = [task.backend_hint] if task.backend_hint else sorted(
             self.replication_manager.backends
         )
-        unrecorded = [
-            backend_name
-            for backend_name in names
-            if not record_member_rename_repair(
-                self.state_manager,
-                backend_name,
-                task.virtual_path,
-                task.new_path,
-                "queued member rename, not replayed",
-                logger,
+        try:
+            self.cache_manager.member_repairs.record(
+                task.virtual_path, task.new_path, names, "queued member rename, not replayed",
             )
-        ]
-        if unrecorded:
+        except OSError as exc:
             raise RuntimeError(
                 f"Could not record the rename {task.virtual_path} -> {task.new_path} "
-                f"for {', '.join(unrecorded)}"
-            )
+                f"for {', '.join(names)}: {exc}"
+            ) from exc
         return True
 
     def _dir_task_current(self, task: DirSyncTask) -> bool:
@@ -573,8 +565,8 @@ class SyncExecutor:
             )
 
         # A member with an open repair at or around this name keeps what it
-        # has there (see StateManager.member_repair_backends).
-        fenced = self.state_manager.member_repair_backends([task.virtual_path])
+        # has there (see MemberRepairs.backends_for).
+        fenced = self.cache_manager.member_repairs.backends_for([task.virtual_path])
         success = True
         for backend in backends:
             if not backend:

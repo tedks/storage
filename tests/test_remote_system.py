@@ -52,8 +52,8 @@ from storage.backends.ssh_mux import ControlSockets
 from storage.checksums import fast_checksum_bytes
 from storage.cli_mount import shared_filesystems
 from storage.fs import StorageFS
+from storage.member_repairs import MemberRepairs
 from storage.models import SyncStatus
-from storage.state import StateManager
 from storage.sync_tasks import DirOperation
 from storage.watcher import RemoteWatcher
 from tests.fuse_mount import (
@@ -481,9 +481,10 @@ def _wait_clean(fs, path: str):
                      == SyncStatus.CLEAN, timeout=30.0), f"{path} never synced"
 
 
-def _repairs(state_manager):
-    return [(r.backend_name, r.old_path, r.new_path)
-            for r in state_manager.list_member_rename_repairs()]
+def _repairs(cache_dir):
+    """Read from the carriers on disk, as a fresh open of the cache would."""
+    return sorted((m, r.old_path, r.new_path)
+                  for r in MemberRepairs(cache_dir).list() for m in r.members)
 
 
 def test_missed_rename_never_overwrites_a_new_target_on_an_ssh_member(
@@ -510,11 +511,8 @@ def test_missed_rename_never_overwrites_a_new_target_on_an_ssh_member(
     assert remote.read_remote(member, "b.txt") == b"unrelated writer"
     assert remote.read_remote(member, "a.txt") == b"old bytes"
     assert len(calls) == 1
-    reopened = StateManager(str(tmp_path / "state.db"))
-    try:
-        assert _repairs(reopened) == [(ssh_backend.name, "/a.txt", "/b.txt")]
-    finally:
-        reopened.close()
+    # The mount's own record and the queued task's, each its own carrier.
+    assert _repairs(tmp_path / "cache") == [(ssh_backend.name, "/a.txt", "/b.txt")] * 2
 
 
 def test_missed_rename_never_moves_a_reused_source_on_an_ssh_member(
@@ -537,7 +535,7 @@ def test_missed_rename_never_moves_a_reused_source_on_an_ssh_member(
     assert sorted(ssh_backend.listdir("/d")) == ["kept.txt", "new.txt"]
     assert not ssh_backend.exists("/e")
     assert len(calls) == 1
-    assert _repairs(fs.state_manager) == [(ssh_backend.name, "/d", "/e")]
+    assert _repairs(fs.cache_manager.cache_root) == [(ssh_backend.name, "/d", "/e")]
 
 def test_filesystem_identity_tells_same_and_different_filesystems_apart(remote):
     """Two roots in one container share a device unless one is its own mount."""

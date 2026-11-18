@@ -51,6 +51,7 @@ from .sync_tasks import DirOperation
 from .recompute import RecomputeEngine
 from .checksum_queue import DEFAULT_CHECKSUM_REVERIFY_INTERVAL, MemberHashQueues
 from .checksums import ChecksumBasis, ChecksumRecord
+from .member_repairs import CARRIER_DIR, is_carrier_path
 from .pathing import ResolvedPath, resolve_path
 from .links import LinkRefused, intermediate_paths, link_checksum, resolve_link_target
 from .namespace import DEFAULT_LISTING_MAX_STALE, NamespaceService
@@ -115,6 +116,7 @@ class StorageFS(Operations):
     _HIDDEN_NAMES = frozenset({
         ".storage.rsync-tmp",      # rsync --partial-dir scratch directory
         ".storage.control.sock",   # FUSE control socket
+        CARRIER_DIR,               # member-rename repair records
     })
     _HIDDEN_PREFIXES = (
         ".storage.mount.",         # mount lock files (.storage.mount.*.lock)
@@ -567,8 +569,16 @@ class StorageFS(Operations):
     # Conflict / checksum helpers
     # ------------------------------------------------------------------ #
     def _resolve_path(self, path: str) -> ResolvedPath:
-        """Resolve a FUSE path into canonical and cache targets."""
-        return resolve_path(path, self.backends.keys(), self.cache_manager.get_cache_path)
+        """Resolve a FUSE path into canonical and cache targets.
+
+        The member-repair carriers are not part of the namespace: a path to
+        them is ENOENT, so no caller (another user of an allow_other mount
+        included) can read, forge or remove a repair through the mount.
+        """
+        resolved = resolve_path(path, self.backends.keys(), self.cache_manager.get_cache_path)
+        if is_carrier_path(resolved.canonical_path) or is_carrier_path(path):
+            raise FuseOSError(errno.ENOENT)
+        return resolved
 
     def _invalidate_dir_cache_entry(self, path: str):
         """Remove a directory entry from the cached listing."""
@@ -2715,7 +2725,7 @@ class StorageFS(Operations):
                 raise FuseOSError(errno.ENOTDIR)
             self._force_verify(self._resolve_path(path).canonical_path)
             return
-        cache_path = self.cache_manager.get_cache_path(path)
+        cache_path = self._resolve_path(path).cache_path
 
         try:
             os.setxattr(str(cache_path), name, value, follow_symlinks=False)

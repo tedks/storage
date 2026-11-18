@@ -11,6 +11,7 @@ from .index_audit import (
     verify_index_against_cache,
 )
 from .mount_profiles import create_storage_members, resolve_member_configuration
+from .member_repairs import CorruptRepairRecord, MemberRepairs
 from .state import StateManager
 
 
@@ -271,52 +272,52 @@ def debug_reprobe_locations(
 
 @debug.command("member-repairs")
 @click.option(
-    "-d",
-    "--database",
+    "-c",
+    "--cache",
     required=True,
-    type=click.Path(exists=True, dir_okay=False, path_type=Path),
-    help="SQLite database path of the mount",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    help="Cache directory of the mount (the repair records live there)",
 )
 @click.option(
     "--resolve",
     "resolve_id",
-    type=int,
-    help="Drop repair ID once the member has been settled by hand (changes no member)",
+    help="Drop repair ID once its members have been settled by hand (changes no member)",
 )
 @click.option("--json-output", is_flag=True, help="Print raw JSON")
-def debug_member_repairs(database: Path, resolve_id: int | None, json_output: bool):
+def debug_member_repairs(cache: Path, resolve_id: str | None, json_output: bool):
     """List renames members missed, which are left for repair, not replayed.
 
-    For each one, the member may still hold the object at OLD, or the rename
-    may have taken effect there; look at both names on the member before
-    moving anything, then --resolve the repair. Until then the member gets no
-    rename or upload at names overlapping either path, and cached files
-    under NEW stay cached. A later move of NEW through the mount is recorded
-    as its own repair; one row may stand for the same names missed twice
-    (see "seen Nx").
+    For each one, the members may still hold the object at OLD, or the
+    rename may have taken effect there; an "intent" was interrupted before
+    its outcome was known. Look at both names on each member before moving
+    anything, then --resolve the repair. Until then those members get no
+    rename, mkdir, rmdir or upload at names overlapping either path, and
+    cached files under NEW stay cached. A running mount sees a resolution
+    at its next lookup. Records are carriers under CACHE/.storage.repairs,
+    not index rows, so they survive a fresh or rebuilt index.
     """
-    state_manager = StateManager(str(database.resolve()))
     try:
-        if resolve_id is not None:
-            if not state_manager.resolve_member_rename_repair(resolve_id):
-                raise click.ClickException(f"No member repair {resolve_id}")
-            if not json_output:
-                click.echo(f"Resolved member repair {resolve_id}.")
-        repairs = state_manager.list_member_rename_repairs()
-    finally:
-        state_manager.close()
+        repairs = MemberRepairs(cache.resolve())
+    except CorruptRepairRecord as exc:
+        raise click.ClickException(str(exc)) from exc
+    if resolve_id is not None:
+        if not repairs.resolve(resolve_id):
+            raise click.ClickException(f"No member repair {resolve_id}")
+        if not json_output:
+            click.echo(f"Resolved member repair {resolve_id}.")
+    records = repairs.list()
 
     if json_output:
-        click.echo(json.dumps([asdict(r) for r in repairs], sort_keys=True, indent=2))
+        click.echo(json.dumps([asdict(r) for r in records], sort_keys=True, indent=2))
         return
     if resolve_id is not None:
         return
-    if not repairs:
+    if not records:
         click.echo("No member repairs.")
         return
-    click.echo(f"{len(repairs)} member repair(s):")
-    for repair in repairs:
+    click.echo(f"{len(records)} member repair(s):")
+    for record in records:
         click.echo(
-            f"  {repair.id}: {repair.backend_name}: {repair.old_path} -> {repair.new_path} "
-            f"({repair.reason}; seen {repair.occurrences}x)"
+            f"  {record.id} [{record.state}] {', '.join(record.members)}: "
+            f"{record.old_path} -> {record.new_path} ({record.reason})"
         )

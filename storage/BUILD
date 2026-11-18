@@ -21,6 +21,7 @@ py_library(
         "index_audit.py",
         "links.py",
         "locks.py",
+        "member_repairs.py",
         "models.py",
         "mount_profiles.py",
         "namespace.py",

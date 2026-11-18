@@ -89,8 +89,8 @@ class TestDirSyncOperations(unittest.TestCase):
             self.assertEqual(["oldname.txt"], sorted(os.listdir(backend_dir)))
         self.assertEqual(
             [("backend1", old_path, new_path), ("backend2", old_path, new_path)],
-            sorted((r.backend_name, r.old_path, r.new_path)
-                   for r in self.state_manager.list_member_rename_repairs()),
+            sorted((m, r.old_path, r.new_path)
+                   for r in self.cache_manager.member_repairs.list() for m in r.members),
         )
 
 

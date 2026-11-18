@@ -66,26 +66,6 @@ class FileLocation:
 
 
 @dataclass(frozen=True)
-class MemberRenameRepair:
-    """A rename a member missed, left for repair instead of replayed.
-
-    The member may still hold the moved object at old_path, or the rename
-    may have taken effect there before the failure was seen; nothing has
-    checked which. Whatever is at either name on the member now is left as
-    it is.
-    """
-
-    id: int
-    backend_name: str
-    old_path: str
-    new_path: str
-    reason: str
-    first_recorded: float
-    last_recorded: float
-    occurrences: int
-
-
-@dataclass(frozen=True)
 class StreamingKeepAfterClose:
     """When read-ahead outlives the last close of a streaming session.
 

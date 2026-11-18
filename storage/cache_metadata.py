@@ -20,6 +20,7 @@ _INTERNAL_CACHE_NAMES = frozenset({
     ".storage.db",
     ".storage.db-shm",
     ".storage.db-wal",
+    ".storage.repairs",
 })
 _INTERNAL_CACHE_PREFIXES = (
     ".storage.mount.",

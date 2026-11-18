@@ -21,6 +21,7 @@ from storage.cache_metadata import read_cache_metadata
 from storage.file_config import FileConfig
 from storage.models import FileLocation, FileMetadata, SyncStatus
 from storage.replication import ReplicationManager
+from storage.member_repairs import MemberRepairs
 from storage.state import StateManager
 from storage.sync_executor import SyncExecutor
 from storage.sync_tasks import DirOperation, DirSyncTask, SyncConfig, SyncTask
@@ -486,7 +487,7 @@ class TestSyncExecutorDirTask(_ExecutorTestBase):
 
     def test_rename_is_recorded_for_repair_not_called(self):
         """DirSyncTask with RENAME -> no member call, one repair per member,
-        even with the member down; running it again keeps one record."""
+        even with the member down."""
         self.cache_manager.get_cache_path("/newname").mkdir()  # renamed through the mount
         self.mock_backend.is_available.return_value = False
         task = DirSyncTask(
@@ -499,10 +500,11 @@ class TestSyncExecutorDirTask(_ExecutorTestBase):
         self.assertTrue(self.executor.process_dir_task(task))
 
         self.mock_backend.rename.assert_not_called()
-        repairs = self.state_manager.list_member_rename_repairs()
+        # Each run is its own record, on disk under the cache.
+        repairs = MemberRepairs(self.cache_dir).list()
         self.assertEqual(
-            [("test0", "/oldname", "/newname", 2)],
-            [(r.backend_name, r.old_path, r.new_path, r.occurrences) for r in repairs],
+            [(("test0",), "/oldname", "/newname", "open")] * 2,
+            [(r.members, r.old_path, r.new_path, r.state) for r in repairs],
         )
 
     def test_dir_retries_the_namespace_moved_past_are_dropped(self):

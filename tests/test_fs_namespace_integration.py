@@ -3012,9 +3012,9 @@ class TestFSNamespaceIntegration(unittest.TestCase):
         finally:
             self.backends['backend2'].rename = original
         self.assertEqual(
-            [('backend2', '/orig', target)],
-            [(r.backend_name, r.old_path, r.new_path)
-             for r in self.fs.state_manager.list_member_rename_repairs()],
+            [(('backend2',), '/orig', target, 'open')],
+            [(r.members, r.old_path, r.new_path, r.state)
+             for r in self.fs.cache_manager.member_repairs.list()],
         )
 
     def test_mkdir_retry_eventually_replicates(self):
