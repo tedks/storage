@@ -68,10 +68,10 @@
   readdir. The snapshot stays internally partial, B's status stays missing
   (its failure class) rather than empty, and it is never complete for B. B
   is retried on its own bounded backoff, independent of the serving TTL. A
-  remote member's empty or ENOENT observation, or one that would remove
-  retained names, is accepted only after a root verification started after
-  it was read (coalesced per member); until then the member is missing and
-  logged. Retry backoff resets on the member's next success. Each
+  member's observation, of any kind, is accepted only after a root check
+  started after it was read, on the same path and class as the listing
+  (coalesced per member); a failed or late check makes the member
+  unverified-root, logged; a pending check is not logged. Retry backoff resets on the member's next success. Each
   missing member is logged at warning level (member ID, failure class,
   directory), rate limited per member, on cold and warm listings alike. The
   foreground wait for members is bounded, also for an expired directory
@@ -89,7 +89,7 @@
   handles) and backoff are mandatory before implementation
   acceptance. Narrowed for the cold-partial slice only: it may integrate
   under the spec's interim values (whole-request deadline, retry backoff,
-  root recheck, per-member worker, per-directory refresh dedup, listing
+  root check, per-member worker, per-directory refresh dedup, listing
   cache limit) without snapshot byte/entry limits, provided it adds no
   revisions, pinned snapshots, history or other per-entry state. Any of
   those requires the full limits. Do not hold global/namespace locks over remote I/O or admission.
@@ -108,9 +108,12 @@
   page failure; all-failed/no-cache (error) and all-failed with local names
   (listed); all-failed with retained observations (stale names listed);
   all members cancelled/no-cache (error, not success-empty); member root
-  unmounted or replaced by an empty directory (unavailable, retained names
-  kept, warning logged) versus ENOENT subdirectory on a verified root
-  (successful empty); single-member failure; continuous local creates while a remote add
+  unmounted or replaced by an empty or populated directory after a
+  successful check (unverified-root, its names not published, retained
+  names kept, warning logged) versus ENOENT subdirectory on a verified root
+  (successful empty); cold empty remote listing during saturating bulk
+  copies (check completes on the interactive class, member not missing, no
+  warning); single-member failure; continuous local creates while a remote add
   still publishes; event identity after delete/recreate or contributor loss;
   older remote-change event after newer local mutation and duplicate events; stale
   response after local rename/unlink; slow A while B publishes; cancelled old

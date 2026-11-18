@@ -159,47 +159,44 @@ storage once the backend is constructed. A member whose disk died and left an
 empty mountpoint would therefore report successful-empty: nothing is logged,
 and on a warm directory its retained names are replaced by an empty set.
 The member-observation owner must tell "directory absent under a verified
-member root" apart from "member root missing or replaced". When the check
-runs:
+member root" apart from "member root missing or replaced". One rule, the
+same for every observation, cold or warm, empty or not:
 
-- A local member checks its root (one local `stat`, uncached) after each
-  listing read, so the check postdates the observation.
-- A remote member's non-empty observation that removes no retained names
-  may rely on a verification cached for at most the interim root recheck
-  interval below.
-- A remote member's empty or ENOENT observation, cold or warm, and any
-  observation that would remove names from its retained set, is accepted
-  only after a root verification that started after the observation was
-  read; until then it is a missing member, logged as such. Verifications
-  coalesce per member: one verification covers every observation of that
-  member read before it started, so a burst of empty listings or deletions
-  costs one probe, and probes are admitted like other member work. There is
-  no silent window: a failed disk is either verified missing or the listing
-  waits (within the whole-request deadline) for the verification.
+- A member's observation is accepted only after a root check that started
+  after the observation was read. There is no cached verification and no
+  silent window: a root replaced after a check (for example by a failed
+  disk, exposing an empty or stale underlying mountpoint) cannot publish
+  its names or its emptiness as that member's.
+- The check is one small request on the same path and class as the listing
+  it verifies: for a local member, one `stat` of the root comparing its
+  device (`st_dev`, as `filesystem_identity` reads it) with the expected
+  identity; for an SSH or rsync member, whose SFTP attributes carry no
+  device id, one `stat` of a root marker file on the same SFTP lease as the
+  listing. A foreground listing's check therefore uses the interactive
+  reserve with it, so cold listings do not queue behind bulk copies (the
+  #175 stall); a background refresh's check uses the background class.
+  Today's `SSHBackend.filesystem_identity` (a fresh connection per call,
+  written to run before FUSE's daemonizing fork) is not this check.
+- Checks coalesce per member: one check covers every observation of that
+  member read before it started, so concurrent listings share a request.
+  The added latency (one round trip per cold remote listing, less when
+  coalesced) is for the snapshot tracer to measure against the PR177 field
+  baseline; if it is too costly, relaxing this rule is a ruling, not an
+  implementation choice.
+- A pending check is internal state, not a warning. A check that fails,
+  returns `None`, finds a different identity or misses the whole-request
+  deadline makes the member missing with failure class unverified-root:
+  logged at warning level, retained names kept, never confirmed absence.
+  (The current `filesystem_identity` contract treats `None` as "no
+  information"; this check must not.)
 - ENOENT for a subdirectory under a verified root stays successful-empty
-  once verified (sparse placement depends on it); the cost on sparse
-  remote directories is the coalesced probe.
+  (sparse placement depends on it).
 
-Mechanisms: a local member compares the root's device (`filesystem_identity`,
-`st_dev`) with the expected identity. An SSH or rsync member, whose SFTP
-attributes carry no device id, uses a root marker file read over SFTP or a
-remote `stat -c %d`. Today's `SSHBackend.filesystem_identity` opens a fresh
-SSH connection per call and is written to run before FUSE's daemonizing
-fork; reusing it after the fork, or running the stat as an exec on the
-pooled transport, is a tracer decision. No variant, including a marker
-read over SFTP, uses the reserved interactive SFTP channel; whether it takes
-a bulk-class lease or a connection of its own is also a tracer decision. A
-probe that cannot complete within the whole-request deadline (for example
-queued behind bulk copies) makes the member missing for that listing,
-logged, never empty. A probe that returns `None` or fails, for
-a member with an expected identity, is an unverified root, not "no
-information" (the current `filesystem_identity` contract treats `None` as
-no information; this check must not). An identity recorded only at startup cannot catch
-a disk already missing at mount time, so the expected identity (or marker)
-comes from member configuration or a marker written with the member; with
-neither, the limitation is reported, not hidden. An unverified root is a
-missing member with its own failure class: logged, retained names kept,
-never confirmed absence.
+The expected identity or marker comes from member configuration or a marker
+written with the member, since an identity recorded only at startup cannot
+catch a disk already missing at mount time. A member with neither has no
+root check; that limitation is reported (at mount and in status), not
+hidden.
 
 The no-success case stays narrow and explicit. It applies only when every
 configured member is missing for this listing, no member has a
@@ -253,15 +250,12 @@ uses these interim values, each from existing defaults:
   (`_background_refreshes`, one queued or running refresh per directory)
   on the existing background executor, so at most one per cached
   directory.
-- Root recheck interval for remote members: at most 60 s (the default
-  fresh window), never unbounded. Local members do not cache it.
 - Admission: the existing single listing worker per member. A member with a
   listing already hung (`_hung_listings`) is treated as missing by
   foreground listings too, instead of queueing behind it.
 - Active directories and cache size: the existing listing cache limit
   (`listing_limit`, 4,096 directories, least recently used). Retries run only
   for directories still in it.
-
 - Snapshot size: this slice adds only per-member status (a constant per
   member per cached directory) and pins no new revisions; entries stay
   bounded as today by the listing cache limit and directory contents. It
