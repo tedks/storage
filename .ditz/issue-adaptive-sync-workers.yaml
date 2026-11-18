@@ -102,3 +102,11 @@ log_events:
     Exercise mixed transports, configuration limits and shutdown timing. Full gates
     on final exact-head council and independent review clearance; merge awaits first-rename
     disposition.
+- time: 2026-11-18T08:28:56-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'PR #167 technically accepted at 1ae2f4060480d227f06473b6856441d4d1eaefc9.
+    Verified exact-tree receipt 1529835a on master 777b993, all 48 gates passed (46
+    executed), CLI build OK, council and independent review clean with Google unavailable.
+    Marked ready for review, shared gate slot released. Merge awaits the first-rename
+    disposition tracked by oq-first-rename-unprotected-member.'
