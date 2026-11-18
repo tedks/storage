@@ -16,7 +16,14 @@ import paramiko
 from pathlib import Path, PurePosixPath
 from typing import Callable, List, Optional, TypeVar
 
-from .base import Backend, BackendType, ChecksumUnavailable, StorageMemberCapabilities, WatcherSpec
+from .base import (
+    Backend,
+    BackendType,
+    ChecksumUnavailable,
+    MemberSourceMissing,
+    StorageMemberCapabilities,
+    WatcherSpec,
+)
 from .ssh_pool import (
     CommandTimeout, MemberConnection, SFTPLease, is_connection_error, is_transient_oserror,
 )
@@ -582,9 +589,27 @@ class SSHBackend(Backend):
                             or is_connection_error(exc)):
                         raise
                     sftp.rename(old_remote, new_remote)
-            except FileNotFoundError:
-                # Nothing to rename; best-effort
-                pass
+            except FileNotFoundError as exc:
+                # Never reported as a move. Named a missing source only when
+                # the member says so; any other ENOENT (a destination parent
+                # gone, say) keeps its own cause.
+                try:
+                    sftp.lstat(old_remote)
+                except FileNotFoundError:
+                    raise MemberSourceMissing(
+                        errno.ENOENT, "no source on this member", old_remote) from exc
+                except BaseException as diagnostic:
+                    if is_connection_error(diagnostic) or not isinstance(diagnostic, Exception):
+                        # The member could not be asked (a timeout, a lost
+                        # connection), or an interrupt: raised as it is, for
+                        # the pool to see, with the rename's error noted.
+                        diagnostic.add_note(f"after the rename failed: {exc!r}")
+                        raise
+                    # A path answer (EACCES, say): no evidence either way.
+                    # The rename's own error stands, with the check noted.
+                    exc.add_note(f"source check failed: {diagnostic!r}")
+                    raise exc from None
+                raise
 
         self._with_sftp("rename", old_virtual_path, rename)
 

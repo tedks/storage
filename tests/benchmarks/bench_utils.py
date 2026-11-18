@@ -138,6 +138,10 @@ class LatencyBackend(Backend):
         self._delay()
         self._inner.rename(old_virtual_path, new_virtual_path)
 
+    def rename_noreplace(self, old_virtual_path: str, new_virtual_path: str):
+        self._delay()
+        self._inner.rename_noreplace(old_virtual_path, new_virtual_path)
+
     def get_free_space(self) -> Optional[int]:
         return self._inner.get_free_space()
 

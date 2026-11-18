@@ -17,8 +17,12 @@ from unittest.mock import patch
 from storage.backends import ssh as ssh_module
 from storage.backends import ssh_pool
 from storage.backends.base import (
-    ChecksumUnavailable, bulk_request, capacity_wait_cancellation,
-    interactive_request, is_interactive_request,
+    ChecksumUnavailable,
+    MemberSourceMissing,
+    bulk_request,
+    capacity_wait_cancellation,
+    interactive_request,
+    is_interactive_request,
 )
 from storage.backends.ssh import SSHBackend
 from storage.backends.ssh_pool import (
@@ -1989,6 +1993,55 @@ class TestSSHBackendOnThePool(_BackendTestCase):
             self._new_backend().rename("/a", "/b")
         self.assertEqual(errno.EACCES, raised.exception.errno)
         self.assertNotIn("rename", [name for name, *_ in self.server.requests])
+
+    def test_rename_enoent_with_the_source_gone_is_a_missing_source(self):
+        """posix-rename ENOENT, and the source lstat agrees: MemberSourceMissing."""
+        def gone(client, path):
+            raise FileNotFoundError(errno.ENOENT, "no such file")
+        self.server.hooks["posix_rename"] = gone
+        self.server.hooks["lstat"] = gone
+        with self.assertRaises(MemberSourceMissing):
+            self._new_backend().rename("/a", "/b")
+
+    def test_rename_enoent_with_a_failed_source_check_keeps_its_own_error(self):
+        """posix-rename ENOENT, but the source lstat itself fails (EACCES):
+        no evidence the source is gone. The rename's own error is raised,
+        not MemberSourceMissing, with the failed check noted (CTO-183-ERRNO)."""
+        def enoent(client, path):
+            raise FileNotFoundError(errno.ENOENT, "parent gone")
+        def denied(client, path):
+            raise PermissionError(errno.EACCES, "denied")
+        self.server.hooks["posix_rename"] = enoent
+        self.server.hooks["lstat"] = denied
+        with self.assertRaises(FileNotFoundError) as raised:
+            self._new_backend().rename("/a", "/b")
+        self.assertNotIsInstance(raised.exception, MemberSourceMissing)
+        self.assertTrue(any("source check failed" in note
+                            for note in getattr(raised.exception, "__notes__", [])))
+
+    def test_a_lost_connection_during_the_source_check_reaches_the_pool(self):
+        """A timeout or a dropped connection in the diagnostic lstat is raised
+        as it is, so the pool sees the stall, with the rename's error noted."""
+        def enoent(client, path):
+            raise FileNotFoundError(errno.ENOENT, "parent gone")
+        for failure in (socket.timeout(), EOFError("connection dropped")):
+            with self.subTest(failure=type(failure).__name__):
+                def lost(client, path, failure=failure):
+                    raise failure
+                self.server.hooks["posix_rename"] = enoent
+                self.server.hooks["lstat"] = lost
+                with self.assertRaises(type(failure)) as raised:
+                    self._new_backend().rename("/a", "/b")
+                self.assertTrue(any("after the rename failed" in note
+                                    for note in getattr(raised.exception, "__notes__", [])))
+
+    def test_rename_enoent_with_the_source_present_keeps_its_own_error(self):
+        def enoent(client, path):
+            raise FileNotFoundError(errno.ENOENT, "parent gone")
+        self.server.hooks["posix_rename"] = enoent
+        with self.assertRaises(FileNotFoundError) as raised:
+            self._new_backend().rename("/a", "/b")
+        self.assertNotIsInstance(raised.exception, MemberSourceMissing)
 
     def test_no_socket_timeout_override(self):
         backend = self._new_backend()

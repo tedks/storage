@@ -445,7 +445,9 @@ def test_ssh_backend_rename_replaces_an_existing_file(remote, ssh_backend, tmp_p
 @pytest.fixture
 def storage_over_ssh(ssh_backend, tmp_path):
     """A StorageFS (not mounted) whose one member is the SSH member, with
-    its first member rename failing as an unreachable member's would."""
+    its first replacing member rename failing as an unreachable member's
+    would. A rename onto a name the namespace did not hold never reaches
+    rename on SSH (no verified no-replace operation): calls stays empty."""
     (tmp_path / "cache").mkdir()
     fs = StorageFS(
         cache_root=tmp_path / "cache",
@@ -510,7 +512,9 @@ def test_missed_rename_never_overwrites_a_new_target_on_an_ssh_member(
 
     assert remote.read_remote(member, "b.txt") == b"unrelated writer"
     assert remote.read_remote(member, "a.txt") == b"old bytes"
-    assert len(calls) == 1
+    # /b.txt was not the namespace's: SSH has no verified no-replace rename,
+    # so the member was never asked to rename at all.
+    assert calls == []
     # The mount's own record and the queued task's, each its own carrier.
     assert _repairs(tmp_path / "cache") == [(ssh_backend.name, "/a.txt", "/b.txt")] * 2
 
@@ -534,8 +538,119 @@ def test_missed_rename_never_moves_a_reused_source_on_an_ssh_member(
 
     assert sorted(ssh_backend.listdir("/d")) == ["kept.txt", "new.txt"]
     assert not ssh_backend.exists("/e")
-    assert len(calls) == 1
+    assert calls == []
     assert _repairs(fs.cache_manager.cache_root) == [(ssh_backend.name, "/d", "/e")]
+
+
+@pytest.fixture
+def plain_storage_over_ssh(ssh_backend, tmp_path):
+    """A StorageFS (not mounted) whose one member is the SSH member."""
+    (tmp_path / "cache").mkdir()
+    fs = StorageFS(
+        cache_root=tmp_path / "cache",
+        state_db=tmp_path / "state.db",
+        backends={ssh_backend.name: ssh_backend},
+        cache_size=10 * 1024 * 1024,
+        num_sync_workers=1,
+        start_sync=False,
+    )
+    fs.sync_manager.config.monitor_interval = 0.1
+    yield fs
+    fs.sync_manager.stop()
+    fs.state_manager.close()
+
+
+def _synced_over_ssh(fs, path, data):
+    fs.sync_manager.start()
+    _write_through(fs, path, data)
+    _wait_clean(fs, path)
+    assert fs.sync_manager.wait_for_completion(timeout=30.0)
+    fs.sync_manager.stop()
+
+
+def test_first_rename_onto_an_occupied_ssh_name_keeps_both(
+        remote, ssh_backend, plain_storage_over_ssh):
+    """The SSH member holds a /b.txt the namespace never had: the first
+    member rename of /a.txt -> /b.txt is not made there (SSH has no verified
+    no-replace rename), both objects stay, the namespace move stands, and a
+    repair names both paths (Ted's first-attempt ruling on #183)."""
+    fs = plain_storage_over_ssh
+    member = remote.members[0]
+    _synced_over_ssh(fs, "/a.txt", b"renamed bytes")
+    remote.write_remote(member, "b.txt", b"unrelated writer")
+    fs.rename("/a.txt", "/b.txt")
+    assert remote.read_remote(member, "b.txt") == b"unrelated writer"
+    assert remote.read_remote(member, "a.txt") == b"renamed bytes"
+    assert fs.cache_manager.get_cache_path("/b.txt").exists()
+    assert _repairs(fs.cache_manager.cache_root) == [(ssh_backend.name, "/a.txt", "/b.txt")]
+
+
+def test_first_rename_onto_a_free_ssh_name_is_not_made_unverified(
+        remote, ssh_backend, plain_storage_over_ssh):
+    """A directory, and a file, moved to names that are free on the SSH
+    member: still not moved there, since nothing on SSH guarantees the
+    names stay free; the sources stay and repairs are recorded."""
+    fs = plain_storage_over_ssh
+    member = remote.members[0]
+    fs.mkdir("/d", 0o755)
+    remote.write_remote(member, "d/kept.txt", b"k")
+    fs.rename("/d", "/e")
+    assert sorted(ssh_backend.listdir("/d")) == ["kept.txt"]
+    assert not ssh_backend.exists("/e")
+    _synced_over_ssh(fs, "/f.txt", b"file bytes")
+    fs.rename("/f.txt", "/g.txt")
+    assert remote.read_remote(member, "f.txt") == b"file bytes"
+    assert not ssh_backend.exists("/g.txt")
+    assert _repairs(fs.cache_manager.cache_root) == sorted(
+        [(ssh_backend.name, "/d", "/e"), (ssh_backend.name, "/f.txt", "/g.txt")])
+
+
+def test_first_rename_onto_an_occupied_ssh_directory_keeps_both(
+        remote, ssh_backend, plain_storage_over_ssh):
+    """The SSH member holds an unrelated /e with a file in it: /d -> /e is
+    not made there, and both directories keep their contents."""
+    fs = plain_storage_over_ssh
+    member = remote.members[0]
+    fs.mkdir("/d", 0o755)
+    remote.write_remote(member, "d/mine.txt", b"mine")
+    remote.write_remote(member, "e/theirs.txt", b"theirs")
+    fs.rename("/d", "/e")
+    assert sorted(ssh_backend.listdir("/d")) == ["mine.txt"]
+    assert sorted(ssh_backend.listdir("/e")) == ["theirs.txt"]
+    assert _repairs(fs.cache_manager.cache_root) == [(ssh_backend.name, "/d", "/e")]
+
+
+def test_an_intended_replacement_whose_ssh_source_vanished_keeps_the_target(
+        remote, ssh_backend, plain_storage_over_ssh):
+    """Both files are recorded on the SSH member, but its /a.txt was removed
+    inside the container: renaming /a.txt over /b.txt moves nothing there,
+    is recorded as a miss, and the member's /b.txt keeps its bytes
+    (CTO-183-SOURCE-OUTCOME)."""
+    fs = plain_storage_over_ssh
+    member = remote.members[0]
+    _synced_over_ssh(fs, "/a.txt", b"renamed bytes")
+    _synced_over_ssh(fs, "/b.txt", b"replaced bytes")
+    remote.exec(member, f"rm {REMOTE_ROOT}/a.txt")
+    fs.rename("/a.txt", "/b.txt")
+    assert remote.read_remote(member, "b.txt") == b"replaced bytes"
+    [record] = MemberRepairs(fs.cache_manager.cache_root).list()
+    assert (record.state, record.old_path, record.new_path) == ("open", "/a.txt", "/b.txt")
+    assert "no source" in record.reason
+
+
+def test_intended_replacement_still_replaces_on_an_ssh_member(
+        remote, ssh_backend, plain_storage_over_ssh):
+    """Control: /b.txt is the namespace's, synced to the SSH member;
+    renaming /a.txt over it replaces it there, as rename(2) does."""
+    fs = plain_storage_over_ssh
+    member = remote.members[0]
+    _synced_over_ssh(fs, "/a.txt", b"renamed bytes")
+    _synced_over_ssh(fs, "/b.txt", b"replaced bytes")
+    fs.rename("/a.txt", "/b.txt")
+    assert remote.read_remote(member, "b.txt") == b"renamed bytes"
+    assert not ssh_backend.exists("/a.txt")
+    assert _repairs(fs.cache_manager.cache_root) == []
+
 
 def test_filesystem_identity_tells_same_and_different_filesystems_apart(remote):
     """Two roots in one container share a device unless one is its own mount."""

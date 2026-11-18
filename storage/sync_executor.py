@@ -644,8 +644,8 @@ class SyncExecutor:
         A retry carries only the two names. Nothing on the member proves the
         object at the old name is still the one the mount renamed (the name
         may be in use again, through the mount or by another writer of the
-        member), or that the new name is free there, and the Local and SSH
-        renames replace their target. Both names are left as they are on
+        member), or that the new name is free there, and a replacing member
+        rename would destroy what is there. Both names are left as they are on
         the member, whatever the task's age or origin. Without a hint the
         task stands for every configured member, including any that never
         held the names: a record too many costs a look, one too few a

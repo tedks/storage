@@ -64,6 +64,12 @@ def current_capacity_cancel_probe():
     return getattr(_CAPACITY_CANCEL_PROBE, "probe", None)
 
 
+class MemberSourceMissing(FileNotFoundError):
+    """A member rename found nothing at the old name on the member: nothing
+    moved. Raised only on positive evidence (the member's own check of the
+    source); any other ENOENT keeps its own cause."""
+
+
 class ChecksumUnavailable(OSError):
     """The member could not hash the file itself and downloading was not allowed."""
 
@@ -275,8 +281,28 @@ class Backend(ABC):
 
     @abstractmethod
     def rename(self, old_virtual_path: str, new_virtual_path: str):
-        """Rename or move a path on this backend."""
+        """Rename or move a path on this backend, replacing the new name.
+
+        Raises MemberSourceMissing when the member has no source: a rename
+        that moved nothing is never reported as done.
+        """
         pass
+
+    def rename_noreplace(self, old_virtual_path: str, new_virtual_path: str):
+        """Rename a path only if nothing is at the new name, atomically.
+
+        For a rename onto a name the namespace did not hold, where an object
+        at the new name on this member would be one the mount never knew
+        (docs/first-member-rename-target.md). It must be a single operation
+        that the member itself refuses when the new name is taken: never a
+        check followed by a rename, nor a link followed by an unlink, both
+        of which a concurrent writer can slip between. Raises
+        FileExistsError when the new name is taken, and MemberSourceMissing
+        when the member has no source (nothing was moved). A member with no such
+        operation raises OSError(ENOTSUP), and the namespace then leaves it
+        alone and records a repair.
+        """
+        raise OSError(errno.ENOTSUP, "no verified no-replace rename on this member")
 
     def filesystem_identity(self) -> Optional[Tuple[str, int, int]]:
         """(host, port, device id) of the filesystem holding this member's root.

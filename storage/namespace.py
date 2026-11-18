@@ -11,7 +11,7 @@ from typing import Callable, Dict, List, NamedTuple, Optional, Set, Tuple
 
 from fuse import FuseOSError
 
-from .backends.base import Backend
+from .backends.base import Backend, MemberSourceMissing
 from .cache_metadata import regular_file_stat
 from .checksums import ChecksumBasis, ChecksumRecord
 from .models import SyncStatus
@@ -548,6 +548,18 @@ class NamespaceService:
             ]
         return list(self.backends.values())
 
+    @staticmethod
+    def _miss_reason(exc, error: str, replacing: bool) -> str:
+        """Why a member's rename was not made, by what the member reported."""
+        if isinstance(exc, MemberSourceMissing):
+            # Said apart: nothing to move. Still a repair, since the member
+            # may hold an unrelated object, or the replaced one, at the new
+            # name, which must stay fenced.
+            return "not renamed: the member has no source at the old name"
+        if replacing:
+            return f"member rename failed: {error}"
+        return f"not renamed, as nothing recorded this member's copy at the new name: {error}"
+
     def _propagate_dir_operation(
         self,
         operation: DirOperation,
@@ -557,11 +569,15 @@ class NamespaceService:
         backend_names: Optional[Set[str]] = None,
         exclude: Optional[Set[str]] = None,
         errors: Optional[Dict[str, str]] = None,
+        noreplace: Optional[Set[str]] = None,
+        raised: Optional[Dict[str, BaseException]] = None,
     ) -> List[str]:
         """Best-effort synchronous propagation; returns backend names that failed.
 
         Members named in exclude are not called and are not reported. With
-        errors, each failed member's exception is recorded there by name.
+        errors, each failed member's exception is recorded there by name. A
+        rename on a member named in noreplace uses Backend.rename_noreplace,
+        which refuses rather than replace an object at the new name.
         """
         failures: List[str] = []
         for backend in self._get_target_backends(backend_hint, backend_names=backend_names):
@@ -575,11 +591,19 @@ class NamespaceService:
                 elif operation == DirOperation.RENAME:
                     if not new_path:
                         raise ValueError("rename requires new_path")
-                    backend.rename(path, new_path)
+                    if noreplace and backend.name in noreplace:
+                        backend.rename_noreplace(path, new_path)
+                    else:
+                        backend.rename(path, new_path)
             except Exception as exc:
                 failures.append(backend.name)
                 if errors is not None:
-                    errors[backend.name] = f"{type(exc).__name__}: {exc}"
+                    # Notes (a failed source check, say) reach the repair.
+                    notes = "; ".join(getattr(exc, "__notes__", ()))
+                    errors[backend.name] = (f"{type(exc).__name__}: {exc}"
+                                            + (f" ({notes})" if notes else ""))
+                if raised is not None:
+                    raised[backend.name] = exc
                 self.logger.debug(
                     "dir op %s failed for %s on %s: %s",
                     operation.value,
@@ -1549,6 +1573,23 @@ class NamespaceService:
                 targets = set(self.backends)
             else:
                 targets = set(self.state_manager.get_location_backends(old_resolved.canonical_path))
+            # The members where replacing the new name is the requested
+            # operation, decided before any effect, on member-specific
+            # evidence only (docs/first-member-rename-target.md): the
+            # namespace holds a file at the new name and its copy on that
+            # member is recorded (a location row). A directory has no such
+            # record per member, so a namespace directory at the new name is
+            # no evidence of what each member holds there. Every other target
+            # gets a rename that refuses rather than replace, or none: no
+            # listing, missing or stale, can tell when an object appeared at
+            # the new name on a member.
+            if (not new_cache.is_dir() or new_cache.is_symlink()) and (
+                    os.path.lexists(new_cache) or self.state_manager.get_file_metadata(
+                        new_resolved.canonical_path) is not None):
+                replace_ok = targets & set(
+                    self.state_manager.get_location_backends(new_resolved.canonical_path))
+            else:
+                replace_ok = set()
             # A member with an open repair at either name holds names the
             # namespace does not describe there: renaming on it could move
             # the object it never moved, or replace it. It is not called.
@@ -1628,6 +1669,7 @@ class NamespaceService:
                     raise
 
             errors: Dict[str, str] = {}
+            raised: Dict[str, BaseException] = {}
             failures = self._propagate_dir_operation(
                 DirOperation.RENAME,
                 old_resolved.canonical_path,
@@ -1636,18 +1678,19 @@ class NamespaceService:
                 backend_names=targets if not old_resolved.backend_name else None,
                 exclude=fenced,
                 errors=errors,
+                noreplace=targets - replace_ok,
+                raised=raised,
             )
 
             # A member that missed the move is never sent it later: by then
             # nothing on it proves the object at the old name is still the
             # one moved here, or that the new name is free there (members
-            # change behind the mount), and Local and SSH renames replace
-            # their target. The member keeps both names as they are; the
+            # change behind the mount), and an intended replacement's member
+            # rename replaces its target. The member keeps both names as they are; the
             # intent becomes an open repair for exactly those members.
-            missed = {
-                name: f"member rename failed: {errors.get(name, 'unknown error')}"
-                for name in failures
-            }
+            missed = {name: self._miss_reason(raised.get(name), errors.get(name, "unknown error"),
+                                              name in replace_ok)
+                      for name in failures}
             missed.update({
                 name: "not renamed: the member has an open repair at these names"
                 for name in fenced

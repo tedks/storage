@@ -15,7 +15,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from fuse import FuseOSError
 
@@ -46,7 +46,7 @@ def _rename_then_die(temp_dir):
     def unreachable(*_args):
         raise OSError("member unreachable")
 
-    member.rename = unreachable
+    member.rename = member.rename_noreplace = unreachable
     fs.rename("/d", "/e")
     os._exit(0)
 
@@ -83,18 +83,23 @@ class SyncRaceTestBase(ThreadingTestBase):
         return sorted(os.listdir(self.member_dir / rel))
 
     def fail_member_once(self, name):
-        real = getattr(self.member, name)
+        """Fail the first call to the member's name with OSError; for
+        "rename", either entry point (rename or rename_noreplace)."""
+        names = [name, "rename_noreplace"] if name == "rename" else [name]
         calls = []
 
-        def failing_once(*args):
-            calls.append(args)
-            if len(calls) == 1:
-                raise OSError("member unreachable")
-            return real(*args)
+        def failing_once(real):
+            def call(*args):
+                calls.append(args)
+                if len(calls) == 1:
+                    raise OSError("member unreachable")
+                return real(*args)
+            return call
 
-        patcher = patch.object(self.member, name, side_effect=failing_once)
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        for each in names:
+            patcher = patch.object(self.member, each, side_effect=failing_once(getattr(self.member, each)))
+            patcher.start()
+            self.addCleanup(patcher.stop)
         return calls
 
     def repairs(self, cache_dir=None):
@@ -366,7 +371,7 @@ class TestDirectoryRetries(SyncRaceTestBase):
             "/d", DirOperation.RENAME, new_path="/e", backend_hint="member", force=True,
         )
         renames = []
-        patcher = patch.object(self.member, "rename", side_effect=lambda *a: renames.append(a))
+        patcher = self.patch_member_rename(side_effect=lambda *a: renames.append(a))
         patcher.start()
         self.addCleanup(patcher.stop)
         self.start_sync()
@@ -407,7 +412,7 @@ class TestDirectoryRetries(SyncRaceTestBase):
         self.fail_member_once("rename")
         self.fs.rename("/d", "/e")
         renames = []
-        patcher = patch.object(self.member, "rename", side_effect=lambda *a: renames.append(a))
+        patcher = self.patch_member_rename(side_effect=lambda *a: renames.append(a))
         patcher.start()
         self.addCleanup(patcher.stop)
         self.fs.rename("/e/sub", "/e/other")
@@ -617,7 +622,7 @@ class TestDirectoryRetries(SyncRaceTestBase):
         self.wait_idle()
         self.fs.sync_manager.stop()
         renames = []
-        patch.object(self.member, "rename", side_effect=lambda *a: renames.append(a)).start()
+        self.patch_member_rename(side_effect=lambda *a: renames.append(a)).start()
         self.addCleanup(patch.stopall)
         real_setxattr = os.setxattr
         for err in (errno.ENOSPC, errno.ENOTSUP, errno.E2BIG):
@@ -697,7 +702,7 @@ class TestDirectoryRetries(SyncRaceTestBase):
 
         patch.object(repairs, "record", side_effect=failing).start()
         renames = []
-        patch.object(self.member, "rename", side_effect=lambda *a: renames.append(a)).start()
+        self.patch_member_rename(side_effect=lambda *a: renames.append(a)).start()
         self.addCleanup(patch.stopall)
         self.fs.sync_manager.queue_dir_sync("/d", DirOperation.RENAME, new_path="/e",
                                             backend_hint="member", force=True)
@@ -731,7 +736,7 @@ class TestDirectoryRetries(SyncRaceTestBase):
 
         patch.object(repairs, "record", side_effect=flaky).start()
         renames = []
-        patch.object(self.member, "rename", side_effect=lambda *a: renames.append(a)).start()
+        self.patch_member_rename(side_effect=lambda *a: renames.append(a)).start()
         self.addCleanup(patch.stopall)
         self.fs.sync_manager.config.retry_delay = 3600.0
         self.fs.sync_manager.queue_dir_sync("/d", DirOperation.RENAME, new_path="/e",
@@ -929,7 +934,7 @@ class TestFencePublicationOrder(SyncRaceTestBase):
         when /p/q -> /p/r is published; the publication waits for it."""
         self.fs.mkdir("/p", 0o755)
         self.fs.mkdir("/p/q", 0o755)
-        gate = self.gate(self.member, "rename")
+        gate = self.gate_member_rename()
         renamer = Worker(self.fs.rename, "/p", "/p2")
         renamer.start()
         self.assertTrue(gate.started.wait(WAIT))
@@ -992,7 +997,7 @@ class TestFencePublicationOrder(SyncRaceTestBase):
         publisher = self.publish("/p/q", "/p/r")
         self.assertTrue(entered.wait(WAIT))
         renames = []
-        patch.object(self.member, "rename", side_effect=lambda *a: renames.append(a)).start()
+        self.patch_member_rename(side_effect=lambda *a: renames.append(a)).start()
         self.fs.rename("/p", "/p2")
         self.assertEqual([], renames)
         release.set()
@@ -1048,7 +1053,7 @@ class TestFencePublicationOrder(SyncRaceTestBase):
         self.wait_synced("/f.txt")
         self.wait_idle()
         self.fs.sync_manager.stop()
-        gate = self.gate(self.member, "rename")
+        gate = self.gate_member_rename()
         renamer = Worker(self.fs.rename, "/f.txt", "/g.txt")
         renamer.start()
         self.assertTrue(gate.started.wait(WAIT))
@@ -1193,13 +1198,13 @@ def _die_after_member_rename(temp_dir):
                    backends={"member": member}, cache_size=10 * 1024 * 1024,
                    num_sync_workers=1, start_sync=False)
     fs.mkdir("/d", 0o755)
-    real = member.rename
+    real = member.rename_noreplace
 
     def rename_then_die(*args):
         real(*args)
         os._exit(0)
 
-    member.rename = rename_then_die
+    member.rename = member.rename_noreplace = rename_then_die
     fs.rename("/d", "/e")
     os._exit(1)
 
@@ -1763,7 +1768,7 @@ class TestRepairsOutliveTheIndex(SyncRaceTestBase):
             self.assertTrue(MemberRepairs(self.cache_dir).resolve(earlier.id))
             return real(*args)
 
-        with patch.object(self.member, "rename", side_effect=resolve_elsewhere_then_rename):
+        with self.patch_member_rename(side_effect=resolve_elsewhere_then_rename):
             self.fs.rename("/d", "/e")
         self.assertEqual([], self.fs.cache_manager.member_repairs.list())
         self.assertEqual(set(), self.fs.cache_manager.member_repairs.backends_for(["/old", "/older"]))
@@ -1787,7 +1792,7 @@ class TestRepairsOutliveTheIndex(SyncRaceTestBase):
             self.assertEqual({"member"}, self.fs.cache_manager.member_repairs.backends_for(["/e"]))
             raise OSError("member unreachable")
 
-        with patch.object(self.member, "rename", side_effect=try_resolve_then_fail):
+        with self.patch_member_rename(side_effect=try_resolve_then_fail):
             self.fs.rename("/d", "/e")
         self.assertEqual([errno.EWOULDBLOCK], attempts)
         [record] = MemberRepairs(self.cache_dir).list()
@@ -1880,7 +1885,7 @@ class TestRepairsOutliveTheIndex(SyncRaceTestBase):
         no member is called and the intent stays."""
         self.fs.mkdir("/d", 0o755)
         renames = []
-        patch.object(self.member, "rename", side_effect=lambda *a: renames.append(a)).start()
+        self.patch_member_rename(side_effect=lambda *a: renames.append(a)).start()
         self.addCleanup(patch.stopall)
         with patch("storage.namespace.fsync_directories", side_effect=OSError(errno.EIO, "injected")):
             with self.assertRaises(FuseOSError):
@@ -1905,8 +1910,7 @@ class TestRepairsOutliveTheIndex(SyncRaceTestBase):
             return real(*paths)
 
         real_rename = self.member.rename
-        patch.object(self.member, "rename",
-                     side_effect=lambda *a: (calls.append(list(synced)), real_rename(*a))).start()
+        self.patch_member_rename(side_effect=lambda *a: (calls.append(list(synced)), real_rename(*a))).start()
         self.addCleanup(patch.stopall)
         with patch("storage.namespace.fsync_directories", side_effect=recording):
             self.fs.rename("/d", "/x/y/d")
@@ -1925,3 +1929,211 @@ class TestCacheAncestors(unittest.TestCase):
     def test_a_path_not_spelled_under_the_root_gets_every_ancestor(self):
         self.assertEqual([Path("/"), Path("/other"), Path("/other/x")],
                          storage_namespace._cache_ancestors(Path("/c"), Path("/other/x")))
+
+
+class TestFirstMemberRenameTarget(SyncRaceTestBase):
+    """The mount's own member rename onto a name the namespace did not hold
+    (docs/first-member-rename-target.md, ditz gh-181-sync-rename-noreplace).
+
+    The first two cases were the synthetic RED of the design: another
+    writer puts an unrelated object at the target in the window between the
+    namespace's decision and the member call, or before it, unlisted. They
+    pass now that the member rename refuses rather than replace.
+    """
+
+    def occupy_target_first(self, rel, data):
+        """Another writer puts an object at rel just before the member call,
+        whichever rename the namespace makes."""
+        real_rename, real_noreplace = self.member.rename, self.member.rename_noreplace
+
+        def racing(real):
+            def call(old, new):
+                (self.member_dir / rel).write_bytes(data)
+                return real(old, new)
+            return call
+
+        patcher = patch.multiple(self.member, rename=Mock(side_effect=racing(real_rename)),
+                                 rename_noreplace=Mock(side_effect=racing(real_noreplace)))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def synced(self, path, data):
+        self.write_file(path, data)
+        self.start_sync()
+        self.wait_synced(path)
+        self.wait_idle()
+        self.fs.sync_manager.stop()
+
+    def test_known_absent_target_created_during_the_rename_is_kept(self):
+        """The namespace had no /b.txt and the member's fresh listing had
+        none; another writer creates one during the rename."""
+        self.synced("/a.txt", b"renamed bytes")
+        self.assertEqual(["a.txt"], sorted(self.fs.readdir("/", None))[2:])
+        self.occupy_target_first("b.txt", b"unrelated writer")
+        self.fs.rename("/a.txt", "/b.txt")
+        self.assertEqual(b"unrelated writer", (self.member_dir / "b.txt").read_bytes())
+        self.assertEqual(b"renamed bytes", (self.member_dir / "a.txt").read_bytes())
+
+    def test_unknown_target_the_mount_never_listed_is_kept(self):
+        """The member already had a /b.txt the mount never listed (no
+        listing of / since it appeared); the namespace has none."""
+        self.synced("/a.txt", b"renamed bytes")
+        (self.member_dir / "b.txt").write_bytes(b"unrelated writer")
+        self.fs.rename("/a.txt", "/b.txt")
+        self.assertEqual(b"unrelated writer", (self.member_dir / "b.txt").read_bytes())
+        self.assertEqual(b"renamed bytes", (self.member_dir / "a.txt").read_bytes())
+
+    def test_occupied_targets_are_kept_and_recorded(self):
+        """Both REDs above also record the miss: a repair naming both paths,
+        and the namespace's own move stands."""
+        self.synced("/a.txt", b"renamed bytes")
+        (self.member_dir / "b.txt").write_bytes(b"unrelated writer")
+        self.fs.rename("/a.txt", "/b.txt")
+        self.assertEqual([("member", "/a.txt", "/b.txt")], self.repairs())
+        self.assertTrue(self.fs.cache_manager.get_cache_path("/b.txt").exists())
+
+    def test_a_directory_onto_an_occupied_member_directory_keeps_both(self):
+        """The member holds an unrelated /e with a file in it; /d -> /e is
+        refused there (renameat2 EEXIST) and both directories stay."""
+        self.fs.mkdir("/d", 0o755)
+        (self.member_dir / "d" / "mine.txt").write_bytes(b"mine")
+        (self.member_dir / "e").mkdir()
+        (self.member_dir / "e" / "theirs.txt").write_bytes(b"theirs")
+        self.fs.rename("/d", "/e")
+        self.assertEqual(["mine.txt"], self.member_names("d"))
+        self.assertEqual(["theirs.txt"], self.member_names("e"))
+        self.assertEqual([("member", "/d", "/e")], self.repairs())
+
+    def test_a_free_target_moves_with_the_no_replace_rename(self):
+        """A free name on a filesystem with RENAME_NOREPLACE: moved, no repair."""
+        self.synced("/a.txt", b"renamed bytes")
+        self.fs.mkdir("/d", 0o755)
+        noreplace, replacing = [], []
+        real_noreplace, real_rename = self.member.rename_noreplace, self.member.rename
+        with patch.multiple(
+                self.member,
+                rename_noreplace=Mock(side_effect=lambda *a: (noreplace.append(a), real_noreplace(*a))),
+                rename=Mock(side_effect=lambda *a: (replacing.append(a), real_rename(*a)))):
+            self.fs.rename("/a.txt", "/b.txt")
+            self.fs.rename("/d", "/e")
+        self.assertEqual([("/a.txt", "/b.txt"), ("/d", "/e")], noreplace)
+        self.assertEqual([], replacing)
+        self.assertEqual(["b.txt", "e"], self.member_names())
+        self.assertEqual([], self.repairs())
+
+    def test_without_a_no_replace_rename_the_member_is_skipped(self):
+        """A filesystem or libc without RENAME_NOREPLACE: no stat-then-rename
+        or link-then-unlink fallback. The member keeps the source, gets no
+        target, and the miss is recorded; the namespace move stands."""
+        self.synced("/a.txt", b"renamed bytes")
+        self.fs.mkdir("/d", 0o755)
+        for unsupported in (None, errno.EINVAL):
+            with self.subTest(unsupported=unsupported):
+                if unsupported is None:
+                    ctx = patch("storage.backends.local._RENAMEAT2", None)
+                else:
+                    ctx = patch("storage.backends.local.rename_noreplace",
+                                side_effect=OSError(errno.EINVAL, "not here"))
+                with ctx:
+                    old, new = ("/a.txt", "/b.txt") if unsupported is None else ("/d", "/e")
+                    self.fs.rename(old, new)
+                self.assertTrue((self.member_dir / old.lstrip("/")).exists())
+                self.assertFalse((self.member_dir / new.lstrip("/")).exists())
+                self.assertTrue(self.fs.cache_manager.get_cache_path(new).exists())
+        self.assertEqual([("member", "/a.txt", "/b.txt"), ("member", "/d", "/e")], self.repairs())
+        [first, second] = sorted(MemberRepairs(self.cache_dir).list(), key=lambda r: r.old_path)
+        self.assertIn("no-replace rename unsupported", first.reason)
+        self.assertIn("no-replace rename unsupported", second.reason)
+
+    def test_an_intended_replacement_whose_source_vanished_keeps_the_target(self):
+        """/a.txt and /b.txt are both recorded on the member, but the member's
+        /a.txt was removed behind the mount: renaming /a.txt over /b.txt moves
+        nothing there, so it is a miss, never a success. The member's /b.txt
+        keeps its bytes and an open repair remains (CTO-183-SOURCE-OUTCOME)."""
+        self.synced("/a.txt", b"renamed bytes")
+        self.synced("/b.txt", b"replaced bytes")
+        (self.member_dir / "a.txt").unlink()
+        self.fs.rename("/a.txt", "/b.txt")
+        self.assertEqual(b"replaced bytes", (self.member_dir / "b.txt").read_bytes())
+        [record] = MemberRepairs(self.cache_dir).list()
+        self.assertEqual(("open", ("member",), "/a.txt", "/b.txt"),
+                         (record.state, record.members, record.old_path, record.new_path))
+        self.assertIn("no source", record.reason)
+
+    def test_an_enoent_with_the_source_present_keeps_its_own_cause(self):
+        """An ENOENT from the member's rename call is not proof the source
+        vanished (a destination parent removed meanwhile, say): the miss is
+        recorded with that error, not as a missing source."""
+        self.synced("/a.txt", b"renamed bytes")
+        self.synced("/b.txt", b"replaced bytes")
+        with patch("storage.backends.local._replace",
+                   side_effect=FileNotFoundError(errno.ENOENT, "parent went away")):
+            self.fs.rename("/a.txt", "/b.txt")
+        [record] = MemberRepairs(self.cache_dir).list()
+        self.assertNotIn("no source", record.reason)
+        self.assertIn("parent went away", record.reason)
+        self.assertEqual(b"renamed bytes", (self.member_dir / "a.txt").read_bytes())
+        self.assertEqual(b"replaced bytes", (self.member_dir / "b.txt").read_bytes())
+
+    def test_a_source_that_cannot_be_inspected_is_not_called_missing(self):
+        """The member's lstat of the source fails with EACCES or EIO: that is
+        no evidence the source is gone. The rename is a miss carrying that
+        error, not "no source", and both objects stay (CTO-183-ERRNO)."""
+        self.synced("/a.txt", b"renamed bytes")
+        self.synced("/b.txt", b"replaced bytes")
+        self.synced("/c.txt", b"free target source")
+        for err, old, new in ((errno.EACCES, "/a.txt", "/b.txt"), (errno.EIO, "/c.txt", "/d.txt")):
+            with self.subTest(errno=err), patch(
+                    "storage.backends.local._lstat",
+                    side_effect=OSError(err, os.strerror(err))):
+                self.fs.rename(old, new)
+        reasons = {r.old_path: r.reason for r in MemberRepairs(self.cache_dir).list()}
+        self.assertEqual({"/a.txt", "/c.txt"}, set(reasons))
+        for old, text in (("/a.txt", os.strerror(errno.EACCES)), ("/c.txt", os.strerror(errno.EIO))):
+            self.assertNotIn("no source", reasons[old])
+            self.assertIn(text, reasons[old])
+        self.assertEqual(b"renamed bytes", (self.member_dir / "a.txt").read_bytes())
+        self.assertEqual(b"replaced bytes", (self.member_dir / "b.txt").read_bytes())
+        self.assertEqual(b"free target source", (self.member_dir / "c.txt").read_bytes())
+        self.assertFalse((self.member_dir / "d.txt").exists())
+
+    def test_a_dangling_link_is_a_present_source(self):
+        """A link whose target is gone is still a source: it is renamed."""
+        self.synced("/a.txt", b"x")
+        (self.member_dir / "a.txt").unlink()
+        os.symlink("nowhere", self.member_dir / "a.txt")
+        self.fs.rename("/a.txt", "/b.txt")
+        self.assertTrue(os.path.islink(self.member_dir / "b.txt"))
+        self.assertEqual([], self.repairs())
+
+    def test_a_dangling_link_replaces_a_recorded_target(self):
+        """The replacing path also counts a dangling link as a present source."""
+        self.synced("/a.txt", b"x")
+        self.synced("/b.txt", b"replaced bytes")
+        (self.member_dir / "a.txt").unlink()
+        os.symlink("nowhere", self.member_dir / "a.txt")
+        self.fs.rename("/a.txt", "/b.txt")
+        self.assertTrue(os.path.islink(self.member_dir / "b.txt"))
+        self.assertEqual([], self.repairs())
+
+    def test_a_noted_cause_reaches_the_repair_reason(self):
+        """Notes on a member's error (a failed source check) are kept in the
+        durable repair, not only on the exception."""
+        self.synced("/a.txt", b"renamed bytes")
+        self.synced("/b.txt", b"replaced bytes")
+        failure = FileNotFoundError(errno.ENOENT, "parent gone")
+        failure.add_note("source check failed: PermissionError(13, 'denied')")
+        with patch("storage.backends.local._replace", side_effect=failure):
+            self.fs.rename("/a.txt", "/b.txt")
+        [record] = MemberRepairs(self.cache_dir).list()
+        self.assertIn("source check failed", record.reason)
+        self.assertNotIn("no source at the old name", record.reason)
+
+    def test_known_intended_replacement_still_replaces(self):
+        """Control: /b.txt is the namespace's own, synced to the member;
+        renaming /a.txt over it replaces it there, as rename(2) does."""
+        self.synced("/a.txt", b"renamed bytes")
+        self.synced("/b.txt", b"replaced bytes")
+        self.fs.rename("/a.txt", "/b.txt")
+        self.assertEqual(b"renamed bytes", (self.member_dir / "b.txt").read_bytes())
+        self.assertFalse((self.member_dir / "a.txt").exists())
