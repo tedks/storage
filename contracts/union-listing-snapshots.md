@@ -68,8 +68,10 @@
   readdir. The snapshot stays internally partial, B's status stays missing
   (its failure class) rather than empty, and it is never complete for B. B
   is retried on its own bounded backoff, independent of the serving TTL. A
-  remote member's observation that would remove retained names is accepted
-  only after a root verification made after it was read. Each
+  remote member's empty or ENOENT observation, or one that would remove
+  retained names, is accepted only after a root verification started after
+  it was read (coalesced per member); until then the member is missing and
+  logged. Retry backoff resets on the member's next success. Each
   missing member is logged at warning level (member ID, failure class,
   directory), rate limited per member, on cold and warm listings alike. The
   foreground wait for members is bounded, also for an expired directory
@@ -85,9 +87,12 @@
 - **Resource policy:** limits on queued/running refreshes, active directories,
   snapshot bytes/entries (including revisions pinned by open directory
   handles) and backoff are mandatory before implementation
-  acceptance; the cold-partial slice may use the spec's interim values
-  (whole-request deadline, retry backoff, root recheck, per-member worker,
-  listing cache limit) until the numeric ruling. Do not hold global/namespace locks over remote I/O or admission.
+  acceptance. Narrowed for the cold-partial slice only: it may integrate
+  under the spec's interim values (whole-request deadline, retry backoff,
+  root recheck, per-member worker, per-directory refresh dedup, listing
+  cache limit) without snapshot byte/entry limits, provided it adds no
+  revisions, pinned snapshots, history or other per-entry state. Any of
+  those requires the full limits. Do not hold global/namespace locks over remote I/O or admission.
   Cache eviction cannot erase dirty files or alter the independent byte cache.
 - **Intentionally unspecified:** numeric freshness/visibility policy pending
   the existing open question; order across member completions; content
