@@ -133,9 +133,11 @@ warning log is the operator's signal. Concretely:
   B's later successful observation (including an empty one) replaces only
   B's set. A member whose enumeration fails midway counts as missing: its
   staged pages are not published (assumption: a partial page is not a
-  member observation). Later readdirs serve the partial snapshot stale-first;
-  B is retried by the normal stale refresh under bounded backoff, not a scan
-  per readdir.
+  member observation). Later readdirs serve the partial snapshot stale-first.
+  B is retried on a schedule of its own, not by the serving TTL (which is
+  infinite on a mount whose members all have watchers) and not per readdir:
+  a background refresh of B for that directory under the interim backoff
+  below, while the directory stays in the listing cache.
 - Each missing member is logged at warning level with its stable member ID,
   the failure class and the directory, under the existing logging policy;
   repeats for the same member are rate limited or coalesced so an outage
@@ -157,13 +159,32 @@ storage once the backend is constructed. A member whose disk died and left an
 empty mountpoint would therefore report successful-empty: nothing is logged,
 and on a warm directory its retained names are replaced by an empty set.
 The member-observation owner must tell "directory absent under a verified
-member root" apart from "member root missing or replaced". The check is per
-member, cached for a bounded recheck interval, not an extra round trip per
-directory listing. Acceptable mechanisms: a local member compares the root's
-device (`filesystem_identity`, `st_dev`) with the expected identity; an SSH
-or rsync member, whose SFTP attributes carry no device id, uses the existing
-exec-channel `stat -c %d` probe or a root marker file, outside the reserved
-interactive SFTP channel. An identity recorded only at startup cannot catch
+member root" apart from "member root missing or replaced". When the check
+runs:
+
+- A local member checks its root (one local `stat`, uncached) with every
+  listing.
+- A remote member's verification may be cached for at most the interim root
+  recheck interval below, but an observation that would remove names from a
+  member's retained set (an empty or ENOENT result where names were
+  retained, or any shrink) is accepted only after a verification made after
+  that observation was read. Otherwise it is a missing member.
+- Accepted limitation: within the cached interval, a remote member's cold
+  empty or ENOENT result (nothing retained to lose) is trusted, so a disk
+  that failed in that window can make one cold listing omit the member
+  without a warning until the next recheck.
+
+Mechanisms: a local member compares the root's device (`filesystem_identity`,
+`st_dev`) with the expected identity. An SSH or rsync member, whose SFTP
+attributes carry no device id, uses a root marker file read over SFTP or a
+remote `stat -c %d`. Today's `SSHBackend.filesystem_identity` opens a fresh
+SSH connection per call and is written to run before FUSE's daemonizing
+fork; reusing it after the fork, or running the stat as an exec on the
+pooled transport, is a tracer decision, and either stays outside the
+reserved interactive SFTP channel. A probe that returns `None` or fails, for
+a member with an expected identity, is an unverified root, not "no
+information" (the current `filesystem_identity` contract treats `None` as
+no information; this check must not). An identity recorded only at startup cannot catch
 a disk already missing at mount time, so the expected identity (or marker)
 comes from member configuration or a marker written with the member; with
 neither, the limitation is reported, not hidden. An unverified root is a
@@ -195,8 +216,9 @@ serves the available union when some members fail, but differs from this
 section in ways the snapshot tracer must close: a missing member is logged
 only at debug level (a background refresh that gives up on a member logs a
 warning in `_abandon_listing`; a foreground failure does not); when every member fails and nothing is cached it
-returns a successful empty listing; a partial listing is published with the
-same freshness timestamp as a complete one; a missing or replaced member
+returns a successful empty listing; a partial listing carries no
+per-member completeness status (its serving timestamp is correct and stays
+as it is); a missing or replaced member
 root lists as successful-empty (above); and a foreground cold listing has no
 deadline of its own (`deadline=None`), bounded only by each member's
 transport timeout, and a local member has none, so a hung local disk blocks
@@ -204,15 +226,33 @@ the listing without bound.
 
 Interim bounds. The cold-partial slice (warning logs, the narrow error,
 per-member completeness status, the root check) does not wait for the
-numeric ruling: until `oq-listing-stale-serve-dir-mtime` sets numbers, it
-uses the existing reference values, `refresh_member_timeout` (60 s) as the
-foreground per-member wait and the existing 60 s TTL / 3,600 s stale
-schedule as the retry cadence, with a root recheck interval no shorter than
-the TTL. A local member's wait needs a worker it can abandon (as background
-refresh already does), since it has no transport timeout. The numeric
-ruling replaces these values; it does not reopen the behavior. Other
-snapshot work (active-directory tracking, admission and cache limits) still
-waits for the numbers.
+numeric ruling. Until `oq-listing-stale-serve-dir-mtime` sets numbers, it
+uses these interim values, each from existing defaults:
+
+- Foreground deadline: one whole-request deadline of `refresh_member_timeout`
+  (60 s) for a listing without a servable snapshot. Members are listed
+  concurrently, so it bounds the request rather than each member in turn.
+  A member still running at the deadline is missing, and its worker is
+  abandoned and accounted for as background refresh already does. A local
+  member therefore also needs an abandonable worker, since it has no
+  transport timeout.
+- Missing-member retry: the first retry after 60 s, doubling to a cap of
+  `listing_max_stale` (3,600 s). This holds even when the serving TTL is
+  infinite (watchers on every member) or shorter.
+- Root recheck interval for remote members: at most 60 s (the default
+  fresh window), never unbounded. Local members do not cache it.
+- Admission: the existing single listing worker per member. A member with a
+  listing already hung (`_hung_listings`) is treated as missing by
+  foreground listings too, instead of queueing behind it.
+- Active directories and cache size: the existing listing cache limit
+  (`listing_limit`, 4,096 directories, least recently used). Retries run only
+  for directories still in it.
+
+These satisfy the contract's resource policy for this slice only. The
+numeric ruling replaces the values; it does not reopen the behavior. Other
+snapshot work (active-directory tracking for change delivery, refresh
+admission beyond one worker per member, snapshot byte limits) still waits
+for the numbers.
 
 ### Freshness and refresh limits
 
