@@ -221,8 +221,14 @@ class StateManager:
             -- name is still the one that was renamed, or that the new name
             -- is free (other writers change members behind the mount), so
             -- a replay could move the wrong object or replace another.
-            -- Created on open, so an older index gains it empty. Losing a
-            -- row loses no bytes: the member keeps both names as they are.
+            -- Created on open, so an older index gains it empty. While a
+            -- row is open the member gets no rename or upload at names
+            -- overlapping either path, and cached files under new_path are
+            -- not evicted. A lost row (a fresh index) destroys nothing on
+            -- the member, since nothing replays, but drops those guards and
+            -- the record that the member still has the old name. Committed
+            -- per write; under WAL with synchronous=NORMAL that survives a
+            -- process crash, not necessarily a power loss.
             CREATE TABLE IF NOT EXISTS member_rename_repairs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 backend_name TEXT NOT NULL,
@@ -840,8 +846,9 @@ class StateManager:
         """Record that backend_name missed old_path -> new_path; return the row id.
 
         Recording the same move again keeps one row, counts the occurrence
-        and keeps the latest reason. Committed before it returns, so the
-        record outlives a restart that drops the sync queue.
+        and keeps the latest reason (so two missed moves with the same names
+        are one row until it is resolved). Committed before it returns, so
+        the record outlives a process restart that drops the sync queue.
         """
         now = time.time()
         with self._db_lock:
