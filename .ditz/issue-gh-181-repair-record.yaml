@@ -70,5 +70,14 @@ log_events:
     repair and perform no member rename. #182 owns the fixed-pool regression and fix.
     #167 owns the saturated growing-pool case and retirement after recovery. In-worker
     delay is verified; indefinite starvation is not yet established.'
+- time: 2026-11-18T06:56:52-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'At c75d1a7 the one-worker regression is reported green. _requeue_after
+    creates a new Timer thread per delayed retry and increments unfinished_tasks before
+    Timer.start; if thread creation fails the task and its completion accounting can
+    be stranded. Cover bounded resource use on a burst and stop/restart accounting;
+    verify unrelated member bytes before retry release. #167 corrects a four-caller/three-party
+    rendezvous separately.'
 blocks:
 - gh-181
