@@ -15,7 +15,7 @@ from .cache_metadata import regular_file_stat
 from .checksums import ChecksumBasis, ChecksumRecord
 from .models import SyncStatus
 from .pathing import ResolvedPath, canonicalize_virtual_path
-from .sync_tasks import DirOperation
+from .sync_tasks import DirOperation, record_member_rename_repair
 
 
 # _listed_attrs: the name is absent from a fresh listing of every available
@@ -1530,14 +1530,20 @@ class NamespaceService:
                     if metadata and metadata.sync_status in (SyncStatus.DIRTY, SyncStatus.SYNCING):
                         self.sync_manager.queue_sync(updated, priority=80, force=True)
 
+            # A member that missed the move is not retried: by the time it
+            # can be, nothing on it proves the object at the old name is
+            # still the one moved here, or that the new name is free there
+            # (members change behind the mount), and Local and SSH renames
+            # replace their target. The member keeps both names as they are;
+            # the index records the missed move for repair.
             for failed_backend in failures:
-                self.sync_manager.queue_dir_sync(
+                record_member_rename_repair(
+                    self.state_manager,
+                    failed_backend,
                     old_resolved.canonical_path,
-                    DirOperation.RENAME,
-                    new_path=new_resolved.canonical_path,
-                    backend_hint=failed_backend,
-                    priority=90,
-                    force=True,
+                    new_resolved.canonical_path,
+                    "member rename failed during the mount's rename",
+                    self.logger,
                 )
         except OSError as exc:
             raise FuseOSError(exc.errno)
