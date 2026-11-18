@@ -9,6 +9,7 @@ import errno
 import multiprocessing
 import os
 import time
+import unittest
 from pathlib import Path
 from unittest.mock import patch
 
@@ -973,3 +974,15 @@ class TestRepairsOutliveTheIndex(SyncRaceTestBase):
         [before_member] = calls
         for directory in (self.cache_dir, self.cache_dir / "x", self.cache_dir / "x" / "y"):
             self.assertIn(str(directory), before_member)
+
+
+class TestCacheAncestors(unittest.TestCase):
+    def test_chain_from_the_root(self):
+        root = Path("/c")
+        self.assertEqual([root], storage_namespace._cache_ancestors(root, root))
+        self.assertEqual([root, root / "x", root / "x" / "y"],
+                         storage_namespace._cache_ancestors(root, root / "x" / "y"))
+
+    def test_a_path_not_spelled_under_the_root_gets_every_ancestor(self):
+        self.assertEqual([Path("/"), Path("/other"), Path("/other/x")],
+                         storage_namespace._cache_ancestors(Path("/c"), Path("/other/x")))

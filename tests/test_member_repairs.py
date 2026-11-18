@@ -168,6 +168,14 @@ class TestRecords(MemberRepairsTestBase):
         self.assertEqual((("m",), "open", "/a", "/b"),
                          (record.members, record.state, record.old_path, record.new_path))
 
+    def test_a_failed_reload_in_begin_leaves_no_intent_or_lock(self):
+        repairs = MemberRepairs(self.cache)
+        with patch.object(repairs, "_reload_locked", side_effect=OSError(errno.EIO, "injected")):
+            with self.assertRaises(OSError):
+                repairs.begin("/a", "/b", ["m"])
+        self.assertEqual({}, repairs._held)
+        self.assertEqual([], os.listdir(self.carriers))
+
     def test_an_in_flight_intent_cannot_be_resolved(self):
         repairs = MemberRepairs(self.cache)
         rid = repairs.begin("/a", "/b", ["m"])

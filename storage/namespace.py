@@ -45,13 +45,16 @@ _MAX_CHILD_RACES = 1024
 def _cache_ancestors(cache_root: Path, directory: Path) -> List[Path]:
     """The cache root, then each directory down to and including directory."""
     root = Path(cache_root)
-    chain = [directory]
-    for parent in directory.parents:
-        if parent == root or root not in parent.parents:
-            break
-        chain.append(parent)
-    chain.append(root)
-    return list(reversed(dict.fromkeys(chain)))
+    try:
+        parts = directory.relative_to(root).parts
+    except ValueError:
+        # Not spelled under the root (a different form of the same path):
+        # every ancestor, which costs more and skips none.
+        return list(reversed([directory, *directory.parents]))
+    chain = [root]
+    for part in parts:
+        chain.append(chain[-1] / part)
+    return chain
 
 
 class _ListingTicket(NamedTuple):

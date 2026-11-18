@@ -370,8 +370,20 @@ class MemberRepairs:
         with self._write_lock:
             # Held until settle: a resolve while the rename is running
             # waits for it, so an in-flight intent is never resolved.
-            self._held[record.id] = self._write_new(record, hold=True)
-            self._after_write(lambda records: records.__setitem__(record.id, record))
+            held = self._write_new(record, hold=True)
+            try:
+                self._after_write(lambda records: records.__setitem__(record.id, record))
+            except BaseException:
+                # Nothing has happened yet: the intent goes, and its lock.
+                try:
+                    (self.dir / record.id).unlink()
+                    _fsync(self.dir, directory=True)
+                except OSError:
+                    logger.exception("Leaving intent %s after a failed reload", record.id)
+                finally:
+                    os.close(held)
+                raise
+            self._held[record.id] = held
         return record.id
 
     def record(self, old_path: str, new_path: str, members: Iterable[str], reason: str) -> str:

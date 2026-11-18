@@ -169,10 +169,11 @@ takes a carrier's `flock` only for a bounded wait. Opening the cache with
 more than 1000 open repairs logs a warning, since every lookup scans them
 all.
 
-Cost: a rename with member targets makes about five fsyncs (the intent, the
-cache directories, and the settle) plus two reloads of the carrier
-directory, each one listdir and one getxattr per open repair. A rename with
-no member target pays nothing.
+Cost: a rename with member targets makes two fsyncs for the intent, one per
+cache directory from the root down to each of the two parents (shared
+levels once), and one or two for the settle. It also makes two reloads of
+the carrier directory, each one listdir and one getxattr per open repair.
+A rename with no member target pays nothing.
 
 Members are identified by their stable member IDs. A member whose ID
 changes in the configuration no longer matches its repairs: settle those
