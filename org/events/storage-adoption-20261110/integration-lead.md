@@ -87,8 +87,9 @@
 - package: A166
 - state: REVIEWING. #165 advanced master, so #166 now needs a rebase,
   exact-head gates and renewed formal review before the scripted merge.
-  The lead requested branch repair authority or reassignment from the parent
-  over `tmux-message`, with a submitted receipt; no source branch edit yet.
+  The lead requested branch repair authority or reassignment from the
+  parent (transport details redacted per records-lead:3); no source branch
+  edit yet.
 
 ## integration-lead:8
 
@@ -214,8 +215,8 @@
 - state: Parent assigned a separate Sol responsiveness lead in
   `foreground-responsiveness-20261110`; worktree observed at `66c640a`.
   This lane made no sibling edits. Parent also relayed a deployment
-  observation for one field host: its installed rsync, watcher and
-  mount-profile hashes match `a7467c6` and differ from `81793ac`, so
+  observation for one field host (redacted per records-lead:2): its
+  installed and running rsync, watcher and mount-profile hashes match `a7467c6` and differ from `81793ac`, so
   #165/#166 are not rolled out there (host details in the private roster).
   That host observation was not independently repeated by this lane. PR #170
   remains under onboarding-root incident remediation without waiver or
@@ -248,10 +249,9 @@
 - state: Peer performance audit DONE/IDLE after GH #74 amendment. The peer
   reports docs-only diff check and 44 valid links; no tests or live access.
   Its 64 MiB, 60 second and one-active-per-mount limits remain proposals.
-  The peer reports a QUEUED receipt to the responsiveness lead for the
-  cold-open finding, not acknowledgment or execution. Its send to the parent
-  is ambiguous after mixed composer input, so this record does not
-  claim that attempt delivered. No source review or merge claim follows.
+  (Transport details redacted per records-lead:3.) The peer reports
+  sending the cold-open finding to the responsiveness lead, which is not acknowledgment or execution. Delivery of its message to
+  the parent is unconfirmed, so this record does not claim it. No source review or merge claim follows.
 
 ## integration-lead:22
 

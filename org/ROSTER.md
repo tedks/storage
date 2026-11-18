@@ -4,10 +4,13 @@
 
 This record is documentation only. It audits the adoption of three PRs that
 were implemented before the Orgs workflow was used here (#165, #166, #167),
-records how #165 and #166 were accepted and integrated, and lists the PRs
-that followed. It does not claim that the full Orgs sprint ran (see
-Inherited process debt). Lane identities, session and pane ids and host
-observations are kept in a private roster outside this public repo.
+records how #165 and #166 were accepted and integrated, and lists the
+related successor PRs (not every later PR). It does not claim that the full Orgs sprint ran (see
+Inherited process debt). Lane identities, session and pane ids, host names
+and host details are kept in a private roster outside this public repo.
+
+Heads of open drafts are as observed at 2026-11-18 05:50Z; they may have
+moved since, so check GitHub before relying on one.
 
 | PR | State on 2026-11-18 | Notes |
 | --- | --- | --- |
@@ -18,11 +21,14 @@ observations are kept in a private roster outside this public repo.
 | #170 | MERGED 2026-11-10 at `66c640a` | Bazel source/test package split |
 | #171 | OPEN, draft, head `01a7edf` | Foreground responsiveness planning; kept as namespace/freshness evidence |
 | #175 | MERGED 2026-11-15 at `5f3dbb3` | Reserves an SSH channel for foreground listing during threaded cold copies; supersedes #171's channel tracer |
-| #180 | OPEN, draft, head `4eda943` | Slice S1 of #171: opt-in foreground admission cap |
+| #179 | MERGED 2026-11-15 at `1811024` | Rsync upload `--ignore-times` guard; closes `gh-112-rsync-quickcheck` |
+| #180 | OPEN, draft, head `d3fa883` (under active development) | Slice S1 of #171: opt-in foreground admission cap |
 
 Successor order, as recorded in #180's description: #180 (S1) first; #167
 after it, with its retry-safety prerequisite handled separately; #171 stays
-draft. Nothing in this record accepts, merges or deploys #167, #171 or #180.
+draft. #171's own description, which says it will succeed #167, predates
+that ordering. Nothing in this record accepts, merges or deploys #167, #171
+or #180.
 
 Bazel moved after the 2026-11-10 coordination note below: #173 pinned Bazel
 8.7.0 and #174 removed `WORKSPACE` (bzlmod only). Master now uses
@@ -36,13 +42,21 @@ Open questions and rulings in ditz, as of 2026-11-18:
 - `oq-conflict-no-remote-hash`: closed 2026-11-10. Bounded download
   fallback with local hashing is allowed when a member has no remote hash.
 - `oq-conflict-fallback-limits`: closed 2026-11-18 (Ted's 2026-11-17
-  ruling). The proposed bounds were adopted with no user override: 64 MiB
-  per member file, 60 seconds total, one active fallback per mount and per
-  member, one second slot wait, 1 MiB read chunks; any exhaustion or failure
-  leaves the member unverified and blocks its upload. Implementation
-  (`gh-74-no-hash-policy`, GitHub #74) is still unstarted.
+  ruling). The proposed initial bounds were adopted with no user override:
+  64 MiB of actual downloaded bytes per member file; 60 seconds total,
+  including slot wait, transfer and local hash; one active fallback per
+  mount and per member; at most one second waiting for the slot; reads of
+  at most 1 MiB. On unknown or oversize input, growth beyond the byte
+  budget, timeout, cancellation or failed verification, the member stays
+  unverified and its upload is blocked. Implementation
+  (`gh-74-no-hash-policy`, GitHub #74) is still unstarted and still
+  blocked by `gh-74-fast-checksum`.
 - `oq-streaming-fleet-keep-threshold`: OPEN. Fleetwide scope was ruled on
-  2026-11-10; the numeric threshold is still Ted's to choose.
+  2026-11-10. On 2026-11-18 Ted chose the form: the greater of a byte floor
+  above 8 MiB and about 30% of file size, applied to contiguous reads,
+  fleetwide; the open read-ahead window stays coupled to that threshold
+  (`oq-streaming-read-ahead-window`), with no independent cap. The exact
+  byte floor is still pending. No rollout.
 
 Backlog items from #169, as of 2026-11-18: `gh-112-rsync-quickcheck` is
 closed (#179 merged); `streaming-prefix-write-open`,
@@ -58,14 +72,17 @@ are as of that date; the table above is current.
 
 ## Lanes (2026-11-10)
 
-| Lane | Worktree / branch | Hat and state then | Next bounded action then |
+Lanes are named by role and by the PR they own; their worktrees and
+session identities are in the private roster.
+
+| Lane | PR | Hat and state then | Next bounded action then |
 | --- | --- | --- | --- |
-| Parent coordinator | storage coordinator | CTO/root; active | Receive consolidated evidence and resolve rulings |
-| Integration lead | `orgs-integration-20261110`, `chore/orgs-integration-20261110`, Sol | Lead; DONE/IDLE after bounded update | Draft PR #168 awaits parent review; no implementation assignment |
-| Responsiveness lead | `foreground-responsiveness-20261110`, `feat/foreground-responsiveness-20261110`, Sol | Active on draft PR #171; last observed head `3f982b1` | Own foreground reads/browsing design and evidence; may reuse #167 on its own branch; no merge/deploy authority inferred |
-| Performance audit | `perf-triage-20261110`, `docs/perf-triage-20261110`, Sol | Peer lead; DONE/IDLE | Draft PR #169 at `d6bdb394`; GH #74 amendment is proposal only |
-| #166 repair owner | `descriptive-remote-names`, `feat/descriptive-remote-names`, native Sol | Implementer; bounded evidence delivered | No further branch change assigned |
-| Other prior implementation lanes | #165 and #167 worktrees | Implementers; DONE/idle | No additional task assigned; preserve branches |
+| Parent coordinator | - | CTO/root; active | Receive consolidated evidence and resolve rulings |
+| Integration lead | #168 | Lead; DONE/IDLE after bounded update | Draft PR #168 awaits parent review; no implementation assignment |
+| Responsiveness lead | #171 | Active on draft PR #171; last observed head `3f982b1` | Own foreground reads/browsing design and evidence; may reuse #167 on its own branch; no merge/deploy authority inferred |
+| Performance audit | #169 | Peer lead; DONE/IDLE | Draft PR #169 at `d6bdb394`; GH #74 amendment is proposal only |
+| #166 repair owner | #166 | Implementer; bounded evidence delivered | No further branch change assigned |
+| Other prior implementation lanes | #165, #167 | Implementers; DONE/idle | No additional task assigned; preserve branches |
 
 ## Bounded adoption packages
 
@@ -95,8 +112,8 @@ Heads #165/#166/#167 do not edit `BUILD`, `MODULE.bazel`, or `flake.nix`;
 performance audit lane proposes further test additions in streaming, remote,
 sync, cache, rsync, namespace and conflict suites; any new top-level module
 requires manifest coordination. #17 scheduler design waits for #167's
-interface. Exact heads and this contract were delivered to the parent
-coordinator with a submitted receipt before any merge. No onboarding code is
+interface. Exact heads and this contract were sent to the parent
+coordinator before any merge (transport details redacted per records-lead:3). No onboarding code is
 in this package.
 
 Responsiveness PR #171 added one explicit `storage/BUILD` source entry,
@@ -158,15 +175,15 @@ live access, acceptance or merge are claimed. (#169 later merged at
    cold fetches occupy others; deterministic concurrency test first.
 5. GitHub #74 / `gh-74-no-hash-policy`: implement the ruled bounded download
    fallback and local hashing, with explicit bounds and unverified failures.
-   Numeric limits and override scope await `oq-conflict-fallback-limits`.
+   Numeric limits and override scope await `oq-conflict-fallback-limits`
+   (ruled 2026-11-17, closed 2026-11-18; see Current state).
 
 These are not authorized implementation packages in this lane. #17 scheduler
 work waits for #167's implementation interface; the scope ruling is settled.
 The full source and boundary test proposals live in the peer audit document,
-not this summary. The peer reports its cold-open channel finding reached the
-responsiveness lead with a queued receipt; that is delivery, not
-acknowledgment or execution. Its message to the parent became ambiguous
-after mixed composer input; no parent delivery is claimed from that attempt.
+not this summary. The peer reports sending its cold-open channel finding to
+the responsiveness lead; that is not acknowledgment or execution. Delivery
+of its message to the parent is unconfirmed and not claimed.
 
 ## Handoff (2026-11-10)
 
