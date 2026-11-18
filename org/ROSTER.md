@@ -1,24 +1,69 @@
 # Storage Orgs adoption roster, 2026-11-10
 
-## Current state
+## Current state (2026-11-18, against master `ebcbdf0`)
 
-This is an adoption audit of three already implemented PRs, not a
-retroactive claim that the full Orgs sprint ran. The integration lead owns
-acceptance and integration evidence for #165 and #166. #165 merged at
-`38c3bdb9562cade82411751acca058b04c974b5c`; #166 merged at
-`81793ac27b70f82c231bf607b55e775d2b905974`. Ted has since ruled that
-foreground reads and browsing are in the worker-responsiveness scope. #167's
-background-only implementation remains draft and incomplete for that mission.
-The parent assigned a separate Sol responsiveness lead; this integration
-lane has only a bounded record update. The sibling performance audit completed
-a draft proposal report, amended for the GH #74 policy ruling.
+This record is documentation only. It audits the adoption of three PRs that
+were implemented before the Orgs workflow was used here (#165, #166, #167),
+records how #165 and #166 were accepted and integrated, and lists the PRs
+that followed. It does not claim that the full Orgs sprint ran (see
+Inherited process debt). Lane identities, session and pane ids and host
+observations are kept in a private roster outside this public repo.
 
-| Lane | Worktree / branch | Hat and state | Next bounded action |
+| PR | State on 2026-11-18 | Notes |
+| --- | --- | --- |
+| #165 | MERGED 2026-11-10 at `38c3bdb` | Accepted at source head `64c04d6` (A165) |
+| #166 | MERGED 2026-11-10 at `81793ac` | Accepted at source head `4ca26cd` (A166) |
+| #167 | OPEN, draft, head `d61bdb1` (unchanged since 2026-11-09) | Not accepted (A167). Background sync only; `git merge-tree` against `ebcbdf0` conflicts in `storage/cli_mount.py`, `storage/fs.py`, `storage/mount_profiles.py` |
+| #169 | MERGED 2026-11-18 at `ebcbdf0` (second parent `cee0a13`) | Performance and correctness backlog, `docs/performance_backlog_2026-11-10.md` |
+| #170 | MERGED 2026-11-10 at `66c640a` | Bazel source/test package split |
+| #171 | OPEN, draft, head `01a7edf` | Foreground responsiveness planning; kept as namespace/freshness evidence |
+| #175 | MERGED 2026-11-15 at `5f3dbb3` | Reserves an SSH channel for foreground listing during threaded cold copies; supersedes #171's channel tracer |
+| #180 | OPEN, draft, head `4eda943` | Slice S1 of #171: opt-in foreground admission cap |
+
+Successor order, as recorded in #180's description: #180 (S1) first; #167
+after it, with its retry-safety prerequisite handled separately; #171 stays
+draft. Nothing in this record accepts, merges or deploys #167, #171 or #180.
+
+Bazel moved after the 2026-11-10 coordination note below: #173 pinned Bazel
+8.7.0 and #174 removed `WORKSPACE` (bzlmod only). Master now uses
+rules_python 2.3.2 and per-file test targets in `tests/BUILD`. The
+2026-11-10 contract (Bazel 7.6, rules_python 1.6.3) is historical.
+
+Open questions and rulings in ditz, as of 2026-11-18:
+
+- `oq-dynamic-workers-scope`: closed 2026-11-10. Foreground reads and
+  browsing are in the responsiveness scope; #167 alone does not cover it.
+- `oq-conflict-no-remote-hash`: closed 2026-11-10. Bounded download
+  fallback with local hashing is allowed when a member has no remote hash.
+- `oq-conflict-fallback-limits`: closed 2026-11-18 (Ted's 2026-11-17
+  ruling). The proposed bounds were adopted with no user override: 64 MiB
+  per member file, 60 seconds total, one active fallback per mount and per
+  member, one second slot wait, 1 MiB read chunks; any exhaustion or failure
+  leaves the member unverified and blocks its upload. Implementation
+  (`gh-74-no-hash-policy`, GitHub #74) is still unstarted.
+- `oq-streaming-fleet-keep-threshold`: OPEN. Fleetwide scope was ruled on
+  2026-11-10; the numeric threshold is still Ted's to choose.
+
+Backlog items from #169, as of 2026-11-18: `gh-112-rsync-quickcheck` is
+closed (#179 merged); `streaming-prefix-write-open`,
+`field-seq-read-serialized`, `threading-cold-open-pool-share` and
+`gh-74-no-hash-policy` are unstarted in ditz. #175 implements the
+cold-copy channel reserve that `threading-cold-open-pool-share` proposed,
+but that ditz item is still open.
+
+Deployment: this record claims no rollout of any PR to any host.
+
+The sections below are the 2026-11-10 record. Their PR heads and states
+are as of that date; the table above is current.
+
+## Lanes (2026-11-10)
+
+| Lane | Worktree / branch | Hat and state then | Next bounded action then |
 | --- | --- | --- | --- |
-| Parent coordinator | `storage:0`, storage coordinator | CTO/root; active | Receive consolidated evidence and resolve rulings |
-| Integration lead | `storage:1` pane `%93`, `orgs-integration-20261110`, `chore/orgs-integration-20261110`, Sol | Lead; DONE/IDLE after bounded update | Draft PR #168 awaits parent review; no implementation assignment |
+| Parent coordinator | storage coordinator | CTO/root; active | Receive consolidated evidence and resolve rulings |
+| Integration lead | `orgs-integration-20261110`, `chore/orgs-integration-20261110`, Sol | Lead; DONE/IDLE after bounded update | Draft PR #168 awaits parent review; no implementation assignment |
 | Responsiveness lead | `foreground-responsiveness-20261110`, `feat/foreground-responsiveness-20261110`, Sol | Active on draft PR #171; last observed head `3f982b1` | Own foreground reads/browsing design and evidence; may reuse #167 on its own branch; no merge/deploy authority inferred |
-| Performance audit | `storage:2` pane `%94`, `perf-triage-20261110`, `docs/perf-triage-20261110`, Sol | Peer lead; DONE/IDLE | Draft PR #169 at `d6bdb394`; GH #74 amendment is proposal only |
+| Performance audit | `perf-triage-20261110`, `docs/perf-triage-20261110`, Sol | Peer lead; DONE/IDLE | Draft PR #169 at `d6bdb394`; GH #74 amendment is proposal only |
 | #166 repair owner | `descriptive-remote-names`, `feat/descriptive-remote-names`, native Sol | Implementer; bounded evidence delivered | No further branch change assigned |
 | Other prior implementation lanes | #165 and #167 worktrees | Implementers; DONE/idle | No additional task assigned; preserve branches |
 
@@ -37,7 +82,7 @@ This adoption uses a fixed cross-branch compatibility check before integration
 and lead review on frozen heads. Any missing formal council or exact-head gate
 remains a real blocker.
 
-## Bazel onboarding coordination
+## Bazel onboarding coordination (2026-11-10)
 
 Ted authorized a separate project-by-project package-graph harmonization
 mission. This lane is the local integration contact, not the implementer.
@@ -50,9 +95,9 @@ Heads #165/#166/#167 do not edit `BUILD`, `MODULE.bazel`, or `flake.nix`;
 performance audit lane proposes further test additions in streaming, remote,
 sync, cache, rsync, namespace and conflict suites; any new top-level module
 requires manifest coordination. #17 scheduler design waits for #167's
-interface. Exact heads and this contract were delivered to the parent coordinator at pane
-`%87` with a submitted receipt before any merge. No onboarding code is in
-this package.
+interface. Exact heads and this contract were delivered to the parent
+coordinator with a submitted receipt before any merge. No onboarding code is
+in this package.
 
 Responsiveness PR #171 added one explicit `storage/BUILD` source entry,
 `foreground_admission.py`, at reported pushed head `2a5490c8d50b436843710fa698d9cd326221b33a`.
@@ -73,7 +118,7 @@ gates and read-only repository inspection are authorized. Normal PR merges
 for accepted #165 and #166 were authorized and completed; #167 and the new
 responsiveness lane have no acceptance, merge or deployment claim here.
 
-## Product rulings and open question
+## Product rulings and open questions (2026-11-10)
 
 - `oq-dynamic-workers-scope`: CLOSED with Ted's 2026-11-10 ruling: foreground
   reads and browsing are in scope for responsiveness. #167 background sync
@@ -87,17 +132,20 @@ responsiveness lane have no acceptance, merge or deployment claim here.
   unavailable. The implementation must enforce bounds and leave exhaustion
   or failure unverified, never silently no-conflict. GitHub #74 remains
   implementation work.
-- `oq-conflict-fallback-limits`: OPEN and synced by the performance audit;
-  blocks `gh-74-no-hash-policy`. The proposed 64 MiB byte limit, 60 second
-  deadline, and one active fallback per mount are not Ted-approved values.
+- `oq-conflict-fallback-limits`: OPEN on 2026-11-10 (closed 2026-11-18; see
+  Current state) and synced by the performance audit; blocked
+  `gh-74-no-hash-policy`. The proposed 64 MiB byte limit, 60 second
+  deadline, and one active fallback per mount were not yet Ted-approved
+  values on 2026-11-10.
 
-## Draft performance backlog
+## Draft performance backlog (2026-11-10)
 
 The peer audit began at pinned `a7467c6` and its GH #74 amendment was pushed
 on master `66c640a` as draft PR #169
 (`d6bdb39438d427906802b48d3c27586a0e51b134`). The peer reports a
 docs-only diff check and 44 valid relative links at that head; no tests,
-live access, acceptance or merge are claimed. Ranked bounded candidates:
+live access, acceptance or merge are claimed. (#169 later merged at
+`ebcbdf0`; see Current state.) Ranked bounded candidates:
 
 1. `streaming-prefix-write-open`: protect dirty sync state when write-open
    encounters a promoted partial prefix. Correctness first; no ruling needed
@@ -116,12 +164,11 @@ These are not authorized implementation packages in this lane. #17 scheduler
 work waits for #167's implementation interface; the scope ruling is settled.
 The full source and boundary test proposals live in the peer audit document,
 not this summary. The peer reports its cold-open channel finding reached the
-responsiveness lead at pane `%106` with a queued receipt; that is delivery,
-not acknowledgment or execution. Its message to parent pane `%87` became
-ambiguous after mixed composer input; no parent delivery is claimed from
-that attempt.
+responsiveness lead with a queued receipt; that is delivery, not
+acknowledgment or execution. Its message to the parent became ambiguous
+after mixed composer input; no parent delivery is claimed from that attempt.
 
-## Handoff
+## Handoff (2026-11-10)
 
 The adoption record is on draft PR #168. #165 and #166 are integrated,
 not deployed. #167 remains a draft, incomplete for the ruled foreground
@@ -131,9 +178,8 @@ responsiveness lead; this integration lane has no implementation assignment.
 PR #170's incident remains under the onboarding root's remediation, with no
 waiver or acceptance from this lane.
 
-The parent relayed an alias check for splinter1: installed and running
-`pq8kn2` package hashes for rsync, watcher and mount profiles match
-`a7467c6` and differ from merged `81793ac`; #165 and #166 are therefore
-not rolled out there. This is a relayed observation, not a live check by this
-lane. No rollout was performed. No mission-owned process, mount, remote host
-session, or cache lease is retained.
+The parent relayed a deployment observation for one field host: #165 and
+#166 were not rolled out there. This lane did not inspect the host, and the
+details are in the private roster. No rollout was performed. No
+mission-owned process, mount, remote host session, or cache lease is
+retained.

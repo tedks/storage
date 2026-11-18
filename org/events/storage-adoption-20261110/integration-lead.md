@@ -213,9 +213,10 @@
 - based_on: `81793ac27b70f82c231bf607b55e775d2b905974`
 - state: Parent assigned a separate Sol responsiveness lead in
   `foreground-responsiveness-20261110`; worktree observed at `66c640a`.
-  This lane made no sibling edits. Parent also relayed that splinter1's
-  installed/running `pq8kn2` rsync, watcher and mount-profile hashes match
-  `a7467c6` and differ from `81793ac`; #165/#166 are not rolled out there.
+  This lane made no sibling edits. Parent also relayed a deployment
+  observation for one field host: its installed rsync, watcher and
+  mount-profile hashes match `a7467c6` and differ from `81793ac`, so
+  #165/#166 are not rolled out there (host details in the private roster).
   That host observation was not independently repeated by this lane. PR #170
   remains under onboarding-root incident remediation without waiver or
   acceptance. No merge, deployment or live inspection was performed here.
@@ -247,9 +248,9 @@
 - state: Peer performance audit DONE/IDLE after GH #74 amendment. The peer
   reports docs-only diff check and 44 valid links; no tests or live access.
   Its 64 MiB, 60 second and one-active-per-mount limits remain proposals.
-  The peer reports a QUEUED receipt to responsiveness lead `%106` for the
-  cold-open finding, not acknowledgment or execution. Its send to parent
-  `%87` is ambiguous after mixed composer input, so this record does not
+  The peer reports a QUEUED receipt to the responsiveness lead for the
+  cold-open finding, not acknowledgment or execution. Its send to the parent
+  is ambiguous after mixed composer input, so this record does not
   claim that attempt delivered. No source review or merge claim follows.
 
 ## integration-lead:22
