@@ -627,8 +627,16 @@ class TestGrowthWithFailingRenameRecords(unittest.TestCase):
         # and every worker holds a distinct failing task. A broken barrier
         # in a worker would otherwise vanish into the retry path, so it is
         # kept and re-raised here.
-        saturated = threading.Barrier(self.CEILING + 1, timeout=10.0)
         first_pass, arrived, barrier_errors = set(), [], []
+        pool_at_rendezvous = []
+        # The action runs once every party has arrived and before any is
+        # released, so the pool size it reads is the size while all the
+        # workers are still inside record(); read later, idle workers may
+        # already have retired (idle_timeout is short).
+        saturated = threading.Barrier(
+            self.CEILING + 1, timeout=10.0,
+            action=lambda: pool_at_rendezvous.append(len(self.sync_manager.workers)),
+        )
         real_record, real_write = MemberRepairs.record, MemberRepairs._write_new
 
         def record(repairs_self, old_path, *args, **kwargs):
@@ -678,7 +686,7 @@ class TestGrowthWithFailingRenameRecords(unittest.TestCase):
                 self.assertEqual(sorted(old for old, _ in names),
                                  sorted(old for old, _ in arrived))
                 self.assertEqual(self.CEILING, len({worker for _, worker in arrived}))
-            self.assertEqual(self.CEILING, len(self.sync_manager.workers))
+            self.assertEqual([self.CEILING], pool_at_rendezvous)
 
             # Only now is the healthy file made and marked dirty: the
             # monitor's pass at start() cannot have synced it early.

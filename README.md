@@ -156,9 +156,14 @@ workers exit after 30 seconds idle. The configured maximum must be at least
 `workers`; it can be at most 8 with any SSH member or 32 with local members
 only. The SSH limit leaves room under the usual ten-session OpenSSH limit for
 the remote watcher and another operation on the shared rsync connection.
-Foreground reads and streaming prefetch use a separate Paramiko connection
-with an SFTP channel reserved for interactive calls. Servers configured with
-a lower session limit may need a lower maximum. CPU
+For an `rsync://` member, uploads run over the shared OpenSSH connection,
+separate from the Paramiko connection that foreground reads and streaming
+prefetch use. For an `ssh://` member, uploads use that same Paramiko
+connection's SFTP channels (four by default, one kept for interactive
+calls), so more than three workers uploading to one `ssh://` member wait
+for a channel rather than adding throughput, each holding its file's upload
+lock while it waits. Servers configured with a lower session limit may need a
+lower maximum. CPU
 load average is not used: sync spends most of its time waiting for member I/O,
 so CPU load is a poor guide to useful concurrency.
 
