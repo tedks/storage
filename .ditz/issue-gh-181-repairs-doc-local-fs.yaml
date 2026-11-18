@@ -1,0 +1,20 @@
+id: gh-181-repairs-doc-local-fs
+title: 'member-rename-repairs doc: state that the cache must be on a local filesystem;
+  rewrap'
+desc: 'Council round 8 on PR #182 (Anthropic nits 1-2, docs only, filed so the reviewed
+  head stays fixed): the rename-refusal errno set relies on a local cache filesystem
+  (an NFS retransmitted RENAME can return ENOENT/EEXIST after taking effect). Say
+  so in docs/member-rename-repairs.md, and rewrap the paragraph at lines 83-86.'
+type: task
+component: sync
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-18T06:04:38-00:00
+references: []
+log_events:
+- time: 2026-11-18T06:04:38-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
