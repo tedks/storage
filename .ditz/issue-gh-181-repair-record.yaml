@@ -114,5 +114,14 @@ log_events:
     files, preserve ambiguous names, and stay within the cache through changes in
     ancestor type. Requested synthetic reopen coverage. PUBLISH_WAIT is per attempt,
     not a queue latency guarantee.'
+- time: 2026-11-18T07:39:24-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'At 7218e95 verified both requested reopen fixes (live payload alias identity,
+    ordered member resolution and scoped startup traversal). Residual for exact-head
+    review: guard the inode actually modified when a retained alias now resolves as
+    an ordinary file, and when a surviving view descriptor points to kept bytes but
+    its former pathname is detached/replaced. Cover ordinary open/truncate and fd
+    write with exact recovery bytes. Full gate awaits clean review.'
 blocks:
 - gh-181
