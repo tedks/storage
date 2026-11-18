@@ -51,6 +51,7 @@ from .sync_tasks import DirOperation
 from .recompute import RecomputeEngine
 from .checksum_queue import DEFAULT_CHECKSUM_REVERIFY_INTERVAL, MemberHashQueues
 from .checksums import ChecksumBasis, ChecksumRecord
+from .member_repairs import CARRIER_DIR, is_carrier_path
 from .pathing import ResolvedPath, resolve_path
 from .links import LinkRefused, intermediate_paths, link_checksum, resolve_link_target
 from .namespace import DEFAULT_LISTING_MAX_STALE, NamespaceService
@@ -115,6 +116,7 @@ class StorageFS(Operations):
     _HIDDEN_NAMES = frozenset({
         ".storage.rsync-tmp",      # rsync --partial-dir scratch directory
         ".storage.control.sock",   # FUSE control socket
+        CARRIER_DIR,               # member-rename repair records
     })
     _HIDDEN_PREFIXES = (
         ".storage.mount.",         # mount lock files (.storage.mount.*.lock)
@@ -137,15 +139,16 @@ class StorageFS(Operations):
     # admitted open made: they must run exactly once even after the gate
     # closes (a member-copy close uploads, a canonical close queues its
     # sync), so they are neither queued nor cancelled, and not counted.
-    # flush is fusepy's no-op (StorageFS does not override it; a test pins
-    # that), so close(2), which sends it synchronously, never waits for a
-    # slot. An override that does work must move flush to _DEMAND_OPS.
-    _ADMISSION_EXEMPT = frozenset({"init", "destroy", "release", "releasedir", "flush"})
+    # flush does work (StorageFS.flush reports a conflict-view write that a
+    # member repair now refuses), so it is admitted as demand, like fsync
+    # (CTO STORAGE-QUEUE-0645): close(2), which sends it synchronously, can
+    # wait for a demand slot. release still never waits.
+    _ADMISSION_EXEMPT = frozenset({"init", "destroy", "release", "releasedir"})
     _METADATA_OPS = frozenset({
         "getattr", "opendir", "readdir", "access", "readlink",
         "getxattr", "listxattr", "statfs",
     })
-    _DEMAND_OPS = frozenset({"read", "write", "fsync"})
+    _DEMAND_OPS = frozenset({"read", "write", "fsync", "flush"})
     # Without hard_remove, libfuse 2 renames a file unlinked while open to
     # .fuse_hidden<16 hex> and, at its last close, unlinks that name from
     # inside the RELEASE request (fuse_do_release). Every unlink, that one
@@ -570,8 +573,16 @@ class StorageFS(Operations):
     # Conflict / checksum helpers
     # ------------------------------------------------------------------ #
     def _resolve_path(self, path: str) -> ResolvedPath:
-        """Resolve a FUSE path into canonical and cache targets."""
-        return resolve_path(path, self.backends.keys(), self.cache_manager.get_cache_path)
+        """Resolve a FUSE path into canonical and cache targets.
+
+        The member-repair carriers are not part of the namespace: a path to
+        them is ENOENT, so no caller (another user of an allow_other mount
+        included) can read, forge or remove a repair through the mount.
+        """
+        resolved = resolve_path(path, self.backends.keys(), self.cache_manager.get_cache_path)
+        if is_carrier_path(resolved.canonical_path) or is_carrier_path(path):
+            raise FuseOSError(errno.ENOENT)
+        return resolved
 
     def _invalidate_dir_cache_entry(self, path: str):
         """Remove a directory entry from the cached listing."""
@@ -2327,7 +2338,7 @@ class StorageFS(Operations):
 
     def chmod(self, path, mode):
         """Change file mode"""
-        cache_path = self.cache_manager.get_cache_path(path)
+        cache_path = self._resolve_path(path).cache_path
 
         try:
             os.chmod(cache_path, mode)
@@ -2336,7 +2347,7 @@ class StorageFS(Operations):
 
     def chown(self, path, uid, gid):
         """Change file owner"""
-        cache_path = self.cache_manager.get_cache_path(path)
+        cache_path = self._resolve_path(path).cache_path
 
         # lchown: the kernel sends chown -h for a link, which must change
         # the link, never its target. (chmod is never sent for a link.)
@@ -2391,9 +2402,21 @@ class StorageFS(Operations):
                     self._refetch_pins.pop(canonical_path, None)
                     self._pinned_stats.pop(canonical_path, None)
 
+    def _refuse_fenced_view_write(self, resolved: ResolvedPath):
+        """A write through a conflict view goes to that member on release,
+        replacing its object; under an open member repair that object may
+        hold the only copy of renamed bytes, so the write is refused up
+        front (EBUSY), as an unlink of the view is."""
+        if resolved.backend_name and resolved.backend_name in (
+            self.cache_manager.member_repairs.backends_for([resolved.canonical_path])
+        ):
+            raise FuseOSError(errno.EBUSY)
+
     def _open(self, path, flags):
         """Open a file"""
         resolved = self._resolve_path(path)
+        if not self._is_read_only_open(flags):
+            self._refuse_fenced_view_write(resolved)
         cache_path = resolved.cache_path
         prefetch_session: Optional[PrefetchSession] = None
 
@@ -2480,6 +2503,7 @@ class StorageFS(Operations):
     def _create(self, path, mode, fi=None):
         """Create a file"""
         resolved = self._resolve_path(path)
+        self._refuse_fenced_view_write(resolved)
         cache_path = self.cache_manager.create_cached_file(resolved.requested_path)
 
         try:
@@ -2639,6 +2663,31 @@ class StorageFS(Operations):
 
             if entry.backend_name:
                 backend = self.backends.get(entry.backend_name)
+                if backend and entry.backend_name in (
+                    self.cache_manager.member_repairs.backends_for([entry.canonical_path])
+                ):
+                    # A write through a conflict view would replace that
+                    # member's object, which an open repair protects. Open
+                    # and create refuse it and flush reports it to close();
+                    # this covers a repair recorded after that flush, when
+                    # close() has already succeeded: the view's bytes are
+                    # kept durably as a repair of their own, listed until
+                    # resolved (MemberRepairs.preserve_view_write). A
+                    # read-only view wrote nothing, so nothing is kept.
+                    if (entry.flags & os.O_ACCMODE) != os.O_RDONLY:
+                        try:
+                            self.cache_manager.member_repairs.preserve_view_write(
+                                entry.canonical_path, entry.backend_name, entry.cache_path,
+                                "write through a conflict view after close(), kept off "
+                                "the member by an open repair",
+                            )
+                        except Exception as exc:  # noqa: BLE001 - release cannot fail usefully
+                            self.logger.error(
+                                "direct sync of %s to %s refused by an open member repair, "
+                                "and its bytes could not be kept: %s; they remain only in %s",
+                                entry.canonical_path, entry.backend_name, exc, entry.cache_path,
+                            )
+                    backend = None
                 if backend:
                     try:
                         backend.copy_from_local(entry.cache_path, entry.canonical_path)
@@ -2665,6 +2714,27 @@ class StorageFS(Operations):
 
         except OSError as e:
             raise FuseOSError(e.errno)
+
+    def flush(self, path, fh):
+        """Report, to close(), a conflict-view write that will not be sent.
+
+        Open and create refuse a write through a conflict view to a member
+        with an open repair (_refuse_fenced_view_write); a repair recorded
+        after the open is caught here, so the writer's close() fails with
+        EBUSY instead of succeeding while release skips the copy. A repair
+        recorded between this flush and the release is left to release,
+        which keeps the bytes durably as a view-write repair, since close()
+        has then already succeeded. Admitted as demand under the cap
+        (_DEMAND_OPS).
+        """
+        with self._fd_lock:
+            entry = self._fd_map.get(fh)
+        if (entry is not None and entry.backend_name
+                and (entry.flags & os.O_ACCMODE) != os.O_RDONLY
+                and entry.backend_name in self.cache_manager.member_repairs.backends_for(
+                    [entry.canonical_path])):
+            raise FuseOSError(errno.EBUSY)
+        return 0
 
     def fsync(self, path, datasync, fh):
         """Sync file to disk"""
@@ -2718,7 +2788,7 @@ class StorageFS(Operations):
                 raise FuseOSError(errno.ENOTDIR)
             self._force_verify(self._resolve_path(path).canonical_path)
             return
-        cache_path = self.cache_manager.get_cache_path(path)
+        cache_path = self._resolve_path(path).cache_path
 
         try:
             os.setxattr(str(cache_path), name, value, follow_symlinks=False)
@@ -2751,7 +2821,7 @@ class StorageFS(Operations):
                     self.MEMBER_STAT_XATTR}:
             # Derived; ignore removals.
             return
-        cache_path = self.cache_manager.get_cache_path(path)
+        cache_path = self._resolve_path(path).cache_path
 
         try:
             os.removexattr(str(cache_path), name, follow_symlinks=False)

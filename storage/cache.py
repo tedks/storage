@@ -18,6 +18,7 @@ from typing import Callable, ContextManager, Optional, List, Set
 from .backends.base import Backend, bulk_request
 from .backends.ssh_pool import BulkCapacityCancelled, BulkCapacityTimeout
 from .cache_metadata import PARTIAL_SUFFIX, PREFIX_XATTR, regular_file_stat, write_cache_metadata
+from .member_repairs import MemberRepairs
 from .models import FileMetadata, SyncStatus
 from .state import StateManager
 
@@ -82,6 +83,11 @@ class CacheManager:
             bulk_cold_copies: Reclassify whole-file copies on a threaded mount
         """
         self.cache_root = cache_root
+        # The renames members missed, read from the cache's own carriers
+        # before anything can sync, sweep or evict: every component that
+        # fences a member or pins a file asks this (storage/member_repairs.py).
+        # An unreadable carrier raises CorruptRepairRecord: no open.
+        self.member_repairs = MemberRepairs(Path(cache_root), sweep_new=True)
         # Set by StorageFS: a context manager that holds the descriptor
         # table lock and yields whether the path has an open descriptor.
         # Eviction stats and unlinks inside it, so no descriptor can be
@@ -463,6 +469,10 @@ class CacheManager:
         with self.state_manager.metadata_lock:
             row = self.state_manager.get_file_metadata(virtual_path)
             if row is None or row.sync_status != SyncStatus.CLEAN:
+                return 0
+            # A member that missed a rename may hold these bytes only under
+            # the old name: the cached copy stays until the repair is resolved.
+            if self.member_repairs.covers(virtual_path):
                 return 0
             guard = self.descriptor_guard(virtual_path) if self.descriptor_guard else nullcontext(False)
             with guard as is_open:

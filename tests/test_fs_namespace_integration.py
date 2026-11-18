@@ -2994,7 +2994,9 @@ class TestFSNamespaceIntegration(unittest.TestCase):
         finally:
             self.backends['backend1'].rmdir = original
 
-    def test_rename_retry_targets_failed_backend(self):
+    def test_rename_failed_on_a_member_is_recorded_for_repair(self):
+        """The member that missed the rename gets a repair record, not a
+        queued replay; the member that took it gets neither."""
         self.fs.mkdir('/orig', 0o755)
         target = '/renamed'
         original = self.backends['backend2'].rename
@@ -3006,16 +3008,14 @@ class TestFSNamespaceIntegration(unittest.TestCase):
         try:
             with patch.object(self.fs.sync_manager, 'queue_dir_sync') as mock_queue:
                 self.fs.rename('/orig', target)
-            mock_queue.assert_called_with(
-                '/orig',
-                DirOperation.RENAME,
-                new_path=target,
-                backend_hint='backend2',
-                priority=90,
-                force=True,
-            )
+            mock_queue.assert_not_called()
         finally:
             self.backends['backend2'].rename = original
+        self.assertEqual(
+            [(('backend2',), '/orig', target, 'open')],
+            [(r.members, r.old_path, r.new_path, r.state)
+             for r in self.fs.cache_manager.member_repairs.list()],
+        )
 
     def test_mkdir_retry_eventually_replicates(self):
         path = '/asyncdir'

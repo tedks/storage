@@ -21,6 +21,7 @@ from storage.index_audit import (
     reprobe_member_locations,
     verify_index_against_cache,
 )
+from storage.member_repairs import MemberRepairs
 from storage.models import FileLocation, FileMetadata, SyncStatus
 from storage.state import StateManager
 
@@ -1631,3 +1632,86 @@ class TestRebuildDerivesDirtyFromStat(unittest.TestCase):
         kinds = {issue.kind for issue in report.issues}
         self.assertIn("stale_clean_xattr", kinds)
         self.assertIn("metadata_mismatch", kinds)
+
+
+class TestMemberRepairsCommand(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.temp_dir, ignore_errors=True)
+        self.cache = self.temp_dir / "cache"
+        self.cache.mkdir()
+        repairs = MemberRepairs(self.cache)
+        self.first = repairs.record("/a", "/b", ["remote1"], "missed")
+        self.second = repairs.record("/d", "/e", ["local0", "remote1"], "missed too")
+        self.runner = CliRunner()
+
+    def invoke(self, *args):
+        return self.runner.invoke(main, ["debug", "member-repairs", "-c", str(self.cache), *args])
+
+    def test_lists_repairs_from_the_cache_carriers(self):
+        result = self.invoke()
+        self.assertEqual(0, result.exit_code, result.output)
+        self.assertIn("2 member repair(s):", result.output)
+        self.assertIn(f"{self.first} [open] remote1: /a -> /b (missed)", result.output)
+        self.assertIn(f"{self.second} [open] local0, remote1: /d -> /e (missed too)", result.output)
+
+    def test_lists_a_view_write_with_where_its_bytes_are(self):
+        view = self.temp_dir / "view"
+        view.write_bytes(b"edited")
+        repairs = MemberRepairs(self.cache)
+        kept = repairs.preserve_view_write("/f.txt", "remote1", view, "kept")
+        carrier = repairs.carrier_path(kept)
+        result = self.invoke()
+        self.assertEqual(0, result.exit_code, result.output)
+        self.assertIn(f"{kept} [open] remote1: view-write /f.txt, BYTES {carrier} (kept)",
+                      result.output)
+        payload = {r["id"]: r for r in json.loads(self.invoke("--json-output").output)}
+        self.assertEqual(("view-write", str(carrier)),
+                         (payload[kept]["kind"], payload[kept]["carrier"]))
+        self.assertEqual(b"edited", Path(payload[kept]["carrier"]).read_bytes())
+
+    def test_resolve_drops_only_that_repair_and_a_replay_fails(self):
+        result = self.invoke("--resolve", self.first)
+        self.assertEqual(0, result.exit_code, result.output)
+        payload = json.loads(self.invoke("--json-output").output)
+        self.assertEqual([self.second], [r["id"] for r in payload])
+        again = self.invoke("--resolve", self.first)
+        self.assertNotEqual(0, again.exit_code)
+        self.assertIn(f"No member repair {self.first}", again.output)
+        self.assertEqual([self.second], [r["id"] for r in json.loads(self.invoke("--json-output").output)])
+
+    def test_resolving_an_unknown_or_malformed_id_fails(self):
+        for bad in ("1", "0" * 32, "../" + self.first):
+            result = self.invoke("--resolve", bad)
+            self.assertNotEqual(0, result.exit_code, bad)
+        self.assertEqual(2, len(json.loads(self.invoke("--json-output").output)))
+
+    def test_a_busy_carrier_is_a_clean_error(self):
+        import fcntl
+        from unittest import mock as _mock
+        fd = os.open(str(self.cache / ".storage.repairs" / self.first), os.O_RDONLY)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            with _mock.patch("storage.member_repairs.FLOCK_WAIT", 0.05):
+                result = self.invoke("--resolve", self.first)
+        finally:
+            os.close(fd)
+        self.assertNotEqual(0, result.exit_code)
+        self.assertIn(f"Could not resolve member repair {self.first}", result.output)
+        self.assertNotIn("Traceback", result.output)
+        self.assertEqual(2, len(json.loads(self.invoke("--json-output").output)))
+
+    def test_an_unreadable_carrier_directory_is_a_clean_error(self):
+        from unittest import mock as _mock
+        with _mock.patch("storage.member_repairs.os.listdir", side_effect=OSError(13, "denied")):
+            result = self.invoke()
+        self.assertNotEqual(0, result.exit_code)
+        self.assertIn("Could not read the member repairs", result.output)
+        self.assertNotIn("Traceback", result.output)
+
+    def test_a_corrupt_carrier_is_reported(self):
+        carrier = self.cache / ".storage.repairs" / self.first
+        os.setxattr(str(carrier), "user.storage.member_repair", b"{not json")
+        result = self.invoke()
+        self.assertNotEqual(0, result.exit_code)
+        self.assertIn("Unreadable member repair carrier", result.output)

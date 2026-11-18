@@ -1,5 +1,6 @@
 import json
 import socket
+from dataclasses import asdict
 from pathlib import Path
 
 import click
@@ -10,6 +11,7 @@ from .index_audit import (
     verify_index_against_cache,
 )
 from .mount_profiles import create_storage_members, resolve_member_configuration
+from .member_repairs import VIEW_WRITE, CorruptRepairRecord, MemberRepairs
 from .state import StateManager
 
 
@@ -266,3 +268,79 @@ def debug_reprobe_locations(
     click.echo(f"  Members unavailable: {payload['members_unavailable']}")
     click.echo(f"  Remote locations found: {payload['remote_locations_found']}")
     click.echo(f"  Issues: {payload['issue_count']}")
+
+
+@debug.command("member-repairs")
+@click.option(
+    "-c",
+    "--cache",
+    required=True,
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    help="Cache directory of the mount (the repair records live there)",
+)
+@click.option(
+    "--resolve",
+    "resolve_id",
+    help="Drop repair ID once its members have been settled by hand (changes no member)",
+)
+@click.option("--json-output", is_flag=True, help="Print raw JSON")
+def debug_member_repairs(cache: Path, resolve_id: str | None, json_output: bool):
+    """List renames members missed, which are left for repair, not replayed.
+
+    For each one, the members may still hold the object at OLD, or the
+    rename may have taken effect there; an "intent" was interrupted before
+    its outcome was known. Look at both names on each member before moving
+    anything, then --resolve the repair. Until then those members get no
+    rename, mkdir, rmdir or upload at names overlapping either path, and
+    cached files under NEW stay cached. A running mount sees a resolution
+    at its next lookup. Records are carriers under CACHE/.storage.repairs,
+    not index rows, so they survive a fresh or rebuilt index.
+
+    A "view-write" repair holds a write made through a conflict view
+    (NAME.MEMBER) that an open repair kept off that member after close()
+    had already succeeded. Its bytes are the carrier file shown as BYTES:
+    copy them where they belong before resolving it, since resolving
+    deletes them.
+    """
+    try:
+        repairs = MemberRepairs(cache.resolve())
+    except (OSError, CorruptRepairRecord) as exc:
+        raise click.ClickException(f"Could not read the member repairs in {cache}: {exc}") from exc
+    if resolve_id is not None:
+        try:
+            resolved = repairs.resolve(resolve_id)
+        except (OSError, CorruptRepairRecord) as exc:
+            raise click.ClickException(f"Could not resolve member repair {resolve_id}: {exc}") from exc
+        if not resolved:
+            raise click.ClickException(f"No member repair {resolve_id}")
+        if not json_output:
+            click.echo(f"Resolved member repair {resolve_id}.")
+    try:
+        records = repairs.list()
+    except OSError as exc:
+        raise click.ClickException(f"Could not read the member repairs in {cache}: {exc}") from exc
+
+    if json_output:
+        click.echo(json.dumps(
+            [dict(asdict(r), carrier=str(repairs.carrier_path(r.id))) for r in records],
+            sort_keys=True, indent=2,
+        ))
+        return
+    if resolve_id is not None:
+        return
+    if not records:
+        click.echo("No member repairs.")
+        return
+    click.echo(f"{len(records)} member repair(s):")
+    for record in records:
+        if record.kind == VIEW_WRITE:
+            click.echo(
+                f"  {record.id} [{record.state}] {', '.join(record.members)}: "
+                f"view-write {record.new_path}, BYTES {repairs.carrier_path(record.id)} "
+                f"({record.reason})"
+            )
+            continue
+        click.echo(
+            f"  {record.id} [{record.state}] {', '.join(record.members)}: "
+            f"{record.old_path} -> {record.new_path} ({record.reason})"
+        )

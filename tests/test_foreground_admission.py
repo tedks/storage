@@ -18,6 +18,7 @@ from storage.foreground_admission import (
     AdmissionClosed, ForegroundAdmission, MAX_CAP, MIN_CAP, validate_cap,
 )
 from storage.fs import StorageFS
+from storage.member_repairs import VIEW_WRITE, MemberRepairs
 from storage.models import SyncStatus
 
 from tests.test_fs_threading import BLOCKED, WAIT, ThreadingTestBase, Worker
@@ -450,8 +451,11 @@ class TestClasses(CappedFSBase):
             with self.subTest(op=op, args=args):
                 self.assertEqual(expected, self.fs._foreground_class(op, args))
         self.call("release", "/warm.txt", cached_fd)
-        for op in ("init", "destroy", "release", "releasedir", "flush"):
+        for op in ("init", "destroy", "release", "releasedir"):
             self.assertIn(op, StorageFS._ADMISSION_EXEMPT)
+        # flush does work (member repairs), so it is admitted as demand.
+        self.assertNotIn("flush", StorageFS._ADMISSION_EXEMPT)
+        self.assertEqual("demand", self.fs._foreground_class("flush", ("/x", 0)))
         # A failing preflight falls back to ordinary; the open reports its own error.
         with patch.object(self.fs.cache_manager, "is_cached", side_effect=RuntimeError):
             self.assertEqual("ordinary", self.fs._foreground_class("open", ("/warm.txt", 0)))
@@ -605,15 +609,72 @@ class TestCleanupThroughShutdown(CappedFSBase):
         self.assertEqual(0, self.gate_.active_count)
         self.assertEqual(b"edited copy", (self.member_dir / "f.txt").read_bytes())
 
-    def test_flush_is_the_fusepy_no_op_and_never_waits(self):
-        # flush is exempt only while it does nothing; an override must
-        # reclassify it (fs.py _ADMISSION_EXEMPT).
+    def test_flush_is_admitted_as_demand_and_release_still_never_waits(self):
+        # StorageFS.flush does work, so it is admitted (fs.py
+        # _ADMISSION_EXEMPT, CTO STORAGE-QUEUE-0645): with every slot held
+        # it waits, while a release runs at once; it returns 0 once a
+        # demand slot frees.
         from fuse import Operations
-        self.assertIs(Operations.flush, type(self.fs).flush)
+        self.assertIsNot(Operations.flush, type(self.fs).flush)
+        self.cache("g.txt", b"other")
+        fd_g = self.call("open", "/g.txt", os.O_RDONLY)
         self.saturate_all()
-        self.assertEqual(0, Worker(self.call, "flush", "/x", 0).finish_started())
-        self.gate_.close()
-        self.assertEqual(0, self.call("flush", "/x", 0))
+        flusher = Worker(self.call, "flush", "/g.txt", fd_g)
+        flusher.start()
+        # saturate already left one fsync queued; the flush is the second.
+        self.assertTrue(self.gate_.waiting_for("demand", 2, WAIT))
+        flusher.join(BLOCKED)
+        self.assertTrue(flusher.is_alive())
+        self._release_blockers()
+        self.assertEqual(0, flusher.finish())
+        self.assertEqual(0, Worker(self.call, "release", "/g.txt", fd_g).finish_started())
+        self.assertEqual(0, self.gate_.active_count)
+
+
+class TestFencedViewCloseUnderTheCap(CappedFSBase):
+    """A conflict view whose member gains a repair while it is open, with
+    the cap on (member repairs with foreground admission, STORAGE-QUEUE-0645).
+    Cap off is covered in test_sync_races."""
+
+    saturate_all = TestCleanupThroughShutdown.saturate_all
+
+    def test_fenced_view_close_waits_for_demand_then_reports_ebusy(self):
+        self.cache("f.txt", b"member copy")
+        self.cache("g.txt", b"other")
+        fd = self.call("open", "/f.txt.member", os.O_RDWR)
+        self.call("write", "/f.txt.member", b"edited", 0, fd)
+        fd_g = self.call("open", "/g.txt", os.O_RDONLY)
+        # A rename missed by the member, at the view's name.
+        self.fs.cache_manager.member_repairs.record(
+            "/f.txt", "/h.txt", ["member"], "missed rename (test)")
+        self.saturate_all()
+        flusher = Worker(self.call, "flush", "/f.txt.member", fd)
+        flusher.start()
+        self.assertTrue(self.gate_.waiting_for("demand", 2, WAIT))
+        flusher.join(BLOCKED)
+        self.assertTrue(flusher.is_alive())
+        # Cleanup is not admitted: a release runs while the flush queues.
+        self.assertEqual(0, Worker(self.call, "release", "/g.txt", fd_g).finish_started())
+        self._release_blockers()
+        with self.assertRaises(FuseOSError) as raised:
+            flusher.finish()
+        self.assertEqual(errno.EBUSY, raised.exception.errno)
+        copies = []
+        with patch.object(self.member, "copy_from_local",
+                          side_effect=lambda *a: copies.append(a)):
+            # Two releases racing for the one descriptor: it runs once.
+            releasers = [Worker(self.call, "release", "/f.txt.member", fd) for _ in range(2)]
+            for releaser in releasers:
+                releaser.start()
+            for releaser in releasers:
+                self.assertEqual(0, releaser.finish())
+        self.assertEqual([], copies)
+        self.assertEqual(b"member copy", (self.member_dir / "f.txt").read_bytes())
+        kept = [r for r in MemberRepairs(self.cache_dir).list() if r.kind == VIEW_WRITE]
+        self.assertEqual(1, len(kept))
+        self.assertEqual(b"edited copy",
+                         MemberRepairs(self.cache_dir).carrier_path(kept[0].id).read_bytes())
+        self.assertEqual(0, self.gate_.active_count)
 
 
 class TestQueuedCallbacksIgnoreNativeCancellation(CappedFSBase):
