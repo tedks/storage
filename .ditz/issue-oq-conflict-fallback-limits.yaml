@@ -28,8 +28,8 @@ type: task
 component: open-questions
 release:
 reporter: Ted Smith <tedks@riseup.net>
-status: unstarted
-disposition:
+status: closed
+disposition: fixed
 creation_time: 2026-11-10T15:44:59-00:00
 references: []
 log_events:
@@ -41,5 +41,14 @@ log_events:
   who: Ted Smith
   what: blocks gh-74-no-hash-policy
   comment: ""
+- time: 2026-11-18T04:39:32-00:00
+  who: Ted Smith
+  what: 'closed: fixed'
+  comment: 'Ted ruling on Storage resumption, 2026-11-17. Adopt the proposed initial
+    bounds without a user override: 64 MiB actual bytes per member file, 60 seconds
+    total including wait, transfer and hash, one active fallback per mount and per
+    member, one second maximum slot wait, maximum 1 MiB read chunks. On unknown/oversize
+    input, growth beyond budget, timeout, cancellation or failed verification, keep
+    the member unverified and block its upload.'
 blocks:
 - gh-74-no-hash-policy
