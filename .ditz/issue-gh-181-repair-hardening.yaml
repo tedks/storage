@@ -45,5 +45,12 @@ log_events:
   who: Ted Smith
   what: blocks gh-181
   comment: ""
+- time: 2026-11-18T07:30:30-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Lead review at dbeaa65, nit 2: SpaceManager.cleanup_over_replication (spacemgmt.py:133)
+    and ReplicationManager.replicate_file / sync_file_to_backends (replication.py:176,
+    :250) mutate members with no fence check or mutation registration. Nothing in
+    the mount calls them; wire both in before anything does.'
 blocks:
 - gh-181
