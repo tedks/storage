@@ -49,3 +49,17 @@ log_events:
     listing. N11 an identity recorded only at startup cannot catch a disk already
     missing at mount time; require the expected identity from member configuration
     (or a marker) for that case.'
+- time: 2026-11-18T05:10:04-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'PR178 final round b2705fef54e7-20261118T050622Z-0bfe4f anthropic nits
+    (non-blocking, for the snapshot tracer): N12 an abandoned foreground SSH listing
+    runs in interactive context and can hold the member''s interactive reserve until
+    its transport timeout; the background abandonment rationale does not carry over.
+    N13 single-member foreground listings run inline on the FUSE thread with no abandonable
+    future; the whole-request deadline needs that path routed through a worker. N14
+    say whether missing-member backoff only adds retries or also makes finite-TTL
+    stale refreshes skip B. N15 harmonize failure-class terms (contract unavailable/timeout/cancelled
+    vs spec failed/timed out/cancelled; permission and partial-read failures log as
+    failed). N16 spec Status line and Evidence list should cite the 2026-11-18 CTO
+    deferral ruling (currently in the failed-disk paragraph and PR body).'
