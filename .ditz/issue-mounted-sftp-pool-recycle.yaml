@@ -32,3 +32,14 @@ log_events:
   who: Ted Smith
   what: updated description
   comment: ""
+- time: 2026-11-18T05:00:24-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Rulings 2026-11-17 (oq-mounted-sftp-maintenance-semantics, oq-mounted-daemon-handoff-scope)
+    are folded into docs/mounted_restart_design_2026-11-11.md via PR 172 (head cb28dc6):
+    bounded wait for new work (drain deadline plus a P1-enforced reconnect allowance),
+    incomplete on drain timeout with the transfer left running, refused without a
+    connected transport, failed on reconnect failure or mid-drain transport loss.
+    Doc nit deferred from council round cb28dc670e61-20261118T045843Z-3588e7: the
+    ''Since the snapshot'' note labels keeping existing deadlines live as ''(ruling
+    2)''; it is item 2''s design reading. Relabel when the doc is next touched.'
