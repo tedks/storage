@@ -309,7 +309,10 @@ def debug_member_repairs(cache: Path, resolve_id: str | None, json_output: bool)
             raise click.ClickException(f"No member repair {resolve_id}")
         if not json_output:
             click.echo(f"Resolved member repair {resolve_id}.")
-    records = repairs.list()
+    try:
+        records = repairs.list()
+    except OSError as exc:
+        raise click.ClickException(f"Could not read the member repairs in {cache}: {exc}") from exc
 
     if json_output:
         click.echo(json.dumps([asdict(r) for r in records], sort_keys=True, indent=2))

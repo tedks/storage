@@ -80,7 +80,10 @@ durable record of it.
    changed: no cache move, no index change, no member call. A rename with no
    target members writes no record.
 2. **Local move.** The cache rename, the index rewrite and the metadata
-   xattrs, as before. Then the cache tree's part of the move is made
+   xattrs, as before. If the cache rename itself fails with an error
+   meaning it refused (ENOENT, ENOTEMPTY, EXDEV and the like), nothing
+   moved, and the intent is dropped. Any other failure or interruption
+   from the rename on, an I/O error included, keeps the intent. Then the cache tree's part of the move is made
    durable:
    - every directory from the cache root down to the old and the new
      parent is fsynced. That includes directories this move created
@@ -171,7 +174,8 @@ all.
 
 Cost: a rename with member targets makes two fsyncs for the intent, one per
 cache directory from the root down to each of the two parents (shared
-levels once), and one or two for the settle. It also makes two reloads of
+levels once), and one for the settle, or three when a member missed the
+move. It also makes two reloads of
 the carrier directory, each one listdir and one getxattr per open repair.
 A rename with no member target pays nothing.
 

@@ -955,22 +955,29 @@ class TestRepairsOutliveTheIndex(SyncRaceTestBase):
         [record] = MemberRepairs(self.cache_dir).list()
         self.assertEqual(("intent", ("member",)), (record.state, record.members))
 
-    def test_a_failed_cache_rename_drops_its_intent(self):
-        """rename(2) failing has no effect: nothing moved, no member called,
-        and no intent left."""
-        self.fs.mkdir("/d", 0o755)
+    def test_a_refused_cache_rename_drops_its_intent_an_io_error_keeps_it(self):
+        """rename(2) refusing (EACCES) has no effect: nothing moved, no
+        member called, no intent left. An I/O error leaves the outcome
+        unknown: the intent stays."""
         real_rename = Path.rename
+        for err, kept in ((errno.EACCES, False), (errno.EIO, True)):
+            self.fs.mkdir("/d", 0o755)
 
-        def failing(path, target):
-            if Path(target) == self.cache_dir / "e":
-                raise OSError(errno.EIO, "injected")
-            return real_rename(path, target)
+            def failing(path, target, err=err):
+                if Path(target) == self.cache_dir / "e":
+                    raise OSError(err, os.strerror(err))
+                return real_rename(path, target)
 
-        with patch.object(Path, "rename", failing):
-            with self.assertRaises(FuseOSError):
-                self.fs.rename("/d", "/e")
-        self.assertTrue((self.cache_dir / "d").is_dir())
-        self.assertEqual([], MemberRepairs(self.cache_dir).list())
+            with patch.object(Path, "rename", failing):
+                with self.assertRaises(FuseOSError):
+                    self.fs.rename("/d", "/e")
+            self.assertTrue((self.cache_dir / "d").is_dir())
+            records = MemberRepairs(self.cache_dir).list()
+            self.assertEqual(kept, [("intent", ("member",))] == [(r.state, r.members) for r in records],
+                             err)
+            for record in records:
+                self.assertTrue(MemberRepairs(self.cache_dir).resolve(record.id))
+            self.fs.rmdir("/d")
 
     def test_the_local_move_is_made_durable_before_any_member_call(self):
         """If the cache directories cannot be fsynced after the local move,

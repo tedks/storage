@@ -42,9 +42,18 @@ DEFAULT_STAT_MEMO_LIMIT = 8192
 _MAX_CHILD_RACES = 1024
 
 
+# rename(2) errors that mean it refused and changed nothing.
+_RENAME_REFUSALS = frozenset({
+    errno.ENOENT, errno.ENOTDIR, errno.EISDIR, errno.ENOTEMPTY, errno.EEXIST,
+    errno.EXDEV, errno.EINVAL, errno.EACCES, errno.EPERM, errno.EBUSY,
+    errno.EROFS, errno.ENAMETOOLONG, errno.ELOOP, errno.EMLINK,
+})
+
+
 def _cache_ancestors(cache_root: Path, directory: Path) -> List[Path]:
     """The cache root, then each directory down to and including directory."""
-    root = Path(cache_root)
+    root = Path(os.path.realpath(cache_root))
+    directory = Path(os.path.realpath(directory))
     try:
         parts = directory.relative_to(root).parts
     except ValueError:
@@ -1542,8 +1551,11 @@ class NamespaceService:
                     attempted = True
                     try:
                         old_cache.rename(new_cache)
-                    except OSError:
-                        attempted = False
+                    except OSError as exc:
+                        # Only a refusal is known to have changed nothing;
+                        # an I/O error (EIO, say) leaves the outcome unknown.
+                        if exc.errno in _RENAME_REFUSALS:
+                            attempted = False
                         raise
                     moved = True
 
