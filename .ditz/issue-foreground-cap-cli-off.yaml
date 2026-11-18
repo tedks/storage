@@ -1,0 +1,20 @@
+id: foreground-cap-cli-off
+title: CLI cannot override a profile's max_foreground_operations off
+desc: 'PR #180 council nit (Anthropic seat, round 15e5ad0656d0-20261118T050147Z-8e2555):
+  once a mount profile sets max_foreground_operations, the CLI cannot turn the cap
+  off for one mount (--no-fuse-threads is then a conflict, and the option has no off
+  value). Options: accept 0 as off (as bulk_capacity_wait_timeout does), or a --no-max-foreground-operations
+  flag. Product surface choice; not needed for S1.'
+type: feature
+component: performance
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-18T05:20:48-00:00
+references: []
+log_events:
+- time: 2026-11-18T05:20:48-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
