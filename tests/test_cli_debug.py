@@ -1631,3 +1631,47 @@ class TestRebuildDerivesDirtyFromStat(unittest.TestCase):
         kinds = {issue.kind for issue in report.issues}
         self.assertIn("stale_clean_xattr", kinds)
         self.assertIn("metadata_mismatch", kinds)
+
+
+class TestMemberRepairsCommand(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.temp_dir, ignore_errors=True)
+        self.database = self.temp_dir / "state.db"
+        state_manager = StateManager(str(self.database))
+        try:
+            self.first = state_manager.record_member_rename_repair("remote1", "/a", "/b", "missed")
+            state_manager.record_member_rename_repair("remote1", "/a", "/b", "missed again")
+            self.second = state_manager.record_member_rename_repair("local0", "/d", "/e", "missed")
+        finally:
+            state_manager.close()
+        self.runner = CliRunner()
+
+    def invoke(self, *args):
+        return self.runner.invoke(main, ["debug", "member-repairs", "-d", str(self.database), *args])
+
+    def test_lists_repairs_with_their_occurrences(self):
+        result = self.invoke()
+        self.assertEqual(0, result.exit_code, result.output)
+        self.assertIn("2 member repair(s):", result.output)
+        self.assertIn(f"{self.first}: remote1: /a -> /b (missed again; seen 2x)", result.output)
+        self.assertIn(f"{self.second}: local0: /d -> /e (missed; seen 1x)", result.output)
+
+    def test_resolve_drops_only_that_repair(self):
+        result = self.invoke("--resolve", str(self.first))
+        self.assertEqual(0, result.exit_code, result.output)
+        payload = json.loads(self.invoke("--json-output").output)
+        self.assertEqual([("local0", "/d", "/e")],
+                         [(r["backend_name"], r["old_path"], r["new_path"]) for r in payload])
+
+    def test_resolving_an_unknown_repair_fails(self):
+        result = self.invoke("--resolve", "999")
+        self.assertNotEqual(0, result.exit_code)
+        self.assertIn("No member repair 999", result.output)
+        self.assertEqual(2, len(json.loads(self.invoke("--json-output").output)))
+
+    def test_a_missing_database_is_not_created(self):
+        missing = self.temp_dir / "nope" / "state.db"
+        result = self.runner.invoke(main, ["debug", "member-repairs", "-d", str(missing)])
+        self.assertNotEqual(0, result.exit_code)
+        self.assertFalse(missing.parent.exists())

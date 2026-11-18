@@ -1,5 +1,6 @@
 import json
 import socket
+from dataclasses import asdict
 from pathlib import Path
 
 import click
@@ -266,3 +267,52 @@ def debug_reprobe_locations(
     click.echo(f"  Members unavailable: {payload['members_unavailable']}")
     click.echo(f"  Remote locations found: {payload['remote_locations_found']}")
     click.echo(f"  Issues: {payload['issue_count']}")
+
+
+@debug.command("member-repairs")
+@click.option(
+    "-d",
+    "--database",
+    required=True,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="SQLite database path of the mount",
+)
+@click.option(
+    "--resolve",
+    "resolve_id",
+    type=int,
+    help="Drop repair ID once the member has been settled by hand (changes no member)",
+)
+@click.option("--json-output", is_flag=True, help="Print raw JSON")
+def debug_member_repairs(database: Path, resolve_id: int | None, json_output: bool):
+    """List renames members missed, which are left for repair, not replayed.
+
+    For each one, the member may still hold the object at OLD, or the rename
+    may have taken effect there; look at both names on the member before
+    moving anything, then --resolve the repair.
+    """
+    state_manager = StateManager(str(database.resolve()))
+    try:
+        if resolve_id is not None:
+            if not state_manager.resolve_member_rename_repair(resolve_id):
+                raise click.ClickException(f"No member repair {resolve_id}")
+            if not json_output:
+                click.echo(f"Resolved member repair {resolve_id}.")
+        repairs = state_manager.list_member_rename_repairs()
+    finally:
+        state_manager.close()
+
+    if json_output:
+        click.echo(json.dumps([asdict(r) for r in repairs], sort_keys=True, indent=2))
+        return
+    if resolve_id is not None:
+        return
+    if not repairs:
+        click.echo("No member repairs.")
+        return
+    click.echo(f"{len(repairs)} member repair(s):")
+    for repair in repairs:
+        click.echo(
+            f"  {repair.id}: {repair.backend_name}: {repair.old_path} -> {repair.new_path} "
+            f"({repair.reason}; seen {repair.occurrences}x)"
+        )
