@@ -46,6 +46,10 @@ class RetryScheduler:
         self._heap: list = []
         self._seq = 0
         self._thread: Optional[threading.Thread] = None
+        # Called after each delivery, outside the scheduler's lock: an
+        # adaptive pool (SyncManager) grows for the returned task as it
+        # would for a newly queued one.
+        self.on_deliver: Optional[Callable[[], None]] = None
 
     @classmethod
     def for_queue(cls, task_queue: queue.Queue) -> "RetryScheduler":
@@ -113,6 +117,12 @@ class RetryScheduler:
                 self._queue.put(task)
             finally:
                 self._queue.task_done()  # the count defer took
+            on_deliver = self.on_deliver
+            if on_deliver is not None:
+                try:
+                    on_deliver()
+                except Exception:
+                    logger.exception("Retry delivery callback failed")
 
 
 class SyncExecutor:

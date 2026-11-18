@@ -608,7 +608,9 @@ class TestGrowthWithFailingRenameRecords(unittest.TestCase):
         self.sync_manager = SyncManager(
             self.state_manager, self.cache_manager, self.replication_manager,
             num_workers=self.FLOOR, max_workers=self.CEILING, idle_timeout=0.1,
-            config=SyncConfig(monitor_interval=30.0, retry_delay=0.2, max_retries=3),
+            # A long backoff: were it held in a worker (not the scheduler),
+            # the healthy sync below could not finish inside its deadline.
+            config=SyncConfig(monitor_interval=30.0, retry_delay=30.0, max_retries=3),
         )
         repairs = self.cache_manager.member_repairs
         names = [(f"/old-{i}", f"/new-{i}") for i in range(self.CEILING)]
@@ -702,22 +704,25 @@ class TestGrowthWithFailingRenameRecords(unittest.TestCase):
             members = on_members()
             self.assertEqual(1, len(members))
             self.assertEqual(payload, (members[0] / "healthy.txt").read_bytes())
-            # Still failing: no record was written, and the tasks keep
-            # retrying after the healthy sync finished.
+            # Still failing: no record was written, and the failing
+            # retries are held in the queue's RetryScheduler, not in a
+            # worker (CTO RRS-CTO-BACKOFF).
             done_at = time.monotonic()
             self.assertTrue(failing.is_set())
             self.assertEqual([], repairs.list())
+            scheduler = RetryScheduler.for_queue(self.sync_manager.task_queue)
+            deadline = time.monotonic() + 10.0
+            seen = scheduler.pending()
+            while seen != self.CEILING and time.monotonic() < deadline:
+                time.sleep(0.01)
+                seen = scheduler.pending()
+            self.assertEqual(self.CEILING, seen)
+            # A further round, delivered now, still fails.
+            scheduler.deliver_all_now()
             deadline = time.monotonic() + 10.0
             while not any(t > done_at for t in failures) and time.monotonic() < deadline:
                 time.sleep(0.02)
             self.assertTrue(any(t > done_at for t in failures))
-            # The landed backoff holds failing rename retries in the queue's
-            # RetryScheduler, not in a worker (CTO RRS-CTO-BACKOFF).
-            scheduler = RetryScheduler.for_queue(self.sync_manager.task_queue)
-            deadline = time.monotonic() + 10.0
-            while not scheduler.pending() and time.monotonic() < deadline:
-                time.sleep(0.01)
-            self.assertGreater(scheduler.pending(), 0)
 
             failing.clear()
             scheduler.deliver_all_now()
@@ -741,6 +746,85 @@ class TestGrowthWithFailingRenameRecords(unittest.TestCase):
             time.sleep(0.02)
         self.assertEqual(self.FLOOR, len(self.sync_manager.workers))
         self.sync_manager.stop()
+
+    def test_a_delivered_rename_retry_starts_a_worker_with_a_zero_floor(self):
+        # workers = 0 is accepted with max_sync_workers: a retry delivered
+        # after the pool retired to nothing must start a worker.
+        self.sync_manager = SyncManager(
+            self.state_manager, self.cache_manager, self.replication_manager,
+            num_workers=0, max_workers=1, idle_timeout=0.1,
+            config=SyncConfig(monitor_interval=30.0, retry_delay=60.0, max_retries=3),
+        )
+        attempts, done = [], threading.Event()
+
+        def process(executor, task):
+            attempts.append(task.virtual_path)
+            if len(attempts) == 1:
+                raise RuntimeError("injected: repair store refused")
+            done.set()
+            return True
+
+        scheduler = RetryScheduler.for_queue(self.sync_manager.task_queue)
+        with patch.object(SyncExecutor, "process", process):
+            self.sync_manager.start()
+            self.sync_manager.queue_dir_sync("/old", DirOperation.RENAME, new_path="/new")
+            deadline = time.monotonic() + 5.0
+            while ((scheduler.pending() != 1 or self.sync_manager.workers)
+                   and time.monotonic() < deadline):
+                time.sleep(0.02)
+            self.assertEqual(1, scheduler.pending())
+            self.assertEqual([], self.sync_manager.workers)
+            scheduler.deliver_all_now()
+            self.assertTrue(done.wait(5.0), "the delivered retry found no worker")
+            self.assertTrue(self.sync_manager.wait_for_completion(timeout=5.0))
+            self.sync_manager.stop()
+
+    def test_a_delivered_rename_retry_grows_the_pool_past_a_busy_floor(self):
+        # The scheduler puts a deferred retry back from its own thread. With
+        # the only floor worker busy, the pool must grow for it then, not
+        # wait for some later queue event.
+        self.sync_manager = SyncManager(
+            self.state_manager, self.cache_manager, self.replication_manager,
+            num_workers=self.FLOOR, max_workers=2, idle_timeout=0.1,
+            config=SyncConfig(monitor_interval=30.0, retry_delay=60.0, max_retries=3),
+        )
+        release, blocked = threading.Event(), threading.Event()
+        attempts, done = [], threading.Event()
+
+        def process(executor, task):
+            if task.virtual_path == "/blocker":
+                blocked.set()
+                release.wait(10.0)
+                return True
+            attempts.append(threading.current_thread().name)
+            if len(attempts) == 1:
+                raise RuntimeError("injected: repair store refused")
+            done.set()
+            return True
+
+        scheduler = RetryScheduler.for_queue(self.sync_manager.task_queue)
+        with patch.object(SyncExecutor, "process", process):
+            self.sync_manager.start()
+            try:
+                self.sync_manager.queue_sync("/blocker")
+                self.assertTrue(blocked.wait(5.0))
+                self.sync_manager.queue_dir_sync("/old", DirOperation.RENAME, new_path="/new")
+                deadline = time.monotonic() + 5.0
+                while ((scheduler.pending() != 1 or len(self.sync_manager.workers) != self.FLOOR)
+                       and time.monotonic() < deadline):
+                    time.sleep(0.02)
+                # Deferred, and the grown worker has retired: only the busy
+                # floor worker is left.
+                self.assertEqual(1, scheduler.pending())
+                self.assertEqual(self.FLOOR, len(self.sync_manager.workers))
+                scheduler.deliver_all_now()
+                self.assertTrue(done.wait(5.0), "the delivered retry waited behind the busy floor")
+                self.assertFalse(release.is_set())
+                self.assertEqual(2, len(attempts))
+            finally:
+                release.set()
+            self.assertTrue(self.sync_manager.wait_for_completion(timeout=5.0))
+            self.sync_manager.stop()
 
 
 class TestSyncConflicts(unittest.TestCase):

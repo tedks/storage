@@ -19,7 +19,7 @@ from .cache import CacheManager
 from .models import SyncStatus
 from .replication import ReplicationManager
 from .state import StateManager
-from .sync_executor import SyncExecutor
+from .sync_executor import RetryScheduler, SyncExecutor
 from .sync_tasks import DirOperation, DirSyncTask, SyncConfig, SyncTask, dir_task_key
 
 logger = logging.getLogger(__name__)
@@ -231,6 +231,11 @@ class SyncManager:
 
         # Task queue (priority queue)
         self.task_queue = queue.PriorityQueue()
+        if self.max_workers > self.num_workers:
+            # A rename retry deferred by #182's RetryScheduler goes back on
+            # the queue from the scheduler's thread; without this the pool
+            # would not grow for it until some other queue event.
+            RetryScheduler.for_queue(self.task_queue).on_deliver = self._maybe_grow
 
         # Workers
         self.workers = []
@@ -303,7 +308,10 @@ class SyncManager:
             for _ in range(target - len(self.workers)):
                 try:
                     self._start_worker_locked()
-                except RuntimeError:
+                except Exception:
+                    # Callers include FUSE handlers (queue_sync after a
+                    # write): a failed growth must not fail their request,
+                    # whose task is already queued.
                     logger.exception("Could not start another sync worker")
                     break
 
@@ -510,7 +518,8 @@ class SyncManager:
     def get_active_tasks(self) -> list:
         """Get list of currently active sync tasks"""
         with self._workers_lock:
-            return [w.get_active_task() for w in self.workers if w.get_active_task()]
+            # One read per worker: its task can finish between two reads.
+            return [task for task in (w.get_active_task() for w in self.workers) if task]
 
     def wait_for_completion(self, timeout: Optional[float] = None) -> bool:
         """
