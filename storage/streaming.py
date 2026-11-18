@@ -13,6 +13,8 @@ from typing import Callable, Dict, List, Optional, Tuple
 from fuse import FuseOSError
 
 from .backends.base import Backend
+from .backends.local import NOREPLACE_UNSUPPORTED
+from .backends.local import rename_noreplace as _rename_noreplace
 from .cache_metadata import PREFIX_XATTR
 from .models import FileLocation, FileMetadata, StreamingKeepAfterClose, SyncStatus
 
@@ -59,8 +61,7 @@ STREAMING_MAX_TRACKED_READ_SPANS = 64
 # partial, but the rename would work there too); renameat2 errors meaning
 # it has no RENAME_NOREPLACE either.
 _LINK_UNSUPPORTED = (errno.EPERM, errno.EOPNOTSUPP, errno.ENOTSUP, errno.ENOSYS, errno.EMLINK)
-_NOREPLACE_UNSUPPORTED = (errno.EINVAL, errno.ENOSYS, errno.EOPNOTSUPP, errno.ENOTSUP)
-from .backends.local import rename_noreplace as _rename_noreplace  # noqa: E402
+_NOREPLACE_UNSUPPORTED = NOREPLACE_UNSUPPORTED
 
 
 @dataclass

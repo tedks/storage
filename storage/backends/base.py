@@ -287,7 +287,8 @@ class Backend(ABC):
         that the member itself refuses when the new name is taken: never a
         check followed by a rename, nor a link followed by an unlink, both
         of which a concurrent writer can slip between. Raises
-        FileExistsError when the new name is taken. A member with no such
+        FileExistsError when the new name is taken, and FileNotFoundError
+        when the member has no source (nothing was moved). A member with no such
         operation raises OSError(ENOTSUP), and the namespace then leaves it
         alone and records a repair.
         """

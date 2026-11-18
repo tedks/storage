@@ -445,7 +445,9 @@ def test_ssh_backend_rename_replaces_an_existing_file(remote, ssh_backend, tmp_p
 @pytest.fixture
 def storage_over_ssh(ssh_backend, tmp_path):
     """A StorageFS (not mounted) whose one member is the SSH member, with
-    its first member rename failing as an unreachable member's would."""
+    its first replacing member rename failing as an unreachable member's
+    would. A rename onto a name the namespace did not hold never reaches
+    rename on SSH (no verified no-replace operation): calls stays empty."""
     (tmp_path / "cache").mkdir()
     fs = StorageFS(
         cache_root=tmp_path / "cache",
@@ -601,6 +603,21 @@ def test_first_rename_onto_a_free_ssh_name_is_not_made_unverified(
     assert not ssh_backend.exists("/g.txt")
     assert _repairs(fs.cache_manager.cache_root) == sorted(
         [(ssh_backend.name, "/d", "/e"), (ssh_backend.name, "/f.txt", "/g.txt")])
+
+
+def test_first_rename_onto_an_occupied_ssh_directory_keeps_both(
+        remote, ssh_backend, plain_storage_over_ssh):
+    """The SSH member holds an unrelated /e with a file in it: /d -> /e is
+    not made there, and both directories keep their contents."""
+    fs = plain_storage_over_ssh
+    member = remote.members[0]
+    fs.mkdir("/d", 0o755)
+    remote.write_remote(member, "d/mine.txt", b"mine")
+    remote.write_remote(member, "e/theirs.txt", b"theirs")
+    fs.rename("/d", "/e")
+    assert sorted(ssh_backend.listdir("/d")) == ["mine.txt"]
+    assert sorted(ssh_backend.listdir("/e")) == ["theirs.txt"]
+    assert _repairs(fs.cache_manager.cache_root) == [(ssh_backend.name, "/d", "/e")]
 
 
 def test_intended_replacement_still_replaces_on_an_ssh_member(

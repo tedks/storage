@@ -1935,11 +1935,10 @@ class TestFirstMemberRenameTarget(SyncRaceTestBase):
     """The mount's own member rename onto a name the namespace did not hold
     (docs/first-member-rename-target.md, ditz gh-181-sync-rename-noreplace).
 
-    Synthetic RED: the member's rename is wrapped so that, just before the
-    real call, another writer puts an unrelated object at the target: the
-    window between the namespace decision and the member operation. The
-    expected failures turn into unexpected successes (which fail the run)
-    once the first member rename refuses to replace; remove the markers then.
+    The first two cases were the synthetic RED of the design: another
+    writer puts an unrelated object at the target in the window between the
+    namespace's decision and the member call, or before it, unlisted. They
+    pass now that the member rename refuses rather than replace.
     """
 
     def occupy_target_first(self, rel, data):
@@ -2009,8 +2008,16 @@ class TestFirstMemberRenameTarget(SyncRaceTestBase):
         """A free name on a filesystem with RENAME_NOREPLACE: moved, no repair."""
         self.synced("/a.txt", b"renamed bytes")
         self.fs.mkdir("/d", 0o755)
-        self.fs.rename("/a.txt", "/b.txt")
-        self.fs.rename("/d", "/e")
+        noreplace, replacing = [], []
+        real_noreplace, real_rename = self.member.rename_noreplace, self.member.rename
+        with patch.multiple(
+                self.member,
+                rename_noreplace=Mock(side_effect=lambda *a: (noreplace.append(a), real_noreplace(*a))),
+                rename=Mock(side_effect=lambda *a: (replacing.append(a), real_rename(*a)))):
+            self.fs.rename("/a.txt", "/b.txt")
+            self.fs.rename("/d", "/e")
+        self.assertEqual([("/a.txt", "/b.txt"), ("/d", "/e")], noreplace)
+        self.assertEqual([], replacing)
         self.assertEqual(["b.txt", "e"], self.member_names())
         self.assertEqual([], self.repairs())
 
@@ -2036,6 +2043,7 @@ class TestFirstMemberRenameTarget(SyncRaceTestBase):
         self.assertEqual([("member", "/a.txt", "/b.txt"), ("member", "/d", "/e")], self.repairs())
         [first, second] = sorted(MemberRepairs(self.cache_dir).list(), key=lambda r: r.old_path)
         self.assertIn("no-replace rename unsupported", first.reason)
+        self.assertIn("no-replace rename unsupported", second.reason)
 
     def test_known_intended_replacement_still_replaces(self):
         """Control: /b.txt is the namespace's own, synced to the member;

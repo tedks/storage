@@ -18,8 +18,9 @@ from storage.backends.base import ChecksumUnavailable
 from storage.backends.local import LocalBackend
 from storage.checksums import ChecksumRecord, fast_checksum_bytes
 from storage.fs import StorageFS
+from storage.member_repairs import MemberRepairs
 from storage.links import link_checksum
-from storage.models import FileMetadata, SyncStatus
+from storage.models import FileLocation, FileMetadata, SyncStatus
 from storage.sync import DirOperation
 
 
@@ -2996,6 +2997,87 @@ class TestFSNamespaceIntegration(unittest.TestCase):
             )
         finally:
             self.backends['backend1'].rmdir = original
+
+    def _write_synced(self, path, data):
+        fh = self.fs.create(path, 0o644)
+        self.fs.write(path, data, 0, fh)
+        self.fs.release(path, fh)
+        self.assertTrue(self.fs.sync_manager.sync_now(path, timeout=5.0))
+
+    def _repairs(self):
+        return sorted((m, r.old_path, r.new_path)
+                      for r in MemberRepairs(self.cache_dir).list() for m in r.members)
+
+    def test_a_namespace_directory_is_no_evidence_for_every_member(self):
+        """/b is the namespace's empty directory, made on backend1 only;
+        backend2 holds an empty /b made independently. Renaming /a onto /b
+        replaces /b in the cache, but neither member's /b, since nothing
+        member-specific says either is the one the user meant
+        (CTO-183-DIR-PROVENANCE): both keep /a, and backend2's /b keeps its
+        identity and metadata."""
+        self.fs.sync_manager.stop()       # keep the queued mkdir retry from running
+        self.fs.mkdir("/a", 0o755)
+        real_mkdir = self.backends["backend2"].mkdir
+        with patch.object(self.backends["backend2"], "mkdir",
+                          side_effect=OSError("backend2 offline")):
+            self.fs.mkdir("/b", 0o755)
+        self.assertFalse((self.backend2_dir / "b").exists())
+        (self.backend2_dir / "b").mkdir(mode=0o701)
+        os.utime(self.backend2_dir / "b", ns=(1_000_000_000, 1_000_000_000))
+        before = os.stat(self.backend2_dir / "b")
+        self.assertTrue(real_mkdir)
+        self.fs.rename("/a", "/b")
+        after = os.stat(self.backend2_dir / "b")
+        self.assertEqual((before.st_ino, before.st_mode, before.st_mtime_ns),
+                         (after.st_ino, after.st_mode, after.st_mtime_ns))
+        for member_dir in (self.backend1_dir, self.backend2_dir):
+            self.assertTrue((member_dir / "a").is_dir(), member_dir)
+            self.assertTrue((member_dir / "b").is_dir(), member_dir)
+        self.assertTrue(self.fs.cache_manager.get_cache_path("/b").is_dir())
+        self.assertFalse(self.fs.cache_manager.get_cache_path("/a").exists())
+        self.assertEqual([("backend1", "/a", "/b"), ("backend2", "/a", "/b")], self._repairs())
+
+    def test_a_recorded_copy_is_replaced_and_an_unrecorded_name_is_kept(self):
+        """Per member: /y.txt's copy is recorded on backend1 only. Renaming
+        /x.txt over it replaces backend1's /y.txt (the request, on the
+        evidence the mount has), while backend2, which holds an unrelated
+        /y.txt the mount never recorded, keeps both of its objects."""
+        self._write_synced("/x.txt", b"moved bytes")
+        self._write_synced("/y.txt", b"namespace y")
+        # /x.txt on both members, recorded on both; /y.txt recorded on
+        # backend1 only, with an unrelated object on backend2.
+        for name, root in (("backend1", self.backend1_dir), ("backend2", self.backend2_dir)):
+            (root / "x.txt").write_bytes(b"moved bytes")
+            (root / "y.txt").write_bytes(b"namespace y")
+            for path in ("/x.txt", "/y.txt"):
+                self.fs.state_manager.add_file_location(FileLocation(
+                    virtual_path=path, backend_name=name, checksum="test",
+                    last_synced=time.time(), is_cached=False))
+        if (self.backend2_dir / "y.txt").exists():
+            (self.backend2_dir / "y.txt").unlink()
+        self.fs.state_manager.remove_file_location("/y.txt", "backend2")
+        (self.backend2_dir / "y.txt").write_bytes(b"unrelated writer")
+        self.assertEqual({"backend1", "backend2"},
+                         set(self.fs.state_manager.get_location_backends("/x.txt")))
+        self.assertEqual({"backend1"}, set(self.fs.state_manager.get_location_backends("/y.txt")))
+        self.fs.rename("/x.txt", "/y.txt")
+        self.assertEqual(b"moved bytes", (self.backend1_dir / "y.txt").read_bytes())
+        self.assertFalse((self.backend1_dir / "x.txt").exists())
+        self.assertEqual(b"unrelated writer", (self.backend2_dir / "y.txt").read_bytes())
+        self.assertEqual(b"moved bytes", (self.backend2_dir / "x.txt").read_bytes())
+        self.assertEqual([("backend2", "/x.txt", "/y.txt")], self._repairs())
+
+    def test_a_member_with_no_source_is_recorded_not_reported_moved(self):
+        """A member with /x.txt's copy recorded no longer has it: nothing
+        moved there, so the intent settles to a repair, never to success."""
+        self._write_synced("/x.txt", b"bytes")
+        located = sorted(self.fs.state_manager.get_location_backends("/x.txt"))
+        gone = located[0]
+        (self.temp_dir / gone / "x.txt").unlink()
+        self.fs.rename("/x.txt", "/z.txt")
+        records = [r for r in MemberRepairs(self.cache_dir).list() if gone in r.members]
+        self.assertEqual(1, len(records))
+        self.assertIn("no source", records[0].reason)
 
     def test_rename_failed_on_a_member_is_recorded_for_repair(self):
         """The member that missed the rename gets a repair record, not a

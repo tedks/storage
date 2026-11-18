@@ -1,8 +1,8 @@
 """Local filesystem storage-member implementation."""
 
+import ctypes
 import errno
 import logging
-import ctypes
 import os
 import shutil
 import stat
@@ -17,7 +17,6 @@ from ..file_config import XATTR_CONFIG_NAME
 # state): never copied to a member, nor back from one. The config policy
 # is the user's and travels with the file.
 _INTERNAL_XATTR_PREFIX = "user.storage."
-
 
 
 _AT_FDCWD = -100
@@ -53,6 +52,7 @@ def rename_noreplace(src, dst) -> bool:
     if err == errno.EEXIST:
         return False
     raise OSError(err, os.strerror(err), str(src))
+
 
 def _is_internal_xattr(name: str) -> bool:
     return name.startswith(_INTERNAL_XATTR_PREFIX) and name != XATTR_CONFIG_NAME
@@ -263,12 +263,15 @@ class LocalBackend(Backend):
         """renameat2(RENAME_NOREPLACE): the kernel refuses atomically when
         the new name is taken (FileExistsError). Where the filesystem has no
         such operation it raises OSError(ENOTSUP): no stat-then-rename or
-        link-then-unlink fallback, which a concurrent writer could defeat."""
+        link-then-unlink fallback, which a concurrent writer could defeat.
+        A missing source raises FileNotFoundError, never a silent success."""
         old_path = self._resolve_path(old_virtual_path)
         new_path = self._resolve_path(new_virtual_path)
-        new_path.parent.mkdir(parents=True, exist_ok=True)
         if not os.path.lexists(old_path):
-            return
+            # Nothing moved: never reported as a move (the caller decides
+            # whether this member was expected to hold the source).
+            raise FileNotFoundError(errno.ENOENT, "no source on this member", str(old_path))
+        new_path.parent.mkdir(parents=True, exist_ok=True)
         try:
             renamed = rename_noreplace(old_path, new_path)
         except OSError as exc:
