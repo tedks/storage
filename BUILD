@@ -71,6 +71,7 @@ test_suite(
         "fs_namespace_integration",
         "fs_revalidate",
         "fs_streaming",
+        "foreground_admission",
         "fs_threading",
         "links",
         "local_backend",

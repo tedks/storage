@@ -16,6 +16,7 @@ py_library(
         "cli_mount.py",
         "conflicts.py",
         "crypto.py",
+        "foreground_admission.py",
         "fs.py",
         "index_audit.py",
         "links.py",

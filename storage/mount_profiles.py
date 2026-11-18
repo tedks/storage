@@ -11,6 +11,7 @@ from .backends.local import LocalBackend
 from .backends.ssh import SSHBackend
 from .models import StreamingKeepAfterClose
 from .checksum_queue import DEFAULT_CHECKSUM_REVERIFY_INTERVAL
+from .foreground_admission import validate_cap
 from .namespace import DEFAULT_LISTING_MAX_STALE
 
 
@@ -58,6 +59,10 @@ class ResolvedMountConfig:
     fuse_threads: bool = False
     # None or zero: wait for bulk SFTP capacity to drain without a deadline.
     bulk_capacity_wait_timeout: Optional[float] = None
+    # Cap on admitted FUSE callbacks (storage.foreground_admission); None,
+    # the default, admits every callback at once. Setting it turns on
+    # fuse_threads.
+    max_foreground_operations: Optional[int] = None
     # Seconds a listing past its fresh window is still served while a
     # background refresh runs (profile only).
     listing_max_stale: float = DEFAULT_LISTING_MAX_STALE
@@ -591,6 +596,9 @@ def _load_mount_profile_settings(config_path: Path, profile_name: str) -> Dict[s
         "bulk_capacity_wait_timeout": _optional_profile_float(
             config_profile, "bulk_capacity_wait_timeout", profile_name
         ),
+        "max_foreground_operations": _optional_profile_int(
+            config_profile, "max_foreground_operations", profile_name
+        ),
         "checksum_reverify_interval": _optional_profile_float(
             config_profile, "checksum_reverify_interval", profile_name
         ),
@@ -631,6 +639,7 @@ def _can_auto_load_mount_profile(
     fuse_threads: Optional[bool] = None,
     checksum_reverify_interval: Optional[float] = None,
     bulk_capacity_wait_timeout: Optional[float] = None,
+    max_foreground_operations: Optional[int] = None,
 ) -> bool:
     if not _target_looks_like_profile_name(mount_target):
         return False
@@ -655,6 +664,7 @@ def _can_auto_load_mount_profile(
         fuse_threads is not None,
         checksum_reverify_interval is not None,
         bulk_capacity_wait_timeout is not None,
+        max_foreground_operations is not None,
     ))
 
 
@@ -681,6 +691,7 @@ def resolve_mount_configuration(
     fuse_threads: Optional[bool] = None,
     checksum_reverify_interval: Optional[float] = None,
     bulk_capacity_wait_timeout: Optional[float] = None,
+    max_foreground_operations: Optional[int] = None,
 ) -> ResolvedMountConfig:
     config_values = {
         "mountpoint": None,
@@ -703,6 +714,7 @@ def resolve_mount_configuration(
         **{key: None for key in KERNEL_TIMEOUT_KEYS},
         "fuse_threads": None,
         "bulk_capacity_wait_timeout": None,
+        "max_foreground_operations": None,
         "checksum_reverify_interval": None,
         "backing_paths": (),
         "remote": (),
@@ -738,6 +750,7 @@ def resolve_mount_configuration(
         fuse_threads,
         checksum_reverify_interval,
         bulk_capacity_wait_timeout,
+        max_foreground_operations,
     ):
         available_configs = [candidate for candidate in default_mount_config_paths() if candidate.exists()]
         if available_configs:
@@ -758,6 +771,25 @@ def resolve_mount_configuration(
                 )
 
     mountpoint = config_values["mountpoint"] if config_values["mountpoint"] is not None else mount_target
+
+    foreground_cap = (
+        max_foreground_operations if max_foreground_operations is not None
+        else config_values["max_foreground_operations"]
+    )
+    if foreground_cap is not None:
+        try:
+            validate_cap(foreground_cap)
+        except ValueError as exc:
+            raise click.ClickException(str(exc)) from exc
+    explicit_threads = (
+        fuse_threads if fuse_threads is not None else config_values["fuse_threads"]
+    )
+    if foreground_cap is not None and explicit_threads is False:
+        raise click.ClickException(
+            "max_foreground_operations requires fuse_threads; it cannot be combined "
+            "with fuse_threads = false"
+        )
+    threaded = foreground_cap is not None or bool(explicit_threads)
     if not mountpoint:
         raise click.ClickException("Missing mountpoint. Provide one directly or load it from --config.")
 
@@ -827,11 +859,8 @@ def resolve_mount_configuration(
         ),
         entry_timeout=config_values["entry_timeout"],
         negative_timeout=config_values["negative_timeout"],
-        fuse_threads=fuse_threads if fuse_threads is not None else (
-            config_values["fuse_threads"]
-            if config_values["fuse_threads"] is not None
-            else False
-        ),
+        fuse_threads=threaded,
+        max_foreground_operations=foreground_cap,
         bulk_capacity_wait_timeout=_validated_seconds(
             "bulk_capacity_wait_timeout",
             bulk_capacity_wait_timeout if bulk_capacity_wait_timeout is not None else (

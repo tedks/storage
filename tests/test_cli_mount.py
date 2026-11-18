@@ -414,6 +414,8 @@ backends = ["{self.temp_dir}"]
             ("explicit-off", "fuse_threads = false", (), True),
             ("threaded", "fuse_threads = true", (), False),
             ("override-off", "fuse_threads = true", ("--no-fuse-threads",), True),
+            ("capped", "max_foreground_operations = 4", (), False),
+            ("capped-flag", "", ("--max-foreground-operations", "6"), False),
         ):
             with self.subTest(name=name):
                 root = self.temp_dir / name
@@ -456,6 +458,105 @@ streaming_reads = false
                 self.assertEqual(0, result.exit_code, result.output)
                 self.assertEqual([expected_class], classes)
                 self.assertEqual([b"exact-mounted-copy"], returned)
+
+
+class TestMountForegroundCap(unittest.TestCase):
+    """max_foreground_operations: off by default, 4-128, turns on fuse_threads."""
+
+    def setUp(self):
+        self.temp_dir = Path(tempfile.mkdtemp())
+        self.runner = CliRunner()
+        self.config_path = self.temp_dir / "storage.toml"
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _invoke(self, profile_line="", extra_args=()):
+        self.config_path.write_text(
+            f"""
+[mounts.cap]
+mountpoint = "{self.temp_dir / 'mnt'}"
+cache = "{self.temp_dir / 'cache'}"
+{profile_line}
+backends = ["{self.temp_dir}"]
+""".strip()
+        )
+        with patch("storage.cli_mount.mount_storage") as mock_mount:
+            result = self.runner.invoke(
+                main, ["mount", "--config", str(self.config_path), *extra_args, "cap"],
+            )
+        return result, mock_mount
+
+    def _mount(self, profile_line="", extra_args=()):
+        result, mock_mount = self._invoke(profile_line, extra_args)
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        kwargs = mock_mount.call_args.kwargs
+        return result, kwargs["max_foreground_operations"], kwargs["fuse_threads"]
+
+    def test_off_by_default_even_when_threaded(self):
+        for line in ("", "fuse_threads = true"):
+            with self.subTest(line=line):
+                result, cap, _threads = self._mount(line)
+                self.assertIsNone(cap)
+                self.assertNotIn("FUSE callback cap", result.output)
+
+    def test_profile_and_flag_turn_on_threads(self):
+        result, cap, threads = self._mount("max_foreground_operations = 4")
+        self.assertEqual((4, True), (cap, threads))
+        self.assertIn("FUSE callback cap: 4", result.output)
+        self.assertIn("FUSE loop: multithreaded", result.output)
+        _, cap, threads = self._mount(
+            "max_foreground_operations = 4", ["--max-foreground-operations", "128"],
+        )
+        self.assertEqual((128, True), (cap, threads))
+
+    def test_out_of_range_rejected_before_mounting(self):
+        for args in (["--max-foreground-operations", "3"],
+                     ["--max-foreground-operations", "0"],
+                     ["--max-foreground-operations", "129"]):
+            with self.subTest(args=args):
+                result, mock_mount = self._invoke("", args)
+                self.assertNotEqual(0, result.exit_code)
+                self.assertIn("max_foreground_operations must be an integer from 4 to 128",
+                              result.output)
+                self.assertIn("two demand slots", result.output)
+                mock_mount.assert_not_called()
+        result, mock_mount = self._invoke("max_foreground_operations = 3")
+        self.assertNotEqual(0, result.exit_code)
+        self.assertIn("from 4 to 128", result.output)
+        mock_mount.assert_not_called()
+        result, mock_mount = self._invoke('max_foreground_operations = "8"')
+        self.assertNotEqual(0, result.exit_code)
+        mock_mount.assert_not_called()
+
+    def test_explicit_single_threaded_conflicts(self):
+        for line, args in (("fuse_threads = false\nmax_foreground_operations = 4", ()),
+                           ("max_foreground_operations = 4", ("--no-fuse-threads",))):
+            with self.subTest(line=line, args=args):
+                result, mock_mount = self._invoke(line, args)
+                self.assertNotEqual(0, result.exit_code)
+                self.assertIn("requires fuse_threads", result.output)
+                mock_mount.assert_not_called()
+
+    def test_direct_mount_rejects_bad_cap_before_mount_lock(self):
+        from storage.fs import mount_storage
+
+        member = self.temp_dir / "member"
+        member.mkdir()
+        for cap, threads in ((4, False), (3, True), (129, True), (True, True)):
+            with self.subTest(cap=cap, threads=threads), \
+                    patch("storage.fs._acquire_mount_lock_ex") as acquire, \
+                    patch("storage.fs.FUSE") as fuse:
+                with self.assertRaises(ValueError):
+                    mount_storage(
+                        str(self.temp_dir / "mnt"), self.temp_dir / "cache",
+                        self.temp_dir / "state.db",
+                        {"member": LocalBackend("member", str(member))}, 1024,
+                        allow_other=False, fuse_threads=threads,
+                        max_foreground_operations=cap,
+                    )
+                acquire.assert_not_called()
+                fuse.assert_not_called()
 
 
 class TestMountChecksumReverify(unittest.TestCase):
