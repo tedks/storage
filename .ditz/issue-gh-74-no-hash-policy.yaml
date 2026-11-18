@@ -37,6 +37,19 @@ log_events:
   who: Ted Smith
   what: blocked by oq-conflict-fallback-limits
   comment: ""
+- time: 2026-11-18T05:32:34-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Implementation notes from PR 169 council round 6 (docs/performance_backlog_2026-11-10.md
+    package 5, verified at master a1abc3c; not doc edits, kept out to avoid moving
+    the reviewed head). (1) The capacity_wait_cancellation probe suggested for bounding
+    the bulk SFTP capacity wait is polled only inside an actual FUSE callback (storage/backends/ssh_pool.py:854)
+    and installed only at storage/fs.py:3249; the conflict fallback runs on a sync
+    worker outside any FUSE callback, so it would need its own deadline-based probe
+    or another mechanism. (2) Besides a missing command, other non-zero exits, malformed/empty
+    output and CommandTimeout, any other non-connection exception from run_command
+    also becomes ChecksumUnavailable under allow_download=False (storage/backends/ssh.py:750-779);
+    the conclusion stands: never map ChecksumUnavailable wholesale to the fallback.'
 blocks:
 - gh-74
 - gh-74-tests
