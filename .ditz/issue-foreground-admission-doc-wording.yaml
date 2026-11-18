@@ -1,0 +1,23 @@
+id: foreground-admission-doc-wording
+title: Tighten two foreground admission doc sentences
+desc: 'PR #180 council round 4eda9439791b-20261118T054231Z-a2e05f nits (OpenAI seat),
+  deferred to keep the gated head frozen: (1) README Status says the demand reserve
+  covers ''fsync on cached files'' but fsync is demand on every descriptor (a local
+  fsync, never member I/O); (2) storage/foreground_admission.py module docstring ''a
+  slot holder can wait on a path lock, never the reverse'' should say StorageFS path
+  lock, since a callback waiting for admission can hold a libfuse path lock (the preceding
+  paragraph says so). Also the independent review''s cosmetic line break at foreground_admission.py:34-35.
+  Doc-only.'
+type: task
+component: performance
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-18T05:44:31-00:00
+references: []
+log_events:
+- time: 2026-11-18T05:44:31-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
