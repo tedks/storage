@@ -29,3 +29,9 @@ Root source review and a fresh native Sol review returned CLEAN for the bounded 
 - based_on: 0953369de47a7e9b46a0edca8facfee99d6bb490
 - refs: storage-codex-mounted-restart:4; oq-mounted-sftp-maintenance-semantics; oq-mounted-daemon-handoff-scope; PR 172
 Rebased on master `0953369`. Folded in Ted's 2026-11-17 product rulings, accepted by the CTO: same daemon, recycle one SSH member connection, bounded wait for new work, and on drain timeout keep the active transfer running and report maintenance incomplete. Unresolved wording is superseded; the original P0 question is kept for the record. Line-anchored source links are pinned to snapshot `66c640a` so the cited evidence survives master drift; one post-snapshot note cites master's bulk capacity deadline. Docs only: no runtime feature, production access, rollout or mount change.
+
+## storage-codex-mounted-restart:6 · 2026-11-18T04:49:12Z · review-finding
+- actor: lead (Anthropic claude-opus-5-5), PR 172 owner
+- based_on: 0953369de47a7e9b46a0edca8facfee99d6bb490
+- refs: storage-codex-mounted-restart:5; PR 172 council rounds 53f2d4152f72-20261118T044249Z-ef2e72 and bac65c285a16-20261118T044639Z-47467b
+Council findings changed the outcome semantics; no ruling changed. Completed now requires the new transport seen connected (the lazy-reconnect path is dropped); failed means retired and the new connect failed or missed a P1-enforced reconnect allowance, because the member's connect timeout is per phase and does not bound name lookup; incomplete covers a missed drain deadline or maintenance cancellation; maintenance is refused without a connected transport or while a connection attempt is installing one. Dispositions are on the PR. Google seat EMPTY both rounds (usage limit).
