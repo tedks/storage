@@ -27,8 +27,9 @@ locks along every path) before the Python callback, so a namespace change
 queued here keeps its libfuse lock while it waits, and operations on paths
 under it, closes included, wait inside libfuse until it is admitted and
 finishes. That is a longer hold than uncapped (where it would run at once),
-not a cycle: gate waiters hold no StorageFS lock and an admitted callback
-never waits for one that is not. The kernel also limits background
+not a cycle: a callback waiting for admission holds no StorageFS lock, so
+every StorageFS lock is held by a callback already running (admitted or
+exempt) or by a background thread, and none of those waits for a slot. The kernel also limits background
 requests (max_background, 12 by default): queued readahead reads count
 toward it and can delay a RELEASE there.
 
