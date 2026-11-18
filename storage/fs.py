@@ -3062,10 +3062,12 @@ class StorageFS(Operations):
 
     def destroy(self, path):
         """Cleanup on unmount"""
-        # libfuse joins its handlers before destroy, and a queued native
-        # callback already ended with EINTR when the session exited (its
-        # cancel probe), so in a mount nothing is normally queued here. For
-        # direct callers this cancels any waiter, which fails with EINTR unrun.
+        # libfuse joins its handlers before destroy: a queued native
+        # callback either ended with EINTR when the session exited (its
+        # cancel probe) or, for the libfuse hidden-name unlink, which has no
+        # probe, ran once a slot freed. So in a mount nothing is normally
+        # queued here. For direct callers this cancels any waiter, which
+        # fails with EINTR unrun.
         if self._foreground_admission is not None:
             self._foreground_admission.close()
         self._destroying.set()

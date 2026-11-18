@@ -330,27 +330,45 @@ def test_user_lookalike_is_admitted_like_any_unlink(capped):
 
 
 def test_queued_cleanup_runs_before_destroy_across_unmount(capped):
-    # Unmount while the cleanup is queued: it runs once the slot frees, and
-    # libfuse joins it before destroy closes the gate. This proves that
-    # ordering only. Whether the session has exited (so the exit probe would
-    # fire) while the cleanup waits is not established here; the unit test
-    # test_queued_hidden_form_unlink_ignores_the_probe_and_runs_once pins
-    # the probe exemption.
+    # The slot is held from a plain thread, not a syscall on the mount, so
+    # nothing pins the mount: the lazy detach ends the session while the
+    # cleanup is queued. The exit probe is then live, the hidden-form
+    # unlink ignores it, runs once the slot frees, and libfuse joins it
+    # before destroy closes the gate.
     fs, member_dir, mount_dir, thread, record, cap = capped
     gate = fs._foreground_admission
     fd, hidden = _unlinked_while_open(fs, mount_dir)
-    hold = _OrdinaryHold(fs, mount_dir).__enter__()
+    held, go = threading.Event(), threading.Event()
+
+    def hold():
+        with gate.admit("ordinary"):
+            held.set()
+            go.wait(WAIT)
+
+    holder = threading.Thread(target=hold, daemon=True)
+    holder.start()
+    assert held.wait(WAIT)
+    # The kernel's fusectl entry for this connection goes away when the
+    # superblock is killed; libfuse's reader then gets ENODEV and exits the
+    # session, which is what the exit probe reports.
+    connections = Path("/sys/fs/fuse/connections")
+    assert connections.is_dir(), "fusectl is not mounted; cannot observe the session end"
+    connection = connections / str(os.minor(os.stat(mount_dir).st_dev))
+    assert connection.is_dir()
     try:
         os.close(fd)
         _wait(lambda: gate.waiting_count("ordinary") >= 1, "the cleanup never queued")
         result = subprocess.run(["fusermount", "-uz", str(mount_dir)],
                                 capture_output=True, text=True, timeout=30)
         assert result.returncode == 0, result.stderr
-        time.sleep(0.5)    # several probe intervals after the detach
+        _wait(lambda: not connection.exists(), "the connection outlived the detach")
+        time.sleep(0.5)    # several probe intervals with the session exited
         assert thread.is_alive() and not fs.destroy_entered.is_set()
+        assert gate.waiting_count("ordinary") == 1
         assert _hidden_unlinks(record, hidden) == []
     finally:
-        hold.release()
+        go.set()
+        holder.join(WAIT)
     thread.join(30.0)
     assert not thread.is_alive(), native_thread_state(thread, mount_dir)
     assert fs.destroy_entered.is_set()
