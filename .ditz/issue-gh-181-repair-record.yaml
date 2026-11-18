@@ -61,5 +61,14 @@ log_events:
     and replace the inherited-no-op premise with a cap-enabled contention/error regression.
     Verify cap-off behavior as well. #180 can integrate independently on its reviewed
     base.'
+- time: 2026-11-18T06:51:52-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'CTO / #167 overlap on 435b958. The never-drop repair retry sleeps inside
+    a sync worker. Verify with one worker that healthy unrelated file bytes sync during
+    failed record persistence and backoff; on recovery retain exactly one logical
+    repair and perform no member rename. #182 owns the fixed-pool regression and fix.
+    #167 owns the saturated growing-pool case and retirement after recovery. In-worker
+    delay is verified; indefinite starvation is not yet established.'
 blocks:
 - gh-181
