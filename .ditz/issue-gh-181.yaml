@@ -32,8 +32,13 @@ log_events:
   who: Ted Smith
   what: blocked by gh-181-rebuilt-index-file-targets
   comment: ""
+- time: 2026-11-18T06:04:40-00:00
+  who: Ted Smith
+  what: blocked by gh-181-repairs-doc-local-fs
+  comment: ""
 blocked_by:
 - gh-181-repair-record
 - gh-181-sync-rename-noreplace
 - gh-181-location-rows
 - gh-181-rebuilt-index-file-targets
+- gh-181-repairs-doc-local-fs
