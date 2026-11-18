@@ -164,6 +164,55 @@ Once the write succeeds, the record replaces that fence. A fence held in
 memory does not survive a restart, but neither does the queued task that
 holds it.
 
+## Ordering fences against member mutations
+
+The namespace's own renames publish their records under its locks.
+A file rename holds both path locks across its member calls, a directory
+rename holds the namespace lock exclusive, and a rename waits for uploads
+of the paths it moves. A queued RENAME task publishes outside those locks,
+so its fence is ordered explicitly (CTO-182-J-LENGTH-C3).
+
+Every entry point that can mutate a member at a name registers itself
+for its whole run, with its members and paths
+(`MemberRepairs.start_mutation` and `end_mutation`):
+
+- namespace rename, mkdir, rmdir and unlink;
+- file and link uploads;
+- queued mkdir and rmdir retries;
+- the conflict-view copy at release.
+
+Each one makes its fence lookups inside that window. The queued rename
+calls `publish_pending`, which works in two steps:
+
+1. It installs the fence at once. Any mutation that registers from then
+   on sees it, and skips the fenced members.
+2. It waits for every overlapping mutation that registered before it.
+   A mutation overlaps when it shares a member and a name at, above or
+   below either path.
+
+The rename writes its durable record only after that wait. So each
+overlapping mutation either finished before the fence took effect, or
+skipped the member. None calls a member past the fence. Mutations on
+other members or other names never wait.
+
+A lookup reads the durable records and the pending fences in one hold of
+the registry lock. A pending fence that is handed off to its durable
+record therefore shows up as one or the other, never as neither.
+
+`TestFencePublicationOrder` uses barriers to cover both orders:
+
+- mutation first: an upload below the names, and a rename above them,
+  each finish before the fence, while an unrelated mkdir reaches the
+  member;
+- fence first: a mkdir and an upload below the names, and a rename above
+  them, each skip the member;
+- a snapshot taken during the handoff.
+
+The checks were mutation-tested:
+
+- without the wait, both mutation-first cases fail;
+- with a two-read snapshot, the handoff case fails.
+
 ## The in-process registry
 
 `MemberRepairs` (`storage/member_repairs.py`) is created by `CacheManager`

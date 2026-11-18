@@ -26,7 +26,7 @@ from storage.index_audit import rebuild_index_from_cache
 from storage.member_repairs import MAX_RECORD_BYTES, VIEW_WRITE, CorruptRepairRecord, MemberRepairs
 from storage.state import StateManager
 from storage.sync_executor import RetryScheduler, SyncExecutor
-from storage.sync_tasks import DirOperation, DirSyncTask, SyncConfig
+from storage.sync_tasks import DirOperation, DirSyncTask, SyncConfig, SyncTask
 from tests.test_fs_threading import BLOCKED, WAIT, ThreadingTestBase, Worker
 
 
@@ -877,6 +877,178 @@ class TestDirectoryRetries(SyncRaceTestBase):
         self.member.set_available(True)
         self.assertTrue(executor.process_dir_task(task))
         self.assertEqual(["d"], self.member_names())
+
+
+class TestFencePublicationOrder(SyncRaceTestBase):
+    """A queued rename's fence, published outside the namespace's path
+    locks, is ordered against member mutations: one already running
+    finishes before the fence takes effect, a later one skips the fenced
+    member, and unrelated member work goes on (CTO-182-J-LENGTH-C3 (3))."""
+
+    def executor(self):
+        return SyncExecutor(
+            worker_id=9, state_manager=self.fs.state_manager,
+            cache_manager=self.fs.cache_manager,
+            replication_manager=self.fs.replication_manager,
+            config=self.fs.sync_manager.config, path_guard=self.fs._path_locked,
+        )
+
+    def publish(self, old, new):
+        """A queued rename of old -> new for the member, recorded from a
+        worker of its own; returns the running Worker."""
+        task = DirSyncTask(old, DirOperation.RENAME, new_path=new, backend_hint="member")
+        worker = Worker(self.executor().process_dir_task, task)
+        worker.start()
+        return worker
+
+    def test_a_running_upload_below_the_names_finishes_before_the_fence(self):
+        """Mutation first, descendant: an upload of /d/x.txt is in its
+        member copy when /d -> /e is published. The publication waits, an
+        unrelated mkdir reaches the member meanwhile, and the record is
+        written once the upload is done."""
+        self.fs.mkdir("/d", 0o755)
+        gate = self.gate_upload("/d/x.txt")
+        self.start_sync()
+        self.write_file("/d/x.txt", b"before the fence")
+        self.assertTrue(gate.started.wait(WAIT))
+        publisher = self.publish("/d", "/e")
+        publisher.join(BLOCKED)
+        self.assertTrue(publisher.is_alive(), "the fence did not wait for the upload")
+        self.assertEqual([], self.repairs())
+        self.fs.mkdir("/z", 0o755)                       # disjoint: not held up
+        self.assertIn("z", self.member_names())
+        gate.opened.set()
+        self.assertTrue(publisher.finish())
+        self.wait_idle()
+        self.assertEqual([("member", "/d", "/e")], self.repairs())
+        self.assertEqual(b"before the fence", (self.member_dir / "d" / "x.txt").read_bytes())
+
+    def test_a_running_rename_above_the_names_finishes_before_the_fence(self):
+        """Mutation first, ancestor: a rename of /p is in its member call
+        when /p/q -> /p/r is published; the publication waits for it."""
+        self.fs.mkdir("/p", 0o755)
+        self.fs.mkdir("/p/q", 0o755)
+        gate = self.gate(self.member, "rename")
+        renamer = Worker(self.fs.rename, "/p", "/p2")
+        renamer.start()
+        self.assertTrue(gate.started.wait(WAIT))
+        publisher = self.publish("/p/q", "/p/r")
+        publisher.join(BLOCKED)
+        self.assertTrue(publisher.is_alive(), "the fence did not wait for the rename")
+        gate.opened.set()
+        renamer.finish()
+        self.assertTrue(publisher.finish())
+        self.assertEqual(["p2"], self.member_names())
+        self.assertEqual([("member", "/p/q", "/p/r")], self.repairs())
+
+    def block_record(self):
+        """Make the next queued rename's record wait, with its fence already
+        published, until the returned event is set."""
+        repairs = self.fs.cache_manager.member_repairs
+        real = repairs.record
+        entered, release = threading.Event(), threading.Event()
+
+        def blocked(*args):
+            entered.set()
+            assert release.wait(WAIT), "record never released"
+            return real(*args)
+
+        patch.object(repairs, "record", side_effect=blocked).start()
+        self.addCleanup(patch.stopall)
+        return entered, release
+
+    def test_a_mutation_below_a_published_fence_skips_the_member(self):
+        """Fence first, descendant: while /d -> /e's record is still being
+        written, a mkdir of /d/sub and an upload of /e/x.txt skip the
+        member; an unrelated mkdir does not."""
+        self.fs.mkdir("/d", 0o755)
+        self.fs.mkdir("/e", 0o755)
+        entered, release = self.block_record()
+        publisher = self.publish("/d", "/e")
+        self.assertTrue(entered.wait(WAIT))
+        mkdirs = []
+        real_mkdir = self.member.mkdir
+        patch.object(self.member, "mkdir",
+                     side_effect=lambda *a: (mkdirs.append(a), real_mkdir(*a))).start()
+        self.fs.mkdir("/d/sub", 0o755)
+        self.fs.mkdir("/z", 0o755)
+        self.write_file("/e/x.txt", b"after the fence")
+        self.assertTrue(self.executor().process_file_task(SyncTask("/e/x.txt")))
+        self.assertEqual([("/z",)], mkdirs)
+        self.assertFalse((self.member_dir / "e" / "x.txt").exists())
+        release.set()
+        self.assertTrue(publisher.finish())
+        self.assertEqual([("member", "/d", "/e")], self.repairs())
+        self.assertEqual(["d", "e", "z"], self.member_names())
+        self.assertEqual([], self.member_names("d"))
+
+    def test_a_rename_above_a_published_fence_skips_the_member(self):
+        """Fence first, ancestor: a rename of /p while /p/q -> /p/r's record
+        is being written is not sent to the member: its miss is recorded."""
+        self.fs.mkdir("/p", 0o755)
+        self.fs.mkdir("/p/q", 0o755)
+        entered, release = self.block_record()
+        publisher = self.publish("/p/q", "/p/r")
+        self.assertTrue(entered.wait(WAIT))
+        renames = []
+        patch.object(self.member, "rename", side_effect=lambda *a: renames.append(a)).start()
+        self.fs.rename("/p", "/p2")
+        self.assertEqual([], renames)
+        release.set()
+        self.assertTrue(publisher.finish())
+        self.assertEqual(["p"], self.member_names())
+        self.assertEqual(sorted([("member", "/p", "/p2"), ("member", "/p/q", "/p/r")]),
+                         self.repairs())
+
+    def test_a_snapshot_is_never_between_a_pending_fence_and_its_record(self):
+        """The handoff from a pending fence to its durable record cannot
+        land between the snapshot's two reads: a snapshot in progress holds
+        it off, and then sees the fence."""
+        repairs = self.fs.cache_manager.member_repairs
+        key = repairs.fence_pending("/h", "/h2", ["member"])
+        real_stamp = repairs._dir_stamp
+        in_snapshot, go_on = threading.Event(), threading.Event()
+        main = threading.get_ident()
+
+        def pausing_stamp():
+            # The stamp is read first, then the snapshot pauses: the
+            # handoff's record lands on disk after the snapshot looked.
+            stamp = real_stamp()
+            if threading.get_ident() == main and not in_snapshot.is_set():
+                in_snapshot.set()
+                assert go_on.wait(WAIT)
+            return stamp
+
+        def handoff():
+            repairs.record("/h", "/h2", ["member"], "handoff")
+            repairs.release_pending(key)
+
+        mover = Worker(handoff)
+        held_off = []
+
+        def start_mover_during_snapshot():
+            assert in_snapshot.wait(WAIT)
+            mover.start()
+            carriers = self.cache_dir / ".storage.repairs"
+            deadline = time.monotonic() + WAIT
+            while not (carriers.exists() and os.listdir(carriers)):
+                assert time.monotonic() < deadline, "the record was never written"
+                time.sleep(0.01)
+            mover.join(BLOCKED)
+            held_off.append(mover.is_alive())   # waiting on the snapshot's lock
+            go_on.set()
+
+        starter = threading.Thread(target=start_mover_during_snapshot)
+        starter.start()
+        fenced_holder = {}
+        with patch.object(repairs, "_dir_stamp", side_effect=pausing_stamp):
+            fenced_holder["fenced"] = repairs.backends_for(["/h"])
+        starter.join(WAIT)
+        mover.finish()
+        self.assertEqual([True], held_off)
+        self.assertEqual({"member"}, fenced_holder["fenced"])
+        self.assertEqual({"member"}, repairs.backends_for(["/h"]))
+        self.assertEqual([("member", "/h", "/h2")], self.repairs())
 
 
 class TestRetryScheduler(unittest.TestCase):

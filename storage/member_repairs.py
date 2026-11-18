@@ -13,6 +13,7 @@ record id, holding the record in its user.storage.member_repair xattr. See
 docs/member-rename-repairs.md for the format and the crash ordering.
 """
 
+import contextlib
 import dataclasses
 import errno
 import fcntl
@@ -277,6 +278,11 @@ class MemberRepairs:
         # Another process's writer (the CLI) is ordered by flock on the
         # carrier it changes.
         self._lock = threading.Lock()
+        # Signalled when a member mutation ends (end_mutation), for a
+        # publication waiting on the overlapping ones (publish_pending).
+        self._cond = threading.Condition(self._lock)
+        self._mutations: Dict[int, Tuple[frozenset, Tuple[str, ...]]] = {}
+        self._mutation_seq = 0
         self._write_lock = threading.Lock()
         self._records: Dict[str, MemberRepair] = {}
         self._seen: Optional[tuple] = None
@@ -841,27 +847,95 @@ class MemberRepairs:
 
     def fence_pending(self, old_path: str, new_path: str, members: Iterable[str]) -> int:
         """Fence old_path and new_path on members now, for a repair whose
-        record could not be written yet; returns a key for release_pending.
-
-        A queued rename's record can fail (the cache full, say) and its
-        retry back off; meanwhile other work goes on, and must be kept off
-        those names on those members as the record would keep it."""
+        record is not written yet; returns a key for release_pending."""
         with self._lock:
-            self._pending_seq += 1
-            self._pending[self._pending_seq] = (old_path, new_path, tuple(sorted(set(members))))
-            return self._pending_seq
+            return self._add_pending_locked(old_path, new_path, members)
+
+    def _add_pending_locked(self, old_path, new_path, members) -> int:
+        self._pending_seq += 1
+        self._pending[self._pending_seq] = (old_path, new_path, tuple(sorted(set(members))))
+        return self._pending_seq
+
+    def publish_pending(self, old_path: str, new_path: str, members: Iterable[str]) -> int:
+        """Fence the names on members, ordered against member mutations.
+
+        For a queued rename's record, published outside the namespace's
+        path locks. The fence is active at once: a mutation that registers
+        after this (start_mutation) sees it and skips those members. Then
+        this waits, before the caller writes the durable record, for every
+        overlapping mutation on those members that registered before it.
+        So each overlapping mutation either finished before the fence took
+        effect, or skipped the fenced members; none can call a member past
+        it. Only overlapping mutations are waited for (names at, above or
+        below either name, on a shared member): unrelated member I/O goes
+        on. Returns the key for release_pending.
+        """
+        members = set(members)
+        with self._cond:
+            key = self._add_pending_locked(old_path, new_path, members)
+            earlier = {
+                token for token, (mutating, paths) in self._mutations.items()
+                if mutating & members
+                and any(paths_overlap(path, name) for path in paths for name in (old_path, new_path))
+            }
+            while earlier & set(self._mutations):
+                self._cond.wait()
+            return key
 
     def release_pending(self, key: int):
         """Drop a pending fence, once its record is durable (or moot)."""
         with self._lock:
             self._pending.pop(key, None)
 
-    def _fenced_names(self):
-        """(old, new, members) for every durable record and pending fence."""
-        names = [(r.old_path, r.new_path, r.members) for r in self._refresh().values()]
-        with self._lock:
-            names.extend(self._pending.values())
+    def _fences_locked(self):
+        """(old, new, members) for every durable record and pending fence,
+        read under one hold of _lock, so a pending fence handed off to its
+        durable record between two reads is never missed by both."""
+        if self._dir_stamp() != self._seen:
+            self._reload_locked(strict=False)
+        names = [(r.old_path, r.new_path, r.members) for r in self._records.values()]
+        names.extend(self._pending.values())
         return names
+
+    def _fenced_names(self):
+        with self._lock:
+            return self._fences_locked()
+
+    @staticmethod
+    def _members_fenced(fences, paths) -> Set[str]:
+        return {
+            member
+            for old, new, members in fences
+            if any(paths_overlap(path, name) for path in paths for name in (old, new))
+            for member in members
+        }
+
+    def start_mutation(self, members: Iterable[str], paths: Iterable[str]) -> Tuple[int, Set[str]]:
+        """Register a member mutation at paths, for publish_pending to order
+        against; returns its token and the members fenced there now, read
+        in the same step. The caller calls no fenced member, and ends the
+        mutation (end_mutation) once its member calls are done."""
+        paths = tuple(paths)
+        with self._lock:
+            fenced = self._members_fenced(self._fences_locked(), paths)
+            self._mutation_seq += 1
+            self._mutations[self._mutation_seq] = (frozenset(set(members) - fenced), paths)
+            return self._mutation_seq, fenced
+
+    def end_mutation(self, token: int):
+        with self._cond:
+            self._mutations.pop(token, None)
+            self._cond.notify_all()
+
+    @contextlib.contextmanager
+    def mutating(self, members: Iterable[str], paths: Iterable[str]):
+        """start_mutation and end_mutation around a block; yields nothing:
+        every fence lookup made inside the block is ordered by it."""
+        token, _fenced = self.start_mutation(members, paths)
+        try:
+            yield
+        finally:
+            self.end_mutation(token)
 
     def backends_for(self, virtual_paths: Iterable[str]) -> Set[str]:
         """The members with a repair at, above or below any of virtual_paths
@@ -869,13 +943,7 @@ class MemberRepairs:
         and conflict-view deletes at those names are not sent to them until
         the repair is resolved. A scan of every open
         repair, expected to be few."""
-        paths = list(virtual_paths)
-        return {
-            member
-            for old, new, members in self._fenced_names()
-            if any(paths_overlap(path, name) for path in paths for name in (old, new))
-            for member in members
-        }
+        return self._members_fenced(self._fenced_names(), list(virtual_paths))
 
     def covers(self, virtual_path: str) -> bool:
         """Whether virtual_path is at or under the new name of any repair: a

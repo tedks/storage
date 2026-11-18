@@ -167,6 +167,15 @@ class SyncExecutor:
         return self.upload_guard(virtual_path) if self.upload_guard else contextlib.nullcontext()
 
     def process_file_task(self, task: SyncTask) -> bool:
+        """Sync one file. Registered as a member mutation at its path for
+        the whole attempt (MemberRepairs.start_mutation), so a queued
+        rename's fence publication either waits for it or is seen by its
+        fence lookups."""
+        with self.cache_manager.member_repairs.mutating(
+                self.replication_manager.backends.keys(), [task.virtual_path]):
+            return self._guarded_file_task(task)
+
+    def _guarded_file_task(self, task: SyncTask) -> bool:
         """Process a single file sync task under the path's upload guard.
 
         A failed attempt is settled before the guard is released: once it
@@ -648,8 +657,11 @@ class SyncExecutor:
         # Fenced in memory from before the first attempt until the record is
         # durable, so work done meanwhile (by other workers, or while a
         # failed attempt backs off) stays off the names.
+        # Published in order with member mutations (publish_pending): an
+        # overlapping one already running finishes first; a later one
+        # sees the fence. The record is written only after that.
         if task.pending_fence is None:
-            task.pending_fence = repairs.fence_pending(task.virtual_path, task.new_path, names)
+            task.pending_fence = repairs.publish_pending(task.virtual_path, task.new_path, names)
         try:
             repairs.record(
                 task.virtual_path, task.new_path, names, "queued member rename, not replayed",
@@ -672,6 +684,11 @@ class SyncExecutor:
         raise ValueError(f"No currency check for dir op {task.operation.value}")
 
     def _process_dir_task(self, task: DirSyncTask) -> bool:
+        with self.cache_manager.member_repairs.mutating(
+                self.replication_manager.backends.keys(), [task.virtual_path]):
+            return self._process_dir_task_registered(task)
+
+    def _process_dir_task_registered(self, task: DirSyncTask) -> bool:
         logger.debug(
             "Worker %s processing dir op %s on %s",
             self.worker_id,

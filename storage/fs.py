@@ -2695,65 +2695,14 @@ class StorageFS(Operations):
             self.cache_manager.flush_file(entry.virtual_path)
 
             if entry.backend_name:
-                backend = self.backends.get(entry.backend_name)
-                if backend and entry.backend_name in (
-                    self.cache_manager.member_repairs.backends_for([entry.canonical_path])
-                ):
-                    # A write through a conflict view would replace that
-                    # member's object, which an open repair protects. Open
-                    # and create refuse it and flush reports it to close();
-                    # this covers a repair recorded after that flush, when
-                    # close() has already succeeded: the view's bytes are
-                    # kept durably as a repair of their own, listed until
-                    # resolved (MemberRepairs.preserve_view_write). A
-                    # read-only view wrote nothing, so nothing is kept.
-                    if (entry.flags & os.O_ACCMODE) != os.O_RDONLY:
-                        try:
-                            kept = inode is not None and self.cache_manager.member_repairs.preserve_view_write(
-                                entry.canonical_path, entry.backend_name, entry.cache_path, inode,
-                                "write through a conflict view after close(), kept off "
-                                "the member by an open repair",
-                            )
-                            if kept:
-                                self.cache_manager.mark_cache_size_dirty()
-                            else:
-                                self.logger.error(
-                                    "direct sync of %s to %s refused by an open member repair, "
-                                    "and the descriptor's bytes are no longer at %s",
-                                    entry.canonical_path, entry.backend_name, entry.cache_path,
-                                )
-                        except Exception as exc:  # noqa: BLE001 - release cannot fail usefully
-                            # A narrow durability limit (CTO-182-J-LENGTH-C3):
-                            # the cache refused the metadata write itself. The
-                            # view's inode and name stay as they were, and the
-                            # member gets nothing.
-                            self.logger.error(
-                                "Conflict-view write to %s on member %s was refused by an "
-                                "open member repair and could not be kept (errno %s: %s). "
-                                "Recover the bytes from %s before anything evicts or "
-                                "refetches it; they are not on the member.",
-                                entry.canonical_path, entry.backend_name,
-                                errno.errorcode.get(getattr(exc, "errno", None), "?"), exc,
-                                entry.cache_path,
-                            )
-                    backend = None
-                if backend:
-                    try:
-                        backend.copy_from_local(entry.cache_path, entry.canonical_path)
-                        backend.sync()
-                        # Hashed on the member's worker, not this thread.
-                        self._schedule_checksum_task(backend, entry.canonical_path, replace=True)
-                        # The member's listed size and mtime are now old;
-                        # a size split on the name drops the parent's
-                        # listing (see NamespaceService.forget_listed_attrs).
-                        self.namespace.forget_listed_attrs(entry.virtual_path)
-                    except Exception as exc:
-                        self.logger.error(
-                            "direct sync failed for %s on %s: %s",
-                            entry.canonical_path,
-                            entry.backend_name,
-                            exc,
-                        )
+                # The view's member copy is a member mutation: registered,
+                # so a queued rename's fence publication is ordered with it.
+                mutation, _fenced = self.cache_manager.member_repairs.start_mutation(
+                    [entry.backend_name], [entry.canonical_path])
+                try:
+                    self._release_view(entry, inode)
+                finally:
+                    self.cache_manager.member_repairs.end_mutation(mutation)
             else:
                 metadata = self.state_manager.get_file_metadata(entry.canonical_path)
                 if metadata and metadata.sync_status == SyncStatus.DIRTY:
@@ -2763,6 +2712,68 @@ class StorageFS(Operations):
 
         except OSError as e:
             raise FuseOSError(e.errno)
+
+    def _release_view(self, entry: FDEntry, inode: Optional[str]):
+        """Send a closed conflict view to its member, or keep it for a repair."""
+        backend = self.backends.get(entry.backend_name)
+        if backend and entry.backend_name in (
+            self.cache_manager.member_repairs.backends_for([entry.canonical_path])
+        ):
+            # A write through a conflict view would replace that
+            # member's object, which an open repair protects. Open
+            # and create refuse it and flush reports it to close();
+            # this covers a repair recorded after that flush, when
+            # close() has already succeeded: the view's bytes are
+            # kept durably as a repair of their own, listed until
+            # resolved (MemberRepairs.preserve_view_write). A
+            # read-only view wrote nothing, so nothing is kept.
+            if (entry.flags & os.O_ACCMODE) != os.O_RDONLY:
+                try:
+                    kept = inode is not None and self.cache_manager.member_repairs.preserve_view_write(
+                        entry.canonical_path, entry.backend_name, entry.cache_path, inode,
+                        "write through a conflict view after close(), kept off "
+                        "the member by an open repair",
+                    )
+                    if kept:
+                        self.cache_manager.mark_cache_size_dirty()
+                    else:
+                        self.logger.error(
+                            "direct sync of %s to %s refused by an open member repair, "
+                            "and the descriptor's bytes are no longer at %s",
+                            entry.canonical_path, entry.backend_name, entry.cache_path,
+                        )
+                except Exception as exc:  # noqa: BLE001 - release cannot fail usefully
+                    # A narrow durability limit (CTO-182-J-LENGTH-C3):
+                    # the cache refused the metadata write itself. The
+                    # view's inode and name stay as they were, and the
+                    # member gets nothing.
+                    self.logger.error(
+                        "Conflict-view write to %s on member %s was refused by an "
+                        "open member repair and could not be kept (errno %s: %s). "
+                        "Recover the bytes from %s before anything evicts or "
+                        "refetches it; they are not on the member.",
+                        entry.canonical_path, entry.backend_name,
+                        errno.errorcode.get(getattr(exc, "errno", None), "?"), exc,
+                        entry.cache_path,
+                    )
+            backend = None
+        if backend:
+            try:
+                backend.copy_from_local(entry.cache_path, entry.canonical_path)
+                backend.sync()
+                # Hashed on the member's worker, not this thread.
+                self._schedule_checksum_task(backend, entry.canonical_path, replace=True)
+                # The member's listed size and mtime are now old;
+                # a size split on the name drops the parent's
+                # listing (see NamespaceService.forget_listed_attrs).
+                self.namespace.forget_listed_attrs(entry.virtual_path)
+            except Exception as exc:
+                self.logger.error(
+                    "direct sync failed for %s on %s: %s",
+                    entry.canonical_path,
+                    entry.backend_name,
+                    exc,
+                )
 
     def flush(self, path, fh):
         """Report, to close(), a conflict-view write that will not be sent.

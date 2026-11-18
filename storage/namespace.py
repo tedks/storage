@@ -1,6 +1,7 @@
 import concurrent.futures
 import contextvars
 import errno
+import functools
 import os
 import stat
 import time
@@ -72,6 +73,21 @@ class _ListingTicket(NamedTuple):
     generation: int
     child_seq: int
 
+
+
+def _member_mutation(path_args: int):
+    """Register the method's call as a member mutation at its first
+    path_args paths (MemberRepairs.start_mutation), so a queued rename's
+    fence publication is ordered against it: every fence lookup the method
+    makes, and every member call, happens inside the registration."""
+    def decorate(method):
+        @functools.wraps(method)
+        def wrapper(self, *args, **kwargs):
+            paths = [self.resolve_path(arg).canonical_path for arg in args[:path_args]]
+            with self.cache_manager.member_repairs.mutating(self.backends.keys(), paths):
+                return method(self, *args, **kwargs)
+        return wrapper
+    return decorate
 
 class NamespaceService:
     """Namespace and directory-view operations extracted from StorageFS."""
@@ -1403,6 +1419,7 @@ class NamespaceService:
             return self._served_snapshot(path, newer_snapshot)
         return ordered_entries
 
+    @_member_mutation(1)
     def mkdir(self, path: str, mode: int):
         """Create a directory."""
         resolved = self.resolve_path(path)
@@ -1434,6 +1451,7 @@ class NamespaceService:
         except OSError as exc:
             raise FuseOSError(exc.errno)
 
+    @_member_mutation(1)
     def rmdir(self, path: str):
         """Remove a directory."""
         resolved = self.resolve_path(path)
@@ -1467,6 +1485,7 @@ class NamespaceService:
         except OSError as exc:
             raise FuseOSError(exc.errno)
 
+    @_member_mutation(1)
     def unlink(self, path: str):
         """Remove a file."""
         resolved = self.resolve_path(path)
@@ -1500,6 +1519,7 @@ class NamespaceService:
         except OSError as exc:
             raise FuseOSError(exc.errno)
 
+    @_member_mutation(2)
     def rename(self, old: str, new: str, on_local_moved: Optional[Callable[[], None]] = None):
         """Rename a file or directory.
 
