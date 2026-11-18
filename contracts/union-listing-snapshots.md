@@ -76,15 +76,17 @@
   member resets on that member's next success. Each
   missing member is logged at warning level (member ID, failure class,
   directory), rate limited per member, on cold and warm listings alike. The
-  foreground wait for members is today's (per-member transport timeouts);
-  a bounded cold wait is deferred with the numeric ruling, and must not
+  foreground wait for members is today's (per-member transport timeouts; a
+  local member has none);
+  a bounded cold wait is deferred (ditz `listing-bounded-cold-wait`), and must not
   make a slow but healthy member invisible (spec, Interim bounds). No public partial flag or notification transport is
   implied; a client may present the result as complete (risk accepted by
   the ruling). A failed member cannot veto collection or publication of healthy
   member observations. Retained stale
-  names may fail at open; listing is not proof of readable bytes. Deadline and
-  cancellation do not allow abandoned or superseded workers to publish
-  later. If transport
+  names may fail at open; listing is not proof of readable bytes. The
+  background refresh deadline and cancellation do not allow abandoned or
+  superseded workers to publish later (a future foreground deadline needs
+  its own late-result rule; see the spec's inputs for it). If transport
   cancellation is unavailable, account for the still-running worker and keep
   concurrency bounded; never spawn replacements without admission.
 - **Resource policy:** limits on queued/running refreshes, active directories,

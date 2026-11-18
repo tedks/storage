@@ -119,7 +119,7 @@ warning log is the operator's signal. Concretely:
   nothing: readdir succeeds with only `.` and `..`. If the local cache holds
   names (cached or dirty files), they are listed.
 - Internally the snapshot stays partial: per-member status records B as
-  unavailable/timeout/cancelled, distinct from A's
+  unavailable/failed/timeout/cancelled, distinct from A's
   successful empty observation. "Never fresh" means a per-member
   completeness status, separate from the serving TTL: the partial snapshot is
   never reported complete or fresh for B, never becomes a confirmed-empty
@@ -242,9 +242,11 @@ uses these interim values, each from existing defaults:
 - Foreground wait: unchanged from today. A foreground listing without a
   servable snapshot waits for each member as it does now, bounded by the
   member's own transport timeout (a local member has none); this slice
-  adds no whole-request deadline. A member whose listing fails, times out
-  or is cancelled within that wait is an observed failure and follows the
-  rules above. The bounded cold wait is deferred with the numeric limits
+  adds no whole-request deadline. A member that reports itself unavailable,
+  or whose listing fails, times out or is cancelled within that wait, is an
+  observed failure and follows the
+  rules above. The bounded cold wait is deferred (ditz
+  `listing-bounded-cold-wait`) with the numeric limits
   (below), because a deadline shorter than a slow member's listing needs a
   late-result path that earlier drafts showed is not a small change.
 - Missing-member retry: per (directory, member) backoff, the first retry
