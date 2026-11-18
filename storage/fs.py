@@ -2698,6 +2698,25 @@ class StorageFS(Operations):
         except OSError as e:
             raise FuseOSError(e.errno)
 
+    def flush(self, path, fh):
+        """Report, to close(), a conflict-view write that will not be sent.
+
+        Open and create refuse a write through a conflict view to a member
+        with an open repair (_refuse_fenced_view_write); a repair recorded
+        after the open is caught here, so the writer's close() fails with
+        EBUSY instead of succeeding while release skips the copy. Only a
+        repair recorded between this flush and the release is left to the
+        release check, which logs it.
+        """
+        with self._fd_lock:
+            entry = self._fd_map.get(fh)
+        if (entry is not None and entry.backend_name
+                and (entry.flags & os.O_ACCMODE) != os.O_RDONLY
+                and entry.backend_name in self.cache_manager.member_repairs.backends_for(
+                    [entry.canonical_path])):
+            raise FuseOSError(errno.EBUSY)
+        return 0
+
     def fsync(self, path, datasync, fh):
         """Sync file to disk"""
         with self._fd_lock:

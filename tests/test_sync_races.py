@@ -542,6 +542,36 @@ class TestDirectoryRetries(SyncRaceTestBase):
         self.assertEqual([], copies)
         self.assertEqual(b"sole bytes", (self.member_dir / "d" / "f.txt").read_bytes())
 
+    def test_a_repair_recorded_while_a_conflict_view_is_open_fails_its_close(self):
+        """A view opened for writing before the repair exists: the write
+        lands in the view, but the close (flush) reports EBUSY and release
+        sends nothing to the member."""
+        self.fs.mkdir("/d", 0o755)
+        self.write_file("/d/f.txt", b"sole bytes")
+        self.start_sync()
+        self.wait_synced("/d/f.txt")
+        self.wait_idle()
+        self.fs.sync_manager.stop()
+        view = self.fs.cache_manager.get_cache_path("/d/f.txt.member")
+        view.write_bytes(b"sole bytes")
+        fh = self.fs.open("/d/f.txt.member", os.O_WRONLY)
+        self.fs.write("/d/f.txt.member", b"overwrite!", 0, fh)
+        self.fs.flush("/d/f.txt.member", fh)  # no repair yet: fine
+
+        self.fail_member_once("rename")
+        self.fs.rename("/d", "/e")
+        copies = []
+        patcher = patch.object(self.member, "copy_from_local",
+                               side_effect=lambda *a: copies.append(a))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        with self.assertRaises(FuseOSError) as raised:
+            self.fs.flush("/d/f.txt.member", fh)
+        self.assertEqual(errno.EBUSY, raised.exception.errno)
+        self.fs.release("/d/f.txt.member", fh)
+        self.assertEqual([], copies)
+        self.assertEqual(b"sole bytes", (self.member_dir / "d" / "f.txt").read_bytes())
+
     def test_a_member_known_down_during_a_rename_gets_a_repair(self):
         """A member that is unavailable when the rename runs has missed it
         like one whose call failed: it must not drop out of the record."""
