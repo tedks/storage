@@ -60,16 +60,18 @@ The value is UTF-8 JSON with these fields:
 - `reason`: at most 256 characters;
 - `recorded`: Unix seconds.
 
-A record larger than 3584 bytes is refused before it is written, with
-ENAMETOOLONG. That keeps the bound independent of the filesystem and inside
-ext4's per-inode xattr block. The cost is that a rename whose two paths
-together exceed about 3.3 KiB fails, on any mount with at least one
-member. The record is raw UTF-8, so a path costs its own encoded bytes:
-3 for a CJK character, 4 outside the Basic Multilingual Plane, 1 for
-ASCII. A name that is not valid UTF-8 is carried through with
-surrogateescape. Resolving rewrites the state as
-`resolved`, 4 bytes longer than `open`, which stays well under the 4 KiB
-block. This is a stated bound, not widened scope. A filesystem that refuses `user.*`
+A record whose JSON fits in 3584 bytes (version 1) lives in the xattr,
+inside ext4's per-inode xattr block on any filesystem. A longer one,
+such as a legal rename of two deep multibyte paths, is written in
+version 2. The xattr then holds only `{"v": 2, "state": ...}`, and the
+record's JSON is the carrier file's data, written and fsynced with the
+xattr before the carrier is named (CTO-182-J-LENGTH-C3). Every valid
+rename therefore keeps working; only a record over 1 MiB of data, far
+beyond two PATH_MAX paths, is refused (ENAMETOOLONG). The state stays in
+the xattr, so a resolution rewrites one small xattr atomically and never
+the data a reader may be parsing. Records are raw UTF-8, with
+surrogateescape for names that are not valid UTF-8. Version-1 records
+written before this keep loading as they are. A filesystem that refuses `user.*`
 xattrs (ENOTSUP) fails the rename the same way. The cache already depends on
 `user.storage.metadata`.
 
@@ -244,20 +246,25 @@ The repair fences this at each step:
   `close()` can wait for a demand slot first. `release` is never admitted.
 - **At release.** A repair recorded after a successful flush is caught
   here, when the caller has already been told the write succeeded. Release
-  sends nothing to the member. Instead the view's inode becomes the
-  carrier of a `view-write` repair (`MemberRepairs.preserve_view_write`).
+  sends nothing to the member. Instead the view's inode is kept as the
+  bytes of a `view-write` repair (`MemberRepairs.preserve_view_write`),
+  whose record is always version 2.
   - **The record.** Its old and new paths are both the canonical name at
     release time. An open descriptor follows a rename, so after a missed
     `/d -> /e` this is `/e/...`. The record also names the member and
     the inode (device and number) the descriptor wrote, taken before the
     descriptor was closed.
-  - **The bytes.** The inode is hard-linked under a temporary name in the
-    carrier directory. It gets its record and is fsynced, then it is
-    named. Only after that is the view's cache name unlinked. So the
-    carrier holds exactly what the descriptors wrote, with no copy and no
-    extra space. Nothing that later rewrites a view cache file in place
-    (a truncate by path, a refetch) can reach it, and it survives
-    eviction, a reopen and a rebuilt index.
+  - **The bytes.** The inode is hard-linked as `<id>.bytes`, under a
+    temporary name first, checked to be the descriptor's inode, fsynced,
+    then named. Only then is the record `<id>` written and named, and
+    only after that is the view's cache name unlinked. So the bytes are
+    exactly what the descriptors wrote, with no copy, no extra space and
+    no record xattr on the user's inode. Nothing that later rewrites a
+    view cache file in place (a truncate by path, a refetch) can reach
+    them, and they survive eviction, a reopen and a rebuilt index. A
+    write through a descriptor still open on the view takes the same
+    path lock as release and fails with `EBUSY` once the member is
+    fenced. So no surviving descriptor can change the kept bytes.
   - **Visibility.** `storage debug member-repairs` lists the record with
     the path of its bytes. Resolving it deletes them, so copy them where
     they belong first.
@@ -266,17 +273,23 @@ The repair fences this at each step:
     operator.
   - **One record per inode.** Every descriptor of the view shares the
     inode, so a second release, a dup'd close or a concurrent release
-    finds the record by inode and writes no second one. The carrier then
-    holds the last bytes any of them wrote.
+    finds the record by inode. It fsyncs the bytes again and writes no
+    second record.
   - **If the link fails.** A cache filesystem that refuses the link
-    (`EXDEV`, `EPERM`, `EMLINK`, `ENOTSUP`) gets a copy instead. That
-    copy is deduplicated by inode, size and mtime, and it shares the
-    repo's same-tick limit for dirty detection.
-  - **If the carrier fails.** If the carrier cannot be made durable at
-    all, for example `ENOSPC` while linking or `setxattr` failing, no
-    partial carrier is left. The failure is logged, with the bytes still
-    under the view's cache name, which is then the only copy. This is the
-    one case where they are not kept durably.
+    (`EXDEV`, `EPERM`, `EMLINK`, `ENOTSUP`) gets a copy instead. A copy
+    is shared with an existing record only if their bytes compare equal
+    byte for byte, never on an identity, size or mtime match. A
+    different version gets a record of its own.
+  - **If the cache refuses the metadata write itself** (`ENOSPC` on the
+    link, the data or the xattr), the CTO accepts a narrow durability
+    limit. The view's inode and cache name stay exactly as they were.
+    Nothing partial is left, the member gets nothing, and an error
+    names the errno, the member, the canonical path and the view's
+    cache path to recover the bytes from. Nothing is promised across a
+    crash in that state.
+  - **A crash between a successful flush and the release** loses the
+    write to the member for any conflict view, repaired or not. That is
+    how conflict views already work, and it is outside this change.
 
 The mount never retries delivery of the bytes to the member, and a
 `view-write` repair never moves bytes there by itself.

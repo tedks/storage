@@ -2587,6 +2587,9 @@ class StorageFS(Operations):
         if entry.prefetch_session is not None:
             raise FuseOSError(errno.EROFS)
 
+        if entry.backend_name is not None:
+            return self._write_view(entry, data, offset)
+
         try:
             # Positional: a descriptor's offset is shared state, and
             # concurrent writes through one fh must not move each other's.
@@ -2608,6 +2611,32 @@ class StorageFS(Operations):
 
         except OSError as e:
             raise FuseOSError(e.errno)
+
+    def _write_view(self, entry: FDEntry, data, offset):
+        """A write through a conflict view, under its canonical path's lock.
+
+        release holds the same lock while it keeps a view's bytes for a
+        repair (MemberRepairs.preserve_view_write), so a write either lands
+        before that, and is kept with the rest, or finds the member fenced
+        and fails with EBUSY: nothing reaches a kept carrier through a
+        descriptor that is still open.
+        """
+        while True:
+            with self._fd_lock:
+                canonical = entry.canonical_path
+            with self._path_locked(canonical):
+                with self._fd_lock:
+                    if entry.canonical_path != canonical:
+                        continue  # re-pointed by a rename meanwhile
+                if entry.backend_name in self.cache_manager.member_repairs.backends_for(
+                        [canonical]):
+                    raise FuseOSError(errno.EBUSY)
+                try:
+                    written = os.pwrite(entry.real_fd, data, offset)
+                except OSError as e:
+                    raise FuseOSError(e.errno)
+                self.cache_manager.mark_cache_size_dirty()
+                return written
 
     def release(self, path, fh):
         """Release (close) a file
@@ -2694,10 +2723,18 @@ class StorageFS(Operations):
                                     entry.canonical_path, entry.backend_name, entry.cache_path,
                                 )
                         except Exception as exc:  # noqa: BLE001 - release cannot fail usefully
+                            # A narrow durability limit (CTO-182-J-LENGTH-C3):
+                            # the cache refused the metadata write itself. The
+                            # view's inode and name stay as they were, and the
+                            # member gets nothing.
                             self.logger.error(
-                                "direct sync of %s to %s refused by an open member repair, "
-                                "and its bytes could not be kept: %s; they remain only in %s",
-                                entry.canonical_path, entry.backend_name, exc, entry.cache_path,
+                                "Conflict-view write to %s on member %s was refused by an "
+                                "open member repair and could not be kept (errno %s: %s). "
+                                "Recover the bytes from %s before anything evicts or "
+                                "refetches it; they are not on the member.",
+                                entry.canonical_path, entry.backend_name,
+                                errno.errorcode.get(getattr(exc, "errno", None), "?"), exc,
+                                entry.cache_path,
                             )
                     backend = None
                 if backend:

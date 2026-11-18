@@ -8,7 +8,6 @@ import heapq
 import queue
 import threading
 import time
-import weakref
 from pathlib import Path
 from typing import Callable, ContextManager, Dict, List, Optional, Union
 
@@ -38,8 +37,7 @@ class RetryScheduler:
     which retry without limit; ordinary retries keep sleeping inline.
     """
 
-    _registry: "weakref.WeakKeyDictionary[queue.Queue, RetryScheduler]" = None
-    _registry_lock = threading.Lock()
+    _attach_lock = threading.Lock()
 
     def __init__(self, task_queue: queue.Queue):
         self._queue = task_queue
@@ -50,12 +48,13 @@ class RetryScheduler:
 
     @classmethod
     def for_queue(cls, task_queue: queue.Queue) -> "RetryScheduler":
-        with cls._registry_lock:
-            if cls._registry is None:
-                cls._registry = weakref.WeakKeyDictionary()
-            scheduler = cls._registry.get(task_queue)
+        """The queue's scheduler, kept on the queue itself, so the two are
+        collected together (a registry would keep every queue alive)."""
+        with cls._attach_lock:
+            scheduler = getattr(task_queue, "_storage_retry_scheduler", None)
             if scheduler is None:
-                scheduler = cls._registry[task_queue] = cls(task_queue)
+                scheduler = cls(task_queue)
+                task_queue._storage_retry_scheduler = scheduler
             return scheduler
 
     def defer(self, task, delay: float) -> bool:

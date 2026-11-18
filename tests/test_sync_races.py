@@ -9,6 +9,7 @@ import errno
 import multiprocessing
 import os
 import queue
+import shutil
 import threading
 import time
 import unittest
@@ -22,7 +23,7 @@ from storage.fs import StorageFS
 import storage.namespace as storage_namespace
 from storage.models import SyncStatus
 from storage.index_audit import rebuild_index_from_cache
-from storage.member_repairs import VIEW_WRITE, CorruptRepairRecord, MemberRepairs
+from storage.member_repairs import MAX_RECORD_BYTES, VIEW_WRITE, CorruptRepairRecord, MemberRepairs
 from storage.state import StateManager
 from storage.sync_executor import RetryScheduler, SyncExecutor
 from storage.sync_tasks import DirOperation, DirSyncTask, SyncConfig
@@ -637,18 +638,6 @@ class TestDirectoryRetries(SyncRaceTestBase):
             self.assertEqual([], self.repairs())
             self.assertEqual([], os.listdir(self.cache_dir / ".storage.repairs"))
 
-    def test_rename_onto_a_name_too_long_to_record_fails_before_any_effect(self):
-        """A record over the bound (two paths together over about 3.3 KiB)
-        is refused before anything is written: ENAMETOOLONG, nothing moved."""
-        self.fs.mkdir("/d", 0o755)
-        long_target = "/e" + ("/" + "x" * 250) * 14  # under PATH_MAX
-        with self.assertRaises(FuseOSError) as raised:
-            self.fs.rename("/d", long_target)
-        self.assertEqual(errno.ENAMETOOLONG, raised.exception.errno)
-        self.assertTrue(self.fs.cache_manager.get_cache_path("/d").is_dir())
-        self.assertEqual(["d"], self.member_names())
-        self.assertEqual([], self.repairs())
-
     def test_failed_settle_leaves_the_intent_for_every_member(self):
         """The member rename failed, and writing its open record fails too:
         the intent stays, naming every target member."""
@@ -1094,6 +1083,86 @@ class TestRepairsOutliveTheIndex(SyncRaceTestBase):
         self.assertEqual(b"EDITEDytes",
                          self.fs.cache_manager.get_cache_path("/e/f.txt.member").read_bytes())
         self.assertEqual(b"sole bytes", (self.member_dir / "d" / "f.txt").read_bytes())
+
+    def test_a_legal_deep_multibyte_rename_is_recorded_beyond_the_xattr_bound(self):
+        """A rename whose two names serialize far past MAX_RECORD_BYTES is
+        legal (each under PATH_MAX, each part under NAME_MAX), so it must
+        work: its miss is kept in a version-2 carrier, through a reopen, a
+        rebuilt index and a resolve (CTO-182-J-LENGTH-C3)."""
+        part = "\u97f3\u697d" * 40                       # 240 bytes
+        deep = "/" + "/".join([part] * 8)               # 1928 bytes
+        self.fs.mkdir(deep.rsplit("/", 7)[0], 0o755)
+        parent = deep.rsplit("/", 7)[0]
+        for depth in range(2, 9):
+            self.fs.mkdir("/" + "/".join([part] * depth), 0o755)
+        self.fs.mkdir(deep + "/a", 0o755)
+        self.fail_member_once("rename")
+        self.fs.rename(deep + "/a", deep + "/b")
+        self.assertGreater(len(MemberRepairs(self.cache_dir).list()[0].to_json()),
+                           MAX_RECORD_BYTES)
+        expected = [("member", deep + "/a", deep + "/b")]
+        self.assertEqual(expected, self.repairs())
+        self.reopen()
+        self.assertEqual(expected, self.repairs())
+        self.reopen(rebuild=True)
+        self.assertEqual(expected, self.repairs())
+        self.assertEqual({"member"},
+                         self.fs.cache_manager.member_repairs.backends_for([deep + "/b/x"]))
+        [record] = self.fs.cache_manager.member_repairs.list()
+        self.assertTrue(self.fs.cache_manager.member_repairs.resolve(record.id))
+        self.assertEqual([], self.repairs())
+        self.assertTrue(parent)
+
+    def test_a_still_open_view_descriptor_cannot_write_into_kept_bytes(self):
+        """After release kept the view's inode, a second descriptor of the
+        same inode is refused (EBUSY): nothing rewrites the kept bytes."""
+        view, fh = self.open_edited_view()
+        fh2 = self.fs.open("/d/f.txt.member", os.O_WRONLY)
+        self.fail_member_once("rename")
+        self.fs.rename("/d", "/e")
+        self.fs.release("/e/f.txt.member", fh)
+        with self.assertRaises(FuseOSError) as raised:
+            self.fs.write("/e/f.txt.member", b"LATER!", 0, fh2)
+        self.assertEqual(errno.EBUSY, raised.exception.errno)
+        self.fs.release("/e/f.txt.member", fh2)
+        self.assertEqual([(("member",), "/e/f.txt", b"EDITEDytes")], self.view_writes())
+
+    def test_a_view_write_the_cache_cannot_record_keeps_its_name_and_bytes(self):
+        """Injected ENOSPC on the link, then on the record's xattr: the
+        narrow durability limit. The member keeps its original bytes, the
+        view's name keeps exactly the edited bytes, nothing partial is
+        left, and the log names errno, member, path and where to recover
+        the bytes (CTO-182-J-LENGTH-C3)."""
+        for target in ("storage.member_repairs.os.link", "storage.member_repairs.os.setxattr"):
+            with self.subTest(injected=target):
+                self.tearDown_view_case()
+                view, fh = self.open_edited_view()
+                self.fail_member_once("rename")
+                self.fs.rename("/d", "/e")
+                with patch(target, side_effect=OSError(errno.ENOSPC, "injected")), \
+                        self.assertLogs("storage", "ERROR") as logged:
+                    self.fs.release("/e/f.txt.member", fh)
+                kept_view = self.fs.cache_manager.get_cache_path("/e/f.txt.member")
+                self.assertEqual(b"EDITEDytes", kept_view.read_bytes())
+                self.assertEqual(b"sole bytes", (self.member_dir / "d" / "f.txt").read_bytes())
+                self.assertEqual([], self.view_writes())
+                self.assertEqual([], [n for n in os.listdir(self.cache_dir / ".storage.repairs")
+                                      if n.endswith((".bytes", ".new"))])
+                message = "\n".join(logged.output)
+                for needle in ("ENOSPC", "member", "/e/f.txt", str(kept_view)):
+                    self.assertIn(needle, message)
+
+    def tearDown_view_case(self):
+        """Reset the namespace between subtests of the same fixture."""
+        for repair in self.fs.cache_manager.member_repairs.list():
+            self.fs.cache_manager.member_repairs.resolve(repair.id)
+        for name in ("d", "e"):
+            for root in (self.member_dir, self.fs.cache_manager.get_cache_path("/")):
+                target = Path(root) / name
+                if target.exists():
+                    shutil.rmtree(target)
+        self.fs.state_manager.delete_file("/d/f.txt")
+        self.fs.state_manager.delete_file("/e/f.txt")
 
     def offline_rename_of_an_uncached_directory(self):
         """/d/f.txt's only bytes are on the member, the file is not cached,

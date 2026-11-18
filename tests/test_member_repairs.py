@@ -62,12 +62,62 @@ class TestRecords(MemberRepairsTestBase):
         self.assertEqual((rid, "/a", "/b", ("m0", "m1"), "open"),
                          (record.id, record.old_path, record.new_path, record.members, record.state))
 
-    def test_a_record_over_the_bound_is_refused_and_leaves_nothing(self):
+    def test_a_record_over_the_xattr_bound_is_kept_in_the_carrier_data(self):
+        """A legal deep multibyte pair, far over MAX_RECORD_BYTES serialized,
+        is recorded in version 2 (data plus a small discriminator), loads
+        on reopen, and resolves (CTO-182-J-LENGTH-C3)."""
+        deep = "/" + "/".join(["\u97f3\u697d" * 40] * 9)      # 2169 UTF-8 bytes
+        old, new = deep + "/a", deep + "/b"
         repairs = MemberRepairs(self.cache)
-        with self.assertRaises(OSError) as raised:
-            repairs.record("/a", "/" + "x" * MAX_RECORD_BYTES, ["m"], "missed")
-        self.assertEqual(errno.ENAMETOOLONG, raised.exception.errno)
-        self.assertEqual([], repairs.list())
+        kept = repairs.record(old, new, ["m"], "missed")
+        carrier = self.carriers / kept
+        self.assertGreater(len(MemberRepairs(self.cache).list()[0].to_json()), MAX_RECORD_BYTES)
+        head = json.loads(os.getxattr(str(carrier), RECORD_XATTR))
+        self.assertEqual({"v": 2, "state": "open"}, head)
+        self.assertGreater(carrier.stat().st_size, MAX_RECORD_BYTES)
+        [record] = MemberRepairs(self.cache).list()
+        self.assertEqual((old, new, ("m",), "open"),
+                         (record.old_path, record.new_path, record.members, record.state))
+        self.assertEqual({"m"}, MemberRepairs(self.cache).backends_for([new + "/x"]))
+        self.assertTrue(MemberRepairs(self.cache).resolve(kept))
+        self.assertFalse(MemberRepairs(self.cache).resolve(kept))
+        self.assertEqual([], MemberRepairs(self.cache).list())
+
+    def test_a_version_1_record_still_loads_and_resolves(self):
+        good = {"v": 1, "id": "c" * 32, "old": "/a", "new": "/b", "members": ["m"],
+                "state": "open", "reason": "r", "recorded": 1.0}
+        self.write_raw("c" * 32, json.dumps(good).encode())
+        [record] = MemberRepairs(self.cache).list()
+        self.assertEqual(("/a", "/b", "rename"), (record.old_path, record.new_path, record.kind))
+        self.assertTrue(MemberRepairs(self.cache).resolve("c" * 32))
+        self.assertEqual([], MemberRepairs(self.cache).list())
+
+    def test_an_interrupted_resolution_of_a_version_2_record_is_finished(self):
+        repairs = MemberRepairs(self.cache)
+        kept = repairs.record("/a", "/" + "x" * MAX_RECORD_BYTES, ["m"], "missed")
+        os.setxattr(str(self.carriers / kept), RECORD_XATTR, b'{"state":"resolved","v":2}')
+        self.assertEqual([], MemberRepairs(self.cache, sweep_new=True).list())
+        self.assertEqual([], os.listdir(self.carriers))
+
+    def test_invalid_version_2_carriers_refuse_the_open(self):
+        for head in (b'{"v":2}', b'{"v":2,"state":"done"}', b'{"v":2,"state":"open","x":1}'):
+            path = self.write_raw("d" * 32, head)
+            with self.assertRaises(CorruptRepairRecord, msg=head):
+                MemberRepairs(self.cache)
+            path.unlink()
+        path = self.write_raw("d" * 32, b'{"v":2,"state":"open"}')
+        path.write_bytes(b"{not json")
+        with self.assertRaises(CorruptRepairRecord):
+            MemberRepairs(self.cache)
+
+    def test_orphan_bytes_are_swept_only_by_the_owner(self):
+        self.carriers.mkdir(exist_ok=True)
+        orphan = self.carriers / ("e" * 32 + ".bytes")
+        orphan.write_bytes(b"never named")
+        self.assertEqual([], MemberRepairs(self.cache).list())
+        self.assertTrue(orphan.exists())
+        MemberRepairs(self.cache, sweep_new=True)
+        self.assertFalse(orphan.exists())
 
     def test_a_failed_directory_fsync_leaves_nothing_behind(self):
         repairs = MemberRepairs(self.cache)
@@ -259,6 +309,39 @@ class TestRecords(MemberRepairsTestBase):
         self.assertTrue(reopened.resolve(kept))
         self.assertFalse(carrier.exists())
         self.assertEqual([], MemberRepairs(self.cache).list())
+
+    def test_an_oversized_view_write_keeps_its_bytes_and_record(self):
+        """A view-write under a path near PATH_MAX: record in version 2,
+        bytes in their own file, both through reopen and resolve."""
+        long_path = "/" + "/".join(["\u97f3" * 80] * 16)       # 3855 UTF-8 bytes
+        view = self.cache / "view"
+        view.write_bytes(b"edited")
+        repairs = MemberRepairs(self.cache)
+        kept = repairs.preserve_view_write(long_path, "m", view, self.inode(view), "r")
+        self.assertEqual({"v": 2, "state": "open"},
+                         json.loads(os.getxattr(str(self.carriers / kept), RECORD_XATTR)))
+        reopened = MemberRepairs(self.cache, sweep_new=True)
+        [record] = reopened.list()
+        self.assertEqual((VIEW_WRITE, long_path), (record.kind, record.new_path))
+        self.assertEqual(b"edited", reopened.carrier_path(kept).read_bytes())
+        self.assertTrue(reopened.resolve(kept))
+        self.assertEqual([], os.listdir(self.carriers))
+
+    def test_a_copied_view_write_is_shared_only_by_equal_bytes(self):
+        view = self.cache / "view"
+        view.write_bytes(b"AAAA")
+        inode = self.inode(view)
+        repairs = MemberRepairs(self.cache)
+        with patch("storage.member_repairs.os.link", side_effect=OSError(errno.EPERM, "no")):
+            first = repairs.preserve_view_write("/f", "m", view, inode, "r")
+            self.assertEqual(first, repairs.preserve_view_write("/f", "m", view, inode, "r"))
+            st = os.stat(view)
+            view.write_bytes(b"BBBB")              # same size
+            os.utime(view, ns=(st.st_atime_ns, st.st_mtime_ns))   # same mtime
+            second = repairs.preserve_view_write("/f", "m", view, inode, "r")
+        self.assertNotEqual(first, second)
+        self.assertEqual({b"AAAA", b"BBBB"},
+                         {repairs.carrier_path(r.id).read_bytes() for r in repairs.list()})
 
     def test_a_view_write_is_copied_where_the_cache_cannot_link(self):
         view = self.cache / "view"

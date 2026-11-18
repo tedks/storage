@@ -32,6 +32,16 @@ logger = logging.getLogger(__name__)
 CARRIER_DIR = ".storage.repairs"
 RECORD_XATTR = "user.storage.member_repair"
 RECORD_VERSION = 1
+# Version 2 keeps the record in the carrier's data, with only this
+# discriminator in the xattr: {"v": 2, "state": ...}. It is used for a
+# record over MAX_RECORD_BYTES (a long rename pair) and for every
+# view-write record, whose bytes are a separate file, <id>.bytes. The state
+# stays in the xattr, so resolving rewrites one small xattr atomically and
+# never the data a reader is parsing. Version 1 records are read as before.
+DATA_VERSION = 2
+# A bound on a version-2 record's data, far above two PATH_MAX paths.
+MAX_DATA_BYTES = 1 << 20
+_BYTES_SUFFIX = ".bytes"
 # Inside ext4's per-inode xattr block on any filesystem: a larger record is
 # refused before anything is written (ENAMETOOLONG).
 MAX_RECORD_BYTES = 3584
@@ -84,11 +94,11 @@ class MemberRepair:
     # same bytes (another descriptor of the view) records nothing new.
     source: str = ""
 
-    def to_json(self) -> bytes:
+    def to_json(self, version: int = RECORD_VERSION) -> bytes:
         return json.dumps({
             "kind": self.kind,
             "source": self.source,
-            "v": RECORD_VERSION,
+            "v": version,
             "id": self.id,
             "old": self.old_path,
             "new": self.new_path,
@@ -103,7 +113,8 @@ class MemberRepair:
         # surrogateescape carries a name that is not valid UTF-8 through.
 
     @classmethod
-    def from_json(cls, raw: bytes, carrier_name: str) -> "MemberRepair":
+    def from_json(cls, raw: bytes, carrier_name: str,
+                  version: int = RECORD_VERSION) -> "MemberRepair":
         try:
             data = json.loads(raw.decode("utf-8", "surrogateescape"))
             if not isinstance(data["members"], list):
@@ -121,7 +132,7 @@ class MemberRepair:
                 source=data.get("source", ""),
             )
             valid = (
-                data["v"] == RECORD_VERSION
+                data["v"] == version
                 and record.kind in (RENAME, VIEW_WRITE)
                 and isinstance(record.source, str)
                 and (record.kind == RENAME
@@ -137,8 +148,40 @@ class MemberRepair:
         except (ValueError, KeyError, TypeError, AttributeError) as exc:
             raise CorruptRepairRecord(f"{carrier_name}: {exc}") from exc
         if not valid:
-            raise CorruptRepairRecord(f"{carrier_name}: not a valid version-{RECORD_VERSION} record")
+            raise CorruptRepairRecord(f"{carrier_name}: not a valid version-{version} record")
         return record
+
+
+def _discriminator(state: str) -> bytes:
+    return json.dumps({"state": state, "v": DATA_VERSION}, sort_keys=True,
+                      separators=(",", ":")).encode()
+
+
+def _read_all(fd: int) -> bytes:
+    chunks, offset = [], 0
+    while True:
+        chunk = os.pread(fd, 1 << 16, offset)
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+        offset += len(chunk)
+        if offset > MAX_DATA_BYTES:
+            raise CorruptRepairRecord(f"record data over {MAX_DATA_BYTES} bytes")
+
+
+def read_record(fd: int, carrier_name: str) -> Tuple[MemberRepair, int]:
+    """The record a carrier open at fd holds, and its format version."""
+    raw = os.getxattr(fd, RECORD_XATTR)
+    try:
+        head = json.loads(raw.decode("utf-8", "surrogateescape"))
+    except ValueError as exc:
+        raise CorruptRepairRecord(f"{carrier_name}: {exc}") from exc
+    if isinstance(head, dict) and head.get("v") == DATA_VERSION:
+        if set(head) != {"v", "state"} or head["state"] not in (INTENT, OPEN, RESOLVED):
+            raise CorruptRepairRecord(f"{carrier_name}: not a valid version-2 discriminator")
+        record = MemberRepair.from_json(_read_all(fd), carrier_name, DATA_VERSION)
+        return dataclasses.replace(record, state=head["state"]), DATA_VERSION
+    return MemberRepair.from_json(raw, carrier_name), RECORD_VERSION
 
 
 def is_at_or_under(path: str, root: str) -> bool:
@@ -168,6 +211,12 @@ def _fsync(path: Path, directory: bool = False):
 FLOCK_WAIT = 5.0
 
 
+def _write_all(fd: int, data: bytes):
+    view = memoryview(data)
+    while view:
+        view = view[os.write(fd, view):]
+
+
 def _copy_into(source: Path, fd: int):
     """Copy source's bytes into the empty file open at fd."""
     with open(source, "rb") as src:
@@ -175,9 +224,19 @@ def _copy_into(source: Path, fd: int):
             chunk = src.read(1 << 20)
             if not chunk:
                 return
-            view = memoryview(chunk)
-            while view:
-                view = view[os.write(fd, view):]
+            _write_all(fd, chunk)
+
+
+def _same_bytes(a: Path, b: Path) -> bool:
+    """Whether two files hold the same bytes, read in full (filecmp's
+    cache would answer from size and mtime alone)."""
+    with open(a, "rb") as fa, open(b, "rb") as fb:
+        while True:
+            ca, cb = fa.read(1 << 20), fb.read(1 << 20)
+            if ca != cb:
+                return False
+            if not ca:
+                return True
 
 
 def _flock_bounded(fd: int, wait: Optional[float] = None):
@@ -251,21 +310,34 @@ class MemberRepairs:
         stamp = self._dir_stamp()
         records: Dict[str, MemberRepair] = {}
         if stamp is not None:
+            byte_files = set()
             for name in sorted(os.listdir(self.dir)):
                 path = self.dir / name
-                if name.endswith(_NEW_SUFFIX) and _ID_RE.match(name[:-len(_NEW_SUFFIX)]):
-                    # Never renamed into place: written before any effect.
+                base = name
+                for suffix in (_NEW_SUFFIX, _BYTES_SUFFIX + _NEW_SUFFIX):
+                    if name.endswith(suffix) and _ID_RE.match(name[:-len(suffix)]):
+                        base = None
+                if base is None:
+                    # Never renamed into place: written before any effect
+                    # (a view-write's view name is unlinked only after its
+                    # record is named).
                     if owner:
                         try:
                             path.unlink()
                         except FileNotFoundError:
                             pass
                     continue
+                if name.endswith(_BYTES_SUFFIX) and _ID_RE.match(name[:-len(_BYTES_SUFFIX)]):
+                    byte_files.add(name[:-len(_BYTES_SUFFIX)])
+                    continue
                 try:
                     if not _ID_RE.match(name):
                         raise CorruptRepairRecord(f"{name}: not a record id")
-                    raw = os.getxattr(str(path), RECORD_XATTR, follow_symlinks=False)
-                    record = MemberRepair.from_json(raw, name)
+                    fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW)
+                    try:
+                        record, _version = read_record(fd, name)
+                    finally:
+                        os.close(fd)
                 except FileNotFoundError:
                     continue  # resolved while listing
                 except (OSError, CorruptRepairRecord) as exc:
@@ -295,6 +367,14 @@ class MemberRepairs:
                         continue
                 records[name] = record
             if owner:
+                # Bytes whose record was never named (the view's own name
+                # still holds them) or was resolved: nothing refers to them.
+                for orphan in byte_files - set(records):
+                    if not (self.dir / orphan).exists():
+                        try:
+                            (self.dir / (orphan + _BYTES_SUFFIX)).unlink()
+                        except FileNotFoundError:
+                            pass
                 _fsync(self.dir, directory=True)
         # The stamp from before the listing, also for the owner (whose own
         # unlinks then cost one extra reload): a change made while listing,
@@ -319,11 +399,15 @@ class MemberRepairs:
                 return False
             if os.fstat(fd).st_nlink == 0:
                 return True
-            if MemberRepair.from_json(os.getxattr(fd, RECORD_XATTR), path.name).state != RESOLVED:
+            if read_record(fd, path.name)[0].state != RESOLVED:
                 return False
             os.fsync(fd)
             try:
                 path.unlink()
+            except FileNotFoundError:
+                pass
+            try:
+                path.with_name(path.name + _BYTES_SUFFIX).unlink()
             except FileNotFoundError:
                 pass
             return True
@@ -356,28 +440,32 @@ class MemberRepairs:
             _fsync(self.dir.parent, directory=True)
             self._dir_durable = True
 
-    def _write_new(self, record: MemberRepair, hold: bool = False,
-                   content: Optional[Path] = None) -> Optional[int]:
+    def _write_new(self, record: MemberRepair, hold: bool = False) -> Optional[int]:
         """Create a carrier durably. With hold, return its descriptor with
         an exclusive flock taken before the carrier had its final name, so
-        no resolve can ever act on it until the caller closes it. With
-        content, the carrier's bytes are a copy of that file, made durable
-        with the record (one fsync covers both) before the carrier is
-        named."""
+        no resolve can ever act on it until the caller closes it. A record
+        over MAX_RECORD_BYTES, and every view-write record, is written in
+        version 2: its JSON as the carrier's data, made durable with the
+        discriminator xattr by the one fsync before the carrier is named."""
         payload = record.to_json()
-        if len(payload) > MAX_RECORD_BYTES:
-            raise OSError(errno.ENAMETOOLONG,
-                          f"member repair record is {len(payload)} bytes, over {MAX_RECORD_BYTES}")
+        data = None
+        if record.kind == VIEW_WRITE or len(payload) > MAX_RECORD_BYTES:
+            data = record.to_json(DATA_VERSION)
+            if len(data) > MAX_DATA_BYTES:
+                raise OSError(errno.ENAMETOOLONG,
+                              f"member repair record is {len(data)} bytes, over {MAX_DATA_BYTES}")
+            payload = _discriminator(record.state)
         self._ensure_dir()
         temp = self.dir / (record.id + _NEW_SUFFIX)
         final = self.dir / record.id
-        fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        # O_RDWR: a held intent's descriptor is later read through (settle).
+        fd = os.open(str(temp), os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
         try:
             try:
                 if hold:
                     fcntl.flock(fd, fcntl.LOCK_EX)
-                if content is not None:
-                    _copy_into(content, fd)
+                if data is not None:
+                    _write_all(fd, data)
                 os.setxattr(fd, RECORD_XATTR, payload)
                 os.fsync(fd)
             except BaseException:
@@ -478,26 +566,37 @@ class MemberRepairs:
                             inode: str, reason: str) -> Optional[str]:
         """Durably keep a conflict view's bytes that a repair kept off member.
 
-        Called at release for a write that close() already reported done.
-        inode is "dev:ino" of the descriptor's file, taken before it was
-        closed. The view's inode itself becomes the carrier: hard-linked
-        under a temporary name, given its record and fsynced, then named,
-        and only then is the view's cache name unlinked. So the bytes are
-        exactly what the descriptor wrote, no space or copy time is needed,
-        and nothing that later rewrites the view's cache file in place can
-        reach them. They outlive eviction, a refetch, a reopen and an
-        index rebuild, and are listed until resolved; the member is not
-        touched. Every descriptor of that inode shares one record: a second
-        release finds it by inode. Where the cache filesystem refuses the
-        link, the bytes are copied instead (and then deduplicated by inode,
-        size and mtime). Returns the record id, or None when the view's
-        cache name no longer holds that inode. Raises OSError when the
-        bytes cannot be made durable.
+        Called at release, under the canonical path's lock, for a write
+        that close() already reported as done. inode is "dev:ino" of the
+        descriptor's file, taken before it was closed. Writes through the
+        view take the same lock and fail once the member is fenced
+        (StorageFS._write_view), so the bytes cannot change while, or
+        after, they are kept.
+
+        The view's inode is hard-linked as <id>.bytes and fsynced, then
+        the version-2 record naming it is written and named, and only then
+        is the view's cache name unlinked. So the bytes are exactly what the
+        descriptors wrote, with no copy and no extra space, and nothing
+        that later rewrites a view cache file in place can reach them. They
+        outlive eviction, a refetch, a reopen and an index rebuild, and are
+        listed until resolved. The member is not touched. Every descriptor
+        of the inode shares one record, which a second release finds by
+        inode (and fsyncs again). Where the cache filesystem cannot link,
+        the bytes are copied; a copy is shared only with a record holding
+        exactly the same bytes, never on an identity guess. Returns the
+        record id, or None when the view's cache name no longer holds that
+        inode. Raises OSError when the bytes cannot be made durable, leaving
+        the view's inode and name as they were.
         """
         with self._write_lock:
             for existing in self._refresh().values():
                 if (existing.kind == VIEW_WRITE and existing.new_path == canonical_path
                         and existing.members == (member,) and existing.source == inode):
+                    fd = os.open(str(self.carrier_path(existing.id)), os.O_RDONLY)
+                    try:
+                        os.fsync(fd)
+                    finally:
+                        os.close(fd)
                     return existing.id
             try:
                 st = os.lstat(view_path)
@@ -509,49 +608,93 @@ class MemberRepairs:
                 self._make(canonical_path, canonical_path, [member], OPEN, reason),
                 kind=VIEW_WRITE, source=inode,
             )
+            self._ensure_dir()
             try:
-                self._link_new(record, view_path)
-                moved = True
+                self._link_bytes(record.id, view_path, st)
+                linked = True
+            except FileNotFoundError:
+                return None  # the view's name no longer holds this inode
             except OSError as exc:
                 if exc.errno not in _NO_LINK:
                     raise
-                moved = False
-                copied = f"{inode}:{st.st_size}:{st.st_mtime_ns}"
-                for existing in self._refresh().values():
-                    if existing.kind == VIEW_WRITE and existing.source == copied:
-                        return existing.id
-                record = dataclasses.replace(record, source=copied)
-                self._write_new(record, content=view_path)
+                linked = False
+                same = self._same_bytes_record(canonical_path, member, view_path)
+                if same is not None:
+                    return same
+                record = dataclasses.replace(record, source="copy:" + inode)
+                self._copy_bytes(record.id, view_path)
+            try:
+                self._write_new(record)
+            except BaseException:
+                try:
+                    (self.dir / (record.id + _BYTES_SUFFIX)).unlink()
+                    _fsync(self.dir, directory=True)
+                except OSError:
+                    pass
+                raise
             self._after_write(lambda records: records.__setitem__(record.id, record))
-        if moved:
+        if linked:
             try:
                 if os.lstat(view_path).st_ino == st.st_ino:
                     os.unlink(view_path)
                     _fsync(view_path.parent, directory=True)
             except OSError as exc:
                 logger.warning("Kept the bytes of %s in %s, but its view cache name %s stays: %s",
-                               canonical_path, self.dir / record.id, view_path, exc)
+                               canonical_path, self.carrier_path(record.id), view_path, exc)
         logger.error(
             "A write through the conflict view of %s on %s was kept off that member by an "
             "open repair; its bytes are kept in %s, repair %s (storage debug member-repairs)",
-            canonical_path, member, self.dir / record.id, record.id,
+            canonical_path, member, self.carrier_path(record.id), record.id,
         )
         return record.id
 
-    def _link_new(self, record: MemberRepair, source: Path):
-        """Make source's inode a carrier, durably: link, record, fsync, name."""
-        payload = record.to_json()
-        if len(payload) > MAX_RECORD_BYTES:
-            raise OSError(errno.ENAMETOOLONG,
-                          f"member repair record is {len(payload)} bytes, over {MAX_RECORD_BYTES}")
-        self._ensure_dir()
-        temp = self.dir / (record.id + _NEW_SUFFIX)
-        final = self.dir / record.id
+    def _same_bytes_record(self, canonical_path, member, view_path) -> Optional[str]:
+        """A copied view-write record for this name and member whose bytes
+        equal view_path's, compared byte for byte."""
+        for existing in self._refresh().values():
+            if (existing.kind == VIEW_WRITE and existing.new_path == canonical_path
+                    and existing.members == (member,) and existing.source.startswith("copy:")):
+                try:
+                    if _same_bytes(self.carrier_path(existing.id), view_path):
+                        return existing.id
+                except OSError:
+                    continue
+        return None
+
+    def _link_bytes(self, repair_id: str, source: Path, expected: os.stat_result):
+        """source's inode as <id>.bytes, durably: link under a temporary name,
+        check it is still the inode expected, fsync, name, fsync the dir."""
+        temp = self.dir / (repair_id + _BYTES_SUFFIX + _NEW_SUFFIX)
+        final = self.dir / (repair_id + _BYTES_SUFFIX)
         os.link(source, temp)
         try:
             fd = os.open(str(temp), os.O_RDONLY)
             try:
-                os.setxattr(fd, RECORD_XATTR, payload)
+                linked = os.fstat(fd)
+                if (linked.st_dev, linked.st_ino) != (expected.st_dev, expected.st_ino):
+                    raise FileNotFoundError(errno.ENOENT, "view replaced before it was kept",
+                                            str(source))
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            os.rename(temp, final)
+            _fsync(self.dir, directory=True)
+        except BaseException:
+            for leftover in (temp, final):
+                try:
+                    leftover.unlink()
+                except OSError:
+                    pass
+            raise
+
+    def _copy_bytes(self, repair_id: str, source: Path):
+        """A copy of source as <id>.bytes, durably."""
+        temp = self.dir / (repair_id + _BYTES_SUFFIX + _NEW_SUFFIX)
+        final = self.dir / (repair_id + _BYTES_SUFFIX)
+        fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            try:
+                _copy_into(source, fd)
                 os.fsync(fd)
             finally:
                 os.close(fd)
@@ -566,8 +709,10 @@ class MemberRepairs:
             raise
 
     def carrier_path(self, repair_id: str) -> Path:
-        """Where a record lives; a VIEW_WRITE record's bytes are its data."""
-        return self.dir / repair_id
+        """Where a record's bytes are: <id>.bytes for a view-write record
+        (its data), else the carrier itself."""
+        kept = self.dir / (repair_id + _BYTES_SUFFIX)
+        return kept if kept.exists() else self.dir / repair_id
 
     def settle(self, repair_id: str, old_path: str, new_path: str, missed: Dict[str, str]):
         """Settle an intent once every member call has returned.
@@ -633,7 +778,7 @@ class MemberRepairs:
                 _flock_bounded(fd)
             if os.fstat(fd).st_nlink == 0:
                 return
-            current = MemberRepair.from_json(os.getxattr(fd, RECORD_XATTR), repair_id)
+            current = read_record(fd, repair_id)[0]
             if current.state != INTENT:
                 return  # being resolved: that resolution finishes it
             carrier.unlink()
@@ -666,14 +811,20 @@ class MemberRepairs:
                 if os.fstat(fd).st_nlink == 0:
                     found = False
                 else:
-                    current = MemberRepair.from_json(os.getxattr(fd, RECORD_XATTR), repair_id)
+                    current, version = read_record(fd, repair_id)
                     resolved = dataclasses.replace(current, state=RESOLVED)
-                    os.setxattr(fd, RECORD_XATTR, resolved.to_json(), os.XATTR_REPLACE)
+                    os.setxattr(fd, RECORD_XATTR,
+                                _discriminator(RESOLVED) if version == DATA_VERSION
+                                else resolved.to_json(), os.XATTR_REPLACE)
                     os.fsync(fd)
                     try:
                         carrier.unlink()
                     except FileNotFoundError:
                         pass  # the owner finished it: still this resolution
+                    try:
+                        (self.dir / (repair_id + _BYTES_SUFFIX)).unlink()
+                    except FileNotFoundError:
+                        pass
                     found = True
             finally:
                 os.close(fd)
