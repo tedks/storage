@@ -80,3 +80,13 @@ log_events:
     clean, pushed and up to date at d61bdb17601aba8918fe552bd456442e4a69b412; PR #167
     draft/open. No processes or leases retained; owned council scratch directories
     removed.'
+- time: 2026-11-18T04:47:58-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'CTO landing disposition based on foreground plan 01a7edf: land foreground
+    admission first. Rebase #167 independently and preserve existing fixed-pool defaults.
+    Before merging worker growth, require a separate verified stale-rename retry safety
+    fix. A preflight stat cannot serialize with external writers. Protect target occupancy
+    and source identity, or leave ambiguous moves pending visible repair without mutating
+    member objects. Exercise competing external target creation and source reuse.
+    This narrower release prerequisite does not require solving every case of sync-member-reconcile.'
