@@ -63,9 +63,12 @@ Open questions and rulings in ditz, as of 2026-11-18:
 Backlog items from #169, as of 2026-11-18: `gh-112-rsync-quickcheck` is
 closed (#179 merged); `streaming-prefix-write-open`,
 `field-seq-read-serialized`, `threading-cold-open-pool-share` and
-`gh-74-no-hash-policy` are unstarted in ditz. #175 implements the
-cold-copy channel reserve that `threading-cold-open-pool-share` proposed,
-but that ditz item is still open.
+`gh-74-no-hash-policy` are unstarted in ditz. #175 partly covers
+`threading-cold-open-pool-share`: on threaded mounts, whole-file SSH copies
+use bulk channel capacity so listings keep the reserved channel. The merged
+audit (`docs/performance_backlog_2026-11-10.md`) keeps lease-wait
+diagnostics and contenders outside FUSE as remaining scope, and the ditz
+item is still open.
 
 Deployment: this record claims no rollout of any PR to any host.
 

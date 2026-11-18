@@ -102,12 +102,13 @@
   history between lanes (a finding sent to another lane, a message's
   delivery state). Anthropic CLEAN with 4 Nits. Google EMPTY (usage limit).
   Independent lead review CLEAN at the same head.
-- disposition: fixed in the same commit as this entry. The delivery reports
-  in the backlog paragraph and in integration-lead:21 (a finding sent to
-  another lane, a message's delivery state) are redacted, with markers; what
-  remains is that the cold-open finding is in the audit. The Bazel
-  coordination paragraph's handoff wording was softened here and removed in
-  records-lead:7. Nits: the title now says the header is current;
+- disposition: partly fixed in the same commit as this entry; completed in
+  records-lead:7. The delivery reports in the backlog paragraph and in
+  integration-lead:21 (a finding sent to another lane, a message's delivery
+  state) are redacted, with markers; what remains is that the cold-open
+  finding is in the audit. The Bazel coordination paragraph's handoff
+  wording was only softened here; the next round still found it, and
+  records-lead:7 removed it. Nits: the title now says the header is current;
   "read-ahead while a file is open" replaces "open read-ahead window".
   Council rounds `2177179cf51d-20261118T055328Z-ebd826` and
   `a2f72081a323-20261118T055525Z-e45e30` each had one OpenAI Important,
@@ -125,12 +126,28 @@
   handoff to the parent), 1 Important (records-lead:6 named rounds 3 and 4
   ambiguously). Anthropic CLEAN with 2 Nits. Google EMPTY (usage limit).
   Independent lead review CLEAN with 2 Nits.
-- disposition: fixed in the same commit as this entry. The handoff
-  sentence is removed from the Bazel paragraph. records-lead:6 was
-  corrected in place: it names the two council round ids, names the ditz
-  issue, and no longer says the delivery reports' substance was kept. The
-  backlog paragraph and integration-lead:21 now say the no-action statement
-  is as of 2026-11-10, with #175 in Current state. All redaction markers now
-  read "redacted; see records-lead:2-7". The remaining "requested from the
-  parent" and "parent relayed" wording records the source of an authority
-  request and of an observation, not message delivery, and is kept.
+- disposition: fixed in the same commit as this entry. The handoff sentence
+  is removed from the Bazel paragraph. records-lead:6 was corrected in
+  place: it names the two council round ids, names the ditz issue, and no
+  longer says the delivery reports' substance was kept. The backlog
+  paragraph and integration-lead:21 now say the no-action statement is as of
+  2026-11-10, with #175 in Current state. All redaction markers now point to
+  records-lead:2-7. The remaining "requested from the parent" and "parent
+  relayed" wording records the source of an authority request and of an
+  observation, not message delivery, and is kept.
+
+## records-lead:8
+
+- kind: review-seat-outcome
+- refs: records-lead:7
+- based_on: `d122eee79b5fd030d91e9245347f0e60ea413422`
+- round: `d122eee79b5f-20261118T060951Z-2f1e99`, warm delta from `67888b2`.
+- outcomes: OpenAI 1 Important (records-lead:6 called its fix complete
+  although the Bazel handoff remained until records-lead:7). Anthropic
+  CLEAN with 1 Nit. Google EMPTY (usage limit). Independent lead review
+  CLEAN with 1 optional Nit.
+- disposition: fixed in the same commit as this entry. records-lead:6 now
+  says its fix was partial and completed in records-lead:7; records-lead:7
+  now says the markers point to records-lead:2-7 rather than quoting one
+  wording. Both were corrected in place. The header now says #175 partly
+  covers `threading-cold-open-pool-share`, matching the merged audit.
