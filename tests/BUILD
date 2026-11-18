@@ -29,6 +29,12 @@ storage_test("fs_streaming", tags = ["no-remote"])
 storage_test("fs_threading")
 storage_test("foreground_admission", extra_srcs = ["test_fs_threading.py"])
 storage_test(
+    "foreground_admission_mounted",
+    target = "storage_tests_foreground_admission_mounted",
+    extra_srcs = ["fuse_mount.py"],
+    tags = ["local", "manual"],
+)
+storage_test(
     "fuse_thread_state",
     target = "storage_tests_fuse_thread_state",
     tags = ["local", "manual"],
