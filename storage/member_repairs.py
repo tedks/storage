@@ -767,6 +767,24 @@ class MemberRepairs:
         return (record is not None and record.kind == VIEW_WRITE
                 and not self.carrier_path(repair_id).exists())
 
+    def kept_fd(self, fd: int) -> Optional[str]:
+        """kept_inode for an open descriptor: its file, wherever (or whether)
+        it is named now."""
+        st = os.fstat(fd)
+        return self._kept_by_stat(st)
+
+    def _kept_by_stat(self, st: os.stat_result) -> Optional[str]:
+        for record in self._refresh().values():
+            if record.kind != VIEW_WRITE:
+                continue
+            try:
+                kept = os.lstat(self.carrier_path(record.id))
+            except FileNotFoundError:
+                continue
+            if (kept.st_dev, kept.st_ino) == (st.st_dev, st.st_ino):
+                return record.id
+        return None
+
     def kept_inode(self, path: Path) -> Optional[str]:
         """The id of the view-write record whose kept bytes are path's inode
         (a view cache name that still aliases them), else None.

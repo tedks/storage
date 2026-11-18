@@ -389,9 +389,19 @@ The repair fences this at each step:
     into a new inode, and the next open keeps that one too. The sweep
     walks the cached subtree under each repair's names on every open, so
     its cost follows the size of those subtrees.
-  - **A moved alias.** An alias whose fence was resolved after a directory
-    rename moved it is still refused: a write open, a write and a truncate
-    each check whether the file itself is kept bytes (`kept_inode`).
+  - **One live-inode guard.** Several kinds of name can still reach kept
+    bytes:
+    - an alias moved by a directory rename whose fence was then
+      resolved;
+    - an alias recovery left in place because it now reads as an
+      ordinary file or as another member's view;
+    - a descriptor whose name is gone or was re-pointed.
+
+    None can change them. Every writable open, create and truncate,
+    whatever the name reads as, refuses a name whose file is a live
+    payload (`kept_inode`). A write through a view descriptor checks the
+    descriptor's own file (`kept_fd`, by `fstat`), not its name. Writes
+    to unrelated files are not affected (CTO-182-IDENTITY).
 
 The mount never retries delivery of the bytes to the member, and a
 `view-write` repair never moves bytes there by itself.

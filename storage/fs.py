@@ -2368,14 +2368,15 @@ class StorageFS(Operations):
         """Truncate a file"""
         resolved = self._resolve_path(path)
         cache_path = resolved.cache_path
-        if resolved.backend_name:
-            # As _write_view (truncate holds the same path lock): a view whose
-            # member is fenced is not changed, and a cache name that still
-            # aliases kept view-write bytes is never truncated in place.
-            repairs = self.cache_manager.member_repairs
-            if (resolved.backend_name in repairs.backends_for([resolved.canonical_path])
-                    or repairs.kept_inode(cache_path) is not None):
-                raise FuseOSError(errno.EBUSY)
+        # As _write_view (truncate holds the same path lock): a cache name
+        # whose file is kept view-write bytes is never truncated in place,
+        # whatever the name reads as, and a view whose member is fenced is
+        # not changed.
+        repairs = self.cache_manager.member_repairs
+        if repairs.kept_inode(cache_path) is not None or (
+                resolved.backend_name
+                and resolved.backend_name in repairs.backends_for([resolved.canonical_path])):
+            raise FuseOSError(errno.EBUSY)
 
         try:
             with open(cache_path, 'r+b') as f:
@@ -2415,9 +2416,12 @@ class StorageFS(Operations):
         hold the only copy of renamed bytes, so the write is refused up
         front (EBUSY), as an unlink of the view is."""
         repairs = self.cache_manager.member_repairs
+        # Any name whose file is bytes a repair keeps, whatever the name now
+        # reads as (an alias left in place may read as an ordinary file).
+        if repairs.kept_inode(resolved.cache_path) is not None:
+            raise FuseOSError(errno.EBUSY)
         if resolved.backend_name and (
             resolved.backend_name in repairs.backends_for([resolved.canonical_path])
-            or repairs.kept_inode(resolved.cache_path) is not None
         ):
             raise FuseOSError(errno.EBUSY)
 
@@ -2642,7 +2646,7 @@ class StorageFS(Operations):
                         continue  # re-pointed by a rename meanwhile
                 repairs = self.cache_manager.member_repairs
                 if (entry.backend_name in repairs.backends_for([canonical])
-                        or repairs.kept_inode(entry.cache_path) is not None):
+                        or repairs.kept_fd(entry.real_fd) is not None):
                     # Fenced, or the descriptor's file is bytes a repair keeps
                     # (an alias that survived, then moved out of the fence).
                     raise FuseOSError(errno.EBUSY)
@@ -2753,8 +2757,10 @@ class StorageFS(Operations):
                         self.cache_manager.mark_cache_size_dirty()
                     else:
                         self.logger.error(
-                            "direct sync of %s to %s refused by an open member repair, "
-                            "and the descriptor's bytes are no longer at %s",
+                            "direct sync of %s to %s refused by an open member repair; its "
+                            "bytes were not kept: %s no longer holds the descriptor's file, "
+                            "or matches a repair whose kept bytes are missing (left in "
+                            "place; see storage debug member-repairs)",
                             entry.canonical_path, entry.backend_name, entry.cache_path,
                         )
                 except Exception as exc:  # noqa: BLE001 - release cannot fail usefully

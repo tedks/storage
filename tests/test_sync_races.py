@@ -1540,6 +1540,58 @@ class TestRepairsOutliveTheIndex(SyncRaceTestBase):
         self.assertEqual(b"also outside", (outside.parent / "t.member").read_bytes())
         self.assertEqual([], self.view_writes())
 
+    def test_a_descriptor_moved_out_of_every_fence_cannot_write_kept_bytes(self):
+        """Two descriptors of a view; the first release keeps the inode, a
+        directory rename re-points the second outside the view-write's
+        fence, and the rename's own repair is resolved: the second still
+        cannot write, since its file is kept bytes (fstat, not its name)."""
+        view, fh = self.open_edited_view()
+        fh2 = self.fs.open("/d/f.txt.member", os.O_WRONLY)
+        self.fail_member_once("rename")
+        self.fs.rename("/d", "/e")
+        self.fs.release("/e/f.txt.member", fh)
+        self.fail_member_once("rename")
+        self.fs.rename("/e", "/k")
+        repairs = self.fs.cache_manager.member_repairs
+        for record in repairs.list():
+            if record.kind != VIEW_WRITE:
+                self.assertTrue(repairs.resolve(record.id))
+        with self.assertRaises(FuseOSError) as raised:
+            self.fs.write("/k/f.txt.member", b"LATER!", 0, fh2)
+        self.assertEqual(errno.EBUSY, raised.exception.errno)
+        self.fs.release("/k/f.txt.member", fh2)
+        self.assertEqual([(("member",), "/e/f.txt", b"EDITEDytes")], self.view_writes())
+
+    def test_an_alias_read_as_an_ordinary_file_cannot_change_kept_bytes(self):
+        """A kept alias survives, and the mount restarts with that member no
+        longer configured, so recovery leaves the alias in place and its name
+        now reads as an ordinary file. A write open, a create and a truncate
+        of it are refused; reading it, and writing an unrelated file, work
+        (CTO-182-IDENTITY)."""
+        kept, alias = self.kept_with_surviving_alias()
+        self.fs.sync_manager.stop()
+        self.fs.state_manager.close()
+        self.fs = StorageFS(
+            cache_root=self.cache_dir, state_db=self.temp_dir / "state.db",
+            backends={"other": self.member}, cache_size=10 * 1024 * 1024,
+            num_sync_workers=1, start_sync=False,
+        )
+        self.assertTrue(alias.exists())               # left in place: not other's view
+        for attempt in (lambda: self.fs.open("/e/f.txt.member", os.O_WRONLY),
+                        lambda: self.fs.create("/e/f.txt.member", 0o644),
+                        lambda: self.fs.truncate("/e/f.txt.member", 0)):
+            with self.assertRaises(FuseOSError) as raised:
+                attempt()
+            self.assertEqual(errno.EBUSY, raised.exception.errno)
+        rh = self.fs.open("/e/f.txt.member", os.O_RDONLY)
+        self.assertEqual(b"EDITEDytes", self.fs.read("/e/f.txt.member", 64, 0, rh))
+        self.fs.release("/e/f.txt.member", rh)
+        self.write_file("/e/notes.txt", b"ordinary write")
+        self.assertEqual(b"ordinary write",
+                         self.fs.cache_manager.get_cache_path("/e/notes.txt").read_bytes())
+        self.assertEqual(b"EDITEDytes",
+                         MemberRepairs(self.cache_dir).carrier_path(kept).read_bytes())
+
     def test_a_crash_between_flush_and_release_still_keeps_the_view(self):
         """flush succeeded, a missed rename fenced the member, and the
         process died before the release: the next open of the cache keeps

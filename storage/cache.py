@@ -162,6 +162,8 @@ class CacheManager:
         means, as in resolve_path."""
         self._break_kept_aliases(member_names)
         self._keep_fenced_views(member_names)
+        # Names it unlinked no longer count in the cache.
+        self.mark_cache_size_dirty()
 
     def _inside_cache(self, path: Path) -> bool:
         """Whether path's directory is inside the cache with no symlinked
