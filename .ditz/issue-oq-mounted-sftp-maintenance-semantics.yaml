@@ -13,8 +13,8 @@ type: task
 component: open-questions
 release:
 reporter: Ted Smith <tedks@riseup.net>
-status: unstarted
-disposition:
+status: closed
+disposition: fixed
 creation_time: 2026-11-11T21:29:41-00:00
 references: []
 log_events:
@@ -30,3 +30,9 @@ log_events:
   who: Ted Smith
   what: updated description
   comment: ""
+- time: 2026-11-18T04:39:31-00:00
+  who: Ted Smith
+  what: 'closed: fixed'
+  comment: Ted ruling on Storage resumption, 2026-11-17. New requests wait for a bounded
+    interval. If an active transfer exceeds the drain deadline, leave it running and
+    report that maintenance did not complete.
