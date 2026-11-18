@@ -1,0 +1,20 @@
+id: gh-181-sync-rename-noreplace
+title: First synchronous member rename still replaces an occupied target
+desc: 'NamespaceService._propagate_dir_operation calls Backend.rename (os.replace
+  / posix-rename) during the mount''s rename. An unrelated object at the member target
+  is replaced. Needs a no-replace member rename (renameat2 RENAME_NOREPLACE locally;
+  SFTP plain rename / hardlink for files on OpenSSH) and a repair record when it refuses.
+  Out of scope for PR #182.'
+type: bugfix
+component: sync
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-18T05:00:07-00:00
+references: []
+log_events:
+- time: 2026-11-18T05:00:07-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
