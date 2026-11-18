@@ -83,9 +83,13 @@
   the ruling). A failed member cannot veto collection or publication of healthy
   member observations. Retained stale
   names may fail at open; listing is not proof of readable bytes. A worker
-  that only missed the foreground deadline keeps running and may publish if
-  its generation is still current; superseded or cancelled workers never
-  publish. If transport
+  that only missed the foreground deadline keeps running, its directory
+  stays counted in flight (generation and child races kept), and its
+  successful result must be merged, as a replacement of that member's set
+  only, into the then-current snapshot, unless an invalidation raced it or
+  a newer observation of the same member was published. Supersession is
+  per member: a refresh that skipped or failed on the member does not
+  supersede it. Cancelled workers never publish. If transport
   cancellation is unavailable, account for the still-running worker and keep
   concurrency bounded; never spawn replacements without admission.
 - **Resource policy:** limits on queued/running refreshes, active directories,
@@ -113,7 +117,10 @@
   (listed); all-failed with retained observations (stale names listed);
   all members cancelled/no-cache (error, not success-empty); member that
   fails only on the foreground listing while bulk copies saturate its
-  channels (logged missing within the deadline, not success-empty); single-member failure; continuous local creates while a remote add
+  channels (logged missing within the deadline, not success-empty); single-member failure; late foreground worker after the deadline: a
+  write through the mount before it completes (not published, member
+  retried) and a stale or retry refresh that skipped it as hung (late
+  success still published); continuous local creates while a remote add
   still publishes; event identity after delete/recreate or contributor loss;
   older remote-change event after newer local mutation and duplicate events; stale
   response after local rename/unlink; slow A while B publishes; cancelled old

@@ -152,7 +152,8 @@ warning log is the operator's signal. Concretely:
 
 "Missing" means any non-success member result, in one shared list of
 failure classes used by the spec, the contract and the log: unavailable
-(the member reports itself unavailable), failed (any error, including
+(the member reports itself unavailable; `_list_members` does not consult
+`is_available()` today, so the tracer adds that check), failed (any error, including
 permission and partial-read errors), timeout, and cancelled (including by
 shutdown). A missing
 member never counts as a successful empty observation.
@@ -166,8 +167,8 @@ empty mountpoint would therefore report successful-empty: nothing is logged,
 and on a warm directory its retained names are replaced by an empty set.
 This slice does not detect that case; it is a documented limit (CTO
 ruling, 2026-11-18, deferring root verification). Best-effort union and the
-missing-member log apply to observed failures only: a listing that fails,
-times out or is cancelled. A readable empty underlying mountpoint is
+missing-member log apply to observed failures only: a member that reports
+itself unavailable, or whose listing fails, times out or is cancelled. A readable empty underlying mountpoint is
 undetectable here and lists as that member's successful empty observation.
 This slice deploys no marker, infers no disk loss from emptiness, mount
 boundaries or any other signal, and never turns a successful empty listing
@@ -175,7 +176,8 @@ into an error or a warning. Root verification is tracked separately (ditz `listi
 owns its design and setup). Until it lands, a failed disk that leaves a
 readable mountpoint behaves exactly as today, the README must not claim
 failed-disk detection, and the warning-log rule above covers only members
-whose listing actually fails, times out or is cancelled. Review of earlier
+that report themselves unavailable or whose listing actually fails, times
+out or is cancelled. Review of earlier
 drafts of this spec produced these inputs to that design:
 
 - Accept an observation only after a check that started after it was read;
@@ -243,16 +245,31 @@ uses these interim values, each from existing defaults:
   today runs inline on the FUSE thread, must move onto its member's executor
   for the deadline to apply. A member still running at the deadline is
   missing for that response (logged), but its listing is not discarded: it
-  keeps running, bounded by its own transport timeout, and publishes its
-  observation if its generation is still current when it finishes, so a
-  slow but healthy member still appears at the next enumeration instead of
-  never. Only superseded or cancelled workers are fenced from publishing.
+  keeps running (a remote member's is bounded by its transport timeout; a
+  local member's has no bound, and is counted rather than unbounded only
+  because of the hung-member admission rule below) and its result is
+  merged when it finishes, so a slow but healthy member still appears at
+  the next enumeration instead of never. The fence that makes this safe:
+  - The directory stays counted in flight, keeping its listing generation
+    and child-race records, until the late worker ends, even though the
+    request has returned; today `_end_listing` drops both when the request
+    returns, after which invalidations bump nothing.
+  - A completion callback, not the returned request, merges the result
+    under `dir_cache_lock` then `listing_lock`, as a replacement of that
+    member's set only, into the snapshot current at that moment; it does
+    not republish the request's older view of the other members.
+  - It must publish unless an invalidation of the directory (or of a name
+    it read) raced it, or a newer observation of that same member was
+    published. Supersession is per member: a later refresh that skipped
+    the member as hung, or failed on it, does not supersede its late
+    success. A raced result is discarded and the member is retried under
+    the backoff below.
+  Cancellation (unmount, shutdown) fences the worker entirely.
   Such a still-running foreground listing is interactive and keeps the
   member's interactive SFTP reserve until it ends (the background
   abandonment rationale, that refresh listings hold no reserved channel,
   does not carry over); later foreground listings treat that member as
-  hung (below) rather than queueing behind it. A local member also needs
-  this worker, since it has no transport timeout.
+  hung (below) rather than queueing behind it.
   The README's statement that a member keeps its last names "until a
   listing that waits for it completes" must be updated when this lands.
 - Missing-member retry: per (directory, member) backoff, the first retry
