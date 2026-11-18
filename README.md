@@ -166,7 +166,8 @@ OpenSSH connection. These limits come from configuration, not a probe of
 the server: one that grants fewer sessions, or other background calls on
 the same channels, can still make uploads wait, and servers configured with
 a lower session limit may need a lower maximum. A maximum or minimum outside
-them is refused with the limit and the member that sets it. The limits
+them is refused with the limit and what sets it (for an `ssh://` limit, the
+member). The limits
 apply only with `max_sync_workers` set: a fixed pool keeps its configured
 size. CPU
 load average is not used: sync spends most of its time waiting for member I/O,

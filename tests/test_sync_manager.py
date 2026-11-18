@@ -783,6 +783,16 @@ class TestGrowthWithFailingRenameRecords(unittest.TestCase):
             while not any(t > done_at for t in failures) and time.monotonic() < deadline:
                 time.sleep(0.02)
             self.assertTrue(any(t > done_at for t in failures))
+            # Every task back in the scheduler before the failure clears: one
+            # deferred after the delivery below would wait its whole 30 s+
+            # backoff. Nothing is delivered on its own inside it, so this
+            # state is stable.
+            deadline = time.monotonic() + 10.0
+            seen = scheduler.pending()
+            while seen != self.CEILING and time.monotonic() < deadline:
+                time.sleep(0.01)
+                seen = scheduler.pending()
+            self.assertEqual(self.CEILING, seen)
 
             failing.clear()
             scheduler.deliver_all_now()
@@ -848,13 +858,17 @@ class TestGrowthWithFailingRenameRecords(unittest.TestCase):
             num_workers=self.FLOOR, max_workers=2, idle_timeout=0.1,
             config=SyncConfig(monitor_interval=30.0, retry_delay=60.0, max_retries=3),
         )
-        release, blocked = threading.Event(), threading.Event()
+        release, blocked, blocker_done = threading.Event(), threading.Event(), threading.Event()
         attempts, done = [], threading.Event()
 
         def process(executor, task):
             if task.virtual_path == "/blocker":
                 blocked.set()
-                release.wait(10.0)
+                # Held until the test releases it (the finally below), well
+                # past every wait in the test: the floor worker never frees
+                # up to run the retry itself.
+                release.wait(120.0)
+                blocker_done.set()
                 return True
             attempts.append(threading.current_thread().name)
             if len(attempts) == 1:
@@ -879,7 +893,7 @@ class TestGrowthWithFailingRenameRecords(unittest.TestCase):
                 self.assertEqual(self.FLOOR, len(self.sync_manager.workers))
                 scheduler.deliver_all_now()
                 self.assertTrue(done.wait(5.0), "the delivered retry waited behind the busy floor")
-                self.assertFalse(release.is_set())
+                self.assertFalse(blocker_done.is_set())
                 self.assertEqual(2, len(attempts))
             finally:
                 release.set()
@@ -887,7 +901,7 @@ class TestGrowthWithFailingRenameRecords(unittest.TestCase):
             self.sync_manager.stop()
 
 
-def _ssh_member(name, sftp_channels=None, interactive_reserve=None):
+def _ssh_member(name, sftp_channels=None, interactive_reserve=1):
     """An ssh:// member (constructed lazily: nothing connects), optionally
     with a non-default SFTP pool configuration."""
     from storage.backends.ssh import SSHBackend
