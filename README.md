@@ -48,7 +48,7 @@ The `setup-venv.sh` helper script creates `.venv/`, installs/upgrades `pip`, and
 
 ## Development Environment (Nix + Bazel + direnv)
 
-- **Nix flake dev shell**: `nix develop` (provides Bazel 7, JDK 11, Python 3.11, git, direnv).
+- **Nix flake dev shell**: `nix develop` (provides Bazel 7, JDK 21, Python 3.11, git, direnv).
 - **direnv auto-load**: Install `direnv` and `nix-direnv`, add `eval "$(direnv hook bash)"` (or zsh/fish) to your shell, then run `direnv allow` once in the repo. This auto-enters the flake environment on `cd`.
 - **Devcontainer**: Open in VS Code Remote Containers; the image installs Nix with flakes and runs `nix develop` on startup. The `/nix` store is cached in a named Docker volume for speed.
 - **Bazel**: Build/test from the dev shell: `bazel build //:storage_cli` and `bazel test //:storage_tests`.
@@ -569,6 +569,7 @@ Implemented:
 - Remote inotify watchers that invalidate the cache when a member changes
 - TOML mount profiles with optional display names for members; numbered member IDs remain stable when labels change
 - A multithreaded FUSE loop (`fuse_threads`, off by default until field-tested), so a slow member call for one file does not hold up listings, stats and reads of others
+- On a threaded mount, whole-file SSH cache copies use bulk SFTP channel capacity while directory listing keeps the interactive reserve. `bulk_capacity_wait_timeout` optionally bounds that bulk-capacity queue (off by default); an existing cold open reports `EAGAIN` on its expiry, and an interrupted native FUSE request reports `EINTR`. Single-threaded foreground copies keep their interactive class.
 - Cache metadata xattrs, with `storage debug rebuild-index`, `reprobe-locations` and `verify-index`
 - File recomputation
 - Symbolic links: made through the mount, replicated to the members holding their target; links already on members show as links

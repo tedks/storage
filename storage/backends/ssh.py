@@ -125,7 +125,8 @@ class SSHBackend(Backend):
                  username: str, password: Optional[str] = None,
                  key_filename: Optional[str] = None,
                  port: int = 22, speed_priority: int = 50,
-                 connect_timeout: float = 10.0):
+                 connect_timeout: float = 10.0,
+                 bulk_capacity_wait_timeout: Optional[float] = None):
         """
         Initialize SSH backend
 
@@ -140,6 +141,8 @@ class SSHBackend(Backend):
             speed_priority: Speed priority (default 50 for remote)
             connect_timeout: Timeout in seconds for SSH connection/auth
                 handshakes, and for metadata requests
+            bulk_capacity_wait_timeout: optional bulk SFTP capacity deadline;
+                None or zero waits for channel capacity to drain
         """
         super().__init__(
             name,
@@ -174,6 +177,7 @@ class SSHBackend(Backend):
             retry_interval=self._reconnect_probe_interval,
             # Background work waits as long as a transfer may hold a channel.
             bulk_wait=self.sftp_operation_timeout,
+            bulk_capacity_wait_timeout=bulk_capacity_wait_timeout,
             on_availability=lambda available: Backend.set_available(self, available),
             logger=self.logger,
         )

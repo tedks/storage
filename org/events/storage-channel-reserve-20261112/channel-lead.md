@@ -1,0 +1,403 @@
+# Channel reserve lead event shard
+
+## channel-lead:1
+
+- kind: state-change
+- based_on: `81793ac27b70f82c231bf607b55e775d2b905974`
+- applied_at: `cb9e66a8fba8523bd2e0270f4f7499efafaeb41c`
+- refs: root `STORAGE-CHANNEL-RESERVE-TRACER-20261112`
+- state: Started the isolated package after confirming exact clean worktree,
+  reading its AGENTS, packed spec/member-I/O contract and separation review.
+  No prior PR #171 scope remained active. Assumed only already threaded mounts
+  can exploit concurrent channel reserve. No unrequested scheduling machinery:
+  the existing SSH pool and concrete namespace list supply the mechanism.
+
+## channel-lead:2
+
+- kind: state-change
+- based_on: `81793ac27b70f82c231bf607b55e775d2b905974`
+- applied_at: `cb9e66a8fba8523bd2e0270f4f7499efafaeb41c`
+- refs: `channel-lead:1`
+- state: Baseline synthetic test RED, first from a listing wait and then,
+  after tightening the assertion, from actual bulk lease count 0 instead of
+  3 before timeout. Focused repaired run selected 3 tests and passed 3.
+  Source/test commit pushed, draft PR #175 opened. RED/GREEN logs and scoped
+  resource monitors are in the owned scratch path named in status. This is
+  verification of the tracer, not release acceptance.
+
+## channel-lead:3
+
+- kind: state-change
+- based_on: `8f1bc3d3a3923ccde1d166d1ffb6dc38ccb12e65`
+- applied_at: evidence-only successor to the same source/test tree
+- refs: `channel-lead:2`
+- state: Clean pushed head ran `//:storage_tests_fast_gate` without test
+  filters and with forced test execution. All three Bazel targets passed:
+  986 sandboxed tests, 8 resilience tests and build source coverage. Four of
+  four authorized focused invocations are spent; scope cgroups verified and
+  all owned scopes inactive. Monitored combined scratch/reused cache growth
+  stayed below 2 GiB; acquisition bytes unknown. Self-review found only the
+  owned three application hunks, one existing test module and own documents.
+  No full gate, CLI, council, root acceptance, merge or deploy is claimed.
+
+## channel-lead:4
+
+- kind: review-finding
+- based_on: `844684bc02cdd66b7bf4a60deada64acdec6cc19`
+- applied_at: pending test-only correction
+- refs: `channel-lead:3`, root/warm Sol `channel-reserve-review-844684b.md`
+- state: Production three hunks scoped CLEAN, package FINDINGS T1. The old
+  four-at-once schedule overconstrained total channel count: the fourth
+  opener can hold a prior metadata lease. The test now stages three real
+  SFTP get gates, then observes the fourth thread denied by the pool's
+  actual bulk capacity decision, without replacing that decision. It allows
+  total channels up to the configured cap and attempts every join before
+  reporting leaks. This is test evidence correction, not code acceptance.
+
+## channel-lead:5
+
+- kind: state-change
+- based_on: `844684bc02cdd66b7bf4a60deada64acdec6cc19`
+- applied_at: pending test-only correction
+- refs: `channel-lead:4`
+- state: Two of three renewed invocations spent. First used a target label
+  absent on this baseline and stopped in analysis; no tests ran. Second
+  selected one corrected test on `//:storage_tests_sandboxed` after a
+  reversible `storage/cache.py` mutation disabling only its bulk context;
+  behavioral RED was `bulk_leased=0` rather than 3 before timeout. The
+  control source was restored and hashes match the pre-control production
+  blobs. Both owned scopes are inactive. One invocation remains for the
+  clean exact-head fast gate; no focused GREEN is claimed yet.
+
+## channel-lead:6
+
+- kind: state-change
+- based_on: `844684bc02cdd66b7bf4a60deada64acdec6cc19`
+- applied_at: `4fe8fb14d715ba080cb756bcd58c8ff3dd053ec0`
+- refs: `channel-lead:5`
+- state: Test-only correction pushed; production blobs remain byte-identical
+  to `cb9e66a`. Unfiltered `//:storage_tests_fast_gate` was forced on clean
+  pushed `4fe8fb1`, executed and passed 986 sandboxed plus 8 resilience tests
+  and build source check, including corrected cold-open schedule. All three
+  renewed invocations spent; owned control/control2/fast2 scopes inactive.
+  Control RED and GREEN use the same test blob; the reversible control only
+  disabled the copy's `bulk_request`, then restored production bytes. T1
+  evidence is ready for root delta review, not formal council, full gates,
+  CLI, merge or deployment.
+
+## channel-lead:7
+
+- kind: lead-review
+- based_on: `a006e6b97f9bf9be3a0a82480b172b908c8d074c`
+- applied_at: pending rebased checkpoint
+- refs: `channel-lead:6`, root/warm Sol `channel-reserve-t1-review-a006e6b.md`
+- state: T1 test delta scoped CLEAN; three production hunks unchanged. This
+  closes the schedule finding only. Nit disposition: extend the gated copy's
+  test-only safety wait from 5 to 30 seconds so it cannot expire before the
+  sequential readiness and browser bounds; finally still releases the gate.
+  Published master remains `66c640a`; branch rebase from accepted `81793ac`
+  gives a five-commit range-diff with equal patches and no conflict. New-base
+  fast gate, CLI and formal council are pending; PR170 incident and full
+  release gates remain open.
+
+## channel-lead:8
+
+- kind: review-finding
+- based_on: `50418327de1af6822955d6d72b138753c591ec34`
+- applied_at: pending council fix delta
+- refs: `channel-lead:7`, PR #175 formal round `50418327de1a-20261112T040721Z-589e74`
+- state: Frozen formal round received OpenAI native gpt-6-sol CLEAN;
+  Anthropic Opus FINDINGS (one Important: bulk timeout on a foreground cold
+  open lacked contract/test evidence; four Nits: stale base/gate wording,
+  eager-list error path wording, private pool test coupling, deadline relation).
+  Google seat EMPTY at usage limit; no substitute. This is not council
+  convergence. In-scope test/contract repairs are underway, preserving the
+  three production blobs. New-base fast gate ran 40 targets, 39 passed and
+  unchanged SSH mux test failed; CLI build passed. The gate failure is filed
+  as `pr175-base-ssh-mux-fastgate`, not waived or repaired outside scope.
+
+## channel-lead:9
+
+- kind: review-finding
+- based_on: `16fa46dda7e608a22f2c4eb9d3576cf0a0977d94`
+- applied_at: pending causal-proof checkpoint
+- refs: `channel-lead:8`, PR #175 formal round 2, root/warm Sol disposition
+- state: Round 2 remains FINDINGS: Anthropic requested positive proof that a
+  healthy existing file reached bulk-capacity denial, plus a same-test
+  disabled-classification negative control. Google was EMPTY. The narrow
+  test now observes a successful stat and invokes the original pool decision
+  unchanged, then reads exact bytes through the spare interactive channel
+  while three holders remain. Contract names current ENOENT as observed and
+  unruled; eager-listing error prose was corrected. No production edit or
+  runtime outcome is claimed by this event. Three-invocation evidence budget
+  starts at zero; the shared mux flock is mandatory.
+
+## channel-lead:10
+
+- kind: state-change
+- based_on: `9c3e2aa8e0c179c9543e80d1bfe50aeb3adc19d9`
+- applied_at: runtime-blocked checkpoint; final receipts on PR #175
+- refs: `channel-lead:9`, `pr175-bulk-timeout-proof`, PR #175 comment 6814629125
+- state: The corrected test and two documentation nits are pushed without
+  production changes. Two attempts waited 60 seconds each on the required
+  mux flock; both timed out before `systemd-run` or Bazel. An exact-path
+  read-only holder check found peer Bazel Java PID 3482627 from the isolated
+  mux worktree retaining the lock descriptor. No peer process was stopped or
+  lock bypassed. The temporary disabled-classification cache edit was
+  restored byte-for-byte to blob `d0cd68b`; causal RED/GREEN and whole-module
+  evidence remain UNRUN, 0/3 invocations spent. Owned causalred scope is
+  inactive; no owned Bazel client, fixture or lease remains. Formal council
+  remains FINDINGS, and observed ENOENT remains an open product question.
+
+## channel-lead:11
+
+- kind: state-change
+- based_on: `7a5c3db38ad69525509630c4509a9536af1fbd89`
+- applied_at: opt-in timeout design checkpoint
+- refs: `channel-lead:10`, PR #175 comment 6814714217, Ted's timeout ruling
+- state: The mux owner released the inherited lock holder; our shared-lock
+  control failed behaviorally before timeout, and the clean SSH backend
+  target executed 117/117 pass. Both owned scopes ended; 2/3 causal-proof
+  invocations were used. Ted then selected an opt-in per-mount capacity wait
+  timeout, default off, returning EAGAIN on expiry. The proposed path is
+  CLI/profile resolution -> SSH member factory/backend -> pool capacity
+  wait -> distinct expiry -> cache pass-through -> FUSE open EAGAIN. Existing
+  connection and operation timeouts remain bounded. This is a proposed
+  implementation boundary, not a test or acceptance of new code; the new
+  six-invocation nonmount budget starts at zero. Physical unmount is outside
+  this phase and requires mounted gate evidence later.
+
+## channel-lead:12
+
+- kind: implementation-stop
+- based_on: `0e95b83e9e87966d408c6805918e8270bb4fc8d3`
+- applied_at: `7907eea` application/test checkpoint
+- refs: `channel-lead:11`, `pr175-default-capacity-unmount-cancel`
+- state: Implemented the ruled optional bulk-capacity deadline through
+  CLI/profile, SSH pool, cache and open, preserving separate connection and
+  operation timeouts. The first focused run failed two old tests that assumed
+  an implicit timeout; after making those tests opt in, the second run passed
+  all 120 SSH, 59 profile and 32 CLI tests. Both owned scopes exited and the
+  mux lock was released; 2/6 focused invocations used. Source review exposed
+  an unmount contract collision: libfuse joins callbacks before `destroy()`
+  can close the pool, while an untimed capacity waiter needs holder release.
+  A progressing transfer has no total duration bound. Synthetic close proves
+  cancellation after close, not mounted unmount completion. Root `%91` has a
+  submitted blocker receipt. No further source/runtime phase is inferred;
+  draft PR #175 remains unaccepted and full gates/council pending.
+
+## channel-lead:13
+
+- kind: bounded-repair-checkpoint
+- based_on: `1f3b896822dc89ede9e272041a5b2dd4f1970e86`
+- applied_at: `d84ee40` application/test checkpoint
+- refs: `channel-lead:12`, root `STORAGE175-PREDESTROY-ADJUDICATION-20261113`,
+  `pr175-default-capacity-unmount-cancel`
+- state: Root authorized a native callback-only cancellation boundary. The
+  pinned libfuse2 exports `fuse_interrupted` and `fuse_exited`; fusepy's
+  wrapper and `fuse_loop_mt` were inspected. A thread-local probe is installed
+  only during native callbacks; pool capacity waits sample it every 0.1 s
+  and map cancellation to `EINTR`, while ordinary wait remains unlimited.
+  The nonmount cancellation unit and affected SSH/allow-other/mount-sigpipe
+  targets passed. First mounted attempt was collection-only failure due a
+  helper absent from this target's BUILD srcs; the fixture was made
+  self-contained. Next mounted run had 1 pass/1 fail: real detach did not
+  expose session exit before held leases were released. Final mounted run
+  had 1 pass/1 fail: explicit native session exit released the queued
+  callback and reached destroy with three holders still held; the
+  disabled-probe control hit an early assertion while its trigger syscall
+  remained blocked. The assertion was corrected after all 6/6 invocations
+  were spent and is UNRUN. Every owned scope and client exited and all
+  scratch mounts were unmounted; no resource lease remains. Real caller
+  interruption, plain/lazy unmount and full gate/CLI/council are unproved.
+  This is a draft checkpoint, not scoped acceptance or release clearance.
+
+## channel-lead:14
+
+- kind: bounded-evidence-repair
+- based_on: `55065aaba022113c31bd44666976cfcb01849397`
+- applied_at: pending exact-head affected-module run
+- refs: `channel-lead:13`, root
+  `STORAGE175-CANCELLATION-EVIDENCE-DISPOSITION-20261113`,
+  `pr175-default-capacity-unmount-cancel`
+- state: Root narrowed the unmount claim: the old fixture tried normal `-u`
+  then lazy `-uz` without preserving individual return codes, and lazy
+  detachment of a busy filesystem is not session cancellation. No new
+  production code was needed. The corrected explicit native session-exit
+  positive and disabled-probe control passed on frozen `55065aa` under an
+  owned 2 CPU/4 GiB/swap 0 scope. A separate focused test with an isolated
+  FUSE daemon passed real caller interruption (SIGKILL, native `request`
+  observation) and owned daemon SIGTERM (native `session` observation,
+  callback before `destroy()` while three bulk holders stayed gated).
+  Test-only cleanup now records exact unmount attempts, requires owned
+  processes and mount gone before scratch deletion, and reports cleanup
+  failures. Two of four invocations spent; both scopes inactive, no mount or
+  lock holder remains. Final affected modules and full release gates remain
+  pending; this event does not assert acceptance.
+
+## channel-lead:15
+
+- kind: state-change
+- based_on: `36fb7b7bef6ec4906f3a0af1dc2cf6882809fff6`
+- applied_at: 2026-11-15 finish mission start
+- refs: `channel-lead:14`, root `STORAGE175-FINISH-20261115`, PR #175
+  comment 6865400265
+- state: Resumed in the sole PR #175 worktree. Prior scoped evidence is the
+  pushed 238-case affected run and real callback cancellation tests; this
+  does not attest the new master. The authorized next boundary is rebase to
+  published `1811024`, affected tests, exact-head all-four-gate and CLI
+  evidence, formal council, then independent root review. No new workload
+  started at this event. Default infinite capacity queue wait, opt-in EAGAIN
+  and callback-local EINTR remain the product behavior; lazy detach alone is
+  not session exit. PR #171 and #167 remain untouched.
+
+## channel-lead:16
+
+- kind: state-change
+- based_on: `5b764f5146ebc184b13f524b9b0daceaf8742847`
+- applied_at: rebased PR #175 worktree on `181102496b37240d5cef4496e21b48c46359037f`
+- refs: `channel-lead:15`, fetched `origin/master`
+- state: Rebased the seventeen-commit PR #175 series onto exact published
+  master. Range-diff found fifteen equal patches and two import-context
+  adjustments where inherited PR #179 added `RsyncBackend` to `fs.py`; both
+  imports were preserved. No sibling branch was edited and no runtime was
+  used. Current master changes the actual pinned flake to Bazel 8; the
+  new-base tests/gates/CLI and council remain pending. The old 238-case
+  receipt is historical, not a new-base pass.
+
+## channel-lead:17
+
+- kind: bounded-validation
+- based_on: `683a0ec8cedcdebf0645e99d1c8e4699fb774503`
+- applied_at: affected-test checkpoint before exact-head gates
+- refs: `channel-lead:16`, owned resource receipts
+  `storage175-finish-affected-20261115.scope.json` and
+  `storage175-finish-affected2-20261115.scope.json`
+- state: First new-base affected attempt was stopped after 25.3 seconds by
+  the owned scanner when a legitimate `_ProbeOperations` scratch FUSE mount
+  was not recognized. The exact owned PID, `/dev/fuse` fd and connection 64
+  were matched before aborting that connection; its process and scope then
+  exited. The scanner was narrowly corrected outside project source. A
+  second run forced six affected Bazel targets: 241 cases passed, including
+  caller interrupt and daemon session-exit controls; 7 fusepy deprecation
+  warnings, no worker-thread warning. Scope 2 CPU/8 GiB/2 GiB swap/1024
+  tasks was observed, pids.peak 296 and no cap hit; sampled named scratch
+  peaked 463 MiB. Both runs count 57 seconds of the 3600-second workload
+  envelope. Local Unix Docker endpoint and exact cached synthetic image were
+  verified read-only; no Docker fixture has started. Full gates and CLI are
+  still pending, with no release acceptance inferred.
+
+## channel-lead:18
+
+- kind: deviation
+- based_on: `0040e0f2ee47733cfe6549d93679a3b7d9c93a9a`
+- applied_at: first full-gate failure repair
+- refs: `channel-lead:17`, owned gate log
+  `storage175-finish-gates-20261115.scope.log`
+- state: The no-args four-gate run executed all 45 targets, 44 pass and one
+  namespace integration test fail. Its first backend mkdir was deliberately
+  failed, but the background retry could complete before the immediate
+  absence assertion. To serve the required full-gate evidence, the narrow
+  test scope bends to an Event-gated real retry: inspect absence before
+  releasing it, then assert eventual replication and two calls. No namespace
+  application behavior changes. Rollback is the single test hunk. Exact
+  source and gate head must advance and rerun. The Docker trio and network
+  were verified absent; the owned scope exited, with 1,108 MiB sampled named
+  scratch and no pids cap hit. Formal council and CLI remain pending.
+
+## channel-lead:19
+
+- kind: bounded-validation
+- based_on: `2f273d582656a25f741daa19c4826d09d1af7169`
+- applied_at: exact-head second all-gates receipt, before status commit
+- refs: `channel-lead:18`,
+  `.gates/2f273d582656a25f741daa19c4826d09d1af7169.json`,
+  owned `storage175-finish-gates2-20261115.scope.json`
+- state: The Event-gated namespace retry case passed in a focused run.
+  The next clean, no-args `scripts/run-gates.sh` executed and passed all 45
+  Bazel targets at the pushed code head, tree
+  `52298a92cdbc09a6a84f200a195f86f8bca319a8`. The exact three capped
+  synthetic Docker containers and run network were verified absent; the
+  owned 2 CPU/8 GiB/2 GiB swap/1024 task client exited inactive/dead,
+  pids.peak 318 and no cap event. Sampled named scratch peaked 1,210 MiB;
+  open-unlinked and hidden mount-underlay bytes remain outside that sample.
+  This ledger/status commit advances HEAD, so all gates, CLI and formal
+  council must bind to the later pushed final head. No release acceptance,
+  merge or deployment is claimed.
+
+## channel-lead:20
+
+- kind: review-finding-and-adjudication
+- based_on: `5f45cc660a9246d9ab4537e1d869446c813cb9fa`
+- applied_at: root `STORAGE175-I1-DISPOSITION-20261115`, pending fix delta
+- refs: `channel-lead:19`, formal round
+  `5f45cc660a92-20261115T195127Z-e81f3b`, PR #175 findings comment
+  6900414982
+- state: The first current-base formal round has Anthropic 4 Important/7
+  Nits, OpenAI 0 Important/1 Nit, Google EMPTY (usage limit). Both old
+  Anthropic Important findings were re-examined by present seats; no new
+  council CLEAN is claimed. I1 identifies the mismatch between unconditional
+  cold-copy bulk classification and the spec's default single-threaded
+  behavior. Root decided on one internal resolved `fuse_threads` flag from
+  mount construction through StorageFS to CacheManager; false preserves the
+  incoming class, true reclassifies only the established copy boundary.
+  Rollback is the small flag/wiring delta, with old source behavior retained
+  at false. The source/test/contract implementation is pending exact-head
+  tests and reviewer re-verification. I2 and I3 require source call-path
+  disposition; I4 requires notification/lock proof. No runtime gate or
+  acceptance has been transferred to the untested delta.
+
+## channel-lead:21
+
+- kind: scoped-test-evidence
+- based_on: formal `5f45cc6` finding I1 and root threaded-mode adjudication
+- applied_at: source/test commits `d3235cb`, `a3d5223`
+- state: Mount/profile resolution now sets the internal copy-class flag before
+  FUSE starts. The false branch retains the incoming foreground/background
+  context; the true branch reclassifies only `copy_to_local`. First affected
+  run failed on two test assumptions: the real CLI profile defaults to
+  streaming, and synthetic pool close reported `EHOSTUNREACH`. Narrow test
+  correction enabled whole-file mode and asserted that observed result.
+  The second owned affected run executed all six targets and passed. One
+  temporary source mutant removed the conditional copy guard; the real
+  CLI-to-cache test failed behaviorally in default, explicit-off and
+  override-off cases before timeout. Committed cache blob was restored
+  byte-identically. Owned scopes exited inactive/dead, pids.events max zero,
+  named scratch peak 1308 MiB. Full gates/CLI/council remain required on the
+  final pushed head; this is not release acceptance.
+
+## channel-lead:22
+
+- kind: formal-fix-delta-and-test-repair
+- based_on: pushed `2b1d1eb7fffa88621cf2ed007409bc7e59ecb149`
+- applied_at: PR formal round
+  `2b1d1eb7fffa-20261115T201145Z-5f034c`, pending test-only commit
+- state: OpenAI native warm seat CLEAN 0/0/0; Anthropic warm seat CLEAN at
+  code level 0 Critical/0 Important/4 Nits and withdrew its mistaken
+  multi-replica fallback premise. Google foreign seat EMPTY at usage limit.
+  No-args all-four gate passed 45/45 on this exact pushed head; receipt
+  tree `485d06576b76e7536363224b02cfe15658191c9a`, scope exited
+  inactive/dead, pids peak 315, named scratch peak 1409 MiB. Nits N-c/N-d
+  prompted only test assertions/fixture alignment. N-a is a concurrent
+  cache-appearance edge after the first `is_cached` check, rather than the
+  stated ordinary cached fallback, and N-b is an old connect-deadline edge;
+  both have specific open tracker follow-ups. No production change from
+  `2b1d1eb` is planned. The next head needs all gates, CLI and formal
+  convergence before any release claim.
+
+## channel-lead:23
+
+- kind: fixture-alignment-checkpoint
+- based_on: pushed `6b2b06a48ae937e943b6eb72094e39b77e9542e4`
+- applied_at: Anthropic warm delta review, pending fixture-alignment commit
+- state: An owned one-line test-local mutant removed only
+  `MemberConnection.release`'s condition notification. The selected discard
+  test failed on its waiter-entry assertion before cleanup and the exact
+  original `ssh_pool.py` blob was restored. No-args four gates on `6b2b06a`
+  then passed 45/45; the owned scope exited inactive/dead, pids peak 306,
+  named scratch peak 1487 MiB. Anthropic returned 0 Critical/0 Important/
+  1 Nit, because shared `run_fuse` set threaded copy class but used plain
+  fusepy rather than the production cancellation wrapper. This helper now
+  imports Storage's FUSE wrapper; no production blob changes. The new head
+  needs fresh gates, CLI and formal fix-delta review. N-a/N-b remain filed
+  as follow-ups, not waived byte-safety regressions.
