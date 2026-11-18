@@ -312,8 +312,16 @@ backends = ["{local_member}"]
                 main, ["mount", "--config", str(config_path),
                        "--workers", "2", "--max-sync-workers", "1", "bad-limits"]
             )
+            zero_max = self.runner.invoke(
+                main, ["mount", "--config", str(config_path),
+                       "--workers", "0", "--max-sync-workers", "0", "bad-limits"]
+            )
+        self.assertNotEqual(0, negative.exit_code)
         self.assertIn("workers must be non-negative", negative.output)
+        self.assertNotEqual(0, reversed_limits.exit_code)
         self.assertIn("max-sync-workers must be at least workers (2)", reversed_limits.output)
+        self.assertNotEqual(0, zero_max.exit_code)
+        self.assertIn("max-sync-workers must be at least 1", zero_max.output)
         mock_mount.assert_not_called()
 
     def test_mount_fails_when_named_profile_is_missing(self):

@@ -249,6 +249,11 @@ def mount(
 
     if resolved.workers < 0:
         raise click.ClickException("workers must be non-negative")
+    if resolved.max_sync_workers is not None and resolved.max_sync_workers < 1:
+        raise click.ClickException(
+            "max-sync-workers must be at least 1 (with 0 the pool could never sync); "
+            "set it to 1 or more, or unset it for a fixed pool"
+        )
     if (resolved.max_sync_workers is not None
             and resolved.max_sync_workers < resolved.workers):
         raise click.ClickException(

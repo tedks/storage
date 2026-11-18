@@ -240,6 +240,8 @@ class SyncManager:
         self.replication_manager = replication_manager
         if num_workers < 0 or max_workers is not None and max_workers < num_workers:
             raise ValueError("sync worker limits must satisfy 0 <= workers <= max_workers")
+        if max_workers is not None and max_workers < 1:
+            raise ValueError("max sync workers must be at least 1: with 0 nothing would sync")
         if max_workers is not None:
             ceiling, reason = sync_worker_limit(replication_manager.backends)
             if max_workers > ceiling:

@@ -103,7 +103,7 @@ Required:
 Options:
   -s, --cache-size SIZE    Cache size (e.g., 10G, 500M) [default: 10G]
   -d, --database PATH      State database path [default: cache/.storage.db]
-  -w, --workers N          Minimum background sync workers [default: 2]
+  -w, --workers N          Sync workers: fixed pool size, or the minimum with --max-sync-workers [default: 2]
   --max-sync-workers N     Grow sync workers on queued tasks up to N
   -f, --foreground         Run in foreground
 ```
@@ -157,8 +157,9 @@ workers exit after 30 seconds idle. The configured maximum must be at least
 local members only; 8 when any member is remote (rsync uploads share one
 OpenSSH connection per host, which also carries the remote watcher, under
 the usual ten-session OpenSSH limit); and for each `ssh://` member, its
-background SFTP channels (its configured SFTP channels less the one kept for
-interactive calls: 3 by default). An `ssh://` member's uploads share those
+background SFTP channels (the four SFTP channels each `ssh://` member opens
+at most, less the one kept for interactive calls: 3; neither is a mount
+option today). An `ssh://` member's uploads share those
 channels with its other background work, in the Paramiko connection that
 foreground reads also use, so more workers would only wait for a channel,
 each holding its file's upload lock. `rsync://` uploads use the separate

@@ -276,6 +276,11 @@ class TestSyncManager(unittest.TestCase):
         self.sync_manager.stop()
 
     def test_adaptive_worker_limits_are_bounded_before_start(self):
+        with self.assertRaisesRegex(ValueError, "at least 1"):
+            SyncManager(
+                self.state_manager, self.cache_manager, self.replication_manager,
+                num_workers=0, max_workers=0,
+            )
         with self.assertRaisesRegex(ValueError, "cannot exceed 32"):
             SyncManager(
                 self.state_manager, self.cache_manager, self.replication_manager,
@@ -344,9 +349,15 @@ class TestSyncManager(unittest.TestCase):
         )
 
     def test_restart_waits_for_worker_that_outlived_stop(self):
+        self._restart_waits_for_worker_that_outlived_stop(max_workers=2)
+
+    def test_fixed_pool_restart_waits_for_worker_that_outlived_stop(self):
+        self._restart_waits_for_worker_that_outlived_stop(max_workers=None)
+
+    def _restart_waits_for_worker_that_outlived_stop(self, max_workers):
         self.sync_manager = SyncManager(
             self.state_manager, self.cache_manager, self.replication_manager,
-            num_workers=1, max_workers=2,
+            num_workers=1, max_workers=max_workers,
             config=SyncConfig(monitor_interval=30.0),
         )
         entered = threading.Event()
