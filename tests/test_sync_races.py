@@ -5,15 +5,38 @@ Event gate in the member's copy_from_local holds the upload mid-transfer,
 so each interleaving is forced. Every wait has a timeout.
 """
 
+import multiprocessing
 import os
 import time
 from unittest.mock import patch
 
+from storage.backends.local import LocalBackend
+from storage.fs import StorageFS
 from storage.models import SyncStatus
 from storage.state import StateManager
 from storage.sync_executor import SyncExecutor
 from storage.sync_tasks import DirOperation
 from tests.test_fs_threading import BLOCKED, WAIT, ThreadingTestBase, Worker
+
+
+def _rename_then_die(temp_dir):
+    """In a forked child: a fresh mount whose member misses /d -> /e, then
+    an exit that skips every close and flush."""
+    root = temp_dir / "crash"
+    (root / "cache").mkdir(parents=True)
+    (root / "member").mkdir()
+    member = LocalBackend("member", str(root / "member"))
+    fs = StorageFS(cache_root=root / "cache", state_db=root / "state.db",
+                   backends={"member": member}, cache_size=10 * 1024 * 1024,
+                   num_sync_workers=1, start_sync=False)
+    fs.mkdir("/d", 0o755)
+
+    def unreachable(*_args):
+        raise OSError("member unreachable")
+
+    member.rename = unreachable
+    fs.rename("/d", "/e")
+    os._exit(0)
 
 
 class SyncRaceTestBase(ThreadingTestBase):
@@ -252,7 +275,10 @@ class TestDirectoryRetries(SyncRaceTestBase):
         self.assertNotIn("e", self.member_names())
         self.assertEqual([("member", "/d", "/e")], self.repairs())
 
-    def test_missed_rename_of_an_evicted_file_is_left_for_repair(self):
+    def test_file_under_an_open_repair_is_not_evicted_until_resolved(self):
+        """With one member, the bytes of /b.txt are on it only under /a.txt
+        once it missed the rename: the cached copy is the one the namespace
+        can read, so it stays until the repair is resolved."""
         self.write_file("/a.txt")
         self.start_sync()
         self.wait_synced("/a.txt")
@@ -260,14 +286,14 @@ class TestDirectoryRetries(SyncRaceTestBase):
         self.fs.sync_manager.stop()
         self.fail_member_once("rename")
         self.fs.rename("/a.txt", "/b.txt")
-        # Stands in for cache pressure evicting the renamed, CLEAN file.
         cache_path = self.fs.cache_manager.get_cache_path("/b.txt")
-        self.assertGreater(self.fs.cache_manager._evict_if_still_clean("/b.txt", cache_path), 0)
-
-        self.start_sync()
-        self.wait_idle()
+        self.assertEqual(0, self.fs.cache_manager._evict_if_still_clean("/b.txt", cache_path))
+        self.assertEqual(b"payload", cache_path.read_bytes())
         self.assertEqual(["a.txt"], self.member_names())
-        self.assertEqual([("member", "/a.txt", "/b.txt")], self.repairs())
+
+        [repair] = self.fs.state_manager.list_member_rename_repairs()
+        self.assertTrue(self.fs.state_manager.resolve_member_rename_repair(repair.id))
+        self.assertGreater(self.fs.cache_manager._evict_if_still_clean("/b.txt", cache_path), 0)
 
     def repairs(self, state_manager=None):
         state_manager = state_manager or self.fs.state_manager
@@ -313,7 +339,7 @@ class TestDirectoryRetries(SyncRaceTestBase):
         self.assertNotIn("e", self.member_names())
         self.assertEqual([("member", "/d", "/e")], self.repairs())
 
-    def test_missed_rename_repair_survives_restart_and_retries(self):
+    def test_missed_rename_repair_survives_reopen_and_retries(self):
         """The repair record is in the index database, not the in-memory
         queue: a restart keeps it, and a legacy queued retry (no record of
         what the member held) is fenced to the same record, with no member
@@ -321,7 +347,8 @@ class TestDirectoryRetries(SyncRaceTestBase):
         self.fs.mkdir("/d", 0o755)
         self.fail_member_once("rename")
         self.fs.rename("/d", "/e")
-        # A retry queued by an older build, carrying only the two names.
+        # A rename task from a direct caller, carrying only the two names
+        # (the queue is in memory, so none survives from an older build).
         self.fs.sync_manager.queue_dir_sync(
             "/d", DirOperation.RENAME, new_path="/e", backend_hint="member", force=True,
         )
@@ -338,6 +365,135 @@ class TestDirectoryRetries(SyncRaceTestBase):
         reopened = StateManager(str(self.temp_dir / "state.db"))
         self.addCleanup(reopened.close)
         self.assertEqual([("member", "/d", "/e")], self.repairs(reopened))
+
+    def test_open_repair_fences_a_later_rename_on_that_member(self):
+        """After the member missed /a.txt -> /b.txt and something else put a
+        /b.txt there, renaming /b.txt back to /a.txt through the mount must
+        not run on that member: it would replace its /a.txt, the only copy
+        of the renamed bytes there, with the unrelated /b.txt."""
+        self.write_file("/a.txt", b"old bytes")
+        self.start_sync()
+        self.wait_synced("/a.txt")
+        self.wait_idle()
+        self.fs.sync_manager.stop()
+        self.fail_member_once("rename")
+        self.fs.rename("/a.txt", "/b.txt")
+        (self.member_dir / "b.txt").write_bytes(b"unrelated writer")
+
+        self.fs.rename("/b.txt", "/a.txt")
+        self.assertEqual(b"old bytes", (self.member_dir / "a.txt").read_bytes())
+        self.assertEqual(b"unrelated writer", (self.member_dir / "b.txt").read_bytes())
+        self.assertEqual(
+            [("member", "/a.txt", "/b.txt"), ("member", "/b.txt", "/a.txt")],
+            sorted(self.repairs()),
+        )
+
+    def test_open_repair_fences_a_later_directory_rename_below_it(self):
+        """A repair at /d -> /e fences a rename of /e/sub on that member (a
+        path below the repair's new name), not only its exact names."""
+        self.fs.mkdir("/d", 0o755)
+        self.fs.mkdir("/d/sub", 0o755)
+        self.fail_member_once("rename")
+        self.fs.rename("/d", "/e")
+        renames = []
+        patcher = patch.object(self.member, "rename", side_effect=lambda *a: renames.append(a))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.fs.rename("/e/sub", "/e/other")
+        self.assertEqual([], renames)
+        self.assertEqual(["sub"], self.member_names("d"))
+        self.assertIn(("member", "/e/sub", "/e/other"), self.repairs())
+
+    def test_open_repair_does_not_fence_a_sibling_name(self):
+        """Fencing is by path segment: a repair at /d leaves /dx alone."""
+        self.fs.mkdir("/d", 0o755)
+        self.fs.mkdir("/dx", 0o755)
+        self.fail_member_once("rename")
+        self.fs.rename("/d", "/e")
+        self.fs.rename("/dx", "/dy")
+        self.assertEqual(["d", "dy"], self.member_names())
+        self.assertEqual([("member", "/d", "/e")], self.repairs())
+
+    def test_open_repair_fences_uploads_at_those_names(self):
+        """A write to /b.txt after the member missed /a.txt -> /b.txt is not
+        uploaded to that member, which gained an unrelated /b.txt; the file
+        stays dirty, as for a member that is down."""
+        self.write_file("/a.txt", b"old bytes")
+        self.start_sync()
+        self.wait_synced("/a.txt")
+        self.wait_idle()
+        self.fs.sync_manager.stop()
+        self.fail_member_once("rename")
+        self.fs.rename("/a.txt", "/b.txt")
+        (self.member_dir / "b.txt").write_bytes(b"unrelated writer")
+        uploads = []
+        real_copy = self.member.copy_from_local
+        patcher = patch.object(self.member, "copy_from_local",
+                               side_effect=lambda *a: (uploads.append(a[1]), real_copy(*a)))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        self.write_file("/b.txt", b"new bytes")
+        self.write_file("/c.txt", b"elsewhere")
+        self.start_sync()
+        self.wait_synced("/c.txt")
+        self.wait_idle()
+        self.fs.sync_manager.stop()
+        self.assertEqual(["/c.txt"], uploads)
+        self.assertEqual(b"unrelated writer", (self.member_dir / "b.txt").read_bytes())
+        self.assertEqual(b"old bytes", (self.member_dir / "a.txt").read_bytes())
+        self.assertNotEqual(SyncStatus.CLEAN, self.fs.state_manager.get_file_metadata("/b.txt").sync_status)
+
+    def test_a_record_that_cannot_be_written_is_retried_by_the_worker(self):
+        """The index refuses the rename's record once (a busy or full
+        database): the rename queues the record as a task, the worker's
+        first try fails too, and its retry writes it; no member call."""
+        self.fs.mkdir("/d", 0o755)
+        self.fail_member_once("rename")
+        real_record = self.fs.state_manager.record_member_rename_repair
+        attempts = []
+
+        def failing_twice(*args):
+            attempts.append(args)
+            if len(attempts) <= 2:
+                raise OSError("database is locked")
+            return real_record(*args)
+
+        patcher = patch.object(self.fs.state_manager, "record_member_rename_repair",
+                               side_effect=failing_twice)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.fs.rename("/d", "/e")
+        self.assertEqual([], self.repairs())
+        self.assertEqual([(DirOperation.RENAME, "/d")], self.queued_dir_ops())
+
+        renames = []
+        rename_patch = patch.object(self.member, "rename", side_effect=lambda *a: renames.append(a))
+        rename_patch.start()
+        self.addCleanup(rename_patch.stop)
+        self.fs.sync_manager.config.retry_delay = 0
+        self.start_sync()
+        deadline = time.monotonic() + WAIT
+        while not self.repairs() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.wait_idle()
+        self.assertEqual([("member", "/d", "/e")], self.repairs())
+        self.assertEqual(3, len(attempts))
+        self.assertEqual([], renames)
+        self.assertEqual(["d"], self.member_names())
+
+    def test_repair_is_on_disk_when_the_rename_returns(self):
+        """A process that dies right after the rename returns, closing
+        nothing, leaves the record in the database file."""
+        ctx = multiprocessing.get_context("fork")
+        child = ctx.Process(target=_rename_then_die, args=(self.temp_dir,))
+        child.start()
+        child.join(WAIT)
+        self.assertEqual(0, child.exitcode)
+        reopened = StateManager(str(self.temp_dir / "crash" / "state.db"))
+        self.addCleanup(reopened.close)
+        self.assertEqual([("member", "/d", "/e")], self.repairs(reopened))
+        self.assertEqual(["d"], sorted(os.listdir(self.temp_dir / "crash" / "member")))
 
     def test_retry_for_a_member_known_down_is_not_tried_under_the_guard(self):
         self.fail_member_once("mkdir")

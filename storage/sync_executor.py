@@ -169,8 +169,21 @@ class SyncExecutor:
             hashed_identity = None
         checksum = self.state_manager.compute_checksum(cache_path)
 
+        # A member with an open repair at or around this name holds names
+        # the namespace does not describe there (see
+        # StateManager.member_repair_backends): it is treated as unavailable
+        # for this file until the repair is resolved.
+        fenced = self.state_manager.member_repair_backends([task.virtual_path])
         sync_results: Dict[str, bool] = {}
         for backend in target_backends:
+            if backend.name in fenced:
+                logger.warning(
+                    "Not syncing %s to %s: it has an open member repair at this name",
+                    task.virtual_path,
+                    backend.label,
+                )
+                sync_results[backend.name] = False
+                continue
             try:
                 conflict = self.conflict_detector.check_conflict(
                     task.virtual_path,
@@ -498,21 +511,34 @@ class SyncExecutor:
         member), or that the new name is free there, and the Local and SSH
         renames replace their target. Both names are left as they are on
         the member, whatever the task's age or origin. Without a hint the
-        task stands for every member.
+        task stands for every configured member, including any that never
+        held the names: a record too many costs a look, one too few a
+        replay. A record that cannot be written fails the task, so it is
+        tried again; a task with no new name cannot be recorded and is
+        dropped, logged, as no caller makes one.
         """
         if not task.new_path:
-            raise ValueError("Rename dir task missing new_path")
+            logger.error("Dropping a rename task for %s with no new name", task.virtual_path)
+            return True
         names = [task.backend_hint] if task.backend_hint else sorted(
             self.replication_manager.backends
         )
-        for backend_name in names:
-            record_member_rename_repair(
+        unrecorded = [
+            backend_name
+            for backend_name in names
+            if not record_member_rename_repair(
                 self.state_manager,
                 backend_name,
                 task.virtual_path,
                 task.new_path,
-                "queued member rename retry, not replayed",
+                "queued member rename, not replayed",
                 logger,
+            )
+        ]
+        if unrecorded:
+            raise RuntimeError(
+                f"Could not record the rename {task.virtual_path} -> {task.new_path} "
+                f"for {', '.join(unrecorded)}"
             )
         return True
 

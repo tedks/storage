@@ -514,11 +514,17 @@ class NamespaceService:
         backend_hint: Optional[str] = None,
         new_path: Optional[str] = None,
         backend_names: Optional[Set[str]] = None,
+        exclude: Optional[Set[str]] = None,
+        errors: Optional[Dict[str, str]] = None,
     ) -> List[str]:
-        """Best-effort synchronous propagation; returns backend names that failed."""
+        """Best-effort synchronous propagation; returns backend names that failed.
+
+        Members named in exclude are not called and are not reported. With
+        errors, each failed member's exception is recorded there by name.
+        """
         failures: List[str] = []
         for backend in self._get_target_backends(backend_hint, backend_names=backend_names):
-            if not backend:
+            if not backend or (exclude and backend.name in exclude):
                 continue
             try:
                 if operation == DirOperation.MKDIR:
@@ -531,6 +537,8 @@ class NamespaceService:
                     backend.rename(path, new_path)
             except Exception as exc:
                 failures.append(backend.name)
+                if errors is not None:
+                    errors[backend.name] = f"{type(exc).__name__}: {exc}"
                 self.logger.debug(
                     "dir op %s failed for %s on %s: %s",
                     operation.value,
@@ -1506,12 +1514,26 @@ class NamespaceService:
                 if on_local_moved is not None:
                     on_local_moved()
 
+            # A member with an open repair at either name holds names the
+            # namespace does not describe there: renaming on it could move
+            # the object it never moved, or replace it. It is left alone and
+            # the move recorded for it too.
+            targets = (
+                {old_resolved.backend_name} if old_resolved.backend_name
+                else rename_backend_names
+            )
+            fenced = self.state_manager.member_repair_backends(
+                [old_resolved.canonical_path, new_resolved.canonical_path]
+            ) & targets
+            errors: Dict[str, str] = {}
             failures = self._propagate_dir_operation(
                 DirOperation.RENAME,
                 old_resolved.canonical_path,
                 backend_hint=old_resolved.backend_name,
                 new_path=new_resolved.canonical_path,
                 backend_names=rename_backend_names if not old_resolved.backend_name else None,
+                exclude=fenced,
+                errors=errors,
             )
 
             self.invalidate_dir_cache_entry(old_resolved.parent_dir)
@@ -1536,14 +1558,32 @@ class NamespaceService:
             # (members change behind the mount), and Local and SSH renames
             # replace their target. The member keeps both names as they are;
             # the index records the missed move for repair.
-            for failed_backend in failures:
-                record_member_rename_repair(
+            # A record that cannot be written is queued as a rename task:
+            # the sync worker records it (SyncExecutor._fence_rename_task),
+            # retrying, and never runs it.
+            missed = [
+                (name, f"member rename failed during the mount's rename: {errors.get(name, 'unknown error')}")
+                for name in failures
+            ] + [
+                (name, "not renamed: the member has an open repair at these names")
+                for name in sorted(fenced)
+            ]
+            for missed_backend, reason in missed:
+                if not record_member_rename_repair(
                     self.state_manager,
-                    failed_backend,
+                    missed_backend,
                     old_resolved.canonical_path,
                     new_resolved.canonical_path,
-                    "member rename failed during the mount's rename",
+                    reason,
                     self.logger,
-                )
+                ):
+                    self.sync_manager.queue_dir_sync(
+                        old_resolved.canonical_path,
+                        DirOperation.RENAME,
+                        new_path=new_resolved.canonical_path,
+                        backend_hint=missed_backend,
+                        priority=90,
+                        force=True,
+                    )
         except OSError as exc:
             raise FuseOSError(exc.errno)
