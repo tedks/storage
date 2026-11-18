@@ -89,13 +89,14 @@ def record_member_rename_repair(
     new_path: str,
     reason: str,
     logger: logging.Logger,
-) -> None:
+) -> bool:
     """Record a rename backend_name missed, for repair; never replay it.
 
     The member may hold the moved object at old_path still, or the move may
     have taken effect there before its failure was seen. A replay could move
     a new object at old_path or replace one at new_path, so the record is
-    the whole response. A record that cannot be written is logged: the
+    the whole response. Returns whether the record was written; one that
+    cannot be is logged, and the caller decides how to try again. The
     member is left as it is either way.
     """
     try:
@@ -108,9 +109,10 @@ def record_member_rename_repair(
             "is left as it is",
             old_path, new_path, backend_name,
         )
-        return
+        return False
     logger.warning(
         "Member %s missed the rename %s -> %s and it is not replayed; repair %d "
         "(storage debug member-repairs): %s",
         backend_name, old_path, new_path, repair_id, reason,
     )
+    return True

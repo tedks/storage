@@ -464,6 +464,10 @@ class CacheManager:
             row = self.state_manager.get_file_metadata(virtual_path)
             if row is None or row.sync_status != SyncStatus.CLEAN:
                 return 0
+            # A member that missed a rename may hold these bytes only under
+            # the old name: the cached copy stays until the repair is resolved.
+            if self.state_manager.member_repair_covers(virtual_path):
+                return 0
             guard = self.descriptor_guard(virtual_path) if self.descriptor_guard else nullcontext(False)
             with guard as is_open:
                 if is_open:

@@ -28,6 +28,17 @@ from .file_config import (
 from .models import FileLocation, FileMetadata, MemberRenameRepair, SyncStatus
 
 
+def _is_at_or_under(path: str, root: str) -> bool:
+    """Segment-bounded: /ab is not under /a."""
+    root = root.rstrip('/')
+    return path == root or path.startswith(root + '/') or root == ''
+
+
+def _paths_overlap(a: str, b: str) -> bool:
+    """Whether one path is at, above or below the other."""
+    return _is_at_or_under(a, b) or _is_at_or_under(b, a)
+
+
 class StateManager:
     """Manages file state in SQLite database"""
 
@@ -873,6 +884,34 @@ class StateManager:
             )
             for row in rows
         ]
+
+    def member_repair_backends(self, virtual_paths: Iterable[str]) -> Set[str]:
+        """The members with an open repair at or above or below any of virtual_paths.
+
+        Either name of a repair counts. Such a member holds names the
+        namespace does not describe there (the object it did not move, or
+        whatever took the other name since), so nothing the namespace does
+        at those names is sent to it until the repair is resolved.
+        """
+        paths = list(virtual_paths)
+        return {
+            repair.backend_name
+            for repair in self.list_member_rename_repairs()
+            if any(_paths_overlap(path, name)
+                   for path in paths
+                   for name in (repair.old_path, repair.new_path))
+        }
+
+    def member_repair_covers(self, virtual_path: str) -> bool:
+        """Whether virtual_path is at or under the new name of an open repair.
+
+        The member that missed the move may hold that file's bytes only under
+        the old name, so the cached copy is the one the namespace can read.
+        """
+        return any(
+            _is_at_or_under(virtual_path, repair.new_path)
+            for repair in self.list_member_rename_repairs()
+        )
 
     def resolve_member_rename_repair(self, repair_id: int) -> bool:
         """Drop a repair once someone has settled the member by hand.
