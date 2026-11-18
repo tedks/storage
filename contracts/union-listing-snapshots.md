@@ -10,7 +10,8 @@
   detect a missing or replaced member root that still lists (for example a
   failed disk leaving an empty mountpoint); that is separate root
   verification work (ditz `listing-member-root-marker-setup`), not claimed
-  here. Partial reads
+  here: a readable empty underlying mountpoint is a successful empty
+  observation, never inferred as failure, an error or a warning. Partial reads
   and permission failures are not confirmed absence. Do not follow a supplied
   child name outside its parent; reject invalid or colliding backend entries
   according to existing conflict policy rather than fabricating completeness.

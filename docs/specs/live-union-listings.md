@@ -158,11 +158,14 @@ to `[]`; neither rechecks that the member root is still the configured
 storage once the backend is constructed. A member whose disk died and left an
 empty mountpoint would therefore report successful-empty: nothing is logged,
 and on a warm directory its retained names are replaced by an empty set.
-This slice does not detect that case. Ted's ruling says what to return once
-a member has failed; recognizing a failed disk that still lists as a
-failure needs member root verification, a separate capability not claimed
-here (if Ted wants it inside this slice, that is a ruling for the CTO to
-record). It is tracked separately (ditz `listing-member-root-marker-setup`, which
+This slice does not detect that case; it is a documented limit (CTO
+ruling, 2026-11-18, deferring root verification). Best-effort union and the
+missing-member log apply to observed failures only: a listing that fails,
+times out or is cancelled. A readable empty underlying mountpoint is
+undetectable here and lists as that member's successful empty observation.
+This slice deploys no marker, infers no disk loss from emptiness, mount
+boundaries or any other signal, and never turns a successful empty listing
+into an error or a warning. Root verification is tracked separately (ditz `listing-member-root-marker-setup`, which
 owns its design and setup). Until it lands, a failed disk that leaves a
 readable mountpoint behaves exactly as today, the README must not claim
 failed-disk detection, and the warning-log rule above covers only members
@@ -184,10 +187,9 @@ drafts of this spec established constraints that design must meet:
   rebuild-index, reprobe and conflict scans, must all exclude it.
 - No member has a marker today, so a setup step must exist before the
   check protects anything; members without one must be reported, not
-  silently treated as checked. A cheaper partial option for local members
-  needs no setup: record at mount whether the root is a separate mount
-  (its device differs from its parent's) and treat a root that falls back
-  to the parent filesystem as failed.
+  silently treated as checked. One option for that future work, not for
+  this slice: record at mount whether a local root is a separate mount and
+  treat a root that falls back to the parent filesystem as failed.
 
 The no-success case stays narrow and explicit. It applies only when every
 configured member is missing for this listing, no member has a
