@@ -43,7 +43,16 @@ MODES = [(threads, None) for threads in FUSE_THREAD_MODES] + [(True, 4)]
 @pytest.fixture(params=MODES, ids=lambda mode: fuse_mode_id(mode[0]) + (
     f"-cap{mode[1]}" if mode[1] else ""))
 def mounted(request):
-    fuse_threads, cap = request.param
+    yield from _serve(*request.param)
+
+
+@pytest.fixture
+def capped():
+    """A threaded mount at the minimum cap: one ordinary slot, none shared."""
+    yield from _serve(True, 4)
+
+
+def _serve(fuse_threads, cap):
     root = Path(tempfile.mkdtemp())
     member_dir, cache_dir, mount_dir = root / "member", root / "cache", root / "mount"
     for path in (member_dir, cache_dir, mount_dir):
@@ -57,6 +66,7 @@ def mounted(request):
     record = {
         "opened": Counter(), "released": Counter(), "releasedir": 0, "opendir": 0,
         "queued": [], "uploads": [], "gate_closed_before_release": [],
+        "unlinks": [],
     }
     lock = threading.Lock()
     real_open, real_create, real_release = fs.open, fs.create, fs._release
@@ -103,6 +113,14 @@ def mounted(request):
             assert hold[1].wait(WAIT), "upload never released"
         return real_upload(local_path, virtual_path)
 
+    real_unlink = fs.unlink
+
+    def unlink(path):
+        with lock:
+            record["unlinks"].append((path, fs.destroy_entered.is_set()))
+        return real_unlink(path)
+
+    fs.unlink = unlink
     fs.open, fs.create, fs._release = opened(real_open), opened(real_create), release
     fs.opendir, fs.releasedir = opendir, releasedir
     fs.sync_manager.queue_sync = queue_sync
@@ -187,6 +205,147 @@ def test_each_close_runs_once_through_unmount(mounted):
         assert not any(record["gate_closed_before_release"])
     else:
         assert fs._foreground_admission is None
+
+
+HIDDEN_PREFIX = ".fuse_hidden"
+
+
+def _hidden_in(directory):
+    return [p.name for p in Path(directory).iterdir() if p.name.startswith(HIDDEN_PREFIX)]
+
+
+def _wait(predicate, what):
+    deadline = time.monotonic() + WAIT
+    while not predicate():
+        assert time.monotonic() < deadline, what
+        time.sleep(0.02)
+
+
+class _OrdinaryHold:
+    """Hold the one ordinary slot (cap 4) with a mkdir blocked in StorageFS."""
+
+    def __init__(self, fs, mount_dir):
+        self.fs, self.go, self.entered = fs, threading.Event(), threading.Event()
+        real = fs.mkdir
+
+        def blocked(path, mode):
+            if path != "/holddir/held":
+                return real(path, mode)
+            self.entered.set()
+            assert self.go.wait(WAIT), "hold never released"
+            return real(path, mode)
+
+        # In its own directory: the kernel holds the parent's inode lock
+        # through a mkdir, which would serialize unrelated unlinks there.
+        (mount_dir / "holddir").mkdir(exist_ok=True)
+        fs.mkdir = blocked
+        self.thread = threading.Thread(
+            target=lambda: _quietly(os.mkdir, mount_dir / "holddir" / "held"), daemon=True)
+
+    def __enter__(self):
+        self.thread.start()
+        assert self.entered.wait(WAIT), "mkdir never reached StorageFS"
+        gate = self.fs._foreground_admission
+        assert gate.active("ordinary") == 1
+        return self
+
+    def release(self):
+        self.go.set()
+        self.thread.join(WAIT)
+
+    def __exit__(self, *exc):
+        self.release()
+
+
+def _quietly(fn, *args):
+    try:
+        fn(*args)
+    except OSError:
+        pass
+
+
+def _unlinked_while_open(fs, mount_dir):
+    """Create, open, unlink: libfuse hides it as .fuse_hidden*."""
+    (mount_dir / "gone.txt").write_bytes(b"short-lived")
+    fd = os.open(mount_dir / "gone.txt", os.O_RDONLY)
+    os.unlink(mount_dir / "gone.txt")
+    hidden = _hidden_in(fs.cache_manager.cache_root)
+    assert len(hidden) == 1, hidden
+    assert os.read(fd, 64) == b"short-lived"
+    return fd, "/" + hidden[0]
+
+
+def _hidden_unlinks(record, hidden):
+    return [entry for entry in record["unlinks"] if entry[0] == hidden]
+
+
+def test_cleanup_of_unlinked_open_file_waits_for_an_ordinary_slot(capped):
+    fs, member_dir, mount_dir, thread, record, cap = capped
+    gate = fs._foreground_admission
+    fd, hidden = _unlinked_while_open(fs, mount_dir)
+    with _OrdinaryHold(fs, mount_dir) as hold:
+        releases_before = sum(record["released"].values())
+        os.close(fd)       # FLUSH is exempt; RELEASE runs, then queues the cleanup
+        _wait(lambda: sum(record["released"].values()) > releases_before,
+              "the close never reached release")
+        _wait(lambda: gate.waiting_count("ordinary") >= 1, "the cleanup never queued")
+        assert _hidden_unlinks(record, hidden) == []
+        assert _hidden_in(fs.cache_manager.cache_root) == [hidden[1:]]
+        hold.release()
+    # The unlink removes the cache file, then the index row: wait for both.
+    _wait(lambda: not _hidden_in(fs.cache_manager.cache_root)
+          and fs.state_manager.get_file_metadata(hidden) is None, "the cleanup never ran")
+    assert _hidden_unlinks(record, hidden) == [(hidden, False)]
+    assert fs.state_manager.get_file_metadata("/gone.txt") is None
+    assert not _hidden_in(mount_dir)
+
+
+def test_user_lookalike_is_admitted_like_any_unlink(capped):
+    fs, member_dir, mount_dir, thread, record, cap = capped
+    gate = fs._foreground_admission
+    name = HIDDEN_PREFIX + "0123456789abcdef"
+    (mount_dir / name).write_bytes(b"mine")
+    with _OrdinaryHold(fs, mount_dir) as hold:
+        remover = threading.Thread(target=os.unlink, args=(mount_dir / name,), daemon=True)
+        remover.start()
+        _wait(lambda: gate.waiting_count("ordinary") >= 1, "the unlink never queued")
+        remover.join(0.3)
+        assert remover.is_alive()
+        assert _hidden_unlinks(record, "/" + name) == []
+        hold.release()
+    remover.join(WAIT)
+    assert not remover.is_alive()
+    _wait(lambda: fs.state_manager.get_file_metadata("/" + name) is None, "row left")
+    assert _hidden_unlinks(record, "/" + name) == [("/" + name, False)]
+    assert not (fs.cache_manager.cache_root / name).exists()
+    assert fs.state_manager.get_file_metadata("/" + name) is None
+
+
+def test_queued_cleanup_runs_before_destroy_across_unmount(capped):
+    # The unmount ends the session while the cleanup is queued: the exit
+    # probe is ignored for that unlink, it runs once the slot frees, and
+    # libfuse joins it before destroy closes the gate.
+    fs, member_dir, mount_dir, thread, record, cap = capped
+    gate = fs._foreground_admission
+    fd, hidden = _unlinked_while_open(fs, mount_dir)
+    hold = _OrdinaryHold(fs, mount_dir).__enter__()
+    try:
+        os.close(fd)
+        _wait(lambda: gate.waiting_count("ordinary") >= 1, "the cleanup never queued")
+        result = subprocess.run(["fusermount", "-uz", str(mount_dir)],
+                                capture_output=True, text=True, timeout=30)
+        assert result.returncode == 0, result.stderr
+        time.sleep(0.5)    # several probe intervals after the detach
+        assert thread.is_alive() and not fs.destroy_entered.is_set()
+        assert _hidden_unlinks(record, hidden) == []
+    finally:
+        hold.release()
+    thread.join(30.0)
+    assert not thread.is_alive(), native_thread_state(thread, mount_dir)
+    assert fs.destroy_entered.is_set()
+    assert _hidden_unlinks(record, hidden) == [(hidden, False)]
+    assert not _hidden_in(fs.cache_manager.cache_root)
+    assert gate._closed and gate.active_count == 0
 
 
 if __name__ == "__main__":

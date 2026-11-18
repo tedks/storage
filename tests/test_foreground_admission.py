@@ -605,23 +605,6 @@ class TestCleanupThroughShutdown(CappedFSBase):
         self.assertEqual(0, self.gate_.active_count)
         self.assertEqual(b"edited copy", (self.member_dir / "f.txt").read_bytes())
 
-    def test_libfuse_hidden_unlink_is_part_of_a_close(self):
-        # libfuse runs this unlink inside the RELEASE of a file unlinked
-        # while open (no hard_remove): it must neither queue nor be
-        # cancelled. Other unlinks stay ordinary.
-        ran = []
-        self.saturate_all()
-        with patch.object(self.fs, "unlink", side_effect=lambda path: ran.append(path) or 0):
-            for path in ("/.fuse_hidden0000000a00000001", "/d/.fuse_hidden000000ff00000002"):
-                self.assertEqual(0, Worker(self.call, "unlink", path).finish_started())
-            self.gate_.close()
-            self.assertEqual(0, self.call("unlink", "/.fuse_hidden0000000b00000003"))
-            with self.assertRaises(FuseOSError) as caught:
-                self.call("unlink", "/plain.txt")
-            self.assertEqual(errno.EINTR, caught.exception.errno)
-        self.assertEqual(["/.fuse_hidden0000000a00000001", "/d/.fuse_hidden000000ff00000002",
-                          "/.fuse_hidden0000000b00000003"], ran)
-
     def test_flush_is_the_fusepy_no_op_and_never_waits(self):
         # flush is exempt only while it does nothing; an override must
         # reclassify it (fs.py _ADMISSION_EXEMPT).
@@ -704,6 +687,62 @@ class TestQueuedCancellation(CappedFSBase):
     def _admit_once(gate, kind):
         with gate.admit(kind):
             return None
+
+    HIDDEN = "/d/.fuse_hidden0000000a00000001"
+
+    def _queued_unlink(self, path, probe):
+        from storage.backends.base import capacity_wait_cancellation
+
+        def call():
+            with capacity_wait_cancellation(probe):
+                return self.call("unlink", path)
+        worker = Worker(call)
+        worker.start()
+        return worker
+
+    def test_every_unlink_is_admitted_ordinary(self):
+        for path in (self.HIDDEN, "/plain.txt", "/.fuse_hiddenXYZ"):
+            self.assertEqual("ordinary", self.fs._foreground_class("unlink", (path,)))
+        self.assertNotIn("unlink", StorageFS._ADMISSION_EXEMPT)
+
+    def test_queued_hidden_form_unlink_ignores_the_probe_and_runs_once(self):
+        # libfuse's cleanup and a user lookalike share the exact form.
+        hold = self.saturate("ordinary", "mkdir", "/d", 0o755)
+        ran = []
+        session_exited = lambda: "session"
+        with patch.object(self.fs, "unlink", side_effect=lambda p: ran.append(p) or 0):
+            hidden = self._queued_unlink(self.HIDDEN, session_exited)
+            self.assertTrue(self.gate_.waiting_for("ordinary", 2, WAIT))
+            plain = self._queued_unlink("/plain.txt", session_exited)
+            plain.join(WAIT)
+            self.assertIsInstance(plain.error, FuseOSError)
+            self.assertEqual(errno.EINTR, plain.error.errno)
+            near = self._queued_unlink("/.fuse_hidden0000000a0000000", session_exited)
+            near.join(WAIT)          # 15 hex digits: not the exact form
+            self.assertIsInstance(near.error, FuseOSError)
+            hidden.join(BLOCKED)
+            self.assertTrue(hidden.is_alive())   # still queued, probe ignored
+            self.assertEqual([], ran)
+            hold.set()
+            self.assertEqual(0, hidden.finish())
+        self.assertEqual([self.HIDDEN], ran)
+
+    def test_explicit_close_cancels_hidden_form_and_rejects_new_requests(self):
+        self.saturate("ordinary", "mkdir", "/d", 0o755)
+        ran = []
+        with patch.object(self.fs, "unlink", side_effect=lambda p: ran.append(p) or 0):
+            hidden = self._queued_unlink(self.HIDDEN, lambda: None)
+            self.assertTrue(self.gate_.waiting_for("ordinary", 2, WAIT))
+            self.gate_.close()
+            hidden.join(WAIT)
+            self.assertIsInstance(hidden.error, FuseOSError)
+            self.assertEqual(errno.EINTR, hidden.error.errno)
+            for op, args in (("unlink", (self.HIDDEN,)), ("getattr", ("/", None)),
+                             ("read", ("/x", 1, 0, 0))):
+                with self.subTest(op=op), self.assertRaises(FuseOSError) as caught:
+                    self.call(op, *args)
+                self.assertEqual(errno.EINTR, caught.exception.errno)
+        self.assertEqual([], ran)
 
     def test_gate_level_probe(self):
         gate = ForegroundAdmission(4)

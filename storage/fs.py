@@ -10,6 +10,7 @@ Main filesystem layer that provides:
 
 import os
 import errno
+import re
 import stat
 import threading
 import logging
@@ -147,21 +148,24 @@ class StorageFS(Operations):
     })
     _DEMAND_OPS = frozenset({"read", "write", "fsync"})
     # Without hard_remove, libfuse 2 renames a file unlinked while open to
-    # .fuse_hidden<hex> and, at its last close, unlinks that name from
-    # inside the RELEASE request (fuse_do_release). That unlink is part of
-    # a close: exempt like release, so a close never queues for a slot and
-    # teardown cannot leave the hidden file behind. Scheduling only: a
-    # user file with this prefix just skips the gate.
-    _LIBFUSE_HIDDEN_PREFIX = ".fuse_hidden"
+    # .fuse_hidden<16 hex> and, at its last close, unlinks that name from
+    # inside the RELEASE request (fuse_do_release). The callback sees only
+    # the path, so that cleanup cannot be told from a user unlink of the
+    # same name (CTO ruling STORAGE-180-HIDDEN-B). Every unlink is admitted
+    # as ordinary and counted; the last close of a file unlinked while open
+    # can therefore wait for an ordinary slot. Once queued, an unlink of
+    # exactly that form ignores the native interrupt/exit probe and runs
+    # when capacity frees, so an unmount does not cancel libfuse's cleanup
+    # and leave the hidden file behind; a user lookalike gets the same
+    # treatment and may complete after its caller was interrupted. An
+    # explicit close() still cancels it, and a closed gate rejects it.
+    _LIBFUSE_HIDDEN_NAME = re.compile(r"\.fuse_hidden[0-9a-f]{16}\Z")
 
     def __call__(self, op, *args):
         # getattr: subclasses and test probes may skip __init__ (one in
         # test_ssh_backend does); with no gate they keep master's dispatch.
         gate = getattr(self, "_foreground_admission", None)
-        if gate is None or op in self._ADMISSION_EXEMPT or (
-            op == "unlink" and args
-            and os.path.basename(str(args[0])).startswith(self._LIBFUSE_HIDDEN_PREFIX)
-        ):
+        if gate is None or op in self._ADMISSION_EXEMPT:
             # Every FUSE operation has a caller waiting on it: members with a
             # connection pool serve it from the channel kept for that.
             with interactive_request():
@@ -172,14 +176,20 @@ class StorageFS(Operations):
             # callback ends with EINTR instead of running after its caller
             # gave up or while libfuse waits to unmount. Direct calls have
             # no probe and wait for entry or close().
-            with gate.admit(self._foreground_class(op, args),
-                            cancel_probe=current_capacity_cancel_probe()):
+            probe = None if self._is_libfuse_hidden_unlink(op, args) \
+                else current_capacity_cancel_probe()
+            with gate.admit(self._foreground_class(op, args), cancel_probe=probe):
                 with interactive_request():
                     return super().__call__(op, *args)
         except AdmissionClosed as exc:
             # Raised only while waiting to enter (no callback raises it):
             # the callback never ran, so nothing it would have done happened.
             raise FuseOSError(errno.EINTR) from exc
+
+    @classmethod
+    def _is_libfuse_hidden_unlink(cls, op: str, args: tuple) -> bool:
+        return (op == "unlink" and bool(args)
+                and cls._LIBFUSE_HIDDEN_NAME.match(os.path.basename(str(args[0]))) is not None)
 
     def _foreground_class(self, op: str, args: tuple) -> str:
         """The admission class, fixed before the callback runs.
