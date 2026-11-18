@@ -43,5 +43,13 @@ log_events:
     feature. This neither selects future replication configuration nor settles first
     synchronous member rename semantics. Required before accepting PR182; a bare journal
     would require a separate change to the authority contract.
+- time: 2026-11-18T06:07:13-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'PR #182 council converged: round 8 (19bef2948267-20261118T060339Z-31e39f)
+    CLEAN for Anthropic and OpenAI, Google EMPTY (usage limit). Rebased on master
+    4989ba7 as 3a2123a with a byte-identical PR diff. Final gates wait for #168, then
+    a rebase, then a formal round on the exact head and an independent lead review
+    (CTO STORAGE-182-FULL-I).'
 blocks:
 - gh-181
