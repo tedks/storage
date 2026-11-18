@@ -22,11 +22,6 @@ storage_test(
 )
 storage_test("crypto")
 storage_test("file_config")
-storage_test("fs_core_integration", tags = ["no-remote"])
-storage_test("fs_namespace_integration", tags = ["no-remote"])
-storage_test("fs_revalidate", tags = ["no-remote"])
-storage_test("fs_streaming", tags = ["no-remote"])
-storage_test("fs_threading")
 storage_test("foreground_admission", extra_srcs = ["test_fs_threading.py"])
 storage_test(
     "foreground_admission_mounted",
@@ -34,6 +29,11 @@ storage_test(
     extra_srcs = ["fuse_mount.py"],
     tags = ["local", "manual"],
 )
+storage_test("fs_core_integration", tags = ["no-remote"])
+storage_test("fs_namespace_integration", tags = ["no-remote"])
+storage_test("fs_revalidate", tags = ["no-remote"])
+storage_test("fs_streaming", tags = ["no-remote"])
+storage_test("fs_threading")
 storage_test(
     "fuse_thread_state",
     target = "storage_tests_fuse_thread_state",

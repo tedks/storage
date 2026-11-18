@@ -7,7 +7,11 @@ joins it before destroy closes the gate. Scope: closes delivered to the
 daemon before teardown. A close made after a lazy unmount can fail to reach
 the daemon at all, with or without the cap (ditz lazy-unmount-late-release);
 nothing here claims it. Both loop modes without a cap are the baseline the
-capped threaded mount must match.
+capped threaded mount must match. This is an integration check: it never
+fills the gate, so it would pass with release admitted too; the exemption
+itself is pinned by tests/test_foreground_admission.py, which also covers
+queued cancellation with a stand-in probe (the native probe is #175's,
+exercised by its own mounted tests).
 """
 
 import os

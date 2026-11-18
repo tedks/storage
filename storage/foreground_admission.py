@@ -21,6 +21,17 @@ neither is StorageFS's classification step before admission (for an open,
 one local lstat of the cache path; for a read, one descriptor-table lookup
 under the fd lock; never a member call).
 
+Waits happen after libfuse's own locking. libfuse 2's high-level layer
+takes its path tree-locks (write locks for rename, unlink and rmdir, read
+locks along every path) before the Python callback, so a namespace change
+queued here keeps its libfuse lock while it waits, and operations on paths
+under it, closes included, wait inside libfuse until it is admitted and
+finishes. That is a longer hold than uncapped (where it would run at once),
+not a cycle: gate waiters hold no StorageFS lock and an admitted callback
+never waits for one that is not. The kernel also limits background
+requests (max_background, 12 by default): queued readahead reads count
+toward it and can delay a RELEASE there.
+
 A callback waits for its slot before it runs, holding no lock while it
 waits (classification's brief fd-lock lookup is released first), and it
 never waits for a second slot, so the gate adds no lock-order edge: a slot
