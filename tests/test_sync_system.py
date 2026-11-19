@@ -5,6 +5,7 @@ These tests mount an actual FUSE filesystem and verify sync behavior
 end-to-end.
 """
 
+import concurrent.futures
 import errno
 import unittest
 import tempfile
@@ -606,6 +607,55 @@ class TestProgressiveListing(_MountedCase):
 
 class TestProgressiveListingThreaded(TestProgressiveListing):
     fuse_threads = True
+
+
+class TestIndependentDirectoryReads(_MountedCase):
+    START_SYNC = False
+    fuse_threads = True
+
+    def _two_directories(self, progressive):
+        self.fs.namespace.progressive_listings = progressive
+        for backend in (self.backend1_dir, self.backend2_dir):
+            (backend / "slow").mkdir()
+            (backend / "quick").mkdir()
+        (self.backend1_dir / "slow" / "last").touch()
+        payload = b"a small file on just this member"
+        (self.backend1_dir / "quick" / "only").write_bytes(payload)
+        entered = threading.Event()
+        release = threading.Event()
+        stalled = self.fs.backends["backend1"]
+        original = stalled.listdir_attrs
+
+        def scan(path):
+            if path == "/slow":
+                entered.set()
+                release.wait(10)
+            return original(path)
+
+        with patch.object(stalled, "listdir_attrs", side_effect=scan), \
+             concurrent.futures.ThreadPoolExecutor(max_workers=2) as clients:
+            slow = clients.submit(os.listdir, self.mount_dir / "slow")
+            try:
+                self.assertTrue(entered.wait(2), "first tab did not start its member request")
+
+                def browse_quick():
+                    while not release.is_set():
+                        if "only" in os.listdir(self.mount_dir / "quick"):
+                            return (self.mount_dir / "quick" / "only").read_bytes()
+                        time.sleep(.01)
+                    return None
+
+                quick = clients.submit(browse_quick)
+                self.assertEqual(quick.result(timeout=3), payload)
+            finally:
+                release.set()
+            slow.result(timeout=3)
+
+    def test_complete_listing_allows_other_directory_on_same_member(self):
+        self._two_directories(progressive=False)
+
+    def test_progressive_listing_allows_other_directory_on_same_member(self):
+        self._two_directories(progressive=True)
 
 
 class TestSyncSystemIntegrationThreaded(TestSyncSystemIntegration):

@@ -1063,6 +1063,40 @@ def _mount_table_type(mount: Path) -> str:
     raise AssertionError(f"{target} is not in /proc/self/mountinfo")
 
 
+def test_progressive_tabs_share_ssh_transport_without_serializing_directories(
+        remote, mounted_factory, monkeypatch):
+    holder = remote.members[0]
+    payload = b"the only copy"
+    remote.write_remote(holder, "busy/first", b"first")
+    remote.write_remote(holder, "quick/only", payload)
+    mnt = mounted_factory(progressive_listings=True, streaming_reads=True)
+    backend = mnt.backends[holder.name]
+    original = backend.listdir_attrs
+    entered, release, expired = threading.Event(), threading.Event(), threading.Event()
+
+    def hold_one_channel(path):
+        if path != "/busy":
+            return original(path)
+        with backend._pool.sftp(backend.connect_timeout):
+            entered.set()
+            if not release.wait(12):
+                expired.set()
+            return original(path)
+
+    monkeypatch.setattr(backend, "listdir_attrs", hold_one_channel)
+    try:
+        # The other member completes the first enumeration. The holder's scan
+        # and its real SFTP lease remain live throughout the second tab's read.
+        os.listdir(mnt.mount / "busy")
+        assert entered.wait(3)
+        assert _wait_for(lambda: "only" in os.listdir(mnt.mount / "quick"), timeout=5)
+        assert (mnt.mount / "quick" / "only").read_bytes() == payload
+        assert not expired.is_set()
+    finally:
+        release.set()
+    assert _wait_for(lambda: "first" in os.listdir(mnt.mount / "busy"))
+
+
 def test_mount_over_ssh_members_is_typed_fuse_sshfs(remote, mounted_factory):
     """GLib treats only fuse.sshfs (not plain fuse) as a remote filesystem."""
     mnt = mounted_factory()

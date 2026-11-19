@@ -338,6 +338,10 @@ a watcher event makes for the event's parent, still keeps it from being
 published. At most 4096 directories keep a listing, the least recently used
 going first, which bounds the memory a mount with watchers uses.
 
+Independent foreground directory scans can use separate SFTP channels on the
+same member. A large scan in one tab can run alongside another tab when the
+member has spare channels. Background listing refreshes remain serial per member.
+
 On a multi-member mount, `--progressive-listings` (profile `progressive_listings = true`)
 returns a cold listing after the first member succeeds, including an empty result.
 Concurrent opens share the scan. Each later response updates the directory for its

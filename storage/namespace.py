@@ -223,12 +223,12 @@ class NamespaceService:
         # older read must not replace the newer. Dropped with the
         # directory's dir_cache entry on invalidation.
         self._listing_as_of: Dict[str, float] = {}
-        # One single-thread executor per member lists it concurrently with
-        # the others. A dedicated thread per member keeps one extra member
-        # connection each (SSH clients are per thread) and never has two
-        # listing threads reconnecting the same member. Created on first use,
-        # after FUSE's daemonizing fork, and shut down by shutdown().
-        self._listing_executors: Dict[str, concurrent.futures.ThreadPoolExecutor] = {}
+        # Foreground directory reads can use different leases on the same member.
+        # Background scans retain a serial executor per member so an abandoned
+        # refresh cannot monopolize the workers needed by a newly opened tab.
+        self._listing_executors: Dict[
+            Tuple[str, bool], concurrent.futures.ThreadPoolExecutor
+        ] = {}
         # Background refreshes run one at a time on their own thread, which
         # hands each member's listing to that member's executor and waits,
         # as the FUSE thread does for a foreground listing. One at a time
@@ -1291,16 +1291,20 @@ class NamespaceService:
         for executor in executors:
             executor.shutdown(wait=False, cancel_futures=True)
 
-    def _listing_executor(self, backend_name: str) -> Optional[concurrent.futures.ThreadPoolExecutor]:
+    def _listing_executor(
+        self, backend_name: str, *, foreground: bool = False,
+    ) -> Optional[concurrent.futures.ThreadPoolExecutor]:
         with self._listing_executors_lock:
             if self._listing_shut_down:
                 return None
-            executor = self._listing_executors.get(backend_name)
+            key = (backend_name, foreground)
+            executor = self._listing_executors.get(key)
             if executor is None:
                 executor = concurrent.futures.ThreadPoolExecutor(
-                    max_workers=1, thread_name_prefix=f"readdir-{backend_name}",
+                    max_workers=self.backends[backend_name].listing_concurrency() if foreground else 1,
+                    thread_name_prefix=f"readdir-{backend_name}",
                 )
-                self._listing_executors[backend_name] = executor
+                self._listing_executors[key] = executor
             return executor
 
     def _list_member(self, backend: Backend, path: str):
@@ -1341,7 +1345,7 @@ class NamespaceService:
                     skipped.set_exception(RuntimeError("member listing still hung"))
                     futures[backend_name] = skipped
                     continue
-            executor = self._listing_executor(backend_name)
+            executor = self._listing_executor(backend_name, foreground=not background)
             future = None
             if executor is not None:
                 try:
