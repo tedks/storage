@@ -37,24 +37,35 @@ class TestStateAccessUpdates(unittest.TestCase):
         self.state_manager.close()
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
-    def test_access_updates_are_debounced(self):
+    def test_access_updates_keep_the_latest_read_without_committing_each_time(self):
         self.state_manager.ACCESS_FLUSH_INTERVAL_SECONDS = 9999.0
         self.state_manager.ACCESS_FLUSH_BATCH_SIZE = 9999
-        self.state_manager.ACCESS_DEBOUNCE_SECONDS = 1.0
+        old_access = self.state_manager.get_file_metadata("/a.txt").last_access
+        first = old_access + 1.0
+        latest = first + 0.125
 
-        self.state_manager.update_access_time("/a.txt")
-        pending_first = dict(self.state_manager._pending_access_updates)
-        self.assertIn("/a.txt", pending_first)
+        self.state_manager.update_access_time("/a.txt", accessed_at=first)
+        self.state_manager.update_access_time("/a.txt", accessed_at=latest)
+        self.assertEqual(self.state_manager.get_file_metadata("/a.txt").last_access, old_access)
 
-        # This should be ignored by debounce window.
-        self.state_manager.update_access_time("/a.txt")
-        pending_second = dict(self.state_manager._pending_access_updates)
-        self.assertEqual(pending_first, pending_second)
+        list(self.state_manager.iter_lru_paths())
+        self.assertEqual(self.state_manager.get_file_metadata("/a.txt").last_access, latest)
+
+    def test_stale_metadata_and_late_access_batches_keep_newer_access(self):
+        snapshot = self.state_manager.get_file_metadata("/a.txt")
+        newer = snapshot.last_access + 2.0
+        self.state_manager.update_access_time("/a.txt", accessed_at=newer)
+        list(self.state_manager.iter_lru_paths())
+
+        self.state_manager.set_file_metadata(snapshot)
+        self.assertEqual(self.state_manager.get_file_metadata("/a.txt").last_access, newer)
+        self.state_manager.update_access_time("/a.txt", accessed_at=newer - 1.0)
+        list(self.state_manager.iter_lru_paths())
+        self.assertEqual(self.state_manager.get_file_metadata("/a.txt").last_access, newer)
 
     def test_access_updates_flush_in_batch(self):
         self.state_manager.ACCESS_FLUSH_INTERVAL_SECONDS = 9999.0
         self.state_manager.ACCESS_FLUSH_BATCH_SIZE = 2
-        self.state_manager.ACCESS_DEBOUNCE_SECONDS = 0.0
 
         old_a = self.state_manager.get_file_metadata("/a.txt").last_access
         old_b = self.state_manager.get_file_metadata("/b.txt").last_access
@@ -74,7 +85,6 @@ class TestStateAccessUpdates(unittest.TestCase):
     def test_close_flushes_pending_access_updates(self):
         self.state_manager.ACCESS_FLUSH_INTERVAL_SECONDS = 9999.0
         self.state_manager.ACCESS_FLUSH_BATCH_SIZE = 9999
-        self.state_manager.ACCESS_DEBOUNCE_SECONDS = 0.0
 
         old_a = self.state_manager.get_file_metadata("/a.txt").last_access
         self.state_manager.update_access_time("/a.txt")
@@ -431,11 +441,12 @@ class TestDirtyGeneration(unittest.TestCase):
         row = self.state_manager.get_file_metadata("/f.txt")
 
         self.assertTrue(self.state_manager.record_cached_stat(
-            "/f.txt", row.dirty_generation, size=42, last_modified=7.0, last_access=8.0,
+            "/f.txt", row.dirty_generation, size=42, last_modified=7.0,
         ))
 
         updated = self.state_manager.get_file_metadata("/f.txt")
-        self.assertEqual((updated.size, updated.last_modified, updated.last_access), (42, 7.0, 8.0))
+        self.assertEqual((updated.size, updated.last_modified), (42, 7.0))
+        self.assertEqual(updated.last_access, row.last_access)
         self.assertEqual(updated.sync_status, SyncStatus.CLEAN)
         self.assertEqual(updated.checksum, "synced")
         self.assertEqual(updated.dirty_generation, row.dirty_generation)
@@ -446,7 +457,7 @@ class TestDirtyGeneration(unittest.TestCase):
         self.state_manager.mark_dirty("/f.txt", size=10, last_modified=2.0)
 
         self.assertFalse(self.state_manager.record_cached_stat(
-            "/f.txt", row.dirty_generation, size=42, last_modified=7.0, last_access=8.0,
+            "/f.txt", row.dirty_generation, size=42, last_modified=7.0,
         ))
 
         updated = self.state_manager.get_file_metadata("/f.txt")
