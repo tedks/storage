@@ -1,0 +1,21 @@
+id: streaming-retention-qualification
+title: Qualify retained downloads and bound speculative read-ahead independently
+desc: Use the larger of 32 MiB and 30% as the default contiguous-read requirement
+  for retention, capped at the file size. Keep explicit comma-list policies compatible
+  and limit pre-qualification speculative read-ahead independently of the file size.
+  Verify mount configuration and live controls, a synthetic 2 GiB case, and both FUSE
+  loop modes. Related to oq-streaming-fleet-keep-threshold. Field rollout remains
+  separate.
+type: bugfix
+component: streaming
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-19T00:33:33-00:00
+references: []
+log_events:
+- time: 2026-11-19T00:33:33-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
