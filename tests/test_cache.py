@@ -9,7 +9,7 @@ from pathlib import Path
 
 from storage.backends.local import LocalBackend
 from storage.cache import PARTIAL_SUFFIX, CacheManager
-from storage.cache_metadata import read_cache_metadata, regular_file_stat
+from storage.cache_metadata import MEMBER_ATTRS_XATTR, read_cache_metadata, regular_file_stat
 from storage.models import FileMetadata, SyncStatus
 from storage.state import StateManager
 
@@ -277,7 +277,9 @@ class TestFetchThroughTempFile(unittest.TestCase):
             # writer changes it (and its xattrs) through an open descriptor.
             written = b"written through the mount"
             self.cache_path.write_bytes(written)
-            os.setxattr(self.cache_path, "user.storage.test", b"kept")
+            os.setxattr(self.cache_path, MEMBER_ATTRS_XATTR, b"winning inode")
+            os.utime(self.cache_path, (1_650_000_000, 1_650_000_000))
+            original_mtime = self.cache_path.stat().st_mtime_ns
             self.cache_manager.mark_cache_size_dirty()
             writer = os.open(self.cache_path, os.O_RDWR)
         finally:
@@ -287,11 +289,12 @@ class TestFetchThroughTempFile(unittest.TestCase):
             # The late fetch still reports the path cached, but did not
             # replace the inode the writer holds.
             self.assertEqual(self.results, [True])
+            self.assertEqual(self.cache_path.stat().st_mtime_ns, original_mtime)
             os.pwrite(writer, b"W", 0)
         finally:
             os.close(writer)
         self.assertEqual(self.cache_path.read_bytes(), b"W" + written[1:])
-        self.assertEqual(os.getxattr(self.cache_path, "user.storage.test"), b"kept")
+        self.assertEqual(os.getxattr(self.cache_path, MEMBER_ATTRS_XATTR), b"winning inode")
         self.assertEqual(self._partials(), [])
         self.assertEqual(self.cache_manager.get_total_cache_size(), len(written))
 

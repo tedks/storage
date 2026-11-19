@@ -14,11 +14,14 @@ import time
 import threading
 from pathlib import Path
 from contextlib import nullcontext
+from enum import Enum
 from typing import Callable, ContextManager, Optional, List, Set
 
 from .backends.base import Backend, bulk_request
 from .backends.ssh_pool import BulkCapacityCancelled, BulkCapacityTimeout
-from .cache_metadata import PARTIAL_SUFFIX, PREFIX_XATTR, regular_file_stat, write_cache_metadata
+from .cache_metadata import (
+    PARTIAL_SUFFIX, PREFIX_XATTR, copy_member_attributes, regular_file_stat, write_cache_metadata,
+)
 from .member_repairs import VIEW_WRITE, MemberRepairs, is_at_or_under
 from .pathing import resolve_path
 
@@ -66,6 +69,15 @@ def _remove_prefix_marker(path: Path):
     finally:
         if usable != mode:
             os.chmod(path, mode)
+
+
+class CacheFetch(Enum):
+    FAILED = 0
+    INSTALLED = 1
+    ALREADY_CACHED = 2
+
+
+_STAT_NOT_PROBED = object()
 
 
 class CacheManager:
@@ -442,6 +454,13 @@ class CacheManager:
         return False
 
     def cache_file(self, virtual_path: str, backend: Backend, source_virtual_path: str = None) -> bool:
+        """Ensure a member file is cached, including when another fill won."""
+        return self.cache_file_result(virtual_path, backend, source_virtual_path) != CacheFetch.FAILED
+
+    def cache_file_result(
+        self, virtual_path: str, backend: Backend, source_virtual_path: str = None,
+        *, member_stat=_STAT_NOT_PROBED,
+    ) -> CacheFetch:
         """
         Download a file from backend into cache
 
@@ -455,36 +474,46 @@ class CacheManager:
             virtual_path: Virtual path of file
             backend: Backend to download from
             source_virtual_path: Virtual path to read from backend (defaults to virtual_path)
+            member_stat: Pre-transfer probe, or None for a failed probe. If omitted, probe here.
 
         Returns:
-            True if the path is cached afterwards (by this fetch or one that
-            installed first), False otherwise
+            Whether this copy was installed, another copy won, or the fetch failed.
         """
         source_virtual_path = source_virtual_path or virtual_path
         # Member probes: no lock, and their errors propagate as before.
         if not backend.exists(source_virtual_path):
-            return False
-        file_size = backend.get_size(source_virtual_path)
+            return CacheFetch.FAILED
+        if member_stat is _STAT_NOT_PROBED:
+            try:
+                member_stat = backend.stat(source_virtual_path)
+            except (OSError, NotImplementedError):
+                member_stat = None
+        file_size = getattr(member_stat, "st_size", None)
+        if file_size is None:
+            file_size = backend.get_size(source_virtual_path)
 
         with self._lock:
             if not self.ensure_space(file_size):
                 print(f"Warning: Insufficient cache space for {virtual_path}")
-                return False
+                return CacheFetch.FAILED
             self._reserved_bytes += file_size
         try:
-            self.fetch_into_cache(backend, source_virtual_path, self.get_cache_path(virtual_path))
+            installed = self.fetch_into_cache(
+                backend, source_virtual_path, self.get_cache_path(virtual_path), member_stat,
+            )
             self.state_manager.update_access_time(virtual_path)
-            return True
+            return CacheFetch.INSTALLED if installed else CacheFetch.ALREADY_CACHED
         except (BulkCapacityCancelled, BulkCapacityTimeout):
             raise
         except Exception as e:
             print(f"Error caching {virtual_path} from {backend.name}: {e}")
-            return False
+            return CacheFetch.FAILED
         finally:
             with self._lock:
                 self._reserved_bytes -= file_size
 
-    def fetch_into_cache(self, backend: Backend, source_virtual_path: str, cache_path: Path) -> bool:
+    def fetch_into_cache(self, backend: Backend, source_virtual_path: str, cache_path: Path,
+                         member_stat=None) -> bool:
         """Copy a member file to cache_path through a temp file beside it.
 
         The copy runs without the cache lock into a fresh name that ends in
@@ -509,10 +538,21 @@ class CacheManager:
         try:
             with bulk_request() if self.bulk_cold_copies else nullcontext():
                 backend.copy_to_local(source_virtual_path, temp_path)
+            st = os.lstat(temp_path)
+            if not stat_module.S_ISREG(st.st_mode):
+                raise OSError(errno.EINVAL, "download did not produce a regular file", temp_path)
             # A whole file is never a streaming prefix, whatever xattrs the
             # member's copy came with.
             _remove_prefix_marker(temp_path)
-            size = os.lstat(temp_path).st_size
+            if not st.st_mode & stat_module.S_IRUSR:
+                os.chmod(temp_path, stat_module.S_IMODE(st.st_mode) | stat_module.S_IRUSR,
+                         follow_symlinks=False)
+            fd = os.open(temp_path, os.O_RDONLY | os.O_NOFOLLOW)
+            try:
+                copy_member_attributes(fd, member_stat)
+                size = os.fstat(fd).st_size
+            finally:
+                os.close(fd)
             with self._lock:
                 try:
                     os.link(temp_path, cache_path)

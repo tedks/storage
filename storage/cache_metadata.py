@@ -2,6 +2,7 @@
 
 import errno
 import json
+import math
 import os
 import stat
 from dataclasses import dataclass, field
@@ -10,6 +11,190 @@ from typing import Iterator, List, Optional
 
 from .file_config import get_inherited_config
 from .models import FileLocation, FileMetadata, SyncStatus
+
+
+MEMBER_ATTRS_XATTR = "user.storage.source_attributes"
+MEMBER_STAT_XATTR = "user.storage.member_stat"
+_SOURCE_ATTR_FIELDS = ("st_mode", "st_uid", "st_gid", "st_nlink", "st_ctime")
+
+
+def _inode(st: os.stat_result) -> list:
+    return [st.st_dev, st.st_ino]
+
+
+def _source_attrs_basis(st: os.stat_result) -> dict:
+    return {
+        "st_mode": st.st_mode,
+        "st_uid": st.st_uid,
+        "st_gid": st.st_gid,
+        "st_size": st.st_size,
+        "mtime_ns": st.st_mtime_ns,
+    }
+
+
+def _source_time_ns(source, field: str, fallback: int) -> int:
+    ns = getattr(source, field + "_ns", None)
+    if ns is not None:
+        return ns
+    seconds = getattr(source, field, None)
+    return fallback if seconds is None else round(seconds * 1_000_000_000)
+
+
+def copy_member_attributes(fd: int, source) -> None:
+    """Apply the member's stat to a private, fully downloaded inode.
+
+    Mode bits required for Storage to read and maintain the backing file
+    may differ from the mount's mode. Keep the inode daemon-owned, and
+    never install source privilege bits. An existing POSIX ACL (copied by a
+    local backend or inherited from the cache parent) owns its group mask;
+    changing the mask with chmod could grant access to other named entries.
+    """
+    local = os.fstat(fd)
+    member_size = getattr(source, "st_size", None)
+    if member_size is not None and member_size != local.st_size:
+        # The member changed during transfer. Keep the transfer's stat;
+        # the older probe can still be used for revalidation.
+        source = None
+    mode = getattr(source, "st_mode", None)
+    permissions = local.st_mode if mode is None else mode
+    # Member IDs have no mapping to local groups or users. Only tighten
+    # the staging inode's group and other permissions. An ACL mask keeps
+    # the permissions the kernel chose when that ACL was installed.
+    permissions &= local.st_mode | 0o700
+    try:
+        os.getxattr(fd, "system.posix_acl_access")
+    except OSError as exc:
+        if exc.errno not in (errno.ENODATA, errno.ENOTSUP):
+            raise
+    else:
+        permissions = (permissions & ~0o070) | (local.st_mode & 0o070)
+    cache_mode = (permissions & 0o777) | stat.S_IRUSR | stat.S_IWUSR
+    if cache_mode != stat.S_IMODE(local.st_mode):
+        os.fchmod(fd, cache_mode)
+
+    times = tuple(_source_time_ns(source, field, getattr(local, field + "_ns"))
+                  for field in ("st_atime", "st_mtime"))
+    if times != (local.st_atime_ns, local.st_mtime_ns):
+        os.utime(fd, ns=times)
+
+    attrs = {}
+    for key in _SOURCE_ATTR_FIELDS:
+        value = getattr(source, key, None)
+        if value is not None:
+            attrs[key] = value
+    if mode is not None:
+        attrs["st_mode"] = stat.S_IFREG | stat.S_IMODE(mode)
+    if "st_ctime" not in attrs and getattr(source, "st_mtime", None) is not None:
+        attrs["st_ctime"] = source.st_mtime  # Same fallback as uncached SFTP stat.
+    actual = os.fstat(fd)
+    # Even an empty record identifies a new fill, which never needs legacy
+    # mtime recovery. Use the actual stat after utime (filesystems can round).
+    record = {"inode": _inode(actual), "basis": _source_attrs_basis(actual), "attrs": attrs}
+    try:
+        os.setxattr(fd, MEMBER_ATTRS_XATTR, json.dumps(record).encode())
+    except OSError as exc:
+        if exc.errno != errno.ENOTSUP:
+            raise
+        # A cache without user xattrs can still hold bytes and timestamps.
+        # Only reserve write access when we can record the visible mode.
+        os.fchmod(fd, (permissions & 0o777) | stat.S_IRUSR)
+
+
+def _read_source_attrs(path: Path, local: os.stat_result) -> Optional[dict]:
+    try:
+        record = json.loads(os.getxattr(path, MEMBER_ATTRS_XATTR, follow_symlinks=False))
+        if (record["inode"] == _inode(local) and isinstance(record["basis"], dict)
+                and isinstance(record["attrs"], dict)):
+            return record
+    except (OSError, ValueError, TypeError, KeyError):
+        pass
+    return None
+
+
+def cached_member_attributes(path: Path, local: os.stat_result) -> Optional[dict]:
+    """Report source fields that still describe this cached inode.
+
+    None allows legacy recovery. An empty dict is a new-format record
+    without any field we can report. Native atime and mtime stay live.
+    """
+    record = _read_source_attrs(path, local)
+    if record is None:
+        return None
+    attrs = {}
+    for key in _SOURCE_ATTR_FIELDS:
+        value = record["attrs"].get(key)
+        if key == "st_ctime":
+            if ((type(value) is float and math.isfinite(value))
+                    or (type(value) is int and -(1 << 63) <= value < (1 << 63))):
+                attrs[key] = value
+        elif type(value) is int and 0 <= value < (1 << 32):
+            if key != "st_mode" or stat.S_ISREG(value):
+                attrs[key] = value
+    basis = _source_attrs_basis(local)
+    for key in ("st_mode", "st_uid", "st_gid"):
+        if basis[key] != record["basis"].get(key):
+            attrs.pop(key, None)
+    if basis != record["basis"]:
+        attrs.pop("st_ctime", None)
+    return attrs
+
+
+def forget_cached_member_fields(path: Path, local: os.stat_result, *fields: str) -> None:
+    """Retire synthetic fields explicitly replaced by chmod, chown or utime."""
+    if not stat.S_ISREG(local.st_mode):
+        return
+    record = _read_source_attrs(path, local)
+    if record is None:
+        if "st_mtime" not in fields or not read_member_baselines(path, cache_identity(local)):
+            return
+        # An explicit timestamp also takes precedence over a legacy
+        # mtime, even when utime happened to keep the native mtime.
+        record = {"inode": _inode(local), "basis": _source_attrs_basis(local), "attrs": {}}
+    elif not any(key in record["attrs"] for key in fields):
+        return
+    for key in fields:
+        record["attrs"].pop(key, None)
+    try:
+        os.setxattr(path, MEMBER_ATTRS_XATTR, json.dumps(record).encode(), follow_symlinks=False)
+    except PermissionError:
+        # An explicit chmod/chown can remove the daemon's native write
+        # permission. The basis then masks the old field while it differs.
+        pass
+
+
+def cache_identity(st: os.stat_result) -> tuple:
+    return (st.st_ino, st.st_size, st.st_mtime_ns)
+
+
+def read_member_baselines(path: Path, identity: tuple) -> dict:
+    """Read revalidation evidence for the same inode, size and native mtime."""
+    try:
+        payload = json.loads(os.getxattr(path, MEMBER_STAT_XATTR, follow_symlinks=False))
+        if tuple(payload.get("cache")) == identity:
+            return {str(name): (int(size), float(mtime))
+                    for name, (size, mtime) in payload.get("members", {}).items()}
+    except (OSError, ValueError, TypeError, AttributeError, OverflowError):
+        pass
+    return {}
+
+
+def legacy_member_mtime(path: Path, local: os.stat_result, row: Optional[FileMetadata]) -> Optional[float]:
+    """Recover a legacy fill's source mtime for reporting, without touching disk.
+
+    A single member baseline can also come from an upload, which records
+    the uploaded content checksum. Skip those, and any row or cached inode
+    whose evidence is missing or disagrees. Never rewrite a CLEAN file's
+    native mtime independently of its row and recovery xattr.
+    """
+    if (row is None or row.sync_status != SyncStatus.CLEAN or row.checksum is not None
+            or row.size != local.st_size or row.last_modified != local.st_mtime):
+        return None
+    times = read_member_baselines(path, cache_identity(local))
+    if len(times) == 1:
+        size, mtime = next(iter(times.values()))
+        if size == local.st_size and math.isfinite(mtime):
+            return mtime
+    return None
 
 
 XATTR_CACHE_METADATA_NAME = "user.storage.metadata"

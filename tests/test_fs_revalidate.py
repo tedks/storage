@@ -9,6 +9,7 @@ checks instead of sleeping.
 
 import dataclasses
 import logging
+import stat
 import os
 import shutil
 import tempfile
@@ -20,9 +21,10 @@ from unittest.mock import patch
 
 from storage.backends.local import LocalBackend
 from storage.backends.rsync import RsyncBackend, RsyncError
+from storage.cache_metadata import MEMBER_ATTRS_XATTR, read_cache_metadata
 from storage.checksums import fast_checksum_file
 from storage.fs import StorageFS
-from storage.models import SyncStatus
+from storage.models import FileMetadata, SyncStatus
 from storage.sync_executor import SyncExecutor
 from storage.sync_tasks import SyncConfig, SyncTask
 
@@ -257,6 +259,187 @@ class RevalidateTestBase(unittest.TestCase):
         self.fs.state_manager.close()
         self.fs = self._make_fs(start_sync=start_sync)
         self.assertEqual({}, self.fs._member_checks)
+
+
+class TestMemberAttributes(RevalidateTestBase):
+    backend_class = NoMtimeBackend
+
+    def test_cached_stat_keeps_member_fields_and_reports_missing_fields(self):
+        source = self.rewrite_member("f.txt", b"original")
+        mtime_ns, atime_ns = 1_000_000_000_123_456_789, 1_000_000_001_234_567_890
+        fake = SimpleNamespace(
+            st_size=8, st_mode=stat.S_IFREG | 0o4640, st_uid=12345, st_gid=12346,
+            st_mtime_ns=mtime_ns, st_atime_ns=atime_ns, st_ctime=1_100_000_000,
+        )
+        with patch.object(self.member, "stat", return_value=fake):
+            self.assertTrue(self.fs._ensure_file_in_cache(self.fs._resolve_path("/f.txt")))
+
+        cached = self.cache_dir / "f.txt"
+        local = cached.stat()
+        attrs = self.fs.getattr("/f.txt")
+        self.assertEqual((local.st_mtime_ns, local.st_atime_ns), (mtime_ns, atime_ns))
+        self.assertEqual((stat.S_IMODE(local.st_mode), local.st_uid, local.st_gid),
+                         (0o640, os.geteuid(), os.getegid()))
+        self.assertEqual((attrs["st_mode"], attrs["st_uid"], attrs["st_gid"]),
+                         (fake.st_mode, fake.st_uid, fake.st_gid))
+        self.assertEqual(attrs["st_ctime"], fake.st_ctime)
+        self.assertEqual(attrs["st_nlink"], local.st_nlink)
+        self.assertEqual(source.read_bytes(), cached.read_bytes())
+
+        # Setting exactly the current physical mode or owner retires the
+        # overlay too. chown -1 still preserves the other reported field.
+        self.fs.chmod("/f.txt", 0o640)
+        self.fs.chown("/f.txt", os.geteuid(), -1)
+        attrs = self.fs.getattr("/f.txt")
+        self.assertEqual(attrs["st_mode"], stat.S_IFREG | 0o640)
+        self.assertEqual((attrs["st_uid"], attrs["st_gid"]), (os.geteuid(), fake.st_gid))
+        self.assertEqual(attrs["st_ctime"], cached.stat().st_ctime)
+        self.fs.chown("/f.txt", -1, os.getegid())
+        self.assertEqual(self.fs.getattr("/f.txt")["st_gid"], os.getegid())
+
+    def test_incomplete_member_stat_reports_native_fallbacks(self):
+        self.rewrite_member("f.txt", b"original")
+        incomplete = SimpleNamespace(
+            st_mode=None, st_uid=None, st_gid=None, st_atime=None,
+            st_size=8, st_mtime=1_000_000_000,
+        )
+        with patch.object(self.member, "lstat", return_value=incomplete), \
+                patch.object(self.member, "stat", return_value=incomplete):
+            cold = self.fs.getattr("/f.txt")
+            self.assertEqual(cold["st_uid"], os.getuid())
+            self.assertEqual(cold["st_gid"], os.getgid())
+            self.assertEqual(cold["st_atime"], cold["st_mtime"])
+            self.assertEqual(cold["st_mode"], stat.S_IFREG | 0o644)
+            self.assertEqual(self.read_through("/f.txt"), b"original")
+
+        st = (self.cache_dir / "f.txt").stat()
+        warm = self.fs.getattr("/f.txt")
+        self.assertEqual(warm["st_mode"], st.st_mode)
+        self.assertEqual((warm["st_uid"], warm["st_gid"]), (st.st_uid, st.st_gid))
+        self.assertEqual(warm["st_mtime"], incomplete.st_mtime)
+
+    def test_utimens_overrides_source_ctime_on_atime_only_change(self):
+        self.rewrite_member("f.txt", b"original", mtime=1_000_000_000)
+        fake = SimpleNamespace(st_size=8, st_mtime=1_000_000_000, st_atime=1_000_000_000)
+        with patch.object(self.member, "stat", return_value=fake):
+            self.read_through("/f.txt")
+
+        self.assertEqual(self.fs.getattr("/f.txt")["st_ctime"], fake.st_mtime)
+        self.fs.utimens("/f.txt", (1_200_000_000, fake.st_mtime))
+        attrs = self.fs.getattr("/f.txt")
+        self.assertEqual(attrs["st_atime"], 1_200_000_000)
+        self.assertEqual(attrs["st_mtime"], fake.st_mtime)
+        self.assertEqual(attrs["st_ctime"], (self.cache_dir / "f.txt").stat().st_ctime)
+        self.assertEqual(self.fs.state_manager.get_file_metadata("/f.txt").sync_status,
+                         SyncStatus.CLEAN)
+
+    def test_full_fetch_with_stat_unavailable_or_size_missing(self):
+        for reason in (NotImplementedError(), OSError(95, "no stat"), None):
+            with self.subTest(reason=reason):
+                src = self.rewrite_member("f.txt", b"original", mtime=1_000_000_000)
+                with patch.object(self.member, "stat", side_effect=reason,
+                                  return_value=SimpleNamespace()), \
+                        patch.object(self.member, "get_size", return_value=src.stat().st_size):
+                    self.assertEqual(self.read_through("/f.txt"), b"original")
+                cache = self.cache_dir / "f.txt"
+                attrs = self.fs.getattr("/f.txt")
+                self.assertEqual(attrs["st_mtime"], cache.stat().st_mtime)
+                self.assertEqual(attrs["st_uid"], cache.stat().st_uid)
+                self.assertEqual(self.fs.state_manager.get_file_metadata("/f.txt").sync_status,
+                                 SyncStatus.CLEAN)
+                self.assertGreater(self.fs.cache_manager._evict_if_still_clean("/f.txt", cache), 0)
+
+    def test_full_fetch_that_loses_install_keeps_winners_baseline(self):
+        self.rewrite_member("f.txt", b"started first", mtime=1_000_000_000)
+        cached = self.cache_dir / "f.txt"
+        copy_to_local = self.member.copy_to_local
+        winning_time = 1_700_000_000
+
+        def copy_with_concurrent_install(path, temp):
+            copy_to_local(path, temp)
+            cached.write_bytes(b"winning stream")
+            os.utime(cached, (winning_time, winning_time))
+            st = cached.stat()
+            self.fs.cache_manager.store_file_metadata(FileMetadata(
+                virtual_path=path, size=st.st_size, checksum=None, last_access=0,
+                last_modified=st.st_mtime, sync_status=SyncStatus.CLEAN,
+                replica_count=1, recomputable=False, recompute_cmd=None,
+                encrypted=False, encryption_key_id=None,
+            ), cache_path=cached)
+            self.fs._store_member_check(path, cached, self.fs._cache_identity(st),
+                                        {"member": (st.st_size, winning_time)}, replace=True)
+
+        with patch.object(self.member, "copy_to_local", side_effect=copy_with_concurrent_install):
+            self.assertEqual(self.read_through("/f.txt"), b"winning stream")
+
+        local = cached.stat()
+        self.assertEqual(local.st_mtime, winning_time)
+        identity = self.fs._cache_identity(local)
+        self.assertEqual(self.fs._load_persisted_members(cached, identity),
+                         {"member": (local.st_size, winning_time)})
+        self.assertEqual(read_cache_metadata(cached).last_modified, winning_time)
+
+    def make_legacy_file(self):
+        self.rewrite_member("f.txt", b"original", mtime=1_000_000_000)
+        self.read_through("/f.txt")
+        cached = self.cache_dir / "f.txt"
+        os.removexattr(cached, MEMBER_ATTRS_XATTR)
+        os.utime(cached, (1_700_000_000, 1_700_000_000))
+        local = cached.stat()
+        row = self.fs.state_manager.get_file_metadata("/f.txt")
+        self.assertTrue(self.fs.state_manager.record_cached_stat(
+            "/f.txt", row.dirty_generation, size=local.st_size, last_modified=local.st_mtime,
+            last_access=local.st_atime,
+        ))
+        self.fs.cache_manager.sync_cache_metadata(
+            "/f.txt", self.fs.state_manager.get_file_metadata("/f.txt"),
+        )
+        self.fs._store_member_check("/f.txt", cached, self.fs._cache_identity(local),
+                                    {"member": (8, 1_000_000_000)}, replace=True)
+        return cached
+
+    def test_legacy_reporting_does_not_touch_clean_inode_or_index(self):
+        cached = self.make_legacy_file()
+        native = cached.stat()
+        record = read_cache_metadata(cached)
+        self.assertEqual(self.fs.getattr("/f.txt")["st_mtime"], 1_000_000_000)
+        self.assertEqual(native, cached.stat())
+        self.assertEqual(record, read_cache_metadata(cached))
+        self.assertEqual(self.read_through("/f.txt"), b"original")
+        self.assertEqual(self.fs.state_manager.get_file_metadata("/f.txt").sync_status,
+                         SyncStatus.CLEAN)
+
+        # Explicitly setting the existing native time takes precedence.
+        self.fs.utimens("/f.txt", (native.st_atime, native.st_mtime))
+        self.assertEqual(self.fs.getattr("/f.txt")["st_mtime"], native.st_mtime)
+
+    def test_legacy_reporting_skips_unproven_timestamps(self):
+        for reason in ("missing", "stale inode", "dirty", "ambiguous", "size", "upload"):
+            with self.subTest(reason=reason):
+                cached = self.make_legacy_file()
+                native = cached.stat()
+                identity = self.fs._cache_identity(native)
+                if reason == "missing":
+                    os.removexattr(cached, StorageFS.MEMBER_STAT_XATTR)
+                elif reason == "stale inode":
+                    self.fs._store_member_check("/f.txt", cached, (0, *identity[1:]),
+                                                {"member": (8, 1_000_000_000)}, replace=True)
+                elif reason == "dirty":
+                    self.fs.cache_manager.mark_file_dirty("/f.txt", cached)
+                elif reason == "ambiguous":
+                    self.fs._store_member_check("/f.txt", cached, identity,
+                                                {"other": (8, 900_000_000)})
+                elif reason == "size":
+                    self.fs._store_member_check("/f.txt", cached, identity,
+                                                {"member": (9, 1_000_000_000)}, replace=True)
+                elif reason == "upload":
+                    row = self.fs.state_manager.get_file_metadata("/f.txt")
+                    self.fs.state_manager.publish_sync_status(
+                        "/f.txt", row.dirty_generation, SyncStatus.CLEAN, checksum="uploaded",
+                    )
+                self.assertEqual(self.fs.getattr("/f.txt")["st_mtime"], native.st_mtime)
+                self.fs.cache_manager.delete_cached_file("/f.txt")
+                self.fs.state_manager.delete_file("/f.txt")
 
 
 class TestRevalidateOnOpen(RevalidateTestBase):
