@@ -10,7 +10,8 @@ Opening a large file to inspect its first few megabytes can make Storage downloa
 
 - [x] (2026-11-19 00:20Z) Started in a dedicated worktree from the mount control branch and confirmed the existing qualification also bounded speculation.
 - [x] (2026-11-19 00:32Z) Implemented independent settings, documented their usage, and added synthetic and mounted cases. Rebased on the cache eviction branch, which includes mount control.
-- [ ] Verify with Bazel gates in the Nix development shell.
+- [x] (2026-11-19 00:34Z) Passed five focused Bazel suites, including 72 streaming unit tests.
+- [ ] Verify all four Bazel gates in the Nix development shell.
 - [ ] Publish the verified branch as a draft pull request against the cache eviction branch.
 
 ## Surprises & Discoveries

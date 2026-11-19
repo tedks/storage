@@ -227,8 +227,10 @@ longest contiguous span readers requested reaches
 the file size. Percentages in an `all:` policy round up to the next byte.
 Existing comma-separated policies without `all:` still use the first
 threshold reached and round percentages down. For example, `4M,50%`
-qualifies at 4 MiB on a large file and halfway through a small one. Use
-`0` to qualify after any read or `100%` to require a full-file read.
+qualifies at 4 MiB on a large file and halfway through a small one.
+To adopt the new default in a profile that sets the old rule explicitly,
+remove that setting or change it to `all:32M,30%`. Use `0` to qualify after
+any read or `100%` to require a full-file read.
 Storage counts the spans requested by the kernel, including its readahead.
 
 Before a file qualifies, its background worker may fetch ahead of the
@@ -537,6 +539,7 @@ override or the profile now points to a different cache.
 storage control --profile media
 storage control --profile media --config ./storage.toml get
 storage control --cache '/var/cache/my media' set --max-streaming-sessions 4 --max-download-workers 2
+storage control --profile media set --streaming-keep-after-close 'all:32M,30%' --streaming-read-ahead-window 4M
 storage control --profile media downloads
 storage control --profile media cancel 474b595adc054281bced844067939d97
 ```
