@@ -240,7 +240,8 @@ class StorageFS(Operations):
                  max_foreground_operations: Optional[int] = None,
                  max_sync_workers: Optional[int] = None,
                  max_download_workers: Optional[int] = None,
-                 streaming_read_ahead_window: int = DEFAULT_STREAMING_READ_AHEAD_WINDOW):
+                 streaming_read_ahead_window: int = DEFAULT_STREAMING_READ_AHEAD_WINDOW,
+                 progressive_listings: bool = False):
         """
         Initialize Storage filesystem
 
@@ -448,6 +449,7 @@ class StorageFS(Operations):
             checksum_records=self._checksum_records,
             checksum_lock=self._checksum_lock,
             listing_max_stale=max(0.0, float(listing_max_stale)),
+            progressive_listings=progressive_listings,
             # Finite even with watchers (an infinite fresh window): see
             # NamespaceService.negative_window.
             negative_window=listing_fresh_window(readdir_ttl, revalidate_after),
@@ -3605,7 +3607,8 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
                  max_foreground_operations: Optional[int] = None,
                  max_sync_workers: Optional[int] = None,
                  max_download_workers: Optional[int] = None,
-                 streaming_read_ahead_window: int = DEFAULT_STREAMING_READ_AHEAD_WINDOW):
+                 streaming_read_ahead_window: int = DEFAULT_STREAMING_READ_AHEAD_WINDOW,
+                 progressive_listings: bool = False):
     """
     Mount a Storage filesystem
 
@@ -3731,6 +3734,7 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
         streaming_read_ahead_window=streaming_read_ahead_window,
         revalidate_after=revalidate_after,
         listing_max_stale=listing_max_stale,
+        progressive_listings=progressive_listings,
         checksum_reverify_interval=checksum_reverify_interval,
         bulk_cold_copies=fuse_threads,
         max_foreground_operations=max_foreground_operations,

@@ -44,6 +44,8 @@ revalidate_after = 60
 # Past that a listing is still served while a background listing replaces
 # it, until it is this many seconds old.
 listing_max_stale = 3600
+# Return the first member response; later directory reads see additional names.
+progressive_listings = false
 # Kernel cache timeouts in seconds. Unset, names are kept for
 # revalidate_after (1 with enable_watchers) and missing names for 10.
 # Attributes are never kept: a kept size would truncate reads of a

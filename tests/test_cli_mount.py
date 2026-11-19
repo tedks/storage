@@ -28,6 +28,7 @@ class TestMountConfigCLI(unittest.TestCase):
         profile = self.temp_dir / "storage.toml"
         profile.write_text(f'''
 [mounts.named]
+progressive_listings = true
 mountpoint = "{self.temp_dir / "mount"}"
 cache = "{self.temp_dir / "cache"}"
 backends = [
@@ -39,6 +40,7 @@ backends = [
              patch("storage.cli_mount.shared_filesystems", return_value=[]):
             result = self.runner.invoke(main, ["mount", "--config", str(profile), "named"])
         self.assertEqual(0, result.exit_code, result.output)
+        self.assertTrue(mock_mount.call_args.kwargs["progressive_listings"])
         backends = mock_mount.call_args.args[3]
         self.assertEqual(("remote0", "remote1"), tuple(backends))
         self.assertEqual("Archive", backends["remote0"].display_name)
@@ -113,7 +115,7 @@ backends = [
         with patch("storage.cli_mount.mount_storage") as mock_mount:
             result = self.runner.invoke(
                 main,
-                ["mount", "--config", str(config_path), "example-media"],
+                ["mount", "--progressive-listings", "--config", str(config_path), "example-media"],
             )
 
         self.assertEqual(result.exit_code, 0, msg=result.output)
@@ -130,6 +132,7 @@ backends = [
         self.assertEqual("storage-host.example", args[3]["remote0"].host)
         self.assertEqual("/srv/raid/media", str(args[3]["remote0"].remote_path))
         self.assertTrue(kwargs["foreground"])
+        self.assertTrue(kwargs["progressive_listings"])
         self.assertTrue(kwargs["streaming_reads"])
         self.assertEqual(2 * 1024 ** 2, kwargs["streaming_chunk_size"])
         self.assertNotIn("max_streaming_sessions", kwargs)

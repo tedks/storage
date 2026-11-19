@@ -572,6 +572,42 @@ class TestSymlinkReplicationThreaded(TestSymlinkReplication):
     fuse_threads = True
 
 
+class TestProgressiveListing(_MountedCase):
+    START_SYNC = False
+    FS_KWARGS = {"progressive_listings": True}
+
+    def test_large_first_member_then_complete_union(self):
+        self.assertTrue(os.path.ismount(self.mount_dir))
+        early = {f"entry-{i:04d}" for i in range(1024)}
+        for name in early:
+            (self.backend2_dir / name).touch()
+        (self.backend1_dir / "late").write_bytes(b"unique")
+        release = threading.Event()
+        backend = self.fs.backends["backend1"]
+        original = backend.listdir_attrs
+
+        def slow(path):
+            if not release.wait(5):
+                raise AssertionError("foreground listing waited for the slow member")
+            return original(path)
+
+        with patch.object(backend, "listdir_attrs", side_effect=slow) as listing:
+            try:
+                self.assertEqual(set(os.listdir(self.mount_dir)), early)
+            finally:
+                release.set()
+            deadline = time.monotonic() + 5
+            while "late" not in os.listdir(self.mount_dir) and time.monotonic() < deadline:
+                time.sleep(.01)
+            self.assertEqual(set(os.listdir(self.mount_dir)), early | {"late"})
+            self.assertEqual((self.mount_dir / "late").read_bytes(), b"unique")
+            self.assertEqual(listing.call_count, 1)
+
+
+class TestProgressiveListingThreaded(TestProgressiveListing):
+    fuse_threads = True
+
+
 class TestSyncSystemIntegrationThreaded(TestSyncSystemIntegration):
     fuse_threads = True
 

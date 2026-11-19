@@ -1,3 +1,4 @@
+import concurrent.futures
 import errno
 import json
 import os
@@ -76,6 +77,125 @@ class TestFSNamespaceIntegration(unittest.TestCase):
         self.assertIn('foo.txt', entries)
         self.assertIn('bar.txt', entries)
         self.assertIn('baz.txt', entries)
+
+    def test_progressive_listing_shares_scan_and_expands_after_first_success(self):
+        namespace = self.fs.namespace
+        namespace.progressive_listings = True
+        (self.cache_dir / "local").touch()
+        (self.backend1_dir / "late").write_bytes(b"content")
+        (self.backend2_dir / "early").touch()
+        entered = threading.Event()
+        release = threading.Event()
+        original = self.backends["backend1"].listdir_attrs
+
+        def slow(path):
+            entered.set()
+            if not release.wait(4):
+                raise AssertionError("first listing waited for the slow member")
+            return original(path)
+
+        with patch.object(self.backends["backend1"], "listdir_attrs", side_effect=slow) as later, \
+             patch.object(self.backends["backend2"], "listdir_attrs",
+                          wraps=self.backends["backend2"].listdir_attrs) as early:
+            try:
+                self.assertEqual(set(self.fs.readdir("/", 0)), {".", "..", "local", "early"})
+                self.assertTrue(entered.wait(2))
+                self.assertEqual(set(self.fs.readdir("/", 0)), {".", "..", "local", "early"})
+                # A name absent from the first response still resolves on its member.
+                self.assertEqual(self.fs.getattr("/late")["st_size"], 7)
+            finally:
+                release.set()
+            self.assertTrue(self._wait_for(lambda: "late" in self.fs.readdir("/", 0)))
+            self.assertEqual((early.call_count, later.call_count), (1, 1))
+
+    def test_progressive_concurrent_readers_share_each_member_observation(self):
+        namespace = self.fs.namespace
+        namespace.progressive_listings = True
+        (self.backend1_dir / "first").touch()
+        (self.backend2_dir / "second").touch()
+        directory = self.temp_dir / "third"
+        directory.mkdir()
+        (directory / "third").touch()
+        self.backends["backend3"] = LocalBackend("backend3", str(directory))
+        gates = {name: threading.Event() for name in self.backends}
+        started = threading.Barrier(len(gates) + 1)
+        calls = []
+        calls_lock = threading.Lock()
+
+        def gated(member, original):
+            def read(path):
+                with calls_lock:
+                    calls.append(member)
+                started.wait(timeout=3)
+                gates[member].wait(4)
+                return original(path)
+            return read
+
+        for member, backend in self.backends.items():
+            backend.listdir_attrs = gated(member, backend.listdir_attrs)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as readers:
+            first = readers.submit(self.fs.readdir, "/", 0)
+            try:
+                started.wait(timeout=3)
+                second = readers.submit(self.fs.readdir, "/", 0)
+                gates["backend3"].set()
+                self.assertEqual(set(first.result(2)), {".", "..", "third"})
+                self.assertEqual(set(second.result(2)), {".", "..", "third"})
+                gates["backend1"].set()
+                self.assertTrue(self._wait_for(lambda: "first" in self.fs.readdir("/", 0)))
+                self.assertNotIn("second", self.fs.readdir("/", 0))
+            finally:
+                for gate in gates.values():
+                    gate.set()
+            self.assertTrue(self._wait_for(lambda: "second" in self.fs.readdir("/", 0)))
+            self.assertCountEqual(calls, self.backends)
+
+    def test_progressive_empty_success_and_late_invalidation(self):
+        namespace = self.fs.namespace
+        namespace.progressive_listings = True
+        (self.backend2_dir / "removed").touch()
+        captured = threading.Event()
+        release = threading.Event()
+        original = self.backends["backend2"].listdir_attrs
+
+        def stale(path):
+            answer = original(path)
+            captured.set()
+            release.wait(4)
+            return answer
+
+        with patch.object(self.backends["backend2"], "listdir_attrs", side_effect=stale):
+            try:
+                self.assertEqual(set(self.fs.readdir("/", 0)), {".", ".."})
+                self.assertTrue(captured.wait(2))
+                (self.backend2_dir / "removed").unlink()
+                namespace.invalidate_dir_cache_entry("/")
+            finally:
+                release.set()
+            self.assertTrue(self._wait_for(lambda: not namespace._listings_in_flight))
+            self.assertNotIn("/", namespace.readdir_snapshot)
+            self.assertEqual(set(self.fs.readdir("/", 0)), {".", ".."})
+            self.assertTrue(self._wait_for(lambda: not namespace._listings_in_flight))
+            self.assertNotIn("removed", self.fs.readdir("/", 0))
+
+    def test_progressive_failed_member_does_not_win_the_race(self):
+        self.fs.namespace.progressive_listings = True
+        failed = threading.Event()
+        original = self.backends["backend2"].listdir_attrs
+        (self.backend2_dir / "healthy").touch()
+
+        def fail(path):
+            failed.set()
+            raise OSError(errno.EIO, "fixture")
+
+        def succeed(path):
+            self.assertTrue(failed.wait(2))
+            return original(path)
+
+        with patch.object(self.backends["backend1"], "listdir_attrs", side_effect=fail), \
+             patch.object(self.backends["backend2"], "listdir_attrs", side_effect=succeed):
+            self.assertIn("healthy", self.fs.readdir("/", 0))
+            self.assertTrue(self._wait_for(lambda: not self.fs.namespace._listings_in_flight))
 
     def test_readdir_falls_back_to_last_known_on_error(self):
         # Prime cache with successful listing

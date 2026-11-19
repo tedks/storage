@@ -117,6 +117,7 @@ class NamespaceService:
         refresh_member_timeout: float = DEFAULT_REFRESH_MEMBER_TIMEOUT,
         listing_limit: int = DEFAULT_LISTING_LIMIT,
         stat_memo_limit: int = DEFAULT_STAT_MEMO_LIMIT,
+        progressive_listings: bool = False,
     ):
         self.backends = backends
         self.cache_manager = cache_manager
@@ -199,6 +200,9 @@ class NamespaceService:
         # Both hold only directories with a listing in flight, foreground
         # or background, from the moment a background refresh is queued
         # until it ends or is cancelled.
+        self.progressive_listings = progressive_listings
+        # First publication shared by foreground callers in the same generation.
+        self._first_publications: Dict[str, Tuple[int, concurrent.futures.Future]] = {}
         self._listings_in_flight: Dict[str, int] = {}
         self._listing_generation: Dict[str, int] = {}
         # Children invalidated while a listing of their directory is in
@@ -1004,16 +1008,94 @@ class NamespaceService:
         # `ls -l` that follows a readdir never probes per entry.
         if snapshot and listing:
             state = self.listing_state(snapshot[0], time.monotonic())
-            if state == "stale":
+            incomplete = self.progressive_listings and len(listing[1]) < len(self.backends)
+            retry_due = incomplete and time.monotonic() - snapshot[0] >= self.refresh_member_timeout
+            if state == "stale" or (retry_due and state == "fresh"):
                 self._schedule_refresh(path)
             if state != "expired":
                 return self._served_snapshot(path, snapshot)
+
+        if self.progressive_listings and len(self.backends) > 1:
+            return self._progressive_readdir(path)
 
         ticket = self._begin_listing(path)
         try:
             return self._list_members(path, ticket)
         finally:
             self._end_listing(path)
+
+    def _progressive_readdir(self, path: str):
+        """Return after a successful member listing. Publish later unions on completion."""
+        with self.listing_lock:
+            current = self._first_publications.get(path)
+            generation = self._listing_generation.get(path, 0)
+            if current is not None and current[0] == generation:
+                first = current[1]
+                ticket = None
+            else:
+                ticket = self._begin_listing_locked(path)
+                first = concurrent.futures.Future()
+                self._first_publications[path] = (ticket.generation, first)
+        if ticket is None:
+            return first.result()
+
+        started_at = time.monotonic()
+        listed_wall = time.time()
+        try:
+            cache_names = self._local_listing(path)
+            pending = self._submit_member_listings(path)
+        except BaseException as exc:
+            self._finish_progressive(path, first)
+            first.set_exception(exc)
+            raise
+
+        # Callbacks run on different member workers, or here if already done.
+        # Serialize only the publication for this directory, never member I/O.
+        publish_lock = Lock()
+        member_count = len(pending)
+        outcomes = {}
+
+        def completed(member, future):
+            try:
+                result = future.result()
+            except Exception as exc:
+                result = exc
+            with publish_lock:
+                outcomes[member] = result
+                finished = len(outcomes) == member_count
+                try:
+                    if self._listing_shut_down:
+                        if not first.done():
+                            first.set_exception(FuseOSError(errno.EINTR))
+                    elif finished or not isinstance(result, Exception):
+                        entries = self._publish_listing(
+                            path, ticket, started_at, listed_wall, cache_names,
+                            outcomes, complete=finished,
+                        )
+                        if not first.done():
+                            first.set_result(entries)
+                except Exception as exc:
+                    if not first.done():
+                        first.set_exception(exc)
+                    else:
+                        self.logger.exception("could not publish a later directory listing")
+                finally:
+                    if finished:
+                        self._finish_progressive(path, first)
+
+        for member, future in pending.items():
+            if future is None:
+                future = concurrent.futures.Future()
+                future.set_exception(RuntimeError("member listing executor unavailable"))
+            future.add_done_callback(lambda done, member=member: completed(member, done))
+        return first.result()
+
+    def _finish_progressive(self, path, first):
+        with self.listing_lock:
+            current = self._first_publications.get(path)
+            if current is not None and current[1] is first:
+                del self._first_publications[path]
+        self._end_listing(path)
 
     def _served_snapshot(self, path: str, snapshot) -> List[str]:
         """A snapshot's entries, with the conflict view recomputed.
@@ -1045,8 +1127,11 @@ class NamespaceService:
     def _begin_listing(self, path: str) -> _ListingTicket:
         """Mark a listing of path in flight; return the ticket it must match."""
         with self.listing_lock:
-            self._listings_in_flight[path] = self._listings_in_flight.get(path, 0) + 1
-            return _ListingTicket(self._listing_generation.setdefault(path, 0), self._child_seq)
+            return self._begin_listing_locked(path)
+
+    def _begin_listing_locked(self, path: str) -> _ListingTicket:
+        self._listings_in_flight[path] = self._listings_in_flight.get(path, 0) + 1
+        return _ListingTicket(self._listing_generation.setdefault(path, 0), self._child_seq)
 
     def _end_listing(self, path: str, *, background: bool = False):
         with self.listing_lock:
@@ -1068,7 +1153,7 @@ class NamespaceService:
         Takes listing_lock and then _listing_executors_lock, never nested.
         """
         with self.listing_lock:
-            if path in self._background_refreshes:
+            if path in self._background_refreshes or path in self._first_publications:
                 return
             self._background_refreshes.add(path)
         ticket = self._begin_listing(path)
@@ -1265,14 +1350,8 @@ class NamespaceService:
         futures = self._submit_member_listings(path, background)
         deadline = started_at + self.refresh_member_timeout if background else None
 
-        entries: Set[str] = {".", ".."}
         try:
-            cache_path = self.cache_manager.get_cache_path(path)
-            if cache_path.exists() and cache_path.is_dir():
-                entries.update(
-                    entry for entry in os.listdir(str(cache_path))
-                    if not self.is_hidden_entry(entry)
-                )
+            cache_names = self._local_listing(path)
         except BaseException:
             # No member listing outlives the readdir that started it, so
             # nothing is in flight once FUSE moves on (shutdown() relies on it).
@@ -1307,12 +1386,32 @@ class NamespaceService:
                 # Cancelled by shutdown().
                 outcomes[backend_name] = exc
 
+        return self._publish_listing(
+            path, ticket, started_at, listed_wall, cache_names, outcomes, verify_out=verify_out,
+        )
+
+    def _local_listing(self, path: str) -> Set[str]:
+        entries = {".", ".."}
+        cache_path = self.cache_manager.get_cache_path(path)
+        if cache_path.is_dir():
+            entries.update(name for name in os.listdir(cache_path) if not self.is_hidden_entry(name))
+        return entries
+
+    def _publish_listing(self, path, ticket, started_at, listed_wall, cache_names, outcomes,
+                         *, complete=True, verify_out=None):
+        entries = set(cache_names)
         backend_attrs: Dict[str, Dict[str, dict]] = {}
         member_entries: Dict[str, Set[str]] = {}
         failed: Set[str] = set()
         with self.dir_cache_lock:
             previous = self.dir_cache.get(path, {})
-            for backend_name, outcome in outcomes.items():
+            for backend_name in self.backends:
+                if backend_name not in outcomes:
+                    cached = previous.get(backend_name)
+                    if cached is not None:
+                        member_entries[backend_name] = cached
+                    continue
+                outcome = outcomes[backend_name]
                 if isinstance(outcome, Exception):
                     failed.add(backend_name)
                     cached = previous.get(backend_name)
@@ -1351,15 +1450,16 @@ class NamespaceService:
                     if published is not None and backend_name in published[1]:
                         split_attrs[backend_name] = dict(published[1][backend_name])
         size_splits = self._size_splits(member_entries, split_attrs)
-        queued = self._schedule_directory_checksums(
-            path,
-            {name: names for name, names in member_entries.items() if name not in failed},
-            backend_attrs,
-            size_splits,
-            replace=verify_out is not None,
-        )
-        if verify_out is not None:
-            verify_out.update({n: m for n, m in queued.items() if len(m) > 1})
+        if complete:
+            queued = self._schedule_directory_checksums(
+                path,
+                {name: names for name, names in member_entries.items() if name not in failed},
+                backend_attrs,
+                size_splits,
+                replace=verify_out is not None,
+            )
+            if verify_out is not None:
+                verify_out.update({n: m for n, m in queued.items() if len(m) > 1})
         visible_entries = self._apply_conflict_view(path, entries, member_entries, size_splits)
         ordered_entries = sorted(visible_entries)
 

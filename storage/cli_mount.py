@@ -178,6 +178,10 @@ def shared_filesystems(backends: Dict[str, Backend]) -> List[List[str]]:
         "(default 60; 0 = off)."
     ),
 )
+@click.option(
+    "--progressive-listings/--no-progressive-listings", default=None,
+    help="Show the first responding member and expand the directory on subsequent listings.",
+)
 def mount(
     mount_target,
     backing_paths,
@@ -206,6 +210,7 @@ def mount(
     bulk_capacity_wait_timeout,
     max_foreground_operations,
     checksum_reverify_interval,
+    progressive_listings,
 ):
     """
     Mount a Storage filesystem
@@ -262,6 +267,7 @@ def mount(
         max_foreground_operations=max_foreground_operations,
         checksum_reverify_interval=checksum_reverify_interval,
         max_sync_workers=max_sync_workers,
+        progressive_listings=progressive_listings,
     )
 
     try:
@@ -434,6 +440,7 @@ def mount(
             streaming_keep_after_close=keep_after_close,
             streaming_read_ahead_window=read_ahead_window,
             readdir_ttl=resolved.readdir_ttl,
+            progressive_listings=resolved.progressive_listings,
             enable_watchers=resolved.enable_watchers,
             revalidate_after=resolved.revalidate_after,
             listing_max_stale=resolved.listing_max_stale,
