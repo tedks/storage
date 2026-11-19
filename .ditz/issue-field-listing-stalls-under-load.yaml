@@ -72,5 +72,18 @@ log_events:
     enabled. The full 49-target suite passed. This is filesystem re-enumeration; #193
     records separate GIO/Nautilus feasibility evidence. No claim that this isolates
     the reported field stall.'
+- time: 2026-11-19T20:47:07-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'A two-directory mounted test also reproduced cross-directory head-of-line
+    blocking on cdc7697: a held request to the member prevented a second client reading
+    that member''s unique small file, with complete and progressive enumeration. Draft
+    #196 lets independent foreground listing workers use spare channels while background
+    refresh remains serial. Both local reproductions pass, plus a disposable two-member
+    SSH mount with a real channel held during the independent read in each FUSE mode.
+    #196 includes #195''s read-source and bounded retry fixes. #193 separately records
+    stock Nautilus same-window observations with simulated member admission. Integrated
+    head 0e874bd passed 49/49 Bazel gate targets and the CLI build. The field user''s
+    particular stall is untraced.'
 blocked_by:
 - field-listing-downloads-to-hash
