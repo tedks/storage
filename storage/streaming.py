@@ -350,11 +350,9 @@ class StreamingReadManager:
         )
         if type(read_ahead_window) is not int or read_ahead_window < 0:
             raise ValueError("read-ahead window must be a non-negative byte count")
-        self._read_ahead_settings = _ReadAheadSettings(
-            keep_after_close if keep_after_close is not None else
-            parse_keep_after_close(DEFAULT_STREAMING_KEEP_AFTER_CLOSE),
-            read_ahead_window,
-        )
+        if keep_after_close is None:
+            keep_after_close = parse_keep_after_close(DEFAULT_STREAMING_KEEP_AFTER_CLOSE)
+        self._read_ahead_settings = _ReadAheadSettings(keep_after_close, read_ahead_window)
         self.partial_suffix = partial_suffix
         self.stream_state_xattr = stream_state_xattr
 

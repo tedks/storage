@@ -3,7 +3,6 @@
 from dataclasses import asdict, dataclass
 from enum import Enum
 from fractions import Fraction
-from math import ceil
 from typing import Dict, Optional, Tuple
 
 
@@ -89,8 +88,9 @@ class StreamingKeepAfterClose:
     def threshold(self, file_size: int) -> int:
         """The span in bytes a reader must reach on a file of file_size bytes."""
         if self.match_all:
+            # Negate the floor of the negative percentage to round up exactly.
             thresholds = self.byte_thresholds + tuple(
-                ceil(file_size * percent / 100) for percent in self.percent_thresholds
+                -(-file_size * percent // 100) for percent in self.percent_thresholds
             )
             return min(file_size, max(thresholds))
 
