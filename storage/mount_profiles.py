@@ -12,7 +12,7 @@ from .checksum_queue import DEFAULT_CHECKSUM_REVERIFY_INTERVAL
 from .foreground_admission import validate_cap
 from .namespace import DEFAULT_LISTING_MAX_STALE
 from .streaming import (
-    DEFAULT_MAX_DOWNLOAD_WORKERS, DEFAULT_MAX_RETAINED_STREAMING_SESSIONS,
+    OBSOLETE_STREAMING_LIMITS,
     validate_download_limits,
 )
 from .streaming_settings import parse_keep_after_close, parse_size
@@ -21,7 +21,6 @@ from .streaming_settings import parse_keep_after_close, parse_size
 DEFAULT_CACHE_SIZE = "10G"
 DEFAULT_SYNC_WORKERS = 2
 DEFAULT_STREAMING_CHUNK_SIZE = "1M"
-DEFAULT_MAX_STREAMING_SESSIONS = 8
 DEFAULT_REVALIDATE_AFTER = 60.0
 DEFAULT_MOUNT_CONFIG_NAME = "storage.toml"
 # Profile keys passed through to the kernel cache (storage.fs.fuse_mount_options).
@@ -43,7 +42,6 @@ class ResolvedMountConfig:
     debug: bool
     streaming_reads: bool
     streaming_chunk_size: str
-    max_streaming_sessions: int
     # Seconds a listing is fresh; None follows revalidate_after.
     readdir_ttl: Optional[float]
     enable_watchers: bool
@@ -74,8 +72,8 @@ class ResolvedMountConfig:
     member_display_names: Tuple[Optional[str], ...] = ()
     # None keeps the historical fixed sync pool at `workers`.
     max_sync_workers: Optional[int] = None
-    max_download_workers: int = DEFAULT_MAX_DOWNLOAD_WORKERS
-    max_retained_streaming_sessions: int = DEFAULT_MAX_RETAINED_STREAMING_SESSIONS
+    max_download_workers: Optional[int] = None
+    obsolete_streaming_limits: Tuple[str, ...] = ()
     streaming_read_ahead_window: Optional[str] = None
 
     @property
@@ -782,22 +780,21 @@ def resolve_mount_configuration(
         (None,) * len(resolved_remote) if remote else config_values["remote_display_names"]
     )
 
-    streaming_limits = {}
-    for name, override, default in (
-        ("max_streaming_sessions", max_streaming_sessions, DEFAULT_MAX_STREAMING_SESSIONS),
-        ("max_download_workers", max_download_workers, DEFAULT_MAX_DOWNLOAD_WORKERS),
-        ("max_retained_streaming_sessions", max_retained_streaming_sessions,
-         DEFAULT_MAX_RETAINED_STREAMING_SESSIONS),
-    ):
-        configured = config_values[name] if override is None else override
-        streaming_limits[name] = default if configured is None else configured
+    download_worker_limit = (config_values["max_download_workers"]
+                             if max_download_workers is None else max_download_workers)
     try:
-        validate_download_limits(streaming_limits)
+        validate_download_limits({"max_download_workers": download_worker_limit})
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
+    ignored = tuple(
+        name for name, override in zip(OBSOLETE_STREAMING_LIMITS, (
+            max_streaming_sessions, max_retained_streaming_sessions,
+        )) if override is not None or config_values[name] is not None
+    )
 
     return ResolvedMountConfig(
-        **streaming_limits,
+        max_download_workers=download_worker_limit,
+        obsolete_streaming_limits=ignored,
         mountpoint=mountpoint,
         backing_paths=resolved_local,
         remote=resolved_remote,

@@ -83,7 +83,6 @@ class TestFSStreamingIntegration(unittest.TestCase):
             start_sync=False,
             streaming_reads=True,
             streaming_chunk_size=chunk_size,
-            max_streaming_sessions=2,
             **({
                 "streaming_keep_after_close": parse_keep_after_close(keep_after_close),
                 "streaming_read_ahead_window": 4 * chunk_size,
@@ -113,7 +112,7 @@ class TestFSStreamingIntegration(unittest.TestCase):
 
     def test_download_workers_grow_for_runnable_files_and_retire_when_idle(self):
         manager = self.fs._streaming_manager
-        manager.update_download_limits(max_streaming_sessions=3, max_download_workers=2)
+        manager.update_download_limits(max_download_workers=2)
         manager._download_pool.idle_seconds = 0.05
         self.backend.worker_gate = threading.Event()
         sessions = []
@@ -136,6 +135,54 @@ class TestFSStreamingIntegration(unittest.TestCase):
             self.assertTrue(session.background_finished.wait(timeout=3))
             self.assertEqual(session.io_fd, -1)
         self.assertTrue(self._wait_for(lambda: manager._download_pool.snapshot() == (0, 0, 0)))
+
+    def test_open_preserves_descriptor_and_member_probe_errors_without_copy(self):
+        name = "failure.bin"
+        path = "/" + name
+        payload = os.urandom(128 * 1024)
+        (self.backend_dir / name).write_bytes(payload)
+        actual_open = os.open
+
+        def cannot_create(path, *args, **kwargs):
+            if Path(path).name.startswith(".storage-staging-"):
+                raise OSError(errno.EMFILE, "synthetic descriptor budget", path)
+            return actual_open(path, *args, **kwargs)
+
+        with patch.object(self.backend, "copy_to_local") as copy:
+            with patch("storage.streaming.os.open", side_effect=cannot_create), \
+                    self.assertRaises(FuseOSError) as fd_error:
+                self.fs.open(path, os.O_RDONLY)
+            self.assertEqual(fd_error.exception.errno, errno.EMFILE)
+            with patch.object(self.backend, "stat", side_effect=OSError(errno.EACCES, "denied", path)), \
+                    self.assertLogs(self.fs.logger, level="WARNING") as logs, self.assertRaises(FuseOSError) as denied:
+                self.fs.open(path, os.O_RDONLY)
+            self.assertEqual(denied.exception.errno, errno.EACCES)
+            self.assertNotIn(name, "\n".join(logs.output))
+            copy.assert_not_called()
+        stats = self.fs._streaming_stats_snapshot()
+        self.assertEqual(stats["streaming_open_error_descriptors"], 1)
+        self.assertEqual(stats["streaming_open_error_source_probe"], 1)
+        self._assert_not_cached(name)
+        self.assertEqual(self.fs._streaming_manager.list_download_sessions(), [])
+
+        fd = self.fs.open(path, os.O_RDONLY)
+        self.assertEqual(self.fs.read(path, 4096, 0, fd), payload[:4096])
+        with patch.object(self.backend, "read_file", side_effect=OSError(errno.EACCES, "denied")), \
+                self.assertRaises(FuseOSError) as denied:
+            self.fs.read(path, 4096, 4096, fd)
+        self.assertEqual(denied.exception.errno, errno.EACCES)
+        self.fs.release(path, fd)
+
+    def test_member_probe_failure_can_use_an_alternate_member(self):
+        payload = os.urandom(128 * 1024)
+        (self.backend_dir / "alternate.bin").write_bytes(payload)
+        alternate = LocalBackend("alternate", str(self.backend_dir), speed_priority=99)
+        self.fs.backends[alternate.name] = alternate
+        with patch.object(self.backend, "stat", side_effect=OSError(errno.EACCES, "denied")):
+            fd = self.fs.open("/alternate.bin", os.O_RDONLY)
+            self.assertIs(self._session_for(fd).backend, alternate)
+            self.assertEqual(self.fs.read("/alternate.bin", 4096, 0, fd), payload[:4096])
+            self.fs.release("/alternate.bin", fd)
 
     def test_foreground_overlapping_range_can_use_interactive_reserve(self):
         payload = os.urandom(512 * 1024)
@@ -178,38 +225,68 @@ class TestFSStreamingIntegration(unittest.TestCase):
             self.assertTrue(session.background_finished.wait(timeout=3))
             self.assertEqual([call.args for call in read.call_args_list], [(path, 0, chunk), (path, chunk, chunk)])
 
-    def test_lower_retained_limit_drains_existing_fill_and_applies_to_new_closes(self):
+    def test_more_than_sixty_four_qualified_fills_can_remain_parked(self):
         manager = self.fs._streaming_manager
-        manager.update_download_limits(max_download_workers=1, max_retained_streaming_sessions=1)
+        manager.update_download_limits(max_download_workers=1)
         self.backend.worker_gate = threading.Event()
+        self.backend.range_delay = 0
         payload = os.urandom(384 * 1024)
-
-        def open_and_read(name):
+        retained = []
+        for index in range(70):
+            name = f"retained-{index}.bin"
             (self.backend_dir / name).write_bytes(payload)
             path = "/" + name
             fd = self.fs.open(path, os.O_RDONLY)
+            retained.append(self._session_for(fd))
+            self.assertEqual(self.fs.read(path, 128 * 1024, 0, fd), payload[:128 * 1024])
+            self.fs.release(path, fd)
+        self.assertTrue(self.backend.worker_in_read.wait(timeout=3))
+        self.assertEqual(self.fs._streaming_stats_snapshot()["retained_streaming_sessions"], 70)
+        self.assertEqual(manager._download_pool.snapshot(), (1, 1, 69))
+        for session in retained:
+            self.assertEqual(manager.cancel_download_session(session.session_id), "cancelled")
+        self.backend.worker_gate.set()
+        for session in retained:
+            self.assertTrue(session.background_finished.wait(timeout=3))
+            self.assertEqual(session.io_fd, -1)
+        self.assertEqual(manager.list_download_sessions(), [])
+
+    def test_automatic_workers_grow_beyond_an_explicit_throttle(self):
+        manager = self.fs._streaming_manager
+        self.backend.worker_gate = threading.Event()
+        payload = os.urandom(384 * 1024)
+        manager.update_download_limits(max_download_workers=1)
+        handles = []
+        for index in range(6):
+            path = f"/automatic-{index}.bin"
+            (self.backend_dir / path[1:]).write_bytes(payload)
+            fd = self.fs.open(path, os.O_RDONLY)
+            handles.append((path, fd, self._session_for(fd)))
+            self.assertEqual(self.fs.read(path, 32 * 1024, 0, fd), payload[:32 * 1024])
+        self.assertTrue(self._wait_for(lambda: manager._download_pool.snapshot() == (1, 1, 5)))
+        self.assertIsNone(manager.update_download_limits(max_download_workers=None)["max_download_workers"])
+        self.assertTrue(self._wait_for(lambda: manager._download_pool.snapshot() == (6, 6, 0)))
+        for path, fd, _ in handles:
+            self.fs.release(path, fd)
+        self.backend.worker_gate.set()
+        for _, _, session in handles:
+            self.assertTrue(session.background_finished.wait(timeout=3))
+
+    def test_no_worker_available_closes_retained_partial_without_copying(self):
+        payload = os.urandom(384 * 1024)
+        (self.backend_dir / "unavailable-worker.bin").write_bytes(payload)
+        path = "/unavailable-worker.bin"
+        with patch.object(threading.Thread, "start", side_effect=OSError(errno.EAGAIN, "thread limit")), \
+                patch.object(self.backend, "copy_to_local") as copy:
+            fd = self.fs.open(path, os.O_RDONLY)
             session = self._session_for(fd)
             self.assertEqual(self.fs.read(path, 128 * 1024, 0, fd), payload[:128 * 1024])
-            return path, fd, session
-
-        older, fd, old_session = open_and_read("old-retained.bin")
-        self.assertTrue(self.backend.worker_in_read.wait(timeout=3))
-        self.fs.release(older, fd)
-        self.assertEqual(manager.update_download_limits(max_retained_streaming_sessions=0)
-                         ["max_retained_streaming_sessions"], 0)
-        self.assertFalse(old_session.detached)
-
-        newer, fd, new_session = open_and_read("new-retained.bin")
-        self.assertTrue(new_session.readers_consumed)
-        self.fs.release(newer, fd)
-        self.assertTrue(new_session.detached)
-        self.assertTrue(new_session.background_finished.wait(timeout=3))
-        self.assertFalse((self.cache_dir / "new-retained.bin.storage.partial").exists())
-        self.assertEqual(manager.list_download_sessions()[0]["id"], old_session.session_id)
-
-        self.backend.worker_gate.set()
-        self.assertTrue(old_session.background_finished.wait(timeout=3))
-        self.assertEqual((self.cache_dir / "old-retained.bin").read_bytes(), payload)
+            self.assertTrue(session.readers_consumed)
+            self.fs.release(path, fd)
+        copy.assert_not_called()
+        self.assertTrue(session.background_finished.is_set())
+        self.assertEqual(session.io_fd, -1)
+        self._assert_not_cached("unavailable-worker.bin")
 
     def test_reader_reclaims_retained_space_without_touching_local_writes(self):
         self.fs.cache_manager.max_size_bytes = 512 * 1024
@@ -2140,7 +2217,7 @@ class TestFSStreamingIntegration(unittest.TestCase):
     def test_streaming_open_racing_destroy_registers_no_session(self):
         # An open misses the registry and prepares its partial; destroy runs
         # to the end before the open registers. The open must not register
-        # a session (nothing would ever stop it): it takes the full-file path.
+        # a session or retry the interrupted open as a whole-file copy.
         self.backend.copy_delay = 0
         manager = self.fs._streaming_manager
         import storage.streaming as streaming_module
@@ -2173,13 +2250,10 @@ class TestFSStreamingIntegration(unittest.TestCase):
             thread.join(timeout=5.0)
         self.assertFalse(thread.is_alive())
 
-        vfd = results["open"]
-        self.assertIsInstance(vfd, int, vfd)
-        with self.fs._fd_lock:
-            self.assertIsNone(self.fs._fd_map[vfd].prefetch_session)
-        self.assertEqual(self.fs.read('/unmount.bin', len(payload), 0, vfd), payload)
-        self.fs.release('/unmount.bin', vfd)
-        self._assert_cache_holds("unmount.bin", payload, dirty=False)
+        self.assertIsInstance(results["open"], FuseOSError)
+        self.assertEqual(results["open"].errno, errno.EINTR)
+        self.assertEqual(list(self.cache_dir.glob("*.storage.partial")), [])
+        self._assert_not_cached("unmount.bin")
 
     def test_streaming_destroy_leaves_an_open_during_destroy_alone(self):
         # destroy has taken the sessions and is waiting for a worker when an
@@ -2206,18 +2280,15 @@ class TestFSStreamingIntegration(unittest.TestCase):
             destroyer = threading.Thread(target=manager.destroy, name="destroyer")
             destroyer.start()
             self.assertTrue(in_join.wait(timeout=3.0))
-            vfd_b = self.fs.open('/during.bin', os.O_RDONLY)
+            with self.assertRaises(FuseOSError) as interrupted:
+                self.fs.open('/during.bin', os.O_RDONLY)
+            self.assertEqual(interrupted.exception.errno, errno.EINTR)
             go.set()
             destroyer.join(timeout=5.0)
         self.assertFalse(destroyer.is_alive())
-
-        with self.fs._fd_lock:
-            self.assertIsNone(self.fs._fd_map[vfd_b].prefetch_session)
         self.assertTrue(session_a.detached)
-        self.assertEqual(self.fs.read('/during.bin', len(payload), 0, vfd_b), payload)
         self.fs.release('/during.bin', vfd_a)
-        self.fs.release('/during.bin', vfd_b)
-        self._assert_cache_holds("during.bin", payload, dirty=False)
+        self._assert_not_cached("during.bin")
 
     def test_streaming_open_does_not_attach_to_a_session_being_cleaned_up(self):
         # The worker's tail has decided to clean up a failed session (no
@@ -2256,25 +2327,19 @@ class TestFSStreamingIntegration(unittest.TestCase):
             go_tail.set()
             self.assertTrue(in_promote.wait(timeout=3.0))
 
-            vfd_b = self.fs.open('/cleanup.bin', os.O_RDONLY)
+            with patch.object(self.backend, "copy_to_local") as copy, self.assertRaises(FuseOSError) as retry:
+                self.fs.open('/cleanup.bin', os.O_RDONLY)
+            self.assertEqual(retry.exception.errno, errno.EAGAIN)
+            copy.assert_not_called()
             go_promote.set()
             self.assertTrue(session.background_finished.wait(timeout=5.0))
-        self.assertTrue(session.background_finished.is_set())
         self.assertTrue(session.detached)
-
-        with self.fs._fd_lock:
-            self.assertIsNone(self.fs._fd_map[vfd_b].prefetch_session)
-        self.assertEqual(
-            self.fs.read('/cleanup.bin', 4096, 16 * 1024, vfd_b), payload[16 * 1024:20 * 1024],
-        )
-        self.fs.release('/cleanup.bin', vfd_b)
-        # The full fetch filled the path first; the promotion left it alone.
-        self._assert_cache_holds("cleanup.bin", payload, dirty=False)
+        self.assertEqual((self.cache_dir / "cleanup.bin").read_bytes(), payload[:4096])
 
     def test_streaming_open_does_not_attach_to_a_failed_session(self):
         # The session has an error and a reader still attached, so its
         # cleanup is not claimed yet. An open attaching now would get EIO on
-        # every range the session lacks; it takes the full-file path.
+        # every range the session lacks; report the original error at open.
         self.backend.copy_delay = 0
         manager = self.fs._streaming_manager
         payload = os.urandom(192 * 1024)
@@ -2287,12 +2352,10 @@ class TestFSStreamingIntegration(unittest.TestCase):
             manager._schedule_background(session)
             self.assertFalse(session.failed_cleanup_claimed)
 
-        vfd_b = self.fs.open('/failed.bin', os.O_RDONLY)
-
-        with self.fs._fd_lock:
-            self.assertIsNone(self.fs._fd_map[vfd_b].prefetch_session)
-        self.assertEqual(self.fs.read('/failed.bin', len(payload), 0, vfd_b), payload)
-        self.fs.release('/failed.bin', vfd_b)
+        with patch.object(self.backend, "copy_to_local") as copy, self.assertRaises(FuseOSError) as failure:
+            self.fs.open('/failed.bin', os.O_RDONLY)
+        self.assertEqual(failure.exception.errno, errno.EIO)
+        copy.assert_not_called()
         self.fs.release('/failed.bin', vfd_a)
 
     def test_streaming_open_attaches_to_an_errored_session_with_every_byte(self):

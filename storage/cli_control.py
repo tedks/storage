@@ -56,9 +56,10 @@ def control(ctx, cache, profile, config_path, timeout, json_output):
 
 
 def _print_parameters(payload: dict):
-    click.echo("Live streaming limits")
+    click.echo("Live streaming settings")
     for setting, value in payload["limits"].items():
-        click.echo(f"  {setting} = {json.dumps(value, sort_keys=True)}")
+        display = "auto" if setting == "max_download_workers" and value is None else json.dumps(value, sort_keys=True)
+        click.echo(f"  {setting} = {display}")
     click.echo("Streaming settings that require a restart")
     for setting, value in payload["restart_only"].items():
         click.echo(f"  {setting} = {json.dumps(value, sort_keys=True)}")
@@ -90,12 +91,8 @@ def control_get(target):
 
 
 @control.command("set")
-@click.option("--max-streaming-sessions", type=int,
-              help="Concurrent streaming files with readers (1–1024).")
-@click.option("--max-retained-streaming-sessions", type=int,
-              help="Retained downloads after the last read handle closes (0–1024).")
-@click.option("--max-download-workers", type=int,
-              help="Background download worker ceiling (1–32).")
+@click.option("--max-download-workers", metavar="COUNT|auto",
+              help="Background worker throttle, or auto to use runnable demand.")
 @click.option("--streaming-keep-after-close",
               help="Read span that qualifies for retention, e.g., all:32M,30%.")
 @click.option("--streaming-read-ahead-window",
@@ -105,7 +102,14 @@ def control_set(target, **limits):
     """Apply live streaming limits together. Changes last until unmount."""
     changes = {key: value for key, value in limits.items() if value is not None}
     if not changes:
-        raise click.UsageError("Provide at least one live streaming limit to set")
+        raise click.UsageError("Provide at least one live streaming setting to set")
+    if "max_download_workers" in changes:
+        limit = changes["max_download_workers"]
+        try:
+            changes["max_download_workers"] = (None if limit == "auto" else
+                                               click.IntRange(min=1).convert(limit, None, None))
+        except click.BadParameter as exc:
+            raise click.BadParameter(exc.message, param_hint="--max-download-workers") from exc
     payload = target.request("streaming.set", limits=changes)
     if not target.json_output:
         _print_parameters(payload)

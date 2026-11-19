@@ -60,6 +60,6 @@ The parent lane maintains the CTO roster. Its mission and these tests prohibit t
 
 ## Interfaces and Dependencies
 
-Depend on `StreamingReadManager.download_limits`, `update_download_limits`, `list_download_sessions`, and `cancel_download_session` from the reader-downloads branch. The socket handler validates command and argument shape, and the streaming manager validates parameter values and applies updates in one operation. The initial live parameters are `max_streaming_sessions` (1 to 1024), `max_retained_streaming_sessions` (0 to 1024), and `max_download_workers` (1 to 32).
+Depend on `StreamingReadManager.download_limits`, `update_download_limits`, `list_download_sessions`, and `cancel_download_session` from the reader-downloads branch. The socket handler validates command and argument shape, and the streaming manager validates parameter values and applies updates in one operation. The live worker setting `max_download_workers` accepts a positive integer or automatic mode. Earlier file-count settings are obsolete.
 
 2026-11-19: Recorded the assigned worktree, agreed API, and mount-level test. Recorded the fast gate results and the rebase onto the integrated scheduler.

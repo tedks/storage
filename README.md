@@ -243,25 +243,22 @@ a 2 GiB file, a 1 MiB contiguous read opens a speculative window of up to
 4 MiB after that span, while a contiguous read of about 614.4 MiB
 (644,245,095 bytes) qualifies the file to keep downloading after close.
 
-Streaming read-ahead and retained fills share an adaptive pool of up to
-`max_download_workers` (`--max-download-workers`, default 4, range 1–32).
-Workers start when chunks are runnable and retire after 30 idle seconds.
+Streaming read-ahead and retained fills share an adaptive pool. Workers
+start as chunks become runnable and retire after 30 idle seconds. Set
+`max_download_workers` (`--max-download-workers`) to a positive integer
+to throttle background transfers across the mount.
 Each worker takes one chunk before checking the queue again. Files with
 open readers take precedence, with a turn for a waiting closed file
 after four reader turns. Reopening a retained fill gives it reader
 priority and reuses the bytes it already has.
 
-`max_streaming_sessions` (`--max-streaming-sessions`, default 8) limits new
-streaming sessions when that many distinct files have open readers. A new
-open above that limit uses the whole-file cache path. A separate
-`max_retained_streaming_sessions` (`--max-retained-streaming-sessions`,
-default 64) limits unfinished fills that continue after the last close.
-Each retains one partial inode and descriptor. The file's entire length
-counts against `cache_size`, even while the partial is sparse. When the
-retained limit is full, the newest close discards its incomplete partial.
-Set the retained limit to 0 to discard every incomplete fill on last close.
-If the cache cannot make enough space for a new reader, it can discard
-unfinished retained fills to make room.
+The kernel governs resources for open files and retained fills. Each
+cached partial uses an inode and a descriptor. The old mount settings
+`max_streaming_sessions` and `max_retained_streaming_sessions` are obsolete.
+Existing profiles still load and warn that the settings are ignored.
+On range-capable reads, a storage or member error returns its errno to
+the caller. A selected member without range support uses the whole-file
+cache path, as do write opens and opens with streaming disabled.
 
 SSH read-ahead and retained fills use bulk SFTP capacity, as do rsync
 members' range reads. A worker claims bytes only after getting a bulk
@@ -540,7 +537,7 @@ override or the profile now points to a different cache.
 ```bash
 storage control --profile media
 storage control --profile media --config ./storage.toml get
-storage control --cache '/var/cache/my media' set --max-streaming-sessions 4 --max-download-workers 2
+storage control --cache '/var/cache/my media' set --max-download-workers 2
 storage control --profile media set --streaming-keep-after-close 'all:32M,30%' --streaming-read-ahead-window 4M
 storage control --profile media downloads
 storage control --profile media cancel 474b595adc054281bced844067939d97
@@ -557,9 +554,7 @@ streaming downloads independently of background sync.
 
 | Live limit | Range | Effect |
 | --- | --- | --- |
-| `--max-streaming-sessions` | 1–1024 | Concurrent streaming files with readers. Additional cold opens fall back to a whole-file fetch. |
-| `--max-retained-streaming-sessions` | 0–1024 | Reader-free downloads retained after close. Set to `0` to discard unfinished downloads at future last closes. Existing retained downloads can finish. |
-| `--max-download-workers` | 1–32 | Ceiling for background download workers. When lowered, transfers in progress finish their current chunks before the lower cap applies. |
+| `--max-download-workers` | Positive integer or `auto` | Optional background transfer throttle. In-progress chunks finish when the throttle is lowered. Use `auto` to restore demand-driven growth. |
 | `--streaming-keep-after-close` | Sizes and percentages | Re-evaluates open, unqualified files using the read spans already observed. Files that qualify stay qualified for that download. |
 | `--streaming-read-ahead-window` | Non-negative size | Speculative window before qualification. A background range request already in flight can finish under the previous window. |
 

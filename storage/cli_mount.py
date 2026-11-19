@@ -95,17 +95,17 @@ def shared_filesystems(backends: Dict[str, Backend]) -> List[List[str]]:
 @click.option(
     "--max-streaming-sessions",
     type=int,
-    help="Maximum new streaming sessions with live readers (default 8).",
+    hidden=True,
 )
 @click.option(
     "--max-download-workers",
     type=int,
-    help="Maximum adaptive workers for streaming downloads (1–32, default 4).",
+    help="Optional background streaming worker throttle. Default is automatic.",
 )
 @click.option(
     "--max-retained-streaming-sessions",
     type=int,
-    help="Maximum unfinished streaming fills retained without readers (default 64).",
+    hidden=True,
 )
 @click.option(
     "--streaming-keep-after-close",
@@ -357,9 +357,10 @@ def mount(
     click.echo(
         f"  Streaming chunk: {resolved.streaming_chunk_size} ({streaming_chunk_bytes:,} bytes)"
     )
-    click.echo(f"  Max streaming sessions with readers: {resolved.max_streaming_sessions}")
-    click.echo(f"  Max retained streaming sessions: {resolved.max_retained_streaming_sessions}")
-    click.echo(f"  Max streaming download workers: {resolved.max_download_workers}")
+    for setting in resolved.obsolete_streaming_limits:
+        click.echo(f"Warning: {setting} is obsolete and ignored", err=True)
+    worker_limit = resolved.max_download_workers
+    click.echo(f"  Streaming download workers: {'automatic' if worker_limit is None else f'up to {worker_limit}'}")
     click.echo(
         "  Streaming keep after close: "
         f"{resolved.streaming_keep_after_close or DEFAULT_STREAMING_KEEP_AFTER_CLOSE}"
@@ -429,9 +430,7 @@ def mount(
             debug=resolved.debug,
             streaming_reads=resolved.streaming_reads,
             streaming_chunk_size=streaming_chunk_bytes,
-            max_streaming_sessions=resolved.max_streaming_sessions,
             max_download_workers=resolved.max_download_workers,
-            max_retained_streaming_sessions=resolved.max_retained_streaming_sessions,
             streaming_keep_after_close=keep_after_close,
             streaming_read_ahead_window=read_ahead_window,
             readdir_ttl=resolved.readdir_ttl,
