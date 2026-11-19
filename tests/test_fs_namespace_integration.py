@@ -972,7 +972,9 @@ class TestFSNamespaceIntegration(unittest.TestCase):
                 self.assertEqual("kept.txt" in unknown, removing)
                 self.assertEqual("kept.txt" in attrs["backend1"], not removing)
 
-    def test_readdir_reuses_one_thread_per_member(self):
+    def test_readdir_reuses_one_thread_for_single_channel_members(self):
+        for member in self.backends.values():
+            member.listing_concurrency = lambda: 1
         threads = {"backend1": set(), "backend2": set()}
 
         def record(name):
@@ -1288,9 +1290,9 @@ class TestFSNamespaceIntegration(unittest.TestCase):
         self.assertTrue(self._wait_for(lambda: not namespace._hung_listings))
         self.assertEqual(namespace._listings_in_flight, {})
 
-    def test_refresh_skips_a_member_busy_with_a_foreground_listing(self):
-        # A member's worker held by something else (here a foreground
-        # listing) makes a refresh time out while queued: the cancel
+    def test_refresh_skips_a_member_busy_with_a_prior_refresh(self):
+        # A member's worker held by another refresh makes this one time
+        # out while queued: the cancel
         # succeeds, but the next refresh must not wait again.
         (self.backend1_dir / "d").mkdir()
         namespace = self.fs.namespace

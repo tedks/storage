@@ -189,6 +189,11 @@ class SSHBackend(Backend):
             logger=self.logger,
         )
 
+    def listing_concurrency(self) -> int:
+        # Let independent scans use spare channels, keeping headroom for a
+        # reader. Each foreground listing still requests an interactive lease.
+        return self._pool.nominal_bulk_capacity()
+
     def sync_upload_capacity(self) -> Optional[int]:
         # Uploads to an ssh:// member share this connection's background
         # SFTP channels with every other background call (copy_from_local

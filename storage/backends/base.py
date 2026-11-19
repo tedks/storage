@@ -143,6 +143,10 @@ class Backend(ABC):
         self.encrypt_all = False
         self._available = True
 
+    def listing_concurrency(self) -> Optional[int]:
+        """Configured foreground listing concurrency, or the executor default."""
+        return None
+
     def sync_upload_capacity(self) -> Optional[int]:
         """How many sync uploads this member can carry at once by its own
         configuration, or None when it sets no such limit. Nominal, from
