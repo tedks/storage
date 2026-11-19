@@ -23,3 +23,12 @@ log_events:
   who: Ted Smith
   what: started
   comment: ""
+- time: 2026-11-19T00:23:35-00:00
+  who: Ted Smith
+  what: commented
+  comment: Draft PR https://github.com/tedks/storage/pull/184 at c435cc50a0ee82dd665b55199712ece7ba64fb0a.
+    The all-gates suite passed all 48 targets and //:storage_cli built. On base 59e8d28,
+    the eight mounted canonical browse cases showed the mtime jump and the two read-only
+    conflict cases overwrote the new member bytes. Both writable conflict controls
+    passed on base and fixed heads. On the fixed head all 12 mounted regressions and
+    controls passed.
