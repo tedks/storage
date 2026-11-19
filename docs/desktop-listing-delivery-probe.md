@@ -72,3 +72,24 @@ use the property and action to atomically reload a specific directory during
 navigation. The client-side proof uses the directory monitor directly.
 [Nautilus 46.4 window-to-locations property](https://github.com/GNOME/nautilus/blob/46.4/src/nautilus-application.c#L1243-L1308),
 [Nautilus 46.4 reload action](https://github.com/GNOME/nautilus/blob/46.4/src/nautilus-window.c#L237-L245).
+
+## Other tabs during a pending listing
+
+A separate scratch trial used one stock Nautilus 46.4 process, one window,
+and one threaded libfuse 2.9.9 mount on the same Linux and GIO versions.
+Each case held one `readdir` at a test gate while Nautilus opened a fresh
+second tab. The fixture used a shared admission lock for the two directories
+representing one member. Another directory on the mount used independent
+admission. The test matched both tab locations to the same window and
+process, and checked the displayed rows through AT-SPI.
+
+| Second tab | Observation while the first `readdir` was held |
+| --- | --- |
+| An unrelated local `file://` directory | Its row appeared before release. |
+| A directory sharing the held listing's admission lock | Its FUSE request arrived. Its row stayed absent throughout a one-second observation and appeared after release. |
+| An independently admitted directory on the same threaded FUSE mount | Its FUSE reply and visible row arrived before release. |
+
+The trial isolates head-of-line blocking at a shared admission queue as one
+way a listing can stall another tab. It covers one held request and one
+second tab per case, with synthetic admission and no Storage scheduler or
+remote backend in the fixture.
