@@ -26,3 +26,16 @@ log_events:
   who: Ted Smith
   what: started
   comment: ""
+- time: 2026-11-19T00:48:04-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Draft PR https://github.com/tedks/storage/pull/189 at d113a13df9fc4b0b7002a88a8921f0218d4bcbb8,
+    stacked directly on retention 0f02210a58efd801d50aadf57e2f8dd1ba03bcf5. The final
+    combined run passed all 49 targets in //:storage_tests_all_gates, and //:storage_cli
+    built at the same head. Gate receipt records tree 5800d7f4bef2850cbee513616487fa7f485066b1
+    and 2026-11-19 00:46:58 UTC.
+
+    Four actual mounted regressions across SSH/local and both FUSE loop modes fail
+    on the previous auto_cache policy and pass on the new default. Each warm pair
+    uses the same member transfer, and each confirmed refetch adds one transfer. Genuine
+    writable descriptors retain and update their backing inodes in both modes.'
