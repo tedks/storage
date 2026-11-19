@@ -186,6 +186,16 @@ class TestParseKeepAfterClose(unittest.TestCase):
         # Percentages round down.
         self.assertEqual(1, spec.threshold(3))
 
+    def test_all_uses_the_largest_threshold_capped_at_the_file_size(self):
+        spec = parse_keep_after_close(" all: 32M , 30% ")
+        mib = 1024 ** 2
+        self.assertEqual(32 * mib, spec.threshold(64 * mib))
+        self.assertEqual(644_245_095, spec.threshold(2048 * mib))
+        self.assertEqual(9, spec.threshold(9))
+        self.assertEqual(0, spec.threshold(0))
+        self.assertEqual(1, parse_keep_after_close("all:30%").threshold(1))
+        self.assertEqual(0, parse_keep_after_close("all:0,0%").threshold(mib))
+
     def test_zero_means_any_read(self):
         self.assertEqual(0, parse_keep_after_close("0").threshold(10 * 1024 ** 3))
         self.assertEqual(0, parse_keep_after_close("0%").threshold(10 * 1024 ** 3))
@@ -199,7 +209,7 @@ class TestParseKeepAfterClose(unittest.TestCase):
 
     def test_bad_values_rejected(self):
         for value in ("", " ", ",", "4M,", ",50%", "-1M", "-5%", "101%", "100.5%",
-                      "abc", "4X", "1/2%", "infM", "nan%", "50 %", "4M;50%", "0x10",
+                      "abc", "4X", "1/2%", "infM", "nan%", "50 %", "4M;50%", "0x10", "all:", "all:,30%", "all:32M,all:30%",
                       "\uff14M", "\u0665\u0660%"):
             with self.subTest(value=value):
                 with self.assertRaises(ValueError):

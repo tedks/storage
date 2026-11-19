@@ -29,14 +29,14 @@ max_streaming_sessions = 8
 max_retained_streaming_sessions = 64
 # Workers appear as chunks become runnable and retire after 30 idle seconds.
 max_download_workers = 4
-# Keep prefetching after the last reader closes once readers have read a
-# contiguous span this long: comma-separated sizes or percentages of the
-# file, whichever is reached first. Unset means 4 chunks or 50% ("4M,50%"
-# at the 1M chunk above); "0" keeps prefetching after any read; "100%"
-# effectively never keeps prefetching after a close. Until readers reach it,
-# read-ahead while the file is open also stays within this far past what
-# they read.
-streaming_keep_after_close = "4M,50%"
+# Retain unfinished downloads after the longest contiguous requested span
+# reaches the larger of 32 MiB and 30% of the file, capped at the file size.
+# Without "all:" a comma-separated list uses the first threshold reached.
+# "0" qualifies after any read; "100%" requires reading the whole file.
+streaming_keep_after_close = "all:32M,30%"
+# Maximum speculative read-ahead beyond the latest read span before it
+# qualifies. Use "0" to disable pre-qualification read-ahead.
+streaming_read_ahead_window = "4M"
 # Seconds after which opening a cached, synced file stats the member that
 # holds it and refetches the file if the member's copy changed. 0 checks at
 # every open.

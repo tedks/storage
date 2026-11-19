@@ -7,7 +7,6 @@ import threading
 import time
 from collections import Counter
 from dataclasses import dataclass, field
-from fractions import Fraction
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -20,6 +19,10 @@ from .backends.local import rename_noreplace as _rename_noreplace
 from .cache_metadata import PREFIX_XATTR, copy_member_attributes
 from .control import ControlError, ControlServer
 from .models import FileLocation, FileMetadata, StreamingKeepAfterClose, SyncStatus
+from .streaming_settings import (
+    DEFAULT_STREAMING_KEEP_AFTER_CLOSE, DEFAULT_STREAMING_READ_AHEAD_WINDOW,
+    parse_keep_after_close, parse_read_ahead_window,
+)
 
 # A foreground read fetches only the bytes the reader asked for that are not
 # already there or being fetched; streaming_chunk_size is the unit of the
@@ -41,18 +44,6 @@ STREAMING_READ_AHEAD_START_CHUNKS = 1
 # instead of growing with every read.
 STREAMING_MAX_FOREGROUND_FRAGMENTS = 1024
 
-# Read-ahead outlives the last close only for readers that consumed the file.
-# The evidence is the longest contiguous span the readers asked for (not what
-# was fetched: the worker runs ahead of the readers), checked against the
-# mount's streaming_keep_after_close. Its
-# default is this many chunks (4 MiB at the default 1 MiB chunk) or half the
-# file, whichever is smaller. A content-type sniff or a thumbnailer reads a
-# few KiB to a few MiB at scattered offsets and stays under it; a copy or a
-# player that has played a few seconds crosses it. A span anywhere counts,
-# so a player resuming mid-file qualifies too. Below the threshold the close
-# cancels the session and the partial is discarded.
-STREAMING_KEEP_AFTER_CLOSE_CHUNKS = 4
-STREAMING_KEEP_AFTER_CLOSE_PERCENT = Fraction(50)
 # Bound on the spans tracked per session before the threshold is reached;
 # past it the shortest span is dropped. Only a reader making that many
 # scattered reads gets here, and losing a short span can only delay the
@@ -93,6 +84,12 @@ def _unique_control_fields(pairs):
     if len(fields) != len(pairs):
         raise ControlError("Duplicate field in control request")
     return fields
+
+
+@dataclass(frozen=True)
+class _ReadAheadSettings:
+    keep_after_close: StreamingKeepAfterClose
+    window_bytes: int
 
 
 @dataclass(eq=False)
@@ -327,6 +324,7 @@ class StreamingReadManager:
         on_finalized: Optional[Callable[["PrefetchSession"], None]] = None,
         max_download_workers: int = DEFAULT_MAX_DOWNLOAD_WORKERS,
         max_retained_streaming_sessions: int = DEFAULT_MAX_RETAINED_STREAMING_SESSIONS,
+        read_ahead_window: int = DEFAULT_STREAMING_READ_AHEAD_WINDOW,
     ):
         self.cache_manager = cache_manager
         # Called once the complete file is in the cache (StorageFS records
@@ -350,12 +348,13 @@ class StreamingReadManager:
             self._run_download_turn,
             logger,
         )
-        if keep_after_close is None:
-            keep_after_close = StreamingKeepAfterClose(
-                byte_thresholds=(STREAMING_KEEP_AFTER_CLOSE_CHUNKS * self.chunk_size,),
-                percent_thresholds=(STREAMING_KEEP_AFTER_CLOSE_PERCENT,),
-            )
-        self.keep_after_close = keep_after_close
+        if type(read_ahead_window) is not int or read_ahead_window < 0:
+            raise ValueError("read-ahead window must be a non-negative byte count")
+        self._read_ahead_settings = _ReadAheadSettings(
+            keep_after_close if keep_after_close is not None else
+            parse_keep_after_close(DEFAULT_STREAMING_KEEP_AFTER_CLOSE),
+            read_ahead_window,
+        )
         self.partial_suffix = partial_suffix
         self.stream_state_xattr = stream_state_xattr
 
@@ -382,19 +381,57 @@ class StreamingReadManager:
     def init(self):
         self._control_server.start()
 
+    def _download_limits_snapshot(self):
+        """Serialize the current settings. Caller holds prefetch_sessions_lock."""
+        settings = self._read_ahead_settings
+        qualification = settings.keep_after_close
+        return {
+            **self._download_limits,
+            "streaming_keep_after_close": {
+                "mode": "all" if qualification.match_all else "any",
+                "bytes": list(qualification.byte_thresholds),
+                "percent": [str(value) for value in qualification.percent_thresholds],
+            },
+            "streaming_read_ahead_window": settings.window_bytes,
+        }
+
     def download_limits(self):
         with self.prefetch_sessions_lock:
-            return self._download_limits.copy()
+            return self._download_limits_snapshot()
 
     def update_download_limits(self, **changes):
+        read_ahead_changes = {}
+        for key, parse in (
+            ("streaming_keep_after_close", parse_keep_after_close),
+            ("streaming_read_ahead_window", parse_read_ahead_window),
+        ):
+            if key in changes:
+                try:
+                    read_ahead_changes[key] = parse(changes.pop(key))
+                except ValueError as exc:
+                    raise ValueError(f"{key}: {exc}") from exc
         validate_download_limits(changes)
+
         with self.prefetch_sessions_lock:
             if self._destroying:
                 raise ValueError("mount is shutting down")
+            previous = self._read_ahead_settings
+            settings = _ReadAheadSettings(
+                read_ahead_changes.get("streaming_keep_after_close", previous.keep_after_close),
+                read_ahead_changes.get("streaming_read_ahead_window", previous.window_bytes),
+            )
             self._download_limits.update(changes)
+            self._read_ahead_settings = settings
             if "max_download_workers" in changes:
                 self._download_pool.set_limit(changes["max_download_workers"])
-            return self._download_limits.copy()
+            if settings != previous:
+                for session in self.prefetch_sessions.values():
+                    with session.lock:
+                        if session.readers_consumed or self._download_terminal(session):
+                            continue
+                        self._refresh_read_ahead_qualification(session, settings.keep_after_close)
+                        self._schedule_background(session)
+            return self._download_limits_snapshot()
 
     def list_download_sessions(self):
         with self.prefetch_sessions_lock:
@@ -727,10 +764,6 @@ class StreamingReadManager:
             "restart_only": {
                 "streaming_reads": bool(self.streaming_reads),
                 "streaming_chunk_size": self.chunk_size,
-                "streaming_keep_after_close": {
-                    "bytes": list(self.keep_after_close.byte_thresholds),
-                    "percent": [str(value) for value in self.keep_after_close.percent_thresholds],
-                },
             },
         }
 
@@ -850,14 +883,20 @@ class StreamingReadManager:
         self._update_streaming_state_xattr(session, "prefetching")
         return fetched_end
 
-    def _keep_after_close_threshold(self, session: PrefetchSession) -> int:
-        return self.keep_after_close.threshold(session.file_size)
-
-    def _read_ahead_start_threshold(self, session: PrefetchSession) -> int:
-        return min(
-            STREAMING_READ_AHEAD_START_CHUNKS * session.chunk_size,
-            self._keep_after_close_threshold(session),
-        )
+    @staticmethod
+    def _refresh_read_ahead_qualification(session: PrefetchSession, policy: StreamingKeepAfterClose):
+        """Evaluate observed reads using one policy. Caller holds session.lock."""
+        spans = session.foreground_read_spans
+        if session.readers_consumed or not spans:
+            return
+        longest = max(end - start for start, end in spans)
+        threshold = policy.threshold(session.file_size)
+        if longest >= threshold:
+            session.read_ahead_started = True
+            session.readers_consumed = True
+            spans.clear()
+        elif longest >= STREAMING_READ_AHEAD_START_CHUNKS * session.chunk_size:
+            session.read_ahead_started = True
 
     def _record_foreground_read(self, session: PrefetchSession, start: int, end: int):
         """Track the spans readers asked for. Caller holds session.lock."""
@@ -865,13 +904,8 @@ class StreamingReadManager:
             return
         spans = session.foreground_read_spans
         self._add_available_range(spans, start, end)
-        longest = max((span_end - span_start for span_start, span_end in spans), default=0)
-        if longest >= self._read_ahead_start_threshold(session):
-            session.read_ahead_started = True
-        if longest >= self._keep_after_close_threshold(session):
-            session.readers_consumed = True
-            spans.clear()
-        elif len(spans) > STREAMING_MAX_TRACKED_READ_SPANS:
+        self._refresh_read_ahead_qualification(session, self._read_ahead_settings.keep_after_close)
+        if len(spans) > STREAMING_MAX_TRACKED_READ_SPANS:
             # Never the span this read just joined: the read-ahead bound is
             # measured from it, and short sequential reads must be able to
             # grow it to the threshold.
@@ -909,30 +943,22 @@ class StreamingReadManager:
             return None, wrapped
         return (missing[0] // session.chunk_size) * session.chunk_size, True
 
-    def _bounded_read_ahead_chunk(self, session: PrefetchSession) -> Optional[int]:
-        """The next chunk the worker may fetch before readers_consumed is set.
+    def _bounded_read_ahead_range(self, session: PrefetchSession) -> Optional[Tuple[int, int]]:
+        """The next unclaimed bytes within the speculative window, or None.
 
-        Caller holds session.lock. Until the readers have consumed the file,
-        the worker stays within the keep-after-close threshold past the end
-        of the span the latest read belongs to (rounded up to whole chunks),
-        fetching forward from that read only, so a reader that sniffs the
-        head and holds the file open pulls at most that much, not the whole
-        file. A reader reading on reaches the threshold inside that window
-        and lifts the bound. None means nothing is due until the readers
-        move or the session ends.
+        Caller holds session.lock. Start after the span containing the latest
+        read and clip both the window and the fetch to their byte boundaries.
         """
         offset = session.last_foreground_offset
-        frontier = offset
         for span_start, span_end in session.foreground_read_spans:
             if span_start <= offset < span_end:
-                frontier = span_end
+                limit = min(session.file_size, span_end + self._read_ahead_settings.window_bytes)
+                fetch = self._first_unclaimed_missing_range(session, span_end, limit)
+                if fetch is not None:
+                    start, end = fetch
+                    return start, min(end, start + session.chunk_size)
                 break
-        limit = min(session.file_size, frontier + self._keep_after_close_threshold(session))
-        aligned = (offset // session.chunk_size) * session.chunk_size
-        missing = self._first_missing_range(session.available_ranges, aligned, limit)
-        if missing is None:
-            return None
-        return (missing[0] // session.chunk_size) * session.chunk_size
+        return None
 
     @staticmethod
     def _covered_ranges(session: PrefetchSession) -> List[Tuple[int, int]]:
@@ -1441,12 +1467,12 @@ class StreamingReadManager:
         if self._download_terminal(session) or not session.read_ahead_started:
             return None
         wrapped = session.background_wrapped
-        if session.readers_consumed:
-            chunk_start, wrapped = self._unbounded_read_ahead_chunk(
-                session, session.background_cursor, wrapped,
-            )
-        else:
-            chunk_start = self._bounded_read_ahead_chunk(session)
+        if not session.readers_consumed:
+            fetch = self._bounded_read_ahead_range(session)
+            return (fetch, wrapped) if fetch is not None else None
+        chunk_start, wrapped = self._unbounded_read_ahead_chunk(
+            session, session.background_cursor, wrapped,
+        )
         if chunk_start is None:
             return None
         chunk_end = min(chunk_start + session.chunk_size, session.file_size)
