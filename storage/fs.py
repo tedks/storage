@@ -60,7 +60,10 @@ from .member_repairs import CARRIER_DIR, is_carrier_path
 from .pathing import ResolvedPath, resolve_path
 from .links import LinkRefused, intermediate_paths, link_checksum, resolve_link_target
 from .namespace import DEFAULT_LISTING_MAX_STALE, NamespaceService
-from .streaming import PrefetchSession, StreamingReadManager
+from .streaming import (
+    DEFAULT_MAX_DOWNLOAD_WORKERS, DEFAULT_MAX_RETAINED_STREAMING_SESSIONS,
+    PrefetchSession, StreamingReadManager,
+)
 
 
 @dataclass
@@ -238,7 +241,9 @@ class StorageFS(Operations):
                  checksum_reverify_interval: float = DEFAULT_CHECKSUM_REVERIFY_INTERVAL,
                  bulk_cold_copies: bool = False,
                  max_foreground_operations: Optional[int] = None,
-                 max_sync_workers: Optional[int] = None):
+                 max_sync_workers: Optional[int] = None,
+                 max_download_workers: int = DEFAULT_MAX_DOWNLOAD_WORKERS,
+                 max_retained_streaming_sessions: int = DEFAULT_MAX_RETAINED_STREAMING_SESSIONS):
         """
         Initialize Storage filesystem
 
@@ -250,6 +255,8 @@ class StorageFS(Operations):
             num_sync_workers: Number of background sync worker threads
             max_sync_workers: Optional upper limit for demand-driven sync workers
             streaming_reads: Enable uncached range streaming + background prefetch
+            max_download_workers: Ceiling for adaptive streaming download workers
+            max_retained_streaming_sessions: Maximum retained fills without readers
             streaming_chunk_size: Unit of background read-ahead (foreground
                 reads fetch only what the reader asked for); read-ahead
                 starts once readers have read one chunk
@@ -461,6 +468,8 @@ class StorageFS(Operations):
             streaming_reads=streaming_reads,
             streaming_chunk_size=streaming_chunk_size,
             max_streaming_sessions=max_streaming_sessions,
+            max_download_workers=max_download_workers,
+            max_retained_streaming_sessions=max_retained_streaming_sessions,
             keep_after_close=streaming_keep_after_close,
             on_finalized=lambda session: self._record_fetched(
                 session.canonical_path, session.final_cache_path,
@@ -471,7 +480,6 @@ class StorageFS(Operations):
         )
         self._streaming_reads = self._streaming_manager.streaming_reads
         self._streaming_chunk_size = self._streaming_manager.chunk_size
-        self._max_streaming_sessions = self._streaming_manager.max_streaming_sessions
         self._prefetch_sessions = self._streaming_manager.prefetch_sessions
         self._prefetch_sessions_lock = self._streaming_manager.prefetch_sessions_lock
 
@@ -1936,9 +1944,6 @@ class StorageFS(Operations):
 
     def _finalize_streaming_session(self, session: PrefetchSession):
         self._streaming_manager._finalize_streaming_session(session)
-
-    def _background_prefetch_worker(self, session: PrefetchSession):
-        self._streaming_manager._background_prefetch_worker(session)
 
     def _create_or_attach_prefetch_session(self, virtual_path: str, canonical_path: str) -> Optional[PrefetchSession]:
         return self._streaming_manager._create_or_attach_prefetch_session(
@@ -3561,7 +3566,9 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
                  fuse_threads: bool = False,
                  checksum_reverify_interval: float = DEFAULT_CHECKSUM_REVERIFY_INTERVAL,
                  max_foreground_operations: Optional[int] = None,
-                 max_sync_workers: Optional[int] = None):
+                 max_sync_workers: Optional[int] = None,
+                 max_download_workers: int = DEFAULT_MAX_DOWNLOAD_WORKERS,
+                 max_retained_streaming_sessions: int = DEFAULT_MAX_RETAINED_STREAMING_SESSIONS):
     """
     Mount a Storage filesystem
 
@@ -3579,7 +3586,9 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
         debug: Enable verbose debug logging
         streaming_reads: Enable uncached range streaming + background prefetch
         streaming_chunk_size: Chunk size used for remote range reads
-        max_streaming_sessions: Maximum concurrent streaming prefetch sessions
+        max_streaming_sessions: Maximum streaming sessions with live readers
+        max_download_workers: Ceiling for adaptive streaming download workers
+        max_retained_streaming_sessions: Maximum retained fills without readers
         streaming_keep_after_close: When read-ahead outlives the last close;
             None for the default
         revalidate_after: Seconds after which opening a CLEAN cached file
@@ -3680,6 +3689,8 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
         streaming_reads=streaming_reads,
         streaming_chunk_size=streaming_chunk_size,
         max_streaming_sessions=max_streaming_sessions,
+        max_download_workers=max_download_workers,
+        max_retained_streaming_sessions=max_retained_streaming_sessions,
         readdir_ttl=readdir_ttl,
         enable_watchers=enable_watchers,
         streaming_keep_after_close=streaming_keep_after_close,

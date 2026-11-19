@@ -674,6 +674,36 @@ class TestMemberConnectionPool(unittest.TestCase):
         self.assertEqual(server.connect_calls, 1)
         pool.close()
 
+    def test_single_channel_hands_off_to_waiting_readers_then_bulk(self):
+        server = _FakeServer()
+        pool = _pool(server, sftp_channels=1, connect_timeout=5)
+        self.addCleanup(pool.close)
+        order = []
+
+        def use_channel(kind):
+            with pool.sftp(1.0):
+                order.append(kind)
+
+        burst = ssh_pool._SFTP_INTERACTIVE_BURST
+        with pool.sftp(1.0):
+            bulk = _InThread(lambda: use_channel("bulk"))
+            readers = [_InThread(lambda: use_channel("reader"), interactive=True)
+                       for _ in range(burst + 1)]
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                with pool._cond:
+                    if pool._bulk_sftp_waiters == 1 and pool._interactive_sftp_waiters == burst + 1:
+                        break
+                time.sleep(0.01)
+            else:
+                self.fail("channel waiters did not queue")
+
+        for waiter in [bulk, *readers]:
+            self.assertTrue(waiter.join())
+            self.assertIsNone(waiter.error)
+        self.assertEqual(order, ["reader"] * burst + ["bulk", "reader"])
+        self.assertEqual(server.transport.max_open_seen, 1)
+
     def test_lease_is_reentrant_within_a_thread(self):
         server = _FakeServer()
         pool = _pool(server, sftp_channels=1)

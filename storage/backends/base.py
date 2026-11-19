@@ -149,6 +149,14 @@ class Backend(ABC):
         configuration: never a live probe."""
         return None
 
+    def background_range_capacity(self) -> Optional[int]:
+        """The member's limit on concurrent background range reads, if any."""
+        return None
+
+    def run_background_range_read(self, virtual_path, fetch):
+        """Hold member capacity before claiming a speculative byte range."""
+        return fetch()
+
     @property
     def label(self) -> str:
         """Human-facing member label with its stable backend identity."""
