@@ -11,6 +11,7 @@ storage_test("allow_other")
 storage_test("cache", tags = ["no-remote"])
 storage_test("cache_metadata", tags = ["no-remote"])
 storage_test("checksum_queue")
+storage_test("cli_control", tags = ["no-remote"])
 storage_test("cli_debug", tags = ["no-remote"])
 storage_test("cli_mount")
 storage_test(
