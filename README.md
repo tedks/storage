@@ -563,6 +563,49 @@ Show storage configuration for a path:
 storage info PATH
 ```
 
+### control
+
+Inspect and tune a running mount as the user who started it. Use the mount's
+cache directory or a profile name. Profile selection reads the configured
+cache path. Use `--cache` when the running mount was started with a cache
+override or the profile now points to a different cache.
+
+```bash
+storage control --profile media
+storage control --profile media --config ./storage.toml get
+storage control --cache '/var/cache/my media' set --max-streaming-sessions 4 --max-download-workers 2
+storage control --profile media downloads
+storage control --profile media cancel 474b595adc054281bced844067939d97
+```
+
+`status` is the default. It shows aggregate download activity and effective
+streaming settings. `downloads` explicitly shows each file's path, progress,
+reader count, and download ID. Pass `--json-output` before the command to
+consume its response programmatically.
+
+`get` shows the live limits. `set` applies all specified values together after
+validating them. Changes last until the mount stops. Use these limits to tune
+streaming downloads independently of background sync.
+
+| Live limit | Range | Effect |
+| --- | --- | --- |
+| `--max-streaming-sessions` | 1–1024 | Concurrent streaming files with readers. Additional cold opens fall back to a whole-file fetch. |
+| `--max-retained-streaming-sessions` | 0–1024 | Reader-free downloads retained after close. Set to `0` to discard unfinished downloads at future last closes. Existing retained downloads can finish. |
+| `--max-download-workers` | 1–32 | Ceiling for background download workers. When lowered, transfers in progress finish their current chunks before the lower cap applies. |
+
+`streaming_reads`, `streaming_chunk_size`, and `streaming_keep_after_close`
+require a restart. `get` reports their current values with chunk size in bytes
+and keep-after-close thresholds in bytes and percentages. Change the mount
+profile or startup flags to persist settings across restarts.
+
+To cancel, copy the exact ID from `downloads`. `cancelled` means the mount
+abandoned the download, including its partial cache file. A download with a
+reader or in finalization reports `busy`. Close its readers or wait for it to
+finish before retrying. A vanished ID reports `not-found`, including when a new
+download has started for the same path. `busy` and `not-found` exit with status 1.
+The endpoint is the private `.storage.control.sock` in the mount cache.
+`storage debug streaming-stats` continues to query it.
+
 ### debug
 
 Inspect or repair local cache/index state:

@@ -88,6 +88,7 @@ storage_test(
     "streaming_system",
     target = "storage_tests_streaming_system",
     extra_srcs = ["fuse_mount.py"],
+    data = ["//:storage_cli"],
     tags = ["local", "manual"],
     timeout = "long",
 )
