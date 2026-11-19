@@ -1368,7 +1368,8 @@ class StorageFS(Operations):
         if errors:
             # Prefer a concrete error from a member over a failed connection
             # to another candidate. An alternate working member wins above.
-            raise next((exc for exc in errors if not is_connection_error(exc)), errors[0])
+            raise next((exc for exc in errors
+                        if not isinstance(exc, ConnectionError) and not is_connection_error(exc)), errors[0])
         if not available and self.backends and not candidates:
             raise OSError(errno.EHOSTUNREACH, "all streaming sources unavailable")
         if any(backend.name in known and backend not in candidates for backend in self.backends.values()):

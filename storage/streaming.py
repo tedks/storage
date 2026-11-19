@@ -97,8 +97,10 @@ def streaming_errno(exc: Exception) -> int:
         return exc.errno
     if isinstance(exc, TimeoutError):
         return errno.ETIMEDOUT
-    if is_connection_error(exc):
+    if isinstance(exc, ConnectionError) or is_connection_error(exc):
         return errno.EHOSTUNREACH
+    if isinstance(exc, MemoryError):
+        return errno.ENOMEM
     return errno.EIO
 
 
@@ -222,15 +224,16 @@ class _DownloadPool:
         retried = False
         target = demand if self.limit is None else min(self.limit, demand)
         while len(self.threads) < target:
-            worker = threading.Thread(target=self._run, name="storage-prefetch-worker", daemon=True)
-            self.threads.add(worker)
+            worker = None
             try:
+                worker = threading.Thread(target=self._run, name="storage-prefetch-worker", daemon=True)
+                self.threads.add(worker)
                 worker.start()
-            except (RuntimeError, OSError) as exc:
-                self.threads.remove(worker)
+            except (RuntimeError, OSError, MemoryError) as exc:
+                self.threads.discard(worker)
                 # Thread.start may report resource exhaustion as RuntimeError without an errno.
-                self.logger.warning("streaming worker start failed errno=%s",
-                                    getattr(exc, "errno", None) or "unknown")
+                error = errno.ENOMEM if isinstance(exc, MemoryError) else getattr(exc, "errno", None)
+                self.logger.warning("streaming worker start failed errno=%s", error or "unknown")
                 # There may never be another offer to retry the first
                 # worker, e.g. when a complete file is queued to publish.
                 if self.threads or retried:
@@ -1769,8 +1772,11 @@ class StreamingReadManager:
                 refcount=1,
                 member_stat=member_stat,
             )
-        except BaseException:
+        except BaseException as exc:
             self._discard_staging_file(io_fd, staging_path)
+            if isinstance(exc, MemoryError):
+                self.report_open_error("cache_prepare", exc)
+                raise OSError(errno.ENOMEM, "streaming session allocation failed") from exc
             raise
 
         with self.prefetch_sessions_lock:
