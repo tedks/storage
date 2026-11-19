@@ -1150,6 +1150,47 @@ def test_mounted_watcher_refreshes_listing(remote, mounted_factory):
         "the mount's watcher must have run inotifywait over ssh to remote1"
 
 
+def test_mounted_read_only_conflict_close_keeps_newer_member_bytes(
+        remote, mounted_factory, monkeypatch):
+    left, right = remote.members
+    remote.write_remote(left, "both", b"left")
+    remote.write_remote(right, "both", b"right")
+    mnt = mounted_factory(streaming_reads=True)
+    view = f"both.{left.name}"
+    assert view in os.listdir(mnt.mount)
+    released = threading.Event()
+    release = mnt.fs.release
+
+    def observed_release(path, fh):
+        result = release(path, fh)
+        if path == "/" + view:
+            released.set()
+        return result
+
+    monkeypatch.setattr(mnt.fs, "release", observed_release)
+    with (mnt.mount / view).open("rb") as reader:
+        assert reader.read() == b"left"
+        remote.write_remote(left, "both", b"newer member edit")
+    assert released.wait(10)
+    assert remote.read_remote(left, "both") == b"newer member edit"
+    assert remote.read_remote(right, "both") == b"right"
+
+
+def test_mounted_write_to_member_conflict_view(remote, mounted_factory):
+    left, right = remote.members
+    remote.write_remote(left, "both", b"left")
+    remote.write_remote(right, "both", b"right")
+    mnt = mounted_factory(streaming_reads=True)
+    view = f"both.{left.name}"
+    assert view in os.listdir(mnt.mount)
+
+    with (mnt.mount / view).open("r+b") as writer:
+        assert writer.write(b"edit") == 4
+
+    assert _wait_for(lambda: remote.read_remote(left, "both") == b"edit")
+    assert remote.read_remote(right, "both") == b"right"
+
+
 def _streaming_read_case(remote, mounted_factory, monkeypatch, streaming: bool):
     chunk = 64 * 1024
     member = remote.members[0]

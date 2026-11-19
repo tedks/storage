@@ -2665,7 +2665,7 @@ class StorageFS(Operations):
 
         Holds the path's lock (the descriptor's current path, read again
         once the lock is held, since a rename re-points it): closing a
-        member copy (a conflict-suffixed path) uploads it, and no rename,
+        writable member copy (a conflict-suffixed path) uploads it, and no rename,
         unlink, refetch or watcher invalidation may run under the upload; a
         canonical close reads the path's row and queues its sync, which a
         rename must not move in between. A streaming descriptor takes no
@@ -2693,7 +2693,8 @@ class StorageFS(Operations):
 
         close_error: Optional[OSError] = None
         inode: Optional[str] = None
-        if entry.backend_name:
+        view_write = entry.backend_name and not self._is_read_only_open(entry.flags)
+        if view_write:
             try:
                 st = os.fstat(entry.real_fd)
                 inode = f"{st.st_dev}:{st.st_ino}"
@@ -2713,10 +2714,13 @@ class StorageFS(Operations):
         if close_error is not None:
             raise FuseOSError(close_error.errno)
 
+        if entry.backend_name and not view_write:
+            return 0
+
         try:
             self.cache_manager.flush_file(entry.virtual_path)
 
-            if entry.backend_name:
+            if view_write:
                 # The view's member copy is a member mutation: registered,
                 # so a queued rename's fence publication is ordered with it.
                 mutation, _fenced = self.cache_manager.member_repairs.start_mutation(
@@ -2747,39 +2751,37 @@ class StorageFS(Operations):
             # this covers a repair recorded after that flush, when
             # close() has already succeeded: the view's bytes are
             # kept durably as a repair of their own, listed until
-            # resolved (MemberRepairs.preserve_view_write). A
-            # read-only view wrote nothing, so nothing is kept.
-            if (entry.flags & os.O_ACCMODE) != os.O_RDONLY:
-                try:
-                    kept = inode is not None and self.cache_manager.member_repairs.preserve_view_write(
-                        entry.canonical_path, entry.backend_name, entry.cache_path, inode,
-                        "write through a conflict view after close(), kept off "
-                        "the member by an open repair",
-                    )
-                    if kept:
-                        self.cache_manager.mark_cache_size_dirty()
-                    else:
-                        self.logger.error(
-                            "direct sync of %s to %s refused by an open member repair; its "
-                            "bytes were not kept: %s no longer holds the descriptor's file, "
-                            "or matches a repair whose kept bytes are missing (left in "
-                            "place; see storage debug member-repairs)",
-                            entry.canonical_path, entry.backend_name, entry.cache_path,
-                        )
-                except Exception as exc:  # noqa: BLE001 - release cannot fail usefully
-                    # A narrow durability limit (CTO-182-J-LENGTH-C3):
-                    # the cache refused the metadata write itself. The
-                    # view's inode and name stay as they were, and the
-                    # member gets nothing.
+            # resolved (MemberRepairs.preserve_view_write).
+            try:
+                kept = inode is not None and self.cache_manager.member_repairs.preserve_view_write(
+                    entry.canonical_path, entry.backend_name, entry.cache_path, inode,
+                    "write through a conflict view after close(), kept off "
+                    "the member by an open repair",
+                )
+                if kept:
+                    self.cache_manager.mark_cache_size_dirty()
+                else:
                     self.logger.error(
-                        "Conflict-view write to %s on member %s was refused by an "
-                        "open member repair and could not be kept (errno %s: %s). "
-                        "Recover the bytes from %s before anything evicts or "
-                        "refetches it; they are not on the member.",
-                        entry.canonical_path, entry.backend_name,
-                        errno.errorcode.get(getattr(exc, "errno", None), "?"), exc,
-                        entry.cache_path,
+                        "direct sync of %s to %s refused by an open member repair; its "
+                        "bytes were not kept: %s no longer holds the descriptor's file, "
+                        "or matches a repair whose kept bytes are missing (left in "
+                        "place; see storage debug member-repairs)",
+                        entry.canonical_path, entry.backend_name, entry.cache_path,
                     )
+            except Exception as exc:  # noqa: BLE001 - release cannot fail usefully
+                # A narrow durability limit (CTO-182-J-LENGTH-C3):
+                # the cache refused the metadata write itself. The
+                # view's inode and name stay as they were, and the
+                # member gets nothing.
+                self.logger.error(
+                    "Conflict-view write to %s on member %s was refused by an "
+                    "open member repair and could not be kept (errno %s: %s). "
+                    "Recover the bytes from %s before anything evicts or "
+                    "refetches it; they are not on the member.",
+                    entry.canonical_path, entry.backend_name,
+                    errno.errorcode.get(getattr(exc, "errno", None), "?"), exc,
+                    entry.cache_path,
+                )
             backend = None
         if backend:
             try:
@@ -2814,7 +2816,7 @@ class StorageFS(Operations):
         with self._fd_lock:
             entry = self._fd_map.get(fh)
         if (entry is not None and entry.backend_name
-                and (entry.flags & os.O_ACCMODE) != os.O_RDONLY
+                and not self._is_read_only_open(entry.flags)
                 and entry.backend_name in self.cache_manager.member_repairs.backends_for(
                     [entry.canonical_path])):
             raise FuseOSError(errno.EBUSY)
