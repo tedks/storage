@@ -24,3 +24,10 @@ log_events:
   who: Ted Smith
   what: started
   comment: ""
+- time: 2026-11-19T00:34:24-00:00
+  who: Ted Smith
+  what: commented
+  comment: Draft https://github.com/tedks/storage/pull/187 shares the CLEAN, descriptor,
+    and repair checks between both eviction tiers. The pressure regression checks
+    that dirty, open, and repair-pinned recomputable files keep their bytes. All 49
+    gates passed at b2e50e0.
