@@ -1,0 +1,21 @@
+id: streaming-resource-admission
+title: Admit streaming readers on resources and report the cause of failures
+desc: A streaming open can synchronously fetch a whole file after a static session
+  ceiling or report ENOENT for an unrelated admission or member failure. Remove active/retained
+  file-count ceilings (including legacy explicit values); full-download fallback must
+  not be the response to pressure or transport failure. Default to adaptive workers,
+  preserve range reads and meaningful OS errors. Test over the former ceiling, competing
+  readers and actual refusal paths.
+type: bugfix
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-19T11:55:44-00:00
+references: []
+log_events:
+- time: 2026-11-19T11:55:44-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
