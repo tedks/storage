@@ -15,6 +15,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from storage.backends.local import LocalBackend
 from storage.fs import StorageFS
@@ -56,12 +57,18 @@ class TestStreamingSystemRegression(unittest.TestCase):
         repeats = (payload_size // len(unit)) + 1
         self.payload = (unit * repeats)[:payload_size]
         (self.backend_dir / "movie.bin").write_bytes(self.payload)
+        self.contended_payloads = {
+            name: os.urandom(3 * 1024 * 1024)
+            for name in ("older.bin", "reopened.bin", "fresh.bin")
+        }
+        for name, payload in self.contended_payloads.items():
+            (self.backend_dir / name).write_bytes(payload)
 
-        backend = SlowRemoteLoopbackBackend("remote0", str(self.backend_dir), range_delay=0.003)
+        self.backend = SlowRemoteLoopbackBackend("remote0", str(self.backend_dir), range_delay=0.003)
         self.fs = StorageFS(
             cache_root=self.cache_dir,
             state_db=self.db_path,
-            backends={"remote0": backend},
+            backends={"remote0": self.backend},
             cache_size=128 * 1024 * 1024,
             num_sync_workers=0,
             start_sync=False,
@@ -181,6 +188,75 @@ class TestStreamingSystemRegression(unittest.TestCase):
         stream_state = self._read_stream_state(cache_path, partial_path)
         if stream_state is not None:
             self.assertNotIn(stream_state.get("status"), {"error", "failed"})
+
+    def test_reader_opens_and_reopened_fill_overtakes_closed_downloads(self):
+        manager = self.fs._streaming_manager
+        manager.update_download_limits(max_streaming_sessions=2, max_download_workers=1)
+        payloads = self.contended_payloads
+
+        older_blocked = threading.Event()
+        let_older_continue = threading.Event()
+        turns_after_older = threading.Event()
+        next_files = []
+        real_read = self.backend.read_file
+        real_copy = self.backend.copy_to_local
+
+        def read(path, offset, size):
+            if threading.current_thread().name == "storage-prefetch-worker":
+                if path == "/older.bin" and offset >= 512 * 1024 and not older_blocked.is_set():
+                    older_blocked.set()
+                    if not let_older_continue.wait(timeout=15):
+                        raise TimeoutError("test never released the older fill")
+                elif older_blocked.is_set() and not turns_after_older.is_set():
+                    next_files.append(path)
+                    if len(next_files) == 5:
+                        turns_after_older.set()
+            return real_read(path, offset, size)
+
+        def copy(path, target):
+            if path == "/fresh.bin":
+                raise AssertionError("fresh reader took the synchronous full-copy fallback")
+            return real_copy(path, target)
+
+        with patch.object(self.backend, "read_file", side_effect=read), \
+                patch.object(self.backend, "copy_to_local", side_effect=copy):
+            try:
+                for name in ("older.bin", "reopened.bin"):
+                    with open(self.mount_dir / name, "rb", buffering=0) as handle:
+                        self.assertEqual(handle.read(256 * 1024), payloads[name][:256 * 1024])
+                    self.assertTrue(self._wait_for(lambda: any(
+                        session["path"] == "/" + name and session["readers"] == 0
+                        for session in manager.list_download_sessions()
+                    )))
+                self.assertTrue(older_blocked.wait(timeout=5))
+                retained = {session["path"]: session["id"] for session in manager.list_download_sessions()}
+                self.assertEqual(set(retained), {"/older.bin", "/reopened.bin"})
+                before = self.fs._streaming_stats_snapshot()
+                self.assertEqual(before["download_workers_running"], 1)
+                self.assertEqual(before["retained_streaming_sessions"], 2)
+
+                with open(self.mount_dir / "fresh.bin", "rb", buffering=0) as handle:
+                    self.assertEqual(handle.read(4096), payloads["fresh.bin"][:4096])
+                    self.assertFalse(let_older_continue.is_set())
+                self.assertEqual(self.fs._streaming_stats_snapshot()["streaming_fallback_opens"], 0)
+
+                with open(self.mount_dir / "reopened.bin", "rb", buffering=0) as handle:
+                    reopened = next(session for session in manager.list_download_sessions()
+                                    if session["path"] == "/reopened.bin")
+                    self.assertEqual(reopened["id"], retained["/reopened.bin"])
+                    self.assertEqual(reopened["readers"], 1)
+                    let_older_continue.set()
+                    self.assertTrue(turns_after_older.wait(timeout=5))
+                    self.assertEqual(next_files, ["/reopened.bin"] * 4 + ["/older.bin"])
+                    self.assertEqual(os.pread(handle.fileno(), 4096, 512 * 1024),
+                                     payloads["reopened.bin"][512 * 1024:516 * 1024])
+            finally:
+                let_older_continue.set()
+
+        for name in ("older.bin", "reopened.bin"):
+            cached = self.cache_dir / name
+            self.assertTrue(self._wait_for(cached.exists))
+            self.assertEqual(cached.read_bytes(), payloads[name])
 
 
 class TestStreamingSystemRegressionThreaded(TestStreamingSystemRegression):

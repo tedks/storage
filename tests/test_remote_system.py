@@ -1370,8 +1370,7 @@ def test_mounted_sniff_of_uncached_file_costs_what_it_reads(remote, mounted_fact
             session = mnt.fs._prefetch_sessions["/sniff.bin"]
     # The kernel sends the release after close() returns.
     assert _wait_for(lambda: session.detached, timeout=10.0), "the close never stopped the session"
-    session.worker.join(timeout=10.0)
-    assert not session.worker.is_alive()
+    assert session.background_finished.wait(timeout=10.0)
 
     # The kernel's readahead for this mount (128 KiB unless the host raised
     # it), read from its backing device info.

@@ -13,7 +13,7 @@ import secrets
 import time
 import threading
 from pathlib import Path
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from enum import Enum
 from typing import Callable, ContextManager, Optional, List, Set
 
@@ -452,6 +452,17 @@ class CacheManager:
 
         # Could not free enough space
         return False
+
+    @contextmanager
+    def admit_streaming_partial(self, file_size: int):
+        """Charge the new sparse file's apparent size before another open can allocate."""
+        with self._lock:
+            admitted = self.ensure_space(file_size)
+            try:
+                yield admitted
+            finally:
+                if admitted:
+                    self._size_dirty = True
 
     def cache_file(self, virtual_path: str, backend: Backend, source_virtual_path: str = None) -> bool:
         """Ensure a member file is cached, including when another fill won."""
