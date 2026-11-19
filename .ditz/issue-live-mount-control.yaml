@@ -1,0 +1,18 @@
+id: live-mount-control
+title: Control a running mount from the CLI
+desc: Expose aggregate status, download listing and lifecycle-safe cancellation, and
+  atomic live streaming limits over the private mount socket. Keep legacy streaming
+  stats compatible and verify the changes on a scratch FUSE mount.
+type: feature
+component: streaming
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-19T00:16:57-00:00
+references: []
+log_events:
+- time: 2026-11-19T00:16:57-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
