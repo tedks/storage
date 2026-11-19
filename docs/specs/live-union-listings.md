@@ -438,8 +438,9 @@ Interpretations promote into this document and both contracts. Open numeric
 and stale-visibility policy remains in `oq-listing-stale-serve-dir-mtime`,
 including the numeric active-refresh, active-directory and backoff limits.
 The cold-partial ruling is recorded in `oq-listing-cold-partial-result`. The
-scratch Nautilus capability proof (milestone 2) remains pending; neither it
-nor the numeric limits gate the cold-partial behavior above, which uses the
-interim bounds until the numbers are ruled.
-Transport feasibility is engineering evidence to obtain, not a presumed
-product ruling to ask Ted to make without results.
+[scratch Nautilus capability probe](../desktop-listing-delivery-probe.md)
+found that native FUSE invalidations did not reach the tested local-file
+monitor. An opt-in client-side bridge demonstrated addition delivery on
+the same `file://` path. Production delivery requires a separate client
+scope decision. Desktop delivery and numeric limits remain independent of
+the cold-partial behavior above, which uses interim bounds.
