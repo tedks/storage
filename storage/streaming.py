@@ -6,6 +6,7 @@ import secrets
 import threading
 import time
 from collections import Counter
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from pathlib import Path
@@ -1104,6 +1105,7 @@ class StreamingReadManager:
 
     def _discard_staging_file(self, io_fd: int, path: Path):
         # Best effort cleanup must preserve the failure which brought us here.
+        # Staging only sets the sparse length, so there are no data blocks.
         try:
             os.close(io_fd)
         except OSError:
@@ -1112,7 +1114,6 @@ class StreamingReadManager:
             path.unlink(missing_ok=True)
         except OSError:
             pass
-        self.cache_manager.mark_cache_size_dirty()
 
     def _discard_unregistered_prefetch_session(self, session: PrefetchSession):
         self._close_streaming_session_resources(session)
@@ -1123,7 +1124,6 @@ class StreamingReadManager:
             session.partial_cache_path.unlink(missing_ok=True)
         except OSError:
             pass
-        self.cache_manager.mark_cache_size_dirty()
 
     @staticmethod
     def _claim_detach(session: PrefetchSession) -> bool:
@@ -1156,6 +1156,9 @@ class StreamingReadManager:
         """
         if self.prefetch_sessions.get(session.canonical_path) is session:
             self.prefetch_sessions.pop(session.canonical_path, None)
+        # The inode's allocation stays charged through unlink. The cache
+        # drops that charge when the last session descriptor closes, or
+        # keeps it if unlink failed and the inode still has a name.
         try:
             session.partial_cache_path.unlink(missing_ok=True)
         except OSError as exc:
@@ -1175,7 +1178,6 @@ class StreamingReadManager:
             if claimed:
                 self._unregister_and_unlink(session)
         self._close_streaming_session_resources(session)
-        self.cache_manager.mark_cache_size_dirty()
 
     def _install_partial(self, session: PrefetchSession) -> str:
         """Move the session's partial to the final cache path unless that path is taken.
@@ -1264,7 +1266,6 @@ class StreamingReadManager:
             session.condition.notify_all()
         self._log_streaming_state_change(session, self._snapshot_streaming_state(
             session, "superseded" if outcome == "taken" else outcome))
-        self.cache_manager.mark_cache_size_dirty()
         if should_close:
             self._close_streaming_session_resources(session)
 
@@ -1756,10 +1757,14 @@ class StreamingReadManager:
                 self._discard_unregistered_prefetch_session(session)
                 return StreamingOpen.CACHED
             # No registered session owns the name. An orphan left by an
-            # earlier unlink failure can be replaced safely here.
+            # earlier unlink failure can be replaced safely here. Reconcile
+            # any charge for that name before the next cache grant. A move
+            # into an unused name preserves the allocation of the empty file.
             try:
-                replaced_orphan = os.path.lexists(partial_cache_path)
-                os.replace(staging_path, partial_cache_path)
+                allocation = (self.cache_manager.cache_size_change()
+                              if os.path.lexists(partial_cache_path) else nullcontext())
+                with allocation:
+                    os.replace(staging_path, partial_cache_path)
             except OSError as exc:
                 self._discard_unregistered_prefetch_session(session)
                 self.report_open_error("cache_register", exc)
@@ -1767,8 +1772,6 @@ class StreamingReadManager:
             session.partial_cache_path = partial_cache_path
             self.prefetch_sessions[canonical_path] = session
 
-        if replaced_orphan:
-            self.cache_manager.mark_cache_size_dirty()
         self._record_streaming_stat("streaming_sessions_started", 1)
 
         self.logger.info(
@@ -1810,7 +1813,6 @@ class StreamingReadManager:
 
     def _complete_cancellation(self, session: PrefetchSession, idle: bool):
         self._log_streaming_state_change(session, self._snapshot_streaming_state(session, "cancelled"))
-        self.cache_manager.mark_cache_size_dirty()
         if idle:
             self._cleanup_cancelled_session(session)
             self._close_cancelled_download(session)

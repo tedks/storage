@@ -486,7 +486,12 @@ class CacheManager:
         return True
 
     def close_streaming_fd(self, fd: int):
-        """Release a partial's charge once its unlinked inode can be freed."""
+        """End fd accounting, releasing the charge only for an unlinked inode.
+
+        The mount releases its reader descriptors before this call. A named
+        inode stays in the cache tree and keeps its existing charge, even
+        when a failed unlink left it behind for replacement or startup cleanup.
+        """
         with self._lock:
             allocated = self._streaming_fds.pop(fd, 0)
             if allocated and os.fstat(fd).st_nlink == 0:

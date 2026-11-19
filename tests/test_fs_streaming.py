@@ -1078,6 +1078,115 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.assertIsNotNone(session)
         return session
 
+    def test_repeated_short_previews_do_not_query_unrelated_cache_extents(self):
+        cache = self.fs.cache_manager
+        block = cache.block_size
+        for index in range(2048):
+            (self.cache_dir / f"cached-{index}.bin").write_bytes(b"c")
+        cache.mark_cache_size_dirty()
+        original_size = cache.get_total_cache_size()
+        self.assertEqual(original_size, 2048 * block)
+        cache.max_size_bytes = original_size + block
+        preview_size = min(block, self.fs._streaming_chunk_size // 2)
+        payload = b"p" * (4 * self.fs._streaming_chunk_size)
+        for index in range(4):
+            (self.backend_dir / f"preview-{index}.bin").write_bytes(payload)
+
+        with patch.object(cache, "_scan_total_cache_size", wraps=cache._scan_total_cache_size) as scans, \
+                patch.object(cache, "_path_data_bytes", wraps=cache._path_data_bytes) as extents:
+            for index in range(4):
+                path = f"/preview-{index}.bin"
+                fd = self.fs.open(path, os.O_RDONLY)
+                session = self._session_for(fd)
+                try:
+                    self.assertEqual(self.fs.read(path, preview_size, 0, fd), payload[:preview_size])
+                finally:
+                    self.fs.release(path, fd)
+                self.assertTrue(session.detached)
+                self.assertEqual(session.io_fd, -1)
+
+            self.assertEqual((scans.call_count, extents.call_count), (0, 0))
+            self.assertEqual(cache.get_total_cache_size(), original_size)
+            self.assertEqual(scans.call_count, 0)
+
+    def test_cancelled_partial_keeps_its_charge_until_the_worker_releases_its_fd(self):
+        cache = self.fs.cache_manager
+        block = cache.block_size
+        chunk = self.fs._streaming_chunk_size
+        cache.max_size_bytes = chunk + block
+        payload = b"s" * (16 * chunk)
+        path = "/held.bin"
+        (self.backend_dir / "held.bin").write_bytes(payload)
+        self.backend.worker_gate = threading.Event()
+        partial = self.cache_dir / "held.bin.storage.partial"
+        first = self.fs.open(path, os.O_RDONLY)
+        second = self.fs.open(path, os.O_RDONLY)
+        old = self._session_for(first)
+        self.assertIs(self._session_for(second), old)
+        self.assertEqual(self.fs.read(path, chunk, 0, first), payload[:chunk])
+        self.assertTrue(self.backend.worker_in_read.wait(timeout=3))
+        old_inode = partial.stat().st_ino
+        self.fs.release(path, first)
+        self.assertTrue(partial.exists())
+        self.assertEqual(self.fs.read(path, block, 0, second), payload[:block])
+        self.fs.release(path, second)
+        self.assertFalse(partial.exists())
+        self.assertGreaterEqual(old.io_fd, 0)
+        self.assertEqual(cache.get_total_cache_size(), chunk)
+
+        successor = self.fs.open(path, os.O_RDONLY)
+        try:
+            self.assertNotEqual(partial.stat().st_ino, old_inode)
+            self.assertEqual(self.fs.read(path, block, chunk, successor), payload[chunk:chunk + block])
+            self.assertEqual(cache.get_total_cache_size(), chunk + block)
+
+            self.backend.worker_gate.set()
+            self.assertTrue(old.background_finished.wait(timeout=3))
+            self.assertEqual(old.io_fd, -1)
+            self.assertTrue(partial.exists())
+            self.assertEqual(cache.get_total_cache_size(), block)
+        finally:
+            self.backend.worker_gate.set()
+            self.fs.release(path, successor)
+        self.assertEqual(cache.get_total_cache_size(), 0)
+
+    def test_replacing_a_named_orphan_releases_its_charge_before_the_next_read(self):
+        cache = self.fs.cache_manager
+        block = cache.block_size
+        cache.max_size_bytes = block
+        payload = b"o" * (4 * self.fs._streaming_chunk_size)
+        path = "/orphan-accounting.bin"
+        partial = self.cache_dir / "orphan-accounting.bin.storage.partial"
+        (self.backend_dir / "orphan-accounting.bin").write_bytes(payload)
+        first = self.fs.open(path, os.O_RDONLY)
+        old = self._session_for(first)
+        self.assertEqual(self.fs.read(path, block, 0, first), payload[:block])
+        old_inode = partial.stat().st_ino
+
+        real_unlink = Path.unlink
+
+        def fail_partial_unlink(target, *args, **kwargs):
+            if target == partial:
+                raise PermissionError(errno.EACCES, "fixture leaves a named orphan")
+            return real_unlink(target, *args, **kwargs)
+
+        with patch.object(Path, "unlink", autospec=True, side_effect=fail_partial_unlink):
+            self.fs.release(path, first)
+        self.assertEqual(old.io_fd, -1)
+        self.assertEqual(partial.stat().st_ino, old_inode)
+        self.assertEqual(cache.get_total_cache_size(), block)
+
+        second = self.fs.open(path, os.O_RDONLY)
+        try:
+            self.assertNotEqual(partial.stat().st_ino, old_inode)
+            self.assertEqual(cache.get_total_cache_size(), 0)
+            self.assertEqual(self.fs.read(path, block, 0, second), payload[:block])
+            self.assertEqual(cache.get_total_cache_size(), block)
+            self.assertEqual(self._session_for(second).available_ranges, [(0, block)])
+        finally:
+            self.fs.release(path, second)
+        self.assertEqual(cache.get_total_cache_size(), 0)
+
     def test_streaming_unread_session_uses_no_worker_and_reopens_fresh(self):
         payload = os.urandom(128 * 1024)
         (self.backend_dir / "reopen.bin").write_bytes(payload)
