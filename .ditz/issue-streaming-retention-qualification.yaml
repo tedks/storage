@@ -10,8 +10,8 @@ type: bugfix
 component: streaming
 release:
 reporter: Ted Smith <tedks@riseup.net>
-status: in_progress
-disposition:
+status: closed
+disposition: fixed
 creation_time: 2026-11-19T00:33:33-00:00
 references: []
 log_events:
@@ -23,3 +23,9 @@ log_events:
   who: Ted Smith
   what: started
   comment: ""
+- time: 2026-11-19T00:44:10-00:00
+  who: Ted Smith
+  what: 'closed: fixed'
+  comment: 'Implemented and verified in draft PR #188 at 0f02210. All 49 Bazel targets
+    passed, including both FUSE loops and the SSH-backed suite. Fleet configuration
+    and rollout remain in the existing follow-up.'
