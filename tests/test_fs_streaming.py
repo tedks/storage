@@ -184,6 +184,130 @@ class TestFSStreamingIntegration(unittest.TestCase):
             self.assertEqual(self.fs.read("/alternate.bin", 4096, 0, fd), payload[:4096])
             self.fs.release("/alternate.bin", fd)
 
+    def _source_discovery_members(self):
+        other_dir = self.temp_dir / "other-member"
+        holder_dir = self.temp_dir / "holder-member"
+        other_dir.mkdir()
+        holder_dir.mkdir()
+        self.backend.speed_priority = 0
+        other = LocalBackend("other", str(other_dir), speed_priority=1)
+        holder = LocalBackend("holder", str(holder_dir), speed_priority=2)
+        self.fs.backends.update({other.name: other, holder.name: holder})
+        return other, holder, holder_dir
+
+    def test_source_discovery_reaches_only_holder_in_partial_or_complete_listing(self):
+        other, holder, holder_dir = self._source_discovery_members()
+        payload = b"only member holding these bytes"
+        for listing_failure in (False, True):
+            with self.subTest(partial_listing=listing_failure):
+                name = "partial.txt" if listing_failure else "complete.txt"
+                path = "/" + name
+                (holder_dir / name).write_bytes(payload)
+                self.fs.namespace.invalidate_all_listings()
+                if listing_failure:
+                    with patch.object(self.backend, "listdir_attrs", side_effect=TimeoutError("listing stalled")):
+                        self.assertIn(name, self.fs.readdir("/", None))
+                else:
+                    self.assertIn(name, self.fs.readdir("/", None))
+                with patch.object(self.backend, "stat", side_effect=TimeoutError("unrelated stat stalled")) as stall, \
+                        patch.object(self.backend, "lstat", side_effect=TimeoutError("unrelated lookup stalled")) as lookup, \
+                        patch.object(other, "stat", wraps=other.stat) as known_miss, \
+                        patch.object(holder, "stat", wraps=holder.stat) as source_stat:
+                    self.assertEqual(self.fs.getattr(path)["st_size"], len(payload))
+                    fd = self.fs.open(path, os.O_RDONLY)
+                    try:
+                        self.assertIs(self._session_for(fd).backend, holder)
+                        self.assertEqual(self.fs.read(path, len(payload), 0, fd), payload)
+                    finally:
+                        self.fs.release(path, fd)
+                stall.assert_not_called()
+                lookup.assert_not_called()
+                known_miss.assert_not_called()
+                source_stat.assert_called_once_with(path)
+
+    def test_source_discovery_keeps_unavailability_and_can_recover_the_only_holder(self):
+        other, holder, holder_dir = self._source_discovery_members()
+        self.fs.namespace.invalidate_all_listings()
+        path = "/only-holder.txt"
+        content = b"readable after retry"
+        (holder_dir / path[1:]).write_bytes(content)
+        holder.set_available(False)
+        with patch.object(holder, "stat", wraps=holder.stat) as holder_stat, \
+                patch.object(other, "stat", wraps=other.stat) as peer_stat:
+            with self.assertRaises(FuseOSError) as outage:
+                self.fs.open(path, os.O_RDONLY)
+            self.assertEqual(outage.exception.errno, errno.EHOSTUNREACH)
+            holder_stat.assert_not_called()
+            peer_stat.assert_called_once_with(path)
+            holder.set_available(True)
+            fd = self.fs.open(path, os.O_RDONLY)
+            self.assertEqual(self.fs.read(path, len(content), 0, fd), content)
+            self.fs.release(path, fd)
+        holder_stat.assert_called_once_with(path)
+
+    def test_source_discovery_definitive_fresh_misses_do_not_probe_members(self):
+        other, holder, _ = self._source_discovery_members()
+        path = "/missing.txt"
+        self.assertNotIn(path[1:], self.fs.readdir("/", None))
+        with patch.object(self.backend, "stat", side_effect=TimeoutError("unrelated stat stalled")) as first, \
+                patch.object(other, "stat", wraps=other.stat) as second, \
+                patch.object(holder, "stat", wraps=holder.stat) as third:
+            with self.assertRaises(FuseOSError) as missing:
+                self.fs.open(path, os.O_RDONLY)
+            self.assertEqual(missing.exception.errno, errno.ENOENT)
+        first.assert_not_called()
+        second.assert_not_called()
+        third.assert_not_called()
+
+    def test_source_discovery_preserves_transient_lookup_error_instead_of_negative_answer(self):
+        other, holder, holder_dir = self._source_discovery_members()
+        path = "/transient.txt"
+        payload = b"only holder returned after one timeout"
+        (holder_dir / path[1:]).write_bytes(payload)
+        with patch.object(holder, "lstat", side_effect=TimeoutError("member is slow")) as probe:
+            with self.assertRaises(FuseOSError) as timeout:
+                self.fs.getattr(path)
+            self.assertEqual(timeout.exception.errno, errno.ETIMEDOUT)
+        probe.assert_called_once_with(path)
+        self.assertEqual(self.fs.getattr(path)["st_size"], len(payload))
+        with patch.object(self.backend, "stat", side_effect=AssertionError("re-probed known non-holder")) as wrong:
+            fd = self.fs.open(path, os.O_RDONLY)
+            self.assertEqual(self.fs.read(path, len(payload), 0, fd), payload)
+            self.fs.release(path, fd)
+        wrong.assert_not_called()
+
+    def test_source_discovery_preserves_duplicate_priority_and_a_live_pin(self):
+        _, holder, holder_dir = self._source_discovery_members()
+        path = "/duplicated.txt"
+        first = b"canonical priority"
+        second = b"other member has a different copy"
+        (self.backend_dir / path[1:]).write_bytes(first)
+        (holder_dir / path[1:]).write_bytes(second)
+        list(self.fs.readdir("/", None))
+        fd = self.fs.open(path, os.O_RDONLY)
+        try:
+            self.assertEqual(self.fs.read(path, len(first), 0, fd), first)
+        finally:
+            self.fs.release(path, fd)
+        view = path + ".holder"
+        fd = self.fs.open(view, os.O_RDONLY)
+        try:
+            self.assertEqual(self.fs.read(view, len(second), 0, fd), second)
+        finally:
+            self.fs.release(view, fd)
+
+        path = "/pinned.txt"
+        (self.backend_dir / path[1:]).write_bytes(first)
+        (holder_dir / path[1:]).write_bytes(second)
+        self.fs._refetch_pins[path] = holder
+        with patch.object(holder, "stat", side_effect=PermissionError(errno.EACCES, "denied")) as pinned, \
+                patch.object(self.backend, "stat", wraps=self.backend.stat) as alternate:
+            with self.assertRaises(FuseOSError) as denied:
+                self.fs.open(path, os.O_RDONLY)
+            self.assertEqual(denied.exception.errno, errno.EACCES)
+        pinned.assert_called_once_with(path)
+        alternate.assert_not_called()
+
     def test_foreground_overlapping_range_can_use_interactive_reserve(self):
         payload = os.urandom(512 * 1024)
         (self.backend_dir / "reserve.bin").write_bytes(payload)

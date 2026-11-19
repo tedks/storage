@@ -1305,6 +1305,121 @@ def test_mounted_nonstreaming_read_makes_no_range_reads(remote, mounted_factory,
     assert downloads == ["/stream.bin"], "the whole file must be downloaded exactly once"
 
 
+def test_mounted_only_holder_reads_while_peer_lists_and_retries_a_closed_channel(
+    remote, mounted_factory, monkeypatch,
+):
+    first, holder = remote.members
+    name = "single-holder-retry.bin"
+    contents = secrets.token_bytes(773)
+    remote.write_remote(holder, name, contents)
+    mnt = mounted_factory(streaming_reads=True, progressive_listings=True,
+                          num_sync_workers=0, start_sync=False)
+    peer = mnt.backends[first.name]
+    source = mnt.backends[holder.name]
+    entered, complete = threading.Event(), threading.Event()
+    slow_listing = peer.listdir_attrs
+    source_stat = source.stat
+    target = "/" + name
+    wrong_probes, stat_calls, read_channels = [], [], []
+
+    def hold_listing(virtual_path):
+        if virtual_path == "/":
+            entered.set()
+            if not complete.wait(15):
+                raise TimeoutError("synthetic peer listing did not resume")
+        return slow_listing(virtual_path)
+
+    def watch_peer_probe(actual):
+        def probe(virtual_path):
+            if virtual_path == target:
+                wrong_probes.append(virtual_path)
+                raise TimeoutError("unrelated member called during only-holder open")
+            return actual(virtual_path)
+        return probe
+
+    def counted_stat(virtual_path):
+        if virtual_path == target:
+            stat_calls.append(virtual_path)
+        return source_stat(virtual_path)
+
+    sftp_open = paramiko.SFTPClient.open
+    remote_name = str(source._resolve_path(target))
+
+    def channel_failure_once(sftp, path, *args, **kwargs):
+        if path == remote_name:
+            channel = sftp.get_channel()
+            read_channels.append(channel)
+            if len(read_channels) == 1:
+                channel.close()
+                raise paramiko.SSHException("Server connection dropped: synthetic EOF")
+        return sftp_open(sftp, path, *args, **kwargs)
+
+    monkeypatch.setattr(peer, "listdir_attrs", hold_listing)
+    monkeypatch.setattr(peer, "lstat", watch_peer_probe(peer.lstat))
+    monkeypatch.setattr(peer, "stat", watch_peer_probe(peer.stat))
+    monkeypatch.setattr(source, "stat", counted_stat)
+    monkeypatch.setattr(paramiko.SFTPClient, "open", channel_failure_once)
+    try:
+        assert name in os.listdir(mnt.mount)
+        assert entered.wait(5), "test did not establish the peer listing barrier"
+        with open(mnt.mount / name, "rb", buffering=0) as handle:
+            assert handle.read() == contents
+        assert not complete.is_set()
+        assert wrong_probes == []
+        assert stat_calls == [target]
+        assert len(read_channels) == 2
+        assert read_channels[0] is not read_channels[1]
+        assert source._pool.connects == 1
+        assert mnt.fs._streaming_manager._streaming_stats_snapshot()["streaming_fallback_opens"] == 0
+    finally:
+        complete.set()
+
+
+def test_mounted_direct_lookup_of_only_holder_can_retry_a_timeout(remote, mounted_factory, monkeypatch):
+    first, holder = remote.members
+    name = "single-holder-direct.bin"
+    payload = b"direct lookup exact bytes"
+    remote.write_remote(holder, name, payload)
+    mnt = mounted_factory(streaming_reads=True, num_sync_workers=0, start_sync=False)
+    peer = mnt.backends[first.name]
+    source = mnt.backends[holder.name]
+    original_lookup = source.lstat
+    original_probe = source.stat
+    original_peer_probe = peer.stat
+    target = "/" + name
+    lookups, probes, other_probes = [], [], []
+
+    def lookup_once_fails(virtual_path):
+        if virtual_path == target:
+            lookups.append(virtual_path)
+            if len(lookups) == 1:
+                raise TimeoutError("synthetic timeout on the only holder")
+        return original_lookup(virtual_path)
+
+    def counted_probe(virtual_path):
+        if virtual_path == target:
+            probes.append(virtual_path)
+        return original_probe(virtual_path)
+
+    def peer_probe(virtual_path):
+        if virtual_path == target:
+            other_probes.append(virtual_path)
+            raise TimeoutError("re-probed a non-holder after successful lookup")
+        return original_peer_probe(virtual_path)
+
+    monkeypatch.setattr(source, "lstat", lookup_once_fails)
+    monkeypatch.setattr(source, "stat", counted_probe)
+    monkeypatch.setattr(peer, "stat", peer_probe)
+    with pytest.raises(OSError) as caught:
+        os.stat(mnt.mount / name)
+    assert caught.value.errno == errno.ETIMEDOUT
+    with open(mnt.mount / name, "rb", buffering=0) as handle:
+        assert handle.read() == payload
+    assert lookups == [target] * 2
+    assert probes == [target]
+    assert other_probes == []
+
+
 def test_mounted_slow_read_does_not_delay_another_listing(remote, mounted_factory, monkeypatch):
     """A member transfer held on one file must not hold up browsing another.
 

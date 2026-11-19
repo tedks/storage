@@ -2112,6 +2112,71 @@ class TestSSHBackendOnThePool(_BackendTestCase):
         self.assertTrue(backend.is_available())
         self.assertEqual(self.server.connect_calls, 2)
 
+    def test_read_and_stat_retry_a_dropped_channel_without_reconnecting(self):
+        backend = self._new_backend()
+        for op, work in (
+            ("stat", lambda: backend.stat("/x").st_size),
+            ("lstat", lambda: backend.lstat("/x").st_size),
+            ("open", lambda: backend.read_file("/x", 2, 5)),
+            ("open", lambda: backend.run_background_range_read(
+                "/x", lambda: backend.read_file("/x", 2, 5))),
+        ):
+            requests_before = len(self.server.requests)
+            dropped = []
+
+            def drop_once(sftp, _path):
+                self.server.hooks.pop(op)
+                dropped.append(sftp)
+                sftp.chan.close()
+                raise ssh_module.paramiko.SSHException("Server connection dropped: synthetic EOF")
+
+            with self.subTest(operation=work):
+                self.server.hooks[op] = drop_once
+                outcome = work()
+                if op == "open":
+                    self.assertEqual(outcome, self.server.payload[2:7])
+                else:
+                    self.assertGreater(outcome, 0)
+                requests = self.server.requests[requests_before:]
+                self.assertEqual(sum(name == op for name, *_ in requests), 2)
+                self.assertEqual(len(dropped), 1)
+                self.assertTrue(dropped[0].closed)
+                self.assertIsNot(dropped[0], self.server.clients[-1])
+                self.assertEqual(self.server.connect_calls, 1)
+                self.assertTrue(backend.is_available())
+
+    def test_range_retry_is_bounded_and_definitive_errors_get_one_attempt(self):
+        backend = self._new_backend()
+        for error, attempts in (
+            (ssh_module.paramiko.SSHException("Server connection dropped: synthetic EOF"), 2),
+            (PermissionError(errno.EACCES, "permission denied"), 1),
+            (FileNotFoundError(errno.ENOENT, "absent"), 1),
+        ):
+            with self.subTest(error=error):
+                requests_before = len(self.server.requests)
+
+                def fail(_sftp, _path):
+                    raise error
+
+                self.server.hooks["open"] = fail
+                with self.assertRaises(type(error)):
+                    backend.run_background_range_read("/x", lambda: backend.read_file("/x", 0, 5))
+                requests = self.server.requests[requests_before:]
+                self.assertEqual(sum(name == "open" for name, *_ in requests), attempts)
+                self.assertEqual(self.server.connect_calls, 1)
+
+    def test_write_does_not_retry_a_dropped_channel_on_a_live_transport(self):
+        backend = self._new_backend()
+
+        def drop(_sftp, _path):
+            raise ssh_module.paramiko.SSHException("Server connection dropped: synthetic EOF")
+
+        self.server.hooks["open"] = drop
+        with self.assertRaises(ssh_module.paramiko.SSHException):
+            backend.write_file("/x", b"bytes", 0)
+        self.assertEqual(sum(name == "open" for name, *_ in self.server.requests), 1)
+        self.assertEqual(self.server.connect_calls, 1)
+
     def test_stat_missing_file_does_not_mark_backend_unavailable(self):
         backend = self._new_backend()
         self.server.missing.add("/data/missing.bin")

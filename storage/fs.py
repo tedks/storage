@@ -1356,11 +1356,20 @@ class StorageFS(Operations):
                 self._recheck.setdefault(canonical_path, set()).add(pinned.name)
 
         known = {location.backend_name for location in self.state_manager.get_file_locations(canonical_path)}
-        available = [backend for backend in self.backends.values() if backend.is_available()]
-        candidates = available or [backend for backend in self.backends.values()
-                                   if backend.supports_reconnect_probe()]
+        present, missing = self.namespace.read_source_hints(self._resolve_path(canonical_path))
+        # An indexed holder is more authoritative than a listing miss. A
+        # unique observed holder is a hint for names absent from the index;
+        # multiple published copies retain the original ordering.
+        unchecked = [backend for backend in self.backends.values()
+                     if backend.name in known or backend.name not in missing]
+        available = [backend for backend in unchecked if backend.is_available()]
+        candidates = available or [backend for backend in unchecked if backend.supports_reconnect_probe()]
+        preferred = next(iter(present)) if len(present) == 1 else None
+        if present.get(preferred) is None:
+            preferred = None
         errors = []
-        for backend in sorted(candidates, key=lambda b: (b.name not in known, b.speed_priority)):
+        for backend in sorted(candidates, key=lambda b: (b.name not in known, b.name != preferred,
+                                                         b.speed_priority)):
             try:
                 return probe(backend)
             except FileNotFoundError:
@@ -1372,10 +1381,8 @@ class StorageFS(Operations):
             # to another candidate. An alternate working member wins above.
             raise next((exc for exc in errors
                         if not isinstance(exc, ConnectionError) and not is_connection_error(exc)), errors[0])
-        if not available and self.backends and not candidates:
-            raise OSError(errno.EHOSTUNREACH, "all streaming sources unavailable")
-        if any(backend.name in known and backend not in candidates for backend in self.backends.values()):
-            raise OSError(errno.EHOSTUNREACH, "known streaming source unavailable")
+        if any(backend not in candidates for backend in unchecked):
+            raise OSError(errno.EHOSTUNREACH, "streaming source may be unavailable")
         return None
 
     def _pinned_stat(self, canonical_path: str, backend: Backend) -> Optional[os.stat_result]:
@@ -2199,7 +2206,7 @@ class StorageFS(Operations):
 
     def getattr(self, path, fh=None):
         """Get file attributes"""
-        return self.namespace.getattr(path)
+        return self.namespace.getattr(path, read_lookup=True)
 
     def readdir(self, path, fh):
         """Read directory contents"""
@@ -2283,7 +2290,7 @@ class StorageFS(Operations):
                 is_dir = False
             else:
                 try:
-                    is_dir = stat.S_ISDIR(self.getattr(old)["st_mode"])
+                    is_dir = stat.S_ISDIR(self.namespace.getattr(old)["st_mode"])
                 except FuseOSError:
                     is_dir = False
             if is_dir:
