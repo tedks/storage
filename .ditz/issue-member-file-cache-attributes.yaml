@@ -1,0 +1,21 @@
+id: member-file-cache-attributes
+title: Preserve member file attributes on cache fill and keep read-only conflict closes
+  read-only
+desc: Opening a regular member file used to change its apparent mtime to the cache
+  fill time. Closing a read-only conflict copy could upload the cached bytes and replace
+  a concurrent member edit. Preserve observable file attributes in full and streaming
+  fills, recover legacy mtime for matching CLEAN evidence, and verify real mounted
+  SSH reads and writes.
+type: bugfix
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-19T00:12:56-00:00
+references: []
+log_events:
+- time: 2026-11-19T00:12:56-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
