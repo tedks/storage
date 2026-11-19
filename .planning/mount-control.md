@@ -11,7 +11,8 @@ A mount owner can inspect live download activity, change limits without restarti
 - [x] (2026-11-19 00:09Z) Created Codex lane worktree `mount-control` on `feat/mount-control` at `59e8d28` and agreed on the streaming manager API with the reader-downloads lane.
 - [x] (2026-11-19 00:19Z) Implemented the control socket framing and owner checks, the CLI, and operator documentation.
 - [ ] Verify the CLI and server contract and run a real scratch FUSE mount in both loop modes. Bazel built the CLI, passed the source manifest check, and passed 5 control and 37 debug tests on the control lane before rebasing.
-- [ ] Rebase on the reader-downloads branch, verify, and push a draft stacked PR.
+- [x] (2026-11-19 00:22Z) Rebased on the integrated scheduler and member-attribute changes.
+- [ ] Run the full integrated gate and push a draft stacked PR. The PR and tracking issue carry the final test receipt and published revision.
 
 ## Surprises & Discoveries
 
@@ -24,7 +25,7 @@ The current control socket uses one `recv` on a stream, which can yield partial 
 
 ## Outcomes & Retrospective
 
-Pending implementation and verification.
+The operator command, socket transport, documentation, and scratch tests are implemented. Publish the final verification result with the draft PR.
 
 ## Context and Orientation
 
@@ -38,12 +39,12 @@ Add `storage/control.py` for the private socket lifecycle and framing. Dispatch 
 
 ## Concrete Steps
 
-Run these commands from `/home/tedks/Projects/storage/mount-control` under the framework0 shared runtime lock for heavy tests.
+Run these commands from the `mount-control` worktree. Use the shared runtime lock for heavy tests.
 
     nix develop --command bazel build //:storage_cli
-    nix develop --command bazel test //tests:storage_test_cli_control //tests:storage_test_cli_debug //:storage_tests_streaming_system //:storage_build_srcs_check --test_output=all
+    nix develop --command bazel test //tests:storage_test_cli_control //tests:storage_test_cli_debug //tests:storage_tests_streaming_system //:storage_build_srcs_check --test_output=all
 
-A mounted run should report passes from both the default and threaded FUSE modes. Rebase and target the draft PR on `feat/adaptive-reader-downloads` once its API is published.
+Run `scripts/run-gates.sh` from the final clean worktree to record full-gate evidence. A mounted run should report passes from both the default and threaded FUSE modes. Rebase and target the draft PR on `feat/adaptive-reader-downloads` once its API is published.
 
 ## Validation and Acceptance
 
@@ -61,4 +62,4 @@ The parent lane maintains the CTO roster. Its mission and these tests prohibit t
 
 Depend on `StreamingReadManager.download_limits`, `update_download_limits`, `list_download_sessions`, and `cancel_download_session` from the reader-downloads branch. The socket handler validates command and argument shape, and the streaming manager validates parameter values and applies updates in one operation. The initial live parameters are `max_streaming_sessions` (1 to 1024), `max_retained_streaming_sessions` (0 to 1024), and `max_download_workers` (1 to 32).
 
-2026-11-19: Recorded the assigned worktree, agreed API, and mount-level test. Recorded the first fast gate results after implementing the interface and before rebasing onto the scheduler.
+2026-11-19: Recorded the assigned worktree, agreed API, and mount-level test. Recorded the fast gate results and the rebase onto the integrated scheduler.
