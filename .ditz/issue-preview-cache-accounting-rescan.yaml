@@ -1,0 +1,22 @@
+id: preview-cache-accounting-rescan
+title: Avoid a full cache extent scan after a short preview closes
+desc: At 0fa941f an unfinished unqualified session discards its partial on last close.
+  _complete_cancellation marks the entire cache size dirty, so the next streaming
+  chunk can walk and open every regular cached file to query data extents under the
+  cache lock. Keep accounting incremental across partial unlink and eventual fd close.
+  Test repeated short preview cycles with thousands of unrelated cached files, assert
+  no global rescans after initialization, and cover racing readers and an in-flight
+  chunk on an unlinked fd.
+type: bugfix
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-19T20:13:36-00:00
+references: []
+log_events:
+- time: 2026-11-19T20:13:36-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
