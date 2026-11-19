@@ -75,6 +75,7 @@ class ResolvedMountConfig:
     max_download_workers: Optional[int] = None
     obsolete_streaming_limits: Tuple[str, ...] = ()
     streaming_read_ahead_window: Optional[str] = None
+    progressive_listings: bool = False
 
     @property
     def member_specs(self) -> Tuple[str, ...]:
@@ -539,6 +540,7 @@ def _load_mount_profile_settings(config_path: Path, profile_name: str) -> Dict[s
         "streaming_read_ahead_window": _optional_profile_string(
             config_profile, "streaming_read_ahead_window", profile_name
         ),
+        "progressive_listings": _optional_profile_bool(config_profile, "progressive_listings", profile_name),
         "readdir_ttl": _optional_profile_float(config_profile, "readdir_ttl", profile_name),
         "enable_watchers": _optional_profile_bool(config_profile, "enable_watchers", profile_name),
         "revalidate_after": _optional_profile_float(config_profile, "revalidate_after", profile_name),
@@ -659,6 +661,7 @@ def resolve_mount_configuration(
     max_download_workers: Optional[int] = None,
     max_retained_streaming_sessions: Optional[int] = None,
     streaming_read_ahead_window: Optional[str] = None,
+    progressive_listings: Optional[bool] = None,
 ) -> ResolvedMountConfig:
     config_values = {
         "mountpoint": None,
@@ -682,6 +685,7 @@ def resolve_mount_configuration(
         "enable_watchers": None,
         "revalidate_after": None,
         "listing_max_stale": None,
+        "progressive_listings": None,
         **{key: None for key in KERNEL_TIMEOUT_KEYS},
         "fuse_threads": None,
         "bulk_capacity_wait_timeout": None,
@@ -859,6 +863,8 @@ def resolve_mount_configuration(
                 config_values["bulk_capacity_wait_timeout"]
             ),
         ),
+        progressive_listings=(progressive_listings if progressive_listings is not None
+                              else bool(config_values["progressive_listings"])),
         listing_max_stale=_validated_seconds(
             "listing_max_stale", config_values["listing_max_stale"]
         ) if config_values["listing_max_stale"] is not None else DEFAULT_LISTING_MAX_STALE,

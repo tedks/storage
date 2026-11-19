@@ -331,6 +331,14 @@ a watcher event makes for the event's parent, still keeps it from being
 published. At most 4096 directories keep a listing, the least recently used
 going first, which bounds the memory a mount with watchers uses.
 
+On a multi-member mount, `--progressive-listings` (profile `progressive_listings = true`)
+returns a cold listing after the first member succeeds, including an empty result.
+Concurrent opens share the scan. Each later response updates the directory for its
+next enumeration. A program that enumerates once can see a partial union. Use the
+default for tools that need a complete first pass. Directory lookups and writes
+keep their usual member precedence. An already-open file manager needs a refresh
+or a supported desktop notification to enumerate again.
+
 Member requests for a browse of one directory, 2 SSH members, 20 entries,
 a 6 s window (the remote gate's `test_mounted_browse_request_budget`):
 
