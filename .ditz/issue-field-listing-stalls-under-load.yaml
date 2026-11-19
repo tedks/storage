@@ -46,5 +46,21 @@ log_events:
     are unmeasured hypotheses. 81793ac already reserves 1 SFTP channel per member
     for interactive requests; unaccepted #175 fixes cold copies holding interactive
     leases.'
+- time: 2026-11-19T20:17:50-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Repeat field report at 0fa941f: some larger directories intermittently
+    appear to hang. The daemon stayed up. Four one-second samples each showed four
+    outstanding FUSE requests for the mount. The count includes in-progress operations
+    and supplies no opcode, so it cannot identify readdir, a member, or a network
+    drop. No directory was opened for the probe. On this head a cold/invalidated foreground
+    readdir waits on all member futures without a total deadline. One executor per
+    member serializes different directories, and concurrent foreground requests for
+    the same uncached directory each enqueue another scan. See listing-bounded-cold-wait
+    and listing-foreground-single-flight. Regress with a synthetic paginated large
+    listing plus a stalled member, repeat and concurrent opens, a fast unrelated directory,
+    and a late result racing invalidation. Measure directory enumeration separately
+    from a file manager''s later getattr/preview work, with filename-free counts and
+    latency by stage.'
 blocked_by:
 - field-listing-downloads-to-hash
