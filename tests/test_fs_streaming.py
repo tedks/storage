@@ -288,7 +288,7 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.assertEqual(session.io_fd, -1)
         self._assert_not_cached("unavailable-worker.bin")
 
-    def test_reader_reclaims_retained_space_without_touching_local_writes(self):
+    def test_small_read_keeps_an_unrelated_retained_fill_and_local_writes(self):
         self.fs.cache_manager.max_size_bytes = 512 * 1024
         self.backend.worker_gate = threading.Event()
         payload = os.urandom(384 * 1024)
@@ -309,13 +309,40 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self._session_for(fd)
         self.assertEqual(self.fs.read("/new-reader.bin", 4096, 0, fd), payload[:4096])
         self.fs.release("/new-reader.bin", fd)
-        self.assertTrue(retained.detached)
+        self.assertFalse(retained.detached)
         self.assertEqual((self.cache_dir / "dirty.bin").read_bytes(), b"local write")
-        self.assertEqual(self.fs._streaming_stats_snapshot()["streaming_retained_space_cancellations"], 1)
 
         self.backend.worker_gate.set()
         self.assertTrue(retained.background_finished.wait(timeout=3))
         self.assertEqual(retained.io_fd, -1)
+        self.assertEqual((self.cache_dir / "retained.bin").read_bytes(), payload)
+
+    def test_full_cache_returns_mixed_cached_and_transient_ranges(self):
+        manager = self.fs.cache_manager
+        block = manager.block_size
+        manager.max_size_bytes = 2 * block
+        payload = b"a" * block + b"b" * block + b"c" * block
+        (self.backend_dir / "mixed.bin").write_bytes(payload)
+        dirty = self.fs.create("/dirty.bin", 0o644)
+        self.fs.write("/dirty.bin", b"local bytes", 0, dirty)
+        try:
+            reader = self.fs.open("/mixed.bin", os.O_RDONLY)
+            session = self._session_for(reader)
+            try:
+                self.assertEqual(manager.get_total_cache_size(), block)
+                self.assertEqual(self.fs.read("/mixed.bin", block, 0, reader), payload[:block])
+                self.assertEqual(self.fs.read("/mixed.bin", 2 * block, 0, reader), payload[:2 * block])
+                self.assertEqual(self.fs.read("/mixed.bin", block, 2 * block, reader), payload[2 * block:])
+                with session.lock:
+                    self.assertEqual(session.available_ranges, [(0, block)])
+                    self.assertTrue(session.cache_full)
+                    self.assertFalse(session.prefetch_complete)
+                self.assertEqual(manager.get_total_cache_size(), 2 * block)
+                self.assertEqual((self.cache_dir / "dirty.bin").read_bytes(), b"local bytes")
+            finally:
+                self.fs.release("/mixed.bin", reader)
+        finally:
+            self.fs.release("/dirty.bin", dirty)
 
     def test_download_worker_start_retry_and_local_publication_on_release(self):
         manager = self.fs._streaming_manager
