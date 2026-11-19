@@ -33,6 +33,7 @@ py_library(
         "spacemgmt.py",
         "state.py",
         "streaming.py",
+        "streaming_settings.py",
         "sync.py",
         "sync_executor.py",
         "sync_tasks.py",
