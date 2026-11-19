@@ -24,3 +24,11 @@ log_events:
   who: Ted Smith
   what: started
   comment: ""
+- time: 2026-11-19T20:30:59-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Draft https://github.com/tedks/storage/pull/192 on #191 at 49aa9653b11e056ef48ca9770848ba27683a28b1.
+    Four disposable short preview cycles with 2,048 unrelated cache files caused three
+    scans and 6,147 per-path extent-measurement calls on 0fa941f, and zero after the
+    fix. Held-fd and failed-unlink orphan tests passed with all 49 exact-head gate
+    targets.'
