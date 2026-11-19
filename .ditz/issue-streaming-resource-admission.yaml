@@ -23,3 +23,11 @@ log_events:
   who: Ted Smith
   what: started
   comment: ""
+- time: 2026-11-19T12:22:22-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Draft PR #190 on #189 at 2d800bb removes active/retained file-count admission,
+    ignores obsolete profile limits, and preserves real streaming errors. The mounted
+    ten-reader regression passes in both FUSE loops; restoring the old cap fails both.
+    Full gate 49/49 plus CLI. #191 supplies incremental partial accounting on the
+    combined path. Pending review/merge.'
