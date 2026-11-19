@@ -13,6 +13,7 @@ from unittest.mock import patch
 from fuse import FuseOSError
 
 from storage.backends.local import LocalBackend
+from storage.cache_metadata import MEMBER_ATTRS_XATTR
 from storage.fs import StorageFS
 from storage.models import SyncStatus
 from storage.mount_profiles import parse_keep_after_close
@@ -527,7 +528,8 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.assertTrue(self.fs._ensure_file_in_cache(self.fs._resolve_path('/plain-ro.bin')))
         cache_path = self.cache_dir / "plain-ro.bin"
         self.assertEqual(b"whole file", cache_path.read_bytes())
-        self.assertEqual(0o444, os.stat(cache_path).st_mode & 0o777)
+        self.assertEqual(0o444, self.fs.getattr("/plain-ro.bin")["st_mode"] & 0o777)
+        self.assertEqual(0o644, os.stat(cache_path).st_mode & 0o777)
         self.assertIsNotNone(self.fs.state_manager.get_file_metadata('/plain-ro.bin'))
 
     def test_unindexed_prefix_is_dropped_only_when_unopened_and_unindexed(self):
@@ -1700,9 +1702,14 @@ class TestFSStreamingIntegration(unittest.TestCase):
             rvfd, session = self._stream_whole_file("writer.bin", payload)
             self.assertTrue(at_finalize.wait(timeout=3.0))
             wvfd = self._write_open_and_edit("writer.bin", edit)
+            cache_file = self.cache_dir / "writer.bin"
+            winning_mtime = cache_file.stat().st_mtime_ns
+            winning_attrs = os.getxattr(cache_file, MEMBER_ATTRS_XATTR)
             go.set()
             session.worker.join(timeout=5.0)
         self.assertFalse(session.worker.is_alive())
+        self.assertEqual(cache_file.stat().st_mtime_ns, winning_mtime)
+        self.assertEqual(os.getxattr(cache_file, MEMBER_ATTRS_XATTR), winning_attrs)
 
         with self.fs._fd_lock:
             writer_fd = self.fs._fd_map[wvfd].real_fd

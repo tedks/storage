@@ -567,6 +567,8 @@ Configuration is hierarchical - child directories inherit from parents, with the
 4. `storage debug rebuild-index` reconstructs cache-backed rows quickly from cache files plus xattrs
 5. `storage debug reprobe-locations` explicitly repopulates non-cache member rows for the rebuilt file set using the cache root to keep `user.storage.metadata` authoritative
 6. `storage debug verify-index` audits the cache/index boundary without mutating state
+7. Full and streaming fills preserve a regular member file's mtime and initial atime as accurately as the member reports them. The mount reports observed member mode and numeric ownership while Storage owns and maintains the backing inode. Storage reports imported special mode bits without enabling them on the backing file. Explicit `chmod`, `chown`, and timestamp changes through the mount take precedence.
+8. Older CLEAN cache files can report their source mtime when one recorded member baseline matches the cache inode, size, and native mtime. Files with missing or conflicting evidence report their native cache timestamps until the next fill. Recovery only changes the value returned by stat, so the cache inode and its sync state retain their existing timestamps.
 
 **Conflict View:**
 1. A name on several members whose listings report regular files of different sizes is shown at once as `name.<member>`, one entry per copy, without hashing anything
@@ -607,6 +609,7 @@ Implemented:
 - Local, SSH/SFTP and rsync storage members (SFTP for reads, rsync for writes); one SSH connection per member, its requests multiplexed over a small pool of SFTP channels
 - Directory listings fresh for `revalidate_after` and refreshed in the background after it, answering `stat` and missing names without a member round trip
 - Local cache with LRU eviction, revalidated against the member on open (`revalidate_after`); streaming cold reads with background prefetch that stops when readers close early (`streaming_keep_after_close`)
+- Member timestamps and stat attributes preserved on regular-file cache fills, including streaming reads. Legacy CLEAN cache entries report recovered source mtime when their recorded evidence agrees.
 - Background sync workers with retry; N-way replication configured per directory through xattrs
 - Conflict detection on sync, and `storage conflicts` to list and resolve conflicts (`--verify` to hash a directory's duplicates again first); a conflict view in listings that splits copies of different sizes from the listing alone and hashes equal-size copies in the background on the members, never by download, keeping hashes across remounts, recording what sync uploads and re-verifying recorded hashes slowly
 - Remote inotify watchers that invalidate the cache when a member changes

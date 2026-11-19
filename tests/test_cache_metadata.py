@@ -2,14 +2,18 @@ import errno
 import os
 import shutil
 import stat
+import struct
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from storage.cache_metadata import (
     XATTR_CACHE_METADATA_NAME,
     cache_file_would_be_scanned,
     cache_path_to_virtual_path,
+    cached_member_attributes,
+    copy_member_attributes,
     read_cache_metadata,
     scan_cache_entries,
     write_cache_metadata,
@@ -25,6 +29,35 @@ class TestCacheMetadata(unittest.TestCase):
 
     def tearDown(self):
         shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_import_preserves_existing_acl_group_mask(self):
+        path = self.cache_root / "from-member"
+        path.write_bytes(b"file")
+        acl_xattr = "system.posix_acl_access"
+        # Linux POSIX ACL xattr v2. A named user has rw behind a read-only
+        # mask. Changing the group bits on the backing file would widen it.
+        entries = (
+            (0x01, 6, 0xffffffff),  # ACL_USER_OBJ
+            (0x02, 6, os.geteuid()), # ACL_USER (mapped in the test sandbox)
+            (0x04, 0, 0xffffffff),  # ACL_GROUP_OBJ
+            (0x10, 4, 0xffffffff),  # ACL_MASK
+            (0x20, 0, 0xffffffff),  # ACL_OTHER
+        )
+        acl = struct.pack("<I", 2) + b"".join(struct.pack("<HHI", *entry) for entry in entries)
+        try:
+            os.setxattr(path, acl_xattr, acl)
+        except OSError as exc:
+            if exc.errno == errno.ENOTSUP:
+                self.skipTest("test filesystem does not support POSIX ACLs")
+            raise
+
+        source = SimpleNamespace(st_size=4, st_mode=stat.S_IFREG | 0o660)
+        with path.open("rb") as handle:
+            copy_member_attributes(handle.fileno(), source)
+
+        self.assertEqual(acl, os.getxattr(path, acl_xattr))
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o640)
+        self.assertEqual(cached_member_attributes(path, path.stat())["st_mode"], source.st_mode)
 
     def test_write_and_read_round_trip(self):
         cache_path = self.cache_root / "video.mp4"

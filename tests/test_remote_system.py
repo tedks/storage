@@ -1150,6 +1150,44 @@ def test_mounted_watcher_refreshes_listing(remote, mounted_factory):
         "the mount's watcher must have run inotifywait over ssh to remote1"
 
 
+@pytest.mark.parametrize("streaming", [False, True], ids=["download", "stream"])
+@pytest.mark.parametrize("mode", [0o640, 0o444], ids=["writable", "read-only"])
+def test_mounted_browse_keeps_member_attributes(remote, mounted_factory, streaming, mode):
+    member = remote.members[0]
+    payload = b"a file older than the cache"
+    remote.write_remote(member, "browse.bin", payload)
+    path = f"{REMOTE_ROOT}/browse.bin"
+    remote.exec(member, f"chmod {mode:o} {path} && touch -d @1000000000 {path}")
+    snapshot = f"stat -c '%i %s %Y %Z %a %u %g' {path}"
+    before = remote.exec(member, snapshot).stdout
+    mnt = mounted_factory(streaming_reads=streaming)
+    assert "browse.bin" in os.listdir(mnt.mount)
+    mounted = mnt.mount / "browse.bin"
+    cold = mounted.stat()
+    assert cold.st_mtime == 1000000000
+    assert mounted.read_bytes() == payload
+    cached = mnt.cache / "browse.bin"
+    assert _wait_for(cached.is_file)
+    assert mounted.read_bytes() == payload
+    assert mnt.fs.sync_manager.wait_for_completion(timeout=5)
+    assert remote.exec(member, snapshot).stdout == before
+    assert remote.read_remote(member, "browse.bin") == payload
+    warm = mounted.stat()
+    assert warm.st_mtime_ns == cold.st_mtime_ns
+    assert (warm.st_mode, warm.st_uid, warm.st_gid) == (cold.st_mode, cold.st_uid, cold.st_gid)
+    backing = cached.stat()
+    assert backing.st_mtime_ns == cold.st_mtime_ns
+    assert (backing.st_uid, backing.st_gid) == (os.geteuid(), os.getegid())
+    row = mnt.fs.state_manager.get_file_metadata("/browse.bin")
+    assert row.sync_status == SyncStatus.CLEAN
+    if mode == 0o444 and os.geteuid() != 0:
+        with pytest.raises(PermissionError):
+            mounted.open("r+b")
+        with pytest.raises(PermissionError):
+            os.truncate(mounted, 0)
+        assert remote.exec(member, snapshot).stdout == before
+
+
 def test_mounted_read_only_conflict_close_keeps_newer_member_bytes(
         remote, mounted_factory, monkeypatch):
     left, right = remote.members

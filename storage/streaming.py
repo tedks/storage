@@ -15,7 +15,7 @@ from fuse import FuseOSError
 from .backends.base import Backend
 from .backends.local import NOREPLACE_UNSUPPORTED
 from .backends.local import rename_noreplace as _rename_noreplace
-from .cache_metadata import PREFIX_XATTR
+from .cache_metadata import PREFIX_XATTR, copy_member_attributes
 from .models import FileLocation, FileMetadata, StreamingKeepAfterClose, SyncStatus
 
 # A foreground read fetches only the bytes the reader asked for that are not
@@ -1131,6 +1131,7 @@ class StreamingReadManager:
         # catch their own.
         metadata = None
         try:
+            copy_member_attributes(io_fd, session.member_stat)
             os.fsync(io_fd)
             session.final_cache_path.parent.mkdir(parents=True, exist_ok=True)
             with self.state_manager.metadata_lock:
@@ -1396,8 +1397,10 @@ class StreamingReadManager:
             # One round trip either way: get_size is a stat on every member.
             try:
                 member_stat = backend.stat(canonical_path)
-                file_size = member_stat.st_size
             except NotImplementedError:
+                pass
+            file_size = getattr(member_stat, "st_size", None)
+            if file_size is None:
                 file_size = backend.get_size(canonical_path)
         except Exception as exc:
             self.logger.debug(

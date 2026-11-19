@@ -38,10 +38,15 @@ from .backends.ssh_mux import close_shared_control_sockets
 from .backends.ssh_pool import (
     BulkCapacityCancelled, BulkCapacityTimeout, is_connection_error,
 )
-from .cache import PARTIAL_SUFFIX, CacheManager
+from .cache import PARTIAL_SUFFIX, CacheFetch, CacheManager
 from .foreground_admission import AdmissionClosed, ForegroundAdmission, validate_cap
 from .locks import NamespaceLock, PathLocks, UploadLocks
-from .cache_metadata import PREFIX_XATTR, XATTR_CACHE_METADATA_NAME, regular_file_stat, scan_cache_entries
+from .cache_metadata import (
+    MEMBER_ATTRS_XATTR, MEMBER_STAT_XATTR as CACHE_MEMBER_STAT_XATTR,
+    PREFIX_XATTR, XATTR_CACHE_METADATA_NAME,
+    cache_identity, cached_member_attributes, forget_cached_member_fields,
+    read_member_baselines, regular_file_stat, scan_cache_entries,
+)
 from .file_config import FileConfig, get_inherited_config
 from .models import FileLocation, FileMetadata, StreamingKeepAfterClose, SyncStatus
 from .state import StateManager
@@ -109,7 +114,7 @@ class StorageFS(Operations):
     _PARTIAL_SUFFIX = PARTIAL_SUFFIX
     _STREAM_STATE_XATTR = "user.storage.stream"
     # Member baselines for revalidation on open (see _store_member_check).
-    MEMBER_STAT_XATTR = "user.storage.member_stat"
+    MEMBER_STAT_XATTR = CACHE_MEMBER_STAT_XATTR
     # Internal artifacts that should be hidden from readdir listings.
     # Entries matching these exactly are filtered, plus anything ending
     # with _PARTIAL_SUFFIX.
@@ -1369,9 +1374,7 @@ class StorageFS(Operations):
     # ------------------------------------------------------------------ #
     # Revalidation of cached files on open
     # ------------------------------------------------------------------ #
-    @staticmethod
-    def _cache_identity(st: os.stat_result) -> Tuple[int, int, int]:
-        return (st.st_ino, st.st_size, st.st_mtime_ns)
+    _cache_identity = staticmethod(cache_identity)
 
     def _forget_member_check(self, virtual_path: str, subtree: bool = False,
                              path_gone: bool = False):
@@ -1443,26 +1446,7 @@ class StorageFS(Operations):
         self.namespace.forget_listed_attrs(virtual_path, removing=removing)
         self._forget_member_check(virtual_path)
 
-    def _load_persisted_members(self, cache_path: Path,
-                                identity: Tuple[int, int, int]) -> Dict[str, Tuple[int, float]]:
-        """Member baselines from the cache file's xattr, if it still describes this file.
-
-        Matched on the cache file's (ino, size, mtime_ns) alone: a rename
-        keeps both the file and its baselines valid, and a copy of the xattr
-        onto another file (copy2 to a local member and back) has another
-        inode.
-        """
-        try:
-            payload = json.loads(os.getxattr(str(cache_path), self.MEMBER_STAT_XATTR,
-                                             follow_symlinks=False))
-            if tuple(payload.get("cache")) != identity:
-                return {}
-            return {
-                str(name): (int(size), float(mtime))
-                for name, (size, mtime) in payload.get("members", {}).items()
-            }
-        except (OSError, ValueError, TypeError, AttributeError):
-            return {}
+    _load_persisted_members = staticmethod(read_member_baselines)
 
     def _store_member_check(self, canonical_path: str, cache_path: Path,
                             identity: Tuple[int, int, int],
@@ -1554,8 +1538,9 @@ class StorageFS(Operations):
             self._forget_member_check(canonical_path)
             return
         members = {}
-        if member_stat is not None:
-            members[backend.name] = (member_stat.st_size, member_stat.st_mtime)
+        size, mtime = getattr(member_stat, "st_size", None), getattr(member_stat, "st_mtime", None)
+        if size is not None and mtime is not None:
+            members[backend.name] = (size, mtime)
         self._store_member_check(canonical_path, cache_path, identity, members, replace=True)
         self._clear_recheck(canonical_path, backend.name)
         with self._member_checks_lock:
@@ -2059,26 +2044,20 @@ class StorageFS(Operations):
                 except Exception:
                     member_stat = None
             # Download to cache
-            cached = self.cache_manager.cache_file(
-                resolved.requested_path,
-                backend,
-                source_virtual_path=canonical_path,
+            outcome = self.cache_manager.cache_file_result(
+                resolved.requested_path, backend, canonical_path, member_stat=member_stat,
             )
-            if cached and self._drop_unindexed_prefix(canonical_path, cache_path):
+            if outcome == CacheFetch.ALREADY_CACHED and self._drop_unindexed_prefix(canonical_path, cache_path):
                 # A failed stream's prefix was installed before this copy
                 # (whose link then found it): once more, for the whole file.
-                cached = self.cache_manager.cache_file(
-                    resolved.requested_path,
-                    backend,
-                    source_virtual_path=canonical_path,
+                outcome = self.cache_manager.cache_file_result(
+                    resolved.requested_path, backend, canonical_path, member_stat=member_stat,
                 )
-            if cached and self._is_unindexed_prefix(canonical_path, cache_path):
-                # Still a prefix (open elsewhere, or another one won again):
-                # serve it unindexed, as any open after a failed session's
-                # cleanup does. (If the second fetch fails instead, the open
-                # fails: the dropped prefix is not served.)
+            if outcome == CacheFetch.ALREADY_CACHED:
+                # A stream or a writer won. Their inode, source baseline
+                # and state rows belong to them, even for an unindexed prefix.
                 return True
-            if cached:
+            if outcome == CacheFetch.INSTALLED:
                 # Fresh from the member: no check needed until revalidate_after.
                 self._record_fetched(canonical_path, cache_path, backend, member_stat)
                 # Populate state metadata and locations if missing
@@ -2122,8 +2101,7 @@ class StorageFS(Operations):
                         created = False
                 if not created:
                     # A refetch after eviction: the member's copy is what the
-                    # row already calls synced, but the transfer does not keep
-                    # the mtime, so the row's stat must follow the new file or
+                    # row already calls synced. Its stat must follow the new file or
                     # heal_stale_clean would resync unchanged content. Only
                     # the stat columns move, and only at the generation read
                     # above; a write recorded since keeps its own stat. The
@@ -2340,23 +2318,45 @@ class StorageFS(Operations):
 
     def chmod(self, path, mode):
         """Change file mode"""
-        cache_path = self._resolve_path(path).cache_path
-
-        try:
-            os.chmod(cache_path, mode)
-        except OSError as e:
-            raise FuseOSError(e.errno)
+        resolved = self._resolve_path(path)
+        with self._path_locked(resolved.canonical_path):
+            try:
+                before = os.lstat(resolved.cache_path)
+                os.chmod(resolved.cache_path, mode)
+                forget_cached_member_fields(resolved.cache_path, before, "st_mode", "st_ctime")
+            except OSError as e:
+                raise FuseOSError(e.errno)
 
     def chown(self, path, uid, gid):
         """Change file owner"""
-        cache_path = self._resolve_path(path).cache_path
-
+        resolved = self._resolve_path(path)
         # lchown: the kernel sends chown -h for a link, which must change
         # the link, never its target. (chmod is never sent for a link.)
-        try:
-            os.chown(cache_path, uid, gid, follow_symlinks=False)
-        except OSError as e:
-            raise FuseOSError(e.errno)
+        with self._path_locked(resolved.canonical_path):
+            try:
+                before = os.lstat(resolved.cache_path)
+                os.chown(resolved.cache_path, uid, gid, follow_symlinks=False)
+                fields = ["st_ctime"]
+                if uid != -1:
+                    fields.append("st_uid")
+                if gid != -1:
+                    fields.append("st_gid")
+                forget_cached_member_fields(resolved.cache_path, before, *fields)
+            except OSError as e:
+                raise FuseOSError(e.errno)
+
+    @staticmethod
+    def _require_imported_write_permission(cache_path: Path):
+        # Without default_permissions, native opens enforce the daemon's
+        # file permissions. The imported backing mode has an owner write
+        # bit for Storage's xattrs; don't grant that bit through the mount.
+        if os.geteuid() == 0:
+            return
+        local = regular_file_stat(cache_path)
+        if local is not None and local.st_uid == os.geteuid():
+            mode = (cached_member_attributes(cache_path, local) or {}).get("st_mode")
+            if mode is not None and not mode & stat.S_IWUSR:
+                raise FuseOSError(errno.EACCES)
 
     def _mark_cache_file_dirty(self, canonical_path: str, cache_path: Path) -> None:
         """Record a modification of a cached file (see CacheManager.mark_file_dirty)."""
@@ -2382,6 +2382,7 @@ class StorageFS(Operations):
             raise FuseOSError(errno.EBUSY)
 
         try:
+            self._require_imported_write_permission(cache_path)
             with open(cache_path, 'r+b') as f:
                 f.truncate(length)
             self.cache_manager.mark_cache_size_dirty()
@@ -2474,6 +2475,8 @@ class StorageFS(Operations):
             if not self._ensure_file_in_cache(resolved):
                 raise FuseOSError(errno.ENOENT)
             cache_path = resolved.cache_path
+            if not self._is_read_only_open(flags):
+                self._require_imported_write_permission(cache_path)
 
         try:
             # Hold _fd_lock across os.open AND _fd_map registration so that
@@ -2866,7 +2869,7 @@ class StorageFS(Operations):
     def setxattr(self, path, name, value, options, position=0):
         """Set extended attribute"""
         if name in {self.CHECKSUM_XATTR, self.CACHE_STATE_XATTR, self.CACHE_METADATA_XATTR,
-                    self.MEMBER_STAT_XATTR}:
+                    self.MEMBER_STAT_XATTR, MEMBER_ATTRS_XATTR}:
             # Ignore manual writes for derived attrs.
             return
         if name == self.VERIFY_XATTR:
@@ -2904,7 +2907,7 @@ class StorageFS(Operations):
     def removexattr(self, path, name):
         """Remove extended attribute"""
         if name in {self.CHECKSUM_XATTR, self.CACHE_STATE_XATTR, self.CACHE_METADATA_XATTR,
-                    self.MEMBER_STAT_XATTR}:
+                    self.MEMBER_STAT_XATTR, MEMBER_ATTRS_XATTR}:
             # Derived; ignore removals.
             return
         cache_path = self._resolve_path(path).cache_path
@@ -3168,6 +3171,10 @@ class StorageFS(Operations):
             and after.st_mtime != before.st_mtime
         ):
             self._mark_cache_file_dirty(resolved.canonical_path, cache_path)
+        try:
+            forget_cached_member_fields(cache_path, before, "st_mtime", "st_ctime")
+        except OSError as e:
+            raise FuseOSError(e.errno)
 
     def sweep_stale_cache_metadata(self) -> int:
         """Mark DIRTY every cached file written after its row last said CLEAN.
