@@ -1957,14 +1957,14 @@ class StorageFS(Operations):
     def _record_streaming_stat(self, key: str, value: int = 1):
         self._streaming_manager._record_streaming_stat(key, value)
 
-    def _write_session_bytes(self, session: PrefetchSession, offset: int, data: bytes):
-        self._streaming_manager._write_session_bytes(session, offset, data)
+    def _write_session_bytes(self, session: PrefetchSession, offset: int, data: bytes) -> bool:
+        return self._streaming_manager._write_session_bytes(session, offset, data)
 
-    def _fetch_range_into_session(self, session: PrefetchSession, start: int, end: int, source: str) -> int:
+    def _fetch_range_into_session(self, session: PrefetchSession, start: int, end: int, source: str):
         return self._streaming_manager._fetch_range_into_session(session, start, end, source)
 
     def _ensure_streaming_range(self, session: PrefetchSession, start: int, end: int):
-        self._streaming_manager._ensure_streaming_range(session, start, end)
+        return self._streaming_manager._ensure_streaming_range(session, start, end)
 
     def _close_streaming_session_resources(self, session: PrefetchSession):
         self._streaming_manager._close_streaming_session_resources(session)
@@ -2570,9 +2570,8 @@ class StorageFS(Operations):
 
         try:
             self._require_imported_write_permission(cache_path)
-            with open(cache_path, 'r+b') as f:
+            with self.cache_manager.cache_size_change(), open(cache_path, 'r+b') as f:
                 f.truncate(length)
-            self.cache_manager.mark_cache_size_dirty()
 
             # Mark as dirty
             if not resolved.backend_name:
@@ -2679,7 +2678,10 @@ class StorageFS(Operations):
             # Hold _fd_lock across a by-name os.open AND _fd_map registration
             # so that _invalidate_file_cache (which also holds _fd_lock)
             # cannot unlink the cache file between os.open and registration.
-            with self._fd_lock:
+            # An O_TRUNC open frees blocks: it is a cache size change.
+            allocation = (self.cache_manager.cache_size_change() if flags & os.O_TRUNC
+                          else contextlib.nullcontext())
+            with allocation, self._fd_lock:
                 if real_fd < 0:
                     real_fd = os.open(str(cache_path), flags)
 
@@ -2730,7 +2732,7 @@ class StorageFS(Operations):
         cache_path = self.cache_manager.create_cached_file(resolved.requested_path)
 
         try:
-            with self._fd_lock:
+            with self.cache_manager.cache_size_change(), self._fd_lock:
                 real_fd = os.open(str(cache_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
                 vfd = self._fd_counter
                 self._fd_counter += 1
@@ -2784,6 +2786,7 @@ class StorageFS(Operations):
             if entry is None:
                 raise FuseOSError(errno.EBADF)
 
+        transient = []
         session = entry.prefetch_session
         if session is not None:
             read_start = max(0, offset)
@@ -2792,7 +2795,7 @@ class StorageFS(Operations):
             if read_start >= read_end:
                 return b""
 
-            self._ensure_streaming_range(session, read_start, read_end)
+            transient = self._ensure_streaming_range(session, read_start, read_end)
 
         try:
             if hasattr(os, "pread"):
@@ -2800,6 +2803,18 @@ class StorageFS(Operations):
             else:
                 os.lseek(entry.real_fd, offset, os.SEEK_SET)
                 data = os.read(entry.real_fd, size)
+
+            if transient:
+                # Use the open descriptor for cached spans and overlay only
+                # bytes fetched directly for this request. Sparse holes
+                # alone never stand in for an uncached backend range.
+                merged = bytearray(data)
+                for start, chunk in transient:
+                    first = max(offset, start)
+                    end = min(offset + len(data), start + len(chunk))
+                    if first < end:
+                        merged[first - offset:end - offset] = chunk[first - start:end - start]
+                data = bytes(merged)
 
             if entry.backend_name is None:
                 self._mark_demand_access(entry.canonical_path, session)
@@ -2825,8 +2840,8 @@ class StorageFS(Operations):
         try:
             # Positional: a descriptor's offset is shared state, and
             # concurrent writes through one fh must not move each other's.
-            written = os.pwrite(entry.real_fd, data, offset)
-            self.cache_manager.mark_cache_size_dirty()
+            with self.cache_manager.cache_size_change():
+                written = os.pwrite(entry.real_fd, data, offset)
 
             if entry.backend_name is None:
                 self.cache_manager.mark_accessed(entry.canonical_path)
@@ -2867,10 +2882,10 @@ class StorageFS(Operations):
                     # (an alias that survived, then moved out of the fence).
                     raise FuseOSError(errno.EBUSY)
                 try:
-                    written = os.pwrite(entry.real_fd, data, offset)
+                    with self.cache_manager.cache_size_change():
+                        written = os.pwrite(entry.real_fd, data, offset)
                 except OSError as e:
                     raise FuseOSError(e.errno)
-                self.cache_manager.mark_cache_size_dirty()
                 return written
 
     def release(self, path, fh):

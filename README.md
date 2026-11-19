@@ -243,6 +243,12 @@ a 2 GiB file, a 1 MiB contiguous read opens a speculative window of up to
 4 MiB after that span, while a contiguous read of about 614.4 MiB
 (644,245,095 bytes) qualifies the file to keep downloading after close.
 
+The cache budget charges data blocks as the partial download writes them.
+An open or a sparse seek reserves space only when bytes arrive and need
+new blocks. When the next write cannot fit after reclaiming eligible
+copies, foreground reads can return the fetched bytes directly and
+preloading pauses.
+
 Streaming read-ahead and retained fills share an adaptive pool. Workers
 start as chunks become runnable and retire after 30 idle seconds. By
 default the pool grows with demand up to each member's own limit: bulk
@@ -666,9 +672,8 @@ Configuration is hierarchical - child directories inherit from parents, with the
 
 **Cache Management:**
 1. Track file access times for LRU
-2. Evict clean files when space needed
-3. Prefer evicting recomputable files
-4. Never evict dirty (unsynced) files
+2. Reclaim clean, recoverable copies in access order as new data needs space
+3. Keep dirty, open, repair-pinned, and recompute-only files under cache pressure
 
 **Metadata and Recovery:**
 1. File/directory policy remains xattr-defined via `user.storage.config`
