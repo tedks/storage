@@ -1,10 +1,10 @@
 import json
-import socket
 from dataclasses import asdict
 from pathlib import Path
 
 import click
 
+from .control import ControlError, request_control_payload
 from .index_audit import (
     rebuild_index_from_cache,
     reprobe_member_locations,
@@ -19,40 +19,6 @@ from .state import StateManager
 def debug():
     """Debug and diagnostics commands."""
     pass
-
-
-def _request_control_payload(cache_root: Path, request: str, timeout: float = 2.0) -> dict:
-    socket_path = cache_root / ".storage.control.sock"
-    if not socket_path.exists():
-        raise click.ClickException(f"No running mount control socket at {socket_path}")
-
-    try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-            sock.settimeout(timeout)
-            sock.connect(str(socket_path))
-            sock.sendall((request + "\n").encode("utf-8"))
-
-            data = b""
-            while True:
-                chunk = sock.recv(4096)
-                if not chunk:
-                    break
-                data += chunk
-    except (OSError, TimeoutError) as exc:
-        raise click.ClickException(f"Failed to query control socket {socket_path}: {exc}") from exc
-
-    if not data:
-        raise click.ClickException(f"No response from control socket {socket_path}")
-
-    try:
-        payload = json.loads(data.decode("utf-8"))
-    except json.JSONDecodeError as exc:
-        raise click.ClickException(f"Invalid response from control socket {socket_path}: {exc}") from exc
-
-    if isinstance(payload, dict) and payload.get("error"):
-        raise click.ClickException(str(payload["error"]))
-
-    return payload
 
 
 @debug.command("streaming-stats")
@@ -74,7 +40,10 @@ def _request_control_payload(cache_root: Path, request: str, timeout: float = 2.
 def debug_streaming_stats(cache, timeout, json_output):
     """Show live streaming-read stats from a running mount."""
     cache_root = Path(cache).resolve()
-    payload = _request_control_payload(cache_root, "streaming-stats", timeout=timeout)
+    try:
+        payload = request_control_payload(cache_root, b"streaming-stats", timeout)
+    except ControlError as exc:
+        raise click.ClickException(str(exc)) from exc
 
     if json_output:
         click.echo(json.dumps(payload, sort_keys=True, indent=2))

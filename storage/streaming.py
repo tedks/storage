@@ -1,8 +1,8 @@
 import errno
 import json
 import os
+import re
 import secrets
-import socket
 import threading
 import time
 from collections import Counter
@@ -21,6 +21,7 @@ from .backends.local import NOREPLACE_UNSUPPORTED
 from .backends.local import rename_noreplace as _rename_noreplace
 from .backends.ssh_pool import BulkCapacityCancelled, BulkCapacityTimeout
 from .cache_metadata import PREFIX_XATTR, confirm_member_stat, copy_member_attributes
+from .control import ControlError, ControlServer
 from .models import FileLocation, FileMetadata, StreamingKeepAfterClose, SyncStatus
 
 # A foreground read fetches only the bytes the reader asked for that are not
@@ -107,6 +108,13 @@ def validate_download_limits(limits):
         low, high = bounds[name]
         if type(value) is not int or not low <= value <= high:
             raise ValueError(f"{name} must be an integer between {low} and {high}")
+
+
+def _unique_control_fields(pairs):
+    fields = dict(pairs)
+    if len(fields) != len(pairs):
+        raise ControlError("Duplicate field in control request")
+    return fields
 
 
 @dataclass(eq=False)
@@ -553,20 +561,16 @@ class StreamingReadManager:
             "foreground_fetches": 0,
             "background_fetches": 0,
         }
-        self._control_socket_path = self.cache_manager.cache_root / ".storage.control.sock"
-        self._control_stop_event = threading.Event()
-        self._control_socket_lock = threading.Lock()
-        self._control_socket: Optional[socket.socket] = None
-        self._control_thread: Optional[threading.Thread] = None
+        self._control_server = ControlServer(
+            self.cache_manager.cache_root, self._handle_control_request, self.logger,
+        )
         # Whole-file fills (CacheManager.cache_file_result) can make room by
         # stopping readerless retained fills, which the cache's own eviction
         # cannot touch: they have no index row.
         self.cache_manager.reclaim_space = self._reclaim_retained_space_for_cache
 
     def init(self):
-        control_thread = self._control_thread
-        if control_thread is None or not control_thread.is_alive():
-            self._start_control_server()
+        self._control_server.start()
 
     def download_limits(self):
         with self.prefetch_sessions_lock:
@@ -646,7 +650,7 @@ class StreamingReadManager:
         libfuse runs destroy after its loop has stopped serving requests,
         so the multithreaded loop does not reach this either.
         """
-        self._stop_control_server()
+        self._control_server.stop()
 
         with self.prefetch_sessions_lock:
             self._destroying = True
@@ -907,100 +911,58 @@ class StreamingReadManager:
         })
         return stats
 
-    def _handle_control_request(self, request: str) -> Dict[str, object]:
-        if request == "streaming-stats":
+    def _control_parameters(self, limits: dict) -> dict:
+        return {
+            "limits": limits,
+            "restart_only": {
+                "streaming_reads": bool(self.streaming_reads),
+                "streaming_chunk_size": self.chunk_size,
+                "streaming_keep_after_close": {
+                    "bytes": list(self.keep_after_close.byte_thresholds),
+                    "percent": [str(value) for value in self.keep_after_close.percent_thresholds],
+                },
+            },
+        }
+
+    def _handle_control_request(self, request: str) -> dict:
+        if request.strip() == "streaming-stats":  # Backward-compatible request.
             return self._streaming_stats_snapshot()
-        return {"error": f"unsupported request: {request}"}
-
-    def _control_server_loop(self):
-        while not self._control_stop_event.is_set():
-            with self._control_socket_lock:
-                control_socket = self._control_socket
-
-            if control_socket is None:
-                return
-
-            try:
-                conn, _ = control_socket.accept()
-            except socket.timeout:
-                continue
-            except OSError:
-                if self._control_stop_event.is_set():
-                    return
-                continue
-
-            with conn:
-                try:
-                    conn.settimeout(2.0)
-                    payload = conn.recv(4096)
-                    request = payload.decode("utf-8", errors="replace").strip()
-                    response = self._handle_control_request(request)
-                except Exception as exc:
-                    response = {"error": f"control request failed: {exc}"}
-
-                try:
-                    conn.sendall((json.dumps(response, sort_keys=True) + "\n").encode("utf-8"))
-                except Exception:
-                    pass
-
-    def _start_control_server(self):
-        self._control_stop_event.clear()
-
         try:
-            self._control_socket_path.unlink(missing_ok=True)
-        except OSError:
-            pass
+            arguments = json.loads(request, object_pairs_hook=_unique_control_fields)
+        except ControlError:
+            raise
+        except (ValueError, RecursionError) as exc:
+            raise ControlError("Expected a JSON control request object") from exc
+        if not isinstance(arguments, dict):
+            raise ControlError("Expected a JSON control request object")
 
-        try:
-            control_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            control_socket.bind(str(self._control_socket_path))
-            os.chmod(self._control_socket_path, 0o600)
-            control_socket.listen(8)
-            control_socket.settimeout(0.5)
-        except OSError as exc:
-            self.logger.warning(
-                "failed to start control socket at %s: %s",
-                self._control_socket_path,
-                exc,
-            )
+        command = arguments.pop("command", None)
+        if command in ("status", "streaming.get", "downloads.list") and arguments:
+            raise ControlError("Unexpected arguments for control command")
+        if command == "status":
+            return {
+                "stats": self._streaming_stats_snapshot(),
+                **self._control_parameters(self.download_limits()),
+            }
+        if command == "streaming.get":
+            return self._control_parameters(self.download_limits())
+        if command == "streaming.set":
+            changes = arguments.get("limits")
+            if set(arguments) != {"limits"} or not isinstance(changes, dict) or not changes:
+                raise ControlError("Provide at least one live streaming limit to set")
             try:
-                control_socket.close()
-            except Exception:
-                pass
-            return
-
-        with self._control_socket_lock:
-            self._control_socket = control_socket
-
-        self._control_thread = threading.Thread(
-            target=self._control_server_loop,
-            daemon=True,
-            name="storage-control-socket",
-        )
-        self._control_thread.start()
-
-    def _stop_control_server(self):
-        self._control_stop_event.set()
-
-        with self._control_socket_lock:
-            control_socket = self._control_socket
-            self._control_socket = None
-
-        if control_socket is not None:
-            try:
-                control_socket.close()
-            except OSError:
-                pass
-
-        control_thread = self._control_thread
-        self._control_thread = None
-        if control_thread and control_thread.is_alive():
-            control_thread.join(timeout=2.0)
-
-        try:
-            self._control_socket_path.unlink(missing_ok=True)
-        except OSError:
-            pass
+                return self._control_parameters(self.update_download_limits(**changes))
+            except ValueError as exc:
+                raise ControlError(str(exc)) from exc
+        if command == "downloads.list":
+            return {"downloads": self.list_download_sessions()}
+        if command == "downloads.cancel":
+            session_id = arguments.get("id")
+            if (set(arguments) != {"id"} or not isinstance(session_id, str)
+                    or re.fullmatch(r"[0-9a-f]{32}", session_id) is None):
+                raise ControlError("Provide a complete download ID from 'storage control ... downloads'")
+            return {"id": session_id, "result": self.cancel_download_session(session_id)}
+        raise ControlError("Unknown mount control command")
 
     def _record_streaming_stat(self, key: str, value: int = 1):
         with self._streaming_stats_lock:

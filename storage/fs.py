@@ -1919,18 +1919,6 @@ class StorageFS(Operations):
     def _streaming_stats_snapshot(self) -> Dict[str, object]:
         return self._streaming_manager._streaming_stats_snapshot()
 
-    def _handle_control_request(self, request: str) -> Dict[str, object]:
-        return self._streaming_manager._handle_control_request(request)
-
-    def _control_server_loop(self):
-        self._streaming_manager._control_server_loop()
-
-    def _start_control_server(self):
-        self._streaming_manager._start_control_server()
-
-    def _stop_control_server(self):
-        self._streaming_manager._stop_control_server()
-
     def _record_streaming_stat(self, key: str, value: int = 1):
         self._streaming_manager._record_streaming_stat(key, value)
 
