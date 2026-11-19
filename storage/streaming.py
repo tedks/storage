@@ -15,7 +15,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 from fuse import FuseOSError
 
 from .backends.base import Backend, capacity_wait_cancellation
-from .backends.ssh_pool import BulkCapacityCancelled, BulkCapacityTimeout, is_connection_error
+from .backends.ssh_pool import BulkCapacityCancelled, member_failure_errno
 from .backends.local import NOREPLACE_UNSUPPORTED
 from .backends.local import rename_noreplace as _rename_noreplace
 from .cache_metadata import PREFIX_XATTR, copy_member_attributes
@@ -87,22 +87,6 @@ class StreamSource:
     backend: Backend
     member_stat: object | None
     file_size: int
-
-
-def streaming_errno(exc: Exception) -> int:
-    if isinstance(exc, BulkCapacityCancelled):
-        return errno.EINTR
-    if isinstance(exc, BulkCapacityTimeout):
-        return errno.EAGAIN
-    if isinstance(exc, OSError) and exc.errno:
-        return exc.errno
-    if isinstance(exc, TimeoutError):
-        return errno.ETIMEDOUT
-    if isinstance(exc, ConnectionError) or is_connection_error(exc):
-        return errno.EHOSTUNREACH
-    if isinstance(exc, MemoryError):
-        return errno.ENOMEM
-    return errno.EIO
 
 
 def _unique_control_fields(pairs):
@@ -1040,7 +1024,7 @@ class StreamingReadManager:
                 if session.stop_requested:
                     raise FuseOSError(errno.EINTR)
                 if session.error is not None:
-                    raise FuseOSError(streaming_errno(session.error))
+                    raise FuseOSError(member_failure_errno(session.error))
 
                 # Only what the reader asked for: not rounded up to a chunk,
                 # which is what made a 4 KiB sniff cost a whole chunk.
@@ -1072,13 +1056,13 @@ class StreamingReadManager:
                 )
                 transient.extend(uncached)
             except Exception as exc:
-                self.logger.warning("streaming foreground range failed errno=%d", streaming_errno(exc))
+                self.logger.warning("streaming foreground range failed errno=%d", member_failure_errno(exc))
                 with session.lock:
                     if session.error is None:
                         session.error = exc
                     session.condition.notify_all()
                 self._update_streaming_state_xattr(session, "error")
-                raise FuseOSError(streaming_errno(exc)) from exc
+                raise FuseOSError(member_failure_errno(exc)) from exc
             finally:
                 with session.lock:
                     session.in_flight_ranges.remove(fetch)
@@ -1635,13 +1619,13 @@ class StreamingReadManager:
             if session.failed_cleanup_claimed:
                 raise OSError(errno.EAGAIN, "streaming cleanup in progress")
             if session.error is not None and not session.prefetch_complete:
-                raise OSError(streaming_errno(session.error), "streaming read failed") from session.error
+                raise OSError(member_failure_errno(session.error), "streaming read failed") from session.error
             session.refcount += 1
             self._schedule_background(session)
         return session
 
     def report_open_error(self, reason: str, exc: Exception):
-        error = streaming_errno(exc)
+        error = member_failure_errno(exc)
         if error in (errno.EMFILE, errno.ENFILE):
             reason = "descriptors"
         self._record_streaming_stat(f"streaming_open_error_{reason}")
@@ -1683,7 +1667,7 @@ class StreamingReadManager:
             if self.cache_manager.is_cached(virtual_path):
                 return StreamingOpen.CACHED
             self.report_open_error("source_probe", exc)
-            raise OSError(streaming_errno(exc), "streaming source probe failed") from exc
+            raise OSError(member_failure_errno(exc), "streaming source probe failed") from exc
         if source is None:
             if self.cache_manager.is_cached(virtual_path):
                 return StreamingOpen.CACHED

@@ -276,6 +276,38 @@ class TestFSStreamingIntegration(unittest.TestCase):
             self.fs.release(path, fd)
         wrong.assert_not_called()
 
+    def test_source_discovery_preserves_duplicate_priority_and_a_live_pin(self):
+        _, holder, holder_dir = self._source_discovery_members()
+        path = "/duplicated.txt"
+        first = b"canonical priority"
+        second = b"other member has a different copy"
+        (self.backend_dir / path[1:]).write_bytes(first)
+        (holder_dir / path[1:]).write_bytes(second)
+        list(self.fs.readdir("/", None))
+        fd = self.fs.open(path, os.O_RDONLY)
+        try:
+            self.assertEqual(self.fs.read(path, len(first), 0, fd), first)
+        finally:
+            self.fs.release(path, fd)
+        view = path + ".holder"
+        fd = self.fs.open(view, os.O_RDONLY)
+        try:
+            self.assertEqual(self.fs.read(view, len(second), 0, fd), second)
+        finally:
+            self.fs.release(view, fd)
+
+        path = "/pinned.txt"
+        (self.backend_dir / path[1:]).write_bytes(first)
+        (holder_dir / path[1:]).write_bytes(second)
+        self.fs._refetch_pins[path] = holder
+        with patch.object(holder, "stat", side_effect=PermissionError(errno.EACCES, "denied")) as pinned, \
+                patch.object(self.backend, "stat", wraps=self.backend.stat) as alternate:
+            with self.assertRaises(FuseOSError) as denied:
+                self.fs.open(path, os.O_RDONLY)
+            self.assertEqual(denied.exception.errno, errno.EACCES)
+        pinned.assert_called_once_with(path)
+        alternate.assert_not_called()
+
     def test_foreground_overlapping_range_can_use_interactive_reserve(self):
         payload = os.urandom(512 * 1024)
         (self.backend_dir / "reserve.bin").write_bytes(payload)

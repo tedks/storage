@@ -12,6 +12,7 @@ from typing import Callable, Dict, List, NamedTuple, Optional, Set, Tuple
 from fuse import FuseOSError
 
 from .backends.base import Backend, MemberSourceMissing
+from .backends.ssh_pool import member_failure_errno
 from .cache_metadata import (
     cached_member_attributes, legacy_member_mtime, regular_file_stat,
 )
@@ -786,8 +787,8 @@ class NamespaceService:
 
         return visible
 
-    def getattr(self, path: str):
-        """Get file attributes."""
+    def getattr(self, path: str, *, read_lookup: bool = False):
+        """Get attributes. A read lookup needs definite absence before returning ENOENT."""
         resolved = self.resolve_path(path)
 
         try:
@@ -823,9 +824,11 @@ class NamespaceService:
             else:
                 backend_iter = list(self.backends.items())
 
-            listed = self._listed_attrs(resolved, backend_iter)
+            listed = self._listed_attrs(resolved, backend_iter, read_lookup=read_lookup)
             if listed is LISTED_MISSING:
-                raise FuseOSError(errno.ENOENT)
+                if not read_lookup or not self.read_source_hints(resolved)[0]:
+                    raise FuseOSError(errno.ENOENT)
+                listed = None  # a newer stat saw a copy after the listing
             if listed is not None:
                 def field(key, default):
                     value = listed.get(key)
@@ -854,12 +857,25 @@ class NamespaceService:
                 if answered_by is not None and answered_by.is_available():
                     return remembered
 
+            missing = set()
+            if read_lookup:
+                present, missing = self.read_source_hints(resolved)
+                if len(present) == 1:
+                    (known, mode), = present.items()
+                    if mode is not None and stat.S_ISREG(mode):
+                        # Try a known regular file before a member that has
+                        # not listed. Multiple visible copies still use the
+                        # configured member order. Links keep readlink's order.
+                        backend_iter.sort(key=lambda item: item[0] != known)
+            failures = []
+            unavailable = False
             for backend_name, backend in backend_iter:
-                if not backend:
+                if backend_name in missing or not backend:
                     continue
                 if not backend.is_available():
-                    if resolved.backend_name:
+                    if resolved.backend_name and not read_lookup:
                         raise FuseOSError(errno.EHOSTUNREACH)
+                    unavailable = True
                     continue
                 try:
                     began = time.monotonic()
@@ -886,6 +902,8 @@ class NamespaceService:
                         backend_name)
                     return answer
                 except Exception as backend_error:
+                    if read_lookup and not isinstance(backend_error, FileNotFoundError):
+                        failures.append(member_failure_errno(backend_error))
                     self.logger.debug(
                         "getattr backend fallback failed for %s on %s: %s",
                         resolved.canonical_path,
@@ -893,13 +911,21 @@ class NamespaceService:
                         backend_error,
                     )
 
+            if read_lookup and exc.errno == errno.ENOENT:
+                if failures:
+                    error = next((error for error in failures if error != errno.EHOSTUNREACH), failures[0])
+                    raise FuseOSError(error)
+                if unavailable:
+                    raise FuseOSError(errno.EHOSTUNREACH)
+                raise FuseOSError(errno.ENOENT)
+
             available_backends, _ = self.backend_availability()
             if not available_backends and self.backends:
                 raise FuseOSError(errno.EHOSTUNREACH)
 
             raise FuseOSError(exc.errno)
 
-    def _listed_attrs(self, resolved: ResolvedPath, backend_iter):
+    def _listed_attrs(self, resolved: ResolvedPath, backend_iter, *, read_lookup=False):
         """Attributes of a path from its parent's listing, if any.
 
         Walks the members in the order getattr probes them, skipping the
@@ -940,8 +966,14 @@ class NamespaceService:
             state = self.listing_state(listing[0], now) if listing else "expired"
             if state != "expired" and name not in listing[2]:
                 result = self._walk_listing_locked(listing, name, available)
-                if result is LISTED_MISSING and not self._answers_missing(listing[0], now):
-                    result = None
+                if result is LISTED_MISSING:
+                    if not self._answers_missing(listing[0], now) or (
+                        read_lookup and any(
+                            member not in listing[1] or name in listing[1][member]
+                            for member, backend in backend_iter if backend
+                        )
+                    ):
+                        result = None
         if state == "stale":
             self._schedule_refresh(parent)
         return result
@@ -952,6 +984,45 @@ class NamespaceService:
         listing = self.entry_attrs.pop(path, None)
         if listing is not None:
             self.entry_attrs[path] = listing
+
+    def read_source_hints(self, resolved: ResolvedPath) -> Tuple[Dict[str, Optional[int]], Set[str]]:
+        """Recent positive and negative evidence for a read-only lookup.
+
+        A failed or pending member listing supplies no absence proof. A stat
+        memo can supplement a listing if it is at least as recent. A hint
+        can order member probes but does not supply a stream's fresh stat.
+        """
+        now = time.monotonic()
+        name = Path(resolved.canonical_path).name
+        present = {}
+        missing = set()
+        with self.listing_lock:
+            listing = self.entry_attrs.get(resolved.parent_dir)
+            if listing and self._answers_missing(listing[0], now) and name not in listing[2]:
+                for member, attrs in listing[1].items():
+                    if name in attrs:
+                        present[member] = attrs[name].get("st_mode")
+                    else:
+                        missing.add(member)
+                # A names-only listing, or names carried over when a member
+                # failed, can still make the source ambiguous. They cannot
+                # prove absence or justify prioritizing a regular file.
+                inputs = self._view_inputs.get(resolved.parent_dir)
+                if inputs is not None:
+                    for member, names in inputs[1].items():
+                        if member not in missing and name in names:
+                            present.setdefault(member, None)
+            memo = self._stat_memo.get(resolved.canonical_path, {}).get(resolved.backend_name)
+            if memo and self._answers_missing(memo[0], now):
+                at, attrs, member = memo
+                if member not in missing or at >= listing[0]:
+                    present[member] = attrs.get("st_mode")
+                    missing.discard(member)
+        if resolved.backend_name is not None:
+            target = resolved.backend_name
+            present = {target: present[target]} if target in present else {}
+            missing.intersection_update({target})
+        return present, missing
 
     def listed_member_attrs(self, resolved: ResolvedPath, backend_name: str,
                             newer_than: float) -> Optional[Tuple[float, dict]]:

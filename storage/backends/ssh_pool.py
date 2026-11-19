@@ -146,6 +146,23 @@ def is_connection_error(exc: BaseException) -> bool:
     return isinstance(exc, MemberUnavailable) or _verdict(exc) >= _Verdict.PROBE
 
 
+def member_failure_errno(exc: Exception) -> int:
+    """Map a member or transport failure to the errno exposed to a caller."""
+    if isinstance(exc, BulkCapacityCancelled):
+        return errno.EINTR
+    if isinstance(exc, BulkCapacityTimeout):
+        return errno.EAGAIN
+    if isinstance(exc, OSError) and exc.errno:
+        return exc.errno
+    if isinstance(exc, TimeoutError):
+        return errno.ETIMEDOUT
+    if isinstance(exc, ConnectionError) or is_connection_error(exc):
+        return errno.EHOSTUNREACH
+    if isinstance(exc, MemoryError):
+        return errno.ENOMEM
+    return errno.EIO
+
+
 def _close_quietly(obj) -> None:
     if obj is None:
         return

@@ -203,7 +203,7 @@ class SSHBackend(Backend):
         # capacity is acquired, so a reader can use the interactive reserve
         # while background work is still queued behind other bulk transfers.
         return self._with_sftp("background read", virtual_path, lambda sftp: fetch(),
-                               timeout=self.sftp_operation_timeout, retry=True)
+                               timeout=self.sftp_operation_timeout, retry=True, retry_closed_channel=True)
 
     # ------------------------------------------------------------------ #
     # Availability
@@ -295,7 +295,8 @@ class SSHBackend(Backend):
 
     def _with_sftp(self, what: str, virtual_path: str,
                    operation: Callable[[paramiko.SFTPClient], _T], *,
-                   timeout: Optional[float] = None, retry: bool = False) -> _T:
+                   timeout: Optional[float] = None, retry: bool = False,
+                   retry_closed_channel: bool = False) -> _T:
         """Run operation on a leased SFTP channel.
 
         timeout is the channel timeout (connect_timeout by default). With
@@ -304,7 +305,9 @@ class SSHBackend(Backend):
         repeat. A request that timed out on a connection that still answers
         is not retried: the member is slow, and the pool marks it down after
         a few of those. A nested call on the same thread reuses the caller's
-        channel and leaves the retry to the outermost call.
+        channel and leaves the retry to the outermost call. Read-only stat
+        and range operations may also retry a dropped SFTP channel on an
+        otherwise healthy transport.
         """
         if timeout is None:
             timeout = self.connect_timeout
@@ -320,7 +323,12 @@ class SSHBackend(Backend):
                     raise
                 self.logger.warning("SFTP %s failed on %s attempt=%d/%d: %r",
                                     what, virtual_path, attempt, attempts, exc)
-                if nested or attempt == attempts or self._pool.is_current(lease.generation):
+                if nested or attempt == attempts:
+                    raise
+                if self._pool.is_current(lease.generation) and not (
+                    retry_closed_channel and isinstance(exc, paramiko.SSHException)
+                    and str(exc).startswith("Server connection dropped:")
+                ):
                     raise
                 continue
             self._pool.release(lease)
@@ -379,7 +387,7 @@ class SSHBackend(Backend):
                 return f.read(size)
 
         return self._with_sftp("read", virtual_path, read,
-                               timeout=self.sftp_operation_timeout, retry=True)
+                               timeout=self.sftp_operation_timeout, retry=True, retry_closed_channel=True)
 
     def _ensure_parent(self, sftp, remote_path: str):
         parent = str(PurePosixPath(remote_path).parent)
@@ -637,7 +645,7 @@ class SSHBackend(Backend):
     def stat(self, virtual_path: str):
         remote_path = str(self._resolve_path(virtual_path))
         return self._with_sftp("stat", virtual_path,
-                               lambda sftp: sftp.stat(remote_path), retry=True)
+                               lambda sftp: sftp.stat(remote_path), retry=True, retry_closed_channel=True)
 
     def lstat(self, virtual_path: str):
         """Like stat, but a link at the last component is reported as a link.
@@ -649,7 +657,7 @@ class SSHBackend(Backend):
             return self.stat(virtual_path)
         remote_path = str(self._resolve_path(virtual_path))
         return self._with_sftp("lstat", virtual_path,
-                               lambda sftp: sftp.lstat(remote_path), retry=True)
+                               lambda sftp: sftp.lstat(remote_path), retry=True, retry_closed_channel=True)
 
     def readlink(self, virtual_path: str) -> str:
         """The link's target, from SFTP readlink (rsync members use it too).

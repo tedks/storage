@@ -266,6 +266,13 @@ On range-capable reads, a storage or member error returns its errno to
 the caller. A selected member without range support uses the whole-file
 cache path, as do write opens and opens with streaming disabled.
 
+For a cold streaming open, recent lookup and directory results can identify
+which member to ask first. The selected member supplies a fresh stat. A
+complete fresh record of absence can answer `ENOENT`; a missing response
+from a member still leaves that member's copy unknown. When a read or stat
+loses its SFTP channel and the SSH transport still answers, Storage makes
+one more attempt on another channel.
+
 SSH read-ahead and retained fills use bulk SFTP capacity, as do rsync
 members' range reads. A worker claims bytes only after getting a bulk
 channel, so a waiting worker leaves those bytes available to foreground

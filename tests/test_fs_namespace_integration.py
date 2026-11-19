@@ -1534,7 +1534,7 @@ class TestFSNamespaceIntegration(unittest.TestCase):
         with patch.object(self.backends["backend1"], "is_available", return_value=False):
             with self.assertRaises(FuseOSError) as caught:
                 self.fs.getattr('/deep')  # backend2 lacks it
-        self.assertEqual(caught.exception.errno, errno.ENOENT)
+        self.assertEqual(caught.exception.errno, errno.EHOSTUNREACH)
 
     def test_stat_memo_is_bounded(self):
         namespace = self.fs.namespace
