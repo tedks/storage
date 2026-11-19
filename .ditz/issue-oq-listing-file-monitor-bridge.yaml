@@ -1,0 +1,20 @@
+id: oq-listing-file-monitor-bridge
+title: Decide whether to support an opt-in desktop listing monitor
+desc: 'The scratch capability probe in PR #193 showed that stock GIO and Nautilus
+  miss native FUSE late additions. A small client-side monitor bridge delivered a
+  late row in the original file URI on installed Nautilus. Production support would
+  add an opt-in client component and restart, plus an authenticated and bounded revision
+  transport. Record the decision on whether that client scope is authorized.'
+type: task
+component: open-questions
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-19T20:34:26-00:00
+references: []
+log_events:
+- time: 2026-11-19T20:34:26-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
