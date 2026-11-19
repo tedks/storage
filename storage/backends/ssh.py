@@ -195,6 +195,16 @@ class SSHBackend(Backend):
         # runs through _with_sftp).
         return self._pool.nominal_bulk_capacity()
 
+    def background_range_capacity(self) -> int:
+        return self._pool.bulk_capacity()
+
+    def run_background_range_read(self, virtual_path, fetch):
+        # read_file reuses this lease. A range may be claimed only after
+        # capacity is acquired, so a reader can use the interactive reserve
+        # while background work is still queued behind other bulk transfers.
+        return self._with_sftp("background read", virtual_path, lambda sftp: fetch(),
+                               timeout=self.sftp_operation_timeout, retry=True)
+
     # ------------------------------------------------------------------ #
     # Availability
     # ------------------------------------------------------------------ #

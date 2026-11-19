@@ -244,6 +244,32 @@ latest read to the end of the file. Empty terms,
 negative sizes, unknown suffixes and percentages above 100 are rejected
 when the mount configuration loads.
 
+Streaming read-ahead and retained fills share an adaptive pool of up to
+`max_download_workers` (`--max-download-workers`, default 4, range 1–32).
+Workers start when chunks are runnable and retire after 30 idle seconds.
+Each worker takes one chunk before checking the queue again. Files with
+open readers take precedence, with a turn for a waiting closed file
+after four reader turns. Reopening a retained fill gives it reader
+priority and reuses the bytes it already has.
+
+`max_streaming_sessions` (`--max-streaming-sessions`, default 8) limits new
+streaming sessions when that many distinct files have open readers. A new
+open above that limit uses the whole-file cache path. A separate
+`max_retained_streaming_sessions` (`--max-retained-streaming-sessions`,
+default 64) limits unfinished fills that continue after the last close.
+Each retains one partial inode and descriptor. The file's entire length
+counts against `cache_size`, even while the partial is sparse. When the
+retained limit is full, the newest close discards its incomplete partial.
+Set the retained limit to 0 to discard every incomplete fill on last close.
+If the cache cannot make enough space for a new reader, it can discard
+unfinished retained fills to make room.
+
+SSH read-ahead and retained fills use bulk SFTP capacity, as do rsync
+members' range reads. A worker claims bytes only after getting a bulk
+channel, so a waiting worker leaves those bytes available to foreground
+reads on the interactive reserve. If a member can open only one channel,
+the current operation finishes before that channel is passed to a waiter.
+
 A cached file that has been synced is checked against its member when it
 is opened and was last checked more than `revalidate_after` seconds ago
 (`--revalidate-after`, default 60; `0` checks at every open). The check is

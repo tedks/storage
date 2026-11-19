@@ -13,6 +13,10 @@ from .models import StreamingKeepAfterClose
 from .checksum_queue import DEFAULT_CHECKSUM_REVERIFY_INTERVAL
 from .foreground_admission import validate_cap
 from .namespace import DEFAULT_LISTING_MAX_STALE
+from .streaming import (
+    DEFAULT_MAX_DOWNLOAD_WORKERS, DEFAULT_MAX_RETAINED_STREAMING_SESSIONS,
+    validate_download_limits,
+)
 
 
 DEFAULT_CACHE_SIZE = "10G"
@@ -72,6 +76,8 @@ class ResolvedMountConfig:
     member_display_names: Tuple[Optional[str], ...] = ()
     # None keeps the historical fixed sync pool at `workers`.
     max_sync_workers: Optional[int] = None
+    max_download_workers: int = DEFAULT_MAX_DOWNLOAD_WORKERS
+    max_retained_streaming_sessions: int = DEFAULT_MAX_RETAINED_STREAMING_SESSIONS
 
     @property
     def member_specs(self) -> Tuple[str, ...]:
@@ -584,6 +590,12 @@ def _load_mount_profile_settings(config_path: Path, profile_name: str) -> Dict[s
         "max_streaming_sessions": _optional_profile_int(
             config_profile, "max_streaming_sessions", profile_name
         ),
+        "max_download_workers": _optional_profile_int(
+            config_profile, "max_download_workers", profile_name
+        ),
+        "max_retained_streaming_sessions": _optional_profile_int(
+            config_profile, "max_retained_streaming_sessions", profile_name
+        ),
         "streaming_keep_after_close": _optional_profile_string(
             config_profile, "streaming_keep_after_close", profile_name
         ),
@@ -644,6 +656,8 @@ def _can_auto_load_mount_profile(
     bulk_capacity_wait_timeout: Optional[float] = None,
     max_foreground_operations: Optional[int] = None,
     max_sync_workers: Optional[int] = None,
+    max_download_workers: Optional[int] = None,
+    max_retained_streaming_sessions: Optional[int] = None,
 ) -> bool:
     if not _target_looks_like_profile_name(mount_target):
         return False
@@ -670,6 +684,8 @@ def _can_auto_load_mount_profile(
         bulk_capacity_wait_timeout is not None,
         max_foreground_operations is not None,
         max_sync_workers is not None,
+        max_download_workers is not None,
+        max_retained_streaming_sessions is not None,
     ))
 
 
@@ -698,6 +714,8 @@ def resolve_mount_configuration(
     bulk_capacity_wait_timeout: Optional[float] = None,
     max_foreground_operations: Optional[int] = None,
     max_sync_workers: Optional[int] = None,
+    max_download_workers: Optional[int] = None,
+    max_retained_streaming_sessions: Optional[int] = None,
 ) -> ResolvedMountConfig:
     config_values = {
         "mountpoint": None,
@@ -713,6 +731,8 @@ def resolve_mount_configuration(
         "streaming_reads": None,
         "streaming_chunk_size": None,
         "max_streaming_sessions": None,
+        "max_download_workers": None,
+        "max_retained_streaming_sessions": None,
         "streaming_keep_after_close": None,
         "readdir_ttl": None,
         "enable_watchers": None,
@@ -759,6 +779,8 @@ def resolve_mount_configuration(
         bulk_capacity_wait_timeout,
         max_foreground_operations,
         max_sync_workers,
+        max_download_workers,
+        max_retained_streaming_sessions,
     ):
         available_configs = [candidate for candidate in default_mount_config_paths() if candidate.exists()]
         if available_configs:
@@ -813,7 +835,22 @@ def resolve_mount_configuration(
         (None,) * len(resolved_remote) if remote else config_values["remote_display_names"]
     )
 
+    streaming_limits = {}
+    for name, override, default in (
+        ("max_streaming_sessions", max_streaming_sessions, DEFAULT_MAX_STREAMING_SESSIONS),
+        ("max_download_workers", max_download_workers, DEFAULT_MAX_DOWNLOAD_WORKERS),
+        ("max_retained_streaming_sessions", max_retained_streaming_sessions,
+         DEFAULT_MAX_RETAINED_STREAMING_SESSIONS),
+    ):
+        configured = config_values[name] if override is None else override
+        streaming_limits[name] = default if configured is None else configured
+    try:
+        validate_download_limits(streaming_limits)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+
     return ResolvedMountConfig(
+        **streaming_limits,
         mountpoint=mountpoint,
         backing_paths=resolved_local,
         remote=resolved_remote,
@@ -839,11 +876,6 @@ def resolve_mount_configuration(
         ),
         streaming_chunk_size=(
             streaming_chunk_size or config_values["streaming_chunk_size"] or DEFAULT_STREAMING_CHUNK_SIZE
-        ),
-        max_streaming_sessions=max_streaming_sessions if max_streaming_sessions is not None else (
-            config_values["max_streaming_sessions"]
-            if config_values["max_streaming_sessions"] is not None
-            else DEFAULT_MAX_STREAMING_SESSIONS
         ),
         readdir_ttl=_validated_seconds(
             "readdir_ttl",

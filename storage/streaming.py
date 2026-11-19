@@ -5,6 +5,7 @@ import secrets
 import socket
 import threading
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from fractions import Fraction
 from pathlib import Path
@@ -12,7 +13,8 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 from fuse import FuseOSError
 
-from .backends.base import Backend
+from .backends.base import Backend, capacity_wait_cancellation
+from .backends.ssh_pool import BulkCapacityCancelled
 from .backends.local import NOREPLACE_UNSUPPORTED
 from .backends.local import rename_noreplace as _rename_noreplace
 from .backends.ssh_pool import BulkCapacityCancelled, BulkCapacityTimeout
@@ -56,6 +58,13 @@ STREAMING_KEEP_AFTER_CLOSE_PERCENT = Fraction(50)
 # scattered reads gets here, and losing a short span can only delay the
 # threshold, never fake it.
 STREAMING_MAX_TRACKED_READ_SPANS = 64
+DEFAULT_MAX_DOWNLOAD_WORKERS = 4
+MAX_DOWNLOAD_WORKERS = 32
+DEFAULT_MAX_RETAINED_STREAMING_SESSIONS = 64
+MAX_STREAMING_SESSION_LIMIT = 1024
+DOWNLOAD_WORKER_IDLE_SECONDS = 30.0
+# Yield a turn to a queued closed file after this many active-reader turns.
+ACTIVE_DOWNLOAD_BURST = 4
 
 # link() errors after which _install_partial tries RENAME_NOREPLACE: no
 # hard links on the cache filesystem (EMLINK cannot happen on a fresh
@@ -65,7 +74,21 @@ _LINK_UNSUPPORTED = (errno.EPERM, errno.EOPNOTSUPP, errno.ENOTSUP, errno.ENOSYS,
 _NOREPLACE_UNSUPPORTED = NOREPLACE_UNSUPPORTED
 
 
-@dataclass
+def validate_download_limits(limits):
+    bounds = {
+        "max_streaming_sessions": (1, MAX_STREAMING_SESSION_LIMIT),
+        "max_retained_streaming_sessions": (0, MAX_STREAMING_SESSION_LIMIT),
+        "max_download_workers": (1, MAX_DOWNLOAD_WORKERS),
+    }
+    for name, value in limits.items():
+        if name not in bounds:
+            raise ValueError(f"unknown download limit: {name}")
+        low, high = bounds[name]
+        if type(value) is not int or not low <= value <= high:
+            raise ValueError(f"{name} must be an integer between {low} and {high}")
+
+
+@dataclass(eq=False)
 class PrefetchSession:
     """Tracks streaming state for an uncached file."""
 
@@ -77,6 +100,7 @@ class PrefetchSession:
     partial_cache_path: Path
     chunk_size: int
     io_fd: int
+    session_id: str = field(default_factory=lambda: secrets.token_hex(16))
     available_ranges: List[Tuple[int, int]] = field(default_factory=list)
     # Byte ranges claimed by a fetch in progress, foreground or background.
     # A range is claimed only where it is missing and not already claimed,
@@ -87,7 +111,8 @@ class PrefetchSession:
     finalized: bool = False
     stop_requested: bool = False
     error: Optional[Exception] = None
-    worker: Optional[threading.Thread] = None
+    background_cursor: int = 0
+    background_wrapped: bool = False
     has_foreground_read: bool = False
     # Set (claimed under session.lock, inside prefetch_sessions_lock; see
     # _claim_detach) when the session leaves the registry
@@ -132,6 +157,147 @@ class PrefetchSession:
         self.lock = threading.RLock()
         self.io_lock = threading.Lock()
         self.condition = threading.Condition(self.lock)
+        self.background_finished = threading.Event()
+
+
+class _DownloadPool:
+    """One turn per session, with priority reconsidered between chunks.
+
+    Callers update a session's readiness under its lock. Workers release
+    the pool condition before touching a session, so parked sessions hold
+    neither a worker nor a network channel. FIFO within each priority gives
+    separate readers turns even if one is far ahead.
+    """
+
+    def __init__(self, limit, run_turn, logger):
+        self.limit = limit
+        self.run_turn = run_turn
+        self.logger = logger
+        self.idle_seconds = DOWNLOAD_WORKER_IDLE_SECONDS
+        self.condition = threading.Condition()
+        self.ready: dict[PrefetchSession, bool] = {}
+        self.running: set[PrefetchSession] = set()
+        self.threads: set[threading.Thread] = set()
+        self.active_turns = 0
+        self.closing = False
+
+    def _eligible(self):
+        running_by_member = Counter(session.backend.name for session in self.running)
+        for session in self.ready:
+            member = session.backend.name
+            capacity = session.backend.background_range_capacity()
+            if capacity is None or running_by_member[member] < capacity:
+                yield session
+                running_by_member[member] += 1
+
+    def _grow(self):
+        demand = len(self.running) + sum(1 for _ in self._eligible())
+        retried = False
+        while len(self.threads) < min(self.limit, demand):
+            worker = threading.Thread(target=self._run, name="storage-prefetch-worker", daemon=True)
+            self.threads.add(worker)
+            try:
+                worker.start()
+            except RuntimeError:
+                self.threads.remove(worker)
+                self.logger.exception("Could not start streaming download worker")
+                # There may never be another offer to retry the first
+                # worker, e.g. when a complete file is queued to publish.
+                if self.threads or retried:
+                    break
+                retried = True
+
+    def offer(self, session, ready, finished_turn=False):
+        with self.condition:
+            if finished_turn:
+                self.running.remove(session)
+            if session not in self.running:
+                if ready and not self.closing:
+                    self.ready[session] = session.refcount > 0
+                    self._grow()
+                else:
+                    self.ready.pop(session, None)
+            self.condition.notify_all()
+
+    def set_limit(self, limit):
+        with self.condition:
+            self.limit = limit
+            self._grow()
+            self.condition.notify_all()
+
+    def cancel(self, session):
+        """Withdraw queued work; return True if no worker owns the session."""
+        with self.condition:
+            self.ready.pop(session, None)
+            return session not in self.running
+
+    def take_unstaffed(self, session):
+        """Let a caller finish a local-only publication when no thread starts."""
+        with self.condition:
+            if self.threads or len(self.running) >= self.limit or session not in self.ready:
+                return False
+            self.ready.pop(session)
+            self.running.add(session)
+            return True
+
+    def snapshot(self):
+        with self.condition:
+            return len(self.threads), len(self.running), len(self.ready)
+
+    def _take(self):
+        if len(self.running) >= self.limit:
+            return None
+        active = closed = None
+        # Member headroom is based on in-flight work. Each priority gets
+        # its first choice of that headroom before either is selected.
+        running_by_member = Counter(session.backend.name for session in self.running)
+        for session, has_reader in self.ready.items():
+            capacity = session.backend.background_range_capacity()
+            if capacity is not None and running_by_member[session.backend.name] >= capacity:
+                continue
+            if has_reader and active is None:
+                active = session
+            if not has_reader and closed is None:
+                closed = session
+            if active is not None and closed is not None:
+                break
+        if closed is not None and (active is None or self.active_turns >= ACTIVE_DOWNLOAD_BURST):
+            session = closed
+            self.active_turns = 0
+        else:
+            session = active
+            self.active_turns = self.active_turns + 1 if closed is not None else 0
+        if session is not None:
+            self.ready.pop(session)
+            self.running.add(session)
+        return session
+
+    def _run(self):
+        while True:
+            with self.condition:
+                idle_until = time.monotonic() + self.idle_seconds
+                while (session := self._take()) is None:
+                    remaining = idle_until - time.monotonic()
+                    if self.closing or remaining <= 0:
+                        self.threads.remove(threading.current_thread())
+                        return
+                    self.condition.wait(remaining)
+            try:
+                self.run_turn(session)
+            except Exception:
+                self.logger.exception("Streaming download turn failed for %s", session.canonical_path)
+                with self.condition:
+                    self.running.discard(session)
+                    self.condition.notify_all()
+
+    def shutdown(self, timeout):
+        with self.condition:
+            self.closing = True
+            self.condition.notify_all()
+            workers = list(self.threads)
+        deadline = time.monotonic() + timeout
+        for worker in workers:
+            worker.join(timeout=max(0.0, deadline - time.monotonic()))
 
 
 class StreamingReadManager:
@@ -152,6 +318,8 @@ class StreamingReadManager:
         stream_state_xattr: str,
         keep_after_close: Optional[StreamingKeepAfterClose] = None,
         on_finalized: Optional[Callable[["PrefetchSession"], None]] = None,
+        max_download_workers: int = DEFAULT_MAX_DOWNLOAD_WORKERS,
+        max_retained_streaming_sessions: int = DEFAULT_MAX_RETAINED_STREAMING_SESSIONS,
     ):
         self.cache_manager = cache_manager
         # Called once the complete file is in the cache (StorageFS records
@@ -163,7 +331,18 @@ class StreamingReadManager:
         self.select_backend_for_read = select_backend_for_read
         self.streaming_reads = streaming_reads
         self.chunk_size = max(4096, int(streaming_chunk_size))
-        self.max_streaming_sessions = max(1, int(max_streaming_sessions))
+        limits = {
+            "max_streaming_sessions": max_streaming_sessions,
+            "max_retained_streaming_sessions": max_retained_streaming_sessions,
+            "max_download_workers": max_download_workers,
+        }
+        validate_download_limits(limits)
+        self._download_limits = limits
+        self._download_pool = _DownloadPool(
+            max_download_workers,
+            self._run_download_turn,
+            logger,
+        )
         if keep_after_close is None:
             keep_after_close = StreamingKeepAfterClose(
                 byte_thresholds=(STREAMING_KEEP_AFTER_CLOSE_CHUNKS * self.chunk_size,),
@@ -200,6 +379,63 @@ class StreamingReadManager:
         if control_thread is None or not control_thread.is_alive():
             self._start_control_server()
 
+    def download_limits(self):
+        with self.prefetch_sessions_lock:
+            return self._download_limits.copy()
+
+    def update_download_limits(self, **changes):
+        validate_download_limits(changes)
+        with self.prefetch_sessions_lock:
+            if self._destroying:
+                raise ValueError("mount is shutting down")
+            self._download_limits.update(changes)
+            if "max_download_workers" in changes:
+                self._download_pool.set_limit(changes["max_download_workers"])
+            return self._download_limits.copy()
+
+    def list_download_sessions(self):
+        with self.prefetch_sessions_lock:
+            sessions = []
+            for session in self.prefetch_sessions.values():
+                with session.lock:
+                    sessions.append({
+                        "id": session.session_id,
+                        "path": session.virtual_path,
+                        "backend": session.backend.name,
+                        "readers": session.refcount,
+                        "size_bytes": session.file_size,
+                        "downloaded_bytes": sum(end - start for start, end in session.available_ranges),
+                        "status": self._download_status(session),
+                    })
+            return sessions
+
+    @staticmethod
+    def _download_status(session):
+        if session.finalized:
+            return "complete"
+        if session.error is not None:
+            return "error"
+        if session.prefetch_complete:
+            return "finalizing"
+        if not session.has_foreground_read:
+            return "awaiting-read"
+        return "reading" if session.refcount > 0 else "retained"
+
+    def cancel_download_session(self, selector: str):
+        with self.prefetch_sessions_lock:
+            for session in self.prefetch_sessions.values():
+                if session.session_id != selector:
+                    continue
+                with session.lock:
+                    if session.refcount > 0 or self._download_terminal(session):
+                        return "busy"
+                    idle = self._stop_background_locked(session)
+                break
+            else:
+                return "not-found"
+        self._complete_cancellation(session, idle)
+        return "cancelled"
+
     def destroy(self):
         """Stop every session; from here on, opens get no session (full-file path).
 
@@ -209,7 +445,7 @@ class StreamingReadManager:
         is detached by claim, as on any other way out of the registry, so
         its partial is unlinked once and a cleanup still running elsewhere
         skips the path. A session whose bytes have all arrived is left to
-        finish its finalize while destroy waits for its worker (see
+        finish its finalize while destroy drains the worker pool (see
         _claim_detach for why a complete session is never stopped). One
         whose worker outlives the wait is claimed anyway, against that
         rule, and that is safe only because no successor can register now:
@@ -229,20 +465,14 @@ class StreamingReadManager:
             for session in sessions:
                 self._detach_for_destroy(session)
 
+        self._download_pool.shutdown(timeout=2.0)
+        # If thread creation failed, provide the same local publication for
+        # fully fetched files. In-flight turns still own their descriptors.
         for session in sessions:
-            worker = session.worker
-            if worker and worker.is_alive():
-                worker.join(timeout=2.0)
-            with self.prefetch_sessions_lock:
+            self._finish_unstaffed_download(session)
+        with self.prefetch_sessions_lock:
+            for session in sessions:
                 self._detach_for_destroy(session, complete_too=True)
-            if worker and worker.is_alive():
-                self.logger.warning(
-                    "Streaming worker still alive during destroy; skipping forced close for %s",
-                    session.canonical_path,
-                )
-                continue
-
-            self._close_streaming_session_resources(session)
         if sessions:
             self.cache_manager.mark_cache_size_dirty()
 
@@ -250,19 +480,18 @@ class StreamingReadManager:
         """Stop the session and, unless it is finishing, claim it and unlink its partial.
 
         Caller holds prefetch_sessions_lock. Without complete_too a session
-        whose bytes have all arrived only gets the stop request, so its
-        worker can still finalize it.
+        whose bytes have all arrived can still finalize.
         """
         with session.lock:
-            session.stop_requested = True
-            session.condition.notify_all()
-            if session.finalized:
-                return
             if session.prefetch_complete and not complete_too:
                 return
-            claimed = self._claim_detach(session)
-        if claimed:
-            self._unregister_and_unlink(session)
+            session.stop_requested = True
+            session.condition.notify_all()
+            if not session.finalized and self._claim_detach(session):
+                self._unregister_and_unlink(session)
+            idle = self._download_pool.cancel(session)
+        if idle:
+            self._close_cancelled_download(session)
 
     def cleanup_stale_partials(self):
         """Delete stale partial-cache files left by prior crashes.
@@ -472,10 +701,17 @@ class StreamingReadManager:
             stats = dict(self._streaming_stats)
 
         with self.prefetch_sessions_lock:
+            active_reader_sessions, retained_sessions = self._download_session_counts()
             active_streaming_sessions = len(self.prefetch_sessions)
+        workers, running, queued = self._download_pool.snapshot()
 
         stats.update({
             "active_streaming_sessions": active_streaming_sessions,
+            "active_reader_sessions": active_reader_sessions,
+            "retained_streaming_sessions": retained_sessions,
+            "download_workers": workers,
+            "download_workers_running": running,
+            "download_sessions_queued": queued,
             "pid": os.getpid(),
             "timestamp": time.time(),
             "streaming_enabled": bool(self.streaming_reads),
@@ -586,12 +822,21 @@ class StreamingReadManager:
             return
 
         with session.io_lock:
+            remaining = memoryview(data)
             if hasattr(os, "pwrite"):
-                os.pwrite(session.io_fd, data, offset)
-                return
-
-            os.lseek(session.io_fd, offset, os.SEEK_SET)
-            os.write(session.io_fd, data)
+                while remaining:
+                    written = os.pwrite(session.io_fd, remaining, offset)
+                    if written <= 0:
+                        raise OSError(errno.EIO, "partial cache write made no progress")
+                    remaining = remaining[written:]
+                    offset += written
+            else:
+                os.lseek(session.io_fd, offset, os.SEEK_SET)
+                while remaining:
+                    written = os.write(session.io_fd, remaining)
+                    if written <= 0:
+                        raise OSError(errno.EIO, "partial cache write made no progress")
+                    remaining = remaining[written:]
 
     def _fetch_range_into_session(
         self,
@@ -609,17 +854,13 @@ class StreamingReadManager:
         total_bytes = 0
 
         while cursor < target_end:
+            if session.stop_requested:
+                return start
             remaining = target_end - cursor
             chunk = session.backend.read_file(session.canonical_path, cursor, remaining)
-            if chunk is None:
-                chunk = b""
-
-            max_bytes = max(0, session.file_size - cursor)
-            if len(chunk) > max_bytes:
-                chunk = chunk[:max_bytes]
-
-            if len(chunk) == 0:
+            if not chunk:
                 break
+            chunk = chunk[:remaining]
 
             chunks.append((cursor, chunk))
             cursor += len(chunk)
@@ -627,6 +868,8 @@ class StreamingReadManager:
 
         fetched_end = cursor
 
+        if session.stop_requested:
+            return start
         if start < session.file_size and fetched_end == start:
             raise IOError(
                 f"range fetch returned no data for {session.canonical_path} at offset {start}"
@@ -775,19 +1018,16 @@ class StreamingReadManager:
                     # In the section that claims the reader's range below,
                     # so a worker woken here cannot claim it first.
                     self._record_foreground_read(session, start, end)
-                    # Wakes a worker held at its read-ahead bound (see
-                    # _bounded_read_ahead_chunk): the bound moves with the
-                    # reader.
                     session.last_foreground_offset = start
-                    session.condition.notify_all()
                     recorded = True
-                # Reported in the state xattr only; the worker waits on
-                # read_ahead_started.
                 session.has_foreground_read = True
 
                 if self._is_range_available(session.available_ranges, start, end):
+                    self._schedule_background(session)
                     return
 
+                if session.stop_requested:
+                    raise FuseOSError(errno.EINTR)
                 if session.error is not None:
                     raise FuseOSError(errno.EIO)
 
@@ -797,6 +1037,7 @@ class StreamingReadManager:
                 fetch = self._first_unclaimed_missing_range(session, start, end, covered)
                 if fetch is None:
                     # The rest is in flight; its fetch notifies when done.
+                    self._schedule_background(session)
                     session.condition.wait(timeout=0.05)
                     continue
                 if len(session.available_ranges) > STREAMING_MAX_FOREGROUND_FRAGMENTS:
@@ -809,6 +1050,7 @@ class StreamingReadManager:
                     )
 
                 session.in_flight_ranges.append(fetch)
+                self._schedule_background(session)
 
             try:
                 _ = self._fetch_range_into_session(
@@ -835,12 +1077,14 @@ class StreamingReadManager:
             finally:
                 with session.lock:
                     session.in_flight_ranges.remove(fetch)
+                    self._schedule_background(session)
                     session.condition.notify_all()
 
     def _close_streaming_session_resources(self, session: PrefetchSession):
-        with session.lock:
-            io_fd = session.io_fd
-            session.io_fd = -1
+        with session.io_lock:
+            with session.lock:
+                io_fd = session.io_fd
+                session.io_fd = -1
 
         if io_fd >= 0:
             try:
@@ -1243,79 +1487,109 @@ class StreamingReadManager:
             except Exception:
                 pass
 
-    def _background_prefetch_worker(self, session: PrefetchSession):
-        cursor = 0
-        wrapped = False
+    @staticmethod
+    def _download_terminal(session: PrefetchSession) -> bool:
+        return session.stop_requested or session.error is not None or session.prefetch_complete
 
-        while True:
+    def _next_background_fetch(self, session: PrefetchSession):
+        """Return a missing span and its wrap flag. Caller holds session.lock."""
+        if self._download_terminal(session) or not session.read_ahead_started:
+            return None
+        wrapped = session.background_wrapped
+        if session.readers_consumed:
+            chunk_start, wrapped = self._unbounded_read_ahead_chunk(
+                session, session.background_cursor, wrapped,
+            )
+        else:
+            chunk_start = self._bounded_read_ahead_chunk(session)
+        if chunk_start is None:
+            return None
+        chunk_end = min(chunk_start + session.chunk_size, session.file_size)
+        fetch = self._first_unclaimed_missing_range(session, chunk_start, chunk_end)
+        return (fetch, wrapped) if fetch is not None else None
+
+    def _schedule_background(self, session: PrefetchSession, finished_turn=False):
+        """Reconsider work after a read, close, reattach or registration.
+
+        Caller holds session.lock and has already claimed any foreground
+        range it plans to fetch. A file waiting for a read or for a range
+        already claimed by a reader takes no pool slot.
+        """
+        ready = not session.worker_done and (
+            self._download_terminal(session) or self._next_background_fetch(session) is not None
+        )
+        self._download_pool.offer(session, ready, finished_turn=finished_turn)
+
+    def _fetch_background_chunk(self, session: PrefetchSession):
+        with session.lock:
+            next_fetch = self._next_background_fetch(session)
+            if next_fetch is None:
+                return
+            fetch, wrapped = next_fetch
+            session.in_flight_ranges.append(fetch)
+
+        try:
+            fetched_end = self._fetch_range_into_session(session, *fetch, source="background")
             with session.lock:
-                if session.stop_requested or session.error is not None:
-                    break
+                session.background_cursor = max(fetched_end, fetch[0] + 1)
+                session.background_wrapped = wrapped
+        finally:
+            with session.lock:
+                session.in_flight_ranges.remove(fetch)
+                session.condition.notify_all()
 
-                # Readers that fetched every byte themselves still need the
-                # worker to finalize, hence prefetch_complete.
-                if not session.read_ahead_started and not session.prefetch_complete:
-                    # Reads, fetches and stop notify; the timeout is only a
-                    # backstop.
-                    session.condition.wait(timeout=1.0)
-                    continue
+    def _run_download_turn(self, session: PrefetchSession):
+        with session.lock:
+            fetch_due = self._next_background_fetch(session) is not None
 
-                if session.readers_consumed:
-                    chunk_start, wrapped = self._unbounded_read_ahead_chunk(session, cursor, wrapped)
-                    if chunk_start is None:
-                        break
-                else:
-                    if self._first_missing_range(session.available_ranges, 0, session.file_size) is None:
-                        break
-                    chunk_start = self._bounded_read_ahead_chunk(session)
-                    if chunk_start is None:
-                        # Reads, consumption, stop, errors and fetches all
-                        # notify; the timeout is only a backstop.
-                        session.condition.wait(timeout=1.0)
-                        continue
-                cursor = chunk_start
-                chunk_end = min(chunk_start + session.chunk_size, session.file_size)
-                # The chunk's missing bytes that no reader is fetching: the
-                # readers' own fetches leave holes of any size in it.
-                fetch = self._first_unclaimed_missing_range(session, chunk_start, chunk_end)
-                if fetch is None:
-                    # Every missing byte is in a reader's fetch, which
-                    # notifies when it ends (success or failure), as do
-                    # stop and errors; the timeout is only a backstop.
-                    session.condition.wait(timeout=1.0)
-                    continue
-
-                session.in_flight_ranges.append(fetch)
-
+        if fetch_due:
             try:
-                fetched_end = self._fetch_range_into_session(
-                    session,
-                    fetch[0],
-                    fetch[1],
-                    source="background",
-                )
-                cursor = max(fetched_end, fetch[0] + 1)
+                # Do not own a range while waiting for a bulk lease. A
+                # reader can claim the bytes and use the interactive reserve.
+                with capacity_wait_cancellation(
+                    lambda: "streaming session" if session.stop_requested else None
+                ):
+                    session.backend.run_background_range_read(
+                        session.canonical_path, lambda: self._fetch_background_chunk(session),
+                    )
+            except BulkCapacityCancelled:
+                # Only this session's stop request can cancel the bulk wait.
+                pass
             except Exception as exc:
-                self.logger.warning(
-                    "streaming background fetch failed path=%s backend=%s range=[%d,%d): %r",
-                    session.canonical_path,
-                    session.backend.name,
-                    fetch[0],
-                    fetch[1],
-                    exc,
-                )
                 with session.lock:
-                    if session.error is None:
+                    if not session.stop_requested and session.error is None:
                         session.error = exc
                     session.condition.notify_all()
-                self._update_streaming_state_xattr(session, "error")
-                break
-            finally:
-                with session.lock:
-                    session.in_flight_ranges.remove(fetch)
-                    session.condition.notify_all()
+                if not session.stop_requested:
+                    self.logger.warning(
+                        "streaming background fetch failed path=%s backend=%s: %r",
+                        session.canonical_path, session.backend.name, exc,
+                    )
+                    self._update_streaming_state_xattr(session, "error")
 
-        self._finalize_streaming_session(session)
+        with session.lock:
+            if not self._download_terminal(session):
+                # Release this turn even if another chunk is due, so queue
+                # priority and the member ceiling apply anew.
+                self._schedule_background(session, finished_turn=True)
+                return
+
+        try:
+            self._finish_background_session(session)
+        finally:
+            with session.lock:
+                self._download_pool.offer(session, False, finished_turn=True)
+                session.background_finished.set()
+
+    def _finish_background_session(self, session: PrefetchSession):
+        try:
+            self._finalize_streaming_session(session)
+        except Exception as exc:
+            self.logger.exception("Streaming download finalize failed for %s", session.canonical_path)
+            with session.lock:
+                if session.error is None:
+                    session.error = exc
+                session.condition.notify_all()
 
         with session.lock:
             session.worker_done = True
@@ -1327,8 +1601,21 @@ class StreamingReadManager:
 
         if clean_up_failed:
             self._cleanup_failed_session(session)
-        elif not has_error and stopped and not finalized and no_readers:
+        elif stopped and not finalized and (no_readers or self._destroying):
             self._cleanup_cancelled_session(session)
+
+    def _close_cancelled_download(self, session: PrefetchSession):
+        """Complete a cancelled session that has no pool turn in progress."""
+        with session.lock:
+            session.worker_done = True
+        self._close_streaming_session_resources(session)
+        session.background_finished.set()
+
+    def _finish_unstaffed_download(self, session: PrefetchSession):
+        with session.lock:
+            claimed = self._download_terminal(session) and self._download_pool.take_unstaffed(session)
+        if claimed:
+            self._run_download_turn(session)
 
     def _attach(self, session: PrefetchSession) -> bool:
         """Add a reader to a registered session; False if it failed or its cleanup is claimed.
@@ -1364,6 +1651,7 @@ class StreamingReadManager:
                 refused = False
                 session.refcount += 1
                 readers = session.refcount
+                self._schedule_background(session)
         if refused:
             self.logger.info(
                 "streaming attach refused path=%s backend=%s: session failed or being cleaned up",
@@ -1377,6 +1665,57 @@ class StreamingReadManager:
             session.backend.name,
             readers,
         )
+        return True
+
+    def _download_session_counts(self):
+        """Counts of files with readers and retained fills. Caller holds the registry lock."""
+        active = retained = 0
+        for session in self.prefetch_sessions.values():
+            with session.lock:
+                if session.refcount > 0:
+                    active += 1
+                elif not self._download_terminal(session):
+                    retained += 1
+        return active, retained
+
+    def _has_session_capacity(self):
+        """Reserve room for readers while bounding retained partials and descriptors."""
+        active, _ = self._download_session_counts()
+        limit = self._download_limits["max_streaming_sessions"]
+        retained_limit = self._download_limits["max_retained_streaming_sessions"]
+        # Complete/failed sessions can be waiting on local publication. Count
+        # them against the hard allocation bound even after their last close.
+        return active < limit and len(self.prefetch_sessions) < limit + retained_limit
+
+    def _reclaim_retained_space(self, file_size: int) -> bool:
+        """Make space for a reader by yielding unfinished readerless partials."""
+        missing = self.cache_manager.get_free_space_needed(file_size)
+        if missing == 0:
+            return True
+
+        cancelled = []
+        with self.prefetch_sessions_lock:
+            if self._destroying or not self._has_session_capacity():
+                return False
+            candidates = []
+            for session in self.prefetch_sessions.values():
+                with session.lock:
+                    if session.refcount == 0 and not self._download_terminal(session):
+                        candidates.append(session)
+            if sum(session.file_size for session in candidates) < missing:
+                return False
+            for session in candidates:
+                with session.lock:
+                    if not self._download_terminal(session):
+                        cancelled.append((session, self._stop_background_locked(session)))
+                        missing -= session.file_size
+                        if missing <= 0:
+                            break
+        for session, idle in cancelled:
+            self._record_streaming_stat("streaming_retained_space_cancellations")
+            self._complete_cancellation(session, idle)
+        # A candidate may have finished while we chose what to cancel.
+        # Retry the cache admission, which accounts for the new final file.
         return True
 
     def _create_or_attach_prefetch_session(
@@ -1393,10 +1732,10 @@ class StreamingReadManager:
                     return None
                 return existing
 
-            if len(self.prefetch_sessions) >= self.max_streaming_sessions:
+            if not self._has_session_capacity():
                 self.logger.warning(
                     "Streaming session limit reached (%d); falling back to full-file cache for %s",
-                    self.max_streaming_sessions,
+                    self._download_limits["max_streaming_sessions"],
                     canonical_path,
                 )
                 return None
@@ -1441,14 +1780,6 @@ class StreamingReadManager:
             )
             return None
 
-        if not self.cache_manager.ensure_space(file_size):
-            self.logger.warning(
-                "streaming session unavailable: insufficient cache space for %s (%d bytes)",
-                canonical_path,
-                file_size,
-            )
-            return None
-
         final_cache_path = self.cache_manager.get_cache_path(virtual_path)
         partial_cache_path = self._partial_cache_path(final_cache_path)
         final_cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1466,8 +1797,18 @@ class StreamingReadManager:
 
         io_fd = -1
         try:
-            io_fd = os.open(str(staging_path), os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o644)
-            os.ftruncate(io_fd, file_size)
+            for attempt in range(2):
+                with self.cache_manager.admit_streaming_partial(file_size) as admitted:
+                    if admitted:
+                        io_fd = os.open(str(staging_path), os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o644)
+                        os.ftruncate(io_fd, file_size)
+                        break
+                if attempt or not self._reclaim_retained_space(file_size):
+                    self.logger.warning(
+                        "streaming session unavailable: insufficient cache space for %s (%d bytes)",
+                        canonical_path, file_size,
+                    )
+                    return None
         except OSError as exc:
             self.logger.debug(
                 "streaming session unavailable: failed to prepare partial cache file %s for %s: %s",
@@ -1516,10 +1857,10 @@ class StreamingReadManager:
                 )
                 self._discard_unregistered_prefetch_session(session)
                 return None
-            if len(self.prefetch_sessions) >= self.max_streaming_sessions:
+            if not self._has_session_capacity():
                 self.logger.warning(
                     "Streaming session limit reached (%d) during registration; falling back to full-file cache for %s",
-                    self.max_streaming_sessions,
+                    self._download_limits["max_streaming_sessions"],
                     canonical_path,
                 )
                 self._discard_unregistered_prefetch_session(session)
@@ -1543,12 +1884,6 @@ class StreamingReadManager:
         self.cache_manager.mark_cache_size_dirty()
         self._record_streaming_stat("streaming_sessions_started", 1)
 
-        worker = threading.Thread(
-            target=self._background_prefetch_worker,
-            args=(session,),
-            daemon=True,
-            name=f"storage-prefetch-{canonical_path}",
-        )
         self.logger.info(
             "streaming session started for %s via backend %s (size=%d, chunk=%d)",
             canonical_path,
@@ -1556,8 +1891,6 @@ class StreamingReadManager:
             file_size,
             session.chunk_size,
         )
-        session.worker = worker
-        worker.start()
         self._update_streaming_state_xattr(session, "awaiting-read")
 
         return session
@@ -1580,11 +1913,26 @@ class StreamingReadManager:
             and not session.readers_consumed
         )
 
+    def _stop_background_locked(self, session: PrefetchSession) -> bool:
+        """Unregister a stopped session. Caller holds the registry and session locks."""
+        session.stop_requested = True
+        session.condition.notify_all()
+        if self._claim_detach(session):
+            self._unregister_and_unlink(session)
+        return self._download_pool.cancel(session)
+
+    def _complete_cancellation(self, session: PrefetchSession, idle: bool):
+        self._log_streaming_state_change(session, self._snapshot_streaming_state(session, "cancelled"))
+        self.cache_manager.mark_cache_size_dirty()
+        if idle:
+            self._cleanup_cancelled_session(session)
+            self._close_cancelled_download(session)
+
     def _stop_and_detach_session(self, session: PrefetchSession) -> str:
         """Drop a reader's ref and decide what its release does.
 
-        Returns "stopped" if this was the last ref of an unfinished session,
-        now stopped and detached; "cleanup-failed" if it was the last ref of
+        Returns "stopped" or "stopped-in-flight" for a session now detached;
+        "cleanup-failed" if it was the last ref of
         a failed session whose worker is done (see worker_done); "close" if
         it was the last ref of a finalized session; otherwise "".
 
@@ -1600,45 +1948,44 @@ class StreamingReadManager:
             with session.lock:
                 if session.refcount > 0:
                     session.refcount -= 1
-                if not self._should_stop_on_last_close(session):
-                    if session.refcount > 0:
-                        return ""
-                    if session.finalized:
-                        return "close"
-                    # Decided with the decrement, not after it: see worker_done.
-                    if (
-                        session.error is not None
-                        and session.worker_done
-                        and self._claim_failed_cleanup(session)
-                    ):
-                        return "cleanup-failed"
+                if session.refcount > 0:
                     return ""
-                # One section with the decision: see _claim_detach.
-                if not self._claim_detach(session):
+                if session.finalized:
+                    return "close"
+                if session.detached:
                     return ""
-                session.stop_requested = True
-                session.condition.notify_all()
-            self._unregister_and_unlink(session)
 
-        self._log_streaming_state_change(session, self._snapshot_streaming_state(session, "cancelled"))
-        self.cache_manager.mark_cache_size_dirty()
-        return "stopped"
+                if not self._download_terminal(session) and not self._should_stop_on_last_close(session):
+                    _, retained = self._download_session_counts()
+                    if retained > self._download_limits["max_retained_streaming_sessions"]:
+                        self._record_streaming_stat("streaming_retained_limit_cancellations")
+                        idle = self._stop_background_locked(session)
+                        return "stopped" if idle else "stopped-in-flight"
+                if self._should_stop_on_last_close(session):
+                    idle = self._stop_background_locked(session)
+                    return "stopped" if idle else "stopped-in-flight"
+                # Decided with the decrement, not after it: see worker_done.
+                if (session.error is not None and session.worker_done
+                        and self._claim_failed_cleanup(session)):
+                    return "cleanup-failed"
+                self._schedule_background(session)
+                return ""
 
     def _release_prefetch_session(self, session: PrefetchSession):
         action = self._stop_and_detach_session(session)
-        worker = session.worker
 
-        if action == "stopped":
+        if action in ("stopped", "stopped-in-flight"):
             # No join: waiting here on a worker mid-chunk would hold this
             # release (and, with the FUSE loop single-threaded, every other
             # operation on the mount) for the length of a remote fetch. The
             # worker writes only to its own descriptor, now on an unlinked
             # inode, and closes it on exit (its cancelled cleanup).
-            if worker is None or not worker.is_alive():
-                self._close_streaming_session_resources(session)
+            self._complete_cancellation(session, idle=action == "stopped")
         elif action == "cleanup-failed":
             # No join here either: a failed session whose worker is not done
             # yet is cleaned up by the worker's tail.
             self._cleanup_failed_session(session)
         elif action == "close":
             self._close_streaming_session_resources(session)
+        else:
+            self._finish_unstaffed_download(session)
