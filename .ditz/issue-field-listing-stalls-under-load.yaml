@@ -62,5 +62,15 @@ log_events:
     and a late result racing invalidation. Measure directory enumeration separately
     from a file manager''s later getattr/preview work, with filename-free counts and
     latency by stage.'
+- time: 2026-11-19T20:34:48-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Opt-in progressive listings are in draft #194 (cdc7697), atop the preview
+    accounting fix in #192. A real mounted test with 1,024 entries on a fast member
+    returns before a held member, then includes the latter on re-enumeration after
+    release. Both FUSE loop modes fail with progressive dispatch disabled and pass
+    enabled. The full 49-target suite passed. This is filesystem re-enumeration; #193
+    records separate GIO/Nautilus feasibility evidence. No claim that this isolates
+    the reported field stall.'
 blocked_by:
 - field-listing-downloads-to-hash
