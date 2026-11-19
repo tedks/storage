@@ -1,0 +1,24 @@
+id: member-refetch-kernel-same-stat
+title: Discard stale kernel pages when a member refetch preserves size and mtime
+desc: 'With disposable SSH members and both FUSE loop modes, a same-size edit that
+  preserves the member mtime refills Storage''s backing cache after change invalidation,
+  but libfuse 2 auto_cache reuses the old kernel pages. The mounted file then returns
+  stale bytes despite having fetched the new bytes. The controls that retain download-time
+  mtime both return fresh bytes.
+
+  Preserve correct member timestamps as in PR #184 and ensure subsequent opens see
+  the newly fetched content. Verify local and SSH mounts, writable descriptor protection,
+  and warm reuse of the backing cache without another transfer.'
+type: bugfix
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-19T00:29:02-00:00
+references: []
+log_events:
+- time: 2026-11-19T00:29:02-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
