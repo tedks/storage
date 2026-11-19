@@ -307,7 +307,7 @@ class StorageFS(Operations):
             cache_root, self.state_manager, cache_size,
             bulk_cold_copies=bulk_cold_copies,
         )
-        self.cache_manager.descriptor_guard = self._descriptor_guard
+        self.cache_manager.descriptor_guard = self._eviction_descriptor_guard
         # Before any worker, eviction or FUSE request (docs/member-rename-repairs.md).
         self.cache_manager.recover_views(list(backends))
         self.replication_manager = ReplicationManager(self.state_manager, backends)
@@ -550,8 +550,8 @@ class StorageFS(Operations):
                 yield held
 
     @contextlib.contextmanager
-    def _descriptor_guard(self, virtual_path: str):
-        """Hold _fd_lock and yield whether a non-prefetch descriptor is open on the path.
+    def _descriptor_guard(self, virtual_path: str, *, include_prefetch: bool = False):
+        """Hold _fd_lock and yield whether a descriptor is open on the path.
 
         Eviction stats and unlinks the cache file inside this, so no open()
         can slip a descriptor onto the file in between: open() takes
@@ -564,9 +564,14 @@ class StorageFS(Operations):
         """
         with self._fd_lock:
             yield any(
-                entry.canonical_path == virtual_path and entry.prefetch_session is None
+                entry.canonical_path == virtual_path and (include_prefetch or entry.prefetch_session is None)
                 for entry in self._fd_map.values()
             )
+
+    def _eviction_descriptor_guard(self, virtual_path: str):
+        # The streaming descriptor can still be open after its inode is
+        # installed in the cache. Keep that path pinned until release.
+        return self._descriptor_guard(virtual_path, include_prefetch=True)
 
     def _has_open_descriptor(self, virtual_path: str) -> bool:
         """Whether any descriptor other than a prefetch session is open on the path."""
@@ -2024,7 +2029,6 @@ class StorageFS(Operations):
         # Check if already cached
         if self.cache_manager.is_cached(resolved.requested_path):
             if not resolved.backend_name:
-                self.cache_manager.mark_accessed(resolved.requested_path)
                 # A CLEAN row older than the file means a write's row update
                 # was lost; the file is dirty whatever the row says.
                 self.cache_manager.heal_stale_clean(canonical_path, cache_path)
@@ -2115,11 +2119,13 @@ class StorageFS(Operations):
                     if not metadata:
                         if config is None:  # the row went meanwhile
                             config = self._get_config(canonical_path)
+                        # A fill alone does not count. _open records access
+                        # once it actually has a descriptor.
                         metadata = FileMetadata(
                             virtual_path=canonical_path,
                             size=st.st_size,
                             checksum=None,
-                            last_access=time.time(),
+                            last_access=0.0,
                             last_modified=st.st_mtime,
                             sync_status=SyncStatus.CLEAN,
                             replica_count=config.replica_count,
@@ -2146,7 +2152,6 @@ class StorageFS(Operations):
                             metadata.dirty_generation,
                             size=st.st_size,
                             last_modified=st.st_mtime,
-                            last_access=time.time(),
                         )
                         metadata = self.state_manager.get_file_metadata(canonical_path) or metadata
                         self.cache_manager.sync_cache_metadata(
@@ -2191,8 +2196,6 @@ class StorageFS(Operations):
             )
 
             if result.success:
-                # File was recomputed successfully
-                self.cache_manager.mark_accessed(resolved.requested_path)
                 return True
 
         available_backends, _ = self._backend_availability()
@@ -2589,7 +2592,7 @@ class StorageFS(Operations):
                 self._mark_view_changed(cache_path, self._fd_map[vfd].view_ino)
 
             if resolved.backend_name is None:
-                self.cache_manager.mark_accessed(resolved.requested_path)
+                self._mark_demand_access(resolved.canonical_path, prefetch_session)
 
             return vfd
 
@@ -2661,6 +2664,13 @@ class StorageFS(Operations):
         except OSError as e:
             raise FuseOSError(e.errno)
 
+    def _mark_demand_access(self, canonical_path: str, session: Optional[PrefetchSession]):
+        accessed_at = time.time()
+        if session is not None:
+            with session.lock:
+                session.last_access = max(session.last_access, accessed_at)
+        self.cache_manager.mark_accessed(canonical_path, accessed_at=accessed_at)
+
     def read(self, path, size, offset, fh):
         """Read from a file"""
         with self._fd_lock:
@@ -2687,7 +2697,7 @@ class StorageFS(Operations):
                 data = os.read(entry.real_fd, size)
 
             if entry.backend_name is None:
-                self.cache_manager.mark_accessed(path)
+                self._mark_demand_access(entry.canonical_path, session)
 
             return data
 
@@ -2714,7 +2724,7 @@ class StorageFS(Operations):
             self.cache_manager.mark_cache_size_dirty()
 
             if entry.backend_name is None:
-                self.cache_manager.mark_accessed(path)
+                self.cache_manager.mark_accessed(entry.canonical_path)
                 # The path is read under the index lock, which a rename
                 # holds from the cache move until it has re-pointed the
                 # descriptors: the mark lands on the row that describes

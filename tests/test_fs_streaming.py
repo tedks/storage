@@ -3342,6 +3342,72 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.assertEqual(self.fs.write('/' + name, edit, 0, vfd), len(edit))
         return vfd
 
+    def test_closed_stream_finalizing_late_is_evicted_before_a_newer_read(self):
+        payload = b"a" * (384 * 1024)
+        for name in ("earlier.bin", "later.bin"):
+            (self.backend_dir / name).write_bytes(payload)
+        self.backend.worker_gate = threading.Event()
+        with patch("storage.fs.time.time", return_value=10.0):
+            vfd = self.fs.open('/earlier.bin', os.O_RDONLY)
+            session = self._session_for(vfd)
+            self.assertEqual(self.fs.read('/earlier.bin', 128 * 1024, 0, vfd), payload[:128 * 1024])
+        self.assertTrue(self.backend.worker_in_read.wait(timeout=3.0))
+        self.fs.release('/earlier.bin', vfd)
+        self.assertEqual(session.refcount, 0)
+        self.assertFalse(session.detached)
+        # A batch flush while the file has no row must not lose the read.
+        self.assertIsNone(self.fs.state_manager.get_file_metadata('/earlier.bin'))
+        self.fs.state_manager.get_all_file_metadata()
+
+        with patch.object(self.fs, "_streaming_reads", False), patch("storage.fs.time.time", return_value=20.0):
+            self.assertEqual(self._read_through_fs("later.bin", len(payload)), payload)
+        with patch("storage.fs.time.time", return_value=30.0):
+            self.assertIn("earlier.bin", list(self.fs.readdir('/', None)))
+        with patch("storage.fs.time.time", return_value=40.0):
+            self.backend.worker_gate.set()
+            self.assertTrue(session.background_finished.wait(timeout=3.0))
+
+        self.assertTrue(session.finalized)
+        earlier = self.cache_dir / "earlier.bin"
+        self.assertTrue(earlier.is_file())
+        self.assertEqual(earlier.stat().st_mtime, (self.backend_dir / "earlier.bin").stat().st_mtime)
+        self.fs.cache_manager.max_size_bytes = 2 * len(payload)
+        self.assertTrue(self.fs.cache_manager.ensure_space(len(payload)))
+        self.assertFalse(earlier.exists())
+        self.assertEqual((self.cache_dir / "later.bin").read_bytes(), payload)
+        row = self.fs.state_manager.get_file_metadata('/earlier.bin')
+        self.assertEqual(row.last_access, 10.0)
+
+    def test_finalized_stream_stays_pinned_and_its_open_handle_can_heat_it(self):
+        payload = b"a" * (32 * 1024)
+        for name in ("held.bin", "other.bin"):
+            (self.backend_dir / name).write_bytes(payload)
+        with patch("storage.fs.time.time", return_value=10.0):
+            vfd, session = self._stream_whole_file("held.bin", payload)
+            self.assertTrue(session.background_finished.wait(timeout=3.0))
+        self.assertTrue(session.finalized)
+
+        def read_other():
+            with patch.object(self.fs, "_streaming_reads", False), patch("storage.fs.time.time", return_value=10.125):
+                self.assertEqual(self._read_through_fs("other.bin", len(payload)), payload)
+
+        held = self.cache_dir / "held.bin"
+        other = self.cache_dir / "other.bin"
+        read_other()
+        self.fs.cache_manager.max_size_bytes = 2 * len(payload)
+        self.assertTrue(self.fs.cache_manager.ensure_space(len(payload)))
+        self.assertTrue(held.is_file())
+        self.assertFalse(other.exists())
+
+        read_other()
+        with patch("storage.fs.time.time", return_value=10.2):
+            self.assertEqual(self.fs.read('/held.bin', len(payload), 0, vfd), payload)
+        self.fs.release('/held.bin', vfd)
+        self.assertTrue(self.fs.cache_manager.ensure_space(len(payload)))
+        self.assertEqual(held.read_bytes(), payload)
+        self.assertFalse(other.exists())
+        self.assertEqual(self.fs.state_manager.get_file_metadata('/held.bin').last_access, 10.2)
+
     def test_streaming_finalize_keeps_an_open_writers_file(self):
         # A write-open during a stream fetches the whole file into the cache
         # path and writes to it. The stream's finalize must not replace that

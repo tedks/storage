@@ -183,6 +183,9 @@ class PrefetchSession:
     confirmation_waited: float = 0.0
     # Set when that budget ran out: finalize discards, as unconfirmed.
     confirmation_timed_out: bool = False
+    # Demand access can arrive before the index row exists. Carry the last
+    # timestamp into the new row even if the pending index batch has flushed.
+    last_access: float = 0.0
 
     def __post_init__(self):
         self.lock = threading.RLock()
@@ -1699,6 +1702,8 @@ class StreamingReadManager:
             st = os.lstat(str(session.final_cache_path))
         except OSError:
             return None
+        with session.lock:
+            last_access = session.last_access
         metadata = self.state_manager.get_file_metadata(session.canonical_path)
         if not metadata:
             config = self.get_config(session.canonical_path)
@@ -1706,7 +1711,7 @@ class StreamingReadManager:
                 virtual_path=session.canonical_path,
                 size=st.st_size,
                 checksum=None,
-                last_access=time.time(),
+                last_access=last_access,
                 last_modified=st.st_mtime,
                 sync_status=SyncStatus.CLEAN,
                 replica_count=config.replica_count,
@@ -1717,7 +1722,7 @@ class StreamingReadManager:
             )
         else:
             metadata.size = st.st_size
-            metadata.last_access = time.time()
+            metadata.last_access = last_access
             metadata.last_modified = st.st_mtime
             if metadata.sync_status != SyncStatus.DIRTY:
                 metadata.sync_status = SyncStatus.CLEAN

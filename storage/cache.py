@@ -375,98 +375,32 @@ class CacheManager:
         return self.path_guard(virtual_path) if self.path_guard else nullcontext(True)
 
     def evict_lru_files(self, bytes_needed: int) -> bool:
-        """
-        Evict least recently used files to free space
+        """Evict CLEAN, non-recomputable cache entries in access order."""
+        return self._evict_by_access(bytes_needed, recomputable=False)
 
-        Only evicts files that are:
-        - Clean (fully synced)
-        - Not recomputable (those handled separately)
+    def evict_recomputable_files(self, bytes_needed: int) -> bool:
+        """Reclaim CLEAN, recomputable cache entries in access order."""
+        return self._evict_by_access(bytes_needed, recomputable=True)
 
-        Args:
-            bytes_needed: Amount of space to free in bytes
-
-        Returns:
-            True if enough space was freed, False otherwise
-        """
+    def _evict_by_access(self, bytes_needed: int, *, recomputable: bool) -> bool:
+        if bytes_needed <= 0:
+            return True
         with self._lock:
             freed = 0
-            lru_files = self.state_manager.get_lru_files(limit=1000)
-
-            for metadata in lru_files:
-                if freed >= bytes_needed:
-                    break
-
-                # Skip files that aren't clean
-                if metadata.sync_status != SyncStatus.CLEAN:
-                    continue
-
-                # Skip recomputable files (handled separately)
-                if metadata.recomputable:
-                    continue
-
-                # Evict this file
-                cache_path = self.get_cache_path(metadata.virtual_path)
-                with self._path_guard(metadata.virtual_path) as free:
+            for virtual_path in self.state_manager.iter_lru_paths(recomputable=recomputable):
+                cache_path = self.get_cache_path(virtual_path)
+                with self._path_guard(virtual_path) as free:
                     if not free or regular_file_stat(cache_path) is None:
                         continue
                     try:
-                        freed += self._evict_if_still_clean(metadata.virtual_path, cache_path)
+                        freed += self._evict_if_still_clean(
+                            virtual_path, cache_path, recomputable=recomputable,
+                        )
                     except OSError as e:
-                        print(f"Warning: Failed to evict {metadata.virtual_path}: {e}")
-
-            return freed >= bytes_needed
-
-    def evict_recomputable_files(self, bytes_needed: int) -> bool:
-        """
-        Evict recomputable files to free space
-
-        Args:
-            bytes_needed: Amount of space to free in bytes
-
-        Returns:
-            True if enough space was freed, False otherwise
-        """
-        with self._lock:
-            freed = 0
-            recomputable = self.state_manager.get_recomputable_files()
-
-            for metadata in recomputable:
+                        print(f"Warning: Failed to evict {virtual_path}: {e}")
                 if freed >= bytes_needed:
-                    break
-
-                cache_path = self.get_cache_path(metadata.virtual_path)
-                with self._path_guard(metadata.virtual_path) as free:
-                    st = regular_file_stat(cache_path) if free else None
-                    if st is None:
-                        # Gone, or not a regular file: never truncate
-                        # through a link.
-                        continue
-                    try:
-                        # Truncate in place to preserve xattrs; O_NOFOLLOW
-                        # and the fstat refuse a link, or any other file,
-                        # swapped in after the lstat.
-                        fd = os.open(cache_path, os.O_WRONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-                        try:
-                            opened = os.fstat(fd)
-                            if (opened.st_dev, opened.st_ino) != (st.st_dev, st.st_ino):
-                                continue
-                            st = opened
-                            os.ftruncate(fd, 0)
-                        finally:
-                            os.close(fd)
-                        file_size = st.st_size
-                        freed += file_size
-                        self._current_size_bytes = max(0, self._current_size_bytes - file_size)
-
-                        # Update metadata to show file needs recomputation
-                        metadata.size = 0
-                        metadata.checksum = None
-                        self.store_file_metadata(metadata, cache_path=cache_path)
-
-                    except OSError as e:
-                        print(f"Warning: Failed to evict recomputable {metadata.virtual_path}: {e}")
-
-            return freed >= bytes_needed
+                    return True
+            return False
 
     def ensure_space(self, bytes_needed: int) -> bool:
         """
@@ -474,7 +408,7 @@ class CacheManager:
 
         Attempts eviction in this order:
         1. LRU non-recomputable files
-        2. Recomputable files (smallest first)
+        2. LRU recomputable files
 
         Args:
             bytes_needed: Amount of space needed in bytes
@@ -491,12 +425,8 @@ class CacheManager:
         if self.evict_lru_files(space_needed):
             return True
 
-        # Try evicting recomputable files
-        if self.evict_recomputable_files(space_needed):
-            return True
-
-        # Could not free enough space
-        return False
+        # The first tier may have freed some of the space.
+        return self.evict_recomputable_files(self.get_free_space_needed(bytes_needed))
 
     @contextmanager
     def admit_streaming_partial(self, file_size: int):
@@ -595,7 +525,6 @@ class CacheManager:
                 backend, source_virtual_path, self.get_cache_path(virtual_path), member_stat,
                 confirmed=confirmed,
             )
-            self.state_manager.update_access_time(virtual_path)
             return CacheFetch.INSTALLED if installed else CacheFetch.ALREADY_CACHED
         except (BulkCapacityCancelled, BulkCapacityTimeout):
             raise
@@ -691,9 +620,9 @@ class CacheManager:
                     # file as well as the linked copy.
                     self._size_dirty = True
 
-    def mark_accessed(self, virtual_path: str):
+    def mark_accessed(self, virtual_path: str, *, accessed_at: Optional[float] = None):
         """Mark a file as accessed (update LRU)"""
-        self.state_manager.update_access_time(virtual_path)
+        self.state_manager.update_access_time(virtual_path, accessed_at=accessed_at)
 
     def mark_file_dirty(self, virtual_path: str, cache_path: Path) -> Optional[int]:
         """Record a modification of a cached file: DIRTY, its size and mtime, a new generation.
@@ -720,50 +649,73 @@ class CacheManager:
                 self.sync_cache_metadata(virtual_path, metadata, cache_path=cache_path)
         return generation
 
-    def _evict_if_still_clean(self, virtual_path: str, cache_path: Path) -> int:
-        """Unlink a cached file if its row is still CLEAN and describes the file.
+    def _evict_if_still_clean(
+        self, virtual_path: str, cache_path: Path, *, recomputable: bool = False,
+    ) -> int:
+        """Reclaim cache bytes if the row is still CLEAN and describes the file.
 
-        The LRU list was read earlier; by now a write or the post-crash
-        sweep may have made the row DIRTY, or a write's row update may have
-        been lost (a CLEAN row older than the file). Both mean the file is
-        the only copy of something. The re-check and the unlink are one
-        critical section under the index lock, which every mark_file_dirty
-        also takes, so no write can be recorded between them. The stat and
-        the unlink also sit inside descriptor_guard, which holds the
-        descriptor table lock: a path with an open descriptor is skipped,
-        and none can be opened on the file before the unlink (open() takes
-        the same lock across its os.open and registration), since bytes
-        written through one after the stat would die with the unlinked
-        inode. A stale CLEAN is marked and kept. The listing attributes for
-        the path are forgotten before the unlink (forget_listed_attrs). Lock
-        order: the caller's
-        self._lock, the index lock, then the descriptor lock; nothing under
-        the descriptor lock takes the other two. Returns the bytes freed.
+        Recheck after selection under the index lock, which mark_file_dirty
+        also takes. A stale CLEAN is marked and kept. Hold descriptor_guard
+        across the stat and the unlink or truncation, so no open descriptor
+        can be missed or registered in between. Forget listing attributes
+        before changing the cache inode. Lock order is the cache lock, the
+        index lock, then the descriptor lock. Returns the bytes freed.
         """
         with self.state_manager.metadata_lock:
             row = self.state_manager.get_file_metadata(virtual_path)
-            if row is None or row.sync_status != SyncStatus.CLEAN:
+            if (row is None or row.sync_status != SyncStatus.CLEAN or row.link_target is not None
+                    or row.recomputable != recomputable or (recomputable and not row.recompute_cmd)):
                 return 0
             # A member that missed a rename may hold these bytes only under
             # the old name: the cached copy stays until the repair is resolved.
-            if self.member_repairs.covers(virtual_path):
+            if self.member_repairs.covers(virtual_path) or self.member_repairs.kept_inode(cache_path):
                 return 0
             guard = self.descriptor_guard(virtual_path) if self.descriptor_guard else nullcontext(False)
             with guard as is_open:
                 if is_open:
                     return 0
-                st = os.lstat(str(cache_path))
+                st = regular_file_stat(cache_path)
+                if st is None:
+                    return 0
                 stale = st.st_size != row.size or st.st_mtime != row.last_modified
                 if not stale:
+                    if st.st_size == 0:
+                        return 0
                     if self.forget_listed_attrs:
                         self.forget_listed_attrs(virtual_path)
-                    cache_path.unlink()
+                    if recomputable:
+                        truncated = self._truncate_recomputable(cache_path, st)
+                        if truncated is None:
+                            return 0
+                    else:
+                        cache_path.unlink()
             if stale:
                 self.mark_file_dirty(virtual_path, cache_path)
                 return 0
             self._current_size_bytes = max(0, self._current_size_bytes - st.st_size)
-            self.state_manager.remove_file_location(virtual_path, "cache")
+            if recomputable:
+                row.size = 0
+                row.checksum = None
+                row.last_modified = truncated.st_mtime
+                self.store_file_metadata(row, cache_path=cache_path)
+            else:
+                self.state_manager.remove_file_location(virtual_path, "cache")
             return st.st_size
+
+    @staticmethod
+    def _truncate_recomputable(cache_path: Path, st: os.stat_result) -> Optional[os.stat_result]:
+        """Keep reconstruction xattrs on the inode selected for eviction."""
+        fd = os.open(cache_path, os.O_WRONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            opened = os.fstat(fd)
+            if (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns) != (
+                st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns,
+            ):
+                return None
+            os.ftruncate(fd, 0)
+            return os.fstat(fd)
+        finally:
+            os.close(fd)
 
     def heal_stale_clean(
         self,

@@ -4,12 +4,13 @@ import tempfile
 import threading
 import unittest
 from contextlib import contextmanager
+from dataclasses import replace
 from unittest.mock import patch
 from pathlib import Path
 
 from storage.backends.local import LocalBackend
 from storage.cache import PARTIAL_SUFFIX, CacheManager
-from storage.cache_metadata import MEMBER_ATTRS_XATTR, read_cache_metadata, regular_file_stat
+from storage.cache_metadata import MEMBER_ATTRS_XATTR, read_cache_metadata
 from storage.models import FileMetadata, SyncStatus
 from storage.state import StateManager
 
@@ -69,37 +70,38 @@ class TestCacheLinks(unittest.TestCase):
 
     def test_recomputable_eviction_refuses_a_link_swapped_in_after_the_check(self):
         # The link replaces the file between the lstat and the open.
-        self._row("/swapped", recomputable=True, recompute_cmd="true")
         swapped = self.cache_dir / "swapped"
         swapped.write_bytes(b"y" * 10)
-        real_check = regular_file_stat
+        self._row("/swapped", recomputable=True, recompute_cmd="true",
+                  size=10, last_modified=swapped.stat().st_mtime)
+        real_open = os.open
 
-        def check_then_swap(path):
-            st = real_check(path)
+        def swap_then_open(path, flags, *args, **kwargs):
             if Path(path) == swapped:
                 swapped.unlink()
                 swapped.symlink_to(self.outside)
-            return st
+            return real_open(path, flags, *args, **kwargs)
 
-        with patch("storage.cache.regular_file_stat", side_effect=check_then_swap):
+        with patch("storage.cache.os.open", side_effect=swap_then_open):
             self.cache_manager.evict_recomputable_files(1)
+        self.assertTrue(swapped.is_symlink())
         self.assertEqual(self.outside.stat().st_size, 100_000)
 
     def test_recomputable_eviction_refuses_a_file_swapped_in_after_the_check(self):
-        self._row("/swapped", recomputable=True, recompute_cmd="true")
         swapped = self.cache_dir / "swapped"
         swapped.write_bytes(b"y" * 10)
-        real_check = regular_file_stat
+        self._row("/swapped", recomputable=True, recompute_cmd="true",
+                  size=10, last_modified=swapped.stat().st_mtime)
+        real_open = os.open
 
-        def check_then_swap(path):
-            st = real_check(path)
+        def swap_then_open(path, flags, *args, **kwargs):
             if Path(path) == swapped:
                 replacement = self.cache_dir / "replacement"
                 replacement.write_bytes(b"z" * 20)
                 os.replace(replacement, swapped)
-            return st
+            return real_open(path, flags, *args, **kwargs)
 
-        with patch("storage.cache.regular_file_stat", side_effect=check_then_swap):
+        with patch("storage.cache.os.open", side_effect=swap_then_open):
             self.cache_manager.evict_recomputable_files(1)
         self.assertEqual(swapped.read_bytes(), b"z" * 20)
 
@@ -418,21 +420,21 @@ class TestEvictionSkipsStaleClean(unittest.TestCase):
         self.state_manager.close()
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
-    def _clean_cached(self, name, content):
+    def _clean_cached(self, name, content, *, last_access=1.0, recomputable=False):
         cache_path = self.cache_dir / name
         cache_path.write_bytes(content)
         st = cache_path.lstat()
         self.state_manager.set_file_metadata(FileMetadata(
-            virtual_path=f"/{name}", size=st.st_size, checksum="c", last_access=1.0,
+            virtual_path=f"/{name}", size=st.st_size, checksum="c", last_access=last_access,
             last_modified=st.st_mtime, sync_status=SyncStatus.CLEAN, replica_count=1,
-            recomputable=False, recompute_cmd=None, encrypted=False,
-            encryption_key_id=None,
+            recomputable=recomputable, recompute_cmd="true" if recomputable else None,
+            encrypted=False, encryption_key_id=None,
         ))
         return cache_path
 
     def test_stale_clean_file_is_marked_dirty_and_kept(self):
         stale = self._clean_cached("stale.txt", b"v1")
-        fresh = self._clean_cached("fresh.txt", b"v1")
+        fresh = self._clean_cached("fresh.txt", b"v1", last_access=2.0)
         stale.write_bytes(b"v2, the only copy")  # row update lost
 
         self.cache_manager.evict_lru_files(bytes_needed=1)
@@ -462,16 +464,62 @@ class TestEvictionSkipsStaleClean(unittest.TestCase):
     def test_file_made_dirty_after_selection_is_kept(self):
         """The LRU list is a snapshot; the row is re-checked before the unlink."""
         turned = self._clean_cached("turned.txt", b"v1")
-        snapshot = self.state_manager.get_lru_files(limit=10)
+        snapshot = list(self.state_manager.iter_lru_paths())
         # A write lands after the snapshot was taken, through the real path.
         turned.write_bytes(b"v2")
         self.cache_manager.mark_file_dirty("/turned.txt", turned)
 
-        with patch.object(self.state_manager, "get_lru_files", return_value=snapshot):
+        with patch.object(self.state_manager, "iter_lru_paths", return_value=snapshot):
             self.cache_manager.evict_lru_files(bytes_needed=1)
 
         self.assertTrue(turned.exists())
         self.assertEqual(self.state_manager.get_file_metadata("/turned.txt").sync_status, SyncStatus.DIRTY)
+
+    def test_missing_rows_cannot_hide_the_oldest_cached_copy_under_pressure(self):
+        oldest = self._clean_cached("oldest.txt", b"old", last_access=2.0)
+        newer = self._clean_cached("newer.txt", b"new", last_access=3.0)
+        template = self.state_manager.get_file_metadata("/oldest.txt")
+        for i in range(1001):
+            # Previously evicted rows share one timestamp, spanning a page.
+            self.state_manager.set_file_metadata(replace(
+                template, virtual_path=f"/missing-{i:04d}", last_access=1.0,
+            ))
+
+        self.cache_manager.mark_cache_size_dirty()
+        self.cache_manager.max_size_bytes = self.cache_manager.get_total_cache_size()
+        self.assertTrue(self.cache_manager.ensure_space(1))
+        self.assertFalse(oldest.exists())
+        self.assertEqual(newer.read_bytes(), b"new")
+
+    def test_recomputable_pressure_preserves_pinned_and_dirty_bytes(self):
+        ordinary = self._clean_cached("ordinary.txt", b"one", last_access=20.0)
+        oldest = self._clean_cached("older.txt", b"older", last_access=4.0, recomputable=True)
+        newer = self._clean_cached("newer.txt", b"n", last_access=5.0, recomputable=True)
+        dirty = self._clean_cached("dirty.txt", b"d", last_access=1.0, recomputable=True)
+        held = self._clean_cached("held.txt", b"h", last_access=2.0, recomputable=True)
+        pinned = self._clean_cached("pinned.txt", b"p", last_access=3.0, recomputable=True)
+        self.cache_manager.mark_file_dirty("/dirty.txt", dirty)
+        self.cache_manager.member_repairs.record("/original.txt", "/pinned.txt", ["member"], "offline")
+        os.setxattr(oldest, "user.test-recompute", b"preserve")
+
+        @contextmanager
+        def guard(path):
+            yield path == "/held.txt"
+
+        self.cache_manager.descriptor_guard = guard
+        self.cache_manager.mark_cache_size_dirty()
+        self.cache_manager.max_size_bytes = self.cache_manager.get_total_cache_size()
+        self.assertTrue(self.cache_manager.ensure_space(8))
+        self.assertFalse(ordinary.exists())
+        self.assertEqual(oldest.read_bytes(), b"")
+        self.assertEqual(os.getxattr(oldest, "user.test-recompute"), b"preserve")
+        row = self.state_manager.get_file_metadata("/older.txt")
+        self.assertEqual((row.size, row.last_modified), (0, oldest.stat().st_mtime))
+        self.assertEqual(row.sync_status, SyncStatus.CLEAN)
+        self.assertEqual(newer.read_bytes(), b"n")
+        self.assertEqual(dirty.read_bytes(), b"d")
+        self.assertEqual(held.read_bytes(), b"h")
+        self.assertEqual(pinned.read_bytes(), b"p")
 
 
 class TestCacheSizeMark(unittest.TestCase):

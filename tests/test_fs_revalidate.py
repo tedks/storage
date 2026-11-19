@@ -394,7 +394,6 @@ class TestMemberAttributes(RevalidateTestBase):
         row = self.fs.state_manager.get_file_metadata("/f.txt")
         self.assertTrue(self.fs.state_manager.record_cached_stat(
             "/f.txt", row.dirty_generation, size=local.st_size, last_modified=local.st_mtime,
-            last_access=local.st_atime,
         ))
         self.fs.cache_manager.sync_cache_metadata(
             "/f.txt", self.fs.state_manager.get_file_metadata("/f.txt"),
@@ -607,7 +606,6 @@ class TestCreatedAndChangedFiles(RevalidateTestBase):
         row = self.fs.state_manager.get_file_metadata("/f.txt")
         self.assertTrue(self.fs.state_manager.record_cached_stat(
             "/f.txt", row.dirty_generation, size=local.st_size, last_modified=local.st_mtime,
-            last_access=local.st_atime,
         ))
         self.fs._store_member_check("/f.txt", cached, self.fs._cache_identity(local),
                                     {"member": (8, 1_000_000_000)}, replace=True)

@@ -32,7 +32,6 @@ class StateManager:
     """Manages file state in SQLite database"""
 
     XATTR_CONFIG_NAME = FILE_CONFIG_XATTR_NAME
-    ACCESS_DEBOUNCE_SECONDS = 0.25
     ACCESS_FLUSH_INTERVAL_SECONDS = 0.5
     ACCESS_FLUSH_BATCH_SIZE = 256
     WRITE_BATCH_SIZE = 1000
@@ -60,8 +59,9 @@ class StateManager:
     # (size, checksum, last_modified, sync_status) belong to the row's
     # dirty_generation: when the stored generation is newer than the one in
     # the incoming row, a write() landed after that row was read, and those
-    # columns keep the stored values. Policy columns and last_access always
-    # take the new values. Parameters are a _metadata_row tuple.
+    # columns keep the stored values. Policy columns take the new values;
+    # an older access timestamp never replaces a newer one. Parameters are
+    # a _metadata_row tuple.
     _UPSERT_FILES_SQL = '''
         INSERT INTO files
         (virtual_path, size, checksum, last_access, last_modified,
@@ -80,7 +80,7 @@ class StateManager:
             link_target = CASE WHEN files.dirty_generation > excluded.dirty_generation
                                THEN files.link_target ELSE excluded.link_target END,
             dirty_generation = MAX(files.dirty_generation, excluded.dirty_generation),
-            last_access = excluded.last_access,
+            last_access = MAX(files.last_access, excluded.last_access),
             replica_count = excluded.replica_count,
             recomputable = excluded.recomputable,
             recompute_cmd = excluded.recompute_cmd,
@@ -95,7 +95,6 @@ class StateManager:
         self._db_lock = threading.RLock()
         self._access_lock = threading.RLock()
         self._pending_access_updates: Dict[str, float] = {}
-        self._recent_access_updates: Dict[str, float] = {}
         self._last_access_flush_mono = time.monotonic()
         self._configure_connection()
         self._init_db()
@@ -216,6 +215,11 @@ class StateManager:
         # replicated.
         if 'link_target' not in columns:
             self.conn.execute('ALTER TABLE files ADD COLUMN link_target TEXT')
+        self.conn.execute('''
+            CREATE INDEX IF NOT EXISTS idx_cache_eviction
+            ON files(sync_status, recomputable, last_access, virtual_path)
+            WHERE link_target IS NULL
+        ''')
         self.conn.commit()
 
     def _flush_access_updates(self, force: bool = False):
@@ -236,7 +240,7 @@ class StateManager:
             rows = [(ts, path) for path, ts in self._pending_access_updates.items()]
             with self._db_lock:
                 self.conn.executemany(
-                    'UPDATE files SET last_access = ? WHERE virtual_path = ?',
+                    'UPDATE files SET last_access = MAX(last_access, ?) WHERE virtual_path = ?',
                     rows
                 )
                 self.conn.commit()
@@ -329,13 +333,11 @@ class StateManager:
         *,
         size: int,
         last_modified: float,
-        last_access: float,
     ) -> bool:
         """Bring a row's recorded stat up to a cache file that holds synced content.
 
-        For a refetch after eviction: the transfer does not keep the mtime,
-        and the row's stat must describe the file on disk or the file looks
-        like a lost write. Touches only size, last_modified and last_access,
+        After a refetch, the row's stat must describe the cached inode or
+        it will look like a lost write. Touches only the size and mtime,
         and only WHERE dirty_generation = `generation`, so a write recorded
         since the caller read the row is left alone. Returns whether it applied.
         """
@@ -343,10 +345,10 @@ class StateManager:
             cursor = self.conn.execute(
                 '''
                 UPDATE files
-                SET size = ?, last_modified = ?, last_access = ?
+                SET size = ?, last_modified = ?
                 WHERE virtual_path = ? AND dirty_generation = ?
                 ''',
-                (size, last_modified, last_access, virtual_path, generation),
+                (size, last_modified, virtual_path, generation),
             )
             self.conn.commit()
             return cursor.rowcount == 1
@@ -921,39 +923,38 @@ class StateManager:
                 return None
             offset += page
 
-    def update_access_time(self, virtual_path: str):
-        """Update last access time (for LRU)"""
-        now = time.time()
+    def update_access_time(self, virtual_path: str, *, accessed_at: Optional[float] = None):
+        """Coalesce demand accesses by path until the next batch write."""
+        now = time.time() if accessed_at is None else accessed_at
         with self._access_lock:
-            recent = self._recent_access_updates.get(virtual_path)
-            if recent is not None and (now - recent) < self.ACCESS_DEBOUNCE_SECONDS:
-                return
-
-            self._recent_access_updates[virtual_path] = now
-            self._pending_access_updates[virtual_path] = now
-        self._flush_access_updates(force=False)
-
-    def get_lru_files(self, limit: int = 100) -> List[FileMetadata]:
-        """Get least recently used files"""
-        self._flush_access_updates(force=True)
-        with self._db_lock:
-            cursor = self.conn.execute('''
-                SELECT * FROM files
-                WHERE sync_status = ? AND link_target IS NULL
-                ORDER BY last_access ASC
-                LIMIT ?
-            ''', (SyncStatus.CLEAN.value, limit))
-            rows = cursor.fetchall()
-        return [FileMetadata.from_dict(dict(row)) for row in rows]
-
-    def get_recomputable_files(self) -> List[FileMetadata]:
-        """Get all recomputable files"""
-        with self._db_lock:
-            cursor = self.conn.execute(
-                'SELECT * FROM files WHERE recomputable = 1 ORDER BY size ASC'
+            self._pending_access_updates[virtual_path] = max(
+                self._pending_access_updates.get(virtual_path, now), now,
             )
-            rows = cursor.fetchall()
-        return [FileMetadata.from_dict(dict(row)) for row in rows]
+        self._flush_access_updates()
+
+    def iter_lru_paths(self, *, recomputable: bool = False) -> Iterator[str]:
+        """Walk CLEAN regular-file rows in access order, including evicted rows.
+
+        The cache tree is authoritative for whether the bytes are present.
+        Page past missing and pinned paths without loading the whole index.
+        """
+        self._flush_access_updates(force=True)
+        last_access, last_path = float('-inf'), ''
+        while True:
+            with self._db_lock:
+                rows = self.conn.execute('''
+                    SELECT virtual_path, last_access FROM files
+                    WHERE sync_status = ? AND recomputable = ? AND link_target IS NULL
+                      AND (last_access, virtual_path) > (?, ?)
+                    ORDER BY last_access ASC, virtual_path ASC
+                    LIMIT ?
+                ''', (SyncStatus.CLEAN.value, int(recomputable), last_access, last_path,
+                      self.WRITE_BATCH_SIZE)).fetchall()
+            for row in rows:
+                yield row['virtual_path']
+            if len(rows) < self.WRITE_BATCH_SIZE:
+                return
+            last_access, last_path = rows[-1]['last_access'], rows[-1]['virtual_path']
 
     def delete_file(self, virtual_path: str):
         """Delete file from state tracking"""
@@ -970,7 +971,6 @@ class StateManager:
         """Replace the local index contents atomically."""
         with self._access_lock:
             self._pending_access_updates.clear()
-            self._recent_access_updates.clear()
 
         with self._db_lock:
             try:
@@ -1005,7 +1005,6 @@ class StateManager:
         """Replace the index from a streaming metadata/location entry source."""
         with self._access_lock:
             self._pending_access_updates.clear()
-            self._recent_access_updates.clear()
 
         with self._db_lock:
             try:
