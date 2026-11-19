@@ -10,6 +10,7 @@ import errno
 import json
 import os
 import shutil
+import subprocess
 import tempfile
 import threading
 import time
@@ -29,8 +30,15 @@ class SlowRemoteLoopbackBackend(LocalBackend):
         super().__init__(name, root_path, speed_priority=50)
         self.is_remote = True
         self.range_delay = range_delay
+        self.hold_past = None
 
     def read_file(self, virtual_path: str, offset: int, size: int) -> bytes:
+        if self.hold_past is not None:
+            name, boundary, entered, resume = self.hold_past
+            if virtual_path.lstrip("/") == name and offset >= boundary:
+                entered.set()
+                if not resume.wait(20):
+                    raise TimeoutError("test did not release the held range read")
         if self.range_delay:
             time.sleep(self.range_delay)
         return super().read_file(virtual_path, offset, size)
@@ -45,7 +53,7 @@ class TestStreamingSystemRegression(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.mkdtemp()
         self.mount_dir = Path(self.temp_dir) / "mount"
-        self.cache_dir = Path(self.temp_dir) / "cache"
+        self.cache_dir = Path(self.temp_dir) / "cache 演奏"
         self.backend_dir = Path(self.temp_dir) / "backend"
         self.db_path = Path(self.temp_dir) / "state.db"
 
@@ -63,6 +71,8 @@ class TestStreamingSystemRegression(unittest.TestCase):
         }
         for name, payload in self.contended_payloads.items():
             (self.backend_dir / name).write_bytes(payload)
+        (self.backend_dir / "recording 演奏.bin").write_bytes(self.payload)
+        (self.backend_dir / "second file.bin").write_bytes(self.payload)
 
         self.backend = SlowRemoteLoopbackBackend("remote0", str(self.backend_dir), range_delay=0.003)
         self.fs = StorageFS(
@@ -257,6 +267,91 @@ class TestStreamingSystemRegression(unittest.TestCase):
             cached = self.cache_dir / name
             self.assertTrue(self._wait_for(cached.exists))
             self.assertEqual(cached.read_bytes(), payloads[name])
+
+    def _run_control_cli(self, *args, expected=0):
+        cli = Path(os.environ["TEST_SRCDIR"]) / os.environ["TEST_WORKSPACE"] / "storage_cli"
+        result = subprocess.run([str(cli), *args], check=False, capture_output=True,
+                                text=True, timeout=8)
+        self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+        return result
+
+    def test_live_mount_control(self):
+        self.assertTrue(os.path.ismount(self.mount_dir), "requires a live scratch FUSE mount")
+        name = "recording 演奏.bin"
+        second = "second file.bin"
+        partial = self.cache_dir / f"{name}.storage.partial"
+        entered = threading.Event()
+        resume = threading.Event()
+        self.backend.hold_past = (name, 1024 * 1024, entered, resume)
+
+        def command(*args, expected=0, json_output=True):
+            options = ["control", "--cache", str(self.cache_dir)]
+            if json_output:
+                options += ["--json-output"]
+            result = self._run_control_cli(*options, *args, expected=expected)
+            return json.loads(result.stdout) if json_output else result
+
+        try:
+            with (self.mount_dir / name).open("rb") as handle:
+                self.assertEqual(handle.read(512 * 1024), self.payload[:512 * 1024])
+                self.assertTrue(entered.wait(4), "the background range reader must be held")
+
+                status = command()
+                self.assertEqual(status["stats"]["active_reader_sessions"], 1)
+                self.assertNotIn(name, json.dumps(status, ensure_ascii=False))
+                self.assertTrue(status["restart_only"]["streaming_reads"])
+                row, = command("downloads")["downloads"]
+                self.assertEqual(row["path"].lstrip("/"), name)
+                self.assertEqual(row["readers"], 1)
+                original = row["id"]
+
+                outcome = command("cancel", original, expected=1)
+                self.assertEqual(outcome, {"id": original, "result": "busy"})
+                human = command("cancel", original, expected=1, json_output=False)
+                self.assertIn("Close its readers or wait for finalization", human.stderr)
+                self.assertEqual(handle.read(64), self.payload[512 * 1024:512 * 1024 + 64])
+
+                limits = command("set", "--max-streaming-sessions", "1",
+                                 "--max-retained-streaming-sessions", "3",
+                                 "--max-download-workers", "1")["limits"]
+                self.assertEqual(limits, {
+                    "max_streaming_sessions": 1,
+                    "max_retained_streaming_sessions": 3,
+                    "max_download_workers": 1,
+                })
+                rejected = command("set", "--max-streaming-sessions", "2",
+                                   "--max-download-workers", "33", expected=1, json_output=False)
+                self.assertIn("max_download_workers", rejected.stderr)
+                self.assertEqual(command("get")["limits"], limits)
+
+                with (self.mount_dir / second).open("rb") as fallback:
+                    self.assertEqual(fallback.read(16), self.payload[:16])
+                self.assertEqual(command("status")["stats"]["streaming_fallback_opens"], 1)
+
+                legacy = json.loads(self._run_control_cli(
+                    "debug", "streaming-stats", "--cache", str(self.cache_dir), "--json-output",
+                ).stdout)
+                self.assertEqual(legacy["pid"], status["stats"]["pid"])
+                self.assertEqual(legacy["active_streaming_sessions"], 1)
+            self.assertTrue(self._wait_for(
+                lambda: command("status")["stats"]["retained_streaming_sessions"] == 1,
+            ))
+            self.assertTrue(partial.exists())
+            self.assertEqual(command("cancel", original), {"id": original, "result": "cancelled"})
+            self.assertEqual(command("downloads")["downloads"], [])
+            self.assertFalse(partial.exists())
+
+            with (self.mount_dir / name).open("rb") as replacement:
+                self.assertEqual(replacement.read(512 * 1024), self.payload[:512 * 1024])
+                row, = command("downloads")["downloads"]
+                self.assertNotEqual(row["id"], original)
+                self.assertEqual(command("cancel", original, expected=1)["result"], "not-found")
+                self.assertEqual(command("downloads")["downloads"][0]["id"], row["id"])
+                command("set", "--max-retained-streaming-sessions", "0")
+            self.assertTrue(self._wait_for(lambda: not command("downloads")["downloads"]))
+            self.assertFalse(partial.exists())
+        finally:
+            resume.set()
 
 
 class TestStreamingSystemRegressionThreaded(TestStreamingSystemRegression):
