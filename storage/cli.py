@@ -3,6 +3,7 @@
 import click
 
 from .cli_conflicts import conflicts
+from .cli_control import control
 from .cli_debug import debug
 from .cli_mount import configure, info, mount
 
@@ -17,6 +18,7 @@ main.add_command(mount)
 main.add_command(configure)
 main.add_command(info)
 main.add_command(debug)
+main.add_command(control)
 main.add_command(conflicts)
 main.add_command(conflicts, name="conflict")
 

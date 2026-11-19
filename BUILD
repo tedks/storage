@@ -67,6 +67,7 @@ test_suite(
         "cache",
         "cache_metadata",
         "checksum_queue",
+        "cli_control",
         "cli_debug",
         "cli_mount",
         "crypto",
