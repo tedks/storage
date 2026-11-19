@@ -60,10 +60,7 @@ from .member_repairs import CARRIER_DIR, is_carrier_path
 from .pathing import ResolvedPath, resolve_path
 from .links import LinkRefused, intermediate_paths, link_checksum, resolve_link_target
 from .namespace import DEFAULT_LISTING_MAX_STALE, NamespaceService
-from .streaming import (
-    DEFAULT_MAX_DOWNLOAD_WORKERS, DEFAULT_MAX_RETAINED_STREAMING_SESSIONS,
-    PrefetchSession, StreamingReadManager,
-)
+from .streaming import PrefetchSession, StreamingOpen, StreamingReadManager, StreamSource
 from .streaming_settings import DEFAULT_STREAMING_READ_AHEAD_WINDOW
 
 
@@ -233,7 +230,6 @@ class StorageFS(Operations):
     def __init__(self, cache_root: Path, state_db: Path, backends: Dict[str, Backend],
                  cache_size: int, num_sync_workers: int = 2, start_sync: bool = True,
                  streaming_reads: bool = False, streaming_chunk_size: int = 1024 * 1024,
-                 max_streaming_sessions: int = 8,
                  readdir_ttl: Optional[float] = None,
                  enable_watchers: bool = False,
                  streaming_keep_after_close: Optional[StreamingKeepAfterClose] = None,
@@ -243,8 +239,7 @@ class StorageFS(Operations):
                  bulk_cold_copies: bool = False,
                  max_foreground_operations: Optional[int] = None,
                  max_sync_workers: Optional[int] = None,
-                 max_download_workers: int = DEFAULT_MAX_DOWNLOAD_WORKERS,
-                 max_retained_streaming_sessions: int = DEFAULT_MAX_RETAINED_STREAMING_SESSIONS,
+                 max_download_workers: Optional[int] = None,
                  streaming_read_ahead_window: int = DEFAULT_STREAMING_READ_AHEAD_WINDOW):
         """
         Initialize Storage filesystem
@@ -258,11 +253,9 @@ class StorageFS(Operations):
             max_sync_workers: Optional upper limit for demand-driven sync workers
             streaming_reads: Enable uncached range streaming + background prefetch
             max_download_workers: Ceiling for adaptive streaming download workers
-            max_retained_streaming_sessions: Maximum retained fills without readers
             streaming_chunk_size: Unit of background read-ahead (foreground
                 reads fetch only what the reader asked for); read-ahead
                 starts once readers have read one chunk
-            max_streaming_sessions: Maximum concurrent streaming sessions
             streaming_keep_after_close: When read-ahead outlives the last
                 close of a streaming session; None for the default
             streaming_read_ahead_window: Maximum bytes beyond a read span
@@ -467,12 +460,10 @@ class StorageFS(Operations):
             state_manager=self.state_manager,
             logger=self.logger,
             get_config=self._get_config,
-            select_backend_for_read=self._select_backend_for_read,
+            select_backend_for_read=self._select_stream_source,
             streaming_reads=streaming_reads,
             streaming_chunk_size=streaming_chunk_size,
-            max_streaming_sessions=max_streaming_sessions,
             max_download_workers=max_download_workers,
-            max_retained_streaming_sessions=max_retained_streaming_sessions,
             keep_after_close=streaming_keep_after_close,
             read_ahead_window=streaming_read_ahead_window,
             on_finalized=lambda session: self._record_fetched(
@@ -1326,15 +1317,8 @@ class StorageFS(Operations):
     def _select_backend_for_read(self, canonical_path: str) -> Optional[Backend]:
         """Pick a readable backend, preferring existing replication metadata.
 
-        A refetch after revalidation reads from the member that was checked
-        (see _revalidate_cached_file) while it is available. The pin stays
-        until open() ends, so selection is idempotent within one open: a
-        stream that bails out after selecting and the full-file fallback
-        both honour it. Within a streaming open the pinned member is the
-        only one tried: if its stream setup fails, the fallback fetch asks
-        it again rather than another holder, which keeps the guarantee that
-        a change seen on the checked member is never adopted unseen (the
-        non-streaming path always behaved so).
+        Revalidation pins the member whose change was checked until the
+        open ends. Streaming uses the same pin in _select_stream_source.
         """
         with self._member_checks_lock:
             pinned = self._refetch_pins.get(canonical_path)
@@ -1348,6 +1332,49 @@ class StorageFS(Operations):
             with self._member_checks_lock:
                 self._recheck.setdefault(canonical_path, set()).add(pinned.name)
         return backend
+
+    def _select_stream_source(self, canonical_path: str):
+        """Find a streaming source with one stat per candidate, preserving why it failed."""
+        def probe(backend):
+            try:
+                member_stat = backend.stat(canonical_path)
+            except NotImplementedError:
+                member_stat = None
+            size = getattr(member_stat, "st_size", None)
+            if size is None:
+                size = backend.get_size(canonical_path)
+            return StreamSource(backend, member_stat, size)
+
+        with self._member_checks_lock:
+            pinned = self._refetch_pins.get(canonical_path)
+        if pinned is not None:
+            if pinned.is_available():
+                return probe(pinned)
+            with self._member_checks_lock:
+                self._recheck.setdefault(canonical_path, set()).add(pinned.name)
+
+        known = {location.backend_name for location in self.state_manager.get_file_locations(canonical_path)}
+        available = [backend for backend in self.backends.values() if backend.is_available()]
+        candidates = available or [backend for backend in self.backends.values()
+                                   if backend.supports_reconnect_probe()]
+        errors = []
+        for backend in sorted(candidates, key=lambda b: (b.name not in known, b.speed_priority)):
+            try:
+                return probe(backend)
+            except FileNotFoundError:
+                continue
+            except Exception as exc:
+                errors.append(exc)
+        if errors:
+            # Prefer a concrete error from a member over a failed connection
+            # to another candidate. An alternate working member wins above.
+            raise next((exc for exc in errors
+                        if not isinstance(exc, ConnectionError) and not is_connection_error(exc)), errors[0])
+        if not available and self.backends and not candidates:
+            raise OSError(errno.EHOSTUNREACH, "all streaming sources unavailable")
+        if any(backend.name in known and backend not in candidates for backend in self.backends.values()):
+            raise OSError(errno.EHOSTUNREACH, "known streaming source unavailable")
+        return None
 
     def _pinned_stat(self, canonical_path: str, backend: Backend) -> Optional[os.stat_result]:
         """The stat revalidation just took of backend, when this open is refetching from it."""
@@ -1942,7 +1969,7 @@ class StorageFS(Operations):
     def _finalize_streaming_session(self, session: PrefetchSession):
         self._streaming_manager._finalize_streaming_session(session)
 
-    def _create_or_attach_prefetch_session(self, virtual_path: str, canonical_path: str) -> Optional[PrefetchSession]:
+    def _create_or_attach_prefetch_session(self, virtual_path: str, canonical_path: str) -> PrefetchSession | StreamingOpen:
         return self._streaming_manager._create_or_attach_prefetch_session(
             virtual_path,
             canonical_path,
@@ -2149,17 +2176,8 @@ class StorageFS(Operations):
 
                 return True
 
-        # File not in cache or backends - try recomputation
-        if self.recompute_engine.can_recompute(resolved.requested_path, cache_path):
-            # Recompute the file synchronously (blocks until complete)
-            result = self.recompute_engine.recompute_file(
-                resolved.requested_path,
-                cache_path,
-                timeout=30.0,
-            )
-
-            if result.success:
-                return True
+        if self._try_recompute(resolved):
+            return True
 
         available_backends, _ = self._backend_availability()
         if not available_backends and self.backends:
@@ -2167,6 +2185,13 @@ class StorageFS(Operations):
 
         # File not available
         return False
+
+    def _try_recompute(self, resolved: ResolvedPath) -> bool:
+        if not self.recompute_engine.can_recompute(resolved.requested_path, resolved.cache_path):
+            return False
+        return self.recompute_engine.recompute_file(
+            resolved.requested_path, resolved.cache_path, timeout=30.0,
+        ).success
 
     # Filesystem methods
 
@@ -2454,27 +2479,28 @@ class StorageFS(Operations):
             and self._is_read_only_open(flags)
             and not self.cache_manager.is_cached(resolved.requested_path)
         ):
-            prefetch_session = self._create_or_attach_prefetch_session(
-                resolved.requested_path,
-                resolved.canonical_path,
-            )
-            if prefetch_session:
-                cache_path = prefetch_session.partial_cache_path
-                if not cache_path.exists() and prefetch_session.final_cache_path.exists():
-                    # Session finished before open() reached os.open.
-                    cache_path = prefetch_session.final_cache_path
+            try:
+                stream = self._create_or_attach_prefetch_session(
+                    resolved.requested_path, resolved.canonical_path,
+                )
+            except OSError as exc:
+                raise FuseOSError(exc.errno or errno.EIO) from exc
+            if isinstance(stream, PrefetchSession):
+                prefetch_session = stream
+                cache_path = stream.partial_cache_path
+            elif stream == StreamingOpen.CACHED:
+                self.cache_manager.heal_stale_clean(resolved.canonical_path, cache_path)
+            elif stream == StreamingOpen.SOURCE_MISSING:
+                if not self.cache_manager.is_cached(resolved.requested_path) and not self._try_recompute(resolved):
+                    raise FuseOSError(errno.ENOENT)
             else:
                 self._record_streaming_stat("streaming_fallback_opens", 1)
-                self.logger.info(
-                    "streaming fallback path=%s reason=unavailable-session",
-                    resolved.canonical_path,
-                )
-
-        # Fallback path: preserve existing full-file cache semantics.
-        if prefetch_session is None:
+                self.logger.info("streaming whole-file copy reason=range_unsupported")
+                if not self._ensure_file_in_cache(resolved):
+                    raise FuseOSError(errno.ENOENT)
+        else:
             if not self._ensure_file_in_cache(resolved):
                 raise FuseOSError(errno.ENOENT)
-            cache_path = resolved.cache_path
             if not self._is_read_only_open(flags):
                 self._require_imported_write_permission(cache_path)
 
@@ -2486,11 +2512,10 @@ class StorageFS(Operations):
                 try:
                     real_fd = os.open(str(cache_path), flags)
                 except FileNotFoundError:
-                    if prefetch_session is not None and prefetch_session.final_cache_path.exists():
-                        cache_path = prefetch_session.final_cache_path
-                        real_fd = os.open(str(cache_path), flags)
-                    else:
+                    if prefetch_session is None:
                         raise
+                    cache_path = prefetch_session.final_cache_path
+                    real_fd = os.open(str(cache_path), flags)
 
                 vfd = self._fd_counter
                 self._fd_counter += 1
@@ -2511,6 +2536,7 @@ class StorageFS(Operations):
 
         except OSError as e:
             if prefetch_session is not None:
+                self._streaming_manager.report_open_error("cache_open", e)
                 self._release_prefetch_session(prefetch_session)
             raise FuseOSError(e.errno)
 
@@ -2581,7 +2607,6 @@ class StorageFS(Operations):
                 raise FuseOSError(errno.EBADF)
 
         session = entry.prefetch_session
-
         if session is not None:
             read_start = max(0, offset)
             read_end = min(session.file_size, offset + size)
@@ -3554,7 +3579,6 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
                  debug: bool = False,
                  streaming_reads: bool = False,
                  streaming_chunk_size: int = 1024 * 1024,
-                 max_streaming_sessions: int = 8,
                  readdir_ttl: Optional[float] = None,
                  enable_watchers: bool = False,
                  streaming_keep_after_close: Optional[StreamingKeepAfterClose] = None,
@@ -3566,8 +3590,7 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
                  checksum_reverify_interval: float = DEFAULT_CHECKSUM_REVERIFY_INTERVAL,
                  max_foreground_operations: Optional[int] = None,
                  max_sync_workers: Optional[int] = None,
-                 max_download_workers: int = DEFAULT_MAX_DOWNLOAD_WORKERS,
-                 max_retained_streaming_sessions: int = DEFAULT_MAX_RETAINED_STREAMING_SESSIONS,
+                 max_download_workers: Optional[int] = None,
                  streaming_read_ahead_window: int = DEFAULT_STREAMING_READ_AHEAD_WINDOW):
     """
     Mount a Storage filesystem
@@ -3586,9 +3609,7 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
         debug: Enable verbose debug logging
         streaming_reads: Enable uncached range streaming + background prefetch
         streaming_chunk_size: Chunk size used for remote range reads
-        max_streaming_sessions: Maximum streaming sessions with live readers
         max_download_workers: Ceiling for adaptive streaming download workers
-        max_retained_streaming_sessions: Maximum retained fills without readers
         streaming_keep_after_close: When read-ahead outlives the last close;
             None for the default
         streaming_read_ahead_window: Pre-qualification read-ahead in bytes
@@ -3689,9 +3710,7 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
         start_sync=False,
         streaming_reads=streaming_reads,
         streaming_chunk_size=streaming_chunk_size,
-        max_streaming_sessions=max_streaming_sessions,
         max_download_workers=max_download_workers,
-        max_retained_streaming_sessions=max_retained_streaming_sessions,
         readdir_ttl=readdir_ttl,
         enable_watchers=enable_watchers,
         streaming_keep_after_close=streaming_keep_after_close,
