@@ -763,6 +763,9 @@ class _FakeStdout:
     def read(self, _n):
         return self._out
 
+    def close(self):
+        pass
+
 
 class _FakeClient:
     """Stands in for the paramiko client the probe opens and must close."""

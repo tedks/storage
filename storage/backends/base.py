@@ -143,6 +143,10 @@ class Backend(ABC):
         self.encrypt_all = False
         self._available = True
 
+    def io_capacity_scope(self) -> object:
+        """Identity shared by members drawing on the same channel capacity."""
+        return self.name
+
     def listing_concurrency(self) -> Optional[int]:
         """Configured foreground listing concurrency, or the executor default."""
         return None
@@ -199,7 +203,7 @@ class Backend(ABC):
             capabilities=self.capabilities,
             speed_priority=self.speed_priority,
             encrypt_all=self.encrypt_all,
-            available=self._available,
+            available=self.is_available(),
             display_name=self.display_name,
         )
 
