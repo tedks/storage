@@ -43,6 +43,7 @@ class OpenSSHSessionPool:
     def __init__(self, config):
         self.name = f"{config.host}:{config.port}"
         self.connect_timeout = config.connect_timeout
+        self.retry_interval = max(1.0, min(5.0, self.connect_timeout / 2.0))
         self.capacity_wait = config.bulk_capacity_wait_timeout or None
         self._master = OpenSSHMaster(
             config.username, config.host, config.port, config.key_filename,
@@ -56,8 +57,11 @@ class OpenSSHSessionPool:
         self._held = {}
         self._waiters = {"interactive": 0, "bulk": 0, "watcher": 0}
 
+    def _root_available_locked(self, root):
+        return root is None or (not root.closed and time.monotonic() >= root.manual_retry_at)
+
     def _check_locked(self, root, cancel):
-        if self._closed or (root is not None and (root.closed or root.disabled)):
+        if self._closed or not self._root_available_locked(root):
             raise MemberUnavailable(f"SSH member on {self.name} is unavailable")
         if cancel is not None and cancel():
             raise BulkCapacityCancelled(f"SSH capacity wait cancelled on {self.name}")
@@ -254,11 +258,15 @@ class OpenSSHSessionPool:
     def available(self, root=None):
         with self._cond:
             return (not self._closed and time.monotonic() >= self._retry_at
-                    and (root is None or not (root.closed or root.disabled)))
+                    and self._root_available_locked(root))
+
+    def check_root(self, root):
+        with self._cond:
+            self._check_locked(root, None)
 
     def set_root_available(self, root, available):
         with self._cond:
-            root.disabled = not available
+            root.manual_retry_at = 0.0 if available else time.monotonic() + self.retry_interval
             self._cond.notify_all()
 
     def close_root(self, root):
