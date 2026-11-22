@@ -135,7 +135,7 @@ class _SSHConnectionConfig:
     """
 
     host: str
-    port: int
+    port: Optional[int]
     username: str
     password: Optional[str]
     key_filename: Optional[str]
@@ -322,7 +322,7 @@ class SSHBackend(Backend):
     def __init__(self, name: str, host: str, remote_path: str,
                  username: str, password: Optional[str] = None,
                  key_filename: Optional[str] = None,
-                 port: int = 22, speed_priority: int = 50,
+                 port: Optional[int] = 22, speed_priority: int = 50,
                  connect_timeout: float = 10.0,
                  bulk_capacity_wait_timeout: Optional[float] = None, *,
                  transport_registry: Optional[SSHTransportRegistry] = None,
@@ -365,7 +365,7 @@ class SSHBackend(Backend):
                 transport_registry = SSHTransportRegistry()
         self._uses_openssh = ssh_transport == "openssh"
         self.host = host
-        self.port = port
+        self.port = port if port is not None else 22
         self.remote_path = PurePosixPath(remote_path)
         self.username = username
         self.key_filename = key_filename
@@ -377,7 +377,7 @@ class SSHBackend(Backend):
         self.logger = logging.getLogger(__name__)
         self._reconnect_probe_interval = max(1.0, min(5.0, float(connect_timeout) / 2.0))
         self._connection_config = _SSHConnectionConfig(
-            host, port, username, password or None,
+            host, port if self._uses_openssh else self.port, username, password or None,
             os.fspath(key_filename) if key_filename else None,
             float(connect_timeout), bulk_capacity_wait_timeout, ssh_transport,
         )
@@ -898,7 +898,8 @@ class SSHBackend(Backend):
         if self._uses_openssh:
             from .openssh import OpenSSHMaster
 
-            master = OpenSSHMaster(self.username, self.host, self.port, self.key_filename,
+            master = OpenSSHMaster(self.username, self.host, self._connection_config.port,
+                                   self.key_filename,
                                    connect_timeout=self.connect_timeout)
             try:
                 yield master.generation()

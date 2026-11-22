@@ -103,7 +103,7 @@ class RsyncBackend(SSHBackend):
     def __init__(self, name: str, host: str, remote_path: str,
                  username: str, password: Optional[str] = None,
                  key_filename: Optional[str] = None,
-                 port: int = 22, speed_priority: int = 50,
+                 port: Optional[int] = 22, speed_priority: int = 50,
                  connect_timeout: float = 10.0,
                  rsync_args: Optional[List[str]] = None,
                  compress: bool = True,

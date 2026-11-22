@@ -377,6 +377,7 @@ def create_storage_members(
                         speed_priority=priority,
                         transport_registry=transport_registry,
                         ssh_transport=ssh_transport,
+                        port=None if ssh_transport == "openssh" else 22,
                         control_sockets=(shared_control_sockets() if ssh_transport == "paramiko" else None),
                         bulk_capacity_wait_timeout=bulk_capacity_wait_timeout,
                     )
@@ -396,6 +397,7 @@ def create_storage_members(
                         speed_priority=priority,
                         transport_registry=transport_registry,
                         ssh_transport=ssh_transport,
+                        port=None if ssh_transport == "openssh" else 22,
                         bulk_capacity_wait_timeout=bulk_capacity_wait_timeout,
                     )
                     backend.display_name = labels[index]

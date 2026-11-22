@@ -54,7 +54,7 @@ class OpenSSHSessionPool:
     """Count every session against the same generation's proven capacity."""
 
     def __init__(self, config):
-        self.name = f"{config.host}:{config.port}"
+        self.name = config.host if config.port is None else f"{config.host}:{config.port}"
         self.connect_timeout = config.connect_timeout
         self.retry_interval = max(1.0, min(5.0, self.connect_timeout / 2.0))
         self.capacity_wait = config.bulk_capacity_wait_timeout or None
