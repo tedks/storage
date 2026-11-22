@@ -1,7 +1,9 @@
 """Owned OpenSSH master generations and attach-only session streams."""
 
 import array
+import errno
 import os
+import select
 import signal
 import socket
 import struct
@@ -15,6 +17,7 @@ from typing import Optional
 
 import paramiko
 
+from ._openssh_supervisor import open_pidfd, signal_pidfd
 from .ssh_mux import _MAX_CONTROL_PATH, _private_base, default_base_dirs
 
 # OpenSSH PROTOCOL.mux version 4. Passenger clients pass three local file
@@ -62,23 +65,10 @@ def _string(value: bytes) -> bytes:
     return _pack(len(value)) + value
 
 
-def _mount_pidfd() -> int:
-    opener = getattr(os, "pidfd_open", None)
-    if opener is not None:
-        return opener(os.getpid())
-
-    # Some Python distributions build against older kernel headers while
-    # running on Linux with a libc and kernel that support pidfd_open.
-    import ctypes
-
-    opener = ctypes.CDLL(None, use_errno=True).pidfd_open
-    opener.argtypes = (ctypes.c_int, ctypes.c_uint)
-    opener.restype = ctypes.c_int
-    fd = opener(os.getpid(), 0)
-    if fd < 0:
-        error = ctypes.get_errno()
-        raise OSError(error, os.strerror(error))
-    return fd
+def _pid_exited(pidfd: int, timeout: float) -> bool:
+    poll = select.poll()
+    poll.register(pidfd, select.POLLIN)
+    return bool(poll.poll(max(0, int(timeout * 1000))))
 
 
 class _MuxConnection:
@@ -231,13 +221,37 @@ class _SFTPStream(socket.socket):
 class OpenSSHGeneration:
     """One authenticated master process and its generation-specific socket."""
 
-    def __init__(self, directory, process):
+    def __init__(self, directory, process, supervisor_fd, handoff):
+        self._state_lock = threading.Lock()
+        self._ready = False
+        self._supervisor_fd = supervisor_fd
+        self._handoff = handoff
+        self._ssh_fd = None
+        self._ssh_pid = None
         self._directory = directory
         self._path = Path(directory.name) / "master"
         self._process = process
 
     def is_active(self) -> bool:
-        return self._process.poll() is None
+        with self._state_lock:
+            return (self._ready and not _pid_exited(self._supervisor_fd, 0)
+                    and not _pid_exited(self._ssh_fd, 0))
+
+    def _authorize(self, deadline: float) -> None:
+        self._handoff.settimeout(max(0, deadline - time.monotonic()))
+        fds = array.array("i")
+        payload, ancillary, flags, _ = self._handoff.recvmsg(
+            4, socket.CMSG_SPACE(fds.itemsize), socket.MSG_CMSG_CLOEXEC)
+        for level, message_type, data in ancillary:
+            if level == socket.SOL_SOCKET and message_type == socket.SCM_RIGHTS:
+                fds.frombytes(data[:len(data) - len(data) % fds.itemsize])
+        if flags & (socket.MSG_CTRUNC | socket.MSG_TRUNC) or len(fds) != 1 or len(payload) != 4:
+            for fd in fds:
+                os.close(fd)
+            raise MasterStartError("OpenSSH supervisor exited without authorizing its child")
+        self._ssh_fd = fds[0]
+        self._ssh_pid = struct.unpack("!I", payload)[0]
+        self._handoff.sendall(b"1")
 
     def attach_options(self) -> list[str]:
         # OpenSSH's command-line passenger may fall back on refusal or loss.
@@ -254,7 +268,7 @@ class OpenSSHGeneration:
             if reply is None or len(reply) != 12 or reply[:8] != _pack(_ALIVE, _REQUEST):
                 return False
             pid = struct.unpack_from("!I", reply, 8)[0]
-            return pid > 0 and os.getpgid(pid) == self._process.pid
+            return pid == self._ssh_pid
         finally:
             connection.close()
 
@@ -324,22 +338,42 @@ class OpenSSHGeneration:
             raise
 
     def close(self) -> None:
+        with self._state_lock:
+            self._ready = False
+        if self._supervisor_fd is None:
+            return
+        # An unacknowledged SSH child cannot dial. Wake it if startup
+        # timed out before the descriptor handoff completed.
         try:
-            if self.is_active():
-                try:
-                    os.killpg(self._process.pid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
-                try:
-                    self._process.wait(timeout=_SHUTDOWN_TIMEOUT)
-                except subprocess.TimeoutExpired:
-                    try:
-                        os.killpg(self._process.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                    self._process.wait(timeout=_SHUTDOWN_TIMEOUT)
-        finally:
-            self._directory.cleanup()
+            self._handoff.shutdown(socket.SHUT_WR)
+        except OSError as exc:
+            if exc.errno != errno.ENOTCONN:
+                raise
+        try:
+            signal_pidfd(self._supervisor_fd, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            self._process.wait(timeout=_SHUTDOWN_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            try:
+                signal_pidfd(self._supervisor_fd, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            self._process.wait(timeout=_SHUTDOWN_TIMEOUT)
+        if self._ssh_fd is not None and not _pid_exited(self._ssh_fd, _SHUTDOWN_TIMEOUT):
+            raise MasterLost("the previous OpenSSH child has not exited")
+        # The guard keeps the other endpoint until it has either cleaned
+        # up the group after supervisor loss, or been killed by the leader.
+        self._handoff.settimeout(_SHUTDOWN_TIMEOUT)
+        while self._handoff.recv(16):
+            pass
+        self._handoff.close()
+        if self._ssh_fd is not None:
+            os.close(self._ssh_fd)
+        os.close(self._supervisor_fd)
+        self._supervisor_fd = None
+        self._directory.cleanup()
 
 
 class OpenSSHMaster:
@@ -387,34 +421,43 @@ class OpenSSHMaster:
         if self._key_filename:
             argv.extend(["-o", "IdentitiesOnly=yes", "-i", self._key_filename])
         argv.extend(["--", self._target])
+        parent = process = None
         try:
-            try:
-                owner_fd = _mount_pidfd()
-            except (AttributeError, OSError) as exc:
-                raise MasterStartError("OpenSSH mount ownership needs Linux pidfd support") from exc
-            try:
-                supervisor = Path(__file__).with_name("_openssh_supervisor.py")
-                process = subprocess.Popen(
-                    [sys.executable, str(supervisor), str(owner_fd), directory.name, *argv],
-                    pass_fds=(owner_fd,), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL, start_new_session=True)
-            finally:
-                os.close(owner_fd)
-        except MasterStartError:
+            parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+            with child:
+                owner_fd = open_pidfd(os.getpid())
+                try:
+                    supervisor = Path(__file__).with_name("_openssh_supervisor.py")
+                    process = subprocess.Popen(
+                        [sys.executable, str(supervisor), str(owner_fd), str(child.fileno()),
+                         directory.name, *argv],
+                        pass_fds=(owner_fd, child.fileno()), stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        start_new_session=True)
+                    supervisor_fd = open_pidfd(process.pid)
+                finally:
+                    os.close(owner_fd)
+        except BaseException as exc:
+            if parent is not None:
+                parent.close()  # No acknowledgment means the child cannot dial.
+            if process is not None:
+                try:
+                    process.wait(timeout=_SHUTDOWN_TIMEOUT)
+                except subprocess.TimeoutExpired:
+                    pass
             directory.cleanup()
+            if isinstance(exc, (AttributeError, OSError)):
+                raise MasterStartError("could not start the OpenSSH supervisor") from exc
             raise
-        except OSError as exc:
-            directory.cleanup()
-            raise MasterStartError("could not start the OpenSSH executable") from exc
-        except BaseException:
-            directory.cleanup()
-            raise
-        generation = OpenSSHGeneration(directory, process)
+        generation = OpenSSHGeneration(directory, process, supervisor_fd, parent)
+        self._generation = generation
         deadline = time.monotonic() + self._connect_timeout
         try:
-            while generation.is_active() and time.monotonic() < deadline:
+            generation._authorize(deadline)
+            while not _pid_exited(supervisor_fd, 0) and time.monotonic() < deadline:
                 try:
                     if generation._check_ready(deadline):
+                        generation._ready = True
                         return generation
                     raise MasterStartError("OpenSSH master sent an unexpected readiness reply")
                 except (FileNotFoundError, ConnectionRefusedError):
@@ -424,6 +467,7 @@ class OpenSSHMaster:
             raise MasterStartError("OpenSSH master failed to become ready")
         except BaseException:
             generation.close()
+            self._generation = None
             raise
 
     def generation(self) -> OpenSSHGeneration:
