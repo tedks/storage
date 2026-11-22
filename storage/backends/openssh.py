@@ -62,6 +62,25 @@ def _string(value: bytes) -> bytes:
     return _pack(len(value)) + value
 
 
+def _mount_pidfd() -> int:
+    opener = getattr(os, "pidfd_open", None)
+    if opener is not None:
+        return opener(os.getpid())
+
+    # Some Python distributions build against older kernel headers while
+    # running on Linux with a libc and kernel that support pidfd_open.
+    import ctypes
+
+    opener = ctypes.CDLL(None, use_errno=True).pidfd_open
+    opener.argtypes = (ctypes.c_int, ctypes.c_uint)
+    opener.restype = ctypes.c_int
+    fd = opener(os.getpid(), 0)
+    if fd < 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    return fd
+
+
 class _MuxConnection:
     def __init__(self, path: Path, deadline: float):
         self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -326,7 +345,7 @@ class OpenSSHGeneration:
 class OpenSSHMaster:
     """Lazily start an owned master; serialize replacement and shutdown."""
 
-    def __init__(self, username: Optional[str], host: str, port: int,
+    def __init__(self, username: Optional[str], host: str, port: Optional[int],
                  key_filename: Optional[str], *, connect_timeout: float = 10.0):
         self._target = f"{username}@{host}" if username else host
         self._port = port
@@ -354,7 +373,7 @@ class OpenSSHMaster:
 
         path = Path(directory.name) / "master"
         argv = [
-            "ssh", "-NnT", "-p", str(self._port),
+            "ssh", "-NnT",
             "-o", "ControlMaster=yes", "-o", "ControlPersist=no",
             "-o", "ControlPath=" + str(path).replace("%", "%%"),
             "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
@@ -363,12 +382,14 @@ class OpenSSHMaster:
             "-o", "ForkAfterAuthentication=no", "-o", "PermitLocalCommand=no",
             "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=2",
         ]
+        if self._port is not None:
+            argv.extend(["-p", str(self._port)])
         if self._key_filename:
             argv.extend(["-o", "IdentitiesOnly=yes", "-i", self._key_filename])
         argv.extend(["--", self._target])
         try:
             try:
-                owner_fd = os.pidfd_open(os.getpid())
+                owner_fd = _mount_pidfd()
             except (AttributeError, OSError) as exc:
                 raise MasterStartError("OpenSSH mount ownership needs Linux pidfd support") from exc
             try:
