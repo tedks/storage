@@ -1,0 +1,38 @@
+id: fuse-kernel-dcache-forget-flake
+title: Keep the mounted TTL gate meaningful under FUSE dentry reclaim
+desc: 'The unmodified #196 base at 0e874bd and #200 at f084bc4 both
+
+  reproduce an extra lookup in both modes of the synthetic
+
+  TestKernelCacheVisibility.test_kernel_keeps_names_and_misses_but_not_attributes
+
+  gate. It occurs after the test''s 1.5 second idle window. A test-only libfuse
+
+  trace at the base shows a kernel BATCH_FORGET removing the synthetic
+
+  directory and child node ids, followed by a LOOKUP for both names and a
+
+  negative name from the pytest process. A different process did two
+
+  GETATTRs during setup, before the failing measurement. The measured
+
+  request did not come from that process. The existing assertion assumes
+
+  a timeout prevents reclaim. The gate should preserve positive and
+
+  negative TTL coverage for retained entries and distinguish kernel reclaim
+
+  from expiration. Make that change independently of SSH transport sharing.'
+type: bugfix
+component: fs
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-22T23:29:04-00:00
+references: []
+log_events:
+- time: 2026-11-22T23:29:04-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
