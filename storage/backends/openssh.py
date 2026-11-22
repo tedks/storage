@@ -46,6 +46,10 @@ class SessionRefused(Exception):
     """The server refused to open the requested session."""
 
 
+class SessionClosed(ConnectionError):
+    """The session ended without a remote status or confirmed master loss."""
+
+
 class MuxProtocolError(ConnectionError):
     """The local OpenSSH process returned an unsupported response."""
 
@@ -116,9 +120,11 @@ class _MuxConnection:
 class MuxSession:
     """A command on one generation. Closing cancels its local mux session."""
 
-    def __init__(self, connection: _MuxConnection, session_id: int):
+    def __init__(self, connection: _MuxConnection, session_id: int,
+                 generation: "OpenSSHGeneration"):
         self._connection = connection
         self._session_id = session_id
+        self._generation = generation
         self._exit: Optional[int] = None
         self._finished = False
         self._wait_lock = threading.Lock()
@@ -134,10 +140,10 @@ class MuxSession:
                 except TimeoutError:
                     raise
                 except OSError as exc:
-                    raise MasterLost("OpenSSH command lost its control socket") from exc
+                    raise self._closed_error() from exc
                 if reply is None:
                     if self._exit is None:
-                        raise MasterLost("OpenSSH command ended without an exit status")
+                        raise self._closed_error()
                     self._finished = True
                     break
                 if len(reply) != 12:
@@ -146,6 +152,7 @@ class MuxSession:
                 if kind != _EXIT or session_id != self._session_id:
                     raise MuxProtocolError("unexpected OpenSSH session response")
                 self._exit = status
+            assert self._exit is not None
             return self._exit
         finally:
             self._wait_lock.release()
@@ -155,6 +162,11 @@ class MuxSession:
             return self.wait(0.0)
         except TimeoutError:
             return None
+
+    def _closed_error(self) -> ConnectionError:
+        if not self._generation.is_active():
+            return MasterLost("OpenSSH master exited during the session")
+        return SessionClosed("OpenSSH session ended without an exit status")
 
     def close(self) -> None:
         self._connection.close()
@@ -245,7 +257,7 @@ class OpenSSHGeneration:
                 raise MasterLost("OpenSSH master closed while opening a session")
             if reply[:8] == _pack(_SESSION_OPENED, _REQUEST) and len(reply) == 12:
                 session_id = struct.unpack_from("!I", reply, 8)[0]
-                session = MuxSession(connection, session_id)
+                session = MuxSession(connection, session_id, self)
                 connection = None
                 return session
             if reply[:8] == _pack(_FAILURE, _REQUEST):

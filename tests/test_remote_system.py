@@ -48,7 +48,9 @@ from unittest import mock
 import paramiko
 import pytest
 
-from storage.backends.openssh import MasterLost, MasterStartError, OpenSSHMaster, SessionRefused
+from storage.backends.openssh import (
+    MasterLost, MasterStartError, OpenSSHMaster, SessionClosed, SessionRefused,
+)
 from storage.backends.rsync import RsyncBackend
 from storage.backends.ssh import SSHBackend
 from storage.backends.ssh_mux import ControlSockets
@@ -1701,7 +1703,7 @@ def test_openssh_master_replaces_only_the_current_generation(remote):
                 with pytest.raises(TimeoutError):
                     session.wait(0.02)
                 remote.exec(member, "pkill -u storage -x sshd")
-                with pytest.raises(MasterLost):
+                with pytest.raises((MasterLost, SessionClosed)):
                     session.wait(5)
         assert _wait_for(lambda: _established_ssh_connections(remote, member) == 0)
         assert _wait_for(lambda: not original.is_active())
