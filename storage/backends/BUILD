@@ -8,6 +8,7 @@ py_library(
         "__init__.py",
         "base.py",
         "local.py",
+        "openssh.py",
         "rsync.py",
         "ssh.py",
         "ssh_mux.py",
