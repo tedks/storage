@@ -6,6 +6,7 @@ import signal
 import socket
 import struct
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -218,8 +219,11 @@ class OpenSSHGeneration:
         connection = _MuxConnection(self._path, deadline)
         try:
             connection.send(_pack(_ALIVE_CHECK, _REQUEST), deadline)
-            return connection.receive(deadline) == _pack(
-                _ALIVE, _REQUEST, self._process.pid)
+            reply = connection.receive(deadline)
+            if reply is None or len(reply) != 12 or reply[:8] != _pack(_ALIVE, _REQUEST):
+                return False
+            pid = struct.unpack_from("!I", reply, 8)[0]
+            return pid > 0 and os.getpgid(pid) == self._process.pid
         finally:
             connection.close()
 
@@ -266,20 +270,27 @@ class OpenSSHGeneration:
         return self._open(command, (stdin_fd, stdout_fd, stderr_fd),
                           False, time.monotonic() + timeout)
 
-    def open_sftp(self, timeout: float) -> paramiko.SFTPClient:
-        deadline = time.monotonic() + timeout
+    def _sftp_stream(self, deadline: float) -> socket.socket:
         parent, child = socket.socketpair()
         with parent, child, open(os.devnull, "wb") as stderr:
             session = self._open("sftp", (child.fileno(), child.fileno(), stderr.fileno()),
                                  True, deadline)
             child.close()
             stream = _SFTPStream(parent.detach(), session)
-            try:
-                stream.settimeout(max(0.0, deadline - time.monotonic()))
-                return paramiko.SFTPClient(stream)
-            except BaseException:
-                stream.close()
-                raise
+            stream.settimeout(max(0.0, deadline - time.monotonic()))
+            return stream
+
+    def open_sftp_stream(self, timeout: float) -> socket.socket:
+        """Open the server session before negotiating the SFTP protocol."""
+        return self._sftp_stream(time.monotonic() + timeout)
+
+    def open_sftp(self, timeout: float) -> paramiko.SFTPClient:
+        stream = self.open_sftp_stream(timeout)
+        try:
+            return paramiko.SFTPClient(stream)
+        except BaseException:
+            stream.close()
+            raise
 
     def close(self) -> None:
         try:
@@ -344,9 +355,21 @@ class OpenSSHMaster:
             argv.extend(["-o", "IdentitiesOnly=yes", "-i", self._key_filename])
         argv.extend(["--", self._target])
         try:
-            process = subprocess.Popen(
-                argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL, start_new_session=True)
+            try:
+                owner_fd = os.pidfd_open(os.getpid())
+            except (AttributeError, OSError) as exc:
+                raise MasterStartError("OpenSSH mount ownership needs Linux pidfd support") from exc
+            try:
+                supervisor = Path(__file__).with_name("_openssh_supervisor.py")
+                process = subprocess.Popen(
+                    [sys.executable, str(supervisor), str(owner_fd), directory.name, *argv],
+                    pass_fds=(owner_fd,), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL, start_new_session=True)
+            finally:
+                os.close(owner_fd)
+        except MasterStartError:
+            directory.cleanup()
+            raise
         except OSError as exc:
             directory.cleanup()
             raise MasterStartError("could not start the OpenSSH executable") from exc

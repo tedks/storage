@@ -29,12 +29,14 @@ import hashlib
 import os
 import re
 import secrets
+import select
 import shlex
 import shutil
 import signal
 import socket
 import stat
 import subprocess
+import sys
 import threading
 import time
 import warnings
@@ -1772,6 +1774,39 @@ def test_openssh_master_honors_a_proxy_route(remote, tmp_path, monkeypatch):
         master.close()
     assert _wait_for(lambda: _established_ssh_connections(remote, member) == 0)
     assert _wait_for(lambda: _established_ssh_connections(remote, jump) == 0)
+
+
+def test_openssh_master_exits_when_mount_process_is_killed(remote):
+    member = remote.limited
+    owner_script = """
+import sys
+from storage.backends.openssh import OpenSSHMaster
+
+owner = OpenSSHMaster(sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4])
+generation = owner.generation()
+with generation.open_sftp(5):
+    print(*(option.split('=', 1)[1] for option in generation.attach_options()
+            if option.startswith('ControlPath=')), flush=True)
+    sys.stdin.read()
+"""
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)}
+    with subprocess.Popen(
+        [sys.executable, "-c", owner_script, REMOTE_USER, member.host,
+         str(member.port), str(remote.key_path)], stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE, env=env, text=True,
+    ) as owner:
+        try:
+            poller = select.poll()
+            poller.register(owner.stdout, select.POLLIN)
+            assert poller.poll(15_000), "the mount fixture never started its master"
+            control_path = owner.stdout.readline().strip()
+            assert control_path and Path(control_path).is_socket()
+            assert _established_ssh_connections(remote, member) == 1
+        finally:
+            owner.kill()
+            owner.wait(timeout=5)
+    assert _wait_for(lambda: _established_ssh_connections(remote, member) == 0)
+    assert _wait_for(lambda: not Path(control_path).parent.exists())
 
 
 @pytest.mark.parametrize("shared", [True, False], ids=["shared", "own-connections"])
