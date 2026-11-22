@@ -1,0 +1,22 @@
+id: ssh-mount-host-transport
+title: Share a Paramiko host session across a mount's compatible member roots
+desc: 'Share SFTP and Paramiko exec capacity per authenticated identity, preserve
+
+  member-specific filesystem behavior, and verify authentication, reserve,
+
+  failure recovery and unmount against synthetic roots on real sshd.
+
+  The OpenSSH watcher and rsync transport follow-up is a separate lane.'
+type: feature
+component: fs
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-22T23:11:41-00:00
+references: []
+log_events:
+- time: 2026-11-22T23:11:41-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
