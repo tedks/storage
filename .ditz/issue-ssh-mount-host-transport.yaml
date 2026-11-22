@@ -40,3 +40,23 @@ log_events:
     mount help smoke pass. A controlled same-byte transport latency experiment
 
     is underway before considering a transport tuning change.'
+- time: 2026-11-22T23:41:33-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Exact draft head 8651e5bf1cd00ba679ab4143ab8acfea0eed2755 has all 49
+
+    gates passing on the alternate Linux build host and an imported exact-tree
+
+    receipt. Docker has 89 passes and one existing watcher xfail. Independent
+
+    lead review is CLEAN at this head. The mounted pool enables TCP_NODELAY
+
+    after a controlled one-connection A/B reproduced and removed the roughly
+
+    44 ms tail. On the final fixed-byte run, p95 reads and listings were
+
+    3.47 / 4.53 ms for two transports and 5.72 / 4.58 ms for one tuned
+
+    transport. Gate and mitigation evidence are recorded in draft PR #200.
+
+    The draft is awaiting authorized stack integration.'
