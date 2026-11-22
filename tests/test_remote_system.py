@@ -35,6 +35,7 @@ import shutil
 import signal
 import socket
 import stat
+import statistics
 import subprocess
 import threading
 import time
@@ -1877,6 +1878,74 @@ def test_shared_transport_reserves_capacity_and_isolates_root_failure(remote):
         for backend in backends.values():
             backend.close()
     assert _wait_for(lambda: _established_ssh_connections(remote, member) == 0)
+
+
+@pytest.mark.parametrize("shared", [False, True], ids=["standalone", "shared"])
+def test_interactive_operations_during_active_bulk_transfer(remote, capsys, shared):
+    member = remote.members[0]
+    remote.write_remote(member, "bulk/payload.bin", secrets.token_bytes(4 * 1024 * 1024))
+    remote.write_remote(member, "interactive/item", b"foreground")
+    registry = SSHTransportRegistry() if shared else None
+
+    def backend(name):
+        return SSHBackend(**{**remote.backend_kwargs(member), "name": name,
+                             "remote_path": f"{REMOTE_ROOT}/{name}",
+                             "transport_registry": registry})
+
+    bulk, foreground = backend("bulk"), backend("interactive")
+    transferred = threading.Event()
+    stop = threading.Event()
+
+    def transfer():
+        def read_repeatedly(sftp):
+            total = 0
+            with sftp.open(str(bulk.remote_path / "payload.bin"), "rb") as source:
+                while not stop.is_set():
+                    chunk = source.read(128 * 1024)
+                    if chunk:
+                        total += len(chunk)
+                        transferred.set()
+                    else:
+                        source.seek(0)
+            return total
+
+        return bulk._with_sftp("bulk sample", "/payload.bin", read_repeatedly)
+
+    reads, listings = [], []
+    try:
+        bulk.stat("/payload.bin")
+        foreground.stat("/item")
+        expected = 1 if shared else 2
+        assert _established_ssh_connections(remote, member) == expected
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            moving = executor.submit(transfer)
+            try:
+                assert transferred.wait(10)
+                with interactive_request():
+                    for _ in range(30):
+                        started = time.perf_counter()
+                        assert foreground.read_file("/item", 0, 10) == b"foreground"
+                        reads.append((time.perf_counter() - started) * 1000)
+                        started = time.perf_counter()
+                        assert foreground.listdir("/") == ["item"]
+                        listings.append((time.perf_counter() - started) * 1000)
+            finally:
+                stop.set()
+            bulk_bytes = moving.result(timeout=10)
+        assert bulk_bytes >= 128 * 1024
+    finally:
+        bulk.close()
+        foreground.close()
+    assert _wait_for(lambda: _established_ssh_connections(remote, member) == 0)
+
+    # Measurements are observations on the fixture, not timing assertions.
+    def distribution(samples):
+        return f"{statistics.median(samples):.2f}/{statistics.quantiles(samples, n=20)[18]:.2f}"
+
+    with capsys.disabled():
+        print(f"active-bulk shared={shared} sockets={expected} bytes={bulk_bytes} n={len(reads)} "
+              f"read_ms_median/p95={distribution(reads)} "
+              f"list_ms_median/p95={distribution(listings)}")
 
 
 def test_shared_transport_separates_distinct_credentials_on_same_server(remote, tmp_path):
