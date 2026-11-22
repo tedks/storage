@@ -394,6 +394,8 @@ class SFTPLease:
 # Command output above this is refused: the commands run here print a digest
 # or an attribute value.
 MAX_COMMAND_OUTPUT = 1024 * 1024
+DEFAULT_SFTP_CHANNELS = 4
+DEFAULT_EXEC_CHANNELS = 2
 
 
 class RootAvailability:
@@ -421,9 +423,9 @@ class MemberConnection:
         retry_interval: float,
         bulk_wait: Optional[float] = None,
         bulk_capacity_wait_timeout: Optional[float] = None,
-        sftp_channels: int = 4,
+        sftp_channels: int = DEFAULT_SFTP_CHANNELS,
         interactive_reserve: int = 1,
-        exec_channels: int = 2,
+        exec_channels: int = DEFAULT_EXEC_CHANNELS,
         stall_limit: int = 2,
         on_availability: Optional[Callable[[bool], None]] = None,
         sftp_client_factory: Optional[Callable] = None,

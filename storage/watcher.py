@@ -371,6 +371,8 @@ class RemoteWatcher:
     def start(self):
         """Start the watcher thread."""
         self._stop_event.clear()
+        if self._session_pool is not None:
+            self._session_pool.set_watching(True)
         self._thread = threading.Thread(
             target=self._watch_loop,
             name=f"Watcher-{self.backend_name}",
@@ -386,6 +388,8 @@ class RemoteWatcher:
         if self._thread is not None:
             self._thread.join(timeout=10)
             self._thread = None
+        if self._session_pool is not None:
+            self._session_pool.set_watching(False)
         logger.info("Stopped remote watcher for %s", self.backend_name)
 
     @property
