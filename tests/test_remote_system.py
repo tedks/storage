@@ -1665,7 +1665,11 @@ def test_mounted_openssh_member_traffic_shares_one_login(
     remote.write_remote(member, "left/foreground", b"foreground bytes")
     remote.exec(member, f"mkdir {REMOTE_ROOT}/right")
 
+    before_probe = _accepted_logins(remote, member)
+    assert shared_filesystems(backends) == [["remote0", "remote1"]]
+    assert _wait_for(lambda: _established_ssh_connections(remote, member) == 0)
     logins_before = _accepted_logins(remote, member)
+    assert logins_before - before_probe == 1
     mnt = mounted_factory(
         backends=backends,
         enable_watchers=watchers, start_sync=False, num_sync_workers=0,
@@ -1675,11 +1679,24 @@ def test_mounted_openssh_member_traffic_shares_one_login(
     if watchers and max_sessions >= 3:
         _wait_for_remote_inotifywait(remote, member)
 
+    if not watchers:
+        running = threading.Barrier(2, timeout=5)
+        original = upload_member._run_rsync_with_shell
+
+        def require_two_bulk_slots(*args):
+            running.wait()
+            return original(*args)
+
+        monkeypatch.setattr(upload_member, "_run_rsync_with_shell", require_two_bulk_slots)
+
     source = tmp_path / "upload"
     data = secrets.token_bytes(512 * 1024)
     source.write_bytes(data)
     with ThreadPoolExecutor() as executor:
         upload = executor.submit(upload_member.copy_from_local, source, "/from-rsync")
+        second_upload = None
+        if not watchers:
+            second_upload = executor.submit(upload_member.copy_from_local, source, "/second-rsync")
         assert _wait_for(lambda: remote.exec(
             member, "pgrep -u storage -x rsync", check=False).returncode == 0, timeout=5)
         foreground = executor.submit((mnt.mount / "foreground").read_bytes)
@@ -1687,6 +1704,9 @@ def test_mounted_openssh_member_traffic_shares_one_login(
         if max_sessions >= 2:
             assert not upload.done(), "foreground lookup waited for the rsync transfer"
         upload.result(timeout=15)
+        if second_upload is not None:
+            second_upload.result(timeout=15)
+            assert remote.read_remote(member, "right/second-rsync") == data
 
     assert remote.read_remote(member, "right/from-rsync") == data
     if watchers and max_sessions >= 3:
