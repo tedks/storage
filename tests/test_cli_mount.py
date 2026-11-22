@@ -11,7 +11,7 @@ from click.testing import CliRunner
 
 from storage.backends.local import LocalBackend
 from storage.backends.base import is_interactive_request
-from storage.backends.ssh import SSHBackend
+from storage.backends.ssh import SSHBackend, SSHTransportRegistry
 from storage.cli import main
 from storage.cli_mount import shared_filesystems
 
@@ -745,50 +745,80 @@ backends = ["{self.temp_dir}"]
 
 
 class _FakeChannel:
-    def __init__(self, rc):
-        self.exit_status = rc
+    def __init__(self, transport):
+        self.transport = transport
         self.status_event = threading.Event()
-        if rc is not None:
-            self.status_event.set()
+        self.exit_status = None
+        self.out = b""
+        self.closed = threading.Event()
 
     def settimeout(self, _t):
         pass
 
+    def get_transport(self):
+        return self.transport
 
-class _FakeStdout:
-    def __init__(self, out, rc):
-        self._out = out
-        self.channel = _FakeChannel(rc)
+    def exec_command(self, command):
+        member = self.transport.member
+        member.commands.append(command)
+        if getattr(member, "held_probe_command", None) == command:
+            self.closed.wait(timeout=5)
+        rc, self.out = member.fs
+        self.exit_status = rc
+        if rc is not None:
+            self.status_event.set()
 
-    def read(self, _n):
-        return self._out
+    def recv(self, _n):
+        out, self.out = self.out, b""
+        return out
 
     def close(self):
-        pass
+        self.closed.set()
+
+
+class _FakeProbeTransport:
+    def __init__(self, member):
+        self.member = member
+        self.member.joined = []
+        self.channels = []
+        self.joined = False
+
+    def open_session(self, timeout):
+        if any(not chan.closed.is_set() for chan in self.channels):
+            raise RuntimeError("the previous channel was left open")
+        channel = _FakeChannel(self)
+        self.channels.append(channel)
+        return channel
+
+    def join(self, timeout):
+        self.member.joined.append(timeout)
+        self.joined = True
+
+    def is_alive(self):
+        return not self.joined or getattr(self.member, "probe_thread_stuck", False)
+
+    def is_active(self):
+        return True
 
 
 class _FakeClient:
     """Stands in for the paramiko client the probe opens and must close."""
 
     def __init__(self, member):
-        self.member = member
+        self.transport = _FakeProbeTransport(member)
         self.closed = False
 
-    def exec_command(self, cmd, timeout=None):
-        self.member.commands.append(cmd)
-        rc, out = self.member.fs
-        return None, _FakeStdout(out, rc), None
-
     def get_transport(self):
-        self.member.joined = []
-        return SimpleNamespace(join=self.member.joined.append, is_alive=lambda: False)
+        return self.transport
 
     def close(self):
         self.closed = True
 
 
-def _fake(name, host, port=22, fs_output=b"1\n", rc=0, fail=False):
-    member = SSHBackend(name, host, "/srv/root", "u", port=port)
+def _fake(name, host, port=22, fs_output=b"1\n", rc=0, fail=False, *,
+          path="/srv/root", registry=None, timeout=10):
+    member = SSHBackend(name, host, path, "u", port=port, connect_timeout=timeout,
+                        transport_registry=registry)
     member.fs = (rc, fs_output)
     member.commands = []
     member.clients = []
@@ -865,6 +895,29 @@ class TestSharedFilesystems(unittest.TestCase):
         member = _fake("a", "h.example", rc=None)
         member.connect_timeout = 0.05
         self.assertIsNone(member.filesystem_identity())
+
+    def test_stalled_probe_releases_channel_for_healthy_roots(self):
+        registry = SSHTransportRegistry()
+        options = {"registry": registry, "timeout": 0.1}
+        blocked = _fake("blocked", "h.example", path="/srv/blocked", **options)
+        blocked.held_probe_command = "stat -L -c %d -- /srv/blocked"
+        left = _fake("left", "h.example", path="/srv/left", **options)
+        right = _fake("right", "h.example", path="/srv/right", **options)
+        backends = {"blocked": blocked, "left": left, "right": right}
+        self.assertEqual([["left", "right"]], shared_filesystems(backends))
+        self.assertEqual([1, 0, 0], [member.probes for member in backends.values()])
+        channels = blocked.clients[0].transport.channels
+        self.assertEqual(3, len(channels))
+        self.assertTrue(all(channel.closed.is_set() for channel in channels))
+
+    def test_startup_stops_if_probe_transport_thread_does_not_exit(self):
+        member = _fake("a", "h.example")
+        member.probe_thread_stuck = True
+        peer = _fake("b", "h.example")
+        with self.assertRaisesRegex(RuntimeError, "probe.*stop"):
+            shared_filesystems({"a": member, "b": peer})
+        self.assertTrue(member.clients[0].closed)
+        self.assertEqual([member.connect_timeout], member.joined)
 
     def test_probe_uses_its_own_connection_and_closes_it(self):
         member = _fake("a", "h.example", fs_output=b"7\n")

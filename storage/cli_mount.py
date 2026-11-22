@@ -7,7 +7,7 @@ from typing import Dict, List, Optional, Tuple
 import click
 
 from .backends.base import Backend
-from .backends.ssh import SSHBackend
+from .backends.ssh import SSHBackend, SSHProbeCleanupError
 from .file_config import FileConfig, get_file_config, get_inherited_config, set_file_config
 from .fs import fuse_mount_options, listing_fresh_window, mount_storage
 from .mount_profiles import (
@@ -51,6 +51,8 @@ def shared_filesystems(backends: Dict[str, Backend]) -> List[List[str]]:
                     if client is None:
                         try:
                             client = probes.enter_context(backend.filesystem_probe_connection())
+                        except SSHProbeCleanupError:
+                            raise
                         except Exception:
                             failed_connections.add(scope)
                             continue
@@ -356,7 +358,11 @@ def mount(
             )
     cache_root.mkdir(parents=True, exist_ok=True)
     mountpoint_path.mkdir(parents=True, exist_ok=True)
-    for names in shared_filesystems(backends):
+    try:
+        shared_devices = shared_filesystems(backends)
+    except SSHProbeCleanupError as exc:
+        raise click.ClickException(str(exc)) from exc
+    for names in shared_devices:
         click.echo(
             f"Warning: members {', '.join(backends[name].label for name in names)} store on the same filesystem; "
             "replicas on it do not protect against that filesystem failing.",

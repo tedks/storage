@@ -692,7 +692,7 @@ class TestMemberConnectionPool(unittest.TestCase):
             deadline = time.monotonic() + 3
             while time.monotonic() < deadline:
                 with pool._cond:
-                    if pool._bulk_sftp_waiters == 1 and pool._interactive_sftp_waiters == burst + 1:
+                    if len(pool._bulk_sftp_waiters) == 1 and pool._interactive_sftp_waiters == burst + 1:
                         break
                 time.sleep(0.01)
             else:
@@ -1561,6 +1561,73 @@ class _BackendTestCase(unittest.TestCase):
 
 
 class TestSharedSSHTransport(_BackendTestCase):
+    def test_waiting_root_keeps_its_bulk_turn_ahead_of_a_new_arrival(self):
+        registry = SSHTransportRegistry()
+        newcomer = self._new_backend(transport_registry=registry)
+        older = SSHBackend("sibling", newcomer.host, "/sibling", newcomer.username,
+                           key_filename=newcomer.key_filename,
+                           connect_timeout=newcomer.connect_timeout,
+                           transport_registry=registry)
+        self.addCleanup(older.close)
+        pool = newcomer._pool
+        holders = [_Holder(pool) for _ in range(3)]
+        older_waiting = threading.Event()
+        allow_older = threading.Event()
+        newcomer_attempted = threading.Event()
+        order = []
+        real_wait = pool._cond.wait
+
+        def wait(timeout=None):
+            if getattr(thread_state, "root", None) is older:
+                older_waiting.set()
+                result = real_wait(timeout)
+                # The holder just freed capacity. Force a fresh request to
+                # attempt acquisition before this older waiter resumes.
+                pool._cond.release()
+                try:
+                    if not allow_older.wait(5):
+                        raise AssertionError("older waiter was never released")
+                finally:
+                    pool._cond.acquire()
+                return result
+            if getattr(thread_state, "root", None) is newcomer:
+                newcomer_attempted.set()
+            return real_wait(timeout)
+
+        thread_state = threading.local()
+
+        def request(backend):
+            thread_state.root = backend
+
+            def use_channel(_sftp):
+                order.append(backend)
+                if backend is newcomer:
+                    newcomer_attempted.set()
+
+            backend._with_sftp("fifo", "/item", use_channel)
+
+        with patch.object(pool._cond, "wait", side_effect=wait):
+            first = _InThread(lambda: request(older))
+            second = None
+            try:
+                self.assertTrue(older_waiting.wait(5))
+                holders.pop().release()
+                second = _InThread(lambda: request(newcomer))
+                self.assertTrue(newcomer_attempted.wait(5))
+                self.assertEqual(order, [])
+            finally:
+                allow_older.set()
+                try:
+                    self.assertTrue(first.join())
+                    if second is not None:
+                        self.assertTrue(second.join())
+                finally:
+                    for holder in holders:
+                        holder.release()
+        self.assertIsNone(first.error)
+        self.assertIsNone(second.error)
+        self.assertEqual(order, [older, newcomer])
+
     def test_root_stalls_back_off_only_that_root(self):
         registry = SSHTransportRegistry()
         slow = self._new_backend(transport_registry=registry)

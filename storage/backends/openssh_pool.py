@@ -3,6 +3,7 @@
 from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass
+from functools import partial
 import logging
 import os
 import select
@@ -365,28 +366,46 @@ class OpenSSHSessionPool:
                 session.close()
 
     def run_command(self, cmd, timeout, *, root=None):
-        read_fd, write_fd = os.pipe()
-        with os.fdopen(read_fd, "rb", buffering=0) as out, os.fdopen(write_fd, "wb") as child, \
-                open(os.devnull, "rb") as inp, open(os.devnull, "wb") as err:
-            with self.command(cmd, inp.fileno(), child.fileno(), err.fileno(), root=root) as session:
-                child.close()
+        deadline = None
+
+        def remaining():
+            nonlocal deadline
+            if deadline is None:
                 deadline = time.monotonic() + timeout
-                data = bytearray()
-                try:
-                    while True:
-                        remaining = max(0.0, deadline - time.monotonic())
-                        if not select.select([out], [], [], remaining)[0]:
-                            raise TimeoutError
-                        chunk = out.read(min(65536, MAX_COMMAND_OUTPUT + 1 - len(data)))
-                        if not chunk:
-                            return session.wait(max(0.0, deadline - time.monotonic())), bytes(data)
-                        data.extend(chunk)
-                        if len(data) > MAX_COMMAND_OUTPUT:
-                            raise ValueError(f"OpenSSH command on {self.name} exceeded output limit")
-                except TimeoutError as exc:
-                    raise CommandTimeout(f"OpenSSH command on {self.name} timed out") from exc
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise TimeoutError
+            return left
+
+        try:
+            return run_mux_command(partial(self.command, root=root), cmd, remaining)
+        except TimeoutError as exc:
+            if deadline is None:
+                raise
+            raise CommandTimeout(f"OpenSSH command on {self.name} timed out") from exc
 
     @contextmanager
     def rsync_options(self, *, root=None):
         with self._permit("bulk", root=root, cancel=current_capacity_cancel_probe()) as reservation:
             yield reservation.generation.attach_options()
+
+
+def run_mux_command(open_command, command, remaining, *, output_limit=MAX_COMMAND_OUTPUT):
+    """Drain a finite mux command without spooling arbitrarily large output."""
+    read_fd, write_fd = os.pipe()
+    with os.fdopen(read_fd, "rb", buffering=0) as out, os.fdopen(write_fd, "wb") as child, \
+            open(os.devnull, "rb") as inp, open(os.devnull, "wb") as err:
+        with open_command(command, inp.fileno(), child.fileno(), err.fileno()) as session:
+            child.close()
+            data = bytearray()
+            poller = select.poll()
+            poller.register(out, select.POLLIN)
+            while True:
+                if not poller.poll(1000 * remaining()):
+                    raise TimeoutError
+                chunk = out.read(min(65536, output_limit + 1 - len(data)))
+                if not chunk:
+                    return session.wait(remaining()), bytes(data)
+                data.extend(chunk)
+                if len(data) > output_limit:
+                    raise ValueError("OpenSSH command exceeded output limit")
