@@ -30,6 +30,7 @@ _PROTOCOL_VERSION = 4
 _REQUEST = 1
 _MAX_REPLY = 64 * 1024
 _SHUTDOWN_TIMEOUT = 2.0
+_SFTP_CLOSE_TIMEOUT = 0.5
 
 
 class MasterLost(ConnectionError):
@@ -168,19 +169,31 @@ class _SFTPStream(socket.socket):
     def __init__(self, fd: int, session: MuxSession):
         super().__init__(fileno=fd)
         self._session = session
+        self._close_lock = threading.Lock()
 
     def get_name(self) -> str:
         return "OpenSSH SFTP session"
 
     def close(self) -> None:
-        # Closing the control socket asks the master to cancel the channel.
-        # Shutdown wakes an operation already waiting on the data stream.
-        self._session.close()
-        try:
-            self.shutdown(socket.SHUT_RDWR)
-        except OSError:
-            pass
-        super().close()
+        with self._close_lock:
+            if self.fileno() < 0:
+                return
+            try:
+                # Let sftp-server exit on EOF and release the sshd session
+                # before the caller counts its slot as available again.
+                self.shutdown(socket.SHUT_WR)
+                self._session.wait(_SFTP_CLOSE_TIMEOUT)
+            except OSError:
+                # Stalled or already lost. Close the control stream to ask
+                # the master to cancel the channel asynchronously.
+                pass
+            finally:
+                self._session.close()
+                try:
+                    self.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                super().close()
 
 
 class OpenSSHGeneration:

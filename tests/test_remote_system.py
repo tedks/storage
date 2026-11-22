@@ -1640,6 +1640,7 @@ def test_openssh_master_carries_sftp_watcher_and_rsync(remote, tmp_path):
     source.write_bytes(b"one OpenSSH connection\n")
     remote.exec(member, f"mkdir {REMOTE_ROOT}/left {REMOTE_ROOT}/right")
     logins_before = _accepted_logins(remote, member)
+
     def run_command(generation, command):
         with open(os.devnull, "rb+") as devnull:
             fd = devnull.fileno()
@@ -1740,6 +1741,37 @@ def test_openssh_master_requires_a_trusted_host_key(remote, tmp_path, monkeypatc
         assert _wait_for(lambda: _established_ssh_connections(remote, member) == 0)
     finally:
         master.close()
+
+
+def test_openssh_master_honors_a_proxy_route(remote, tmp_path, monkeypatch):
+    member, jump = remote.members
+    alias = "storage-fixture-routed.invalid"
+    known_hosts = tmp_path / "route_known_hosts"
+    known_hosts.write_text(f"{alias} {member.host_pubkey}\n")
+    ssh = shutil.which("ssh")
+    proxy = shlex.join([
+        ssh, "-p", str(jump.port), "-i", str(remote.key_path),
+        "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
+        "-W", f"{member.ip}:22", f"{REMOTE_USER}@{jump.host}",
+    ])
+    shim = tmp_path / "ssh"
+    route_args = shlex.join([ssh, "-o", f"ProxyCommand={proxy}",
+                             "-o", f"UserKnownHostsFile={known_hosts}"])
+    shim.write_text(f'#!/bin/sh\nexec {route_args} "$@"\n')
+    shim.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ['PATH']}")
+    master = OpenSSHMaster(REMOTE_USER, alias, 22, str(remote.key_path))
+    member_before = _accepted_logins(remote, member)
+    jump_before = _accepted_logins(remote, jump)
+    try:
+        with master.generation().open_sftp(5) as sftp:
+            assert sftp.listdir(REMOTE_ROOT) == []
+        assert _accepted_logins(remote, member) - member_before == 1
+        assert _accepted_logins(remote, jump) - jump_before == 1
+    finally:
+        master.close()
+    assert _wait_for(lambda: _established_ssh_connections(remote, member) == 0)
+    assert _wait_for(lambda: _established_ssh_connections(remote, jump) == 0)
 
 
 @pytest.mark.parametrize("shared", [True, False], ids=["shared", "own-connections"])
