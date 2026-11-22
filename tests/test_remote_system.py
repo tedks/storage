@@ -67,7 +67,7 @@ from storage.sync_tasks import DirOperation
 from storage.watcher import RemoteWatcher
 from tests.fuse_mount import (
     FUSE_THREAD_MODES, ORPHAN_GRACE, _thread_stacks, fuse_mode_id, native_thread_state,
-    release_orphaned_loop, run_fuse, unmount_fuse,
+    release_orphaned_loop, run_fuse, stop_fuse, unmount_fuse,
 )
 
 IMAGE_DIR = Path(__file__).resolve().parent / "remote"
@@ -945,6 +945,7 @@ class Mounted:
     mount: Path
     cache: Path
     backends: dict
+    thread: threading.Thread
     fuse_threads: bool = False
     # Set by a test that unmounts itself, so teardown does not report the
     # mount as lost.
@@ -1001,7 +1002,7 @@ def mounted_factory(remote, tmp_path, request):
 
         thread = threading.Thread(target=run, daemon=True)
         thread.start()
-        handle = Mounted(fs, mount, cache, backends, fuse_threads)
+        handle = Mounted(fs, mount, cache, backends, thread, fuse_threads)
         came_up = _wait_for(lambda: os.path.ismount(mount) or bool(errors),
                             timeout=MOUNT_TIMEOUT, interval=0.1) and os.path.ismount(mount)
         created.append((handle, thread, errors, came_up, destroy_called))
@@ -1719,7 +1720,7 @@ def test_mounted_openssh_member_traffic_shares_one_login(
     assert _accepted_logins(remote, member) - logins_before == 1
 
     mnt.unmounted_by_test = True
-    assert not unmount_fuse(mnt.mount)
+    assert stop_fuse(mnt.mount, mnt.thread, fs=mnt.fs) == []
     assert _wait_for(lambda: _established_ssh_connections(remote, member) == 0)
     assert _wait_for(lambda: not _remote_inotifywait_running(remote, member))
 

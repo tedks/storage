@@ -217,10 +217,9 @@ class OpenSSHSessionPool:
                 idle.close()
             yield reservation
         except MasterLost:
-            # A command can lose its own session while the master still
-            # serves siblings. Only dead masters warrant replacing the group.
-            if not budget.generation.is_active():
-                self._master.reset(budget.generation)
+            # The typed failure proves master loss. A command that closes
+            # while the master is healthy produces SessionClosed instead.
+            self._master.reset(budget.generation)
             raise
         finally:
             with self._cond:

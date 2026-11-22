@@ -19,9 +19,8 @@ import os
 import shlex
 import tempfile
 import threading
-import time
 from pathlib import PurePosixPath
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, List, Optional
 
 from .backends.openssh_pool import WatcherUnsupported
 from .backends.ssh_mux import ControlSockets
