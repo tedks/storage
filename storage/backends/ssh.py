@@ -163,9 +163,20 @@ def _close_probe_client(client: paramiko.SSHClient, timeout: float) -> None:
         raise SSHProbeCleanupError("Could not stop SSH filesystem probe reader") from exc
 
 
+def _interactive_transport(sock: socket.socket, **kwargs) -> paramiko.Transport:
+    """Send small interactive requests promptly when bulk data shares TCP."""
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except OSError:
+        logging.getLogger(__name__).debug("Could not set TCP_NODELAY on SSH socket",
+                                          exc_info=True)
+    return paramiko.Transport(sock, **kwargs)
+
+
 class _SSHConnector:
-    def __init__(self, config: _SSHConnectionConfig):
+    def __init__(self, config: _SSHConnectionConfig, *, interactive_tcp: bool = False):
         self.config = config
+        self._interactive_tcp = interactive_tcp
         self.logger = logging.getLogger(__name__)
         self._host_resolver_logged = False
 
@@ -186,6 +197,9 @@ class _SSHConnector:
                 'banner_timeout': self.config.connect_timeout,
                 'auth_timeout': self.config.connect_timeout,
             }
+
+            if self._interactive_tcp:
+                connect_kwargs['transport_factory'] = _interactive_transport
 
             if self.config.password:
                 connect_kwargs['password'] = self.config.password
@@ -288,8 +302,9 @@ class SSHTransportRegistry:
                 root = group.attach(name)
                 if root is not None:
                     return group, root
+            connector = _SSHConnector(config, interactive_tcp=True)
             group = _SharedTransport(_make_pool(
-                f"{config.host}:{config.port}", config, _SSHConnector(config).open))
+                f"{config.host}:{config.port}", config, connector.open))
             self._transports[config] = group
             return group, group.attach(name)
 
