@@ -17,6 +17,7 @@ py_library(
         "cli_mount.py",
         "conflicts.py",
         "control.py",
+        "desktop_additions.py",
         "crypto.py",
         "foreground_admission.py",
         "fs.py",
