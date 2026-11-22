@@ -1718,6 +1718,11 @@ def test_mounted_openssh_member_traffic_shares_one_login(
     assert _established_ssh_connections(remote, member) == 1
     assert _accepted_logins(remote, member) - logins_before == 1
 
+    mnt.unmounted_by_test = True
+    assert not unmount_fuse(mnt.mount)
+    assert _wait_for(lambda: _established_ssh_connections(remote, member) == 0)
+    assert _wait_for(lambda: not _remote_inotifywait_running(remote, member))
+
 
 def test_openssh_master_carries_sftp_watcher_and_rsync(remote, tmp_path):
     """Exercise one authenticated connection with three sshd session slots."""

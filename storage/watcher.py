@@ -13,7 +13,7 @@ own watcher instances (no IPC between mounts).
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 import logging
 import os
 import shlex
@@ -34,6 +34,28 @@ _CHANGE_EVENTS = frozenset({
     "CREATE", "DELETE", "MODIFY", "MOVED_FROM", "MOVED_TO",
     "ATTRIB", "CLOSE_WRITE",
 })
+
+
+class _MuxWatch:
+    """Close remote inotifywait's keepalive input before cancelling mux."""
+
+    def __init__(self, session, keepalive):
+        self._session = session
+        self._keepalive = keepalive
+
+    def wait(self, timeout):
+        return self._session.wait(timeout)
+
+    def poll(self):
+        return self._session.poll()
+
+    def close(self):
+        self._keepalive.close()
+        try:
+            with suppress(ConnectionError, TimeoutError):
+                self._session.wait(1)
+        finally:
+            self._session.close()
 
 
 class RemoteWatcher:
@@ -247,18 +269,37 @@ class RemoteWatcher:
             return
 
         read_fd, write_fd = os.pipe()
-        with os.fdopen(read_fd, "r", errors="replace") as out, \
-                os.fdopen(write_fd, "wb") as child, open(os.devnull, "rb") as inp:
-            with self._session_pool.command(
-                self._inotify_command(), inp.fileno(), child.fileno(), stderr_file.fileno(),
-                watcher_stop=self._stop_event.is_set,
-            ) as session:
-                child.close()
-                try:
-                    yield session, out
-                except ConnectionError:
-                    if not self._stop_event.is_set():
-                        raise
+        with os.fdopen(read_fd, "r", errors="replace") as out, os.fdopen(write_fd, "wb") as child:
+            input_fd, keepalive_fd = os.pipe()
+            with os.fdopen(input_fd, "rb") as inp, os.fdopen(keepalive_fd, "wb") as keepalive:
+                # sshd does not always signal a non-PTY command on channel
+                # close. Tie the idle remote inotifywait to stdin EOF.
+                guard = f"""
+exec 3<&0
+{self._inotify_command()} </dev/null &
+watch=$!
+( IFS= read -r unused <&3; kill "$watch" 2>/dev/null ) &
+guard=$!
+wait "$watch"
+status=$?
+kill "$guard" 2>/dev/null
+wait "$guard" 2>/dev/null
+exit "$status"
+"""
+                with self._session_pool.command(
+                    "sh -c " + shlex.quote(guard), inp.fileno(), child.fileno(), stderr_file.fileno(),
+                    watcher_stop=self._stop_event.is_set,
+                ) as session:
+                    inp.close()
+                    child.close()
+                    process = _MuxWatch(session, keepalive)
+                    try:
+                        yield process, out
+                    except ConnectionError:
+                        if not self._stop_event.is_set():
+                            raise
+                    finally:
+                        process.close()
 
     def _dispatch_events(self, output):
         for line in output:
