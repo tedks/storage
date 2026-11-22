@@ -176,3 +176,35 @@ Keep paths and child records generation-scoped so cleanup cannot affect a
 replacement connection. Use only the synthetic fixture to force disconnects.
 A mount restarted with the default transport configuration uses its
 existing Paramiko and system SSH paths.
+
+## Artifacts and Notes
+
+The current synthetic test lives in `tests/test_remote_system.py` under
+`test_openssh_master_carries_sftp_watcher_and_rsync`. The uncached rerun
+at `4a1aafe` reported the result below.
+
+    //tests:storage_tests_remote_system  PASSED in 6.0s
+    Executed 1 out of 1 test: 1 test passes.
+
+## Interfaces and Dependencies
+
+The new connection owner should expose `open_sftp(deadline)`,
+`open_command(command, stdin_fd, stdout_fd, stderr_fd, deadline)`, and
+`close()` on a particular authenticated generation. Command opens return
+a session handle whose lifetime covers copying data and collecting a
+remote exit status. Open refusal and loss are distinct errors, and each
+failed open closes every partially acquired descriptor. Use the installed
+OpenSSH executable for authenticated connections and Paramiko's SFTP client
+for protocol operations. Add new backend sources to
+`storage/backends/BUILD`.
+
+The scheduler wraps this interface and owns physical opens and permits.
+Backends obtain SFTP with the current operation timeout and request class,
+while a checksum or rsync owns a finite command permit. A watcher obtains
+its revocable permit through the same scheduler. Existing
+`Backend.io_capacity_scope()` can expose only the shared scheduling identity
+to the surrounding worker admission. Keep low-level session handles inside
+the backend layer.
+
+2026-11-22 revision. Recorded the uncached rerun and the dependency
+boundary for starting the next package from the pushed tracer.
