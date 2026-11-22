@@ -1854,7 +1854,8 @@ def test_openssh_master_requires_a_trusted_host_key(remote, tmp_path, monkeypatc
         master.close()
 
 
-def test_openssh_master_honors_a_proxy_route(remote, tmp_path, monkeypatch):
+@pytest.mark.parametrize("kill_supervisor", [False, True], ids=["close", "supervisor-loss"])
+def test_openssh_master_honors_a_proxy_route(remote, tmp_path, monkeypatch, kill_supervisor):
     member, jump = remote.members
     alias = "storage-fixture-routed.invalid"
     known_hosts = tmp_path / "route_known_hosts"
@@ -1875,10 +1876,24 @@ def test_openssh_master_honors_a_proxy_route(remote, tmp_path, monkeypatch):
     member_before = _accepted_logins(remote, member)
     jump_before = _accepted_logins(remote, jump)
     try:
-        with master.generation().open_sftp(5) as sftp:
+        original = master.generation()
+        with original.open_sftp(5) as sftp:
             assert sftp.listdir(REMOTE_ROOT) == []
         assert _accepted_logins(remote, member) - member_before == 1
         assert _accepted_logins(remote, jump) - jump_before == 1
+        if kill_supervisor:
+            # Kill only the supervisor. The authenticated child and proxy
+            # initially retain their own identities and descriptors.
+            original._process.kill()
+            original._process.wait(timeout=5)
+            replacement = master.generation()
+            assert replacement is not original
+            with replacement.open_sftp(5) as sftp:
+                assert sftp.listdir(REMOTE_ROOT) == []
+            assert _established_ssh_connections(remote, member) == 1
+            assert _established_ssh_connections(remote, jump) == 1
+            assert _accepted_logins(remote, member) - member_before == 2
+            assert _accepted_logins(remote, jump) - jump_before == 2
     finally:
         master.close()
     assert _wait_for(lambda: _established_ssh_connections(remote, member) == 0)
