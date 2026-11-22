@@ -501,6 +501,23 @@ key_file = "/tmp/profile-key"
                 cache_root=Path("/tmp/cache"),
             )
 
+    def test_mount_member_capacity_is_shared_only_inside_one_compatible_group(self):
+        specs = (
+            "ssh://user@host:/left", "rsync://user@host:/right",
+            "ssh://other@host:/third", "ssh://user@alias:/fourth",
+        )
+        backends = create_storage_members(specs, None, announce=False,
+                                          bulk_capacity_wait_timeout=1)
+        separate = create_storage_members(specs[:1], None, announce=False)
+        try:
+            scopes = [backend.io_capacity_scope() for backend in backends.values()]
+            self.assertIs(scopes[0], scopes[1])
+            self.assertEqual(len(set(scopes)), 3)
+            self.assertIsNot(scopes[0], separate["remote0"].io_capacity_scope())
+        finally:
+            for backend in [*backends.values(), *separate.values()]:
+                backend.close()
+
     def test_create_storage_members_handles_interleaved_specs_without_name_mismatch(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             local_a = Path(temp_dir) / "local-a"

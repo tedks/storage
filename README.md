@@ -156,13 +156,12 @@ workers exit after 30 seconds idle. The configured maximum must be at least
 `workers`, and both must be within the smallest limit that applies: 32 with
 local members only; 8 when any member is remote (rsync uploads share one
 OpenSSH connection per host, which also carries the remote watcher, under
-the usual ten-session OpenSSH limit); and for each `ssh://` member, its
-background SFTP channels (the four SFTP channels each `ssh://` member opens
-at most, less the one kept for interactive calls: 3; neither is a mount
-option today). An `ssh://` member's uploads share those
-channels with its other background work, in the Paramiko connection that
-foreground reads also use, so more workers would only wait for a channel,
-each holding its file's upload lock. `rsync://` uploads use the separate
+the usual ten-session OpenSSH limit); and the background SFTP capacity
+of each Paramiko connection handling `ssh://` uploads (three of its four
+default SFTP channels, with one held for interactive calls). Uploads share
+that connection with other background work and with foreground reads from
+every root using it. Extra workers would wait for a channel while holding
+their files' upload locks. `rsync://` uploads use the separate
 OpenSSH connection. These limits come from configuration, not a probe of
 the server: one that grants fewer sessions, or other background calls on
 the same channels, can still make uploads wait, and servers configured with
@@ -339,8 +338,10 @@ published. At most 4096 directories keep a listing, the least recently used
 going first, which bounds the memory a mount with watchers uses.
 
 Independent foreground directory scans can use separate SFTP channels on the
-same member. A large scan in one tab can run alongside another tab when the
-member has spare channels. Background listing refreshes remain serial per member.
+same connection. A large scan in one tab can run alongside another tab when the
+connection has spare channels. A new request waits if all four default SFTP
+channels are already serving interactive requests. The reserve protects
+against bulk work. Background listing refreshes remain serial per member.
 
 On a multi-member mount, `--progressive-listings` (profile `progressive_listings = true`)
 returns a cold listing after the first member succeeds, including an empty result.
@@ -460,15 +461,23 @@ depends on its members:
   directory operations, and the system `ssh` (through `rsync -e`, with
   `StrictHostKeyChecking=accept-new`) for uploads.
 - **Remote watchers** (`enable_watchers`, off by default) run the system
-  `ssh` with `StrictHostKeyChecking=accept-new` for every remote member.
+  `ssh` with `StrictHostKeyChecking=accept-new`, grouping compatible roots
+  into one watcher session.
+- Within one mount, the Paramiko work of `ssh://` and `rsync://` members
+  with the same configured host, port, login, authentication and connection
+  settings shares one authenticated connection. The SFTP and command
+  channel limits apply to all of its roots together. Each root still has
+  its own files, availability, member name and replication role. A startup
+  same-filesystem check can make one temporary connection for that login,
+  which closes before the serving connection opens.
 - Those system `ssh` runs share one OpenSSH connection per host and user
   (`ControlMaster=auto`, bounded by `ControlPersist=60`), so an upload does
   not handshake again and a watcher rides the same connection. The sockets
   live in a private directory made for the mount (under `XDG_RUNTIME_DIR`
-  when set) and are removed at unmount; the shared connection is one more
-  TCP connection to the member, apart from the SFTP transport's, and an
-  rsync that times out or loses its connection ends it so the next upload
-  starts fresh. `STORAGE_SSH_MUX=0` turns sharing off.
+  when set) and are removed at unmount. The active OpenSSH master adds a
+  second TCP connection for that login alongside Paramiko. If an rsync
+  upload times out or loses the connection, Storage resets that master so
+  the next upload starts fresh. `STORAGE_SSH_MUX=0` turns sharing off.
 
 `accept-new` adds an unseen host to `~/.ssh/known_hosts` of the user running
 the mount without asking and without showing anything (the output is only
@@ -698,7 +707,7 @@ has been run against a real host since the field use above.
 
 Implemented:
 
-- Local, SSH/SFTP and rsync storage members (SFTP for reads, rsync for writes); one SSH connection per member, its requests multiplexed over a small pool of SFTP channels
+- Local, SSH/SFTP and rsync storage members (SFTP for reads, rsync for writes); one Paramiko connection per compatible SSH identity within the mount, with a shared pool of SFTP channels
 - Directory listings fresh for `revalidate_after` and refreshed in the background after it, answering `stat` and missing names without a member round trip
 - Local cache with LRU eviction, revalidated against the member on open (`revalidate_after`); streaming cold reads with background prefetch that stops when readers close early (`streaming_keep_after_close`)
 - Member timestamps and stat attributes preserved on regular-file cache fills, including streaming reads. Legacy CLEAN cache entries report recovered source mtime when their recorded evidence agrees.

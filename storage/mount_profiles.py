@@ -7,7 +7,7 @@ import re
 from typing import Any, Dict, Optional, Sequence, Tuple
 
 from .backends.local import LocalBackend
-from .backends.ssh import SSHBackend
+from .backends.ssh import SSHBackend, SSHTransportRegistry
 from .checksum_queue import DEFAULT_CHECKSUM_REVERIFY_INTERVAL
 from .foreground_admission import validate_cap
 from .namespace import DEFAULT_LISTING_MAX_STALE
@@ -342,6 +342,7 @@ def create_storage_members(
         raise click.ClickException("Duplicate display name")
     labels = tuple(label.strip() if label is not None else None for label in labels)
 
+    transport_registry = SSHTransportRegistry()
     local_index = 0
     remote_index = 0
     for index, (name, spec) in enumerate(zip(resolved_names, member_specs)):
@@ -371,7 +372,9 @@ def create_storage_members(
                         username=username,
                         key_filename=key_file,
                         speed_priority=priority,
+                        transport_registry=transport_registry,
                         control_sockets=shared_control_sockets(),
+                        bulk_capacity_wait_timeout=bulk_capacity_wait_timeout,
                     )
                     backend.display_name = labels[index]
                     if announce:
@@ -387,6 +390,7 @@ def create_storage_members(
                         username=username,
                         key_filename=key_file,
                         speed_priority=priority,
+                        transport_registry=transport_registry,
                         bulk_capacity_wait_timeout=bulk_capacity_wait_timeout,
                     )
                     backend.display_name = labels[index]

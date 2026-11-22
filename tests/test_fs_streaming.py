@@ -8,7 +8,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from fuse import FuseOSError
 
@@ -17,7 +17,7 @@ from storage.cache_metadata import MEMBER_ATTRS_XATTR
 from storage.fs import StorageFS
 from storage.models import SyncStatus
 from storage.mount_profiles import parse_keep_after_close
-from storage.streaming import PrefetchSession
+from storage.streaming import PrefetchSession, _DownloadPool
 
 
 class SlowRangeLocalBackend(LocalBackend):
@@ -53,6 +53,36 @@ class SlowRangeLocalBackend(LocalBackend):
         if self.copy_delay:
             time.sleep(self.copy_delay)
         return super().copy_to_local(virtual_path, local_path)
+
+
+class TestDownloadPoolCapacity(unittest.TestCase):
+    def test_members_sharing_transport_do_not_amplify_worker_demand(self):
+        def session(name, scope):
+            backend = Mock(name=name)
+            backend.name = name
+            backend.background_range_capacity.return_value = 1
+            backend.io_capacity_scope.return_value = scope
+            return PrefetchSession(
+                canonical_path=f"/{name}", virtual_path=f"/{name}", backend=backend,
+                file_size=1, final_cache_path=Path(name),
+                partial_cache_path=Path(f"{name}.partial"), chunk_size=1, io_fd=-1,
+            )
+
+        shared = object()
+        first = session("root1", shared)
+        sibling = session("root2", shared)
+        separate = session("other", object())
+
+        pool = _DownloadPool(None, None, None)
+        pool.running.add(first)
+        pool.ready = {sibling: True, separate: True}
+        self.assertEqual(list(pool._eligible()), [separate])
+        self.assertIs(pool._take(), separate)
+        self.assertIsNone(pool._take())
+
+        pool.running.remove(first)
+        self.assertEqual(list(pool._eligible()), [sibling])
+        self.assertIs(pool._take(), sibling)
 
 
 class TestFSStreamingIntegration(unittest.TestCase):

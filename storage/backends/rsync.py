@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from .base import Backend, BackendType
-from .ssh import SSHBackend
+from .ssh import SSHBackend, SSHTransportRegistry
 from .ssh_mux import ControlSockets
 
 # Hidden directory on each side for rsync partial transfers.
@@ -107,7 +107,9 @@ class RsyncBackend(SSHBackend):
                  connect_timeout: float = 10.0,
                  rsync_args: Optional[List[str]] = None,
                  compress: bool = True,
-                 control_sockets: Optional[ControlSockets] = None):
+                 control_sockets: Optional[ControlSockets] = None, *,
+                 bulk_capacity_wait_timeout: Optional[float] = None,
+                 transport_registry: Optional[SSHTransportRegistry] = None):
         super().__init__(
             name=name,
             host=host,
@@ -118,6 +120,8 @@ class RsyncBackend(SSHBackend):
             port=port,
             speed_priority=speed_priority,
             connect_timeout=connect_timeout,
+            bulk_capacity_wait_timeout=bulk_capacity_wait_timeout,
+            transport_registry=transport_registry,
         )
         self.backend_type = BackendType.RSYNC
         # A later mutation of the caller's list must not change the options
@@ -336,6 +340,9 @@ class RsyncBackend(SSHBackend):
             # If SFTP mkdir fails, rsync might still work if dir exists.
             pass
 
+        # A mkdir failure on Paramiko may be independent of OpenSSH. A
+        # retired or explicitly unavailable root must stop before upload.
+        self._pool.check_root(self._root_availability)
         remote = self._remote_spec(virtual_path)
         try:
             # Storage has already selected this file for upload. Rsync's

@@ -1,5 +1,6 @@
 import logging
 import sys
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -28,9 +29,8 @@ def shared_filesystems(backends: Dict[str, Backend]) -> List[List[str]]:
     An SSH member alone on its host cannot share with anyone, so it is not
     probed (no connection is opened for it); local members are always
     checked, which is a stat. A member whose probe fails drops out of the
-    grouping; if the connection itself failed, the host's remaining members
-    are not probed either, so an unreachable host costs one connect
-    timeout, not one per member.
+    grouping. The startup connection is reused per compatible identity and
+    closed before daemonization. A failed connect skips just that identity.
     """
     on_host: Dict[Tuple[str, int], int] = {}
     for backend in backends.values():
@@ -38,18 +38,32 @@ def shared_filesystems(backends: Dict[str, Backend]) -> List[List[str]]:
             key = (backend.host, backend.port)
             on_host[key] = on_host.get(key, 0) + 1
     groups: Dict[Tuple[str, int, int], List[str]] = {}
-    failed_hosts = set()
-    for name, backend in backends.items():
-        if isinstance(backend, SSHBackend):
-            host = (backend.host, backend.port)
-            if on_host[host] < 2 or host in failed_hosts:
-                continue
-        identity = backend.filesystem_identity()
-        if identity is None:
-            if isinstance(backend, SSHBackend) and not backend.probe_reached_host:
-                failed_hosts.add((backend.host, backend.port))
-            continue
-        groups.setdefault(identity, []).append(name)
+    failed_connections = set()
+    clients = {}
+    with ExitStack() as probes:
+        for name, backend in backends.items():
+            if isinstance(backend, SSHBackend):
+                scope = backend.probe_connection_scope()
+                if on_host[(backend.host, backend.port)] < 2 or scope in failed_connections:
+                    continue
+                if backend.shares_transport():
+                    client = clients.get(scope)
+                    if client is None:
+                        try:
+                            client = probes.enter_context(backend.filesystem_probe_connection())
+                        except Exception:
+                            failed_connections.add(scope)
+                            continue
+                        clients[scope] = client
+                    identity = backend.filesystem_identity(client)
+                else:
+                    identity = backend.filesystem_identity()
+                    if not backend.probe_reached_host:
+                        failed_connections.add(scope)
+            else:
+                identity = backend.filesystem_identity()
+            if identity is not None:
+                groups.setdefault(identity, []).append(name)
     return [names for names in groups.values() if len(names) > 1]
 
 
@@ -69,7 +83,8 @@ def shared_filesystems(backends: Dict[str, Backend]) -> List[List[str]]:
 @click.option(
     "--max-sync-workers", type=int,
     help=("Grow background sync from --workers up to this limit when tasks queue "
-          "(at most 32 local-only, 8 with remote members, 3 per default ssh:// member)."),
+          "(at most 32 local-only, 8 with remote members, "
+          "3 per default Paramiko connection serving ssh:// uploads)."),
 )
 @click.option("-r", "--remote", multiple=True, help="Remote storage member (ssh://user@host:/path)")
 @click.option("-k", "--key-file", help="SSH private key file")

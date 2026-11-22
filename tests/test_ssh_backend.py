@@ -24,7 +24,7 @@ from storage.backends.base import (
     interactive_request,
     is_interactive_request,
 )
-from storage.backends.ssh import SSHBackend
+from storage.backends.ssh import SSHBackend, SSHTransportRegistry
 from storage.backends.ssh_pool import (
     BulkCapacityCancelled, BulkCapacityTimeout, CommandTimeout,
     MemberConnection, MemberUnavailable,
@@ -1558,6 +1558,39 @@ class _BackendTestCase(unittest.TestCase):
         )
         self.addCleanup(backend.close)
         return backend
+
+
+class TestSharedSSHTransport(_BackendTestCase):
+    def test_root_stalls_back_off_only_that_root(self):
+        registry = SSHTransportRegistry()
+        slow = self._new_backend(transport_registry=registry)
+        fast = SSHBackend("sibling", slow.host, "/fast", slow.username,
+                          key_filename=slow.key_filename,
+                          connect_timeout=slow.connect_timeout,
+                          transport_registry=registry)
+        self.addCleanup(fast.close)
+
+        def stat(_sftp, path):
+            if path == "/data/item":
+                raise socket.timeout("synthetic root stalled")
+
+        self.server.hooks["stat"] = stat
+        for _ in range(2):
+            with self.assertRaises(socket.timeout):
+                slow.stat("/item")
+            # Success on another root does not erase the slow root's stalls.
+            fast.stat("/item")
+        self.assertFalse(slow.is_available())
+        self.assertTrue(fast.is_available())
+        self.assertEqual(self.server.connect_calls, 1)
+        with self.assertRaises(MemberUnavailable):
+            slow.stat("/item")
+        slow.set_available(True)
+        self.assertTrue(slow.is_available())
+        slow.set_available(False)
+        self.assertFalse(slow.is_available())
+        fast.stat("/item")
+        self.assertEqual(self.server.connect_calls, 1)
 
 
 class TestSSHBackendLinks(_BackendTestCase):
