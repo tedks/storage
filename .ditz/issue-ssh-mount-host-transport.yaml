@@ -24,3 +24,19 @@ log_events:
   who: Ted Smith
   what: started
   comment: ""
+- time: 2026-11-22T23:30:21-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Draft https://github.com/tedks/storage/pull/200 at f084bc4. Focused SSH,
+
+    CLI and mounted remote checks pass. The full gate passes 48 of 49 targets,
+
+    including the Docker remote target (89 passed with the existing watcher
+
+    xfail). The independent local FUSE TTL failure reproduces on the untouched
+
+    stack base and is recorded as fuse-kernel-dcache-forget-flake. CLI build and
+
+    mount help smoke pass. A controlled same-byte transport latency experiment
+
+    is underway before considering a transport tuning change.'
