@@ -62,7 +62,7 @@ from storage.cli_mount import shared_filesystems
 from storage.fs import StorageFS
 from storage.member_repairs import MemberRepairs
 from storage.models import SyncStatus
-from storage.mount_profiles import create_storage_members
+from storage.mount_profiles import create_storage_members, resolve_member_configuration
 from storage.sync_tasks import DirOperation
 from storage.watcher import RemoteWatcher
 from tests.fuse_mount import (
@@ -1629,9 +1629,11 @@ def _accepted_logins(remote, member) -> int:
 UPLOADS = 5
 
 
-@pytest.mark.parametrize("max_sessions", [1, 2, 3, 10])
+@pytest.mark.parametrize(
+    "max_sessions,watchers", [(1, True), (2, True), (3, True), (10, True), (3, False)],
+)
 def test_mounted_openssh_member_traffic_shares_one_login(
-        remote, mounted_factory, tmp_path, max_sessions):
+        remote, mounted_factory, tmp_path, monkeypatch, max_sessions, watchers):
     if max_sessions == 10:
         member = remote.members[0]
     elif max_sessions == 3:
@@ -1639,28 +1641,38 @@ def test_mounted_openssh_member_traffic_shares_one_login(
     else:
         member = remote.low_session_members[max_sessions]
 
-    registry = SSHTransportRegistry()
-    common = {
-        **remote.backend_kwargs(member),
-        "transport_registry": registry,
-        "ssh_transport": "openssh",
-    }
-    read_member = SSHBackend(**{**common, "name": "remote0",
-                                "remote_path": f"{REMOTE_ROOT}/left"})
-    upload_member = RsyncBackend(**{**common, "name": "remote1",
-                                    "remote_path": f"{REMOTE_ROOT}/right"},
-                                 compress=False, rsync_args=["--bwlimit=128"])
+    alias = "storage-mixed-" + secrets.token_hex(5)
+    ssh_config = remote.ssh_log.parent / "ssh_config"
+    with ssh_config.open("a") as config:
+        config.write(f"\nHost {alias}\n    HostName {member.host}\n    Port {member.port}\n")
+    profile = tmp_path / "storage.toml"
+    profile.write_text(
+        '[mounts.mixed]\n'
+        f'mountpoint = "{tmp_path / "mount"}"\n'
+        f'cache = "{tmp_path / "cache"}"\n'
+        'ssh_transport = "openssh"\n'
+        f'key_file = "{remote.key_path}"\n'
+        f'backends = ["ssh://{REMOTE_USER}@{alias}:{REMOTE_ROOT}/left", '
+        f'"rsync://{REMOTE_USER}@{alias}:{REMOTE_ROOT}/right"]\n'
+    )
+    resolved = resolve_member_configuration("mixed", profile, (), None, None)
+    backends = create_storage_members(resolved.member_specs, resolved.key_file,
+                                      announce=False, ssh_transport=resolved.ssh_transport)
+    upload_member = backends["remote1"]
+    # Keep transfer duration observable without relying on machine load.
+    monkeypatch.setattr(upload_member, "_compress", False)
+    monkeypatch.setattr(upload_member, "_rsync_args", ("--bwlimit=128",))
     remote.write_remote(member, "left/foreground", b"foreground bytes")
     remote.exec(member, f"mkdir {REMOTE_ROOT}/right")
 
     logins_before = _accepted_logins(remote, member)
     mnt = mounted_factory(
-        backends={b.name: b for b in (read_member, upload_member)},
-        enable_watchers=True, start_sync=False, num_sync_workers=0,
+        backends=backends,
+        enable_watchers=watchers, start_sync=False, num_sync_workers=0,
         streaming_reads=True, revalidate_after=60,
     )
     assert "foreground" in os.listdir(mnt.mount)
-    if max_sessions >= 3:
+    if watchers and max_sessions >= 3:
         _wait_for_remote_inotifywait(remote, member)
 
     source = tmp_path / "upload"
@@ -1677,7 +1689,7 @@ def test_mounted_openssh_member_traffic_shares_one_login(
         upload.result(timeout=15)
 
     assert remote.read_remote(member, "right/from-rsync") == data
-    if max_sessions >= 3:
+    if watchers and max_sessions >= 3:
         assert _wait_for(lambda: "from-rsync" in os.listdir(mnt.mount), timeout=3), (
             "the watcher did not invalidate a mount listing within its 60-second TTL")
         assert (mnt.mount / "from-rsync").read_bytes() == data
