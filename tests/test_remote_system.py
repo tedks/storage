@@ -38,6 +38,7 @@ import subprocess
 import threading
 import time
 import warnings
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List
@@ -1611,6 +1612,109 @@ def _accepted_logins(remote, member) -> int:
 
 
 UPLOADS = 5
+
+
+def test_openssh_master_carries_sftp_watcher_and_rsync(remote, tmp_path):
+    """Exercise one authenticated connection with three sshd session slots."""
+    member = remote.limited
+    identity = (REMOTE_USER, member.host, member.port, str(remote.key_path))
+    target = f"{REMOTE_USER}@{member.host}"
+
+    class AttachOnlySockets(ControlSockets):
+        def options(self, *identity):
+            options = super().options(*identity)
+            assert options
+            # A session refusal or missing control socket can make OpenSSH
+            # fall back to a fresh connection. Test an attach-only client.
+            options[1] = "ControlMaster=no"
+            return [*options, "-o", "ProxyCommand=exit 255"]
+
+    sockets = AttachOnlySockets()
+    ssh = ["ssh", "-T", "-p", str(member.port), "-o", "BatchMode=yes",
+           "-o", "StrictHostKeyChecking=yes", "-o", "UpdateHostKeys=no",
+           "-i", str(remote.key_path)]
+    master_options = ControlSockets.options(sockets, *identity)
+    attach = [*ssh, *sockets.options(*identity)]
+
+    class SFTPStream(socket.socket):
+        def get_name(self):
+            return "synthetic OpenSSH mux session"
+
+    @contextmanager
+    def sftp_session():
+        parent, child = socket.socketpair()
+        with SFTPStream(fileno=parent.detach()) as stream, child, subprocess.Popen(
+            [*attach, "-s", target, "sftp"], stdin=child, stdout=child,
+        ) as process:
+            child.close()
+            stream.settimeout(10)
+            try:
+                with paramiko.SFTPClient(stream) as sftp:
+                    yield sftp
+            finally:
+                stream.close()
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    raise
+            assert process.returncode == 0
+
+    changed = threading.Event()
+    ready = threading.Event()
+    watcher = RemoteWatcher(
+        backend_name=member.name, ssh_host=member.host, ssh_port=member.port,
+        remote_path=REMOTE_ROOT, username=REMOTE_USER,
+        key_filename=str(remote.key_path), control_sockets=sockets,
+        on_resync=ready.set,
+        on_change=lambda path: changed.set() if path == "/right/upload.bin" else None,
+    )
+    backend = RsyncBackend(**remote.backend_kwargs(member), control_sockets=sockets)
+    source = tmp_path / "upload.bin"
+    source.write_bytes(b"one OpenSSH connection\n")
+    remote.exec(member, f"mkdir {REMOTE_ROOT}/left {REMOTE_ROOT}/right")
+    logins_before = _accepted_logins(remote, member)
+    master = subprocess.Popen([
+        *ssh, "-o", "ControlMaster=yes", "-o", "ControlPersist=no",
+        *master_options, "-Nn", target,
+    ])
+    try:
+        assert _wait_for(lambda: subprocess.run(
+            [*attach, "-O", "check", target], capture_output=True, timeout=2,
+        ).returncode == 0)
+        watcher.start()
+        assert ready.wait(10), "the watcher did not open its session"
+        with sftp_session() as bulk, sftp_session() as interactive:
+            assert bulk.listdir(f"{REMOTE_ROOT}/left") == []
+            assert interactive.listdir(f"{REMOTE_ROOT}/right") == []
+            fourth = subprocess.run([*attach, target, "true"], capture_output=True, timeout=10)
+            assert fourth.returncode == 255, fourth
+            assert b"Session open refused" in fourth.stderr, fourth.stderr
+
+        with sftp_session() as interactive:
+            # The watcher and the existing SFTP channel leave one slot for
+            # the rsync command. The directories were prepared separately.
+            backend._run_rsync(str(source), backend._remote_spec("/right/upload.bin"))
+            assert changed.wait(10), "the watcher missed the rsync upload"
+            with interactive.open(f"{REMOTE_ROOT}/right/upload.bin", "rb") as uploaded:
+                assert uploaded.read() == source.read_bytes()
+            assert _established_ssh_connections(remote, member) == 1
+            assert _accepted_logins(remote, member) - logins_before == 1
+    finally:
+        watcher.stop()
+        backend.close()
+        sockets.close()
+        try:
+            master.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            master.kill()
+            master.wait(timeout=10)
+            raise
+
+    disconnected = subprocess.run([*attach, target, "true"], capture_output=True, timeout=10)
+    assert disconnected.returncode == 255, disconnected
+    assert _accepted_logins(remote, member) - logins_before == 1
+    assert _wait_for(lambda: _established_ssh_connections(remote, member) == 0)
 
 
 @pytest.mark.parametrize("shared", [True, False], ids=["shared", "own-connections"])
