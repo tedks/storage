@@ -443,11 +443,32 @@ SSH member no longer shows as the directory or file it names on that host.
 A name that was cached before this changed keeps its cached view until it
 is evicted.
 
+#### OpenSSH transport
+
+Set `ssh_transport = "openssh"` in a mount profile to carry SFTP, remote
+commands, rsync uploads and inotify watches over one authenticated SSH
+connection per compatible identity. Storage groups roots by the configured
+SSH host token, user, port, key and connection settings. An alias can carry
+its own routing or trust settings in your OpenSSH config. OpenSSH
+authenticates in batch mode using keys or an agent and takes host keys from
+its configured known-hosts files. It accepts new keys, refuses changed
+keys, and leaves existing host keys intact.
+
+On connection, Storage checks up to four simultaneous sessions. At two
+or more sessions it keeps a slot available for foreground operations.
+A host must allow at least three sessions for Storage to run its watcher
+alongside foreground operations and transfers. With a single session,
+foreground and bulk operations take turns. Pull revalidation bounds the
+listing age even when the watch is unavailable. The same-filesystem check
+can briefly authenticate before the mount starts serving and closes its
+probe before that serving connection opens.
+
+Profiles that omit the selector use `ssh_transport = "paramiko"`.
+
 #### SSH host keys
 
 There is no host-key setting yet: host-key verification is not configurable,
-and the three SSH code paths behave as follows. Which ones a mount uses
-depends on its members:
+and the default `paramiko` transport uses the following SSH paths:
 
 - **`ssh://` members** use paramiko (`SSHBackend`) for everything: reads,
   metadata and writes. It uses `AutoAddPolicy` without loading any

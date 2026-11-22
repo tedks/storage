@@ -249,6 +249,31 @@ class TestResolvedMountConfig(unittest.TestCase):
         defaults.update(overrides)
         return resolve_mount_configuration(**defaults)
 
+    def test_profile_can_select_openssh_for_mixed_members(self):
+        config_path = self._profile('ssh_transport = "openssh"\n')
+        config = self._resolve(mount_target="prof", backing_paths=[], config_path=config_path)
+        self.assertEqual("openssh", config.ssh_transport)
+        self.assertEqual("paramiko", self._resolve().ssh_transport)
+        backends = create_storage_members(
+            ("ssh://user@alias:/one", "rsync://user@alias:/two", "ssh://user@other:/three"),
+            config.key_file, announce=False, ssh_transport=config.ssh_transport,
+        )
+        try:
+            first, second, third = backends.values()
+            self.assertIs(first.io_capacity_scope(), second.io_capacity_scope())
+            self.assertIsNot(first.io_capacity_scope(), third.io_capacity_scope())
+            self.assertTrue(first.requires_pull_revalidation())
+            self.assertEqual(first.push_invalidation_spec().group_key,
+                             second.push_invalidation_spec().group_key)
+        finally:
+            for backend in backends.values():
+                backend.close()
+
+    def test_profile_rejects_unknown_ssh_transport(self):
+        config_path = self._profile('ssh_transport = "automatic"\n')
+        with self.assertRaisesRegex(click.ClickException, "ssh_transport"):
+            self._resolve(mount_target="prof", backing_paths=[], config_path=config_path)
+
     def test_readdir_ttl_defaults_to_none_following_revalidate_after(self):
         config = self._resolve()
         self.assertIsNone(config.readdir_ttl)

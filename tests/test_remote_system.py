@@ -210,12 +210,13 @@ class RemoteCluster:
     """The running members and the client-side files the tests connect with."""
 
     def __init__(self, run_id: str, members: List[Member], key_path: Path, ssh_log: Path,
-                 limited: Member):
+                 limited: Member, low_session_members: dict[int, Member]):
         self.run_id = run_id
         # The members a mount uses; limited is a separate container whose
         # sshd allows only three session channels per connection.
         self.members = members
         self.limited = limited
+        self.low_session_members = low_session_members
         self.key_path = key_path
         self.ssh_log = ssh_log
 
@@ -256,7 +257,7 @@ class RemoteCluster:
         A stopped watcher's remote inotifywait outlives it (#106); without
         this, the next test's check that one is running would pass early.
         """
-        for member in [*self.members, self.limited]:
+        for member in [*self.members, self.limited, *self.low_session_members.values()]:
             self.exec(member, "pkill -u storage -x inotifywait", check=False)
             if not _wait_for(lambda member=member: self.exec(
                     member, "pgrep -u storage -x inotifywait", check=False).returncode != 0,
@@ -357,15 +358,20 @@ def cluster(tmp_path_factory):
         # instead of ten, so the SSH channel pool meets refusals.
         limited = start_member("limited", ("-o", "MaxSessions=3"))
 
+        low_session_members = {
+            limit: start_member(f"sessions-{limit}", ("-o", f"MaxSessions={limit}"))
+            for limit in (1, 2)
+        }
+
         known_hosts = work / "known_hosts"
         known_hosts.write_text("".join(
             f"{m.host if m.port == 22 else f'[{m.host}]:{m.port}'} {m.host_pubkey}\n"
-            for m in [*members, limited]
+            for m in [*members, limited, *low_session_members.values()]
         ))
         shim_dir, ssh_log = _install_ssh_shim(work, known_hosts)
         os.environ["PATH"] = f"{shim_dir}{os.pathsep}{old_path}"
 
-        yield RemoteCluster(run_id, members, key_path, ssh_log, limited)
+        yield RemoteCluster(run_id, members, key_path, ssh_log, limited, low_session_members)
     finally:
         os.environ["PATH"] = old_path
         removals = [("rm", "-f", "-v", c) for c in created_containers]
@@ -1616,6 +1622,64 @@ def _accepted_logins(remote, member) -> int:
 
 
 UPLOADS = 5
+
+
+@pytest.mark.parametrize("max_sessions", [1, 2, 3, 10])
+def test_mounted_openssh_member_traffic_shares_one_login(
+        remote, mounted_factory, tmp_path, max_sessions):
+    if max_sessions == 10:
+        member = remote.members[0]
+    elif max_sessions == 3:
+        member = remote.limited
+    else:
+        member = remote.low_session_members[max_sessions]
+
+    registry = SSHTransportRegistry()
+    common = {
+        **remote.backend_kwargs(member),
+        "transport_registry": registry,
+        "ssh_transport": "openssh",
+    }
+    read_member = SSHBackend(**{**common, "name": "remote0",
+                                "remote_path": f"{REMOTE_ROOT}/left"})
+    upload_member = RsyncBackend(**{**common, "name": "remote1",
+                                    "remote_path": f"{REMOTE_ROOT}/right"},
+                                 compress=False, rsync_args=["--bwlimit=128"])
+    remote.write_remote(member, "left/foreground", b"foreground bytes")
+    remote.exec(member, f"mkdir {REMOTE_ROOT}/right")
+
+    logins_before = _accepted_logins(remote, member)
+    mnt = mounted_factory(
+        backends={b.name: b for b in (read_member, upload_member)},
+        enable_watchers=True, start_sync=False, num_sync_workers=0,
+        streaming_reads=True, revalidate_after=60,
+    )
+    assert "foreground" in os.listdir(mnt.mount)
+    if max_sessions >= 3:
+        _wait_for_remote_inotifywait(remote, member)
+
+    source = tmp_path / "upload"
+    data = secrets.token_bytes(512 * 1024)
+    source.write_bytes(data)
+    with ThreadPoolExecutor() as executor:
+        upload = executor.submit(upload_member.copy_from_local, source, "/from-rsync")
+        assert _wait_for(lambda: remote.exec(
+            member, "pgrep -u storage -x rsync", check=False).returncode == 0, timeout=5)
+        foreground = executor.submit((mnt.mount / "foreground").read_bytes)
+        assert foreground.result(timeout=8) == b"foreground bytes"
+        if max_sessions >= 2:
+            assert not upload.done(), "foreground lookup waited for the rsync transfer"
+        upload.result(timeout=15)
+
+    assert remote.read_remote(member, "right/from-rsync") == data
+    if max_sessions >= 3:
+        assert _wait_for(lambda: "from-rsync" in os.listdir(mnt.mount), timeout=3), (
+            "the watcher did not invalidate a mount listing within its 60-second TTL")
+        assert (mnt.mount / "from-rsync").read_bytes() == data
+    else:
+        assert not _remote_inotifywait_running(remote, member)
+    assert _established_ssh_connections(remote, member) == 1
+    assert _accepted_logins(remote, member) - logins_before == 1
 
 
 def test_openssh_master_carries_sftp_watcher_and_rsync(remote, tmp_path):
