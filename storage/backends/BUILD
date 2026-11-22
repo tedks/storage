@@ -6,6 +6,7 @@ py_library(
     name = "storage_backends",
     srcs = [
         "__init__.py",
+        "_openssh_supervisor.py",
         "base.py",
         "local.py",
         "openssh_pool.py",

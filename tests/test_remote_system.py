@@ -30,12 +30,14 @@ import hashlib
 import os
 import re
 import secrets
+import select
 import shlex
 import shutil
 import signal
 import socket
 import stat
 import subprocess
+import sys
 import threading
 import time
 import warnings
@@ -1708,6 +1710,7 @@ def test_openssh_master_carries_sftp_watcher_and_rsync(remote, tmp_path):
     source.write_bytes(b"one OpenSSH connection\n")
     remote.exec(member, f"mkdir {REMOTE_ROOT}/left {REMOTE_ROOT}/right")
     logins_before = _accepted_logins(remote, member)
+
     def run_command(generation, command):
         with open(os.devnull, "rb+") as devnull:
             fd = devnull.fileno()
@@ -1808,6 +1811,70 @@ def test_openssh_master_requires_a_trusted_host_key(remote, tmp_path, monkeypatc
         assert _wait_for(lambda: _established_ssh_connections(remote, member) == 0)
     finally:
         master.close()
+
+
+def test_openssh_master_honors_a_proxy_route(remote, tmp_path, monkeypatch):
+    member, jump = remote.members
+    alias = "storage-fixture-routed.invalid"
+    known_hosts = tmp_path / "route_known_hosts"
+    known_hosts.write_text(f"{alias} {member.host_pubkey}\n")
+    ssh = shutil.which("ssh")
+    proxy = shlex.join([
+        ssh, "-p", str(jump.port), "-i", str(remote.key_path),
+        "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
+        "-W", f"{member.ip}:22", f"{REMOTE_USER}@{jump.host}",
+    ])
+    shim = tmp_path / "ssh"
+    route_args = shlex.join([ssh, "-o", f"ProxyCommand={proxy}",
+                             "-o", f"UserKnownHostsFile={known_hosts}"])
+    shim.write_text(f'#!/bin/sh\nexec {route_args} "$@"\n')
+    shim.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ['PATH']}")
+    master = OpenSSHMaster(REMOTE_USER, alias, 22, str(remote.key_path))
+    member_before = _accepted_logins(remote, member)
+    jump_before = _accepted_logins(remote, jump)
+    try:
+        with master.generation().open_sftp(5) as sftp:
+            assert sftp.listdir(REMOTE_ROOT) == []
+        assert _accepted_logins(remote, member) - member_before == 1
+        assert _accepted_logins(remote, jump) - jump_before == 1
+    finally:
+        master.close()
+    assert _wait_for(lambda: _established_ssh_connections(remote, member) == 0)
+    assert _wait_for(lambda: _established_ssh_connections(remote, jump) == 0)
+
+
+def test_openssh_master_exits_when_mount_process_is_killed(remote):
+    member = remote.limited
+    owner_script = """
+import sys
+from storage.backends.openssh import OpenSSHMaster
+
+owner = OpenSSHMaster(sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4])
+generation = owner.generation()
+with generation.open_sftp(5):
+    print(*(option.split('=', 1)[1] for option in generation.attach_options()
+            if option.startswith('ControlPath=')), flush=True)
+    sys.stdin.read()
+"""
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)}
+    with subprocess.Popen(
+        [sys.executable, "-c", owner_script, REMOTE_USER, member.host,
+         str(member.port), str(remote.key_path)], stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE, env=env, text=True,
+    ) as owner:
+        try:
+            poller = select.poll()
+            poller.register(owner.stdout, select.POLLIN)
+            assert poller.poll(15_000), "the mount fixture never started its master"
+            control_path = owner.stdout.readline().strip()
+            assert control_path and Path(control_path).is_socket()
+            assert _established_ssh_connections(remote, member) == 1
+        finally:
+            owner.kill()
+            owner.wait(timeout=5)
+    assert _wait_for(lambda: _established_ssh_connections(remote, member) == 0)
+    assert _wait_for(lambda: not Path(control_path).parent.exists())
 
 
 @pytest.mark.parametrize("shared", [True, False], ids=["shared", "own-connections"])
