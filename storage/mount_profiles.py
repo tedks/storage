@@ -7,7 +7,7 @@ import re
 from typing import Any, Dict, Optional, Sequence, Tuple
 
 from .backends.local import LocalBackend
-from .backends.ssh import SSHBackend
+from .backends.ssh import SSHBackend, SSHTransportRegistry
 from .checksum_queue import DEFAULT_CHECKSUM_REVERIFY_INTERVAL
 from .foreground_admission import validate_cap
 from .namespace import DEFAULT_LISTING_MAX_STALE
@@ -76,6 +76,7 @@ class ResolvedMountConfig:
     obsolete_streaming_limits: Tuple[str, ...] = ()
     streaming_read_ahead_window: Optional[str] = None
     progressive_listings: bool = False
+    ssh_transport: str = "paramiko"
 
     @property
     def member_specs(self) -> Tuple[str, ...]:
@@ -91,6 +92,7 @@ class ResolvedMemberConfig:
     profile_name: Optional[str] = None
     profile_source: Optional[Path] = None
     member_display_names: Tuple[Optional[str], ...] = ()
+    ssh_transport: str = "paramiko"
 
 
 def default_mount_config_paths() -> Tuple[Path, ...]:
@@ -327,6 +329,7 @@ def create_storage_members(
     member_names: Optional[Sequence[str]] = None,
     display_names: Optional[Sequence[Optional[str]]] = None,
     bulk_capacity_wait_timeout: Optional[float] = None,
+    ssh_transport: str = "paramiko",
 ):
     backends = {}
     resolved_names = tuple(member_names) if member_names is not None else _default_member_names(member_specs)
@@ -342,6 +345,7 @@ def create_storage_members(
         raise click.ClickException("Duplicate display name")
     labels = tuple(label.strip() if label is not None else None for label in labels)
 
+    transport_registry = SSHTransportRegistry()
     local_index = 0
     remote_index = 0
     for index, (name, spec) in enumerate(zip(resolved_names, member_specs)):
@@ -371,7 +375,11 @@ def create_storage_members(
                         username=username,
                         key_filename=key_file,
                         speed_priority=priority,
-                        control_sockets=shared_control_sockets(),
+                        transport_registry=transport_registry,
+                        ssh_transport=ssh_transport,
+                        port=None if ssh_transport == "openssh" else 22,
+                        control_sockets=(shared_control_sockets() if ssh_transport == "paramiko" else None),
+                        bulk_capacity_wait_timeout=bulk_capacity_wait_timeout,
                     )
                     backend.display_name = labels[index]
                     if announce:
@@ -387,6 +395,9 @@ def create_storage_members(
                         username=username,
                         key_filename=key_file,
                         speed_priority=priority,
+                        transport_registry=transport_registry,
+                        ssh_transport=ssh_transport,
+                        port=None if ssh_transport == "openssh" else 22,
                         bulk_capacity_wait_timeout=bulk_capacity_wait_timeout,
                     )
                     backend.display_name = labels[index]
@@ -475,6 +486,7 @@ def resolve_member_configuration(
             member_specs=resolved_specs,
             member_names=_default_member_names(resolved_specs),
             key_file=key_file or settings["key_file"],
+            ssh_transport=settings["ssh_transport"],
             cache_root=(cache_root or Path(settings["cache"])).resolve(),
             profile_name=profile_name,
             profile_source=profile_source,
@@ -510,7 +522,13 @@ def _load_mount_profile_settings(config_path: Path, profile_name: str) -> Dict[s
     remote_entries = [(spec, label) for spec, label in entries if spec.startswith(("ssh://", "rsync://"))]
     config_backing_paths = tuple(spec for spec, _ in local_entries)
     config_remote = tuple(spec for spec, _ in remote_entries)
+    ssh_transport = _optional_profile_string(config_profile, "ssh_transport", profile_name)
+    if ssh_transport is None:
+        ssh_transport = "paramiko"
+    if ssh_transport not in ("paramiko", "openssh"):
+        raise click.ClickException(f"Mount profile '{profile_name}' ssh_transport must be 'paramiko' or 'openssh'")
     return {
+        "ssh_transport": ssh_transport,
         "mountpoint": _require_profile_string(config_profile, "mountpoint", profile_name),
         "cache": _require_profile_string(config_profile, "cache", profile_name),
         "cache_size": _optional_profile_string(config_profile, "cache_size", profile_name),
@@ -664,6 +682,7 @@ def resolve_mount_configuration(
     progressive_listings: Optional[bool] = None,
 ) -> ResolvedMountConfig:
     config_values = {
+        "ssh_transport": "paramiko",
         "mountpoint": None,
         "cache": None,
         "cache_size": None,
@@ -797,6 +816,7 @@ def resolve_mount_configuration(
     )
 
     return ResolvedMountConfig(
+        ssh_transport=config_values["ssh_transport"],
         max_download_workers=download_worker_limit,
         obsolete_streaming_limits=ignored,
         mountpoint=mountpoint,

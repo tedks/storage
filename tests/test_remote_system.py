@@ -25,6 +25,7 @@ a message naming Docker. It never skips.
 """
 
 import errno
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import os
 import re
@@ -35,6 +36,7 @@ import shutil
 import signal
 import socket
 import stat
+import statistics
 import subprocess
 import sys
 import threading
@@ -48,22 +50,24 @@ from unittest import mock
 import paramiko
 import pytest
 
+from storage.backends.base import interactive_request
 from storage.backends.openssh import (
     MasterLost, MasterStartError, OpenSSHMaster, SessionClosed, SessionRefused,
 )
 from storage.backends.rsync import RsyncBackend
-from storage.backends.ssh import SSHBackend
+from storage.backends.ssh import SSHBackend, SSHTransportRegistry
 from storage.backends.ssh_mux import ControlSockets
 from storage.checksums import fast_checksum_bytes
 from storage.cli_mount import shared_filesystems
 from storage.fs import StorageFS
 from storage.member_repairs import MemberRepairs
 from storage.models import SyncStatus
+from storage.mount_profiles import create_storage_members, resolve_member_configuration
 from storage.sync_tasks import DirOperation
 from storage.watcher import RemoteWatcher
 from tests.fuse_mount import (
     FUSE_THREAD_MODES, ORPHAN_GRACE, _thread_stacks, fuse_mode_id, native_thread_state,
-    release_orphaned_loop, run_fuse, unmount_fuse,
+    release_orphaned_loop, run_fuse, stop_fuse, unmount_fuse,
 )
 
 IMAGE_DIR = Path(__file__).resolve().parent / "remote"
@@ -211,12 +215,13 @@ class RemoteCluster:
     """The running members and the client-side files the tests connect with."""
 
     def __init__(self, run_id: str, members: List[Member], key_path: Path, ssh_log: Path,
-                 limited: Member):
+                 limited: Member, low_session_members: dict[int, Member]):
         self.run_id = run_id
         # The members a mount uses; limited is a separate container whose
         # sshd allows only three session channels per connection.
         self.members = members
         self.limited = limited
+        self.low_session_members = low_session_members
         self.key_path = key_path
         self.ssh_log = ssh_log
 
@@ -257,7 +262,7 @@ class RemoteCluster:
         A stopped watcher's remote inotifywait outlives it (#106); without
         this, the next test's check that one is running would pass early.
         """
-        for member in [*self.members, self.limited]:
+        for member in [*self.members, self.limited, *self.low_session_members.values()]:
             self.exec(member, "pkill -u storage -x inotifywait", check=False)
             if not _wait_for(lambda member=member: self.exec(
                     member, "pgrep -u storage -x inotifywait", check=False).returncode != 0,
@@ -358,15 +363,20 @@ def cluster(tmp_path_factory):
         # instead of ten, so the SSH channel pool meets refusals.
         limited = start_member("limited", ("-o", "MaxSessions=3"))
 
+        low_session_members = {
+            limit: start_member(f"sessions-{limit}", ("-o", f"MaxSessions={limit}"))
+            for limit in (1, 2)
+        }
+
         known_hosts = work / "known_hosts"
         known_hosts.write_text("".join(
             f"{m.host if m.port == 22 else f'[{m.host}]:{m.port}'} {m.host_pubkey}\n"
-            for m in [*members, limited]
+            for m in [*members, limited, *low_session_members.values()]
         ))
         shim_dir, ssh_log = _install_ssh_shim(work, known_hosts)
         os.environ["PATH"] = f"{shim_dir}{os.pathsep}{old_path}"
 
-        yield RemoteCluster(run_id, members, key_path, ssh_log, limited)
+        yield RemoteCluster(run_id, members, key_path, ssh_log, limited, low_session_members)
     finally:
         os.environ["PATH"] = old_path
         removals = [("rm", "-f", "-v", c) for c in created_containers]
@@ -935,6 +945,7 @@ class Mounted:
     mount: Path
     cache: Path
     backends: dict
+    thread: threading.Thread
     fuse_threads: bool = False
     # Set by a test that unmounts itself, so teardown does not report the
     # mount as lost.
@@ -956,7 +967,7 @@ def mounted_factory(remote, tmp_path, request):
 
     created: List[tuple] = []
 
-    def make(backend_kwargs=None, backend_class=SSHBackend, **fs_kwargs) -> Mounted:
+    def make(backend_kwargs=None, backend_class=SSHBackend, *, backends=None, **fs_kwargs) -> Mounted:
         """backend_kwargs: backend_class arguments per member name, in place
         of one member per container."""
         assert not created, "one mount per test"
@@ -964,9 +975,10 @@ def mounted_factory(remote, tmp_path, request):
         cache = tmp_path / "cache"
         mount.mkdir()
         cache.mkdir()
-        if backend_kwargs is None:
-            backend_kwargs = {m.name: remote.backend_kwargs(m) for m in remote.members}
-        backends = {name: backend_class(**kwargs) for name, kwargs in backend_kwargs.items()}
+        if backends is None:
+            if backend_kwargs is None:
+                backend_kwargs = {m.name: remote.backend_kwargs(m) for m in remote.members}
+            backends = {name: backend_class(**kwargs) for name, kwargs in backend_kwargs.items()}
         fs_kwargs.setdefault("num_sync_workers", 2)
         fs = StorageFS(cache_root=cache, state_db=tmp_path / "state.db",
                        backends=backends, cache_size=256 * 1024 * 1024, **fs_kwargs)
@@ -990,7 +1002,7 @@ def mounted_factory(remote, tmp_path, request):
 
         thread = threading.Thread(target=run, daemon=True)
         thread.start()
-        handle = Mounted(fs, mount, cache, backends, fuse_threads)
+        handle = Mounted(fs, mount, cache, backends, thread, fuse_threads)
         came_up = _wait_for(lambda: os.path.ismount(mount) or bool(errors),
                             timeout=MOUNT_TIMEOUT, interval=0.1) and os.path.ismount(mount)
         created.append((handle, thread, errors, came_up, destroy_called))
@@ -1618,6 +1630,101 @@ def _accepted_logins(remote, member) -> int:
 UPLOADS = 5
 
 
+@pytest.mark.parametrize(
+    "max_sessions,watchers", [(1, True), (2, True), (3, True), (10, True), (3, False)],
+)
+def test_mounted_openssh_member_traffic_shares_one_login(
+        remote, mounted_factory, tmp_path, monkeypatch, max_sessions, watchers):
+    if max_sessions == 10:
+        member = remote.members[0]
+    elif max_sessions == 3:
+        member = remote.limited
+    else:
+        member = remote.low_session_members[max_sessions]
+
+    alias = "storage-mixed-" + secrets.token_hex(5)
+    ssh_config = remote.ssh_log.parent / "ssh_config"
+    with ssh_config.open("a") as config:
+        config.write(f"\nHost {alias}\n    HostName {member.host}\n    Port {member.port}\n")
+    profile = tmp_path / "storage.toml"
+    profile.write_text(
+        '[mounts.mixed]\n'
+        f'mountpoint = "{tmp_path / "mount"}"\n'
+        f'cache = "{tmp_path / "cache"}"\n'
+        'ssh_transport = "openssh"\n'
+        f'key_file = "{remote.key_path}"\n'
+        f'backends = ["ssh://{REMOTE_USER}@{alias}:{REMOTE_ROOT}/left", '
+        f'"rsync://{REMOTE_USER}@{alias}:{REMOTE_ROOT}/right"]\n'
+    )
+    resolved = resolve_member_configuration("mixed", profile, (), None, None)
+    backends = create_storage_members(resolved.member_specs, resolved.key_file,
+                                      announce=False, ssh_transport=resolved.ssh_transport)
+    upload_member = backends["remote1"]
+    # Keep transfer duration observable without relying on machine load.
+    monkeypatch.setattr(upload_member, "_compress", False)
+    monkeypatch.setattr(upload_member, "_rsync_args", ("--bwlimit=128",))
+    remote.write_remote(member, "left/foreground", b"foreground bytes")
+    remote.exec(member, f"mkdir {REMOTE_ROOT}/right")
+
+    before_probe = _accepted_logins(remote, member)
+    assert shared_filesystems(backends) == [["remote0", "remote1"]]
+    assert _wait_for(lambda: _established_ssh_connections(remote, member) == 0)
+    logins_before = _accepted_logins(remote, member)
+    assert logins_before - before_probe == 1
+    mnt = mounted_factory(
+        backends=backends,
+        enable_watchers=watchers, start_sync=False, num_sync_workers=0,
+        streaming_reads=True, revalidate_after=60,
+    )
+    assert "foreground" in os.listdir(mnt.mount)
+    if watchers and max_sessions >= 3:
+        _wait_for_remote_inotifywait(remote, member)
+
+    if not watchers:
+        running = threading.Barrier(2, timeout=5)
+        original = upload_member._run_rsync_with_shell
+
+        def require_two_bulk_slots(*args):
+            running.wait()
+            return original(*args)
+
+        monkeypatch.setattr(upload_member, "_run_rsync_with_shell", require_two_bulk_slots)
+
+    source = tmp_path / "upload"
+    data = secrets.token_bytes(512 * 1024)
+    source.write_bytes(data)
+    with ThreadPoolExecutor() as executor:
+        upload = executor.submit(upload_member.copy_from_local, source, "/from-rsync")
+        second_upload = None
+        if not watchers:
+            second_upload = executor.submit(upload_member.copy_from_local, source, "/second-rsync")
+        assert _wait_for(lambda: remote.exec(
+            member, "pgrep -u storage -x rsync", check=False).returncode == 0, timeout=5)
+        foreground = executor.submit((mnt.mount / "foreground").read_bytes)
+        assert foreground.result(timeout=8) == b"foreground bytes"
+        if max_sessions >= 2:
+            assert not upload.done(), "foreground lookup waited for the rsync transfer"
+        upload.result(timeout=15)
+        if second_upload is not None:
+            second_upload.result(timeout=15)
+            assert remote.read_remote(member, "right/second-rsync") == data
+
+    assert remote.read_remote(member, "right/from-rsync") == data
+    if watchers and max_sessions >= 3:
+        assert _wait_for(lambda: "from-rsync" in os.listdir(mnt.mount), timeout=3), (
+            "the watcher did not invalidate a mount listing within its 60-second TTL")
+        assert (mnt.mount / "from-rsync").read_bytes() == data
+    else:
+        assert not _remote_inotifywait_running(remote, member)
+    assert _established_ssh_connections(remote, member) == 1
+    assert _accepted_logins(remote, member) - logins_before == 1
+
+    mnt.unmounted_by_test = True
+    assert stop_fuse(mnt.mount, mnt.thread, fs=mnt.fs) == []
+    assert _wait_for(lambda: _established_ssh_connections(remote, member) == 0)
+    assert _wait_for(lambda: not _remote_inotifywait_running(remote, member))
+
+
 def test_openssh_master_carries_sftp_watcher_and_rsync(remote, tmp_path):
     """Exercise one authenticated connection with three sshd session slots."""
     member = remote.limited
@@ -1932,68 +2039,267 @@ def _established_ssh_connections(remote, member) -> int:
     return count
 
 
-def test_mount_holds_one_connection_per_member(remote, mounted_factory, tmp_path):
-    """Three members on one host: three transports and the watcher's ssh, under
-    parallel listing, reading and writing (the per-thread design held one per
-    thread per member)."""
+@pytest.mark.parametrize("watchers", [False, True], ids=["pull", "push"])
+def test_mount_shares_one_paramiko_transport_across_roots(remote, mounted_factory, watchers):
     member = remote.members[0]
-    names = ("a", "b", "c")
+    labels = ("remote0", "remote1", "remote2")
+    payloads = [secrets.token_bytes(16_384 * (index + 1)) for index in range(len(labels))]
+    for name, data in zip(labels, payloads):
+        remote.write_remote(member, f"{name}/sentinel.bin", data)
+
+    if member.port == 22:
+        specs = tuple(f"ssh://{REMOTE_USER}@{member.host}:{REMOTE_ROOT}/{name}" for name in labels)
+        backends = create_storage_members(specs, str(remote.key_path), announce=False)
+    else:
+        # Mount specs use port 22. The remote fixture's published-port
+        # fallback still exercises the same registry and mount lifetime.
+        registry = SSHTransportRegistry()
+        backends = {
+            name: SSHBackend(**{**remote.backend_kwargs(member), "name": name,
+                               "remote_path": f"{REMOTE_ROOT}/{name}",
+                               "transport_registry": registry})
+            for name in labels
+        }
+    before = _accepted_logins(remote, member)
+    assert shared_filesystems(backends) == [list(labels)]
+    assert _wait_for(lambda: _established_ssh_connections(remote, member) == 0)
+    assert _accepted_logins(remote, member) - before == 1
+
+    mnt = mounted_factory(backends=backends, enable_watchers=watchers)
+    assert _mount_table_type(mnt.mount) == "fuse.sshfs"
+    if watchers:
+        _wait_for_remote_inotifywait(remote, member)
+    assert set(os.listdir(mnt.mount)) >= {f"sentinel.bin.{name}" for name in labels}
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        views = [mnt.mount / f"sentinel.bin.{name}" for name in labels]
+        assert list(executor.map(Path.read_bytes, views)) == payloads
+    assert mnt.fs.sync_manager.wait_for_completion(timeout=10)
+    # One pre-fork login, one lazy serving login, plus the optional
+    # OpenSSH watcher. Both active TCP and cumulative auth counts matter.
+    assert _established_ssh_connections(remote, member) == 1 + watchers
+    assert _accepted_logins(remote, member) - before == 2 + watchers
+
+    assert unmount_fuse(mnt.mount) == []
+    mnt.unmounted_by_test = True
+    assert _wait_for(lambda: _established_ssh_connections(remote, member) == 0)
+
+
+def test_shared_transport_spare_channel_preserves_cross_tab_progress(
+        remote, mounted_factory, monkeypatch):
+    host, peer = remote.members
+    registry = SSHTransportRegistry()
+    names = ("left", "center", "right")
     for name in names:
-        remote.exec(member, f"mkdir -p {REMOTE_ROOT}/{name}")
-        for index in range(4):
-            remote.write_remote(member, f"{name}/seed-{index}.bin", secrets.token_bytes(300_000))
-    base = remote.backend_kwargs(member)
-    kwargs = {f"m{name}": dict(base, name=f"m{name}", remote_path=f"{REMOTE_ROOT}/{name}")
-              for name in names}
-    assert _established_ssh_connections(remote, member) == 0
-    mnt = mounted_factory(backend_kwargs=kwargs, enable_watchers=True)
+        remote.exec(host, f"mkdir -p {REMOTE_ROOT}/{name}/busy {REMOTE_ROOT}/{name}/quick")
+    remote.write_remote(host, "left/quick/only", b"read from the second tab")
+    remote.write_remote(peer, "busy/first", b"the first tab can return a partial listing")
 
-    peak = [0]
-    stop = threading.Event()
+    backends = {
+        name: SSHBackend(**{**remote.backend_kwargs(host), "name": name,
+                           "remote_path": f"{REMOTE_ROOT}/{name}",
+                           "transport_registry": registry})
+        for name in names
+    }
+    backends[peer.name] = SSHBackend(**remote.backend_kwargs(peer), transport_registry=registry)
+    mnt = mounted_factory(backends=backends, progressive_listings=True, start_sync=False)
+    entered = [threading.Event() for _ in names]
+    release = threading.Event()
 
-    def sample():
-        while not stop.is_set():
-            peak[0] = max(peak[0], _established_ssh_connections(remote, member))
-            time.sleep(0.05)
+    def held_listing(backend, entered):
+        actual = backend.listdir_attrs
 
-    def work(index):
-        for round_ in range(5):
-            os.listdir(mnt.mount)
-            for seed in os.listdir(mnt.mount):
-                if seed.startswith("seed-"):
-                    (mnt.mount / seed).read_bytes()
-            (mnt.mount / f"new-{index}-{round_}.bin").write_bytes(secrets.token_bytes(50_000))
+        def listdir(path):
+            if path != "/busy":
+                return actual(path)
 
-    sampler = threading.Thread(target=sample, daemon=True)
-    sampler.start()
-    errors: List[BaseException] = []
+            def hold(sftp):
+                entered.set()
+                assert release.wait(15)
+                return actual(path)
 
-    def guarded(index):
-        try:
-            work(index)
-        except BaseException as exc:
-            errors.append(exc)
+            return backend._with_sftp("held listing", path, hold)
 
-    workers = [threading.Thread(target=guarded, args=(i,)) for i in range(6)]
-    for worker in workers:
-        worker.start()
-    for worker in workers:
-        worker.join(timeout=120)
-    assert not any(worker.is_alive() for worker in workers), "a worker never finished"
-    # Let the sync workers upload what was written.
-    assert _wait_for(lambda: mnt.fs.sync_manager.get_queue_size() == 0, timeout=60.0)
-    time.sleep(1.0)
-    stop.set()
-    sampler.join(timeout=10)
+        return listdir
 
-    assert errors == []
-    for backend in mnt.backends.values():
-        assert backend._pool.connects == 1, backend._pool.snapshot()
-        assert backend.is_available()
-    # Three transports plus the one watcher for the shared host; nothing
-    # else here runs system ssh.
-    assert peak[0] <= 4, peak[0]
-    assert _established_ssh_connections(remote, member) <= 4
+    for name, event in zip(names, entered):
+        backend = backends[name]
+        monkeypatch.setattr(backend, "listdir_attrs", held_listing(backend, event))
+    try:
+        assert "first" in os.listdir(mnt.mount / "busy")
+        assert all(event.wait(5) for event in entered)
+        assert _wait_for(lambda: "only" in os.listdir(mnt.mount / "quick"), timeout=5)
+        assert (mnt.mount / "quick" / "only").read_bytes() == b"read from the second tab"
+    finally:
+        release.set()
+
+
+def test_shared_transport_reserves_capacity_and_isolates_root_failure(remote):
+    member = remote.members[0]
+    registry = SSHTransportRegistry()
+    backends = {
+        name: SSHBackend(**{**remote.backend_kwargs(member), "name": name,
+                           "remote_path": f"{REMOTE_ROOT}/{name}",
+                           "transport_registry": registry})
+        for name in ("left", "right", "missing")
+    }
+    left, right, missing = backends.values()
+    remote.write_remote(member, "left/item", b"one")
+    remote.write_remote(member, "right/item", b"two")
+    before = _accepted_logins(remote, member)
+    release = threading.Event()
+    bulk_ready = threading.Barrier(4)
+
+    def hold(backend):
+        def hold_after_acquire(sftp):
+            bulk_ready.wait(timeout=10)
+            assert release.wait(10)
+            return sftp.stat(f"{backend.remote_path}/item").st_size
+
+        return backend._with_sftp("hold", "/item", hold_after_acquire)
+
+    try:
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            holders = [executor.submit(hold, backend) for backend in (left, right, right)]
+            try:
+                bulk_ready.wait(timeout=10)
+                # The pool has three shared bulk leases. The other root
+                # can still make a real interactive request while they hold.
+                assert left._pool.snapshot()["bulk_leased"] == 3
+                with interactive_request():
+                    with pytest.raises(FileNotFoundError):
+                        missing.stat("/")
+                    assert left.read_file("/item", 0, 3) == b"one"
+                missing.close()
+                assert not missing.is_available()
+                with pytest.raises(ConnectionError):
+                    missing.stat("/")
+                assert _established_ssh_connections(remote, member) == 1
+                assert _accepted_logins(remote, member) - before == 1
+            finally:
+                release.set()
+            assert [future.result(timeout=10) for future in holders] == [3, 3, 3]
+
+        remote.exec(member, "pkill -u storage -x sshd")
+        assert _wait_for(lambda: _established_ssh_connections(remote, member) == 0)
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            reads = [executor.submit(backend.read_file, "/item", 0, 3)
+                     for backend in (left, right)]
+            assert [future.result(timeout=10) for future in reads] == [b"one", b"two"]
+        assert _accepted_logins(remote, member) - before == 2
+        left.close()
+        assert right.read_file("/item", 0, 3) == b"two"
+        assert _established_ssh_connections(remote, member) == 1
+    finally:
+        for backend in backends.values():
+            backend.close()
+    assert _wait_for(lambda: _established_ssh_connections(remote, member) == 0)
+
+
+@pytest.mark.parametrize("shared", [False, True], ids=["standalone", "shared"])
+def test_interactive_operations_during_active_bulk_transfer(remote, capsys, shared):
+    member = remote.members[0]
+    samples = 30
+    chunk_size = 128 * 1024
+    interval = 0.075
+    expected_bytes = samples * chunk_size
+    remote.write_remote(member, "bulk/payload.bin", secrets.token_bytes(expected_bytes))
+    remote.write_remote(member, "interactive/item", b"foreground")
+    registry = SSHTransportRegistry() if shared else None
+
+    def backend(name):
+        return SSHBackend(**{**remote.backend_kwargs(member), "name": name,
+                             "remote_path": f"{REMOTE_ROOT}/{name}",
+                             "transport_registry": registry})
+
+    bulk, foreground = backend("bulk"), backend("interactive")
+    barrier = threading.Barrier(2)
+    started = [threading.Event() for _ in range(samples)]
+    begin_at, finish_at = [0.0] * samples, [0.0] * samples
+
+    def transfer():
+        def read_fixed_chunks(sftp):
+            with sftp.open(str(bulk.remote_path / "payload.bin"), "rb") as source:
+                for index in range(samples):
+                    barrier.wait(10)
+                    begin_at[index] = time.perf_counter()
+                    started[index].set()
+                    assert len(source.read(chunk_size)) == chunk_size
+                    finish_at[index] = time.perf_counter()
+                    barrier.wait(10)
+
+        bulk._with_sftp("bulk sample", "/payload.bin", read_fixed_chunks)
+
+    read_ms, list_ms, read_started_at = [], [], []
+    try:
+        assert bulk.stat("/payload.bin").st_size == expected_bytes
+        assert foreground.stat("/item").st_size == 10
+        socks = {backend._pool._transport.sock for backend in (bulk, foreground)}
+        nodelay = {sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY) for sock in socks}
+        if shared:
+            assert nodelay == {1}
+        assert _established_ssh_connections(remote, member) == (1 if shared else 2)
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(transfer)
+            try:
+                started_at = time.perf_counter()
+                with interactive_request():
+                    for index in range(samples):
+                        time.sleep(max(0.0, started_at + index * interval - time.perf_counter()))
+                        barrier.wait(10)
+                        assert started[index].wait(5)
+                        begin = time.perf_counter()
+                        read_started_at.append(begin)
+                        assert foreground.read_file("/item", 0, 10) == b"foreground"
+                        read_ms.append((time.perf_counter() - begin) * 1000)
+                        begin = time.perf_counter()
+                        assert foreground.listdir("/") == ["item"]
+                        list_ms.append((time.perf_counter() - begin) * 1000)
+                        barrier.wait(10)
+                future.result(timeout=10)
+            finally:
+                barrier.abort()
+        elapsed_ms = (time.perf_counter() - started_at) * 1000
+    finally:
+        bulk.close()
+        foreground.close()
+    assert _wait_for(lambda: _established_ssh_connections(remote, member) == 0)
+
+    # Report matched loopback observations without imposing latency cutoffs.
+    overlap = sum(begin <= read_start <= end for begin, end, read_start in
+                  zip(begin_at, finish_at, read_started_at))
+    assert overlap > 0
+
+    def distribution(values):
+        return f"{statistics.median(values):.2f}/{statistics.quantiles(values, n=20)[18]:.2f}"
+
+    with capsys.disabled():
+        print(f"active-bulk shared={shared} sockets={len(socks)} nodelay={nodelay} "
+              f"bytes={expected_bytes} n={samples} active_overlap={overlap} elapsed_ms={elapsed_ms:.0f} "
+              f"read_ms_median/p95={distribution(read_ms)} list_ms_median/p95={distribution(list_ms)}")
+
+
+def test_shared_transport_separates_distinct_credentials_on_same_server(remote, tmp_path):
+    member = remote.members[0]
+    second_key = tmp_path / "other_ed25519"
+    _ssh_keygen(second_key, "synthetic-second-identity")
+    second_pub = second_key.with_suffix(".pub").read_text()
+    remote.exec(member, "cat >> /home/storage/.ssh/authorized_keys", input=second_pub)
+    registry = SSHTransportRegistry()
+    first = SSHBackend(**remote.backend_kwargs(member), transport_registry=registry)
+    second = SSHBackend(**{**remote.backend_kwargs(member), "name": "second",
+                          "key_filename": str(second_key)}, transport_registry=registry)
+    try:
+        before = _accepted_logins(remote, member)
+        assert first.listdir("/") == second.listdir("/") == []
+        assert _accepted_logins(remote, member) - before == 2
+        assert _established_ssh_connections(remote, member) == 2
+    finally:
+        first.close()
+        second.close()
+        remote.exec(member, "cat /keys/authorized_keys > /home/storage/.ssh/authorized_keys",
+                    user="root")
+    assert _wait_for(lambda: _established_ssh_connections(remote, member) == 0)
 
 
 def test_maxsessions_3_refusals_shrink_the_pool_without_errors(remote, tmp_path):

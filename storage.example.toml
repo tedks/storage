@@ -13,7 +13,10 @@ workers = 2
 # default). With ssh:// members, as here, at most 3.
 # max_sync_workers = 3
 key_file = "/home/user/.ssh/id_ed25519"
-# Host keys are not configurable yet (#107, #30). SFTP (paramiko) trusts any
+# Opt in to sharing one authenticated OpenSSH connection per compatible
+# login across SFTP, commands, rsync, and the watcher.
+# ssh_transport = "openssh"
+# With the default transport, SFTP (Paramiko) trusts any
 # key and remembers none. rsync uploads and the remote watcher (when
 # enabled) use ssh's StrictHostKeyChecking=accept-new and write your
 # known_hosts (normally ~/.ssh/known_hosts); after a member's key changes they fail with "REMOTE

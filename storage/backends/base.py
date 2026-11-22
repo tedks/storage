@@ -101,6 +101,7 @@ class WatcherSpec:
     username: Optional[str]
     key_filename: Optional[str]
     remote_path: str
+    session_pool: Optional[object] = None
 
 
 @dataclass
@@ -142,6 +143,10 @@ class Backend(ABC):
         self.speed_priority = speed_priority
         self.encrypt_all = False
         self._available = True
+
+    def io_capacity_scope(self) -> object:
+        """Identity shared by members drawing on the same channel capacity."""
+        return self.name
 
     def listing_concurrency(self) -> Optional[int]:
         """Configured foreground listing concurrency, or the executor default."""
@@ -199,7 +204,7 @@ class Backend(ABC):
             capabilities=self.capabilities,
             speed_priority=self.speed_priority,
             encrypt_all=self.encrypt_all,
-            available=self._available,
+            available=self.is_available(),
             display_name=self.display_name,
         )
 
@@ -399,6 +404,11 @@ class Backend(ABC):
         method so watcher eligibility and watcher metadata cannot drift apart.
         """
         return self.push_invalidation_spec() is not None
+
+    def requires_pull_revalidation(self) -> bool:
+        """Whether listings need a finite TTL with push invalidation enabled."""
+        spec = self.push_invalidation_spec()
+        return spec is None or spec.session_pool is not None
 
     def supports_reconnect_probe(self) -> bool:
         """Return whether this member should be opportunistically reprobed after failure."""

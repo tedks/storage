@@ -9,6 +9,7 @@ py_library(
         "_openssh_supervisor.py",
         "base.py",
         "local.py",
+        "openssh_pool.py",
         "openssh.py",
         "rsync.py",
         "ssh.py",

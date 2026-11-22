@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from .base import Backend, BackendType
-from .ssh import SSHBackend
+from .ssh import SSHBackend, SSHTransportRegistry
 from .ssh_mux import ControlSockets
 
 # Hidden directory on each side for rsync partial transfers.
@@ -103,11 +103,14 @@ class RsyncBackend(SSHBackend):
     def __init__(self, name: str, host: str, remote_path: str,
                  username: str, password: Optional[str] = None,
                  key_filename: Optional[str] = None,
-                 port: int = 22, speed_priority: int = 50,
+                 port: Optional[int] = 22, speed_priority: int = 50,
                  connect_timeout: float = 10.0,
                  rsync_args: Optional[List[str]] = None,
                  compress: bool = True,
-                 control_sockets: Optional[ControlSockets] = None):
+                 control_sockets: Optional[ControlSockets] = None, *,
+                 bulk_capacity_wait_timeout: Optional[float] = None,
+                 transport_registry: Optional[SSHTransportRegistry] = None,
+                 ssh_transport: str = "paramiko"):
         super().__init__(
             name=name,
             host=host,
@@ -118,6 +121,9 @@ class RsyncBackend(SSHBackend):
             port=port,
             speed_priority=speed_priority,
             connect_timeout=connect_timeout,
+            bulk_capacity_wait_timeout=bulk_capacity_wait_timeout,
+            transport_registry=transport_registry,
+            ssh_transport=ssh_transport,
         )
         self.backend_type = BackendType.RSYNC
         # A later mutation of the caller's list must not change the options
@@ -152,6 +158,8 @@ class RsyncBackend(SSHBackend):
         return " ".join(parts)
 
     def _reset_shared_connection(self) -> None:
+        if self._uses_openssh:
+            return
         if self._control_sockets is not None:
             self._control_sockets.reset(
                 self.username, self.host, self.port, self.key_filename)
@@ -266,10 +274,13 @@ class RsyncBackend(SSHBackend):
 
         Raises RuntimeError on non-zero exit code.
         """
-        cmd = self._rsync_argv(
-            src, dst, extra_args=extra_args or (),
-            ssh_cmd=self._build_rsync_ssh_cmd(),
-        )
+        if self._uses_openssh:
+            with self._pool.rsync_options(root=self._root_availability) as options:
+                return self._run_rsync_with_shell(src, dst, extra_args, shlex.join(["ssh", *options]))
+        return self._run_rsync_with_shell(src, dst, extra_args, self._build_rsync_ssh_cmd())
+
+    def _run_rsync_with_shell(self, src, dst, extra_args, ssh_cmd):
+        cmd = self._rsync_argv(src, dst, extra_args=extra_args or (), ssh_cmd=ssh_cmd)
 
         self.logger.debug("rsync: %s", " ".join(cmd))
 
@@ -319,6 +330,8 @@ class RsyncBackend(SSHBackend):
     # beneficial for writes where delta compression matters.
 
     def sync_upload_capacity(self) -> Optional[int]:
+        if self._uses_openssh:
+            return super().sync_upload_capacity()
         # The transfer runs over the OpenSSH master, not the SFTP pool; only
         # the brief parent mkdir takes a background SFTP lease. The 8-worker
         # remote limit (storage.sync.sync_worker_limit) covers it.
@@ -336,6 +349,9 @@ class RsyncBackend(SSHBackend):
             # If SFTP mkdir fails, rsync might still work if dir exists.
             pass
 
+        # A mkdir failure on Paramiko may be independent of OpenSSH. A
+        # retired or explicitly unavailable root must stop before upload.
+        self._pool.check_root(self._root_availability)
         remote = self._remote_spec(virtual_path)
         try:
             # Storage has already selected this file for upload. Rsync's
