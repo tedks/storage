@@ -36,8 +36,13 @@ log_events:
   who: Ted Smith
   what: blocked by gh-29-tests
   comment: ""
+- time: 2026-11-22T23:11:10-00:00
+  who: Ted Smith
+  what: blocked by gh-29-unified-openssh
+  comment: ""
 blocked_by:
 - gh-29-benchmark
 - gh-29-model
 - gh-29-backpressure
 - gh-29-tests
+- gh-29-unified-openssh
