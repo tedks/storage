@@ -13,7 +13,7 @@ import stat as stat_module
 import logging
 import time
 import threading
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 import paramiko
 from pathlib import Path, PurePosixPath
@@ -29,7 +29,7 @@ from .base import (
 )
 from .ssh_pool import (
     CommandTimeout, MemberConnection, MemberUnavailable, RootAvailability,
-    SFTPLease, is_connection_error, is_transient_oserror,
+    SFTPLease, is_connection_error, is_transient_oserror, run_channel_command,
 )
 
 _T = TypeVar("_T")
@@ -143,17 +143,38 @@ class _SSHConnectionConfig:
     bulk_capacity_wait_timeout: Optional[float]
 
 
+class SSHProbeCleanupError(RuntimeError):
+    """A startup probe could not prove its SSH reader thread stopped."""
+
+
+def _close_probe_client(client: paramiko.SSHClient, timeout: float) -> None:
+    try:
+        transport = client.get_transport()
+        try:
+            client.close()
+        finally:
+            if transport is not None and transport.is_alive():
+                transport.join(timeout)
+                if transport.is_alive():
+                    raise SSHProbeCleanupError("SSH filesystem probe reader did not stop")
+    except SSHProbeCleanupError:
+        raise
+    except Exception as exc:
+        raise SSHProbeCleanupError("Could not stop SSH filesystem probe reader") from exc
+
+
 class _SSHConnector:
     def __init__(self, config: _SSHConnectionConfig):
         self.config = config
         self.logger = logging.getLogger(__name__)
         self._host_resolver_logged = False
 
-    def open(self) -> paramiko.SSHClient:
+    def open(self, *, startup_probe: bool = False) -> paramiko.SSHClient:
         """Connect and authenticate one SSH client; the pool calls this
         once per transport, from one thread at a time."""
         ssh_client = paramiko.SSHClient()
         connected = False
+        sock = None
         try:
             ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
@@ -188,18 +209,7 @@ class _SSHConnector:
                     "Resolved %s through the host's getent after: %s",
                     self.config.host, lookup_error)
                 self._host_resolver_logged = True
-                try:
-                    ssh_client.connect(sock=sock, **connect_kwargs)
-                except BaseException:
-                    # A failure after the handshake leaves paramiko's
-                    # transport thread on the socket; close both, and let
-                    # neither close hide the connect error.
-                    for close in (ssh_client.close, sock.close):
-                        try:
-                            close()
-                        except Exception:
-                            pass
-                    raise
+                ssh_client.connect(sock=sock, **connect_kwargs)
             # paramiko's transport polls its socket with a short timeout to
             # notice close(); request timeouts are set per channel instead.
             connected = True
@@ -220,9 +230,20 @@ class _SSHConnector:
         finally:
             if not connected:
                 try:
-                    ssh_client.close()
+                    if startup_probe:
+                        _close_probe_client(ssh_client, self.config.connect_timeout)
+                    else:
+                        ssh_client.close()
+                except SSHProbeCleanupError:
+                    raise
                 except Exception:
                     pass
+                finally:
+                    if sock is not None:
+                        try:
+                            sock.close()
+                        except Exception:
+                            pass
 
 
 class _SharedTransport:
@@ -349,14 +370,14 @@ class SSHBackend(Backend):
         self._shared_transport = None
         self._root_availability = None
         if transport_registry is None:
-            self._pool = _make_pool(name, self._connection_config, self._open_client)
+            self._pool = _make_pool(name, self._connection_config, self._probe_connector.open)
         else:
             self._shared_transport, self._root_availability = transport_registry.attach(
                 self._connection_config, name)
             self._pool = self._shared_transport.pool
 
     def _open_client(self) -> paramiko.SSHClient:
-        return self._probe_connector.open()
+        return self._probe_connector.open(startup_probe=True)
 
     def io_capacity_scope(self) -> object:
         return self._pool
@@ -861,17 +882,7 @@ class SSHBackend(Backend):
         try:
             yield client
         finally:
-            try:
-                transport = client.get_transport()
-                client.close()
-                if transport is not None:
-                    transport.join(self.connect_timeout)
-                    if transport.is_alive():
-                        self.logger.warning(
-                            "member %s: probe connection's transport thread "
-                            "did not stop in %ss", self.name, self.connect_timeout)
-            except Exception:
-                pass
+            _close_probe_client(client, self.connect_timeout)
 
     def filesystem_identity(self, probe_client=None):
         """The device id of this root (stat -c %d), on this host and port.
@@ -880,25 +891,31 @@ class SSHBackend(Backend):
         roots. The serving pool must stay unopened until FUSE daemonizes.
         """
         self.probe_reached_host = False
+        probe = (self.filesystem_probe_connection() if probe_client is None
+                 else nullcontext(probe_client))
         try:
-            if probe_client is None:
-                with self.filesystem_probe_connection() as client:
-                    return self.filesystem_identity(client)
-            self.probe_reached_host = True
-            cmd = f"stat -L -c %d -- {self._shell_quote(str(self.remote_path))}"
-            _stdin, stdout, _stderr = probe_client.exec_command(cmd, timeout=self.connect_timeout)
-            try:
-                stdout.channel.settimeout(self.connect_timeout)
-                text = stdout.read(64).decode(errors="replace").strip()
-                # recv_exit_status() has no timeout; bound the wait ourselves.
-                if not stdout.channel.status_event.wait(self.connect_timeout):
-                    raise socket.timeout("no exit status from stat")
-                rc = stdout.channel.exit_status
-                if rc != 0 or not text.isdigit():
-                    raise ValueError(f"unusable stat output (exit {rc})")
-                return (self.host, self.port, int(text))
-            finally:
-                stdout.close()
+            with probe as client:
+                self.probe_reached_host = True
+                cmd = f"stat -L -c %d -- {self._shell_quote(str(self.remote_path))}"
+                deadline = time.monotonic() + self.connect_timeout
+
+                def remaining():
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        raise socket.timeout("filesystem probe timed out")
+                    return left
+
+                channel = client.get_transport().open_session(timeout=remaining())
+                try:
+                    rc, output = run_channel_command(channel, cmd, remaining)
+                    text = output.decode(errors="replace").strip()
+                    if rc != 0 or not text.isdigit():
+                        raise ValueError(f"unusable stat output (exit {rc})")
+                    return (self.host, self.port, int(text))
+                finally:
+                    channel.close()
+        except SSHProbeCleanupError:
+            raise
         except Exception as exc:
             self.logger.debug("member %s: filesystem probe failed: %s", self.name, exc)
             return None
