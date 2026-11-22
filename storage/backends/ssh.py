@@ -141,6 +141,7 @@ class _SSHConnectionConfig:
     key_filename: Optional[str]
     connect_timeout: float
     bulk_capacity_wait_timeout: Optional[float]
+    ssh_transport: str = "paramiko"
 
 
 class _SSHConnector:
@@ -228,7 +229,7 @@ class _SSHConnector:
 class _SharedTransport:
     """One pool with a reference for each configured member."""
 
-    def __init__(self, pool: MemberConnection):
+    def __init__(self, pool):
         self.pool = pool
         self._lock = threading.Lock()
         self._roots: set[RootAvailability] = set()
@@ -267,8 +268,13 @@ class SSHTransportRegistry:
                 root = group.attach(name)
                 if root is not None:
                     return group, root
-            group = _SharedTransport(_make_pool(
-                f"{config.host}:{config.port}", config, _SSHConnector(config).open))
+            if config.ssh_transport == "openssh":
+                from .openssh_pool import OpenSSHSessionPool
+                pool = OpenSSHSessionPool(config)
+            else:
+                pool = _make_pool(
+                    f"{config.host}:{config.port}", config, _SSHConnector(config).open)
+            group = _SharedTransport(pool)
             self._transports[config] = group
             return group, group.attach(name)
 
@@ -298,7 +304,8 @@ class SSHBackend(Backend):
                  port: int = 22, speed_priority: int = 50,
                  connect_timeout: float = 10.0,
                  bulk_capacity_wait_timeout: Optional[float] = None, *,
-                 transport_registry: Optional[SSHTransportRegistry] = None):
+                 transport_registry: Optional[SSHTransportRegistry] = None,
+                 ssh_transport: str = "paramiko"):
         """
         Initialize SSH backend
 
@@ -328,6 +335,14 @@ class SSHBackend(Backend):
             ),
         )
 
+        if ssh_transport not in ("paramiko", "openssh"):
+            raise ValueError("ssh_transport must be 'paramiko' or 'openssh'")
+        if ssh_transport == "openssh":
+            if password is not None:
+                raise ValueError("OpenSSH transport does not accept a configured password")
+            if transport_registry is None:
+                transport_registry = SSHTransportRegistry()
+        self._uses_openssh = ssh_transport == "openssh"
         self.host = host
         self.port = port
         self.remote_path = PurePosixPath(remote_path)
@@ -343,7 +358,7 @@ class SSHBackend(Backend):
         self._connection_config = _SSHConnectionConfig(
             host, port, username, password or None,
             os.fspath(key_filename) if key_filename else None,
-            float(connect_timeout), bulk_capacity_wait_timeout,
+            float(connect_timeout), bulk_capacity_wait_timeout, ssh_transport,
         )
         self._probe_connector = _SSHConnector(self._connection_config)
         self._shared_transport = None
@@ -466,12 +481,14 @@ class SSHBackend(Backend):
 
     def push_invalidation_spec(self) -> Optional[WatcherSpec]:
         return WatcherSpec(
-            group_key=(self.host, self.port, self.username, self.key_filename),
+            group_key=((self._pool,) if self._uses_openssh else
+                       (self.host, self.port, self.username, self.key_filename)),
             ssh_host=self.host,
             ssh_port=self.port,
             username=self.username,
             key_filename=self.key_filename,
             remote_path=str(self.remote_path),
+            session_pool=self._pool if self._uses_openssh else None,
         )
 
     # ------------------------------------------------------------------ #
@@ -857,6 +874,16 @@ class SSHBackend(Backend):
     @contextmanager
     def filesystem_probe_connection(self):
         """Open a transient connection and stop its thread before FUSE forks."""
+        if self._uses_openssh:
+            from .openssh import OpenSSHMaster
+
+            master = OpenSSHMaster(self.username, self.host, self.port, self.key_filename,
+                                   connect_timeout=self.connect_timeout)
+            try:
+                yield master.generation()
+            finally:
+                master.close()
+            return
         client = self._open_client()
         try:
             yield client
@@ -886,6 +913,22 @@ class SSHBackend(Backend):
                     return self.filesystem_identity(client)
             self.probe_reached_host = True
             cmd = f"stat -L -c %d -- {self._shell_quote(str(self.remote_path))}"
+            if self._uses_openssh:
+                import tempfile
+
+                with open(os.devnull, "rb") as inp, open(os.devnull, "wb") as err, \
+                        tempfile.TemporaryFile() as out:
+                    session = probe_client.open_command(
+                        cmd, inp.fileno(), out.fileno(), err.fileno(), self.connect_timeout)
+                    try:
+                        rc = session.wait(self.connect_timeout)
+                    finally:
+                        session.close()
+                    out.seek(0)
+                    text = out.read(64).decode(errors="replace").strip()
+                if rc != 0 or not text.isdigit():
+                    raise ValueError(f"unusable stat output (exit {rc})")
+                return (self.host, self.port, int(text))
             _stdin, stdout, _stderr = probe_client.exec_command(cmd, timeout=self.connect_timeout)
             try:
                 stdout.channel.settimeout(self.connect_timeout)

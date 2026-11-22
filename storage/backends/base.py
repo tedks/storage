@@ -101,6 +101,7 @@ class WatcherSpec:
     username: Optional[str]
     key_filename: Optional[str]
     remote_path: str
+    session_pool: Optional[object] = None
 
 
 @dataclass
@@ -403,6 +404,11 @@ class Backend(ABC):
         method so watcher eligibility and watcher metadata cannot drift apart.
         """
         return self.push_invalidation_spec() is not None
+
+    def requires_pull_revalidation(self) -> bool:
+        """Whether listings need a finite TTL with push invalidation enabled."""
+        spec = self.push_invalidation_spec()
+        return spec is None or spec.session_pool is not None
 
     def supports_reconnect_probe(self) -> bool:
         """Return whether this member should be opportunistically reprobed after failure."""

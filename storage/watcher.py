@@ -13,6 +13,7 @@ own watcher instances (no IPC between mounts).
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import logging
 import os
 import shlex
@@ -22,7 +23,9 @@ import time
 from pathlib import PurePosixPath
 from typing import Callable, Dict, List, Optional, Tuple
 
+from .backends.openssh_pool import WatcherUnsupported
 from .backends.ssh_mux import ControlSockets
+from .backends.ssh_pool import BulkCapacityCancelled
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +84,7 @@ class RemoteWatcher:
         remote_paths: Optional[List[str]] = None,
         control_sockets: Optional[ControlSockets] = None,
         on_resync: Optional[Callable[[], None]] = None,
+        session_pool=None,
     ):
         self.backend_name = backend_name
         self.ssh_host = ssh_host
@@ -90,6 +94,7 @@ class RemoteWatcher:
         self.username = username
         self.key_filename = key_filename
         self._control_sockets = control_sockets
+        self._session_pool = session_pool
 
         # Accept either remote_paths (list) or remote_path (single string).
         if not remote_paths and remote_path:
@@ -107,6 +112,7 @@ class RemoteWatcher:
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._process = None
+        self._process_lock = threading.Lock()
 
     # Legacy property for tests that read self.remote_path.
     @property
@@ -135,15 +141,13 @@ class RemoteWatcher:
         target = f"{self.username}@{self.ssh_host}" if self.username else self.ssh_host
         ssh_cmd.append(target)
 
+        ssh_cmd.append(self._inotify_command())
+        return ssh_cmd
+
+    def _inotify_command(self) -> str:
         events = ",".join(sorted(_CHANGE_EVENTS))
         quoted_paths = " ".join(shlex.quote(p) for p in self._remote_paths)
-        inotify_cmd = (
-            f"inotifywait -mr --format '%e %w%f' "
-            f"-e {events} "
-            f"{quoted_paths}"
-        )
-        ssh_cmd.append(inotify_cmd)
-        return ssh_cmd
+        return f"inotifywait -mr --format '%e %w%f' -e {events} -- {quoted_paths}"
 
     def _parse_event_line(self, line: str) -> Optional[str]:
         """
@@ -201,7 +205,10 @@ class RemoteWatcher:
         offset = 0
         tail = b""
         while not done.is_set() and not self._stop_event.is_set():
-            exited = process.poll() is not None  # before the read: it is the last
+            try:
+                exited = process.poll() is not None  # before the last read
+            except ConnectionError:
+                return
             try:
                 chunk = os.pread(fd, 65536, offset)
             except OSError:
@@ -224,134 +231,138 @@ class RemoteWatcher:
     _MAX_BACKOFF = 300.0  # 5 minutes
     _INITIAL_BACKOFF = 5.0
 
-    def _watch_loop(self):
-        """Main loop: run inotifywait over SSH and dispatch change events."""
+    @contextmanager
+    def _watch_process(self, stderr_file):
         import subprocess
 
-        cmd = self._build_ssh_command()
-        logger.info("Starting remote watcher for %s: %s",
-                    self.backend_name, " ".join(cmd))
-
-        backoff = self._INITIAL_BACKOFF
-
-        while not self._stop_event.is_set():
-            stderr_file = None
-            announce_done = threading.Event()
-            announcer = None
+        if self._session_pool is None:
+            cmd = self._build_ssh_command()
+            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=stderr_file,
+                                       text=True, start_new_session=True)
             try:
-                # stderr goes to a file, not a pipe: a shared ssh master
-                # forked from this ssh may keep its descriptors (older
-                # OpenSSH releases keep stderr), and reading a pipe would
-                # wait for it to exit.
-                stderr_file = tempfile.TemporaryFile("w+", errors="replace")
-                self._process = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=stderr_file,
-                    text=True,
-                    start_new_session=True,
-                )
-                if self.on_resync is not None:
-                    # The helper owns a duplicate descriptor, closed when it
-                    # ends, so nothing can close one it is still reading.
-                    announce_fd = os.dup(stderr_file.fileno())
-                    try:
-                        announcer = threading.Thread(
-                            target=self._announce_watches,
-                            args=(announce_fd, self._process, announce_done),
-                            name=f"WatcherReady-{self.backend_name}",
-                            daemon=True,
-                        )
-                        announcer.start()
-                    except Exception:  # RuntimeError: no thread was started
-                        announcer = None
-                        os.close(announce_fd)
+                yield process, process.stdout
+            finally:
+                self._close_process(process)
+                process.stdout.close()
+            return
+
+        read_fd, write_fd = os.pipe()
+        with os.fdopen(read_fd, "r", errors="replace") as out, \
+                os.fdopen(write_fd, "wb") as child, open(os.devnull, "rb") as inp:
+            with self._session_pool.command(
+                self._inotify_command(), inp.fileno(), child.fileno(), stderr_file.fileno(),
+                watcher_stop=self._stop_event.is_set,
+            ) as session:
+                child.close()
+                try:
+                    yield session, out
+                except ConnectionError:
+                    if not self._stop_event.is_set():
                         raise
 
-                for line in self._process.stdout:
-                    if self._stop_event.is_set():
-                        break
-                    vpath = self._parse_event_line(line)
-                    if vpath is not None:
-                        try:
-                            self.on_change(vpath)
-                            parent = self._event_to_dir(vpath)
-                            if parent != vpath:
-                                self.on_change(parent)
-                        except Exception:
-                            logger.exception("Error in on_change callback")
+    def _dispatch_events(self, output):
+        for line in output:
+            if self._stop_event.is_set():
+                break
+            vpath = self._parse_event_line(line)
+            if vpath is not None:
+                try:
+                    self.on_change(vpath)
+                    parent = self._event_to_dir(vpath)
+                    if parent != vpath:
+                        self.on_change(parent)
+                except Exception:
+                    logger.exception("Error in on_change callback")
 
-                self._process.wait()
-                rc = self._process.returncode
-
-                if self._stop_event.is_set():
-                    break
-
-                if rc != 0:
-                    stderr_text = ""
+    def _watch_loop(self):
+        """Run inotifywait over SSH and dispatch change events."""
+        backoff = self._INITIAL_BACKOFF
+        while not self._stop_event.is_set():
+            try:
+                # Older OpenSSH clients can leave stderr held by the master.
+                # A file lets readiness polling and diagnostics read it safely.
+                with tempfile.TemporaryFile("w+", errors="replace") as err, \
+                        self._watch_process(err) as (process, output):
+                    with self._process_lock:
+                        self._process = process
+                        stopped = self._stop_event.is_set()
+                    if stopped:
+                        return
+                    announce_done = threading.Event()
+                    announcer = None
                     try:
-                        stderr_file.seek(0)
-                        stderr_text = "\n".join(
-                            line for line in stderr_file.read().splitlines()
+                        if self.on_resync is not None:
+                            announce_fd = os.dup(err.fileno())
+                            announcer = threading.Thread(
+                                target=self._announce_watches,
+                                args=(announce_fd, process, announce_done),
+                                name=f"WatcherReady-{self.backend_name}",
+                                daemon=True,
+                            )
+                            try:
+                                announcer.start()
+                            except BaseException:
+                                announcer = None
+                                os.close(announce_fd)
+                                raise
+                        self._dispatch_events(output)
+                        if self._stop_event.is_set():
+                            return
+                        if self._session_pool is None:
+                            rc = process.wait()
+                        else:
+                            rc = process.wait(5)
+                    finally:
+                        announce_done.set()
+                        if announcer is not None:
+                            announcer.join(timeout=10)
+                    if rc:
+                        if rc == 255 and self._control_sockets is not None:
+                            self._control_sockets.reset(
+                                self.username, self.ssh_host, self.ssh_port, self.key_filename)
+                        err.seek(0)
+                        detail = "\n".join(
+                            line for line in err.read().splitlines()
                             if line.strip() and not line.startswith(self._INFO_LINES)
                         )
-                    except Exception:
-                        pass
-                    if rc == 255 and self._control_sockets is not None:
-                        # ssh itself failed: a shared master behind it may be
-                        # gone or hung; the next ssh starts a fresh one.
-                        self._control_sockets.reset(
-                            self.username, self.ssh_host, self.ssh_port, self.key_filename)
-                    if stderr_text:
-                        logger.warning(
-                            "inotifywait exited with code %d for %s: %s",
-                            rc, self.backend_name, stderr_text,
-                        )
+                        logger.warning("inotifywait exited with code %d for %s: %s",
+                                       rc, self.backend_name, detail)
                     else:
-                        logger.warning(
-                            "inotifywait exited with code %d for %s",
-                            rc, self.backend_name,
-                        )
-                else:
-                    backoff = self._INITIAL_BACKOFF
-
+                        backoff = self._INITIAL_BACKOFF
+            except (WatcherUnsupported, BulkCapacityCancelled):
+                pass
             except Exception:
                 logger.exception("Watcher error for %s", self.backend_name)
             finally:
-                announce_done.set()
-                if announcer is not None:
-                    announcer.join(timeout=10)
-                if stderr_file is not None:
-                    stderr_file.close()
-
-            if not self._stop_event.is_set():
-                logger.info(
-                    "Restarting watcher for %s in %.0fs",
-                    self.backend_name, backoff,
-                )
-                self._stop_event.wait(backoff)
+                with self._process_lock:
+                    self._process = None
+            if not self._stop_event.wait(backoff):
                 backoff = min(backoff * 2, self._MAX_BACKOFF)
 
-        self._cleanup_process()
-
-    def _cleanup_process(self):
-        proc = self._process
-        if proc is None:
+    def _close_process(self, process):
+        if self._session_pool is not None:
+            process.close()
             return
-        try:
-            os.killpg(proc.pid, 9)
-        except (ProcessLookupError, PermissionError):
-            pass
-        except OSError:
+        if process.poll() is None:
             try:
-                proc.kill()
-            except Exception:
+                os.killpg(process.pid, 9)
+            except (ProcessLookupError, PermissionError):
                 pass
+            except OSError:
+                try:
+                    process.kill()
+                except OSError:
+                    pass
         try:
-            proc.wait(timeout=5)
+            process.wait(timeout=5)
         except Exception:
             pass
-        self._process = None
+
+    def _cleanup_process(self):
+        with self._process_lock:
+            process = self._process
+        if process is not None:
+            self._close_process(process)
 
     # ------------------------------------------------------------------ #
     # Public API

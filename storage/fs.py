@@ -393,7 +393,7 @@ class StorageFS(Operations):
         self._enable_watchers = enable_watchers
         self._watchers = []
         all_watchable = backends and all(
-            b.supports_push_invalidation() for b in backends.values()
+            not b.requires_pull_revalidation() for b in backends.values()
         )
         if enable_watchers and all_watchable:
             self._readdir_snapshot_ttl = float('inf')
@@ -820,6 +820,7 @@ class StorageFS(Operations):
                 "ssh_port": watcher_spec.ssh_port,
                 "username": watcher_spec.username,
                 "key_filename": watcher_spec.key_filename,
+                "session_pool": watcher_spec.session_pool,
             }
 
         for key, backends_on_host in host_groups.items():
@@ -837,7 +838,8 @@ class StorageFS(Operations):
                 on_resync=self._on_watcher_resync,
                 username=meta["username"],
                 key_filename=meta["key_filename"],
-                control_sockets=shared_control_sockets(),
+                control_sockets=(shared_control_sockets() if meta["session_pool"] is None else None),
+                session_pool=meta["session_pool"],
             )
             watcher.start()
             self._watchers.append(watcher)

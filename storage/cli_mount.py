@@ -335,6 +335,7 @@ def mount(
     backends = create_storage_members(
         resolved.member_specs, resolved.key_file,
         display_names=resolved.member_display_names,
+        ssh_transport=resolved.ssh_transport,
         bulk_capacity_wait_timeout=resolved.bulk_capacity_wait_timeout,
     )
     if resolved.max_sync_workers is not None:
@@ -393,7 +394,7 @@ def mount(
         f"{max(fresh_window, resolved.listing_max_stale)}s"
     )
     if resolved.enable_watchers:
-        non_watchable = [n for n, b in backends.items() if not b.supports_push_invalidation()]
+        non_watchable = [n for n, b in backends.items() if b.requires_pull_revalidation()]
         if non_watchable:
             click.echo(
                 f"  Invalidation: push (watch-capable members) + pull, {pull} "

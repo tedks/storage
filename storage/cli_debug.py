@@ -210,6 +210,7 @@ def debug_reprobe_locations(
         announce=not json_output,
         member_names=resolved.member_names,
         display_names=resolved.member_display_names,
+        ssh_transport=resolved.ssh_transport,
     )
 
     state_manager = _with_state_manager(database.resolve())

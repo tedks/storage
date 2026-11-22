@@ -109,7 +109,8 @@ class RsyncBackend(SSHBackend):
                  compress: bool = True,
                  control_sockets: Optional[ControlSockets] = None, *,
                  bulk_capacity_wait_timeout: Optional[float] = None,
-                 transport_registry: Optional[SSHTransportRegistry] = None):
+                 transport_registry: Optional[SSHTransportRegistry] = None,
+                 ssh_transport: str = "paramiko"):
         super().__init__(
             name=name,
             host=host,
@@ -122,6 +123,7 @@ class RsyncBackend(SSHBackend):
             connect_timeout=connect_timeout,
             bulk_capacity_wait_timeout=bulk_capacity_wait_timeout,
             transport_registry=transport_registry,
+            ssh_transport=ssh_transport,
         )
         self.backend_type = BackendType.RSYNC
         # A later mutation of the caller's list must not change the options
@@ -156,6 +158,8 @@ class RsyncBackend(SSHBackend):
         return " ".join(parts)
 
     def _reset_shared_connection(self) -> None:
+        if self._uses_openssh:
+            return
         if self._control_sockets is not None:
             self._control_sockets.reset(
                 self.username, self.host, self.port, self.key_filename)
@@ -270,10 +274,13 @@ class RsyncBackend(SSHBackend):
 
         Raises RuntimeError on non-zero exit code.
         """
-        cmd = self._rsync_argv(
-            src, dst, extra_args=extra_args or (),
-            ssh_cmd=self._build_rsync_ssh_cmd(),
-        )
+        if self._uses_openssh:
+            with self._pool.rsync_options(root=self._root_availability) as options:
+                return self._run_rsync_with_shell(src, dst, extra_args, shlex.join(["ssh", *options]))
+        return self._run_rsync_with_shell(src, dst, extra_args, self._build_rsync_ssh_cmd())
+
+    def _run_rsync_with_shell(self, src, dst, extra_args, ssh_cmd):
+        cmd = self._rsync_argv(src, dst, extra_args=extra_args or (), ssh_cmd=ssh_cmd)
 
         self.logger.debug("rsync: %s", " ".join(cmd))
 
@@ -323,6 +330,8 @@ class RsyncBackend(SSHBackend):
     # beneficial for writes where delta compression matters.
 
     def sync_upload_capacity(self) -> Optional[int]:
+        if self._uses_openssh:
+            return super().sync_upload_capacity()
         # The transfer runs over the OpenSSH master, not the SFTP pool; only
         # the brief parent mkdir takes a background SFTP lease. The 8-worker
         # remote limit (storage.sync.sync_worker_limit) covers it.
