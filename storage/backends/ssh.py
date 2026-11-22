@@ -12,6 +12,9 @@ import subprocess
 import stat as stat_module
 import logging
 import time
+import threading
+from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass
 import paramiko
 from pathlib import Path, PurePosixPath
 from typing import Callable, List, Optional, TypeVar
@@ -25,7 +28,8 @@ from .base import (
     WatcherSpec,
 )
 from .ssh_pool import (
-    CommandTimeout, MemberConnection, SFTPLease, is_connection_error, is_transient_oserror,
+    CommandTimeout, MemberConnection, MemberUnavailable, RootAvailability,
+    SFTPLease, is_connection_error, is_transient_oserror, run_channel_command,
 )
 
 _T = TypeVar("_T")
@@ -36,8 +40,8 @@ _T = TypeVar("_T")
 # the host's nsswitch.conf names) and has no nscd to ask, so getaddrinfo fails
 # for names the host resolves. getent is the host's own NSS front end, so SSH
 # connects fall back to it on a lookup failure. /usr/bin first: a nixpkgs
-# getent earlier on PATH has the same blind spot. A member holds one
-# transport, so this runs once per connect or retry window, not per thread;
+# getent earlier on PATH has the same blind spot. The pool connects once
+# per connection attempt rather than per thread;
 # the result is not cached, because the connect that follows an address
 # change is the one that must resolve afresh.
 _GETENT_CANDIDATES = ("/usr/bin/getent", "/bin/getent")
@@ -121,11 +125,207 @@ def _connect_via_host_resolver(host: str, port: int, timeout: float,
     raise last_error
 
 
+@dataclass(frozen=True, repr=False)
+class _SSHConnectionConfig:
+    """Effective Paramiko connection settings, independent of root.
+
+    The configured host is the host-key lookup name. The host-key policy
+    is fixed, and the presence of a key file controls agent/key discovery.
+    Credentials stay out of the representation and pool diagnostics.
+    """
+
+    host: str
+    port: int
+    username: str
+    password: Optional[str]
+    key_filename: Optional[str]
+    connect_timeout: float
+    bulk_capacity_wait_timeout: Optional[float]
+
+
+class SSHProbeCleanupError(RuntimeError):
+    """A startup probe could not prove its SSH reader thread stopped."""
+
+
+def _close_probe_client(client: paramiko.SSHClient, timeout: float) -> None:
+    try:
+        transport = client.get_transport()
+        try:
+            client.close()
+        finally:
+            if transport is not None and transport.is_alive():
+                transport.join(timeout)
+                if transport.is_alive():
+                    raise SSHProbeCleanupError("SSH filesystem probe reader did not stop")
+    except SSHProbeCleanupError:
+        raise
+    except Exception as exc:
+        raise SSHProbeCleanupError("Could not stop SSH filesystem probe reader") from exc
+
+
+def _interactive_transport(sock: socket.socket, **kwargs) -> paramiko.Transport:
+    """Send small interactive requests promptly when bulk data shares TCP."""
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except OSError:
+        logging.getLogger(__name__).debug("Could not set TCP_NODELAY on SSH socket",
+                                          exc_info=True)
+    return paramiko.Transport(sock, **kwargs)
+
+
+class _SSHConnector:
+    def __init__(self, config: _SSHConnectionConfig, *, interactive_tcp: bool = False):
+        self.config = config
+        self._interactive_tcp = interactive_tcp
+        self.logger = logging.getLogger(__name__)
+        self._host_resolver_logged = False
+
+    def open(self, *, startup_probe: bool = False) -> paramiko.SSHClient:
+        """Connect and authenticate one SSH client; the pool calls this
+        once per transport, from one thread at a time."""
+        ssh_client = paramiko.SSHClient()
+        connected = False
+        sock = None
+        try:
+            ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+            connect_kwargs = {
+                'hostname': self.config.host,
+                'port': self.config.port,
+                'username': self.config.username,
+                'timeout': self.config.connect_timeout,
+                'banner_timeout': self.config.connect_timeout,
+                'auth_timeout': self.config.connect_timeout,
+            }
+
+            if self._interactive_tcp:
+                connect_kwargs['transport_factory'] = _interactive_transport
+
+            if self.config.password:
+                connect_kwargs['password'] = self.config.password
+            if self.config.key_filename:
+                connect_kwargs['key_filename'] = self.config.key_filename
+            else:
+                # Prevent agent/key probing delays when no explicit key provided
+                connect_kwargs['allow_agent'] = False
+                connect_kwargs['look_for_keys'] = False
+
+            try:
+                ssh_client.connect(**connect_kwargs)
+            except socket.gaierror as lookup_error:
+                # paramiko raises this from its getaddrinfo, before it opens
+                # a socket, so the client is still unused. The hostname stays
+                # in connect_kwargs: paramiko names the host key by it.
+                sock = _connect_via_host_resolver(
+                    self.config.host, self.config.port, self.config.connect_timeout, lookup_error)
+                self.logger.log(
+                    logging.DEBUG if self._host_resolver_logged else logging.INFO,
+                    "Resolved %s through the host's getent after: %s",
+                    self.config.host, lookup_error)
+                self._host_resolver_logged = True
+                ssh_client.connect(sock=sock, **connect_kwargs)
+            # paramiko's transport polls its socket with a short timeout to
+            # notice close(); request timeouts are set per channel instead.
+            connected = True
+            return ssh_client
+
+        except paramiko.AuthenticationException as e:
+            self.logger.error("SSH authentication failed for %s@%s:%s: %s",
+                              self.config.username, self.config.host, self.config.port, e)
+            raise
+        except paramiko.SSHException as e:
+            self.logger.error("SSH handshake failed for %s@%s:%s: %s",
+                              self.config.username, self.config.host, self.config.port, e)
+            raise
+        except Exception as e:
+            self.logger.error("Failed to connect to %s@%s:%s: %s",
+                              self.config.username, self.config.host, self.config.port, e)
+            raise
+        finally:
+            if not connected:
+                try:
+                    if startup_probe:
+                        _close_probe_client(ssh_client, self.config.connect_timeout)
+                    else:
+                        ssh_client.close()
+                except SSHProbeCleanupError:
+                    raise
+                except Exception:
+                    pass
+                finally:
+                    if sock is not None:
+                        try:
+                            sock.close()
+                        except Exception:
+                            pass
+
+
+class _SharedTransport:
+    """One pool with a reference for each configured member."""
+
+    def __init__(self, pool: MemberConnection):
+        self.pool = pool
+        self._lock = threading.Lock()
+        self._roots: set[RootAvailability] = set()
+        self._retired = False
+
+    def attach(self, name: str) -> Optional[RootAvailability]:
+        with self._lock:
+            if self._retired:
+                return None
+            root = RootAvailability(name)
+            self._roots.add(root)
+            return root
+
+    def detach(self, root: RootAvailability) -> None:
+        with self._lock:
+            if root not in self._roots:
+                return
+            self.pool.close_root(root)
+            self._roots.remove(root)
+            if not self._roots:
+                self._retired = True
+                self.pool.close()
+
+
+class SSHTransportRegistry:
+    """Registers pool owners during construction of one mount's members."""
+
+    def __init__(self):
+        self._transports: dict[_SSHConnectionConfig, _SharedTransport] = {}
+        self._lock = threading.Lock()
+
+    def attach(self, config: _SSHConnectionConfig, name: str):
+        with self._lock:
+            group = self._transports.get(config)
+            if group is not None:
+                root = group.attach(name)
+                if root is not None:
+                    return group, root
+            connector = _SSHConnector(config, interactive_tcp=True)
+            group = _SharedTransport(_make_pool(
+                f"{config.host}:{config.port}", config, connector.open))
+            self._transports[config] = group
+            return group, group.attach(name)
+
+
+def _make_pool(name, config: _SSHConnectionConfig, connect) -> MemberConnection:
+    return MemberConnection(
+        name,
+        connect,
+        connect_timeout=config.connect_timeout,
+        retry_interval=max(1.0, min(5.0, config.connect_timeout / 2.0)),
+        # Background work waits as long as a transfer may hold a channel.
+        bulk_wait=max(60.0, config.connect_timeout * 6.0),
+        bulk_capacity_wait_timeout=config.bulk_capacity_wait_timeout,
+    )
+
+
 class SSHBackend(Backend):
     """Backend for SSH/SFTP remote filesystems.
 
-    One SSH transport per member, shared by every thread through a leased
-    pool of SFTP channels (see ssh_pool.MemberConnection).
+    Members of one mount can share a pool across roots. Standalone backends
+    own a private transport.
     """
 
     def __init__(self, name: str, host: str, remote_path: str,
@@ -133,7 +333,8 @@ class SSHBackend(Backend):
                  key_filename: Optional[str] = None,
                  port: int = 22, speed_priority: int = 50,
                  connect_timeout: float = 10.0,
-                 bulk_capacity_wait_timeout: Optional[float] = None):
+                 bulk_capacity_wait_timeout: Optional[float] = None, *,
+                 transport_registry: Optional[SSHTransportRegistry] = None):
         """
         Initialize SSH backend
 
@@ -150,6 +351,7 @@ class SSHBackend(Backend):
                 handshakes, and for metadata requests
             bulk_capacity_wait_timeout: optional bulk SFTP capacity deadline;
                 None or zero waits for channel capacity to drain
+            transport_registry: the mount's shared Paramiko transports
         """
         super().__init__(
             name,
@@ -166,7 +368,6 @@ class SSHBackend(Backend):
         self.port = port
         self.remote_path = PurePosixPath(remote_path)
         self.username = username
-        self.password = password
         self.key_filename = key_filename
         self.connect_timeout = connect_timeout
         self.probe_reached_host = False
@@ -175,19 +376,33 @@ class SSHBackend(Backend):
         self.sftp_operation_timeout = max(60.0, float(connect_timeout) * 6.0)
         self.logger = logging.getLogger(__name__)
         self._reconnect_probe_interval = max(1.0, min(5.0, float(connect_timeout) / 2.0))
-        # Log the first getent fallback at info, later ones at debug.
-        self._host_resolver_logged = False
-        self._pool = MemberConnection(
-            name,
-            self._open_client,
-            connect_timeout=connect_timeout,
-            retry_interval=self._reconnect_probe_interval,
-            # Background work waits as long as a transfer may hold a channel.
-            bulk_wait=self.sftp_operation_timeout,
-            bulk_capacity_wait_timeout=bulk_capacity_wait_timeout,
-            on_availability=lambda available: Backend.set_available(self, available),
-            logger=self.logger,
+        self._connection_config = _SSHConnectionConfig(
+            host, port, username, password or None,
+            os.fspath(key_filename) if key_filename else None,
+            float(connect_timeout), bulk_capacity_wait_timeout,
         )
+        self._probe_connector = _SSHConnector(self._connection_config)
+        self._shared_transport = None
+        self._root_availability = None
+        if transport_registry is None:
+            self._pool = _make_pool(name, self._connection_config, self._probe_connector.open)
+        else:
+            self._shared_transport, self._root_availability = transport_registry.attach(
+                self._connection_config, name)
+            self._pool = self._shared_transport.pool
+
+    def _open_client(self) -> paramiko.SSHClient:
+        return self._probe_connector.open(startup_probe=True)
+
+    def io_capacity_scope(self) -> object:
+        return self._pool
+
+    def probe_connection_scope(self) -> object:
+        """Opaque identity for the startup probe, where credentials matter."""
+        return self._connection_config
+
+    def shares_transport(self) -> bool:
+        return self._shared_transport is not None
 
     def listing_concurrency(self) -> int:
         # Let independent scans use spare channels, keeping headroom for a
@@ -215,10 +430,12 @@ class SSHBackend(Backend):
     # ------------------------------------------------------------------ #
     def is_available(self) -> bool:
         """Transport connected, or the retry window after a failed connect has passed."""
-        return self._pool.available()
+        return self._pool.available(self._root_availability)
 
     def set_available(self, available: bool):
-        if available:
+        if self._root_availability is not None:
+            self._pool.set_root_available(self._root_availability, available)
+        elif available:
             self._pool.clear_down()
         else:
             self._pool.mark_down()
@@ -231,73 +448,6 @@ class SSHBackend(Backend):
     # ------------------------------------------------------------------ #
     # Connection
     # ------------------------------------------------------------------ #
-    def _open_client(self) -> paramiko.SSHClient:
-        """Connect and authenticate one SSH client; the pool calls this
-        once per transport, from one thread at a time."""
-        ssh_client = paramiko.SSHClient()
-        try:
-            ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-
-            connect_kwargs = {
-                'hostname': self.host,
-                'port': self.port,
-                'username': self.username,
-                'timeout': self.connect_timeout,
-                'banner_timeout': self.connect_timeout,
-                'auth_timeout': self.connect_timeout,
-            }
-
-            if self.password:
-                connect_kwargs['password'] = self.password
-            if self.key_filename:
-                connect_kwargs['key_filename'] = self.key_filename
-            else:
-                # Prevent agent/key probing delays when no explicit key provided
-                connect_kwargs['allow_agent'] = False
-                connect_kwargs['look_for_keys'] = False
-
-            try:
-                ssh_client.connect(**connect_kwargs)
-            except socket.gaierror as lookup_error:
-                # paramiko raises this from its getaddrinfo, before it opens
-                # a socket, so the client is still unused. The hostname stays
-                # in connect_kwargs: paramiko names the host key by it.
-                sock = _connect_via_host_resolver(
-                    self.host, self.port, self.connect_timeout, lookup_error)
-                self.logger.log(
-                    logging.DEBUG if self._host_resolver_logged else logging.INFO,
-                    "Resolved %s through the host's getent after: %s",
-                    self.host, lookup_error)
-                self._host_resolver_logged = True
-                try:
-                    ssh_client.connect(sock=sock, **connect_kwargs)
-                except BaseException:
-                    # A failure after the handshake leaves paramiko's
-                    # transport thread on the socket; close both, and let
-                    # neither close hide the connect error.
-                    for close in (ssh_client.close, sock.close):
-                        try:
-                            close()
-                        except Exception:
-                            pass
-                    raise
-            # paramiko's transport polls its socket with a short timeout to
-            # notice close(); request timeouts are set per channel instead.
-            return ssh_client
-
-        except paramiko.AuthenticationException as e:
-            self.logger.error("SSH authentication failed for %s@%s:%s: %s",
-                              self.username, self.host, self.port, e)
-            raise
-        except paramiko.SSHException as e:
-            self.logger.error("SSH handshake failed for %s@%s:%s: %s",
-                              self.username, self.host, self.port, e)
-            raise
-        except Exception as e:
-            self.logger.error("Failed to connect to %s@%s:%s: %s",
-                              self.username, self.host, self.port, e)
-            raise
-
     def _with_sftp(self, what: str, virtual_path: str,
                    operation: Callable[[paramiko.SFTPClient], _T], *,
                    timeout: Optional[float] = None, retry: bool = False,
@@ -318,12 +468,12 @@ class SSHBackend(Backend):
             timeout = self.connect_timeout
         attempts = 2 if retry else 1
         for attempt in range(1, attempts + 1):
-            lease: SFTPLease = self._pool.acquire_sftp(timeout)
+            lease: SFTPLease = self._pool.acquire_sftp(timeout, root=self._root_availability)
             nested = lease.depth > 1
             try:
                 result = operation(lease.client)
             except BaseException as exc:
-                self._pool.release(lease, exc)
+                self._pool.release(lease, exc, root=self._root_availability)
                 if not isinstance(exc, Exception) or not is_connection_error(exc):
                     raise
                 self.logger.warning("SFTP %s failed on %s attempt=%d/%d: %r",
@@ -336,9 +486,14 @@ class SSHBackend(Backend):
                 ):
                     raise
                 continue
-            self._pool.release(lease)
+            self._pool.release(lease, root=self._root_availability)
             return result
         raise AssertionError("unreachable")
+
+    def _run_command(self, command: str, timeout: float):
+        if self._root_availability is None:
+            return self._pool.run_command(command, timeout)
+        return self._pool.run_command(command, timeout, root=self._root_availability)
 
     def _resolve_path(self, virtual_path: str) -> PurePosixPath:
         """Convert virtual path to remote path"""
@@ -716,10 +871,14 @@ class SSHBackend(Backend):
             raise FileExistsError(errno.EEXIST, "already exists", virtual_path) from exc
 
     def close(self):
-        """Close the member's transport and channels; it does not reconnect."""
-        pool = getattr(self, "_pool", None)
-        if pool is not None:
-            pool.close()
+        """Retire this root and close its transport after the last root."""
+        group = getattr(self, "_shared_transport", None)
+        if group is not None:
+            group.detach(self._root_availability)
+        else:
+            pool = getattr(self, "_pool", None)
+            if pool is not None:
+                pool.close()
 
     def __del__(self):
         """Cleanup on deletion"""
@@ -731,51 +890,50 @@ class SSHBackend(Backend):
     # ------------------------------------------------------------------ #
     # Optional capabilities used by conflict detection
     # ------------------------------------------------------------------ #
-    def filesystem_identity(self):
-        """The device id of the remote root (`stat -c %d`), on this host and port.
-
-        Runs on a connection of its own, closed before returning: this is
-        called before FUSE's daemonizing fork, and a pooled transport opened
-        here would reach the forked child with its reader thread gone. A
-        failure here also leaves the member's pool state untouched.
-        probe_reached_host says whether the connection itself succeeded.
-        """
-        client = None
-        self.probe_reached_host = False
+    @contextmanager
+    def filesystem_probe_connection(self):
+        """Open a transient connection and stop its thread before FUSE forks."""
+        client = self._open_client()
         try:
-            client = self._open_client()
-            self.probe_reached_host = True
-            cmd = f"stat -L -c %d -- {self._shell_quote(str(self.remote_path))}"
-            _stdin, stdout, _stderr = client.exec_command(cmd, timeout=self.connect_timeout)
-            stdout.channel.settimeout(self.connect_timeout)
-            text = stdout.read(64).decode(errors="replace").strip()
-            # recv_exit_status() has no timeout; bound the wait ourselves.
-            if not stdout.channel.status_event.wait(self.connect_timeout):
-                raise socket.timeout("no exit status from stat")
-            rc = stdout.channel.exit_status
-            if rc != 0 or not text.isdigit():
-                raise ValueError(f"unusable stat output (exit {rc})")
-            return (self.host, self.port, int(text))
+            yield client
+        finally:
+            _close_probe_client(client, self.connect_timeout)
+
+    def filesystem_identity(self, probe_client=None):
+        """The device id of this root (stat -c %d), on this host and port.
+
+        A startup caller can pass a transient client shared by compatible
+        roots. The serving pool must stay unopened until FUSE daemonizes.
+        """
+        self.probe_reached_host = False
+        probe = (self.filesystem_probe_connection() if probe_client is None
+                 else nullcontext(probe_client))
+        try:
+            with probe as client:
+                self.probe_reached_host = True
+                cmd = f"stat -L -c %d -- {self._shell_quote(str(self.remote_path))}"
+                deadline = time.monotonic() + self.connect_timeout
+
+                def remaining():
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        raise socket.timeout("filesystem probe timed out")
+                    return left
+
+                channel = client.get_transport().open_session(timeout=remaining())
+                try:
+                    rc, output = run_channel_command(channel, cmd, remaining)
+                    text = output.decode(errors="replace").strip()
+                    if rc != 0 or not text.isdigit():
+                        raise ValueError(f"unusable stat output (exit {rc})")
+                    return (self.host, self.port, int(text))
+                finally:
+                    channel.close()
+        except SSHProbeCleanupError:
+            raise
         except Exception as exc:
             self.logger.debug("member %s: filesystem probe failed: %s", self.name, exc)
             return None
-        finally:
-            if client is not None:
-                try:
-                    transport = client.get_transport()
-                    client.close()
-                    # close() does not wait for the transport thread; a thread
-                    # still running at FUSE's fork could leave a lock held in
-                    # the child.
-                    if transport is not None:
-                        transport.join(self.connect_timeout)
-                        if transport.is_alive():
-                            # Nothing safe to do about it here; say so.
-                            self.logger.warning(
-                                "member %s: probe connection's transport thread "
-                                "did not stop in %ss", self.name, self.connect_timeout)
-                except Exception:
-                    pass
 
     def _shell_quote(self, value: str) -> str:
         return shlex.quote(value)
@@ -803,7 +961,7 @@ class SSHBackend(Backend):
         remote_error = None
         try:
             cmd = f"xxh128sum {self._shell_quote(remote_path)} 2>/dev/null"
-            rc, stdout = self._pool.run_command(cmd, self.sftp_operation_timeout)
+            rc, stdout = self._run_command(cmd, self.sftp_operation_timeout)
             output = stdout.decode(errors="replace").strip()
             if rc == 0 and output:
                 token = output.split()[0]
@@ -855,7 +1013,7 @@ class SSHBackend(Backend):
                 f"setfattr -n {self._shell_quote(name)} "
                 f"-v {self._shell_quote(value_str)} {self._shell_quote(remote_path)} 2>/dev/null"
             )
-            self._pool.run_command(cmd, self.connect_timeout)
+            self._run_command(cmd, self.connect_timeout)
         except Exception:
             # Remote might not support xattrs; ignore
             pass
@@ -867,7 +1025,7 @@ class SSHBackend(Backend):
                 f"getfattr --absolute-names --only-values "
                 f"-n {self._shell_quote(name)} {self._shell_quote(remote_path)} 2>/dev/null"
             )
-            rc, data = self._pool.run_command(cmd, self.connect_timeout)
+            rc, data = self._run_command(cmd, self.connect_timeout)
             return data if rc == 0 and data else None
         except Exception:
             return None

@@ -197,13 +197,13 @@ class _DownloadPool:
         self.closing = False
 
     def _eligible(self):
-        running_by_member = Counter(session.backend.name for session in self.running)
+        running_by_scope = Counter(session.backend.io_capacity_scope() for session in self.running)
         for session in self.ready:
-            member = session.backend.name
+            scope = session.backend.io_capacity_scope()
             capacity = session.backend.background_range_capacity()
-            if capacity is None or running_by_member[member] < capacity:
+            if capacity is None or running_by_scope[scope] < capacity:
                 yield session
-                running_by_member[member] += 1
+                running_by_scope[scope] += 1
 
     def _grow(self):
         demand = len(self.running) + sum(1 for _ in self._eligible())
@@ -267,12 +267,12 @@ class _DownloadPool:
         if self.limit is not None and len(self.running) >= self.limit:
             return None
         active = closed = None
-        # Member headroom is based on in-flight work. Each priority gets
+        # Transport headroom is based on in-flight work. Each priority gets
         # its first choice of that headroom before either is selected.
-        running_by_member = Counter(session.backend.name for session in self.running)
+        running_by_scope = Counter(session.backend.io_capacity_scope() for session in self.running)
         for session, has_reader in self.ready.items():
             capacity = session.backend.background_range_capacity()
-            if capacity is not None and running_by_member[session.backend.name] >= capacity:
+            if capacity is not None and running_by_scope[session.backend.io_capacity_scope()] >= capacity:
                 continue
             if has_reader and active is None:
                 active = session

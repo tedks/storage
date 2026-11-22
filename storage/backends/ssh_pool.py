@@ -1,26 +1,23 @@
 """
-One SSH transport per storage member, with a leased pool of channels on it.
+One authenticated SSH transport with a leased pool of channels on it.
 
-A member holds one paramiko Transport for the life of the mount, the way a
-native sftp mount holds one connection per host. paramiko's SFTPClient is
-not safe for concurrent requests (its packet reader takes no lock), so each
+Compatible roots of one mount share one Paramiko transport and its budget.
+Paramiko's SFTPClient is not safe for concurrent requests (its packet reader takes no lock), so each
 SFTP channel is leased to one operation at a time. sshd allows about ten
 session channels per connection (MaxSessions), counting SFTP and exec
 alike, so the pool is small: by default four SFTP channels, one of them kept
 for interactive requests (the FUSE thread and directory listings), and at
 most two exec channels open at once.
 
-Connects are single-flight. While the member is believed up, callers wait
-for the one connect in progress; once a connect has failed the member is
-down, and callers fail fast until the retry window passes, when one caller
-probes and the rest keep failing fast. A server refusing a channel shrinks
+Connects are single-flight. Callers wait for the initial connect in progress.
+After a connect fails, callers fail fast until the retry window passes, when
+one caller probes and the rest keep failing fast. A server refusing a channel shrinks
 the pool and never marks the member down. A broken transport (EOF, an
 inactive transport, a connection-level OSError) is closed, which wakes every
 operation still running on it; the next lease reconnects. A timed-out
 request is ambiguous, so the transport is probed with a channel open before
 deciding; a transport that answers probes while its SFTP requests keep
-timing out (a hung remote filesystem) is marked down after a few such
-stalls in a row.
+timing out backs off the affected root after a few stalls in a row.
 
 Leases do not depend on which thread holds them beyond one call: libfuse's
 worker threads give Python a fresh thread state per callback
@@ -347,7 +344,7 @@ class SFTPLease:
     """One SFTP channel, held by one operation (and its nested calls)."""
 
     __slots__ = ("client", "generation", "interactive", "owner", "depth",
-                 "verdict", "error", "stalled_since", "acquired_at", "_timeouts")
+                 "verdict", "error", "error_root", "stalled_since", "acquired_at", "_timeouts")
 
     def __init__(self, client, generation: int, interactive: bool, owner: int):
         self.client = client
@@ -359,6 +356,7 @@ class SFTPLease:
         # The first connection error a call on this lease raised, kept so the
         # outermost release acts on it even if an outer caller swallowed it.
         self.error: Optional[BaseException] = None
+        self.error_root: Optional[RootAvailability] = None
         # When the request that timed out was sent, if error is a timeout.
         self.stalled_since: Optional[float] = None
         self.acquired_at = time.monotonic()
@@ -398,8 +396,61 @@ class SFTPLease:
 MAX_COMMAND_OUTPUT = 1024 * 1024
 
 
+class RootAvailability:
+    """Root-local state, guarded by the owning pool's condition."""
+
+    def __init__(self, name: str):
+        self.name = name
+        self.closed = False
+        self.manual_retry_at = 0.0
+        self.retry_at = 0.0
+        self.generation = -1
+        self.stalls = 0
+        self.last_stall_at = float("-inf")
+
+
+def run_channel_command(chan, command: str, remaining) -> Tuple[Optional[int], bytes]:
+    """Run a bounded command on an open exec channel and collect stdout."""
+    run_bounded(chan, remaining(), lambda: chan.exec_command(command))
+    transport = chan.get_transport()
+    chunks = []
+    size = 0
+    try:
+        while True:
+            chan.settimeout(remaining())
+            data = chan.recv(32768)
+            if not data:
+                break
+            size += len(data)
+            if size > MAX_COMMAND_OUTPUT:
+                raise RuntimeError(
+                    f"command output exceeds {MAX_COMMAND_OUTPUT} bytes")
+            chunks.append(data)
+        status = chan.exit_status if chan.status_event.wait(remaining()) else None
+    except socket.timeout as exc:
+        # The command was started; a timeout from here on is the
+        # command's unless the transport is gone (a connect or channel
+        # open that timed out never gets this far; run_command rechecks
+        # after the pool's probe, for a transport that only looked alive).
+        if transport is not None and transport.is_active():
+            raise CommandTimeout(str(exc)) from exc
+        raise
+    if (transport is not None and not transport.is_active()) or (
+        status == -1 and not getattr(chan, "eof_received", True)
+    ):
+        # paramiko closes the channels of a transport that died: recv
+        # returns b"" and the status event fires with no exit status.
+        # It does so before it marks the transport inactive, so a reader
+        # woken in between sees it active; a server that closed the
+        # channel itself sent EOF first. Not an answer from the member.
+        # (A transport that dies just after a command finished turns
+        # its answer into this error too: a retry, the safe direction.)
+        raise EOFError("the transport closed during the command")
+    return status, b"".join(chunks)
+
+
 class MemberConnection:
-    """The transport and channel pool of one storage member."""
+    """The transport and channel pool of an SSH connection identity."""
 
     def __init__(
         self,
@@ -454,7 +505,7 @@ class MemberConnection:
         )
         self._interactive_reserve = max(0, interactive_reserve)
         self._interactive_sftp_waiters = 0
-        self._bulk_sftp_waiters = 0
+        self._bulk_sftp_waiters: dict[int, None] = {}
         self._interactive_sftp_turns = 0
         self._stall_limit = max(1, stall_limit)
         self._on_availability = on_availability
@@ -482,6 +533,7 @@ class MemberConnection:
         # was sent after that, so a burst of concurrent timeouts is one).
         self._stalls = 0
         self._last_stall_at = float("-inf")
+        self._probe_generation: Optional[int] = None
         # The transport generation the lost-reserve warning was last logged
         # for, so it is said once per transport, not per refused channel.
         self._reserve_warned_generation = -1
@@ -510,16 +562,45 @@ class MemberConnection:
     # ------------------------------------------------------------------ #
     # Availability
     # ------------------------------------------------------------------ #
-    def available(self) -> bool:
+    def available(self, root: Optional[RootAvailability] = None) -> bool:
         """Transport connected, or the retry window has passed."""
         with self._cond:
-            if self._closed:
+            if self._closed or not self._root_available_locked(root):
                 return False
             if self._state is _State.DOWN:
                 return time.monotonic() >= self._next_retry_at
             if self._state is _State.CONNECTING:
                 return not self._probing
             return True
+
+    def _root_available_locked(self, root: Optional[RootAvailability]) -> bool:
+        return root is None or (
+            not root.closed and time.monotonic() >= root.manual_retry_at
+            and (root.generation != self._generation or time.monotonic() >= root.retry_at)
+        )
+
+    def _check_root_locked(self, root: Optional[RootAvailability]) -> None:
+        if not self._root_available_locked(root):
+            raise MemberUnavailable(f"SSH member {root.name} is unavailable")
+
+    def check_root(self, root: Optional[RootAvailability]) -> None:
+        with self._cond:
+            self._check_root_locked(root)
+
+    def set_root_available(self, root: RootAvailability, available: bool) -> None:
+        with self._cond:
+            if available:
+                root.manual_retry_at = 0.0
+                root.retry_at = 0.0
+                root.stalls = 0
+            else:
+                root.manual_retry_at = time.monotonic() + self.retry_interval
+            self._cond.notify_all()
+
+    def close_root(self, root: RootAvailability) -> None:
+        with self._cond:
+            root.closed = True
+            self._cond.notify_all()
 
     def is_current(self, generation: int) -> bool:
         """Whether generation is still the installed transport."""
@@ -600,7 +681,7 @@ class MemberConnection:
     # ------------------------------------------------------------------ #
     # Transport
     # ------------------------------------------------------------------ #
-    def _transport_locked(self, deadline: float):
+    def _transport_locked(self, deadline: float, root: Optional[RootAvailability] = None):
         """Return (transport, generation), connecting if needed.
 
         Holds self._cond on entry and on return; releases it while
@@ -610,6 +691,7 @@ class MemberConnection:
         deadline; raises the connect's own error to the caller that ran it.
         """
         while True:
+            self._check_root_locked(root)
             if self._closed:
                 raise MemberUnavailable(f"SSH member {self.name} is closed")
             state = self._state
@@ -699,7 +781,8 @@ class MemberConnection:
         self._close_all(closables)
 
     def _probe(self, generation: int, exc: BaseException,
-               stalled_since: Optional[float] = None) -> None:
+               stalled_since: Optional[float] = None,
+               root: Optional[RootAvailability] = None) -> None:
         """Decide whether a timeout or channel error means the transport is dead.
 
         stalled_since, for an SFTP request that timed out, is when that
@@ -710,14 +793,31 @@ class MemberConnection:
             if generation != self._generation or self._state is not _State.CONNECTED:
                 return
             transport = self._transport
-        try:
-            chan = transport.open_session(timeout=self.connect_timeout)
-        except paramiko.ChannelException:
-            chan = None  # refused, but the server answered
-        except Exception as probe_exc:
-            self._fail_transport(generation, probe_exc)
-            return
-        _close_quietly(chan)
+            already_probing = self._probe_generation == generation
+            if already_probing:
+                finished = self._cond.wait_for(
+                    lambda: generation != self._generation or self._probe_generation != generation,
+                    timeout=self.connect_timeout,
+                )
+                if not finished or generation != self._generation:
+                    return
+            else:
+                self._probe_generation = generation
+        if not already_probing:
+            try:
+                chan = transport.open_session(timeout=self.connect_timeout)
+            except paramiko.ChannelException:
+                pass  # refused, but the server answered
+            except Exception as probe_exc:
+                self._fail_transport(generation, probe_exc)
+                return
+            else:
+                _close_quietly(chan)
+            finally:
+                with self._cond:
+                    if self._probe_generation == generation:
+                        self._probe_generation = None
+                        self._cond.notify_all()
         if stalled_since is None:
             return
         closables = None
@@ -725,6 +825,21 @@ class MemberConnection:
             # The transport may have been replaced while the probe ran; a
             # stall on the old one says nothing about the new one.
             if generation != self._generation or self._state is not _State.CONNECTED:
+                return
+            if root is not None:
+                if root.generation != generation:
+                    root.generation = generation
+                    root.stalls = 0
+                    root.last_stall_at = float("-inf")
+                if not root.closed and stalled_since > root.last_stall_at:
+                    root.stalls += 1
+                    root.last_stall_at = time.monotonic()
+                    if root.stalls >= self._stall_limit:
+                        root.retry_at = root.last_stall_at + self.retry_interval
+                        self._cond.notify_all()
+                        self.logger.warning(
+                            "SSH member %s: requests timed out on a live connection; "
+                            "backing off this root", root.name)
                 return
             if stalled_since <= self._last_stall_at:
                 return  # part of a burst already counted
@@ -758,11 +873,12 @@ class MemberConnection:
         self._probe(generation, reason)
 
     def _after_error(self, generation: int, verdict: _Verdict, exc: BaseException,
-                     stalled_since: Optional[float] = None) -> None:
+                     stalled_since: Optional[float] = None,
+                     root: Optional[RootAvailability] = None) -> None:
         if verdict is _Verdict.TRANSPORT:
             self._fail_transport(generation, exc)
         elif verdict is _Verdict.PROBE:
-            self._probe(generation, exc, stalled_since)
+            self._probe(generation, exc, stalled_since, root)
 
     def _shrink_locked(self, generation: int, kind: str, pending: int = 0) -> None:
         """A channel was refused: cap the pool at what the server allowed.
@@ -833,7 +949,8 @@ class MemberConnection:
         factory = self._sftp_client_factory or paramiko.SFTPClient
         return factory(chan)
 
-    def acquire_sftp(self, timeout: float) -> SFTPLease:
+    def acquire_sftp(self, timeout: float, *,
+                     root: Optional[RootAvailability] = None) -> SFTPLease:
         """Lease an SFTP channel for one operation; release it with release().
 
         timeout is the channel timeout for the operation. A thread that
@@ -841,6 +958,7 @@ class MemberConnection:
         """
         owner = threading.get_ident()
         with self._cond:
+            self._check_root_locked(root)
             held = self._held.get(owner)
             if held is not None:
                 if held.generation != self._generation:
@@ -853,10 +971,12 @@ class MemberConnection:
                 held._set_timeout(timeout)
                 return held
         interactive = is_interactive_request()
-        with self._sftp_waiter(interactive):
-            lease = self._acquire_new_sftp(interactive, owner)
+        with self._sftp_waiter(interactive, owner):
+            lease = self._acquire_new_sftp(interactive, owner, root)
         lease.depth = 1
         try:
+            with self._cond:
+                self._check_root_locked(root)
             lease._set_timeout(timeout)
         except BaseException as exc:
             self.release(lease, exc)
@@ -864,12 +984,12 @@ class MemberConnection:
         return lease
 
     @contextmanager
-    def _sftp_waiter(self, interactive: bool):
+    def _sftp_waiter(self, interactive: bool, owner: int):
         with self._cond:
             if interactive:
                 self._interactive_sftp_waiters += 1
             else:
-                self._bulk_sftp_waiters += 1
+                self._bulk_sftp_waiters[owner] = None
         try:
             yield
         finally:
@@ -877,14 +997,19 @@ class MemberConnection:
                 if interactive:
                     self._interactive_sftp_waiters -= 1
                 else:
-                    self._bulk_sftp_waiters -= 1
+                    self._bulk_sftp_waiters.pop(owner, None)
                 self._cond.notify_all()
+
+    def _finish_bulk_turn_locked(self, interactive: bool, owner: int) -> None:
+        if not interactive:
+            del self._bulk_sftp_waiters[owner]
+            self._cond.notify_all()
 
     def _sftp_turn_allowed_locked(self, interactive: bool) -> bool:
         if not self._reserve_lost(self._sftp_cap):
             return True
         if interactive:
-            return (self._bulk_sftp_waiters == 0
+            return (not self._bulk_sftp_waiters
                     or self._interactive_sftp_turns < _SFTP_INTERACTIVE_BURST)
         return (self._interactive_sftp_waiters == 0
                 or self._interactive_sftp_turns >= _SFTP_INTERACTIVE_BURST)
@@ -895,7 +1020,8 @@ class MemberConnection:
         else:
             self._interactive_sftp_turns = 0
 
-    def _acquire_new_sftp(self, interactive: bool, owner: int) -> SFTPLease:
+    def _acquire_new_sftp(self, interactive: bool, owner: int,
+                          root: Optional[RootAvailability]) -> SFTPLease:
         deadline = self._deadline(interactive)
         capacity_deadline = None
         cancel_probe = current_capacity_cancel_probe() if not interactive else None
@@ -905,8 +1031,12 @@ class MemberConnection:
         refusals_left = 2
         while True:
             with self._cond:
+                if not interactive:
+                    # A slot reservation counts as admission. If opening
+                    # that channel fails, retry from the back of the queue.
+                    self._bulk_sftp_waiters.setdefault(owner, None)
                 generation_before = self._generation
-                transport, generation = self._transport_locked(deadline)
+                transport, generation = self._transport_locked(deadline, root)
                 if generation != generation_before:
                     connects_left -= 1
                     if connects_left < 0:
@@ -917,10 +1047,16 @@ class MemberConnection:
                     if reason:
                         raise BulkCapacityCancelled(
                             f"SSH member {self.name}: {reason} ended during bulk capacity wait")
-                lease = self._take_idle_locked(interactive, owner)
-                if lease is not None:
-                    return lease
-                if not self._can_open_locked(interactive):
+                if capacity_deadline is not None and time.monotonic() >= capacity_deadline:
+                    raise BulkCapacityTimeout(
+                        f"SSH member {self.name}: no bulk SFTP capacity came free")
+                turn = interactive or owner == next(iter(self._bulk_sftp_waiters))
+                if turn:
+                    lease = self._take_idle_locked(interactive, owner)
+                    if lease is not None:
+                        self._finish_bulk_turn_locked(interactive, owner)
+                        return lease
+                if not turn or not self._can_open_locked(interactive):
                     if not interactive:
                         if self.bulk_capacity_wait_timeout is None:
                             # Poll only inside an actual FUSE callback: libfuse
@@ -931,10 +1067,7 @@ class MemberConnection:
                                 capacity_deadline = (
                                     time.monotonic() + self.bulk_capacity_wait_timeout
                                 )
-                            remaining = capacity_deadline - time.monotonic()
-                            if remaining <= 0:
-                                raise BulkCapacityTimeout(
-                                    f"SSH member {self.name}: no bulk SFTP capacity came free")
+                            remaining = max(0.0, capacity_deadline - time.monotonic())
                             self._cond.wait(min(remaining, 0.1) if cancel_probe else remaining)
                         continue
                     remaining = deadline - time.monotonic()
@@ -944,6 +1077,7 @@ class MemberConnection:
                             raise MemberUnavailable(
                                 f"SSH member {self.name}: no SFTP channel came free")
                     continue
+                self._finish_bulk_turn_locked(interactive, owner)
                 self._sftp_open += 1
                 self._record_sftp_turn_locked(interactive)
                 if not interactive:
@@ -1013,6 +1147,7 @@ class MemberConnection:
         lease.owner = owner
         lease.verdict = _Verdict.HEALTHY
         lease.error = None
+        lease.error_root = None
         lease.stalled_since = None
         lease.acquired_at = time.monotonic()
         self._record_sftp_turn_locked(interactive)
@@ -1026,7 +1161,8 @@ class MemberConnection:
             return False
         return interactive or self._bulk_leased < self._bulk_limit()
 
-    def release(self, lease: SFTPLease, exc: Optional[BaseException] = None) -> None:
+    def release(self, lease: SFTPLease, exc: Optional[BaseException] = None, *,
+                root: Optional[RootAvailability] = None) -> None:
         """Return a lease; exc is what the operation raised, if anything."""
         verdict = _verdict(exc)
         closables = []
@@ -1035,6 +1171,7 @@ class MemberConnection:
                 lease.verdict = verdict
             if verdict >= _Verdict.PROBE and lease.error is None:
                 lease.error = exc
+                lease.error_root = root
                 if isinstance(exc, socket.timeout):
                     lease.stalled_since = lease._request_start()
             lease.depth -= 1
@@ -1053,15 +1190,19 @@ class MemberConnection:
                     self._idle.append(lease)
             else:
                 closables.append(lease.client)
-            if exc is None and lease.verdict is _Verdict.HEALTHY:
-                self._stalls = 0
+            if (exc is None and lease.verdict is _Verdict.HEALTHY
+                    and lease.generation == self._generation):
+                if root is None:
+                    self._stalls = 0
+                elif root.generation == self._generation:
+                    root.stalls = 0
             final_verdict = lease.verdict
             final_error = lease.error
             self._cond.notify_all()
         self._close_all(closables)
         if final_verdict >= _Verdict.PROBE and final_error is not None:
             self._after_error(lease.generation, final_verdict, final_error,
-                              lease.stalled_since)
+                              lease.stalled_since, lease.error_root)
 
     @contextmanager
     def sftp(self, timeout: float) -> Iterator[paramiko.SFTPClient]:
@@ -1078,7 +1219,8 @@ class MemberConnection:
     # Exec channels
     # ------------------------------------------------------------------ #
     @contextmanager
-    def exec_channel(self, timeout: float) -> Iterator[paramiko.Channel]:
+    def exec_channel(self, timeout: float, *,
+                     root: Optional[RootAvailability] = None) -> Iterator[paramiko.Channel]:
         """Open a session channel for one command; it is closed afterwards.
 
         A refused channel shrinks the pool and raises MemberUnavailable; the
@@ -1087,7 +1229,7 @@ class MemberConnection:
         deadline = self._deadline(is_interactive_request())
         with self._cond:
             while True:
-                transport, generation = self._transport_locked(deadline)
+                transport, generation = self._transport_locked(deadline, root)
                 if self._exec_open < self._exec_cap:
                     self._exec_open += 1
                     break
@@ -1112,6 +1254,8 @@ class MemberConnection:
                 if not transport.is_active() or _is_open_timeout(exc):
                     body_error = exc
                 raise
+            with self._cond:
+                self._check_root_locked(root)
             chan.settimeout(timeout)
             try:
                 yield chan
@@ -1132,7 +1276,8 @@ class MemberConnection:
                 if verdict >= _Verdict.PROBE:
                     self._after_error(generation, verdict, body_error)
 
-    def run_command(self, command: str, timeout: float) -> Tuple[Optional[int], bytes]:
+    def run_command(self, command: str, timeout: float, *,
+                    root: Optional[RootAvailability] = None) -> Tuple[Optional[int], bytes]:
         """Run command on an exec channel; return (exit status or None, stdout).
 
         The whole command, its output and its exit status are bounded by one
@@ -1149,9 +1294,9 @@ class MemberConnection:
 
         transport = None
         try:
-            with self.exec_channel(timeout) as chan:
+            with self.exec_channel(timeout, root=root) as chan:
                 transport = chan.get_transport()
-                return self._run_started(chan, command, remaining)
+                return run_channel_command(chan, command, remaining)
         except CommandTimeout as exc:
             # exec_channel probed the transport on the way out; one the probe
             # dropped (a half-open connection) was the cause, not the command.
@@ -1166,46 +1311,6 @@ class MemberConnection:
                 and self._state is _State.CONNECTED
                 and self._transport is transport
             )
-
-    @staticmethod
-    def _run_started(chan, command: str, remaining) -> Tuple[Optional[int], bytes]:
-        """run_command's body on an open exec channel."""
-        run_bounded(chan, remaining(), lambda: chan.exec_command(command))
-        transport = chan.get_transport()
-        chunks = []
-        size = 0
-        try:
-            while True:
-                chan.settimeout(remaining())
-                data = chan.recv(32768)
-                if not data:
-                    break
-                size += len(data)
-                if size > MAX_COMMAND_OUTPUT:
-                    raise RuntimeError(
-                        f"command output exceeds {MAX_COMMAND_OUTPUT} bytes")
-                chunks.append(data)
-            status = chan.exit_status if chan.status_event.wait(remaining()) else None
-        except socket.timeout as exc:
-            # The command was started; a timeout from here on is the
-            # command's unless the transport is gone (a connect or channel
-            # open that timed out never gets this far; run_command rechecks
-            # after the pool's probe, for a transport that only looked alive).
-            if transport is not None and transport.is_active():
-                raise CommandTimeout(str(exc)) from exc
-            raise
-        if (transport is not None and not transport.is_active()) or (
-            status == -1 and not getattr(chan, "eof_received", True)
-        ):
-            # paramiko closes the channels of a transport that died: recv
-            # returns b"" and the status event fires with no exit status.
-            # It does so before it marks the transport inactive, so a reader
-            # woken in between sees it active; a server that closed the
-            # channel itself sent EOF first. Not an answer from the member.
-            # (A transport that dies just after a command finished turns
-            # its answer into this error too: a retry, the safe direction.)
-            raise EOFError("the transport closed during the command")
-        return status, b"".join(chunks)
 
     # ------------------------------------------------------------------ #
     # Introspection for tests and diagnostics
