@@ -1,0 +1,29 @@
+id: desktop-additions-bounded-resync
+title: Resynchronize an open Nautilus monitor after a late-addition gap
+desc: 'The opt-in tracer in https://github.com/tedks/storage/pull/199 drops the entire
+  batch and stops delivery if one later member adds more than 128 names or if the
+  active monitor otherwise loses its retained window. Large directories can exceed
+  that bound in a single publication. The existing window keeps the rows it has, and
+  the user must refresh or revisit it.
+
+
+  Before qualifying the bridge for everyday use, specify bounded, directory-targeted
+  resynchronization against a current committed union, tied to the original monitor
+  and mount generation. Exercise a single late member with more than 128 names, a
+  paused consumer over several publications, a stale view during reconcile, cancellation,
+  mount replacement, and unaffected windows. Prove a dropped or oversized batch can
+  never be acknowledged as fully delivered and that changes do not mutate or navigate
+  other views.'
+type: feature
+component: desktop
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-22T23:15:43-00:00
+references: []
+log_events:
+- time: 2026-11-22T23:15:43-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
