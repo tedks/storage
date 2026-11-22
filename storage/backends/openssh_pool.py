@@ -9,6 +9,8 @@ import select
 import threading
 import time
 
+import paramiko
+
 from .base import current_capacity_cancel_probe, is_interactive_request
 from .openssh import MasterLost, OpenSSHMaster, SessionRefused
 from .ssh_pool import (
@@ -38,6 +40,7 @@ class _Budget:
     watcher: int = 0
     interactive_turns: int = 0
     idle: object = None
+    watcher_warned: bool = False
 
 
 @dataclass
@@ -78,29 +81,31 @@ class OpenSSHSessionPool:
 
     def _prepare(self):
         generation = self._master.generation()
-        # Verify actual server capacity: concurrent open SFTP sessions count,
-        # and the typed mux reply distinguishes refusal from command failure.
-        clients = []
+        # Hold simultaneous session opens so the typed refusal gives a
+        # ceiling. Only the first session needs a full SFTP negotiation.
+        deadline = time.monotonic() + self.connect_timeout
+        streams = []
         try:
             for _ in range(_SESSION_LIMIT):
                 try:
-                    clients.append(generation.open_sftp(self.connect_timeout))
-                except SessionRefused:
-                    if not clients:
-                        raise
+                    stream = generation.open_sftp_stream(max(0.0, deadline - time.monotonic()))
+                except SessionRefused as exc:
+                    if not streams:
+                        raise MemberUnavailable(f"OpenSSH {self.name} refused the first session") from exc
                     break
+                streams.append(stream)
+            first = streams[0]
+            first.settimeout(max(0.0, deadline - time.monotonic()))
+            warm_client = paramiko.SFTPClient(first)
+            limit = len(streams)
+            streams.pop(0)
         finally:
-            for client in clients:
-                client.close()
-        if len(clients) < 3:
-            logger.warning(
-                "OpenSSH %s allows %d sessions. Remote watching is unsupported "
-                "at this capacity; listings use pull revalidation.",
-                self.name, len(clients))
-        if len(clients) == 1:
+            for stream in streams:
+                stream.close()
+        if limit == 1:
             logger.warning("OpenSSH %s shares its sole session between foreground and bulk work",
                            self.name)
-        return _Budget(generation, len(clients))
+        return _Budget(generation, limit, idle=warm_client)
 
     def _get_budget(self, root, cancel):
         deadline = time.monotonic() + self.connect_timeout
@@ -130,9 +135,13 @@ class OpenSSHSessionPool:
             raise
         else:
             with self._cond:
-                self._budget = budget
-                self._check_locked(root, cancel)
-            return budget
+                closed = self._closed
+                if not closed:
+                    self._budget = budget
+                    self._check_locked(root, cancel)
+                    return budget
+            budget.idle.close()
+            raise MemberUnavailable(f"OpenSSH {self.name} is closed")
         finally:
             with self._cond:
                 self._initializing = False
@@ -170,6 +179,12 @@ class OpenSSHSessionPool:
                     self._check_locked(root, cancel)
                     if self._budget is budget and budget.generation.is_active():
                         if kind == "watcher" and budget.limit < 3:
+                            if not budget.watcher_warned:
+                                logger.warning(
+                                    "OpenSSH %s allows %d sessions. Remote watching is unsupported "
+                                    "at this capacity; listings use pull revalidation.",
+                                    self.name, budget.limit)
+                                budget.watcher_warned = True
                             raise WatcherUnsupported(
                                 f"OpenSSH {self.name} requires three sessions for watching")
                         if (self._waiters[kind][0] is ticket and self._can_admit(budget, kind)):

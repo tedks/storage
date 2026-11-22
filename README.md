@@ -450,11 +450,12 @@ commands, rsync uploads and inotify watches over one authenticated SSH
 connection per compatible identity. Storage groups roots by the configured
 SSH host token, user, port, key and connection settings. An alias can carry
 its own routing or trust settings in your OpenSSH config. OpenSSH
-authenticates in batch mode using keys or an agent and takes host keys from
-its configured known-hosts files. It accepts new keys, refuses changed
-keys, and leaves existing host keys intact.
+authenticates in batch mode using keys or an agent. The server's host key
+must already be trusted in the configured known-hosts files. Storage
+refuses unknown or changed keys and leaves existing host keys intact.
 
-On connection, Storage checks up to four simultaneous sessions. At two
+On connection, Storage checks up to six simultaneous sessions, the total
+default Paramiko session budget. At two
 or more sessions it keeps a slot available for foreground operations.
 A host must allow at least three sessions for Storage to run its watcher
 alongside foreground operations and transfers. With a single session,
