@@ -17,11 +17,15 @@ policy should apply when that connection reconnects.
 
 - [x] (2026-11-22) Prove SFTP, watcher, and rsync can carry real traffic on
   one OpenSSH master with a three-session synthetic SSH server.
-- [ ] Implement and test a host connection with attach-only session opens,
-  bounded startup and teardown, and explicit refusal and loss results.
-- [ ] Implement host-wide admission, carry the existing request context into
-  it, and integrate SFTP, exec, watcher, and rsync.
-- [ ] Add the explicit mount policy selector and verify the mounted path.
+- [x] (2026-11-22) Implement and test the owned master, bounded lifecycle
+  and typed attach-only session opens in draft PR #201.
+- [x] (2026-11-22) Reuse the mount registry and integrate host admission for
+  SFTP, exec, watcher, and rsync in draft PR #202.
+- [x] (2026-11-22) Verify the explicit selector on mounted traffic at
+  server session limits 1, 2, 3 and 10 in both FUSE loop modes.
+- [ ] Compare mixed OpenSSH foreground latency against separate
+  per-member connections under matched synthetic traffic. Verify a
+  mount with two simultaneously active policy identities.
 
 ## Surprises & Discoveries
 
@@ -54,15 +58,35 @@ dial. The master itself uses its normal configured route.
   small servers. The three-session test models the case where only one slot
   remains for transient bulk work after the watcher and interactive reserve.
 
+- 2026-11-22, mixed mount. Follow the host contract in #197 and require
+  configured trust for the opt-in. Let profile aliases use the configured
+  OpenSSH port. Use a separate startup probe, scoped by compatible
+  identity and closed before FUSE daemonizes.
+- 2026-11-22, mixed mount. Prove simultaneous session opens up to the
+  nominal Paramiko budget of six. Negotiate SFTP only on the first
+  session and retain one warm idle SFTP client. Keep a watcher slot only
+  when watching is enabled. At one or two sessions, report watching
+  unsupported for the generation and retain pull listing revalidation.
+
 ## Outcomes & Retrospective
 
 The focused Docker test passed in 4.2 seconds at code revision `69b128e`
 in [draft PR #198](https://github.com/tedks/storage/pull/198). The tracer
 uses the existing watcher and rsync command execution, including watcher
 readiness and delivery. It prepares the upload directory outside rsync and
-uses a test SFTP adapter outside the mount. The mount path, global admission,
-policy selection, and recovery over successive master generations are still
-pending.
+uses a test SFTP adapter outside the mount.
+
+Draft PR #202 extends that tracer to a named profile and an ordinary FUSE
+mount with an SSH root and an rsync root on one synthetic server. At
+`3223fdb`, all ten focused Docker cases passed in 70.84 seconds. They
+checked one serving authentication and one established TCP connection,
+distinct from the closed pre-fork probe. Mounted reads completed during
+uploads when at least two sessions were available. An active watcher
+invalidated listings with at least three sessions. With watching disabled
+at three sessions, two simultaneous uploads left the foreground slot
+available. Unmount stopped inotifywait and closed all serving connections.
+Owned-master generation recovery and strict trust are separately covered
+by PR #201 at `a059864`.
 
 ## Context and Orientation
 
@@ -85,8 +109,8 @@ port, and key selection. Canonicalize only inputs with equivalent SSH config
 matching. Keep alias, proxy, host-key, and auth inputs in the policy identity,
 and keep the member root and per-root availability result outside it. Run
 one foreground master per group. It should honor configured OpenSSH routes
-and keys, retain batch mode, accept new host keys, reject changed keys, and
-keep `UpdateHostKeys=no` in line with the existing command path. A master
+and keys, retain batch mode, require a trusted host key, and keep `UpdateHostKeys=no`
+in line with the existing command path. A master
 generation owns a private socket path and all associated local processes.
 Publish readiness only after the listener answers and fail attach-only
 operations when the path is gone. Serialize replacement, reap the previous
