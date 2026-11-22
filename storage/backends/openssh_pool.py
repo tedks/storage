@@ -200,7 +200,10 @@ class OpenSSHSessionPool:
                             break
                         remaining = _POLL_INTERVAL if deadline is None else deadline - time.monotonic()
                         if remaining <= 0:
-                            raise BulkCapacityTimeout(f"No OpenSSH session available on {self.name}")
+                            message = f"No OpenSSH session available on {self.name}"
+                            if kind == "bulk":
+                                raise BulkCapacityTimeout(message)
+                            raise MemberUnavailable(message)
                         self._cond.wait(min(remaining, _POLL_INTERVAL))
                         continue
                 budget = self._get_budget(root, cancel)

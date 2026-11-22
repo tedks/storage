@@ -127,7 +127,7 @@ def _connect_via_host_resolver(host: str, port: int, timeout: float,
 
 @dataclass(frozen=True, repr=False)
 class _SSHConnectionConfig:
-    """Effective Paramiko connection settings, independent of root.
+    """Effective SSH connection settings, independent of root.
 
     The configured host is the host-key lookup name. The host-key policy
     is fixed, and the presence of a key file controls agent/key discovery.
@@ -343,7 +343,8 @@ class SSHBackend(Backend):
                 handshakes, and for metadata requests
             bulk_capacity_wait_timeout: optional bulk SFTP capacity deadline;
                 None or zero waits for channel capacity to drain
-            transport_registry: the mount's shared Paramiko transports
+            transport_registry: the mount's shared connection owners
+            ssh_transport: Paramiko by default or explicit OpenSSH batch authentication
         """
         super().__init__(
             name,
@@ -904,7 +905,10 @@ class SSHBackend(Backend):
             try:
                 yield master.generation()
             finally:
-                master.close()
+                try:
+                    master.close()
+                except Exception as exc:
+                    raise SSHProbeCleanupError("Could not stop OpenSSH filesystem probe") from exc
             return
         client = self._open_client()
         try:
