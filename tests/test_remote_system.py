@@ -29,16 +29,17 @@ import hashlib
 import os
 import re
 import secrets
+import select
 import shlex
 import shutil
 import signal
 import socket
 import stat
 import subprocess
+import sys
 import threading
 import time
 import warnings
-from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List
@@ -47,6 +48,9 @@ from unittest import mock
 import paramiko
 import pytest
 
+from storage.backends.openssh import (
+    MasterLost, MasterStartError, OpenSSHMaster, SessionClosed, SessionRefused,
+)
 from storage.backends.rsync import RsyncBackend
 from storage.backends.ssh import SSHBackend
 from storage.backends.ssh_mux import ControlSockets
@@ -1617,48 +1621,14 @@ UPLOADS = 5
 def test_openssh_master_carries_sftp_watcher_and_rsync(remote, tmp_path):
     """Exercise one authenticated connection with three sshd session slots."""
     member = remote.limited
-    identity = (REMOTE_USER, member.host, member.port, str(remote.key_path))
+    master = OpenSSHMaster(REMOTE_USER, member.host, member.port, str(remote.key_path))
     target = f"{REMOTE_USER}@{member.host}"
 
     class AttachOnlySockets(ControlSockets):
-        def options(self, *identity):
-            options = super().options(*identity)
-            assert options
-            # A session refusal or missing control socket can make OpenSSH
-            # fall back to a fresh connection. Test an attach-only client.
-            options[1] = "ControlMaster=no"
-            return [*options, "-o", "ProxyCommand=exit 255"]
+        def options(self, *_identity):
+            return master.generation().attach_options()
 
     sockets = AttachOnlySockets()
-    ssh = ["ssh", "-T", "-p", str(member.port), "-o", "BatchMode=yes",
-           "-o", "StrictHostKeyChecking=yes", "-o", "UpdateHostKeys=no",
-           "-i", str(remote.key_path)]
-    master_options = ControlSockets.options(sockets, *identity)
-    attach = [*ssh, *sockets.options(*identity)]
-
-    class SFTPStream(socket.socket):
-        def get_name(self):
-            return "synthetic OpenSSH mux session"
-
-    @contextmanager
-    def sftp_session():
-        parent, child = socket.socketpair()
-        with SFTPStream(fileno=parent.detach()) as stream, child, subprocess.Popen(
-            [*attach, "-s", target, "sftp"], stdin=child, stdout=child,
-        ) as process:
-            child.close()
-            stream.settimeout(10)
-            try:
-                with paramiko.SFTPClient(stream) as sftp:
-                    yield sftp
-            finally:
-                stream.close()
-                try:
-                    process.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    raise
-            assert process.returncode == 0
 
     changed = threading.Event()
     ready = threading.Event()
@@ -1674,47 +1644,171 @@ def test_openssh_master_carries_sftp_watcher_and_rsync(remote, tmp_path):
     source.write_bytes(b"one OpenSSH connection\n")
     remote.exec(member, f"mkdir {REMOTE_ROOT}/left {REMOTE_ROOT}/right")
     logins_before = _accepted_logins(remote, member)
-    master = subprocess.Popen([
-        *ssh, "-o", "ControlMaster=yes", "-o", "ControlPersist=no",
-        *master_options, "-Nn", target,
-    ])
+
+    def run_command(generation, command):
+        with open(os.devnull, "rb+") as devnull:
+            fd = devnull.fileno()
+            with generation.open_command(command, fd, fd, fd, 10) as session:
+                return session.wait(10)
+
     try:
-        assert _wait_for(lambda: subprocess.run(
-            [*attach, "-O", "check", target], capture_output=True, timeout=2,
-        ).returncode == 0)
+        generation = master.generation()
+        attach = ["ssh", "-T", "-p", str(member.port), *generation.attach_options()]
         watcher.start()
         assert ready.wait(10), "the watcher did not open its session"
-        with sftp_session() as bulk, sftp_session() as interactive:
+        with generation.open_sftp(10) as bulk, generation.open_sftp(10) as interactive:
             assert bulk.listdir(f"{REMOTE_ROOT}/left") == []
             assert interactive.listdir(f"{REMOTE_ROOT}/right") == []
+            with pytest.raises(SessionRefused):
+                run_command(generation, "true")
             fourth = subprocess.run([*attach, target, "true"], capture_output=True, timeout=10)
             assert fourth.returncode == 255, fourth
             assert b"Session open refused" in fourth.stderr, fourth.stderr
 
-        with sftp_session() as interactive:
+        with generation.open_sftp(10) as interactive:
             # The watcher and the existing SFTP channel leave one slot for
             # the rsync command. The directories were prepared separately.
             backend._run_rsync(str(source), backend._remote_spec("/right/upload.bin"))
             assert changed.wait(10), "the watcher missed the rsync upload"
             with interactive.open(f"{REMOTE_ROOT}/right/upload.bin", "rb") as uploaded:
                 assert uploaded.read() == source.read_bytes()
+            assert run_command(generation, "exit 42") == 42
             assert _established_ssh_connections(remote, member) == 1
             assert _accepted_logins(remote, member) - logins_before == 1
     finally:
         watcher.stop()
         backend.close()
         sockets.close()
-        try:
-            master.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            master.kill()
-            master.wait(timeout=10)
-            raise
+        master.close()
 
+    with pytest.raises(MasterLost):
+        generation.open_sftp(10)
     disconnected = subprocess.run([*attach, target, "true"], capture_output=True, timeout=10)
     assert disconnected.returncode == 255, disconnected
     assert _accepted_logins(remote, member) - logins_before == 1
     assert _wait_for(lambda: _established_ssh_connections(remote, member) == 0)
+
+
+def test_openssh_master_replaces_only_the_current_generation(remote):
+    member = remote.limited
+    master = OpenSSHMaster(REMOTE_USER, member.host, member.port, str(remote.key_path))
+    logins_before = _accepted_logins(remote, member)
+    try:
+        original = master.generation()
+        read_end, write_end = socket.socketpair()
+        with read_end, write_end, open(os.devnull, "rb+") as devnull:
+            fd = devnull.fileno()
+            with original.open_command("read line", read_end.fileno(), fd, fd, 5) as session:
+                assert session.poll() is None
+                with pytest.raises(TimeoutError):
+                    session.wait(0.02)
+                remote.exec(member, "pkill -u storage -x sshd")
+                with pytest.raises((MasterLost, SessionClosed)):
+                    session.wait(5)
+        assert _wait_for(lambda: _established_ssh_connections(remote, member) == 0)
+        assert _wait_for(lambda: not original.is_active())
+
+        replacement = master.generation()
+        assert original is not replacement
+        assert original.attach_options() != replacement.attach_options()
+        master.reset(original)
+        assert master.generation() is replacement
+        with replacement.open_sftp(5) as sftp:
+            assert sftp.listdir(REMOTE_ROOT) == []
+        assert _established_ssh_connections(remote, member) == 1
+        assert _accepted_logins(remote, member) - logins_before == 2
+    finally:
+        master.close()
+    assert _wait_for(lambda: _established_ssh_connections(remote, member) == 0)
+    with pytest.raises(MasterLost):
+        master.generation()
+
+
+@pytest.mark.parametrize("changed", [True, False], ids=["changed", "unknown"])
+def test_openssh_master_requires_a_trusted_host_key(remote, tmp_path, monkeypatch, changed):
+    member, wrong_key_member = remote.members
+    known_hosts = tmp_path / "wrong_known_hosts"
+    host_field = member.host if member.port == 22 else f"[{member.host}]:{member.port}"
+    known_hosts.write_text(f"{host_field} {wrong_key_member.host_pubkey}\n" if changed else "")
+    ssh = shutil.which("ssh")
+    shim = tmp_path / "ssh"
+    option = shlex.quote(f"UserKnownHostsFile={known_hosts}")
+    shim.write_text(f'#!/bin/sh\nexec {shlex.quote(ssh)} -o {option} "$@"\n')
+    shim.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ['PATH']}")
+    master = OpenSSHMaster(REMOTE_USER, member.host, member.port, str(remote.key_path))
+    logins_before = _accepted_logins(remote, member)
+    try:
+        with pytest.raises(MasterStartError):
+            master.generation()
+        assert _accepted_logins(remote, member) == logins_before
+        assert _wait_for(lambda: _established_ssh_connections(remote, member) == 0)
+    finally:
+        master.close()
+
+
+def test_openssh_master_honors_a_proxy_route(remote, tmp_path, monkeypatch):
+    member, jump = remote.members
+    alias = "storage-fixture-routed.invalid"
+    known_hosts = tmp_path / "route_known_hosts"
+    known_hosts.write_text(f"{alias} {member.host_pubkey}\n")
+    ssh = shutil.which("ssh")
+    proxy = shlex.join([
+        ssh, "-p", str(jump.port), "-i", str(remote.key_path),
+        "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
+        "-W", f"{member.ip}:22", f"{REMOTE_USER}@{jump.host}",
+    ])
+    shim = tmp_path / "ssh"
+    route_args = shlex.join([ssh, "-o", f"ProxyCommand={proxy}",
+                             "-o", f"UserKnownHostsFile={known_hosts}"])
+    shim.write_text(f'#!/bin/sh\nexec {route_args} "$@"\n')
+    shim.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ['PATH']}")
+    master = OpenSSHMaster(REMOTE_USER, alias, 22, str(remote.key_path))
+    member_before = _accepted_logins(remote, member)
+    jump_before = _accepted_logins(remote, jump)
+    try:
+        with master.generation().open_sftp(5) as sftp:
+            assert sftp.listdir(REMOTE_ROOT) == []
+        assert _accepted_logins(remote, member) - member_before == 1
+        assert _accepted_logins(remote, jump) - jump_before == 1
+    finally:
+        master.close()
+    assert _wait_for(lambda: _established_ssh_connections(remote, member) == 0)
+    assert _wait_for(lambda: _established_ssh_connections(remote, jump) == 0)
+
+
+def test_openssh_master_exits_when_mount_process_is_killed(remote):
+    member = remote.limited
+    owner_script = """
+import sys
+from storage.backends.openssh import OpenSSHMaster
+
+owner = OpenSSHMaster(sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4])
+generation = owner.generation()
+with generation.open_sftp(5):
+    print(*(option.split('=', 1)[1] for option in generation.attach_options()
+            if option.startswith('ControlPath=')), flush=True)
+    sys.stdin.read()
+"""
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)}
+    with subprocess.Popen(
+        [sys.executable, "-c", owner_script, REMOTE_USER, member.host,
+         str(member.port), str(remote.key_path)], stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE, env=env, text=True,
+    ) as owner:
+        try:
+            poller = select.poll()
+            poller.register(owner.stdout, select.POLLIN)
+            assert poller.poll(15_000), "the mount fixture never started its master"
+            control_path = owner.stdout.readline().strip()
+            assert control_path and Path(control_path).is_socket()
+            assert _established_ssh_connections(remote, member) == 1
+        finally:
+            owner.kill()
+            owner.wait(timeout=5)
+    assert _wait_for(lambda: _established_ssh_connections(remote, member) == 0)
+    assert _wait_for(lambda: not Path(control_path).parent.exists())
 
 
 @pytest.mark.parametrize("shared", [True, False], ids=["shared", "own-connections"])
