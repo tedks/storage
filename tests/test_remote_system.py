@@ -2183,7 +2183,11 @@ def test_shared_transport_reserves_capacity_and_isolates_root_failure(remote):
 @pytest.mark.parametrize("shared", [False, True], ids=["standalone", "shared"])
 def test_interactive_operations_during_active_bulk_transfer(remote, capsys, shared):
     member = remote.members[0]
-    remote.write_remote(member, "bulk/payload.bin", secrets.token_bytes(4 * 1024 * 1024))
+    samples = 30
+    chunk_size = 128 * 1024
+    interval = 0.075
+    expected_bytes = samples * chunk_size
+    remote.write_remote(member, "bulk/payload.bin", secrets.token_bytes(expected_bytes))
     remote.write_remote(member, "interactive/item", b"foreground")
     registry = SSHTransportRegistry() if shared else None
 
@@ -2193,59 +2197,71 @@ def test_interactive_operations_during_active_bulk_transfer(remote, capsys, shar
                              "transport_registry": registry})
 
     bulk, foreground = backend("bulk"), backend("interactive")
-    transferred = threading.Event()
-    stop = threading.Event()
+    barrier = threading.Barrier(2)
+    started = [threading.Event() for _ in range(samples)]
+    begin_at, finish_at = [0.0] * samples, [0.0] * samples
 
     def transfer():
-        def read_repeatedly(sftp):
-            total = 0
+        def read_fixed_chunks(sftp):
             with sftp.open(str(bulk.remote_path / "payload.bin"), "rb") as source:
-                while not stop.is_set():
-                    chunk = source.read(128 * 1024)
-                    if chunk:
-                        total += len(chunk)
-                        transferred.set()
-                    else:
-                        source.seek(0)
-            return total
+                for index in range(samples):
+                    barrier.wait(10)
+                    begin_at[index] = time.perf_counter()
+                    started[index].set()
+                    assert len(source.read(chunk_size)) == chunk_size
+                    finish_at[index] = time.perf_counter()
+                    barrier.wait(10)
 
-        return bulk._with_sftp("bulk sample", "/payload.bin", read_repeatedly)
+        bulk._with_sftp("bulk sample", "/payload.bin", read_fixed_chunks)
 
-    reads, listings = [], []
+    read_ms, list_ms, read_started_at = [], [], []
     try:
-        bulk.stat("/payload.bin")
-        foreground.stat("/item")
-        expected = 1 if shared else 2
-        assert _established_ssh_connections(remote, member) == expected
+        assert bulk.stat("/payload.bin").st_size == expected_bytes
+        assert foreground.stat("/item").st_size == 10
+        socks = {backend._pool._transport.sock for backend in (bulk, foreground)}
+        nodelay = {sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY) for sock in socks}
+        if shared:
+            assert nodelay == {1}
+        assert _established_ssh_connections(remote, member) == (1 if shared else 2)
+
         with ThreadPoolExecutor(max_workers=1) as executor:
-            moving = executor.submit(transfer)
+            future = executor.submit(transfer)
             try:
-                assert transferred.wait(10)
+                started_at = time.perf_counter()
                 with interactive_request():
-                    for _ in range(30):
-                        started = time.perf_counter()
+                    for index in range(samples):
+                        time.sleep(max(0.0, started_at + index * interval - time.perf_counter()))
+                        barrier.wait(10)
+                        assert started[index].wait(5)
+                        begin = time.perf_counter()
+                        read_started_at.append(begin)
                         assert foreground.read_file("/item", 0, 10) == b"foreground"
-                        reads.append((time.perf_counter() - started) * 1000)
-                        started = time.perf_counter()
+                        read_ms.append((time.perf_counter() - begin) * 1000)
+                        begin = time.perf_counter()
                         assert foreground.listdir("/") == ["item"]
-                        listings.append((time.perf_counter() - started) * 1000)
+                        list_ms.append((time.perf_counter() - begin) * 1000)
+                        barrier.wait(10)
+                future.result(timeout=10)
             finally:
-                stop.set()
-            bulk_bytes = moving.result(timeout=10)
-        assert bulk_bytes >= 128 * 1024
+                barrier.abort()
+        elapsed_ms = (time.perf_counter() - started_at) * 1000
     finally:
         bulk.close()
         foreground.close()
     assert _wait_for(lambda: _established_ssh_connections(remote, member) == 0)
 
-    # Measurements are observations on the fixture, not timing assertions.
-    def distribution(samples):
-        return f"{statistics.median(samples):.2f}/{statistics.quantiles(samples, n=20)[18]:.2f}"
+    # Report matched loopback observations without imposing latency cutoffs.
+    overlap = sum(begin <= read_start <= end for begin, end, read_start in
+                  zip(begin_at, finish_at, read_started_at))
+    assert overlap > 0
+
+    def distribution(values):
+        return f"{statistics.median(values):.2f}/{statistics.quantiles(values, n=20)[18]:.2f}"
 
     with capsys.disabled():
-        print(f"active-bulk shared={shared} sockets={expected} bytes={bulk_bytes} n={len(reads)} "
-              f"read_ms_median/p95={distribution(reads)} "
-              f"list_ms_median/p95={distribution(listings)}")
+        print(f"active-bulk shared={shared} sockets={len(socks)} nodelay={nodelay} "
+              f"bytes={expected_bytes} n={samples} active_overlap={overlap} elapsed_ms={elapsed_ms:.0f} "
+              f"read_ms_median/p95={distribution(read_ms)} list_ms_median/p95={distribution(list_ms)}")
 
 
 def test_shared_transport_separates_distinct_credentials_on_same_server(remote, tmp_path):

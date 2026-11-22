@@ -488,7 +488,9 @@ and the default `paramiko` transport uses the following SSH paths:
 - Within one mount, the Paramiko work of `ssh://` and `rsync://` members
   with the same configured host, port, login, authentication and connection
   settings shares one authenticated connection. The SFTP and command
-  channel limits apply to all of its roots together. Each root still has
+  channel limits apply to all of its roots together. The connection uses
+  TCP_NODELAY to reduce delay for small interactive requests during bulk
+  transfers. Each root still has
   its own files, availability, member name and replication role. A startup
   same-filesystem check can make one temporary connection for that login,
   which closes before the serving connection opens.
