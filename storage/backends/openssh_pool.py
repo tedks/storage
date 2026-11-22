@@ -175,38 +175,38 @@ class OpenSSHSessionPool:
         try:
             budget = self._get_budget(root, cancel)
             deadline = None if wait is None else time.monotonic() + wait
-            while True:
-                with self._cond:
+            with self._cond:
+                while True:
                     self._check_locked(root, cancel)
-                    if self._budget is budget and budget.generation.is_active():
-                        if kind == "watcher" and budget.limit < 3:
-                            if not budget.watcher_warned:
-                                logger.warning(
-                                    "OpenSSH %s allows %d sessions. Remote watching is unsupported "
-                                    "at this capacity; listings use pull revalidation.",
-                                    self.name, budget.limit)
-                                budget.watcher_warned = True
-                            raise WatcherUnsupported(
-                                f"OpenSSH {self.name} requires three sessions for watching")
-                        if (self._waiters[kind][0] is ticket and self._can_admit(budget, kind)):
-                            setattr(budget, kind, getattr(budget, kind) + 1)
-                            if kind == "interactive" and self._waiters["bulk"]:
-                                budget.interactive_turns += 1
-                            elif kind != "watcher":
-                                budget.interactive_turns = 0
-                            used = budget.interactive + budget.bulk + budget.watcher
-                            if sftp or used >= budget.limit:
-                                idle, budget.idle = budget.idle, None
-                            break
-                        remaining = _POLL_INTERVAL if deadline is None else deadline - time.monotonic()
-                        if remaining <= 0:
-                            message = f"No OpenSSH session available on {self.name}"
-                            if kind == "bulk":
-                                raise BulkCapacityTimeout(message)
-                            raise MemberUnavailable(message)
-                        self._cond.wait(min(remaining, _POLL_INTERVAL))
-                        continue
-                budget = self._get_budget(root, cancel)
+                    remaining = _POLL_INTERVAL if deadline is None else deadline - time.monotonic()
+                    if remaining <= 0:
+                        message = f"No OpenSSH session available on {self.name}"
+                        if kind == "bulk":
+                            raise BulkCapacityTimeout(message)
+                        raise MemberUnavailable(message)
+                    if self._budget is not budget or not budget.generation.is_active():
+                        raise MemberUnavailable(
+                            f"OpenSSH {self.name} lost its connection while waiting for a session")
+                    if kind == "watcher" and budget.limit < 3:
+                        if not budget.watcher_warned:
+                            logger.warning(
+                                "OpenSSH %s allows %d sessions. Remote watching is unsupported "
+                                "at this capacity; listings use pull revalidation.",
+                                self.name, budget.limit)
+                            budget.watcher_warned = True
+                        raise WatcherUnsupported(
+                            f"OpenSSH {self.name} requires three sessions for watching")
+                    if self._waiters[kind][0] is ticket and self._can_admit(budget, kind):
+                        setattr(budget, kind, getattr(budget, kind) + 1)
+                        if kind == "interactive" and self._waiters["bulk"]:
+                            budget.interactive_turns += 1
+                        elif kind != "watcher":
+                            budget.interactive_turns = 0
+                        used = budget.interactive + budget.bulk + budget.watcher
+                        if sftp or used >= budget.limit:
+                            idle, budget.idle = budget.idle, None
+                        break
+                    self._cond.wait(min(remaining, _POLL_INTERVAL))
         finally:
             with self._cond:
                 self._waiters[kind].remove(ticket)

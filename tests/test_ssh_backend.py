@@ -15,7 +15,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from storage.backends import ssh as ssh_module
-from storage.backends import ssh_pool
+from storage.backends import openssh_pool, ssh_pool
 from storage.backends.base import (
     ChecksumUnavailable,
     MemberSourceMissing,
@@ -2890,6 +2890,45 @@ class TestSSHBackendHostResolverConnect(_BackendTestCase):
             backend.stat("/x")
         self.assertFalse(backend.is_available())
         self.assertEqual(len(self.server.ssh_clients[0].connect_kwargs), 1)
+
+
+class TestOpenSSHCapacityWait(unittest.TestCase):
+    def setUp(self):
+        config = SimpleNamespace(
+            host="synthetic.invalid", port=22, username="synthetic", key_filename=None,
+            connect_timeout=10.0, bulk_capacity_wait_timeout=1.0,
+        )
+        self.pool = openssh_pool.OpenSSHSessionPool(config)
+        self.addCleanup(self.pool.close)
+        self.active = True
+        generation = SimpleNamespace(is_active=lambda: self.active, attach_options=lambda: [])
+        self.budget = openssh_pool._Budget(generation, limit=1, bulk=1)
+        self.pool._budget = self.budget
+        self.now = 0.0
+
+    def test_expired_bulk_waiter_cannot_take_slot_released_after_deadline(self):
+        def release_after_deadline(_timeout):
+            self.now = 1.01
+            self.budget.bulk = 0
+
+        with patch.object(openssh_pool, "time", SimpleNamespace(monotonic=lambda: self.now)), \
+                patch.object(self.pool._cond, "wait", side_effect=release_after_deadline) as wait:
+            with self.assertRaises(BulkCapacityTimeout), self.pool.rsync_options():
+                self.fail("an expired waiter took a newly released session")
+        wait.assert_called_once()
+        self.assertFalse(self.pool._waiters["bulk"])
+
+    def test_old_capacity_waiter_does_not_start_a_new_generation(self):
+        def lose_generation(_timeout):
+            self.now = 0.5
+            self.active = False
+
+        with patch.object(openssh_pool, "time", SimpleNamespace(monotonic=lambda: self.now)), \
+                patch.object(self.pool._cond, "wait", side_effect=lose_generation), \
+                patch.object(self.pool, "_prepare", side_effect=AssertionError("unexpected reconnect")):
+            with self.assertRaises(MemberUnavailable), self.pool.rsync_options():
+                self.fail("an old waiter took a replacement session")
+        self.assertFalse(self.pool._waiters["bulk"])
 
 
 if __name__ == "__main__":
