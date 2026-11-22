@@ -19,3 +19,29 @@ sh_test(
     tags = ["local", "manual"],
     timeout = "moderate",
 )
+
+genrule(
+    name = "monitor_probe_binary",
+    srcs = ["monitor_probe.c"],
+    # The bridge attaches only inside a process named nautilus.
+    outs = ["probe/nautilus"],
+    cmd = "PATH=/usr/bin:/bin " +
+          "\"$${STORAGE_NAUTILUS_CC:-/usr/bin/cc}\" -Wall -Wextra -Werror -O2 -o $@ $< " +
+          "$$(pkg-config --cflags --libs gio-2.0)",
+    local = True,
+    tags = ["manual"],
+)
+
+sh_test(
+    name = "monitor_lifecycle",
+    env_inherit = ["FUSE_LIBRARY_PATH"],
+    srcs = ["visible_rows.sh"],
+    args = ["--monitor-probe", "probe/nautilus"],
+    data = [
+        ":held_mount",
+        ":monitor_probe_binary",
+        "visible_rows.py",
+    ],
+    tags = ["local", "manual"],
+    timeout = "moderate",
+)

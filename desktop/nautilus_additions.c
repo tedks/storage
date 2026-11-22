@@ -65,6 +65,8 @@ static void subscription_unref(gpointer data)
 static void additions_free(gpointer data)
 {
     Additions *additions = data;
+    if (additions == NULL)
+        return;
     g_free(additions->generation);
     g_ptr_array_unref(additions->names);
     g_free(additions);
@@ -263,7 +265,6 @@ static void delivered(GObject *source, GAsyncResult *result, gpointer data)
     (void)source;
     Subscription *sub = data;
     Additions *additions = g_task_propagate_pointer(G_TASK(result), NULL);
-    sub->pending = FALSE;
     g_autoptr(GFileMonitor) monitor = g_weak_ref_get(&sub->monitor);
     if (monitor != NULL && !g_file_monitor_is_cancelled(monitor)) {
         if (additions == NULL) {
@@ -283,8 +284,8 @@ static void delivered(GObject *source, GAsyncResult *result, gpointer data)
             }
         }
     }
-    if (additions != NULL)
-        additions_free(additions);
+    additions_free(additions);
+    sub->pending = FALSE;
 }
 
 static gboolean poll_subscription(gpointer data)

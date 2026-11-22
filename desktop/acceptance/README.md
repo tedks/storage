@@ -13,3 +13,15 @@ nix develop --command bazel test //desktop/acceptance:visible_rows \
 ```
 
 Use `--test_arg=--control-only` in place of the library argument to run the unmodified desktop baseline alone. The fixture runs with a threaded FUSE loop, progressive listings and a zero negative-entry timeout. It primes a negative lookup before adding the late child to the slow backing filesystem. It never requires an existing mount or a desktop session.
+
+Run the GIO lifecycle check without Xvfb or AT-SPI:
+
+```sh
+nix develop --command bazel test //desktop/acceptance:monitor_lifecycle \
+  --nocache_test_results --test_output=errors \
+  --test_arg=--library="$PWD/bazel-bin/desktop/libstorage-nautilus.so"
+```
+
+The lifecycle test observes one late addition on a private GLib main
+context, none on a cancelled monitor, and none in another executable
+that inherited the preload.

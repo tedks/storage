@@ -156,13 +156,20 @@ def main():
     parser.add_argument("--session", type=Path)
     parser.add_argument("--library")
     parser.add_argument("--fixture")
+    parser.add_argument("--monitor-probe", type=Path)
     parser.add_argument("--xvfb", default=shutil.which("Xvfb"))
     parser.add_argument("--control-only", action="store_true")
     args = parser.parse_args()
     if args.session:
         observe(args.session, args.library)
         return
-    if not args.xvfb or not args.fixture or (not args.control_only and not args.library):
+    if args.monitor_probe and not args.library:
+        parser.error("the monitor probe needs --library")
+    if (
+        not args.fixture
+        or (not args.monitor_probe and not args.xvfb)
+        or (not args.control_only and not args.library)
+    ):
         parser.error("supply --xvfb and --library (or --control-only for the baseline)")
     if args.library:
         args.library = str(Path(args.library).resolve(strict=True))
@@ -175,7 +182,20 @@ def main():
                     # Prime a missing lookup, then seed the member before opening Nautilus.
                     assert not (root / "mount/late-visible.txt").exists()
                     (root / "second/late-visible.txt").write_bytes(b"second")
-                    start_case(root, args, enabled)
+                    if args.monitor_probe:
+                        quiet_env = dict(os.environ, LD_PRELOAD=args.library, GIO_USE_VFS="local",
+                                         STORAGE_NAUTILUS_MOUNT=str(root / "mount"),
+                                         STORAGE_NAUTILUS_SOCKET=str(root / "cache/.storage.control.sock"))
+                        probe = args.monitor_probe
+                        if not enabled:
+                            # Keep the preload but change the executable name.
+                            probe = Path(shutil.copy2(probe, root / "other-monitor"))
+                        subprocess.run([probe, root, str(int(enabled))], env=quiet_env,
+                                       check=True, timeout=10)
+                        until(lambda: "late-visible.txt" in os.listdir(root / "mount"),
+                              "late union did not publish")
+                    else:
+                        start_case(root, args, enabled)
                 finally:
                     (root / "release").touch()
                     if os.path.ismount(root / "mount"):
@@ -185,7 +205,11 @@ def main():
             if os.path.ismount(root / "mount"):
                 raise RuntimeError(f"Owned test mount still attached under {root}")
             shutil.rmtree(root)
-        print("Visible rows verified, bridge " + ("enabled" if enabled else "disabled"))
+        if args.monitor_probe:
+            print("Native monitor scope and lifetime verified, bridge " +
+                  ("active" if enabled else "inactive for another executable"))
+        else:
+            print("Visible rows verified, bridge " + ("enabled" if enabled else "disabled"))
 
 
 if __name__ == "__main__":
