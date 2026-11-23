@@ -10,8 +10,8 @@ type: feature
 component: default
 release:
 reporter: Ted Smith <tedks@riseup.net>
-status: in_progress
-disposition:
+status: closed
+disposition: fixed
 creation_time: 2026-11-22T23:11:09-00:00
 references: []
 log_events:
@@ -27,5 +27,12 @@ log_events:
   who: Ted Smith
   what: started
   comment: ""
+- time: 2026-11-23T23:16:19-00:00
+  who: Ted Smith
+  what: 'closed: fixed'
+  comment: 'Implemented in draft #201 and #202, staged via #203. Mounted SFTP, watcher
+    and rsync traffic share one authenticated connection across compatible roots.
+    The test matrix includes server session limits 1, 2, 3, and 10 and supervisor
+    loss.'
 blocks:
 - gh-29
