@@ -15,8 +15,8 @@ type: task
 component: performance
 release:
 reporter: Ted Smith <tedks@riseup.net>
-status: unstarted
-disposition:
+status: closed
+disposition: fixed
 creation_time: 2026-10-30T02:19:17-00:00
 references: []
 log_events:
@@ -28,5 +28,11 @@ log_events:
   who: Ted Smith
   what: blocks gh-111
   comment: ""
+- time: 2026-11-23T23:16:32-00:00
+  who: Ted Smith
+  what: 'closed: fixed'
+  comment: 'The decision and opt-in callback admission limit landed in #180, with
+    demand reservations and cap-four contention tests. This bounds admitted work,
+    while libfuse retains control over native thread creation.'
 blocks:
 - gh-111
