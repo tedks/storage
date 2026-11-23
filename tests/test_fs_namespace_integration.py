@@ -18,6 +18,8 @@ from fuse import FuseOSError
 from storage.backends.base import ChecksumUnavailable
 from storage.backends.local import LocalBackend
 from storage.checksums import ChecksumRecord, fast_checksum_bytes
+from storage.control import request_control_payload
+from storage.desktop_additions import DesktopAdditions
 from storage.fs import StorageFS
 from storage.member_repairs import MemberRepairs
 from storage.links import link_checksum
@@ -107,6 +109,78 @@ class TestFSNamespaceIntegration(unittest.TestCase):
                 release.set()
             self.assertTrue(self._wait_for(lambda: "late" in self.fs.readdir("/", 0)))
             self.assertEqual((early.call_count, later.call_count), (1, 1))
+
+    def test_desktop_subscription_replays_only_committed_late_names(self):
+        namespace = self.fs.namespace
+        namespace.progressive_listings = True
+        mount = self.temp_dir / "mount"
+        namespace.desktop_additions = DesktopAdditions(mount)
+        streaming = self.fs._streaming_manager
+        streaming._poll_desktop_additions = namespace.poll_desktop_additions
+        late_member = self.backends["backend1"]
+        original = late_member.listdir_attrs
+        release = threading.Event()
+        (self.backend1_dir / "late").write_text("new")
+        (self.backend1_dir / "duplicate").write_text("same")
+        (self.backend2_dir / "duplicate").write_text("same")
+        (self.backend2_dir / "early").write_text("old")
+        since = time.monotonic_ns() // 1000
+
+        def late(path):
+            if not release.wait(4):
+                raise AssertionError("first listing waited for the slow member")
+            return original(path)
+
+        def poll(directory=b"/", **cursor):
+            request = {
+                "command": "desktop.additions.v1",
+                "mount_hex": os.fsencode(mount).hex(),
+                "directory_hex": directory.hex(),
+                **cursor,
+            }
+            return request_control_payload(self.cache_dir, json.dumps(request).encode(), 2)
+
+        streaming.init()
+        try:
+            with patch.object(late_member, "listdir_attrs", side_effect=late):
+                try:
+                    self.assertEqual(set(self.fs.readdir("/", 0)), {".", "..", "duplicate", "early"})
+                    self.assertEqual(poll(since_us=since)["added"], [])
+                finally:
+                    release.set()
+                result = {}
+
+                def delivered():
+                    result.update(poll(since_us=since))
+                    return bool(result["added"])
+
+                self.assertTrue(self._wait_for(delivered))
+                self.assertEqual(result["status"], "ok")
+                self.assertEqual(result["added"], [b"late".hex()])
+                self.assertIn("late", self.fs.readdir("/", 0))
+                self.assertEqual(self.fs.getattr("/late")["st_size"], 3)
+                self.assertEqual(poll(b"/different", since_us=since)["added"], [])
+                self.assertEqual(poll(generation=result["generation"],
+                                      after=result["through"])["added"], [])
+                self.assertEqual(poll(generation="0" * 32, after=0)["status"],
+                                 "generation-changed")
+
+                namespace.invalidate_dir_cache_entry("/")
+                invalidated = poll(since_us=since)
+                self.assertEqual((invalidated["status"], invalidated["added"]), ("gap", []))
+        finally:
+            streaming.destroy()
+
+    def test_desktop_journal_explicitly_degrades_on_overflow(self):
+        journal = DesktopAdditions("/mount")
+        request = {"mount_hex": b"/mount".hex(), "directory_hex": b"/".hex()}
+        since = time.monotonic_ns() // 1000
+        journal.record("/", 1, {str(i) for i in range(129)})
+        current = lambda path, revision, name: True
+        result = journal.poll({**request, "since_us": since}, current)
+        self.assertEqual((result["status"], result["added"]), ("gap", []))
+        result = journal.poll({**request, "generation": journal.generation, "after": 0}, current)
+        self.assertEqual((result["status"], result["added"]), ("gap", []))
 
     def test_progressive_concurrent_readers_share_each_member_observation(self):
         namespace = self.fs.namespace
