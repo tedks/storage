@@ -11,8 +11,8 @@ type: feature
 component: fs
 release:
 reporter: Ted Smith <tedks@riseup.net>
-status: in_progress
-disposition:
+status: closed
+disposition: fixed
 creation_time: 2026-11-22T23:11:41-00:00
 references: []
 log_events:
@@ -60,3 +60,10 @@ log_events:
     transport. Gate and mitigation evidence are recorded in draft PR #200.
 
     The draft is awaiting authorized stack integration.'
+- time: 2026-11-23T23:16:17-00:00
+  who: Ted Smith
+  what: 'closed: fixed'
+  comment: 'Merged #132 introduced the bounded pool. Draft #200 at 8651e5b extends
+    pooling to compatible roots and tests shared auth, reserve, contention, recovery,
+    and teardown on real sshd. Included in the staged #203 tree, awaiting upstream
+    landing.'
