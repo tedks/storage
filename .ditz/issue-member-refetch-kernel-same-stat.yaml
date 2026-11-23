@@ -13,8 +13,8 @@ type: bugfix
 component: default
 release:
 reporter: Ted Smith <tedks@riseup.net>
-status: in_progress
-disposition:
+status: closed
+disposition: fixed
 creation_time: 2026-11-19T00:29:02-00:00
 references: []
 log_events:
@@ -39,3 +39,9 @@ log_events:
     on the previous auto_cache policy and pass on the new default. Each warm pair
     uses the same member transfer, and each confirmed refetch adds one transfer. Genuine
     writable descriptors retain and update their backing inodes in both modes.'
+- time: 2026-11-23T23:16:43-00:00
+  who: Ted Smith
+  what: 'closed: fixed'
+  comment: 'Draft #189 at d113a13 drops retained kernel pages across reopen after
+    refetch, including the same-size, same-mtime regression in both mounted modes.
+    Staged via #203.'
