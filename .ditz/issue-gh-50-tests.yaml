@@ -7,8 +7,8 @@ type: task
 component: default
 release:
 reporter: Ted Smith <tedks@riseup.net>
-status: unstarted
-disposition:
+status: closed
+disposition: fixed
 creation_time: 2026-09-14T22:59:56-00:00
 references: []
 log_events:
@@ -24,6 +24,12 @@ log_events:
   who: Ted Smith
   what: blocked by gh-50-invalidate
   comment: ""
+- time: 2026-11-23T23:15:58-00:00
+  who: Ted Smith
+  what: 'closed: fixed'
+  comment: 'Merged in #113 and #161. getattr uses member attributes already returned
+    by a valid directory listing. Invalidation drops affected attributes. The synthetic
+    SSH browse gate bounds the member requests.'
 blocks:
 - gh-50
 blocked_by:
