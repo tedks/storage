@@ -22,3 +22,11 @@ log_events:
   who: Ted Smith
   what: created
   comment: ""
+- time: 2026-11-23T23:18:56-00:00
+  who: Ted Smith
+  what: commented
+  comment: The same disappearing-pane observation occurred during a later Storage
+    records lane closeout. Its voluntary exit choice, private handoff and process
+    end were verified independently. The final native banner could not be recovered
+    from tmux. The private Storage closeout record holds the exact identities and
+    receipts.
