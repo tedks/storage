@@ -24,6 +24,13 @@ log_events:
   who: Ted Smith
   what: blocks gh-29-model
   comment: ""
+- time: 2026-11-23T23:18:52-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'The Paramiko comparison in #200 is complete. The remaining OpenSSH measurement
+    is a matched comparison of foreground listing and read latency during bulk transfer
+    in #202 against separate member connections. Collect synthetic latency and throughput
+    distributions with the same session limit and workload.'
 blocks:
 - gh-29
 - gh-29-model
