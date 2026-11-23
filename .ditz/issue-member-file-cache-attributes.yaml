@@ -10,8 +10,8 @@ type: bugfix
 component: default
 release:
 reporter: Ted Smith <tedks@riseup.net>
-status: in_progress
-disposition:
+status: closed
+disposition: fixed
 creation_time: 2026-11-19T00:12:56-00:00
 references: []
 log_events:
@@ -39,3 +39,9 @@ log_events:
     for same-size/same-mtime refetches in draft PR https://github.com/tedks/storage/pull/189
     (ditz member-refetch-kernel-same-stat). The combined exact head d113a13df9fc4b0b7002a88a8921f0218d4bcbb8
     passed all 49 gate targets and the CLI build.
+- time: 2026-11-23T23:16:38-00:00
+  who: Ted Smith
+  what: 'closed: fixed'
+  comment: 'Draft #184 at c435cc5 preserves regular-file attributes across full and
+    streaming fills and covers read-only conflict closes. Staged via #203. UID mapping
+    and arbitrary xattr/ACL policy remain open.'
