@@ -338,6 +338,7 @@ class StreamingReadManager:
         on_finalized: Optional[Callable[["PrefetchSession"], None]] = None,
         max_download_workers: Optional[int] = None,
         read_ahead_window: int = DEFAULT_STREAMING_READ_AHEAD_WINDOW,
+        poll_desktop_additions: Optional[Callable[[dict], dict]] = None,
     ):
         self.cache_manager = cache_manager
         # Called once the complete file is in the cache (StorageFS records
@@ -384,6 +385,7 @@ class StreamingReadManager:
             "foreground_fetches": 0,
             "background_fetches": 0,
         }
+        self._poll_desktop_additions = poll_desktop_additions
         self._control_server = ControlServer(
             self.cache_manager.cache_root, self._handle_control_request, self.logger,
         )
@@ -792,6 +794,10 @@ class StreamingReadManager:
         command = arguments.pop("command", None)
         if command in ("status", "streaming.get", "downloads.list") and arguments:
             raise ControlError("Unexpected arguments for control command")
+        if command == "desktop.additions.v1":
+            if self._poll_desktop_additions is None:
+                raise ControlError("Desktop listing delivery is disabled on this mount")
+            return self._poll_desktop_additions(arguments)
         if command == "status":
             return {
                 "stats": self._streaming_stats_snapshot(),

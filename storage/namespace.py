@@ -1,3 +1,4 @@
+import bisect
 import concurrent.futures
 import contextvars
 import errno
@@ -17,6 +18,7 @@ from .cache_metadata import (
     cached_member_attributes, legacy_member_mtime, regular_file_stat,
 )
 from .checksums import ChecksumBasis, ChecksumRecord
+from .desktop_additions import DesktopAdditions
 from .models import SyncStatus
 from .pathing import ResolvedPath, canonicalize_virtual_path
 from .member_repairs import fsync_directories
@@ -119,6 +121,7 @@ class NamespaceService:
         listing_limit: int = DEFAULT_LISTING_LIMIT,
         stat_memo_limit: int = DEFAULT_STAT_MEMO_LIMIT,
         progressive_listings: bool = False,
+        desktop_mountpoint: Optional[Path] = None,
     ):
         self.backends = backends
         self.cache_manager = cache_manager
@@ -202,6 +205,8 @@ class NamespaceService:
         # or background, from the moment a background refresh is queued
         # until it ends or is cancelled.
         self.progressive_listings = progressive_listings
+        self.desktop_additions = (DesktopAdditions(desktop_mountpoint)
+                                  if desktop_mountpoint is not None else None)
         # First publication shared by foreground callers in the same generation.
         self._first_publications: Dict[str, Tuple[int, concurrent.futures.Future]] = {}
         self._listings_in_flight: Dict[str, int] = {}
@@ -1142,6 +1147,9 @@ class NamespaceService:
                         entries = self._publish_listing(
                             path, ticket, started_at, listed_wall, cache_names,
                             outcomes, complete=finished,
+                            late_member_names=(result[0]
+                                               if first.done() and not isinstance(result, Exception)
+                                               else ()),
                         )
                         if not first.done():
                             first.set_result(entries)
@@ -1160,6 +1168,22 @@ class NamespaceService:
                 future.set_exception(RuntimeError("member listing executor unavailable"))
             future.add_done_callback(lambda done, member=member: completed(member, done))
         return first.result()
+
+    def poll_desktop_additions(self, arguments):
+        with self.listing_lock:
+            return self.desktop_additions.poll(arguments, self._current_desktop_addition)
+
+    def _current_desktop_addition(self, path, revision, name):
+        snapshot = self.readdir_snapshot.get(path)
+        listing = self.entry_attrs.get(path)
+        if (
+            snapshot is None or listing is None or snapshot[0] != revision
+            or name in listing[2] or self.listing_state(revision, time.monotonic()) == "expired"
+        ):
+            return False
+        names = snapshot[1]
+        index = bisect.bisect_left(names, name)
+        return index < len(names) and names[index] == name
 
     def _finish_progressive(self, path, first):
         with self.listing_lock:
@@ -1473,7 +1497,7 @@ class NamespaceService:
         return entries
 
     def _publish_listing(self, path, ticket, started_at, listed_wall, cache_names, outcomes,
-                         *, complete=True, verify_out=None):
+                         *, complete=True, verify_out=None, late_member_names=()):
         entries = set(cache_names)
         backend_attrs: Dict[str, Dict[str, dict]] = {}
         member_entries: Dict[str, Set[str]] = {}
@@ -1579,11 +1603,19 @@ class NamespaceService:
                     self.dir_cache.pop(path, None)  # re-inserted: most recently used
                     self.dir_cache[path] = member_entries
                     self._listing_as_of[path] = started_at
+                    previous_snapshot = self.readdir_snapshot.get(path)
                     self.readdir_snapshot[path] = (started_at, ordered_entries)
                     self._view_inputs[path] = (entries, member_entries, size_splits, listed_wall)
                     # Re-inserted, so it is the most recently used.
                     self.entry_attrs.pop(path, None)
                     self.entry_attrs[path] = (started_at, backend_attrs, raced)
+                    if (
+                        self.desktop_additions is not None and late_member_names
+                        and previous_snapshot is not None and previous_snapshot[0] == started_at
+                    ):
+                        additions = visible_entries.intersection(late_member_names)
+                        additions.difference_update(previous_snapshot[1], raced, (".", ".."))
+                        self.desktop_additions.record(path, started_at, additions)
                 # A listing that began later was published while this one
                 # ran: answer with it, so a readdir never shows names older
                 # than what getattr now answers from.

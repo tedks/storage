@@ -241,7 +241,8 @@ class StorageFS(Operations):
                  max_sync_workers: Optional[int] = None,
                  max_download_workers: Optional[int] = None,
                  streaming_read_ahead_window: int = DEFAULT_STREAMING_READ_AHEAD_WINDOW,
-                 progressive_listings: bool = False):
+                 progressive_listings: bool = False,
+                 desktop_mountpoint: Optional[Path] = None):
         """
         Initialize Storage filesystem
 
@@ -450,6 +451,7 @@ class StorageFS(Operations):
             checksum_lock=self._checksum_lock,
             listing_max_stale=max(0.0, float(listing_max_stale)),
             progressive_listings=progressive_listings,
+            desktop_mountpoint=desktop_mountpoint,
             # Finite even with watchers (an infinite fresh window): see
             # NamespaceService.negative_window.
             negative_window=listing_fresh_window(readdir_ttl, revalidate_after),
@@ -474,6 +476,8 @@ class StorageFS(Operations):
             ),
             partial_suffix=self._PARTIAL_SUFFIX,
             stream_state_xattr=self._STREAM_STATE_XATTR,
+            poll_desktop_additions=(self.namespace.poll_desktop_additions
+                                    if desktop_mountpoint is not None else None),
         )
         self._streaming_reads = self._streaming_manager.streaming_reads
         self._streaming_chunk_size = self._streaming_manager.chunk_size
@@ -489,6 +493,10 @@ class StorageFS(Operations):
         Args:
             path: Mount path provided by FUSE (unused in this implementation).
         """
+        if self.namespace.desktop_additions is not None:
+            # Stamp the active generation after FUSE's mount/fork, before
+            # making it visible through the control socket.
+            self.namespace.desktop_additions.started_us = time.monotonic_ns() // 1000
         self._streaming_manager.init()
 
         if not self._sync_started:
@@ -3685,6 +3693,14 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
         negative_timeout=negative_timeout,
     )
 
+    desktop_mountpoint = None
+    if os.environ.get("STORAGE_EXPERIMENTAL_DESKTOP_ADDITIONS") == "1":
+        if not progressive_listings or fuse_options["negative_timeout"] != 0:
+            raise ValueError("Desktop listing delivery requires progressive listings and negative_timeout=0")
+        desktop_mountpoint = Path(mountpoint).resolve()
+        if len(os.fsencode(desktop_mountpoint)) > 768:
+            raise ValueError("Desktop listing mount path exceeds 768 bytes")
+
     is_root = os.geteuid() == 0
 
     # Auto-detect allow_other if not specified
@@ -3744,6 +3760,7 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
         revalidate_after=revalidate_after,
         listing_max_stale=listing_max_stale,
         progressive_listings=progressive_listings,
+        desktop_mountpoint=desktop_mountpoint,
         checksum_reverify_interval=checksum_reverify_interval,
         bulk_cold_copies=fuse_threads,
         max_foreground_operations=max_foreground_operations,
