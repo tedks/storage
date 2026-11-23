@@ -11,8 +11,8 @@ type: feature
 component: default
 release:
 reporter: Ted Smith <tedks@riseup.net>
-status: unstarted
-disposition:
+status: closed
+disposition: fixed
 creation_time: 2026-09-14T01:34:53-00:00
 references: []
 log_events:
@@ -28,6 +28,12 @@ log_events:
   who: Ted Smith
   what: blocked by gh-81-offline-semantics
   comment: ""
+- time: 2026-11-23T23:16:14-00:00
+  who: Ted Smith
+  what: 'closed: fixed'
+  comment: 'Merged #84 and #85. docs/refactor_roadmap.md Phase 6 defines per-member
+    reprobe outcomes. Tests preserve failed-member rows and reconcile successful members.
+    The checksumless-file design question remains tracked in reprobe-checksum-baseline-design.'
 blocked_by:
 - gh-81-land-pr85
 - gh-81-offline-semantics
