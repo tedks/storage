@@ -7,8 +7,8 @@ type: bugfix
 component: performance
 release:
 reporter: Ted Smith <tedks@riseup.net>
-status: unstarted
-disposition:
+status: closed
+disposition: fixed
 creation_time: 2026-10-24T19:18:32-00:00
 references: []
 log_events:
@@ -97,6 +97,12 @@ log_events:
   who: Ted Smith
   what: blocked by gh-111-refresh-followups
   comment: ""
+- time: 2026-11-23T23:16:01-00:00
+  who: Ted Smith
+  what: 'closed: fixed'
+  comment: 'Merged in #113 and #161. getattr uses member attributes already returned
+    by a valid directory listing. Invalidation drops affected attributes. The synthetic
+    SSH browse gate bounds the member requests.'
 blocked_by:
 - gh-111-listing-attrs
 - gh-111-parallel-listing
