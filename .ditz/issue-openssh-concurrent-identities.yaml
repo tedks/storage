@@ -1,0 +1,20 @@
+id: openssh-concurrent-identities
+title: Verify simultaneous OpenSSH policy identities on one mounted fixture
+desc: 'The #202 ExecPlan leaves a mounted case with two simultaneously active SSH
+  policy identities open. Use synthetic roots and distinct authentication policies,
+  assert one authenticated master per compatible identity, independent data routing
+  and teardown. #203 stages the opt-in transport. Matched latency measurement stays
+  in gh-29-benchmark.'
+type: task
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-23T23:18:52-00:00
+references: []
+log_events:
+- time: 2026-11-23T23:18:52-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
