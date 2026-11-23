@@ -10,8 +10,8 @@ type: bugfix
 component: default
 release:
 reporter: Ted Smith <tedks@riseup.net>
-status: in_progress
-disposition:
+status: closed
+disposition: fixed
 creation_time: 2026-11-19T12:02:29-00:00
 references: []
 log_events:
@@ -32,3 +32,9 @@ log_events:
     passed both FUSE loop modes, preserving least-recent eviction, exact member recovery
     after eviction, and cold reads with only dirty bytes in cache. Evidence uses disposable
     fixtures.'
+- time: 2026-11-23T23:16:46-00:00
+  who: Ted Smith
+  what: 'closed: fixed'
+  comment: 'Draft #191 at 0fa941f charges materialized blocks, evicts eligible files
+    by demand access and still serves direct demand reads when no eligible victim
+    fits. Full-cache mounted tests cover both loop modes. Staged via #203.'
