@@ -24,8 +24,8 @@ type: bugfix
 component: cache
 release:
 reporter: Ted Smith <tedks@riseup.net>
-status: in_progress
-disposition:
+status: closed
+disposition: fixed
 creation_time: 2026-10-24T21:14:19-00:00
 references: []
 log_events:
@@ -45,3 +45,10 @@ log_events:
     matches the retained inode. Serving the placeholder as an empty file is independently
     reproduced and tracked in recomputable-eviction-placeholder-read. All 49 gates
     passed at b2e50e0.
+- time: 2026-11-23T23:16:42-00:00
+  who: Ted Smith
+  what: 'closed: fixed'
+  comment: 'Draft #187 at b2e50e0 rechecks CLEAN and live stat under the metadata
+    and descriptor guards, keeps open and dirty bytes and records the post-truncate
+    mtime. #191 keeps recompute-only data under automatic pressure. Both changes are
+    in staged #203. The separate empty-placeholder reconstruction issue remains open.'
