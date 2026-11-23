@@ -10,8 +10,8 @@ type: bugfix
 component: default
 release:
 reporter: Ted Smith <tedks@riseup.net>
-status: in_progress
-disposition:
+status: closed
+disposition: fixed
 creation_time: 2026-11-19T11:55:44-00:00
 references: []
 log_events:
@@ -31,3 +31,9 @@ log_events:
     ten-reader regression passes in both FUSE loops; restoring the old cap fails both.
     Full gate 49/49 plus CLI. #191 supplies incremental partial accounting on the
     combined path. Pending review/merge.'
+- time: 2026-11-23T23:16:44-00:00
+  who: Ted Smith
+  what: 'closed: fixed'
+  comment: 'Draft #190 at 2d800bb removes static streaming file slots and preserves
+    meaningful resource and availability errors without a whole-file fallback. Staged
+    via #203.'
