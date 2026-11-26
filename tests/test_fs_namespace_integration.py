@@ -1628,30 +1628,32 @@ class TestFSNamespaceIntegration(unittest.TestCase):
             self.fs.getattr('/' + name)
         self.assertEqual(set(namespace._stat_memo), {'/b', '/c'})
 
-    def test_resync_drops_listings_and_keeps_in_flight_ones_unpublished(self):
+    def test_resync_drops_old_listings_and_retries_an_in_flight_scan(self):
         (self.backend1_dir / "f.txt").write_text("1")
         namespace = self.fs.namespace
         list(self.fs.readdir('/', None))
+        directory = self.backend1_dir / "d"
+        directory.mkdir()
+        (directory / "old.txt").touch()
         started, release = threading.Event(), threading.Event()
 
-        def before(_path):
+        def after(_path):
             started.set()
-            release.wait(5)
+            self.assertTrue(release.wait(5))
 
-        result = {}
-        with self._wrap_listdir_attrs("backend1", before=before):
-            thread = threading.Thread(
-                target=lambda: result.setdefault('e', list(self.fs.readdir('/d', None))))
-            (self.backend1_dir / "d").mkdir()
-            thread.start()
-            self.assertTrue(started.wait(5))
-            namespace.invalidate_all_listings()
-            release.set()
-            thread.join(5)
-        self.assertFalse(thread.is_alive())
-        self.assertEqual(namespace.entry_attrs, {})
-        self.assertEqual(namespace.readdir_snapshot, {})
-        self.assertEqual(self.fs._dir_cache, {})
+        with self._wrap_listdir_attrs("backend1", after=after):
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                read = pool.submit(self.fs.readdir, "/d", None)
+                try:
+                    self.assertTrue(started.wait(5))
+                    (directory / "old.txt").rename(directory / "current.txt")
+                    namespace.invalidate_all_listings()
+                finally:
+                    release.set()
+                self.assertEqual(set(read.result(timeout=5)), {".", "..", "current.txt"})
+        self.assertEqual(set(namespace.entry_attrs), {"/d"})
+        self.assertEqual(set(namespace.readdir_snapshot), {"/d"})
+        self.assertEqual(set(self.fs._dir_cache), {"/d"})
         self.assertEqual(namespace._listings_in_flight, {})
 
     def test_older_background_refresh_does_not_replace_newer_listing(self):
@@ -1922,6 +1924,24 @@ class TestFSNamespaceIntegration(unittest.TestCase):
         with self.assertRaises(FuseOSError) as gone:
             self.fs.getattr("/before.txt")
         self.assertEqual(gone.exception.errno, errno.ENOENT)
+
+    def test_cold_listing_retries_a_single_superseded_scan(self):
+        path = self.backend1_dir / "stale-name"
+        path.write_bytes(b"old")
+        raced = False
+
+        def invalidate_once(_path):
+            nonlocal raced
+            if not raced:
+                path.rename(self.backend1_dir / "current-name")
+                self.fs.namespace.invalidate_dir_cache_entry("/")
+                raced = True
+
+        with self._wrap_listdir_attrs("backend1", after=invalidate_once):
+            names = self.fs.readdir("/", None)
+        self.assertTrue(raced)
+        self.assertIn("current-name", names)
+        self.assertNotIn("stale-name", names)
 
     def test_cold_empty_success_is_distinct_from_all_unavailable(self):
         self.fs.namespace.progressive_listings = True

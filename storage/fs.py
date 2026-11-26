@@ -1977,29 +1977,30 @@ class StorageFS(Operations):
                     cache_path.unlink()
                     self.state_manager.delete_file(path)
                     self._forget_member_check(path, path_gone=True)
-                    self.namespace.record_local_child(self._resolve_path(path))
-                    return
-                if staged is None:
+                elif staged is None:
                     self._store_member_check(path, cache_path, self._cache_identity(current),
                                              baselines, verified_at=checked_at)
                     return
-                if (self._defer_for_buffered_reader_locked(path) or current.st_nlink != 1
-                        or self.cache_manager.get_free_space_needed(0)):
-                    return
-                refreshed = os.lstat(staged)
-                metadata.size = refreshed.st_size
-                metadata.last_modified = refreshed.st_mtime
-                metadata.checksum = None
-                derived = {self.MEMBER_STAT_XATTR, MEMBER_ATTRS_XATTR,
-                           self.CACHE_METADATA_XATTR, PREFIX_XATTR}
-                for name in os.listxattr(cache_path, follow_symlinks=False):
-                    if name.startswith("user.") and name not in derived:
-                        value = os.getxattr(cache_path, name, follow_symlinks=False)
-                        os.setxattr(staged, name, value, follow_symlinks=False)
-                self.cache_manager.sync_cache_metadata(path, metadata, cache_path=staged)
-                os.replace(staged, cache_path)
-                self.state_manager.set_file_metadata(metadata)
-                self._record_fetched(path, cache_path, backend, observed)
+                else:
+                    if (self._defer_for_buffered_reader_locked(path) or current.st_nlink != 1
+                            or self.cache_manager.get_free_space_needed(0)):
+                        return
+                    refreshed = os.lstat(staged)
+                    metadata.size = refreshed.st_size
+                    metadata.last_modified = refreshed.st_mtime
+                    metadata.checksum = None
+                    derived = {self.MEMBER_STAT_XATTR, MEMBER_ATTRS_XATTR,
+                               self.CACHE_METADATA_XATTR, PREFIX_XATTR}
+                    for name in os.listxattr(cache_path, follow_symlinks=False):
+                        if name.startswith("user.") and name not in derived:
+                            value = os.getxattr(cache_path, name, follow_symlinks=False)
+                            os.setxattr(staged, name, value, follow_symlinks=False)
+                    self.cache_manager.sync_cache_metadata(path, metadata, cache_path=staged)
+                    os.replace(staged, cache_path)
+                    self.state_manager.set_file_metadata(metadata)
+                    self._record_fetched(path, cache_path, backend, observed)
+            if remove:
+                self.namespace.record_local_child(self._resolve_path(path))
 
     def _revalidate_cached_file(self, resolved: ResolvedPath):
         """Refetch a CLEAN cached file whose member copy changed.

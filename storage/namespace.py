@@ -1183,7 +1183,15 @@ class NamespaceService:
         return LISTED_MISSING if complete_miss else None
 
     def readdir(self, path: str):
-        """Serve a published listing immediately, refreshing it when due."""
+        """Serve a committed view or retry one superseded cold scan."""
+        try:
+            return self._readdir(path)
+        except FuseOSError as exc:
+            if exc.errno != errno.EAGAIN:
+                raise
+        return self._readdir(path)
+
+    def _readdir(self, path: str):
         with self.listing_lock:
             snapshot = self.readdir_snapshot.get(path)
             listing = self.entry_attrs.get(path)
@@ -1215,7 +1223,7 @@ class NamespaceService:
         with self.listing_lock:
             current = self._first_publications.get(path)
             generation = self._listing_generation.get(path, 0)
-            if current is not None and current[0] == generation:
+            if current is not None and current[0] == generation and not current[1].done():
                 first = current[1]
                 ticket = None
             else:
@@ -1703,7 +1711,7 @@ class NamespaceService:
 
         # Pending and failed members keep their previous positives. Their
         # attributes remain usable but cannot prove freshness or absence.
-        fresh_members = set(backend_attrs)
+        fresh_members = {member for member in member_entries if member in outcomes and member not in failed}
         split_attrs = dict(backend_attrs)
         with self.listing_lock:
             published = self.entry_attrs.get(path)

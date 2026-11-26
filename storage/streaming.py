@@ -1432,6 +1432,9 @@ class StreamingReadManager:
                         session.finalized = True
                         should_close = session.refcount == 0
                         session.condition.notify_all()
+                    # This callback records only local source baselines.
+                    # It must not take a path lock: watcher hints take the
+                    # path lock before acquiring this session's I/O lock.
                     if self.on_finalized is not None:
                         try:
                             self.on_finalized(session)

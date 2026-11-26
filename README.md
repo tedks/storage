@@ -300,8 +300,9 @@ Size and mtime baselines persist in the cache file's read-only
 and has no inode or change time. A same-size rewrite in the same timestamp
 tick may be indistinguishable until a watcher supplies a change hint. A
 hint can retire a clean cache copy after every configured member confirms
-the name is absent and the reader and repair checks permit retirement. A
-cold stream checks the observed generation around missing-range reads. If the
+the name is absent and the reader and repair checks permit retirement.
+Without a trusted hint, member absence alone leaves the local copy
+available. A cold stream checks the observed generation around missing-range reads. If the
 member changes, a reader can still use previously cached ranges, and a
 missing range fails with `ESTALE`. A later open can start a new stream.
 
