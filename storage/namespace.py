@@ -829,7 +829,7 @@ class NamespaceService:
             else:
                 backend_iter = list(self.backends.items())
 
-            listed = self._listed_attrs(resolved, backend_iter, read_lookup=read_lookup)
+            listed = self._listed_attrs(resolved, backend_iter)
             if listed is LISTED_MISSING:
                 if not read_lookup or not self.read_source_hints(resolved)[0]:
                     raise FuseOSError(errno.ENOENT)
@@ -930,56 +930,32 @@ class NamespaceService:
 
             raise FuseOSError(exc.errno)
 
-    def _listed_attrs(self, resolved: ResolvedPath, backend_iter, *, read_lookup=False):
-        """Attributes of a path from its parent's listing, if any.
+    def _listed_attrs(self, resolved: ResolvedPath, backend_iter):
+        """Serve known attributes locally and refresh the parent when due.
 
-        Walks the members in the order getattr probes them, skipping the
-        unavailable ones as getattr does. The first available member that
-        lists the name decides: its listed attributes are returned when
-        complete (a symlink is listed by lstat, so it is reported as a link
-        and the kernel asks readlink for its target), and None (probe the
-        members) when it lists the name without mode, size or mtime. None is also returned
-        when there is no listing, it has expired, the name is unknown (see
-        entry_attrs), or a member walked before the name was found has no
-        attributes in it (its listing failed or carried none). A member
-        that listed successfully without the name is passed over, as its
-        stat would have failed.
-
-        LISTED_MISSING: the listing is fresh, no older than negative_window,
-        and every available member listed without the name, so getattr
-        answers ENOENT without a stat. A stale listing never answers that;
-        its misses are probed.
-
-        A stale listing schedules a background refresh of the parent.
+        A negative answer requires a fresh observation from every candidate
+        member. Pending members and unknown children leave absence undecided.
         """
         parent = resolved.parent_dir
         name = Path(resolved.canonical_path).name
-        # Availability first: is_available() may do more than read a flag,
-        # and the walk below runs under listing_lock, which is a leaf.
-        available = [
-            backend_name for backend_name, backend in backend_iter
-            if backend and backend.is_available()
-        ]
+        members = [member for member, backend in backend_iter if backend]
+        online = [member for member, backend in backend_iter if backend and backend.is_available()]
         now = time.monotonic()
         result = None
         with self.listing_lock:
-            # Under the lock throughout: forget_listed_attrs edits these
-            # dictionaries in place (pops the name, then marks it unknown),
-            # and a walk between the two would read the name as absent.
             listing = self.entry_attrs.get(parent)
             self._touch_listing_locked(parent)
-            state = self.listing_state(listing[0], now) if listing else "expired"
-            if state != "expired" and name not in listing[2]:
-                result = self._walk_listing_locked(listing, name, available)
-                if result is LISTED_MISSING:
-                    if not self._answers_missing(listing[0], now) or (
-                        read_lookup and any(
-                            member not in listing[1] or name in listing[1][member]
-                            for member, backend in backend_iter if backend
-                        )
-                    ):
-                        result = None
-        if state == "stale":
+            if listing is None or self.readdir_snapshot_ttl <= 0:
+                return None
+            if name not in listing[2]:
+                inputs = self._view_inputs.get(parent)
+                names = inputs[1] if inputs else {}
+                result = self._walk_listing_locked(listing, name, online, names)
+                if result in (None, LISTED_MISSING) and online != members:
+                    result = self._walk_listing_locked(listing, name, members, names)
+                if result is LISTED_MISSING and not self._answers_missing(listing[0], now):
+                    result = None
+        if now - listing[0] > self.readdir_snapshot_ttl:
             self._schedule_refresh(parent)
         return result
 
@@ -1050,46 +1026,36 @@ class NamespaceService:
             return (listing[0], dict(attrs)) if attrs is not None else None
 
     @staticmethod
-    def _walk_listing_locked(listing, name: str, available: List[str]):
-        for backend_name in available:
+    def _walk_listing_locked(listing, name: str, members: List[str], names):
+        complete_miss = bool(members)
+        for backend_name in members:
             member_attrs = listing[1].get(backend_name)
             if member_attrs is None:
-                return None
+                if name in names.get(backend_name, ()):
+                    return None  # Known first copy, but its attributes need a stat.
+                complete_miss = False
+                continue
             attrs = member_attrs.get(name)
             if attrs is None:
                 continue
-            mode = attrs.get("st_mode")
-            if (
-                mode is None
-                or attrs.get("st_size") is None
-                or attrs.get("st_mtime") is None
-            ):
-                return None
-            return attrs
-        return LISTED_MISSING if available else None
+            if all(attrs.get(key) is not None for key in ("st_mode", "st_size", "st_mtime")):
+                return attrs
+            complete_miss = False
+        return LISTED_MISSING if complete_miss else None
 
     def readdir(self, path: str):
-        """Read directory contents.
-
-        A fresh listing is served as is. A stale one is served too, and a
-        background refresh of the directory is scheduled; an expired one
-        (or none) is replaced by listing every member now.
-        """
+        """Serve a published listing immediately, refreshing it when due."""
         with self.listing_lock:
             snapshot = self.readdir_snapshot.get(path)
             listing = self.entry_attrs.get(path)
             self._touch_listing_locked(path)
-        # The snapshot and the attributes are published, dropped and pruned
-        # together; a snapshot is served only with its attributes, so the
-        # `ls -l` that follows a readdir never probes per entry.
-        if snapshot and listing:
-            state = self.listing_state(snapshot[0], time.monotonic())
-            incomplete = self.progressive_listings and len(listing[1]) < len(self.backends)
-            retry_due = incomplete and time.monotonic() - snapshot[0] >= self.refresh_member_timeout
-            if state == "stale" or (retry_due and state == "fresh"):
+        if snapshot and listing and self.readdir_snapshot_ttl > 0:
+            now = time.monotonic()
+            incomplete = len(listing[1]) < len(self.backends)
+            retry_due = incomplete and now - snapshot[0] >= self.refresh_member_timeout
+            if now - snapshot[0] > self.readdir_snapshot_ttl or retry_due:
                 self._schedule_refresh(path)
-            if state != "expired":
-                return self._served_snapshot(path, snapshot)
+            return self._served_snapshot(path, snapshot)
 
         if self.progressive_listings and len(self.backends) > 1:
             return self._progressive_readdir(path)
@@ -1621,22 +1587,6 @@ class NamespaceService:
                 # than what getattr now answers from.
                 newer = self._listing_as_of.get(path, float("-inf")) > started_at
                 newer_snapshot = self.readdir_snapshot.get(path) if newer else None
-                # A snapshot is not served once its listing has expired, so
-                # both go; the time goes only with the listing it stamps (a
-                # guard: they are always set and dropped together). Linear
-                # in the listed directories, under both locks, once per
-                # listing.
-                now = time.monotonic()
-                expired = [
-                    dir_path for dir_path, (at, _, _) in self.entry_attrs.items()
-                    if self.listing_state(at, now) == "expired"
-                ]
-                for dir_path in expired:
-                    at = self.entry_attrs.pop(dir_path)[0]
-                    self.readdir_snapshot.pop(dir_path, None)
-                    self._view_inputs.pop(dir_path, None)
-                    if self._listing_as_of.get(dir_path) == at:
-                        del self._listing_as_of[dir_path]
                 # Over the limit, the least recently used go, dir_cache
                 # included (watchers never expire a listing). A listing
                 # in flight for such a directory is published again.
