@@ -1,0 +1,18 @@
+id: storage-cache-first-revalidation
+title: Serve warm Storage listings and read-only opens from cache
+desc: Serve local observations and complete bytes while bounded revalidation runs.
+  Cover restart, member failure, and reader generations on synthetic data. Draft against
+  the staged desktop and transport branch.
+type: feature
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-26T19:38:38-00:00
+references: []
+log_events:
+- time: 2026-11-26T19:38:38-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
