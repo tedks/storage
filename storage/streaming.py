@@ -14,7 +14,9 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 from fuse import FuseOSError
 
-from .backends.base import Backend, capacity_wait_cancellation, member_generation
+from .backends.base import (
+    Backend, capacity_wait_cancellation, member_generation, member_range_generation,
+)
 from .backends.ssh_pool import BulkCapacityCancelled, member_failure_errno
 from .backends.local import NOREPLACE_UNSUPPORTED
 from .backends.local import rename_noreplace as _rename_noreplace
@@ -879,14 +881,9 @@ class StreamingReadManager:
             if session.stop_requested:
                 return start, []
             remaining = target_end - cursor
-            generation = member_generation(session.member_stat)
             try:
-                before = member_generation(session.backend.stat(session.canonical_path))
-                if generation is None or before != generation:
-                    raise OSError(errno.ESTALE, "member generation changed")
-                chunk = session.backend.read_file(session.canonical_path, cursor, remaining)
-                if member_generation(session.backend.stat(session.canonical_path)) != generation:
-                    raise OSError(errno.ESTALE, "member generation changed during read")
+                with member_range_generation(member_generation(session.member_stat)):
+                    chunk = session.backend.read_file(session.canonical_path, cursor, remaining)
             except FileNotFoundError as exc:
                 raise OSError(errno.ESTALE, "member generation no longer exists") from exc
             if not chunk:

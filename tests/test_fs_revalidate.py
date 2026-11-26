@@ -1228,6 +1228,37 @@ class TestRevalidateStreamedFetch(RevalidateTestBase):
             self.fs.release("/m.bin", fd)
 
 
+    def test_range_rejects_another_inode_even_if_the_path_is_restored(self):
+        from fuse import FuseOSError
+
+        old = b"x" * (3 * 4096 + 17)
+        new = b"y" * len(old)
+        source = self.rewrite_member("current.bin", old, mtime=1_700_000_000)
+        substitute = self.rewrite_member("substitute.bin", new, mtime=1_700_000_000)
+        saved = self.member_dir / "saved.bin"
+        reader = self.fs.open("/current.bin", os.O_RDONLY)
+        original = self.member.read_file
+
+        def swap_only_while_reading(path, offset, size):
+            source.rename(saved)
+            substitute.rename(source)
+            try:
+                return original(path, offset, size)
+            finally:
+                source.rename(substitute)
+                saved.rename(source)
+
+        try:
+            self.assertEqual(self.fs.read("/current.bin", 8, 0, reader), old[:8])
+            with patch.object(self.member, "read_file", side_effect=swap_only_while_reading):
+                with self.assertRaises(FuseOSError) as raised:
+                    self.fs.read("/current.bin", 8, 8192, reader)
+            self.assertEqual(raised.exception.errno, errno.ESTALE)
+            self.assertEqual(self.fs.read("/current.bin", 8, 0, reader), old[:8])
+        finally:
+            self.fs.release("/current.bin", reader)
+
+
 class TestRevalidateStreamBail(RevalidateTestBase):
     """A stream that selects the pinned member and then bails to a full fetch."""
 

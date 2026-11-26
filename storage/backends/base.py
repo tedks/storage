@@ -79,6 +79,33 @@ def member_generation(st):
             getattr(st, "st_ino", None))
 
 
+_EXPECTED_RANGE_GENERATION = contextvars.ContextVar("storage_range_generation", default=None)
+
+
+@contextmanager
+def member_range_generation(generation):
+    """Pin a range read to the generation observed when its stream opened."""
+    if generation is None:
+        raise OSError(errno.ESTALE, "member does not report a range generation")
+    token = _EXPECTED_RANGE_GENERATION.set(generation)
+    try:
+        yield
+    finally:
+        _EXPECTED_RANGE_GENERATION.reset(token)
+
+
+def read_member_range(handle, offset, size, fstat):
+    """Check the actual open file around the read, including reconnect retries."""
+    expected = _EXPECTED_RANGE_GENERATION.get()
+    if expected is not None and member_generation(fstat()) != expected:
+        raise OSError(errno.ESTALE, "member generation changed")
+    handle.seek(offset)
+    data = handle.read(size)
+    if expected is not None and member_generation(fstat()) != expected:
+        raise OSError(errno.ESTALE, "member generation changed during read")
+    return data
+
+
 class MemberSourceMissing(FileNotFoundError):
     """A member rename found nothing at the old name on the member: nothing
     moved. Raised only on positive evidence (the member's own check of the
