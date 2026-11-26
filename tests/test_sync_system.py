@@ -6,6 +6,11 @@ end-to-end.
 """
 
 import concurrent.futures
+import dataclasses
+import mmap
+import json
+import select
+import sys
 import errno
 import unittest
 import tempfile
@@ -402,6 +407,47 @@ class TestKernelCacheVisibility(_MountedCase):
             self.fs.getattr = original
 
 
+# A page fault can block in the kernel while Python holds its GIL. The FUSE
+# loop runs in this test process, so perform mmap reads in a separate client.
+# libc mmap also avoids CPython's implicit dup of the file descriptor.
+_MAPPED_READER = """
+import ctypes
+import json
+import mmap
+import os
+import sys
+
+libc = ctypes.CDLL(None, use_errno=True)
+libc.mmap.restype = ctypes.c_void_p
+fd = os.open(sys.argv[1], os.O_RDONLY)
+size = int(sys.argv[2])
+address = libc.mmap(None, size, mmap.PROT_READ, mmap.MAP_PRIVATE, fd, 0)
+error = ctypes.get_errno()
+if address == ctypes.c_void_p(-1).value:
+    address = None
+else:
+    libc.madvise(ctypes.c_void_p(address), size, mmap.MADV_RANDOM)
+print(json.dumps(error if address is None else 0), flush=True)
+for line in sys.stdin:
+    op, *args = line.split()
+    if op == "mapped":
+        assert address is not None
+        result = ctypes.string_at(address + int(args[0]), 32).hex()
+    elif op == "read":
+        result = os.pread(fd, 32, int(args[0])).hex()
+    elif op == "close":
+        os.close(fd)
+        result = None
+    elif op == "unmap":
+        assert libc.munmap(ctypes.c_void_p(address), size) == 0
+        address = None
+        result = None
+    else:
+        raise ValueError(op)
+    print(json.dumps(result), flush=True)
+"""
+
+
 class TestKernelCacheRefetch(_MountedCase):
     """A refetch after revalidation is read in full, never through stale
     pages or a stale size the kernel still holds (fuse_mount_options)."""
@@ -428,8 +474,115 @@ class TestKernelCacheRefetch(_MountedCase):
         # so the kernel and libfuse both hold the old size and mtime.
         self.assertEqual(len(old), os.stat(target).st_size)
         with open(target, "rb") as f:
-            self.assertEqual(new, f.read())
+            self.assertEqual(old, f.read())
+        self.assertTrue(self._wait_for(lambda: (self.cache_dir / name).read_bytes() == new))
+        self.assertEqual(target.read_bytes(), new)
         self.assertEqual(len(new), os.stat(target).st_size)
+
+    def _generation_probe(self, name, page_delta, *, direct=False):
+        page = mmap.PAGESIZE
+        old = b"".join(bytes([0x11 + i]) * page for i in range(4))
+        new = b"".join(bytes([0x71 + i]) * page for i in range(4 + page_delta))
+        target = self.mount_dir / name
+        (self.backend1_dir / name).write_bytes(old)
+        if direct:
+            self.fs._experimental_reader_direct_io = True
+        client = subprocess.Popen(
+            [sys.executable, "-u", "-c", _MAPPED_READER, str(target), str(len(old))],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+        )
+
+        def read_reply():
+            self.assertTrue(select.select([client.stdout], [], [], 5)[0],
+                            "mapped reader did not respond")
+            return json.loads(client.stdout.readline())
+
+        def request(command, offset=None):
+            line = command if offset is None else f"{command} {offset}"
+            client.stdin.write(line + "\n")
+            client.stdin.flush()
+            reply = read_reply()
+            return bytes.fromhex(reply) if isinstance(reply, str) else reply
+
+        def verify():
+            error = read_reply()
+            if error:
+                self.assertTrue(direct, f"buffered mmap failed with errno {error}")
+                self.assertIn(error, {errno.ENODEV, errno.EINVAL, errno.ENOSYS})
+                print(f"direct reader mmap failed with errno {error}")
+            else:
+                self.assertEqual(request("mapped", 0), old[:32])
+            self._change_on_member(name, new)
+            with self.fs._member_checks_lock:
+                check = self.fs._member_checks["/" + name]
+                self.fs._member_checks["/" + name] = dataclasses.replace(
+                    check, verified_at=time.monotonic() - 30,
+                )
+            with target.open("rb", buffering=0):
+                pass
+            legacy = not hasattr(self.fs, "_deferred_validations")
+            if not legacy:
+                predicate = (lambda: (self.cache_dir / name).read_bytes() == new) if direct else (
+                    lambda: "/" + name in self.fs._deferred_validations)
+                self.assertTrue(self._wait_for(predicate))
+            with target.open("rb", buffering=0) as later:
+                new_sample = os.pread(later.fileno(), 32, 2 * page)
+                old_sample = request("read", 3 * page)
+                mapped_sample = request("mapped", 2 * page) if not error else b""
+                old_eof = request("read", len(old))
+                new_eof = os.pread(later.fileno(), 32, len(old))
+                # A second interleaved read must still see the same version.
+                self.assertEqual(os.pread(later.fileno(), 32, 2 * page), new_sample)
+                print(f"generation probe page-delta={page_delta} direct={direct} mmap={not error} "
+                      f"later={new_sample[:1].hex()} older={old_sample[:1].hex()} "
+                      f"mapped={mapped_sample[:1].hex()} old-eof={old_eof[:1].hex()} "
+                      f"later-eof={new_eof[:1].hex()}")
+                if legacy:
+                    # Print the staged behavior even when the old and new views
+                    # disagree. The draft is required to satisfy the checks below.
+                    self.assertEqual(new_sample, new[2 * page:2 * page + 32])
+                    return
+                self.assertEqual(new_sample, (new if direct else old)[2 * page:2 * page + 32])
+                self.assertEqual(old_sample, old[3 * page:3 * page + 32])
+                self.assertEqual(old_eof, b"")
+                self.assertEqual(new_eof, new[len(old):len(old) + 32] if direct else b"")
+                if not error:
+                    self.assertEqual(mapped_sample, old[2 * page:2 * page + 32])
+            request("close")
+            if not error:
+                if not direct:
+                    with target.open("rb", buffering=0) as overlapping:
+                        self.assertEqual(os.pread(overlapping.fileno(), 32, 3 * page),
+                                         old[3 * page:3 * page + 32])
+                        self.assertEqual(os.pread(overlapping.fileno(), 32, len(old)), b"")
+                    self.assertEqual((self.cache_dir / name).read_bytes(), old)
+                self.assertEqual(request("mapped", page), old[page:page + 32])
+                request("unmap")
+            self.assertTrue(self._wait_for(lambda: (self.cache_dir / name).read_bytes() == new))
+            with target.open("rb", buffering=0) as final:
+                self.assertEqual(final.read(), new)
+                self.assertEqual(os.pread(final.fileno(), 32, len(new)), b"")
+
+        try:
+            verify()
+        finally:
+            client.stdin.close()
+            try:
+                client.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                client.kill()
+                client.wait()
+            client.stdout.close()
+
+    def test_buffered_mmap_holds_old_generation_until_the_last_unmap(self):
+        for page_delta in (0, 1, -1):
+            with self.subTest(page_delta=page_delta):
+                self._generation_probe(f"mapped-{page_delta}.bin", page_delta)
+
+    def test_experimental_direct_reader_generations(self):
+        for page_delta in (0, 1, -1):
+            with self.subTest(page_delta=page_delta):
+                self._generation_probe(f"direct-{page_delta}.bin", page_delta, direct=True)
 
     def test_grown_file_reads_in_full(self):
         self._read_after_revalidation("grow.bin", b"a" * 100, b"b" * 200)
@@ -458,10 +611,11 @@ class TestKernelCacheRefetch(_MountedCase):
             source.write_bytes(after)
             os.utime(source, (stamp, stamp))
             self.fs._on_remote_change("/" + name)
-            self.assertFalse(cached.exists())
-
+            self.assertEqual(cached.read_bytes(), before)
             with target.open("rb") as reader:
-                self.assertEqual(after, cached.read_bytes())
+                self.assertEqual(before, reader.read())
+            self.assertTrue(self._wait_for(lambda: cached.read_bytes() == after))
+            with target.open("rb") as reader:
                 self.assertEqual(stamp, target.stat().st_mtime)
                 self.assertEqual(after, reader.read())
             self.assertEqual(after, target.read_bytes())

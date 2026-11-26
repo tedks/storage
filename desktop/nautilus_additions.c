@@ -14,8 +14,8 @@
 
 #define MAX_PATH_BYTES 768
 #define MAX_NAME_BYTES 255
-#define MAX_ADDITIONS 128
-#define MAX_RESPONSE_BYTES 67584
+#define MAX_VIEW_NAMES 8192
+#define MAX_RESPONSE_BYTES (5 * 1024 * 1024)
 #define MAX_MONITORS 16
 #define POLL_MS 500
 
@@ -28,19 +28,21 @@ typedef struct {
     char *mount_hex;
     char *directory_hex;
     char *endpoint;
-    gint64 attached;
     char *generation;
-    gint64 through;
+    gint64 revision;
     guint64 mount_id;
     gboolean pending;
     gboolean stopped;
+    gboolean degraded;
+    GHashTable *known;
 } Subscription;
 
 typedef struct {
     char *generation;
-    gint64 through;
+    gint64 revision;
     guint64 mount_id;
-    GPtrArray *names;
+    char *status;
+    GHashTable *entries;
 } Additions;
 
 static gint active_monitors;
@@ -58,6 +60,7 @@ static void subscription_unref(gpointer data)
     g_free(sub->directory_hex);
     g_free(sub->endpoint);
     g_free(sub->generation);
+    g_clear_pointer(&sub->known, g_hash_table_unref);
     g_free(sub);
     g_atomic_int_add(&active_monitors, -1);
 }
@@ -68,7 +71,8 @@ static void additions_free(gpointer data)
     if (additions == NULL)
         return;
     g_free(additions->generation);
-    g_ptr_array_unref(additions->names);
+    g_free(additions->status);
+    g_clear_pointer(&additions->entries, g_hash_table_unref);
     g_free(additions);
 }
 
@@ -127,33 +131,50 @@ static Additions *parse_additions(const char *frame, gsize length, const Subscri
     JsonObject *object = json_node_get_object(root);
     const char *status = json_string(json_object_get_member(object, "status"));
     const char *generation = json_string(json_object_get_member(object, "generation"));
-    JsonNode *cursor = json_object_get_member(object, "through");
-    JsonNode *items = json_object_get_member(object, "added");
-    if (g_strcmp0(status, "ok") != 0 || generation == NULL ||
+    JsonNode *cursor = json_object_get_member(object, "revision");
+    if (status == NULL || generation == NULL ||
         strlen(generation) != 32 || strspn(generation, "0123456789abcdef") != 32 ||
-        (sub->generation != NULL && strcmp(generation, sub->generation) != 0) ||
-        cursor == NULL || json_node_get_value_type(cursor) != G_TYPE_INT64 ||
-        items == NULL || !JSON_NODE_HOLDS_ARRAY(items))
+        cursor == NULL || json_node_get_value_type(cursor) != G_TYPE_INT64)
         return NULL;
 
-    gint64 through = json_node_get_int(cursor);
-    JsonArray *array = json_node_get_array(items);
-    guint count = json_array_get_length(array);
-    if (through < sub->through || count > MAX_ADDITIONS ||
-        count > (guint64)(through - sub->through))
+    gint64 revision = json_node_get_int(cursor);
+    gboolean replaced = sub->generation != NULL && strcmp(generation, sub->generation) != 0;
+    if ((!replaced && revision < 0) || (replaced && strcmp(status, "generation-changed")))
         return NULL;
-
-    g_autoptr(GPtrArray) names = g_ptr_array_new_with_free_func(g_free);
-    for (guint index = 0; index < count; index++) {
-        char *name = decode_name(json_string(json_array_get_element(array, index)));
-        if (name == NULL)
+    g_autoptr(GHashTable) entries = NULL;
+    if (!strcmp(status, "ok")) {
+        JsonNode *items = json_object_get_member(object, "entries");
+        if (revision <= sub->revision || items == NULL || !JSON_NODE_HOLDS_ARRAY(items))
             return NULL;
-        g_ptr_array_add(names, name);
+        JsonArray *array = json_node_get_array(items);
+        guint count = json_array_get_length(array);
+        if (count > MAX_VIEW_NAMES)
+            return NULL;
+        entries = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+        for (guint index = 0; index < count; index++) {
+            JsonNode *item = json_array_get_element(array, index);
+            if (!JSON_NODE_HOLDS_ARRAY(item))
+                return NULL;
+            JsonArray *pair = json_node_get_array(item);
+            if (json_array_get_length(pair) != 2)
+                return NULL;
+            g_autofree char *name = decode_name(json_string(json_array_get_element(pair, 0)));
+            const char *marker = json_string(json_array_get_element(pair, 1));
+            if (name == NULL || marker == NULL || strlen(marker) > 128 ||
+                g_hash_table_contains(entries, name))
+                return NULL;
+            g_hash_table_insert(entries, g_steal_pointer(&name), g_strdup(marker));
+        }
+    } else if (strcmp(status, "pending") && strcmp(status, "unchanged") &&
+               strcmp(status, "too-large") && strcmp(status, "generation-changed")) {
+        return NULL;
     }
+
     Additions *additions = g_new0(Additions, 1);
     additions->generation = g_strdup(generation);
-    additions->through = through;
-    additions->names = g_steal_pointer(&names);
+    additions->status = g_strdup(status);
+    additions->revision = revision;
+    additions->entries = g_steal_pointer(&entries);
     return additions;
 }
 
@@ -206,11 +227,11 @@ static Additions *request_additions(const Subscription *sub)
         return NULL;
 
     g_autofree char *cursor = sub->generation == NULL
-        ? g_strdup_printf("\"since_us\":%" G_GINT64_FORMAT, sub->attached)
-        : g_strdup_printf("\"generation\":\"%s\",\"after\":%" G_GINT64_FORMAT,
-                          sub->generation, sub->through);
+        ? g_strdup_printf("\"revision\":%" G_GINT64_FORMAT, sub->revision)
+        : g_strdup_printf("\"generation\":\"%s\",\"revision\":%" G_GINT64_FORMAT,
+                          sub->generation, sub->revision);
     g_autofree char *request =
-        g_strdup_printf("{\"command\":\"desktop.additions.v1\",\"mount_hex\":\"%s\","
+        g_strdup_printf("{\"command\":\"desktop.changes.v2\",\"mount_hex\":\"%s\","
                         "\"directory_hex\":\"%s\",%s}\n",
                         sub->mount_hex, sub->directory_hex, cursor);
     g_socket_set_blocking(socket, FALSE);
@@ -226,17 +247,17 @@ static Additions *request_additions(const Subscription *sub)
     if (sent != length)
         return NULL;
 
-    g_autofree char *frame = g_malloc(MAX_RESPONSE_BYTES);
-    gsize received = 0;
-    while (received < MAX_RESPONSE_BYTES && socket_ready(socket, G_IO_IN, deadline)) {
-        gssize count = g_socket_receive(socket, frame + received,
-                                        MAX_RESPONSE_BYTES - received, NULL, NULL);
+    g_autoptr(GByteArray) frame = g_byte_array_sized_new(4096);
+    while (frame->len < MAX_RESPONSE_BYTES && socket_ready(socket, G_IO_IN, deadline)) {
+        char buffer[4096];
+        gsize available = MIN(sizeof(buffer), MAX_RESPONSE_BYTES - frame->len);
+        gssize count = g_socket_receive(socket, buffer, available, NULL, NULL);
         if (count <= 0)
             return NULL;
-        char *lf = memchr(frame + received, '\n', count);
+        char *lf = memchr(buffer, '\n', count);
+        g_byte_array_append(frame, (guint8 *)buffer, lf != NULL ? lf - buffer : count);
         if (lf != NULL)
-            return parse_additions(frame, lf - frame, sub);
-        received += count;
+            return parse_additions((const char *)frame->data, frame->len, sub);
     }
     return NULL;
 }
@@ -251,13 +272,54 @@ static void worker(GTask *task, gpointer source, gpointer data, GCancellable *ca
     if (id != 0 && (sub->mount_id == 0 || id == sub->mount_id)) {
         additions = request_additions(sub);
         if (additions != NULL) {
-            if (additions->names->len != 0 && id != mount_id(sub))
+            if (additions->entries != NULL && id != mount_id(sub))
                 g_clear_pointer(&additions, additions_free);
             else
                 additions->mount_id = id;
         }
     }
     g_task_return_pointer(task, additions, additions_free);
+}
+
+static void emit_child(Subscription *sub, GFileMonitor *monitor, const char *name,
+                       GFileMonitorEvent event)
+{
+    if (!g_file_monitor_is_cancelled(monitor)) {
+        g_autoptr(GFile) child = g_file_get_child(sub->directory, name);
+        g_file_monitor_emit_event(monitor, child, NULL, event);
+    }
+}
+
+static void reconcile(Subscription *sub, GFileMonitor *monitor, GHashTable *entries)
+{
+    GHashTableIter iter;
+    gpointer name, marker;
+    if (sub->known != NULL) {
+        g_hash_table_iter_init(&iter, sub->known);
+        while (g_hash_table_iter_next(&iter, &name, NULL)) {
+            if (!g_hash_table_contains(entries, name))
+                emit_child(sub, monitor, name, G_FILE_MONITOR_EVENT_DELETED);
+        }
+    }
+    g_hash_table_iter_init(&iter, entries);
+    while (g_hash_table_iter_next(&iter, &name, &marker)) {
+        const char *previous = sub->known != NULL ? g_hash_table_lookup(sub->known, name) : NULL;
+        if (previous == NULL) {
+            emit_child(sub, monitor, name, G_FILE_MONITOR_EVENT_CREATED);
+        } else if (strcmp(previous, marker)) {
+            glong before = g_ascii_strtoll(previous, NULL, 10) & S_IFMT;
+            glong after = g_ascii_strtoll(marker, NULL, 10) & S_IFMT;
+            if (before && after && before != after) {
+                emit_child(sub, monitor, name, G_FILE_MONITOR_EVENT_DELETED);
+                emit_child(sub, monitor, name, G_FILE_MONITOR_EVENT_CREATED);
+            } else {
+                emit_child(sub, monitor, name, G_FILE_MONITOR_EVENT_ATTRIBUTE_CHANGED);
+                emit_child(sub, monitor, name, G_FILE_MONITOR_EVENT_CHANGES_DONE_HINT);
+            }
+        }
+    }
+    g_clear_pointer(&sub->known, g_hash_table_unref);
+    sub->known = g_hash_table_ref(entries);
 }
 
 static void delivered(GObject *source, GAsyncResult *result, gpointer data)
@@ -267,20 +329,20 @@ static void delivered(GObject *source, GAsyncResult *result, gpointer data)
     Additions *additions = g_task_propagate_pointer(G_TASK(result), NULL);
     g_autoptr(GFileMonitor) monitor = g_weak_ref_get(&sub->monitor);
     if (monitor != NULL && !g_file_monitor_is_cancelled(monitor)) {
-        if (additions == NULL) {
+        if (additions == NULL || !strcmp(additions->status, "too-large")) {
+            if (!sub->degraded)
+                g_warning("Storage desktop view is unavailable or exceeds the reconciliation limit");
+            sub->degraded = TRUE;
+        } else if (!strcmp(additions->status, "generation-changed")) {
             sub->stopped = TRUE;
-            g_warning("Storage desktop additions stopped: reconnect or delivery gap; reopen the directory");
         } else {
-            g_free(sub->generation);
-            sub->generation = g_strdup(additions->generation);
-            sub->through = additions->through;
+            sub->degraded = FALSE;
             sub->mount_id = additions->mount_id;
-            for (guint index = 0; index < additions->names->len; index++) {
-                if (g_file_monitor_is_cancelled(monitor))
-                    break;
-                const char *name = g_ptr_array_index(additions->names, index);
-                g_autoptr(GFile) child = g_file_get_child(sub->directory, name);
-                g_file_monitor_emit_event(monitor, child, NULL, G_FILE_MONITOR_EVENT_CREATED);
+            if (sub->generation == NULL)
+                sub->generation = g_strdup(additions->generation);
+            if (additions->entries != NULL) {
+                reconcile(sub, monitor, additions->entries);
+                sub->revision = additions->revision;
             }
         }
     }
@@ -331,7 +393,6 @@ GFileMonitor *g_file_monitor_directory(GFile *file, GFileMonitorFlags flags,
         g_once_init_leave(&symbol, (gsize)delegate);
     }
 
-    gint64 attached = g_get_monotonic_time();
     GFileMonitor *monitor = ((MonitorDirectory)symbol)(file, flags, cancellable, error);
     const char *mount = g_getenv("STORAGE_NAUTILUS_MOUNT");
     const char *socket = g_getenv("STORAGE_NAUTILUS_SOCKET");
@@ -365,7 +426,6 @@ GFileMonitor *g_file_monitor_directory(GFile *file, GFileMonitorFlags flags,
     sub->mount_hex = hex_encode(mount);
     sub->directory_hex = hex_encode(relative);
     sub->endpoint = g_strdup(socket);
-    sub->attached = attached;
     GSource *poll = g_timeout_source_new(POLL_MS);
     g_source_set_callback(poll, poll_subscription, sub, subscription_unref);
     g_autoptr(GMainContext) context = g_main_context_ref_thread_default();

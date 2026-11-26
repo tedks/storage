@@ -403,7 +403,7 @@ class TestReaddirSnapshotTTL(unittest.TestCase):
             cache_root=self.cache_root,
             backends={"backend0": self.backend},
             readdir_snapshot_ttl=0.15,
-            listing_max_stale=0.15,  # expired, not stale: relisted at once
+            listing_max_stale=0.15,
         )
         cache_dir = self.cache_root / "ttl_expire"
         cache_dir.mkdir()
@@ -416,9 +416,13 @@ class TestReaddirSnapshotTTL(unittest.TestCase):
         (cache_dir / "beta.txt").touch()
         time.sleep(0.25)
 
-        refreshed = self._ns.readdir("/ttl_expire")
-        self.assertIn("alpha.txt", refreshed)
-        self.assertIn("beta.txt", refreshed)
+        stale = self._ns.readdir("/ttl_expire")
+        self.assertIn("alpha.txt", stale)
+        self.assertNotIn("beta.txt", stale)
+        expires = time.monotonic() + 5
+        while "/ttl_expire" in self._ns._background_refreshes and time.monotonic() < expires:
+            time.sleep(0.01)
+        self.assertIn("beta.txt", self._ns.readdir("/ttl_expire"))
 
 
     def test_readdir_serves_stale_snapshot_then_the_refresh(self):

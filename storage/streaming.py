@@ -14,7 +14,9 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 from fuse import FuseOSError
 
-from .backends.base import Backend, capacity_wait_cancellation
+from .backends.base import (
+    Backend, capacity_wait_cancellation, member_generation, member_range_generation,
+)
 from .backends.ssh_pool import BulkCapacityCancelled, member_failure_errno
 from .backends.local import NOREPLACE_UNSUPPORTED
 from .backends.local import rename_noreplace as _rename_noreplace
@@ -794,7 +796,7 @@ class StreamingReadManager:
         command = arguments.pop("command", None)
         if command in ("status", "streaming.get", "downloads.list") and arguments:
             raise ControlError("Unexpected arguments for control command")
-        if command == "desktop.additions.v1":
+        if command in {"desktop.additions.v1", "desktop.changes.v2"}:
             if self._poll_desktop_additions is None:
                 raise ControlError("Desktop listing delivery is disabled on this mount")
             return self._poll_desktop_additions(arguments)
@@ -827,8 +829,22 @@ class StreamingReadManager:
         with self._streaming_stats_lock:
             self._streaming_stats[key] = self._streaming_stats.get(key, 0) + value
 
+    def mark_generation_stale(self, path):
+        """A watcher hint can invalidate a range source with identical SFTP attrs."""
+        with self.prefetch_sessions_lock:
+            session = self.prefetch_sessions.get(path)
+        if session is None:
+            return
+        with session.io_lock, session.lock:
+            if not session.finalized and not session.detached:
+                session.error = OSError(errno.ESTALE, "member reported a generation change")
+                session.condition.notify_all()
+                self._schedule_background(session)
+
     def _write_session_bytes(self, session: PrefetchSession, offset: int, data: bytes) -> bool:
         with session.io_lock:
+            if getattr(session.error, "errno", None) == errno.ESTALE:
+                raise session.error
             if session.stop_requested or session.io_fd < 0:
                 return False
             try:
@@ -865,7 +881,11 @@ class StreamingReadManager:
             if session.stop_requested:
                 return start, []
             remaining = target_end - cursor
-            chunk = session.backend.read_file(session.canonical_path, cursor, remaining)
+            try:
+                with member_range_generation(member_generation(session.member_stat)):
+                    chunk = session.backend.read_file(session.canonical_path, cursor, remaining)
+            except FileNotFoundError as exc:
+                raise OSError(errno.ESTALE, "member generation no longer exists") from exc
             if not chunk:
                 break
             chunk = chunk[:remaining]
@@ -1296,11 +1316,14 @@ class StreamingReadManager:
             # install refuses; a full fetch that loses the race to this
             # install finds the marker and fetches again instead of indexing
             # the prefix.
-            with self.state_manager.metadata_lock:
-                if self.state_manager.get_file_metadata(session.canonical_path) is not None:
-                    outcome = "indexed"
-                else:
-                    outcome = self._install_partial(session)
+            with session.io_lock:
+                if getattr(session.error, "errno", None) == errno.ESTALE:
+                    return False
+                with self.state_manager.metadata_lock:
+                    if self.state_manager.get_file_metadata(session.canonical_path) is not None:
+                        outcome = "indexed"
+                    else:
+                        outcome = self._install_partial(session)
             if outcome != "installed":
                 self.logger.info(
                     "streaming partial-cache skipped path=%s backend=%s reason=%s",
@@ -1354,7 +1377,8 @@ class StreamingReadManager:
         handling it.
         """
         assert session.failed_cleanup_claimed, "claim with _claim_failed_cleanup first"
-        if self._promote_failed_session_cache_prefix(session):
+        if (getattr(session.error, "errno", None) != errno.ESTALE
+                and self._promote_failed_session_cache_prefix(session)):
             self._cleanup_prefetch_session(session, "partial-cache")
             return
         self._cleanup_prefetch_session(session, "failed")
@@ -1389,35 +1413,43 @@ class StreamingReadManager:
             copy_member_attributes(io_fd, session.member_stat)
             os.fsync(io_fd)
             session.final_cache_path.parent.mkdir(parents=True, exist_ok=True)
-            with self.state_manager.metadata_lock:
-                outcome = self._install_partial(session)
+            # A watcher orders its invalidation with both installation and
+            # the source baseline, through the same I/O lock.
+            with session.io_lock:
+                with session.lock:
+                    if session.error is not None or session.detached:
+                        return
+                with self.state_manager.metadata_lock:
+                    outcome = self._install_partial(session)
+                    if outcome == "installed":
+                        metadata = self._store_finalized_row(session)
+                        if metadata is not None:
+                            self._add_finalized_locations(session, metadata)
                 if outcome == "installed":
-                    metadata = self._store_finalized_row(session)
-                    if metadata is not None:
-                        self._add_finalized_locations(session, metadata)
+                    self.cache_manager.publish_streaming_fd(io_fd)
+                    with session.lock:
+                        session.prefetch_complete = True
+                        session.finalized = True
+                        should_close = session.refcount == 0
+                        session.condition.notify_all()
+                    # This callback records only local source baselines.
+                    # It must not take a path lock: watcher hints take the
+                    # path lock before acquiring this session's I/O lock.
+                    if self.on_finalized is not None:
+                        try:
+                            self.on_finalized(session)
+                        except Exception:
+                            self.logger.exception("on_finalized failed for %s", session.canonical_path)
         except OSError as exc:
             with session.lock:
-                session.error = exc
+                if session.error is None:
+                    session.error = exc
                 session.condition.notify_all()
             return
 
         if outcome != "installed":
             self._discard_superseded_session(session, outcome)
             return
-
-        self.cache_manager.publish_streaming_fd(io_fd)
-
-        with session.lock:
-            session.prefetch_complete = True
-            session.finalized = True
-            should_close = session.refcount == 0
-            session.condition.notify_all()
-
-        if self.on_finalized is not None:
-            try:
-                self.on_finalized(session)
-            except Exception:
-                self.logger.exception("on_finalized failed for %s", session.canonical_path)
 
         self._update_streaming_state_xattr(session, "complete")
         self._remove_prefetch_session(session)
@@ -1665,7 +1697,13 @@ class StreamingReadManager:
                 raise OSError(errno.EINTR, "streaming manager is shutting down")
             existing = self.prefetch_sessions.get(canonical_path)
             if existing:
-                return self._attach_for_open(existing)
+                with existing.lock:
+                    if getattr(existing.error, "errno", None) == errno.ESTALE:
+                        if self._claim_detach(existing):
+                            self._unregister_and_unlink(existing)
+                        existing = None
+                if existing is not None:
+                    return self._attach_for_open(existing)
 
         try:
             source = self.select_backend_for_read(canonical_path)
@@ -1682,7 +1720,7 @@ class StreamingReadManager:
             return StreamingOpen.SOURCE_MISSING
 
         backend, member_stat, file_size = source.backend, source.member_stat, source.file_size
-        if not backend.supports_range_reads():
+        if not backend.supports_range_reads() or member_generation(member_stat) is None:
             return StreamingOpen.RANGE_UNSUPPORTED
         if type(file_size) is not int or file_size < 0:
             exc = OSError(errno.EIO, "streaming source returned an invalid size")
@@ -1832,7 +1870,7 @@ class StreamingReadManager:
                 if session.finalized:
                     return "close"
                 if session.detached:
-                    return ""
+                    return "close" if session.worker_done else ""
 
                 if self._should_stop_on_last_close(session):
                     idle = self._stop_background_locked(session)

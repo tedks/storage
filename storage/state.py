@@ -185,6 +185,14 @@ class StateManager:
             CREATE INDEX IF NOT EXISTS idx_recomputable ON files(recomputable);
             CREATE INDEX IF NOT EXISTS idx_cached ON file_locations(is_cached);
 
+            CREATE TABLE IF NOT EXISTS directory_observations (
+                path BLOB PRIMARY KEY,
+                observation TEXT NOT NULL,
+                observed_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_directory_observed_at
+                ON directory_observations(observed_at);
+
             -- Member-side hashes for the conflict view, one per path and
             -- member, valid only while the member still reports the basis
             -- (st_size, st_mtime, st_ctime or NULL) it had when hashed.
@@ -1121,6 +1129,50 @@ class StateManager:
     def compute_checksum(file_path: Path) -> str:
         """Compute a fast non-cryptographic checksum of a file (XXH3-128)."""
         return fast_checksum_file(file_path)
+
+    def load_directory_observations(self, limit):
+        if self._checksum_conn is self.conn:  # no restart state in an in-memory index
+            return []
+        with self._checksum_db_lock:
+            rows = self._checksum_conn.execute(
+                "SELECT path, observation FROM directory_observations ORDER BY observed_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [(os.fsdecode(path), observation) for path, observation in reversed(rows)]
+
+    def store_directory_observation(self, path, observation, limit):
+        if self._checksum_conn is self.conn:
+            return
+        with self._checksum_db_lock, self._checksum_conn:
+            self._checksum_conn.execute(
+                "INSERT OR REPLACE INTO directory_observations VALUES (?, ?, ?)",
+                (os.fsencode(path), observation, time.time()),
+            )
+            self._checksum_conn.execute(
+                """DELETE FROM directory_observations WHERE path IN (
+                    SELECT path FROM directory_observations
+                    ORDER BY observed_at DESC LIMIT -1 OFFSET ?
+                )""", (limit,),
+            )
+
+    def delete_directory_observations(self, paths=(), *, subtree=None, all_paths=False):
+        if self._checksum_conn is self.conn:
+            return
+        with self._checksum_db_lock, self._checksum_conn:
+            if all_paths:
+                self._checksum_conn.execute("DELETE FROM directory_observations")
+                return
+            self._checksum_conn.executemany(
+                "DELETE FROM directory_observations WHERE path = ?",
+                [(os.fsencode(path),) for path in paths],
+            )
+            if subtree is not None:
+                prefix = os.fsencode(subtree.rstrip("/") + "/")
+                end = prefix[:-1] + b"0"
+                self._checksum_conn.execute(
+                    "DELETE FROM directory_observations WHERE path = ? OR (path >= ? AND path < ?)",
+                    (os.fsencode(subtree), prefix, end),
+                )
 
     def close(self):
         """Close database connection"""

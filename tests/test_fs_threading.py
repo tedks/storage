@@ -158,8 +158,8 @@ class ThreadingTestBase(unittest.TestCase):
     def read_all(self, path, fd):
         return self.fs.read(path, 1 << 20, 0, fd)
 
-    def open_read_release(self, path):
-        fd = self.fs.open(path, os.O_RDONLY)
+    def open_read_release(self, path, flags=os.O_RDONLY):
+        fd = self.fs.open(path, flags)
         try:
             return self.read_all(path, fd)
         finally:
@@ -248,10 +248,10 @@ class TestOpenRaces(ThreadingTestBase):
 
         copies = self.gate(self.member, "copy_to_local", only=lambda *a: False)
         with patch.object(self.fs, "_select_backend_for_read", side_effect=select):
-            first = Worker(self.open_read_release, "/f.txt")
+            first = Worker(self.open_read_release, "/f.txt", os.O_RDWR)
             first.start()
             self.assertTrue(invalidate.started.wait(WAIT))
-            second = Worker(self.open_read_release, "/f.txt")
+            second = Worker(self.open_read_release, "/f.txt", os.O_RDWR)
             second.start()
             self.wait_for_path_waiter("/f.txt")
             self.assertTrue(second.is_alive())
@@ -491,7 +491,8 @@ class TestWatcherInvalidation(ThreadingTestBase):
         heal.opened.set()
         self.assertEqual(b"cached", opener.finish())
         watcher.finish()
-        self.assertFalse((self.cache_dir / "f.txt").exists())
+        self.assertEqual((self.cache_dir / "f.txt").read_bytes(), b"cached")
+        self.assertIn("/f.txt", self.fs._recheck)
 
 
 if __name__ == "__main__":

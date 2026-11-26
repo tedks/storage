@@ -9,7 +9,9 @@ import stat
 from pathlib import Path
 from typing import List, Optional
 
-from .base import Backend, BackendType, MemberSourceMissing, StorageMemberCapabilities
+from .base import (
+    Backend, BackendType, MemberSourceMissing, StorageMemberCapabilities, read_member_range,
+)
 from ..checksums import fast_checksum_file
 from ..file_config import XATTR_CONFIG_NAME
 
@@ -167,9 +169,8 @@ class LocalBackend(Backend):
     def read_file(self, virtual_path: str, offset: int, size: int) -> bytes:
         """Read data from a file"""
         real_path = self._resolve_path(virtual_path)
-        with open(real_path, 'rb') as f:
-            f.seek(offset)
-            return f.read(size)
+        with open(real_path, 'rb') as handle:
+            return read_member_range(handle, offset, size, lambda: os.fstat(handle.fileno()))
 
     def write_file(self, virtual_path: str, data: bytes, offset: int):
         """Write data to a file"""

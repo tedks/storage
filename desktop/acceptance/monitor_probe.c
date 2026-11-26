@@ -1,10 +1,14 @@
 /* Drives the native bridge in a non-default main context, without GTK. */
 #include <gio/gio.h>
+#include <glib/gstdio.h>
 
 typedef struct {
     GMainContext *context;
-    GFile *expected;
+    GFile *late;
+    GFile *first;
     unsigned arrivals;
+    unsigned removals;
+    unsigned attributes;
 } Observer;
 
 static void changed(GFileMonitor *monitor, GFile *file, GFile *other,
@@ -14,14 +18,32 @@ static void changed(GFileMonitor *monitor, GFile *file, GFile *other,
     (void)other;
     Observer *observer = data;
     g_assert_true(g_main_context_is_owner(observer->context));
-    g_assert_cmpint(event, ==, G_FILE_MONITOR_EVENT_CREATED);
-    g_assert_true(g_file_equal(observer->expected, file));
-    observer->arrivals++;
+    if (event == G_FILE_MONITOR_EVENT_CREATED && g_file_equal(observer->late, file))
+        observer->arrivals++;
+    if (event == G_FILE_MONITOR_EVENT_DELETED && g_file_equal(observer->first, file))
+        observer->removals++;
+    if (event == G_FILE_MONITOR_EVENT_ATTRIBUTE_CHANGED && g_file_equal(observer->late, file))
+        observer->attributes++;
 }
 
 static gboolean finish(gpointer data)
 {
     g_main_loop_quit(data);
+    return G_SOURCE_REMOVE;
+}
+
+static gboolean mutate_members(gpointer data)
+{
+    const char *root = data;
+    g_autofree char *first = g_build_filename(root, "first", "first-visible.txt", NULL);
+    g_autofree char *late = g_build_filename(root, "second", "late-visible.txt", NULL);
+    g_assert_cmpint(g_unlink(first), ==, 0);
+    g_assert_true(g_file_set_contents(late, "changed attributes", -1, NULL));
+    for (guint i = 0; i < 130; i++) {
+        g_autofree char *basename = g_strdup_printf(".gap-%03u", i);
+        g_autofree char *path = g_build_filename(root, "second", basename, NULL);
+        g_assert_true(g_file_set_contents(path, "", 0, NULL));
+    }
     return G_SOURCE_REMOVE;
 }
 
@@ -43,8 +65,9 @@ int main(int argc, char **argv)
     g_assert_no_error(error);
     g_assert_nonnull(cancelled);
     g_main_context_pop_thread_default(context);
-    Observer listening = { .context = context, .expected = late };
-    Observer detached = { .context = context, .expected = late };
+    g_autoptr(GFile) original = g_file_get_child(root, "first-visible.txt");
+    Observer listening = { .context = context, .late = late, .first = original };
+    Observer detached = { .context = context, .late = late, .first = original };
     g_signal_connect(active, "changed", G_CALLBACK(changed), &listening);
     g_signal_connect(cancelled, "changed", G_CALLBACK(changed), &detached);
     g_assert_true(g_file_monitor_cancel(cancelled));
@@ -61,16 +84,27 @@ int main(int argc, char **argv)
     g_assert_no_error(error);
     g_assert_null(next);
 
+    g_autoptr(GMainLoop) loop = g_main_loop_new(context, FALSE);
+    g_autoptr(GSource) prime = g_timeout_source_new(750);
+    g_source_set_callback(prime, finish, loop, NULL);
+    g_source_attach(prime, context);
+    g_main_loop_run(loop);
     gboolean released = g_file_set_contents(release, "", 0, &error);
     g_assert_no_error(error);
     g_assert_true(released);
-    g_autoptr(GMainLoop) loop = g_main_loop_new(context, FALSE);
-    g_autoptr(GSource) timeout = g_timeout_source_new_seconds(2);
+    g_autoptr(GSource) mutation = g_timeout_source_new(1200);
+    g_source_set_callback(mutation, mutate_members, argv[1], NULL);
+    g_source_attach(mutation, context);
+    g_autoptr(GSource) timeout = g_timeout_source_new_seconds(4);
     g_source_set_callback(timeout, finish, loop, NULL);
     g_source_attach(timeout, context);
     g_main_loop_run(loop);
     g_assert_cmpuint(listening.arrivals, ==, expected_arrivals);
+    g_assert_cmpuint(listening.removals, ==, expected_arrivals);
+    g_assert_cmpuint(listening.attributes, ==, expected_arrivals);
     g_assert_cmpuint(detached.arrivals, ==, 0);
+    g_assert_cmpuint(detached.removals, ==, 0);
+    g_assert_cmpuint(detached.attributes, ==, 0);
     g_file_monitor_cancel(active);
     return 0;
 }

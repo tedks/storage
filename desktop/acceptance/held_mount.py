@@ -34,7 +34,7 @@ def main():
     mount_storage(
         str(root / "mount"), root / "cache", root / "index", members,
         16 << 20, foreground=True, fuse_threads=True, allow_other=False,
-        progressive_listings=True, streaming_reads=True, negative_timeout=0,
+        progressive_listings=True, streaming_reads=True, negative_timeout=0, readdir_ttl=0.35,
     )
 
 

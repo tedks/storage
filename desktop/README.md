@@ -1,11 +1,10 @@
-# Experimental Nautilus late additions
+# Experimental Nautilus directory updates
 
-On Linux, this bridge can deliver names added by a later member of an
-ongoing Storage directory listing to the ordinary native directory
-monitor of an opted-in Nautilus process. A client stays on the
-`file://` URI and uses normal Storage operations to resolve the new entry.
-The bridge targets one mount and the exact monitor that registered for
-the directory.
+On Linux, the bridge reconciles an opted-in Nautilus process's native
+directory monitor with the committed Storage view. It reports added,
+removed and changed children while Nautilus stays on the ordinary
+`file://` URI. Each subscription belongs to one directory and one mount
+generation.
 
 ## Run the experiment
 
@@ -29,21 +28,17 @@ the directory.
    basename is `nautilus`. Keep the variable scoped to the dedicated
    launch command.
 
-The mount and virtual directory paths each support up to 768 native
-bytes. The UID-checked socket uses a mount generation and a bounded
-journal of up to 128 additions. A monitor polls at roughly 500 ms
-intervals, with at most one query outstanding and a maximum of 16
-monitors in the process. Linux path checks require `openat2` and
-`statx` mount IDs and exclude symlinks and nested mounts.
+The mount and virtual directory paths each support up to 768 native bytes.
+The UID-checked socket reports snapshot revisions, and the bridge compares
+a new committed view with the last one it received. Skipped revisions
+coalesce into the latest view. Under temporary socket failure the monitor
+keeps its last view and continues polling. A new mount generation requires
+a new monitor. Linux path checks require `openat2` and `statx` mount IDs
+and exclude symlinks and nested mounts.
 
-A delivery gap, invalidated or superseding snapshot, socket failure, or
-mount identity change stops the affected subscription and logs a
-warning. One later member adding more than 128 names can cause a gap.
-Nautilus keeps the rows already on screen. Use Reload to enumerate the
-current view, or navigate away and reopen it to attach a new monitor.
-The tracer covers additions by late members in the
-same progressive scan. Removal, replacement, metadata changes, refresh
-of an already complete listing, and automatic reconciliation are
-follow-up work. The worker checks the mount identity before handing off an
-event, so a concurrent remount between that check and the GIO callback is
-outside the tracer's qualification.
+The bridge polls about every 500 ms with one request per monitor and up to
+16 monitors per process. Reconciliation accepts up to 8,192 entries
+per directory. Above that limit the subscription reports degraded
+delivery and can recover when the directory comes back within the bound.
+Metadata changes in a directory snapshot do not fetch replacement file
+bytes. A cached file's published size follows the local generation.

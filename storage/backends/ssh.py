@@ -26,6 +26,7 @@ from .base import (
     MemberSourceMissing,
     StorageMemberCapabilities,
     WatcherSpec,
+    read_member_range,
 )
 from .ssh_pool import (
     CommandTimeout, MemberConnection, MemberUnavailable, RootAvailability,
@@ -559,9 +560,8 @@ class SSHBackend(Backend):
         remote_path = str(self._resolve_path(virtual_path))
 
         def read(sftp):
-            with sftp.open(remote_path, 'rb') as f:
-                f.seek(offset)
-                return f.read(size)
+            with sftp.open(remote_path, 'rb') as handle:
+                return read_member_range(handle, offset, size, lambda: handle.stat())
 
         return self._with_sftp("read", virtual_path, read,
                                timeout=self.sftp_operation_timeout, retry=True, retry_closed_channel=True)

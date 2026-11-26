@@ -31,7 +31,7 @@ from typing import Dict, Optional, Set, List, Tuple
 
 from .backends.base import (
     Backend, ChecksumUnavailable, capacity_wait_cancellation,
-    interactive_request,
+    interactive_request, member_generation,
 )
 from .backends.rsync import RsyncBackend
 from .backends.ssh_mux import close_shared_control_sockets
@@ -92,6 +92,13 @@ class MemberCheck:
     cache_identity: Tuple[int, int, int]
     verified_at: float
     members: Dict[str, Tuple[int, float]] = field(default_factory=dict)
+
+
+@dataclass
+class PendingValidation:
+    removal_only: bool
+    cancelled: threading.Event = field(default_factory=threading.Event)
+    follow_up: Optional[bool] = None  # True checks absence only, False includes content.
 
 
 class StorageFS(Operations):
@@ -331,6 +338,13 @@ class StorageFS(Operations):
         self._revalidate_after = max(0.0, float(revalidate_after))
         self._member_checks: Dict[str, MemberCheck] = {}
         self._member_checks_lock = threading.Lock()
+        self._pending_validations: Dict[str, PendingValidation] = {}
+        self._deferred_validations: Set[str] = set()
+        self._validation_commit_lock = threading.Lock()
+        self._experimental_reader_direct_io = False
+        self._validation_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=4, thread_name_prefix="cache-validate",
+        )
         # Members whose failed revalidation has been logged; cleared by the
         # member's next successful stat, so an outage is logged once.
         # Deliberately unlocked: with fuse_threads a race costs at most a
@@ -778,9 +792,9 @@ class StorageFS(Operations):
         """
         Callback from RemoteWatcher when inotifywait detects a change.
 
-        Invalidates the canonical path AND any backend-suffixed conflict
-        variants (e.g. /foo.remote0, /foo.remote1) so that cached
-        conflict views are also refreshed.
+        Marks the complete canonical copy for validation and invalidates
+        backend-suffixed conflict variants. The canonical bytes remain
+        available while a background absence check runs.
 
         Runs on the watcher's thread holding nothing; it waits for the
         path's lock, so an open's fetch, a rename or an upload of the path
@@ -791,7 +805,18 @@ class StorageFS(Operations):
 
     def _on_remote_change_locked(self, virtual_path: str):
         self._invalidate_dir_cache_entry(virtual_path)
-        self._invalidate_file_cache(virtual_path)
+        resolved = self._resolve_path(virtual_path)
+        self.namespace.expire_parent_observation(resolved.parent_dir)
+        self._streaming_manager.mark_generation_stale(resolved.canonical_path)
+        if (resolved.backend_name is None and regular_file_stat(resolved.cache_path) is not None
+                and not self._is_unindexed_prefix(resolved.canonical_path, resolved.cache_path)):
+            self._forget_checksums({resolved.canonical_path})
+            self._forget_member_check(resolved.canonical_path)
+            with self._member_checks_lock:
+                self._recheck.setdefault(resolved.canonical_path, set()).update(self.backends)
+            self._schedule_cached_validation(resolved, removal_only=True)
+        else:
+            self._invalidate_file_cache(virtual_path)
         # Also invalidate backend-suffixed conflict caches.
         # When /foo exists on multiple backends with different content,
         # the FUSE layer exposes /foo.remote0, /foo.remote1 etc.
@@ -805,8 +830,8 @@ class StorageFS(Operations):
         """A watcher's watches were (re)established: events before that
         moment were never seen, so every listing and remembered stat that
         predates it is dropped. Cached files are revalidated on open."""
-        self.logger.info("watcher watches established; dropping listing state")
-        self.namespace.invalidate_all_listings()
+        self.logger.info("watcher watches established; expiring directory observations")
+        self.namespace.expire_listing_observations()
 
     def _start_watchers(self):
         """Start push-invalidation watchers, coalescing members by watch scope."""
@@ -1453,6 +1478,14 @@ class StorageFS(Operations):
         if path_gone:
             tables += [self._refetch_pins, self._pinned_stats, self._recheck]
         with self._member_checks_lock:
+            self._deferred_validations.difference_update(
+                path for path in tuple(self._deferred_validations)
+                if path == virtual_path or (subtree and path.startswith(prefix))
+            )
+            for path, pending in self._pending_validations.items():
+                if path == virtual_path or (subtree and path.startswith(prefix)):
+                    pending.cancelled.set()
+                    pending.follow_up = None
             for table in tables:
                 table.pop(virtual_path, None)
                 if subtree:
@@ -1489,6 +1522,16 @@ class StorageFS(Operations):
         old_prefix = old.rstrip("/") + "/"
         new_prefix = new.rstrip("/") + "/"
         with self._member_checks_lock:
+            def affected(path):
+                return path in (old, new) or path.startswith((old_prefix, new_prefix))
+
+            self._deferred_validations = {
+                path for path in self._deferred_validations if not affected(path)
+            }
+            for path, pending in self._pending_validations.items():
+                if affected(path):
+                    pending.cancelled.set()
+                    pending.follow_up = None
             for table in (self._member_checks, self._refetch_pins, self._pinned_stats,
                           self._recheck, self._revalidate_unreachable):
                 for key in [k for k in table if k == new or k.startswith(new_prefix)]:
@@ -1777,6 +1820,187 @@ class StorageFS(Operations):
         if (attrs.get("st_size"), attrs.get("st_mtime")) != baseline:
             return None
         return listed_at
+
+    def _schedule_cached_validation(self, resolved: ResolvedPath, *, removal_only=False, resume=False):
+        path = resolved.canonical_path
+        with self._member_checks_lock:
+            check = self._member_checks.get(path)
+            if check is not None and time.monotonic() - check.verified_at < self._revalidate_after:
+                if resume:
+                    self._deferred_validations.discard(path)
+                return
+            pending = self._pending_validations.get(path)
+            if pending is not None:
+                if pending.cancelled.is_set() or (pending.removal_only and not removal_only):
+                    pending.follow_up = removal_only and pending.follow_up is not False
+                return
+            if len(self._pending_validations) >= 64 or (path in self._deferred_validations) != resume:
+                return
+            self._deferred_validations.discard(path)
+            pending = PendingValidation(removal_only)
+            self._pending_validations[path] = pending
+
+        def finished(future=None):
+            with self._member_checks_lock:
+                del self._pending_validations[path]
+                follow_up = pending.follow_up
+            if future is not None and not future.cancelled() and not self._destroying.is_set():
+                self._resume_cached_validation(path)
+                if follow_up is not None:
+                    self._schedule_cached_validation(resolved, removal_only=follow_up)
+
+        try:
+            future = self._validation_executor.submit(
+                self._validate_complete_copy, resolved, pending.cancelled, removal_only,
+            )
+        except RuntimeError:  # shutdown raced the request
+            finished()
+        else:
+            future.add_done_callback(finished)
+
+    def _resume_cached_validation(self, path):
+        """After release or a worker finishing, give a reader-free path a slot."""
+        if self._destroying.is_set():
+            return
+        with self._fd_lock, self._member_checks_lock:
+            if not self._deferred_validations or len(self._pending_validations) >= 64:
+                return
+            readers = {entry.canonical_path for entry in self._fd_map.values()}
+            eligible = self._deferred_validations - readers - self._pending_validations.keys()
+            if path not in eligible:
+                path = next(iter(eligible), None)
+        if path is not None:
+            self._schedule_cached_validation(self._resolve_path(path), resume=True)
+
+    def _defer_for_buffered_reader_locked(self, path):
+        if self._experimental_reader_direct_io:
+            return False
+        if not any(entry.canonical_path == path for entry in self._fd_map.values()):
+            return False
+        with self._member_checks_lock:
+            # There can only be one deferred name per open path here.
+            self._deferred_validations.add(path)
+        return True
+
+    def _validate_complete_copy(self, resolved: ResolvedPath, cancelled: threading.Event,
+                                removal_only: bool):
+        """Check and stage off the path lock. Commit only against the observed local copy."""
+        path, cache_path = resolved.canonical_path, resolved.cache_path
+        try:
+            with self._path_locked(path):
+                old = regular_file_stat(cache_path)
+                row = self.state_manager.get_file_metadata(path)
+                if cancelled.is_set() or self._destroying.is_set() or old is None or row is None:
+                    return
+                if (row.sync_status != SyncStatus.CLEAN or row.link_target is not None
+                        or old.st_nlink != 1 or (row.size, row.last_modified) != (old.st_size, old.st_mtime)
+                        or self.cache_manager.member_repairs.covers(path)):
+                    return
+                identity = self._cache_identity(old)
+                members = self._load_persisted_members(cache_path, identity)
+
+            backend, unavailable = self._member_for_revalidation(path)
+            if backend is None:
+                for name in unavailable:
+                    self._note_revalidation_outage(name, "unavailable")
+                return
+            with self._member_checks_lock:
+                check = self._member_checks.get(path)
+                if check is not None and check.cache_identity == identity:
+                    members = dict(check.members)
+                forced = backend.name in self._recheck.get(path, ())
+            listed_at = None if forced else self._listing_confirms_baseline(resolved, backend, members)
+            if listed_at is not None:
+                self._finish_cached_validation(path, cache_path, old, row, cancelled,
+                                               {backend.name: members[backend.name]}, listed_at)
+                return
+
+            try:
+                observed = backend.stat(path)
+            except FileNotFoundError:
+                if forced and self._absent_on_every_member(path):
+                    self._finish_cached_validation(path, cache_path, old, row, cancelled,
+                                                   {}, time.monotonic(), remove=True)
+                return
+            if removal_only:
+                return
+            generation = member_generation(observed)
+            if generation is None or not stat.S_ISREG(observed.st_mode):
+                return
+            self._revalidate_outages.discard(backend.name)
+            stamp = (observed.st_size, observed.st_mtime)
+            baseline = members.get(backend.name)
+            changed = stamp != baseline if baseline is not None else (
+                observed.st_size != old.st_size or observed.st_mtime > old.st_mtime)
+            if not forced and not changed:
+                self._finish_cached_validation(path, cache_path, old, row, cancelled,
+                                               {backend.name: stamp}, time.monotonic())
+                return
+
+            if cancelled.is_set() or self._destroying.is_set() or not backend.is_available():
+                return
+            with self._fd_lock:
+                if self._defer_for_buffered_reader_locked(path):
+                    return
+            with self.cache_manager.stage_cache_copy(
+                backend, path, self.cache_manager.cache_root, observed,
+                expected_size=observed.st_size, evict=False,
+            ) as staged:
+                if member_generation(backend.stat(path)) != generation:
+                    return
+                self._finish_cached_validation(path, cache_path, old, row, cancelled,
+                                               {}, time.monotonic(), staged, backend, observed)
+        except Exception as exc:
+            self.logger.debug("Cached file validation did not publish for %s: %r", path, exc)
+
+    def _finish_cached_validation(self, path, cache_path, old, row, cancelled, baselines,
+                                  checked_at, staged=None, backend=None, observed=None, *, remove=False):
+        with self._path_locked(path), self._validation_commit_lock:
+            if cancelled.is_set() or self._destroying.is_set():
+                return
+            with self.cache_manager.cache_size_change(), self.state_manager.metadata_lock, self._fd_lock:
+                current = regular_file_stat(cache_path)
+                metadata = self.state_manager.get_file_metadata(path)
+                repairs = self.cache_manager.member_repairs
+                if (current is None or metadata is None or current.st_dev != old.st_dev
+                        or self._cache_identity(current) != self._cache_identity(old)
+                        or current.st_ctime_ns != old.st_ctime_ns
+                        or metadata.dirty_generation != row.dirty_generation
+                        or metadata.sync_status != SyncStatus.CLEAN
+                        or repairs.covers(path) or repairs.kept_inode(cache_path) is not None
+                        or any(entry.canonical_path == path and not self._is_read_only_open(entry.flags)
+                               for entry in self._fd_map.values())):
+                    return
+                if remove:
+                    if self._defer_for_buffered_reader_locked(path):
+                        return
+                    cache_path.unlink()
+                    self.state_manager.delete_file(path)
+                    self._forget_member_check(path, path_gone=True)
+                elif staged is None:
+                    self._store_member_check(path, cache_path, self._cache_identity(current),
+                                             baselines, verified_at=checked_at)
+                    return
+                else:
+                    if (self._defer_for_buffered_reader_locked(path) or current.st_nlink != 1
+                            or self.cache_manager.get_free_space_needed(0)):
+                        return
+                    refreshed = os.lstat(staged)
+                    metadata.size = refreshed.st_size
+                    metadata.last_modified = refreshed.st_mtime
+                    metadata.checksum = None
+                    derived = {self.MEMBER_STAT_XATTR, MEMBER_ATTRS_XATTR,
+                               self.CACHE_METADATA_XATTR, PREFIX_XATTR}
+                    for name in os.listxattr(cache_path, follow_symlinks=False):
+                        if name.startswith("user.") and name not in derived:
+                            value = os.getxattr(cache_path, name, follow_symlinks=False)
+                            os.setxattr(staged, name, value, follow_symlinks=False)
+                    self.cache_manager.sync_cache_metadata(path, metadata, cache_path=staged)
+                    os.replace(staged, cache_path)
+                    self.state_manager.set_file_metadata(metadata)
+                    self._record_fetched(path, cache_path, backend, observed)
+            if remove:
+                self.namespace.record_local_child(self._resolve_path(path))
 
     def _revalidate_cached_file(self, resolved: ResolvedPath):
         """Refetch a CLEAN cached file whose member copy changed.
@@ -2215,7 +2439,16 @@ class StorageFS(Operations):
     # Filesystem methods
 
     def getattr(self, path, fh=None):
-        """Get file attributes"""
+        """Get path attributes or the attributes of an open generation."""
+        if fh is not None and self._experimental_reader_direct_io:
+            with self._fd_lock:
+                entry = self._fd_map.get(fh)
+                if entry is not None and self._is_read_only_open(entry.flags):
+                    st = os.fstat(entry.real_fd)
+                    return {key: getattr(st, key) for key in (
+                        "st_atime", "st_ctime", "st_gid", "st_mode", "st_mtime",
+                        "st_nlink", "st_size", "st_uid",
+                    )}
         return self.namespace.getattr(path, read_lookup=True)
 
     def readdir(self, path, fh):
@@ -2485,6 +2718,7 @@ class StorageFS(Operations):
         # An O_TRUNC open discards the bytes, so their freshness does not matter.
         if (
             resolved.backend_name is None
+            and not self._is_read_only_open(flags)
             and not flags & os.O_TRUNC
             and self.cache_manager.is_cached(resolved.requested_path)
         ):
@@ -2551,6 +2785,8 @@ class StorageFS(Operations):
 
             if resolved.backend_name is None:
                 self._mark_demand_access(resolved.canonical_path, prefetch_session)
+                if prefetch_session is None and self._is_read_only_open(flags):
+                    self._schedule_cached_validation(resolved)
 
             return vfd
 
@@ -2603,9 +2839,8 @@ class StorageFS(Operations):
             self.state_manager.set_file_metadata(metadata)
             self._mark_cache_file_dirty(resolved.canonical_path, cache_path)
 
-            parent_dir = resolved.parent_dir
-            self._invalidate_dir_cache_entry(parent_dir)
-            self._invalidate_dir_cache_entry(resolved.canonical_path)
+            self._invalidate_dir_cache_entry(resolved.requested_path)
+            self.namespace.record_local_child(resolved)
 
             return vfd
 
@@ -2742,15 +2977,23 @@ class StorageFS(Operations):
         while True:
             with self._fd_lock:
                 entry = self._fd_map.get(fh)
-            if entry is None or entry.prefetch_session is not None:
+            if entry is None:
                 return self._release(path, fh)
+            if entry.prefetch_session is not None:
+                try:
+                    return self._release(path, fh)
+                finally:
+                    self._resume_cached_validation(entry.canonical_path)
             locked_path = entry.canonical_path
             with self._path_locked(locked_path):
                 with self._fd_lock:
                     current = self._fd_map.get(fh)
                     moved = current is not None and current.canonical_path != locked_path
                 if not moved:
-                    return self._release(path, fh)
+                    try:
+                        return self._release(path, fh)
+                    finally:
+                        self._resume_cached_validation(locked_path)
 
     def _release(self, path, fh):
         with self._fd_lock:
@@ -2942,10 +3185,11 @@ class StorageFS(Operations):
                 raise FuseOSError(errno.ENOTDIR)
             self._force_verify(self._resolve_path(path).canonical_path)
             return
-        cache_path = self._resolve_path(path).cache_path
+        resolved = self._resolve_path(path)
 
         try:
-            os.setxattr(str(cache_path), name, value, follow_symlinks=False)
+            with self._path_locked(resolved.canonical_path):
+                os.setxattr(resolved.cache_path, name, value, follow_symlinks=False)
         except OSError as e:
             raise FuseOSError(e.errno)
 
@@ -2975,10 +3219,11 @@ class StorageFS(Operations):
                     self.MEMBER_STAT_XATTR, MEMBER_ATTRS_XATTR}:
             # Derived; ignore removals.
             return
-        cache_path = self._resolve_path(path).cache_path
+        resolved = self._resolve_path(path)
 
         try:
-            os.removexattr(str(cache_path), name, follow_symlinks=False)
+            with self._path_locked(resolved.canonical_path):
+                os.removexattr(resolved.cache_path, name, follow_symlinks=False)
         except OSError as e:
             raise FuseOSError(e.errno)
 
@@ -3154,8 +3399,8 @@ class StorageFS(Operations):
 
         # Like create: a listing taken before the link would miss it, and
         # any listing kept under the new path itself is now wrong.
-        self._invalidate_dir_cache_entry(resolved.parent_dir)
         self._invalidate_dir_cache_entry(link_path)
+        self.namespace.record_local_child(resolved)
         self.sync_manager.queue_sync(link_path, priority=100)
 
     def _existing_mode(self, canonical_path: str) -> Optional[int]:
@@ -3286,6 +3531,12 @@ class StorageFS(Operations):
         if self._foreground_admission is not None:
             self._foreground_admission.close()
         self._destroying.set()
+        self._validation_executor.shutdown(wait=False, cancel_futures=True)
+        # A worker already in local publication must finish its index
+        # update before destroy can close SQLite. Other workers observe
+        # _destroying before publication and may still be in member I/O.
+        with self._validation_commit_lock:
+            pass
         self._streaming_manager.destroy()
         self._stop_watchers()
 
@@ -3564,6 +3815,15 @@ def _native_capacity_cancel_reason():
 class FUSE(_FusePyFUSE):
     """Give pool waits a same-thread cancellation probe during callbacks."""
 
+    def open(self, path, fip):
+        result = super().open(path, fip)
+        if (getattr(self.operations, "_experimental_reader_direct_io", False)
+                and StorageFS._is_read_only_open(fip.contents.flags)):
+            # Buffered FUSE pages belong to the virtual inode. Two readers
+            # of different backing inodes must not share that page cache.
+            fip.contents.direct_io = 1
+        return result
+
     @staticmethod
     def _wrapper(func, *args, **kwargs):
         # fusepy enters here directly from libfuse. A thread-local scope keeps
@@ -3759,7 +4019,7 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
         streaming_read_ahead_window=streaming_read_ahead_window,
         revalidate_after=revalidate_after,
         listing_max_stale=listing_max_stale,
-        progressive_listings=progressive_listings,
+        progressive_listings=True,
         desktop_mountpoint=desktop_mountpoint,
         checksum_reverify_interval=checksum_reverify_interval,
         bulk_cold_copies=fuse_threads,

@@ -278,78 +278,51 @@ channel, so a waiting worker leaves those bytes available to foreground
 reads on the interactive reserve. If a member can open only one channel,
 the current operation finishes before that channel is passed to a waiter.
 
-A cached file that has been synced is checked against its member when it
-is opened and was last checked more than `revalidate_after` seconds ago
-(`--revalidate-after`, default 60; `0` checks at every open). The check is
-one stat of one member that holds the file. If the member's size or mtime
-changed, the cached copy is dropped and the file is fetched again. A file
-with unsynced writes is never dropped, and a file open for writing keeps
-its copy. If the member cannot be reached, the cached copy is served and
-the outage is logged once. This applies with watchers on or off, so a file
-changed behind the mount is seen within about a minute of being opened
-again. The member's size and mtime are recorded when the file is fetched or
-synced, and each check compares against them; they are also kept in a
-read-only `user.storage.member_stat` xattr on the cached file. Check times
-are kept in memory, so after a restart each cached file is checked at its
-first open. Each check is a remote round trip on the single FUSE thread:
-the first open after a member silently drops off can wait for the SSH
-connect timeout (10 s by default) three times over (the request, a probe
-of the connection, and a reconnect) before the member is marked
-unavailable. A member whose connection still answers while its requests
-time out (a hung remote disk) costs the request and a probe each time,
-and is marked unavailable after two such timeouts in a row. Walking a large cached tree after the age costs one
-round trip per file.
+Read-only opens serve complete cached files immediately. An open past
+`revalidate_after` (default 60 seconds) schedules a background check, as does
+the first open after restart. Opens of the same file share a pending check.
+Storage compares member metadata, stages a changed copy, and installs it
+only while the original cache identity and dirty generation still match.
+A failed transfer keeps the usable copy. The existing checks for writes,
+open writers and member repair fences still apply.
 
-Directory listings follow the same policy. With watchers off, a listing
-is fresh for `readdir_ttl` seconds (default: `revalidate_after`, so 60):
-it answers `ls`, the `stat` of every entry in it, and a lookup of a name
-it lacks (`ENOENT`, without asking any member), so a browse costs one
-listing per member per directory per minute and nothing per entry. Past
-that it is still served, and one listing per member runs in the
-background to replace it, until it is `listing_max_stale` seconds old
-(profile only, default 3600); an older listing is replaced before the
-answer. A name is still asked of the members when a member's listing
-failed or carried no attributes, or when the listing is past its fresh
-window. A fresh window of 0 has no stale phase: every access lists. With
-watchers on every member, listings stay until a watcher invalidates them,
-so a change whose watcher event was lost stays out of `ls` until the
-directory is invalidated, except across a watcher outage: whenever a
-watcher reports its watches established (at mount and after every
-restart) every listing is dropped; a lookup of a name missing
-from a listing is still answered from it only for `readdir_ttl` (else
-`revalidate_after`) seconds, and stat'd after that. Changes made through the mount (create, write, rename,
-unlink, mkdir, rmdir) drop the affected listings at once; a file
-added or changed directly on a member shows within the fresh window, plus
-one more listing while a stale one is served.
-A path whose parent was never listed (a `cd` to a deep path) is asked of a
-member once per window (the shorter of the fresh and negative windows), not
-once per access; the answer is dropped by the same writes that drop
-listings.
-A background refresh stops waiting for a member that has not answered 60
-seconds after the refresh began (queue time included) and publishes without
-it, as for a member that failed; refreshes then skip that member until its
-listing worker is free. A member that always needs longer keeps the
-names it last listed (its entries are stat'd) until a listing that waits
-for it completes. A refresh is also published when only children of its directory
-were invalidated meanwhile by an eviction or an upload (their names are
-stat'd rather than answered from it); a directory's own invalidation, which
-a watcher event makes for the event's parent, still keeps it from being
-published. At most 4096 directories keep a listing, the least recently used
-going first, which bounds the memory a mount with watchers uses.
+The default mount keeps buffered reads and read-only `mmap`. Publication
+waits for the last open handle to the old copy, including a mapping that
+outlives its descriptor. Overlapping opens can keep seeing the old
+generation until the file is free of readers. After the last release,
+Storage rechecks the member in the background and a later open can see the
+replacement without a directory visit. The cache needs enough space to stage
+the replacement while retaining its usable copy. Write-capable opens keep their
+existing synchronous freshness checks.
 
-Independent foreground directory scans can use separate SFTP channels on the
-same connection. A large scan in one tab can run alongside another tab when the
-connection has spare channels. A new request waits if all four default SFTP
-channels are already serving interactive requests. The reserve protects
-against bulk work. Background listing refreshes remain serial per member.
+Size and mtime baselines persist in the cache file's read-only
+`user.storage.member_stat` xattr. SFTP v3 reports second-resolution mtime
+and has no inode or change time. A same-size rewrite in the same timestamp
+tick may be indistinguishable until a watcher supplies a change hint. A
+hint can retire a clean cache copy after every configured member confirms
+the name is absent and the reader and repair checks permit retirement.
+Without a trusted hint, member absence alone leaves the local copy
+available. A cold stream checks the observed generation around missing-range reads. If the
+member changes, a reader can still use previously cached ranges, and a
+missing range fails with `ESTALE`. A later open can start a new stream.
 
-On a multi-member mount, `--progressive-listings` (profile `progressive_listings = true`)
-returns a cold listing after the first member succeeds, including an empty result.
-Concurrent opens share the scan. Each later response updates the directory for its
-next enumeration. A program that enumerates once can see a partial union. Use the
-default for tools that need a complete first pass. Directory lookups and writes
-keep their usual member precedence. An already-open file manager needs a refresh
-or a supported desktop notification to enumerate again.
+Directory listings and known child attributes are also served from local
+observations, including expired entries restored from the index. After
+`readdir_ttl` (which follows `revalidate_after` by default), Storage schedules
+a metadata refresh. A failed member contributes its last usable
+observations. A missing name is conclusive only with fresh, complete
+coverage. An explicit zero TTL requests a foreground scan. Watcher
+reconnects expire observations for refresh and preserve usable entries in
+the meantime. Local namespace changes invalidate older scans.
+
+A cold mount serves useful cache-directory entries immediately. When it
+needs a member, the first successful response can publish even when it is
+empty. Later replies update the union for the next enumeration. The existing progressive-listing setting is still required
+when enabling the experimental desktop bridge. A failed member supplies
+no evidence of absence. Foreground scans for independent
+directories can use separate SFTP channels, and background refreshes use
+bounded queues. The opted-in [Nautilus bridge](desktop/README.md) can
+reconcile an already-open directory after later publications.
 
 Member requests for a browse of one directory, 2 SSH members, 20 entries,
 a 6 s window (the remote gate's `test_mounted_browse_request_budget`):
@@ -732,12 +705,12 @@ has been run against a real host since the field use above.
 Implemented:
 
 - Local, SSH/SFTP and rsync storage members (SFTP for reads, rsync for writes); one Paramiko connection per compatible SSH identity within the mount, with a shared pool of SFTP channels
-- Directory listings fresh for `revalidate_after` and refreshed in the background after it, answering `stat` and missing names without a member round trip
-- Local cache with LRU eviction, revalidated against the member on open (`revalidate_after`); streaming cold reads with background prefetch that stops when readers close early (`streaming_keep_after_close`)
+- Persisted directory observations and cache-first positive lookups, with background refresh and first-member publication on a cold mount
+- Local cache with LRU eviction and asynchronous validation for complete read-only hits. Buffered descriptors and mappings retain their generation until the final release. Cold reads support range streaming and bounded read-ahead.
 - Member timestamps and stat attributes preserved on regular-file cache fills, including streaming reads. Legacy CLEAN cache entries report recovered source mtime when their recorded evidence agrees.
 - Background sync workers with retry; N-way replication configured per directory through xattrs
 - Conflict detection on sync, and `storage conflicts` to list and resolve conflicts (`--verify` to hash a directory's duplicates again first); a conflict view in listings that splits copies of different sizes from the listing alone and hashes equal-size copies in the background on the members, never by download, keeping hashes across remounts, recording what sync uploads and re-verifying recorded hashes slowly
-- Remote inotify watchers that invalidate the cache when a member changes
+- Remote inotify watchers that expire directory observations and request fresh file validation after a member changes
 - TOML mount profiles with optional display names for members; numbered member IDs remain stable when labels change
 - A multithreaded FUSE loop (`fuse_threads`, off by default until field-tested), so a slow member call for one file does not hold up listings, stats and reads of others
 - On a threaded mount, whole-file SSH cache copies use bulk SFTP channel capacity while directory listing keeps the interactive reserve. `bulk_capacity_wait_timeout` optionally bounds that bulk-capacity queue (off by default); an existing cold open reports `EAGAIN` on its expiry, and an interrupted native FUSE request reports `EINTR`. Single-threaded foreground copies keep their interactive class.

@@ -584,20 +584,47 @@ class CacheManager:
         regular file is there), with the temp file removed.
         """
         cache_path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = cache_path.parent / f".{secrets.token_hex(8)}{PARTIAL_SUFFIX}"
+        with self.stage_cache_copy(
+            backend, source_virtual_path, cache_path.parent, member_stat,
+            expected_size=expected_size,
+        ) as temp_path:
+            with self._lock:
+                size = self._temp_data_bytes(temp_path)
+                if not self.ensure_space(0):
+                    raise OSError(errno.ENOSPC, "insufficient cache space")
+                try:
+                    os.link(temp_path, cache_path)
+                except FileExistsError:
+                    if regular_file_stat(cache_path) is None:
+                        raise
+                    return False
+                self._current_size_bytes += size
+                return True
+
+    @contextmanager
+    def stage_cache_copy(self, backend, source, directory, member_stat, *, expected_size,
+                         evict=True):
+        """Reserve and download a whole copy without touching its final name.
+
+        A speculative replacement uses only unreserved space. In particular,
+        building it cannot evict the usable copy it intends to replace.
+        """
+        temp_path = directory / f".{secrets.token_hex(8)}{PARTIAL_SUFFIX}"
         with self._lock:
             reserved = self._round_up(expected_size)
-            if not self.ensure_space(reserved):
+            fits = (self.ensure_space(reserved) if evict
+                    else not self.get_free_space_needed(reserved))
+            if not fits:
                 raise OSError(errno.ENOSPC, "insufficient cache space")
             self._whole_file_temps[temp_path] = reserved
         try:
-            with bulk_request() if self.bulk_cold_copies else nullcontext():
-                backend.copy_to_local(source_virtual_path, temp_path)
+            with bulk_request() if self.bulk_cold_copies or not evict else nullcontext():
+                backend.copy_to_local(source, temp_path)
             st = os.lstat(temp_path)
             if not stat_module.S_ISREG(st.st_mode):
                 raise OSError(errno.EINVAL, "download did not produce a regular file", temp_path)
-            # A whole file is never a streaming prefix, whatever xattrs the
-            # member's copy came with.
+            if not evict and st.st_size != expected_size:
+                raise OSError(errno.ESTALE, "member size changed during refresh", temp_path)
             _remove_prefix_marker(temp_path)
             if not st.st_mode & stat_module.S_IRUSR:
                 os.chmod(temp_path, stat_module.S_IMODE(st.st_mode) | stat_module.S_IRUSR,
@@ -607,26 +634,10 @@ class CacheManager:
                 copy_member_attributes(fd, member_stat)
             finally:
                 os.close(fd)
+            yield temp_path
+        finally:
             with self._lock:
-                try:
-                    size = self._temp_data_bytes(temp_path)
-                    if not self.ensure_space(0):
-                        raise OSError(errno.ENOSPC, "insufficient cache space")
-                    try:
-                        os.link(temp_path, cache_path)
-                    except FileExistsError:
-                        if regular_file_stat(cache_path) is None:
-                            raise
-                        return False
-                    self._current_size_bytes += size
-                    return True
-                finally:
-                    self._drop_whole_temp(temp_path)
-        except BaseException:
-            with self._lock:
-                if temp_path in self._whole_file_temps:
-                    self._drop_whole_temp(temp_path)
-            raise
+                self._drop_whole_temp(temp_path)
 
     def _drop_whole_temp(self, path: Path):
         """Release the temp reservation under the cache lock."""

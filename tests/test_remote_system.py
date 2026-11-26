@@ -1262,10 +1262,11 @@ def test_mounted_same_stat_refetch_reads_fresh_bytes(remote, mounted_factory):
         # Deliver the watcher's change deterministically, without waiting
         # for remote inotify delivery or racing its file state.
         mnt.fs._on_remote_change("/" + name)
-        assert not cached.exists()
-
+        assert cached.read_bytes() == before
         with target.open("rb") as reader:
-            assert cached.read_bytes() == after
+            assert reader.read() == before
+        assert _wait_for(lambda: cached.read_bytes() == after, timeout=10)
+        with target.open("rb") as reader:
             assert target.stat().st_mtime == stamp
             assert reader.read() == after
         assert target.read_bytes() == after

@@ -83,7 +83,6 @@ class TestFSNamespaceIntegration(unittest.TestCase):
     def test_progressive_listing_shares_scan_and_expands_after_first_success(self):
         namespace = self.fs.namespace
         namespace.progressive_listings = True
-        (self.cache_dir / "local").touch()
         (self.backend1_dir / "late").write_bytes(b"content")
         (self.backend2_dir / "early").touch()
         entered = threading.Event()
@@ -100,9 +99,9 @@ class TestFSNamespaceIntegration(unittest.TestCase):
              patch.object(self.backends["backend2"], "listdir_attrs",
                           wraps=self.backends["backend2"].listdir_attrs) as early:
             try:
-                self.assertEqual(set(self.fs.readdir("/", 0)), {".", "..", "local", "early"})
+                self.assertEqual(set(self.fs.readdir("/", 0)), {".", "..", "early"})
                 self.assertTrue(entered.wait(2))
-                self.assertEqual(set(self.fs.readdir("/", 0)), {".", "..", "local", "early"})
+                self.assertEqual(set(self.fs.readdir("/", 0)), {".", "..", "early"})
                 # A name absent from the first response still resolves on its member.
                 self.assertEqual(self.fs.getattr("/late")["st_size"], 7)
             finally:
@@ -409,7 +408,7 @@ class TestFSNamespaceIntegration(unittest.TestCase):
         self.backends["backend1"].set_available(False)
         self.assertEqual(self.fs.getattr('/both.txt')['st_size'], len("second member"))
 
-    def test_getattr_probes_members_after_listing_expires(self):
+    def test_getattr_refreshes_after_serving_expired_attributes(self):
         self.fs.namespace.readdir_snapshot_ttl = 0.05
         self.fs.namespace.listing_max_stale = 0.05
         (self.backend1_dir / "aging.txt").write_text("old")
@@ -417,6 +416,8 @@ class TestFSNamespaceIntegration(unittest.TestCase):
         (self.backend1_dir / "aging.txt").write_text("newer bytes")
         time.sleep(0.1)
 
+        self.assertEqual(self.fs.getattr('/aging.txt')['st_size'], len("old"))
+        self._wait_refreshed()
         self.assertEqual(self.fs.getattr('/aging.txt')['st_size'], len("newer bytes"))
 
     def test_getattr_probes_members_after_invalidation(self):
@@ -531,7 +532,7 @@ class TestFSNamespaceIntegration(unittest.TestCase):
             self.fs.symlink('/link', 'target.txt')
         self.assertEqual(os.readlink(self.cache_dir / "link"), "target.txt")
         self.assertFalse(os.path.lexists(self.cache_dir / "target.txt"))
-        self.assertNotIn('/', self.fs.namespace.entry_attrs)
+        self.assertIn('link', self.fs.readdir('/', None))
         row = self.fs.state_manager.get_file_metadata('/link')
         self.assertEqual(row.link_target, "target.txt")
         self.assertEqual(row.sync_status, SyncStatus.DIRTY)
@@ -846,7 +847,9 @@ class TestFSNamespaceIntegration(unittest.TestCase):
             self.fs._invalidate_dir_cache_entry('/')
 
         with patch.object(namespace, "_schedule_directory_checksums", side_effect=schedule_then_change):
-            list(self.fs.readdir('/', None))
+            with self.assertRaises(FuseOSError) as raced:
+                self.fs.readdir('/', None)
+            self.assertEqual(raced.exception.errno, errno.EAGAIN)
 
         self.assertNotIn('/', namespace.entry_attrs)
         self.assertNotIn('/', self.fs._readdir_snapshot)
@@ -962,9 +965,9 @@ class TestFSNamespaceIntegration(unittest.TestCase):
             self.fs._invalidate_dir_cache_entry('/')
 
         with self._wrap_listdir_attrs("backend1", after=change):
-            entries = set(self.fs.readdir('/', None))
-
-        self.assertIn("raced.txt", entries)
+            with self.assertRaises(FuseOSError) as raced:
+                self.fs.readdir('/', None)
+        self.assertEqual(raced.exception.errno, errno.EAGAIN)
         namespace = self.fs.namespace
         self.assertNotIn('/', namespace.entry_attrs)
         self.assertNotIn('/', self.fs._readdir_snapshot)
@@ -1131,7 +1134,7 @@ class TestFSNamespaceIntegration(unittest.TestCase):
         self.fs._invalidate_dir_cache_entry('/')
         self.assertIn("appeared.txt", set(self.fs.readdir('/', None)))
 
-    def test_readdir_prunes_expired_listing_attrs(self):
+    def test_readdir_retains_expired_listing_attrs(self):
         (self.backend1_dir / "a").mkdir()
         (self.backend1_dir / "b").mkdir()
         self.fs.namespace.readdir_snapshot_ttl = 0.05
@@ -1140,7 +1143,7 @@ class TestFSNamespaceIntegration(unittest.TestCase):
         time.sleep(0.1)
         list(self.fs.readdir('/b', None))
 
-        self.assertEqual(set(self.fs.namespace.entry_attrs), {'/b'})
+        self.assertEqual(set(self.fs.namespace.entry_attrs), {'/a', '/b'})
 
     def test_readdir_keeps_stale_listing_attrs_until_max_stale(self):
         (self.backend1_dir / "a").mkdir()
@@ -1302,7 +1305,9 @@ class TestFSNamespaceIntegration(unittest.TestCase):
 
         with patch("storage.namespace._MAX_CHILD_RACES", 1), \
                 self._wrap_listdir_attrs("backend1", after=change):
-            list(self.fs.readdir('/', None))
+            with self.assertRaises(FuseOSError) as raced:
+                self.fs.readdir('/', None)
+            self.assertEqual(raced.exception.errno, errno.EAGAIN)
 
         self.assertNotIn('/', namespace.entry_attrs)
         self.assertEqual(namespace._child_races, {})
@@ -1347,7 +1352,7 @@ class TestFSNamespaceIntegration(unittest.TestCase):
                 # Published without the hung member's attributes; its names
                 # are the previous ones.
                 self.assertGreater(namespace.entry_attrs['/'][0], stale_at)
-                self.assertNotIn("backend1", namespace.entry_attrs['/'][1])
+                self.assertNotIn("backend1", namespace._fresh_members['/'])
                 self.assertIn("f.txt", self.fs._dir_cache['/']["backend1"])
                 with namespace._listing_executors_lock:
                     self.assertIn("backend1", namespace._hung_listings)
@@ -1358,7 +1363,7 @@ class TestFSNamespaceIntegration(unittest.TestCase):
                 self._wait_refreshed('/d')
                 self.assertLess(time.monotonic() - begun, 0.4)
                 self.assertEqual(calls, ["/"])
-                self.assertNotIn("backend1", namespace.entry_attrs['/d'][1])
+                self.assertNotIn("backend1", namespace._fresh_members['/d'])
         finally:
             release.set()
         self.assertTrue(self._wait_for(lambda: not namespace._hung_listings))
@@ -1420,7 +1425,9 @@ class TestFSNamespaceIntegration(unittest.TestCase):
             namespace.forget_listed_attrs('/dup.txt', removing=True)
 
         with self._wrap_listdir_attrs("backend1", after=change):
-            list(self.fs.readdir('/', None))
+            with self.assertRaises(FuseOSError) as raced:
+                self.fs.readdir('/', None)
+            self.assertEqual(raced.exception.errno, errno.EAGAIN)
         self.assertNotIn('/', namespace.entry_attrs)
 
     def test_eviction_of_a_replicated_name_does_not_starve_the_listing(self):
@@ -1621,35 +1628,37 @@ class TestFSNamespaceIntegration(unittest.TestCase):
             self.fs.getattr('/' + name)
         self.assertEqual(set(namespace._stat_memo), {'/b', '/c'})
 
-    def test_resync_drops_listings_and_keeps_in_flight_ones_unpublished(self):
+    def test_resync_drops_old_listings_and_retries_an_in_flight_scan(self):
         (self.backend1_dir / "f.txt").write_text("1")
         namespace = self.fs.namespace
         list(self.fs.readdir('/', None))
+        directory = self.backend1_dir / "d"
+        directory.mkdir()
+        (directory / "old.txt").touch()
         started, release = threading.Event(), threading.Event()
 
-        def before(_path):
+        def after(_path):
             started.set()
-            release.wait(5)
+            self.assertTrue(release.wait(5))
 
-        result = {}
-        with self._wrap_listdir_attrs("backend1", before=before):
-            thread = threading.Thread(
-                target=lambda: result.setdefault('e', list(self.fs.readdir('/d', None))))
-            (self.backend1_dir / "d").mkdir()
-            thread.start()
-            self.assertTrue(started.wait(5))
-            namespace.invalidate_all_listings()
-            release.set()
-            thread.join(5)
-        self.assertFalse(thread.is_alive())
-        self.assertEqual(namespace.entry_attrs, {})
-        self.assertEqual(namespace.readdir_snapshot, {})
-        self.assertEqual(self.fs._dir_cache, {})
+        with self._wrap_listdir_attrs("backend1", after=after):
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                read = pool.submit(self.fs.readdir, "/d", None)
+                try:
+                    self.assertTrue(started.wait(5))
+                    (directory / "old.txt").rename(directory / "current.txt")
+                    namespace.invalidate_all_listings()
+                finally:
+                    release.set()
+                self.assertEqual(set(read.result(timeout=5)), {".", "..", "current.txt"})
+        self.assertEqual(set(namespace.entry_attrs), {"/d"})
+        self.assertEqual(set(namespace.readdir_snapshot), {"/d"})
+        self.assertEqual(set(self.fs._dir_cache), {"/d"})
         self.assertEqual(namespace._listings_in_flight, {})
 
     def test_older_background_refresh_does_not_replace_newer_listing(self):
         # A background refresh reads the old directory, then stalls; a
-        # foreground listing (the stale one expired meanwhile) reads the new
+        # an explicit verification reads the new
         # file and publishes. The refresh finishing last must not put the
         # older read back, or the new file would be ENOENT for a window.
         (self.backend1_dir / "old.txt").write_text("o")
@@ -1673,12 +1682,8 @@ class TestFSNamespaceIntegration(unittest.TestCase):
             self.assertTrue(self._wait_for(lambda: len(reads) >= 2))  # both members read
 
             (self.backend2_dir / "new.txt").write_text("n")
-            with namespace.listing_lock:  # expire the stale listing
-                at, snapshot = namespace.readdir_snapshot['/']
-                _, attrs, unknown = namespace.entry_attrs['/']
-                namespace.readdir_snapshot['/'] = (at - 200.0, snapshot)
-                namespace.entry_attrs['/'] = (at - 200.0, attrs, unknown)
-            self.assertIn("new.txt", set(self.fs.readdir('/', None)))  # foreground
+            namespace.verify_listing("/")
+            self.assertIn("new.txt", set(self.fs.readdir('/', None)))
             release.set()
             self._wait_refreshed()
 
@@ -1849,20 +1854,171 @@ class TestFSNamespaceIntegration(unittest.TestCase):
         self.assertEqual(namespace._listings_in_flight, {})
         self.assertEqual(namespace._listing_generation, {})
 
-    def test_expired_listing_is_relisted_in_the_foreground(self):
-        (self.backend1_dir / "old.txt").write_text("o")
-        namespace = self.fs.namespace
-        namespace.listing_max_stale = 120.0
-        self._make_stale()
-        with namespace.listing_lock:
-            at, snapshot = namespace.readdir_snapshot['/']
-            _, attrs, unknown = namespace.entry_attrs['/']
-            namespace.readdir_snapshot['/'] = (at - 200.0, snapshot)
-            namespace.entry_attrs['/'] = (at - 200.0, attrs, unknown)
-        (self.backend2_dir / "new.txt").write_text("n")
+    def test_restart_keeps_positive_entries_during_a_blocked_failed_member_read(self):
+        (self.backend1_dir / "known.txt").write_bytes(b"observed")
+        self.assertIn("known.txt", self.fs.readdir("/", None))
+        self.fs.destroy("/")
+        self.fs = StorageFS(self.cache_dir, self.db_path, self.backends,
+                            cache_size=10 * 1024 * 1024, start_sync=False,
+                            progressive_listings=True)
+        entered, release = threading.Event(), threading.Event()
 
-        self.assertIn("new.txt", set(self.fs.readdir('/', None)))
-        self.assertEqual(namespace._background_refreshes, set())
+        def disconnect(path):
+            entered.set()
+            if not release.wait(10):
+                raise TimeoutError("test did not release member")
+            raise ConnectionError("synthetic disconnect")
+
+        with patch.object(self.backends["backend1"], "listdir_attrs", side_effect=disconnect):
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                try:
+                    result = pool.submit(self.fs.readdir, "/", None)
+                    self.assertTrue(entered.wait(5))
+                    self.assertIn("known.txt", result.result(timeout=1))
+                    result = pool.submit(self.fs.getattr, "/known.txt")
+                    self.assertEqual(result.result(timeout=1)["st_size"], 8)
+                finally:
+                    release.set()
+            self._wait_refreshed()
+        self.assertIn("known.txt", self.fs.readdir("/", None))
+        self.assertEqual(self.fs.getattr("/known.txt")["st_size"], 8)
+
+    def test_local_create_keeps_observed_siblings_while_members_are_blocked(self):
+        (self.backend2_dir / "member-child").write_bytes(b"older observation")
+        self.assertIn("member-child", self.fs.readdir("/", None))
+        self.fs.namespace.progressive_listings = True
+        blocked, release = threading.Event(), threading.Event()
+        original = self.backends["backend1"].listdir_attrs
+
+        def hold(path):
+            blocked.set()
+            if not release.wait(10):
+                raise TimeoutError("test did not release member")
+            return original(path)
+
+        with patch.object(self.backends["backend1"], "listdir_attrs", side_effect=hold):
+            fh = self.fs.create("/local-child", 0o644)
+            try:
+                self.assertEqual(set(self.fs.readdir("/", None)),
+                                 {".", "..", "member-child", "local-child"})
+                self.assertTrue(blocked.wait(5))
+                self.assertEqual(self.fs.getattr("/member-child")["st_size"], 17)
+            finally:
+                release.set()
+                self.fs.release("/local-child", fh)
+            self._wait_refreshed()
+
+    def test_restart_does_not_restore_the_old_name_after_local_rename(self):
+        (self.backend1_dir / "before.txt").write_bytes(b"original")
+        reader = self.fs.open("/before.txt", os.O_RDONLY)
+        self.fs.release("/before.txt", reader)
+        self.assertIn("before.txt", self.fs.readdir("/", None))
+        self.fs.rename("/before.txt", "/after.txt")
+        self.fs.destroy("/")
+        self.fs = StorageFS(self.cache_dir, self.db_path, self.backends,
+                            cache_size=10 * 1024 * 1024, start_sync=False,
+                            progressive_listings=True)
+        names = self.fs.readdir("/", None)
+        self.assertIn("after.txt", names)
+        self.assertNotIn("before.txt", names)
+        with self.assertRaises(FuseOSError) as gone:
+            self.fs.getattr("/before.txt")
+        self.assertEqual(gone.exception.errno, errno.ENOENT)
+
+    def test_cold_listing_retries_a_single_superseded_scan(self):
+        path = self.backend1_dir / "stale-name"
+        path.write_bytes(b"old")
+        raced = False
+
+        def invalidate_once(_path):
+            nonlocal raced
+            if not raced:
+                path.rename(self.backend1_dir / "current-name")
+                self.fs.namespace.invalidate_dir_cache_entry("/")
+                raced = True
+
+        with self._wrap_listdir_attrs("backend1", after=invalidate_once):
+            names = self.fs.readdir("/", None)
+        self.assertTrue(raced)
+        self.assertIn("current-name", names)
+        self.assertNotIn("stale-name", names)
+
+    def test_cold_scan_racing_multiple_creates_serves_new_local_names(self):
+        namespace = self.fs.namespace
+        namespace.progressive_listings = True
+        namespace.readdir_snapshot_ttl = 0
+        (self.backend2_dir / "remote-child").touch()
+        entered, first_release, rest_release = (threading.Event() for _ in range(3))
+
+        def hold_after_read(_path):
+            if not entered.is_set():
+                entered.set()
+                self.assertTrue(first_release.wait(5))
+            else:
+                self.assertTrue(rest_release.wait(5))
+
+        with self._wrap_listdir_attrs("backend2", after=hold_after_read), \
+             self._wrap_listdir_attrs("backend1", before=lambda _path: rest_release.wait(5)):
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                reading = pool.submit(self.fs.readdir, "/", None)
+                try:
+                    self.assertTrue(entered.wait(3))
+                    first = self.fs.create("/one", 0o644)
+                    second = self.fs.create("/two", 0o644)
+                    self.fs.release("/one", first)
+                    self.fs.release("/two", second)
+                    first_release.set()
+                    self.assertEqual(set(reading.result(timeout=3)), {".", "..", "one", "two"})
+                finally:
+                    first_release.set()
+                    rest_release.set()
+            self.assertTrue(self._wait_for(
+                lambda: "remote-child" in namespace.readdir_snapshot.get("/", (None, ()))[1],
+            ))
+
+    def test_cold_empty_success_is_distinct_from_all_unavailable(self):
+        self.fs.namespace.progressive_listings = True
+        with patch.object(self.backends["backend1"], "listdir_attrs",
+                          side_effect=ConnectionError("no member 1")):
+            self.assertEqual(set(self.fs.readdir("/", None)), {".", ".."})
+        self.assertTrue(self._wait_for(lambda: not self.fs.namespace._listings_in_flight))
+        self.fs.namespace.invalidate_all_listings()
+        with patch.object(self.backends["backend1"], "listdir_attrs",
+                          side_effect=ConnectionError("no member 1")), \
+             patch.object(self.backends["backend2"], "listdir_attrs",
+                          side_effect=ConnectionError("no member 2")):
+            with self.assertRaises(FuseOSError) as raised:
+                self.fs.readdir("/", None)
+        self.assertEqual(raised.exception.errno, errno.EHOSTUNREACH)
+
+    def test_expired_listing_and_child_attrs_survive_blocked_refresh(self):
+        (self.backend1_dir / "old.txt").write_bytes(b"old")
+        namespace = self.fs.namespace
+        namespace.listing_max_stale = 60.0
+        self._make_stale()
+        (self.backend2_dir / "new.txt").write_bytes(b"new")
+        member = self.backends["backend1"]
+        original = member.listdir_attrs
+        entered, release = threading.Event(), threading.Event()
+
+        def blocked(path):
+            entered.set()
+            if not release.wait(10):
+                raise TimeoutError("test did not release member")
+            return original(path)
+
+        with patch.object(member, "listdir_attrs", side_effect=blocked):
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                try:
+                    listing = pool.submit(self.fs.readdir, "/", None)
+                    self.assertTrue(entered.wait(5))
+                    self.assertEqual(set(listing.result(timeout=1)), {".", "..", "old.txt"})
+                    child = pool.submit(self.fs.getattr, "/old.txt")
+                    self.assertEqual(child.result(timeout=1)["st_size"], 3)
+                finally:
+                    release.set()
+            self._wait_refreshed()
+        self.assertIn("new.txt", self.fs.readdir("/", None))
 
     def test_shutdown_tolerates_a_background_refresh_in_flight(self):
         (self.backend1_dir / "f.txt").write_text("f")

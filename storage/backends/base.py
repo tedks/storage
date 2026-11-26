@@ -64,6 +64,48 @@ def current_capacity_cancel_probe():
     return getattr(_CAPACITY_CANCEL_PROBE, "probe", None)
 
 
+def member_generation(st):
+    """Best identity observable through the member's stat protocol.
+
+    SFTP v3 has only second-resolution mtime and omits inode and ctime.
+    """
+    def timestamp(name):
+        return getattr(st, f"st_{name}_ns", None) or getattr(st, f"st_{name}", None)
+
+    if getattr(st, "st_size", None) is None or timestamp("mtime") is None:
+        return None
+    return (st.st_size, timestamp("mtime"), timestamp("ctime"),
+            getattr(st, "st_mode", None), getattr(st, "st_dev", None),
+            getattr(st, "st_ino", None))
+
+
+_EXPECTED_RANGE_GENERATION = contextvars.ContextVar("storage_range_generation", default=None)
+
+
+@contextmanager
+def member_range_generation(generation):
+    """Pin a range read to the generation observed when its stream opened."""
+    if generation is None:
+        raise OSError(errno.ESTALE, "member does not report a range generation")
+    token = _EXPECTED_RANGE_GENERATION.set(generation)
+    try:
+        yield
+    finally:
+        _EXPECTED_RANGE_GENERATION.reset(token)
+
+
+def read_member_range(handle, offset, size, fstat):
+    """Check the actual open file around the read, including reconnect retries."""
+    expected = _EXPECTED_RANGE_GENERATION.get()
+    if expected is not None and member_generation(fstat()) != expected:
+        raise OSError(errno.ESTALE, "member generation changed")
+    handle.seek(offset)
+    data = handle.read(size)
+    if expected is not None and member_generation(fstat()) != expected:
+        raise OSError(errno.ESTALE, "member generation changed during read")
+    return data
+
+
 class MemberSourceMissing(FileNotFoundError):
     """A member rename found nothing at the old name on the member: nothing
     moved. Raised only on positive evidence (the member's own check of the
