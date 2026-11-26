@@ -4,6 +4,7 @@ import argparse
 import os
 import secrets
 import select
+import signal
 import shutil
 import struct
 import subprocess
@@ -143,6 +144,23 @@ def observe(root, library):
         if library:
             until(lambda: contains("late-visible.txt"), "late addition did not appear in this window")
             assert contains("first-visible.txt"), "first row disappeared"
+            # Let two published revisions pass while this exact private
+            # Nautilus cannot poll its control socket.
+            process.send_signal(signal.SIGSTOP)
+            try:
+                (root / "first/first-visible.txt").unlink()
+                until(lambda: "first-visible.txt" not in os.listdir(root / "mount"),
+                      "member removal never published")
+                (root / "second/000-resync-added.txt").write_bytes(b"new generation")
+                for index in range(130):
+                    (root / "second" / f".gap-{index:03}").touch()
+                until(lambda: "000-resync-added.txt" in os.listdir(root / "mount"),
+                      "oversized revision never published")
+            finally:
+                process.send_signal(signal.SIGCONT)
+            until(lambda: contains("000-resync-added.txt") and not contains("first-visible.txt"),
+                  "the open window did not reconcile an oversized change")
+            assert not contains("000-resync-added.txt", other), "refresh leaked into another view"
         else:
             end = time.monotonic() + 3
             while time.monotonic() < end:

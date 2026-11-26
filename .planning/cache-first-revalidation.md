@@ -9,8 +9,8 @@ A user reopening a directory or file should be able to use already observed entr
 ## Progress
 
 - [x] (2026-11-26 19:39Z) Proved that an expired listing waited on a blocked member and that the first change serves its entries and child attributes locally.
-- [ ] Preserve member observations across scans and process restarts, including partial availability.
-- [ ] Add bounded read-only validation and generation-safe installation and streaming.
+- [x] (2026-11-26 19:47Z) Added bounded persisted member observations and partial refresh publication.
+- [x] (2026-11-26 20:01Z) Implemented bounded read-only validation and verified buffered generations on a synthetic mount with same-size, grow and shrink replacements.
 - [ ] Extend the staged desktop bridge, exercise a synthetic mount, review the draft, and record exact-head gates.
 
 ## Surprises & Discoveries
@@ -24,7 +24,7 @@ The staged listing code already has per-directory publication tickets, separate 
 
 ## Outcomes & Retrospective
 
-The first regression exercises Storage's normal readdir and getattr entry points with a held member. Later milestones must cover actual bytes, restart and an open desktop window.
+The first regression exercises Storage's normal readdir and getattr entry points with a held member. The staged FUSE mount reproduced mixed old mapping pages with identical-size and growing replacements. The default draft kept buffered mmap valid across overlapping opens and published after final unmap, including shrink. The test-only direct-I/O variant passed this host’s MAP_PRIVATE probe. Startup, directory refresh and desktop checks use synthetic paths.
 
 ## Context and Orientation
 
@@ -64,4 +64,4 @@ The initial test is test_expired_listing_and_child_attrs_survive_blocked_refresh
 
 Use NamespaceService's listing ticket and publication path, and StateManager for durable listing acceleration. Keep the mount control socket's existing peer-UID and mount checks. Use the existing cache budget, dirty generation, descriptor registration, and repair fence when publishing a replacement file.
 
-2026-11-26. Created the plan with the first barrier result and the remaining acceptance steps.
+2026-11-26. Updated the plan with the persisted observations, deferred-publication decision and mounted evidence.
