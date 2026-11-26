@@ -11,6 +11,7 @@ from .control import ControlError
 _MAX_PATH = 768
 _MAX_NAME = 255
 _MAX_EVENTS = 128
+_MAX_VIEW_NAMES = 8192
 
 
 def _native_path(value):
@@ -40,6 +41,56 @@ class DesktopAdditions:
         self.through = 0
         self.dropped = 0
         self.dropped_us = -1
+        self.view_revision = 0
+        self.revisions = {}
+
+    def published(self, path, limit):
+        self.view_revision += 1
+        self.revisions.pop(path, None)
+        self.revisions[path] = self.view_revision
+        if len(self.revisions) > limit:
+            self.revisions.pop(next(iter(self.revisions)))
+
+    def snapshot_request(self, arguments):
+        fields = set(arguments) - {"mount_hex", "directory_hex"}
+        if fields not in ({"revision"}, {"revision", "generation"}):
+            raise ControlError("Invalid desktop snapshot request")
+        if _native_path(arguments.get("mount_hex")) != self.mount:
+            raise ControlError("Desktop listing mount does not match control socket")
+        path = os.fsdecode(_native_path(arguments.get("directory_hex")))
+        revision = arguments["revision"]
+        if type(revision) is not int or revision < 0:
+            raise ControlError("Invalid desktop snapshot revision")
+        return path, revision
+
+    def snapshot(self, path, after, generation, entries, attrs):
+        revision = self.revisions.get(path, 0)
+        reply = {"generation": self.generation, "revision": revision}
+        if generation is not None and generation != self.generation:
+            return {**reply, "status": "generation-changed"}
+        if entries is None or not revision:
+            return {**reply, "status": "pending"}
+        if after == revision:
+            return {**reply, "status": "unchanged"}
+        if len(entries) > _MAX_VIEW_NAMES + 2:
+            return {**reply, "status": "too-large"}
+
+        rows = []
+        for name in entries:
+            if name in (".", ".."):
+                continue
+            raw = os.fsencode(name)
+            if not 0 < len(raw) <= _MAX_NAME or b"/" in raw or b"\x00" in raw:
+                return {**reply, "status": "too-large"}
+            entry = next((member[name] for member in attrs.values() if name in member), None)
+            if entry is None:
+                base, _, member = name.rpartition(".")
+                entry = attrs.get(member, {}).get(base, {})
+            fingerprint = ",".join(str(entry.get(key, "")) for key in
+                                   ("st_mode", "st_size", "st_mtime", "st_ctime", "st_uid",
+                                    "st_gid", "st_nlink"))
+            rows.append((raw.hex(), fingerprint))
+        return {**reply, "status": "ok", "entries": rows}
 
     def record(self, directory, revision, additions):
         if not additions:

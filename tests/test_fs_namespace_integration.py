@@ -83,7 +83,6 @@ class TestFSNamespaceIntegration(unittest.TestCase):
     def test_progressive_listing_shares_scan_and_expands_after_first_success(self):
         namespace = self.fs.namespace
         namespace.progressive_listings = True
-        (self.cache_dir / "local").touch()
         (self.backend1_dir / "late").write_bytes(b"content")
         (self.backend2_dir / "early").touch()
         entered = threading.Event()
@@ -100,9 +99,9 @@ class TestFSNamespaceIntegration(unittest.TestCase):
              patch.object(self.backends["backend2"], "listdir_attrs",
                           wraps=self.backends["backend2"].listdir_attrs) as early:
             try:
-                self.assertEqual(set(self.fs.readdir("/", 0)), {".", "..", "local", "early"})
+                self.assertEqual(set(self.fs.readdir("/", 0)), {".", "..", "early"})
                 self.assertTrue(entered.wait(2))
-                self.assertEqual(set(self.fs.readdir("/", 0)), {".", "..", "local", "early"})
+                self.assertEqual(set(self.fs.readdir("/", 0)), {".", "..", "early"})
                 # A name absent from the first response still resolves on its member.
                 self.assertEqual(self.fs.getattr("/late")["st_size"], 7)
             finally:
@@ -966,7 +965,7 @@ class TestFSNamespaceIntegration(unittest.TestCase):
         with self._wrap_listdir_attrs("backend1", after=change):
             entries = set(self.fs.readdir('/', None))
 
-        self.assertIn("raced.txt", entries)
+        self.assertNotIn("raced.txt", entries)
         namespace = self.fs.namespace
         self.assertNotIn('/', namespace.entry_attrs)
         self.assertNotIn('/', self.fs._readdir_snapshot)
@@ -1349,7 +1348,7 @@ class TestFSNamespaceIntegration(unittest.TestCase):
                 # Published without the hung member's attributes; its names
                 # are the previous ones.
                 self.assertGreater(namespace.entry_attrs['/'][0], stale_at)
-                self.assertNotIn("backend1", namespace.entry_attrs['/'][1])
+                self.assertNotIn("backend1", namespace._fresh_members['/'])
                 self.assertIn("f.txt", self.fs._dir_cache['/']["backend1"])
                 with namespace._listing_executors_lock:
                     self.assertIn("backend1", namespace._hung_listings)
@@ -1360,7 +1359,7 @@ class TestFSNamespaceIntegration(unittest.TestCase):
                 self._wait_refreshed('/d')
                 self.assertLess(time.monotonic() - begun, 0.4)
                 self.assertEqual(calls, ["/"])
-                self.assertNotIn("backend1", namespace.entry_attrs['/d'][1])
+                self.assertNotIn("backend1", namespace._fresh_members['/d'])
         finally:
             release.set()
         self.assertTrue(self._wait_for(lambda: not namespace._hung_listings))
@@ -1846,6 +1845,50 @@ class TestFSNamespaceIntegration(unittest.TestCase):
         self.assertIn('/', namespace.entry_attrs)
         self.assertEqual(namespace._listings_in_flight, {})
         self.assertEqual(namespace._listing_generation, {})
+
+    def test_restart_keeps_positive_entries_during_a_blocked_failed_member_read(self):
+        (self.backend1_dir / "known.txt").write_bytes(b"observed")
+        self.assertIn("known.txt", self.fs.readdir("/", None))
+        self.fs.destroy("/")
+        self.fs = StorageFS(self.cache_dir, self.db_path, self.backends,
+                            cache_size=10 * 1024 * 1024, start_sync=False,
+                            progressive_listings=True)
+        entered, release = threading.Event(), threading.Event()
+
+        def disconnect(path):
+            entered.set()
+            if not release.wait(10):
+                raise TimeoutError("test did not release member")
+            raise ConnectionError("synthetic disconnect")
+
+        with patch.object(self.backends["backend1"], "listdir_attrs", side_effect=disconnect):
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                try:
+                    result = pool.submit(self.fs.readdir, "/", None)
+                    self.assertTrue(entered.wait(5))
+                    self.assertIn("known.txt", result.result(timeout=1))
+                    result = pool.submit(self.fs.getattr, "/known.txt")
+                    self.assertEqual(result.result(timeout=1)["st_size"], 8)
+                finally:
+                    release.set()
+            self._wait_refreshed()
+        self.assertIn("known.txt", self.fs.readdir("/", None))
+        self.assertEqual(self.fs.getattr("/known.txt")["st_size"], 8)
+
+    def test_cold_empty_success_is_distinct_from_all_unavailable(self):
+        self.fs.namespace.progressive_listings = True
+        with patch.object(self.backends["backend1"], "listdir_attrs",
+                          side_effect=ConnectionError("no member 1")):
+            self.assertEqual(set(self.fs.readdir("/", None)), {".", ".."})
+        self.assertTrue(self._wait_for(lambda: not self.fs.namespace._listings_in_flight))
+        self.fs.namespace.invalidate_all_listings()
+        with patch.object(self.backends["backend1"], "listdir_attrs",
+                          side_effect=ConnectionError("no member 1")), \
+             patch.object(self.backends["backend2"], "listdir_attrs",
+                          side_effect=ConnectionError("no member 2")):
+            with self.assertRaises(FuseOSError) as raised:
+                self.fs.readdir("/", None)
+        self.assertEqual(raised.exception.errno, errno.EHOSTUNREACH)
 
     def test_expired_listing_and_child_attrs_survive_blocked_refresh(self):
         (self.backend1_dir / "old.txt").write_bytes(b"old")

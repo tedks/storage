@@ -540,8 +540,8 @@ class TestWatcherInvalidation(TestCase):
             finally:
                 fs.state_manager.close()
 
-    def test_on_remote_change_invalidates_canonical_and_suffixed(self):
-        """_on_remote_change clears the canonical cache and dir cache entry."""
+    def test_on_remote_change_retains_canonical_and_invalidates_suffixed_copies(self):
+        """A watcher leaves complete canonical bytes available for readers."""
         with tempfile.TemporaryDirectory() as tmp:
             be0 = Path(tmp) / "be0"
             be1 = Path(tmp) / "be1"
@@ -558,8 +558,8 @@ class TestWatcherInvalidation(TestCase):
 
                 fs._on_remote_change("/shared.txt")
 
-                # Canonical cache should be gone.
-                self.assertFalse(cache_path.exists())
+                self.assertTrue(cache_path.exists())
+                self.assertIn("/shared.txt", fs._recheck)
             finally:
                 fs.state_manager.close()
 

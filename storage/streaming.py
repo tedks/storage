@@ -14,7 +14,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 from fuse import FuseOSError
 
-from .backends.base import Backend, capacity_wait_cancellation
+from .backends.base import Backend, capacity_wait_cancellation, member_generation
 from .backends.ssh_pool import BulkCapacityCancelled, member_failure_errno
 from .backends.local import NOREPLACE_UNSUPPORTED
 from .backends.local import rename_noreplace as _rename_noreplace
@@ -794,7 +794,7 @@ class StreamingReadManager:
         command = arguments.pop("command", None)
         if command in ("status", "streaming.get", "downloads.list") and arguments:
             raise ControlError("Unexpected arguments for control command")
-        if command == "desktop.additions.v1":
+        if command in {"desktop.additions.v1", "desktop.changes.v2"}:
             if self._poll_desktop_additions is None:
                 raise ControlError("Desktop listing delivery is disabled on this mount")
             return self._poll_desktop_additions(arguments)
@@ -827,8 +827,22 @@ class StreamingReadManager:
         with self._streaming_stats_lock:
             self._streaming_stats[key] = self._streaming_stats.get(key, 0) + value
 
+    def mark_generation_stale(self, path):
+        """A watcher hint can invalidate a range source with identical SFTP attrs."""
+        with self.prefetch_sessions_lock:
+            session = self.prefetch_sessions.get(path)
+        if session is None:
+            return
+        with session.io_lock, session.lock:
+            if not session.prefetch_complete and not session.detached:
+                session.error = OSError(errno.ESTALE, "member reported a generation change")
+                session.condition.notify_all()
+                self._schedule_background(session)
+
     def _write_session_bytes(self, session: PrefetchSession, offset: int, data: bytes) -> bool:
         with session.io_lock:
+            if getattr(session.error, "errno", None) == errno.ESTALE:
+                raise session.error
             if session.stop_requested or session.io_fd < 0:
                 return False
             try:
@@ -865,7 +879,16 @@ class StreamingReadManager:
             if session.stop_requested:
                 return start, []
             remaining = target_end - cursor
-            chunk = session.backend.read_file(session.canonical_path, cursor, remaining)
+            generation = member_generation(session.member_stat)
+            try:
+                before = member_generation(session.backend.stat(session.canonical_path))
+                if generation is None or before != generation:
+                    raise OSError(errno.ESTALE, "member generation changed")
+                chunk = session.backend.read_file(session.canonical_path, cursor, remaining)
+                if member_generation(session.backend.stat(session.canonical_path)) != generation:
+                    raise OSError(errno.ESTALE, "member generation changed during read")
+            except FileNotFoundError as exc:
+                raise OSError(errno.ESTALE, "member generation no longer exists") from exc
             if not chunk:
                 break
             chunk = chunk[:remaining]
@@ -1354,7 +1377,8 @@ class StreamingReadManager:
         handling it.
         """
         assert session.failed_cleanup_claimed, "claim with _claim_failed_cleanup first"
-        if self._promote_failed_session_cache_prefix(session):
+        if (getattr(session.error, "errno", None) != errno.ESTALE
+                and self._promote_failed_session_cache_prefix(session)):
             self._cleanup_prefetch_session(session, "partial-cache")
             return
         self._cleanup_prefetch_session(session, "failed")
@@ -1665,7 +1689,13 @@ class StreamingReadManager:
                 raise OSError(errno.EINTR, "streaming manager is shutting down")
             existing = self.prefetch_sessions.get(canonical_path)
             if existing:
-                return self._attach_for_open(existing)
+                with existing.lock:
+                    if getattr(existing.error, "errno", None) == errno.ESTALE:
+                        if self._claim_detach(existing):
+                            self._unregister_and_unlink(existing)
+                        existing = None
+                if existing is not None:
+                    return self._attach_for_open(existing)
 
         try:
             source = self.select_backend_for_read(canonical_path)
@@ -1682,7 +1712,7 @@ class StreamingReadManager:
             return StreamingOpen.SOURCE_MISSING
 
         backend, member_stat, file_size = source.backend, source.member_stat, source.file_size
-        if not backend.supports_range_reads():
+        if not backend.supports_range_reads() or member_generation(member_stat) is None:
             return StreamingOpen.RANGE_UNSUPPORTED
         if type(file_size) is not int or file_size < 0:
             exc = OSError(errno.EIO, "streaming source returned an invalid size")
@@ -1832,7 +1862,7 @@ class StreamingReadManager:
                 if session.finalized:
                     return "close"
                 if session.detached:
-                    return ""
+                    return "close" if session.worker_done else ""
 
                 if self._should_stop_on_last_close(session):
                     idle = self._stop_background_locked(session)

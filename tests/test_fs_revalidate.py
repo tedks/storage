@@ -8,6 +8,9 @@ checks instead of sleeping.
 """
 
 import dataclasses
+import errno
+import concurrent.futures
+import threading
 import logging
 import stat
 import os
@@ -194,6 +197,7 @@ class TestLocalRsyncSyncSettlement(unittest.TestCase):
 class RevalidateTestBase(unittest.TestCase):
     revalidate_after = 60.0
     backend_class = LocalBackend
+    read_open_flags = os.O_RDONLY
 
     def setUp(self):
         self.temp_dir = Path(tempfile.mkdtemp())
@@ -222,8 +226,8 @@ class RevalidateTestBase(unittest.TestCase):
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     # helpers ----------------------------------------------------------
-    def read_through(self, path, flags=os.O_RDONLY):
-        fd = self.fs.open(path, flags)
+    def read_through(self, path, flags=None):
+        fd = self.fs.open(path, self.read_open_flags if flags is None else flags)
         try:
             return self.fs.read(path, 1 << 20, 0, fd)
         finally:
@@ -260,6 +264,164 @@ class RevalidateTestBase(unittest.TestCase):
         self.fs = self._make_fs(start_sync=start_sync)
         self.assertEqual({}, self.fs._member_checks)
 
+
+class TestCacheFirstReadOnly(RevalidateTestBase):
+    def tearDown(self):
+        self.fs.destroy("/")
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def wait_validation(self, path):
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            with self.fs._member_checks_lock:
+                if path not in self.fs._pending_validations:
+                    return
+            time.sleep(0.01)
+        self.fail("validation never completed")
+
+    def test_restart_and_overlapping_hits_preserve_reader_generations(self):
+        path = "/f.txt"
+        self.rewrite_member("f.txt", b"first version", mtime=1_700_000_000)
+        self.assertEqual(self.read_through(path), b"first version")
+        self.restart()
+        self.fs._experimental_reader_direct_io = True
+        self.rewrite_member("f.txt", b"second version is longer", mtime=1_700_000_100)
+        self.rewrite_member("other.txt", b"unrelated")
+        real_stat = self.member.stat
+        started, unblock = threading.Event(), threading.Event()
+
+        def stat_member(requested):
+            if requested == path:
+                started.set()
+                if not unblock.wait(10):
+                    raise TimeoutError("member stayed blocked")
+            return real_stat(requested)
+
+        self.assertEqual(self.read_through("/other.txt"), b"unrelated")
+        self.age_checks()
+        with patch.object(self.member, "stat", side_effect=stat_member):
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                first = pool.submit(self.fs.open, path, os.O_RDONLY)
+                try:
+                    self.assertTrue(started.wait(5))
+                    reader = first.result(timeout=1)
+                    overlaps = [pool.submit(self.read_through, path) for _ in range(6)]
+                    other = pool.submit(self.read_through, "/other.txt")
+                    self.assertEqual(other.result(timeout=1), b"unrelated")
+                    self.wait_validation("/other.txt")
+                    for overlap in overlaps:
+                        self.assertEqual(overlap.result(timeout=1), b"first version")
+                    with self.fs._member_checks_lock:
+                        self.assertEqual(set(self.fs._pending_validations), {path})
+                finally:
+                    unblock.set()
+            try:
+                self.wait_validation(path)
+                self.assertEqual(self.read_through(path), b"second version is longer")
+                self.assertEqual(self.fs.read(path, 100, 0, reader), b"first version")
+            finally:
+                self.fs.release(path, reader)
+
+    def test_failed_copy_keeps_old_bytes_and_local_write_wins_a_later_copy(self):
+        path = "/f.txt"
+        self.rewrite_member("f.txt", b"cached", mtime=1_700_000_000)
+        self.assertEqual(self.read_through(path), b"cached")
+        self.rewrite_member("f.txt", b"remote replacement")
+        self.age_checks()
+        with patch.object(self.member, "copy_to_local", side_effect=ConnectionError("test outage")):
+            self.assertEqual(self.read_through(path), b"cached")
+            self.wait_validation(path)
+            self.assertEqual((self.cache_dir / "f.txt").read_bytes(), b"cached")
+
+        copying, release = threading.Event(), threading.Event()
+        original = self.member.copy_to_local
+
+        def blocked_copy(source, staged):
+            original(source, staged)
+            copying.set()
+            if not release.wait(10):
+                raise TimeoutError("test did not release download")
+
+        with patch.object(self.member, "copy_to_local", side_effect=blocked_copy):
+            self.assertEqual(self.read_through(path), b"cached")
+            try:
+                self.assertTrue(copying.wait(5))
+                writer = self.fs.open(path, os.O_WRONLY | os.O_TRUNC)
+                try:
+                    self.fs.write(path, b"local data", 0, writer)
+                    release.set()
+                    self.wait_validation(path)
+                    self.assertEqual(self.read_through(path), b"local data")
+                    self.assertEqual((self.cache_dir / "f.txt").read_bytes(), b"local data")
+                finally:
+                    self.fs.release(path, writer)
+            finally:
+                release.set()
+
+
+    def test_open_racing_a_staged_copy_keeps_it_unpublished_until_release(self):
+        path = "/f.txt"
+        self.rewrite_member("f.txt", b"old bytes", mtime=1_700_000_000)
+        self.assertEqual(self.read_through(path), b"old bytes")
+        self.rewrite_member("f.txt", b"replacement bytes")
+        self.age_checks()
+        staged, unblock = threading.Event(), threading.Event()
+        original = self.member.copy_to_local
+
+        def held_copy(source, destination):
+            original(source, destination)
+            staged.set()
+            if not unblock.wait(10):
+                raise TimeoutError("test did not release copy")
+
+        with patch.object(self.member, "copy_to_local", side_effect=held_copy):
+            self.assertEqual(self.read_through(path), b"old bytes")
+            try:
+                self.assertTrue(staged.wait(5))
+                reader = self.fs.open(path, os.O_RDONLY)
+                try:
+                    unblock.set()
+                    self.wait_validation(path)
+                    self.assertIn(path, self.fs._deferred_validations)
+                    self.assertEqual(self.fs.read(path, 100, 0, reader), b"old bytes")
+                    self.assertEqual((self.cache_dir / "f.txt").read_bytes(), b"old bytes")
+                finally:
+                    self.fs.release(path, reader)
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    if (self.cache_dir / "f.txt").read_bytes() == b"replacement bytes":
+                        break
+                    time.sleep(0.01)
+                self.assertEqual(self.read_through(path), b"replacement bytes")
+            finally:
+                unblock.set()
+
+    def test_rename_supersedes_pending_copy_without_reviving_the_old_path(self):
+        old, new = "/before.txt", "/after.txt"
+        self.rewrite_member("before.txt", b"cached version", mtime=1_700_000_000)
+        self.assertEqual(self.read_through(old), b"cached version")
+        self.rewrite_member("before.txt", b"new remote generation")
+        self.age_checks()
+        staged, unblock = threading.Event(), threading.Event()
+        original = self.member.copy_to_local
+
+        def held_copy(source, destination):
+            original(source, destination)
+            staged.set()
+            if not unblock.wait(10):
+                raise TimeoutError("test did not release copy")
+
+        with patch.object(self.member, "copy_to_local", side_effect=held_copy):
+            self.assertEqual(self.read_through(old), b"cached version")
+            try:
+                self.assertTrue(staged.wait(5))
+                self.fs.rename(old, new)
+            finally:
+                unblock.set()
+            self.wait_validation(old)
+        self.assertFalse((self.cache_dir / "before.txt").exists())
+        self.assertEqual((self.cache_dir / "after.txt").read_bytes(), b"cached version")
+        self.assertIsNone(self.fs.state_manager.get_file_metadata(old))
 
 class TestMemberAttributes(RevalidateTestBase):
     backend_class = NoMtimeBackend
@@ -442,6 +604,8 @@ class TestMemberAttributes(RevalidateTestBase):
 
 
 class TestRevalidateOnOpen(RevalidateTestBase):
+    read_open_flags = os.O_RDWR
+
     def setUp(self):
         super().setUp()
         self.member_file = self.rewrite_member("f.txt", b"original", mtime=1_700_000_000)
@@ -578,7 +742,7 @@ class TestRevalidateOnOpen(RevalidateTestBase):
 
         self.age_checks()
         with patch.object(self.member, "stat", side_effect=stat):
-            fd = self.fs("open", "/f.txt", os.O_RDONLY)
+            fd = self.fs("open", "/f.txt", os.O_RDWR)
             self.fs("release", "/f.txt", fd)
         self.assertEqual([True], seen)
 
@@ -870,6 +1034,8 @@ class TestRevalidateSftpLikeMember(RevalidateTestBase):
 
     backend_class = NoMtimeBackend
 
+    read_open_flags = os.O_RDWR
+
     def test_future_member_mtime_refetches_at_most_once(self):
         # A member clock ahead of ours (or touch -d tomorrow): the baseline
         # taken at the fetch means no check ever refetches.
@@ -899,6 +1065,8 @@ class TestRevalidateSftpLikeMember(RevalidateTestBase):
 
 
 class TestRevalidateTwoMembers(RevalidateTestBase):
+    read_open_flags = os.O_RDWR
+
     def test_checks_the_member_a_refetch_reads(self):
         fast_dir = self.temp_dir / "fast"
         fast_dir.mkdir()
@@ -1026,6 +1194,10 @@ class TestRevalidateStreamedFetch(RevalidateTestBase):
         changed = os.urandom(len(payload))
         self.rewrite_member("s.bin", changed, mtime=1_600_000_000)
         self.age_checks()
+        self.assertEqual(payload, self.read_through("/s.bin"))
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and (self.cache_dir / "s.bin").read_bytes() != changed:
+            time.sleep(0.01)
         self.assertEqual(changed, self.read_through("/s.bin"))
 
     def _wait_for_baseline(self, path):
@@ -1037,31 +1209,23 @@ class TestRevalidateStreamedFetch(RevalidateTestBase):
             time.sleep(0.05)
         self.fail(f"no baseline recorded for {path}")
 
-    def test_member_change_mid_stream_is_refetched(self):
-        # The baseline is the stat taken when the stream started, so bytes
-        # that mix the old and new versions never match it.
-        old = os.urandom(3 * 4096 + 17)
-        new = os.urandom(len(old))
+    def test_changed_member_cannot_supply_missing_ranges_to_an_old_reader(self):
+        from fuse import FuseOSError
+
+        old = b"a" * (3 * 4096 + 17)
+        new = b"b" * len(old)
         self.rewrite_member("m.bin", old, mtime=1_700_000_000)
-        real_read = self.member.read_file
-        state = {"changed": False}
-
-        def read_then_change(path, offset, size):
-            data = real_read(path, offset, size)
-            if not state["changed"]:
-                state["changed"] = True
-                self.rewrite_member("m.bin", new, mtime=1_600_000_000)
-            return data
-
-        with patch.object(self.member, "read_file", side_effect=read_then_change):
-            # Read it all, so the stream finishes (keep-after-close).
-            mixed = self.read_through("/m.bin")
-            check = self._wait_for_baseline("/m.bin")
-        # The first range came from the old version, the rest from the new.
-        self.assertNotEqual(new, mixed)
-        self.assertEqual({"member": (len(old), 1_700_000_000.0)}, check.members)
-        self.age_checks()
-        self.assertEqual(new, self.read_through("/m.bin"))
+        fd = self.fs.open("/m.bin", os.O_RDONLY)
+        try:
+            self.assertEqual(self.fs.read("/m.bin", 8, 0, fd), old[:8])
+            self.rewrite_member("m.bin", new, mtime=1_600_000_000)
+            with self.assertRaises(FuseOSError) as raised:
+                self.fs.read("/m.bin", 8, 8192, fd)
+            self.assertEqual(raised.exception.errno, errno.ESTALE)
+            self.assertEqual(self.read_through("/m.bin"), new)
+            self.assertEqual(self.fs.read("/m.bin", 8, 0, fd), old[:8])
+        finally:
+            self.fs.release("/m.bin", fd)
 
 
 class TestRevalidateStreamBail(RevalidateTestBase):
@@ -1126,47 +1290,44 @@ class TestRevalidateStreamBail(RevalidateTestBase):
         self.fs.release("/f.txt", self.fs.open("/f.txt", os.O_RDONLY))
         self.assertNotIn("/f.txt", self.fs._refetch_pins)
 
-    def test_stream_bailing_to_the_fallback_still_fetches_from_the_pinned_member(self):
+    def wait_replacement(self, payload):
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if (self.cache_dir / "f.txt").read_bytes() == payload:
+                return
+            time.sleep(0.01)
+        self.fail("selected member's copy was not published")
+
+    def test_read_validation_keeps_its_selected_member_for_replacement(self):
         self._cached_on_both()
         (self.fast_dir / "f.txt").write_bytes(b"changed on fast")
         self.age_checks()
-        # The unpinned order would now choose "member" (old bytes): only the
-        # pin, carried into the fallback, brings in the checked member's.
-        with patch.object(self.fast, "supports_range_reads", return_value=False), \
-                patch.object(self.fs.replication_manager, "get_backend_for_read",
-                             return_value=self.member):
-            self.assertEqual(b"changed on fast", self.read_through("/f.txt"))
-        self.assertNotIn("/f.txt", self.fs._refetch_pins)
+        with patch.object(self.fs.replication_manager, "get_backend_for_read",
+                          return_value=self.member):
+            self.assertEqual(self.read_through("/f.txt"), b"original")
+            self.wait_replacement(b"changed on fast")
+            self.assertEqual(self.read_through("/f.txt"), b"changed on fast")
 
-    def test_recheck_mark_survives_a_stream_that_bails_when_the_pinned_member_drops(self):
+    def test_read_validation_does_not_switch_to_another_members_old_bytes(self):
         self._cached_on_both()
         (self.fast_dir / "f.txt").write_bytes(b"changed on fast")
         self.age_checks()
-        real_stat = self.fast.stat
-
-        def stat_then_drop(path):
-            result = real_stat(path)
-            self.fast.set_available(False)
-            return result
-
-        with patch.object(self.fast, "stat", side_effect=stat_then_drop), \
-                patch.object(self.member, "supports_range_reads", return_value=False):
-            # The slower member supplies its older bytes through the fallback.
-            self.assertEqual(b"original", self.read_through("/f.txt"))
-        self.assertEqual({"fast"}, self.fs._recheck["/f.txt"])
-        self.assertNotIn("/f.txt", self.fs._refetch_pins)
-        self.fast.set_available(True)
-        self.age_checks()
-        self.assertEqual(b"changed on fast", self.read_through("/f.txt"))
-        # Streamed this time: the mark clears when the stream finishes.
-        deadline = time.monotonic() + 10
-        while "/f.txt" in self.fs._recheck and time.monotonic() < deadline:
-            time.sleep(0.05)
-        self.assertNotIn("/f.txt", self.fs._recheck)
+        inode = self.cache_inode("f.txt")
+        with patch.object(self.fast, "copy_to_local", side_effect=ConnectionError("outage")):
+            self.assertEqual(self.read_through("/f.txt"), b"original")
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and self.fs._pending_validations:
+                time.sleep(0.01)
+        self.assertEqual(self.cache_inode("f.txt"), inode)
+        self.assertEqual((self.cache_dir / "f.txt").read_bytes(), b"original")
+        self.assertEqual(self.read_through("/f.txt"), b"original")
+        self.wait_replacement(b"changed on fast")
 
 
 class TestRevalidateFromListing(RevalidateTestBase):
     """A recent listing of the parent stands in for the stat when it shows no change."""
+
+    read_open_flags = os.O_RDWR
 
     def setUp(self):
         super().setUp()

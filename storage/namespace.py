@@ -3,6 +3,8 @@ import concurrent.futures
 import contextvars
 import errno
 import functools
+import json
+import sqlite3
 import os
 import stat
 import time
@@ -248,6 +250,62 @@ class NamespaceService:
         # member costs the refresh queue one timeout, not one per directory.
         # Guarded by _listing_executors_lock.
         self._hung_listings: Dict[str, concurrent.futures.Future] = {}
+        self._fresh_members: Dict[str, Set[str]] = {}
+        self._observation_identity = {
+            backend.name: [str(getattr(backend, field, "")) for field in
+                           ("backend_type", "root_path", "host", "port", "username", "remote_path")]
+            for backend in backends.values()
+        }
+        self._restore_observations()
+
+    def _restore_observations(self):
+        """Restore positive member observations. Every restored entry is due."""
+        try:
+            rows = self.state_manager.load_directory_observations(self.listing_limit)
+        except sqlite3.Error as exc:
+            self.logger.debug("Could not load directory observations: %r", exc)
+            return
+        for path, payload in rows:
+            try:
+                identities, raw_names, raw_attrs, unknown = json.loads(payload)
+                members = {name for name, identity in identities.items()
+                           if self._observation_identity.get(name) == identity}
+                member_names = {name: set(raw_names[name]) for name in members if name in raw_names}
+                if not member_names:
+                    continue
+                attrs = {name: raw_attrs[name] for name in member_names if name in raw_attrs}
+                local = self._local_listing(path)
+                for names in member_names.values():
+                    local.update(names)
+                splits = self._size_splits(member_names, attrs)
+                entries = sorted(self._apply_conflict_view(path, local, member_names, splits))
+            except (AttributeError, KeyError, OSError, TypeError, ValueError) as exc:
+                self.logger.debug("Could not restore a directory observation: %r", exc)
+                continue
+            self.dir_cache[path] = member_names
+            self._view_inputs[path] = (local, member_names, splits, 0.0)
+            self.readdir_snapshot[path] = (float("-inf"), entries)
+            self.entry_attrs[path] = (float("-inf"), attrs, set(unknown))
+            self._fresh_members[path] = set()
+
+    def _persist_observation_locked(self, path, names, attrs, unknown):
+        if not names or self._listing_shut_down:
+            return
+        try:
+            record = json.dumps([self._observation_identity,
+                                 {member: sorted(entries) for member, entries in names.items()},
+                                 attrs, sorted(unknown)])
+            self.state_manager.store_directory_observation(path, record, self.listing_limit)
+        except (OSError, sqlite3.Error, TypeError) as exc:
+            self.logger.debug("Could not save directory observation: %r", exc)
+
+    def _drop_observations_locked(self, *paths, subtree=None, all_paths=False):
+        try:
+            self.state_manager.delete_directory_observations(
+                paths, subtree=subtree, all_paths=all_paths,
+            )
+        except (OSError, sqlite3.Error) as exc:
+            self.logger.debug("Could not discard directory observation: %r", exc)
 
     @property
     def listing_stale_limit(self) -> float:
@@ -267,6 +325,8 @@ class NamespaceService:
 
     def listing_state(self, listed_at: float, now: float) -> str:
         """'fresh', 'stale' (serve it and refresh in the background) or 'expired'."""
+        if listed_at == float("-inf"):
+            return "expired"
         age = now - listed_at
         if age <= self.readdir_snapshot_ttl:
             return "fresh"
@@ -333,6 +393,8 @@ class NamespaceService:
                 self.readdir_snapshot.pop(path, None)
                 self._view_inputs.pop(path, None)
                 self.entry_attrs.pop(path, None)
+                self._fresh_members.pop(path, None)
+                self._drop_observations_locked(path, parent)
                 if parent != path:
                     self._forget_listed_name_locked(path, canonical, parent)
 
@@ -359,9 +421,10 @@ class NamespaceService:
                     if under(key):
                         self._listing_generation[key] += 1
                 for table in (self.readdir_snapshot, self._view_inputs,
-                              self.entry_attrs, self._listing_as_of):
+                              self.entry_attrs, self._listing_as_of, self._fresh_members):
                     for key in [k for k in table if under(k)]:
                         del table[key]
+                self._drop_observations_locked(subtree=canonical)
                 self._drop_stat_memo_locked(
                     {k for k in self._stat_memo if under(k)} | {canonical},
                     everything_below=True)
@@ -379,12 +442,34 @@ class NamespaceService:
                     self._listing_generation[key] += 1
                 for table in (self.readdir_snapshot, self._view_inputs,
                               self.entry_attrs, self._listing_as_of,
-                              self._child_races):
+                              self._child_races, self._fresh_members):
                     table.clear()
+                self._drop_observations_locked(all_paths=True)
                 self._stat_memo.clear()
                 self._stat_dropped.clear()
                 self._stat_epoch += 1
                 self._stat_floor = self._stat_epoch
+
+    def expire_parent_observation(self, parent):
+        with self.listing_lock:
+            if parent in self.entry_attrs:
+                _, members, unknown = self.entry_attrs[parent]
+                self.entry_attrs[parent] = (float("-inf"), members, unknown)
+                self._fresh_members[parent] = set()
+                _, names = self.readdir_snapshot[parent]
+                self.readdir_snapshot[parent] = (float("-inf"), names)
+
+    def expire_listing_observations(self):
+        """Retain positive entries when a watcher reconnects or loses events."""
+        with self.listing_lock:
+            for path in self._listings_in_flight:
+                self._listing_generation[path] += 1
+            for path, (_, members, unknown) in self.entry_attrs.items():
+                self.entry_attrs[path] = (float("-inf"), members, unknown)
+                self._fresh_members[path] = set()
+            for path, (_, names) in self.readdir_snapshot.items():
+                self.readdir_snapshot[path] = (float("-inf"), names)
+            self._drop_stat_memo_locked(set(self._stat_memo), everything_below=True)
 
     _MAX_STAT_DROPS = 1024
 
@@ -510,6 +595,7 @@ class NamespaceService:
             self._view_inputs.pop(parent, None)
             self.entry_attrs.pop(parent, None)
             self._listing_as_of.pop(parent, None)
+            self._fresh_members.pop(parent, None)
             return
         if bump:
             self._note_child_race_locked(parent, names_to_drop)
@@ -829,7 +915,7 @@ class NamespaceService:
             else:
                 backend_iter = list(self.backends.items())
 
-            listed = self._listed_attrs(resolved, backend_iter)
+            listed = self._listed_attrs(resolved, backend_iter, read_lookup=read_lookup)
             if listed is LISTED_MISSING:
                 if not read_lookup or not self.read_source_hints(resolved)[0]:
                     raise FuseOSError(errno.ENOENT)
@@ -930,7 +1016,7 @@ class NamespaceService:
 
             raise FuseOSError(exc.errno)
 
-    def _listed_attrs(self, resolved: ResolvedPath, backend_iter):
+    def _listed_attrs(self, resolved: ResolvedPath, backend_iter, *, read_lookup):
         """Serve known attributes locally and refresh the parent when due.
 
         A negative answer requires a fresh observation from every candidate
@@ -947,15 +1033,20 @@ class NamespaceService:
             self._touch_listing_locked(parent)
             if listing is None or self.readdir_snapshot_ttl <= 0:
                 return None
+            if not read_lookup and self.listing_state(listing[0], now) == "expired":
+                return None
             if name not in listing[2]:
                 inputs = self._view_inputs.get(parent)
                 names = inputs[1] if inputs else {}
                 result = self._walk_listing_locked(listing, name, online, names)
                 if result in (None, LISTED_MISSING) and online != members:
                     result = self._walk_listing_locked(listing, name, members, names)
-                if result is LISTED_MISSING and not self._answers_missing(listing[0], now):
+                if result is LISTED_MISSING and (
+                    not self._answers_missing(listing[0], now)
+                    or not all(member in self._fresh_members.get(parent, ()) for member in members)
+                ):
                     result = None
-        if now - listing[0] > self.readdir_snapshot_ttl:
+        if listing[0] == float("-inf") or now - listing[0] > self.readdir_snapshot_ttl:
             self._schedule_refresh(parent)
         return result
 
@@ -983,7 +1074,7 @@ class NamespaceService:
                 for member, attrs in listing[1].items():
                     if name in attrs:
                         present[member] = attrs[name].get("st_mode")
-                    else:
+                    elif member in self._fresh_members.get(resolved.parent_dir, ()):
                         missing.add(member)
                 # A names-only listing, or names carried over when a member
                 # failed, can still make the source ambiguous. They cannot
@@ -1020,7 +1111,8 @@ class NamespaceService:
         name = Path(resolved.canonical_path).name
         with self.listing_lock:
             listing = self.entry_attrs.get(resolved.parent_dir)
-            if listing is None or listing[0] <= newer_than or name in listing[2]:
+            if (listing is None or listing[0] <= newer_than or name in listing[2]
+                    or backend_name not in self._fresh_members.get(resolved.parent_dir, ())):
                 return None
             attrs = listing[1].get(backend_name, {}).get(name)
             return (listing[0], dict(attrs)) if attrs is not None else None
@@ -1048,15 +1140,20 @@ class NamespaceService:
         with self.listing_lock:
             snapshot = self.readdir_snapshot.get(path)
             listing = self.entry_attrs.get(path)
+            incomplete = len(self._fresh_members.get(path, ())) < len(self.backends)
             self._touch_listing_locked(path)
         if snapshot and listing and self.readdir_snapshot_ttl > 0:
             now = time.monotonic()
-            incomplete = len(listing[1]) < len(self.backends)
             retry_due = incomplete and now - snapshot[0] >= self.refresh_member_timeout
-            if now - snapshot[0] > self.readdir_snapshot_ttl or retry_due:
+            if snapshot[0] == float("-inf") or now - snapshot[0] > self.readdir_snapshot_ttl or retry_due:
                 self._schedule_refresh(path)
             return self._served_snapshot(path, snapshot)
 
+        if self.progressive_listings and self.readdir_snapshot_ttl > 0:
+            local = self._local_listing(path)
+            if len(local) > 2:
+                self._schedule_refresh(path)
+                return sorted(local)
         if self.progressive_listings and len(self.backends) > 1:
             return self._progressive_readdir(path)
 
@@ -1136,8 +1233,24 @@ class NamespaceService:
         return first.result()
 
     def poll_desktop_additions(self, arguments):
+        if "revision" not in arguments:
+            with self.listing_lock:
+                return self.desktop_additions.poll(arguments, self._current_desktop_addition)
+
+        path, after = self.desktop_additions.snapshot_request(arguments)
         with self.listing_lock:
-            return self.desktop_additions.poll(arguments, self._current_desktop_addition)
+            snapshot = self.readdir_snapshot.get(path)
+            listing = self.entry_attrs.get(path)
+            response = self.desktop_additions.snapshot(
+                path, after, arguments.get("generation"),
+                snapshot[1] if snapshot else None, listing[1] if listing else {},
+            )
+            interval = min(self.readdir_snapshot_ttl, self.refresh_member_timeout)
+            due = (snapshot is not None and time.monotonic() - snapshot[0] > interval
+                   or snapshot is None and path in self.desktop_additions.revisions)
+        if due and response["status"] != "generation-changed":
+            self._schedule_refresh(path)
+        return response
 
     def _current_desktop_addition(self, path, revision, name):
         snapshot = self.readdir_snapshot.get(path)
@@ -1214,10 +1327,11 @@ class NamespaceService:
         Takes listing_lock and then _listing_executors_lock, never nested.
         """
         with self.listing_lock:
-            if path in self._background_refreshes or path in self._first_publications:
+            if (path in self._background_refreshes or path in self._first_publications
+                    or len(self._background_refreshes) >= 64):
                 return
             self._background_refreshes.add(path)
-        ticket = self._begin_listing(path)
+            ticket = self._begin_listing_locked(path)
         executor = self._background_executor()
         future = None
         if executor is not None:
@@ -1253,7 +1367,7 @@ class NamespaceService:
                 return None
             if self._refresh_executor is None:
                 self._refresh_executor = concurrent.futures.ThreadPoolExecutor(
-                    max_workers=1, thread_name_prefix="readdir-refresh",
+                    max_workers=2, thread_name_prefix="readdir-refresh",
                 )
             return self._refresh_executor
 
@@ -1423,6 +1537,11 @@ class NamespaceService:
             concurrent.futures.wait([f for f in futures.values() if f is not None])
             raise
 
+        if background and self.progressive_listings:
+            return self._publish_refresh_as_members_answer(
+                path, ticket, started_at, listed_wall, cache_names, futures, deadline,
+            )
+
         outcomes = {}
         for backend_name, future in futures.items():
             if future is None:
@@ -1455,6 +1574,32 @@ class NamespaceService:
             path, ticket, started_at, listed_wall, cache_names, outcomes, verify_out=verify_out,
         )
 
+    def _publish_refresh_as_members_answer(self, path, ticket, started_at, listed_wall,
+                                           cache_names, futures, deadline):
+        pending = {future: member for member, future in futures.items() if future is not None}
+        outcomes = {member: RuntimeError("member listing executor unavailable")
+                    for member, future in futures.items() if future is None}
+        while pending and not self._listing_shut_down:
+            done, _ = concurrent.futures.wait(
+                pending, timeout=max(0.0, deadline - time.monotonic()),
+                return_when=concurrent.futures.FIRST_COMPLETED,
+            )
+            if not done:
+                break
+            for future in done:
+                member = pending.pop(future)
+                try:
+                    outcomes[member] = future.result()
+                except Exception as exc:
+                    outcomes[member] = exc
+            if pending and any(not isinstance(value, Exception) for value in outcomes.values()):
+                self._publish_listing(path, ticket, started_at, listed_wall, cache_names,
+                                      outcomes, complete=False)
+        for future, member in pending.items():
+            self._abandon_listing(member, future)
+            outcomes[member] = TimeoutError("member did not finish the directory refresh")
+        return self._publish_listing(path, ticket, started_at, listed_wall, cache_names, outcomes)
+
     def _local_listing(self, path: str) -> Set[str]:
         entries = {".", ".."}
         cache_path = self.cache_manager.get_cache_path(path)
@@ -1468,6 +1613,7 @@ class NamespaceService:
         backend_attrs: Dict[str, Dict[str, dict]] = {}
         member_entries: Dict[str, Set[str]] = {}
         failed: Set[str] = set()
+        published_result = False
         with self.dir_cache_lock:
             previous = self.dir_cache.get(path, {})
             for backend_name in self.backends:
@@ -1495,6 +1641,11 @@ class NamespaceService:
                 member_entries[backend_name] = names
                 if listed is not None:
                     backend_attrs[backend_name] = listed
+        if (self.progressive_listings and complete and self.backends and not member_entries
+                and len(cache_names) == 2 and len(failed) == len(self.backends)):
+            errors = [member_failure_errno(exc) for exc in outcomes.values()]
+            error = next((err for err in errors if err != errno.EHOSTUNREACH), errno.EHOSTUNREACH)
+            raise FuseOSError(error)
         for names in member_entries.values():
             entries.update(names)
 
@@ -1505,20 +1656,20 @@ class NamespaceService:
         # the name dropped the listing, or one after a local write forgot
         # the name's attributes has none for it and shows the plain name:
         # its sizes are not known.
-        split_attrs = backend_attrs
-        if failed:
-            split_attrs = dict(backend_attrs)
-            with self.listing_lock:
-                # Copied under the lock: forget_listed_attrs edits them in place.
-                published = self.entry_attrs.get(path)
-                for backend_name in failed:
-                    if published is not None and backend_name in published[1]:
-                        split_attrs[backend_name] = dict(published[1][backend_name])
+        fresh_members = set(backend_attrs)
+        split_attrs = dict(backend_attrs)
+        with self.listing_lock:
+            published = self.entry_attrs.get(path)
+            if published is not None:
+                for member in member_entries.keys() - outcomes.keys() | failed:
+                    if member in published[1]:
+                        split_attrs[member] = dict(published[1][member])
         size_splits = self._size_splits(member_entries, split_attrs)
         if complete:
             queued = self._schedule_directory_checksums(
                 path,
-                {name: names for name, names in member_entries.items() if name not in failed},
+                {name: names for name, names in member_entries.items()
+                 if name in outcomes and name not in failed},
                 backend_attrs,
                 size_splits,
                 replace=verify_out is not None,
@@ -1563,18 +1714,23 @@ class NamespaceService:
                         name for name, seq in self._child_races.get(path, {}).items()
                         if seq > ticket.child_seq
                     }
-                    for attrs_by_name in backend_attrs.values():
+                    for attrs_by_name in split_attrs.values():
                         for name in raced:
                             attrs_by_name.pop(name, None)
                     self.dir_cache.pop(path, None)  # re-inserted: most recently used
                     self.dir_cache[path] = member_entries
                     self._listing_as_of[path] = started_at
+                    published_result = True
                     previous_snapshot = self.readdir_snapshot.get(path)
                     self.readdir_snapshot[path] = (started_at, ordered_entries)
                     self._view_inputs[path] = (entries, member_entries, size_splits, listed_wall)
                     # Re-inserted, so it is the most recently used.
                     self.entry_attrs.pop(path, None)
-                    self.entry_attrs[path] = (started_at, backend_attrs, raced)
+                    self.entry_attrs[path] = (started_at, split_attrs, raced)
+                    self._fresh_members[path] = fresh_members
+                    self._persist_observation_locked(path, member_entries, split_attrs, raced)
+                    if self.desktop_additions is not None:
+                        self.desktop_additions.published(path, self.listing_limit)
                     if (
                         self.desktop_additions is not None and late_member_names
                         and previous_snapshot is not None and previous_snapshot[0] == started_at
@@ -1595,6 +1751,7 @@ class NamespaceService:
                     at = self.entry_attrs.pop(dir_path)[0]
                     self.readdir_snapshot.pop(dir_path, None)
                     self._view_inputs.pop(dir_path, None)
+                    self._fresh_members.pop(dir_path, None)
                     self.dir_cache.pop(dir_path, None)
                     if self._listing_as_of.get(dir_path) == at:
                         del self._listing_as_of[dir_path]
@@ -1613,7 +1770,7 @@ class NamespaceService:
 
         if newer_snapshot is not None:
             return self._served_snapshot(path, newer_snapshot)
-        return ordered_entries
+        return ordered_entries if published_result else sorted(self._local_listing(path))
 
     @_member_mutation(1)
     def mkdir(self, path: str, mode: int):

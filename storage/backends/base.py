@@ -64,6 +64,21 @@ def current_capacity_cancel_probe():
     return getattr(_CAPACITY_CANCEL_PROBE, "probe", None)
 
 
+def member_generation(st):
+    """Best identity observable through the member's stat protocol.
+
+    SFTP v3 has only second-resolution mtime and omits inode and ctime.
+    """
+    def timestamp(name):
+        return getattr(st, f"st_{name}_ns", None) or getattr(st, f"st_{name}", None)
+
+    if getattr(st, "st_size", None) is None or timestamp("mtime") is None:
+        return None
+    return (st.st_size, timestamp("mtime"), timestamp("ctime"),
+            getattr(st, "st_mode", None), getattr(st, "st_dev", None),
+            getattr(st, "st_ino", None))
+
+
 class MemberSourceMissing(FileNotFoundError):
     """A member rename found nothing at the old name on the member: nothing
     moved. Raised only on positive evidence (the member's own check of the

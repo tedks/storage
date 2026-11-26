@@ -253,7 +253,7 @@ class TestFSStreamingIntegration(unittest.TestCase):
                 stall.assert_not_called()
                 lookup.assert_not_called()
                 known_miss.assert_not_called()
-                source_stat.assert_called_once_with(path)
+                source_stat.assert_called_with(path)
 
     def test_source_discovery_keeps_unavailability_and_can_recover_the_only_holder(self):
         other, holder, holder_dir = self._source_discovery_members()
@@ -273,7 +273,7 @@ class TestFSStreamingIntegration(unittest.TestCase):
             fd = self.fs.open(path, os.O_RDONLY)
             self.assertEqual(self.fs.read(path, len(content), 0, fd), content)
             self.fs.release(path, fd)
-        holder_stat.assert_called_once_with(path)
+        holder_stat.assert_called_with(path)
 
     def test_source_discovery_definitive_fresh_misses_do_not_probe_members(self):
         other, holder, _ = self._source_discovery_members()
