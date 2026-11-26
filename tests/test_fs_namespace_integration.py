@@ -1943,6 +1943,32 @@ class TestFSNamespaceIntegration(unittest.TestCase):
         self.assertIn("current-name", names)
         self.assertNotIn("stale-name", names)
 
+    def test_cold_scan_racing_multiple_creates_serves_new_local_names(self):
+        self.fs.namespace.progressive_listings = True
+        (self.backend2_dir / "remote-child").touch()
+        entered, unblock = threading.Event(), threading.Event()
+
+        def hold_after_read(_path):
+            entered.set()
+            self.assertTrue(unblock.wait(5))
+
+        with self._wrap_listdir_attrs("backend2", after=hold_after_read), \
+             self._wrap_listdir_attrs("backend1", before=lambda _path: unblock.wait(5)):
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                reading = pool.submit(self.fs.readdir, "/", None)
+                try:
+                    self.assertTrue(entered.wait(3))
+                    first = self.fs.create("/one", 0o644)
+                    second = self.fs.create("/two", 0o644)
+                    self.fs.release("/one", first)
+                    self.fs.release("/two", second)
+                finally:
+                    unblock.set()
+                self.assertTrue({"one", "two"}.issubset(reading.result(timeout=3)))
+            self.assertTrue(self._wait_for(
+                lambda: "remote-child" in self.fs.readdir("/", None),
+            ))
+
     def test_cold_empty_success_is_distinct_from_all_unavailable(self):
         self.fs.namespace.progressive_listings = True
         with patch.object(self.backends["backend1"], "listdir_attrs",

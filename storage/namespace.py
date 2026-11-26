@@ -74,6 +74,11 @@ def _cache_ancestors(cache_root: Path, directory: Path) -> List[Path]:
     return chain
 
 
+class _SupersededListing(FuseOSError):
+    def __init__(self):
+        super().__init__(errno.EAGAIN)
+
+
 class _ListingTicket(NamedTuple):
     """What a listing must match to be published (see _begin_listing)."""
 
@@ -1186,12 +1191,12 @@ class NamespaceService:
         """Serve a committed view or retry one superseded cold scan."""
         try:
             return self._readdir(path)
-        except FuseOSError as exc:
-            if exc.errno != errno.EAGAIN:
-                raise
-        return self._readdir(path)
+        except _SupersededListing:
+            # A concurrent local producer may have created the first useful
+            # cache view. Serve it before asking the same members again.
+            return self._readdir(path, prefer_local=True)
 
-    def _readdir(self, path: str):
+    def _readdir(self, path: str, *, prefer_local=False):
         with self.listing_lock:
             snapshot = self.readdir_snapshot.get(path)
             listing = self.entry_attrs.get(path)
@@ -1204,7 +1209,7 @@ class NamespaceService:
                 self._schedule_refresh(path)
             return self._served_snapshot(path, snapshot)
 
-        if self.progressive_listings and self.readdir_snapshot_ttl > 0:
+        if (self.progressive_listings or prefer_local) and self.readdir_snapshot_ttl > 0:
             local = self._local_listing(path)
             if len(local) > 2:
                 self._schedule_refresh(path)
@@ -1825,7 +1830,7 @@ class NamespaceService:
             return ordered_entries
         if current_snapshot is not None:
             return self._served_snapshot(path, current_snapshot)
-        raise FuseOSError(errno.EAGAIN)
+        raise _SupersededListing()
 
     @_member_mutation(1)
     def mkdir(self, path: str, mode: int):
