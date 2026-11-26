@@ -299,7 +299,7 @@ class TestFixedClassAndCompetingRead(CappedFSBase):
     # Every open of a cached file stats its member.
     revalidate_after = 0.0
 
-    def test_unrelated_read_progresses_past_a_slow_warm_to_cold_open(self):
+    def test_unrelated_read_progresses_past_a_slow_write_capable_open(self):
         self.cache("a.txt", b"old a")
         b_bytes = os.urandom(64 * 1024)
         self.cache("b.txt", b_bytes)
@@ -309,7 +309,7 @@ class TestFixedClassAndCompetingRead(CappedFSBase):
         (self.member_dir / "a.txt").write_bytes(new_a)
         copy = self.gate(self.member, "copy_to_local", only=lambda path, *_: path == "/a.txt")
 
-        opener = Worker(self.open_read_release_called, "/a.txt")
+        opener = Worker(self.open_read_release_called, "/a.txt", os.O_RDWR)
         opener.start()
         self.assertTrue(copy.started.wait(WAIT))
         # Classified at entry as a warm open; it keeps the demand slot and
@@ -342,8 +342,8 @@ class TestFixedClassAndCompetingRead(CappedFSBase):
         self.assertEqual(0, self.gate_.active_count)
         self.assertEqual(1, len([c for c in copy.calls if c[0] == "/a.txt"]))
 
-    def open_read_release_called(self, path):
-        fd = self.call("open", path, os.O_RDONLY)
+    def open_read_release_called(self, path, flags=os.O_RDONLY):
+        fd = self.call("open", path, flags)
         try:
             return self.call("read", path, 1 << 20, 0, fd)
         finally:

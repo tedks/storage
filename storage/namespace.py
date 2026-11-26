@@ -1247,7 +1247,11 @@ class NamespaceService:
             )
             interval = min(self.readdir_snapshot_ttl, self.refresh_member_timeout)
             due = (snapshot is not None and time.monotonic() - snapshot[0] > interval
-                   or snapshot is None and path in self.desktop_additions.revisions)
+                   or snapshot is None and (
+                       path in self.desktop_additions.revisions or (
+                           after > 0 and arguments.get("generation") == self.desktop_additions.generation
+                       )
+                   ))
         if due and response["status"] != "generation-changed":
             self._schedule_refresh(path)
         return response
@@ -1603,7 +1607,8 @@ class NamespaceService:
     def _local_listing(self, path: str) -> Set[str]:
         entries = {".", ".."}
         cache_path = self.cache_manager.get_cache_path(path)
-        if cache_path.is_dir():
+        if (not cache_path.is_symlink() and cache_path.is_dir()
+                and self.cache_manager._inside_cache(cache_path)):
             entries.update(name for name in os.listdir(cache_path) if not self.is_hidden_entry(name))
         return entries
 

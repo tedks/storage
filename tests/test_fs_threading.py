@@ -158,8 +158,8 @@ class ThreadingTestBase(unittest.TestCase):
     def read_all(self, path, fd):
         return self.fs.read(path, 1 << 20, 0, fd)
 
-    def open_read_release(self, path):
-        fd = self.fs.open(path, os.O_RDONLY)
+    def open_read_release(self, path, flags=os.O_RDONLY):
+        fd = self.fs.open(path, flags)
         try:
             return self.read_all(path, fd)
         finally:
@@ -491,7 +491,8 @@ class TestWatcherInvalidation(ThreadingTestBase):
         heal.opened.set()
         self.assertEqual(b"cached", opener.finish())
         watcher.finish()
-        self.assertFalse((self.cache_dir / "f.txt").exists())
+        self.assertEqual((self.cache_dir / "f.txt").read_bytes(), b"cached")
+        self.assertIn("/f.txt", self.fs._recheck)
 
 
 if __name__ == "__main__":
