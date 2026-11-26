@@ -1607,8 +1607,8 @@ class NamespaceService:
     def _local_listing(self, path: str) -> Set[str]:
         entries = {".", ".."}
         cache_path = self.cache_manager.get_cache_path(path)
-        if (not cache_path.is_symlink() and cache_path.is_dir()
-                and self.cache_manager._inside_cache(cache_path)):
+        if (cache_path.is_dir() and cache_path.resolve() ==
+                self.cache_manager.cache_root.resolve() / path.lstrip("/")):
             entries.update(name for name in os.listdir(cache_path) if not self.is_hidden_entry(name))
         return entries
 
