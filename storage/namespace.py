@@ -1209,7 +1209,7 @@ class NamespaceService:
                 self._schedule_refresh(path)
             return self._served_snapshot(path, snapshot)
 
-        if (self.progressive_listings or prefer_local) and self.readdir_snapshot_ttl > 0:
+        if prefer_local or (self.progressive_listings and self.readdir_snapshot_ttl > 0):
             local = self._local_listing(path)
             if len(local) > 2:
                 self._schedule_refresh(path)
@@ -1391,7 +1391,9 @@ class NamespaceService:
         Takes listing_lock and then _listing_executors_lock, never nested.
         """
         with self.listing_lock:
-            if (path in self._background_refreshes or path in self._first_publications
+            first = self._first_publications.get(path)
+            current_first = first is not None and first[0] == self._listing_generation.get(path)
+            if (path in self._background_refreshes or current_first
                     or len(self._background_refreshes) >= 64):
                 return
             self._background_refreshes.add(path)

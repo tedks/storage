@@ -1944,16 +1944,21 @@ class TestFSNamespaceIntegration(unittest.TestCase):
         self.assertNotIn("stale-name", names)
 
     def test_cold_scan_racing_multiple_creates_serves_new_local_names(self):
-        self.fs.namespace.progressive_listings = True
+        namespace = self.fs.namespace
+        namespace.progressive_listings = True
+        namespace.readdir_snapshot_ttl = 0
         (self.backend2_dir / "remote-child").touch()
-        entered, unblock = threading.Event(), threading.Event()
+        entered, first_release, rest_release = (threading.Event() for _ in range(3))
 
         def hold_after_read(_path):
-            entered.set()
-            self.assertTrue(unblock.wait(5))
+            if not entered.is_set():
+                entered.set()
+                self.assertTrue(first_release.wait(5))
+            else:
+                self.assertTrue(rest_release.wait(5))
 
         with self._wrap_listdir_attrs("backend2", after=hold_after_read), \
-             self._wrap_listdir_attrs("backend1", before=lambda _path: unblock.wait(5)):
+             self._wrap_listdir_attrs("backend1", before=lambda _path: rest_release.wait(5)):
             with concurrent.futures.ThreadPoolExecutor() as pool:
                 reading = pool.submit(self.fs.readdir, "/", None)
                 try:
@@ -1962,11 +1967,13 @@ class TestFSNamespaceIntegration(unittest.TestCase):
                     second = self.fs.create("/two", 0o644)
                     self.fs.release("/one", first)
                     self.fs.release("/two", second)
+                    first_release.set()
+                    self.assertEqual(set(reading.result(timeout=3)), {".", "..", "one", "two"})
                 finally:
-                    unblock.set()
-                self.assertTrue({"one", "two"}.issubset(reading.result(timeout=3)))
+                    first_release.set()
+                    rest_release.set()
             self.assertTrue(self._wait_for(
-                lambda: "remote-child" in self.fs.readdir("/", None),
+                lambda: "remote-child" in namespace.readdir_snapshot.get("/", (None, ()))[1],
             ))
 
     def test_cold_empty_success_is_distinct_from_all_unavailable(self):

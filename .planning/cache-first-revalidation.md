@@ -12,7 +12,7 @@ A user reopening a directory or file should be able to use already observed entr
 - [x] (2026-11-26 19:47Z) Added bounded persisted member observations and partial refresh publication.
 - [x] (2026-11-26 20:01Z) Implemented bounded read-only validation and verified buffered generations on a synthetic mount with same-size, grow and shrink replacements.
 - [x] (2026-11-26 20:12Z) Verified the opt-in bridge on a synthetic mount, including native GIO attribute changes and a real Nautilus window paused across two publications.
-- [ ] Finish the council fixes and record gates on the final pushed revision.
+- [x] (2026-11-26 20:35Z) Ran all four quality gates on `206926a`. The PR records review and gate evidence for subsequent revisions.
 
 ## Surprises & Discoveries
 
@@ -20,7 +20,7 @@ The staged listing code already has per-directory publication tickets, separate 
 
 ## Decision Log
 
-- (2026-11-26 / Storage lead) Age controls when to check a directory. Positive attributes can survive expiry. A conclusive negative answer uses a fresh successful observation from each configured candidate. The existing zero-TTL setting still explicitly bypasses a warm listing.
+- (2026-11-26 / Storage lead) Age controls when to check a directory. Positive attributes can survive expiry. A conclusive negative answer uses a fresh successful observation from each configured candidate. Zero TTL bypasses a previously published listing. If a local change invalidates a cold scan, newly available local names can serve the retry while the current generation refreshes.
 - (2026-11-26 / Storage lead) A read-only hit can schedule content validation. Directory refresh will continue to use namespace metadata, without downloading a replacement for a changed file. Remote size and times are evidence for a generation only to the degree that the backend reports them.
 
 ## Outcomes & Retrospective
