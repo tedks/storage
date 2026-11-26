@@ -248,10 +248,10 @@ class TestOpenRaces(ThreadingTestBase):
 
         copies = self.gate(self.member, "copy_to_local", only=lambda *a: False)
         with patch.object(self.fs, "_select_backend_for_read", side_effect=select):
-            first = Worker(self.open_read_release, "/f.txt")
+            first = Worker(self.open_read_release, "/f.txt", os.O_RDWR)
             first.start()
             self.assertTrue(invalidate.started.wait(WAIT))
-            second = Worker(self.open_read_release, "/f.txt")
+            second = Worker(self.open_read_release, "/f.txt", os.O_RDWR)
             second.start()
             self.wait_for_path_waiter("/f.txt")
             self.assertTrue(second.is_alive())
