@@ -94,6 +94,13 @@ class MemberCheck:
     members: Dict[str, Tuple[int, float]] = field(default_factory=dict)
 
 
+@dataclass
+class PendingValidation:
+    removal_only: bool
+    cancelled: threading.Event = field(default_factory=threading.Event)
+    follow_up: Optional[bool] = None  # True checks absence only, False includes content.
+
+
 class StorageFS(Operations):
     """
     Storage FUSE filesystem
@@ -331,8 +338,9 @@ class StorageFS(Operations):
         self._revalidate_after = max(0.0, float(revalidate_after))
         self._member_checks: Dict[str, MemberCheck] = {}
         self._member_checks_lock = threading.Lock()
-        self._pending_validations: Dict[str, threading.Event] = {}
+        self._pending_validations: Dict[str, PendingValidation] = {}
         self._deferred_validations: Set[str] = set()
+        self._validation_commit_lock = threading.Lock()
         self._experimental_reader_direct_io = False
         self._validation_executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=4, thread_name_prefix="cache-validate",
@@ -784,9 +792,9 @@ class StorageFS(Operations):
         """
         Callback from RemoteWatcher when inotifywait detects a change.
 
-        Invalidates the canonical path AND any backend-suffixed conflict
-        variants (e.g. /foo.remote0, /foo.remote1) so that cached
-        conflict views are also refreshed.
+        Marks the complete canonical copy for validation and invalidates
+        backend-suffixed conflict variants. The canonical bytes remain
+        available while a background absence check runs.
 
         Runs on the watcher's thread holding nothing; it waits for the
         path's lock, so an open's fetch, a rename or an upload of the path
@@ -800,11 +808,13 @@ class StorageFS(Operations):
         resolved = self._resolve_path(virtual_path)
         self.namespace.expire_parent_observation(resolved.parent_dir)
         self._streaming_manager.mark_generation_stale(resolved.canonical_path)
-        if resolved.backend_name is None and regular_file_stat(resolved.cache_path) is not None:
+        if (resolved.backend_name is None and regular_file_stat(resolved.cache_path) is not None
+                and not self._is_unindexed_prefix(resolved.canonical_path, resolved.cache_path)):
             self._forget_checksums({resolved.canonical_path})
             self._forget_member_check(resolved.canonical_path)
             with self._member_checks_lock:
                 self._recheck.setdefault(resolved.canonical_path, set()).update(self.backends)
+            self._schedule_cached_validation(resolved, removal_only=True)
         else:
             self._invalidate_file_cache(virtual_path)
         # Also invalidate backend-suffixed conflict caches.
@@ -1472,9 +1482,10 @@ class StorageFS(Operations):
                 path for path in tuple(self._deferred_validations)
                 if path == virtual_path or (subtree and path.startswith(prefix))
             )
-            for path, cancelled in self._pending_validations.items():
+            for path, pending in self._pending_validations.items():
                 if path == virtual_path or (subtree and path.startswith(prefix)):
-                    cancelled.set()
+                    pending.cancelled.set()
+                    pending.follow_up = None
             for table in tables:
                 table.pop(virtual_path, None)
                 if subtree:
@@ -1517,9 +1528,10 @@ class StorageFS(Operations):
             self._deferred_validations = {
                 path for path in self._deferred_validations if not affected(path)
             }
-            for path, cancelled in self._pending_validations.items():
+            for path, pending in self._pending_validations.items():
                 if affected(path):
-                    cancelled.set()
+                    pending.cancelled.set()
+                    pending.follow_up = None
             for table in (self._member_checks, self._refetch_pins, self._pinned_stats,
                           self._recheck, self._revalidate_unreachable):
                 for key in [k for k in table if k == new or k.startswith(new_prefix)]:
@@ -1809,43 +1821,56 @@ class StorageFS(Operations):
             return None
         return listed_at
 
-    def _schedule_cached_validation(self, resolved: ResolvedPath):
+    def _schedule_cached_validation(self, resolved: ResolvedPath, *, removal_only=False, resume=False):
         path = resolved.canonical_path
         with self._member_checks_lock:
             check = self._member_checks.get(path)
             if check is not None and time.monotonic() - check.verified_at < self._revalidate_after:
+                if resume:
+                    self._deferred_validations.discard(path)
                 return
-            if (path in self._pending_validations or path in self._deferred_validations
-                    or len(self._pending_validations) >= 64):
+            pending = self._pending_validations.get(path)
+            if pending is not None:
+                if pending.cancelled.is_set() or (pending.removal_only and not removal_only):
+                    pending.follow_up = removal_only and pending.follow_up is not False
                 return
-            cancelled = threading.Event()
-            self._pending_validations[path] = cancelled
+            if len(self._pending_validations) >= 64 or (path in self._deferred_validations) != resume:
+                return
+            self._deferred_validations.discard(path)
+            pending = PendingValidation(removal_only)
+            self._pending_validations[path] = pending
 
         def finished(future=None):
             with self._member_checks_lock:
                 del self._pending_validations[path]
-            if future is not None and not future.cancelled():
+                follow_up = pending.follow_up
+            if future is not None and not future.cancelled() and not self._destroying.is_set():
                 self._resume_cached_validation(path)
+                if follow_up is not None:
+                    self._schedule_cached_validation(resolved, removal_only=follow_up)
 
         try:
-            future = self._validation_executor.submit(self._validate_complete_copy, resolved, cancelled)
+            future = self._validation_executor.submit(
+                self._validate_complete_copy, resolved, pending.cancelled, removal_only,
+            )
         except RuntimeError:  # shutdown raced the request
             finished()
         else:
             future.add_done_callback(finished)
 
     def _resume_cached_validation(self, path):
-        """After the final buffered handle is released, retry from a new stat."""
+        """After release or a worker finishing, give a reader-free path a slot."""
         if self._destroying.is_set():
             return
-        with self._fd_lock:
-            if any(entry.canonical_path == path for entry in self._fd_map.values()):
+        with self._fd_lock, self._member_checks_lock:
+            if not self._deferred_validations or len(self._pending_validations) >= 64:
                 return
-            with self._member_checks_lock:
-                if path not in self._deferred_validations or path in self._pending_validations:
-                    return
-                self._deferred_validations.remove(path)
-        self._schedule_cached_validation(self._resolve_path(path))
+            readers = {entry.canonical_path for entry in self._fd_map.values()}
+            eligible = self._deferred_validations - readers - self._pending_validations.keys()
+            if path not in eligible:
+                path = next(iter(eligible), None)
+        if path is not None:
+            self._schedule_cached_validation(self._resolve_path(path), resume=True)
 
     def _defer_for_buffered_reader_locked(self, path):
         if self._experimental_reader_direct_io:
@@ -1853,11 +1878,12 @@ class StorageFS(Operations):
         if not any(entry.canonical_path == path for entry in self._fd_map.values()):
             return False
         with self._member_checks_lock:
-            if len(self._deferred_validations) < 64:
-                self._deferred_validations.add(path)
+            # There can only be one deferred name per open path here.
+            self._deferred_validations.add(path)
         return True
 
-    def _validate_complete_copy(self, resolved: ResolvedPath, cancelled: threading.Event):
+    def _validate_complete_copy(self, resolved: ResolvedPath, cancelled: threading.Event,
+                                removal_only: bool):
         """Check and stage off the path lock. Commit only against the observed local copy."""
         path, cache_path = resolved.canonical_path, resolved.cache_path
         try:
@@ -1889,7 +1915,15 @@ class StorageFS(Operations):
                                                {backend.name: members[backend.name]}, listed_at)
                 return
 
-            observed = backend.stat(path)
+            try:
+                observed = backend.stat(path)
+            except FileNotFoundError:
+                if forced and self._absent_on_every_member(path):
+                    self._finish_cached_validation(path, cache_path, old, row, cancelled,
+                                                   {}, time.monotonic(), remove=True)
+                return
+            if removal_only:
+                return
             generation = member_generation(observed)
             if generation is None or not stat.S_ISREG(observed.st_mode):
                 return
@@ -1920,8 +1954,8 @@ class StorageFS(Operations):
             self.logger.debug("Cached file validation did not publish for %s: %r", path, exc)
 
     def _finish_cached_validation(self, path, cache_path, old, row, cancelled, baselines,
-                                  checked_at, staged=None, backend=None, observed=None):
-        with self._path_locked(path):
+                                  checked_at, staged=None, backend=None, observed=None, *, remove=False):
+        with self._path_locked(path), self._validation_commit_lock:
             if cancelled.is_set() or self._destroying.is_set():
                 return
             with self.cache_manager.cache_size_change(), self.state_manager.metadata_lock, self._fd_lock:
@@ -1930,11 +1964,20 @@ class StorageFS(Operations):
                 repairs = self.cache_manager.member_repairs
                 if (current is None or metadata is None or current.st_dev != old.st_dev
                         or self._cache_identity(current) != self._cache_identity(old)
+                        or current.st_ctime_ns != old.st_ctime_ns
                         or metadata.dirty_generation != row.dirty_generation
                         or metadata.sync_status != SyncStatus.CLEAN
                         or repairs.covers(path) or repairs.kept_inode(cache_path) is not None
                         or any(entry.canonical_path == path and not self._is_read_only_open(entry.flags)
                                for entry in self._fd_map.values())):
+                    return
+                if remove:
+                    if self._defer_for_buffered_reader_locked(path):
+                        return
+                    cache_path.unlink()
+                    self.state_manager.delete_file(path)
+                    self._forget_member_check(path, path_gone=True)
+                    self.namespace.record_local_child(self._resolve_path(path))
                     return
                 if staged is None:
                     self._store_member_check(path, cache_path, self._cache_identity(current),
@@ -2396,7 +2439,7 @@ class StorageFS(Operations):
 
     def getattr(self, path, fh=None):
         """Get path attributes or the attributes of an open generation."""
-        if fh is not None:
+        if fh is not None and self._experimental_reader_direct_io:
             with self._fd_lock:
                 entry = self._fd_map.get(fh)
                 if entry is not None and self._is_read_only_open(entry.flags):
@@ -2795,9 +2838,8 @@ class StorageFS(Operations):
             self.state_manager.set_file_metadata(metadata)
             self._mark_cache_file_dirty(resolved.canonical_path, cache_path)
 
-            parent_dir = resolved.parent_dir
-            self._invalidate_dir_cache_entry(parent_dir)
-            self._invalidate_dir_cache_entry(resolved.canonical_path)
+            self._invalidate_dir_cache_entry(resolved.requested_path)
+            self.namespace.record_local_child(resolved)
 
             return vfd
 
@@ -3356,8 +3398,8 @@ class StorageFS(Operations):
 
         # Like create: a listing taken before the link would miss it, and
         # any listing kept under the new path itself is now wrong.
-        self._invalidate_dir_cache_entry(resolved.parent_dir)
         self._invalidate_dir_cache_entry(link_path)
+        self.namespace.record_local_child(resolved)
         self.sync_manager.queue_sync(link_path, priority=100)
 
     def _existing_mode(self, canonical_path: str) -> Optional[int]:
@@ -3489,6 +3531,11 @@ class StorageFS(Operations):
             self._foreground_admission.close()
         self._destroying.set()
         self._validation_executor.shutdown(wait=False, cancel_futures=True)
+        # A worker already in local publication must finish its index
+        # update before destroy can close SQLite. Other workers observe
+        # _destroying before publication and may still be in member I/O.
+        with self._validation_commit_lock:
+            pass
         self._streaming_manager.destroy()
         self._stop_watchers()
 

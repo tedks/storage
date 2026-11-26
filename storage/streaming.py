@@ -836,7 +836,7 @@ class StreamingReadManager:
         if session is None:
             return
         with session.io_lock, session.lock:
-            if not session.prefetch_complete and not session.detached:
+            if not session.finalized and not session.detached:
                 session.error = OSError(errno.ESTALE, "member reported a generation change")
                 session.condition.notify_all()
                 self._schedule_background(session)
@@ -1316,11 +1316,14 @@ class StreamingReadManager:
             # install refuses; a full fetch that loses the race to this
             # install finds the marker and fetches again instead of indexing
             # the prefix.
-            with self.state_manager.metadata_lock:
-                if self.state_manager.get_file_metadata(session.canonical_path) is not None:
-                    outcome = "indexed"
-                else:
-                    outcome = self._install_partial(session)
+            with session.io_lock:
+                if getattr(session.error, "errno", None) == errno.ESTALE:
+                    return False
+                with self.state_manager.metadata_lock:
+                    if self.state_manager.get_file_metadata(session.canonical_path) is not None:
+                        outcome = "indexed"
+                    else:
+                        outcome = self._install_partial(session)
             if outcome != "installed":
                 self.logger.info(
                     "streaming partial-cache skipped path=%s backend=%s reason=%s",
@@ -1410,35 +1413,40 @@ class StreamingReadManager:
             copy_member_attributes(io_fd, session.member_stat)
             os.fsync(io_fd)
             session.final_cache_path.parent.mkdir(parents=True, exist_ok=True)
-            with self.state_manager.metadata_lock:
-                outcome = self._install_partial(session)
+            # A watcher orders its invalidation with both installation and
+            # the source baseline, through the same I/O lock.
+            with session.io_lock:
+                with session.lock:
+                    if session.error is not None or session.detached:
+                        return
+                with self.state_manager.metadata_lock:
+                    outcome = self._install_partial(session)
+                    if outcome == "installed":
+                        metadata = self._store_finalized_row(session)
+                        if metadata is not None:
+                            self._add_finalized_locations(session, metadata)
                 if outcome == "installed":
-                    metadata = self._store_finalized_row(session)
-                    if metadata is not None:
-                        self._add_finalized_locations(session, metadata)
+                    self.cache_manager.publish_streaming_fd(io_fd)
+                    with session.lock:
+                        session.prefetch_complete = True
+                        session.finalized = True
+                        should_close = session.refcount == 0
+                        session.condition.notify_all()
+                    if self.on_finalized is not None:
+                        try:
+                            self.on_finalized(session)
+                        except Exception:
+                            self.logger.exception("on_finalized failed for %s", session.canonical_path)
         except OSError as exc:
             with session.lock:
-                session.error = exc
+                if session.error is None:
+                    session.error = exc
                 session.condition.notify_all()
             return
 
         if outcome != "installed":
             self._discard_superseded_session(session, outcome)
             return
-
-        self.cache_manager.publish_streaming_fd(io_fd)
-
-        with session.lock:
-            session.prefetch_complete = True
-            session.finalized = True
-            should_close = session.refcount == 0
-            session.condition.notify_all()
-
-        if self.on_finalized is not None:
-            try:
-                self.on_finalized(session)
-            except Exception:
-                self.logger.exception("on_finalized failed for %s", session.canonical_path)
 
         self._update_streaming_state_xattr(session, "complete")
         self._remove_prefetch_session(session)

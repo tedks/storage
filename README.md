@@ -298,8 +298,10 @@ existing synchronous freshness checks.
 Size and mtime baselines persist in the cache file's read-only
 `user.storage.member_stat` xattr. SFTP v3 reports second-resolution mtime
 and has no inode or change time. A same-size rewrite in the same timestamp
-tick may be indistinguishable until a watcher supplies a change hint. A cold
-stream checks the observed generation around missing-range reads. If the
+tick may be indistinguishable until a watcher supplies a change hint. A
+hint can retire a clean cache copy after every configured member confirms
+the name is absent and the reader and repair checks permit retirement. A
+cold stream checks the observed generation around missing-range reads. If the
 member changes, a reader can still use previously cached ranges, and a
 missing range fails with `ESTALE`. A later open can start a new stream.
 
@@ -314,8 +316,9 @@ the meantime. Local namespace changes invalidate older scans.
 
 A cold mount serves useful cache-directory entries immediately. When it
 needs a member, the first successful response can publish even when it is
-empty. Later replies update the union for the next enumeration. A failed
-member supplies no evidence of absence. Foreground scans for independent
+empty. Later replies update the union for the next enumeration. The existing progressive-listing setting is still required
+when enabling the experimental desktop bridge. A failed member supplies
+no evidence of absence. Foreground scans for independent
 directories can use separate SFTP channels, and background refreshes use
 bounded queues. The opted-in [Nautilus bridge](desktop/README.md) can
 reconcile an already-open directory after later publications.

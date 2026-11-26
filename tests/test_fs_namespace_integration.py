@@ -532,7 +532,7 @@ class TestFSNamespaceIntegration(unittest.TestCase):
             self.fs.symlink('/link', 'target.txt')
         self.assertEqual(os.readlink(self.cache_dir / "link"), "target.txt")
         self.assertFalse(os.path.lexists(self.cache_dir / "target.txt"))
-        self.assertNotIn('/', self.fs.namespace.entry_attrs)
+        self.assertIn('link', self.fs.readdir('/', None))
         row = self.fs.state_manager.get_file_metadata('/link')
         self.assertEqual(row.link_target, "target.txt")
         self.assertEqual(row.sync_status, SyncStatus.DIRTY)
@@ -847,7 +847,9 @@ class TestFSNamespaceIntegration(unittest.TestCase):
             self.fs._invalidate_dir_cache_entry('/')
 
         with patch.object(namespace, "_schedule_directory_checksums", side_effect=schedule_then_change):
-            list(self.fs.readdir('/', None))
+            with self.assertRaises(FuseOSError) as raced:
+                self.fs.readdir('/', None)
+            self.assertEqual(raced.exception.errno, errno.EAGAIN)
 
         self.assertNotIn('/', namespace.entry_attrs)
         self.assertNotIn('/', self.fs._readdir_snapshot)
@@ -963,9 +965,9 @@ class TestFSNamespaceIntegration(unittest.TestCase):
             self.fs._invalidate_dir_cache_entry('/')
 
         with self._wrap_listdir_attrs("backend1", after=change):
-            entries = set(self.fs.readdir('/', None))
-
-        self.assertNotIn("raced.txt", entries)
+            with self.assertRaises(FuseOSError) as raced:
+                self.fs.readdir('/', None)
+        self.assertEqual(raced.exception.errno, errno.EAGAIN)
         namespace = self.fs.namespace
         self.assertNotIn('/', namespace.entry_attrs)
         self.assertNotIn('/', self.fs._readdir_snapshot)
@@ -1303,7 +1305,9 @@ class TestFSNamespaceIntegration(unittest.TestCase):
 
         with patch("storage.namespace._MAX_CHILD_RACES", 1), \
                 self._wrap_listdir_attrs("backend1", after=change):
-            list(self.fs.readdir('/', None))
+            with self.assertRaises(FuseOSError) as raced:
+                self.fs.readdir('/', None)
+            self.assertEqual(raced.exception.errno, errno.EAGAIN)
 
         self.assertNotIn('/', namespace.entry_attrs)
         self.assertEqual(namespace._child_races, {})
@@ -1421,7 +1425,9 @@ class TestFSNamespaceIntegration(unittest.TestCase):
             namespace.forget_listed_attrs('/dup.txt', removing=True)
 
         with self._wrap_listdir_attrs("backend1", after=change):
-            list(self.fs.readdir('/', None))
+            with self.assertRaises(FuseOSError) as raced:
+                self.fs.readdir('/', None)
+            self.assertEqual(raced.exception.errno, errno.EAGAIN)
         self.assertNotIn('/', namespace.entry_attrs)
 
     def test_eviction_of_a_replicated_name_does_not_starve_the_listing(self):
@@ -1874,6 +1880,48 @@ class TestFSNamespaceIntegration(unittest.TestCase):
             self._wait_refreshed()
         self.assertIn("known.txt", self.fs.readdir("/", None))
         self.assertEqual(self.fs.getattr("/known.txt")["st_size"], 8)
+
+    def test_local_create_keeps_observed_siblings_while_members_are_blocked(self):
+        (self.backend2_dir / "member-child").write_bytes(b"older observation")
+        self.assertIn("member-child", self.fs.readdir("/", None))
+        self.fs.namespace.progressive_listings = True
+        blocked, release = threading.Event(), threading.Event()
+        original = self.backends["backend1"].listdir_attrs
+
+        def hold(path):
+            blocked.set()
+            if not release.wait(10):
+                raise TimeoutError("test did not release member")
+            return original(path)
+
+        with patch.object(self.backends["backend1"], "listdir_attrs", side_effect=hold):
+            fh = self.fs.create("/local-child", 0o644)
+            try:
+                self.assertEqual(set(self.fs.readdir("/", None)),
+                                 {".", "..", "member-child", "local-child"})
+                self.assertTrue(blocked.wait(5))
+                self.assertEqual(self.fs.getattr("/member-child")["st_size"], 17)
+            finally:
+                release.set()
+                self.fs.release("/local-child", fh)
+            self._wait_refreshed()
+
+    def test_restart_does_not_restore_the_old_name_after_local_rename(self):
+        (self.backend1_dir / "before.txt").write_bytes(b"original")
+        reader = self.fs.open("/before.txt", os.O_RDONLY)
+        self.fs.release("/before.txt", reader)
+        self.assertIn("before.txt", self.fs.readdir("/", None))
+        self.fs.rename("/before.txt", "/after.txt")
+        self.fs.destroy("/")
+        self.fs = StorageFS(self.cache_dir, self.db_path, self.backends,
+                            cache_size=10 * 1024 * 1024, start_sync=False,
+                            progressive_listings=True)
+        names = self.fs.readdir("/", None)
+        self.assertIn("after.txt", names)
+        self.assertNotIn("before.txt", names)
+        with self.assertRaises(FuseOSError) as gone:
+            self.fs.getattr("/before.txt")
+        self.assertEqual(gone.exception.errno, errno.ENOENT)
 
     def test_cold_empty_success_is_distinct_from_all_unavailable(self):
         self.fs.namespace.progressive_listings = True

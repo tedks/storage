@@ -11,7 +11,8 @@ A user reopening a directory or file should be able to use already observed entr
 - [x] (2026-11-26 19:39Z) Proved that an expired listing waited on a blocked member and that the first change serves its entries and child attributes locally.
 - [x] (2026-11-26 19:47Z) Added bounded persisted member observations and partial refresh publication.
 - [x] (2026-11-26 20:01Z) Implemented bounded read-only validation and verified buffered generations on a synthetic mount with same-size, grow and shrink replacements.
-- [ ] Extend the staged desktop bridge, exercise a synthetic mount, review the draft, and record exact-head gates.
+- [x] (2026-11-26 20:12Z) Verified the opt-in bridge on a synthetic mount, including native GIO attribute changes and a real Nautilus window paused across two publications.
+- [ ] Finish the council fixes and record gates on the final pushed revision.
 
 ## Surprises & Discoveries
 
@@ -64,4 +65,4 @@ The initial test is test_expired_listing_and_child_attrs_survive_blocked_refresh
 
 Use NamespaceService's listing ticket and publication path, and StateManager for durable listing acceleration. Keep the mount control socket's existing peer-UID and mount checks. Use the existing cache budget, dirty generation, descriptor registration, and repair fence when publishing a replacement file.
 
-2026-11-26. Updated the plan with the persisted observations, deferred-publication decision and mounted evidence.
+2026-11-26. Updated the plan with persisted observations, mounted evidence and the desktop result. Council review prompted generation checks during stream publication, retention of known directory siblings and moving observation writes outside the listing lock.

@@ -359,6 +359,34 @@ class TestCacheFirstReadOnly(RevalidateTestBase):
                 release.set()
 
 
+    def test_trusted_removal_keeps_bytes_until_every_member_can_answer(self):
+        path = "/gone.txt"
+        remote = self.rewrite_member("gone.txt", b"keep during outage")
+        self.assertEqual(self.read_through(path), b"keep during outage")
+        other_dir = self.temp_dir / "other"
+        other_dir.mkdir()
+        other = LocalBackend("other", str(other_dir))
+        self.fs.backends["other"] = other
+        other.set_available(False)
+        remote.unlink()
+
+        self.fs._on_remote_change(path)
+        self.wait_validation(path)
+        self.assertEqual((self.cache_dir / "gone.txt").read_bytes(), b"keep during outage")
+
+        other.set_available(True)
+        reader = self.fs.open(path, os.O_RDONLY)
+        try:
+            self.fs._on_remote_change(path)
+            self.wait_validation(path)
+            self.assertEqual(self.fs.read(path, 1024, 0, reader), b"keep during outage")
+        finally:
+            self.fs.release(path, reader)
+        deadline = time.monotonic() + 5
+        while (self.cache_dir / "gone.txt").exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertFalse((self.cache_dir / "gone.txt").exists())
+
     def test_open_racing_a_staged_copy_keeps_it_unpublished_until_release(self):
         path = "/f.txt"
         self.rewrite_member("f.txt", b"old bytes", mtime=1_700_000_000)
@@ -1227,6 +1255,36 @@ class TestRevalidateStreamedFetch(RevalidateTestBase):
         finally:
             self.fs.release("/m.bin", fd)
 
+
+    def test_watcher_hint_retires_complete_bytes_waiting_for_publication(self):
+        from storage.streaming import copy_member_attributes
+
+        path = "/full.bin"
+        old = b"a" * 1024
+        new = b"b" * 1024
+        self.rewrite_member("full.bin", old, mtime=1_700_000_000)
+        ready, unblock = threading.Event(), threading.Event()
+
+        def before_publication(fd, member_stat):
+            copy_member_attributes(fd, member_stat)
+            ready.set()
+            if not unblock.wait(10):
+                raise TimeoutError("test did not release publication")
+
+        with patch("storage.streaming.copy_member_attributes", side_effect=before_publication):
+            reader = self.fs.open(path, os.O_RDONLY)
+            try:
+                self.assertEqual(self.fs.read(path, len(old), 0, reader), old)
+                self.assertTrue(ready.wait(5))
+                self.rewrite_member("full.bin", new, mtime=1_700_000_000)
+                self.fs._on_remote_change(path)
+                self.assertFalse((self.cache_dir / "full.bin").exists())
+                unblock.set()
+                self.assertEqual(self.read_through(path), new)
+                self.assertEqual(self.fs.read(path, len(old), 0, reader), old)
+            finally:
+                unblock.set()
+                self.fs.release(path, reader)
 
     def test_range_rejects_another_inode_even_if_the_path_is_restored(self):
         from fuse import FuseOSError
