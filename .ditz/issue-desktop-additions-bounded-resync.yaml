@@ -31,3 +31,11 @@ log_events:
   who: Ted Smith
   what: started
   comment: ""
+- time: 2026-11-26T20:39:04-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Draft PR #204 at 1162c314ec3cbb75428a8fed26eb1951aa605263 passes the real
+    Nautilus and GIO lifecycle fixtures on a synthetic mount. The original window
+    converged across skipped publications and more than 128 changes including removals,
+    with the other view unaffected. GIO checked attributes, cancellation and executable
+    scope. Synthetic replacement-mount acceptance remains open.'
