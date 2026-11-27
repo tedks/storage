@@ -1,0 +1,22 @@
+id: desktop-nautilus-child-preload
+title: Keep the Nautilus bridge preload out of launched applications
+desc: A launcher that opts Nautilus into the Storage GIO bridge also leaves the shim
+  in LD_PRELOAD for child processes. A Nix-wrapped application failed during ELF dependency
+  loading before its program started. Preserve unrelated caller preloads and ordinary
+  application launches. Exercise the actual opted-in Nautilus opening a harmless Nix-wrapped
+  probe and a system probe in a synthetic desktop, and verify that live directory
+  reconciliation continues. Track the Storage injection boundary and its launcher
+  contract here.
+type: bugfix
+component: desktop
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-27T17:41:13-00:00
+references: []
+log_events:
+- time: 2026-11-27T17:41:13-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
