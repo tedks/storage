@@ -21,6 +21,29 @@ sh_test(
 )
 
 genrule(
+    name = "caller_preload",
+    srcs = ["caller_preload.c"],
+    outs = ["caller-preload.so"],
+    cmd = "/usr/bin/cc -shared -fPIC -nostdlib -Wall -Wextra -Werror -o $@ $<",
+    local = True,
+    tags = ["manual"],
+)
+
+sh_test(
+    name = "child_preloads",
+    env_inherit = ["FUSE_LIBRARY_PATH"],
+    srcs = ["visible_rows.sh"],
+    args = ["--caller-preload", "caller-preload.so"],
+    data = [
+        ":caller_preload",
+        ":held_mount",
+        "visible_rows.py",
+    ],
+    tags = ["local", "manual"],
+    timeout = "moderate",
+)
+
+genrule(
     name = "monitor_probe_binary",
     srcs = ["monitor_probe.c"],
     # The bridge attaches only inside a process named nautilus.

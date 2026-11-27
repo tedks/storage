@@ -23,3 +23,27 @@ nix develop --command bazel test //desktop/acceptance:monitor_lifecycle \
 ```
 
 The lifecycle test observes a late addition, a removal and an attribute update on a private GLib main context. It also verifies that the cancelled monitor and another executable inheriting the preload receive none of those changes.
+The opted-in probe starts with the bridge and a symlink to it in
+`LD_PRELOAD`, then verifies that the variable is unset before using GIO.
+
+## Verify Nautilus application launches
+
+`child_preloads` uses the same private desktop and synthetic mount. It registers
+two file associations, then opens their files through Nautilus. A Nix Bash
+and a system Bash record which preloads they received and loaded. The test
+checks that two caller preloads survive in order, including one with the
+bridge's basename, and that the bridge and its mount settings stay out of
+the child environment. It repeats the directory update checks in the same
+opted-in Nautilus process.
+
+With `update-desktop-database` installed and Xvfb on PATH, run:
+
+```sh
+nix develop --command bazel build //desktop:nautilus_bridge
+nix develop --command bash -c '
+  bazel test //desktop/acceptance:child_preloads \
+    --nocache_test_results --test_output=errors \
+    --test_arg=--library="$PWD/bazel-bin/desktop/libstorage-nautilus.so" \
+    --test_arg=--xvfb="$(command -v Xvfb)" --test_arg=--nix-bash="$BASH"
+'
+```

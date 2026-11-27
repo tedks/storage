@@ -20,13 +20,17 @@ generation.
 3. Start a fresh Nautilus process. Set `STORAGE_NAUTILUS_MOUNT` to the
    canonical absolute mount path, `STORAGE_NAUTILUS_SOCKET` to the
    absolute path to `.storage.control.sock` in its cache, and
-   `LD_PRELOAD` to the absolute library path for that invocation.
+   prepend the library's literal absolute path to `LD_PRELOAD` for that invocation.
+   The launcher can export these variables and then exec Nautilus directly.
    Nautilus normally reuses a running instance for new windows. See
    [the isolated acceptance test](acceptance/README.md) to try this in a
-   private desktop session. Child processes can inherit `LD_PRELOAD`.
-   The loaded library activates only in a process whose executable
-   basename is `nautilus`. Keep the variable scoped to the dedicated
-   launch command.
+   private desktop session.
+
+The shim initializes inside the native executable named `nautilus`.
+It saves the mount and socket settings in memory and removes them from
+the environment. It also removes its own `LD_PRELOAD` entries before
+Nautilus launches applications, preserving other entries in their
+original order. Scope the variables to the dedicated launch command.
 
 The mount and virtual directory paths each support up to 768 native bytes.
 The UID-checked socket reports snapshot revisions, and the bridge compares
