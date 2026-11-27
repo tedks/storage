@@ -369,15 +369,54 @@ static gboolean poll_subscription(gpointer data)
     return G_SOURCE_CONTINUE;
 }
 
-static gboolean is_nautilus(void)
+static char *bridge_mount;
+static char *bridge_socket;
+
+static void __attribute__((constructor)) initialize_bridge(void)
 {
-    static gsize checked = 0;
-    if (g_once_init_enter(&checked)) {
-        g_autofree char *exe = g_file_read_link("/proc/self/exe", NULL);
-        g_autofree char *name = exe != NULL ? g_path_get_basename(exe) : NULL;
-        g_once_init_leave(&checked, g_strcmp0(name, "nautilus") == 0 ? 1 : 2);
+    g_autofree char *exe = g_file_read_link("/proc/self/exe", NULL);
+    g_autofree char *name = exe != NULL ? g_path_get_basename(exe) : NULL;
+    if (g_strcmp0(name, "nautilus") != 0)
+        return;
+
+    // Capture the launch configuration before Nautilus starts threads or applications.
+    bridge_mount = g_strdup(g_getenv("STORAGE_NAUTILUS_MOUNT"));
+    bridge_socket = g_strdup(g_getenv("STORAGE_NAUTILUS_SOCKET"));
+    g_unsetenv("STORAGE_NAUTILUS_MOUNT");
+    g_unsetenv("STORAGE_NAUTILUS_SOCKET");
+
+    const char *preload = g_getenv("LD_PRELOAD");
+    Dl_info self;
+    if (preload == NULL || !dladdr(&bridge_mount, &self) || self.dli_fname == NULL)
+        return;
+
+    // Match the loaded object, including filesystem aliases, without using its basename.
+    struct stat image;
+    gboolean have_image = stat(self.dli_fname, &image) == 0;
+    g_auto(GStrv) entries = g_strsplit_set(preload, " :", -1);
+    g_autoptr(GString) kept = g_string_new(NULL);
+    gboolean removed = FALSE;
+    for (char **entry = entries; *entry != NULL; entry++) {
+        if (**entry == '\0')
+            continue;
+        struct stat candidate;
+        if (strcmp(*entry, self.dli_fname) == 0 ||
+            (have_image && strchr(*entry, '/') != NULL && strchr(*entry, '$') == NULL &&
+             stat(*entry, &candidate) == 0 &&
+             image.st_dev == candidate.st_dev && image.st_ino == candidate.st_ino)) {
+            removed = TRUE;
+            continue;
+        }
+        if (kept->len != 0)
+            g_string_append_c(kept, ' ');
+        g_string_append(kept, *entry);
     }
-    return checked == 1;
+    if (removed) {
+        if (kept->len == 0)
+            g_unsetenv("LD_PRELOAD");
+        else if (!g_setenv("LD_PRELOAD", kept->str, TRUE))
+            g_warning("Storage desktop additions could not update LD_PRELOAD");
+    }
 }
 
 GFileMonitor *g_file_monitor_directory(GFile *file, GFileMonitorFlags flags,
@@ -394,10 +433,9 @@ GFileMonitor *g_file_monitor_directory(GFile *file, GFileMonitorFlags flags,
     }
 
     GFileMonitor *monitor = ((MonitorDirectory)symbol)(file, flags, cancellable, error);
-    const char *mount = g_getenv("STORAGE_NAUTILUS_MOUNT");
-    const char *socket = g_getenv("STORAGE_NAUTILUS_SOCKET");
-    if (monitor == NULL || mount == NULL || socket == NULL || !is_nautilus() ||
-        !g_file_is_native(file))
+    const char *mount = bridge_mount;
+    const char *socket = bridge_socket;
+    if (monitor == NULL || mount == NULL || socket == NULL || !g_file_is_native(file))
         return monitor;
 
     g_autofree char *path = g_file_get_path(file);
