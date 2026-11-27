@@ -300,6 +300,12 @@ def main():
                         if enabled:
                             alias = root / "bridge-alias.so"
                             alias.symlink_to(args.library)
+                            printenv = shutil.copy2("/usr/bin/printenv", root / "nautilus")
+                            mixed = dict(quiet_env, LD_PRELOAD=f"{args.library}:libm.so.6:{alias}")
+                            retained = subprocess.check_output(
+                                [printenv, "LD_PRELOAD"], env=mixed, text=True, timeout=10,
+                            )
+                            assert retained == "libm.so.6\n", retained
                             quiet_env["LD_PRELOAD"] += f":{alias}"
                         else:
                             # Keep the preload but change the executable name.

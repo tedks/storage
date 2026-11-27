@@ -398,8 +398,8 @@ static void __attribute__((constructor)) initialize_bridge(void)
     g_autoptr(GString) kept = g_string_new(NULL);
     gboolean removed = FALSE;
     gboolean has_other_entry = FALSE;
-    // Keep the caller's delimiters as supplied. A removed token takes its
-    // following delimiter, including the one added by a prepending launcher.
+    // Drop the separator after a removed token, or the one before it if
+    // the token is last. Preserve the rest of the caller's list verbatim.
     for (char *next = entries; next != NULL;) {
         char *entry = next;
         next = strpbrk(entry, " :");
@@ -412,6 +412,8 @@ static void __attribute__((constructor)) initialize_bridge(void)
              stat(entry, &candidate) == 0 &&
              image.st_dev == candidate.st_dev && image.st_ino == candidate.st_ino)) {
             removed = TRUE;
+            if (separator == '\0' && kept->len != 0)
+                g_string_truncate(kept, kept->len - 1);
             continue;
         }
         g_string_append(kept, entry);
