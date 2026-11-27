@@ -51,6 +51,10 @@ int main(int argc, char **argv)
 {
     g_assert_cmpint(argc, ==, 3);
     unsigned expected_arrivals = (unsigned)g_ascii_strtoull(argv[2], NULL, 10);
+    gboolean inherited = expected_arrivals == 0;
+    g_assert_cmpint(g_getenv("LD_PRELOAD") != NULL, ==, inherited);
+    g_assert_cmpint(g_getenv("STORAGE_NAUTILUS_MOUNT") != NULL, ==, inherited);
+    g_assert_cmpint(g_getenv("STORAGE_NAUTILUS_SOCKET") != NULL, ==, inherited);
     g_autofree char *mount = g_build_filename(argv[1], "mount", NULL);
     g_autofree char *release = g_build_filename(argv[1], "release", NULL);
     g_autoptr(GFile) root = g_file_new_for_path(mount);

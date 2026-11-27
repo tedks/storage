@@ -379,7 +379,8 @@ static void __attribute__((constructor)) initialize_bridge(void)
     if (g_strcmp0(name, "nautilus") != 0)
         return;
 
-    // Capture the launch configuration before Nautilus starts threads or applications.
+    // Capture settings before Nautilus starts. Other preload constructors must not
+    // race environment access from their own threads.
     bridge_mount = g_strdup(g_getenv("STORAGE_NAUTILUS_MOUNT"));
     bridge_socket = g_strdup(g_getenv("STORAGE_NAUTILUS_SOCKET"));
     g_unsetenv("STORAGE_NAUTILUS_MOUNT");
@@ -393,26 +394,33 @@ static void __attribute__((constructor)) initialize_bridge(void)
     // Match the loaded object, including filesystem aliases, without using its basename.
     struct stat image;
     gboolean have_image = stat(self.dli_fname, &image) == 0;
-    g_auto(GStrv) entries = g_strsplit_set(preload, " :", -1);
+    g_autofree char *entries = g_strdup(preload);
     g_autoptr(GString) kept = g_string_new(NULL);
     gboolean removed = FALSE;
-    for (char **entry = entries; *entry != NULL; entry++) {
-        if (**entry == '\0')
-            continue;
+    gboolean has_other_entry = FALSE;
+    // Keep the caller's delimiters as supplied. A removed token takes its
+    // following delimiter, including the one added by a prepending launcher.
+    for (char *next = entries; next != NULL;) {
+        char *entry = next;
+        next = strpbrk(entry, " :");
+        char separator = next != NULL ? *next : '\0';
+        if (next != NULL)
+            *next++ = '\0';
         struct stat candidate;
-        if (strcmp(*entry, self.dli_fname) == 0 ||
-            (have_image && strchr(*entry, '/') != NULL && strchr(*entry, '$') == NULL &&
-             stat(*entry, &candidate) == 0 &&
+        if (strcmp(entry, self.dli_fname) == 0 ||
+            (have_image && strchr(entry, '/') != NULL && strchr(entry, '$') == NULL &&
+             stat(entry, &candidate) == 0 &&
              image.st_dev == candidate.st_dev && image.st_ino == candidate.st_ino)) {
             removed = TRUE;
             continue;
         }
-        if (kept->len != 0)
-            g_string_append_c(kept, ' ');
-        g_string_append(kept, *entry);
+        g_string_append(kept, entry);
+        if (separator != '\0')
+            g_string_append_c(kept, separator);
+        has_other_entry |= *entry != '\0';
     }
     if (removed) {
-        if (kept->len == 0)
+        if (!has_other_entry)
             g_unsetenv("LD_PRELOAD");
         else if (!g_setenv("LD_PRELOAD", kept->str, TRUE))
             g_warning("Storage desktop additions could not update LD_PRELOAD");

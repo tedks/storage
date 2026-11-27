@@ -23,6 +23,8 @@ nix develop --command bazel test //desktop/acceptance:monitor_lifecycle \
 ```
 
 The lifecycle test observes a late addition, a removal and an attribute update on a private GLib main context. It also verifies that the cancelled monitor and another executable inheriting the preload receive none of those changes.
+The opted-in probe starts with the bridge and a symlink to it in
+`LD_PRELOAD`, then verifies that the variable is unset before using GIO.
 
 ## Verify Nautilus application launches
 

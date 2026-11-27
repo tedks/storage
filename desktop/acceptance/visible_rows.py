@@ -219,7 +219,7 @@ def observe(root, library, nix_bash, caller_preload):
                 actual = until(receipt, f"Nautilus did not launch {target.name}", timeout=6)
                 loaded = list(map(str, callers))
                 assert actual[:2] == [interpreter, str(target)], actual
-                assert actual[2].replace(":", " ").split() == loaded, actual
+                assert actual[2] == env["LD_PRELOAD"], actual
                 assert actual[3:] == ["", *loaded, "done"], actual
                 print(f"Nautilus launched {target.name} with only the caller preloads", flush=True)
         (root / "release").touch()
@@ -297,7 +297,11 @@ def main():
                                          STORAGE_NAUTILUS_MOUNT=str(root / "mount"),
                                          STORAGE_NAUTILUS_SOCKET=str(root / "cache/.storage.control.sock"))
                         probe = args.monitor_probe
-                        if not enabled:
+                        if enabled:
+                            alias = root / "bridge-alias.so"
+                            alias.symlink_to(args.library)
+                            quiet_env["LD_PRELOAD"] += f":{alias}"
+                        else:
                             # Keep the preload but change the executable name.
                             probe = Path(shutil.copy2(probe, root / "other-monitor"))
                         subprocess.run([probe, root, str(int(enabled))], env=quiet_env,
@@ -310,7 +314,7 @@ def main():
                     (root / "release").touch()
                     if os.path.ismount(root / "mount"):
                         subprocess.run(["fusermount", "-u", str(root / "mount")], check=True)
-                    fixture.wait(timeout=8)
+                    fixture.wait(timeout=20)
         finally:
             if os.path.ismount(root / "mount"):
                 raise RuntimeError(f"Owned test mount still attached under {root}")

@@ -20,7 +20,7 @@ generation.
 3. Start a fresh Nautilus process. Set `STORAGE_NAUTILUS_MOUNT` to the
    canonical absolute mount path, `STORAGE_NAUTILUS_SOCKET` to the
    absolute path to `.storage.control.sock` in its cache, and
-   prepend the absolute library path to `LD_PRELOAD` for that invocation.
+   prepend the library's literal absolute path to `LD_PRELOAD` for that invocation.
    The launcher can export these variables and then exec Nautilus directly.
    Nautilus normally reuses a running instance for new windows. See
    [the isolated acceptance test](acceptance/README.md) to try this in a
