@@ -11,8 +11,8 @@ type: bugfix
 component: desktop
 release:
 reporter: Ted Smith <tedks@riseup.net>
-status: in_progress
-disposition:
+status: closed
+disposition: fixed
 creation_time: 2026-11-27T17:41:13-00:00
 references: []
 log_events:
@@ -24,3 +24,10 @@ log_events:
   who: Ted Smith
   what: started
   comment: ""
+- time: 2026-11-27T18:01:36-00:00
+  who: Ted Smith
+  what: 'closed: fixed'
+  comment: 'Fixed in draft PR #205 at 09b435fd0338611cae797835c52eb18b9b3e0f26. The
+    isolated Nautilus test reproduced the loader failure at 1162c31 and verified Nix
+    and system child launches, caller preload preservation and live monitoring at
+    the fix. All exact-head gates and both available council seats cleared.'
