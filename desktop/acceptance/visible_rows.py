@@ -302,8 +302,10 @@ def main():
                             alias.symlink_to(args.library)
                             printenv = shutil.copy2("/usr/bin/printenv", root / "nautilus")
                             mixed = dict(quiet_env, LD_PRELOAD=f"{args.library}:libm.so.6:{alias}")
+                            # Multicall coreutils still select printenv from argv[0].
                             retained = subprocess.check_output(
-                                [printenv, "LD_PRELOAD"], env=mixed, text=True, timeout=10,
+                                ["printenv", "LD_PRELOAD"], executable=printenv,
+                                env=mixed, text=True, timeout=10,
                             )
                             assert retained == "libm.so.6\n", retained
                             quiet_env["LD_PRELOAD"] += f":{alias}"
