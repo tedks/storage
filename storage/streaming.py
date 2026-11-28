@@ -1572,8 +1572,8 @@ class StreamingReadManager:
             # deadline, never a bulk channel, so a publication cannot wait
             # behind sync's bulk leases with no yield. A deadline failure is
             # retried once, then the probe stands in when the size matches
-            # (confirm_member_stat); with no probe the file is installed
-            # with no member attributes, which fails closed on mode.
+            # (confirm_member_stat); what an unconfirmed result means beyond
+            # that is the decision below, unchanged from master.
             try:
                 with interactive_request():
                     confirmed, agreed = confirm_member_stat(
@@ -1586,7 +1586,7 @@ class StreamingReadManager:
                 # its readers are woken, as for any failed finalize.
                 raise OSError(errno.EINTR if isinstance(exc, BulkCapacityCancelled)
                               else errno.EAGAIN, str(exc)) from exc
-            if not agreed and confirmed is not None:
+            if not agreed:
                 self._discard_superseded_session(session, "member-changed")
                 # Counted once the partial is gone and the session finished.
                 self._record_streaming_stat("streaming_member_changed_discards", 1)
