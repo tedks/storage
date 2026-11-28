@@ -1887,6 +1887,44 @@ class TestFSStreamingIntegration(unittest.TestCase):
         row = self.fs.state_manager.get_file_metadata('/earlier.bin')
         self.assertEqual(row.last_access, 10.0)
 
+    def test_read_between_finalize_snapshot_and_row_store_is_kept(self):
+        # The finalizer snapshots session.last_access, then stores the row.
+        # A read in between advances the session and queues an update; a
+        # batch flush before the row exists matches nothing. The stored row
+        # must still carry that read.
+        payload = b"g" * (384 * 1024)
+        (self.backend_dir / "gap.bin").write_bytes(payload)
+        self.backend.worker_gate = threading.Event()
+        with patch("storage.fs.time.time", return_value=10.0):
+            vfd = self.fs.open('/gap.bin', os.O_RDONLY)
+            session = self._session_for(vfd)
+            self.assertEqual(self.fs.read('/gap.bin', 128 * 1024, 0, vfd), payload[:128 * 1024])
+        self.assertTrue(self.backend.worker_in_read.wait(timeout=3.0))
+
+        cache_manager = self.fs.cache_manager
+        real_store = cache_manager.store_file_metadata
+        injected = []
+
+        def read_in_the_gap(metadata, *args, **kwargs):
+            if metadata.virtual_path == '/gap.bin' and not injected:
+                injected.append(metadata.last_access)
+                with patch("storage.fs.time.time", return_value=50.0):
+                    self.fs._mark_demand_access('/gap.bin', session)
+                self.fs.state_manager._flush_access_updates(force=True)
+                injected.append(self.fs.state_manager.get_file_metadata('/gap.bin'))
+            return real_store(metadata, *args, **kwargs)
+
+        with patch.object(cache_manager, "store_file_metadata", side_effect=read_in_the_gap):
+            self.backend.worker_gate.set()
+            self.assertTrue(session.background_finished.wait(timeout=3.0))
+        self.fs.release('/gap.bin', vfd)
+
+        self.assertTrue(session.finalized)
+        # The snapshot predates the read, and the flush found no row.
+        self.assertEqual(injected, [10.0, None])
+        self.fs.state_manager._flush_access_updates(force=True)
+        self.assertEqual(self.fs.state_manager.get_file_metadata('/gap.bin').last_access, 50.0)
+
     def test_finalized_stream_stays_pinned_and_its_open_handle_can_heat_it(self):
         payload = b"a" * (32 * 1024)
         for name in ("held.bin", "other.bin"):
