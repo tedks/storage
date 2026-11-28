@@ -264,7 +264,7 @@ class StorageFS(Operations):
             streaming_chunk_size: Unit of background read-ahead (foreground
                 reads fetch only what the reader asked for); read-ahead
                 starts once readers have read one chunk
-            max_streaming_sessions: Maximum concurrent streaming sessions
+            max_streaming_sessions: Maximum streaming sessions with live readers
             streaming_keep_after_close: When read-ahead outlives the last
                 close of a streaming session; None for the default, 4 chunks
                 or 50% of the file
