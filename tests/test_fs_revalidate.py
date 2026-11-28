@@ -1798,11 +1798,6 @@ class TestRevalidateFromListing(RevalidateTestBase):
             self.read_through("/f.txt")
         self.assertEqual(1, stat.call_count)
 
-
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestRecomputeRecordsStat(unittest.TestCase):
     """A cache-miss recompute over a CLEAN size-0 row leaves its bytes evictable."""
 
@@ -1844,23 +1839,35 @@ class TestRecomputeRecordsStat(unittest.TestCase):
             recomputable=True, recompute_cmd="make", encrypted=False, encryption_key_id=None,
         ), **changes))
 
-    def test_cache_miss_recompute_over_a_size_zero_row_becomes_a_candidate(self):
+    def test_cache_miss_recompute_over_a_clean_row_is_recorded_dirty(self):
         self._row()
+        before = self.fs.state_manager.get_file_metadata("/derived.bin")
         cache_path = self._recompute(b"recomputed bytes")
         st = cache_path.stat()
         row = self.fs.state_manager.get_file_metadata("/derived.bin")
-        self.assertEqual((row.size, row.last_modified, row.sync_status),
-                         (st.st_size, st.st_mtime, SyncStatus.CLEAN))
-        self.assertEqual(read_cache_metadata(cache_path).size, st.st_size)
+        # Nothing says the command reproduced the members' bytes: no row
+        # stays CLEAN over different bytes, as the next open's heal would
+        # also decide.
+        self.assertEqual((row.sync_status, row.size, row.last_modified),
+                         (SyncStatus.DIRTY, st.st_size, st.st_mtime))
+        self.assertEqual(row.dirty_generation, before.dirty_generation + 1)
+        record = read_cache_metadata(cache_path)
+        self.assertEqual((record.sync_status, record.size), (SyncStatus.DIRTY, st.st_size))
+        self.assertEqual(list(self.fs.state_manager.iter_lru_paths(recomputable=True)), [])
+
+        # Once the sync publishes CLEAN, the new size makes it a candidate.
+        self.assertTrue(self.fs.state_manager.publish_sync_status(
+            "/derived.bin", row.dirty_generation, SyncStatus.CLEAN, checksum="synced"))
         self.assertEqual(list(self.fs.state_manager.iter_lru_paths(recomputable=True)), ["/derived.bin"])
-        # The stat matches, so the next open does not take it for a lost write.
         self.assertFalse(self.fs.cache_manager.heal_stale_clean("/derived.bin", cache_path))
 
     def test_recompute_leaves_a_dirty_row_alone(self):
         self._row(sync_status=SyncStatus.DIRTY, size=5, last_modified=2.0)
+        before = self.fs.state_manager.get_file_metadata("/derived.bin")
         self._recompute(b"recomputed bytes")
         row = self.fs.state_manager.get_file_metadata("/derived.bin")
-        self.assertEqual((row.size, row.last_modified, row.sync_status), (5, 2.0, SyncStatus.DIRTY))
+        self.assertEqual((row.size, row.last_modified, row.sync_status, row.dirty_generation),
+                         (5, 2.0, SyncStatus.DIRTY, before.dirty_generation))
 
 
 class TestMountStartupClearsEvictionHints(unittest.TestCase):
@@ -1904,3 +1911,7 @@ class TestMountStartupClearsEvictionHints(unittest.TestCase):
                 fs.state_manager.close()
         finally:
             shutil.rmtree(temp_dir)
+
+
+if __name__ == "__main__":
+    unittest.main()

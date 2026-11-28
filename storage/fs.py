@@ -2223,31 +2223,35 @@ class StorageFS(Operations):
 
     def _record_recomputed(self, canonical_path: str, cache_path: Path,
                            before: Optional[FileMetadata]):
-        """Bring a CLEAN row's stat up to a file its recompute command just wrote.
+        """Record a file the recompute command just wrote over a CLEAN row as a modification.
 
-        Like a refetch after eviction: the command reproduces what the row
-        already calls synced, and without the new stat the row would keep
-        describing the old copy (size 0 for an evicted placeholder or an
-        invalidated copy), so the eviction scan, which reads only rows of
-        size > 0, would never reach the new bytes. Only at the generation
-        read before the command ran: a write recorded since keeps its own
-        stat. A path with no row, or one that is not CLEAN, is left as it
-        was. The mirror rewrites the metadata xattr from the stored row.
+        The row described the old copy (size 0 for an evicted placeholder or
+        an invalidated copy), and nothing says the command reproduced the
+        members' bytes. Without a record, the next open's heal_stale_clean
+        would find the stat changed and mark the file DIRTY; this reaches
+        the same outcome eagerly through mark_file_dirty (DIRTY, the new
+        size and mtime, a new generation, the xattr mirrored), so the
+        recompute does not change sync semantics. The checksum column is
+        left as every write leaves it; the sync's CLEAN publish replaces
+        it. A DIRTY row is not evictable; once the sync publishes CLEAN, the
+        new size makes it a candidate again. Whether recompute output
+        should be uploaded at all is an open question (ditz
+        recompute-output-sync-semantics).
+
+        Only when the row was CLEAN before the command ran and no write has
+        been recorded since (same dirty_generation): a write's own mark
+        already describes the file. A path with no row, a link or a row
+        that was not CLEAN is left as it was.
         """
         if before is None or before.sync_status != SyncStatus.CLEAN or before.link_target is not None:
             return
-        st = regular_file_stat(cache_path)
-        if st is None:
+        if regular_file_stat(cache_path) is None:
             return
         with self.state_manager.metadata_lock:
-            if not self.state_manager.record_cached_stat(
-                canonical_path, before.dirty_generation,
-                size=st.st_size, last_modified=st.st_mtime,
-            ):
-                return
             row = self.state_manager.get_file_metadata(canonical_path)
-            if row is not None:
-                self.cache_manager.sync_cache_metadata(canonical_path, row, cache_path=cache_path)
+            if row is None or row.dirty_generation != before.dirty_generation:
+                return
+            self.cache_manager.mark_file_dirty(canonical_path, cache_path)
 
     # Filesystem methods
 

@@ -256,7 +256,7 @@ class StateManager:
         # INSERT OR REPLACE re-inserts at the default 0. Every path that
         # places bytes in the cache writes the row after the bytes are in
         # place: a fetch, a streaming finalize, a create, a write, a
-        # recompute over an existing CLEAN row (record_cached_stat). The
+        # recompute over an existing CLEAN row (mark_file_dirty). The
         # access batch's UPDATE that follows an open counts as a row write
         # too, so any path that writes no row itself is re-admitted by it.
         # The clear terminates whether or not recursive_triggers is on: its
