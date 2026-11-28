@@ -6,6 +6,7 @@ import logging
 import os
 import socket
 import stat
+import sys
 import tempfile
 import threading
 from pathlib import Path
@@ -20,6 +21,7 @@ from storage.control import (
     MAX_REQUEST_BYTES,
     ControlError,
     ControlServer,
+    _check_peer,
     canonical_mountpoint,
     request_control_payload,
 )
@@ -240,6 +242,95 @@ def test_cli_identifies_and_connects_through_one_cache_open(cache, monkeypatch):
         assert fds_open_on(cache) == [server._cache_fd]
     finally:
         server.stop()
+
+
+def other_uid_in(function_name):
+    """geteuid() as seen from `function_name` only: another user's uid."""
+    real = os.geteuid()
+
+    def geteuid():
+        return real + 1 if sys._getframe(1).f_code.co_name == function_name else real
+
+    return geteuid
+
+
+def test_check_peer_refuses_another_users_peer(monkeypatch):
+    left, right = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    with left, right:
+        _check_peer(left)  # Same user: accepted.
+        other = os.geteuid() + 1
+        monkeypatch.setattr("storage.control.os.geteuid", lambda: other)
+        with pytest.raises(ControlError, match="not the mount owner"):
+            _check_peer(left)
+
+
+def test_server_drops_a_peer_that_is_not_the_mount_owner(cache, monkeypatch):
+    dispatched = []
+    server = server_for(cache, lambda frame: dispatched.append(frame) or {"served": True})
+    server.start()
+    try:
+        # Applied after start: publication checks ownership too.
+        monkeypatch.setattr("storage.control.os.geteuid", other_uid_in("_check_peer"))
+        with socket_for(cache) as conn:
+            conn.sendall(b"status\n")
+            try:
+                answer = conn.recv(4096)
+            except ConnectionResetError:
+                answer = b""  # Closed with our request unread.
+            assert answer == b""
+        assert dispatched == []
+        monkeypatch.undo()
+        assert request_control_payload(cache, b"status", 2) == {"served": True}
+        assert dispatched == ["status"]
+    finally:
+        monkeypatch.undo()
+        server.stop()
+
+
+def raw_listener(path):
+    """A plain listener owned by this user, recording what reaches it."""
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(path))
+    listener.listen(4)
+    listener.settimeout(0.2)
+    return listener
+
+
+def accepted(listener):
+    try:
+        conn, _ = listener.accept()
+    except socket.timeout:
+        return None
+    with conn:
+        conn.settimeout(2)
+        return conn.recv(4096)
+
+
+def test_client_refuses_a_peer_that_is_not_the_mount_owner(cache, monkeypatch):
+    with raw_listener(cache / CONTROL_SOCKET_NAME) as listener:
+        monkeypatch.setattr("storage.control.os.geteuid", other_uid_in("_check_peer"))
+        with pytest.raises(ControlError, match="not the mount owner"):
+            request_control_payload(cache, b"status", 2)
+        # Connected (the check needs a peer), but nothing was sent.
+        assert accepted(listener) == b""
+
+
+@pytest.mark.parametrize("entry", ["symlink", "file", "fifo"])
+def test_client_refuses_a_control_entry_that_is_not_our_socket(cache, entry):
+    elsewhere = cache / "elsewhere"
+    elsewhere.mkdir()
+    with raw_listener(elsewhere / "live.sock") as listener:
+        path = cache / CONTROL_SOCKET_NAME
+        if entry == "symlink":
+            path.symlink_to(elsewhere / "live.sock")
+        elif entry == "file":
+            path.write_text("not a socket")
+        else:
+            os.mkfifo(path)
+        with pytest.raises(ControlError, match="Expected a mount control socket owned by this user"):
+            request_control_payload(cache, b"status", 2)
+        # Refused before connecting: the live socket behind the link saw nothing.
+        assert accepted(listener) is None
 
 
 def test_never_replaces_arbitrary_entries(cache):
