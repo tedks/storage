@@ -80,6 +80,18 @@ class TestCacheMetadata(unittest.TestCase):
         self.assertEqual(cached_member_attributes(path, path.stat())["st_mode"],
                          stat.S_IFREG | 0o755)
 
+    def test_agreeing_confirmation_keeps_the_probes_atime(self):
+        from storage.cache_metadata import confirm_member_stat
+        probe = SimpleNamespace(st_size=4, st_mode=stat.S_IFREG | 0o644, st_mtime=1_000_000_000,
+                                st_atime=900_000_000, st_uid=1, st_gid=2)
+        after = SimpleNamespace(st_size=4, st_mode=stat.S_IFREG | 0o644, st_mtime=1_000_000_000,
+                                st_atime=1_700_000_000, st_uid=3, st_gid=4)
+        backend = SimpleNamespace(stat=lambda path: after)
+        confirmed, agreed = confirm_member_stat(backend, "/f", probe, 4)
+        self.assertTrue(agreed)
+        self.assertEqual((confirmed.st_atime, confirmed.st_uid, confirmed.st_gid),
+                         (900_000_000, 3, 4))
+
     def test_native_record_is_empty_and_keeps_an_existing_one(self):
         path = self.cache_root / "made-here"
         path.write_bytes(b"file")

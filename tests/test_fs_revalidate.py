@@ -676,6 +676,40 @@ class TestFillConfirmsMemberVersion(RevalidateTestBase):
                 self.fs.cache_manager.delete_cached_file("/f.txt")
                 self.fs.state_manager.delete_file("/f.txt")
 
+    def test_second_transfer_is_the_baseline(self):
+        src = self.rewrite_member("f.txt", b"original", mtime=1_000_000_000)
+
+        def change():
+            src.write_bytes(b"newbytes")
+            os.utime(src, (1_100_000_000, 1_100_000_000))
+
+        patcher, calls = self.rewrite_during_first_copy(change)
+        with patcher:
+            self.read_through("/f.txt")
+        self.assertEqual(self.fs._member_checks["/f.txt"].members, {"member": (8, 1_100_000_000)})
+        self.age_checks()
+        with self.count_fetches() as fetches:
+            self.assertEqual(self.read_through("/f.txt"), b"newbytes")
+        self.assertEqual(fetches.call_count, 0)  # the baseline matched: no needless refetch
+
+    def test_failed_confirmations_with_another_size_keep_no_member_attributes(self):
+        self.rewrite_member("f.txt", b"original", mtime=1_000_000_000)
+        probe = SimpleNamespace(st_size=99, st_mode=stat.S_IFREG | 0o644, st_mtime=1_200_000_000)
+        seen = []
+
+        def stat_once(path):
+            seen.append(path)
+            if len(seen) == 1:
+                return probe
+            raise OSError(errno.EIO, "stat failed")
+
+        with patch.object(self.member, "stat", side_effect=stat_once), \
+                patch.object(self.member, "get_size", return_value=99):
+            self.assertEqual(self.read_through("/f.txt"), b"original")
+        attrs = self.fs.getattr("/f.txt")
+        self.assertNotEqual(attrs["st_mtime"], 1_200_000_000)
+        self.assertEqual(attrs["st_mode"] & 0o222, 0)  # fails closed
+
     def test_transfer_of_another_size_than_the_stat_is_fetched_again(self):
         self.rewrite_member("f.txt", b"original", mtime=1_000_000_000)
         fake = SimpleNamespace(st_size=99, st_mode=stat.S_IFREG | 0o600, st_mtime=1_200_000_000)
@@ -1491,8 +1525,9 @@ class TestRevalidateStreamedFetch(RevalidateTestBase):
         self.fail(f"no baseline recorded for {path}")
 
     def test_member_change_mid_stream_is_refetched(self):
-        # The baseline is the stat taken when the stream started, so bytes
-        # that mix the old and new versions never match it.
+        # The member's stat at the end no longer matches the one taken when
+        # the stream started, so bytes that mix the old and new versions are
+        # never installed: the next open fetches the file again.
         old = os.urandom(3 * 4096 + 17)
         new = os.urandom(len(old))
         self.rewrite_member("m.bin", old, mtime=1_700_000_000)
@@ -1509,12 +1544,17 @@ class TestRevalidateStreamedFetch(RevalidateTestBase):
         with patch.object(self.member, "read_file", side_effect=read_then_change):
             # Read it all, so the stream finishes (keep-after-close).
             mixed = self.read_through("/m.bin")
-            check = self._wait_for_baseline("/m.bin")
+            stats = self.fs._streaming_manager._streaming_stats
+            deadline = time.monotonic() + 10
+            while (time.monotonic() < deadline
+                   and not stats.get("streaming_member_changed_discards")):
+                time.sleep(0.05)
         # The first range came from the old version, the rest from the new.
         self.assertNotEqual(new, mixed)
-        self.assertEqual({"member": (len(old), 1_700_000_000.0)}, check.members)
-        self.age_checks()
+        self.assertEqual(stats.get("streaming_member_changed_discards"), 1)
+        self.assertFalse((self.cache_dir / "m.bin").exists())
         self.assertEqual(new, self.read_through("/m.bin"))
+        self.assertEqual(self.fs.getattr("/m.bin")["st_mtime"], 1_600_000_000)
 
 
 class TestRevalidateStreamBail(RevalidateTestBase):

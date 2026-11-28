@@ -169,29 +169,68 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.fs.release("/nomode.bin", self.fs.open("/nomode.bin", os.O_WRONLY))
         self.assertTrue(stat_module.S_ISREG(attrs["st_mode"]))
 
-    def test_streaming_fill_of_a_member_changed_since_its_probe_is_rechecked(self):
-        from types import SimpleNamespace
-        payload = os.urandom(64 * 1024)
+    def _stream_and_finish(self, name, size):
+        """Read name whole through a stream and wait for its session to end."""
+        vfd = self.fs.open("/" + name, os.O_RDONLY)
+        with self.fs._fd_lock:
+            session = self.fs._fd_map[vfd].prefetch_session
+        self.assertIsNotNone(session)
+        try:
+            data = self.fs.read("/" + name, size, 0, vfd)
+            self.assertTrue(self._wait_for(
+                lambda: session.finalized or session.error is not None, timeout=8.0))
+        finally:
+            self.fs.release("/" + name, vfd)
+        return data, session
+
+    def test_streaming_fill_of_a_member_changed_since_its_probe_is_discarded(self):
+        old, new = b"o" * (64 * 1024), b"n" * (64 * 1024)
         member = self.backend_dir / "moved.bin"
-        member.write_bytes(payload)
+        member.write_bytes(old)
         os.utime(member, (1_600_000_000, 1_600_000_000))
-        probe = self.backend.stat("/moved.bin")
-        later = SimpleNamespace(st_size=probe.st_size, st_mtime=1_650_000_000.0,
-                                st_mode=probe.st_mode)
-        # The probe at open, then the member (same size) at finalize.
-        with patch.object(self.backend, "stat", side_effect=[probe, later, later, later]):
-            data, cache_path = self._stream_whole("moved.bin", len(payload))
-        self.assertEqual(data, payload)
-        # The member's newest genuine mtime, never a local one.
-        self.assertEqual(cache_path.stat().st_mtime, 1_650_000_000)
+        real_stat, calls = self.backend.stat, []
+
+        def stat(path):
+            calls.append(path)
+            if len(calls) == 2:  # the confirmation at finalize: replaced meanwhile
+                member.write_bytes(new)
+                os.utime(member, (1_650_000_000, 1_650_000_000))
+            return real_stat(path)
+
+        with patch.object(self.backend, "stat", side_effect=stat):
+            data, session = self._stream_and_finish("moved.bin", len(old))
+        self.assertEqual(data, old)  # the reader kept its bytes
+        cache_path = self.cache_dir / "moved.bin"
+        self.assertFalse(cache_path.exists())  # nothing pairs 1_650_000_000 with old bytes
+        self.assertFalse((self.cache_dir / "moved.bin.storage.partial").exists())
+        self.assertEqual(self.fs._streaming_manager._streaming_stats.get(
+            "streaming_member_changed_discards"), 1)
+        # A reopen fetches the replacement; stat and fstat report its mtime.
+        self.assertEqual(self._stream_whole("moved.bin", len(new))[0], new)
         self.assertEqual(self.fs.getattr("/moved.bin")["st_mtime"], 1_650_000_000)
         with open(cache_path, "rb") as f:
-            self.assertEqual(os.fstat(f.fileno()).st_mtime, 1_650_000_000)
-        # The install owes a recheck against the probe, due at the next open.
-        self.assertTrue(self._wait_for(
-            lambda: "backend" in self.fs._recheck.get("/moved.bin", ()), timeout=5.0))
-        check = self.fs._member_checks["/moved.bin"]
-        self.assertEqual(check.verified_at, float("-inf"))
+            self.assertEqual((f.read(), os.fstat(f.fileno()).st_mtime), (new, 1_650_000_000))
+
+    def test_interrupted_confirmation_fails_the_session_and_wakes_readers(self):
+        from storage.backends.ssh_pool import BulkCapacityTimeout
+        payload = os.urandom(64 * 1024)
+        (self.backend_dir / "cut.bin").write_bytes(payload)
+        real_stat, calls = self.backend.stat, []
+
+        def stat(path):
+            calls.append(path)
+            if len(calls) >= 2:
+                raise BulkCapacityTimeout("no capacity")
+            return real_stat(path)
+
+        with patch.object(self.backend, "stat", side_effect=stat):
+            data, session = self._stream_and_finish("cut.bin", len(payload))
+        self.assertEqual(data, payload)
+        self.assertIsInstance(session.error, OSError)
+        self.assertEqual(session.error.errno, errno.EAGAIN)
+        # Not installed as a confirmed fill: the failed session's usual
+        # cleanup applies (at most an unindexed prefix, refetched on open).
+        self.assertIsNone(self.fs.state_manager.get_file_metadata("/cut.bin"))
 
     def test_streaming_open_uses_cached_file_without_prefetch_session(self):
         payload = os.urandom(128 * 1024)

@@ -473,7 +473,6 @@ class StorageFS(Operations):
             on_finalized=lambda session: self._record_fetched(
                 session.canonical_path, session.final_cache_path,
                 session.backend, session.member_stat,
-                owe_recheck=not session.member_confirmed,
             ),
             partial_suffix=self._PARTIAL_SUFFIX,
             stream_state_xattr=self._STREAM_STATE_XATTR,
@@ -1533,7 +1532,7 @@ class StorageFS(Operations):
                     self.logger.debug("could not persist member baseline: %r", exc)
 
     def _record_fetched(self, canonical_path: str, cache_path: Path, backend: Backend,
-                        member_stat: Optional[os.stat_result], owe_recheck: bool = False):
+                        member_stat: Optional[os.stat_result]):
         """A full fetch from backend just finished; member_stat was taken before it.
 
         Stat before copy: a change landing in between leaves a baseline older
@@ -1545,10 +1544,6 @@ class StorageFS(Operations):
         then land after the FUSE thread's own refetch of the same path and
         install the older stream-start baseline over the newer one. That is
         conservative: the next check sees a difference and refetches once.
-
-        owe_recheck: the member no longer reported member_stat's version
-        after the transfer, so the next open checks it against that
-        baseline whatever its age, and refetches.
         """
         try:
             identity = self._cache_identity(os.lstat(str(cache_path)))
@@ -1563,13 +1558,6 @@ class StorageFS(Operations):
         self._clear_recheck(canonical_path, backend.name)
         with self._member_checks_lock:
             self._revalidate_unreachable.pop(canonical_path, None)
-            if owe_recheck:
-                self._recheck.setdefault(canonical_path, set()).add(backend.name)
-                check = self._member_checks.get(canonical_path)
-                if check is not None:
-                    # Due now, whatever the age: the next open checks and refetches.
-                    self._member_checks[canonical_path] = dataclasses.replace(
-                        check, verified_at=float("-inf"))
 
     def _record_member_written(self, virtual_path: str, backend: Backend, cache_path: Path,
                                checksum: Optional[str] = None):
@@ -2069,14 +2057,17 @@ class StorageFS(Operations):
                 except Exception:
                     member_stat = None
             # Download to cache
+            confirmed: list = []
             outcome = self.cache_manager.cache_file_result(
                 resolved.requested_path, backend, canonical_path, member_stat=member_stat,
+                confirmed=confirmed,
             )
             if outcome == CacheFetch.ALREADY_CACHED and self._drop_unindexed_prefix(canonical_path, cache_path):
                 # A failed stream's prefix was installed before this copy
                 # (whose link then found it): once more, for the whole file.
                 outcome = self.cache_manager.cache_file_result(
                     resolved.requested_path, backend, canonical_path, member_stat=member_stat,
+                    confirmed=confirmed,
                 )
             if outcome == CacheFetch.ALREADY_CACHED:
                 # A stream or a writer won. Their inode, source baseline
@@ -2084,7 +2075,11 @@ class StorageFS(Operations):
                 return True
             if outcome == CacheFetch.INSTALLED:
                 # Fresh from the member: no check needed until revalidate_after.
-                self._record_fetched(canonical_path, cache_path, backend, member_stat)
+                # The baseline is the stat the copy was confirmed against (the
+                # newer one after a second transfer); unconfirmed, the probe,
+                # so the next check refetches.
+                self._record_fetched(canonical_path, cache_path, backend,
+                                     confirmed[-1] if confirmed else member_stat)
                 # Populate state metadata and locations if missing
                 try:
                     st = os.lstat(str(cache_path))

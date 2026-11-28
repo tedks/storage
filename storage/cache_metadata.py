@@ -7,6 +7,7 @@ import os
 import stat
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Callable, Iterator, List, Optional
 
 from .file_config import get_inherited_config
@@ -68,14 +69,16 @@ def confirm_member_stat(backend, virtual_path: str, probe, transferred_size: int
 
     The member is stat'ed again after the transfer. When that stat reports
     the probe's size, mtime and mode, the transfer read that version and the
-    newer stat's genuine attributes are recorded (agreed). A disagreement,
-    even a mode-only change, still records the newer stat's genuine
-    attributes, never local ones, but agreed is False: the caller refetches
-    or forces a recheck against the probe baseline. A stat that raises is
-    retried once; if it fails again the probe's attributes are used when
-    the transfer's size matches them. A transfer of another size than the
-    stat reports is a disagreement too. BulkCapacityCancelled and
-    BulkCapacityTimeout propagate: an interrupted request is not a fill.
+    newer stat's genuine attributes are recorded (agreed), with the probe's
+    atime: the confirming stat's may be the transfer's own read. A
+    disagreement, even a mode-only change, returns the newer stat with
+    agreed False, for the caller to refetch (full fill) or discard
+    (streaming). A stat that raises is retried once; if it fails again the
+    probe is used when the transfer's size matches it, and otherwise no
+    member attributes at all (None: the fill fails closed on mode). A
+    transfer of another size than the stat reports is a disagreement too.
+    BulkCapacityCancelled and BulkCapacityTimeout propagate: an
+    interrupted request is not a fill.
     """
     from .backends.ssh_pool import BulkCapacityCancelled, BulkCapacityTimeout
 
@@ -89,7 +92,9 @@ def confirm_member_stat(backend, virtual_path: str, probe, transferred_size: int
         except Exception:  # noqa: BLE001 - retried once, then the probe stands
             after = None
     if after is None:
-        return probe, getattr(probe, "st_size", None) == transferred_size
+        if getattr(probe, "st_size", None) == transferred_size:
+            return probe, True
+        return None, False
     if probe is None:
         # Nothing taken before the transfer to compare against.
         return after, getattr(after, "st_size", None) == transferred_size
@@ -99,7 +104,14 @@ def confirm_member_stat(backend, virtual_path: str, probe, transferred_size: int
               and _member_mtime_ns(probe) is not None
               and _member_mtime_ns(after) == _member_mtime_ns(probe)
               and getattr(after, "st_mode", None) == getattr(probe, "st_mode", None))
-    return after, agreed
+    if not agreed:
+        return after, False
+    fields = {key: getattr(after, key, None) for key in (
+        "st_mode", "st_uid", "st_gid", "st_nlink", "st_ctime", "st_size",
+        "st_mtime", "st_mtime_ns")}
+    fields["st_atime"] = getattr(probe, "st_atime", None)
+    fields["st_atime_ns"] = getattr(probe, "st_atime_ns", None)
+    return SimpleNamespace(**fields), True
 
 
 def copy_member_attributes(fd: int, source) -> None:

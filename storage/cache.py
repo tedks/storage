@@ -460,7 +460,7 @@ class CacheManager:
 
     def cache_file_result(
         self, virtual_path: str, backend: Backend, source_virtual_path: str = None,
-        *, member_stat=_STAT_NOT_PROBED,
+        *, member_stat=_STAT_NOT_PROBED, confirmed: Optional[list] = None,
     ) -> CacheFetch:
         """
         Download a file from backend into cache
@@ -476,6 +476,8 @@ class CacheManager:
             backend: Backend to download from
             source_virtual_path: Virtual path to read from backend (defaults to virtual_path)
             member_stat: Pre-transfer probe, or None for a failed probe. If omitted, probe here.
+            confirmed: A list that gets the member stat an installed copy was
+                confirmed against (see fetch_into_cache), for the caller's baseline.
 
         Returns:
             Whether this copy was installed, another copy won, or the fetch failed.
@@ -501,6 +503,7 @@ class CacheManager:
         try:
             installed = self.fetch_into_cache(
                 backend, source_virtual_path, self.get_cache_path(virtual_path), member_stat,
+                confirmed=confirmed,
             )
             self.state_manager.update_access_time(virtual_path)
             return CacheFetch.INSTALLED if installed else CacheFetch.ALREADY_CACHED
@@ -514,7 +517,7 @@ class CacheManager:
                 self._reserved_bytes -= file_size
 
     def fetch_into_cache(self, backend: Backend, source_virtual_path: str, cache_path: Path,
-                         member_stat=None) -> bool:
+                         member_stat=None, *, confirmed: Optional[list] = None) -> bool:
         """Copy a member file to cache_path through a temp file beside it.
 
         The copy runs without the cache lock into a fresh name that ends in
@@ -528,7 +531,9 @@ class CacheManager:
         No space is reserved here (cache_file does that).
 
         Returns True when this copy was installed, False when a file was
-        already there and this copy was discarded. Raises what the copy or
+        already there and this copy was discarded. When installed, a given
+        confirmed list gets the stat the transfer was confirmed against
+        (cache_metadata.confirm_member_stat), if it was. Raises what the copy or
         the link raised (FileExistsError when something other than a
         regular file is there), with the temp file removed.
         """
@@ -556,14 +561,14 @@ class CacheManager:
                 # fetch once more against it; a second disagreement keeps the
                 # newest attributes, and the caller's baseline (the first
                 # probe) makes the next revalidation refetch.
-                confirmed, agreed = confirm_member_stat(
+                newest, agreed = confirm_member_stat(
                     backend, source_virtual_path, member_stat, st.st_size)
                 if agreed or member_stat is None:
                     break  # (no probe: a second transfer confirms nothing more)
-                member_stat = confirmed
+                member_stat = newest
             fd = os.open(temp_path, os.O_RDONLY | os.O_NOFOLLOW)
             try:
-                copy_member_attributes(fd, confirmed)
+                copy_member_attributes(fd, newest)
                 size = os.fstat(fd).st_size
             finally:
                 os.close(fd)
@@ -575,6 +580,8 @@ class CacheManager:
                         raise
                     return False
                 self._current_size_bytes += size
+            if agreed and newest is not None and confirmed is not None:
+                confirmed.append(newest)
             return True
         except BaseException:
             # Whatever the copy wrote may have been counted by a rescan,
