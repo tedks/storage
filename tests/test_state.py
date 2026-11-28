@@ -37,24 +37,35 @@ class TestStateAccessUpdates(unittest.TestCase):
         self.state_manager.close()
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
-    def test_access_updates_are_debounced(self):
+    def test_access_updates_keep_the_latest_read_without_committing_each_time(self):
         self.state_manager.ACCESS_FLUSH_INTERVAL_SECONDS = 9999.0
         self.state_manager.ACCESS_FLUSH_BATCH_SIZE = 9999
-        self.state_manager.ACCESS_DEBOUNCE_SECONDS = 1.0
+        old_access = self.state_manager.get_file_metadata("/a.txt").last_access
+        first = old_access + 1.0
+        latest = first + 0.125
 
-        self.state_manager.update_access_time("/a.txt")
-        pending_first = dict(self.state_manager._pending_access_updates)
-        self.assertIn("/a.txt", pending_first)
+        self.state_manager.update_access_time("/a.txt", accessed_at=first)
+        self.state_manager.update_access_time("/a.txt", accessed_at=latest)
+        self.assertEqual(self.state_manager.get_file_metadata("/a.txt").last_access, old_access)
 
-        # This should be ignored by debounce window.
-        self.state_manager.update_access_time("/a.txt")
-        pending_second = dict(self.state_manager._pending_access_updates)
-        self.assertEqual(pending_first, pending_second)
+        list(self.state_manager.iter_lru_paths())
+        self.assertEqual(self.state_manager.get_file_metadata("/a.txt").last_access, latest)
+
+    def test_stale_metadata_and_late_access_batches_keep_newer_access(self):
+        snapshot = self.state_manager.get_file_metadata("/a.txt")
+        newer = snapshot.last_access + 2.0
+        self.state_manager.update_access_time("/a.txt", accessed_at=newer)
+        list(self.state_manager.iter_lru_paths())
+
+        self.state_manager.set_file_metadata(snapshot)
+        self.assertEqual(self.state_manager.get_file_metadata("/a.txt").last_access, newer)
+        self.state_manager.update_access_time("/a.txt", accessed_at=newer - 1.0)
+        list(self.state_manager.iter_lru_paths())
+        self.assertEqual(self.state_manager.get_file_metadata("/a.txt").last_access, newer)
 
     def test_access_updates_flush_in_batch(self):
         self.state_manager.ACCESS_FLUSH_INTERVAL_SECONDS = 9999.0
         self.state_manager.ACCESS_FLUSH_BATCH_SIZE = 2
-        self.state_manager.ACCESS_DEBOUNCE_SECONDS = 0.0
 
         old_a = self.state_manager.get_file_metadata("/a.txt").last_access
         old_b = self.state_manager.get_file_metadata("/b.txt").last_access
@@ -74,7 +85,6 @@ class TestStateAccessUpdates(unittest.TestCase):
     def test_close_flushes_pending_access_updates(self):
         self.state_manager.ACCESS_FLUSH_INTERVAL_SECONDS = 9999.0
         self.state_manager.ACCESS_FLUSH_BATCH_SIZE = 9999
-        self.state_manager.ACCESS_DEBOUNCE_SECONDS = 0.0
 
         old_a = self.state_manager.get_file_metadata("/a.txt").last_access
         self.state_manager.update_access_time("/a.txt")
@@ -431,11 +441,12 @@ class TestDirtyGeneration(unittest.TestCase):
         row = self.state_manager.get_file_metadata("/f.txt")
 
         self.assertTrue(self.state_manager.record_cached_stat(
-            "/f.txt", row.dirty_generation, size=42, last_modified=7.0, last_access=8.0,
+            "/f.txt", row.dirty_generation, size=42, last_modified=7.0,
         ))
 
         updated = self.state_manager.get_file_metadata("/f.txt")
-        self.assertEqual((updated.size, updated.last_modified, updated.last_access), (42, 7.0, 8.0))
+        self.assertEqual((updated.size, updated.last_modified), (42, 7.0))
+        self.assertEqual(updated.last_access, row.last_access)
         self.assertEqual(updated.sync_status, SyncStatus.CLEAN)
         self.assertEqual(updated.checksum, "synced")
         self.assertEqual(updated.dirty_generation, row.dirty_generation)
@@ -446,7 +457,7 @@ class TestDirtyGeneration(unittest.TestCase):
         self.state_manager.mark_dirty("/f.txt", size=10, last_modified=2.0)
 
         self.assertFalse(self.state_manager.record_cached_stat(
-            "/f.txt", row.dirty_generation, size=42, last_modified=7.0, last_access=8.0,
+            "/f.txt", row.dirty_generation, size=42, last_modified=7.0,
         ))
 
         updated = self.state_manager.get_file_metadata("/f.txt")
@@ -568,3 +579,315 @@ class TestMemberChecksums(unittest.TestCase):
             self.assertIsNotNone(state.get_member_checksum("/f", "m0"))
         finally:
             state.close()
+
+
+class TestCacheAbsentCandidacy(unittest.TestCase):
+    """The eviction scan's cache_absent column, its trigger and its index."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.state_manager = StateManager(str(Path(self.temp_dir) / "state.db"))
+
+    def tearDown(self):
+        self.state_manager.close()
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _row(self, path, *, size=3, last_access=1.0):
+        self.state_manager.set_file_metadata(FileMetadata(
+            virtual_path=path, size=size, checksum="c", last_access=last_access,
+            last_modified=1.0, sync_status=SyncStatus.CLEAN, replica_count=1,
+            recomputable=False, recompute_cmd=None, encrypted=False, encryption_key_id=None,
+        ))
+
+    def _absent(self, path):
+        row = self.state_manager.conn.execute(
+            'SELECT cache_absent FROM files WHERE virtual_path = ?', (path,),
+        ).fetchone()
+        return row['cache_absent']
+
+    def test_clearing_terminates_with_recursive_triggers_on(self):
+        conn = self.state_manager.conn
+        conn.execute('PRAGMA recursive_triggers = ON')
+        self.assertEqual(conn.execute('PRAGMA recursive_triggers').fetchone()[0], 1)
+        self._row("/a")
+        self.state_manager.mark_cache_absent(["/a"])
+        self.assertEqual(self._absent("/a"), 1)
+        # The trigger's own 1-to-0 update fails its WHEN, so it fires once.
+        self.state_manager.update_access_time("/a", accessed_at=5.0)
+        self.state_manager._flush_access_updates(force=True)
+        self.assertEqual(self._absent("/a"), 0)
+        self.assertEqual(self.state_manager.get_file_metadata("/a").last_access, 5.0)
+
+    def test_opening_the_index_keeps_marks_and_the_mount_reset_clears_them(self):
+        # A diagnostic open (verify-index) must not change the index; the
+        # mount's startup reset is what keeps a crash's mark from lasting.
+        self._row("/populated")
+        self.state_manager.mark_cache_absent(["/populated"])
+        db = self.state_manager.db_path
+        self.state_manager.close()
+        self.state_manager = StateManager(str(db))
+        self.assertEqual(self._absent("/populated"), 1)
+        self.assertEqual(list(self.state_manager.iter_lru_paths()), [])
+        self.state_manager.reset_cache_absent()
+        self.assertEqual(self._absent("/populated"), 0)
+        self.assertEqual(list(self.state_manager.iter_lru_paths()), ["/populated"])
+
+    def test_a_pass_clamps_future_access_times_and_reaches_those_rows(self):
+        future = time.time() + 3600.0
+        self._row("/ahead", last_access=future)
+        self._row("/now", last_access=time.time() - 1.0)
+        self.assertEqual(list(self.state_manager.iter_lru_paths()), ["/now", "/ahead"])
+        clamped = self.state_manager.get_file_metadata("/ahead").last_access
+        self.assertLess(clamped, future)
+        self.assertLessEqual(clamped, time.time())
+
+    def test_the_clamp_clears_a_mark_on_a_row_it_rewrites(self):
+        self._row("/ahead", last_access=time.time() + 3600.0)
+        self.state_manager.mark_cache_absent(["/ahead"])
+        self.assertEqual(list(self.state_manager.iter_lru_paths()), ["/ahead"])
+        self.assertEqual(self._absent("/ahead"), 0)
+
+    def test_the_clamp_uses_the_access_index(self):
+        plan = [tuple(row)[-1] for row in self.state_manager.conn.execute(
+            'EXPLAIN QUERY PLAN ' + StateManager._CLAMP_ACCESS_SQL, (1.0, 1.0),
+        )]
+        self.assertTrue(any("idx_last_access" in step for step in plan), plan)
+
+    def test_rows_read_through_the_model_ignore_unknown_columns(self):
+        self._row("/a")
+        conn = self.state_manager.conn
+        conn.execute('ALTER TABLE files ADD COLUMN some_future_column TEXT')
+        conn.commit()
+        self.assertEqual([m.virtual_path for m in self.state_manager.get_all_file_metadata()], ["/a"])
+        self.assertEqual([m.virtual_path for m in self.state_manager.iter_file_metadata()], ["/a"])
+
+    def test_a_pass_ends_although_busy_files_are_read_while_it_runs(self):
+        # Rows a guard skips as busy are read again whenever visited: each
+        # gets a newer flushed timestamp, past the page cursor.
+        sm = self.state_manager
+        sm.WRITE_BATCH_SIZE = 3
+        for i in range(sm.WRITE_BATCH_SIZE):
+            self._row(f"/busy-{i}", last_access=1.0 + i)
+        visits = []
+        for path in sm.iter_lru_paths():
+            visits.append(path)
+            self.assertLess(len(visits), 50, "the pass did not end")
+            sm.update_access_time(path)
+            sm._flush_access_updates(force=True)
+        self.assertEqual(visits, [f"/busy-{i}" for i in range(sm.WRITE_BATCH_SIZE)])
+
+    def test_a_backward_clock_step_mid_pass_cannot_keep_busy_rows_refilling_pages(self):
+        # After the first page the clock steps back below the bound but
+        # above the cursor, and readers keep stamping the busy rows at the
+        # current time, which lands them between the cursor and the bound.
+        sm = self.state_manager
+        sm.WRITE_BATCH_SIZE = 3
+        busy = [f"/busy-{i}" for i in range(3)]
+        for i, path in enumerate(busy):
+            self._row(path, last_access=1.0 + i)
+        start = 1_000_000.0
+        # Ahead of the pass start, so clamped to it, then reached after the step.
+        self._row("/late", last_access=start + 100.0)
+        readings = []
+
+        def clock():
+            n = len(readings)
+            # The pass start and the first page read the true time; then
+            # the clock steps back below the bound, above the cursor.
+            now = start + 0.001 * n if n < 2 else 500.0 + 0.001 * n
+            if n >= 2:  # readers stamp the busy rows at the current time
+                sm.conn.executemany(
+                    'UPDATE files SET last_access = ? WHERE virtual_path = ?',
+                    [(now, path) for path in busy],
+                )
+                sm.conn.commit()
+            readings.append(now)
+            self.assertLess(len(readings), 100, "the pass did not end")
+            return now
+
+        visits = []
+        with mock.patch("storage.state.time.time", side_effect=clock):
+            for path in sm.iter_lru_paths():
+                visits.append(path)
+                self.assertLess(len(visits), 50, "the pass did not end")
+                clock()  # the busy files are read again while the pass runs
+        # The rewind meets the busy rows once more, on the tie at the new
+        # bound; after that their stamps are above it. Nothing else repeats.
+        self.assertEqual(visits[-1], "/late")
+        self.assertEqual(visits.count("/late"), 1)
+        for path in busy:
+            self.assertLessEqual(visits.count(path), 2)
+
+    def test_marked_rows_leave_the_scan_and_the_model_ignores_the_column(self):
+        self._row("/a")
+        self._row("/b", last_access=2.0)
+        self.state_manager.mark_cache_absent(["/a"])
+        self.assertEqual(self._absent("/a"), 1)
+        self.assertEqual(list(self.state_manager.iter_lru_paths()), ["/b"])
+        self.assertEqual([m.virtual_path for m in self.state_manager.get_all_file_metadata()], ["/a", "/b"])
+        self.assertEqual(self.state_manager.get_file_metadata("/a").size, 3)
+
+    def test_remarking_a_marked_row_keeps_the_mark(self):
+        self._row("/a")
+        self.state_manager.mark_cache_absent(["/a"])
+        self.state_manager.mark_cache_absent(["/a"])
+        self.assertEqual(self._absent("/a"), 1)
+
+    def test_every_row_write_clears_the_mark(self):
+        sm = self.state_manager
+        writes = {
+            "upsert": lambda p: sm.set_file_metadata(sm.get_file_metadata(p)),
+            "mark_dirty": lambda p: sm.mark_dirty(p, size=4, last_modified=2.0),
+            "record_cached_stat": lambda p: sm.record_cached_stat(
+                p, sm.get_file_metadata(p).dirty_generation, size=3, last_modified=1.0),
+            "access_batch": lambda p: (sm.update_access_time(p, accessed_at=5.0),
+                                       sm._flush_access_updates(force=True)),
+            "publish_sync_status": lambda p: sm.publish_sync_status(
+                p, sm.get_file_metadata(p).dirty_generation, SyncStatus.CLEAN, checksum="d"),
+        }
+        for name, write in writes.items():
+            with self.subTest(write=name):
+                path = f"/{name}"
+                self._row(path)
+                sm.mark_cache_absent([path])
+                self.assertEqual(self._absent(path), 1)
+                write(path)
+                self.assertEqual(self._absent(path), 0)
+
+    def test_rename_clears_the_mark(self):
+        self._row("/old")
+        self.state_manager.mark_cache_absent(["/old"])
+        self.state_manager.rename_path("/old", "/new")
+        self.assertEqual(self._absent("/new"), 0)
+        self.assertEqual(list(self.state_manager.iter_lru_paths()), ["/new"])
+
+    def test_replace_index_starts_rows_unmarked(self):
+        self._row("/a")
+        self.state_manager.mark_cache_absent(["/a"])
+        snapshot = self.state_manager.get_all_file_metadata()
+        self.state_manager.replace_index(snapshot, [])
+        self.assertEqual(self._absent("/a"), 0)
+        self.state_manager.mark_cache_absent(["/a"])
+        self.state_manager.replace_index_from_entries((m, None) for m in snapshot)
+        self.assertEqual(self._absent("/a"), 0)
+
+    def test_eviction_page_uses_the_candidate_index(self):
+        plan = [tuple(row)[-1] for row in self.state_manager.conn.execute(
+            'EXPLAIN QUERY PLAN ' + StateManager._LRU_PAGE_SQL,
+            (SyncStatus.CLEAN.value, 0, 0.0, '', 1e12, 10),
+        )]
+        self.assertTrue(any("idx_cache_eviction_candidates" in step for step in plan), plan)
+        self.assertFalse(any("TEMP B-TREE" in step for step in plan), plan)
+
+    def test_eviction_newer_probe_seeks_the_candidate_index(self):
+        plan = [tuple(row)[-1] for row in self.state_manager.conn.execute(
+            'EXPLAIN QUERY PLAN ' + StateManager._LRU_NEWER_SQL,
+            (SyncStatus.CLEAN.value, 0, 1e12),
+        )]
+        self.assertTrue(any("idx_cache_eviction_candidates" in step and "last_access>?" in step
+                            for step in plan), plan)
+
+    def _page_steps(self):
+        steps = [0]
+
+        def count():
+            steps[0] += 1
+            return 0
+
+        conn = self.state_manager.conn
+        conn.set_progress_handler(count, 1)
+        try:
+            rows = conn.execute(StateManager._LRU_PAGE_SQL, (
+                SyncStatus.CLEAN.value, 0, float('-inf'), '', 1e12, StateManager.WRITE_BATCH_SIZE,
+            )).fetchall()
+        finally:
+            conn.set_progress_handler(None, 1)
+        return steps[0], [row['virtual_path'] for row in rows]
+
+    def test_eviction_page_does_not_visit_marked_or_empty_rows(self):
+        self._row("/live", last_access=10.0)
+        baseline, paths = self._page_steps()
+        self.assertEqual(paths, ["/live"])
+
+        conn = self.state_manager.conn
+        # Older than the live row, so a scan that visited them would meet
+        # them first.
+        conn.executemany(
+            '''INSERT INTO files (virtual_path, size, checksum, last_access, last_modified,
+               sync_status, replica_count, recomputable, recompute_cmd, encrypted,
+               encryption_key_id, dirty_generation, link_target, cache_absent)
+               VALUES (?, ?, 'c', 1.0, 1.0, 'clean', 1, 0, NULL, 0, NULL, 0, NULL, ?)''',
+            [(f"/marked-{i:05d}", 3, 1) for i in range(10000)]
+            + [(f"/empty-{i:05d}", 0, 0) for i in range(10000)],
+        )
+        conn.commit()
+        steps, paths = self._page_steps()
+        self.assertEqual(paths, ["/live"])
+        # A visit costs several VM steps per row; 20000 hidden rows would
+        # add tens of thousands.
+        self.assertLess(steps, baseline + 100, (baseline, steps))
+
+    def test_an_index_with_masters_schema_gains_the_column_index_and_trigger(self):
+        import sqlite3
+
+        db = str(Path(self.temp_dir) / "master.db")
+        conn = sqlite3.connect(db)
+        # master's files table: dirty_generation and link_target, no cache_absent.
+        conn.executescript('''
+            CREATE TABLE files (
+                virtual_path TEXT PRIMARY KEY,
+                size INTEGER NOT NULL,
+                checksum TEXT,
+                last_access REAL NOT NULL,
+                last_modified REAL NOT NULL,
+                sync_status TEXT NOT NULL,
+                replica_count INTEGER NOT NULL,
+                recomputable INTEGER NOT NULL,
+                recompute_cmd TEXT,
+                encrypted INTEGER NOT NULL,
+                encryption_key_id TEXT,
+                dirty_generation INTEGER NOT NULL DEFAULT 0,
+                link_target TEXT
+            );
+            INSERT INTO files VALUES ('/old.txt', 5, 'c', 1.0, 1.0, 'clean', 1, 0, NULL, 0, NULL, 0, NULL);
+        ''')
+        conn.commit()
+        conn.close()
+        opened = StateManager(db)
+        try:
+            columns = {row['name'] for row in opened.conn.execute('PRAGMA table_info(files)')}
+            self.assertIn("cache_absent", columns)
+            names = {row['name'] for row in opened.conn.execute('SELECT name FROM sqlite_master')}
+            self.assertIn("idx_cache_eviction_candidates", names)
+            self.assertIn("files_cache_absent_clear", names)
+            self.assertEqual(list(opened.iter_lru_paths()), ["/old.txt"])
+            opened.mark_cache_absent(["/old.txt"])
+            self.assertEqual(list(opened.iter_lru_paths()), [])
+            opened.set_file_metadata(opened.get_file_metadata("/old.txt"))
+            self.assertEqual(list(opened.iter_lru_paths()), ["/old.txt"])
+        finally:
+            opened.close()
+
+    def test_an_index_from_the_side_table_build_converges(self):
+        db = str(Path(self.temp_dir) / "old.db")
+        old = StateManager(db)
+        old.conn.executescript('''
+            DROP TRIGGER files_cache_absent_clear;
+            DROP INDEX idx_cache_eviction_candidates;
+            CREATE TABLE cache_absent (virtual_path TEXT PRIMARY KEY);
+            CREATE TRIGGER cache_absent_on_delete AFTER DELETE ON files
+            BEGIN DELETE FROM cache_absent WHERE virtual_path = OLD.virtual_path; END;
+            CREATE INDEX idx_cache_eviction ON files(sync_status, recomputable, last_access, virtual_path)
+            WHERE link_target IS NULL;
+        ''')
+        old.close()
+        reopened = StateManager(db)
+        try:
+            names = {row['name'] for row in reopened.conn.execute('SELECT name FROM sqlite_master')}
+            self.assertNotIn("cache_absent", names)
+            self.assertNotIn("cache_absent_on_delete", names)
+            self.assertNotIn("idx_cache_eviction", names)
+            self.assertIn("idx_cache_eviction_candidates", names)
+            self.assertIn("files_cache_absent_clear", names)
+        finally:
+            reopened.close()

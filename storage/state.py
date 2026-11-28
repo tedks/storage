@@ -14,6 +14,7 @@ import os
 import threading
 import sqlite3
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
@@ -32,7 +33,6 @@ class StateManager:
     """Manages file state in SQLite database"""
 
     XATTR_CONFIG_NAME = FILE_CONFIG_XATTR_NAME
-    ACCESS_DEBOUNCE_SECONDS = 0.25
     ACCESS_FLUSH_INTERVAL_SECONDS = 0.5
     ACCESS_FLUSH_BATCH_SIZE = 256
     WRITE_BATCH_SIZE = 1000
@@ -60,8 +60,12 @@ class StateManager:
     # (size, checksum, last_modified, sync_status) belong to the row's
     # dirty_generation: when the stored generation is newer than the one in
     # the incoming row, a write() landed after that row was read, and those
-    # columns keep the stored values. Policy columns and last_access always
-    # take the new values. Parameters are a _metadata_row tuple.
+    # columns keep the stored values. Policy columns take the new values;
+    # an older access timestamp never replaces a newer one. A timestamp
+    # taken ahead of the clock (a forward jump that is later corrected)
+    # would stick under MAX; each eviction pass clamps such timestamps to
+    # its start time (iter_lru_paths), so they cannot keep a file out of
+    # eviction. Parameters are a _metadata_row tuple.
     _UPSERT_FILES_SQL = '''
         INSERT INTO files
         (virtual_path, size, checksum, last_access, last_modified,
@@ -80,7 +84,7 @@ class StateManager:
             link_target = CASE WHEN files.dirty_generation > excluded.dirty_generation
                                THEN files.link_target ELSE excluded.link_target END,
             dirty_generation = MAX(files.dirty_generation, excluded.dirty_generation),
-            last_access = excluded.last_access,
+            last_access = MAX(files.last_access, excluded.last_access),
             replica_count = excluded.replica_count,
             recomputable = excluded.recomputable,
             recompute_cmd = excluded.recompute_cmd,
@@ -95,7 +99,6 @@ class StateManager:
         self._db_lock = threading.RLock()
         self._access_lock = threading.RLock()
         self._pending_access_updates: Dict[str, float] = {}
-        self._recent_access_updates: Dict[str, float] = {}
         self._last_access_flush_mono = time.monotonic()
         self._configure_connection()
         self._init_db()
@@ -216,6 +219,57 @@ class StateManager:
         # replicated.
         if 'link_target' not in columns:
             self.conn.execute('ALTER TABLE files ADD COLUMN link_target TEXT')
+        # cache_absent = 1: eviction found no regular cache file for the
+        # row, and nothing has written the row since. A hint for the
+        # eviction scan (iter_lru_paths), never the record of anything: a
+        # rebuilt index starts every row at 0, which costs one full scan.
+        # Not part of FileMetadata (from_dict keeps only its own fields).
+        # To roll an index back to a build without the column:
+        #   DROP INDEX idx_cache_eviction_candidates;
+        #   DROP TRIGGER files_cache_absent_clear;
+        #   ALTER TABLE files DROP COLUMN cache_absent;
+        if 'cache_absent' not in columns:
+            self.conn.execute(
+                'ALTER TABLE files ADD COLUMN cache_absent INTEGER NOT NULL DEFAULT 0'
+            )
+        # The side table and the first eviction index of this branch, never
+        # released; dropped so an index opened by that build converges.
+        self.conn.executescript('''
+            DROP TRIGGER IF EXISTS cache_absent_on_insert;
+            DROP TRIGGER IF EXISTS cache_absent_on_update;
+            DROP TRIGGER IF EXISTS cache_absent_on_delete;
+            DROP TABLE IF EXISTS cache_absent;
+            DROP INDEX IF EXISTS idx_cache_eviction;
+        ''')
+        # The predicate is exactly the scan's filters, so the scan reads
+        # only live candidates: marked and size-0 rows are not in it.
+        self.conn.execute('''
+            CREATE INDEX IF NOT EXISTS idx_cache_eviction_candidates
+            ON files(sync_status, recomputable, last_access, virtual_path)
+            WHERE link_target IS NULL AND size > 0 AND cache_absent = 0
+        ''')
+        # Any write to a marked row clears the mark, except the marking
+        # write itself (0 to 1, which this WHEN excludes) and this
+        # trigger's own clear (1 to 0). That covers the upsert's ON
+        # CONFLICT DO UPDATE (which leaves the column alone), mark_dirty,
+        # publish_sync_status, record_cached_stat, a rename's rewrite of
+        # virtual_path and the access batch's UPDATE of last_access. An
+        # INSERT OR REPLACE re-inserts at the default 0. Every path that
+        # places bytes in the cache writes the row after the bytes are in
+        # place: a fetch, a streaming finalize, a create, a write, a
+        # recompute over an existing CLEAN row (mark_file_dirty). The
+        # access batch's UPDATE that follows an open counts as a row write
+        # too, so any path that writes no row itself is re-admitted by it.
+        # The clear terminates whether or not recursive_triggers is on: its
+        # own 1-to-0 update fails the WHEN.
+        self.conn.execute('''
+            CREATE TRIGGER IF NOT EXISTS files_cache_absent_clear
+            AFTER UPDATE ON files
+            WHEN OLD.cache_absent = 1 AND NEW.cache_absent = 1
+            BEGIN
+                UPDATE files SET cache_absent = 0 WHERE rowid = NEW.rowid;
+            END
+        ''')
         self.conn.commit()
 
     def _flush_access_updates(self, force: bool = False):
@@ -236,7 +290,7 @@ class StateManager:
             rows = [(ts, path) for path, ts in self._pending_access_updates.items()]
             with self._db_lock:
                 self.conn.executemany(
-                    'UPDATE files SET last_access = ? WHERE virtual_path = ?',
+                    'UPDATE files SET last_access = MAX(last_access, ?) WHERE virtual_path = ?',
                     rows
                 )
                 self.conn.commit()
@@ -329,13 +383,11 @@ class StateManager:
         *,
         size: int,
         last_modified: float,
-        last_access: float,
     ) -> bool:
         """Bring a row's recorded stat up to a cache file that holds synced content.
 
-        For a refetch after eviction: the transfer does not keep the mtime,
-        and the row's stat must describe the file on disk or the file looks
-        like a lost write. Touches only size, last_modified and last_access,
+        After a refetch, the row's stat must describe the cached inode or
+        it will look like a lost write. Touches only the size and mtime,
         and only WHERE dirty_generation = `generation`, so a write recorded
         since the caller read the row is left alone. Returns whether it applied.
         """
@@ -343,10 +395,10 @@ class StateManager:
             cursor = self.conn.execute(
                 '''
                 UPDATE files
-                SET size = ?, last_modified = ?, last_access = ?
+                SET size = ?, last_modified = ?
                 WHERE virtual_path = ? AND dirty_generation = ?
                 ''',
-                (size, last_modified, last_access, virtual_path, generation),
+                (size, last_modified, virtual_path, generation),
             )
             self.conn.commit()
             return cursor.rowcount == 1
@@ -921,39 +973,171 @@ class StateManager:
                 return None
             offset += page
 
-    def update_access_time(self, virtual_path: str):
-        """Update last access time (for LRU)"""
-        now = time.time()
+    def update_access_time(self, virtual_path: str, *, accessed_at: Optional[float] = None):
+        """Coalesce demand accesses by path until the next batch write."""
+        now = time.time() if accessed_at is None else accessed_at
         with self._access_lock:
-            recent = self._recent_access_updates.get(virtual_path)
-            if recent is not None and (now - recent) < self.ACCESS_DEBOUNCE_SECONDS:
-                return
-
-            self._recent_access_updates[virtual_path] = now
-            self._pending_access_updates[virtual_path] = now
-        self._flush_access_updates(force=False)
-
-    def get_lru_files(self, limit: int = 100) -> List[FileMetadata]:
-        """Get least recently used files"""
-        self._flush_access_updates(force=True)
-        with self._db_lock:
-            cursor = self.conn.execute('''
-                SELECT * FROM files
-                WHERE sync_status = ? AND link_target IS NULL
-                ORDER BY last_access ASC
-                LIMIT ?
-            ''', (SyncStatus.CLEAN.value, limit))
-            rows = cursor.fetchall()
-        return [FileMetadata.from_dict(dict(row)) for row in rows]
-
-    def get_recomputable_files(self) -> List[FileMetadata]:
-        """Get all recomputable files"""
-        with self._db_lock:
-            cursor = self.conn.execute(
-                'SELECT * FROM files WHERE recomputable = 1 ORDER BY size ASC'
+            self._pending_access_updates[virtual_path] = max(
+                self._pending_access_updates.get(virtual_path, now), now,
             )
-            rows = cursor.fetchall()
-        return [FileMetadata.from_dict(dict(row)) for row in rows]
+        self._flush_access_updates()
+
+    @contextmanager
+    def eviction_metadata(self, virtual_path: str) -> Iterator[Optional[Tuple[FileMetadata, float]]]:
+        """Hold a candidate's row and effective access time stable during eviction.
+
+        Take the locks in flush order so a demand mark is visible either in
+        the pending batch or in the row, even if a flush just moved it.
+        """
+        with self._access_lock, self._db_lock:
+            row = self.get_file_metadata(virtual_path)
+            if row is None:
+                yield None
+            else:
+                pending = self._pending_access_updates.get(virtual_path, row.last_access)
+                yield row, max(row.last_access, pending)
+
+    def mark_cache_absent(self, virtual_paths: Iterable[str]):
+        """Mark rows whose cache file eviction found missing, in one commit.
+
+        Only rows not marked already: re-marking a marked row would be a
+        1-to-1 write, which the clearing trigger treats as a row write.
+        """
+        with self._db_lock:
+            self.conn.executemany(
+                'UPDATE files SET cache_absent = 1 WHERE virtual_path = ? AND cache_absent = 0',
+                [(path,) for path in virtual_paths],
+            )
+            self.conn.commit()
+
+    def reset_cache_absent(self):
+        """Make every row an eviction candidate again; the mount calls it at startup.
+
+        A mark commits before eviction's second stat, so a crash between
+        them could keep a mark on a file a fill placed meanwhile, whose row
+        then matches the file and is never written again. Clearing every
+        mark when a mount starts means a hint never outlives the mount that
+        set it, at the cost of one full scan. Opening the index does not
+        call this, so diagnostic commands leave the marks as they are.
+        """
+        self._execute_write('UPDATE files SET cache_absent = 0 WHERE cache_absent = 1')
+
+    def clear_cache_absent(self, virtual_paths: Iterable[str]):
+        with self._db_lock:
+            self.conn.executemany(
+                'UPDATE files SET cache_absent = 0 WHERE virtual_path = ? AND cache_absent = 1',
+                [(path,) for path in virtual_paths],
+            )
+            self.conn.commit()
+
+    _CLAMP_ACCESS_SQL = 'UPDATE files SET last_access = ? WHERE last_access > ?'
+
+    def _clamp_future_access(self, now: float):
+        """Bring access timestamps later than `now` down to it (idx_last_access)."""
+        with self._db_lock:
+            self.conn.execute(self._CLAMP_ACCESS_SQL, (now, now))
+            self.conn.commit()
+
+    _LRU_CANDIDATES_SQL = '''
+        FROM files
+        WHERE sync_status = ? AND recomputable = ?
+          AND link_target IS NULL AND size > 0 AND cache_absent = 0
+    '''
+    _LRU_PAGE_SQL = f'''
+        SELECT virtual_path, last_access {_LRU_CANDIDATES_SQL}
+          AND (last_access, virtual_path) > (?, ?) AND last_access <= ?
+        ORDER BY last_access ASC, virtual_path ASC
+        LIMIT ?
+    '''
+    _LRU_NEWER_SQL = f'''
+        SELECT 1 {_LRU_CANDIDATES_SQL}
+          AND last_access > ?
+        LIMIT 1
+    '''
+
+    def iter_lru_paths(self, *, recomputable: bool = False) -> Iterator[str]:
+        """Walk candidate paths in access order."""
+        for candidate in self.iter_lru_candidates(recomputable=recomputable):
+            if candidate is not None:
+                yield candidate[0]
+
+    def iter_lru_candidates(
+        self, *, recomputable: bool = False,
+    ) -> Iterator[Optional[Tuple[str, float]]]:
+        """Walk CLEAN regular-file candidates as (path, selected access time).
+
+        Yield None at exhaustion if the same index has a candidate past
+        the bound. Its access may have advanced before we reached its page.
+
+        The cache tree is authoritative for whether the bytes are present,
+        so evicted rows are walked too, except rows whose file eviction
+        already found missing and that nothing has written since
+        (cache_absent; see the trigger in _init_db, which counts the
+        access batch's UPDATE as a write). Rows of size 0 free nothing: an
+        evicted recomputable placeholder, an invalidated copy, or an empty
+        file. A file that grew under a size-0 CLEAN row is a stale CLEAN,
+        which the open path and the post-crash sweep heal; eviction would
+        only mark it dirty and keep it. The WHERE matches the predicate of
+        idx_cache_eviction_candidates, so each page reads only live
+        candidates. Page past missing and pinned paths without loading the
+        whole index.
+
+        A pass has an upper bound on last_access, first T0, taken after
+        the forced flush: a busy file read during the pass gets a newer
+        timestamp and would otherwise come back in a later page, again and
+        again while reads continue. A file read since the pass began is
+        recently used, so skipping it is right. Rows stamped above T0 (a
+        forward jump, or a backward step before the pass) are first
+        clamped to T0, so none is out of reach of the bound. The clamp
+        writes the rows it moves, so the trigger clears their cache_absent
+        marks, which costs one revisit.
+
+        Termination. Before each page query the clock is read again. If it
+        is below the bound (the clock stepped back), rows above it are
+        clamped down to it, the bound is lowered to it, and the cursor is
+        rewound to (bound, '') if it is past that, since the clamp can move
+        an unvisited row below the cursor. Between rewinds the cursor only
+        moves forward in (last_access, virtual_path) order, and a row comes
+        back only with a stamp in (cursor, bound]. A read stamped after a
+        page query is stamped at or above that query's clock reading, which
+        is at or above the bound, so it comes back only on an exact tie
+        (walked once, by path) or after a further backward step, and each
+        step lowers the bound once, at the next page. A read taken before a
+        query and flushed after it can come back once. So with the clock
+        running forward between steps, every page advances the cursor
+        through rows that cannot be refilled, and the pass ends. A row that
+        does come back is yielded again: one more stat and path try-lock,
+        which the caller handles like any other visit. Nothing is kept per
+        path, so a pass needs O(page) memory however many rows it walks
+        (the first pass after a mount starts can walk every row evicted
+        before, since startup clears the absence marks).
+        """
+        self._flush_access_updates(force=True)
+        bound = time.time()
+        self._clamp_future_access(bound)
+        cursor: Tuple[float, str] = (float('-inf'), '')
+        while True:
+            now = time.time()
+            if now < bound:
+                self._clamp_future_access(now)
+                bound = now
+                cursor = min(cursor, (bound, ''))
+            with self._db_lock:
+                rows = self.conn.execute(self._LRU_PAGE_SQL, (
+                    SyncStatus.CLEAN.value, int(recomputable), cursor[0], cursor[1],
+                    bound, self.WRITE_BATCH_SIZE,
+                )).fetchall()
+            for row in rows:
+                yield row['virtual_path'], row['last_access']
+            if len(rows) < self.WRITE_BATCH_SIZE:
+                with self._db_lock:
+                    newer = self.conn.execute(self._LRU_NEWER_SQL, (
+                        SyncStatus.CLEAN.value, int(recomputable), bound,
+                    )).fetchone()
+                if newer is not None:
+                    yield None
+                return
+            cursor = (rows[-1]['last_access'], rows[-1]['virtual_path'])
 
     def delete_file(self, virtual_path: str):
         """Delete file from state tracking"""
@@ -970,7 +1154,6 @@ class StateManager:
         """Replace the local index contents atomically."""
         with self._access_lock:
             self._pending_access_updates.clear()
-            self._recent_access_updates.clear()
 
         with self._db_lock:
             try:
@@ -1005,7 +1188,6 @@ class StateManager:
         """Replace the index from a streaming metadata/location entry source."""
         with self._access_lock:
             self._pending_access_updates.clear()
-            self._recent_access_updates.clear()
 
         with self._db_lock:
             try:

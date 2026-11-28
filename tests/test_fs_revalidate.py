@@ -394,7 +394,6 @@ class TestMemberAttributes(RevalidateTestBase):
         row = self.fs.state_manager.get_file_metadata("/f.txt")
         self.assertTrue(self.fs.state_manager.record_cached_stat(
             "/f.txt", row.dirty_generation, size=local.st_size, last_modified=local.st_mtime,
-            last_access=local.st_atime,
         ))
         self.fs.cache_manager.sync_cache_metadata(
             "/f.txt", self.fs.state_manager.get_file_metadata("/f.txt"),
@@ -607,7 +606,6 @@ class TestCreatedAndChangedFiles(RevalidateTestBase):
         row = self.fs.state_manager.get_file_metadata("/f.txt")
         self.assertTrue(self.fs.state_manager.record_cached_stat(
             "/f.txt", row.dirty_generation, size=local.st_size, last_modified=local.st_mtime,
-            last_access=local.st_atime,
         ))
         self.fs._store_member_check("/f.txt", cached, self.fs._cache_identity(local),
                                     {"member": (8, 1_000_000_000)}, replace=True)
@@ -1799,6 +1797,247 @@ class TestRevalidateFromListing(RevalidateTestBase):
         with self.count_stats() as stat:
             self.read_through("/f.txt")
         self.assertEqual(1, stat.call_count)
+
+class TestRecomputeRecordsStat(unittest.TestCase):
+    """A cache-miss recompute over a CLEAN size-0 row leaves its bytes evictable."""
+
+    def setUp(self):
+        self.temp_dir = Path(tempfile.mkdtemp())
+        self.cache_dir = self.temp_dir / "cache"
+        self.cache_dir.mkdir()
+        self.member_dir = self.temp_dir / "member"
+        self.member_dir.mkdir()
+        self.member = LocalBackend("member", str(self.member_dir))
+        self.fs = StorageFS(
+            cache_root=self.cache_dir, state_db=self.temp_dir / "state.db",
+            backends={"member": self.member}, cache_size=10 * 1024 * 1024,
+            start_sync=False,
+        )
+
+    def tearDown(self):
+        self.fs.sync_manager.stop()
+        self.fs.state_manager.close()
+        shutil.rmtree(self.temp_dir)
+
+    def _recompute(self, output, *, mtime=None):
+        cache_path = self.cache_dir / "derived.bin"
+
+        def run(virtual_path, path, timeout=None):
+            path.write_bytes(output)
+            if mtime is not None:  # like cp -p from a preserved copy
+                os.utime(path, (mtime, mtime))
+            return SimpleNamespace(success=True, output="", error="", duration=0.0, timed_out=False)
+
+        engine = self.fs.recompute_engine
+        with patch.object(engine, "can_recompute", return_value=True), \
+                patch.object(engine, "recompute_file", side_effect=run):
+            self.assertTrue(self.fs._ensure_file_in_cache(self.fs._resolve_path("/derived.bin")))
+        return cache_path
+
+    def _row(self, **changes):
+        self.fs.state_manager.set_file_metadata(dataclasses.replace(FileMetadata(
+            virtual_path="/derived.bin", size=0, checksum=None, last_access=1.0,
+            last_modified=0.0, sync_status=SyncStatus.CLEAN, replica_count=1,
+            recomputable=True, recompute_cmd="make", encrypted=False, encryption_key_id=None,
+        ), **changes))
+
+    def test_cache_miss_recompute_over_a_clean_row_is_recorded_dirty(self):
+        self._row()
+        before = self.fs.state_manager.get_file_metadata("/derived.bin")
+        cache_path = self._recompute(b"recomputed bytes")
+        st = cache_path.stat()
+        row = self.fs.state_manager.get_file_metadata("/derived.bin")
+        # Nothing says the command reproduced the members' bytes: no row
+        # stays CLEAN over different bytes, as the next open's heal would
+        # also decide.
+        self.assertEqual((row.sync_status, row.size, row.last_modified),
+                         (SyncStatus.DIRTY, st.st_size, st.st_mtime))
+        self.assertEqual(row.dirty_generation, before.dirty_generation + 1)
+        record = read_cache_metadata(cache_path)
+        self.assertEqual((record.sync_status, record.size), (SyncStatus.DIRTY, st.st_size))
+        self.assertEqual(list(self.fs.state_manager.iter_lru_paths(recomputable=True)), [])
+
+        # Once the sync publishes CLEAN, the new size makes it a candidate.
+        self.assertTrue(self.fs.state_manager.publish_sync_status(
+            "/derived.bin", row.dirty_generation, SyncStatus.CLEAN, checksum="synced"))
+        self.assertEqual(list(self.fs.state_manager.iter_lru_paths(recomputable=True)), ["/derived.bin"])
+        self.assertFalse(self.fs.cache_manager.heal_stale_clean("/derived.bin", cache_path))
+
+    def test_recompute_that_restores_the_recorded_stat_stays_clean(self):
+        output = b"preserved output"
+        self._row(size=len(output), last_modified=1_600_000_000.0, checksum="synced")
+        before = self.fs.state_manager.get_file_metadata("/derived.bin")
+        cache_path = self._recompute(output, mtime=1_600_000_000.0)
+        row = self.fs.state_manager.get_file_metadata("/derived.bin")
+        self.assertEqual((row.sync_status, row.dirty_generation, row.size, row.checksum),
+                         (SyncStatus.CLEAN, before.dirty_generation, len(output), "synced"))
+        self.assertEqual(cache_path.stat().st_mtime, row.last_modified)
+        self.assertEqual(list(self.fs.state_manager.iter_lru_paths(recomputable=True)), ["/derived.bin"])
+
+    def test_recompute_leaves_a_dirty_row_alone(self):
+        self._row(sync_status=SyncStatus.DIRTY, size=5, last_modified=2.0)
+        before = self.fs.state_manager.get_file_metadata("/derived.bin")
+        self._recompute(b"recomputed bytes")
+        row = self.fs.state_manager.get_file_metadata("/derived.bin")
+        self.assertEqual((row.size, row.last_modified, row.sync_status, row.dirty_generation),
+                         (5, 2.0, SyncStatus.DIRTY, before.dirty_generation))
+
+
+class TestEvictionAccessRace(RevalidateTestBase):
+    def _assert_eviction_rechecks_recent_read(self, *, flush):
+        hot, cold = "/hot.txt", "/cold.txt"
+        self.rewrite_member(hot[1:], b"hot")
+        self.rewrite_member(cold[1:], b"cold")
+        with patch("storage.fs.time.time", return_value=10.0):
+            fh = self.fs.open(hot, os.O_RDONLY)
+        state = self.fs.state_manager
+        cache = self.fs.cache_manager
+        real_guard = cache.path_guard
+
+        def read_and_release_before_guard(path):
+            if path == hot:
+                self.assertEqual(state.get_file_metadata(hot).last_access, 10.0)
+                with patch("storage.fs.time.time", return_value=40.0):
+                    self.assertEqual(self.fs.read(hot, 3, 0, fh), b"hot")
+                self.fs.release(hot, fh)
+                if flush:
+                    state._flush_access_updates(force=True)
+                self.assertEqual(state.get_file_metadata(hot).last_access, 40.0 if flush else 10.0)
+            return real_guard(path)
+
+        try:
+            with patch("storage.fs.time.time", return_value=20.0):
+                self.assertEqual(self.read_through(cold), b"cold")
+            # A one-row page selects hot first. Its demand read and release
+            # happen after that selection, before the real path guard.
+            with patch.object(state, "WRITE_BATCH_SIZE", 1), \
+                    patch.object(state, "ACCESS_FLUSH_INTERVAL_SECONDS", float("inf")), \
+                    patch.object(cache, "path_guard", side_effect=read_and_release_before_guard), \
+                    patch("storage.fs.time.time", return_value=30.0):
+                self.assertTrue(cache.evict_lru_files(1))
+        finally:
+            self.fs.release(hot, fh)
+
+        self.assertTrue((self.cache_dir / hot[1:]).is_file(), "evicted the newly accessed file")
+        self.assertFalse((self.cache_dir / cold[1:]).exists())
+
+    def test_eviction_rechecks_pending_access_after_selection(self):
+        self._assert_eviction_rechecks_recent_read(flush=False)
+
+    def test_eviction_rechecks_flushed_access_after_selection(self):
+        self._assert_eviction_rechecks_recent_read(flush=True)
+
+    def _evict_when_an_access_moves_past_the_page_bound(self, *, keep_touching):
+        pinned, hot, derived = "/pinned.txt", "/hot.txt", "/derived.txt"
+        for path, content in ((pinned, b"pinned"), (hot, b"hot"), (derived, b"derived")):
+            self.rewrite_member(path[1:], content)
+        cache = self.fs.cache_manager
+        state = self.fs.state_manager
+        real_guard = cache.path_guard
+        pinned_visits = 0
+
+        def read_during_first_page(path):
+            nonlocal pinned_visits
+            if path == pinned:
+                pinned_visits += 1
+                self.assertLessEqual(pinned_visits, 2, "eviction retried more than once")
+                if pinned_visits == 1 or keep_touching:
+                    fh = hot_fh if pinned_visits == 1 else self.fs.open(hot, os.O_RDONLY)
+                    clock.return_value += 10.0
+                    try:
+                        self.assertEqual(self.fs.read(hot, 3, 0, fh), b"hot")
+                    finally:
+                        self.fs.release(hot, fh)
+                    state._flush_access_updates(force=True)
+                    self.assertEqual(state.get_file_metadata(hot).last_access, clock.return_value)
+            return real_guard(path)
+
+        with patch("storage.fs.time.time", return_value=10.0) as clock:
+            pinned_fh = self.fs.open(pinned, os.O_RDONLY)
+            try:
+                clock.return_value = 20.0
+                hot_fh = self.fs.open(hot, os.O_RDONLY)
+                try:
+                    self.assertEqual(self.read_through(derived), b"derived")
+                    state.set_file_metadata(dataclasses.replace(
+                        state.get_file_metadata(derived), recomputable=True, recompute_cmd="true",
+                    ))
+                    cache.max_size_bytes = cache.get_total_cache_size()
+                    # Only the pinned row fits on page one. The read advances
+                    # hot's committed timestamp before its page can be fetched.
+                    clock.return_value = 30.0
+                    with patch.object(state, "WRITE_BATCH_SIZE", 1), \
+                            patch.object(cache, "path_guard", side_effect=read_during_first_page):
+                        self.assertTrue(cache.ensure_space(3))
+                finally:
+                    self.fs.release(hot, hot_fh)
+            finally:
+                self.fs.release(pinned, pinned_fh)
+
+        self.assertEqual((self.cache_dir / derived[1:]).read_bytes(), b"" if keep_touching else b"derived")
+        self.assertEqual((self.cache_dir / hot[1:]).exists(), keep_touching)
+        self.assertEqual(pinned_visits, 2)
+
+    def test_later_page_access_preserves_ordinary_tier_priority(self):
+        self._evict_when_an_access_moves_past_the_page_bound(keep_touching=False)
+
+    def test_later_page_access_causes_at_most_one_retry(self):
+        self._evict_when_an_access_moves_past_the_page_bound(keep_touching=True)
+
+    def test_pinned_tier_without_newer_rows_is_walked_once(self):
+        pinned = "/pinned.txt"
+        self.rewrite_member(pinned[1:], b"pinned")
+        fh = self.fs.open(pinned, os.O_RDONLY)
+        cache = self.fs.cache_manager
+        try:
+            with patch.object(cache, "path_guard", wraps=cache.path_guard) as guard:
+                self.assertFalse(cache.evict_lru_files(1))
+            guard.assert_called_once_with(pinned)
+        finally:
+            self.fs.release(pinned, fh)
+
+
+class TestMountStartupClearsEvictionHints(unittest.TestCase):
+    """A mark left by a crashed mount does not survive into the next one."""
+
+    def test_storage_fs_startup_clears_marks_left_in_the_index(self):
+        from storage.state import StateManager
+
+        temp_dir = Path(tempfile.mkdtemp())
+        try:
+            cache_dir = temp_dir / "cache"
+            cache_dir.mkdir()
+            member_dir = temp_dir / "member"
+            member_dir.mkdir()
+            db = temp_dir / "state.db"
+            cached = cache_dir / "populated.bin"
+            cached.write_bytes(b"bytes")
+            st = cached.stat()
+            previous = StateManager(str(db))
+            previous.set_file_metadata(FileMetadata(
+                virtual_path="/populated.bin", size=st.st_size, checksum="c", last_access=1.0,
+                last_modified=st.st_mtime, sync_status=SyncStatus.CLEAN, replica_count=1,
+                recomputable=False, recompute_cmd=None, encrypted=False, encryption_key_id=None,
+            ))
+            # The crash: the mark committed, the second stat never ran.
+            previous.mark_cache_absent(["/populated.bin"])
+            previous.close()
+
+            fs = StorageFS(
+                cache_root=cache_dir, state_db=db,
+                backends={"member": LocalBackend("member", str(member_dir))},
+                cache_size=10 * 1024 * 1024, start_sync=False,
+            )
+            try:
+                self.assertEqual(list(fs.state_manager.iter_lru_paths()), ["/populated.bin"])
+                fs.cache_manager.max_size_bytes = st.st_size
+                self.assertTrue(fs.cache_manager.ensure_space(1))
+                self.assertFalse(cached.exists())
+            finally:
+                fs.sync_manager.stop()
+                fs.state_manager.close()
+        finally:
+            shutil.rmtree(temp_dir)
 
 
 if __name__ == "__main__":

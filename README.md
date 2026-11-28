@@ -617,13 +617,14 @@ Configuration is hierarchical - child directories inherit from parents, with the
 **Cache Management:**
 1. Track file access times for LRU
 2. Evict clean files when space needed
-3. Prefer evicting recomputable files
+3. Evict non-recomputable files first, least recently read first; reclaim recomputable files only after that, in the same order, by truncating them in place so their xattrs stay
 4. Never evict dirty (unsynced) files
 
 **Metadata and Recovery:**
 1. File/directory policy remains xattr-defined via `user.storage.config`
 2. Cached files persist cache-local metadata in `user.storage.metadata`
 3. SQLite stores rebuildable acceleration state such as cache locations and LRU ordering
+   - The first open by a build with demand-access eviction adds an eviction hint to the index (the `cache_absent` column, the `idx_cache_eviction_candidates` index and the `files_cache_absent_clear` trigger); each mount clears the hints at startup. Before running an older build on that index again, stop the mount and drop all three; the SQL is next to the migration in `storage/state.py`.
 4. `storage debug rebuild-index` reconstructs cache-backed rows quickly from cache files plus xattrs
 5. `storage debug reprobe-locations` explicitly repopulates non-cache member rows for the rebuilt file set using the cache root to keep `user.storage.metadata` authoritative
 6. `storage debug verify-index` audits the cache/index boundary without mutating state

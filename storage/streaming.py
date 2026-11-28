@@ -183,6 +183,9 @@ class PrefetchSession:
     confirmation_waited: float = 0.0
     # Set when that budget ran out: finalize discards, as unconfirmed.
     confirmation_timed_out: bool = False
+    # Demand access can arrive before the index row exists. Carry the last
+    # timestamp into the new row even if the pending index batch has flushed.
+    last_access: float = 0.0
 
     def __post_init__(self):
         self.lock = threading.RLock()
@@ -1670,6 +1673,8 @@ class StreamingReadManager:
             self._discard_superseded_session(session, outcome)
             return
 
+        if metadata is not None:
+            self._replay_session_access(session)
         self.cache_manager.mark_cache_size_dirty()
 
         with session.lock:
@@ -1699,6 +1704,8 @@ class StreamingReadManager:
             st = os.lstat(str(session.final_cache_path))
         except OSError:
             return None
+        with session.lock:
+            last_access = session.last_access
         metadata = self.state_manager.get_file_metadata(session.canonical_path)
         if not metadata:
             config = self.get_config(session.canonical_path)
@@ -1706,7 +1713,7 @@ class StreamingReadManager:
                 virtual_path=session.canonical_path,
                 size=st.st_size,
                 checksum=None,
-                last_access=time.time(),
+                last_access=last_access,
                 last_modified=st.st_mtime,
                 sync_status=SyncStatus.CLEAN,
                 replica_count=config.replica_count,
@@ -1717,13 +1724,31 @@ class StreamingReadManager:
             )
         else:
             metadata.size = st.st_size
-            metadata.last_access = time.time()
+            metadata.last_access = last_access
             metadata.last_modified = st.st_mtime
             if metadata.sync_status != SyncStatus.DIRTY:
                 metadata.sync_status = SyncStatus.CLEAN
         # Mirrors the row as stored: a write during the fill keeps its
         # DIRTY in SQLite, and the xattr must say the same.
         return self.cache_manager.store_file_metadata(metadata, cache_path=session.final_cache_path)
+
+    def _replay_session_access(self, session: PrefetchSession):
+        """Carry a read that raced the row store into the stored row.
+
+        A read between _store_finalized_row's snapshot and its store
+        advanced session.last_access, and its batched update may have
+        flushed before the row existed and matched nothing. Called once the
+        row is stored, and outside the index lock: the access batch takes
+        its own lock and then the index lock, so taking them the other way
+        round could deadlock with a flush. The access path keeps the
+        larger timestamp, so replaying one already recorded changes
+        nothing. A read whose session update this misses queues its own
+        update after the store, and that one finds the row.
+        """
+        with session.lock:
+            latest = session.last_access
+        if latest > 0:
+            self.state_manager.update_access_time(session.canonical_path, accessed_at=latest)
 
     def _add_finalized_locations(self, session: PrefetchSession, metadata: FileMetadata):
         """Record the member and the cache as holding the file; caller holds the index lock."""
