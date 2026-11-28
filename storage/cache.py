@@ -5,6 +5,7 @@ Manages the local cache of files from remote backing filesystems.
 Files are cached on first access and evicted using LRU when space is needed.
 """
 
+import bisect
 import errno
 import logging
 import os
@@ -70,6 +71,59 @@ def _remove_prefix_marker(path: Path):
     finally:
         if usable != mode:
             os.chmod(path, mode)
+
+
+class _PartialCharge:
+    """The data blocks one streaming descriptor has written, as sorted,
+    disjoint, block-aligned [start, end) ranges, and their total.
+
+    The ranges are what this cache wrote (plus the extents the inode had
+    when its first grant measured them), so each later grant knows which
+    of its blocks are new without asking the filesystem. Bounded by the
+    number of disjoint spans the session fetched.
+    """
+
+    __slots__ = ("ranges", "bytes")
+
+    def __init__(self, ranges):
+        self.ranges = list(ranges)
+        self.bytes = sum(end - start for start, end in self.ranges)
+
+    def overlap(self, start: int, end: int) -> int:
+        ranges = self.ranges
+        i = bisect.bisect_left(ranges, (start, -1))
+        if i and ranges[i - 1][1] > start:
+            i -= 1
+        covered = 0
+        while i < len(ranges) and ranges[i][0] < end:
+            covered += min(end, ranges[i][1]) - max(start, ranges[i][0])
+            i += 1
+        return covered
+
+    def add(self, start: int, end: int) -> int:
+        """Record [start, end) as written; return the bytes it added."""
+        if start >= end:
+            return 0
+        added = end - start - self.overlap(start, end)
+        ranges = self.ranges
+        i = bisect.bisect_left(ranges, (start, -1))
+        if i and ranges[i - 1][1] >= start:
+            i -= 1
+        j = bisect.bisect_right(ranges, (end, float("inf")))
+        if i < j:
+            start = min(start, ranges[i][0])
+            end = max(end, ranges[j - 1][1])
+        ranges[i:j] = [(start, end)]
+        self.bytes += added
+        return added
+
+    def trim(self, end: int) -> int:
+        """Drop everything at or past end; return the bytes dropped."""
+        kept = [(s, min(e, end)) for s, e in self.ranges if s < end]
+        dropped = self.bytes - sum(e - s for s, e in kept)
+        self.ranges = kept
+        self.bytes -= dropped
+        return dropped
 
 
 class CacheFetch(Enum):
@@ -139,7 +193,7 @@ class CacheManager:
         # Streaming data is charged immediately, including an unlinked
         # partial until its last session descriptor closes.
         self._whole_file_temps: dict[Path, int] = {}
-        self._streaming_fds: dict[int, int] = {}
+        self._streaming_fds: dict[int, _PartialCharge] = {}
         self._current_size_bytes = self._scan_total_cache_size()
         self._size_dirty = False
         # The last eviction dry run that found too few victims: (epoch,
@@ -159,9 +213,10 @@ class CacheManager:
     def _round_up(self, size: int) -> int:
         return (size + self.block_size - 1) // self.block_size * self.block_size
 
-    def _data_bytes(self, fd: int, start: int, end: int) -> int:
-        """Count allocated data blocks intersecting a block-aligned interval."""
-        total = 0
+    def _extent_ranges(self, fd: int, start: int, end: int) -> List[Tuple[int, int]]:
+        """Allocated data extents within a block-aligned interval, as
+        sorted, disjoint, block-aligned ranges (SEEK_DATA/SEEK_HOLE)."""
+        ranges = []
         while start < end:
             try:
                 data = os.lseek(fd, start, os.SEEK_DATA)
@@ -174,9 +229,16 @@ class CacheManager:
                 break
             hole = os.lseek(fd, data, os.SEEK_HOLE)
             next_block = min(end, self._round_up(hole))
-            total += next_block - start
+            if ranges and ranges[-1][1] == start:
+                ranges[-1] = (ranges[-1][0], next_block)
+            else:
+                ranges.append((start, next_block))
             start = next_block
-        return total
+        return ranges
+
+    def _data_bytes(self, fd: int, start: int, end: int) -> int:
+        """Count allocated data blocks intersecting a block-aligned interval."""
+        return sum(stop - begin for begin, stop in self._extent_ranges(fd, start, end))
 
     def _path_data_bytes(self, path: Path, st: os.stat_result) -> int:
         if st.st_size == 0 or st.st_blocks == 0:
@@ -204,7 +266,7 @@ class CacheManager:
 
     def _scan_total_cache_size(self) -> int:
         """Reconcile data blocks, counting named and held inodes only once."""
-        total = sum(self._streaming_fds.values())
+        total = sum(charge.bytes for charge in self._streaming_fds.values())
         seen = set()
         for fd in self._streaming_fds:
             st = os.fstat(fd)
@@ -561,9 +623,10 @@ class CacheManager:
         if not self._grant_warning_logged:
             self._grant_warning_logged = True
             logger.warning(
-                "Streaming reads will not be cached in %s: %s. Reads are served "
-                "from the member without keeping their bytes. Use a cache "
-                "filesystem with exact SEEK_DATA/SEEK_HOLE (ext4, xfs, btrfs, tmpfs).",
+                "Some streaming reads are not being cached in %s: %s. Those "
+                "reads are served from the member without keeping their bytes. "
+                "Use a cache filesystem with exact SEEK_DATA/SEEK_HOLE (ext4, "
+                "xfs, btrfs, tmpfs). Logged once.",
                 self.cache_root, reason,
             )
         return False
@@ -573,15 +636,17 @@ class CacheManager:
 
         The caller serializes writes on this sparse inode and fetches the
         network bytes before entering. The cache lock orders the grant and
-        the local write against every other allocation. Size accounting only
-        inspects the blocks this write can change.
+        the local write against every other allocation.
 
-        The charge is only as good as SEEK_DATA/SEEK_HOLE. Every grant
-        checks that the extents it reports for the whole inode fit in the
-        blocks it has allocated (st_blocks): a filesystem that reports holes
-        as data (the generic llseek, or OpenZFS while a file has dirty data)
-        fails that check, and the chunk is refused (served transient)
-        rather than charged as if it were already there.
+        The first grant on a descriptor measures the inode's extents once
+        (SEEK_DATA/SEEK_HOLE) and refuses, logging once, when they exceed
+        the blocks it has allocated (st_blocks): a filesystem that reports
+        holes as data cannot be charged. From then on the charge is the
+        blocks this descriptor has written (_PartialCharge), so a grant
+        costs a lookup in that range list, not an extent walk, and an
+        extent report that goes wrong later cannot hide a block the budget
+        has not paid for. On a filesystem that allocates less than it is
+        given (compression), that only overstates the charge.
         """
         if not data:
             return True
@@ -591,53 +656,55 @@ class CacheManager:
             st = os.fstat(fd)
             if st.st_nlink == 0:
                 return False
-            try:
-                before = self._data_bytes(fd, start, end)
-                whole = self._data_bytes(fd, 0, self._round_up(st.st_size))
-            except OSError as exc:
-                if exc.errno in (errno.EINVAL, errno.ENOTSUP, errno.ENOSYS):
-                    return self._grants_unavailable(f"extent seeks failed ({exc.strerror})")
-                raise
-            if whole > st.st_blocks * 512:
-                return self._grants_unavailable("the filesystem reports sparse holes as data")
+            charge = self._streaming_fds.get(fd)
+            if charge is None:
+                try:
+                    extents = self._extent_ranges(fd, 0, self._round_up(st.st_size))
+                except OSError as exc:
+                    if exc.errno in (errno.EINVAL, errno.ENOTSUP, errno.ENOSYS):
+                        return self._grants_unavailable(f"extent seeks failed ({exc.strerror})")
+                    raise
+                charge = _PartialCharge(extents)
+                if charge.bytes > st.st_blocks * 512:
+                    return self._grants_unavailable("the filesystem reports sparse holes as data")
+                # The tree scan counted this inode at its path; from here it
+                # is counted through the descriptor, at the same bytes.
+                self._streaming_fds[fd] = charge
             self._ensure_size_current_locked()
-            required = end - start - before
+            required = end - start - charge.overlap(start, end)
             if required and not self.ensure_space(required):
                 return False
-            if fd not in self._streaming_fds:
-                self._streaming_fds[fd] = whole
+            cursor = offset
             try:
                 remaining = memoryview(data)
                 while remaining:
-                    written = os.pwrite(fd, remaining, offset)
+                    written = os.pwrite(fd, remaining, cursor)
                     if written <= 0:
                         raise OSError(errno.EIO, "partial cache write made no progress")
                     remaining = remaining[written:]
-                    offset += written
+                    cursor += written
             finally:
-                # Never raise from here: that would replace the write's own
-                # error. Blocks that cannot be measured are charged at the
-                # grant, the most this write can have allocated.
-                try:
-                    growth = max(0, self._data_bytes(fd, start, end) - before)
-                except OSError:
-                    growth = required
-                self._streaming_fds[fd] += growth
-                self._current_size_bytes += growth
+                # Only the blocks bytes reached; nothing here can raise and
+                # replace the write's own error.
+                if cursor > offset:
+                    growth = charge.add(start, self._round_up(cursor))
+                    self._current_size_bytes += growth
         return True
 
     def close_streaming_fd(self, fd: int):
         """Release a partial's charge once its unlinked inode can be freed.
 
-        Only the session's own descriptor is tracked: a reader descriptor
-        still open on the unlinked inode keeps its blocks past this close,
-        uncharged, until that reader closes too.
+        The charge stays until the session descriptor closes, which is after
+        every reader's: a FUSE reader of the partial holds a session
+        reference, StorageFS._release closes the reader's descriptor before
+        it drops that reference, and the session closes this descriptor only
+        once no references remain (or at unmount).
         """
         with self._lock:
-            allocated = self._streaming_fds.pop(fd, 0)
+            charge = self._streaming_fds.pop(fd, None)
             try:
-                if allocated and os.fstat(fd).st_nlink == 0:
-                    self._current_size_bytes = max(0, self._current_size_bytes - allocated)
+                if charge is not None and charge.bytes and os.fstat(fd).st_nlink == 0:
+                    self._current_size_bytes = max(0, self._current_size_bytes - charge.bytes)
             except OSError:
                 self._size_dirty = True
             finally:
@@ -650,13 +717,18 @@ class CacheManager:
             self._size_dirty = True
 
     def truncate_streaming_fd(self, fd: int, size: int):
-        """Keep accounting in step when a failed fill preserves only a prefix."""
+        """Keep accounting in step when a failed fill preserves only a prefix.
+
+        The charge drops the blocks past the new end from what this
+        descriptor wrote; nothing is measured, so once the truncate has
+        succeeded nothing here can fail.
+        """
         with self._lock:
             os.ftruncate(fd, size)
-            if fd in self._streaming_fds:
-                allocated = self._data_bytes(fd, 0, self._round_up(size))
-                self._current_size_bytes += allocated - self._streaming_fds[fd]
-                self._streaming_fds[fd] = allocated
+            charge = self._streaming_fds.get(fd)
+            if charge is not None:
+                self._current_size_bytes = max(
+                    0, self._current_size_bytes - charge.trim(self._round_up(size)))
 
     def cache_file(self, virtual_path: str, backend: Backend, source_virtual_path: str = None) -> bool:
         """Ensure a member file is cached, including when another fill won."""

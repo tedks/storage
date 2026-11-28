@@ -375,60 +375,73 @@ class TestCacheAccounting(unittest.TestCase):
         self.assertTrue(manager.ensure_space(block))
         self.assertFalse((self.cache_dir / "dirty.bin").exists())
 
-    def test_streaming_grant_refused_when_extents_exceed_allocation(self):
-        """A filesystem that starts reporting holes as data (OpenZFS with
-        dirty data) is caught at the next grant, not only the first."""
+    def test_first_grant_refused_when_extents_exceed_allocation(self):
+        """A filesystem that reports holes as data (the generic llseek)
+        cannot be charged: the first grant refuses, logging once."""
         manager = self.cache_manager
-        block = manager.block_size
-        real = manager._data_bytes
-        holes_as_data = []
 
-        def data_bytes(fd, start, end):
-            if holes_as_data:
-                return end - start
-            return real(fd, start, end)
+        def holes_as_data(fd, start, end):
+            return [(start, end)] if start < end else []
 
-        with self._partial("zfs") as (_, fd), \
-                patch.object(manager, "_data_bytes", side_effect=data_bytes), \
+        with self._partial("llseek") as (_, fd), \
+                patch.object(manager, "_extent_ranges", side_effect=holes_as_data), \
                 self.assertLogs("storage.cache", "WARNING") as logged:
-            self.assertTrue(manager.write_streaming_chunk(fd, 0, b"x"))
-            holes_as_data.append(True)
+            self.assertFalse(manager.write_streaming_chunk(fd, 0, b"x"))
             self.assertFalse(manager.write_streaming_chunk(fd, 1 << 29, b"y"))
-            self.assertFalse(manager.write_streaming_chunk(fd, 1 << 28, b"z"))
-            self.assertEqual(manager.get_total_cache_size(), block)
-            self.assertEqual(os.pread(fd, 1, 1 << 29), b"\0")
+            self.assertNotIn(fd, manager._streaming_fds)
+        self.assertEqual(manager.get_total_cache_size(), 0)
         self.assertEqual(len(logged.output), 1)
         self.assertIn("holes as data", logged.output[0])
+        self.assertIn("Some streaming reads are not being cached", logged.output[0])
+
+    def test_later_extent_misreports_cannot_hide_unpaid_blocks(self):
+        """After the first grant the charge is what this descriptor wrote,
+        so a filesystem that starts reporting holes as data (OpenZFS with
+        dirty data) neither stops the budget nor is consulted."""
+        manager = self.cache_manager
+        block = manager.block_size
+        manager.max_size_bytes = 2 * block
+        with self._partial("zfs") as (_, fd):
+            self.assertTrue(manager.write_streaming_chunk(fd, 0, b"x"))
+            with patch.object(manager, "_extent_ranges",
+                              side_effect=AssertionError("extent walk on a later grant")):
+                self.assertTrue(manager.write_streaming_chunk(fd, 1 << 29, b"y"))
+                self.assertTrue(manager.write_streaming_chunk(fd, 1, b"z"))  # same block
+                self.assertFalse(manager.write_streaming_chunk(fd, 1 << 28, b"over"))
+                self.assertEqual(manager.get_total_cache_size(), 2 * block)
+
+    def test_a_fragmented_partial_grants_without_walking_its_extents(self):
+        manager = self.cache_manager
+        block = manager.block_size
+        with self._partial("fragmented") as (_, fd):
+            self.assertTrue(manager.write_streaming_chunk(fd, 0, b"0"))
+            with patch.object(manager, "_extent_ranges",
+                              side_effect=AssertionError("extent walk on a later grant")):
+                for index in range(1, 200):
+                    self.assertTrue(manager.write_streaming_chunk(fd, 2 * index * block, b"x"))
+                # Bridging two written blocks adds one block, not three.
+                self.assertTrue(manager.write_streaming_chunk(fd, block, b"b" * block))
+            self.assertEqual(manager.get_total_cache_size(), 201 * block)
+            manager.mark_cache_size_dirty()
+            self.assertEqual(manager.get_total_cache_size(), 201 * block)
 
     def test_streaming_grant_refused_without_extent_seeks(self):
         manager = self.cache_manager
         with self._partial("noseek") as (_, fd), \
-                patch.object(manager, "_data_bytes", side_effect=OSError(errno.EINVAL, "no seek")), \
+                patch.object(manager, "_extent_ranges", side_effect=OSError(errno.EINVAL, "no seek")), \
                 self.assertLogs("storage.cache", "WARNING"):
             self.assertFalse(manager.write_streaming_chunk(fd, 0, b"x"))
         self.assertEqual(manager.get_total_cache_size(), 0)
 
-    def test_failed_measurement_after_a_failed_write_keeps_the_write_error(self):
+    def test_a_failed_write_charges_nothing_and_keeps_its_error(self):
         manager = self.cache_manager
-        block = manager.block_size
-        real = manager._data_bytes
-        calls = []
-
-        def measure(fd, start, end):
-            calls.append((start, end))
-            if len(calls) > 2:  # the measurement after the write
-                raise OSError(errno.EIO, "extent query failed")
-            return real(fd, start, end)
-
-        with self._partial("masked") as (_, fd):
-            with patch("storage.cache.os.pwrite", side_effect=OSError(errno.ENOSPC, "disk full")), \
-                    patch.object(manager, "_data_bytes", side_effect=measure):
+        with self._partial("failed-write") as (_, fd):
+            with patch("storage.cache.os.pwrite", side_effect=OSError(errno.ENOSPC, "disk full")):
                 with self.assertRaises(OSError) as raised:
                     manager.write_streaming_chunk(fd, 0, b"x")
             self.assertEqual(raised.exception.errno, errno.ENOSPC)
-            # Unmeasured: charged at the grant, never less.
-            self.assertEqual(manager._streaming_fds[fd], block)
-            self.assertEqual(manager.get_total_cache_size(), block)
+            self.assertEqual(manager._streaming_fds[fd].bytes, 0)
+            self.assertEqual(manager.get_total_cache_size(), 0)
 
     def test_close_streaming_fd_closes_even_when_fstat_fails(self):
         manager = self.cache_manager
@@ -453,7 +466,7 @@ class TestCacheAccounting(unittest.TestCase):
             with self._no_rescan():
                 manager.truncate_streaming_fd(fd, block + 1)
                 self.assertEqual(manager.get_total_cache_size(), 2 * block)
-                self.assertEqual(manager._streaming_fds[fd], 2 * block)
+                self.assertEqual(manager._streaming_fds[fd].bytes, 2 * block)
             manager.mark_cache_size_dirty()
             self.assertEqual(manager.get_total_cache_size(), 2 * block)
             # Promoted: the prefix is a named file the tree scan counts.
@@ -463,6 +476,19 @@ class TestCacheAccounting(unittest.TestCase):
             manager.publish_streaming_fd(fd)
             self.assertEqual(manager.get_total_cache_size(), 2 * block)
         self.assertEqual(manager.get_total_cache_size(), 2 * block)
+
+    def test_prefix_truncate_cannot_fail_after_the_truncate(self):
+        """Nothing is measured after the truncate, so an extent query that
+        would fail cannot stop the caller's prefix marker."""
+        manager = self.cache_manager
+        block = manager.block_size
+        with self._partial("prefix-measure") as (_, fd):
+            self.assertTrue(manager.write_streaming_chunk(fd, 0, b"p" * (3 * block)))
+            with patch.object(manager, "_extent_ranges",
+                              side_effect=OSError(errno.EIO, "extent query failed")):
+                manager.truncate_streaming_fd(fd, block)
+            self.assertEqual(os.fstat(fd).st_size, block)
+            self.assertEqual(manager.get_total_cache_size(), block)
 
     def test_superseded_partial_charge_is_released_at_its_session_close(self):
         """A reader still holding an unlinked partial keeps its bytes, but
