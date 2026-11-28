@@ -20,3 +20,9 @@ log_events:
   who: Ted Smith
   what: created
   comment: ""
+- time: 2026-11-28T12:03:38-00:00
+  who: Ted Smith
+  what: commented
+  comment: Include direct writes to a published inode while a streaming reader still
+    holds it. The absolute post-mutation charge can require a whole-inode extent walk
+    under the same cache lock.
