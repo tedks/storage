@@ -907,20 +907,43 @@ class CacheManager:
 
     def ensure_space(self, bytes_needed: int) -> bool:
         """Free the minimum whole-file LRU victims for a cache allocation."""
+        if bytes_needed <= 0:
+            return True
         with self._lock:
             if bytes_needed > self.max_size_bytes or self._withheld():
                 return False
             pending = self._admit_pending() if self._in_flight else 0
             if pending is None:
                 return False
-            # Evict only for the allocation itself, never for the pending
-            # allowance of direct changes that may not have written yet;
-            # then admit only if it also fits beside that allowance.
-            if not self._free_space(self.get_free_space_needed(bytes_needed)):
-                return False
-            return not pending or self.get_free_space_needed(bytes_needed + pending) == 0
+            if not pending:
+                return self._free_space(self.get_free_space_needed(bytes_needed))
+            return self._admit_beside_pending(
+                self.get_free_space_needed(bytes_needed),
+                lambda: self.get_free_space_needed(bytes_needed + pending))
 
-    def _free_space(self, needed: int) -> bool:
+    def _admit_beside_pending(self, needed: int, needed_with_pending) -> bool:
+        """Admit an allocation that needs `needed` bytes freed while direct
+        changes in flight hold back their allowances; caller holds the lock.
+
+        Victims are chosen for `needed` alone, never for an allowance (bytes
+        a write may not have put on disk). The exact victims that eviction
+        would take for it (the dry run's prefix in access order) must also
+        cover the allowance: otherwise the allocation is refused with
+        nothing evicted, since evicting would only lose a recoverable copy
+        and refuse anyway, and the refusal is not remembered as a victim
+        shortfall (the allowance goes when the write settles). An
+        allocation that fits only without the allowance evicts nothing.
+        """
+        cover = needed_with_pending()
+        if cover <= 0:
+            return True
+        if needed <= 0:
+            return False
+        if not self._free_space(needed, must_cover=cover):
+            return False
+        return needed_with_pending() <= 0
+
+    def _free_space(self, needed: int, must_cover: Optional[int] = None) -> bool:
         """Evict CLEAN copies in access order until `needed` bytes are freed.
 
         A dry run first keeps useful copies when even every eligible victim
@@ -946,6 +969,8 @@ class CacheManager:
                                time.monotonic(), freeable)
             return False
         self._shortfall = None
+        if must_cover is not None and freeable < must_cover:
+            return False  # an allowance conflict: nothing evicted, nothing remembered
         return self._evict_by_access(needed, recomputable=None)
 
     def _known_shortfall(self, needed: int) -> bool:
@@ -1257,9 +1282,11 @@ class CacheManager:
         if pending is None:
             return False
         finishing = (temp_path, size)
-        if not self._free_space(min(excess, self.get_free_space_needed(0, finishing=finishing))):
-            return False
-        return not pending or self.get_free_space_needed(pending, finishing=finishing) == 0
+        needed = min(excess, self.get_free_space_needed(0, finishing=finishing))
+        if not pending:
+            return self._free_space(needed)
+        return self._admit_beside_pending(
+            needed, lambda: self.get_free_space_needed(pending, finishing=finishing))
 
     def _drop_whole_temp(self, path: Path):
         """Release the temp reservation under the cache lock."""

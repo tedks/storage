@@ -1314,6 +1314,104 @@ class TestCacheAccounting(unittest.TestCase):
             self._assert_total(2 * block)
             self.assertFalse(manager.write_streaming_chunk(b, 0, b"b"))
 
+    def _full_with_victim(self, victim_blocks, dirty_blocks=2, *, before_write=None):
+        """A cache filled exactly by an unevictable dirty file and one
+        recoverable CLEAN victim, with a direct write holding back one
+        block of allowance (in flight, nothing written yet). before_write
+        runs once the cache is full, before the write goes in flight."""
+        manager = self.cache_manager
+        block = manager.block_size
+        (self.cache_dir / "dirty").write_bytes(b"d" * (dirty_blocks * block))
+        victim = self.cache_dir / "victim"
+        victim.write_bytes(b"v" * (victim_blocks * block))
+        self._clean_row("victim", last_access=1.0)
+        manager.max_size_bytes = (dirty_blocks + victim_blocks) * block
+        manager.mark_cache_size_dirty()
+        self._assert_total((dirty_blocks + victim_blocks) * block)
+        if before_write is not None:
+            before_write()
+        target = self.cache_dir / "written"
+        target.write_bytes(b"")
+        fd = os.open(target, os.O_RDWR)
+        self.addCleanup(os.close, fd)
+        run, gate, errors = self._blocked_change(fd=fd, span=(0, block))
+        writer = run(lambda: None)
+        return victim, writer, gate, errors
+
+    def test_a_grant_the_allowance_defeats_evicts_nothing(self):
+        """R8: budget 3B, dirty 2B, only victim 1B, an allowance of B, a
+        stream asking B. Its own need takes the victim, but with the
+        allowance it still cannot run, so the victim is kept and the
+        refusal is not remembered as a victim shortfall."""
+        manager = self.cache_manager
+        block = manager.block_size
+        victim, writer, gate, errors = self._full_with_victim(1)
+        with self._partial("b") as (_, b):
+            self.assertFalse(manager.write_streaming_chunk(b, 0, b"x"))
+            self.assertTrue(victim.exists())
+            self.assertIsNone(manager._shortfall)
+            gate.set()
+            writer.join(timeout=5.0)
+            self.assertEqual(errors, [])
+            # Settled: the same grant now takes the victim and runs.
+            self.assertTrue(manager.write_streaming_chunk(b, 0, b"x"))
+            self.assertFalse(victim.exists())
+
+    def test_a_victim_that_covers_the_allowance_too_is_taken(self):
+        """R8 positive: the one victim the grant's own need selects (2B)
+        also covers the allowance (B), so it is evicted and the grant runs;
+        nothing beyond it is selected."""
+        manager = self.cache_manager
+        block = manager.block_size
+        victim, writer, gate, errors = self._full_with_victim(2)
+        with self._partial("b") as (_, b):
+            self.assertTrue(manager.write_streaming_chunk(b, 0, b"x"))
+            self.assertFalse(victim.exists())
+            self.assertTrue((self.cache_dir / "dirty").exists())
+            gate.set()
+            writer.join(timeout=5.0)
+        self.assertEqual(errors, [])
+
+    def test_a_grown_copy_the_allowance_defeats_evicts_nothing(self):
+        """R8, whole-copy growth: a copy reserved 0 before the write went in
+        flight grows by B; freeing B would take the victim but the
+        allowance still leaves no room, so the copy fails with ENOSPC and
+        the victim is kept."""
+        manager = self.cache_manager
+        block = manager.block_size
+        copying, grow = threading.Event(), threading.Event()
+        self.addCleanup(grow.set)
+
+        class GrowingBackend(LocalBackend):
+            def copy_to_local(self, virtual_path, local_path):
+                copying.set()
+                assert grow.wait(10.0)
+                Path(local_path).write_bytes(b"g" * block)
+
+        backend = GrowingBackend("member", str(self.backend_dir))
+        outcome = []
+
+        def fetch():
+            try:
+                manager.fetch_into_cache(backend, "/grown", self.cache_dir / "grown",
+                                         expected_size=0)
+                outcome.append(None)
+            except OSError as exc:
+                outcome.append(exc.errno)
+
+        fetching = threading.Thread(target=fetch)
+        victim, writer, gate, errors = self._full_with_victim(
+            1, before_write=lambda: (fetching.start(), self.assertTrue(copying.wait(5.0))))
+        grow.set()
+        fetching.join(timeout=5.0)
+        self.assertEqual(outcome, [errno.ENOSPC])
+        self.assertTrue(victim.exists())
+        self.assertFalse((self.cache_dir / "grown").exists())
+        self.assertIsNone(manager._shortfall)
+        gate.set()
+        writer.join(timeout=5.0)
+        self.assertEqual(errors, [])
+
     def test_direct_writer_uses_space_before_the_next_stream_grant(self):
         manager = self.cache_manager
         block = manager.block_size
