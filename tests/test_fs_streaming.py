@@ -3,11 +3,11 @@ import json
 import os
 import re
 import shutil
-import sys
 import tempfile
 import threading
 import time
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -445,6 +445,37 @@ class TestFSStreamingIntegration(unittest.TestCase):
             self.assertEqual(attempts, 2)
             self.assertEqual((self.cache_dir / "retry.bin").read_bytes(), payload)
 
+    @contextmanager
+    def _reclaim_measurements(self, on_measure):
+        """Call on_measure(deficit) after each deficit measurement space reclaim makes.
+
+        Patches the callees: _reclaim_retained_space marks its own extent
+        (per thread), and get_free_space_needed reports inside it only.
+        Inside reclaim nothing else measures the deficit.
+        """
+        manager = self.fs._streaming_manager
+        cache = self.fs.cache_manager
+        real_reclaim = manager._reclaim_retained_space
+        real_needed = cache.get_free_space_needed
+        inside = threading.local()
+
+        def reclaim(*args, **kwargs):
+            inside.active = True
+            try:
+                return real_reclaim(*args, **kwargs)
+            finally:
+                inside.active = False
+
+        def needed(required):
+            result = real_needed(required)
+            if getattr(inside, "active", False):
+                on_measure(result)
+            return result
+
+        with patch.object(manager, "_reclaim_retained_space", reclaim), \
+                patch.object(cache, "get_free_space_needed", needed):
+            yield
+
     def _bulk_gate(self, poll_probe=True):
         """A run_background_range_read that waits for bulk capacity until released.
 
@@ -655,19 +686,16 @@ class TestFSStreamingIntegration(unittest.TestCase):
         retained = self._open_retained_fill("retained.bin", os.urandom(384 * 1024))
         written = os.urandom(384 * 1024)
         (self.backend_dir / "write-open.bin").write_bytes(written)
-        real_needed = cache.get_free_space_needed
         injected = []
 
-        def needed(required):
-            result = real_needed(required)
+        def measured(deficit):
             # Between reclaim's first look at the deficit and its scan of
             # the registry, the retained fill is cancelled by hand.
-            if not injected and sys._getframe(1).f_code.co_name == "_reclaim_retained_space":
-                injected.append(result)
+            if not injected:
+                injected.append(deficit)
                 self.assertEqual(manager.cancel_download_session(retained.session_id), "cancelled")
-            return result
 
-        with patch.object(cache, "get_free_space_needed", needed):
+        with self._reclaim_measurements(measured):
             fd = self.fs.open("/write-open.bin", os.O_RDWR)
         self.assertEqual(len(injected), 1)
         self.assertGreater(injected[0], 0)
@@ -738,19 +766,29 @@ class TestFSStreamingIntegration(unittest.TestCase):
         payload = os.urandom(64 * 1024)
         (self.backend_dir / "reader.bin").write_bytes(payload)
         real_counts = manager._download_session_counts
+        real_fits = manager._reader_fits_locked
+        displacing = threading.local()
         counted = []
+
+        def fits(displaced=None):
+            displacing.active = displaced is not None
+            try:
+                return real_fits(displaced)
+            finally:
+                displacing.active = False
 
         def counts():
             result = real_counts()
             # In the displacing call: the fill completes (under its own
             # lock only) after the count and before the victim scan.
-            if not counted and sys._getframe(1).f_locals.get("displaced") is not None:
+            if not counted and getattr(displacing, "active", False):
                 counted.append(result)
                 with retained.lock:
                     retained.prefetch_complete = True
             return result
 
-        with patch.object(manager, "_download_session_counts", counts):
+        with patch.object(manager, "_reader_fits_locked", fits), \
+                patch.object(manager, "_download_session_counts", counts):
             fd = self.fs.open("/reader.bin", os.O_RDONLY)
         self.assertEqual(counted, [(0, 1)])
         with self.fs._fd_lock:
@@ -772,20 +810,17 @@ class TestFSStreamingIntegration(unittest.TestCase):
         small = self._open_retained_fill("small.bin", os.urandom(192 * 1024), read_bytes=96 * 1024)
         written = os.urandom(896 * 1024)
         (self.backend_dir / "write-open.bin").write_bytes(written)
-        real_needed = cache.get_free_space_needed
         injected = []
 
-        def needed(required):
-            result = real_needed(required)
+        def measured(deficit):
             # The large fill is cancelled by hand after reclaim's first
             # look: the deficit drops from 576 KiB, which the small fill
             # cannot cover, to 64 KiB, which it can.
-            if not injected and sys._getframe(1).f_code.co_name == "_reclaim_retained_space":
-                injected.append(result)
+            if not injected:
+                injected.append(deficit)
                 self.assertEqual(manager.cancel_download_session(large.session_id), "cancelled")
-            return result
 
-        with patch.object(cache, "get_free_space_needed", needed):
+        with self._reclaim_measurements(measured):
             fd = self.fs.open("/write-open.bin", os.O_RDWR)
         self.assertEqual(injected, [576 * 1024])
         self.assertTrue(small.detached)
@@ -805,23 +840,19 @@ class TestFSStreamingIntegration(unittest.TestCase):
                  for index in range(4)]
         written = os.urandom(992 * 1024)
         (self.backend_dir / "write-open.bin").write_bytes(written)
-        real_needed = cache.get_free_space_needed
         measured = []
 
-        def needed(required):
-            result = real_needed(required)
-            if sys._getframe(1).f_code.co_name == "_reclaim_retained_space":
-                measured.append(result)
-                # After each of the first three measurements a different
-                # fill is cancelled by hand before reclaim scans, so each
-                # of those selections falls short of a deficit that then
-                # shrinks by a fill. The fourth is covered by the last.
-                if len(measured) <= 3:
-                    self.assertEqual(
-                        manager.cancel_download_session(fills[len(measured) - 1].session_id), "cancelled")
-            return result
+        def measure(deficit):
+            measured.append(deficit)
+            # After each of the first three measurements a different fill
+            # is cancelled by hand before reclaim scans, so each of those
+            # selections falls short of a deficit that then shrinks by a
+            # fill. The fourth is covered by the last.
+            if len(measured) <= 3:
+                self.assertEqual(
+                    manager.cancel_download_session(fills[len(measured) - 1].session_id), "cancelled")
 
-        with patch.object(cache, "get_free_space_needed", needed):
+        with self._reclaim_measurements(measure):
             fd = self.fs.open("/write-open.bin", os.O_RDWR)
         self.assertEqual(measured, [kib * 1024 for kib in (992, 736, 480, 224)])
         self.assertTrue(all(fill.detached for fill in fills))
