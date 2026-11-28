@@ -802,8 +802,11 @@ class CacheManager:
                     # partial is): a scan skips it under any name, so it is
                     # counted once, by this reservation, until released.
                     reservation = self.reserve_new_file(kept_st.st_size, kept_st)
+                    # The member's own attributes for the private handle,
+                    # newest first; its times never the staging file's.
                     known = {}
-                    for key in ("st_mode", "st_uid", "st_gid"):
+                    for key in ("st_mode", "st_uid", "st_gid", "st_mtime", "st_mtime_ns",
+                                "st_atime", "st_atime_ns", "st_ctime"):
                         value = getattr(newest, key, None)
                         known[key] = getattr(member_stat, key, None) if value is None else value
                     private.append((kept, reservation, known))

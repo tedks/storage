@@ -2774,6 +2774,54 @@ class TestRefreshRound5(RevalidateTestBase):
         self.assertTrue(self.stale_mark())
         self.assertEqual(self.fs._refreshing, set())
 
+    def test_a_private_handle_reports_the_member_mtime_not_the_staging_time(self):
+        self.member = NoMtimeBackend("member", str(self.member_dir))
+        self.fs.sync_manager.stop()
+        self.fs.state_manager.close()
+        self.fs = self._make_fs()
+        self.rewrite_member("live.log", b"line 1\n", mtime=1_000_000_000)
+        src = self.member_dir / "live.log"
+        copy = self.member.copy_to_local
+
+        def grows(path, temp):
+            copy(path, temp)  # staging mtime: now
+            with open(src, "ab") as f:
+                f.write(b"+")
+            os.utime(src, (1_200_000_000, 1_200_000_000))
+
+        with patch.object(self.member, "copy_to_local", side_effect=grows):
+            fh = self.fs.open("/live.log", os.O_RDONLY)
+        try:
+            self.assertTrue(self.fs.is_private_handle(fh))
+            attrs = self.fs.getattr("/live.log", fh)
+            # The member's own (its ctime is genuinely now, a local member's).
+            self.assertEqual(attrs["st_mtime"], 1_200_000_000)
+            self.assertEqual(attrs["st_ctime"], os.stat(src).st_ctime)
+        finally:
+            self.fs.release("/live.log", fh)
+
+    def test_a_private_handle_with_no_member_time_reports_none_newer(self):
+        self.rewrite_member("live.log", b"line 1\n")
+        src = self.member_dir / "live.log"
+        copy = self.member.copy_to_local
+
+        def grows(path, temp):
+            copy(path, temp)
+            with open(src, "ab") as f:
+                f.write(b"+")
+
+        size_only = lambda path: SimpleNamespace(st_size=os.stat(src).st_size + 1)  # noqa: E731
+        with patch.object(self.member, "copy_to_local", side_effect=grows), \
+                patch.object(self.member, "stat", side_effect=size_only):
+            fh = self.fs.open("/live.log", os.O_RDONLY)
+        try:
+            self.assertTrue(self.fs.is_private_handle(fh))
+            attrs = self.fs.getattr("/live.log", fh)
+            self.assertEqual((attrs["st_mtime"], attrs["st_atime"], attrs["st_ctime"]),
+                             (0.0, 0.0, 0.0))
+        finally:
+            self.fs.release("/live.log", fh)
+
     def test_a_conflict_view_whose_member_has_no_file_is_enoent(self):
         self.assert_errno(errno.ENOENT, self.fs.open, "/absent.txt.member", os.O_RDONLY)
 

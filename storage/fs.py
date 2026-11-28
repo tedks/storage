@@ -2371,14 +2371,35 @@ class StorageFS(Operations):
 
     @staticmethod
     def _private_attrs(entry: FDEntry) -> dict:
-        """A private handle's attributes, from its captured descriptor alone
-        (never the live path): its length, its own times, and the member's
-        mode and ids as last reported, without write (read-only copy)."""
+        """A private handle's attributes: its length from its captured
+        descriptor (never the live path), and the member's mode, ids and
+        times as last reported, without write (read-only copy).
+
+        The times are the newest member stat's (st_mtime_ns where it has
+        one), never the staging file's, which only say when this host copied
+        the bytes. With no member time at all they are 0, so no tool takes
+        the copy for newer than anything (CTO-208-PRIVATE-STAT). A source
+        that grew during the copy may hold bytes newer than the reported
+        mtime: the copy is unverified, which is why it is private.
+        """
         st = os.fstat(entry.real_fd)
         known = entry.private_attrs or {}
         mode = known.get("st_mode")
         mode = stat.S_IMODE(st.st_mode if type(mode) is not int else mode)
-        attrs = {key: getattr(st, key) for key in ("st_atime", "st_mtime", "st_ctime", "st_size")}
+
+        def seconds(key):
+            ns = known.get(key + "_ns")
+            if type(ns) is int:
+                return ns / 1e9
+            value = known.get(key)
+            return value if isinstance(value, (int, float)) and math.isfinite(value) else None
+
+        mtime = seconds("st_mtime")
+        mtime = 0.0 if mtime is None else mtime
+        atime, ctime = seconds("st_atime"), seconds("st_ctime")
+        attrs = {"st_size": st.st_size, "st_mtime": mtime,
+                 "st_atime": mtime if atime is None else atime,
+                 "st_ctime": mtime if ctime is None else ctime}
         attrs.update(st_mode=stat.S_IFREG | (mode & 0o7555 & ~(stat.S_ISUID | stat.S_ISGID)),
                      st_nlink=1,
                      st_uid=known.get("st_uid") if type(known.get("st_uid")) is int else st.st_uid,
