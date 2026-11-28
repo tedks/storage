@@ -1,15 +1,22 @@
 import errno
+import json
 import os
 import shutil
 import stat
+import struct
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from storage.cache_metadata import (
     XATTR_CACHE_METADATA_NAME,
     cache_file_would_be_scanned,
     cache_path_to_virtual_path,
+    MEMBER_ATTRS_XATTR,
+    cached_member_attributes,
+    copy_member_attributes,
+    record_native_attributes,
     read_cache_metadata,
     scan_cache_entries,
     write_cache_metadata,
@@ -25,6 +32,90 @@ class TestCacheMetadata(unittest.TestCase):
 
     def tearDown(self):
         shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_import_preserves_existing_acl_group_mask(self):
+        path = self.cache_root / "from-member"
+        path.write_bytes(b"file")
+        acl_xattr = "system.posix_acl_access"
+        # Linux POSIX ACL xattr v2. A named user has rw behind a read-only
+        # mask. Changing the group bits on the backing file would widen it.
+        entries = (
+            (0x01, 6, 0xffffffff),  # ACL_USER_OBJ
+            (0x02, 6, os.geteuid()), # ACL_USER (mapped in the test sandbox)
+            (0x04, 0, 0xffffffff),  # ACL_GROUP_OBJ
+            (0x10, 4, 0xffffffff),  # ACL_MASK
+            (0x20, 0, 0xffffffff),  # ACL_OTHER
+        )
+        acl = struct.pack("<I", 2) + b"".join(struct.pack("<HHI", *entry) for entry in entries)
+        try:
+            os.setxattr(path, acl_xattr, acl)
+        except OSError as exc:
+            if exc.errno == errno.ENOTSUP:
+                self.skipTest("test filesystem does not support POSIX ACLs")
+            raise
+
+        source = SimpleNamespace(st_size=4, st_mode=stat.S_IFREG | 0o660)
+        with path.open("rb") as handle:
+            copy_member_attributes(handle.fileno(), source)
+
+        self.assertEqual(acl, os.getxattr(path, acl_xattr))
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o640)
+        self.assertEqual(cached_member_attributes(path, path.stat())["st_mode"], source.st_mode)
+
+    def test_import_records_no_set_id_bits(self):
+        path = self.cache_root / "from-member"
+        path.write_bytes(b"file")
+        os.chmod(path, 0o755)
+        source = SimpleNamespace(st_size=4, st_mode=stat.S_IFREG | 0o7755)
+        with path.open("rb") as handle:
+            copy_member_attributes(handle.fileno(), source)
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o755)
+        # Sticky means nothing on a regular file and is kept as reported.
+        self.assertEqual(cached_member_attributes(path, path.stat())["st_mode"],
+                         stat.S_IFREG | 0o1755)
+        # A record written with them (an earlier build) is read without them.
+        record = json.loads(os.getxattr(path, MEMBER_ATTRS_XATTR))
+        record["attrs"]["st_mode"] = stat.S_IFREG | 0o6755
+        os.setxattr(path, MEMBER_ATTRS_XATTR, json.dumps(record).encode())
+        self.assertEqual(cached_member_attributes(path, path.stat())["st_mode"],
+                         stat.S_IFREG | 0o755)
+
+    def test_agreeing_confirmation_keeps_the_probes_atime(self):
+        from storage.cache_metadata import confirm_member_stat
+        probe = SimpleNamespace(st_size=4, st_mode=stat.S_IFREG | 0o644, st_mtime=1_000_000_000,
+                                st_atime=900_000_000, st_uid=1, st_gid=2)
+        after = SimpleNamespace(st_size=4, st_mode=stat.S_IFREG | 0o644, st_mtime=1_000_000_000,
+                                st_atime=1_700_000_000, st_uid=3, st_gid=4)
+        backend = SimpleNamespace(stat=lambda path: after)
+        confirmed, agreed = confirm_member_stat(backend, "/f", probe, 4)
+        self.assertTrue(agreed)
+        self.assertEqual((confirmed.st_atime, confirmed.st_uid, confirmed.st_gid),
+                         (900_000_000, 3, 4))
+
+    def test_native_record_is_empty_and_keeps_an_existing_one(self):
+        path = self.cache_root / "made-here"
+        path.write_bytes(b"file")
+        fd = os.open(path, os.O_RDWR)
+        try:
+            record_native_attributes(fd)
+            self.assertEqual(cached_member_attributes(path, path.stat()), {})
+            source = SimpleNamespace(st_size=4, st_mode=stat.S_IFREG | 0o600, st_uid=4242)
+            os.removexattr(path, MEMBER_ATTRS_XATTR)
+            copy_member_attributes(fd, source)
+            record_native_attributes(fd)  # O_TRUNC over an imported file
+        finally:
+            os.close(fd)
+        self.assertEqual(cached_member_attributes(path, path.stat())["st_uid"], 4242)
+
+    def test_scan_orders_a_fill_by_its_ctime_not_the_member_atime(self):
+        path = self.cache_root / "filled"
+        path.write_bytes(b"file")
+        os.utime(path, (1_000_000_000, 1_000_000_000))  # the member's atime
+        entry, = scan_cache_entries(self.cache_root)
+        self.assertEqual(entry.stat_atime, path.stat().st_ctime)
+        os.utime(path, (4_000_000_000, 1_000_000_000))  # read later
+        entry, = scan_cache_entries(self.cache_root)
+        self.assertEqual(entry.stat_atime, 4_000_000_000)
 
     def test_write_and_read_round_trip(self):
         cache_path = self.cache_root / "video.mp4"

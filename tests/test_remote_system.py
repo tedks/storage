@@ -1150,6 +1150,118 @@ def test_mounted_watcher_refreshes_listing(remote, mounted_factory):
         "the mount's watcher must have run inotifywait over ssh to remote1"
 
 
+@pytest.mark.parametrize("streaming", [False, True], ids=["download", "stream"])
+@pytest.mark.parametrize("mode", [0o640, 0o444], ids=["writable", "read-only"])
+def test_mounted_browse_keeps_member_attributes(remote, mounted_factory, streaming, mode):
+    member = remote.members[0]
+    payload = b"a file older than the cache"
+    remote.write_remote(member, "browse.bin", payload)
+    path = f"{REMOTE_ROOT}/browse.bin"
+    remote.exec(member, f"chmod {mode:o} {path} && touch -d @1000000000 {path}")
+    snapshot = f"stat -c '%i %s %Y %Z %a %u %g' {path}"
+    before = remote.exec(member, snapshot).stdout
+    mnt = mounted_factory(streaming_reads=streaming)
+    assert "browse.bin" in os.listdir(mnt.mount)
+    mounted = mnt.mount / "browse.bin"
+    cold = mounted.stat()
+    assert cold.st_mtime == 1000000000
+    assert mounted.read_bytes() == payload
+    cached = mnt.cache / "browse.bin"
+    assert _wait_for(cached.is_file)
+    assert mounted.read_bytes() == payload
+    assert mnt.fs.sync_manager.wait_for_completion(timeout=5)
+    assert remote.exec(member, snapshot).stdout == before
+    assert remote.read_remote(member, "browse.bin") == payload
+    warm = mounted.stat()
+    assert warm.st_mtime_ns == cold.st_mtime_ns
+    assert (warm.st_mode, warm.st_uid, warm.st_gid) == (cold.st_mode, cold.st_uid, cold.st_gid)
+    backing = cached.stat()
+    assert backing.st_mtime_ns == cold.st_mtime_ns
+    assert (backing.st_uid, backing.st_gid) == (os.geteuid(), os.getegid())
+    row = mnt.fs.state_manager.get_file_metadata("/browse.bin")
+    assert row.sync_status == SyncStatus.CLEAN
+    if mode == 0o444 and os.geteuid() != 0:
+        with pytest.raises(PermissionError):
+            mounted.open("r+b")
+        with pytest.raises(PermissionError):
+            os.truncate(mounted, 0)
+        assert remote.exec(member, snapshot).stdout == before
+
+
+def test_mounted_same_stat_refetch_reads_fresh_bytes(remote, mounted_factory):
+    member = remote.members[0]
+    name = "same-stat.bin"
+    path = f"{REMOTE_ROOT}/{name}"
+    before, after = b"a" * 16384, b"b" * 16384
+    stamp = 1_000_000_000
+    remote.write_remote(member, name, before)
+    remote.exec(member, f"touch -d @{stamp} {path}")
+
+    mnt = mounted_factory(streaming_reads=False)
+    target = mnt.mount / name
+    cached = mnt.cache / name
+    backend = mnt.backends[member.name]
+    with mock.patch.object(backend, "copy_to_local", wraps=backend.copy_to_local) as download:
+        assert target.read_bytes() == before
+        assert target.read_bytes() == before
+        assert download.call_count == 1
+
+        remote.write_remote(member, name, after)
+        remote.exec(member, f"touch -d @{stamp} {path}")
+        # Deliver the watcher's change deterministically, without waiting
+        # for remote inotify delivery or racing its file state.
+        mnt.fs._on_remote_change("/" + name)
+        assert not cached.exists()
+
+        with target.open("rb") as reader:
+            assert cached.read_bytes() == after
+            assert target.stat().st_mtime == stamp
+            assert reader.read() == after
+        assert target.read_bytes() == after
+        assert download.call_count == 2
+
+
+def test_mounted_read_only_conflict_close_keeps_newer_member_bytes(
+        remote, mounted_factory, monkeypatch):
+    left, right = remote.members
+    remote.write_remote(left, "both", b"left")
+    remote.write_remote(right, "both", b"right")
+    mnt = mounted_factory(streaming_reads=True)
+    view = f"both.{left.name}"
+    assert view in os.listdir(mnt.mount)
+    released = threading.Event()
+    release = mnt.fs.release
+
+    def observed_release(path, fh):
+        result = release(path, fh)
+        if path == "/" + view:
+            released.set()
+        return result
+
+    monkeypatch.setattr(mnt.fs, "release", observed_release)
+    with (mnt.mount / view).open("rb") as reader:
+        assert reader.read() == b"left"
+        remote.write_remote(left, "both", b"newer member edit")
+    assert released.wait(10)
+    assert remote.read_remote(left, "both") == b"newer member edit"
+    assert remote.read_remote(right, "both") == b"right"
+
+
+def test_mounted_write_to_member_conflict_view(remote, mounted_factory):
+    left, right = remote.members
+    remote.write_remote(left, "both", b"left")
+    remote.write_remote(right, "both", b"right")
+    mnt = mounted_factory(streaming_reads=True)
+    view = f"both.{left.name}"
+    assert view in os.listdir(mnt.mount)
+
+    with (mnt.mount / view).open("r+b") as writer:
+        assert writer.write(b"edit") == 4
+
+    assert _wait_for(lambda: remote.read_remote(left, "both") == b"edit")
+    assert remote.read_remote(right, "both") == b"right"
+
+
 def _streaming_read_case(remote, mounted_factory, monkeypatch, streaming: bool):
     chunk = 64 * 1024
     member = remote.members[0]

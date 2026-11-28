@@ -324,10 +324,12 @@ missing for 10 s. Attributes are not kept: each `stat` reaches the mount,
 which answers it from the cached file or from the parent's listing, and
 asks a member only when neither knows the name. (Kept
 attributes would hold a file's old size past a refetch, and reads would
-stop there.) A file's pages stay in the page cache across opens while
-its size and mtime are unchanged and are dropped when they change, so a
-refetched file is read fresh. Changes made through the mount are visible
-at once. A file added directly on a member can stay hidden for up to
+stop there.) Each new open discards the mount's buffered pages from
+earlier opens so a refetch can return fresh bytes with the same size and
+mtime. Repeated opens can incur additional local FUSE reads. A warm open
+still uses Storage's backing cache and requires no download of the cached
+file. Changes made through the mount are visible at once. A file added
+directly on a member can stay hidden for up to
 10 s after a lookup missed it, and a name removed on a member can still
 be walked through for up to the fresh window. The profile keys
 `entry_timeout` and `negative_timeout` (seconds) override the first two
@@ -567,12 +569,14 @@ Configuration is hierarchical - child directories inherit from parents, with the
 4. `storage debug rebuild-index` reconstructs cache-backed rows quickly from cache files plus xattrs
 5. `storage debug reprobe-locations` explicitly repopulates non-cache member rows for the rebuilt file set using the cache root to keep `user.storage.metadata` authoritative
 6. `storage debug verify-index` audits the cache/index boundary without mutating state
+7. Full and streaming fills preserve a regular member file's mtime and initial atime as accurately as the member reports them. The mount reports observed member mode and numeric ownership while Storage owns and maintains the backing inode. A member file's setuid and setgid bits are never installed on the backing file or reported. A read-only member file stays read-only through the mount. A fill whose member reports no mode reports the downloaded copy's mode without write permission until a `chmod` through the mount. After each transfer the member is stat'ed once more (one extra member stat per cold fill, retried once if it fails) and the file gets that newest stat's attributes. The atime stays the one reported before the transfer. If size, mtime or mode changed since the stat taken before the transfer, a full fill fetches once more, and a streaming fill is not kept (its readers keep their bytes; the next open fetches the file again, streaming once more, so a file that keeps changing during every stream is never cached). If both stats after the transfer fail, the earlier stat is used when the transfer's size matches it, and otherwise the file is reported read-only with no member attributes. Explicit `chmod`, `chown`, and timestamp changes through the mount take precedence.
+8. Older CLEAN cache files can report their source mtime when one recorded member baseline matches the cache inode, size, and native mtime. Files with missing or conflicting evidence report their native cache timestamps until the next fill. Recovery only changes the value returned by stat, so the cache inode and its sync state retain their existing timestamps.
 
 **Conflict View:**
 1. A name on several members whose listings report regular files of different sizes is shown at once as `name.<member>`, one entry per copy, without hashing anything
 2. Copies of equal size show the plain name and are hashed on the member in the background (`xxh128sum` over SSH): one hash at a time per member, behind interactive requests for the member's connection, newest directory first; they split into `name.<member>` at the next `readdir` if the hashes differ. Equal mtimes are not taken as identity
 3. The view never downloads a file to hash it: a copy the member cannot hash itself (no `xxh128sum`, or the hash did not finish within the SFTP operation timeout) is left unverified, keeps the plain name, and is not hashed again until its listed size, mtime or (where the member reports it) ctime changes; a hash the member could not be asked for (the connection dropped, no channel was free) records nothing and is retried at the next listing of the directory
-4. A change to a member's copy of a name split by size (a watcher event, the upload when a conflict copy is closed) makes the next `readdir` list the directory again
+4. A change to a member's copy of a name split by size (a watcher event or an upload when a changed conflict copy is closed) makes the next `readdir` list the directory again. A content change to a conflict copy through the mount (a write, an `O_TRUNC` open or create, a size-changing truncate) is pending until the next close of any descriptor on that copy, read-only or writable, sends it; once sent it is not sent again, and a failed send stays pending. Timestamp, mode, owner and xattr changes stay local. Pending changes are kept in memory only, and a truncate with no descriptor opened on the copy afterwards is never sent
 5. `getfattr -n user.storage.checksums` on the name lists each copy as `<member>:<hash>:<time>`, `<member>:unverified:<time>`, or `<member>:size=<bytes>:<time>` for a size split
 6. A hash is recorded with its basis, the member's listed size, mtime and ctime (SFTP reports no ctime), and kept in the index across remounts: a listing that reports the same basis uses it without hashing, so the first listing after a remount already splits a diverged name. The index is acceleration state; a lost row costs one hash
 7. Sync records the hash of each file it uploads against the member's stat after the upload, so a change written through the mount is never hidden by an older hash, and needs no member hash to be compared. With `enable_watchers`, the member's own event for the upload drops that record again (an event means the member changed, whatever its stat says), so the next listing hashes the copy once. A write to the member by something else between the end of the upload and that stat would be recorded under the upload's hash
@@ -607,6 +611,7 @@ Implemented:
 - Local, SSH/SFTP and rsync storage members (SFTP for reads, rsync for writes); one SSH connection per member, its requests multiplexed over a small pool of SFTP channels
 - Directory listings fresh for `revalidate_after` and refreshed in the background after it, answering `stat` and missing names without a member round trip
 - Local cache with LRU eviction, revalidated against the member on open (`revalidate_after`); streaming cold reads with background prefetch that stops when readers close early (`streaming_keep_after_close`)
+- Member timestamps and stat attributes preserved on regular-file cache fills, including streaming reads. Legacy CLEAN cache entries report recovered source mtime when their recorded evidence agrees.
 - Background sync workers with retry; N-way replication configured per directory through xattrs
 - Conflict detection on sync, and `storage conflicts` to list and resolve conflicts (`--verify` to hash a directory's duplicates again first); a conflict view in listings that splits copies of different sizes from the listing alone and hashes equal-size copies in the background on the members, never by download, keeping hashes across remounts, recording what sync uploads and re-verifying recorded hashes slowly
 - Remote inotify watchers that invalidate the cache when a member changes

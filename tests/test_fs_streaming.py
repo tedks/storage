@@ -13,6 +13,7 @@ from unittest.mock import patch
 from fuse import FuseOSError
 
 from storage.backends.local import LocalBackend
+from storage.cache_metadata import MEMBER_ATTRS_XATTR
 from storage.fs import StorageFS
 from storage.models import SyncStatus
 from storage.mount_profiles import parse_keep_after_close
@@ -134,6 +135,105 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.assertEqual(cache_path.read_bytes(), payload)
 
         self.fs.release('/large.bin', vfd)
+
+    def _stream_whole(self, name, size):
+        vfd = self.fs.open("/" + name, os.O_RDONLY)
+        try:
+            data = self.fs.read("/" + name, size, 0, vfd)
+        finally:
+            self.fs.release("/" + name, vfd)
+        cache_path = self.cache_dir / name
+        self.assertTrue(self._wait_for(cache_path.exists, timeout=8.0))
+        return data, cache_path
+
+    def test_streaming_fill_without_member_mode_is_read_only(self):
+        # Size and mtime known, mode missing: the staging file's own mode
+        # (owner-writable) must not become the reported, enforced one.
+        import stat as stat_module
+        from types import SimpleNamespace
+        payload = os.urandom(64 * 1024)
+        (self.backend_dir / "nomode.bin").write_bytes(payload)
+        os.chmod(self.backend_dir / "nomode.bin", 0o444)
+        fake = SimpleNamespace(st_size=len(payload), st_mtime=1_600_000_000.0, st_mode=None)
+        with patch.object(self.backend, "stat", return_value=fake):
+            data, cache_path = self._stream_whole("nomode.bin", len(payload))
+        self.assertEqual(data, payload)
+        attrs = self.fs.getattr("/nomode.bin")
+        self.assertEqual(attrs["st_mode"] & 0o222, 0)
+        self.assertEqual(attrs["st_mtime"], 1_600_000_000.0)
+        with self.assertRaises(FuseOSError) as raised:
+            self.fs.open("/nomode.bin", os.O_WRONLY)
+        self.assertEqual(raised.exception.errno, errno.EACCES)
+        # An explicit chmod through the mount grants write.
+        self.fs.chmod("/nomode.bin", 0o644)
+        self.fs.release("/nomode.bin", self.fs.open("/nomode.bin", os.O_WRONLY))
+        self.assertTrue(stat_module.S_ISREG(attrs["st_mode"]))
+
+    def _stream_and_finish(self, name, size):
+        """Read name whole through a stream and wait for its session to end."""
+        vfd = self.fs.open("/" + name, os.O_RDONLY)
+        with self.fs._fd_lock:
+            session = self.fs._fd_map[vfd].prefetch_session
+        self.assertIsNotNone(session)
+        try:
+            data = self.fs.read("/" + name, size, 0, vfd)
+            self.assertTrue(self._wait_for(
+                lambda: session.finalized or session.error is not None, timeout=8.0))
+        finally:
+            self.fs.release("/" + name, vfd)
+        return data, session
+
+    def test_streaming_fill_of_a_member_changed_since_its_probe_is_discarded(self):
+        old, new = b"o" * (64 * 1024), b"n" * (64 * 1024)
+        member = self.backend_dir / "moved.bin"
+        member.write_bytes(old)
+        os.utime(member, (1_600_000_000, 1_600_000_000))
+        real_stat, calls = self.backend.stat, []
+
+        def stat(path):
+            calls.append(path)
+            if len(calls) == 2:  # the confirmation at finalize: replaced meanwhile
+                member.write_bytes(new)
+                os.utime(member, (1_650_000_000, 1_650_000_000))
+            return real_stat(path)
+
+        with patch.object(self.backend, "stat", side_effect=stat):
+            data, session = self._stream_and_finish("moved.bin", len(old))
+            # Counted once the partial is gone and the session finished.
+            self.assertTrue(self._wait_for(lambda: self.fs._streaming_manager._streaming_stats.get(
+                "streaming_member_changed_discards") == 1, timeout=8.0))
+        self.assertEqual(data, old)  # the reader kept its bytes
+        cache_path = self.cache_dir / "moved.bin"
+        self.assertFalse(cache_path.exists())  # nothing pairs 1_650_000_000 with old bytes
+        self.assertFalse((self.cache_dir / "moved.bin.storage.partial").exists())
+        self.assertEqual(self.fs._streaming_manager._streaming_stats.get(
+            "streaming_member_changed_discards"), 1)
+        # A reopen fetches the replacement; stat and fstat report its mtime.
+        self.assertEqual(self._stream_whole("moved.bin", len(new))[0], new)
+        self.assertEqual(self.fs.getattr("/moved.bin")["st_mtime"], 1_650_000_000)
+        with open(cache_path, "rb") as f:
+            self.assertEqual((f.read(), os.fstat(f.fileno()).st_mtime), (new, 1_650_000_000))
+
+    def test_interrupted_confirmation_fails_the_session_and_wakes_readers(self):
+        from storage.backends.ssh_pool import BulkCapacityTimeout
+        payload = os.urandom(64 * 1024)
+        (self.backend_dir / "cut.bin").write_bytes(payload)
+        real_stat, calls = self.backend.stat, []
+
+        def stat(path):
+            calls.append(path)
+            if len(calls) >= 2:
+                raise BulkCapacityTimeout("no capacity")
+            return real_stat(path)
+
+        with patch.object(self.backend, "stat", side_effect=stat):
+            data, session = self._stream_and_finish("cut.bin", len(payload))
+        self.assertEqual(data, payload)
+        self.assertIsInstance(session.error, OSError)
+        self.assertEqual(session.error.errno, errno.EAGAIN)
+        # Not installed as a confirmed fill: the failed session's usual
+        # cleanup applies (at most an unindexed prefix, refetched on open).
+        self.assertIsNone(self.fs.state_manager.get_file_metadata("/cut.bin"))
 
     def test_streaming_open_uses_cached_file_without_prefetch_session(self):
         payload = os.urandom(128 * 1024)
@@ -527,7 +627,8 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.assertTrue(self.fs._ensure_file_in_cache(self.fs._resolve_path('/plain-ro.bin')))
         cache_path = self.cache_dir / "plain-ro.bin"
         self.assertEqual(b"whole file", cache_path.read_bytes())
-        self.assertEqual(0o444, os.stat(cache_path).st_mode & 0o777)
+        self.assertEqual(0o444, self.fs.getattr("/plain-ro.bin")["st_mode"] & 0o777)
+        self.assertEqual(0o644, os.stat(cache_path).st_mode & 0o777)
         self.assertIsNotNone(self.fs.state_manager.get_file_metadata('/plain-ro.bin'))
 
     def test_unindexed_prefix_is_dropped_only_when_unopened_and_unindexed(self):
@@ -1700,9 +1801,14 @@ class TestFSStreamingIntegration(unittest.TestCase):
             rvfd, session = self._stream_whole_file("writer.bin", payload)
             self.assertTrue(at_finalize.wait(timeout=3.0))
             wvfd = self._write_open_and_edit("writer.bin", edit)
+            cache_file = self.cache_dir / "writer.bin"
+            winning_mtime = cache_file.stat().st_mtime_ns
+            winning_attrs = os.getxattr(cache_file, MEMBER_ATTRS_XATTR)
             go.set()
             session.worker.join(timeout=5.0)
         self.assertFalse(session.worker.is_alive())
+        self.assertEqual(cache_file.stat().st_mtime_ns, winning_mtime)
+        self.assertEqual(os.getxattr(cache_file, MEMBER_ATTRS_XATTR), winning_attrs)
 
         with self.fs._fd_lock:
             writer_fd = self.fs._fd_map[wvfd].real_fd

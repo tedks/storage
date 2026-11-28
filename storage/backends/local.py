@@ -88,7 +88,7 @@ def _listxattr(path) -> List[str]:
         raise
 
 
-def _copy_file(src: Path, dst: Path):
+def _copy_file(src: Path, dst: Path, *, download: bool = False):
     """shutil.copy2 without the mount's internal xattrs.
 
     Bytes, xattrs, mode and times, in copy2's order: the xattrs go before
@@ -101,6 +101,13 @@ def _copy_file(src: Path, dst: Path):
     stay, and so do ACL entries the source no longer has. Errors copy2
     ignores per name are ignored; others raise, leaving the new bytes with
     partly updated metadata, as copy2 would.
+
+    download (copy_to_local) copies neither security.capability nor the
+    set-ID and sticky bits: a member file never becomes privileged on this
+    host. That holds for every copy_to_local caller, so a file relayed
+    through a download (ReplicationManager.replicate_file, which nothing
+    outside the tests calls) reaches its target without them too. Other
+    xattrs, POSIX ACLs included, are copied as above.
     """
     shutil.copyfile(src, dst)
     st = os.stat(src)
@@ -112,13 +119,18 @@ def _copy_file(src: Path, dst: Path):
             except OSError as exc:
                 if exc.errno not in _XATTR_SKIP_ERRNOS:
                     raise
+    if download:
+        keep.discard("security.capability")
     for name in sorted(keep):
         try:
             os.setxattr(dst, name, os.getxattr(src, name))
         except OSError as exc:
             if exc.errno not in _XATTR_SKIP_ERRNOS:
                 raise
-    os.chmod(dst, stat.S_IMODE(st.st_mode))
+    mode = stat.S_IMODE(st.st_mode)
+    if download:
+        mode &= 0o777
+    os.chmod(dst, mode)
     os.utime(dst, ns=(st.st_atime_ns, st.st_mtime_ns))
 
 
@@ -258,7 +270,7 @@ class LocalBackend(Backend):
         """Copy a file from backend to local path"""
         real_path = self._resolve_path(virtual_path)
         local_path.parent.mkdir(parents=True, exist_ok=True)
-        _copy_file(real_path, local_path)
+        _copy_file(real_path, local_path, download=True)
 
     def copy_from_local(self, local_path: Path, virtual_path: str):
         """Copy a local file to backend"""

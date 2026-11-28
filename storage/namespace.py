@@ -12,7 +12,10 @@ from typing import Callable, Dict, List, NamedTuple, Optional, Set, Tuple
 from fuse import FuseOSError
 
 from .backends.base import Backend, MemberSourceMissing
-from .cache_metadata import regular_file_stat
+from .cache_metadata import (
+    cached_member_attributes, legacy_member_mtime, regular_file_stat, reported_mode,
+    stale_record_mode,
+)
 from .checksums import ChecksumBasis, ChecksumRecord
 from .models import SyncStatus
 from .pathing import ResolvedPath, canonicalize_virtual_path
@@ -781,12 +784,27 @@ class NamespaceService:
         return visible
 
     def getattr(self, path: str):
-        """Get file attributes."""
+        """Get file attributes, never with set-ID bits on a regular file.
+
+        Whatever answers (the cache file, its member record, a listing or a
+        member's stat), a member's setuid or setgid bit, which the kernel
+        would honour with the member's uid on a mount without nosuid, is
+        not reported (cache_metadata.reported_mode).
+        """
+        attrs = self._getattr(path)
+        mode = attrs.get("st_mode")
+        if type(mode) is int:
+            stripped = reported_mode(mode)
+            if stripped != mode:
+                attrs = dict(attrs, st_mode=stripped)
+        return attrs
+
+    def _getattr(self, path: str):
         resolved = self.resolve_path(path)
 
         try:
             st = os.lstat(str(resolved.cache_path))
-            return {
+            attrs = {
                 key: getattr(st, key)
                 for key in (
                     "st_atime",
@@ -799,6 +817,24 @@ class NamespaceService:
                     "st_uid",
                 )
             }
+            if stat.S_ISREG(st.st_mode):
+                source = cached_member_attributes(resolved.cache_path, st)
+                if source is not None:
+                    attrs.update(source)
+                    stale_mode = None
+                else:
+                    stale_mode = stale_record_mode(resolved.cache_path, st)
+                if stale_mode is not None:
+                    # A copied record's read-only mode, as enforced.
+                    attrs["st_mode"] = stale_mode
+                if source is None and resolved.backend_name is None:
+                    recovered = legacy_member_mtime(
+                        resolved.cache_path, st,
+                        lambda: self.state_manager.get_file_metadata(resolved.canonical_path),
+                    )
+                    if recovered is not None:
+                        attrs["st_mtime"] = recovered
+            return attrs
         except OSError as exc:
             if resolved.backend_name:
                 backend_iter = [(resolved.backend_name, self.backends.get(resolved.backend_name))]
@@ -848,19 +884,20 @@ class NamespaceService:
                     # lstat: a member's link is reported as a link, as its
                     # listing reports it (readlink answers its target).
                     st = backend.lstat(resolved.canonical_path)
+                    def field(key, default):
+                        value = getattr(st, key, None)
+                        return default if value is None else value
+
+                    mtime = field("st_mtime", time.time())
                     answer = {
-                        "st_atime": getattr(st, "st_atime", time.time()),
-                        "st_ctime": getattr(
-                            st,
-                            "st_ctime",
-                            getattr(st, "st_mtime", time.time()),
-                        ),
-                        "st_gid": getattr(st, "st_gid", os.getgid()),
-                        "st_mode": getattr(st, "st_mode", stat.S_IFREG | 0o644),
-                        "st_mtime": getattr(st, "st_mtime", time.time()),
-                        "st_nlink": getattr(st, "st_nlink", 1),
-                        "st_size": getattr(st, "st_size", 0),
-                        "st_uid": getattr(st, "st_uid", os.getuid()),
+                        "st_atime": field("st_atime", mtime),
+                        "st_ctime": field("st_ctime", mtime),
+                        "st_gid": field("st_gid", os.getgid()),
+                        "st_mode": field("st_mode", stat.S_IFREG | 0o644),
+                        "st_mtime": mtime,
+                        "st_nlink": field("st_nlink", 1),
+                        "st_size": field("st_size", 0),
+                        "st_uid": field("st_uid", os.getuid()),
                     }
                     self._stat_memo_put(
                         resolved.canonical_path, resolved.backend_name, answer, epoch, began,

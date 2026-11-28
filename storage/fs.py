@@ -8,6 +8,7 @@ Main filesystem layer that provides:
 - N-way replication
 """
 
+import dataclasses
 import os
 import errno
 import stat
@@ -38,10 +39,15 @@ from .backends.ssh_mux import close_shared_control_sockets
 from .backends.ssh_pool import (
     BulkCapacityCancelled, BulkCapacityTimeout, is_connection_error,
 )
-from .cache import PARTIAL_SUFFIX, CacheManager
+from .cache import PARTIAL_SUFFIX, CacheFetch, CacheManager
 from .foreground_admission import AdmissionClosed, ForegroundAdmission, validate_cap
 from .locks import NamespaceLock, PathLocks, UploadLocks
-from .cache_metadata import PREFIX_XATTR, XATTR_CACHE_METADATA_NAME, regular_file_stat, scan_cache_entries
+from .cache_metadata import (
+    MEMBER_ATTRS_XATTR, MEMBER_STAT_XATTR as CACHE_MEMBER_STAT_XATTR,
+    PREFIX_XATTR, XATTR_CACHE_METADATA_NAME,
+    cache_identity, forget_cached_member_fields, imported_mode_denies_write,
+    read_member_baselines, record_native_attributes, regular_file_stat, scan_cache_entries,
+)
 from .file_config import FileConfig, get_inherited_config
 from .models import FileLocation, FileMetadata, StreamingKeepAfterClose, SyncStatus
 from .state import StateManager
@@ -69,6 +75,9 @@ class FDEntry:
     backend_name: Optional[str]
     canonical_path: str
     prefetch_session: Optional[PrefetchSession] = None
+    # A conflict view descriptor's cached inode: with cache_path, the key of
+    # the view's pending content change (StorageFS._mark_view_changed).
+    view_ino: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -109,7 +118,7 @@ class StorageFS(Operations):
     _PARTIAL_SUFFIX = PARTIAL_SUFFIX
     _STREAM_STATE_XATTR = "user.storage.stream"
     # Member baselines for revalidation on open (see _store_member_check).
-    MEMBER_STAT_XATTR = "user.storage.member_stat"
+    MEMBER_STAT_XATTR = CACHE_MEMBER_STAT_XATTR
     # Internal artifacts that should be hidden from readdir listings.
     # Entries matching these exactly are filtered, plus anything ending
     # with _PARTIAL_SUFFIX.
@@ -334,6 +343,10 @@ class StorageFS(Operations):
         # _member_checks_lock.
         self._refetch_pins: Dict[str, Backend] = {}
         self._recheck: Dict[str, Set[str]] = {}
+        # Conflict views whose cached copy has content not yet sent to its
+        # member: (cache path, st_ino) -> generation, under _fd_lock. See
+        # _mark_view_changed.
+        self._view_pending: Dict[Tuple[str, int], int] = {}
         # Paths whose holders were all unavailable at the last open past the
         # age: (monotonic time, holder names). Later opens skip the index
         # queries until one of those holders answers again or the age
@@ -458,8 +471,9 @@ class StorageFS(Operations):
             max_streaming_sessions=max_streaming_sessions,
             keep_after_close=streaming_keep_after_close,
             on_finalized=lambda session: self._record_fetched(
-                session.canonical_path, session.final_cache_path,
-                session.backend, session.member_stat,
+                session.canonical_path, session.final_cache_path, session.backend,
+                session.confirmed_stat if session.confirmed_stat is not None
+                else session.member_stat,
             ),
             partial_suffix=self._PARTIAL_SUFFIX,
             stream_state_xattr=self._STREAM_STATE_XATTR,
@@ -649,6 +663,9 @@ class StorageFS(Operations):
                         return
                 try:
                     st = os.lstat(str(cache_path))
+                    if resolved.backend_name and (str(cache_path), st.st_ino) in self._view_pending:
+                        # Content not yet sent to its member: kept, as for a writer.
+                        return
                     if meta and not resolved.backend_name:
                         stale = st.st_size != meta.size or st.st_mtime != meta.last_modified
                     if not stale:
@@ -1369,9 +1386,7 @@ class StorageFS(Operations):
     # ------------------------------------------------------------------ #
     # Revalidation of cached files on open
     # ------------------------------------------------------------------ #
-    @staticmethod
-    def _cache_identity(st: os.stat_result) -> Tuple[int, int, int]:
-        return (st.st_ino, st.st_size, st.st_mtime_ns)
+    _cache_identity = staticmethod(cache_identity)
 
     def _forget_member_check(self, virtual_path: str, subtree: bool = False,
                              path_gone: bool = False):
@@ -1443,26 +1458,7 @@ class StorageFS(Operations):
         self.namespace.forget_listed_attrs(virtual_path, removing=removing)
         self._forget_member_check(virtual_path)
 
-    def _load_persisted_members(self, cache_path: Path,
-                                identity: Tuple[int, int, int]) -> Dict[str, Tuple[int, float]]:
-        """Member baselines from the cache file's xattr, if it still describes this file.
-
-        Matched on the cache file's (ino, size, mtime_ns) alone: a rename
-        keeps both the file and its baselines valid, and a copy of the xattr
-        onto another file (copy2 to a local member and back) has another
-        inode.
-        """
-        try:
-            payload = json.loads(os.getxattr(str(cache_path), self.MEMBER_STAT_XATTR,
-                                             follow_symlinks=False))
-            if tuple(payload.get("cache")) != identity:
-                return {}
-            return {
-                str(name): (int(size), float(mtime))
-                for name, (size, mtime) in payload.get("members", {}).items()
-            }
-        except (OSError, ValueError, TypeError, AttributeError):
-            return {}
+    _load_persisted_members = staticmethod(read_member_baselines)
 
     def _store_member_check(self, canonical_path: str, cache_path: Path,
                             identity: Tuple[int, int, int],
@@ -1536,12 +1532,22 @@ class StorageFS(Operations):
 
     def _record_fetched(self, canonical_path: str, cache_path: Path, backend: Backend,
                         member_stat: Optional[os.stat_result]):
-        """A full fetch from backend just finished; member_stat was taken before it.
+        """A full fetch from backend just finished; member_stat is its baseline.
 
-        Stat before copy: a change landing in between leaves a baseline older
-        than the copy, which costs one needless refetch at the next check;
-        the other order could pair a new baseline with old bytes and never
-        see the change.
+        Normally the member's stat after the transfer that agreed with the
+        one taken before it (cache_metadata.confirm_member_stat): agreement
+        makes their size and mtime identical, so it describes the bytes
+        fetched. Otherwise the stat taken before the transfer: a change
+        landing in between then leaves a baseline older than the copy, which
+        costs one refetch at the next check; a baseline taken after the copy
+        alone could pair a new baseline with old bytes and never see the
+        change.
+
+        Limit: with no stat before the transfer (the probe failed or the
+        member has none), the confirming stat taken after it is the only
+        one, so nothing was compared and a same-size change during the
+        transfer goes unseen, as it did before confirmation existed (the
+        copy then carried that post-transfer mtime anyway).
 
         Also called off the FUSE thread, from a stream's on_finalized. It can
         then land after the FUSE thread's own refetch of the same path and
@@ -1554,8 +1560,9 @@ class StorageFS(Operations):
             self._forget_member_check(canonical_path)
             return
         members = {}
-        if member_stat is not None:
-            members[backend.name] = (member_stat.st_size, member_stat.st_mtime)
+        size, mtime = getattr(member_stat, "st_size", None), getattr(member_stat, "st_mtime", None)
+        if size is not None and mtime is not None:
+            members[backend.name] = (size, mtime)
         self._store_member_check(canonical_path, cache_path, identity, members, replace=True)
         self._clear_recheck(canonical_path, backend.name)
         with self._member_checks_lock:
@@ -2059,28 +2066,29 @@ class StorageFS(Operations):
                 except Exception:
                     member_stat = None
             # Download to cache
-            cached = self.cache_manager.cache_file(
-                resolved.requested_path,
-                backend,
-                source_virtual_path=canonical_path,
+            confirmed: list = []
+            outcome = self.cache_manager.cache_file_result(
+                resolved.requested_path, backend, canonical_path, member_stat=member_stat,
+                confirmed=confirmed,
             )
-            if cached and self._drop_unindexed_prefix(canonical_path, cache_path):
+            if outcome == CacheFetch.ALREADY_CACHED and self._drop_unindexed_prefix(canonical_path, cache_path):
                 # A failed stream's prefix was installed before this copy
                 # (whose link then found it): once more, for the whole file.
-                cached = self.cache_manager.cache_file(
-                    resolved.requested_path,
-                    backend,
-                    source_virtual_path=canonical_path,
+                outcome = self.cache_manager.cache_file_result(
+                    resolved.requested_path, backend, canonical_path, member_stat=member_stat,
+                    confirmed=confirmed,
                 )
-            if cached and self._is_unindexed_prefix(canonical_path, cache_path):
-                # Still a prefix (open elsewhere, or another one won again):
-                # serve it unindexed, as any open after a failed session's
-                # cleanup does. (If the second fetch fails instead, the open
-                # fails: the dropped prefix is not served.)
+            if outcome == CacheFetch.ALREADY_CACHED:
+                # A stream or a writer won. Their inode, source baseline
+                # and state rows belong to them, even for an unindexed prefix.
                 return True
-            if cached:
+            if outcome == CacheFetch.INSTALLED:
                 # Fresh from the member: no check needed until revalidate_after.
-                self._record_fetched(canonical_path, cache_path, backend, member_stat)
+                # The baseline is the stat the copy was confirmed against (the
+                # newer one after a second transfer); unconfirmed, the probe,
+                # so the next check refetches.
+                self._record_fetched(canonical_path, cache_path, backend,
+                                     confirmed[-1] if confirmed else member_stat)
                 # Populate state metadata and locations if missing
                 try:
                     st = os.lstat(str(cache_path))
@@ -2122,8 +2130,7 @@ class StorageFS(Operations):
                         created = False
                 if not created:
                     # A refetch after eviction: the member's copy is what the
-                    # row already calls synced, but the transfer does not keep
-                    # the mtime, so the row's stat must follow the new file or
+                    # row already calls synced. Its stat must follow the new file or
                     # heal_stale_clean would resync unchanged content. Only
                     # the stat columns move, and only at the generation read
                     # above; a write recorded since keeps its own stat. The
@@ -2237,8 +2244,14 @@ class StorageFS(Operations):
 
     def _unlink(self, path):
         """Remove a file"""
+        # The inode the name holds now, under the path's lock: its pending
+        # change (if a view's) goes with it, exactly that key, so a later
+        # copy at the name never inherits it even if it reuses the number.
+        cache_path = self._resolve_path(path).cache_path
+        before = regular_file_stat(cache_path)
         try:
             self.namespace.unlink(path)
+            self._retire_view_inode(cache_path, before)
         finally:
             canonical_path = self._resolve_path(path).canonical_path
             self._forget_checksums({canonical_path})
@@ -2296,6 +2309,10 @@ class StorageFS(Operations):
         # A source the cache never held cannot have moved into the target:
         # the target's baselines are about the copy that was already there.
         old_was_cached = os.path.lexists(self.cache_manager.get_cache_path(old_canonical))
+        # The target's own copy, which a successful rename replaces: its
+        # pending change (a view's) goes with exactly that inode.
+        target_cache = self.cache_manager.get_cache_path(new)
+        target_before = regular_file_stat(target_cache)
         try:
             self.namespace.rename(old, new, on_local_moved=lambda: self._repoint_descriptors(old, new))
         except BaseException:
@@ -2311,6 +2328,16 @@ class StorageFS(Operations):
                 self._drop_persisted_baselines(new_canonical)
             raise
         finally:
+            # Whether the rename succeeded or failed after the local move,
+            # the target's old copy is gone once its name holds another
+            # inode (or none): retire exactly that inode's pending change.
+            # A rename moves canonical cache files, so it replaces a view's
+            # copy only if new names one; the moved file is another live
+            # inode, so a changed number at the name means replaced.
+            if target_before is not None:
+                target_after = regular_file_stat(target_cache)
+                if target_after is None or target_after.st_ino != target_before.st_ino:
+                    self._retire_view_inode(target_cache, target_before)
             # Records are keyed by path, so neither name's records (nor, for a
             # directory, its children's) describe what is there now. Dropping
             # them is always safe, so a failed rename drops them too.
@@ -2325,7 +2352,14 @@ class StorageFS(Operations):
         right after the cache move and the index rewrite.
         """
         prefix = old.rstrip("/") + "/"
+        old_cache = str(self.cache_manager.get_cache_path(old))
+        new_cache = str(self.cache_manager.get_cache_path(new))
         with self._fd_lock:
+            # A pending view change follows its copy (_mark_view_changed).
+            for (path, ino) in [k for k in self._view_pending
+                                if k[0] == old_cache or k[0].startswith(old_cache.rstrip("/") + "/")]:
+                self._view_pending[(new_cache + path[len(old_cache):], ino)] = (
+                    self._view_pending.pop((path, ino)))
             for entry in self._fd_map.values():
                 if entry.virtual_path == old:
                     moved = new
@@ -2340,23 +2374,57 @@ class StorageFS(Operations):
 
     def chmod(self, path, mode):
         """Change file mode"""
-        cache_path = self._resolve_path(path).cache_path
-
-        try:
-            os.chmod(cache_path, mode)
-        except OSError as e:
-            raise FuseOSError(e.errno)
+        resolved = self._resolve_path(path)
+        with self._path_locked(resolved.canonical_path):
+            try:
+                before = os.lstat(resolved.cache_path)
+                os.chmod(resolved.cache_path, mode)
+            except OSError as e:
+                raise FuseOSError(e.errno)
+            self._forget_member_fields(resolved.cache_path, before, "st_mode", "st_ctime")
 
     def chown(self, path, uid, gid):
         """Change file owner"""
-        cache_path = self._resolve_path(path).cache_path
-
+        resolved = self._resolve_path(path)
         # lchown: the kernel sends chown -h for a link, which must change
         # the link, never its target. (chmod is never sent for a link.)
+        with self._path_locked(resolved.canonical_path):
+            try:
+                before = os.lstat(resolved.cache_path)
+                os.chown(resolved.cache_path, uid, gid, follow_symlinks=False)
+            except OSError as e:
+                raise FuseOSError(e.errno)
+            fields = ["st_ctime"]
+            if uid != -1:
+                fields.append("st_uid")
+            if gid != -1:
+                fields.append("st_gid")
+            self._forget_member_fields(resolved.cache_path, before, *fields)
+
+    def _forget_member_fields(self, cache_path: Path, before: os.stat_result, *fields: str):
+        """Retire reported member fields after chmod, chown or utimens.
+
+        The change itself has happened, so a failure to update the record
+        is logged, not reported to the caller: the field it leaves is still
+        masked while the backing stat differs from the record's basis.
+        """
         try:
-            os.chown(cache_path, uid, gid, follow_symlinks=False)
-        except OSError as e:
-            raise FuseOSError(e.errno)
+            forget_cached_member_fields(cache_path, before, *fields)
+        except OSError as exc:
+            self.logger.warning("could not retire member fields %s of %s: %s",
+                                ",".join(fields), cache_path, exc)
+
+    @staticmethod
+    def _require_imported_write_permission(cache_path: Path):
+        # Without default_permissions, native opens enforce the daemon's
+        # file permissions. The imported backing mode has an owner write
+        # bit for Storage's xattrs; don't grant that bit through the mount.
+        if os.geteuid() == 0:
+            return
+        local = regular_file_stat(cache_path)
+        if (local is not None and local.st_uid == os.geteuid()
+                and imported_mode_denies_write(cache_path, local)):
+            raise FuseOSError(errno.EACCES)
 
     def _mark_cache_file_dirty(self, canonical_path: str, cache_path: Path) -> None:
         """Record a modification of a cached file (see CacheManager.mark_file_dirty)."""
@@ -2382,13 +2450,22 @@ class StorageFS(Operations):
             raise FuseOSError(errno.EBUSY)
 
         try:
+            self._require_imported_write_permission(cache_path)
             with open(cache_path, 'r+b') as f:
-                f.truncate(length)
+                truncated = os.fstat(f.fileno())
+                resized = truncated.st_size != length
+                # A no-op truncate of a view changes no content.
+                if resized or not resolved.backend_name:
+                    f.truncate(length)
             self.cache_manager.mark_cache_size_dirty()
 
             # Mark as dirty
             if not resolved.backend_name:
                 self._mark_cache_file_dirty(resolved.canonical_path, cache_path)
+            elif resized:
+                # Sent by the next close of any descriptor on this view, by
+                # path or ftruncate alike (_mark_view_changed).
+                self._mark_view_changed(cache_path, truncated.st_ino)
 
         except OSError as e:
             raise FuseOSError(e.errno)
@@ -2474,6 +2551,8 @@ class StorageFS(Operations):
             if not self._ensure_file_in_cache(resolved):
                 raise FuseOSError(errno.ENOENT)
             cache_path = resolved.cache_path
+            if not self._is_read_only_open(flags):
+                self._require_imported_write_permission(cache_path)
 
         try:
             # Hold _fd_lock across os.open AND _fd_map registration so that
@@ -2499,7 +2578,10 @@ class StorageFS(Operations):
                     backend_name=resolved.backend_name,
                     canonical_path=resolved.canonical_path,
                     prefetch_session=prefetch_session,
+                    view_ino=os.fstat(real_fd).st_ino if resolved.backend_name else None,
                 )
+            if resolved.backend_name and flags & os.O_TRUNC:
+                self._mark_view_changed(cache_path, self._fd_map[vfd].view_ino)
 
             if resolved.backend_name is None:
                 self.cache_manager.mark_accessed(resolved.requested_path)
@@ -2520,6 +2602,8 @@ class StorageFS(Operations):
         """Create a file"""
         resolved = self._resolve_path(path)
         self._refuse_fenced_view_write(resolved)
+        # O_CREAT on an existing read-only member file is refused natively.
+        self._require_imported_write_permission(resolved.cache_path)
         cache_path = self.cache_manager.create_cached_file(resolved.requested_path)
 
         try:
@@ -2535,7 +2619,16 @@ class StorageFS(Operations):
                     backend_name=resolved.backend_name,
                     canonical_path=resolved.canonical_path,
                     prefetch_session=None,
+                    view_ino=os.fstat(real_fd).st_ino if resolved.backend_name else None,
                 )
+            if resolved.backend_name:
+                # A create truncates or makes the view's copy: content to send.
+                self._mark_view_changed(cache_path, self._fd_map[vfd].view_ino)
+            try:
+                # No member fields: stat skips legacy recovery and its index read.
+                record_native_attributes(real_fd)
+            except OSError as exc:
+                self.logger.debug("no attribute record for %s: %s", cache_path, exc)
 
             config = self._get_config(resolved.canonical_path)
             metadata = FileMetadata(
@@ -2657,6 +2750,7 @@ class StorageFS(Operations):
                     written = os.pwrite(entry.real_fd, data, offset)
                 except OSError as e:
                     raise FuseOSError(e.errno)
+                self._mark_view_changed(entry.cache_path, entry.view_ino)
                 self.cache_manager.mark_cache_size_dirty()
                 return written
 
@@ -2665,7 +2759,8 @@ class StorageFS(Operations):
 
         Holds the path's lock (the descriptor's current path, read again
         once the lock is held, since a rename re-points it): closing a
-        member copy (a conflict-suffixed path) uploads it, and no rename,
+        member copy (a conflict-suffixed path) with a pending content change
+        (_mark_view_changed) uploads it, and no rename,
         unlink, refetch or watcher invalidation may run under the upload; a
         canonical close reads the path's row and queues its sync, which a
         rename must not move in between. A streaming descriptor takes no
@@ -2693,12 +2788,26 @@ class StorageFS(Operations):
 
         close_error: Optional[OSError] = None
         inode: Optional[str] = None
+        pending: Optional[int] = None
         if entry.backend_name:
-            try:
-                st = os.fstat(entry.real_fd)
-                inode = f"{st.st_dev}:{st.st_ino}"
-            except OSError:
-                pass
+            pending = self._view_pending_generation(entry)
+            if pending is not None:
+                # Send only the inode the view's name still holds (under the
+                # path's lock, release holds it): bytes of a copy unlinked or
+                # replaced since the change was recorded are not that view's.
+                try:
+                    st = os.fstat(entry.real_fd)
+                    inode = f"{st.st_dev}:{st.st_ino}"
+                except OSError:
+                    pass
+                if not self._names_descriptor_inode(entry):
+                    self.logger.warning(
+                        "conflict view %s no longer names the closed descriptor's file; "
+                        "its pending change is not sent to %s",
+                        entry.virtual_path, entry.backend_name)
+                    self._clear_view_pending(entry, None, force=True)
+                    pending = None
+        view_write = pending is not None
         try:
             os.close(entry.real_fd)
         except OSError as exc:
@@ -2713,16 +2822,19 @@ class StorageFS(Operations):
         if close_error is not None:
             raise FuseOSError(close_error.errno)
 
+        if entry.backend_name and not view_write:
+            return 0
+
         try:
             self.cache_manager.flush_file(entry.virtual_path)
 
-            if entry.backend_name:
+            if view_write:
                 # The view's member copy is a member mutation: registered,
                 # so a queued rename's fence publication is ordered with it.
                 mutation, _fenced = self.cache_manager.member_repairs.start_mutation(
                     [entry.backend_name], [entry.canonical_path])
                 try:
-                    self._release_view(entry, inode)
+                    self._release_view(entry, inode, pending)
                 finally:
                     self.cache_manager.member_repairs.end_mutation(mutation)
             else:
@@ -2735,10 +2847,81 @@ class StorageFS(Operations):
         except OSError as e:
             raise FuseOSError(e.errno)
 
-    def _release_view(self, entry: FDEntry, inode: Optional[str]):
-        """Send a closed conflict view to its member, or keep it for a repair."""
+    def _mark_view_changed(self, cache_path: Path, ino: Optional[int]) -> None:
+        """Record a content change of a conflict view's cached inode.
+
+        One pending flag per (view cache path, inode), set only by content
+        changes made through the mount: a write through any descriptor on
+        the view, an O_TRUNC open or a create, a truncate that changes its
+        size (by path or ftruncate). Metadata changes (utimens, chmod,
+        chown, xattrs) stay local and set nothing. The next close of any
+        descriptor on the view, read-only or writable, sends the copy;
+        a successful send clears only the generation it started with, so
+        a change recorded meanwhile stays pending. A failed send leaves it
+        pending for a later close. The flag lives in memory: a restart
+        loses a pending change, as before (MemberRepairs keeps durably only
+        a view write that an open repair refused, preserve_view_write).
+        A truncate with no descriptor opened on the view afterwards is
+        never sent (as on master).
+        """
+        if ino is None:
+            return
+        with self._fd_lock:
+            key = (str(cache_path), ino)
+            self._view_pending[key] = self._view_pending.get(key, 0) + 1
+
+    def _view_pending_generation(self, entry: FDEntry) -> Optional[int]:
+        with self._fd_lock:
+            return self._view_pending.get((str(entry.cache_path), entry.view_ino))
+
+    def _clear_view_pending(self, entry: FDEntry, generation: Optional[int],
+                            force: bool = False) -> None:
+        """Acknowledge the pending change sent at generation (or, with force,
+        drop the descriptor's claim whatever was recorded)."""
+        with self._fd_lock:
+            key = (str(entry.cache_path), entry.view_ino)
+            if force or (generation is not None and self._view_pending.get(key) == generation):
+                self._view_pending.pop(key, None)
+
+    @staticmethod
+    def _names_descriptor_inode(entry: FDEntry) -> bool:
+        """Whether the view's name still holds the descriptor's inode (dev, ino)."""
+        try:
+            st = os.fstat(entry.real_fd)
+        except OSError:
+            return False
+        current = regular_file_stat(entry.cache_path)
+        return current is not None and (current.st_dev, current.st_ino) == (st.st_dev, st.st_ino)
+
+    def _retire_view_inode(self, cache_path: Path, removed: Optional[os.stat_result]) -> None:
+        """Drop the pending change of the inode a successful unlink or
+        rename took from cache_path (its stat taken before, under the same
+        path lock), and only that key: a later inode at the name, even one
+        that reuses the number, starts with nothing pending."""
+        if removed is None:
+            return
+        with self._fd_lock:
+            self._view_pending.pop((str(cache_path), removed.st_ino), None)
+
+    def _release_view(self, entry: FDEntry, inode: Optional[str], pending: Optional[int]):
+        """Send a closed conflict view to its member, or keep it for a repair.
+
+        The pending change (generation pending) is acknowledged as soon as
+        the member has the copy (copy and sync returned) or a repair keeps
+        it durably, before any bookkeeping, whose failure is only logged:
+        it cannot make a completed upload be sent again. A failed send
+        stays pending for a later close.
+        """
         backend = self.backends.get(entry.backend_name)
-        if backend and entry.backend_name in (
+        if backend is None:
+            # The view names a member this mount no longer has: nothing can
+            # ever take the change.
+            self.logger.error(
+                "conflict view %s names no configured member %s; its change is not sent",
+                entry.virtual_path, entry.backend_name)
+            self._clear_view_pending(entry, pending)
+            return
+        if entry.backend_name in (
             self.cache_manager.member_repairs.backends_for([entry.canonical_path])
         ):
             # A write through a conflict view would replace that
@@ -2747,50 +2930,43 @@ class StorageFS(Operations):
             # this covers a repair recorded after that flush, when
             # close() has already succeeded: the view's bytes are
             # kept durably as a repair of their own, listed until
-            # resolved (MemberRepairs.preserve_view_write). A
-            # read-only view wrote nothing, so nothing is kept.
-            if (entry.flags & os.O_ACCMODE) != os.O_RDONLY:
-                try:
-                    kept = inode is not None and self.cache_manager.member_repairs.preserve_view_write(
-                        entry.canonical_path, entry.backend_name, entry.cache_path, inode,
-                        "write through a conflict view after close(), kept off "
-                        "the member by an open repair",
-                    )
-                    if kept:
-                        self.cache_manager.mark_cache_size_dirty()
-                    else:
-                        self.logger.error(
-                            "direct sync of %s to %s refused by an open member repair; its "
-                            "bytes were not kept: %s no longer holds the descriptor's file, "
-                            "or matches a repair whose kept bytes are missing (left in "
-                            "place; see storage debug member-repairs)",
-                            entry.canonical_path, entry.backend_name, entry.cache_path,
-                        )
-                except Exception as exc:  # noqa: BLE001 - release cannot fail usefully
-                    # A narrow durability limit (CTO-182-J-LENGTH-C3):
-                    # the cache refused the metadata write itself. The
-                    # view's inode and name stay as they were, and the
-                    # member gets nothing.
+            # resolved (MemberRepairs.preserve_view_write).
+            try:
+                kept = inode is not None and self.cache_manager.member_repairs.preserve_view_write(
+                    entry.canonical_path, entry.backend_name, entry.cache_path, inode,
+                    "write through a conflict view after close(), kept off "
+                    "the member by an open repair",
+                )
+                if kept:
+                    self._clear_view_pending(entry, pending)
+                    self.cache_manager.mark_cache_size_dirty()
+                else:
                     self.logger.error(
-                        "Conflict-view write to %s on member %s was refused by an "
-                        "open member repair and could not be kept (errno %s: %s). "
-                        "Recover the bytes from %s before anything evicts or "
-                        "refetches it; they are not on the member.",
-                        entry.canonical_path, entry.backend_name,
-                        errno.errorcode.get(getattr(exc, "errno", None), "?"), exc,
-                        entry.cache_path,
+                        "direct sync of %s to %s refused by an open member repair; its "
+                        "bytes were not kept: %s no longer holds the descriptor's file, "
+                        "or matches a repair whose kept bytes are missing (left in "
+                        "place; see storage debug member-repairs)",
+                        entry.canonical_path, entry.backend_name, entry.cache_path,
                     )
+            except Exception as exc:  # noqa: BLE001 - release cannot fail usefully
+                # A narrow durability limit (CTO-182-J-LENGTH-C3):
+                # the cache refused the metadata write itself. The
+                # view's inode and name stay as they were, and the
+                # member gets nothing.
+                self.logger.error(
+                    "Conflict-view write to %s on member %s was refused by an "
+                    "open member repair and could not be kept (errno %s: %s). "
+                    "Recover the bytes from %s before anything evicts or "
+                    "refetches it; they are not on the member.",
+                    entry.canonical_path, entry.backend_name,
+                    errno.errorcode.get(getattr(exc, "errno", None), "?"), exc,
+                    entry.cache_path,
+                )
             backend = None
         if backend:
             try:
                 backend.copy_from_local(entry.cache_path, entry.canonical_path)
                 backend.sync()
-                # Hashed on the member's worker, not this thread.
-                self._schedule_checksum_task(backend, entry.canonical_path, replace=True)
-                # The member's listed size and mtime are now old;
-                # a size split on the name drops the parent's
-                # listing (see NamespaceService.forget_listed_attrs).
-                self.namespace.forget_listed_attrs(entry.virtual_path)
             except Exception as exc:
                 self.logger.error(
                     "direct sync failed for %s on %s: %s",
@@ -2798,6 +2974,19 @@ class StorageFS(Operations):
                     entry.backend_name,
                     exc,
                 )
+                return
+            self._clear_view_pending(entry, pending)
+            try:
+                # Hashed on the member's worker, not this thread.
+                self._schedule_checksum_task(backend, entry.canonical_path, replace=True)
+                # The member's listed size and mtime are now old;
+                # a size split on the name drops the parent's
+                # listing (see NamespaceService.forget_listed_attrs).
+                self.namespace.forget_listed_attrs(entry.virtual_path)
+            except Exception as exc:  # noqa: BLE001 - the upload itself completed
+                self.logger.error(
+                    "after sending %s to %s, its checksum or listing bookkeeping failed: %s",
+                    entry.canonical_path, entry.backend_name, exc)
 
     def flush(self, path, fh):
         """Report, to close(), a conflict-view write that will not be sent.
@@ -2814,10 +3003,11 @@ class StorageFS(Operations):
         with self._fd_lock:
             entry = self._fd_map.get(fh)
         if (entry is not None and entry.backend_name
-                and (entry.flags & os.O_ACCMODE) != os.O_RDONLY
                 and entry.backend_name in self.cache_manager.member_repairs.backends_for(
                     [entry.canonical_path])):
-            raise FuseOSError(errno.EBUSY)
+            if (self._view_pending_generation(entry) is not None
+                    and self._names_descriptor_inode(entry)):
+                raise FuseOSError(errno.EBUSY)
         return 0
 
     def fsync(self, path, datasync, fh):
@@ -2864,7 +3054,7 @@ class StorageFS(Operations):
     def setxattr(self, path, name, value, options, position=0):
         """Set extended attribute"""
         if name in {self.CHECKSUM_XATTR, self.CACHE_STATE_XATTR, self.CACHE_METADATA_XATTR,
-                    self.MEMBER_STAT_XATTR}:
+                    self.MEMBER_STAT_XATTR, MEMBER_ATTRS_XATTR}:
             # Ignore manual writes for derived attrs.
             return
         if name == self.VERIFY_XATTR:
@@ -2872,12 +3062,16 @@ class StorageFS(Operations):
                 raise FuseOSError(errno.ENOTDIR)
             self._force_verify(self._resolve_path(path).canonical_path)
             return
-        cache_path = self._resolve_path(path).cache_path
-
-        try:
-            os.setxattr(str(cache_path), name, value, follow_symlinks=False)
-        except OSError as e:
-            raise FuseOSError(e.errno)
+        resolved = self._resolve_path(path)
+        # A user xattr needs write permission on a file, as natively. The
+        # path's lock spans the check and the change, so no refetch can
+        # install a read-only import between them.
+        with self._path_locked(resolved.canonical_path):
+            self._require_imported_write_permission(resolved.cache_path)
+            try:
+                os.setxattr(str(resolved.cache_path), name, value, follow_symlinks=False)
+            except OSError as e:
+                raise FuseOSError(e.errno)
 
     def listxattr(self, path):
         """List extended attributes"""
@@ -2902,15 +3096,16 @@ class StorageFS(Operations):
     def removexattr(self, path, name):
         """Remove extended attribute"""
         if name in {self.CHECKSUM_XATTR, self.CACHE_STATE_XATTR, self.CACHE_METADATA_XATTR,
-                    self.MEMBER_STAT_XATTR}:
+                    self.MEMBER_STAT_XATTR, MEMBER_ATTRS_XATTR}:
             # Derived; ignore removals.
             return
-        cache_path = self._resolve_path(path).cache_path
-
-        try:
-            os.removexattr(str(cache_path), name, follow_symlinks=False)
-        except OSError as e:
-            raise FuseOSError(e.errno)
+        resolved = self._resolve_path(path)
+        with self._path_locked(resolved.canonical_path):  # as setxattr
+            self._require_imported_write_permission(resolved.cache_path)
+            try:
+                os.removexattr(str(resolved.cache_path), name, follow_symlinks=False)
+            except OSError as e:
+                raise FuseOSError(e.errno)
 
     # Symbolic links
 
@@ -3166,6 +3361,7 @@ class StorageFS(Operations):
             and after.st_mtime != before.st_mtime
         ):
             self._mark_cache_file_dirty(resolved.canonical_path, cache_path)
+        self._forget_member_fields(cache_path, before, "st_mtime", "st_ctime")
 
     def sweep_stale_cache_metadata(self) -> int:
         """Mark DIRTY every cached file written after its row last said CLEAN.
@@ -3437,12 +3633,11 @@ def fuse_mount_options(backends: Dict[str, Backend], *, enable_watchers: bool,
     a remembered miss hides a name added behind the mount's back (on a
     member, or a conflict copy such as name.member0 after a split).
 
-    auto_cache keeps a file's pages across opens while its mtime and size
-    are unchanged and drops them otherwise, so a refetch after revalidation
-    is not read through old pages (kernel_cache would keep them). libfuse
-    compares against attributes it fetched within ac_attr_timeout, which
-    defaults to attr_timeout; ac_attr_timeout=0 states that a getattr
-    follows every open rather than leaving it implied.
+    Use libfuse's default buffered I/O without retaining pages across
+    opens. A member refetch can replace bytes while preserving size and
+    mtime, so auto_cache's comparison can keep old pages after a refetch.
+    Warm opens still use Storage's local backing file. Repeated reads
+    across opens can require FUSE callbacks again.
 
     Writes through the mount stay visible at once: create, mkdir, unlink,
     rmdir and rename update the kernel's entries themselves. (symlink is
@@ -3461,8 +3656,6 @@ def fuse_mount_options(backends: Dict[str, Backend], *, enable_watchers: bool,
         DEFAULT_NEGATIVE_TIMEOUT if negative_timeout is None
         else _kernel_timeout("negative_timeout", negative_timeout)
     )
-    options["auto_cache"] = True
-    options["ac_attr_timeout"] = 0.0
     return options
 
 

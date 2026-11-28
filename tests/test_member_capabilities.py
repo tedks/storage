@@ -107,8 +107,6 @@ class TestFuseMountOptions(unittest.TestCase):
                 "attr_timeout": KERNEL_ATTR_TIMEOUT,
                 "entry_timeout": 60.0,
                 "negative_timeout": DEFAULT_NEGATIVE_TIMEOUT,
-                "auto_cache": True,
-                "ac_attr_timeout": 0.0,
             },
             options,
         )
@@ -128,13 +126,10 @@ class TestFuseMountOptions(unittest.TestCase):
         options = fuse_mount_options(self.local, enable_watchers=False, fresh_window=0)
         self.assertEqual(0.0, options["entry_timeout"])
 
-    def test_never_kernel_cache(self):
-        # kernel_cache would keep pages a revalidation refetch replaced.
+    def test_use_buffered_io_without_cross_open_page_retention(self):
         for watchers in (False, True):
             options = fuse_mount_options(self.ssh, enable_watchers=watchers, fresh_window=60.0)
-            self.assertNotIn("kernel_cache", options)
-            self.assertIs(True, options["auto_cache"])
-            self.assertEqual(0.0, options["ac_attr_timeout"])
+            self.assertFalse(options.keys() & {"kernel_cache", "auto_cache", "ac_attr_timeout", "direct_io"})
 
     def test_includes_subtype(self):
         self.assertEqual(
@@ -190,9 +185,7 @@ class TestFuseMountOptions(unittest.TestCase):
         rendered = sorted(FUSE._normalize_fuse_options(**options))
         self.assertEqual(
             [
-                "ac_attr_timeout=0.0",
                 "attr_timeout=0.0",
-                "auto_cache",
                 "entry_timeout=60.0",
                 "negative_timeout=10.0",
                 "subtype=sshfs",

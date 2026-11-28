@@ -15,7 +15,8 @@ from fuse import FuseOSError
 from .backends.base import Backend
 from .backends.local import NOREPLACE_UNSUPPORTED
 from .backends.local import rename_noreplace as _rename_noreplace
-from .cache_metadata import PREFIX_XATTR
+from .backends.ssh_pool import BulkCapacityCancelled, BulkCapacityTimeout
+from .cache_metadata import PREFIX_XATTR, confirm_member_stat, copy_member_attributes
 from .models import FileLocation, FileMetadata, StreamingKeepAfterClose, SyncStatus
 
 # A foreground read fetches only the bytes the reader asked for that are not
@@ -121,8 +122,11 @@ class PrefetchSession:
     last_logged_downloaded_bytes: int = 0
     last_foreground_offset: int = 0
     # The member's stat at session start (None when the member has no
-    # stat); handed to on_finalized as the revalidation baseline.
+    # stat).
     member_stat: Optional[object] = None
+    # The member's stat after the stream, when it agreed with member_stat
+    # (cache_metadata.confirm_member_stat): on_finalized's baseline.
+    confirmed_stat: Optional[object] = None
 
     def __post_init__(self):
         self.lock = threading.RLock()
@@ -1131,6 +1135,25 @@ class StreamingReadManager:
         # catch their own.
         metadata = None
         try:
+            # The member's stat once more. A version other than the one the
+            # session probed is not installed: the readers keep their bytes,
+            # the partial is dropped, and the next open fetches the file
+            # again, so no stat pairs the newer version's attributes with
+            # these bytes.
+            try:
+                confirmed, agreed = confirm_member_stat(
+                    session.backend, session.canonical_path, session.member_stat,
+                    os.fstat(io_fd).st_size)
+            except (BulkCapacityCancelled, BulkCapacityTimeout) as exc:
+                raise OSError(errno.EINTR if isinstance(exc, BulkCapacityCancelled)
+                              else errno.EAGAIN, str(exc)) from exc
+            if not agreed:
+                self._discard_superseded_session(session, "member-changed")
+                # Counted once the partial is gone and the session finished.
+                self._record_streaming_stat("streaming_member_changed_discards", 1)
+                return
+            session.confirmed_stat = confirmed
+            copy_member_attributes(io_fd, confirmed)
             os.fsync(io_fd)
             session.final_cache_path.parent.mkdir(parents=True, exist_ok=True)
             with self.state_manager.metadata_lock:
@@ -1396,8 +1419,10 @@ class StreamingReadManager:
             # One round trip either way: get_size is a stat on every member.
             try:
                 member_stat = backend.stat(canonical_path)
-                file_size = member_stat.st_size
             except NotImplementedError:
+                pass
+            file_size = getattr(member_stat, "st_size", None)
+            if file_size is None:
                 file_size = backend.get_size(canonical_path)
         except Exception as exc:
             self.logger.debug(

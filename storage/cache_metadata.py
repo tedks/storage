@@ -2,14 +2,352 @@
 
 import errno
 import json
+import math
 import os
 import stat
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterator, List, Optional
+from types import SimpleNamespace
+from typing import Callable, Iterator, List, Optional
 
 from .file_config import get_inherited_config
 from .models import FileLocation, FileMetadata, SyncStatus
+
+
+MEMBER_ATTRS_XATTR = "user.storage.source_attributes"
+MEMBER_STAT_XATTR = "user.storage.member_stat"
+_SOURCE_ATTR_FIELDS = ("st_mode", "st_uid", "st_gid", "st_nlink", "st_ctime")
+# Set-ID bits are never reported for a regular file, whatever the member
+# or a chmod through the mount says: the kernel would honour a reported
+# setuid bit, with the member's uid, on a mount without nosuid.
+SET_ID_BITS = stat.S_ISUID | stat.S_ISGID
+
+
+def reported_mode(mode: int) -> int:
+    """A mode as the mount reports it: a regular file never has set-ID bits."""
+    return mode & ~SET_ID_BITS if stat.S_ISREG(mode) else mode
+
+
+def _inode(st: os.stat_result) -> int:
+    # The inode number alone, as MEMBER_STAT_XATTR's identity: st_dev can
+    # change across a remount (btrfs subvolumes, ZFS, overlayfs anonymous
+    # devices) while the inode and its xattrs stay. A copy of the xattr onto
+    # another file (copy2 out and back) still has another inode.
+    return st.st_ino
+
+
+def _source_attrs_basis(st: os.stat_result) -> dict:
+    return {
+        "st_mode": st.st_mode,
+        "st_uid": st.st_uid,
+        "st_gid": st.st_gid,
+        "st_size": st.st_size,
+        "mtime_ns": st.st_mtime_ns,
+    }
+
+
+def _source_time_ns(source, field: str, fallback: int) -> int:
+    ns = getattr(source, field + "_ns", None)
+    if ns is not None:
+        return ns
+    seconds = getattr(source, field, None)
+    return fallback if seconds is None else round(seconds * 1_000_000_000)
+
+
+def _member_mtime_ns(st) -> Optional[int]:
+    ns = getattr(st, "st_mtime_ns", None)
+    if type(ns) is int:
+        return ns
+    seconds = getattr(st, "st_mtime", None)
+    if seconds is None or not math.isfinite(seconds):
+        return None
+    return round(seconds * 1_000_000_000)
+
+
+def confirm_member_stat(backend, virtual_path: str, probe, transferred_size: int):
+    """(stat to record, agreed) for a transfer whose probe was taken before it.
+
+    The member is stat'ed again after the transfer. When that stat reports
+    the probe's size, mtime and mode, the transfer read that version and the
+    newer stat's genuine attributes are recorded (agreed), with the probe's
+    atime: the confirming stat's may be the transfer's own read. A
+    disagreement, even a mode-only change, returns the newer stat with
+    agreed False, for the caller to refetch (full fill) or discard
+    (streaming). A stat that raises is retried once; if it fails again the
+    probe is used when the transfer's size matches it, and otherwise no
+    member attributes at all (None: the fill fails closed on mode). A
+    transfer of another size than the stat reports is a disagreement too.
+    BulkCapacityCancelled and BulkCapacityTimeout propagate: an
+    interrupted request is not a fill.
+    """
+    from .backends.ssh_pool import BulkCapacityCancelled, BulkCapacityTimeout
+
+    after = None
+    for _attempt in range(2):
+        try:
+            after = backend.stat(virtual_path)
+            break
+        except (BulkCapacityCancelled, BulkCapacityTimeout):
+            raise
+        except Exception:  # noqa: BLE001 - retried once, then the probe stands
+            after = None
+    if after is None:
+        if getattr(probe, "st_size", None) == transferred_size:
+            return probe, True
+        return None, False
+    if probe is None:
+        # Nothing taken before the transfer to compare against.
+        return after, getattr(after, "st_size", None) == transferred_size
+    agreed = (getattr(after, "st_size", None) == transferred_size
+              and getattr(probe, "st_size", None) is not None
+              and getattr(after, "st_size", None) == getattr(probe, "st_size", None)
+              and _member_mtime_ns(probe) is not None
+              and _member_mtime_ns(after) == _member_mtime_ns(probe)
+              and getattr(after, "st_mode", None) == getattr(probe, "st_mode", None))
+    if not agreed:
+        return after, False
+    fields = {key: getattr(after, key, None) for key in (
+        "st_mode", "st_uid", "st_gid", "st_nlink", "st_ctime", "st_size",
+        "st_mtime", "st_mtime_ns")}
+    fields["st_atime"] = getattr(probe, "st_atime", None)
+    fields["st_atime_ns"] = getattr(probe, "st_atime_ns", None)
+    return SimpleNamespace(**fields), True
+
+
+def copy_member_attributes(fd: int, source) -> None:
+    """Apply the member's stat to a private, fully downloaded inode.
+
+    Mode bits required for Storage to read and maintain the backing file
+    may differ from the mount's mode. Keep the inode daemon-owned, and
+    never install or report source set-ID bits. An existing POSIX ACL (copied by a
+    local backend or inherited from the cache parent) owns its group mask;
+    changing the mask with chmod could grant access to other named entries.
+    """
+    local = os.fstat(fd)
+    # source is the member's newest genuine stat (confirm_member_stat); a
+    # version the transfer may not have read is the caller's to refetch,
+    # never a reason to report local times.
+    mode = getattr(source, "st_mode", None)
+    permissions = local.st_mode if mode is None else mode
+    # Without a member mode, an import fails closed: the downloaded file's
+    # own mode (a local member's copy, a transfer's or a streaming staging
+    # file's default otherwise) is reported and enforced without write bits, so a read-only member file never becomes
+    # writable. A chmod through the mount grants write explicitly.
+    visible_mode = stat.S_IFREG | stat.S_IMODE(permissions)
+    if mode is None:
+        visible_mode &= ~(stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH)
+    # Member IDs have no mapping to local groups or users. Only tighten
+    # the staging inode's group and other permissions. An ACL mask keeps
+    # the permissions the kernel chose when that ACL was installed.
+    permissions &= local.st_mode | 0o700
+    try:
+        os.getxattr(fd, "system.posix_acl_access")
+    except OSError as exc:
+        if exc.errno not in (errno.ENODATA, errno.ENOTSUP):
+            raise
+    else:
+        permissions = (permissions & ~0o070) | (local.st_mode & 0o070)
+    cache_mode = (permissions & 0o777) | stat.S_IRUSR | stat.S_IWUSR
+    if cache_mode != stat.S_IMODE(local.st_mode):
+        os.fchmod(fd, cache_mode)
+
+    times = tuple(_source_time_ns(source, field, getattr(local, field + "_ns"))
+                  for field in ("st_atime", "st_mtime"))
+    if times != (local.st_atime_ns, local.st_mtime_ns):
+        os.utime(fd, ns=times)
+
+    attrs = {}
+    for key in _SOURCE_ATTR_FIELDS:
+        value = getattr(source, key, None)
+        if value is not None:
+            attrs[key] = value
+    attrs["st_mode"] = reported_mode(visible_mode)
+    if "st_ctime" not in attrs and getattr(source, "st_mtime", None) is not None:
+        attrs["st_ctime"] = source.st_mtime  # Same fallback as uncached SFTP stat.
+    actual = os.fstat(fd)
+    # The record identifies a new fill, which never needs legacy mtime
+    # recovery. Use the actual stat after utime (filesystems can round).
+    record = {"inode": _inode(actual), "basis": _source_attrs_basis(actual), "attrs": attrs}
+    try:
+        os.setxattr(fd, MEMBER_ATTRS_XATTR, json.dumps(record).encode())
+    except OSError as exc:
+        if exc.errno != errno.ENOTSUP:
+            raise
+        # A cache without user xattrs can still hold bytes and timestamps.
+        # Only reserve write access when we can record the visible mode.
+        os.fchmod(fd, (visible_mode & 0o777) | stat.S_IRUSR
+                  if mode is None else (permissions & 0o777) | stat.S_IRUSR)
+
+
+def record_native_attributes(fd: int) -> None:
+    """Mark a file created through the mount as having no member fields.
+
+    An empty record skips legacy mtime recovery (and its index read) at
+    every stat. An existing record is kept: O_TRUNC keeps an inode's mode
+    and owner, so it keeps their reported values too.
+    """
+    local = os.fstat(fd)
+    record = {"inode": _inode(local), "basis": _source_attrs_basis(local), "attrs": {}}
+    try:
+        os.setxattr(fd, MEMBER_ATTRS_XATTR, json.dumps(record).encode(), os.XATTR_CREATE)
+    except OSError as exc:
+        if exc.errno not in (errno.EEXIST, errno.ENOTSUP):
+            raise
+
+
+def _read_record(path: Path) -> Optional[dict]:
+    try:
+        record = json.loads(os.getxattr(path, MEMBER_ATTRS_XATTR, follow_symlinks=False))
+        if (isinstance(record, dict) and isinstance(record.get("basis"), dict)
+                and isinstance(record.get("attrs"), dict)):
+            return record
+    except (OSError, ValueError, TypeError):
+        pass
+    return None
+
+
+def _read_source_attrs(path: Path, local: os.stat_result) -> Optional[dict]:
+    record = _read_record(path)
+    if record is not None and record.get("inode") == _inode(local):
+        return record
+    return None
+
+
+def stale_record_mode(path: Path, local: os.stat_result) -> Optional[int]:
+    """The read-only mode a record for another inode still imposes, if any.
+
+    A record whose inode no longer matches (its xattr was copied with the
+    file, as a cache migrated with cp -a) describes nothing else, but if
+    the mode it recorded withheld write, that mode is reported and
+    enforced: failing closed costs a chmod, failing open grants write to a
+    read-only member's file. A chmod through the mount rebinds the record
+    to this inode without it (forget_cached_member_fields).
+    """
+    record = _read_record(path)
+    if record is None or record.get("inode") == _inode(local):
+        return None
+    mode = record["attrs"].get("st_mode")
+    if type(mode) is int and 0 <= mode < (1 << 32) and stat.S_ISREG(mode) and not mode & stat.S_IWUSR:
+        return reported_mode(mode)
+    return None
+
+
+def imported_mode_denies_write(path: Path, local: os.stat_result) -> bool:
+    """Whether a recorded member mode withholds owner write from this file,
+    as stat reports it (cached_member_attributes, else stale_record_mode)."""
+    attrs = cached_member_attributes(path, local)
+    mode = attrs.get("st_mode") if attrs is not None else stale_record_mode(path, local)
+    return type(mode) is int and not mode & stat.S_IWUSR
+
+
+def cached_member_attributes(path: Path, local: os.stat_result) -> Optional[dict]:
+    """Report source fields that still describe this cached inode.
+
+    None allows legacy recovery. An empty dict is a new-format record
+    without any field we can report. Native atime and mtime stay live.
+    """
+    record = _read_source_attrs(path, local)
+    if record is None:
+        return None
+    attrs = {}
+    for key in _SOURCE_ATTR_FIELDS:
+        value = record["attrs"].get(key)
+        if key == "st_ctime":
+            if ((type(value) is float and math.isfinite(value))
+                    or (type(value) is int and -(1 << 63) <= value < (1 << 63))):
+                attrs[key] = value
+        elif type(value) is int and 0 <= value < (1 << 32):
+            if key != "st_mode":
+                attrs[key] = value
+            elif stat.S_ISREG(value):
+                attrs[key] = reported_mode(value)
+    basis = _source_attrs_basis(local)
+    for key in ("st_mode", "st_uid", "st_gid"):
+        if basis[key] != record["basis"].get(key):
+            attrs.pop(key, None)
+    if basis != record["basis"]:
+        attrs.pop("st_ctime", None)
+    return attrs
+
+
+def forget_cached_member_fields(path: Path, local: os.stat_result, *fields: str) -> None:
+    """Retire synthetic fields explicitly replaced by chmod, chown or utime."""
+    if not stat.S_ISREG(local.st_mode):
+        return
+    record = _read_source_attrs(path, local)
+    stale_mode = stale_record_mode(path, local) if record is None else None
+    if stale_mode is not None:
+        # Rebind a copied record to this inode, keeping only what it still
+        # imposed (the read-only mode) unless this change retires that too.
+        attrs = {} if "st_mode" in fields else {"st_mode": stale_mode}
+        record = {"inode": _inode(local), "basis": _source_attrs_basis(local), "attrs": attrs}
+    elif record is None:
+        if "st_mtime" not in fields or not read_member_baselines(path, cache_identity(local)):
+            return
+        # An explicit timestamp also takes precedence over a legacy
+        # mtime, even when utime happened to keep the native mtime.
+        record = {"inode": _inode(local), "basis": _source_attrs_basis(local), "attrs": {}}
+    elif not any(key in record["attrs"] for key in fields):
+        return
+    for key in fields:
+        record["attrs"].pop(key, None)
+    data = json.dumps(record).encode()
+    try:
+        os.setxattr(path, MEMBER_ATTRS_XATTR, data, follow_symlinks=False)
+    except PermissionError:
+        # The backing file lacks owner write: an explicit chmod removed it,
+        # or a legacy fill copied a read-only mode. The daemon owns the
+        # inode, so lend itself write for the xattr and put the mode back
+        # (callers hold the path's lock). Otherwise, the basis still masks
+        # a mode or owner field while it differs.
+        current = os.lstat(path)
+        if current.st_uid != os.geteuid() or current.st_mode & stat.S_IWUSR:
+            return
+        os.chmod(path, stat.S_IMODE(current.st_mode) | stat.S_IWUSR)
+        try:
+            os.setxattr(path, MEMBER_ATTRS_XATTR, data, follow_symlinks=False)
+        finally:
+            os.chmod(path, stat.S_IMODE(current.st_mode))
+
+
+def cache_identity(st: os.stat_result) -> tuple:
+    return (st.st_ino, st.st_size, st.st_mtime_ns)
+
+
+def read_member_baselines(path: Path, identity: tuple) -> dict:
+    """Read revalidation evidence for the same inode, size and native mtime."""
+    try:
+        payload = json.loads(os.getxattr(path, MEMBER_STAT_XATTR, follow_symlinks=False))
+        if tuple(payload.get("cache")) == identity:
+            return {str(name): (int(size), float(mtime))
+                    for name, (size, mtime) in payload.get("members", {}).items()}
+    except (OSError, ValueError, TypeError, AttributeError, OverflowError):
+        pass
+    return {}
+
+
+def legacy_member_mtime(path: Path, local: os.stat_result,
+                        load_row: Callable[[], Optional[FileMetadata]]) -> Optional[float]:
+    """Recover a legacy fill's source mtime for reporting, without touching disk.
+
+    A single member baseline can also come from an upload, which records
+    the uploaded content checksum. Skip those, and any row or cached inode
+    whose evidence is missing or disagrees. Never rewrite a CLEAN file's
+    native mtime independently of its row and recovery xattr. The row is
+    loaded only once the cache file's own baseline qualifies, so a file
+    without one costs no index read.
+    """
+    times = read_member_baselines(path, cache_identity(local))
+    if len(times) != 1:
+        return None
+    size, mtime = next(iter(times.values()))
+    if size != local.st_size or not math.isfinite(mtime):
+        return None
+    row = load_row()
+    if (row is None or row.sync_status != SyncStatus.CLEAN or row.checksum is not None
+            or row.size != local.st_size or row.last_modified != local.st_mtime):
+        return None
+    return mtime
 
 
 XATTR_CACHE_METADATA_NAME = "user.storage.metadata"
@@ -428,7 +766,10 @@ def scan_cache_entries(cache_root: Path) -> Iterator[CacheScanEntry]:
                 virtual_path=virtual_path,
                 stat_size=st.st_size,
                 stat_mtime=st.st_mtime,
-                stat_atime=st.st_atime,
+                # A fill installs the member's atime, which says nothing of
+                # this cache's use; its ctime is the fill (or a later
+                # change), so the later of the two orders eviction.
+                stat_atime=max(st.st_atime, st.st_ctime),
                 metadata=metadata,
                 issues=issues,
             )

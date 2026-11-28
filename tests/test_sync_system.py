@@ -6,6 +6,8 @@ end-to-end.
 """
 
 import errno
+import json
+import sys
 import unittest
 import tempfile
 import time
@@ -15,9 +17,11 @@ import subprocess
 import threading
 import shutil
 from pathlib import Path
+from unittest.mock import patch
 
 from storage.fs import StorageFS
 from storage.backends.local import LocalBackend
+from storage.models import SyncStatus
 from tests.fuse_mount import run_fuse, stop_fuse
 
 
@@ -399,6 +403,20 @@ class TestKernelCacheVisibility(_MountedCase):
             self.fs.getattr = original
 
 
+# A page fault can block in the kernel while Python holds its GIL. The FUSE
+# loop runs in the test process, so a mapping of a mounted file is read by a
+# separate client process (the pattern of #204's _MAPPED_READER).
+_FSTAT_MMAP_PROBE = """
+import json, mmap, os, sys
+with open(sys.argv[1], "rb") as f:
+    first = os.fstat(f.fileno()).st_mtime
+    with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mapped:
+        data = mapped[:]
+    last = os.fstat(f.fileno()).st_mtime
+print(json.dumps({"fstat_mtime": first, "mapped": data.hex(), "fstat_after": last}))
+"""
+
+
 class TestKernelCacheRefetch(_MountedCase):
     """A refetch after revalidation is read in full, never through stale
     pages or a stale size the kernel still holds (fuse_mount_options)."""
@@ -436,6 +454,93 @@ class TestKernelCacheRefetch(_MountedCase):
 
     def test_shrunk_file_reads_short(self):
         self._read_after_revalidation("shrink.bin", b"a" * 200, b"d" * 50)
+
+    def test_same_stat_refetch_reads_fresh_bytes_and_reuses_warm_backing(self):
+        name = "same-stat.bin"
+        source = self.backend1_dir / name
+        target = self.mount_dir / name
+        cached = self.cache_dir / name
+        before, after = b"a" * 16384, b"b" * 16384
+        stamp = 1_000_000_000
+        source.write_bytes(before)
+        os.utime(source, (stamp, stamp))
+        backend = self.fs.backends["backend1"]
+        with patch.object(backend, "copy_to_local", wraps=backend.copy_to_local) as download:
+            self.assertEqual(before, target.read_bytes())
+            self.assertEqual(before, target.read_bytes())
+            self.assertEqual(1, download.call_count)
+
+            source.write_bytes(after)
+            os.utime(source, (stamp, stamp))
+            self.fs._on_remote_change("/" + name)
+            self.assertFalse(cached.exists())
+
+            with target.open("rb") as reader:
+                self.assertEqual(after, cached.read_bytes())
+                self.assertEqual(stamp, target.stat().st_mtime)
+                self.assertEqual(after, reader.read())
+            self.assertEqual(after, target.read_bytes())
+            self.assertEqual(2, download.call_count)
+
+    def _probe_in_client(self, target):
+        """fstat and an mmap read of target, from another process.
+
+        A page fault can block in the kernel while Python holds its GIL,
+        and this process runs the FUSE loop that serves the fault, so the
+        mapping is read by a separate client (as in #204's _MAPPED_READER).
+        """
+        done = subprocess.run(
+            [sys.executable, "-c", _FSTAT_MMAP_PROBE, str(target)],
+            capture_output=True, text=True, timeout=30, check=True,
+        )
+        result = json.loads(done.stdout)
+        return result["fstat_mtime"], bytes.fromhex(result["mapped"]), result["fstat_after"]
+
+    def test_same_stat_refetch_keeps_member_mtime_in_fstat_and_mmap(self):
+        # The member's own timestamp is what stat and fstat report, before
+        # and after a same-stat refetch, and mmap (which reads through the
+        # page cache) sees the new bytes.
+        name = "same-stat-mmap.bin"
+        source = self.backend1_dir / name
+        target = self.mount_dir / name
+        before, after = b"a" * 16384, b"b" * 16384
+        stamp = 1_000_000_000
+        source.write_bytes(before)
+        os.utime(source, (stamp, stamp))
+        self.assertEqual((stamp, before, stamp), self._probe_in_client(target))
+
+        source.write_bytes(after)
+        os.utime(source, (stamp, stamp))
+        self.fs._on_remote_change("/" + name)
+
+        self.assertEqual((stamp, after, stamp), self._probe_in_client(target))
+        self.assertEqual(stamp, os.stat(target).st_mtime)
+        # A later open (warm, same backing inode) still reads the new bytes.
+        with open(target, "rb") as reader:
+            self.assertEqual(after, reader.read())
+            self.assertEqual(stamp, os.fstat(reader.fileno()).st_mtime)
+
+    def test_watcher_invalidation_keeps_real_writer_on_clean_backing(self):
+        name = "writer.bin"
+        source = self.backend1_dir / name
+        target = self.mount_dir / name
+        cached = self.cache_dir / name
+        source.write_bytes(b"original")
+        self.assertEqual(b"original", target.read_bytes())
+
+        with target.open("r+b", buffering=0) as writer:
+            inode = cached.stat().st_ino
+            row = self.fs.state_manager.get_file_metadata("/" + name)
+            self.assertEqual(SyncStatus.CLEAN, row.sync_status)
+
+            source.write_bytes(b"whatever")
+            self.fs._on_remote_change("/" + name)
+            self.assertEqual(inode, cached.stat().st_ino)
+            self.assertEqual(8, writer.write(b"mount-ed"))
+
+        self.assertEqual(inode, cached.stat().st_ino)
+        self.assertEqual(b"mount-ed", cached.read_bytes())
+        self.assertEqual(b"mount-ed", target.read_bytes())
 
 
 class TestMemberSymlinks(_MountedCase):
