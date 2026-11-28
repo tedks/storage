@@ -835,10 +835,14 @@ class TestCacheAccounting(unittest.TestCase):
 
         try:
             with patch("os.fstat", side_effect=fstat):
-                with manager.cache_size_change(fd=writer, span=(block, 2 * block)):
-                    os.pwrite(writer, b"g" * block, block)
+                with self.assertLogs("storage.cache", "WARNING") as warned:
+                    with manager.cache_size_change(fd=writer, span=(block, 2 * block)):
+                        os.pwrite(writer, b"g" * block, block)
+                self.assertEqual(len(warned.records), 1)
                 self.assertTrue(manager._streaming_fds[fd].unmeasured)
-                self.assertFalse(manager.ensure_space(block))
+                with self.assertNoLogs("storage.cache", "WARNING"):  # not per grant
+                    self.assertFalse(manager.ensure_space(block))
+                    self.assertFalse(manager.ensure_space(block))
                 # R6: with a rescan pending, a competing stream's grant is
                 # refused (its bytes go uncached), not failed with the held
                 # descriptor's error: the scan never stats it.
@@ -851,7 +855,8 @@ class TestCacheAccounting(unittest.TestCase):
                     manager.write_streaming_chunk(fd, 0, b"x")
                 self.assertEqual(raised.exception.errno, errno.EIO)
             # Measurable again: the next allocation recharges and proceeds.
-            self.assertTrue(manager.ensure_space(block))
+            with self.assertLogs("storage.cache", "INFO"):
+                self.assertTrue(manager.ensure_space(block))
             self.assertFalse(manager._streaming_fds[fd].unmeasured)
             self._assert_total(2 * block)
             with self._partial("competing-after") as (competing, other):

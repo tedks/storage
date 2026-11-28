@@ -309,9 +309,17 @@ class CacheManager:
             charge.direct = True
             try:
                 st = os.fstat(fd)
-            except OSError:
+            except OSError as exc:
+                if not charge.unmeasured:
+                    # Once per transition, not per withheld grant.
+                    logger.warning(
+                        "Cache allocations are withheld: a streaming download's "
+                        "file changed and its descriptor cannot be measured (%s). "
+                        "Downloads are served uncached until it can.", exc.strerror)
                 charge.unmeasured = True
                 continue
+            if charge.unmeasured:
+                logger.info("Cache allocations resumed: the download's descriptor can be measured again.")
             charge.unmeasured = False
             try:
                 new = self._fd_data_bytes(fd, st)
