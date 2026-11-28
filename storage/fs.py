@@ -2854,6 +2854,7 @@ class StorageFS(Operations):
             # concurrent writes through one fh must not move each other's.
             with self.cache_manager.cache_size_change(
                 fd=entry.real_fd, span=self._write_span(entry, offset, data),
+                growth=len(data),
             ):
                 written = os.pwrite(entry.real_fd, data, offset)
 
@@ -2898,6 +2899,7 @@ class StorageFS(Operations):
                 try:
                     with self.cache_manager.cache_size_change(
                         fd=entry.real_fd, span=self._write_span(entry, offset, data),
+                        growth=len(data),
                     ):
                         written = os.pwrite(entry.real_fd, data, offset)
                 except OSError as e:

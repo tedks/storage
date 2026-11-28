@@ -141,18 +141,24 @@ class _PartialCharge:
 
 
 class _InFlight:
-    """A direct change between its two measurements (cache_size_change):
-    its target, its measurement before (None: unknown, re-based by a
-    rescan) or, for an inode a streaming descriptor holds, that identity."""
+    """A direct change between its two measurements (cache_size_change).
 
-    __slots__ = ("path", "fd", "span", "before", "held")
+    before is its charge measurement (None: unknown, settles to a rescan),
+    whole_before its whole-inode extents when the allocation cap may bind,
+    epoch the scan epoch it measured in, and held whether a streaming
+    descriptor held its inode then. allowance bounds the charge it can add
+    before it settles; withhold means no bound is known, so admits wait.
+    """
 
-    def __init__(self, path, fd, span, before, held):
-        self.path = path
-        self.fd = fd
-        self.span = span
+    __slots__ = ("before", "whole_before", "epoch", "held", "allowance", "withhold")
+
+    def __init__(self, before, whole_before, epoch, held, allowance, withhold):
         self.before = before
+        self.whole_before = whole_before
+        self.epoch = epoch
         self.held = held
+        self.allowance = allowance
+        self.withhold = withhold
 
 
 class CacheFetch(Enum):
@@ -237,9 +243,12 @@ class CacheManager:
         self._inode_locks: dict = {}
         self._inode_locks_mutex = threading.Lock()
         # Direct changes between their measurements: token -> _InFlight.
-        # Grants count what each has already put on disk (see
-        # _in_flight_growth); a rescan re-bases them.
+        # Their allowances hold back admits until they settle
+        # (_admit_pending).
         self._in_flight: dict = {}
+        # Moves at every tree rescan: a change that measured before a
+        # rescan settles to another rescan instead of adding its delta.
+        self._scan_epoch = 0
         self._evictable_epoch = 0
         self._grant_warning_logged = False
 
@@ -391,7 +400,7 @@ class CacheManager:
         if self._size_dirty:
             self._current_size_bytes = self._scan_total_cache_size()
             self._size_dirty = False
-            self._rebase_in_flight()
+            self._scan_epoch += 1
 
     def recover_views(self, member_names: List[str]):
         """At mount start, before any worker, eviction or FUSE request: drop
@@ -594,7 +603,8 @@ class CacheManager:
         data extents, at most its allocated blocks."""
         return min(self._data_bytes(fd, 0, self._round_up(st.st_size)), st.st_blocks * 512)
 
-    def _span_delta(self, fd: int, before, after) -> Optional[int]:
+    def _span_delta(self, fd: int, before, after,
+                    whole_before: Optional[int] = None) -> Optional[int]:
         """The change in a named inode's charge across a pwrite of a span,
         from the span's data blocks measured before and after it.
 
@@ -605,7 +615,10 @@ class CacheManager:
         and the whole inode is measured once, after: the extents outside
         the span did not change (every write to a named cache inode runs
         under the cache lock), so the extents before are those after minus
-        the span's growth. None when the measurement fails.
+        the span's growth. When the whole extents before are known
+        (measured at entry because the cap could bind then), those after
+        are derived from them instead, with no walk. None when the
+        measurement fails.
         """
         _, span_before, st_before = before
         _, span_after, st_after = after
@@ -614,36 +627,46 @@ class CacheManager:
         if (self._round_up(st_before.st_size) <= cap_before
                 and self._round_up(st_after.st_size) <= cap_after):
             return span_after - span_before
-        try:
-            whole_after = self._data_bytes(fd, 0, self._round_up(st_after.st_size))
-        except OSError:
-            return None
-        whole_before = max(0, whole_after - span_after + span_before)
+        if whole_before is not None:
+            whole_after = whole_before + span_after - span_before
+        else:
+            try:
+                whole_after = self._data_bytes(fd, 0, self._round_up(st_after.st_size))
+            except OSError:
+                return None
+            whole_before = max(0, whole_after - span_after + span_before)
         return min(whole_after, cap_after) - min(whole_before, cap_before)
 
     @contextmanager
     def cache_size_change(self, path: Optional[Path] = None, *, fd: Optional[int] = None,
-                          span: Optional[Tuple[int, int]] = None):
+                          span: Optional[Tuple[int, int]] = None,
+                          growth: Optional[int] = None):
         """Serialize a direct write or truncate with grants, charging its blocks.
 
         Give the cache file it changes: a path (a truncate, an O_TRUNC open,
         a create) or an open descriptor, and for a pwrite the byte span
-        [start, end) it covers. The data blocks are measured before and
+        [start, end) it covers, or for an O_APPEND write (no span) the
+        bytes it writes as growth. The data blocks are measured before and
         after the change under the cache lock and the difference charged,
         so the next grant needs no rescan. The change itself runs without
         the cache lock, so a slow write to one file does not stall grants
         or writes to others: changes to one inode (through any name or
-        descriptor) are serialized by a per-inode lock instead, eviction
-        skips an inode with a change in flight, and a rescan in between
-        re-bases it. While a change is in flight, grants count the bytes it
-        has already put on disk (_in_flight_growth). With no
-        target, a target that does not qualify (see _direct_charge), or a
-        path whose inode changed in between, the change is unknown and the
-        next allocation rescans the tree. An inode a streaming descriptor holds (an
-        installed download a reader still has open) is charged only through
-        that descriptor: it is recognized by a stat alone, measured nowhere
-        before the change, and recharged absolutely after it
-        (_recharge_held), never charged a second time for the name. A
+        descriptor) are serialized by a per-inode lock instead, and
+        eviction skips an inode with a change in flight.
+
+        Until it settles, a change holds back admits by an allowance fixed
+        at entry, an upper bound on the charge it can add (_entry_allowance):
+        a direct write is never refused or made to evict, but no stream or
+        whole copy is admitted into blocks it may already have used.
+
+        The change settles to a rescan, never to a guessed delta, when a
+        rescan ran in between, when a streaming descriptor held its inode
+        at entry or at settlement but not both (a last close mid-change),
+        when a measurement failed, or when a path's name moved to another
+        inode. An inode a streaming descriptor holds at both ends is
+        charged only through that descriptor: recognized by a stat alone,
+        measured nowhere before the change, and recharged absolutely after
+        it (_recharge_held), never charged a second time for the name. A
         change's own error propagates unchanged.
         """
         if path is None and fd is None:
@@ -662,80 +685,86 @@ class CacheManager:
                 id_before = (st_before.st_dev, st_before.st_ino) if st_before is not None else None
                 if st_key is not None and id_before != key:
                     failed_before = True  # the name moved to another inode: unknown
+                allowance, withhold, whole_before = self._entry_allowance(
+                    path, fd, span, growth, st_before, failed_before)
                 before = None
                 if id_before not in held and not failed_before:
                     before = self._direct_charge(path, fd, span, st_before)
                 token = object()
-                record = _InFlight(path, fd, span, before,
-                                   id_before if id_before in held else None)
+                record = _InFlight(before, whole_before, self._scan_epoch, id_before in held,
+                                   allowance, withhold)
                 self._in_flight[token] = record
             try:
                 yield
             finally:
                 with self._lock:
                     del self._in_flight[token]
-                    # record.before, as re-based by any rescan meanwhile.
-                    self._settle_direct_change(path, fd, span, held, id_before,
-                                               failed_before, record.before)
+                    self._settle_direct_change(path, fd, span, record, id_before, failed_before)
 
-    def _in_flight_growth(self) -> int:
-        """Data bytes direct changes in flight have already added on disk
-        but not yet charged; caller holds the lock.
+    def _entry_allowance(self, path, fd, span, growth, st, failed):
+        """(allowance, withhold, whole extents or None) for a change about to
+        run; caller holds the lock and the inode's lock.
 
-        Exact while the change runs: its inode lock lets no other change
-        touch the inode, and eviction skips it, so whatever its
-        measurement moved since `before` is this change's. Only bytes on
-        disk count, never a change's prospective size, and a shrink counts
-        as 0 until it settles. A held inode counts what it holds beyond its
-        descriptor's charge. A measurement that fails counts the span's
-        blocks, or the file's rounded size without a span.
+        The charge is min(data extents, allocation), so a change adds at
+        most the data it writes plus any existing data the allocation cap
+        hides now: an overwrite that stops compressing lifts it. With the
+        rounded size within the allocation nothing is hidden and the bound
+        is the block-aligned span, an append's bytes plus a block, or 0
+        for a path change (a truncate, O_TRUNC or create shrinks or extends
+        sparsely). When the cap may bind the inode's extents are measured
+        once (the settlement reuses them) and the hidden part added. A
+        failed stat or measurement, or a descriptor change with neither a
+        span nor growth, has no bound: withhold. A path that names nothing
+        yet (a create) adds nothing.
         """
-        growth = 0
+        if failed:
+            return 0, True, None
+        if st is None:
+            return 0, False, None
+        if span is not None:
+            start = span[0] // self.block_size * self.block_size
+            allowance = self._round_up(span[1]) - start
+        elif growth is not None:
+            allowance = self._round_up(growth) + self.block_size
+        elif fd is not None:
+            return 0, True, None
+        else:
+            allowance = 0
+        allocated = st.st_blocks * 512
+        if self._round_up(st.st_size) <= allocated:
+            return allowance, False, None
+        try:
+            extents = self._whole_extents(path, fd, st)
+        except OSError:
+            return allowance, True, None
+        if extents is None:
+            return allowance, True, None
+        return allowance + max(0, extents - allocated), False, extents
+
+    def _whole_extents(self, path, fd, st) -> Optional[int]:
+        """The inode's data extents in bytes, through fd or by path (None if
+        the path no longer names that inode)."""
+        rounded = self._round_up(st.st_size)
+        if fd is not None:
+            return self._data_bytes(fd, 0, rounded)
+        opened_fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            opened = os.fstat(opened_fd)
+            if (opened.st_dev, opened.st_ino) != (st.st_dev, st.st_ino):
+                return None
+            return self._data_bytes(opened_fd, 0, rounded)
+        finally:
+            os.close(opened_fd)
+
+    def _admit_pending(self) -> Optional[int]:
+        """The allowances of every direct change in flight, summed, or None
+        when one has no bound. Caller holds the lock."""
+        total = 0
         for record in self._in_flight.values():
-            if record.held is not None:
-                growth += self._held_growth(record.held)
-                continue
-            if record.before is None:
-                continue  # unknown; settles to a rescan
-            st, failed = self._target_stat(record.path, record.fd)
-            now = None if failed else self._direct_charge(record.path, record.fd, record.span, st)
-            if now is None or now[0] != record.before[0]:
-                growth += self._growth_bound(record, st)
-                continue
-            delta = now[1] - record.before[1]
-            if now[2] is not None and record.before[2] is not None:
-                delta = self._span_delta(record.fd, record.before, now)
-                if delta is None:
-                    delta = self._growth_bound(record, st)
-            growth += max(0, delta)
-        return growth
-
-    def _growth_bound(self, record, st) -> int:
-        if record.span is not None:
-            start = record.span[0] // self.block_size * self.block_size
-            return self._round_up(record.span[1]) - start
-        return self._round_up(st.st_size) if st is not None else 0
-
-    def _held_growth(self, identity) -> int:
-        for fd, charge in self._streaming_fds.items():
-            if charge.identity == identity:
-                try:
-                    st = os.fstat(fd)
-                    return max(0, self._fd_data_bytes(fd, st) - charge.bytes)
-                except OSError:
-                    return 0  # _recharge_held withholds at settlement
-        return 0
-
-    def _rebase_in_flight(self):
-        """After a rescan, which counted every in-flight change as far as
-        it had got: measure each again, so its settlement charges only what
-        it does from here. Caller holds the lock."""
-        for record in self._in_flight.values():
-            if record.held is not None or record.before is None:
-                continue
-            st, failed = self._target_stat(record.path, record.fd)
-            record.before = None if failed else self._direct_charge(
-                record.path, record.fd, record.span, st)
+            if record.withhold:
+                return None
+            total += record.allowance
+        return total
 
     @contextmanager
     def _inode_lock(self, key):
@@ -767,23 +796,33 @@ class CacheManager:
         with self._inode_locks_mutex:
             return identity in self._inode_locks
 
-    def _settle_direct_change(self, path, fd, span, held, id_before, failed_before, before):
+    def _settle_direct_change(self, path, fd, span, record, id_before, failed_before):
         """The second half of cache_size_change; never raises, so the
         change's own error is the one the caller sees."""
         st_after, failed_after = self._target_stat(path, fd)
         id_after = (st_after.st_dev, st_after.st_ino) if st_after is not None else None
+        # Held-ness is decided now, from the live descriptors.
+        held = self._held_identities() if self._streaming_fds else set()
+        if failed_before and failed_after:
+            if held:
+                for identity in held:  # the target is unknown: any of them
+                    self._recharge_held(identity)
+            self._size_dirty = True
+            return
         holders = {identity for identity in (id_before, id_after) if identity in held}
-        if held and failed_before and failed_after:
-            holders = set(held)  # the target is unknown: it may be any of them
         for identity in holders:
             self._recharge_held(identity)
-        if holders:
-            # Held inodes are charged absolutely above. Anything else the
-            # change touched (a name that now names another inode) is left
-            # to a rescan, which counts held inodes at those charges.
-            if id_before != id_after or failed_before or failed_after:
+        if record.held or holders:
+            if not (record.held and holders == {id_before} and id_before == id_after
+                    and not failed_before and not failed_after):
+                # Held at one end only (a last close mid-change), or the
+                # name moved: the tree total is left to a rescan, which
+                # counts held inodes at the charges set above.
                 self._size_dirty = True
             return
+        before = record.before
+        if record.epoch != self._scan_epoch:
+            before = None  # a rescan counted part of this change
         delta = None
         if before is not None and not failed_after:
             after = self._direct_charge(path, fd, span, st_after)
@@ -791,7 +830,7 @@ class CacheManager:
                     and (before[0] is None or before[0] == after[0])):
                 delta = after[1] - before[1]
                 if after[2] is not None and before[2] is not None:
-                    delta = self._span_delta(fd, before, after)
+                    delta = self._span_delta(fd, before, after, record.whole_before)
         if delta is None:
             self._size_dirty = True
         else:
@@ -820,8 +859,7 @@ class CacheManager:
                 st = regular_file_stat(path)
                 apparent_growth = min(self._round_up(st.st_size), st.st_blocks * 512) if st else 0
                 reserved += max(size, apparent_growth)
-            available = (self.max_size_bytes - self._current_size_bytes - reserved
-                         - (self._in_flight_growth() if self._in_flight else 0))
+            available = self.max_size_bytes - self._current_size_bytes - reserved
 
         if available >= required_bytes:
             return 0
@@ -869,7 +907,15 @@ class CacheManager:
         with self._lock:
             if bytes_needed > self.max_size_bytes or self._withheld():
                 return False
-            return self._free_space(self.get_free_space_needed(bytes_needed))
+            pending = self._admit_pending() if self._in_flight else 0
+            if pending is None:
+                return False
+            # Evict only for the allocation itself, never for the pending
+            # allowance of direct changes that may not have written yet;
+            # then admit only if it also fits beside that allowance.
+            if not self._free_space(self.get_free_space_needed(bytes_needed)):
+                return False
+            return not pending or self.get_free_space_needed(bytes_needed + pending) == 0
 
     def _free_space(self, needed: int) -> bool:
         """Evict CLEAN copies in access order until `needed` bytes are freed.
@@ -1003,7 +1049,8 @@ class CacheManager:
 
         An unlinked inode's charge is released. A named one moves into tree
         accounting: with one name, the charge becomes what the scan counts
-        for it; otherwise the next allocation rescans. Either way a copy may
+        for it; otherwise, or while a direct change to it is in flight
+        (whose settlement then rescans), the next allocation rescans. Either way a copy may
         be evictable now, so a remembered shortfall is forgotten.
         """
         with self._lock:
@@ -1013,7 +1060,8 @@ class CacheManager:
                     st = os.fstat(fd)
                     if st.st_nlink == 0:
                         self._current_size_bytes = max(0, self._current_size_bytes - charge.bytes)
-                    elif st.st_nlink == 1 and not self._size_dirty:
+                    elif (st.st_nlink == 1 and not self._size_dirty
+                          and not self._inode_busy((st.st_dev, st.st_ino))):
                         self._current_size_bytes = max(
                             0, self._current_size_bytes + self._fd_data_bytes(fd, st) - charge.bytes)
                     else:
@@ -1193,7 +1241,13 @@ class CacheManager:
         """
         if size > self.max_size_bytes or self._withheld():
             return False
-        return self._free_space(min(excess, self.get_free_space_needed(0, finishing=(temp_path, size))))
+        pending = self._admit_pending() if self._in_flight else 0
+        if pending is None:
+            return False
+        finishing = (temp_path, size)
+        if not self._free_space(min(excess, self.get_free_space_needed(0, finishing=finishing))):
+            return False
+        return not pending or self.get_free_space_needed(pending, finishing=finishing) == 0
 
     def _drop_whole_temp(self, path: Path):
         """Release the temp reservation under the cache lock."""

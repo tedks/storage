@@ -1049,7 +1049,8 @@ class TestCacheAccounting(unittest.TestCase):
         flags = os.O_RDWR | (os.O_APPEND if append else 0)
         fd = os.open(path, flags)
         self.addCleanup(os.close, fd)
-        target = {"fd": fd} if append else {"fd": fd, "span": (0, blocks * block)}
+        target = ({"fd": fd, "growth": blocks * block} if append
+                  else {"fd": fd, "span": (0, blocks * block)})
         run, gate, errors = self._blocked_change(**target)
         if append:
             writer = run(lambda: os.write(fd, b"w" * (blocks * block)))
@@ -1090,8 +1091,10 @@ class TestCacheAccounting(unittest.TestCase):
             self._assert_total(2 * block)
 
     def test_a_rescan_during_an_in_flight_write_counts_it_once(self):
-        """A rescan in the interval counts the written blocks; the grant
-        and the settlement then count them no second time."""
+        """A rescan in the interval counts the written blocks. The pending
+        allowance still holds admits back until settlement (conservative:
+        it may overlap what the scan saw); the settlement then rescans
+        instead of adding its delta, so the total counts them once."""
         manager = self.cache_manager
         block = manager.block_size
         manager.max_size_bytes = 3 * block
@@ -1100,12 +1103,13 @@ class TestCacheAccounting(unittest.TestCase):
         manager.mark_cache_size_dirty()
         self.assertEqual(manager.get_total_cache_size(), 2 * block)
         with self._partial("b") as (_, b):
-            self.assertTrue(manager.write_streaming_chunk(b, 0, b"x"))
-            self.assertFalse(manager.write_streaming_chunk(b, block, b"y"))
+            self.assertFalse(manager.write_streaming_chunk(b, 0, b"x"))
             gate.set()
             writer.join(timeout=5.0)
             self.assertEqual(errors, [])
-            self.assertEqual(manager.get_total_cache_size(), 3 * block)
+            self.assertEqual(manager.get_total_cache_size(), 2 * block)
+            self.assertTrue(manager.write_streaming_chunk(b, 0, b"x"))
+            self.assertFalse(manager.write_streaming_chunk(b, block, b"y"))
             self._assert_total(3 * block)
 
     def test_unrelated_grants_with_ample_room_ignore_in_flight_writes(self):
@@ -1215,6 +1219,63 @@ class TestCacheAccounting(unittest.TestCase):
         with self._partial("b") as (_, b):
             self.assertTrue(manager.write_streaming_chunk(b, 0, b"x"))
             self.assertFalse(manager.write_streaming_chunk(b, block, b"y"))
+            gate.set()
+            writer.join(timeout=5.0)
+        self.assertEqual(errors, [])
+
+    def test_an_overwrite_that_lifts_the_allocation_cap_is_bounded(self):
+        """R7 qualification: a compressed file (three data blocks in one
+        allocated) charged one block; a one-block overwrite stops it
+        compressing, and its charge rises by two blocks, more than the
+        span. The allowance covers the hidden data, so a stream is not
+        admitted into those blocks."""
+        manager = self.cache_manager
+        block = manager.block_size
+        manager.max_size_bytes = 3 * block
+        path = self.cache_dir / "compressed"
+        path.write_bytes(b"c" * (3 * block))
+        fd = os.open(path, os.O_RDWR)
+        self.addCleanup(os.close, fd)
+        with _ReportedBlocks() as reported:
+            reported.set(path, block)
+            manager.mark_cache_size_dirty()
+            self._assert_total(block)
+            run, gate, errors = self._blocked_change(fd=fd, span=(0, block))
+
+            def overwrite():
+                os.pwrite(fd, b"x" * block, 0)
+                reported.set(path, 3 * block)
+
+            writer = run(overwrite)
+            with self._partial("b") as (_, b):
+                self.assertFalse(manager.write_streaming_chunk(b, 0, b"y"))
+                gate.set()
+                writer.join(timeout=5.0)
+                self.assertEqual(errors, [])
+                self._assert_total(3 * block)
+                self.assertFalse(manager.write_streaming_chunk(b, 0, b"y"))
+
+    def test_a_sparse_file_written_in_flight_holds_back_only_its_span(self):
+        """No whole logical file: a sparse file with one data block in a
+        large size holds back one block while a one-block write is in
+        flight, and a grant that fits beside that is admitted."""
+        manager = self.cache_manager
+        block = manager.block_size
+        manager.max_size_bytes = 4 * block
+        path = self.cache_dir / "sparse-large"
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        self.addCleanup(os.close, fd)
+        os.ftruncate(fd, 1 << 30)
+        os.pwrite(fd, b"d", 0)
+        manager.mark_cache_size_dirty()
+        self._assert_total(block)
+        run, gate, errors = self._blocked_change(fd=fd, span=(1 << 29, (1 << 29) + block))
+        writer = run(lambda: os.pwrite(fd, b"w" * block, 1 << 29))
+        with self._partial("b") as (_, b), \
+                patch.object(manager, "_evict_if_still_clean",
+                             side_effect=AssertionError("evicted for an allowance")):
+            self.assertTrue(manager.write_streaming_chunk(b, 0, b"y" * (2 * block)))
+            self.assertFalse(manager.write_streaming_chunk(b, 2 * block, b"z"))
             gate.set()
             writer.join(timeout=5.0)
         self.assertEqual(errors, [])
