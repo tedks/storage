@@ -560,8 +560,16 @@ class StorageFS(Operations):
             )
 
     def _eviction_descriptor_guard(self, virtual_path: str):
-        # The streaming descriptor can still be open after its inode is
-        # installed in the cache. Keep that path pinned until release.
+        """The descriptor guard eviction uses: prefetch descriptors pin the path too.
+
+        Differs on purpose from _has_open_descriptor and this guard's
+        default, which do not count a prefetch session's descriptor as
+        open (_invalidate_file_cache skips them too: a member change
+        unlinks the copy, and the reader keeps its inode). Eviction must
+        count them: a streaming descriptor can still be open after its
+        inode is installed in the cache, and its reads are demand
+        accesses, so the path stays pinned until release.
+        """
         return self._descriptor_guard(virtual_path, include_prefetch=True)
 
     def _has_open_descriptor(self, virtual_path: str) -> bool:
@@ -2595,7 +2603,13 @@ class StorageFS(Operations):
                 data = os.read(entry.real_fd, size)
 
             if entry.backend_name is None:
-                self._mark_demand_access(entry.canonical_path, session)
+                # Read under _fd_lock, as write() does: a rename re-points
+                # the entry. Unlike write() this takes no index lock; an
+                # access mark that lands on the pre-rename path only loses
+                # that one access for eviction order.
+                with self._fd_lock:
+                    canonical_path = entry.canonical_path
+                self._mark_demand_access(canonical_path, session)
 
             return data
 
@@ -2622,7 +2636,6 @@ class StorageFS(Operations):
             self.cache_manager.mark_cache_size_dirty()
 
             if entry.backend_name is None:
-                self.cache_manager.mark_accessed(entry.canonical_path)
                 # The path is read under the index lock, which a rename
                 # holds from the cache move until it has re-pointed the
                 # descriptors: the mark lands on the row that describes
@@ -2631,6 +2644,9 @@ class StorageFS(Operations):
                     with self._fd_lock:
                         canonical_path, cache_path = entry.canonical_path, entry.cache_path
                     self._mark_cache_file_dirty(canonical_path, cache_path)
+                # Outside the index lock: the access batch takes its own
+                # lock before the index lock.
+                self.cache_manager.mark_accessed(canonical_path)
 
             return written
 
