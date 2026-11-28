@@ -403,6 +403,8 @@ class TestStreamingSystemRegression(unittest.TestCase):
                 self.assertNotIn(name, json.dumps(status, ensure_ascii=False))
                 self.assertTrue(status["restart_only"]["streaming_reads"])
                 self.assertEqual(status["mount"]["mountpoint"], canonical_mountpoint(str(self.mount_dir)))
+                cache_entry = os.stat(self.cache_dir)
+                self.assertEqual(status["mount"]["cache"], [cache_entry.st_dev, cache_entry.st_ino])
                 row, = command("downloads")["downloads"]
                 self.assertEqual(row["path"].lstrip("/"), name)
                 self.assertEqual(row["readers"], 1)

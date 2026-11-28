@@ -941,6 +941,16 @@ class StreamingReadManager:
             raise ControlError("Expected a JSON control request object")
 
         command = arguments.pop("command", None)
+        if "cache" in arguments:
+            # The client names the cache directory it reached the socket
+            # through; a socket moved there from another cache refuses.
+            expected = arguments.pop("cache")
+            if (not isinstance(expected, list) or len(expected) != 2
+                    or any(type(value) is not int for value in expected)):
+                raise ControlError("Expected the target cache identity as [device, inode]")
+            published = self._control_server.cache_identity
+            if published is None or tuple(expected) != published:
+                raise ControlError("This control socket was published in a different cache directory")
         if "mountpoint" in arguments:
             # The client names the mount it means; refuse before acting
             # rather than answer for another mount sharing the cache.
@@ -954,8 +964,10 @@ class StreamingReadManager:
         if command in ("status", "streaming.get", "downloads.list") and arguments:
             raise ControlError("Unexpected arguments for control command")
         if command == "status":
+            identity = self._control_server.cache_identity
+            published = list(identity) if identity is not None else None
             return {
-                "mount": {"mountpoint": self.mountpoint, "pid": os.getpid()},
+                "mount": {"mountpoint": self.mountpoint, "pid": os.getpid(), "cache": published},
                 "stats": self._streaming_stats_snapshot(),
                 **self._control_parameters(self.download_limits()),
             }

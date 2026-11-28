@@ -175,14 +175,22 @@ backends = ["/no-member-probe"]
     return config
 
 
-def recording_server(cache, mountpoint):
-    """A stub mount reporting `mountpoint`; it does not check requests' mountpoints."""
+def cache_identity(cache):
+    entry = os.stat(cache)
+    return [entry.st_dev, entry.st_ino]
+
+
+def recording_server(cache, mountpoint, reported_cache=None):
+    """A stub mount reporting `mountpoint` and a cache identity (by default
+    `cache`'s); it does not check the identities requests name."""
     requests = []
+    reported_cache = cache_identity(cache) if reported_cache is None else reported_cache
 
     def dispatch(frame):
         request = json.loads(frame)
         requests.append(request)
-        return {"ok": True, "result": "cancelled", "mount": {"mountpoint": mountpoint, "pid": 1}}
+        return {"ok": True, "result": "cancelled",
+                "mount": {"mountpoint": mountpoint, "pid": 1, "cache": reported_cache}}
 
     return server_for(cache, dispatch), requests
 
@@ -203,11 +211,12 @@ def test_profile_selection_and_atomic_set_request(cache):
         assert result.exit_code == 0, result.output
         # Only the mutation's own response is printed, not the identity check.
         assert json.loads(result.output)["ok"] is True
-        identity = {"command": "status", "mountpoint": "/never-mounted"}
+        named = {"mountpoint": "/never-mounted", "cache": cache_identity(cache)}
+        identity = {"command": "status", **named}
         assert requests == [
             identity,
             identity,
-            {"command": "streaming.set", "mountpoint": "/never-mounted", "limits": {
+            {"command": "streaming.set", **named, "limits": {
                 "max_streaming_sessions": 3, "max_retained_streaming_sessions": 0,
             }},
         ]
@@ -216,11 +225,14 @@ def test_profile_selection_and_atomic_set_request(cache):
         assert runner.invoke(main, ["control", "set", "--help"]).exit_code == 0
         assert len(requests) == 3
 
-        # --cache names the socket directly: no mountpoint to check or send.
+        # --cache names the cache directory only: no mountpoint to check or send.
         requests.clear()
         result = runner.invoke(main, ["control", "--cache", str(cache), "cancel", "0" * 32])
         assert result.exit_code == 0, result.output
-        assert requests == [{"command": "downloads.cancel", "id": "0" * 32}]
+        assert requests == [
+            {"command": "status", "cache": cache_identity(cache)},
+            {"command": "downloads.cancel", "id": "0" * 32, "cache": cache_identity(cache)},
+        ]
     finally:
         server.stop()
 
@@ -240,7 +252,33 @@ def test_profile_refuses_a_socket_answering_for_another_mount(cache):
             assert "belongs to the mount at '/mnt/profile-a'" in result.output
             assert "mountpoint '/mnt/profile-b'" in result.output
             # Only the identity check (or the status itself) was sent.
-            assert requests == [{"command": "status", "mountpoint": "/mnt/profile-b"}]
+            assert requests == [{"command": "status", "mountpoint": "/mnt/profile-b",
+                                 "cache": cache_identity(cache)}]
+    finally:
+        server.stop()
+
+
+@pytest.mark.parametrize("by_profile", [False, True])
+def test_refuses_a_socket_published_in_another_cache(cache, by_profile):
+    # A group writer moved another mount's live socket into this cache.
+    config = write_profile(cache)
+    other = cache_identity(cache)
+    other[1] += 1
+    server, requests = recording_server(cache, "/never-mounted", reported_cache=other)
+    server.start()
+    try:
+        runner = CliRunner()
+        if by_profile:
+            options = ["control", "--profile", "example", "--config", str(config)]
+        else:
+            options = ["control", "--cache", str(cache)]
+        for command in (["set", "--max-download-workers", "2"], ["cancel", "0" * 32], ["status"]):
+            requests.clear()
+            result = runner.invoke(main, options + command)
+            assert result.exit_code == 1, result.output
+            assert "published in a different cache directory" in result.output
+            assert [request["command"] for request in requests] == ["status"]
+            assert requests[0]["cache"] == cache_identity(cache)
     finally:
         server.stop()
 
@@ -295,7 +333,7 @@ def test_reported_mountpoints_are_quoted(cache):
                            "download_workers_running", "download_workers",
                            "download_sessions_queued"], 0)
     server = server_for(cache, lambda _: {
-        "mount": {"mountpoint": "/mnt/a\nQueued downloads: 0", "pid": 0},
+        "mount": {"mountpoint": "/mnt/a\nQueued downloads: 0", "pid": 0, "cache": cache_identity(cache)},
         "stats": stats, "limits": {}, "restart_only": {},
     })
     server.start()

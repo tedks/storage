@@ -1,6 +1,8 @@
 """Operator commands for a running Storage mount."""
 
 import json
+import os
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -29,6 +31,17 @@ class ControlTarget:
             return resolved.cache_root, canonical_mountpoint(resolved.mountpoint)
         return self.cache.resolve(), None
 
+    @staticmethod
+    def _cache_identity(cache: Path) -> list[int]:
+        # The cache directory, not the mount, so following symlinks is safe.
+        try:
+            entry = os.stat(cache)
+        except OSError as exc:
+            raise click.ClickException(f"Cannot read cache directory {str(cache)!r}: {exc.strerror}") from exc
+        if not stat.S_ISDIR(entry.st_mode):
+            raise click.ClickException(f"Cache {str(cache)!r} is not a directory")
+        return [entry.st_dev, entry.st_ino]
+
     def _send(self, cache: Path, request: dict) -> dict:
         try:
             return request_control_payload(cache, json.dumps(request).encode("ascii"), self.timeout)
@@ -36,10 +49,19 @@ class ControlTarget:
             raise click.ClickException(str(exc)) from exc
 
     @staticmethod
-    def _require_mount(payload: dict, mountpoint: str):
-        # Two mounts can share a cache; only one of them owns its socket.
+    def _require_mount(payload: dict, mountpoint: str | None, cache: list[int]):
         mount = payload.get("mount")
-        reported = mount.get("mountpoint") if isinstance(mount, dict) else None
+        if not isinstance(mount, dict) or not isinstance(mount.get("mountpoint"), (str, type(None))):
+            raise click.ClickException("The control socket did not report which mount it belongs to")
+        # A socket moved here from another cache still reports its own.
+        if mount.get("cache") != cache:
+            raise click.ClickException(
+                "The control socket in this cache was published in a different cache directory"
+            )
+        if mountpoint is None:
+            return
+        # Two mounts can share a cache; only one of them owns its socket.
+        reported = mount["mountpoint"]
         if not isinstance(reported, str):
             raise click.ClickException("The control socket did not report which mount it belongs to")
         if reported != mountpoint:
@@ -50,17 +72,19 @@ class ControlTarget:
 
     def request(self, command: str, *, mutation: bool = False, **arguments) -> dict:
         cache, mountpoint = self._resolve()
+        # Every request names the cache directory (and, with --profile, the
+        # mountpoint) it means; the mount refuses one naming another.
+        identity = {"cache": self._cache_identity(cache)}
         if mountpoint is not None:
-            if mutation:
-                # Confirm the mount before changing anything, even if the
-                # server were to ignore the mountpoint sent below.
-                self._require_mount(self._send(cache, {"command": "status", "mountpoint": mountpoint}),
-                                    mountpoint)
-            # The mount refuses a request naming another mountpoint.
-            arguments["mountpoint"] = mountpoint
-        payload = self._send(cache, {"command": command, **arguments})
-        if mountpoint is not None and command == "status":
-            self._require_mount(payload, mountpoint)
+            identity["mountpoint"] = mountpoint
+        if mutation:
+            # Confirm the mount before changing anything, even if the
+            # server were to ignore the identity sent with the change.
+            self._require_mount(self._send(cache, {"command": "status", **identity}),
+                                mountpoint, identity["cache"])
+        payload = self._send(cache, {"command": command, **arguments, **identity})
+        if command == "status":
+            self._require_mount(payload, mountpoint, identity["cache"])
         if self.json_output:
             click.echo(json.dumps(payload, sort_keys=True, indent=2))
         return payload

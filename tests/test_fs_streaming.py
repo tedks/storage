@@ -3846,6 +3846,8 @@ class TestControlRequests(unittest.TestCase):
             mountpoint="/mnt/example",
         )
         self.manager = self.fs._streaming_manager
+        # As if published; the socket itself is not started here.
+        self.manager._control_server.cache_identity = (1, 2)
         self.initial_limits = self.manager.download_limits()
 
     def tearDown(self):
@@ -3916,6 +3918,16 @@ class TestControlRequests(unittest.TestCase):
               "mountpoint": None}, "Expected the target mountpoint as a string"),
             ({"command": "downloads.cancel", "id": self.VALID_ID, "mountpoint": "/mnt/other"},
              "This control socket belongs to the mount at '/mnt/example', not '/mnt/other'"),
+            ({"command": "streaming.set", "limits": {"max_download_workers": 2}, "cache": [1, 3]},
+             "This control socket was published in a different cache directory"),
+            ({"command": "downloads.cancel", "id": self.VALID_ID, "cache": [2, 2]},
+             "This control socket was published in a different cache directory"),
+            ({"command": "streaming.set", "limits": {"max_download_workers": 2}, "cache": "1:2"},
+             "Expected the target cache identity as [device, inode]"),
+            ({"command": "streaming.set", "limits": {"max_download_workers": 2}, "cache": [1, True]},
+             "Expected the target cache identity as [device, inode]"),
+            ({"command": "streaming.set", "limits": {"max_download_workers": 2}, "cache": [1, 2, 3]},
+             "Expected the target cache identity as [device, inode]"),
             ({"command": "status", "mountpoint": "/mnt/other"},
              "This control socket belongs to the mount at '/mnt/example', not '/mnt/other'"),
         ]
@@ -3934,7 +3946,8 @@ class TestControlRequests(unittest.TestCase):
 
         status = self.handle({"command": "status"})
         self.assertEqual(set(status), {"mount", "stats", "limits", "restart_only"})
-        self.assertEqual(status["mount"], {"mountpoint": "/mnt/example", "pid": os.getpid()})
+        self.assertEqual(status["mount"], {"mountpoint": "/mnt/example", "pid": os.getpid(),
+                                           "cache": [1, 2]})
         named = self.handle({"command": "status", "mountpoint": "/mnt/example"})
         self.assertEqual(named["mount"], status["mount"])
         self.assertEqual(named["limits"], status["limits"])
@@ -3947,7 +3960,8 @@ class TestControlRequests(unittest.TestCase):
             {"limits": self.initial_limits, "restart_only": status["restart_only"]},
         )
 
-        changed = self.handle({"command": "streaming.set", "mountpoint": "/mnt/example", "limits": {
+        changed = self.handle({"command": "streaming.set", "mountpoint": "/mnt/example",
+                               "cache": [1, 2], "limits": {
             "max_streaming_sessions": 3, "max_download_workers": 2,
         }})
         expected = {**self.initial_limits, "max_streaming_sessions": 3, "max_download_workers": 2}

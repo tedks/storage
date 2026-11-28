@@ -229,6 +229,10 @@ class ControlServer:
         self._thread = None
         self._listener = None
         self._owned_entry = None
+        # (st_dev, st_ino) of the cache directory the socket was published
+        # in, from its locked fd. A socket moved into another cache still
+        # reports this one, so clients can tell. None until published.
+        self.cache_identity = None
 
     def _stale_entry(self, root_fd: int) -> tuple[int, int] | None:
         try:
@@ -245,11 +249,13 @@ class ControlServer:
                 return _identity(entry)
         raise ControlError("a mount control socket is already listening")
 
-    def _publish(self, listener: socket.socket) -> tuple[int, int]:
+    def _publish(self, listener: socket.socket) -> tuple[tuple[int, int], tuple[int, int]]:
+        """Publish the listener; return the socket's and the cache's identities."""
         if len(os.fsencode(self.path)) > 107:
             raise ControlError("control socket path exceeds the 107-byte Unix socket limit")
         with _locked_cache(self.path.parent) as root:
             _require_private_cache(root)
+            cache = _identity(os.fstat(root))
             stale = self._stale_entry(root)
             # Every step below goes through the cache and stage fds, never a
             # path through the cache, so a renamed or swapped stage cannot
@@ -289,7 +295,7 @@ class ControlServer:
                     if _identity(current) != stale:
                         raise ControlError("control socket changed during startup")
                     os.rename("socket", CONTROL_SOCKET_NAME, src_dir_fd=stage_fd, dst_dir_fd=root)
-                return bound
+                return bound, cache
             finally:
                 if stage is not None:
                     _remove_stage(root, name, stage_fd, stage, bound)
@@ -302,7 +308,7 @@ class ControlServer:
             listener = None
             try:
                 listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                self._owned_entry = self._publish(listener)
+                self._owned_entry, self.cache_identity = self._publish(listener)
             except (OSError, ControlError) as exc:
                 if listener is not None:
                     listener.close()

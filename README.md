@@ -575,7 +575,9 @@ the first to start owns it. With `--profile`, every request names the
 profile's mountpoint and the mount refuses one that names another mount;
 `set` and `cancel` also check the mount's reported mountpoint before sending
 the change. `--cache` reaches whichever mount owns that cache's socket;
-`status` shows its mountpoint. Mountpoints are compared as absolute paths with
+`status` shows its mountpoint. With either option, every request also names
+the cache directory (by device and inode), and both the mount and the CLI
+refuse a socket that was published in a different cache and moved here. Mountpoints are compared as absolute paths with
 the parent directory's symlinks resolved, so a relative mountpoint matches only
 from the working directory the mount was started in.
 
