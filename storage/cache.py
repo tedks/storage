@@ -558,8 +558,8 @@ class CacheManager:
                 # probe) makes the next revalidation refetch.
                 confirmed, agreed = confirm_member_stat(
                     backend, source_virtual_path, member_stat, st.st_size)
-                if agreed:
-                    break
+                if agreed or member_stat is None:
+                    break  # (no probe: a second transfer confirms nothing more)
                 member_stat = confirmed
             fd = os.open(temp_path, os.O_RDONLY | os.O_NOFOLLOW)
             try:

@@ -90,8 +90,10 @@ def confirm_member_stat(backend, virtual_path: str, probe, transferred_size: int
             after = None
     if after is None:
         return probe, getattr(probe, "st_size", None) == transferred_size
-    agreed = (probe is not None
-              and getattr(after, "st_size", None) == transferred_size
+    if probe is None:
+        # Nothing taken before the transfer to compare against.
+        return after, getattr(after, "st_size", None) == transferred_size
+    agreed = (getattr(after, "st_size", None) == transferred_size
               and getattr(probe, "st_size", None) is not None
               and getattr(after, "st_size", None) == getattr(probe, "st_size", None)
               and _member_mtime_ns(probe) is not None
