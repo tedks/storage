@@ -602,6 +602,18 @@ class TestImportedPermissions(RevalidateTestBase):
             self.assertTrue(self.fs._ensure_file_in_cache(self.fs._resolve_path("/f.txt")))
         self.assertEqual((self.cache_dir / "f.txt").stat().st_atime, 900_000_000)
 
+    def test_warm_open_past_the_age_with_a_stat_lacking_mtime_keeps_the_copy(self):
+        self.rewrite_member("f.txt", b"original")
+        size_only = lambda path: SimpleNamespace(st_size=8)  # noqa: E731
+        with patch.object(self.member, "stat", side_effect=size_only):
+            self.assertEqual(self.read_through("/f.txt"), b"original")
+            for limited in (SimpleNamespace(st_size=8), SimpleNamespace(st_size=8, st_mtime=None)):
+                self.age_checks()
+                with patch.object(self.member, "stat", return_value=limited), \
+                        self.count_fetches() as fetches:
+                    self.assertEqual(self.read_through("/f.txt"), b"original")
+                self.assertEqual(fetches.call_count, 0)
+
     def test_read_only_member_mode_is_enforced(self):
         self.assert_write_refused(self.fill_read_only({"wraps": self.member.stat}))
 

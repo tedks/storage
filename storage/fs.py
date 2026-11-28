@@ -1559,11 +1559,10 @@ class StorageFS(Operations):
         alone could pair a new baseline with old bytes and never see the
         change.
 
-        Limit: with no stat before the transfer (the probe failed or the
-        member has none), the confirming stat taken after it is the only
-        one, so nothing was compared and a same-size change during the
-        transfer goes unseen, as it did before confirmation existed (the
-        copy then carried that post-transfer mtime anyway).
+        With no stat before the transfer (the probe failed or the member has
+        none), the verdict is NEVER_VERSIONED (or CHANGED), the baseline is
+        None and no member baseline is recorded: the next check uses the
+        rule for a member without one.
 
         Also called off the FUSE thread, from a stream's on_finalized. It can
         then land after the FUSE thread's own refetch of the same path and
@@ -1858,7 +1857,14 @@ class StorageFS(Operations):
             self._revalidate_outages.discard(backend.name)
             self.logger.info("Revalidating cached files against %s again", backend.label)
 
-        observed = (member_stat.st_size, member_stat.st_mtime)
+        observed = (getattr(member_stat, "st_size", None), getattr(member_stat, "st_mtime", None))
+        if None in observed:
+            # A member stat without a size or mtime cannot tell a change
+            # (a member that never supplies a version token): keep the copy,
+            # and count it as a check so the next open within the age is
+            # free.
+            self._store_member_check(canonical_path, cache_path, identity, {})
+            return
         baseline = members.get(backend.name)
         with self._member_checks_lock:
             # The last refetch for a change here came from another member.
