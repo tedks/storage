@@ -44,9 +44,10 @@ from .foreground_admission import AdmissionClosed, ForegroundAdmission, validate
 from .locks import NamespaceLock, PathLocks, UploadLocks
 from .cache_metadata import (
     MEMBER_ATTRS_XATTR, MEMBER_STAT_XATTR as CACHE_MEMBER_STAT_XATTR,
-    PREFIX_XATTR, STALE_LAST_GOOD_XATTR, XATTR_CACHE_METADATA_NAME,
-    _member_mtime_ns, cache_identity, forget_cached_member_fields, imported_mode_denies,
-    imported_mode_denies_write, read_member_baselines, record_native_attributes, regular_file_stat,
+    PREFIX_XATTR, STALE_LAST_GOOD_XATTR, STALE_READ_DENIED, XATTR_CACHE_METADATA_NAME,
+    _member_mtime_ns, cache_identity, cache_path_to_virtual_path, forget_cached_member_fields,
+    imported_mode_denies, imported_mode_denies_write, read_member_baselines,
+    record_native_attributes, regular_file_stat,
     restrict_cached_member_write, scan_cache_entries,
 )
 from .file_config import FileConfig, get_inherited_config
@@ -361,6 +362,9 @@ class StorageFS(Operations):
         # cache, index and descriptor locks.
         self._revalidate_after = max(0.0, float(revalidate_after))
         self._member_checks: Dict[str, MemberCheck] = {}
+        # Admission evidence for an inode whose mark could not be written,
+        # or a known read denial whose marker might become unreadable.
+        self._remembered_stale: Dict[str, Tuple[tuple, bytes]] = {}
         self._member_checks_lock = threading.Lock()
         # Members whose failed revalidation has been logged; cleared by the
         # member's next successful stat, so an outage is logged once.
@@ -1507,8 +1511,8 @@ class StorageFS(Operations):
         old_prefix = old.rstrip("/") + "/"
         new_prefix = new.rstrip("/") + "/"
         with self._member_checks_lock:
-            for table in (self._member_checks, self._refetch_pins, self._pinned_stats,
-                          self._recheck, self._revalidate_unreachable):
+            for table in (self._member_checks, self._remembered_stale, self._refetch_pins,
+                          self._pinned_stats, self._recheck, self._revalidate_unreachable):
                 for key in [k for k in table if k == new or k.startswith(new_prefix)]:
                     del table[key]
                 moved = {}
@@ -1909,7 +1913,8 @@ class StorageFS(Operations):
             return
 
         exact_mtime = exact_mtimes.get(backend.name)
-        marked_stale = self._is_stale_last_good(cache_path)
+        stale_mark = self._last_good_mark(cache_path)
+        marked_stale = stale_mark is not None
         listed_at = (None if marked_stale else
                      self._listing_confirms_baseline(resolved, backend, members, exact_mtime))
         if listed_at is not None:
@@ -1936,7 +1941,7 @@ class StorageFS(Operations):
             self._store_member_check(canonical_path, cache_path, identity, {})
             return
         except PermissionError:
-            self._invalidate_file_cache(resolved.requested_path)
+            self._invalidate_read_denied(resolved)
             raise
         except Exception as exc:
             # Counts as a check, so a member that fails without being marked
@@ -1954,13 +1959,14 @@ class StorageFS(Operations):
         observed_exact = observed_mtimes.get(backend.name)
         with self._member_checks_lock:
             # The last refetch for a change here came from another member.
-            must_refetch = backend.name in self._recheck.get(canonical_path, ())
+            must_refetch = (stale_mark == STALE_READ_DENIED
+                            or backend.name in self._recheck.get(canonical_path, ()))
         mode = getattr(member_stat, "st_mode", None)
         if os.geteuid() != 0 and type(mode) is int:
             if not mode & stat.S_IRUSR:
                 # The denial is already known. No capacity check or failed
                 # refresh may make the old copy readable again.
-                self._invalidate_file_cache(resolved.requested_path)
+                self._invalidate_read_denied(resolved)
                 raise FuseOSError(errno.EACCES)
             if not mode & stat.S_IWUSR:
                 restrict_cached_member_write(cache_path, cache_stat)
@@ -2072,34 +2078,69 @@ class StorageFS(Operations):
                 and not self._is_read_only_open(entry.flags)
                 for entry in self._fd_map.values())
 
-    def _mark_last_good_stale(self, cache_path: Path) -> bool:
-        """The cached copy is the last good one but known stale (its refresh
-        could not be verified): writable opens and truncates get EAGAIN until
-        a verified fill replaces it; read-only opens read it. The mark is an
-        xattr on the copy's inode, so it follows the bytes (a rename away
-        keeps it, a rename over the name or a replacing fill drops it) and
-        outlives a restart."""
+    def _invalidate_read_denied(self, resolved: ResolvedPath) -> None:
+        # A refused invalidation can retain the bytes, so record the read
+        # denial before trying to unlink them.
+        self._mark_last_good_stale(resolved.cache_path, read_denied=True)
+        self._invalidate_file_cache(resolved.requested_path)
+        if not self.cache_manager.is_cached(resolved.requested_path):
+            with self._member_checks_lock:
+                self._remembered_stale.pop(resolved.requested_path, None)
+
+    def _mark_last_good_stale(self, cache_path: Path, *, read_denied: bool = False) -> bool:
+        """Remember this inode's admission restriction. Return whether it persisted."""
+        st = regular_file_stat(cache_path)
+        if st is None:
+            return False
+        denied = read_denied or self._last_good_mark(cache_path) == STALE_READ_DENIED
+        mark = STALE_READ_DENIED if denied else b"1"
+        path = cache_path_to_virtual_path(self.cache_manager.cache_root, cache_path)
+        persisted = False
         try:
-            os.setxattr(str(cache_path), STALE_LAST_GOOD_XATTR, b"1", follow_symlinks=False)
+            os.setxattr(str(cache_path), STALE_LAST_GOOD_XATTR, mark, follow_symlinks=False)
+            persisted = True
         except OSError as exc:
             self.logger.warning("could not mark %s stale: %s", cache_path, exc)
-            return False
-        return True
+        with self._member_checks_lock:
+            if denied or not persisted:
+                self._remembered_stale[path] = (self._cache_identity(st), mark)
+            else:
+                self._remembered_stale.pop(path, None)
+        return persisted
 
-    @staticmethod
-    def _is_stale_last_good(cache_path: Path) -> bool:
-        """Whether the copy is marked. Only a regular file carries the mark;
-        on one, any error but "no such attribute" counts as marked, so an
-        unreadable mark refuses writers rather than admitting them."""
-        if regular_file_stat(cache_path) is None:
-            return False
+    def _last_good_mark(self, cache_path: Path) -> Optional[bytes]:
+        """Read the persisted or remembered restriction for the named inode."""
+        st = regular_file_stat(cache_path)
+        path = cache_path_to_virtual_path(self.cache_manager.cache_root, cache_path)
+        identity = self._cache_identity(st) if st is not None else None
+        with self._member_checks_lock:
+            remembered = self._remembered_stale.get(path)
+            if remembered is not None:
+                if remembered[0] == identity:
+                    return remembered[1]
+                self._remembered_stale.pop(path)
+        if st is None:
+            return None
         try:
-            os.getxattr(str(cache_path), STALE_LAST_GOOD_XATTR, follow_symlinks=False)
-            return True
+            mark = os.getxattr(str(cache_path), STALE_LAST_GOOD_XATTR, follow_symlinks=False)
         except OSError as exc:
-            return exc.errno not in (errno.ENODATA, getattr(errno, "ENOATTR", errno.ENODATA))
+            if exc.errno in (errno.ENODATA, getattr(errno, "ENOATTR", errno.ENODATA)):
+                return None
+            return b"1"  # an unreadable mark cannot authorize a writer
+        if mark == STALE_READ_DENIED:
+            with self._member_checks_lock:
+                self._remembered_stale[path] = (identity, mark)
+        return mark
 
-    def _clear_stale_last_good(self, cache_path: Path) -> None:
+    def _is_stale_last_good(self, cache_path: Path) -> bool:
+        return self._last_good_mark(cache_path) is not None
+
+    def _clear_stale_last_good(self, cache_path: Path, *, discarded: bool = False) -> None:
+        if not discarded and self._last_good_mark(cache_path) == STALE_READ_DENIED:
+            return
+        path = cache_path_to_virtual_path(self.cache_manager.cache_root, cache_path)
+        with self._member_checks_lock:
+            self._remembered_stale.pop(path, None)
         try:
             os.removexattr(str(cache_path), STALE_LAST_GOOD_XATTR, follow_symlinks=False)
         except OSError as exc:
@@ -2719,7 +2760,7 @@ class StorageFS(Operations):
             self.cache_manager.mark_cache_size_dirty()
 
             if stale:
-                self._clear_stale_last_good(cache_path)  # emptied: no stale bytes left
+                self._clear_stale_last_good(cache_path, discarded=True)
 
             # Mark as dirty
             if not resolved.backend_name:
@@ -2807,12 +2848,16 @@ class StorageFS(Operations):
             repair_error = self._revalidate_cached_file(resolved, keep_named=not streams)
             if repair_error is not None and not read_only:
                 raise FuseOSError(_full_fill_errno(repair_error)) from repair_error
+        stale_mark = self._last_good_mark(cache_path) if resolved.backend_name is None else None
+        refresh_due = resolved.canonical_path in self._refresh_pending
+        reads_bytes = flags & os.O_ACCMODE != os.O_WRONLY
+        if stale_mark == STALE_READ_DENIED and reads_bytes and not refresh_due:
+            raise FuseOSError(errno.EACCES)
         clear_stale = False
-        if (not self._is_read_only_open(flags) and resolved.backend_name is None
-                and self._is_stale_last_good(cache_path)):
+        if not read_only and stale_mark is not None:
             if flags & os.O_TRUNC:
                 clear_stale = True  # its bytes are discarded: once the open succeeds
-            elif resolved.canonical_path not in self._refresh_pending:
+            elif not refresh_due:
                 # Known stale and no refresh due yet (within the age): no
                 # baseline to edit. A due refresh runs first and decides.
                 raise FuseOSError(errno.EAGAIN)
@@ -2890,8 +2935,7 @@ class StorageFS(Operations):
                     # The member now withholds read: the copy goes (a CLEAN
                     # one, the member holds its bytes), so later opens ask
                     # the member again rather than read it.
-                    self._mark_last_good_stale(resolved.cache_path)
-                    self._invalidate_file_cache(resolved.requested_path)
+                    self._invalidate_read_denied(resolved)
                 elif kept:
                     if code == errno.ENOENT and absent:
                         # The member it was pinned to no longer has the file:
@@ -2914,7 +2958,10 @@ class StorageFS(Operations):
                     raise FuseOSError(code)
             if not self._is_read_only_open(flags):
                 self._require_imported_write_permission(cache_path)
-            if flags & os.O_ACCMODE != os.O_WRONLY:
+            if reads_bytes:
+                if (stale_mark == STALE_READ_DENIED
+                        and self._last_good_mark(cache_path) == STALE_READ_DENIED):
+                    raise FuseOSError(errno.EACCES)
                 self._require_imported_permission(cache_path, stat.S_IRUSR)
 
         try:
@@ -2945,7 +2992,7 @@ class StorageFS(Operations):
                     view_ino=os.fstat(real_fd).st_ino if resolved.backend_name else None,
                 )
             if clear_stale:
-                self._clear_stale_last_good(cache_path)
+                self._clear_stale_last_good(cache_path, discarded=True)
             if resolved.backend_name and flags & os.O_TRUNC:
                 opened = self._fd_map[vfd]
                 self._mark_view_changed(cache_path, opened.view_ino, opened)
@@ -2994,7 +3041,7 @@ class StorageFS(Operations):
                 self._mark_view_changed(cache_path, created.view_ino, created)
             # Its bytes were replaced: a stale last good mark goes (once the
             # create succeeded).
-            self._clear_stale_last_good(cache_path)
+            self._clear_stale_last_good(cache_path, discarded=True)
             try:
                 # No member fields: stat skips legacy recovery and its index read.
                 record_native_attributes(real_fd)
@@ -3800,13 +3847,17 @@ class StorageFS(Operations):
         """
         marked = 0
         for entry in scan_cache_entries(self.cache_manager.cache_root):
-            if self.cache_manager.heal_stale_clean(
-                entry.virtual_path,
-                entry.cache_path,
-                stat_size=entry.stat_size,
-                stat_mtime=entry.stat_mtime,
-            ):
-                marked += 1
+            try:
+                if self.cache_manager.heal_stale_clean(
+                    entry.virtual_path,
+                    entry.cache_path,
+                    stat_size=entry.stat_size,
+                    stat_mtime=entry.stat_mtime,
+                ):
+                    marked += 1
+            except OSError as exc:
+                self.logger.warning("could not inspect recovery evidence for %s: %s",
+                                    entry.virtual_path, exc)
         if marked:
             self.logger.warning("Marked %d cached files dirty after an unclean shutdown", marked)
         return marked

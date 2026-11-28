@@ -1028,8 +1028,8 @@ class CacheManager:
         """
         try:
             record = read_cache_metadata(cache_path)
-        except (OSError, ValueError):
-            return None
+        except ValueError as exc:
+            raise OSError(errno.EIO, "could not read cache recovery evidence", cache_path) from exc
         if (record is None or record.sync_status != SyncStatus.CLEAN
                 or record.is_stale_for(stat_size, stat_mtime)):
             return None

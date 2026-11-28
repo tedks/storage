@@ -2893,11 +2893,7 @@ class TestRefreshRound5(RevalidateTestBase):
         import sqlite3
 
         path = "/live.log"
-        self.refreshed_with_checksums()
-        with patch.object(self.fs, "_record_fetched", side_effect=KeyboardInterrupt):
-            with self.assertRaises(KeyboardInterrupt):
-                self.fs.open(path, os.O_RDONLY)
-        self.restart()
+        self.crash_after_installing_refresh()
         self.rewrite_member("live.log", b"version 3 is newest", mtime=1_200_000_000)
         cached = self.cache_dir / "live.log"
         state = self.fs.state_manager
@@ -2933,6 +2929,107 @@ class TestRefreshRound5(RevalidateTestBase):
                 self.assertEqual(self.fs.read(path, 64, 0, fh), b"version 3 is newest")
             finally:
                 self.fs.release(path, fh)
+
+    def test_unpersisted_stale_mark_still_refuses_offline_writes(self):
+        import sqlite3
+
+        from storage.cache_metadata import STALE_LAST_GOOD_XATTR
+
+        path = "/live.log"
+        self.crash_after_installing_refresh()
+        self.rewrite_member("live.log", b"version 3 is newest", mtime=1_200_000_000)
+        cached = self.cache_dir / "live.log"
+        setxattr = os.setxattr
+
+        def fail_stale_mark(target, name, *args, **kwargs):
+            if name == STALE_LAST_GOOD_XATTR and Path(target) == cached:
+                raise OSError(errno.ENOSPC, "cannot persist stale mark")
+            return setxattr(target, name, *args, **kwargs)
+
+        with patch.object(self.fs.state_manager, "record_cached_stat",
+                          side_effect=sqlite3.OperationalError("row repair failed once")) as repair, \
+                patch.object(os, "setxattr", side_effect=fail_stale_mark):
+            self.assert_errno(errno.EIO, self.fs.open, path, os.O_RDWR)
+        repair.assert_called_once()
+        with self.assertRaises(OSError) as absent:
+            os.getxattr(cached, STALE_LAST_GOOD_XATTR)
+        self.assertEqual(absent.exception.errno, errno.ENODATA)
+
+        self.member.set_available(False)
+        try:
+            self.assertEqual(self.read_through(path), b"version 2!")
+            for flags in (os.O_WRONLY, os.O_RDWR):
+                self.assert_errno(errno.EAGAIN, self.fs.open, path, flags)
+            self.assert_errno(errno.EAGAIN, self.fs.truncate, path, 1)
+            self.assert_errno(errno.EAGAIN, self.fs.utimens, path, (10, 10))
+            self.assertEqual(cached.read_bytes(), b"version 2!")
+        finally:
+            self.member.set_available(True)
+
+        fh = self.fs.open(path, os.O_RDWR)
+        try:
+            self.assertEqual(self.fs.read(path, 64, 0, fh), b"version 3 is newest")
+        finally:
+            self.fs.release(path, fh)
+        self.assertFalse(self.fs._is_stale_last_good(cached))
+
+    def test_read_denial_survives_repair_failure_and_offline_reopen(self):
+        import sqlite3
+
+        from storage.cache_metadata import STALE_LAST_GOOD_XATTR
+
+        path = "/live.log"
+        self.crash_after_installing_refresh()
+        (self.member_dir / "live.log").chmod(0o200)
+        cached = self.cache_dir / "live.log"
+        with patch.object(self.fs.state_manager, "record_cached_stat",
+                          side_effect=sqlite3.OperationalError("row repair failed once")) as repair:
+            self.assert_errno(errno.EACCES, self.fs.open, path, os.O_RDONLY)
+        repair.assert_called_once()
+        self.restart()
+
+        self.member.set_available(False)
+        try:
+            for flags in (os.O_RDONLY, os.O_RDWR):
+                self.assert_errno(errno.EACCES, self.fs.open, path, flags)
+            self.assert_errno(errno.EAGAIN, self.fs.open, path, os.O_WRONLY)
+            self.assert_errno(errno.EAGAIN, self.fs.truncate, path, 1)
+            self.assertEqual(cached.read_bytes(), b"version 2!")
+            self.assertEqual(os.getxattr(cached, STALE_LAST_GOOD_XATTR), b"read-denied")
+        finally:
+            self.member.set_available(True)
+
+        # The source's new accessible version must be fetched to lift the
+        # retained inode's admission restriction.
+        (self.member_dir / "live.log").chmod(0o644)
+        self.rewrite_member("live.log", b"version 3 is newest", mtime=1_200_000_000)
+        self.assertEqual(self.read_through(path), b"version 3 is newest")
+        self.assertFalse(self.fs._is_stale_last_good(cached))
+
+    def test_unreadable_recovery_record_does_not_make_a_refresh_dirty(self):
+        from storage.cache_metadata import XATTR_CACHE_METADATA_NAME
+
+        self.crash_after_installing_refresh()
+        cached = self.cache_dir / "live.log"
+        state = self.fs.state_manager
+        getxattr = os.getxattr
+
+        def fail_recovery_read(path, name, *args, **kwargs):
+            if name == XATTR_CACHE_METADATA_NAME and Path(path) == cached:
+                raise OSError(errno.EIO, "cannot read recovery record")
+            return getxattr(path, name, *args, **kwargs)
+
+        with patch.object(os, "getxattr", side_effect=fail_recovery_read), \
+                patch.object(self.fs.sync_manager, "queue_sync") as sync:
+            self.assertFalse(self.fs.cache_manager.evict_lru_files(bytes_needed=10))
+            self.assertEqual(self.fs.sweep_stale_cache_metadata(), 0)
+            sync.assert_not_called()
+            row = state.get_file_metadata("/live.log")
+            self.assertEqual((row.size, row.sync_status, row.dirty_generation),
+                             (9, SyncStatus.CLEAN, 0))
+            self.assertEqual(cached.read_bytes(), b"version 2!")
+        self.assertTrue(self.fs.cache_manager.evict_lru_files(bytes_needed=10))
+        self.assertIsNone(state.get_file_metadata("/live.log").checksum)
 
     def test_eviction_heals_verified_replacement_before_the_sweep(self):
         self.refreshed_with_checksums()
@@ -2977,7 +3074,7 @@ class TestRefreshRound5(RevalidateTestBase):
                          SyncStatus.CLEAN)
 
     def test_a_crash_after_equal_stat_replacement_forgets_the_old_checksums(self):
-        self.crash_after_installing_equal_stat_refresh()
+        self.crash_after_installing_refresh(equal_stat=True)
         self.assertEqual(self.fs.sweep_stale_cache_metadata(), 0)
         row = self.fs.state_manager.get_file_metadata("/live.log")
         self.assertEqual((row.size, row.last_modified, row.sync_status, row.checksum),
@@ -2987,7 +3084,7 @@ class TestRefreshRound5(RevalidateTestBase):
         self.assertEqual(self.read_through("/live.log"), b"version 2")
 
     def test_equal_stat_replacement_refills_without_old_checksum_after_eviction_crash(self):
-        self.crash_after_installing_equal_stat_refresh()
+        self.crash_after_installing_refresh(equal_stat=True)
         cached = self.cache_dir / "live.log"
         unlink = Path.unlink
 
@@ -3009,7 +3106,7 @@ class TestRefreshRound5(RevalidateTestBase):
     def test_eviction_keeps_a_verified_copy_when_its_row_repair_fails(self):
         import sqlite3
 
-        self.crash_after_installing_equal_stat_refresh()
+        self.crash_after_installing_refresh(equal_stat=True)
         cached = self.cache_dir / "live.log"
         state = self.fs.state_manager
         inode = cached.stat().st_ino
@@ -3023,10 +3120,11 @@ class TestRefreshRound5(RevalidateTestBase):
         self.assertTrue(self.fs.cache_manager.evict_lru_files(bytes_needed=9))
         self.assertIsNone(state.get_file_metadata("/live.log").checksum)
 
-    def crash_after_installing_equal_stat_refresh(self):
+    def crash_after_installing_refresh(self, *, equal_stat=False):
         old_inode = self.refreshed_with_checksums()
-        self.rewrite_member("live.log", b"version 2", mtime=1_000_000_000)
-        self.fs._recheck["/live.log"] = {"member"}
+        if equal_stat:
+            self.rewrite_member("live.log", b"version 2", mtime=1_000_000_000)
+            self.fs._recheck["/live.log"] = {"member"}
         with patch.object(self.fs, "_record_fetched", side_effect=KeyboardInterrupt):
             with self.assertRaises(KeyboardInterrupt):
                 self.fs.open("/live.log", os.O_RDONLY)

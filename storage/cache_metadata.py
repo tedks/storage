@@ -19,6 +19,7 @@ MEMBER_STAT_XATTR = "user.storage.member_stat"
 # On a cached copy whose refresh could not be verified: the last good bytes,
 # known stale, not a baseline for writes (StorageFS._mark_last_good_stale).
 STALE_LAST_GOOD_XATTR = "user.storage.stale_last_good"
+STALE_READ_DENIED = b"read-denied"
 _SOURCE_ATTR_FIELDS = ("st_mode", "st_uid", "st_gid", "st_nlink", "st_ctime")
 # Set-ID bits are never reported for a regular file, whatever the member
 # or a chmod through the mount says: the kernel would honour a reported
