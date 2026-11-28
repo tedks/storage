@@ -165,12 +165,13 @@ def test_never_replaces_arbitrary_entries(cache):
 
 def write_profile(cache, mountpoint="/never-mounted"):
     config = cache / "storage.toml"
+    # TOML has no surrogate escapes, so write non-ASCII paths as UTF-8.
     config.write_text(f"""
 [mounts.example]
-mountpoint = {json.dumps(str(mountpoint))}
+mountpoint = {json.dumps(str(mountpoint), ensure_ascii=False)}
 cache = {json.dumps(str(cache))}
 backends = ["/no-member-probe"]
-""")
+""", encoding="utf-8")
     return config
 
 
@@ -240,6 +241,39 @@ def test_profile_refuses_a_socket_answering_for_another_mount(cache):
             assert "/mnt/profile-b" in result.output
             # Only the identity check (or the status itself) was sent.
             assert requests == [{"command": "status", "mountpoint": "/mnt/profile-b"}]
+    finally:
+        server.stop()
+
+
+def test_long_multibyte_mountpoint_fits_a_request(cache):
+    # 16 components of 63 four-byte characters: 4048 bytes on disk, each
+    # character escaped to a twelve-byte surrogate pair in the request.
+    mountpoint = "/" + "/".join(["\U00020000" * 63] * 16)
+    assert len(os.fsencode(mountpoint)) == 4048
+    config = write_profile(cache, mountpoint)
+    server, requests = recording_server(cache, mountpoint)
+    server.start()
+    try:
+        runner = CliRunner()
+        options = ["control", "--profile", "example", "--config", str(config), "--json-output"]
+        for command in ([], ["set", "--max-download-workers", "2"]):
+            result = runner.invoke(main, options + command)
+            assert result.exit_code == 0, result.output
+        assert [request["mountpoint"] for request in requests] == [mountpoint] * 3
+    finally:
+        server.stop()
+
+
+def test_worst_case_escaped_mountpoint_fits_a_request(cache):
+    # Every byte of a 4095-byte path undecodable, so each escapes to six bytes.
+    mountpoint = os.fsdecode(b"/" + b"\xff" * 4094)
+    request = json.dumps({"command": "downloads.cancel", "id": "0" * 32,
+                          "mountpoint": mountpoint}).encode("ascii")
+    assert len(request) > 6 * 4094
+    server = server_for(cache, lambda frame: {"mountpoint": json.loads(frame)["mountpoint"]})
+    server.start()
+    try:
+        assert request_control_payload(cache, request, 2) == {"mountpoint": mountpoint}
     finally:
         server.stop()
 

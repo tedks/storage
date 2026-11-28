@@ -17,7 +17,12 @@ from pathlib import Path
 
 
 CONTROL_SOCKET_NAME = ".storage.control.sock"
-MAX_REQUEST_BYTES = 4096
+# Requests are ASCII JSON, and a request may name a mountpoint: a Linux
+# path up to 4096 bytes, which JSON can escape to six bytes per byte (a
+# control character or an undecodable byte as \u00XX or \udcXX; a
+# four-byte character is twelve bytes as a surrogate pair, three per
+# byte). 24 KiB for the path leaves 8 KiB for the command and arguments.
+MAX_REQUEST_BYTES = 32 * 1024
 # At most 2048 downloads, each with a Linux path up to 4096 bytes long.
 # Even if JSON escapes every path byte as six ASCII bytes, the list fits.
 MAX_RESPONSE_BYTES = 64 * 1024 * 1024
