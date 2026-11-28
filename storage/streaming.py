@@ -1901,6 +1901,16 @@ class StreamingReadManager:
         virtual_path: str,
         canonical_path: str,
     ) -> PrefetchSession | StreamingOpen:
+        """One attempt of _create_or_attach_prefetch_session.
+
+        Same-path concurrency: StorageFS.open, the only caller, holds the
+        file's path lock (_path_locked) for the whole open, so two opens of
+        one file never race through staging and registration here. The
+        staging-name and admission-join handling below are defence for any
+        other caller; the rejection of council finding R3-I1 (#190) relies
+        on that lock, so a second caller, or a narrower lock, reopens it.
+        Other files' opens, workers and releases do run concurrently.
+        """
         with self.prefetch_sessions_lock:
             if self._destroying:
                 raise OSError(errno.EINTR, "streaming manager is shutting down")
@@ -1964,7 +1974,8 @@ class StreamingReadManager:
                         break
                 # No room for a partial of our own. A concurrent open of the
                 # same file may have registered one since the lookup above
-                # (its partial is what filled the budget): join it.
+                # (its partial is what filled the budget): join it. Not
+                # reachable through StorageFS.open (see the docstring).
                 with self.prefetch_sessions_lock:
                     existing = None if self._destroying else self.prefetch_sessions.get(canonical_path)
                     attached = self._attach(existing) if existing is not None else None
