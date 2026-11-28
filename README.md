@@ -633,16 +633,25 @@ user and is not writable by all users unless sticky (group write, as under umask
 socket.
 `storage debug streaming-stats` continues to query it.
 
-Publishing and withdrawing the socket happen in a private staging directory
-in the cache, `.storage.mount.<16 hex digits>`, which exists only for that
-moment. A mount killed at that moment can leave one behind. The next
-publication removes leftovers that hold only a `nonce` file and/or a dead
-`socket`, both owned by the mount's user. A staging directory holding a
-`moved` entry kept something that was at the socket's name and could not be
-put back; inspect it before removing it. To clean up by hand, with no mount
-of that cache starting or stopping, remove such directories after checking
-they hold nothing else (`ls -la` on each); the `.storage.mount.<hash>.lock`
-files are mount locks, not staging directories.
+Storage creates a private `.storage.mount.<32 hex digits>` directory in the
+cache while publishing or withdrawing the socket. Older builds used 16 hex
+digits. Takeover of a dead socket uses an atomic exchange so the incoming
+socket is public and the displaced entry remains in the stage until it is
+verified or restored. Without exchange support, startup leaves an occupied
+name in place and logs a warning. Without no-replace rename support,
+shutdown leaves its dead socket in place.
+
+An interrupted operation can leave a staging directory behind. Storage
+leaves those directories for manual recovery. A stage can contain `nonce`
+(the hex suffix), `socket` (the incoming or displaced entry), or `moved`
+(the entry moved during shutdown). Only the mount user should clean up,
+with no mount of that cache starting or stopping. Inspect each directory
+with `ls -la`. Preserve any unexpected entry for recovery, and verify that
+each socket is dead before removing it. `ss -xap` shows live sockets but
+may display their original bind paths after a rename. If in doubt,
+confirm a connection to the entry returns `ECONNREFUSED`. Check the public
+socket the same way before removing a dead one by hand. Leave
+`.storage.mount.<hash>.lock` mount-lock files in place.
 
 ### debug
 
