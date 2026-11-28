@@ -637,12 +637,17 @@ Storage creates a private `.storage.mount.<32 hex digits>` directory in the
 cache while publishing or withdrawing the socket. Older builds used 16 hex
 digits. Takeover of a dead socket uses an atomic exchange so the incoming
 socket is public and the displaced entry remains in the stage until it is
-verified or restored. Without exchange support, startup leaves an occupied
-name in place and logs a warning. Without no-replace rename support,
-shutdown leaves its dead socket in place.
+verified or restored. If restoration would displace a public entry in a
+shared writable cache, Storage keeps the entry in the stage and logs its
+location. Without exchange support, startup leaves an occupied name in
+place and logs a warning. Without no-replace rename support, shutdown
+leaves its dead socket in place. Failure to start the control thread leaves
+the mount running without a control socket.
 
-An interrupted operation can leave a staging directory behind. Storage
-leaves those directories for manual recovery. A stage can contain `nonce`
+An interrupted operation can leave a staging directory behind. A cache
+writable by other users can also retain empty stages after normal
+operation. Startup partial-file cleanup skips these directories so they
+remain available for manual recovery. A stage can contain `nonce`
 (the hex suffix), `socket` (the incoming or displaced entry), or `moved`
 (the entry moved during shutdown). Only the mount user should clean up,
 with no mount of that cache starting or stopping. Inspect each directory
