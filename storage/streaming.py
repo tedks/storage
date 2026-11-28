@@ -1870,7 +1870,17 @@ class StreamingReadManager:
                     except _PublicationYielded:
                         yielded = True
         finally:
+            stopped_after_yield = False
             with session.lock:
+                # Decided under session.lock, where destroy sets
+                # stop_requested and asks the pool whether a turn owns the
+                # session: a stop that landed after the yield found this
+                # turn running, so destroy closes nothing and this turn
+                # must clean up.
+                if yielded and session.stop_requested:
+                    yielded = False
+                    stopped_after_yield = True
+                    session.worker_done = True
                 if yielded:
                     # Queued again as a publication: it waits for an
                     # interactive channel, which the member's bulk ceiling
@@ -1880,6 +1890,15 @@ class StreamingReadManager:
                                               yielded=True)
                 else:
                     self._download_pool.offer(session, False, finished_turn=True)
+                    if not stopped_after_yield:
+                        session.background_finished.set()
+            if stopped_after_yield:
+                # The cancelled-session cleanup, as _finish_background_session
+                # takes for a stop; after session.lock (it takes the
+                # registry lock first). Its detach claim is single-shot.
+                try:
+                    self._cleanup_cancelled_session(session)
+                finally:
                     session.background_finished.set()
 
     def _publication_wait_probe(self, session: PrefetchSession):

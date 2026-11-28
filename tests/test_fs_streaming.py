@@ -23,7 +23,8 @@ from storage.cache_metadata import MEMBER_ATTRS_XATTR
 from storage.fs import StorageFS
 from storage.models import SyncStatus
 from storage.streaming import (
-    ACTIVE_DOWNLOAD_BURST, PrefetchSession, _DownloadPool, validate_download_limits,
+    ACTIVE_DOWNLOAD_BURST, PrefetchSession, _DownloadPool, _PublicationYielded,
+    validate_download_limits,
 )
 from storage.mount_profiles import parse_keep_after_close
 
@@ -1415,6 +1416,53 @@ class TestFSStreamingIntegration(unittest.TestCase):
         # After the replacement only the new partial is charged.
         self.assertEqual(cache.get_free_space_needed(600 * 1024), 0)
         self.fs.release("/replacing.bin", fd)
+
+    def test_destroy_landing_after_a_confirmation_yield_cleans_up(self):
+        manager = self.fs._streaming_manager
+        pool = manager._download_pool
+        payload = os.urandom(64 * 1024)
+        (self.backend_dir / "yielding.bin").write_bytes(payload)
+        busy = threading.Event()
+        self.addCleanup(busy.clear)
+        stat, _ = self._channel_busy_stat(busy)
+        real_finish = manager._finish_background_session
+        yielded = threading.Event()
+        resume = threading.Event()
+        self.addCleanup(resume.set)
+
+        def finish(session):
+            try:
+                return real_finish(session)
+            except _PublicationYielded:
+                # Between the contention yield and the turn's requeue.
+                yielded.set()
+                resume.wait(timeout=10)
+                raise
+
+        def contended(_session):
+            return lambda: "streaming publication yielded to other work"
+
+        with patch.object(self.backend, "stat", side_effect=stat), \
+                patch.object(manager, "_publication_wait_probe", side_effect=contended), \
+                patch.object(manager, "_finish_background_session", side_effect=finish):
+            fd = self.fs.open("/yielding.bin", os.O_RDONLY)
+            session = self._session_for(fd)
+            busy.set()
+            self.assertEqual(self.fs.read("/yielding.bin", len(payload), 0, fd), payload)
+            self.fs.release("/yielding.bin", fd)
+            self.assertTrue(yielded.wait(timeout=3))
+            # destroy's complete_too pass, with the pool already closing.
+            with pool.condition:
+                pool.closing = True
+            with manager.prefetch_sessions_lock:
+                manager._detach_for_destroy(session, complete_too=True)
+            resume.set()
+            self.assertTrue(session.background_finished.wait(timeout=3))
+        self.assertEqual(session.io_fd, -1)
+        self.assertFalse(session.finalized)
+        self.assertFalse((self.cache_dir / "yielding.bin").exists())
+        self.assertEqual(list(self.cache_dir.rglob("*.storage.partial")), [])
+        self.assertEqual(manager.list_download_sessions(), [])
 
     def test_offer_during_turn_failure_recovery_starts_no_second_turn(self):
         manager = self.fs._streaming_manager
