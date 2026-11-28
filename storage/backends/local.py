@@ -100,8 +100,14 @@ def _copy_file(src: Path, dst: Path, *, download: bool = False):
     copied over, as copy2 does: xattrs other software set on a member file
     stay, and so do ACL entries the source no longer has. Errors copy2
     ignores per name are ignored; others raise, leaving the new bytes with
-    partly updated metadata, as copy2 would. A download doesn't install
-    file capabilities or set-ID/sticky bits on the local backing file.
+    partly updated metadata, as copy2 would.
+
+    download (copy_to_local) copies neither security.capability nor the
+    set-ID and sticky bits: a member file never becomes privileged on this
+    host. That holds for every copy_to_local caller, so a file relayed
+    through a download (ReplicationManager.replicate_file, which nothing
+    outside the tests calls) reaches its target without them too. Other
+    xattrs, POSIX ACLs included, are copied as above.
     """
     shutil.copyfile(src, dst)
     st = os.stat(src)
