@@ -213,6 +213,24 @@ def confirm_member_stat(backend, virtual_path: str, probe, transferred_size: int
     return SimpleNamespace(**fields), verdict
 
 
+def verdict_without_confirmation(probe):
+    """(stat, verdict) for a transfer no stat could follow (confirm_member_stat's rules).
+
+    A probe with a version token is UNCONFIRMED: the token was never
+    confirmed. Without one it is NEVER_VERSIONED, with the probe's
+    attributes as conservatively as a confirmation without a mode: no
+    mtime, and its mode without write bits (CTO-VERSION-EVIDENCE).
+    """
+    if _has_token(probe):
+        return None, MemberVersion.UNCONFIRMED
+    fields = {key: getattr(probe, key, None) if probe is not None else None
+              for key in ("st_mode", "st_uid", "st_gid", "st_nlink", "st_ctime", "st_size",
+                          "st_atime", "st_atime_ns")}
+    fields["st_mtime"] = fields["st_mtime_ns"] = None
+    fields["mode_unconfirmed"] = fields["st_mode"] is not None
+    return SimpleNamespace(**fields), MemberVersion.NEVER_VERSIONED
+
+
 def copy_member_attributes(fd: int, source) -> None:
     """Apply the member's stat to a private, fully downloaded inode.
 
