@@ -96,6 +96,14 @@ copy. Dirty, open, repair-pinned, and recompute-only files are kept under
 pressure. A streaming reader can receive fetched bytes directly when the
 cache cannot keep them, and speculative reads pause.
 
+The budget is kept incrementally. Local writes and truncates are charged
+by the change in the blocks they touch, and an eviction pass that finds
+too few victims is remembered until a descriptor closes, the index changes
+or a second passes. Charging needs exact `SEEK_DATA`/`SEEK_HOLE` from the
+cache filesystem (see README.md). A whole-file copy reserves its expected
+size up front, and publishing it needs room only for any growth beyond
+that reservation.
+
 # Write Path
 
 Storage will always write to and reliably fflush and similar the local cache (or most performant local filesystem) to ensure that a copy is stored at least one place first. Then, Storage will sync files as configured across backing filesystems in the background. Storage buffers writes to disconnected remote filesystems and performs them in the background upon reconnection. Storage can be configured to transparently encrypt files written to backing filesystems, though this is primarily useful in the case of cloud storage and warnings are issued if local storage is configured for transparent encryption. 
