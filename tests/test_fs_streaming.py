@@ -287,6 +287,23 @@ class TestFSStreamingIntegration(unittest.TestCase):
             self.fs.open("/odd.bin", os.O_RDONLY)
         self.assertEqual(failure.exception.errno, errno.EIO)
 
+    def test_file_gone_from_member_mid_read_is_stale_not_absent(self):
+        # Other member errnos pass through read() unchanged
+        # (test_open_preserves_descriptor_and_member_probe_errors_without_copy).
+        payload = os.urandom(128 * 1024)
+        (self.backend_dir / "vanish.bin").write_bytes(payload)
+        fd = self.fs.open("/vanish.bin", os.O_RDONLY)
+        self.assertEqual(self.fs.read("/vanish.bin", 4096, 0, fd), payload[:4096])
+        (self.backend_dir / "vanish.bin").unlink()
+        with self.assertRaises(FuseOSError) as stale:
+            self.fs.read("/vanish.bin", 4096, 64 * 1024, fd)
+        self.assertEqual(stale.exception.errno, errno.ESTALE)
+        # The session error is reported the same way to a later read.
+        with self.assertRaises(FuseOSError) as again:
+            self.fs.read("/vanish.bin", 4096, 96 * 1024, fd)
+        self.assertEqual(again.exception.errno, errno.ESTALE)
+        self.fs.release("/vanish.bin", fd)
+
     def test_foreground_overlapping_range_can_use_interactive_reserve(self):
         payload = os.urandom(512 * 1024)
         (self.backend_dir / "reserve.bin").write_bytes(payload)

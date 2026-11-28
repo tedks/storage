@@ -109,6 +109,15 @@ class _CleanupPending(Exception):
         self.session = session
 
 
+def streaming_read_errno(exc: Exception) -> int:
+    """The errno read(2) returns for exc: a file gone from the member mid-read is stale, not absent.
+
+    ENOENT from read(2) would tell the caller its open file does not exist.
+    """
+    error = streaming_errno(exc)
+    return errno.ESTALE if error == errno.ENOENT else error
+
+
 def streaming_errno(exc: Exception) -> int:
     if isinstance(exc, BulkCapacityCancelled):
         return errno.EINTR
@@ -1061,7 +1070,7 @@ class StreamingReadManager:
                 if session.stop_requested:
                     raise FuseOSError(errno.EINTR)
                 if session.error is not None:
-                    raise FuseOSError(streaming_errno(session.error))
+                    raise FuseOSError(streaming_read_errno(session.error))
 
                 # Only what the reader asked for: not rounded up to a chunk,
                 # which is what made a 4 KiB sniff cost a whole chunk.
@@ -1098,7 +1107,7 @@ class StreamingReadManager:
                         session.error = exc
                     session.condition.notify_all()
                 self._update_streaming_state_xattr(session, "error")
-                raise FuseOSError(streaming_errno(exc)) from exc
+                raise FuseOSError(streaming_read_errno(exc)) from exc
             finally:
                 with session.lock:
                     session.in_flight_ranges.remove(fetch)
