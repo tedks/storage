@@ -691,8 +691,6 @@ class StorageFS(Operations):
                     self.state_manager.set_file_metadata(meta)
         if not stale:
             self.cache_manager.mark_cache_size_dirty()
-            if resolved.backend_name:
-                self._retire_view_pending(cache_path)
 
     def _forget_checksums(self, paths: Set[str], subtree: bool = False):
         """Drop the checksum records and tasks for paths (and, with subtree,
@@ -2235,10 +2233,15 @@ class StorageFS(Operations):
 
     def _unlink(self, path):
         """Remove a file"""
+        # The inode the name holds now, under the path's lock: its pending
+        # change (if a view's) goes with it, exactly that key, so a later
+        # copy at the name never inherits it even if it reuses the number.
+        cache_path = self._resolve_path(path).cache_path
+        before = regular_file_stat(cache_path)
         try:
             self.namespace.unlink(path)
+            self._retire_view_inode(cache_path, before)
         finally:
-            self._retire_view_pending(self._resolve_path(path).cache_path)
             canonical_path = self._resolve_path(path).canonical_path
             self._forget_checksums({canonical_path})
             self._forget_member_check(canonical_path, path_gone=True)
@@ -2295,8 +2298,19 @@ class StorageFS(Operations):
         # A source the cache never held cannot have moved into the target:
         # the target's baselines are about the copy that was already there.
         old_was_cached = os.path.lexists(self.cache_manager.get_cache_path(old_canonical))
+        # The target's own copy, which a successful rename replaces: its
+        # pending change (a view's) goes with exactly that inode.
+        target_cache = self.cache_manager.get_cache_path(new)
+        target_before = regular_file_stat(target_cache)
         try:
             self.namespace.rename(old, new, on_local_moved=lambda: self._repoint_descriptors(old, new))
+            # (A rename moves canonical cache files, so it replaces a view's
+            # copy only if new names one; the moved file is another live
+            # inode, so a changed number at the name means replaced.)
+            target_after = regular_file_stat(target_cache)
+            if target_after is None or (target_before is not None
+                                        and target_after.st_ino != target_before.st_ino):
+                self._retire_view_inode(target_cache, target_before)
         except BaseException:
             # If the cached copy moved but the rename failed after (or
             # before) the members', its baselines, matched on identity alone,
@@ -2314,10 +2328,6 @@ class StorageFS(Operations):
             # directory, its children's) describe what is there now. Dropping
             # them is always safe, so a failed rename drops them too.
             self._forget_checksums({old_canonical, new_canonical}, subtree=True)
-            # A target view's old copy was replaced (its pending change went
-            # with it); a moved copy's change follows it (_repoint_descriptors).
-            for name in (old, new):
-                self._retire_view_pending(self.cache_manager.get_cache_path(name))
         self._move_member_checks(old_canonical, new_canonical)
 
     def _repoint_descriptors(self, old, new):
@@ -2774,12 +2784,9 @@ class StorageFS(Operations):
                 try:
                     st = os.fstat(entry.real_fd)
                     inode = f"{st.st_dev}:{st.st_ino}"
-                    current = regular_file_stat(entry.cache_path)
-                    named = current is not None and (current.st_dev, current.st_ino) == (
-                        st.st_dev, st.st_ino)
                 except OSError:
-                    named = False
-                if not named:
+                    pass
+                if not self._names_descriptor_inode(entry):
                     self.logger.warning(
                         "conflict view %s no longer names the closed descriptor's file; "
                         "its pending change is not sent to %s",
@@ -2862,22 +2869,25 @@ class StorageFS(Operations):
             if force or (generation is not None and self._view_pending.get(key) == generation):
                 self._view_pending.pop(key, None)
 
-    def _retire_view_pending(self, cache_path: Path) -> None:
-        """Drop pending changes recorded for inodes cache_path no longer names.
+    @staticmethod
+    def _names_descriptor_inode(entry: FDEntry) -> bool:
+        """Whether the view's name still holds the descriptor's inode (dev, ino)."""
+        try:
+            st = os.fstat(entry.real_fd)
+        except OSError:
+            return False
+        current = regular_file_stat(entry.cache_path)
+        return current is not None and (current.st_dev, current.st_ino) == (st.st_dev, st.st_ino)
 
-        Called after a view's name was unlinked, replaced by a rename or
-        invalidated, so a later inode at the name (even one that reuses the
-        number) never inherits an earlier copy's pending change.
-        """
-        prefix = str(cache_path)
+    def _retire_view_inode(self, cache_path: Path, removed: Optional[os.stat_result]) -> None:
+        """Drop the pending change of the inode a successful unlink or
+        rename took from cache_path (its stat taken before, under the same
+        path lock), and only that key: a later inode at the name, even one
+        that reuses the number, starts with nothing pending."""
+        if removed is None:
+            return
         with self._fd_lock:
-            keys = [k for k in self._view_pending if k[0] == prefix]
-            if not keys:
-                return
-            current = regular_file_stat(cache_path)
-            for key in keys:
-                if current is None or current.st_ino != key[1]:
-                    del self._view_pending[key]
+            self._view_pending.pop((str(cache_path), removed.st_ino), None)
 
     def _release_view(self, entry: FDEntry, inode: Optional[str], pending: Optional[int]):
         """Send a closed conflict view to its member, or keep it for a repair.
@@ -2981,7 +2991,8 @@ class StorageFS(Operations):
         if (entry is not None and entry.backend_name
                 and entry.backend_name in self.cache_manager.member_repairs.backends_for(
                     [entry.canonical_path])):
-            if self._view_pending_generation(entry) is not None:
+            if (self._view_pending_generation(entry) is not None
+                    and self._names_descriptor_inode(entry)):
                 raise FuseOSError(errno.EBUSY)
         return 0
 

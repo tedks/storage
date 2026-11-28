@@ -24,7 +24,7 @@ from fuse import FuseOSError
 
 from storage.backends.local import LocalBackend
 from storage.backends.rsync import RsyncBackend, RsyncError
-from storage.cache_metadata import MEMBER_ATTRS_XATTR, read_cache_metadata
+from storage.cache_metadata import MEMBER_ATTRS_XATTR, read_cache_metadata, regular_file_stat
 from storage.checksums import fast_checksum_file
 from storage.fs import StorageFS
 from storage.models import FileMetadata, SyncStatus
@@ -554,12 +554,20 @@ class TestImportedPermissions(RevalidateTestBase):
                 self.fs.state_manager.delete_file("/f.txt")
 
 
-def _with_dev(st, dev):
+def _with_field(st, index, value):
     fields = list(st)
-    fields[2] = dev  # st_dev
+    fields[index] = value
     return os.stat_result(fields, {name: getattr(st, name) for name in (
         "st_atime", "st_mtime", "st_ctime", "st_atime_ns", "st_mtime_ns", "st_ctime_ns",
         "st_blksize", "st_blocks")})
+
+
+def _with_dev(st, dev):
+    return _with_field(st, 2, dev)  # st_dev
+
+
+def _with_ino(st, ino):
+    return _with_field(st, 1, ino)  # st_ino
 
 
 class TestCreatedAndChangedFiles(RevalidateTestBase):
@@ -874,16 +882,28 @@ class TestConflictViewClose(RevalidateTestBase):
         self.assertFalse(self.view.exists())
 
     def test_a_reused_inode_number_inherits_nothing(self):
+        # A copy put at the name right after the unlink reports the removed
+        # inode's number: the removed key goes all the same.
         self.fs.truncate("/f.txt.member", 6)
         ((path, ino),) = self.fs._view_pending
-        self.view.unlink()  # replaced behind the mount (an invalidation, a refetch)
-        self.view.write_bytes(b"member bytes")
-        self.fs._retire_view_pending(self.view)
+        real_unlink = self.fs.namespace.unlink
+        real_stat = regular_file_stat
+
+        def unlink_then_refill(name):
+            real_unlink(name)
+            self.view.write_bytes(b"member bytes")
+
+        def reused(target):
+            st = real_stat(target)
+            if st is not None and str(target) == path:
+                return _with_ino(st, ino)
+            return st
+
+        with patch.object(self.fs.namespace, "unlink", side_effect=unlink_then_refill), \
+                patch("storage.fs.regular_file_stat", side_effect=reused), \
+                patch.object(self.member, "delete_file"):
+            self.fs.unlink("/f.txt.member")
         self.assertEqual(self.fs._view_pending, {})
-        # Had the new file reused the number, the key would have matched it.
-        self.fs._view_pending[(path, self.view.stat().st_ino)] = 1
-        self.fs._retire_view_pending(self.view)
-        self.assertEqual(len(self.fs._view_pending), 1)  # names this inode: kept
 
     def test_a_replaced_name_under_an_open_descriptor_sends_nothing(self):
         fh = self.fs.open("/f.txt.member", os.O_RDONLY)
