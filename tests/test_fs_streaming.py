@@ -1387,6 +1387,35 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.assertFalse(session.finalized)
         self.assertFalse((self.cache_dir / "unmounting.bin").exists())
 
+    def test_admission_during_registration_charges_the_replaced_partial_too(self):
+        cache = self.fs.cache_manager
+        cache.max_size_bytes = 1024 * 1024
+        payload = os.urandom(384 * 1024)
+        (self.backend_dir / "replacing.bin").write_bytes(payload)
+        # A detached session's partial left at the path: the rename
+        # replaces it, and it is charged until it does.
+        orphan = self.cache_dir / "replacing.bin.storage.partial"
+        orphan.write_bytes(b"o" * (128 * 1024))
+        cache.mark_cache_size_dirty()
+        real_replace = os.replace
+        needed = []
+
+        def replace(src, dst):
+            if ".storage-staging-" in str(src):
+                with cache._lock:
+                    cache._size_dirty = True
+                    # 1024 KiB less 128 KiB (old partial) and 384 KiB (new).
+                    needed.append(cache.get_free_space_needed(600 * 1024))
+            return real_replace(src, dst)
+
+        with patch("storage.streaming.os.replace", side_effect=replace):
+            fd = self.fs.open("/replacing.bin", os.O_RDONLY)
+        self._session_for(fd)
+        self.assertEqual(needed, [88 * 1024])
+        # After the replacement only the new partial is charged.
+        self.assertEqual(cache.get_free_space_needed(600 * 1024), 0)
+        self.fs.release("/replacing.bin", fd)
+
     def test_offer_during_turn_failure_recovery_starts_no_second_turn(self):
         manager = self.fs._streaming_manager
         pool = manager._download_pool

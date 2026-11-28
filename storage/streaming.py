@@ -2332,7 +2332,7 @@ class StreamingReadManager:
                         os.ftruncate(io_fd, file_size)
                         # Charged by reservation, not by name, until it is
                         # registered or discarded (released below).
-                        reservation = self.cache_manager.reserve_new_file(file_size, staging_path)
+                        reservation = self.cache_manager.reserve_new_file(file_size, os.fstat(io_fd))
                         break
                 if attempt or not self._reclaim_retained_space(file_size):
                     self.logger.warning(
@@ -2366,7 +2366,6 @@ class StreamingReadManager:
             io_fd=io_fd,
             refcount=1,
             member_stat=member_stat,
-            cache_reservation=reservation,
         )
 
         displaced = []
@@ -2431,8 +2430,8 @@ class StreamingReadManager:
             # Replaces any partial a detached session failed to unlink. No
             # registered session owns the path: detaching unlinks it inside
             # this lock, and a registered one would have been attached above.
-            # The reservation covers the new name too (reserve_new_file).
-            self.cache_manager.reserve_rename_target(session.cache_reservation, partial_cache_path)
+            # The reservation follows the inode to the new name
+            # (reserve_new_file).
             try:
                 os.replace(staging_path, partial_cache_path)
             except OSError as exc:
