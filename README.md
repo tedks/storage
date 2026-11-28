@@ -614,8 +614,9 @@ finish before retrying. A vanished ID reports `not-found`, including when a new
 download has started for the same path. `busy` and `not-found` exit with status 1.
 The endpoint is the private `.storage.control.sock` in the mount cache.
 The mount publishes it only when the cache directory is owned by the mount's
-user and is not writable by group or other users, or is sticky; otherwise the
-mount logs a warning and runs without a control socket.
+user and is not writable by all users unless sticky (group write, as under umask
+002, is fine); otherwise the mount logs a warning and runs without a control
+socket.
 `storage debug streaming-stats` continues to query it.
 
 ### debug

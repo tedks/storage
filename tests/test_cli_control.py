@@ -385,23 +385,24 @@ def test_swapped_stage_never_redirects_and_refuses(cache):
         assert swapped.is_symlink()
 
 
-@pytest.mark.parametrize("mode", [0o770, 0o707, 0o777, 0o720])
-def test_refuses_a_cache_others_can_rename_in(cache, mode, caplog):
+@pytest.mark.parametrize("mode", [0o707, 0o777, 0o702])
+def test_refuses_a_world_writable_cache(cache, mode, caplog):
     cache.chmod(mode)
     server = server_for(cache, lambda _: {})
     with caplog.at_level(logging.WARNING, logger=__name__):
         server.start()
     try:
         assert server._listener is None
-        assert any("writable by other users" in r.getMessage() for r in caplog.records)
+        assert any("writable by all users" in r.getMessage() for r in caplog.records)
         assert sorted(os.listdir(cache)) == []
     finally:
         server.stop()
         cache.chmod(0o700)
 
 
-@pytest.mark.parametrize("mode", [0o700, 0o755, 0o1777, 0o1770])
-def test_publishes_in_a_private_or_sticky_cache(cache, mode):
+# 0775 and 0770 are what mkdir gives under umask 002 and 007.
+@pytest.mark.parametrize("mode", [0o700, 0o755, 0o775, 0o770, 0o720, 0o1777, 0o1770])
+def test_publishes_in_an_owned_cache_not_world_writable(cache, mode):
     cache.chmod(mode)
     server = server_for(cache, lambda _: {"mode": mode})
     server.start()

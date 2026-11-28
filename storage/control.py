@@ -145,22 +145,26 @@ def _locked_cache(cache_root: Path):
 
 
 def _require_private_cache(root_fd: int):
-    """Refuse a cache directory where another user can rename our entries.
+    """Refuse a cache directory we do not own or that anyone may write.
 
     The rule: the directory is owned by the mount's effective uid, and is
-    either writable by its owner only or sticky. In a sticky directory we
-    own, nobody else can rename or remove the stage directory or the socket
-    (they can still create a name first, which makes publication fail, not
-    redirect). Ancestors are not checked: everything below runs relative to
-    this directory's fd, so renaming an ancestor moves the whole cache, and
-    the CLI then finds no socket rather than another user's.
+    not writable by other users unless it is sticky. Group write is
+    allowed, because mkdir under umask 002 (the user-private-group default
+    on Debian and Ubuntu) gives it. That is safe here: every step of
+    publication runs relative to this directory's fd and the stage fd and
+    checks identities, so a group member who renames or creates entries can
+    make publication fail but never redirect it, and clients accept only a
+    socket owned by, and a peer running as, the mount's user. World write
+    without the sticky bit is still refused, as a cache nobody should run.
+    Ancestors are not checked: renaming one moves the whole cache, and the
+    CLI then finds no socket rather than another user's.
     """
     entry = os.fstat(root_fd)
     if entry.st_uid != os.geteuid():
         raise ControlError("cache directory is not owned by the mount's user")
     mode = stat.S_IMODE(entry.st_mode)
-    if mode & (stat.S_IWGRP | stat.S_IWOTH) and not mode & stat.S_ISVTX:
-        raise ControlError("cache directory is writable by other users and not sticky")
+    if mode & stat.S_IWOTH and not mode & stat.S_ISVTX:
+        raise ControlError("cache directory is writable by all users and not sticky")
 
 
 def _identity(entry: os.stat_result) -> tuple[int, int]:
