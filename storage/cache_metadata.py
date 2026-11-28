@@ -16,6 +16,10 @@ from .models import FileLocation, FileMetadata, SyncStatus
 
 MEMBER_ATTRS_XATTR = "user.storage.source_attributes"
 MEMBER_STAT_XATTR = "user.storage.member_stat"
+# On a cached copy whose refresh could not be verified: the last good bytes,
+# known stale, not a baseline for writes (StorageFS._mark_last_good_stale).
+STALE_LAST_GOOD_XATTR = "user.storage.stale_last_good"
+STALE_READ_DENIED = b"read-denied"
 _SOURCE_ATTR_FIELDS = ("st_mode", "st_uid", "st_gid", "st_nlink", "st_ctime")
 # Set-ID bits are never reported for a regular file, whatever the member
 # or a chmod through the mount says: the kernel would honour a reported
@@ -64,54 +68,182 @@ def _member_mtime_ns(st) -> Optional[int]:
     return round(seconds * 1_000_000_000)
 
 
-def confirm_member_stat(backend, virtual_path: str, probe, transferred_size: int):
-    """(stat to record, agreed) for a transfer whose probe was taken before it.
+class MemberVersion:
+    """confirm_member_stat's verdict on what a transfer read.
 
-    The member is stat'ed again after the transfer. When that stat reports
-    the probe's size, mtime and mode, the transfer read that version and the
-    newer stat's genuine attributes are recorded (agreed), with the probe's
-    atime: the confirming stat's may be the transfer's own read. A
-    disagreement, even a mode-only change, returns the newer stat with
-    agreed False, for the caller to refetch (full fill) or discard
-    (streaming). A stat that raises is retried once; if it fails again the
-    probe is used when the transfer's size matches it, and otherwise no
-    member attributes at all (None: the fill fails closed on mode). A
-    transfer of another size than the stat reports is a disagreement too.
-    BulkCapacityCancelled and BulkCapacityTimeout propagate: an
-    interrupted request is not a fill.
+    Consumed by CacheManager.fetch_into_cache (full fills) and
+    StreamingReadManager._finalize_streaming_session (streams): only
+    AGREED and NEVER_VERSIONED copies are installed in the cache.
+    """
+
+    # Sticky versioning: once any stat seen for a fill carries a version
+    # token (size and mtime), the fill is published only on AGREED.
+    #
+    # The probe's token was confirmed after the transfer: install with the
+    # confirming stat's attributes.
+    AGREED = "agreed"
+    # Positive evidence of another version (a size, or two mtimes or modes,
+    # that differ): never installed. A full fill fetches once more only
+    # against a newer stat that carries a token; a stream is discarded.
+    CHANGED = "changed"
+    # Some stat carried a token but no compatible pair confirmed it (the
+    # confirming stat failed or lost its mtime, or only the stat after the
+    # transfer had one): not a verified generation, never installed; any
+    # cached copy stays.
+    UNCONFIRMED = "unconfirmed"
+    # No stat seen carried a token (no stat, size-only, no mtime): the
+    # complete bytes are installed with conservative attributes and no
+    # member mtime.
+    NEVER_VERSIONED = "never-versioned"
+
+
+class FillAction:
+    """What a completed transfer's MemberVersion allows (fill_action)."""
+
+    INSTALL = "install"   # publish in the shared cache (AGREED, NEVER_VERSIONED)
+    FAIL = "fail"         # nothing served from it: EAGAIN (retryable)
+
+
+def fill_action(version: str) -> str:
+    """The one verdict-to-action contract, for full fills
+    (CacheManager.fetch_into_cache) and streams.
+
+    AGREED and NEVER_VERSIONED install. CHANGED and UNCONFIRMED never
+    publish and serve nothing from the copy: a cold open, read-only or
+    writable, fails with EAGAIN; a warm read-only open keeps the last good
+    copy (CTO-208-MMAP-FALLBACK, which withdrew CTO-208-LIVE-READ's private
+    serve: a private copy shared the path's page cache with its other
+    handles through mmap).
+    """
+    if version in (MemberVersion.AGREED, MemberVersion.NEVER_VERSIONED):
+        return FillAction.INSTALL
+    return FillAction.FAIL
+
+
+def has_version_token(st) -> bool:
+    """Whether a member stat carries a version token: a size and an mtime."""
+    return st is not None and getattr(st, "st_size", None) is not None \
+        and _member_mtime_ns(st) is not None
+
+
+_has_token = has_version_token
+
+
+class StatBudget:
+    """Member stats a transfer's confirmation may still make (shared across calls)."""
+
+    def __init__(self, stats: int = 2):
+        self.remaining = stats
+
+
+def confirm_member_stat(backend, virtual_path: str, probe, transferred_size: int,
+                        budget: Optional[StatBudget] = None, *, full_fill: bool = False):
+    """(stat to record, MemberVersion) for a transfer probed before it began.
+
+    The member is stat'ed again after the transfer (retried once if the
+    stat raises; not after NotImplementedError). CHANGED needs positive
+    evidence: a known size other than the transfer's, or two stats that
+    both report an mtime, or a mode, and disagree; the newest stat is
+    returned. AGREED needs a probe and a confirming stat that both carry a
+    token (size and mtime) with nothing disagreeing; the attributes are
+    returned with the probe's atime (the confirming stat's may be the
+    transfer's own read). If only one of them carries a token it is
+    UNCONFIRMED (sticky versioning: a token seen anywhere in a fill makes
+    AGREED the only verdict that publishes). If neither does it is
+    NEVER_VERSIONED: the attributes some stat reported, newest first, the
+    probe's atime, and no mtime (none was compared).
+
+    A mode only the probe reported (the confirming stat lacked one) is
+    marked mode_unconfirmed, and copy_member_attributes records it without
+    write bits: its denials stand, its grants of write do not. No mode at
+    all fails closed on write as before. BulkCapacityCancelled and
+    BulkCapacityTimeout propagate: an interrupted request is not a fill.
+    A shared budget bounds the stats across calls for one transfer (the
+    retry here and a caller's second confirmation together); by default
+    each call may make two. A full fill preserves definitive member errors.
+    Two transient I/O failures leave the version unconfirmed, even without
+    a pathname token. Explicitly unsupported stat is missing evidence.
     """
     from .backends.ssh_pool import BulkCapacityCancelled, BulkCapacityTimeout
 
+    budget = StatBudget() if budget is None else budget
     after = None
-    for _attempt in range(2):
+    failed = False
+    while budget.remaining > 0:
+        budget.remaining -= 1
         try:
             after = backend.stat(virtual_path)
             break
         except (BulkCapacityCancelled, BulkCapacityTimeout):
             raise
-        except Exception:  # noqa: BLE001 - retried once, then the probe stands
-            after = None
-    if after is None:
-        if getattr(probe, "st_size", None) == transferred_size:
-            return probe, True
-        return None, False
-    if probe is None:
-        # Nothing taken before the transfer to compare against.
-        return after, getattr(after, "st_size", None) == transferred_size
-    agreed = (getattr(after, "st_size", None) == transferred_size
-              and getattr(probe, "st_size", None) is not None
-              and getattr(after, "st_size", None) == getattr(probe, "st_size", None)
-              and _member_mtime_ns(probe) is not None
-              and _member_mtime_ns(after) == _member_mtime_ns(probe)
-              and getattr(after, "st_mode", None) == getattr(probe, "st_mode", None))
-    if not agreed:
-        return after, False
-    fields = {key: getattr(after, key, None) for key in (
-        "st_mode", "st_uid", "st_gid", "st_nlink", "st_ctime", "st_size",
-        "st_mtime", "st_mtime_ns")}
-    fields["st_atime"] = getattr(probe, "st_atime", None)
-    fields["st_atime_ns"] = getattr(probe, "st_atime_ns", None)
-    return SimpleNamespace(**fields), True
+        except NotImplementedError:
+            break  # no stat at all: nothing to retry
+        except OSError as exc:
+            if full_fill and exc.errno in (errno.ENOSYS, errno.ENOTSUP):
+                break
+            if full_fill and exc.errno != errno.EIO:
+                raise
+            failed = True
+        except Exception:  # noqa: BLE001 - streaming confirmation is best effort
+            if full_fill:
+                raise
+            failed = True
+
+    def known(st, key):
+        return getattr(st, key, None) if st is not None else None
+
+    sizes = [known(st, "st_size") for st in (probe, after)]
+    mtimes = [_member_mtime_ns(st) if st is not None else None for st in (probe, after)]
+    modes = [known(st, "st_mode") for st in (probe, after)]
+    changed = (any(size is not None and size != transferred_size for size in sizes)
+               or (None not in mtimes and mtimes[0] != mtimes[1])
+               or (None not in modes and modes[0] != modes[1]))
+    if changed:
+        return after, MemberVersion.CHANGED
+    if _has_token(probe) and _has_token(after):
+        verdict = MemberVersion.AGREED
+    elif _has_token(probe) or _has_token(after) or (full_fill and failed and after is None):
+        verdict = MemberVersion.UNCONFIRMED
+    else:
+        verdict = MemberVersion.NEVER_VERSIONED
+    if probe is None and after is None:
+        return None, verdict
+    fields = {}
+    for key in ("st_mode", "st_uid", "st_gid", "st_nlink", "st_ctime", "st_size",
+                "st_mtime", "st_mtime_ns"):
+        value = known(after, key)
+        fields[key] = known(probe, key) if value is None else value
+    # Identify the confirmed pathname independently of the original probe.
+    fields["st_dev"], fields["st_ino"] = known(after, "st_dev"), known(after, "st_ino")
+    # The atime the member reported before the transfer read it, seconds
+    # and nanoseconds from the same stat.
+    atime_from = probe if (known(probe, "st_atime") is not None
+                           or known(probe, "st_atime_ns") is not None) else after
+    fields["st_atime"] = known(atime_from, "st_atime")
+    fields["st_atime_ns"] = known(atime_from, "st_atime_ns")
+    fields["mode_unconfirmed"] = known(after, "st_mode") is None and fields["st_mode"] is not None
+    if verdict == MemberVersion.NEVER_VERSIONED:
+        # No stat's mtime was compared with another: none is recorded.
+        fields["st_mtime"] = fields["st_mtime_ns"] = None
+    return SimpleNamespace(**fields), verdict
+
+
+def verdict_without_confirmation(probe):
+    """(stat, verdict) for a transfer no stat could follow (confirm_member_stat's rules).
+
+    A probe with a version token is UNCONFIRMED: the token was never
+    confirmed. Without one it is NEVER_VERSIONED, with the probe's
+    attributes as conservatively as a confirmation without a mode: no
+    mtime, and its mode without write bits (CTO-VERSION-EVIDENCE).
+    """
+    if _has_token(probe):
+        return None, MemberVersion.UNCONFIRMED
+    fields = {key: getattr(probe, key, None) if probe is not None else None
+              for key in ("st_mode", "st_uid", "st_gid", "st_nlink", "st_ctime", "st_size",
+                          "st_atime", "st_atime_ns")}
+    fields["st_mtime"] = fields["st_mtime_ns"] = None
+    fields["mode_unconfirmed"] = fields["st_mode"] is not None
+    return SimpleNamespace(**fields), MemberVersion.NEVER_VERSIONED
 
 
 def copy_member_attributes(fd: int, source) -> None:
@@ -128,6 +260,12 @@ def copy_member_attributes(fd: int, source) -> None:
     # version the transfer may not have read is the caller's to refetch,
     # never a reason to report local times.
     mode = getattr(source, "st_mode", None)
+    if mode is not None and getattr(source, "mode_unconfirmed", False):
+        # A mode no stat after the transfer reported keeps its denials but
+        # grants no write: it fails closed, as a missing mode does (the
+        # receiving file's own mode, an SFTP or staging default, says
+        # nothing of the member's). A chmod through the mount grants write.
+        mode &= ~(stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH)
     permissions = local.st_mode if mode is None else mode
     # Without a member mode, an import fails closed: the downloaded file's
     # own mode (a local member's copy, a transfer's or a streaming staging
@@ -232,12 +370,18 @@ def stale_record_mode(path: Path, local: os.stat_result) -> Optional[int]:
     return None
 
 
-def imported_mode_denies_write(path: Path, local: os.stat_result) -> bool:
-    """Whether a recorded member mode withholds owner write from this file,
-    as stat reports it (cached_member_attributes, else stale_record_mode)."""
+def imported_mode_denies(path: Path, local: os.stat_result, bit: int) -> bool:
+    """Whether a recorded member mode withholds an owner bit (S_IRUSR or
+    S_IWUSR) from this file, as stat reports it (cached_member_attributes,
+    else stale_record_mode). The backing inode always has owner read and
+    write for Storage itself; those synthesized bits never decide."""
     attrs = cached_member_attributes(path, local)
     mode = attrs.get("st_mode") if attrs is not None else stale_record_mode(path, local)
-    return type(mode) is int and not mode & stat.S_IWUSR
+    return type(mode) is int and not mode & bit
+
+
+def imported_mode_denies_write(path: Path, local: os.stat_result) -> bool:
+    return imported_mode_denies(path, local, stat.S_IWUSR)
 
 
 def cached_member_attributes(path: Path, local: os.stat_result) -> Optional[dict]:
@@ -270,6 +414,24 @@ def cached_member_attributes(path: Path, local: os.stat_result) -> Optional[dict
     return attrs
 
 
+def restrict_cached_member_write(path: Path, local: os.stat_result) -> None:
+    """Apply an aged member's owner-write denial to this imported inode.
+
+    An explicit chmod retires the imported mode; leave that override on
+    the inode in force. The physical mode remains usable by the daemon.
+    """
+    record = _read_source_attrs(path, local)
+    if record is None:
+        record = {"inode": _inode(local), "basis": _source_attrs_basis(local),
+                  "attrs": {"st_mode": reported_mode(local.st_mode)}}
+    mode = record["attrs"].get("st_mode")
+    if (type(mode) is int and mode & stat.S_IWUSR
+            and record["basis"].get("st_mode") == local.st_mode):
+        record["attrs"]["st_mode"] = mode & ~stat.S_IWUSR
+        os.setxattr(path, MEMBER_ATTRS_XATTR, json.dumps(record).encode(),
+                    follow_symlinks=False)
+
+
 def forget_cached_member_fields(path: Path, local: os.stat_result, *fields: str) -> None:
     """Retire synthetic fields explicitly replaced by chmod, chown or utime."""
     if not stat.S_ISREG(local.st_mode):
@@ -282,7 +444,8 @@ def forget_cached_member_fields(path: Path, local: os.stat_result, *fields: str)
         attrs = {} if "st_mode" in fields else {"st_mode": stale_mode}
         record = {"inode": _inode(local), "basis": _source_attrs_basis(local), "attrs": attrs}
     elif record is None:
-        if "st_mtime" not in fields or not read_member_baselines(path, cache_identity(local)):
+        if "st_mode" not in fields and (
+                "st_mtime" not in fields or not read_member_baselines(path, cache_identity(local))):
             return
         # An explicit timestamp also takes precedence over a legacy
         # mtime, even when utime happened to keep the native mtime.
@@ -314,13 +477,22 @@ def cache_identity(st: os.stat_result) -> tuple:
     return (st.st_ino, st.st_size, st.st_mtime_ns)
 
 
-def read_member_baselines(path: Path, identity: tuple) -> dict:
-    """Read revalidation evidence for the same inode, size and native mtime."""
+def read_member_baselines(path: Path, identity: tuple, *, exact_mtimes=None) -> dict:
+    """Read revalidation evidence for the same inode, size and native mtime.
+
+    The optional nanosecond field records only explicitly reported source
+    nanoseconds. Older readers and xattrs use the original seconds pairs.
+    """
     try:
         payload = json.loads(os.getxattr(path, MEMBER_STAT_XATTR, follow_symlinks=False))
         if tuple(payload.get("cache")) == identity:
-            return {str(name): (int(size), float(mtime))
-                    for name, (size, mtime) in payload.get("members", {}).items()}
+            members = {str(name): (int(size), float(mtime))
+                       for name, (size, mtime) in payload.get("members", {}).items()}
+            exact = payload.get("mtime_ns", {})
+            if exact_mtimes is not None and isinstance(exact, dict):
+                exact_mtimes.update({name: ns for name, ns in exact.items()
+                                     if name in members and type(ns) is int})
+            return members
     except (OSError, ValueError, TypeError, AttributeError, OverflowError):
         pass
     return {}

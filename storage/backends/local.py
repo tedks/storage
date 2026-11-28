@@ -9,7 +9,10 @@ import stat
 from pathlib import Path
 from typing import List, Optional
 
-from .base import Backend, BackendType, MemberSourceMissing, StorageMemberCapabilities
+from .base import (
+    Backend, BackendType, MemberSourceMissing, StorageMemberCapabilities, copy_bounded_stream,
+    current_copy_bound,
+)
 from ..checksums import fast_checksum_file
 from ..file_config import XATTR_CONFIG_NAME
 
@@ -109,8 +112,37 @@ def _copy_file(src: Path, dst: Path, *, download: bool = False):
     outside the tests calls) reaches its target without them too. Other
     xattrs, POSIX ACLs included, are copied as above.
     """
-    shutil.copyfile(src, dst)
-    st = os.stat(src)
+    bound = current_copy_bound() if download else None
+    if bound is None:
+        shutil.copyfile(src, dst)
+        _copy_file_metadata(src, dst, os.stat(src), download=download)
+        return
+
+    # Bound the read using one source open. O_NONBLOCK avoids hanging on a
+    # substituted FIFO before fstat verifies the descriptor is regular.
+    fd = os.open(src, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise OSError(errno.EINVAL, "not a regular file", str(src))
+        os.set_blocking(fd, True)
+        bound.source_stats.append(st)
+        # Unbuffered reads keep the descriptor within cap + 1 bytes.
+        fin = os.fdopen(fd, "rb", buffering=0)
+    except BaseException:
+        os.close(fd)
+        raise
+    with fin:
+        with open(dst, "wb") as fout:
+            copy_bounded_stream(fin.read, fout.write, bound)
+            # Keep the closing evidence even if the receiver subsequently
+            # fails to flush or apply metadata.
+            bound.source_stats.append(os.fstat(fin.fileno()))
+        _copy_file_metadata(fin.fileno(), dst, st, download=download)
+
+
+def _copy_file_metadata(src: Path | int, dst: Path, st: os.stat_result, *, download: bool):
+    """Copy supported attributes from the path or still-open source fd."""
     keep = {name for name in _listxattr(src) if not _is_internal_xattr(name)}
     for name in _listxattr(dst):
         if name.startswith(_INTERNAL_XATTR_PREFIX) and name not in keep:
@@ -136,6 +168,8 @@ def _copy_file(src: Path, dst: Path, *, download: bool = False):
 
 class LocalBackend(Backend):
     """Backend for local filesystems"""
+
+    supports_bounded_copy = True
 
     def __init__(self, name: str, root_path: str, speed_priority: int = 0):
         """
@@ -250,6 +284,7 @@ class LocalBackend(Backend):
                         'st_mode': st.st_mode,
                         'st_size': st.st_size,
                         'st_mtime': st.st_mtime,
+                        'st_mtime_ns': st.st_mtime_ns,
                         'st_atime': st.st_atime,
                         'st_ctime': st.st_ctime,
                         'st_gid': st.st_gid,

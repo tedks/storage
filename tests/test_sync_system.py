@@ -757,5 +757,107 @@ class TestKernelCacheRefetchThreaded(TestKernelCacheRefetch):
     fuse_threads = True
 
 
+# Read through the actual FUSE client, including buffered reads and faults
+# from read-only mappings. Keeping both descriptors open lets this reproduce
+# the page-cache contamination on the old private-fill implementation.
+_UNSTABLE_FILL_CLIENT = """
+import json, mmap, os, sys
+
+fds = {}
+for line in sys.stdin:
+    cmd, name, arg = json.loads(line)
+    try:
+        if cmd == "open":
+            fds[name] = os.open(arg, os.O_RDONLY)
+            out = None
+        elif cmd == "read":
+            out = os.pread(fds[name], arg + 1, 0).hex()
+        elif cmd == "mmap":
+            with mmap.mmap(fds[name], arg, flags=mmap.MAP_PRIVATE,
+                           prot=mmap.PROT_READ) as mapped:
+                out = mapped[:].hex()
+    except OSError as exc:
+        out = {"errno": exc.errno}
+    print(json.dumps(out), flush=True)
+"""
+
+
+class TestUnstableFullFillMounted(_MountedCase):
+    START_SYNC = False
+
+    def _call(self, client, cmd, name, arg):
+        client.stdin.write(json.dumps((cmd, name, arg)) + "\n")
+        client.stdin.flush()
+        line = []
+        reader = threading.Thread(target=lambda: line.append(client.stdout.readline()), daemon=True)
+        reader.start()
+        reader.join(60)
+        self.assertTrue(line and line[0], f"client gave no answer to {cmd!r}")
+        return json.loads(line[0])
+
+    def test_unstable_cold_fill_cannot_contaminate_buffered_replacement(self):
+        self.assertTrue(os.path.ismount(self.mount_dir))
+        name = "live.log"
+        path = f"/{name}"
+        mounted = str(self.mount_dir / name)
+        source = self.backend1_dir / name
+        first, second = b"first version\n" * 400, b"other version\n" * 400
+        stamp = 1_700_000_000
+        source.write_bytes(first)
+        os.utime(source, (stamp, stamp))
+        self.fs._on_remote_change(path)
+        backend = self.fs.backends["backend1"]
+        real_stat = backend.stat
+
+        def off_by_one(path):
+            st = real_stat(path)
+            return type("St", (), {"st_size": st.st_size + 1, "st_mtime": st.st_mtime,
+                                   "st_mtime_ns": st.st_mtime_ns, "st_mode": st.st_mode})()
+
+        client = subprocess.Popen([sys.executable, "-c", _UNSTABLE_FILL_CLIENT],
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        try:
+            with patch.object(backend, "stat", side_effect=off_by_one), \
+                    patch.object(backend, "copy_to_local", wraps=backend.copy_to_local) as copies, \
+                    patch.object(self.fs.sync_manager, "queue_sync") as queue_sync:
+                unstable = self._call(client, "open", "unstable", mounted)
+                self.assertEqual(copies.call_count, 2)
+                queue_sync.assert_not_called()
+            self.assertEqual(source.read_bytes(), first)
+            self.assertFalse((self.backend2_dir / name).exists())
+            self.assertFalse((self.cache_dir / name).exists())
+            self.assertEqual(list(self.cache_dir.rglob("*.storage.partial")), [])
+            if unstable is not None:
+                self.assertEqual(self.fs.cache_manager._reserved_bytes, 0)
+            self.assertIsNone(self.fs.state_manager.get_file_metadata(path))
+            self.assertEqual(self.fs.state_manager.get_file_locations(path), [])
+
+            source.write_bytes(second)
+            os.utime(source, (stamp, stamp))
+            self.fs._on_remote_change(path)
+            self.assertIsNone(self._call(client, "open", "verified", mounted))
+            size = len(second)
+            before = bytes.fromhex(self._call(client, "read", "verified", size))
+            self.assertTrue(before == second, "initial buffered read differed from the replacement")
+            if unstable is None:
+                # On 1334047 the private handle can fault its old bytes into
+                # the pages the verified buffered handle uses.
+                self._call(client, "mmap", "unstable", size)
+            after = bytes.fromhex(self._call(client, "read", "verified", size))
+            self.assertTrue(after == second, f"buffered read after unstable mmap: {after[:40]!r}")
+            mapped = bytes.fromhex(self._call(client, "mmap", "verified", size))
+            self.assertTrue(mapped == second, f"verified mmap returned {mapped[:40]!r}")
+            self.assertEqual(unstable, {"errno": errno.EAGAIN})
+        finally:
+            client.stdin.close()
+            client.wait(30)
+            client.stdout.close()
+        self.assertEqual((self.cache_dir / name).read_bytes(), second)
+
+
+class TestUnstableFullFillMountedThreaded(TestUnstableFullFillMounted):
+    fuse_threads = True
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -236,8 +236,9 @@ class TestOpenRaces(ThreadingTestBase):
                     check, verified_at=check.verified_at - 3600,
                 )
         # Pause the first opener after its check pinned the refetch and
-        # before its fetch consumed the pin.
-        invalidate = self.gate(self.fs, "_invalidate_file_cache")
+        # before its fetch consumed the pin (the copy stays named while it
+        # is refreshed in place, so the pause is where that is decided).
+        invalidate = self.gate(self.fs, "_may_refresh_in_place")
         pins_at_select = []
         real_select = self.fs._select_backend_for_read
 

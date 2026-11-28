@@ -5,11 +5,13 @@ Manages the local cache of files from remote backing filesystems.
 Files are cached on first access and evicted using LRU when space is needed.
 """
 
+import dataclasses
 import errno
 import logging
 import os
 import stat as stat_module
 import secrets
+import sqlite3
 import time
 import threading
 from pathlib import Path
@@ -17,11 +19,12 @@ from contextlib import contextmanager, nullcontext
 from enum import Enum
 from typing import Callable, ContextManager, Optional, List, Set
 
-from .backends.base import Backend, bulk_request
+from .backends.base import Backend, bounded_copy, bulk_request
 from .backends.ssh_pool import BulkCapacityCancelled, BulkCapacityTimeout
 from .cache_metadata import (
-    PARTIAL_SUFFIX, PREFIX_XATTR, confirm_member_stat, copy_member_attributes, regular_file_stat,
-    write_cache_metadata,
+    PARTIAL_SUFFIX, PREFIX_XATTR, StatBudget, _member_mtime_ns, FillAction, MemberVersion, confirm_member_stat,
+    cache_identity, copy_member_attributes, fill_action, has_version_token, regular_file_stat,
+    read_cache_metadata, write_cache_metadata,
 )
 from .member_repairs import VIEW_WRITE, MemberRepairs, is_at_or_under
 from .pathing import resolve_path
@@ -82,6 +85,42 @@ class NewFileReservation:
         self.inode = inode  # (st_dev, st_ino)
 
 
+def _denies_read(st) -> bool:
+    """Whether a stat reports a mode without owner read (a root daemon aside)."""
+    mode = getattr(st, "st_mode", None)
+    return os.geteuid() != 0 and type(mode) is int and not mode & stat_module.S_IRUSR
+
+
+def _token_contradicts(fd_st, path_st) -> bool:
+    """Whether two versioned stats disagree on size, time or known identity."""
+    if not (has_version_token(fd_st) and has_version_token(path_st)):
+        return False
+    for field in ("st_dev", "st_ino"):
+        fd_value, path_value = getattr(fd_st, field, None), getattr(path_st, field, None)
+        if fd_value is not None and path_value is not None and fd_value != path_value:
+            return True
+    return (fd_st.st_size != path_st.st_size
+            or _member_mtime_ns(fd_st) != _member_mtime_ns(path_st))
+
+
+def _without_owner_read(st):
+    """A copy of the verified member stat (or None) whose mode lacks owner
+    read: only the denial is applied, the stat's own grants otherwise, and
+    mode_unconfirmed is kept. Without a verified mode it is a mode that
+    grants nothing (unconfirmed, so no write either): an earlier stat's
+    grants are never imported."""
+    from types import SimpleNamespace
+    fields = {key: getattr(st, key, None) for key in (
+        "st_uid", "st_gid", "st_nlink", "st_ctime", "st_size", "st_mtime", "st_mtime_ns",
+        "st_atime", "st_atime_ns")}
+    mode = getattr(st, "st_mode", None)
+    fields["mode_unconfirmed"] = bool(getattr(st, "mode_unconfirmed", False))
+    if type(mode) is not int:
+        mode, fields["mode_unconfirmed"] = stat_module.S_IFREG, True
+    fields["st_mode"] = mode & ~stat_module.S_IRUSR
+    return SimpleNamespace(**fields)
+
+
 class CacheFetch(Enum):
     FAILED = 0
     INSTALLED = 1
@@ -130,6 +169,9 @@ class CacheManager:
         # predate its last write. It takes only a leaf lock and is safe
         # under every lock here. None (no StorageFS) means no listings.
         self.forget_listed_attrs: Optional[Callable[..., None]] = None
+        # Keeps old checksum tasks and records from crossing an in-place
+        # replacement or its recovery. The standalone cache has no such tasks.
+        self.replace_checksum_guard: Optional[Callable[[str], ContextManager]] = None
         # Set by StorageFS: a context manager that try-acquires the outer
         # locks of a canonical path (storage/locks.py) and yields whether it
         # got them. Eviction runs under self._lock, inside those locks'
@@ -151,6 +193,9 @@ class CacheManager:
         self.bulk_cold_copies = bulk_cold_copies
         self.max_size_bytes = max_size_bytes
         self._lock = threading.RLock()
+        # Per thread: why the last fill this thread ran was not installed,
+        # when it was not a plain failure (take_fill_errno).
+        self._fill_errno = threading.local()
         # Bytes promised to fetches in flight (cache_file): counted against
         # max_size_bytes so concurrent fetches cannot each see the same free
         # space. Under _lock.
@@ -545,6 +590,7 @@ class CacheManager:
     def cache_file_result(
         self, virtual_path: str, backend: Backend, source_virtual_path: str = None,
         *, member_stat=_STAT_NOT_PROBED, confirmed: Optional[list] = None,
+        replace_identity: Optional[tuple] = None,
     ) -> CacheFetch:
         """
         Download a file from backend into cache
@@ -568,12 +614,18 @@ class CacheManager:
         """
         source_virtual_path = source_virtual_path or virtual_path
         # Member probes: no lock, and their errors propagate as before.
-        if not backend.exists(source_virtual_path):
+        if not backend.exists_or_raise(source_virtual_path):
+            self.note_fill_errno(errno.ENOENT)
+            self.note_fill_absent()
             return CacheFetch.FAILED
         if member_stat is _STAT_NOT_PROBED:
             try:
                 member_stat = backend.stat(source_virtual_path)
-            except (OSError, NotImplementedError):
+            except OSError as exc:
+                if exc.errno not in (errno.EIO, errno.ENOSYS, errno.ENOTSUP):
+                    raise
+                member_stat = None
+            except NotImplementedError:
                 member_stat = None
         file_size = getattr(member_stat, "st_size", None)
         if file_size is None:
@@ -589,11 +641,13 @@ class CacheManager:
             reclaim = self.reclaim_space
             if attempt or reclaim is None or not reclaim(file_size):
                 print(f"Warning: Insufficient cache space for {virtual_path}")
+                self.note_fill_errno(errno.ENOSPC)
                 return CacheFetch.FAILED
         try:
             installed = self.fetch_into_cache(
                 backend, source_virtual_path, self.get_cache_path(virtual_path), member_stat,
-                confirmed=confirmed,
+                confirmed=confirmed, reserved=file_size,
+                replace_identity=replace_identity,
             )
             self.state_manager.update_access_time(virtual_path)
             return CacheFetch.INSTALLED if installed else CacheFetch.ALREADY_CACHED
@@ -606,8 +660,50 @@ class CacheManager:
             with self._lock:
                 self._reserved_bytes -= file_size
 
+    def fill_errno_noted(self) -> bool:
+        return getattr(self._fill_errno, "code", None) is not None
+
+    def note_fill_errno(self, code: int) -> None:
+        """Record why this thread's fill failed, unless the fill already did."""
+        if getattr(self._fill_errno, "code", None) is None:
+            self._fill_errno.code = code
+
+    def take_fill_errno(self) -> Optional[int]:
+        """The errno this thread's last failed fill reported, once (cleared,
+        with the absence and installed notes below)."""
+        code = getattr(self._fill_errno, "code", None)
+        self._fill_errno.code = None
+        self._fill_errno.absent = False
+        self._fill_errno.installed = None
+        return code
+
+    def note_fill_absent(self) -> None:
+        """Record that the member the fill was pinned to confirmed absence."""
+        self._fill_errno.absent = True
+
+    def clear_fill_absence(self) -> None:
+        """A different member's answer cannot confirm the pinned holder's absence."""
+        self._fill_errno.absent = False
+
+    def fill_absent(self) -> bool:
+        return bool(getattr(self._fill_errno, "absent", False))
+
+    def fill_installed_identity(self) -> Optional[tuple]:
+        """The cache identity of the inode this thread's fill last named, if any."""
+        return getattr(self._fill_errno, "installed", None)
+
+    def _reserve_more(self, nbytes: int) -> bool:
+        """Reserve nbytes more for a fill in progress, if there is room."""
+        with self._lock:
+            if not self.ensure_space(nbytes):
+                return False
+            self._reserved_bytes += nbytes
+            return True
+
     def fetch_into_cache(self, backend: Backend, source_virtual_path: str, cache_path: Path,
-                         member_stat=None, *, confirmed: Optional[list] = None) -> bool:
+                         member_stat=None, *, confirmed: Optional[list] = None,
+                         reserved: Optional[int] = None,
+                         replace_identity: Optional[tuple] = None) -> bool:
         """Copy a member file to cache_path through a temp file beside it.
 
         The copy runs without the cache lock into a fresh name that ends in
@@ -618,7 +714,9 @@ class CacheManager:
         replaced, and the existing inode keeps its bytes and xattrs. The
         link and the size accounting run under the lock. The cache
         filesystem must support hard links (it must support xattrs anyway).
-        No space is reserved here (cache_file does that).
+        Space is reserved by the caller (cache_file_result: reserved bytes);
+        a retry for a confirmed larger version reserves the difference
+        first (_reserve_more) and fails the fill if it cannot.
 
         Returns True when this copy was installed, False when a file was
         already there and this copy was discarded. When installed, a given
@@ -631,11 +729,30 @@ class CacheManager:
         temp_path = cache_path.parent / f".{secrets.token_hex(8)}{PARTIAL_SUFFIX}"
         with self._lock:
             scans = self._scan_count
+        extra_reserved = 0
+        bound = None
+        read_denied = False
         try:
+            token_seen = has_version_token(member_stat)
             for attempt in range(2):
+                # Any stat of this attempt (the one whose bytes may be
+                # installed) that withheld owner read: the denial stands,
+                # whatever a later stat of the attempt (or none) reports.
+                bound = None
+                read_denied = _denies_read(member_stat)
                 if attempt:
                     temp_path.unlink(missing_ok=True)
-                with bulk_request() if self.bulk_cold_copies else nullcontext():
+                # The reservation is the copy's bound (CTO-208-BOUNDED): one
+                # open of the source, at most that many bytes, one probe read
+                # for growth. A member that cannot bound its copy gives no
+                # capped fill at all.
+                cap = None if reserved is None else reserved + extra_reserved
+                if cap is not None and not getattr(backend, "supports_bounded_copy", False):
+                    self._fill_errno.code = errno.EAGAIN
+                    raise OSError(errno.EAGAIN, f"{backend.name} cannot bound a copy of "
+                                  f"{source_virtual_path}", source_virtual_path)
+                with bulk_request() if self.bulk_cold_copies else nullcontext(), \
+                        (bounded_copy(cap) if cap is not None else nullcontext()) as bound:
                     backend.copy_to_local(source_virtual_path, temp_path)
                 st = os.lstat(temp_path)
                 if not stat_module.S_ISREG(st.st_mode):
@@ -646,40 +763,173 @@ class CacheManager:
                 if not st.st_mode & stat_module.S_IRUSR:
                     os.chmod(temp_path, stat_module.S_IMODE(st.st_mode) | stat_module.S_IRUSR,
                              follow_symlinks=False)
-                # The member's stat after the transfer: the newest genuine
-                # attributes. If it disagrees with the version probed before,
-                # fetch once more against it; a second disagreement keeps the
-                # newest attributes, and the caller's baseline (the first
-                # probe) makes the next revalidation refetch.
-                newest, agreed = confirm_member_stat(
-                    backend, source_virtual_path, member_stat, st.st_size)
-                if agreed or member_stat is None:
-                    break  # (no probe: a second transfer confirms nothing more)
+                # The member's stat after the transfer (MemberVersion): an
+                # unconfirmed version gets one more confirmation. Only AGREED
+                # and NEVER_VERSIONED are installed (sticky versioning: once
+                # any stat of this fill carried a token, never NEVER_VERSIONED).
+                # At most two confirming stats per transfer, across the
+                # retry inside confirm_member_stat and the second call.
+                budget = StatBudget(2)
+                fd_stats = bound.source_stats if bound is not None else ()
+                read_denied = read_denied or any(_denies_read(fd_st) for fd_st in fd_stats)
+                try:
+                    newest, version = confirm_member_stat(
+                        backend, source_virtual_path, member_stat, st.st_size, budget,
+                        full_fill=True)
+                    token_seen = token_seen or has_version_token(newest)
+                    read_denied = read_denied or _denies_read(newest)
+                    if version == MemberVersion.UNCONFIRMED and budget.remaining:
+                        newest, version = confirm_member_stat(
+                            backend, source_virtual_path, member_stat, st.st_size, budget,
+                            full_fill=True)
+                        token_seen = token_seen or has_version_token(newest)
+                        read_denied = read_denied or _denies_read(newest)
+                except OSError as exc:
+                    if read_denied:
+                        self.note_fill_errno(errno.EACCES)
+                    # A stat of the member's name confirmed absence. An
+                    # ENOENT from the transfer or staging file is still EIO.
+                    elif isinstance(exc, FileNotFoundError):
+                        self.note_fill_errno(errno.ENOENT)
+                        self.note_fill_absent()
+                    raise
+                # Descriptor tokens are evidence about the bytes, but even
+                # two stable fstats cannot confirm the pathname's version.
+                token_seen = token_seen or any(has_version_token(fd_st) for fd_st in fd_stats)
+                fd_changed = any(_token_contradicts(a, b)
+                                 for a, b in zip(fd_stats, fd_stats[1:]))
+                # A stat that showed another version with a token: the only
+                # one a retry may be confirmed against.
+                newer = newest if version == MemberVersion.CHANGED else None
+                if version == MemberVersion.NEVER_VERSIONED and token_seen:
+                    version = MemberVersion.UNCONFIRMED
+                if bound is not None and bound.grew:
+                    # The source outran the bounded copy: another version.
+                    version = MemberVersion.CHANGED
+                if fd_changed or any(
+                        getattr(fd_st, "st_size", None) not in (None, st.st_size)
+                        for fd_st in fd_stats) or any(
+                        _token_contradicts(fd_st, other)
+                        for fd_st in fd_stats for other in (member_stat, newest)):
+                    # The descriptor actually copied was at another version
+                    # than the pathname stats (renamed away and back, or
+                    # written during the copy): whatever they agree on, these
+                    # bytes are not theirs.
+                    version = MemberVersion.CHANGED
+                if fill_action(version) == FillAction.INSTALL:
+                    break
+                # A CHANGED version is fetched once more, only against a
+                # probe and a newer stat that carries a token (it becomes the
+                # retry's probe and its bound). A denied attempt fails below
+                # before retry admission can mask the denial with ENOSPC.
+                if (read_denied or attempt or version != MemberVersion.CHANGED or member_stat is None
+                        or not has_version_token(newer)):
+                    break
                 member_stat = newest
+                # The retry's cap: the larger of this fill's cap and the
+                # newer stat's size; only the difference is reserved more.
+                more = (max(0, newest.st_size - (reserved + extra_reserved))
+                        if reserved is not None else 0)
+                if more:
+                    if not self._reserve_more(more):
+                        print(f"Warning: Insufficient cache space for {source_virtual_path}")
+                        self._fill_errno.code = errno.ENOSPC
+                        raise OSError(errno.ENOSPC, "insufficient cache space for the "
+                                      "member's larger version", source_virtual_path)
+                    extra_reserved += more
+            if fill_action(version) != FillAction.INSTALL:
+                # Not a verified generation: nothing is installed or served,
+                # and a copy already cached (the last good one) stays as it
+                # is. The open reports EAGAIN, retryable, for read-only and
+                # writable opens alike (CTO-208-MMAP-FALLBACK).
+                if read_denied:
+                    # A read denial seen in this attempt wins over any copy,
+                    # the last good one included (the open reports EACCES).
+                    self._fill_errno.code = errno.EACCES
+                    raise OSError(errno.EACCES, f"the member withheld read of {source_virtual_path}",
+                                  source_virtual_path)
+                self._fill_errno.code = errno.EAGAIN
+                raise OSError(errno.EAGAIN, f"the member's version of {source_virtual_path} "
+                              f"could not be confirmed ({version})", source_virtual_path)
+            if read_denied:
+                # Installed although a stat of this attempt withheld owner
+                # read (say, a confirmation without a mode after one with
+                # 0o200): the recorded mode keeps that denial, and only it.
+                newest = _without_owner_read(newest)
             fd = os.open(temp_path, os.O_RDONLY | os.O_NOFOLLOW)
             try:
                 copy_member_attributes(fd, newest)
-                size = os.fstat(fd).st_size
+                staged = os.fstat(fd)
             finally:
                 os.close(fd)
             with self._lock:
+                current = regular_file_stat(cache_path) if replace_identity is not None else None
+                if current is not None and cache_identity(current) == replace_identity:
+                    # A refresh in place: the last good copy stayed named
+                    # until now and is replaced atomically by this verified
+                    # one (open descriptors keep the old inode). The new inode
+                    # carries its own CLEAN record (its size and mtime, no
+                    # checksum: the old version's never describes it) before
+                    # it is named, so a crash before the index row follows is
+                    # healed from it as CLEAN (heal_stale_clean), never read
+                    # as a lost local write.
+                    row = self.state_manager.get_file_metadata(source_virtual_path)
+                    if row is not None:
+                        # The record takes the staged file's own size and mtime.
+                        write_cache_metadata(temp_path, dataclasses.replace(
+                            row, checksum=None, sync_status=SyncStatus.CLEAN,
+                        ), virtual_path=source_virtual_path)
+                    # Clear location evidence before naming the replacement.
+                    # An interruption can require rechecking the old copy,
+                    # but cannot pair its checksums with a same-stat new one.
+                    self.state_manager.clear_location_checksums(source_virtual_path)
+                    guard = self.replace_checksum_guard
+                    with guard(source_virtual_path) if guard else nullcontext():
+                        if guard is None:
+                            self.state_manager.delete_member_checksums([source_virtual_path])
+                        os.replace(temp_path, cache_path)
+                    self._fill_errno.installed = cache_identity(staged)
+                    self._current_size_bytes += staged.st_size - current.st_size
+                    if version == MemberVersion.AGREED and newest is not None and confirmed is not None:
+                        confirmed.append(newest)
+                    return True
+                if current is not None:
+                    return False  # changed since the check: that copy stays
                 try:
                     os.link(temp_path, cache_path)
                 except FileExistsError:
                     if not (cache_path.is_file() and not cache_path.is_symlink()):
                         raise
                     return False
-                self._current_size_bytes += size
-            if agreed and newest is not None and confirmed is not None:
+                self._fill_errno.installed = cache_identity(staged)
+                self._current_size_bytes += staged.st_size
+            if version == MemberVersion.AGREED and newest is not None and confirmed is not None:
                 confirmed.append(newest)
             return True
-        except BaseException:
+        except BaseException as exc:
             # Whatever the copy wrote may have been counted by a rescan,
             # and a failure after the link leaves the sum unknown.
             with self._lock:
                 self._size_dirty = True
+            if getattr(self._fill_errno, "code", None) is None:
+                # A copy can collect descriptor evidence and then fail while
+                # applying attributes. Keep any read denial it observed.
+                if read_denied or (bound is not None and any(
+                        _denies_read(fd_st) for fd_st in bound.source_stats)):
+                    self._fill_errno.code = errno.EACCES
+                else:
+                    # The transfer's own errno, with ENOENT from a transfer
+                    # or a staging failure treated as I/O, never absence.
+                    self._fill_errno.code = (
+                        errno.EIO if isinstance(exc, FileNotFoundError)
+                        else exc.errno if isinstance(exc, OSError) and exc.errno
+                        else errno.EHOSTUNREACH if isinstance(exc, ConnectionError)
+                        else errno.EIO)
             raise
         finally:
+            if extra_reserved:
+                with self._lock:
+                    self._reserved_bytes -= extra_reserved
             try:
                 temp_path.unlink(missing_ok=True)
             except OSError:
@@ -734,8 +984,10 @@ class CacheManager:
         and none can be opened on the file before the unlink (open() takes
         the same lock across its os.open and registration), since bytes
         written through one after the stat would die with the unlinked
-        inode. A stale CLEAN is marked and kept. The listing attributes for
-        the path are forgotten before the unlink (forget_listed_attrs). Lock
+        inode. A stale CLEAN is marked and kept unless the inode carries
+        a verified replacement's CLEAN record. Repair the row and checksums
+        under both guards before unlinking that evidence. Forget the path's
+        listing attributes before unlinking (forget_listed_attrs). Lock
         order: the caller's
         self._lock, the index lock, then the descriptor lock; nothing under
         the descriptor lock takes the other two. Returns the bytes freed.
@@ -753,17 +1005,70 @@ class CacheManager:
                 if is_open:
                     return 0
                 st = os.lstat(str(cache_path))
-                stale = st.st_size != row.size or st.st_mtime != row.last_modified
-                if not stale:
+                local_change = self.clean_row_has_local_change(
+                    row, cache_path, st.st_size, st.st_mtime)
+                if not local_change:
                     if self.forget_listed_attrs:
                         self.forget_listed_attrs(virtual_path)
                     cache_path.unlink()
-            if stale:
+            if local_change:
                 self.mark_file_dirty(virtual_path, cache_path)
                 return 0
             self._current_size_bytes = max(0, self._current_size_bytes - st.st_size)
             self.state_manager.remove_file_location(virtual_path, "cache")
             return st.st_size
+
+    @staticmethod
+    def clean_record_for(cache_path: Path, stat_size: int, stat_mtime: float):
+        """The file's own metadata record, if it says CLEAN for exactly this stat.
+
+        A refresh in place names a verified copy carrying such a record
+        (fetch_into_cache); a write records DIRTY, and a change behind the
+        mount leaves a record for another stat.
+        """
+        try:
+            record = read_cache_metadata(cache_path)
+        except ValueError as exc:
+            raise OSError(errno.EIO, "could not read cache recovery evidence", cache_path) from exc
+        if (record is None or record.sync_status != SyncStatus.CLEAN
+                or record.is_stale_for(stat_size, stat_mtime)):
+            return None
+        return record
+
+    def clean_row_has_local_change(self, row: FileMetadata, cache_path: Path,
+                                   size: int, mtime: float) -> bool:
+        """Check a CLEAN row against the inode, repairing a verified replacement.
+
+        The caller holds the row lock from reading the row through repair,
+        and protects the stat and pathname through unlink if discarding it.
+        A repair error leaves the inode available as recovery evidence.
+        """
+        stale = size != row.size or mtime != row.last_modified
+        if not stale and not row.checksum:
+            return False
+        record = self.clean_record_for(cache_path, size, mtime)
+        # An equal-stat replacement has its own CLEAN record without the
+        # old row's checksum.
+        if record is None or (not stale and record.checksum is not None):
+            return stale
+
+        virtual_path = row.virtual_path
+        guard = self.replace_checksum_guard
+        try:
+            with guard(virtual_path) if guard else nullcontext():
+                if guard is None:
+                    self.state_manager.delete_member_checksums([virtual_path])
+                self.state_manager.clear_location_checksums(virtual_path)
+                # Reset the old row checksum last: it is what makes an
+                # interrupted equal-stat repair detectable on the next try.
+                repaired = self.state_manager.record_cached_stat(
+                    virtual_path, row.dirty_generation, size=size, last_modified=mtime,
+                    last_access=time.time(), clear_checksum=True)
+        except sqlite3.Error as exc:
+            raise OSError(errno.EIO, "could not repair refreshed cache row", cache_path) from exc
+        if not repaired:
+            raise OSError(errno.EIO, "refreshed cache row changed before repair", cache_path)
+        return False
 
     def heal_stale_clean(
         self,
@@ -773,31 +1078,25 @@ class CacheManager:
         stat_size: Optional[int] = None,
         stat_mtime: Optional[float] = None,
     ) -> bool:
-        """Mark a CLEAN row DIRTY when the cache file was written after it.
+        """Repair a CLEAN row that may describe a previous cache version.
 
-        The row's size and mtime are the stat recorded by the last
-        mark_file_dirty (or the last fetch). A CLEAN row whose stat differs
-        from the file means a write landed and its row update was lost (a
-        crash between the two), or something wrote to the cache directory
-        behind the mount; in that second case a sync may publish CLEAN for
-        a half-written file and the next open heals it again. One row read
-        and one lstat, unless the caller passes a stat it already has. The
-        read and the stat are not under the index lock: a writer racing
-        them bumps the generation, and mark_file_dirty's own bump keeps the
-        row at the newer write. Returns True when the file was marked.
+        A verified refresh puts a matching CLEAN record on the new inode
+        before naming it. A local write leaves a DIRTY or outdated record.
+        Check the live stat under the row lock before acting on a scan's
+        snapshot. Return True when a local modification was marked DIRTY.
         """
-        row = self.state_manager.get_file_metadata(virtual_path)
-        if row is None or row.sync_status != SyncStatus.CLEAN:
-            return False
-        if stat_size is None or stat_mtime is None:
-            try:
-                st = os.lstat(str(cache_path))
-            except OSError:
+        with self.state_manager.metadata_lock:
+            row = self.state_manager.get_file_metadata(virtual_path)
+            if row is None or row.sync_status != SyncStatus.CLEAN:
                 return False
-            stat_size, stat_mtime = st.st_size, st.st_mtime
-        if stat_size == row.size and stat_mtime == row.last_modified:
+            if stat_size != row.size or stat_mtime != row.last_modified or row.checksum:
+                st = regular_file_stat(cache_path)
+                if st is None:
+                    return False
+                stat_size, stat_mtime = st.st_size, st.st_mtime
+            if self.clean_row_has_local_change(row, cache_path, stat_size, stat_mtime):
+                return self.mark_file_dirty(virtual_path, cache_path) is not None
             return False
-        return self.mark_file_dirty(virtual_path, cache_path) is not None
 
     def store_file_metadata(
         self,

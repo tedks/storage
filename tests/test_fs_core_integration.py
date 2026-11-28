@@ -103,7 +103,8 @@ class TestFSCoreIntegration(unittest.TestCase):
         with patch.object(self.backends["backend1"], "copy_to_local", side_effect=half_then_fail):
             with self.assertRaises(FuseOSError) as ctx:
                 self.fs.open('/copy.txt.backend1', os.O_RDONLY)
-        self.assertEqual(ctx.exception.errno, errno.ENOENT)
+        # The transfer's own I/O error, not "absent" (CTO-208-LIVE-READ).
+        self.assertEqual(ctx.exception.errno, errno.EIO)
         self.assertEqual(sorted(p.name for p in self.cache_dir.rglob("*.storage.partial")), [])
         self.assertFalse((self.cache_dir / "copy.txt.backend1").exists())
 

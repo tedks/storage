@@ -49,6 +49,64 @@ def is_interactive_request() -> bool:
     return _INTERACTIVE_REQUEST.get()
 
 
+class CopyBound:
+    """A byte cap for the copy_to_local running under bounded_copy.
+
+    A backend whose class sets supports_bounded_copy reads the source
+    through one open, writes at most cap bytes, then reads once more: a
+    byte past the cap sets grew (it is never written). A copy is then
+    finite however fast a writer appends to the source (CTO-208-BOUNDED).
+    """
+
+    def __init__(self, cap: int):
+        self.cap = cap
+        self.grew = False
+        self.written = 0
+        self.read = 0
+        # Stats of the open source itself (fstat), when the backend has them:
+        # the version actually copied, whatever its pathname says later.
+        self.source_stats: list = []
+
+
+_COPY_BOUND: contextvars.ContextVar = contextvars.ContextVar("copy_bound", default=None)
+
+
+@contextmanager
+def bounded_copy(cap: int):
+    """Cap the copy_to_local calls inside to cap bytes (see CopyBound)."""
+    bound = CopyBound(cap)
+    token = _COPY_BOUND.set(bound)
+    try:
+        yield bound
+    finally:
+        _COPY_BOUND.reset(token)
+
+
+def current_copy_bound() -> Optional[CopyBound]:
+    return _COPY_BOUND.get()
+
+
+COPY_CHUNK = 1 << 20
+
+
+def copy_bounded_stream(read, write, bound: CopyBound) -> None:
+    """Copy from read(n) to write(data) through one open source: at most
+    bound.cap bytes written, then one probe read for growth."""
+    remaining = bound.cap
+    while remaining > 0:
+        chunk = read(min(COPY_CHUNK, remaining))
+        if not chunk:
+            return
+        bound.read += len(chunk)
+        write(chunk)
+        bound.written += len(chunk)
+        remaining -= len(chunk)
+    extra = read(1)
+    if extra:
+        bound.read += len(extra)
+        bound.grew = True
+
+
 @contextmanager
 def capacity_wait_cancellation(probe):
     """Expose a cancellation probe only for this native callback's lifetime."""
@@ -153,6 +211,11 @@ class BackendInfo:
 
 class Backend(ABC):
     """Base class for all backend implementations"""
+
+    # Whether copy_to_local honours bounded_copy (one open, a byte cap). A
+    # member without it cannot give a capped fill: that fill fails with
+    # EAGAIN rather than copy without a bound (CTO-208-BOUNDED).
+    supports_bounded_copy = False
 
     def __init__(
         self,

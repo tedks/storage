@@ -581,6 +581,202 @@ class TestDirectoryRetries(SyncRaceTestBase):
         self.assertEqual([], copies)
         self.assertEqual(b"sole bytes", (self.member_dir / "d" / "f.txt").read_bytes())
 
+    def _synced_view(self):
+        """/d/f.txt synced to the member, its conflict view cached; sync off."""
+        self.fs.mkdir("/d", 0o755)
+        self.write_file("/d/f.txt", b"sole bytes")
+        self.start_sync()
+        self.wait_synced("/d/f.txt")
+        self.wait_idle()
+        self.fs.sync_manager.stop()
+        view = self.fs.cache_manager.get_cache_path("/d/f.txt.member")
+        view.write_bytes(b"sole bytes")
+        return view
+
+    def _open_repair(self):
+        """A missed rename of /d records a repair that fences the member."""
+        self.fail_member_once("rename")
+        self.fs.rename("/d", "/e")
+
+    def _record_copies(self):
+        copies = []
+        patcher = patch.object(self.member, "copy_from_local",
+                               side_effect=lambda *a: copies.append(a))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return copies
+
+    def _kept_view_writes(self):
+        repairs = MemberRepairs(self.cache_dir)
+        return [repairs.carrier_path(r.id).read_bytes()
+                for r in repairs.list() if r.kind == VIEW_WRITE]
+
+    def _reader_close_keeps_the_writers_refusal(self, change, expected):
+        """Barrier/control: a writer and an unmodified reader share a changed
+        view; a repair appears; the reader closes first. The reader's close
+        succeeds, the writer's close (flush) reports EBUSY, the member gets
+        nothing, and the changed bytes are kept as one view-write repair.
+        (Pre-#184, 59e8d28, behaved so too: a read-only close sent nothing
+        and only writable descriptors were refused.)"""
+        self._synced_view()
+        reader = self.fs.open("/d/f.txt.member", os.O_RDONLY)
+        writer = change()
+        self._open_repair()
+        copies = self._record_copies()
+        self.assertEqual(0, self.fs.flush("/d/f.txt.member", reader))
+        self.fs.release("/d/f.txt.member", reader)
+        with self.assertRaises(FuseOSError) as raised:
+            self.fs.flush("/d/f.txt.member", writer)
+        self.assertEqual(errno.EBUSY, raised.exception.errno)
+        self.fs.release("/d/f.txt.member", writer)
+        self.assertEqual([], copies)
+        self.assertEqual(b"sole bytes", (self.member_dir / "d" / "f.txt").read_bytes())
+        self.assertEqual([expected], self._kept_view_writes())
+
+    def test_a_reader_close_does_not_take_the_writers_refusal(self):
+        def write():
+            fh = self.fs.open("/d/f.txt.member", os.O_WRONLY)
+            self.fs.write("/d/f.txt.member", b"overwrite!", 0, fh)
+            return fh
+        self._reader_close_keeps_the_writers_refusal(write, b"overwrite!")
+
+    def test_a_reader_close_does_not_take_an_ftruncates_refusal(self):
+        def ftruncate():
+            fh = self.fs.open("/d/f.txt.member", os.O_WRONLY)
+            self.fs.truncate("/d/f.txt.member", 3, fh)
+            return fh
+        self._reader_close_keeps_the_writers_refusal(ftruncate, b"sol")
+
+    def test_a_reader_close_does_not_take_an_o_trunc_opens_refusal(self):
+        self._reader_close_keeps_the_writers_refusal(
+            lambda: self.fs.open("/d/f.txt.member", os.O_WRONLY | os.O_TRUNC), b"")
+
+    def test_a_reader_close_does_not_take_a_creates_refusal(self):
+        self._reader_close_keeps_the_writers_refusal(
+            lambda: self.fs.create("/d/f.txt.member", 0o644), b"")
+
+    def test_a_change_already_sent_is_not_refused_for_a_later_one(self):
+        """A's write is sent by a reader's close; B then writes, a repair
+        appears and another reader's close keeps B's bytes: only B's close
+        reports the refusal."""
+        self._synced_view()
+        first_reader = self.fs.open("/d/f.txt.member", os.O_RDONLY)
+        second_reader = self.fs.open("/d/f.txt.member", os.O_RDONLY)
+        a = self.fs.open("/d/f.txt.member", os.O_WRONLY)
+        self.fs.write("/d/f.txt.member", b"A", 0, a)
+        self.fs.release("/d/f.txt.member", first_reader)  # sends A's change
+        self.assertEqual(b"Aole bytes", (self.member_dir / "d" / "f.txt").read_bytes())
+        b = self.fs.open("/d/f.txt.member", os.O_WRONLY)
+        self.fs.write("/d/f.txt.member", b"B", 1, b)
+        self._open_repair()
+        self._record_copies()
+        self.fs.release("/d/f.txt.member", second_reader)  # keeps B's
+        self.assertEqual(0, self.fs.flush("/d/f.txt.member", a))
+        with self.assertRaises(FuseOSError) as raised:
+            self.fs.flush("/d/f.txt.member", b)
+        self.assertEqual(errno.EBUSY, raised.exception.errno)
+        for fh in (a, b):
+            self.fs.release("/d/f.txt.member", fh)
+        self.assertEqual([b"ABle bytes"], self._kept_view_writes())
+
+    def test_bytes_not_kept_mark_no_one_refused(self):
+        self._synced_view()
+        reader = self.fs.open("/d/f.txt.member", os.O_RDONLY)
+        writer = self.fs.open("/d/f.txt.member", os.O_WRONLY)
+        self.fs.write("/d/f.txt.member", b"overwrite!", 0, writer)
+        self._open_repair()
+        self._record_copies()
+        with patch.object(self.fs.cache_manager.member_repairs, "preserve_view_write",
+                          return_value=False), self.assertLogs("storage.fs", level="ERROR"):
+            self.fs.release("/d/f.txt.member", reader)
+        with self.fs._fd_lock:
+            self.assertFalse(self.fs._fd_map[writer].view_refused)
+        # Still pending, so the writer's own close reports the refusal.
+        with self.assertRaises(FuseOSError):
+            self.fs.flush("/d/f.txt.member", writer)
+        self.fs.release("/d/f.txt.member", writer)
+
+    def test_flush_and_a_keeping_release_do_not_interleave(self):
+        """Barrier: a reader's release is inside the keep (holding the path
+        lock) when the writer's flush starts. The flush must not read
+        "not refused" before the keep and "nothing pending" after it."""
+        self._synced_view()
+        reader = self.fs.open("/d/f.txt.member", os.O_RDONLY)
+        writer = self.fs.open("/d/f.txt.member", os.O_WRONLY)
+        self.fs.write("/d/f.txt.member", b"overwrite!", 0, writer)
+        self._open_repair()
+        self._record_copies()
+        repairs = self.fs.cache_manager.member_repairs
+        in_keep, finish_keep = threading.Event(), threading.Event()
+        flush_checking, finish_flush = threading.Event(), threading.Event()
+        real_preserve, real_backends_for = repairs.preserve_view_write, repairs.backends_for
+        flusher = {}
+
+        def slow_preserve(*args, **kwargs):
+            in_keep.set()
+            finish_keep.wait(10)
+            return real_preserve(*args, **kwargs)
+
+        def observed_backends_for(paths):
+            if threading.current_thread() is flusher.get("thread"):
+                flush_checking.set()
+                finish_flush.wait(10)
+            return real_backends_for(paths)
+
+        def flush():
+            try:
+                flusher["result"] = self.fs.flush("/d/f.txt.member", writer)
+            except FuseOSError as exc:
+                flusher["result"] = exc.errno
+
+        with patch.object(repairs, "preserve_view_write", side_effect=slow_preserve), \
+                patch.object(repairs, "backends_for", side_effect=observed_backends_for):
+            releaser = threading.Thread(target=self.fs.release, args=("/d/f.txt.member", reader))
+            releaser.start()
+            self.assertTrue(in_keep.wait(10))
+            thread = threading.Thread(target=flush)
+            flusher["thread"] = thread
+            thread.start()
+            # With the lock the flush waits for the keep; without it, it would
+            # check here, between "not refused" and "pending".
+            flush_checking.wait(0.5)
+            finish_keep.set()
+            releaser.join(10)
+            finish_flush.set()
+            thread.join(10)
+        self.assertEqual(errno.EBUSY, flusher["result"])
+        self.fs.release("/d/f.txt.member", writer)
+        self.assertEqual([b"overwrite!"], self._kept_view_writes())
+
+    def _path_truncate_kept(self, flags):
+        """A truncate by path (no descriptor of its own), then a repair, then
+        a descriptor that changes nothing closes: its close succeeds, and the
+        truncated bytes are kept once. (59e8d28: a read-only close kept
+        nothing; fa274d4: that close got EBUSY.)"""
+        self._synced_view()
+        # Opened before the repair: a repair refuses a writable view open.
+        closer = self.fs.open("/d/f.txt.member", flags)
+        self.fs.truncate("/d/f.txt.member", 4)
+        self._open_repair()
+        copies = self._record_copies()
+        self.assertEqual(0, self.fs.flush("/e/f.txt.member", closer))
+        self.fs.release("/e/f.txt.member", closer)
+        self.assertEqual([], copies)
+        self.assertEqual([b"sole"], self._kept_view_writes())
+
+    def test_a_path_truncate_kept_by_a_readers_close(self):
+        self._path_truncate_kept(os.O_RDONLY)
+
+    def test_a_path_truncate_kept_by_an_unchanged_writers_close(self):
+        self._path_truncate_kept(os.O_RDWR)
+
+    def test_read_only_flush_takes_no_path_lock(self):
+        self._synced_view()
+        reader = self.fs.open("/d/f.txt.member", os.O_RDONLY)
+        with patch.object(self.fs, "_path_locked", side_effect=AssertionError("path lock")):
+            self.assertEqual(0, self.fs.flush("/d/f.txt.member", reader))
+        self.fs.release("/d/f.txt.member", reader)
+
     def test_a_member_known_down_during_a_rename_gets_a_repair(self):
         """A member that is unavailable when the rename runs has missed it
         like one whose call failed: it must not drop out of the record."""

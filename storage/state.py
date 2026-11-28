@@ -330,23 +330,28 @@ class StateManager:
         size: int,
         last_modified: float,
         last_access: float,
+        clear_checksum: bool = False,
     ) -> bool:
         """Bring a row's recorded stat up to a cache file that holds synced content.
 
         For a refetch after eviction: the transfer does not keep the mtime,
         and the row's stat must describe the file on disk or the file looks
-        like a lost write. Touches only size, last_modified and last_access,
-        and only WHERE dirty_generation = `generation`, so a write recorded
-        since the caller read the row is left alone. Returns whether it applied.
+        like a lost write. Touches only size, last_modified and last_access
+        (and, with clear_checksum, drops the checksum: a refresh installed
+        another version, which the old checksum never describes), and only
+        WHERE dirty_generation = `generation`, so a write recorded since the
+        caller read the row is left alone. Returns whether it applied.
         """
         with self._db_lock:
             cursor = self.conn.execute(
                 '''
                 UPDATE files
-                SET size = ?, last_modified = ?, last_access = ?
+                SET size = ?, last_modified = ?, last_access = ?,
+                    checksum = CASE WHEN ? THEN NULL ELSE checksum END
                 WHERE virtual_path = ? AND dirty_generation = ?
                 ''',
-                (size, last_modified, last_access, virtual_path, generation),
+                (size, last_modified, last_access, 1 if clear_checksum else 0,
+                 virtual_path, generation),
             )
             self.conn.commit()
             return cursor.rowcount == 1
@@ -376,6 +381,16 @@ class StateManager:
             )
             self.conn.commit()
             return cursor.rowcount == 1
+
+    def clear_location_checksums(self, virtual_path: str) -> None:
+        """Forget every location's checksum for a path (another version was
+        installed; the old checksums describe nothing that is there)."""
+        with self._db_lock:
+            self.conn.execute(
+                "UPDATE file_locations SET checksum = '' WHERE virtual_path = ?",
+                (virtual_path,),
+            )
+            self.conn.commit()
 
     def get_file_locations(self, virtual_path: str) -> List[FileLocation]:
         """Get all locations where a file is stored"""

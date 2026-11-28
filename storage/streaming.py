@@ -20,7 +20,10 @@ from .backends.base import (
 from .backends.local import NOREPLACE_UNSUPPORTED
 from .backends.local import rename_noreplace as _rename_noreplace
 from .backends.ssh_pool import BulkCapacityCancelled, BulkCapacityTimeout
-from .cache_metadata import PREFIX_XATTR, confirm_member_stat, copy_member_attributes
+from .cache_metadata import (
+    PREFIX_XATTR, FillAction, MemberVersion, confirm_member_stat, copy_member_attributes,
+    fill_action, verdict_without_confirmation,
+)
 from .models import FileLocation, FileMetadata, StreamingKeepAfterClose, SyncStatus
 
 # A foreground read fetches only the bytes the reader asked for that are not
@@ -1432,6 +1435,58 @@ class StreamingReadManager:
         """The log reason for an _install_partial outcome other than "installed"."""
         return "cache-path-filled" if outcome == "taken" else outcome
 
+    def _confirm_publication(self, session: PrefetchSession, io_fd: int):
+        """A worker's confirmation of a stream: (stat, verdict), or (None, None)
+        when the session was stopped meanwhile (nothing to publish).
+
+        A worker's stat is an interactive request: the member's
+        interactive reserve and its connect deadline, never a bulk
+        lease. It can still wait behind a bulk lease when SSH
+        negotiated a single shared channel, or behind other
+        confirmations on the reserve; that wait yields under
+        contention and is bounded across yields
+        (_publication_wait_probe).
+        A deadline failure is retried once; a stat that still fails is
+        UNCONFIRMED when the probe carried a version token, never the
+        probe standing in (CTO-VERSION-EVIDENCE: MemberVersion).
+        """
+        try:
+            with interactive_request():
+                return confirm_member_stat(
+                    session.backend, session.canonical_path, session.member_stat,
+                    os.fstat(io_fd).st_size)
+        except BulkCapacityCancelled as exc:
+            if session.stop_requested:
+                # Stopped (destroy) during the channel wait, not
+                # contention: nothing is published, and the finish
+                # takes the cancelled-session cleanup.
+                return None, None
+            if session.confirmation_timed_out:
+                # The member's wait budget ran out across attempts: no
+                # stat follows the transfer (verdict_without_confirmation).
+                return verdict_without_confirmation(session.member_stat)
+            if current_interactive_cancel_probe() is not None:
+                # The turn's channel-wait probe gave up under contention.
+                raise _PublicationYielded() from exc
+            # Otherwise (and a BulkCapacityTimeout, never raised for an
+            # interactive request today) nothing was confirmed or
+            # disagreed, so it is not member-changed: the session fails
+            # and its readers are woken, as for any failed finalize.
+            raise OSError(errno.EINTR, str(exc)) from exc
+        except BulkCapacityTimeout as exc:
+            raise OSError(errno.EAGAIN, str(exc)) from exc
+
+    def _discard_unverified(self, session: PrefetchSession, version: str):
+        """Discard a finished stream that fill_action does not install:
+        CHANGED as member-changed, UNCONFIRMED (no stat could confirm the
+        probe's token, an inline or destroy publication that makes no stat,
+        or a confirmation whose wait budget ran out) as member-unconfirmed.
+        Counted once, after the partial is gone and the session finished."""
+        changed = version == MemberVersion.CHANGED
+        self._discard_superseded_session(session, "member-changed" if changed else "member-unconfirmed")
+        self._record_streaming_stat(
+            "streaming_member_changed_discards" if changed else "streaming_unconfirmed_discards", 1)
+
     def _discard_superseded_session(self, session: PrefetchSession, outcome: str):
         """Finish a complete session whose partial was not installed (outcome, see _install_partial).
 
@@ -1600,57 +1655,30 @@ class StreamingReadManager:
             # these bytes.
             #
             # Only a worker's publication confirms. An inline one (a release
-            # with no worker, or destroy) makes no member stat: its result
-            # counts as not agreed and is discarded, and the next open
-            # fetches again, so unverified bytes are never published.
+            # with no worker, or destroy) makes no member stat: a probe that
+            # carried a version token is UNCONFIRMED and discarded (the next
+            # open fetches again); one that carried none is NEVER_VERSIONED
+            # and kept with conservative attributes, as a worker's would be
+            # (verdict_without_confirmation).
             if session.unconfirmed_publication:
-                self._discard_superseded_session(session, "unconfirmed")
-                self._record_streaming_stat("streaming_unconfirmed_discards", 1)
-                return
-            # A worker's stat is an interactive request: the member's
-            # interactive reserve and its connect deadline, never a bulk
-            # lease. It can still wait behind a bulk lease when SSH
-            # negotiated a single shared channel, or behind other
-            # confirmations on the reserve; that wait yields under
-            # contention and is bounded across yields
-            # (_publication_wait_probe).
-            # A deadline failure is retried once, then the probe stands in
-            # when the size matches (confirm_member_stat); what an
-            # unconfirmed result means beyond that is the decision below,
-            # unchanged from master.
-            try:
-                with interactive_request():
-                    confirmed, agreed = confirm_member_stat(
-                        session.backend, session.canonical_path, session.member_stat,
-                        os.fstat(io_fd).st_size)
-            except BulkCapacityCancelled as exc:
-                if session.stop_requested:
-                    # Stopped (destroy) during the channel wait, not
-                    # contention: nothing is published, and the finish
-                    # takes the cancelled-session cleanup.
+                confirmed, version = verdict_without_confirmation(session.member_stat)
+            else:
+                confirmed, version = self._confirm_publication(session, io_fd)
+                if version is None:
                     return
-                if session.confirmation_timed_out:
-                    # The member's wait budget ran out across attempts:
-                    # unconfirmed, so discarded like any result not agreed.
-                    self._discard_superseded_session(session, "unconfirmed")
-                    self._record_streaming_stat("streaming_unconfirmed_discards", 1)
-                    return
-                if current_interactive_cancel_probe() is not None:
-                    # The turn's channel-wait probe gave up under contention.
-                    raise _PublicationYielded() from exc
-                # Otherwise (and a BulkCapacityTimeout, never raised for an
-                # interactive request today) nothing was confirmed or
-                # disagreed, so it is not member-changed: the session fails
-                # and its readers are woken, as for any failed finalize.
-                raise OSError(errno.EINTR, str(exc)) from exc
-            except BulkCapacityTimeout as exc:
-                raise OSError(errno.EAGAIN, str(exc)) from exc
-            if not agreed:
-                self._discard_superseded_session(session, "member-changed")
-                # Counted once the partial is gone and the session finished.
-                self._record_streaming_stat("streaming_member_changed_discards", 1)
+            # Positive evidence of another version, or a token the stream
+            # started with that could not be confirmed, discards it: bytes
+            # assembled over many reads are not a verified generation. (The
+            # simplest correct choice: the next open fetches again.) A
+            # member that never supplied a token keeps its stream, with
+            # only the attributes it reported.
+            # (fill_action: a stream's readers already have their bytes, so a
+            # copy that may not be installed is simply not kept.)
+            if fill_action(version) != FillAction.INSTALL:
+                self._discard_unverified(session, version)
                 return
-            session.confirmed_stat = confirmed
+            if version == MemberVersion.AGREED:
+                session.confirmed_stat = confirmed
             copy_member_attributes(io_fd, confirmed)
             os.fsync(io_fd)
             session.final_cache_path.parent.mkdir(parents=True, exist_ok=True)

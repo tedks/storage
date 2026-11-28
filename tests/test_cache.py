@@ -1,3 +1,4 @@
+import errno
 import os
 import shutil
 import tempfile
@@ -234,6 +235,311 @@ class _GatedBackend(LocalBackend):
             if self.fail:
                 raise OSError("member went away mid-transfer")
             f.write(data[len(data) // 2:])
+
+
+class TestBoundedCopy(unittest.TestCase):
+    """CTO-208-BOUNDED: a capped copy_to_local reads one open of the source
+    and stops at the cap, however fast a writer appends (here after every
+    chunk read, with the producer capped at a guard)."""
+
+    CAP, GUARD = 40, 10_000
+
+    def setUp(self):
+        self.temp_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.temp_dir, True)
+
+    def appending_reader(self, read, append):
+        """read() that appends to the source after every chunk it returns."""
+        appended = []
+
+        def read_and_grow(n):
+            data = read(n)
+            if sum(appended) < self.GUARD:
+                appended.append(append())
+            return data
+        return read_and_grow
+
+    def check(self, bound, dst):
+        self.assertTrue(bound.grew)
+        self.assertLessEqual(bound.written, self.CAP)
+        self.assertLessEqual(bound.read, self.CAP + 1)
+        self.assertEqual(dst.stat().st_size, self.CAP)
+
+    def test_local_member_copy_stops_at_the_cap(self):
+        from storage.backends import base, local
+        root = self.temp_dir / "member"
+        root.mkdir()
+        src = root / "f.log"
+        src.write_bytes(b"x" * self.CAP)
+        backend = LocalBackend("m", str(root))
+        real_stream = local.copy_bounded_stream
+
+        def stream(read, write, bound):
+            def append():
+                with open(src, "ab") as f:
+                    f.write(b"+" * 7)
+                return 7
+            return real_stream(self.appending_reader(read, append), write, bound)
+
+        dst = self.temp_dir / "copy"
+        with patch.object(base, "COPY_CHUNK", 8), patch.object(local, "copy_bounded_stream", stream), \
+                base.bounded_copy(self.CAP) as bound:
+            backend.copy_to_local("/f.log", dst)
+        self.check(bound, dst)
+        self.assertEqual(dst.read_bytes(), b"x" * self.CAP)
+
+    def test_ssh_member_copy_stops_at_the_cap(self):
+        from types import SimpleNamespace
+        from storage.backends import base
+        from storage.backends.ssh import SSHBackend
+        data = bytearray(b"y" * self.CAP)
+        offset = {"at": 0}
+
+        class GrowingRemote:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self, n):
+                chunk = bytes(data[offset["at"]:offset["at"] + n])
+                offset["at"] += len(chunk)
+                return chunk
+
+            def prefetch(self, file_size=None, max_concurrent_requests=None):
+                prefetches.append(file_size)
+
+            def stat(self):
+                return SimpleNamespace(st_size=len(data), st_mtime=2.0)
+
+        prefetches = []
+        remote = GrowingRemote()
+        requested = []
+        read = remote.read
+
+        def recorded(n):
+            requested.append(n)
+            return read(n)
+        remote.read = self.appending_reader(recorded, lambda: data.extend(b"+" * 7) or 7)
+        sftp = SimpleNamespace(open=lambda path, mode: remote,
+                               get=lambda *a: self.fail("an unbounded get"))
+        backend = SSHBackend.__new__(SSHBackend)
+        backend._resolve_path = lambda path: "/remote" + path
+        backend.sftp_operation_timeout = 1.0
+        backend._with_sftp = lambda what, path, fn, **kw: fn(sftp)
+        dst = self.temp_dir / "copy"
+        with patch.object(base, "COPY_CHUNK", 8), base.bounded_copy(self.CAP) as bound:
+            backend.copy_to_local("/f.log", dst)
+        self.check(bound, dst)
+        # Read-ahead queued for the cap only, never for an open-ended size,
+        # and no more than the cap requested before the one-byte probe.
+        self.assertEqual(prefetches, [self.CAP])
+        self.assertEqual(sum(requested[:-1]), self.CAP)
+        self.assertEqual(requested[-1], 1)
+        # The open handle's own attributes are the copy's evidence (S4).
+        self.assertEqual([st.st_mtime for st in bound.source_stats], [2.0])
+
+    def test_ssh_copy_is_not_replayed_after_the_source_opened(self):
+        from types import SimpleNamespace
+        from storage.backends import base
+        from storage.backends.ssh import SSHBackend
+        opens = []
+
+        class Dropping:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def prefetch(self, file_size=None, max_concurrent_requests=None):
+                pass
+
+            def read(self, n):
+                raise ConnectionResetError("connection dropped mid-copy")
+
+        sftp = SimpleNamespace(open=lambda path, mode: opens.append(path) or Dropping())
+        backend = SSHBackend.__new__(SSHBackend)
+        backend._resolve_path = lambda path: "/remote" + path
+        backend.sftp_operation_timeout = 1.0
+
+        def with_sftp(what, path, fn, retry=False, **kw):
+            # As _with_sftp: with retry, a connection error runs fn again.
+            for attempt in range(2 if retry else 1):
+                try:
+                    return fn(sftp)
+                except ConnectionResetError:
+                    if not retry or attempt:
+                        raise
+        backend._with_sftp = with_sftp
+        with base.bounded_copy(self.CAP), self.assertRaises(ConnectionResetError):
+            backend.copy_to_local("/f.log", self.temp_dir / "copy")
+        self.assertEqual(len(opens), 1)
+
+    def test_local_copy_refuses_a_fifo_without_blocking(self):
+        from storage.backends import base
+        root = self.temp_dir / "member"
+        root.mkdir()
+        os.mkfifo(root / "f.log")  # the name became a FIFO after the probe
+        result = {}
+
+        def copy():
+            try:
+                with base.bounded_copy(self.CAP):
+                    LocalBackend("m", str(root)).copy_to_local("/f.log", self.temp_dir / "copy")
+            except OSError as exc:
+                result["errno"] = exc.errno
+
+        worker = threading.Thread(target=copy, daemon=True)
+        worker.start()
+        worker.join(5)
+        self.assertFalse(worker.is_alive(), "the copy blocked on a FIFO")
+        self.assertEqual(result.get("errno"), errno.EINVAL)
+
+    def test_a_source_of_exactly_the_cap_copies_whole(self):
+        from storage.backends import base
+        root = self.temp_dir / "member"
+        root.mkdir()
+        (root / "f.log").write_bytes(b"z" * self.CAP)
+        dst = self.temp_dir / "copy"
+        with base.bounded_copy(self.CAP) as bound:
+            LocalBackend("m", str(root)).copy_to_local("/f.log", dst)
+        self.assertFalse(bound.grew)
+        self.assertEqual(dst.read_bytes(), b"z" * self.CAP)
+
+    def test_a_member_that_cannot_bound_its_copy_gives_eagain(self):
+        state = StateManager(str(self.temp_dir / "state.db"))
+        self.addCleanup(state.close)
+        cache = CacheManager(self.temp_dir / "cache", state, 10_000)
+        backend = LocalBackend("m", str(self.temp_dir))
+        (self.temp_dir / "f.log").write_bytes(b"abc")
+        with patch.object(LocalBackend, "supports_bounded_copy", False), \
+                patch.object(backend, "copy_to_local",
+                             side_effect=AssertionError("an unbounded copy")):
+            self.assertFalse(cache.cache_file("/f.log", backend))
+        self.assertEqual(cache.take_fill_errno(), errno.EAGAIN)
+
+
+class TestConfirmedLargerRetryBudget(unittest.TestCase):
+    """A full fill whose member is confirmed to have grown is fetched again
+    only within the cache budget (pre-#191: reserve the difference first)."""
+
+    def make(self, max_size):
+        self.temp_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.temp_dir, True)
+        cache_dir = Path(self.temp_dir) / "cache"
+        backend_dir = Path(self.temp_dir) / "backend"
+        cache_dir.mkdir()
+        backend_dir.mkdir()
+        state = StateManager(str(Path(self.temp_dir) / "state.db"))
+        self.addCleanup(state.close)
+        self.cache = CacheManager(cache_dir, state, max_size)
+        self.backend = LocalBackend("backend", str(backend_dir))
+        self.source = backend_dir / "f.bin"
+        self.source.write_bytes(b"x" * 100)
+        self.cache_dir = cache_dir
+        copy = self.backend.copy_to_local
+        self.reserved_during = []
+
+        def grows_once(path, temp):
+            self.reserved_during.append(self.cache._reserved_bytes)
+            if len(self.reserved_during) == 1:
+                self.source.write_bytes(b"y" * 400)  # after the probe: larger
+            copy(path, temp)
+
+        return patch.object(self.backend, "copy_to_local", side_effect=grows_once)
+
+    def test_confirmed_larger_retry_reserves_the_difference(self):
+        with self.make(max_size=10_000):
+            self.assertTrue(self.cache.cache_file("/f.bin", self.backend))
+        self.assertEqual(self.reserved_during, [100, 400])
+        self.assertEqual(self.cache._reserved_bytes, 0)
+        self.assertEqual(self.cache.get_cache_path("/f.bin").read_bytes(), b"y" * 400)
+
+    def probe_then(self, after):
+        """Member stat: a probe of the original 100 bytes, then after(path)."""
+        from types import SimpleNamespace
+        real, seen = self.backend.stat, []
+
+        def stats(path):
+            seen.append(path)
+            if len(seen) == 1:
+                st = real(path)
+                return SimpleNamespace(st_size=100, st_mtime=st.st_mtime, st_mode=st.st_mode)
+            return after(path)
+        return patch.object(self.backend, "stat", side_effect=stats)
+
+    def test_confirmed_larger_retry_reserves_the_newer_stats_size(self):
+        # The member grows after the first copy: the retry is reserved for
+        # the newer stat's size, not for what the first transfer was.
+        with self.make(max_size=10_000):
+            real_copy = LocalBackend.copy_to_local.__get__(self.backend)
+            calls = []
+
+            def grows_after(path, temp):
+                calls.append(self.cache._reserved_bytes)
+                real_copy(path, temp)
+                if len(calls) == 1:
+                    self.source.write_bytes(b"y" * 400)
+
+            with patch.object(self.backend, "copy_to_local", side_effect=grows_after):
+                self.assertTrue(self.cache.cache_file("/f.bin", self.backend))
+        self.assertEqual(calls, [100, 400])
+        self.assertEqual(self.cache._reserved_bytes, 0)
+
+    def test_confirmed_larger_retry_needs_a_newer_token(self):
+        # CHANGED (the transfer is another size) and the stat after it has no
+        # token (it failed, or reports a size but no mtime): nothing to retry
+        # against, so no retry and nothing installed.
+        from types import SimpleNamespace
+
+        def fails(path):
+            raise OSError(5, "stat failed")
+        for after in (fails, lambda path: SimpleNamespace(st_size=400)):
+            with self.subTest(after=after):
+                with self.make(max_size=10_000), self.probe_then(after):
+                    self.assertFalse(self.cache.cache_file("/f.bin", self.backend))
+                self.assertEqual(self.reserved_during, [100])
+                self.assertEqual(self.cache._reserved_bytes, 0)
+                self.assertFalse(self.cache.get_cache_path("/f.bin").exists())
+
+    def test_confirmed_larger_retry_that_changes_again_fails(self):
+        # The retry's probe is the newer stat (400 bytes, reserved); its
+        # transfer then finds another size again: never installed.
+        with self.make(max_size=10_000):
+            copy = self.backend.copy_to_local.side_effect
+
+            def grows_twice(path, temp):
+                if len(self.reserved_during) == 1:
+                    self.source.write_bytes(b"z" * 500)
+                copy(path, temp)
+
+            with patch.object(self.backend, "copy_to_local", side_effect=grows_twice):
+                self.assertFalse(self.cache.cache_file("/f.bin", self.backend))
+        self.assertEqual(self.reserved_during, [100, 400])
+        self.assertEqual(self.cache._reserved_bytes, 0)
+        self.assertFalse(self.cache.get_cache_path("/f.bin").exists())
+
+    def test_confirmed_larger_retry_without_a_probe_never_installs_another_size(self):
+        # No probe, and the stat after the copy reports another size.
+        from types import SimpleNamespace
+        with self.make(max_size=10_000):
+            with patch.object(self.backend, "stat", side_effect=lambda path: SimpleNamespace(
+                    st_size=999, st_mtime=1.0)):
+                with self.assertRaises(OSError):
+                    self.cache.fetch_into_cache(self.backend, "/f.bin",
+                                                self.cache.get_cache_path("/f.bin"), None)
+        self.assertEqual(len(self.reserved_during), 1)  # one transfer, no retry
+        self.assertFalse(self.cache.get_cache_path("/f.bin").exists())
+
+    def test_confirmed_larger_retry_fails_when_it_cannot_reserve(self):
+        with self.make(max_size=300):
+            self.assertFalse(self.cache.cache_file("/f.bin", self.backend))
+        self.assertEqual(self.reserved_during, [100])  # no second transfer
+        self.assertEqual(self.cache._reserved_bytes, 0)
+        self.assertFalse(self.cache.get_cache_path("/f.bin").exists())
+        self.assertEqual(sorted(p.name for p in self.cache_dir.rglob(f"*{PARTIAL_SUFFIX}")), [])
 
 
 class TestFetchThroughTempFile(unittest.TestCase):

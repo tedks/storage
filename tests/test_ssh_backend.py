@@ -19,6 +19,7 @@ from storage.backends import ssh_pool
 from storage.backends.base import (
     ChecksumUnavailable,
     MemberSourceMissing,
+    bounded_copy,
     bulk_request,
     interactive_wait_cancellation,
     capacity_wait_cancellation,
@@ -151,6 +152,14 @@ class _FakeRemoteFile:
 
     def seek(self, offset: int):
         self._offset = offset
+
+    def prefetch(self, file_size=None, max_concurrent_requests=None):
+        # paramiko 4 queues read-ahead for [0, file_size) only.
+        self._sftp.server.prefetches.append(file_size)
+
+    def stat(self):
+        # SFTPFile.stat(): the open handle's attributes (an fstat request).
+        return SimpleNamespace(st_size=len(self._data), st_mode=0o100644, st_mtime=1.0)
 
     def read(self, size: int):
         chunk = self._data[self._offset:self._offset + size]
@@ -298,6 +307,7 @@ class _FakeServer:
         self.requests = []
         self.concurrent_use = []
         self.opens = []
+        self.prefetches = []
         self.create_errors = {}
         self.transports = []
         self.ssh_clients = []
@@ -1857,6 +1867,26 @@ class TestSSHBackendOnThePool(_BackendTestCase):
                 holder.release()
             reader.join(3)
 
+    def test_bounded_copy_distinguishes_unsupported_handle_stat_from_io_failure(self):
+        backend = self._new_backend()
+        payload = b"source bytes"
+        self.server.payload = payload
+        with tempfile.TemporaryDirectory() as directory:
+            dest = Path(directory) / "download"
+            for error in (OSError("Operation unsupported"),
+                          OSError(errno.EOPNOTSUPP, "unsupported")):
+                with self.subTest(error=error), bounded_copy(len(payload)) as bound, \
+                        patch.object(_FakeRemoteFile, "stat", side_effect=error):
+                    backend.copy_to_local("/file", dest)
+                    self.assertEqual(bound.source_stats, [])
+                    self.assertEqual(dest.read_bytes(), payload)
+
+            with bounded_copy(len(payload)), \
+                    patch.object(_FakeRemoteFile, "stat", side_effect=OSError(errno.EIO, "io")):
+                with self.assertRaises(OSError) as raised:
+                    backend.copy_to_local("/file", dest)
+            self.assertEqual(raised.exception.errno, errno.EIO)
+
     def test_bulk_copy_and_eager_readdir_restore_context_on_error(self):
         from storage.fs import StorageFS
 
@@ -1877,6 +1907,12 @@ class TestSSHBackendOnThePool(_BackendTestCase):
             observed.append(is_interactive_request())
             raise RuntimeError("copy failed")
 
+        # No probe here: a stat after the copy that carried a version token
+        # would make the fill unconfirmed (sticky versioning), so the member
+        # has no stat, as the copy context is what this test is about.
+        no_stat = patch.object(backend, "stat", side_effect=NotImplementedError)
+        no_stat.start()
+        self.addCleanup(no_stat.stop)
         with interactive_request():
             with patch.object(backend, "copy_to_local", side_effect=copy_ok):
                 self.assertTrue(fs.cache_manager.fetch_into_cache(
@@ -1924,7 +1960,8 @@ class TestSSHBackendOnThePool(_BackendTestCase):
         self.addCleanup(fs.sync_manager.stop)
         holders = [_Holder(backend._pool) for _ in range(3)]
         copy_entered = threading.Event()
-        self.server.hooks["get"] = lambda _client, _path: copy_entered.set()
+        # A capped cold copy is one bounded sftp.open of the file (CTO-208-BOUNDED).
+        self.server.hooks["open"] = lambda _client, _path: copy_entered.set()
         opener = None
         try:
             self.assertFalse(fs.cache_manager.bulk_cold_copies)
@@ -1984,7 +2021,7 @@ class TestSSHBackendOnThePool(_BackendTestCase):
             if not release.wait(30):
                 raise AssertionError("copy gate was not released")
 
-        self.server.hooks["get"] = hold_copy
+        self.server.hooks["open"] = hold_copy
         self.server.hooks["listdir_attr"] = lambda _client, _path: listing.set()
         workers = []
         browser = None
@@ -2127,7 +2164,7 @@ class TestSSHBackendOnThePool(_BackendTestCase):
                 self.assertEqual(3, backend._pool.snapshot()["bulk_leased"])
                 self.assertFalse(fs.cache_manager.is_cached("/cold"))
                 self.assertIsNone(fs.state_manager.get_file_metadata("/cold"))
-                self.assertFalse(any(name == "get" for name, *_ in self.server.requests))
+                self.assertFalse(any(name == "open" for name, *_ in self.server.requests))
 
                 # The failed open installed no cache entry. With only the
                 # copy's bulk scope disabled, the same file uses the spare
@@ -2139,7 +2176,7 @@ class TestSSHBackendOnThePool(_BackendTestCase):
                     finally:
                         fs("release", "/cold", fd)
                 self.assertEqual(3, backend._pool.snapshot()["bulk_leased"])
-                self.assertEqual(1, sum(name == "get" for name, *_ in self.server.requests))
+                self.assertEqual(1, sum(name == "open" for name, *_ in self.server.requests))
                 self.assertTrue(fs.cache_manager.is_cached("/cold"))
                 self.assertIsNotNone(fs.state_manager.get_file_metadata("/cold"))
         except BaseException as exc:

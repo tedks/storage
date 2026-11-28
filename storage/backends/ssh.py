@@ -23,6 +23,8 @@ from .base import (
     MemberSourceMissing,
     StorageMemberCapabilities,
     WatcherSpec,
+    copy_bounded_stream,
+    current_copy_bound,
 )
 from .ssh_pool import (
     CommandTimeout, MemberConnection, SFTPLease, is_connection_error, is_transient_oserror,
@@ -121,12 +123,26 @@ def _connect_via_host_resolver(host: str, port: int, timeout: float,
     raise last_error
 
 
+def _handle_stat_unsupported(exc: OSError) -> bool:
+    """Whether an SFTPFile.stat() failure means the server lacks handle stat.
+
+    paramiko raises IOError(text), without an errno, for
+    SFTP_OP_UNSUPPORTED (the text is the server's, usually "Operation
+    unsupported"); a local errno of ENOSYS or EOPNOTSUPP says the same.
+    """
+    if exc.errno in (errno.ENOSYS, errno.EOPNOTSUPP, errno.ENOTSUP):
+        return True
+    return exc.errno is None and "unsupported" in str(exc).lower()
+
+
 class SSHBackend(Backend):
     """Backend for SSH/SFTP remote filesystems.
 
     One SSH transport per member, shared by every thread through a leased
     pool of SFTP channels (see ssh_pool.MemberConnection).
     """
+
+    supports_bounded_copy = True
 
     def __init__(self, name: str, host: str, remote_path: str,
                  username: str, password: Optional[str] = None,
@@ -565,9 +581,38 @@ class SSHBackend(Backend):
         # Ensure local parent directory exists
         local_path.parent.mkdir(parents=True, exist_ok=True)
 
-        self._with_sftp("copy_to_local", virtual_path,
-                        lambda sftp: sftp.get(remote_path, str(local_path)),
-                        timeout=self.sftp_operation_timeout, retry=True)
+        bound = current_copy_bound()
+        if bound is None:
+            self._with_sftp("copy_to_local", virtual_path,
+                            lambda sftp: sftp.get(remote_path, str(local_path)),
+                            timeout=self.sftp_operation_timeout, retry=True)
+            return
+
+        def bounded(sftp):
+            # One open of the remote file, at most bound.cap bytes and one
+            # probe read (CopyBound). prefetch(cap) queues read-ahead only for
+            # [0, cap) (paramiko 4: SFTPFile.prefetch(file_size)), so it stays
+            # bounded; the probe at cap is an ordinary request afterwards.
+            # Without prefetch, paramiko 4 dispatches each read as synchronous
+            # 32 KiB SFTP requests (one round trip each).
+            with sftp.open(remote_path, "rb") as fin, open(local_path, "wb") as fout:
+                fin.prefetch(bound.cap)
+                copy_bounded_stream(fin.read, fout.write, bound)
+                # The open handle's own attributes (one SFTP fstat round
+                # trip): the version the bytes came from, whatever the path
+                # names by the confirmation. A server without handle stat
+                # gives no such evidence; any other error fails the copy.
+                try:
+                    bound.source_stats.append(fin.stat())
+                except OSError as exc:
+                    if not _handle_stat_unsupported(exc):
+                        raise
+
+        # Not retried: a copy whose connection drops after the source was
+        # opened fails with that error, never reopens and copies again (one
+        # source, opened once). The open's own failure fails it too.
+        self._with_sftp("copy_to_local", virtual_path, bounded,
+                        timeout=self.sftp_operation_timeout)
 
     def copy_from_local(self, local_path: Path, virtual_path: str):
         """Copy a local file to remote"""

@@ -1063,6 +1063,29 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.assertTrue(read.called)
         self.assertEqual((self.cache_dir / "inline.bin").read_bytes(), payload)
 
+    def test_inline_publication_without_a_token_is_never_versioned_and_kept(self):
+        # A-N4: a probe with no version token (no mtime) gives nothing an
+        # inline publication could fail to confirm: NEVER_VERSIONED, kept
+        # with conservative attributes (no write bits, no member mtime).
+        import stat
+        start, _ = self._fail_worker_starts(after=0)
+        payload = os.urandom(8192)
+        (self.backend_dir / "plain.bin").write_bytes(payload)
+        size_only = lambda path: SimpleNamespace(  # noqa: E731
+            st_size=len(payload), st_mode=stat.S_IFREG | 0o644)
+        with patch.object(threading.Thread, "start", start), \
+                patch.object(self.backend, "stat", side_effect=size_only):
+            fd = self.fs.open("/plain.bin", os.O_RDONLY)
+            session = self._session_for(fd)
+            self.assertEqual(self.fs.read("/plain.bin", len(payload), 0, fd), payload)
+            self.fs.release("/plain.bin", fd)
+        self.assertTrue(session.finalized)
+        self.assertEqual((self.cache_dir / "plain.bin").read_bytes(), payload)
+        self.assertEqual(self.fs._streaming_stats_snapshot().get("streaming_unconfirmed_discards", 0), 0)
+        with self.assertRaises(FuseOSError) as raised:
+            self.fs.open("/plain.bin", os.O_WRONLY)
+        self.assertEqual(raised.exception.errno, errno.EACCES)
+
     def test_retained_fill_whose_version_changed_releases_its_charge(self):
         manager = self.fs._streaming_manager
         self.backend.worker_gate = threading.Event()
@@ -1765,6 +1788,223 @@ class TestFSStreamingIntegration(unittest.TestCase):
         finally:
             self.fs.release("/" + name, vfd)
         return data, session
+
+    def _no_timestamp_fill(self, name, stat_kwargs):
+        """Stream name whole from a member whose stat gives no comparable
+        timestamp; return (bytes read, cache path) once it is installed."""
+        payload = os.urandom(96 * 1024)
+        (self.backend_dir / name).write_bytes(payload)
+        with patch.object(self.backend, "stat", **stat_kwargs):
+            data, session = self._stream_and_finish(name, len(payload))
+        cache_path = self.cache_dir / name
+        self.assertTrue(self._wait_for(cache_path.exists, timeout=8.0), "stream not installed")
+        self.assertEqual(data, payload)
+        self.assertEqual(cache_path.read_bytes(), payload)
+        return payload, cache_path
+
+    def _assert_warm_and_offline(self, name, payload):
+        with patch.object(self.backend, "read_file",
+                          side_effect=AssertionError("member read on a warm open")), \
+                patch.object(self.backend, "copy_to_local",
+                             side_effect=AssertionError("member download on a warm open")):
+            vfd = self.fs.open("/" + name, os.O_RDONLY)
+            try:
+                self.assertEqual(self.fs.read("/" + name, len(payload), 0, vfd), payload)
+            finally:
+                self.fs.release("/" + name, vfd)
+            self.backend.set_available(False)
+            try:
+                vfd = self.fs.open("/" + name, os.O_RDONLY)
+                try:
+                    self.assertEqual(self.fs.read("/" + name, len(payload), 0, vfd), payload)
+                finally:
+                    self.fs.release("/" + name, vfd)
+            finally:
+                self.backend.set_available(True)
+
+    def test_stream_from_a_member_without_stat_is_installed(self):
+        # The member has no stat: the session sized the file by get_size.
+        payload, _ = self._no_timestamp_fill(
+            "nostat.bin", {"side_effect": NotImplementedError()})
+        self._assert_warm_and_offline("nostat.bin", payload)
+        attrs = self.fs.getattr("/nostat.bin")
+        self.assertEqual(attrs["st_size"], len(payload))
+        self.assertEqual(attrs["st_mode"] & 0o222, 0)  # no member mode: fails closed
+
+    def test_stream_from_a_size_only_stat_is_installed(self):
+        from types import SimpleNamespace
+        payload, _ = self._no_timestamp_fill(
+            "sizeonly.bin", {"side_effect": lambda path: SimpleNamespace(
+                st_size=(self.backend_dir / "sizeonly.bin").stat().st_size)})
+        self._assert_warm_and_offline("sizeonly.bin", payload)
+        self.assertEqual(self.fs.getattr("/sizeonly.bin")["st_mode"] & 0o222, 0)
+
+    def test_stream_with_size_and_mode_but_no_mtime_keeps_the_mode(self):
+        import stat as stat_module
+        from types import SimpleNamespace
+        payload, _ = self._no_timestamp_fill(
+            "partial.bin", {"side_effect": lambda path: SimpleNamespace(
+                st_size=(self.backend_dir / "partial.bin").stat().st_size,
+                st_mode=stat_module.S_IFREG | 0o640, st_uid=4242)})
+        attrs = self.fs.getattr("/partial.bin")
+        self.assertEqual((stat_module.S_IMODE(attrs["st_mode"]), attrs["st_uid"]), (0o640, 4242))
+        self._assert_warm_and_offline("partial.bin", payload)
+
+    def test_cold_streaming_open_without_owner_read_is_refused(self):
+        import stat as stat_module
+        from types import SimpleNamespace
+        for mode in (0o200, 0o040):
+            with self.subTest(mode=oct(mode)):
+                name = f"noread{mode:o}.bin"
+                (self.backend_dir / name).write_bytes(os.urandom(64 * 1024))
+                real = self.backend.stat
+                with patch.object(self.backend, "stat", side_effect=lambda path: SimpleNamespace(
+                        st_size=real(path).st_size, st_mtime_ns=real(path).st_mtime_ns,
+                        st_mtime=real(path).st_mtime, st_mode=stat_module.S_IFREG | mode)):
+                    with self.assertRaises(FuseOSError) as raised:
+                        self.fs.open("/" + name, os.O_RDONLY)  # the first, cold open
+                self.assertEqual(raised.exception.errno, errno.EACCES)
+
+    def test_open_that_finds_the_stream_finished_checks_the_installed_inode(self):
+        # The probe has no mode, the confirmation reports 0o200 (same size and
+        # mtime): the installed inode records 0o200. An open that attaches to
+        # the finished session and falls back to that inode is refused.
+        import stat as stat_module
+        from types import SimpleNamespace
+        payload = os.urandom(64 * 1024)
+        (self.backend_dir / "late.bin").write_bytes(payload)
+        real, seen = self.backend.stat, []
+
+        def stats(path):
+            seen.append(path)
+            st = real(path)
+            mode = None if len(seen) == 1 else stat_module.S_IFREG | 0o200
+            return SimpleNamespace(st_size=st.st_size, st_mtime=st.st_mtime,
+                                   st_mtime_ns=st.st_mtime_ns, st_mode=mode)
+
+        with patch.object(self.backend, "stat", side_effect=stats):
+            vfd = self.fs.open("/late.bin", os.O_RDONLY)
+            with self.fs._fd_lock:
+                session = self.fs._fd_map[vfd].prefetch_session
+            self.fs.read("/late.bin", len(payload), 0, vfd)
+            self.assertTrue(self._wait_for(lambda: session.finalized, timeout=8.0))
+
+        def attach_finished(requested, canonical):
+            with session.lock:
+                session.refcount += 1
+            return session
+
+        # The race: the open saw no cached file and attached to the session,
+        # which then finished and installed before os.open.
+        with patch.object(self.fs, "_create_or_attach_prefetch_session", side_effect=attach_finished), \
+                patch.object(self.fs.cache_manager, "is_cached", return_value=False):
+            with self.assertRaises(FuseOSError) as raised:
+                self.fs.open("/late.bin", os.O_RDONLY)
+        self.assertEqual(raised.exception.errno, errno.EACCES)
+        self.fs.release("/late.bin", vfd)
+
+    def test_changed_cached_file_streams_again_for_a_read_only_open(self):
+        # Streaming on: a read-only open of a changed cached file takes the
+        # ordinary path, a stream, with no whole-file download first.
+        import dataclasses
+        first = os.urandom(64 * 1024)
+        member = self.backend_dir / "kept.bin"
+        member.write_bytes(first)
+        os.utime(member, (1_600_000_000, 1_600_000_000))
+        self._stream_and_finish("kept.bin", len(first))
+        self.assertTrue(self._wait_for((self.cache_dir / "kept.bin").exists, timeout=8.0))
+        second = os.urandom(64 * 1024)
+        member.write_bytes(second)
+        os.utime(member, (1_650_000_000, 1_650_000_000))
+        with self.fs._member_checks_lock:
+            for path, check in list(self.fs._member_checks.items()):
+                self.fs._member_checks[path] = dataclasses.replace(
+                    check, verified_at=check.verified_at - 10_000)
+        with patch.object(self.backend, "copy_to_local",
+                          side_effect=AssertionError("a whole-file download")):
+            vfd = self.fs.open("/kept.bin", os.O_RDONLY)
+            try:
+                with self.fs._fd_lock:
+                    self.assertIsNotNone(self.fs._fd_map[vfd].prefetch_session)
+                self.assertEqual(self.fs.read("/kept.bin", 4096, 0, vfd), second[:4096])
+            finally:
+                self.fs.release("/kept.bin", vfd)
+
+    def test_streaming_fill_with_an_unconfirmed_mode_grants_no_write(self):
+        # No version token, a mode only the probe reported: the staging
+        # file's own owner write is not granted through the mount.
+        import stat as stat_module
+        from types import SimpleNamespace
+        payload = os.urandom(64 * 1024)
+        (self.backend_dir / "staged.bin").write_bytes(payload)
+        seen = []
+
+        def probe_then_fail(path):
+            seen.append(path)
+            if len(seen) == 1:
+                return SimpleNamespace(st_size=len(payload), st_mode=stat_module.S_IFREG | 0o644)
+            raise OSError(errno.EIO, "stat failed")
+
+        with patch.object(self.backend, "stat", side_effect=probe_then_fail):
+            self._stream_and_finish("staged.bin", len(payload))
+            self.assertTrue(self._wait_for((self.cache_dir / "staged.bin").exists, timeout=8.0))
+        self.assertEqual(self.fs.getattr("/staged.bin")["st_mode"] & 0o222, 0)
+
+    def test_rewrite_during_range_reads_with_a_lost_final_stat_is_not_published(self):
+        # A comparable probe; the member is rewritten (same size) while the
+        # ranges are read; the stat after the stream fails. The mixed bytes
+        # are never installed under either version, and a later open with
+        # the member answering reads the new version.
+        old, new = b"o" * (96 * 1024), b"n" * (96 * 1024)
+        member = self.backend_dir / "mixed.bin"
+        member.write_bytes(old)
+        os.utime(member, (1_600_000_000, 1_600_000_000))
+        real_read, real_stat = self.backend.read_file, self.backend.stat
+        state = {"rewritten": False, "stats": 0}
+
+        def read_then_rewrite(path, offset, size):
+            data = real_read(path, offset, size)
+            if not state["rewritten"]:
+                state["rewritten"] = True
+                member.write_bytes(new)
+                os.utime(member, (1_650_000_000, 1_650_000_000))
+            return data
+
+        def probe_then_fail(path):
+            state["stats"] += 1
+            if state["stats"] == 1:
+                return real_stat(path)
+            raise OSError(errno.EIO, "stat failed")
+
+        with patch.object(self.backend, "read_file", side_effect=read_then_rewrite), \
+                patch.object(self.backend, "stat", side_effect=probe_then_fail):
+            data, session = self._stream_and_finish("mixed.bin", len(old))
+            self.assertTrue(self._wait_for(lambda: self.fs._streaming_manager._streaming_stats.get(
+                "streaming_unconfirmed_discards") == 1, timeout=8.0))
+        self.assertNotIn("streaming_member_changed_discards",
+                         self.fs._streaming_manager._streaming_stats)
+        self.assertNotEqual(data, new)  # it read from both versions
+        self.assertFalse((self.cache_dir / "mixed.bin").exists())
+        self.assertIsNone(self.fs.state_manager.get_file_metadata("/mixed.bin"))
+        data2, _ = self._stream_and_finish("mixed.bin", len(new))
+        self.assertEqual(data2, new)
+        self.assertTrue(self._wait_for((self.cache_dir / "mixed.bin").exists, timeout=8.0))
+        self.assertEqual((self.cache_dir / "mixed.bin").read_bytes(), new)
+        self.assertEqual(self.fs.getattr("/mixed.bin")["st_mtime"], 1_650_000_000)
+
+    def test_stream_whose_size_only_stat_changes_size_is_discarded(self):
+        # Control: positive evidence of another version still discards.
+        from types import SimpleNamespace
+        payload = os.urandom(96 * 1024)
+        (self.backend_dir / "grew.bin").write_bytes(payload)
+        sizes = iter([len(payload), len(payload) + 1, len(payload) + 1, len(payload) + 1])
+        with patch.object(self.backend, "stat",
+                          side_effect=lambda path: SimpleNamespace(st_size=next(sizes))):
+            data, session = self._stream_and_finish("grew.bin", len(payload))
+            self.assertTrue(self._wait_for(lambda: self.fs._streaming_manager._streaming_stats.get(
+                "streaming_member_changed_discards") == 1, timeout=8.0))
+        self.assertEqual(data, payload)
+        self.assertFalse((self.cache_dir / "grew.bin").exists())
 
     def test_streaming_fill_of_a_member_changed_since_its_probe_is_discarded(self):
         old, new = b"o" * (64 * 1024), b"n" * (64 * 1024)
