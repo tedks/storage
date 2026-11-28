@@ -2785,6 +2785,21 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.assertEqual(self.fs.cache_manager._reserved_bytes, 0)
         self.fs.release('/charged.bin', vfd_b)
 
+    def test_non_oserror_at_registration_leaves_nothing_behind(self):
+        # R3-I3: whatever the registration rename raises, the staging file
+        # and descriptor go and nothing is registered.
+        manager = self.fs._streaming_manager
+        (self.backend_dir / "audit.bin").write_bytes(b"x" * 8192)
+        before = manager.session_descriptor_count()
+        with patch("storage.streaming.os.replace", side_effect=RuntimeError("audit hook")), \
+                self.assertLogs(self.fs.logger, level="ERROR"), \
+                self.assertRaises(FuseOSError) as failure:
+            self.fs.open('/audit.bin', os.O_RDONLY)
+        self.assertEqual(failure.exception.errno, errno.EIO)
+        self.assertEqual(list(self.cache_dir.glob("*.storage.partial")), [])
+        self.assertEqual(manager.session_descriptor_count(), before)
+        self.assertEqual(manager.list_download_sessions(), [])
+
     def test_attach_in_the_finalize_window_opens_the_installed_file(self):
         # R3-I5: finalize decided to close the descriptor (no readers) and
         # is recording the file when an open attaches; the descriptor is

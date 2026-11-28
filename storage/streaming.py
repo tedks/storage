@@ -1996,48 +1996,51 @@ class StreamingReadManager:
                 raise OSError(errno.ENOMEM, "streaming session allocation failed") from exc
             raise
 
-        with self.prefetch_sessions_lock:
-            if self._destroying:
-                self._discard_unregistered_prefetch_session(session)
-                raise OSError(errno.EINTR, "streaming manager is shutting down")
-            existing = self.prefetch_sessions.get(canonical_path)
-            if existing:
-                try:
+        # Until it is registered, the staging session (its descriptor and
+        # file) is this open's: every way out below that does not register
+        # it discards it, whatever was raised.
+        registered = False
+        try:
+            with self.prefetch_sessions_lock:
+                if self._destroying:
+                    raise OSError(errno.EINTR, "streaming manager is shutting down")
+                existing = self.prefetch_sessions.get(canonical_path)
+                if existing:
                     attached = self._attach(existing)
-                except _CleanupPending:
-                    self._discard_unregistered_prefetch_session(session)
+                    if attached is not None:
+                        return attached
+                    # A failed session left the registry: register this one.
+                if os.path.lexists(final_cache_path):
+                    # A concurrent fill or local writer already owns the final path.
+                    return self._final_path_outcome(canonical_path, final_cache_path)
+                # No registered session owns the name. An orphan left by an
+                # earlier unlink failure can be replaced safely here.
+                try:
+                    os.replace(staging_path, partial_cache_path)
+                except OSError as exc:
+                    self.report_open_error("cache_register", exc)
                     raise
-                if attached is not None:
-                    self._discard_unregistered_prefetch_session(session)
-                    return attached
-                # A failed session left the registry: register this one.
-            if os.path.lexists(final_cache_path):
-                # A concurrent fill or local writer already owns the final path.
+                session.partial_cache_path = partial_cache_path
+                self.prefetch_sessions[canonical_path] = session
+                registered = True
+        finally:
+            if not registered:
                 self._discard_unregistered_prefetch_session(session)
-                return self._final_path_outcome(canonical_path, final_cache_path)
-            # No registered session owns the name. An orphan left by an
-            # earlier unlink failure can be replaced safely here.
-            try:
-                os.replace(staging_path, partial_cache_path)
-            except OSError as exc:
-                self._discard_unregistered_prefetch_session(session)
-                self.report_open_error("cache_register", exc)
-                raise
-            session.partial_cache_path = partial_cache_path
-            self.prefetch_sessions[canonical_path] = session
 
-        self.cache_manager.mark_cache_size_dirty()
-        self._record_streaming_stat("streaming_sessions_started", 1)
-
-        self.logger.info(
-            "streaming session started for %s via backend %s (size=%d, chunk=%d)",
-            canonical_path,
-            backend.name,
-            file_size,
-            session.chunk_size,
-        )
-        self._update_streaming_state_xattr(session, "awaiting-read")
-
+        # Registered: the caller owns the ref, and bookkeeping does not fail the open.
+        try:
+            self.cache_manager.mark_cache_size_dirty()
+            self._record_streaming_stat("streaming_sessions_started", 1)
+            self.logger.info(
+                "streaming session started for %s via backend %s (size=%d, chunk=%d)",
+                canonical_path,
+                backend.name,
+                file_size,
+                session.chunk_size,
+            )
+            self._update_streaming_state_xattr(session, "awaiting-read")
+        except Exception:
+            self.logger.exception("streaming session start bookkeeping failed")
         return session
 
     def _should_stop_on_last_close(self, session: PrefetchSession) -> bool:
