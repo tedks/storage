@@ -863,8 +863,14 @@ class CacheManager:
             if getattr(self._fill_errno, "code", None) is None:
                 # What the open reports (take_fill_errno): the transfer's own
                 # error (EIO when it carries none), never "absent".
-                self._fill_errno.code = (exc.errno if isinstance(exc, OSError) and exc.errno
-                                         else errno.EIO)
+                # A transfer's ENOENT (its temp file swept, or the member
+                # file gone mid-copy) is EIO: only cache_file_result's
+                # exists() probe confirms absence (_ensure_file_in_cache).
+                self._fill_errno.code = (
+                    errno.EIO if isinstance(exc, FileNotFoundError)
+                    else exc.errno if isinstance(exc, OSError) and exc.errno
+                    else errno.EHOSTUNREACH if isinstance(exc, ConnectionError)
+                    else errno.EIO)
             raise
         finally:
             if extra_reserved:

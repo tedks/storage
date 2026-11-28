@@ -2602,6 +2602,17 @@ class TestRefreshRound5(RevalidateTestBase):
         self.assertFalse(self.stale_mark())
         self.fs.release("/live.log", self.fs.open("/live.log", os.O_RDWR))
 
+    def test_a_refresh_that_finds_the_file_gone_clears_the_mark(self):
+        # Gone between the check and the fill: the copy is the one left.
+        self.stale_copy()
+        self.age_checks()
+        real_copy = self.member.copy_to_local
+        with patch.object(self.member, "exists", return_value=False):
+            fh = self.fs.open("/live.log", os.O_RDWR)
+            self.fs.release("/live.log", fh)
+        self.assertFalse(self.stale_mark())
+        del real_copy
+
     def refreshed_with_checksums(self):
         from storage.models import FileLocation
         self.changed_v1()
@@ -2665,6 +2676,24 @@ class TestRefreshRound5(RevalidateTestBase):
         self.assertFalse((self.cache_dir / "live.log").exists())
         self.assertEqual(self.fs.state_manager.get_file_metadata("/live.log").sync_status,
                          SyncStatus.CLEAN)
+
+    def test_a_warm_refresh_after_read_revocation_gives_eacces(self):
+        self.changed_v1()
+        real = self.member.stat
+
+        def revoked(path):
+            st = real(path)
+            return SimpleNamespace(st_size=st.st_size, st_mtime=st.st_mtime,
+                                   st_mtime_ns=st.st_mtime_ns, st_mode=stat.S_IFREG | 0o200)
+
+        # The refresh does not settle (the member keeps growing), so only the
+        # denial decides: never last good.
+        with patch.object(self.member, "stat", side_effect=revoked), self.growing_copy():
+            self.assert_errno(errno.EACCES, self.fs.open, "/live.log", os.O_RDONLY)
+            # The copy is dropped, not kept for later opens.
+            self.assertFalse((self.cache_dir / "live.log").exists())
+            # And the next open, within the age, too: last good is not served.
+            self.assert_errno(errno.EACCES, self.fs.open, "/live.log", os.O_RDONLY)
 
     def test_a_denial_in_any_confirmation_survives_a_mode_less_one(self):
         # Probe: a token, no mode. First confirmation: 0o200 and no mtime
@@ -2734,6 +2763,46 @@ class TestRefreshRound5(RevalidateTestBase):
         self.assertTrue(bound.grew)
         del src
 
+    def test_the_copy_being_refreshed_is_pinned_against_its_own_eviction(self):
+        # Room for one copy only: the refresh's reservation could be met by
+        # evicting the copy it would fall back to.
+        self.changed_v1()
+        self.fs.cache_manager.max_size_bytes = 15
+        with self.growing_copy():
+            self.assertEqual(self.read_through("/live.log"), b"version 1")
+        self.assertEqual((self.cache_dir / "live.log").read_bytes(), b"version 1")
+        self.assertTrue(self.stale_mark())
+        self.assertEqual(self.fs._refreshing, set())
+
+    def test_a_conflict_view_whose_member_has_no_file_is_enoent(self):
+        self.assert_errno(errno.ENOENT, self.fs.open, "/absent.txt.member", os.O_RDONLY)
+
+    def test_a_conflict_view_that_does_not_fit_is_enospc(self):
+        self.rewrite_member("f.txt", b"member bytes")
+        with patch.object(self.fs.cache_manager, "ensure_space", return_value=False), \
+                patch.object(self.fs.cache_manager, "reclaim_space", None):
+            self.assert_errno(errno.ENOSPC, self.fs.open, "/f.txt.member", os.O_RDONLY)
+
+    def test_an_access_time_update_failing_after_the_install_is_not_enospc(self):
+        import sqlite3
+        self.rewrite_member("f.txt", b"member bytes")
+        real, calls = self.fs.state_manager.update_access_time, []
+
+        def once(path):
+            calls.append(path)
+            if len(calls) == 1:  # the one in cache_file_result, after the install
+                raise sqlite3.OperationalError("database is locked")
+            return real(path)
+
+        with patch.object(self.fs.state_manager, "update_access_time", side_effect=once):
+            self.assertEqual(self.read_through("/f.txt"), b"member bytes")
+        row = self.fs.state_manager.get_file_metadata("/f.txt")
+        self.assertEqual(row.sync_status, SyncStatus.CLEAN)
+        # Baselined as an install: the next open within the age stats nothing.
+        with self.count_stats() as stats:
+            self.assertEqual(self.read_through("/f.txt"), b"member bytes")
+        self.assertEqual(stats.call_count, 0)
+
     def refresh_raising(self, method, exc, writer_errno):
         self.changed_v1()
         with patch.object(self.member, method, side_effect=exc):
@@ -2749,6 +2818,14 @@ class TestRefreshRound5(RevalidateTestBase):
         with patch.object(self.member, method, side_effect=exc):
             self.assert_errno(writer_errno, self.fs.open, "/live.log", os.O_RDWR)
         self.assertEqual((self.cache_dir / "live.log").read_bytes(), b"version 1")
+
+    def test_a_refresh_without_capacity_in_time_keeps_last_good(self):
+        from storage.backends.ssh_pool import BulkCapacityTimeout
+        self.refresh_raising("copy_to_local", BulkCapacityTimeout("no capacity"), errno.EAGAIN)
+
+    def test_a_refresh_whose_member_is_unreachable_keeps_last_good(self):
+        from storage.backends.ssh_pool import MemberUnavailable
+        self.refresh_raising("exists", MemberUnavailable("down"), errno.EHOSTUNREACH)
 
     def test_a_no_baseline_check_reads_st_mtime_ns_alone(self):
         self.rewrite_member("f.txt", b"original", mtime=1_000_000_000)
