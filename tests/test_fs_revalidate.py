@@ -318,7 +318,8 @@ class TestMemberAttributes(RevalidateTestBase):
 
         st = (self.cache_dir / "f.txt").stat()
         warm = self.fs.getattr("/f.txt")
-        self.assertEqual(warm["st_mode"], st.st_mode)
+        # No member mode: the native mode, read-only until a chmod.
+        self.assertEqual(warm["st_mode"], st.st_mode & ~0o222)
         self.assertEqual((warm["st_uid"], warm["st_gid"]), (st.st_uid, st.st_gid))
         self.assertEqual(warm["st_mtime"], incomplete.st_mtime)
 
@@ -584,6 +585,38 @@ class TestCreatedAndChangedFiles(RevalidateTestBase):
         self.assertEqual(stat.S_IMODE(cached.stat().st_mode), 0o444)
 
 
+class TestFillConfirmsMemberVersion(RevalidateTestBase):
+    """A fill attaches the probe's attributes only when the member still
+    reports that version after the transfer."""
+
+    def test_member_rewritten_at_the_same_size_after_its_probe(self):
+        src = self.rewrite_member("f.txt", b"original", mtime=1_000_000_000)
+        os.chmod(src, 0o644)
+        copy_to_local = self.member.copy_to_local
+
+        def rewritten_first(path, temp):
+            src.write_bytes(b"newbytes")  # same size, after the probe
+            os.utime(src, (1_100_000_000, 1_100_000_000))
+            copy_to_local(path, temp)
+
+        with patch.object(self.member, "copy_to_local", side_effect=rewritten_first):
+            self.assertEqual(self.read_through("/f.txt"), b"newbytes")
+        cached = self.cache_dir / "f.txt"
+        # The copy's own captured mtime stays; the probe's older one is not
+        # attached to the newer bytes, and its mode is not trusted either.
+        self.assertEqual(cached.stat().st_mtime, 1_100_000_000)
+        attrs = self.fs.getattr("/f.txt")
+        self.assertEqual(attrs["st_mtime"], 1_100_000_000)
+        self.assertEqual(attrs["st_mode"] & 0o222, 0)
+
+    def test_unchanged_member_keeps_its_attributes(self):
+        src = self.rewrite_member("f.txt", b"original", mtime=1_000_000_000)
+        os.chmod(src, 0o640)
+        self.assertEqual(self.read_through("/f.txt"), b"original")
+        attrs = self.fs.getattr("/f.txt")
+        self.assertEqual((attrs["st_mtime"], stat.S_IMODE(attrs["st_mode"])), (1_000_000_000, 0o640))
+
+
 class TestConflictViewClose(RevalidateTestBase):
     """A conflict view's close sends its copy to the member when the copy
     changed while the descriptor was open, whatever its open flags."""
@@ -668,8 +701,9 @@ class TestRevalidateOnOpen(RevalidateTestBase):
         self.age_checks()
         with self.count_stats() as stat:
             self.assertEqual(b"changed-and-longer", self.read_through("/f.txt"))
-        # The check's stat is also the refetch's baseline.
-        self.assertEqual(1, stat.call_count)
+        # The check's stat is also the refetch's baseline; one more confirms
+        # the transfer read that version.
+        self.assertEqual(2, stat.call_count)
         self.assertEqual(b"changed-and-longer", (self.cache_dir / "f.txt").read_bytes())
         meta = self.fs.state_manager.get_file_metadata("/f.txt")
         self.assertEqual(SyncStatus.CLEAN, meta.sync_status)
@@ -795,7 +829,8 @@ class TestRevalidateOnOpen(RevalidateTestBase):
         self.age_checks()
         with self.count_stats() as stat:
             self.assertEqual(b"changed-and-longer", self.read_through("/f.txt"))
-        self.assertEqual(1, stat.call_count)
+        # The check's stat, and one confirming the refetch's transfer.
+        self.assertEqual(2, stat.call_count)
         self.assertEqual({"member": (len(b"changed-and-longer"), 1_700_000_500.0)},
                          self.fs._member_checks["/f.txt"].members)
         self.assertNotIn("/f.txt", self.fs._pinned_stats)
@@ -1408,7 +1443,8 @@ class TestRevalidateFromListing(RevalidateTestBase):
                 at, attrs, unknown = self.fs.namespace.entry_attrs["/"]
                 self.fs.namespace.entry_attrs["/"] = (at - 10, attrs, unknown)
             self.assertEqual(b"changed-and-longer", self.read_through("/f.txt"))
-        self.assertEqual(1, stat.call_count)
+        # The check's stat, and one confirming the refetch's transfer.
+        self.assertEqual(2, stat.call_count)
 
     def test_changed_listing_falls_back_to_a_stat_and_refetches(self):
         self.rewrite_member("f.txt", b"ORIGINAL", mtime=1_600_000_000)
@@ -1416,7 +1452,8 @@ class TestRevalidateFromListing(RevalidateTestBase):
         self.list_root()
         with self.count_stats() as stat:
             self.assertEqual(b"ORIGINAL", self.read_through("/f.txt"))
-        self.assertEqual(1, stat.call_count)
+        # The check's stat, and one confirming the refetch's transfer.
+        self.assertEqual(2, stat.call_count)
 
     def test_listing_older_than_the_age_is_ignored(self):
         self.list_root()
@@ -1443,7 +1480,8 @@ class TestRevalidateFromListing(RevalidateTestBase):
             self.fs._recheck["/f.txt"] = {"member"}
         with self.count_stats() as stat:
             self.read_through("/f.txt")
-        self.assertEqual(1, stat.call_count)
+        # The check's stat, and one confirming the refetch's transfer.
+        self.assertEqual(2, stat.call_count)
 
     def test_member_without_a_baseline_is_stat_ed(self):
         with self.fs._member_checks_lock:

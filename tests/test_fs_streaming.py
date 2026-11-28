@@ -136,6 +136,55 @@ class TestFSStreamingIntegration(unittest.TestCase):
 
         self.fs.release('/large.bin', vfd)
 
+    def _stream_whole(self, name, size):
+        vfd = self.fs.open("/" + name, os.O_RDONLY)
+        try:
+            data = self.fs.read("/" + name, size, 0, vfd)
+        finally:
+            self.fs.release("/" + name, vfd)
+        cache_path = self.cache_dir / name
+        self.assertTrue(self._wait_for(cache_path.exists, timeout=8.0))
+        return data, cache_path
+
+    def test_streaming_fill_without_member_mode_is_read_only(self):
+        # Size and mtime known, mode missing: the staging file's own mode
+        # (owner-writable) must not become the reported, enforced one.
+        import stat as stat_module
+        from types import SimpleNamespace
+        payload = os.urandom(64 * 1024)
+        (self.backend_dir / "nomode.bin").write_bytes(payload)
+        os.chmod(self.backend_dir / "nomode.bin", 0o444)
+        fake = SimpleNamespace(st_size=len(payload), st_mtime=1_600_000_000.0, st_mode=None)
+        with patch.object(self.backend, "stat", return_value=fake):
+            data, cache_path = self._stream_whole("nomode.bin", len(payload))
+        self.assertEqual(data, payload)
+        attrs = self.fs.getattr("/nomode.bin")
+        self.assertEqual(attrs["st_mode"] & 0o222, 0)
+        self.assertEqual(attrs["st_mtime"], 1_600_000_000.0)
+        with self.assertRaises(FuseOSError) as raised:
+            self.fs.open("/nomode.bin", os.O_WRONLY)
+        self.assertEqual(raised.exception.errno, errno.EACCES)
+        # An explicit chmod through the mount grants write.
+        self.fs.chmod("/nomode.bin", 0o644)
+        self.fs.release("/nomode.bin", self.fs.open("/nomode.bin", os.O_WRONLY))
+        self.assertTrue(stat_module.S_ISREG(attrs["st_mode"]))
+
+    def test_streaming_fill_of_a_member_changed_since_its_probe_keeps_no_old_mtime(self):
+        from types import SimpleNamespace
+        payload = os.urandom(64 * 1024)
+        member = self.backend_dir / "moved.bin"
+        member.write_bytes(payload)
+        os.utime(member, (1_600_000_000, 1_600_000_000))
+        probe = self.backend.stat("/moved.bin")
+        later = SimpleNamespace(st_size=probe.st_size, st_mtime=1_650_000_000.0,
+                                st_mode=probe.st_mode)
+        # The probe at open, then the member (same size) at finalize.
+        with patch.object(self.backend, "stat", side_effect=[probe, later, later, later]):
+            data, cache_path = self._stream_whole("moved.bin", len(payload))
+        self.assertEqual(data, payload)
+        self.assertNotEqual(cache_path.stat().st_mtime, 1_600_000_000)
+        self.assertNotEqual(self.fs.getattr("/moved.bin")["st_mtime"], 1_600_000_000)
+
     def test_streaming_open_uses_cached_file_without_prefetch_session(self):
         payload = os.urandom(128 * 1024)
         (self.backend_dir / "warm.bin").write_bytes(payload)

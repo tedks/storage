@@ -20,7 +20,8 @@ from typing import Callable, ContextManager, Optional, List, Set
 from .backends.base import Backend, bulk_request
 from .backends.ssh_pool import BulkCapacityCancelled, BulkCapacityTimeout
 from .cache_metadata import (
-    PARTIAL_SUFFIX, PREFIX_XATTR, copy_member_attributes, regular_file_stat, write_cache_metadata,
+    PARTIAL_SUFFIX, PREFIX_XATTR, confirm_member_stat, copy_member_attributes, regular_file_stat,
+    write_cache_metadata,
 )
 from .member_repairs import VIEW_WRITE, MemberRepairs, is_at_or_under
 from .pathing import resolve_path
@@ -547,6 +548,7 @@ class CacheManager:
             if not st.st_mode & stat_module.S_IRUSR:
                 os.chmod(temp_path, stat_module.S_IMODE(st.st_mode) | stat_module.S_IRUSR,
                          follow_symlinks=False)
+            member_stat = confirm_member_stat(backend, source_virtual_path, member_stat)
             fd = os.open(temp_path, os.O_RDONLY | os.O_NOFOLLOW)
             try:
                 copy_member_attributes(fd, member_stat)

@@ -53,6 +53,40 @@ def _source_time_ns(source, field: str, fallback: int) -> int:
     return fallback if seconds is None else round(seconds * 1_000_000_000)
 
 
+def _member_mtime_ns(st) -> Optional[int]:
+    ns = getattr(st, "st_mtime_ns", None)
+    if type(ns) is int:
+        return ns
+    seconds = getattr(st, "st_mtime", None)
+    if seconds is None or not math.isfinite(seconds):
+        return None
+    return round(seconds * 1_000_000_000)
+
+
+def confirm_member_stat(backend, virtual_path: str, probe):
+    """The pre-transfer probe if the member still reports it, else None.
+
+    Called after a transfer: a member rewritten between the probe and the
+    read, even at the same size, must not lend the probe's older mtime,
+    mode or owner to the newer bytes. Both stats must report the same size
+    and mtime; anything else (no probe, a failed stat, a field missing)
+    is no confirmation, and the fill keeps its own native attributes
+    (copy_member_attributes with no source). Costs one member stat a fill.
+    """
+    if probe is None:
+        return None
+    try:
+        after = backend.stat(virtual_path)
+    except Exception:  # noqa: BLE001 - no confirmation, whatever the member raised
+        return None
+    size = getattr(probe, "st_size", None)
+    mtime = _member_mtime_ns(probe)
+    if (size is None or mtime is None or getattr(after, "st_size", None) != size
+            or _member_mtime_ns(after) != mtime):
+        return None
+    return probe
+
+
 def copy_member_attributes(fd: int, source) -> None:
     """Apply the member's stat to a private, fully downloaded inode.
 
@@ -71,11 +105,14 @@ def copy_member_attributes(fd: int, source) -> None:
         source = None
     mode = getattr(source, "st_mode", None)
     permissions = local.st_mode if mode is None else mode
-    # Without a usable member mode, the downloaded file's own mode (copied
-    # by a local member, the transfer's default otherwise) is reported and
-    # enforced, so a read-only file stays read-only although the backing
-    # inode gains owner write below.
+    # Without a member mode it can trust, an import fails closed: the
+    # downloaded file's own mode (a local member's copy, a transfer's or a
+    # streaming staging file's default otherwise) is reported and enforced
+    # without write bits, so a read-only member file never becomes
+    # writable. A chmod through the mount grants write explicitly.
     visible_mode = stat.S_IFREG | stat.S_IMODE(permissions)
+    if mode is None:
+        visible_mode &= ~(stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH)
     # Member IDs have no mapping to local groups or users. Only tighten
     # the staging inode's group and other permissions. An ACL mask keeps
     # the permissions the kernel chose when that ACL was installed.
@@ -115,7 +152,8 @@ def copy_member_attributes(fd: int, source) -> None:
             raise
         # A cache without user xattrs can still hold bytes and timestamps.
         # Only reserve write access when we can record the visible mode.
-        os.fchmod(fd, (permissions & 0o777) | stat.S_IRUSR)
+        os.fchmod(fd, (visible_mode & 0o777) | stat.S_IRUSR
+                  if mode is None else (permissions & 0o777) | stat.S_IRUSR)
 
 
 def record_native_attributes(fd: int) -> None:
