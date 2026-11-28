@@ -95,6 +95,16 @@ class TestCacheMetadata(unittest.TestCase):
             os.close(fd)
         self.assertEqual(cached_member_attributes(path, path.stat())["st_uid"], 4242)
 
+    def test_scan_orders_a_fill_by_its_ctime_not_the_member_atime(self):
+        path = self.cache_root / "filled"
+        path.write_bytes(b"file")
+        os.utime(path, (1_000_000_000, 1_000_000_000))  # the member's atime
+        entry, = scan_cache_entries(self.cache_root)
+        self.assertEqual(entry.stat_atime, path.stat().st_ctime)
+        os.utime(path, (4_000_000_000, 1_000_000_000))  # read later
+        entry, = scan_cache_entries(self.cache_root)
+        self.assertEqual(entry.stat_atime, 4_000_000_000)
+
     def test_write_and_read_round_trip(self):
         cache_path = self.cache_root / "video.mp4"
         cache_path.write_bytes(b"abc123")

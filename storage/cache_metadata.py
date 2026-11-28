@@ -688,7 +688,10 @@ def scan_cache_entries(cache_root: Path) -> Iterator[CacheScanEntry]:
                 virtual_path=virtual_path,
                 stat_size=st.st_size,
                 stat_mtime=st.st_mtime,
-                stat_atime=st.st_atime,
+                # A fill installs the member's atime, which says nothing of
+                # this cache's use; its ctime is the fill (or a later
+                # change), so the later of the two orders eviction.
+                stat_atime=max(st.st_atime, st.st_ctime),
                 metadata=metadata,
                 issues=issues,
             )
