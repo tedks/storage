@@ -767,6 +767,65 @@ class TestConflictViewClose(RevalidateTestBase):
         self.assertEqual(self.member_file.read_bytes(), b"MEMBER bytes")
         self.assertEqual(self.copies.call_count, 1)
 
+    def test_timestamp_change_alone_is_not_sent(self):
+        fh = self.fs.open("/f.txt.member", os.O_RDONLY)
+        self.fs.utimens("/f.txt.member", (1_200_000_000, 1_200_000_000))
+        self.fs.chmod("/f.txt.member", 0o600)
+        self.member_file.write_bytes(b"newer edit")
+        self.fs.release("/f.txt.member", fh)
+        self.assertEqual(self.member_file.read_bytes(), b"newer edit")
+        self.assertEqual(self.copies.call_count, 0)
+
+    def test_a_change_is_sent_by_the_first_close_only(self):
+        first = self.fs.open("/f.txt.member", os.O_RDONLY)
+        second = self.fs.open("/f.txt.member", os.O_RDONLY)
+        self.fs.truncate("/f.txt.member", 6)
+        self.fs.release("/f.txt.member", first)
+        self.assertEqual(self.member_file.read_bytes(), b"member")
+        self.member_file.write_bytes(b"newer edit")
+        self.fs.release("/f.txt.member", second)
+        self.assertEqual(self.member_file.read_bytes(), b"newer edit")
+        self.assertEqual(self.copies.call_count, 1)
+
+    def test_a_standalone_truncate_is_sent_by_a_later_close(self):
+        self.fs.truncate("/f.txt.member", 6)
+        self.assertEqual(self.member_file.read_bytes(), b"member bytes")
+        fh = self.fs.open("/f.txt.member", os.O_RDWR)
+        self.fs.release("/f.txt.member", fh)
+        self.assertEqual(self.member_file.read_bytes(), b"member")
+        self.assertEqual(self.copies.call_count, 1)
+
+    def test_a_failed_send_stays_pending(self):
+        fh = self.fs.open("/f.txt.member", os.O_WRONLY)
+        self.fs.write("/f.txt.member", b"MEMBER", 0, fh)
+        self.copies.side_effect = OSError(errno.EIO, "member down")
+        with self.assertLogs("storage.fs", level="ERROR"):
+            self.fs.release("/f.txt.member", fh)
+        self.assertEqual(self.member_file.read_bytes(), b"member bytes")
+        self.copies.side_effect = None
+        self.fs.release("/f.txt.member", self.fs.open("/f.txt.member", os.O_RDONLY))
+        self.assertEqual(self.member_file.read_bytes(), b"MEMBER bytes")
+
+    def test_a_change_recorded_during_a_send_stays_pending(self):
+        fh = self.fs.open("/f.txt.member", os.O_WRONLY)
+        self.fs.write("/f.txt.member", b"MEMBER", 0, fh)
+        real = type(self.member).copy_from_local.__get__(self.member)
+        ino = self.view.stat().st_ino
+
+        def racing(local, virtual):
+            real(local, virtual)
+            self.view.write_bytes(b"later bytes!")  # lands after the copy
+            self.fs._mark_view_changed(self.view, ino)
+
+        self.copies.side_effect = racing
+        self.fs.release("/f.txt.member", fh)
+        self.assertEqual(self.member_file.read_bytes(), b"MEMBER bytes")
+        self.copies.side_effect = None
+        self.fs.release("/f.txt.member", self.fs.open("/f.txt.member", os.O_RDONLY))
+        self.assertEqual(self.member_file.read_bytes(), b"later bytes!")
+        self.fs.release("/f.txt.member", self.fs.open("/f.txt.member", os.O_RDONLY))
+        self.assertEqual(self.copies.call_count, 2)
+
     def test_path_truncate_without_a_handle_stays_in_the_cached_copy(self):
         # As on master: nothing closes, so nothing is sent (a known gap).
         self.fs.truncate("/f.txt.member", 0)
