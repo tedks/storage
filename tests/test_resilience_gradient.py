@@ -210,8 +210,11 @@ class TestResilienceGradient(unittest.TestCase):
 
         cache_path = self.rt.cache_dir / "retain.bin"
         partial_path = self.rt.cache_dir / "retain.bin.storage.partial"
-        self.assertTrue(self._wait_for(lambda: cache_path.exists(), timeout=5.0))
-        self.assertFalse(partial_path.exists())
+        # Installation links the final name before it unlinks the partial
+        # (_install_partial), so the partial can briefly coexist with the
+        # cache file: wait for the installed state, not its first half.
+        self.assertTrue(self._wait_for(
+            lambda: cache_path.exists() and not partial_path.exists(), timeout=5.0))
 
     def test_invariant_cache_state_xattr_matches_filesystem(self):
         _ = self._write_remote_file("/xattr.bin", 128 * 1024)
