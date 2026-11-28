@@ -41,13 +41,23 @@ def _set_deadline(sock: socket.socket, deadline: float):
     sock.settimeout(remaining)
 
 
-def _read_line(sock: socket.socket, max_bytes: int, deadline: float) -> bytes | None:
-    """Read one frame, ending at LF. A connection can carry one request."""
+# The request older clients sent without a newline, ended by EOF instead.
+LEGACY_STATS_REQUEST = b"streaming-stats"
+
+
+def _read_line(sock: socket.socket, max_bytes: int, deadline: float,
+               unterminated: bytes | None = None) -> bytes | None:
+    """Read one frame, ending at LF. A connection can carry one request.
+
+    A frame ended by EOF is incomplete unless it is exactly `unterminated`.
+    """
     data = bytearray()
     while True:
         _set_deadline(sock, deadline)
         chunk = sock.recv(min(65536, max_bytes + 1 - len(data)))
         if not chunk:
+            if data and unterminated is not None and data == unterminated:
+                return bytes(data)
             if data:
                 raise ControlError("Incomplete control socket frame")
             return None
@@ -436,7 +446,8 @@ class ControlServer:
         # the connection quietly; anything the handler raises other than a
         # ControlError, OSError included, is a server bug and is logged.
         try:
-            frame = _read_line(conn, MAX_REQUEST_BYTES, time.monotonic() + REQUEST_TIMEOUT)
+            frame = _read_line(conn, MAX_REQUEST_BYTES, time.monotonic() + REQUEST_TIMEOUT,
+                               unterminated=LEGACY_STATS_REQUEST)
         except TimeoutError:
             # The deadline check and a recv timeout word this differently.
             response = {"error": "Control request timed out"}

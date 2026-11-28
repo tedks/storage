@@ -86,6 +86,26 @@ def test_fragmented_request_and_bounded_frames(cache):
         server.stop()
 
 
+def test_legacy_stats_request_may_end_at_eof(cache):
+    frames = []
+    server = server_for(cache, lambda frame: frames.append(frame) or {"frame": frame})
+    server.start()
+    try:
+        with socket_for(cache) as conn:
+            conn.sendall(b"streaming-stats")
+            conn.shutdown(socket.SHUT_WR)
+            assert read_response(conn) == {"frame": "streaming-stats"}
+        # Only that exact frame: anything else unterminated is incomplete.
+        for unterminated in (b"streaming-stats ", b"status", b"streaming-stat"):
+            with socket_for(cache) as conn:
+                conn.sendall(unterminated)
+                conn.shutdown(socket.SHUT_WR)
+                assert "Incomplete" in read_response(conn)["error"]
+        assert frames == ["streaming-stats"]
+    finally:
+        server.stop()
+
+
 def test_request_timeout_uses_a_shared_deadline(cache, monkeypatch):
     monkeypatch.setattr("storage.control.REQUEST_TIMEOUT", 0.3)
     server = server_for(cache, lambda _: {"command_ran": True})
