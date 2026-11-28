@@ -737,6 +737,133 @@ class TestCacheAccounting(unittest.TestCase):
         manager.mark_cache_size_dirty()
         self.assertEqual(manager.get_total_cache_size(), 0)
 
+    def _held_installed(self, name, blocks):
+        """A session descriptor that wrote `blocks` blocks, its inode then
+        installed at `name` (the partial name gone): held and named."""
+        manager = self.cache_manager
+        partial = self.cache_dir / (name + PARTIAL_SUFFIX)
+        fd = os.open(partial, os.O_RDWR | os.O_CREAT, 0o600)
+        self.assertTrue(manager.write_streaming_chunk(fd, 0, b"s" * (blocks * manager.block_size)))
+        final = self.cache_dir / name
+        os.link(partial, final)
+        partial.unlink()
+        return fd, final
+
+    def _assert_total(self, expected):
+        manager = self.cache_manager
+        self.assertEqual(manager.get_total_cache_size(), expected)
+        manager.mark_cache_size_dirty()
+        self.assertEqual(manager.get_total_cache_size(), expected)
+
+    def test_a_held_inode_grown_after_a_failed_pre_measurement_is_charged(self):
+        """R5: the holder is found by a stat alone, so an extent query that
+        fails before the write cannot hide a real grow from the charge."""
+        manager = self.cache_manager
+        block = manager.block_size
+        manager.max_size_bytes = 3 * block
+        fd, final = self._held_installed("grown", 1)
+        writer = os.open(final, os.O_RDWR)
+        real_extents = manager._extent_ranges
+        failing = [True]
+
+        def extents(*args, **kwargs):
+            if failing[0]:
+                raise OSError(errno.EIO, "extent query failed")
+            return real_extents(*args, **kwargs)
+
+        try:
+            with patch.object(manager, "_extent_ranges", side_effect=extents):
+                with manager.cache_size_change(fd=writer, span=(block, 3 * block)):
+                    failing[0] = False
+                    self.assertEqual(os.pwrite(writer, b"g" * (2 * block), block), 2 * block)
+            self.assertEqual(manager.get_total_cache_size(), 3 * block)
+            self.assertFalse(manager.ensure_space(block))
+            self._assert_total(3 * block)
+        finally:
+            os.close(writer)
+        manager.close_streaming_fd(fd)
+        self._assert_total(3 * block)
+        self.assertFalse(manager.ensure_space(block))
+
+    def test_o_trunc_of_a_held_inode_under_its_stream_charge_leaves_no_phantom(self):
+        """R5: the stream charged the blocks it wrote; the installed inode
+        is allocated fewer (compression). O_TRUNC through the name while a
+        reader is attached frees the whole charge, not the capped part."""
+        manager = self.cache_manager
+        block = manager.block_size
+        manager.max_size_bytes = 2 * block
+        fd, final = self._held_installed("compressed", 2)
+        reader = os.open(final, os.O_RDONLY)
+        try:
+            with _ReportedBlocks() as reported:
+                reported.set(final, block)  # two written blocks, one allocated
+                self._assert_total(2 * block)
+                with manager.cache_size_change(final):
+                    os.close(os.open(final, os.O_WRONLY | os.O_TRUNC))
+                self._assert_total(0)
+                self.assertEqual(manager._streaming_fds[fd].bytes, 0)
+                self.assertTrue(manager.ensure_space(2 * block))
+        finally:
+            os.close(reader)
+        manager.close_streaming_fd(fd)
+        self._assert_total(0)
+
+    def test_a_held_inode_changed_through_a_hard_link_alias_is_charged_once(self):
+        manager = self.cache_manager
+        block = manager.block_size
+        fd, final = self._held_installed("aliased", 2)
+        alias = self.cache_dir / "alias"
+        os.link(final, alias)
+        self._assert_total(2 * block)
+        with manager.cache_size_change(alias):
+            os.truncate(alias, block)
+        self._assert_total(block)
+        manager.close_streaming_fd(fd)
+        self._assert_total(block)
+
+    def test_allocations_are_withheld_while_a_held_charge_cannot_be_measured(self):
+        manager = self.cache_manager
+        block = manager.block_size
+        fd, final = self._held_installed("unmeasured", 1)
+        writer = os.open(final, os.O_RDWR)
+        real_fstat = os.fstat
+
+        def fstat(target):
+            if target == fd:
+                raise OSError(errno.EIO, "fstat failed")
+            return real_fstat(target)
+
+        try:
+            with patch("os.fstat", side_effect=fstat):
+                with manager.cache_size_change(fd=writer, span=(block, 2 * block)):
+                    os.pwrite(writer, b"g" * block, block)
+                self.assertTrue(manager._streaming_fds[fd].unmeasured)
+                self.assertFalse(manager.ensure_space(block))
+            # Measurable again: the next allocation recharges and proceeds.
+            self.assertTrue(manager.ensure_space(block))
+            self.assertFalse(manager._streaming_fds[fd].unmeasured)
+            self._assert_total(2 * block)
+        finally:
+            os.close(writer)
+        manager.close_streaming_fd(fd)
+        self._assert_total(2 * block)
+
+    def test_a_failed_write_to_a_held_inode_keeps_its_error(self):
+        manager = self.cache_manager
+        block = manager.block_size
+        fd, final = self._held_installed("failing", 1)
+        reader = os.open(final, os.O_RDONLY)
+        try:
+            with self.assertRaises(OSError) as raised:
+                with manager.cache_size_change(fd=reader, span=(0, block)):
+                    os.pwrite(reader, b"x", 0)
+            self.assertEqual(raised.exception.errno, errno.EBADF)
+            self._assert_total(block)
+        finally:
+            os.close(reader)
+        manager.close_streaming_fd(fd)
+        self._assert_total(block)
+
     def test_deleting_a_held_installed_inode_refunds_its_charge_once(self):
         """Nit 4: a promoted prefix is named while its session descriptor
         stays open; deleting the name, then closing, refunds the blocks
