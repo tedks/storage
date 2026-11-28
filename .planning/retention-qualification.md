@@ -14,7 +14,8 @@ Opening a large file to inspect its first few megabytes can make Storage downloa
 - [x] Verified all four Bazel gates in the Nix development shell at 0f02210 (49 of 49 targets passed, as reported in the PR #188 body).
 - [x] Published the branch as draft pull request #188 against the cache eviction branch.
 - [x] (2026-11-28) Addressed council round 1 nits: an integer read-ahead window from `streaming.set` and from profiles, a case-insensitive `all:` prefix with an error that names the expected form, the sub-chunk read-ahead note in the README, and this record. Focused suites for the changed modules pass.
-- [ ] Re-run all four Bazel gates on the commit that carries the round 1 fixes.
+- [x] (2026-11-28) Addressed the second full review: bounded percentage precision so a reported policy always serializes, exact parsing of the window string, and a mounted case for a window-only change on an unqualified file. Focused suites and the mounted streaming target pass.
+- [ ] Re-run all four Bazel gates on the commit that carries the review fixes.
 
 ## Surprises & Discoveries
 
@@ -26,9 +27,11 @@ On 2026-11-19 the implementation used `all:` to opt in to requiring every term, 
 
 On 2026-11-28, after council round 1, the read-ahead window accepts a non-negative integer of bytes as well as a size string, in `streaming.set` and in a profile, because `streaming.get` reports an integer and a JSON client should be able to send it back. The profile loader checks only the type and leaves the value to the parser the flag uses. The keep-after-close value stays string-only, since `get` reports its parsed structure, not a policy string. The `all:` prefix is matched case-insensitively and allows whitespace before the colon.
 
+Also on 2026-11-28, after a second full review, a percentage may have at most six decimal places. `streaming.get` reports percentages with `str()`, and an unbounded Fraction could exceed Python's 4300-digit int-to-string limit after `streaming.set` had already installed it. The window string is converted exactly and truncated to whole bytes rather than through `parse_size`'s float. Its digits are bounded and its value is at most 2**63 - 1 bytes in both forms. `parse_size` keeps its float conversion for the cache size, the chunk size and the keep-after-close byte terms.
+
 ## Outcomes & Retrospective
 
-The four Bazel gates passed at 0f02210 and the branch is published as draft PR #188. The round 1 fixes after that commit passed their focused suites and still need the four gates re-run on their head. The 2 GiB case uses a synthetic session with a declared size. The mounted cases use scratch files and the same control commands an operator runs.
+The four Bazel gates passed at 0f02210 and the branch is published as draft PR #188. The review fixes after that commit passed their focused suites and the mounted streaming target, and still need the four gates re-run on their head. The 2 GiB case uses a synthetic session with a declared size. The mounted cases use scratch files and the same control commands an operator runs.
 
 ## Context and Orientation
 
@@ -48,7 +51,7 @@ From the `retention-qualification` worktree, run the four Bazel quality gates us
 
 ## Validation and Acceptance
 
-`tests/test_fs_streaming.py` checks that a 1 MiB read of a synthetic 2 GiB file stops background work at 5 MiB until readers request a contiguous 644,245,095-byte span. It also checks the exact bound after a seek. `tests/test_mount_profiles.py` and `tests/test_cli_mount.py` cover legacy rules, larger-of rules, small files, and configuration precedence. `tests/test_streaming_system.py` checks both FUSE loops, including a 1 MiB read, a rejected mixed update, and the retention of an existing download after its qualification threshold is raised.
+`tests/test_fs_streaming.py` checks that a 1 MiB read of a synthetic 2 GiB file stops background work at 5 MiB until readers request a contiguous 644,245,095-byte span. It also checks the exact bound after a seek, and that a control request with an unreportable percentage changes nothing. `tests/test_mount_profiles.py` and `tests/test_cli_mount.py` cover legacy rules, larger-of rules, small files, and configuration precedence. `tests/test_streaming_system.py` checks both FUSE loops, including a 1 MiB read, a rejected mixed update, the retention of an existing download after its qualification threshold is raised, and a window-only change that wakes an unqualified file's worker and stops it at the new byte boundary.
 
 ## Idempotence and Recovery
 
@@ -65,3 +68,4 @@ The startup and live flags are `--streaming-keep-after-close` and `--streaming-r
 2026-11-19. Recorded the implementation and the acceptance criteria for the combined branch.
 
 2026-11-28. Recorded the gate pass at 0f02210, the draft PR, and the council round 1 fixes awaiting a gate re-run.
+2026-11-28. Recorded the second review's fixes and the new mounted case.
