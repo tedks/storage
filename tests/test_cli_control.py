@@ -806,6 +806,21 @@ def test_a_link_through_a_missing_directory_is_refused(tmp_path):
     assert canonical_mountpoint(str(tmp_path / "a")) == str((tmp_path / "a").resolve())
 
 
+def test_a_parent_through_a_regular_file_is_refused(tmp_path, monkeypatch):
+    # realpath accepts regular-file/.. lexically; the kernel lookup does not.
+    (tmp_path / "a").mkdir()
+    (tmp_path / "regular-file").write_text("not a directory")
+    with pytest.raises(ControlError, match="Not a directory"):
+        canonical_mountpoint(str(tmp_path / "regular-file" / ".." / "a" / "mount"))
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(ControlError, match="Not a directory"):
+        canonical_mountpoint("regular-file/../a")
+    link = tmp_path / "media"
+    link.symlink_to(tmp_path / "regular-file" / ".." / "a")
+    with pytest.raises(ControlError, match="Not a directory"):
+        canonical_mountpoint(str(link))
+
+
 def test_canonical_mountpoint_never_stats_the_final_directory(tmp_path, monkeypatch):
     # Only readlink touches the last component; a stat there would ask a
     # hung mount's filesystem.

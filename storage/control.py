@@ -117,26 +117,32 @@ def canonical_mountpoint(mountpoint: str) -> str:
 
 def _canonical_mountpoint(mountpoint: str) -> str:
     original = os.fsdecode(mountpoint)
-    path = original if os.path.isabs(original) else os.path.join(os.getcwd(), original)
+    path = original or os.getcwd()
     for _ in range(_MAX_SYMLINKS + 1):
         path = path.rstrip("/")
         if not path:
             return "/"
-        parent, name = path.rsplit("/", 1)
+        parent, name = os.path.split(path)
         if name in (".", ".."):
             raise ControlError(
                 f"Mountpoint {original!r} ends in {name!r}; give it without a final '.' or '..'"
             )
-        # strict: every directory up to the final component must exist, so
-        # a link to missing/../a cannot be read as the sibling a.
-        candidate = os.path.join(os.path.realpath(parent or "/", strict=True), name)
+        parent = parent or "."
+        os.path.realpath(parent, strict=True)
+        # The kernel also rejects a non-directory before '..'. Use its
+        # directory fd for both the canonical path and the final readlink.
+        parent_fd = os.open(parent, os.O_PATH | os.O_DIRECTORY)
         try:
-            target = os.readlink(candidate)
-        except OSError as exc:
-            if exc.errno in (errno.EINVAL, errno.ENOENT, errno.ENOTDIR):
-                return candidate  # Not a symlink, or nothing there yet.
-            raise
-        path = target if os.path.isabs(target) else os.path.join(os.path.dirname(candidate), target)
+            canonical_parent = os.readlink(f"/proc/self/fd/{parent_fd}")
+            try:
+                target = os.readlink(name, dir_fd=parent_fd)
+            except OSError as exc:
+                if exc.errno in (errno.EINVAL, errno.ENOENT):
+                    return os.path.join(canonical_parent, name)
+                raise
+        finally:
+            os.close(parent_fd)
+        path = os.path.join(canonical_parent, target)
     raise ControlError(f"Mountpoint {original!r}: too many levels of symbolic links")
 
 
