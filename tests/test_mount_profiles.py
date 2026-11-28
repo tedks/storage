@@ -196,6 +196,23 @@ class TestParseKeepAfterClose(unittest.TestCase):
         self.assertEqual(1, parse_keep_after_close("all:30%").threshold(1))
         self.assertEqual(0, parse_keep_after_close("all:0,0%").threshold(mib))
 
+    def test_all_prefix_ignores_case_and_space_before_colon(self):
+        for value in ("ALL:32M,30%", "All:32M,30%", "all :32M,30%", " aLl\t: 32M , 30% "):
+            with self.subTest(value=value):
+                spec = parse_keep_after_close(value)
+                self.assertTrue(spec.match_all)
+                self.assertEqual((32 * 1024 ** 2,), spec.byte_thresholds)
+                self.assertEqual((Fraction(30),), spec.percent_thresholds)
+
+    def test_unknown_term_error_names_the_expected_form(self):
+        with self.assertRaisesRegex(ValueError, r"'lots'.*such as all:32M,30%"):
+            parse_keep_after_close("lots")
+        # A second prefix, or a misspelled one, is a bad term, not a mode.
+        for value in ("all:32M,ALL:30%", "allx:32M", "a ll:32M"):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "such as all:32M,30%"):
+                    parse_keep_after_close(value)
+
     def test_zero_means_any_read(self):
         self.assertEqual(0, parse_keep_after_close("0").threshold(10 * 1024 ** 3))
         self.assertEqual(0, parse_keep_after_close("0%").threshold(10 * 1024 ** 3))
@@ -210,7 +227,7 @@ class TestParseKeepAfterClose(unittest.TestCase):
     def test_bad_values_rejected(self):
         for value in ("", " ", ",", "4M,", ",50%", "-1M", "-5%", "101%", "100.5%",
                       "abc", "4X", "1/2%", "infM", "nan%", "50 %", "4M;50%", "0x10",
-                      "all:", "all:,30%", "all:32M,all:30%", "\uff14M", "\u0665\u0660%"):
+                      "all:", "ALL :", "all:,30%", "all:32M,all:30%", "\uff14M", "\u0665\u0660%"):
             with self.subTest(value=value):
                 with self.assertRaises(ValueError):
                     parse_keep_after_close(value)

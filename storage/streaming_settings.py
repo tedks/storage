@@ -36,15 +36,21 @@ def parse_size(size_str: str) -> int:
 
 _SIZE = re.compile(r"\d+(\.\d+)?[KMGT]?", re.IGNORECASE | re.ASCII)
 _KEEP_AFTER_CLOSE_PERCENT = re.compile(r"(\d+(\.\d+)?)%", re.ASCII)
+_KEEP_AFTER_CLOSE_ALL = re.compile(r"all\s*:", re.IGNORECASE | re.ASCII)
 
 
 def parse_keep_after_close(text: str) -> StreamingKeepAfterClose:
-    """Parse sizes and percentages; an optional all: prefix requires every term."""
+    """Parse sizes and percentages; an optional all: prefix requires every term.
+
+    The prefix is case-insensitive and may have whitespace before its colon.
+    """
     if not isinstance(text, str):
-        raise ValueError("expected a string of sizes or percentages")
+        raise ValueError("expected a string of sizes or percentages such as all:32M,30%")
     text = text.strip()
-    match_all = text.startswith("all:")
-    terms = [term.strip() for term in text.removeprefix("all:").split(",")]
+    prefix = _KEEP_AFTER_CLOSE_ALL.match(text)
+    match_all = prefix is not None
+    body = text[prefix.end():] if prefix else text
+    terms = [term.strip() for term in body.split(",")]
     if not all(terms):
         raise ValueError(f"expected comma-separated sizes or percentages, got {text!r}")
 
@@ -60,7 +66,10 @@ def parse_keep_after_close(text: str) -> StreamingKeepAfterClose:
         elif _SIZE.fullmatch(term):
             byte_thresholds.append(parse_size(term))
         else:
-            raise ValueError(f"not a size or percentage: {term!r}")
+            raise ValueError(
+                f"not a size or percentage: {term!r}; expected sizes or "
+                "percentages such as all:32M,30% or 4M,50%"
+            )
 
     return StreamingKeepAfterClose(tuple(byte_thresholds), tuple(percent_thresholds), match_all)
 

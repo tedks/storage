@@ -400,6 +400,13 @@ backends = [
         spec = mock_mount.call_args.kwargs["streaming_keep_after_close"]
         self.assertEqual(0, spec.threshold(10 * 1024 ** 3))
 
+    def test_all_prefix_is_case_insensitive_at_mount(self):
+        result, mock_mount = self._mount('streaming_keep_after_close = "ALL :8M,25%"')
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        spec = mock_mount.call_args.kwargs["streaming_keep_after_close"]
+        self.assertTrue(spec.match_all)
+        self.assertEqual(8 * 1024 ** 2, spec.threshold(16 * 1024 ** 2))
+
     def test_window_profile_and_flag_override(self):
         profile = 'streaming_read_ahead_window = "2.5M"'
         result, mock_mount = self._mount(profile)
@@ -424,6 +431,7 @@ backends = [
             ('streaming_keep_after_close = 0', ()),
             ("", ["--streaming-keep-after-close", ""]),
             ("", ["--streaming-keep-after-close", "4M,"]),
+            ("", ["--streaming-keep-after-close", "all:lots"]),
         ):
             with self.subTest(profile_line=profile_line, args=args):
                 result, mock_mount = self._mount(profile_line, args)
