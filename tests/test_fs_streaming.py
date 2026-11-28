@@ -3,6 +3,7 @@ import json
 import os
 import re
 import shutil
+import sys
 import tempfile
 import threading
 import time
@@ -19,6 +20,7 @@ from storage.backends.ssh_pool import BulkCapacityCancelled
 from storage.cache_metadata import MEMBER_ATTRS_XATTR
 from storage.fs import StorageFS
 from storage.models import SyncStatus
+from storage.streaming import PrefetchSession
 from storage.mount_profiles import parse_keep_after_close
 
 
@@ -241,16 +243,17 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.assertTrue(retained.background_finished.wait(timeout=3))
         self.assertEqual(retained.io_fd, -1)
 
-    def _open_retained_fill(self, name, payload):
+    def _open_retained_fill(self, name, payload, read_bytes=128 * 1024):
         """Open, read enough to keep it after close, and close: a retained fill.
 
-        Needs worker_gate set, so the worker is parked mid-chunk.
+        Needs worker_gate set, so the worker is parked mid-chunk. The read
+        is one foreground fetch of read_bytes from the start.
         """
         (self.backend_dir / name).write_bytes(payload)
         path = "/" + name
         fd = self.fs.open(path, os.O_RDONLY)
         session = self._session_for(fd)
-        self.assertEqual(self.fs.read(path, 128 * 1024, 0, fd), payload[:128 * 1024])
+        self.assertEqual(self.fs.read(path, read_bytes, 0, fd), payload[:read_bytes])
         self.assertTrue(session.readers_consumed)
         self.assertTrue(self.backend.worker_in_read.wait(timeout=3))
         self.fs.release(path, fd)
@@ -643,6 +646,86 @@ class TestFSStreamingIntegration(unittest.TestCase):
             self.assertEqual((self.cache_dir / name).read_bytes(), payload)
         self.assertEqual(manager.list_download_sessions(), [])
         self.assertEqual(manager._download_pool.snapshot(), (0, 0, 0))
+
+    def test_whole_file_fill_uses_space_a_cancellation_frees_during_reclaim(self):
+        manager = self.fs._streaming_manager
+        cache = self.fs.cache_manager
+        cache.max_size_bytes = 512 * 1024
+        self.backend.worker_gate = threading.Event()
+        retained = self._open_retained_fill("retained.bin", os.urandom(384 * 1024))
+        written = os.urandom(384 * 1024)
+        (self.backend_dir / "write-open.bin").write_bytes(written)
+        real_needed = cache.get_free_space_needed
+        injected = []
+
+        def needed(required):
+            result = real_needed(required)
+            # Between reclaim's first look at the deficit and its scan of
+            # the registry, the retained fill is cancelled by hand.
+            if not injected and sys._getframe(1).f_code.co_name == "_reclaim_retained_space":
+                injected.append(result)
+                self.assertEqual(manager.cancel_download_session(retained.session_id), "cancelled")
+            return result
+
+        with patch.object(cache, "get_free_space_needed", needed):
+            fd = self.fs.open("/write-open.bin", os.O_RDWR)
+        self.assertEqual(len(injected), 1)
+        self.assertGreater(injected[0], 0)
+        self.assertTrue(retained.detached)
+        self.assertEqual(self.fs.read("/write-open.bin", len(written), 0, fd), written)
+        self.fs.release("/write-open.bin", fd)
+        self.assertEqual((self.cache_dir / "write-open.bin").read_bytes(), written)
+        self.assertNotIn("streaming_retained_space_cancellations", self.fs._streaming_stats_snapshot())
+        self.backend.worker_gate.set()
+        self.assertTrue(retained.background_finished.wait(timeout=3))
+
+    def test_space_reclaim_stops_the_retained_fill_with_fewest_bytes_first(self):
+        self.fs.cache_manager.max_size_bytes = 1024 * 1024
+        self.backend.worker_gate = threading.Event()
+        more = self._open_retained_fill("more.bin", os.urandom(384 * 1024), read_bytes=256 * 1024)
+        fewer = self._open_retained_fill("fewer.bin", os.urandom(384 * 1024))
+        written = os.urandom(384 * 1024)
+        (self.backend_dir / "write-open.bin").write_bytes(written)
+        fd = self.fs.open("/write-open.bin", os.O_RDWR)
+        self.fs.release("/write-open.bin", fd)
+        self.assertTrue(fewer.detached)
+        self.assertFalse(more.detached)
+        self.assertEqual(self.fs._streaming_stats_snapshot()["streaming_retained_space_cancellations"], 1)
+        self.backend.worker_gate.set()
+        self.assertTrue(more.background_finished.wait(timeout=5))
+        self.assertTrue(more.finalized)
+
+    def test_reader_that_cannot_fit_displaces_no_retained_fill(self):
+        manager = self.fs._streaming_manager
+        manager.update_download_limits(max_streaming_sessions=1, max_retained_streaming_sessions=1)
+
+        def fake(name, **state):
+            session = PrefetchSession(
+                canonical_path="/" + name, virtual_path="/" + name, backend=self.backend,
+                file_size=4096, final_cache_path=self.cache_dir / name,
+                partial_cache_path=self.cache_dir / (name + ".storage.partial"),
+                chunk_size=4096, io_fd=-1,
+            )
+            for key, value in state.items():
+                setattr(session, key, value)
+            return session
+
+        # Two readerless files still publishing fill the bound of two with
+        # no reader; stopping the retained fill could not make room.
+        sessions = [fake("publishing-0", prefetch_complete=True),
+                    fake("publishing-1", prefetch_complete=True),
+                    fake("retained")]
+        with manager.prefetch_sessions_lock:
+            for session in sessions:
+                manager.prefetch_sessions[session.canonical_path] = session
+            try:
+                displaced = []
+                self.assertFalse(manager._reader_fits_locked(displaced))
+                self.assertEqual(displaced, [])
+                self.assertFalse(sessions[2].stop_requested)
+            finally:
+                for session in sessions:
+                    manager.prefetch_sessions.pop(session.canonical_path, None)
 
     def test_bulk_wait_yield_interval_restarts_for_each_acquisition(self):
         manager = self.fs._streaming_manager

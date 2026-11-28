@@ -1255,6 +1255,11 @@ class StreamingReadManager:
         registry here is one destroy() claims after its worker stopped
         short of finalizing; destroy refuses every open from its start, so
         no successor owns the path and the unlink is still ours.
+
+        The cache size is marked stale here too, not only by the callers
+        after the lock: space reclaim (_reclaim_retained_space) measures the
+        deficit after a scan under this lock, and must see a partial
+        unlinked before it as freed.
         """
         if self.prefetch_sessions.get(session.canonical_path) is session:
             self.prefetch_sessions.pop(session.canonical_path, None)
@@ -1266,6 +1271,7 @@ class StreamingReadManager:
             self.logger.warning(
                 "streaming could not remove partial %s: %r", session.partial_cache_path, exc,
             )
+        self.cache_manager.mark_cache_size_dirty()
 
     def _cleanup_prefetch_session(self, session: PrefetchSession, status: str):
         # Single-shot: release and the worker's tail can both reach cleanup
@@ -1866,6 +1872,11 @@ class StreamingReadManager:
         return active, retained
 
     @staticmethod
+    def _downloaded_bytes(session: PrefetchSession) -> int:
+        """Bytes the session holds. Caller holds session.lock."""
+        return sum(end - start for start, end in session.available_ranges)
+
+    @staticmethod
     def _retained(session: PrefetchSession) -> bool:
         """A readerless fill still fetching. Caller holds session.lock."""
         return session.refcount == 0 and not StreamingReadManager._download_terminal(session)
@@ -1885,24 +1896,27 @@ class StreamingReadManager:
         to pass to _complete_cancellation after dropping the lock. This is
         what admits a reader when max_retained_streaming_sessions has been
         lowered below the fills already retained, which otherwise drain.
+
+        Before each stop, the counts are taken again in this same lock
+        hold: nothing is stopped for a reader that would not fit with every
+        retained fill gone. (A fill can still complete or fail without this
+        lock between two stops, which can leave a stop made for nothing.)
         """
-        active, retained = self._download_session_counts()
         limit = self._download_limits["max_streaming_sessions"]
         bound = limit + self._download_limits["max_retained_streaming_sessions"]
-        if active >= limit:
-            return False
-        if displaced is None:
-            return len(self.prefetch_sessions) - retained < bound
-        while len(self.prefetch_sessions) >= bound:
+        while True:
+            active, retained = self._download_session_counts()
+            if active >= limit or len(self.prefetch_sessions) - retained >= bound:
+                return False
+            if displaced is None or len(self.prefetch_sessions) < bound:
+                return True
             victim = fewest = None
             for session in self.prefetch_sessions.values():
                 with session.lock:
                     if self._retained(session):
-                        have = sum(end - start for start, end in session.available_ranges)
+                        have = self._downloaded_bytes(session)
                         if victim is None or have < fewest:
                             victim, fewest = session, have
-            if victim is None:
-                return False
             with victim.lock:
                 # Re-checked under its lock: a fill that completed since
                 # the scan is never stopped (see _claim_detach).
@@ -1910,7 +1924,6 @@ class StreamingReadManager:
                     continue
                 displaced.append((victim, self._stop_background_locked(victim)))
             self._record_streaming_stat("streaming_retained_reader_cancellations")
-        return True
 
     def _complete_displacements(self, displaced: list):
         for session, idle in displaced:
@@ -1928,7 +1941,19 @@ class StreamingReadManager:
         return self._reclaim_retained_space(file_size, for_reader=False)
 
     def _reclaim_retained_space(self, file_size: int, for_reader: bool = True) -> bool:
-        """Make space for a reader or a whole-file fill by stopping retained fills."""
+        """Make space for a reader or a whole-file fill by stopping retained fills.
+
+        Fills are stopped fewest bytes first, as for a reader's slot (see
+        _reader_fits_locked). The deficit is measured before the registry
+        lock, so space can come free while the candidates are chosen (a
+        cancellation, a finalize, an eviction); a decline measures again
+        and reports the space if it is now there. A stop unlinks its
+        partial under the registry lock and marks the cache size stale
+        there (_unregister_and_unlink), so that measurement counts it. The
+        measurement is not taken under the registry lock because a stale
+        size means a scan of the whole cache. A deficit that shrank this
+        way can still stop more fills than needed.
+        """
         missing = self.cache_manager.get_free_space_needed(file_size)
         if missing == 0:
             return True
@@ -1943,16 +1968,20 @@ class StreamingReadManager:
             for session in self.prefetch_sessions.values():
                 with session.lock:
                     if self._retained(session):
-                        candidates.append(session)
-            if sum(session.file_size for session in candidates) < missing:
-                return False
-            for session in candidates:
-                with session.lock:
-                    if self._retained(session):
-                        cancelled.append((session, self._stop_background_locked(session)))
-                        missing -= session.file_size
-                        if missing <= 0:
-                            break
+                        candidates.append((self._downloaded_bytes(session), session))
+            candidates = [session for _, session in sorted(candidates, key=lambda entry: entry[0])]
+            short = sum(session.file_size for session in candidates) < missing
+            if not short:
+                for session in candidates:
+                    with session.lock:
+                        if self._retained(session):
+                            cancelled.append((session, self._stop_background_locked(session)))
+                            missing -= session.file_size
+                            if missing <= 0:
+                                break
+        if short:
+            # After the lock: a stale size means a scan of the cache.
+            return self.cache_manager.get_free_space_needed(file_size) == 0
         for session, idle in cancelled:
             self._record_streaming_stat("streaming_retained_space_cancellations")
             self._complete_cancellation(session, idle)
@@ -2118,13 +2147,21 @@ class StreamingReadManager:
                 )
                 self._discard_unregistered_prefetch_session(session)
                 return None
-            if not self._reader_fits_locked(displaced):
+
+            def refuse():
                 self.logger.warning(
                     "Streaming session limit reached (%d) during registration; falling back to full-file cache for %s",
                     self._download_limits["max_streaming_sessions"],
                     canonical_path,
                 )
+                # Unlinks the staging file, or the partial path it was
+                # renamed to, which no registered session owns.
                 self._discard_unregistered_prefetch_session(session)
+
+            # Asked first without displacing anything, so no retained fill
+            # is stopped for a reader whose rename then fails.
+            if not self._reader_fits_locked():
+                refuse()
                 return None
             # Replaces any partial a detached session failed to unlink. No
             # registered session owns the path: detaching unlinks it inside
@@ -2140,6 +2177,11 @@ class StreamingReadManager:
                 self._discard_unregistered_prefetch_session(session)
                 return None
             session.partial_cache_path = partial_cache_path
+            # Refuses after the check above only if a retained fill
+            # completed or failed in between, which takes no registry lock.
+            if not self._reader_fits_locked(displaced):
+                refuse()
+                return None
             self.prefetch_sessions[canonical_path] = session
 
         self.cache_manager.mark_cache_size_dirty()
