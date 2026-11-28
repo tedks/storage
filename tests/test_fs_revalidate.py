@@ -800,30 +800,32 @@ class TestFillConfirmsMemberVersion(RevalidateTestBase):
         self.assertEqual(len(calls), 2)
         self.assertEqual(stat.S_IMODE(self.fs.getattr("/f.txt")["st_mode"]), 0o444)
 
-    def test_confirming_stat_failures_fall_back_to_the_probe(self):
-        for failures in (1, 2):
-            with self.subTest(failures=failures):
-                src = self.member_dir / "f.txt"
-                src.unlink(missing_ok=True)
-                src = self.rewrite_member("f.txt", b"original", mtime=1_000_000_000)
-                os.chmod(src, 0o644)
-                real_stat, seen = self.member.stat, []
+    def test_a_second_stat_can_confirm_the_probe_after_a_transient_failure(self):
+        self.rewrite_member("f.txt", b"original", mtime=1_000_000_000).chmod(0o644)
+        probe = self.member.stat("/f.txt")
+        with patch.object(self.member, "stat", side_effect=[
+                probe, OSError(errno.EIO, "stat failed"), probe]) as stats:
+            self.assertEqual(self.read_through("/f.txt"), b"original")
+        self.assertEqual(stats.call_count, 3)
+        attrs = self.fs.getattr("/f.txt")
+        self.assertEqual(stat.S_IMODE(attrs["st_mode"]), 0o644)
+        self.assertEqual(attrs["st_mtime"], 1_000_000_000)
+        self.fs.release("/f.txt", self.fs.open("/f.txt", os.O_WRONLY))
 
-                def flaky(path):
-                    seen.append(path)
-                    # The first call is the probe; the next ones confirm.
-                    if 1 < len(seen) <= 1 + failures:
-                        raise OSError(errno.EIO, "stat failed")
-                    return real_stat(path)
-
-                with patch.object(self.member, "stat", side_effect=flaky):
-                    self.assertEqual(self.read_through("/f.txt"), b"original")
-                attrs = self.fs.getattr("/f.txt")
-                self.assertEqual(stat.S_IMODE(attrs["st_mode"]), 0o644)  # still writable
-                self.assertEqual(attrs["st_mtime"], 1_000_000_000)
-                self.fs.release("/f.txt", self.fs.open("/f.txt", os.O_WRONLY))
-                self.fs.cache_manager.delete_cached_file("/f.txt")
-                self.fs.state_manager.delete_file("/f.txt")
+    def test_a_cold_open_requires_confirmation_of_the_token(self):
+        self.rewrite_member("f.txt", b"original", mtime=1_000_000_000)
+        probe = self.member.stat("/f.txt")
+        for flags in (os.O_RDONLY, os.O_WRONLY):
+            with self.subTest(flags=flags), patch.object(self.member, "stat", side_effect=[
+                    probe, OSError(errno.EIO, "stat failed"), OSError(errno.EIO, "stat failed")
+            ]) as stats:
+                with self.assertRaises(FuseOSError) as raised:
+                    self.fs.open("/f.txt", flags)
+                self.assertEqual(raised.exception.errno, errno.EAGAIN)
+                self.assertEqual(stats.call_count, 3)
+            self.assertFalse((self.cache_dir / "f.txt").exists())
+            self.assertIsNone(self.fs.state_manager.get_file_metadata("/f.txt"))
+        self.assertEqual(self.read_through("/f.txt"), b"original")
 
     def test_second_transfer_is_the_baseline(self):
         src = self.rewrite_member("f.txt", b"original", mtime=1_000_000_000)

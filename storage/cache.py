@@ -774,10 +774,11 @@ class CacheManager:
                 # (two that agree), which is a read of one version.
                 fd_stats = list(bound.source_stats) if bound is not None else []
                 read_denied = read_denied or any(_denies_read(fd_st) for fd_st in fd_stats)
+                fd_changed = any(_token_contradicts(a, b)
+                                 for a, b in zip(fd_stats, fd_stats[1:]))
                 bracketed = (len(fd_stats) >= 2
                              and all(has_version_token(fd_st) for fd_st in fd_stats)
-                             and not any(_token_contradicts(a, b)
-                                         for a, b in zip(fd_stats, fd_stats[1:])))
+                             and not fd_changed)
                 if not bracketed:
                     token_seen = token_seen or any(has_version_token(fd_st) for fd_st in fd_stats)
                 # A stat that showed another version with a token: the only
@@ -788,7 +789,9 @@ class CacheManager:
                 if bound is not None and bound.grew:
                     # The source outran the bounded copy: another version.
                     version = MemberVersion.CHANGED
-                if any(_token_contradicts(a, b) for a, b in zip(fd_stats, fd_stats[1:])) or any(
+                if fd_changed or any(
+                        getattr(fd_st, "st_size", None) not in (None, st.st_size)
+                        for fd_st in fd_stats) or any(
                         _token_contradicts(fd_st, other)
                         for fd_st in fd_stats for other in (member_stat, newest)):
                     # The descriptor actually copied was at another version
