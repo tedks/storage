@@ -203,8 +203,12 @@ cache. A read fetches only the bytes it asks for (the kernel asks for at
 most its readahead, 128K by default), and the worker starts only once the
 readers have read a contiguous span of one `streaming_chunk_size` (1M by
 default; the keep-after-close threshold below if that is smaller), then
-prefetches in chunks of that size. So a file manager sniffing a content
-type costs about what it reads, as on a plain sftp mount. A reader making
+prefetches in chunks of that size. The default `all:32M,30%` policy caps
+its threshold at the file size, so a file smaller than one chunk would
+reach it only once readers had requested all of it: under that policy
+such a file is fetched on demand, one kernel request at a time, with no
+read-ahead. So a file manager sniffing a content type costs about what
+it reads, as on a plain sftp mount. A reader making
 more than 1024 scattered reads of one file (a database, an archive index)
 gets whole-chunk fetches again: once a file's session is that fragmented,
 even a small read costs up to one chunk.
