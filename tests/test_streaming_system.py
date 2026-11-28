@@ -7,6 +7,7 @@ streaming stays healthy under sustained reads and does not regress to the
 """
 
 import errno
+import hashlib
 import json
 import os
 import shutil
@@ -67,6 +68,39 @@ for line in sys.stdin:
                 break
             data += chunk
         out = {"sha": hashlib.sha256(data).hexdigest()}
+    else:
+        break
+    print(json.dumps(out), flush=True)
+"""
+
+
+# The same rule, for reads of byte ranges: one JSON command per line.
+# {"op": "read", "path", "offset", "size"} opens, reads and closes;
+# "open" holds a descriptor on path, "pread" reads through it, "close"
+# closes it. Reads answer with the bytes' sha256 and length.
+_RANGE_CLIENT = """
+import hashlib, json, os, sys
+held = None
+def answer(data):
+    return {"sha": hashlib.sha256(data).hexdigest(), "size": len(data)}
+for line in sys.stdin:
+    cmd = json.loads(line)
+    op = cmd["op"]
+    if op == "read":
+        fd = os.open(cmd["path"], os.O_RDONLY)
+        try:
+            out = answer(os.pread(fd, cmd["size"], cmd["offset"]))
+        finally:
+            os.close(fd)
+    elif op == "open":
+        held = os.open(cmd["path"], os.O_RDONLY)
+        out = {}
+    elif op == "pread":
+        out = answer(os.pread(held, cmd["size"], cmd["offset"]))
+    elif op == "close":
+        os.close(held)
+        held = None
+        out = {}
     else:
         break
     print(json.dumps(out), flush=True)
@@ -255,12 +289,23 @@ class TestStreamingSystemRegression(unittest.TestCase):
                 raise AssertionError("fresh reader took the synchronous full-copy fallback")
             return real_copy(path, target)
 
+        client = self._range_client()
+
+        def call(op, **args):
+            return self._client_call(client, json.dumps({"op": op, **args}), timeout=30.0)
+
+        def digest(data):
+            return {"sha": hashlib.sha256(data).hexdigest(), "size": len(data)}
+
+        def mounted(name):
+            return str(self.mount_dir / name)
+
         with patch.object(self.backend, "read_file", side_effect=read), \
                 patch.object(self.backend, "copy_to_local", side_effect=copy):
             try:
                 for name in ("older.bin", "reopened.bin"):
-                    with open(self.mount_dir / name, "rb", buffering=0) as handle:
-                        self.assertEqual(handle.read(256 * 1024), payloads[name][:256 * 1024])
+                    self.assertEqual(call("read", path=mounted(name), offset=0, size=256 * 1024),
+                                     digest(payloads[name][:256 * 1024]))
                     self.assertTrue(self._wait_for(lambda: any(
                         session["path"] == "/" + name and session["readers"] == 0
                         for session in manager.list_download_sessions()
@@ -272,12 +317,13 @@ class TestStreamingSystemRegression(unittest.TestCase):
                 self.assertEqual(before["download_workers_running"], 1)
                 self.assertEqual(before["retained_streaming_sessions"], 2)
 
-                with open(self.mount_dir / "fresh.bin", "rb", buffering=0) as handle:
-                    self.assertEqual(handle.read(4096), payloads["fresh.bin"][:4096])
-                    self.assertFalse(let_older_continue.is_set())
+                self.assertEqual(call("read", path=mounted("fresh.bin"), offset=0, size=4096),
+                                 digest(payloads["fresh.bin"][:4096]))
+                self.assertFalse(let_older_continue.is_set())
                 self.assertEqual(self.fs._streaming_stats_snapshot()["streaming_fallback_opens"], 0)
 
-                with open(self.mount_dir / "reopened.bin", "rb", buffering=0) as handle:
+                call("open", path=mounted("reopened.bin"))
+                try:
                     reopened = next(session for session in manager.list_download_sessions()
                                     if session["path"] == "/reopened.bin")
                     self.assertEqual(reopened["id"], retained["/reopened.bin"])
@@ -285,8 +331,10 @@ class TestStreamingSystemRegression(unittest.TestCase):
                     let_older_continue.set()
                     self.assertTrue(turns_after_older.wait(timeout=5))
                     self.assertEqual(next_files, ["/reopened.bin"] * 4 + ["/older.bin"])
-                    self.assertEqual(os.pread(handle.fileno(), 4096, 512 * 1024),
-                                     payloads["reopened.bin"][512 * 1024:516 * 1024])
+                    self.assertEqual(call("pread", offset=512 * 1024, size=4096),
+                                     digest(payloads["reopened.bin"][512 * 1024:516 * 1024]))
+                finally:
+                    call("close")
             finally:
                 let_older_continue.set()
 
@@ -295,6 +343,26 @@ class TestStreamingSystemRegression(unittest.TestCase):
             self.assertTrue(self._wait_for(cached.exists))
             self.assertEqual(cached.read_bytes(), payloads[name])
 
+
+    def _range_client(self):
+        """A _RANGE_CLIENT process, stopped at cleanup."""
+        import subprocess
+        import sys
+
+        client = subprocess.Popen(
+            [sys.executable, "-c", _RANGE_CLIENT],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+        def stop():
+            try:
+                client.stdin.close()
+                client.wait(timeout=30)
+            except Exception:
+                client.kill()
+                client.wait(timeout=30)
+
+        self.addCleanup(stop)
+        return client
 
     def _client_call(self, client, command, timeout=60.0):
         client.stdin.write(command + "\n")
