@@ -380,7 +380,8 @@ backends = [
         result, mock_mount = self._mount()
         self.assertEqual(result.exit_code, 0, msg=result.output)
         self.assertIsNone(mock_mount.call_args.kwargs["streaming_keep_after_close"])
-        self.assertIn("Streaming keep after close: default (4 chunks or 50%)", result.output)
+        self.assertIn("Streaming keep after close: all:32M,30%", result.output)
+        self.assertEqual(4 * 1024 ** 2, mock_mount.call_args.kwargs["streaming_read_ahead_window"])
 
     def test_profile_value_is_parsed(self):
         result, mock_mount = self._mount('streaming_keep_after_close = "8M,25%"')
@@ -399,6 +400,62 @@ backends = [
         spec = mock_mount.call_args.kwargs["streaming_keep_after_close"]
         self.assertEqual(0, spec.threshold(10 * 1024 ** 3))
 
+    def test_all_prefix_is_case_insensitive_at_mount(self):
+        result, mock_mount = self._mount('streaming_keep_after_close = "ALL :8M,25%"')
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        spec = mock_mount.call_args.kwargs["streaming_keep_after_close"]
+        self.assertTrue(spec.match_all)
+        self.assertEqual(8 * 1024 ** 2, spec.threshold(16 * 1024 ** 2))
+
+    def test_window_profile_and_flag_override(self):
+        profile = 'streaming_read_ahead_window = "2.5M"'
+        result, mock_mount = self._mount(profile)
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        self.assertEqual(2560 * 1024, mock_mount.call_args.kwargs["streaming_read_ahead_window"])
+
+        result, mock_mount = self._mount(profile, ["--streaming-read-ahead-window", "0"])
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        self.assertEqual(0, mock_mount.call_args.kwargs["streaming_read_ahead_window"])
+
+        for value in ("", "-1M", "25%", "invalid"):
+            with self.subTest(value=value):
+                result, mock_mount = self._mount(profile, ["--streaming-read-ahead-window", value])
+                self.assertNotEqual(result.exit_code, 0, msg=result.output)
+                self.assertIn("Invalid streaming read-ahead window", result.output)
+                mock_mount.assert_not_called()
+
+    def test_window_profile_accepts_a_toml_integer(self):
+        for line, expected in (
+            ("streaming_read_ahead_window = 0", 0),
+            ("streaming_read_ahead_window = 4194304", 4 * 1024 ** 2),
+        ):
+            with self.subTest(line=line):
+                result, mock_mount = self._mount(line)
+                self.assertEqual(result.exit_code, 0, msg=result.output)
+                self.assertEqual(expected, mock_mount.call_args.kwargs["streaming_read_ahead_window"])
+                self.assertIn(f"Streaming read-ahead window: {expected:,} bytes", result.output)
+
+        # A negative integer reaches the same parser as the flag; other
+        # TOML types are refused by the profile loader.
+        result, mock_mount = self._mount("streaming_read_ahead_window = -1")
+        self.assertNotEqual(result.exit_code, 0, msg=result.output)
+        self.assertIn("Invalid streaming read-ahead window", result.output)
+        mock_mount.assert_not_called()
+        for line in ("streaming_read_ahead_window = true", "streaming_read_ahead_window = 4.5",
+                     'streaming_read_ahead_window = ""'):
+            with self.subTest(line=line):
+                result, mock_mount = self._mount(line)
+                self.assertNotEqual(result.exit_code, 0, msg=result.output)
+                self.assertIn("streaming_read_ahead_window", result.output)
+                mock_mount.assert_not_called()
+
+        # The flag overrides an integer in the profile.
+        result, mock_mount = self._mount(
+            "streaming_read_ahead_window = 4194304", ["--streaming-read-ahead-window", "1M"],
+        )
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        self.assertEqual(1024 ** 2, mock_mount.call_args.kwargs["streaming_read_ahead_window"])
+
     def test_bad_values_rejected_before_mounting(self):
         for profile_line, args in (
             ('streaming_keep_after_close = "150%"', ()),
@@ -406,6 +463,7 @@ backends = [
             ('streaming_keep_after_close = 0', ()),
             ("", ["--streaming-keep-after-close", ""]),
             ("", ["--streaming-keep-after-close", "4M,"]),
+            ("", ["--streaming-keep-after-close", "all:lots"]),
         ):
             with self.subTest(profile_line=profile_line, args=args):
                 result, mock_mount = self._mount(profile_line, args)

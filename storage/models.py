@@ -69,13 +69,13 @@ class FileLocation:
 class StreamingKeepAfterClose:
     """When read-ahead outlives the last close of a streaming session.
 
-    Read-ahead continues once the longest contiguous span the readers asked
-    for reaches any of the thresholds: a byte count, or a percentage of the
-    file rounded down. 0 (bytes or percent) means any read qualifies.
+    The longest contiguous span readers requested must reach any configured
+    threshold, or every threshold when match_all is set.
     """
 
     byte_thresholds: Tuple[int, ...] = ()
     percent_thresholds: Tuple[Fraction, ...] = ()
+    match_all: bool = False
 
     def __post_init__(self):
         if not self.byte_thresholds and not self.percent_thresholds:
@@ -87,7 +87,14 @@ class StreamingKeepAfterClose:
 
     def threshold(self, file_size: int) -> int:
         """The span in bytes a reader must reach on a file of file_size bytes."""
-        return min(
-            list(self.byte_thresholds)
-            + [int(file_size * percent // 100) for percent in self.percent_thresholds]
-        )
+        if self.match_all:
+            # Negate the floor of the negative percentage to round up exactly.
+            thresholds = self.byte_thresholds + tuple(
+                -(-file_size * percent // 100) for percent in self.percent_thresholds
+            )
+            return min(file_size, max(thresholds))
+
+        # Preserve the rounding of existing comma-separated policies.
+        return min(self.byte_thresholds + tuple(
+            int(file_size * percent // 100) for percent in self.percent_thresholds
+        ))

@@ -64,6 +64,7 @@ from .streaming import (
     DEFAULT_MAX_DOWNLOAD_WORKERS, DEFAULT_MAX_RETAINED_STREAMING_SESSIONS,
     PrefetchSession, StreamingReadManager,
 )
+from .streaming_settings import DEFAULT_STREAMING_READ_AHEAD_WINDOW
 
 
 @dataclass
@@ -243,7 +244,8 @@ class StorageFS(Operations):
                  max_foreground_operations: Optional[int] = None,
                  max_sync_workers: Optional[int] = None,
                  max_download_workers: int = DEFAULT_MAX_DOWNLOAD_WORKERS,
-                 max_retained_streaming_sessions: int = DEFAULT_MAX_RETAINED_STREAMING_SESSIONS):
+                 max_retained_streaming_sessions: int = DEFAULT_MAX_RETAINED_STREAMING_SESSIONS,
+                 streaming_read_ahead_window: int = DEFAULT_STREAMING_READ_AHEAD_WINDOW):
         """
         Initialize Storage filesystem
 
@@ -262,8 +264,9 @@ class StorageFS(Operations):
                 starts once readers have read one chunk
             max_streaming_sessions: Maximum concurrent streaming sessions
             streaming_keep_after_close: When read-ahead outlives the last
-                close of a streaming session; None for the default, 4 chunks
-                or 50% of the file
+                close of a streaming session; None for the default
+            streaming_read_ahead_window: Maximum bytes beyond a read span
+                to prefetch before it qualifies for retention
             readdir_ttl: Seconds a directory listing is fresh: it answers
                          readdir, getattr of its entries and lookups of
                          names it lacks without asking a member. None
@@ -471,6 +474,7 @@ class StorageFS(Operations):
             max_download_workers=max_download_workers,
             max_retained_streaming_sessions=max_retained_streaming_sessions,
             keep_after_close=streaming_keep_after_close,
+            read_ahead_window=streaming_read_ahead_window,
             on_finalized=lambda session: self._record_fetched(
                 session.canonical_path, session.final_cache_path,
                 session.backend, session.member_stat,
@@ -3582,7 +3586,8 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
                  max_foreground_operations: Optional[int] = None,
                  max_sync_workers: Optional[int] = None,
                  max_download_workers: int = DEFAULT_MAX_DOWNLOAD_WORKERS,
-                 max_retained_streaming_sessions: int = DEFAULT_MAX_RETAINED_STREAMING_SESSIONS):
+                 max_retained_streaming_sessions: int = DEFAULT_MAX_RETAINED_STREAMING_SESSIONS,
+                 streaming_read_ahead_window: int = DEFAULT_STREAMING_READ_AHEAD_WINDOW):
     """
     Mount a Storage filesystem
 
@@ -3605,6 +3610,7 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
         max_retained_streaming_sessions: Maximum retained fills without readers
         streaming_keep_after_close: When read-ahead outlives the last close;
             None for the default
+        streaming_read_ahead_window: Pre-qualification read-ahead in bytes
         revalidate_after: Seconds after which opening a CLEAN cached file
             stats its member (see StorageFS._revalidate_cached_file)
         readdir_ttl, listing_max_stale: listing freshness (see StorageFS)
@@ -3708,6 +3714,7 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
         readdir_ttl=readdir_ttl,
         enable_watchers=enable_watchers,
         streaming_keep_after_close=streaming_keep_after_close,
+        streaming_read_ahead_window=streaming_read_ahead_window,
         revalidate_after=revalidate_after,
         listing_max_stale=listing_max_stale,
         checksum_reverify_interval=checksum_reverify_interval,

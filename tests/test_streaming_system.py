@@ -151,6 +151,7 @@ class TestStreamingSystemRegression(unittest.TestCase):
         - reopen while prefetch is active
         """
         mount_file = self.mount_dir / "movie.bin"
+        self.fs._streaming_manager.update_download_limits(streaming_keep_after_close="256K,50%")
 
         fd = os.open(str(mount_file), os.O_RDONLY)
         try:
@@ -201,7 +202,9 @@ class TestStreamingSystemRegression(unittest.TestCase):
 
     def test_reader_opens_and_reopened_fill_overtakes_closed_downloads(self):
         manager = self.fs._streaming_manager
-        manager.update_download_limits(max_streaming_sessions=2, max_download_workers=1)
+        manager.update_download_limits(
+            max_streaming_sessions=2, max_download_workers=1, streaming_keep_after_close="256K,50%",
+        )
         payloads = self.contended_payloads
 
         older_blocked = threading.Event()
@@ -291,6 +294,7 @@ class TestStreamingSystemRegression(unittest.TestCase):
             result = self._run_control_cli(*options, *args, expected=expected)
             return json.loads(result.stdout) if json_output else result
 
+        command("set", "--streaming-keep-after-close", "256K,50%")
         try:
             with (self.mount_dir / name).open("rb") as handle:
                 self.assertEqual(handle.read(512 * 1024), self.payload[:512 * 1024])
@@ -318,6 +322,8 @@ class TestStreamingSystemRegression(unittest.TestCase):
                     "max_streaming_sessions": 1,
                     "max_retained_streaming_sessions": 3,
                     "max_download_workers": 1,
+                    "streaming_keep_after_close": {"mode": "any", "bytes": [256 * 1024], "percent": ["50"]},
+                    "streaming_read_ahead_window": 4 * 1024 ** 2,
                 })
                 rejected = command("set", "--max-streaming-sessions", "2",
                                    "--max-download-workers", "33", expected=1, json_output=False)
@@ -350,6 +356,147 @@ class TestStreamingSystemRegression(unittest.TestCase):
                 command("set", "--max-retained-streaming-sessions", "0")
             self.assertTrue(self._wait_for(lambda: not command("downloads")["downloads"]))
             self.assertFalse(partial.exists())
+        finally:
+            resume.set()
+
+    def test_live_qualification_and_window_on_an_open_file(self):
+        self.assertTrue(os.path.ismount(self.mount_dir), "requires a live scratch FUSE mount")
+        mib = 1024 ** 2
+        name = "movie.bin"
+        entered, resume = threading.Event(), threading.Event()
+        self.backend.hold_past = (name, 6 * mib, entered, resume)
+
+        def command(*args):
+            return json.loads(self._run_control_cli(
+                "control", "--cache", str(self.cache_dir), "--json-output", *args,
+            ).stdout)
+
+        defaults = command("get")["limits"]
+        self.assertEqual(defaults["streaming_keep_after_close"],
+                         {"mode": "all", "bytes": [32 * mib], "percent": ["30"]})
+        self.assertEqual(defaults["streaming_read_ahead_window"], 4 * mib)
+
+        try:
+            with (self.mount_dir / name).open("rb", buffering=0) as handle:
+                self.assertEqual(handle.read(mib), self.payload[:mib])
+
+                def initial_window_filled():
+                    row, = command("downloads")["downloads"]
+                    return row["downloaded_bytes"] >= 5 * mib
+
+                self.assertTrue(self._wait_for(initial_window_filled))
+                self.assertTrue(self._wait_for(
+                    lambda: command("status")["stats"]["download_workers_running"] == 0,
+                ))
+                self.assertFalse(entered.is_set(), "default read-ahead reached 6 MiB after a 1 MiB read")
+
+                rejected = self._run_control_cli(
+                    "control", "--cache", str(self.cache_dir), "set",
+                    "--streaming-keep-after-close", "all:1M,5%",
+                    "--streaming-read-ahead-window", "-1M", expected=1,
+                )
+                self.assertIn("streaming_read_ahead_window", rejected.stderr)
+                self.assertEqual(command("get")["limits"], defaults)
+
+                updated = command("set", "--streaming-keep-after-close", "all:1M,5%",
+                                  "--streaming-read-ahead-window", "0")["limits"]
+                self.assertEqual(updated["streaming_keep_after_close"],
+                                 {"mode": "all", "bytes": [mib], "percent": ["5"]})
+                self.assertEqual(updated["streaming_read_ahead_window"], 0)
+                self.assertTrue(entered.wait(5), "existing read span should now qualify")
+                command("set", "--streaming-keep-after-close", "100%")
+
+            self.assertTrue(self._wait_for(
+                lambda: command("status")["stats"]["retained_streaming_sessions"] == 1,
+            ))
+        finally:
+            resume.set()
+        cache_path = self.cache_dir / name
+        self.assertTrue(self._wait_for(cache_path.exists))
+        self.assertEqual(cache_path.read_bytes(), self.payload)
+
+    def test_live_window_change_wakes_an_unqualified_file(self):
+        # A window-only update on a file that has not qualified: the parked
+        # worker wakes and fetches exactly up to the new byte boundary.
+        self.assertTrue(os.path.ismount(self.mount_dir), "requires a live scratch FUSE mount")
+        kib, mib = 1024, 1024 ** 2
+        name = "movie.bin"
+        window = 3 * mib + 17 * kib + 5  # Not a multiple of the 64 KiB chunk.
+        # Past any boundary this test can reach; entering it means overrun.
+        entered, resume = threading.Event(), threading.Event()
+        self.backend.hold_past = (name, 6 * mib, entered, resume)
+        manager = self.fs._streaming_manager
+
+        def command(*args):
+            return json.loads(self._run_control_cli(
+                "control", "--cache", str(self.cache_dir), "--json-output", *args,
+            ).stdout)
+
+        def session():
+            with manager.prefetch_sessions_lock:
+                found, = manager.prefetch_sessions.values()
+            return found
+
+        def settled():
+            """(fetched ranges, foreground spans) once nothing is running or changing."""
+            current = session()
+            with current.lock:
+                snapshot = (list(current.available_ranges), list(current.foreground_read_spans),
+                            list(current.in_flight_ranges))
+            time.sleep(0.3)
+            with current.lock:
+                again = (list(current.available_ranges), list(current.foreground_read_spans),
+                         list(current.in_flight_ranges))
+            if snapshot != again or again[2]:
+                return None
+            if command("status")["stats"]["download_workers_running"]:
+                return None
+            return again[:2]
+
+        def wait_settled():
+            deadline = time.time() + 8
+            while time.time() < deadline:
+                state = settled()
+                if state is not None:
+                    return state
+            self.fail("streaming session did not settle")
+
+        self.assertEqual(command("set", "--streaming-read-ahead-window", "0")
+                         ["limits"]["streaming_read_ahead_window"], 0)
+        try:
+            with (self.mount_dir / name).open("rb", buffering=0) as handle:
+                self.assertEqual(handle.read(mib), self.payload[:mib])
+
+                fetched, spans = wait_settled()
+                # The default all:32M,30% caps at the 12 MiB file: unqualified.
+                self.assertFalse(session().readers_consumed)
+                self.assertTrue(session().read_ahead_started)
+                # With a zero window only the readers' own requests were fetched.
+                self.assertEqual(fetched, spans)
+                (span_start, span_end), = spans
+                self.assertEqual(span_start, 0)
+                self.assertGreaterEqual(span_end, mib)
+                row, = command("downloads")["downloads"]
+                self.assertEqual(row["downloaded_bytes"], span_end)
+
+                # Window-only change; keep-after-close is untouched.
+                updated = command("set", "--streaming-read-ahead-window", str(window))["limits"]
+                self.assertEqual(updated["streaming_read_ahead_window"], window)
+                self.assertEqual(updated["streaming_keep_after_close"],
+                                 {"mode": "all", "bytes": [32 * mib], "percent": ["30"]})
+
+                boundary = span_end + window
+                self.assertTrue(self._wait_for(
+                    lambda: command("downloads")["downloads"][0]["downloaded_bytes"] >= boundary,
+                ), "the parked worker did not wake for the wider window")
+                fetched, spans = wait_settled()
+                self.assertEqual(spans, [(0, span_end)], "no reader request arrived meanwhile")
+                self.assertEqual(fetched, [(0, boundary)])
+                row, = command("downloads")["downloads"]
+                self.assertEqual(row["downloaded_bytes"], boundary)
+                self.assertLess(row["downloaded_bytes"], len(self.payload))
+                self.assertFalse(session().readers_consumed)
+                self.assertFalse(entered.is_set(), "read-ahead passed the new window")
         finally:
             resume.set()
 

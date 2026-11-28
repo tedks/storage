@@ -58,7 +58,7 @@ def control(ctx, cache, profile, config_path, timeout, json_output):
 def _print_parameters(payload: dict):
     click.echo("Live streaming limits")
     for setting, value in payload["limits"].items():
-        click.echo(f"  {setting} = {value}")
+        click.echo(f"  {setting} = {json.dumps(value, sort_keys=True)}")
     click.echo("Streaming settings that require a restart")
     for setting, value in payload["restart_only"].items():
         click.echo(f"  {setting} = {json.dumps(value, sort_keys=True)}")
@@ -96,6 +96,10 @@ def control_get(target):
               help="Retained downloads after the last read handle closes (0–1024).")
 @click.option("--max-download-workers", type=int,
               help="Background download worker ceiling (1–32).")
+@click.option("--streaming-keep-after-close",
+              help="Read span that qualifies for retention, e.g., all:32M,30%.")
+@click.option("--streaming-read-ahead-window",
+              help="Speculative bytes before qualification, e.g., 4M or 0.")
 @click.pass_obj
 def control_set(target, **limits):
     """Apply live streaming limits together. Changes last until unmount."""

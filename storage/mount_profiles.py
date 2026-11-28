@@ -1,15 +1,13 @@
 import click
 import tomllib
 from dataclasses import dataclass
-from fractions import Fraction
 import math
 from pathlib import Path
 import re
-from typing import Any, Dict, Optional, Sequence, Tuple
+from typing import Any, Dict, Optional, Sequence, Tuple, Union
 
 from .backends.local import LocalBackend
 from .backends.ssh import SSHBackend
-from .models import StreamingKeepAfterClose
 from .checksum_queue import DEFAULT_CHECKSUM_REVERIFY_INTERVAL
 from .foreground_admission import validate_cap
 from .namespace import DEFAULT_LISTING_MAX_STALE
@@ -17,6 +15,7 @@ from .streaming import (
     DEFAULT_MAX_DOWNLOAD_WORKERS, DEFAULT_MAX_RETAINED_STREAMING_SESSIONS,
     validate_download_limits,
 )
+from .streaming_settings import parse_keep_after_close, parse_size
 
 
 DEFAULT_CACHE_SIZE = "10G"
@@ -50,7 +49,6 @@ class ResolvedMountConfig:
     enable_watchers: bool
     profile_name: Optional[str] = None
     profile_source: Optional[Path] = None
-    # None: the default, 4 chunks or 50% (see storage/streaming.py).
     streaming_keep_after_close: Optional[str] = None
     # Seconds after which opening a CLEAN cached file checks its member.
     revalidate_after: float = DEFAULT_REVALIDATE_AFTER
@@ -78,6 +76,9 @@ class ResolvedMountConfig:
     max_sync_workers: Optional[int] = None
     max_download_workers: int = DEFAULT_MAX_DOWNLOAD_WORKERS
     max_retained_streaming_sessions: int = DEFAULT_MAX_RETAINED_STREAMING_SESSIONS
+    # A size string, or a TOML integer of bytes; parse_read_ahead_window
+    # validates either form when the mount starts.
+    streaming_read_ahead_window: Optional[Union[str, int]] = None
 
     @property
     def member_specs(self) -> Tuple[str, ...]:
@@ -100,66 +101,6 @@ def default_mount_config_paths() -> Tuple[Path, ...]:
         Path.home() / ".config" / "storage" / DEFAULT_MOUNT_CONFIG_NAME,
         Path("/etc/storage") / DEFAULT_MOUNT_CONFIG_NAME,
     )
-
-
-def parse_size(size_str: str) -> int:
-    """Parse size string to bytes."""
-    size_str = size_str.strip().upper()
-
-    multipliers = {
-        "K": 1024,
-        "M": 1024 ** 2,
-        "G": 1024 ** 3,
-        "T": 1024 ** 4,
-    }
-
-    for suffix, multiplier in multipliers.items():
-        if size_str.endswith(suffix):
-            try:
-                value = float(size_str[:-1])
-                return int(value * multiplier)
-            except ValueError as exc:
-                raise ValueError(f"Invalid size format: {size_str}") from exc
-
-    try:
-        return int(size_str)
-    except ValueError as exc:
-        raise ValueError(f"Invalid size format: {size_str}") from exc
-
-
-_KEEP_AFTER_CLOSE_SIZE = re.compile(r"\d+(\.\d+)?[KMGT]?", re.IGNORECASE | re.ASCII)
-_KEEP_AFTER_CLOSE_PERCENT = re.compile(r"(\d+(\.\d+)?)%", re.ASCII)
-
-
-def parse_keep_after_close(text: str) -> StreamingKeepAfterClose:
-    """Parse a streaming_keep_after_close value: comma-separated terms.
-
-    Each term is a size in parse_size's form ("4M", "512K", "4194304") or a
-    percentage of the file from 0 to 100 ("50%", "12.5%"). Read-ahead
-    continues after the last close once the readers' longest contiguous
-    span reaches any term. Raises ValueError on an empty value or term, a
-    negative or non-numeric size, an unknown suffix, or a percentage above
-    100.
-    """
-    terms = [term.strip() for term in text.split(",")]
-    if not any(terms) or not all(terms):
-        raise ValueError(f"expected comma-separated sizes or percentages, got {text!r}")
-
-    byte_thresholds = []
-    percent_thresholds = []
-    for term in terms:
-        percent = _KEEP_AFTER_CLOSE_PERCENT.fullmatch(term)
-        if percent:
-            value = Fraction(percent.group(1))
-            if value > 100:
-                raise ValueError(f"percentage above 100%: {term!r}")
-            percent_thresholds.append(value)
-        elif _KEEP_AFTER_CLOSE_SIZE.fullmatch(term):
-            byte_thresholds.append(parse_size(term))
-        else:
-            raise ValueError(f"not a size or percentage: {term!r}")
-
-    return StreamingKeepAfterClose(tuple(byte_thresholds), tuple(percent_thresholds))
 
 
 def _load_mount_profile(config_path: Path, profile_name: str) -> Dict[str, Any]:
@@ -207,6 +148,25 @@ def _optional_profile_string(profile: Dict[str, Any], key: str, profile_name: st
     if not isinstance(value, str) or not value.strip():
         raise click.ClickException(
             f"Mount profile '{profile_name}' must define '{key}' as a non-empty string when present"
+        )
+    return value
+
+
+def _optional_profile_size(
+    profile: Dict[str, Any], key: str, profile_name: str,
+) -> Optional[Union[str, int]]:
+    """A size string or an integer of bytes, checked only for its type here.
+
+    The value itself goes through the same parser as the flag of that name,
+    so the profile and the command line accept the same sizes.
+    """
+    value = profile.get(key)
+    if value is None or (isinstance(value, int) and not isinstance(value, bool)):
+        return value
+    if not isinstance(value, str) or not value.strip():
+        raise click.ClickException(
+            f"Mount profile '{profile_name}' must define '{key}' as a non-empty "
+            "size string or an integer of bytes when present"
         )
     return value
 
@@ -599,6 +559,9 @@ def _load_mount_profile_settings(config_path: Path, profile_name: str) -> Dict[s
         "streaming_keep_after_close": _optional_profile_string(
             config_profile, "streaming_keep_after_close", profile_name
         ),
+        "streaming_read_ahead_window": _optional_profile_size(
+            config_profile, "streaming_read_ahead_window", profile_name
+        ),
         "readdir_ttl": _optional_profile_float(config_profile, "readdir_ttl", profile_name),
         "enable_watchers": _optional_profile_bool(config_profile, "enable_watchers", profile_name),
         "revalidate_after": _optional_profile_float(config_profile, "revalidate_after", profile_name),
@@ -658,6 +621,7 @@ def _can_auto_load_mount_profile(
     max_sync_workers: Optional[int] = None,
     max_download_workers: Optional[int] = None,
     max_retained_streaming_sessions: Optional[int] = None,
+    streaming_read_ahead_window: Optional[str] = None,
 ) -> bool:
     if not _target_looks_like_profile_name(mount_target):
         return False
@@ -686,6 +650,7 @@ def _can_auto_load_mount_profile(
         max_sync_workers is not None,
         max_download_workers is not None,
         max_retained_streaming_sessions is not None,
+        streaming_read_ahead_window is not None,
     ))
 
 
@@ -716,6 +681,7 @@ def resolve_mount_configuration(
     max_sync_workers: Optional[int] = None,
     max_download_workers: Optional[int] = None,
     max_retained_streaming_sessions: Optional[int] = None,
+    streaming_read_ahead_window: Optional[str] = None,
 ) -> ResolvedMountConfig:
     config_values = {
         "mountpoint": None,
@@ -734,6 +700,7 @@ def resolve_mount_configuration(
         "max_download_workers": None,
         "max_retained_streaming_sessions": None,
         "streaming_keep_after_close": None,
+        "streaming_read_ahead_window": None,
         "readdir_ttl": None,
         "enable_watchers": None,
         "revalidate_after": None,
@@ -781,6 +748,7 @@ def resolve_mount_configuration(
         max_sync_workers,
         max_download_workers,
         max_retained_streaming_sessions,
+        streaming_read_ahead_window,
     ):
         available_configs = [candidate for candidate in default_mount_config_paths() if candidate.exists()]
         if available_configs:
@@ -892,6 +860,11 @@ def resolve_mount_configuration(
             streaming_keep_after_close
             if streaming_keep_after_close is not None
             else config_values["streaming_keep_after_close"]
+        ),
+        streaming_read_ahead_window=(
+            streaming_read_ahead_window
+            if streaming_read_ahead_window is not None
+            else config_values["streaming_read_ahead_window"]
         ),
         revalidate_after=_validated_revalidate_after(
             revalidate_after if revalidate_after is not None else (

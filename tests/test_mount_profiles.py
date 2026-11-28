@@ -20,6 +20,7 @@ from storage.mount_profiles import (
     split_storage_member_specs,
 )
 from storage.pathing import resolve_path
+from storage.streaming_settings import parse_read_ahead_window
 
 
 class TestParseSize(unittest.TestCase):
@@ -168,6 +169,33 @@ enable_watchers = true
             config_path.unlink()
 
 
+class TestParseReadAheadWindow(unittest.TestCase):
+    def test_size_strings(self):
+        self.assertEqual(4 * 1024 ** 2, parse_read_ahead_window("4M"))
+        self.assertEqual(0, parse_read_ahead_window(" 0 "))
+
+    def test_non_negative_integers_are_bytes(self):
+        # streaming.get reports an int; a JSON client can send it back.
+        for value in (0, 1, 4 * 1024 ** 2, 2 ** 63 - 1):
+            with self.subTest(value=value):
+                self.assertEqual(value, parse_read_ahead_window(value))
+
+    def test_strings_are_exact_and_truncate_to_whole_bytes(self):
+        # parse_size goes through float and would round this up to 1024.
+        self.assertEqual(1023, parse_read_ahead_window("0.999999999999999999K"))
+        self.assertEqual(2560 * 1024, parse_read_ahead_window("2.5m"))
+        self.assertEqual(1, parse_read_ahead_window("1.9"))
+        self.assertEqual(8796082027091, parse_read_ahead_window("7.99999T"))
+        self.assertEqual(7, parse_read_ahead_window("0" * 5000 + "7"))
+
+    def test_bad_values_rejected(self):
+        for value in (-1, True, False, 4.0, None, [4], "", "-1M", "25%", "4X", "8E",
+                      2 ** 63, "8388608T", "9" * 41, "0." + "1" * 41):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    parse_read_ahead_window(value)
+
+
 class TestParseKeepAfterClose(unittest.TestCase):
     def test_bytes_and_percent_list(self):
         spec = parse_keep_after_close("4M,50%")
@@ -186,6 +214,46 @@ class TestParseKeepAfterClose(unittest.TestCase):
         # Percentages round down.
         self.assertEqual(1, spec.threshold(3))
 
+    def test_all_uses_the_largest_threshold_capped_at_the_file_size(self):
+        spec = parse_keep_after_close(" all: 32M , 30% ")
+        mib = 1024 ** 2
+        self.assertEqual(32 * mib, spec.threshold(64 * mib))
+        self.assertEqual(644_245_095, spec.threshold(2048 * mib))
+        self.assertEqual(9, spec.threshold(9))
+        self.assertEqual(0, spec.threshold(0))
+        self.assertEqual(1, parse_keep_after_close("all:30%").threshold(1))
+        self.assertEqual(0, parse_keep_after_close("all:0,0%").threshold(mib))
+
+    def test_all_prefix_ignores_case_and_space_before_colon(self):
+        for value in ("ALL:32M,30%", "All:32M,30%", "all :32M,30%", " aLl\t: 32M , 30% "):
+            with self.subTest(value=value):
+                spec = parse_keep_after_close(value)
+                self.assertTrue(spec.match_all)
+                self.assertEqual((32 * 1024 ** 2,), spec.byte_thresholds)
+                self.assertEqual((Fraction(30),), spec.percent_thresholds)
+
+    def test_percent_precision_is_bounded(self):
+        self.assertEqual((Fraction(1, 10 ** 6),),
+                         parse_keep_after_close("all:0.000001%").percent_thresholds)
+        self.assertEqual((Fraction(100),), parse_keep_after_close("0" * 5000 + "100%").percent_thresholds)
+        self.assertEqual((Fraction(101, 2),), parse_keep_after_close("050.500000%").percent_thresholds)
+        for value in ("0.0000001%", "all:0." + "0" * 4299 + "1%", "1" + "0" * 5000 + "%",
+                      "0" * 5000 + "101%", "100.000001%"):
+            with self.subTest(value=value[:40]):
+                with self.assertRaises(ValueError):
+                    parse_keep_after_close(value)
+        with self.assertRaisesRegex(ValueError, "more than 6 decimal places"):
+            parse_keep_after_close("all:32M,0.1234567%")
+
+    def test_unknown_term_error_names_the_expected_form(self):
+        with self.assertRaisesRegex(ValueError, r"'lots'.*such as all:32M,30%"):
+            parse_keep_after_close("lots")
+        # A second prefix, or a misspelled one, is a bad term, not a mode.
+        for value in ("all:32M,ALL:30%", "allx:32M", "a ll:32M"):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "such as all:32M,30%"):
+                    parse_keep_after_close(value)
+
     def test_zero_means_any_read(self):
         self.assertEqual(0, parse_keep_after_close("0").threshold(10 * 1024 ** 3))
         self.assertEqual(0, parse_keep_after_close("0%").threshold(10 * 1024 ** 3))
@@ -200,7 +268,7 @@ class TestParseKeepAfterClose(unittest.TestCase):
     def test_bad_values_rejected(self):
         for value in ("", " ", ",", "4M,", ",50%", "-1M", "-5%", "101%", "100.5%",
                       "abc", "4X", "1/2%", "infM", "nan%", "50 %", "4M;50%", "0x10",
-                      "\uff14M", "\u0665\u0660%"):
+                      "all:", "ALL :", "all:,30%", "all:32M,all:30%", "\uff14M", "\u0665\u0660%"):
             with self.subTest(value=value):
                 with self.assertRaises(ValueError):
                     parse_keep_after_close(value)

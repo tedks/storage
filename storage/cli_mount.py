@@ -11,9 +11,11 @@ from .file_config import FileConfig, get_file_config, get_inherited_config, set_
 from .fs import fuse_mount_options, listing_fresh_window, mount_storage
 from .mount_profiles import (
     create_storage_members,
-    parse_keep_after_close,
-    parse_size,
     resolve_mount_configuration,
+)
+from .streaming_settings import (
+    DEFAULT_STREAMING_KEEP_AFTER_CLOSE, DEFAULT_STREAMING_READ_AHEAD_WINDOW,
+    parse_keep_after_close, parse_read_ahead_window, parse_size,
 )
 from .sync import sync_worker_limit
 
@@ -109,10 +111,14 @@ def shared_filesystems(backends: Dict[str, Backend]) -> List[List[str]]:
     "--streaming-keep-after-close",
     help=(
         "Keep prefetching after the last close once readers have read a contiguous "
-        "span this long: comma-separated sizes or percentages of the file, whichever "
-        "is reached first (default: 4 chunks or 50%; 0 = after any read). Spans include "
-        "kernel readahead, so sizes up to about 128K can act like 0."
+        "span this long. Comma-separated sizes and percentages use the first term reached. "
+        f"Prefix with all: to require every term (default: {DEFAULT_STREAMING_KEEP_AFTER_CLOSE}). "
+        "Use 0 for any read. Spans include kernel readahead."
     ),
+)
+@click.option(
+    "--streaming-read-ahead-window",
+    help="Speculative bytes ahead of a read span before it qualifies (default 4M, 0 disables).",
 )
 @click.option(
     "--readdir-ttl",
@@ -192,6 +198,7 @@ def mount(
     max_download_workers,
     max_retained_streaming_sessions,
     streaming_keep_after_close,
+    streaming_read_ahead_window,
     readdir_ttl,
     enable_watchers,
     revalidate_after,
@@ -248,6 +255,7 @@ def mount(
         max_download_workers=max_download_workers,
         max_retained_streaming_sessions=max_retained_streaming_sessions,
         streaming_keep_after_close=streaming_keep_after_close,
+        streaming_read_ahead_window=streaming_read_ahead_window,
         revalidate_after=revalidate_after,
         fuse_threads=fuse_threads,
         bulk_capacity_wait_timeout=bulk_capacity_wait_timeout,
@@ -286,6 +294,13 @@ def mount(
             keep_after_close = parse_keep_after_close(resolved.streaming_keep_after_close)
         except ValueError as exc:
             raise click.ClickException(f"Invalid streaming keep-after-close: {exc}") from exc
+
+    read_ahead_window = DEFAULT_STREAMING_READ_AHEAD_WINDOW
+    if resolved.streaming_read_ahead_window is not None:
+        try:
+            read_ahead_window = parse_read_ahead_window(resolved.streaming_read_ahead_window)
+        except ValueError as exc:
+            raise click.ClickException(f"Invalid streaming read-ahead window: {exc}") from exc
 
     cache_root = Path(resolved.cache).resolve()
 
@@ -347,8 +362,9 @@ def mount(
     click.echo(f"  Max streaming download workers: {resolved.max_download_workers}")
     click.echo(
         "  Streaming keep after close: "
-        f"{resolved.streaming_keep_after_close if keep_after_close else 'default (4 chunks or 50%)'}"
+        f"{resolved.streaming_keep_after_close or DEFAULT_STREAMING_KEEP_AFTER_CLOSE}"
     )
+    click.echo(f"  Streaming read-ahead window: {read_ahead_window:,} bytes")
     fresh_window = listing_fresh_window(resolved.readdir_ttl, resolved.revalidate_after)
     pull = (
         f"listings fresh {fresh_window}s, then served while refreshing up to "
@@ -417,6 +433,7 @@ def mount(
             max_download_workers=resolved.max_download_workers,
             max_retained_streaming_sessions=resolved.max_retained_streaming_sessions,
             streaming_keep_after_close=keep_after_close,
+            streaming_read_ahead_window=read_ahead_window,
             readdir_ttl=resolved.readdir_ttl,
             enable_watchers=resolved.enable_watchers,
             revalidate_after=resolved.revalidate_after,

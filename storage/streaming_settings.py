@@ -1,0 +1,123 @@
+"""Size and policy values shared by mount profiles and live controls."""
+
+import re
+from fractions import Fraction
+from typing import Union
+
+from .models import StreamingKeepAfterClose
+
+DEFAULT_STREAMING_KEEP_AFTER_CLOSE = "all:32M,30%"
+DEFAULT_STREAMING_READ_AHEAD_WINDOW = 4 * 1024 ** 2
+
+
+def parse_size(size_str: str) -> int:
+    """Parse size string to bytes."""
+    size_str = size_str.strip().upper()
+
+    multipliers = {
+        "K": 1024,
+        "M": 1024 ** 2,
+        "G": 1024 ** 3,
+        "T": 1024 ** 4,
+    }
+
+    for suffix, multiplier in multipliers.items():
+        if size_str.endswith(suffix):
+            try:
+                value = float(size_str[:-1])
+                return int(value * multiplier)
+            except (ValueError, OverflowError) as exc:
+                raise ValueError(f"Invalid size format: {size_str}") from exc
+
+    try:
+        return int(size_str)
+    except ValueError as exc:
+        raise ValueError(f"Invalid size format: {size_str}") from exc
+
+
+_SIZE = re.compile(r"\d+(\.\d+)?[KMGT]?", re.IGNORECASE | re.ASCII)
+_KEEP_AFTER_CLOSE_PERCENT = re.compile(r"(\d+)(?:\.(\d+))?%", re.ASCII)
+# A percentage has at most this many decimal places. The bound keeps the
+# Fraction small enough to serialize: streaming.get reports it with str(),
+# and an int over 4300 digits cannot be converted to a string.
+MAX_PERCENT_DECIMALS = 6
+_KEEP_AFTER_CLOSE_ALL = re.compile(r"all\s*:", re.IGNORECASE | re.ASCII)
+
+
+def parse_keep_after_close(text: str) -> StreamingKeepAfterClose:
+    """Parse sizes and percentages; an optional all: prefix requires every term.
+
+    The prefix is case-insensitive and may have whitespace before its colon.
+    """
+    if not isinstance(text, str):
+        raise ValueError("expected a string of sizes or percentages such as all:32M,30%")
+    text = text.strip()
+    prefix = _KEEP_AFTER_CLOSE_ALL.match(text)
+    match_all = prefix is not None
+    body = text[prefix.end():] if prefix else text
+    terms = [term.strip() for term in body.split(",")]
+    if not all(terms):
+        raise ValueError(f"expected comma-separated sizes or percentages, got {text!r}")
+
+    byte_thresholds = []
+    percent_thresholds = []
+    for term in terms:
+        percent = _KEEP_AFTER_CLOSE_PERCENT.fullmatch(term)
+        if percent:
+            whole, decimals = percent.group(1).lstrip("0"), percent.group(2) or ""
+            if len(decimals) > MAX_PERCENT_DECIMALS:
+                raise ValueError(
+                    f"percentage with more than {MAX_PERCENT_DECIMALS} decimal places: {term!r}"
+                )
+            # Leading zeros are dropped before conversion, so the whole part
+            # of a percentage at most 100 has at most three digits.
+            if len(whole) > 3:
+                raise ValueError(f"percentage above 100%: {term!r}")
+            value = Fraction(f"{whole or '0'}.{decimals or '0'}")
+            if value > 100:
+                raise ValueError(f"percentage above 100%: {term!r}")
+            percent_thresholds.append(value)
+        elif _SIZE.fullmatch(term):
+            byte_thresholds.append(parse_size(term))
+        else:
+            raise ValueError(
+                f"not a size or percentage: {term!r}; expected sizes or "
+                "percentages such as all:32M,30% or 4M,50%"
+            )
+
+    return StreamingKeepAfterClose(tuple(byte_thresholds), tuple(percent_thresholds), match_all)
+
+
+_WINDOW = re.compile(r"(\d+)(?:\.(\d+))?([KMGT]?)", re.IGNORECASE | re.ASCII)
+_SIZE_MULTIPLIERS = {"": 1, "K": 1024, "M": 1024 ** 2, "G": 1024 ** 3, "T": 1024 ** 4}
+# Bounds that keep the window a sane byte count: a 64-bit size, written
+# with at most this many significant digits on either side of the point.
+MAX_READ_AHEAD_WINDOW = 2 ** 63 - 1
+_MAX_WINDOW_DIGITS = 40
+
+
+def parse_read_ahead_window(value: Union[str, int]) -> int:
+    """A size string such as 4M, or a non-negative int of bytes.
+
+    The int form lets a JSON control client send back the integer that
+    streaming.get reports, and a TOML profile use a bare integer. bool is an
+    int subclass and is rejected. A string is converted exactly and
+    truncated to whole bytes ("0.999999999999999999K" is 1023), unlike
+    parse_size, which goes through float.
+    """
+    expected = "expected a non-negative size such as 4M or 0"
+    if isinstance(value, int) and not isinstance(value, bool):
+        if value < 0:
+            raise ValueError(f"{expected}, got {value}")
+        size = value
+    elif isinstance(value, str) and (match := _WINDOW.fullmatch(value.strip())):
+        whole, decimals = match.group(1).lstrip("0"), (match.group(2) or "").rstrip("0")
+        if len(whole) > _MAX_WINDOW_DIGITS or len(decimals) > _MAX_WINDOW_DIGITS:
+            raise ValueError(f"{expected}, with at most {_MAX_WINDOW_DIGITS} digits on each side of the point")
+        number = Fraction(f"{whole or '0'}.{decimals or '0'}")
+        size = int(number * _SIZE_MULTIPLIERS[match.group(3).upper()])
+    else:
+        raise ValueError(expected)
+    if size > MAX_READ_AHEAD_WINDOW:
+        raise ValueError(f"read-ahead window above {MAX_READ_AHEAD_WINDOW} bytes")
+    return size

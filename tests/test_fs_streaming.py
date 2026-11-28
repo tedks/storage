@@ -14,9 +14,11 @@ from fuse import FuseOSError
 
 from storage.backends.local import LocalBackend
 from storage.cache_metadata import MEMBER_ATTRS_XATTR
+from storage.control import ControlError
 from storage.fs import StorageFS
 from storage.models import SyncStatus
 from storage.mount_profiles import parse_keep_after_close
+from storage.streaming import PrefetchSession
 
 
 class SlowRangeLocalBackend(LocalBackend):
@@ -72,7 +74,7 @@ class TestFSStreamingIntegration(unittest.TestCase):
 
         self.fs = self._make_fs()
 
-    def _make_fs(self, keep_after_close=None, chunk_size=32 * 1024):
+    def _make_fs(self, keep_after_close="128K,50%", chunk_size=32 * 1024):
         return StorageFS(
             cache_root=self.cache_dir,
             state_db=self.db_path,
@@ -83,12 +85,13 @@ class TestFSStreamingIntegration(unittest.TestCase):
             streaming_reads=True,
             streaming_chunk_size=chunk_size,
             max_streaming_sessions=2,
-            streaming_keep_after_close=(
-                parse_keep_after_close(keep_after_close) if keep_after_close is not None else None
-            ),
+            **({
+                "streaming_keep_after_close": parse_keep_after_close(keep_after_close),
+                "streaming_read_ahead_window": 4 * chunk_size,
+            } if keep_after_close is not None else {}),
         )
 
-    def _remake_fs(self, keep_after_close=None, chunk_size=32 * 1024):
+    def _remake_fs(self, keep_after_close="128K,50%", chunk_size=32 * 1024):
         self.fs.destroy('/')
         self.fs = self._make_fs(keep_after_close, chunk_size)
 
@@ -1536,21 +1539,94 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.assertEqual(self.fs.read('/orphan-partial.bin', 4096, 0, vfd), payload[:4096])
         self.fs.release('/orphan-partial.bin', vfd)
 
+    def test_default_qualification_and_window_for_a_two_gib_file(self):
+        mib = 1024 ** 2
+        self._remake_fs(keep_after_close=None, chunk_size=mib)
+        manager = self.fs._streaming_manager
+        # A synthetic session gives the planner a realistic file size
+        # without allocating or transferring a 2 GiB payload.
+        session = PrefetchSession(
+            canonical_path="/large.bin", virtual_path="/large.bin",
+            backend=self.backend, file_size=2048 * mib, chunk_size=mib, io_fd=-1,
+            final_cache_path=self.cache_dir / "large.bin",
+            partial_cache_path=self.cache_dir / "large.bin.storage.partial",
+        )
+        with session.lock:
+            manager._record_foreground_read(session, 0, mib)
+            session.has_foreground_read = True
+            self.assertFalse(session.readers_consumed)
+            self.assertEqual(manager._next_background_fetch(session), ((mib, 2 * mib), False))
+            session.available_ranges = [(0, 4 * mib)]
+            self.assertEqual(manager._next_background_fetch(session), ((4 * mib, 5 * mib), False))
+            session.available_ranges = [(0, 5 * mib)]
+            self.assertIsNone(manager._next_background_fetch(session))
+
+            manager._record_foreground_read(session, 1024 * mib, 1200 * mib)
+            manager._record_foreground_read(session, mib, 644_245_094)
+            self.assertFalse(session.readers_consumed)
+            manager._record_foreground_read(session, 644_245_094, 644_245_095)
+            self.assertTrue(session.readers_consumed)
+
+    def test_control_window_round_trips_the_integer_that_get_reports(self):
+        # A JSON client reads the window as an integer and can send it back.
+        manager = self.fs._streaming_manager
+        request = manager._handle_control_request
+        limits = request(json.dumps({"command": "streaming.get"}))["limits"]
+        window = limits["streaming_read_ahead_window"]
+        self.assertIsInstance(window, int)
+        updated = request(json.dumps({
+            "command": "streaming.set",
+            "limits": {"streaming_read_ahead_window": window + 1},
+        }))["limits"]
+        self.assertEqual(window + 1, updated["streaming_read_ahead_window"])
+        updated = request(json.dumps({
+            "command": "streaming.set", "limits": {"streaming_read_ahead_window": 0},
+        }))["limits"]
+        self.assertEqual(0, updated["streaming_read_ahead_window"])
+
+        for bad in (-1, True, 4.0, None, [1]):
+            with self.subTest(value=bad):
+                with self.assertRaisesRegex(ControlError, "streaming_read_ahead_window"):
+                    request(json.dumps({
+                        "command": "streaming.set",
+                        "limits": {"streaming_read_ahead_window": bad},
+                    }))
+        self.assertEqual(0, manager.download_limits()["streaming_read_ahead_window"])
+
+        # A percentage too precise to report is refused before it is
+        # installed, so the policy and later gets are unaffected.
+        policy = limits["streaming_keep_after_close"]
+        with self.assertRaisesRegex(ControlError, "decimal places"):
+            request(json.dumps({
+                "command": "streaming.set",
+                "limits": {"streaming_keep_after_close": "all:0." + "0" * 4299 + "1%"},
+            }))
+        self.assertEqual(policy, request(json.dumps({"command": "streaming.get"}))
+                         ["limits"]["streaming_keep_after_close"])
+
+        # keep-after-close stays string-only: get reports a structure, not
+        # the string set accepts.
+        with self.assertRaisesRegex(ControlError, "streaming_keep_after_close"):
+            request(json.dumps({
+                "command": "streaming.set",
+                "limits": {"streaming_keep_after_close": limits["streaming_keep_after_close"]},
+            }))
+
     def test_streaming_open_sniffer_does_not_pull_whole_file(self):
         # A reader reads the first chunk, which starts read-ahead, and holds
         # the file open. Until the readers show consumption, read-ahead stays
-        # within the keep-after-close threshold (here 4 chunks: 128 KiB) past
-        # what they read, rounded up to whole chunks, and follows the reader
+        # within the configured window past what they read and follows the reader
         # when it moves.
         self.backend.range_delay = 0.005
         payload = os.urandom(2 * 1024 * 1024)
         (self.backend_dir / "held.bin").write_bytes(payload)
         chunk = 32 * 1024
-        threshold = 4 * chunk
+        window = 96 * 1024 + 17
         manager = self.fs._streaming_manager
+        manager.update_download_limits(streaming_read_ahead_window=str(window))
         # create=True so that, without the bound, the test fails on the
         # forbidden fetch below rather than on a missing attribute.
-        real_bounded = getattr(manager, "_bounded_read_ahead_chunk", None)
+        real_bounded = getattr(manager, "_bounded_read_ahead_range", None)
         real_read_file = self.backend.read_file
         parked_at = []
         background_reads = []
@@ -1572,13 +1648,12 @@ class TestFSStreamingIntegration(unittest.TestCase):
             with session.lock:
                 return list(session.available_ranges)
 
-        with patch.object(manager, "_bounded_read_ahead_chunk", side_effect=spy_bounded, create=True), \
+        with patch.object(manager, "_bounded_read_ahead_range", side_effect=spy_bounded, create=True), \
                 patch.object(self.backend, "read_file", side_effect=spy_read_file):
             vfd = self.fs.open('/held.bin', os.O_RDONLY)
             session = self._session_for(vfd)
             self.assertEqual(self.fs.read('/held.bin', chunk, 0, vfd), payload[:chunk])
-            # Chunks up to the end of the read + threshold, and no further.
-            first_end = chunk + threshold
+            first_end = chunk + window
             self.assertTrue(self._wait_for(
                 lambda: 0 in parked_at or any(start >= first_end for start, _ in background_reads),
                 timeout=5.0,
@@ -1590,7 +1665,7 @@ class TestFSStreamingIntegration(unittest.TestCase):
             offset = 1024 * 1024
             self.assertEqual(self.fs.read('/held.bin', 4096, offset, vfd), payload[offset:offset + 4096])
             self.assertTrue(self._wait_for(lambda: offset in parked_at, timeout=5.0))
-            second_end = ((offset + 4096 + threshold) // chunk + 1) * chunk
+            second_end = offset + 4096 + window
             self.assertEqual(fetched(session), [(0, first_end), (offset, second_end)])
             self.assertTrue(
                 all(start < first_end or offset <= start < second_end for start, _ in background_reads),
@@ -1692,7 +1767,7 @@ class TestFSStreamingIntegration(unittest.TestCase):
     def test_streaming_sniff_requests_only_what_it_reads(self):
         # A content-type sniff of an uncached multi-MiB file at the default
         # 1 MiB chunk: the member is asked for the 4 KiB read, nothing else.
-        self._remake_fs(chunk_size=1024 * 1024)
+        self._remake_fs(keep_after_close=None, chunk_size=1024 * 1024)
         reads = self._sniff("sniff-large.bin", 6 * 1024 * 1024)
         self.assertEqual(reads, [(0, 4096, False)])
         self._assert_not_cached("sniff-large.bin")
@@ -1700,7 +1775,7 @@ class TestFSStreamingIntegration(unittest.TestCase):
     def test_streaming_sniff_of_file_under_one_chunk_is_not_kept(self):
         # Below one chunk the old rounding fetched the whole file, which then
         # finalized into the cache.
-        self._remake_fs(chunk_size=1024 * 1024)
+        self._remake_fs(keep_after_close=None, chunk_size=1024 * 1024)
         reads = self._sniff("sniff-small.bin", 700 * 1024)
         self.assertEqual(reads, [(0, 4096, False)])
         self._assert_not_cached("sniff-small.bin")

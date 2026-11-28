@@ -203,8 +203,12 @@ cache. A read fetches only the bytes it asks for (the kernel asks for at
 most its readahead, 128K by default), and the worker starts only once the
 readers have read a contiguous span of one `streaming_chunk_size` (1M by
 default; the keep-after-close threshold below if that is smaller), then
-prefetches in chunks of that size. So a file manager sniffing a content
-type costs about what it reads, as on a plain sftp mount. A reader making
+prefetches in chunks of that size. The default `all:32M,30%` policy caps
+its threshold at the file size, so a file smaller than one chunk would
+reach it only once readers had requested all of it: under that policy
+such a file is fetched on demand, one kernel request at a time, with no
+read-ahead. So a file manager sniffing a content type costs about what
+it reads, as on a plain sftp mount. A reader making
 more than 1024 scattered reads of one file (a database, an archive index)
 gets whole-chunk fetches again: once a file's session is that fragmented,
 even a small read costs up to one chunk.
@@ -220,29 +224,29 @@ each), before and after this behaviour, at the default 1M chunk:
   requests (512 at a 128K chunk, which matters on a link with real
   latency; paramiko's SFTP, not the chunk size, limits the speed here).
 
-When the last reader closes before the file is complete, the
-prefetch continues only if the readers consumed the file: the longest
-contiguous span they read reached `streaming_keep_after_close`
-(`--streaming-keep-after-close`). Otherwise the partial download is
-discarded, so a file manager sniffing content types or making thumbnails
-does not pull whole files. The same threshold bounds read-ahead while the
-file is open: once it has started and until the readers have consumed it,
-the worker fetches forward from the latest read to at most that far past the span it belongs
-to (rounded up to a whole chunk), so a reader that reads the head and
-holds the file open does not pull the whole file either. A percentage
-threshold therefore also widens that window: `50%` lets a reader that
-holds a file open pull up to half of it. The value is a comma-separated list of sizes
-(`4M`, `512K`, plain bytes) and percentages of the file (`50%`, `12.5%`,
-rounded down to bytes), whichever is reached first. Spans count the
-read requests the kernel sends, which include its own readahead (up to
-128K by default), so a size at or below that can act like `0`. Unset, it is 4
-chunks or 50% (`4M,50%` at the default 1M `streaming_chunk_size`). `0`
-keeps prefetching after any read, the behaviour before this option, and
-leaves read-ahead unbounded while open. `100%` effectively never keeps
-prefetching after a close, and lets read-ahead while open run from the
-latest read to the end of the file. Empty terms,
-negative sizes, unknown suffixes and percentages above 100 are rejected
-when the mount configuration loads.
+When the last reader closes, an unfinished download continues once the
+longest contiguous span readers requested reaches
+`streaming_keep_after_close` (`--streaming-keep-after-close`). The default
+`all:32M,30%` requires the larger of 32 MiB and 30% of the file, capped at
+the file size. Percentages in an `all:` policy round up to the next byte.
+Existing comma-separated policies without `all:` still use the first
+threshold reached and round percentages down. For example, `4M,50%`
+qualifies at 4 MiB on a large file and halfway through a small one.
+To adopt the new default in a profile that sets the old rule explicitly,
+remove that setting or change it to `all:32M,30%`. Use `0` to qualify after
+any read or `100%` to require a full-file read.
+Storage counts the spans requested by the kernel, including its readahead.
+
+Before a file qualifies, its background worker may fetch ahead of the
+latest contiguous read span by up to `streaming_read_ahead_window`
+(`--streaming-read-ahead-window`). The default is 4 MiB, independent of
+file size and chunk size. In a profile it may be a size string or an
+integer of bytes (`streaming_read_ahead_window = 4194304`). Use `0` to
+disable speculative reads before qualification. If the last reader closes before the file qualifies and
+the file is still incomplete, Storage discards the partial download. On
+a 2 GiB file, a 1 MiB contiguous read opens a speculative window of up to
+4 MiB after that span, while a contiguous read of about 614.4 MiB
+(644,245,095 bytes) qualifies the file to keep downloading after close.
 
 Streaming read-ahead and retained fills share an adaptive pool of up to
 `max_download_workers` (`--max-download-workers`, default 4, range 1–32).
@@ -540,6 +544,7 @@ override or the profile now points to a different cache.
 storage control --profile media
 storage control --profile media --config ./storage.toml get
 storage control --cache '/var/cache/my media' set --max-streaming-sessions 4 --max-download-workers 2
+storage control --profile media set --streaming-keep-after-close 'all:32M,30%' --streaming-read-ahead-window 4M
 storage control --profile media downloads
 storage control --profile media cancel 474b595adc054281bced844067939d97
 ```
@@ -558,11 +563,17 @@ streaming downloads independently of background sync.
 | `--max-streaming-sessions` | 1–1024 | Concurrent streaming files with readers. Additional cold opens fall back to a whole-file fetch. |
 | `--max-retained-streaming-sessions` | 0–1024 | Reader-free downloads retained after close. Set to `0` to discard unfinished downloads at future last closes. Existing retained downloads can finish. |
 | `--max-download-workers` | 1–32 | Ceiling for background download workers. When lowered, transfers in progress finish their current chunks before the lower cap applies. |
+| `--streaming-keep-after-close` | Sizes and percentages | Re-evaluates open, unqualified files using the read spans already observed. Files that qualify stay qualified for that download. |
+| `--streaming-read-ahead-window` | Non-negative size | Speculative window before qualification. A background range request already in flight can finish under the previous window. |
 
-`streaming_reads`, `streaming_chunk_size`, and `streaming_keep_after_close`
-require a restart. `get` reports their current values with chunk size in bytes
-and keep-after-close thresholds in bytes and percentages. Change the mount
-profile or startup flags to persist settings across restarts.
+`get` reports chunk and window sizes in bytes and keep-after-close
+thresholds as an `any` or `all` rule with byte counts and percentages.
+A JSON client of the `streaming.set` request may send the window back as
+the integer `get` reported, or as a size string such as `4M`. The
+keep-after-close value accepts only the policy string (for example
+`all:32M,30%`), not the structure `get` reports.
+Changing `streaming_reads` or `streaming_chunk_size` requires a restart.
+Change the mount profile or startup flags to persist settings across restarts.
 
 To cancel, copy the exact ID from `downloads`. `cancelled` means the mount
 abandoned the download, including its partial cache file. A download with a
