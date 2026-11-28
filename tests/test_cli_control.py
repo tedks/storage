@@ -277,6 +277,23 @@ def test_canonical_mountpoint(tmp_path, monkeypatch):
     # The final component is never resolved, so a hung mount root is not touched.
     assert canonical_mountpoint(str(tmp_path / "alias" / "final")) == str(real / "final")
     assert canonical_mountpoint("/") == "/"
+    assert canonical_mountpoint("//") == "/"
+    assert canonical_mountpoint(str(real / "mount" / ".")) == str(real / "mount")
+    assert canonical_mountpoint(str(real / "mount" / "..")) == str(real)
+
+
+def test_canonical_mountpoint_resolves_dotdot_after_symlinks(tmp_path):
+    # srv/alias -> data/subdir, so the kernel resolves srv/alias/../mount
+    # to data/mount; lexical normalization would give srv/mount.
+    base = tmp_path.resolve()
+    (base / "data" / "subdir").mkdir(parents=True)
+    (base / "data" / "mount").mkdir()
+    (base / "srv" / "mount").mkdir(parents=True)
+    (base / "srv" / "alias").symlink_to(base / "data" / "subdir")
+    through_alias = canonical_mountpoint(str(base / "srv" / "alias" / ".." / "mount"))
+    assert through_alias == str(base / "data" / "mount")
+    assert through_alias != canonical_mountpoint(str(base / "srv" / "mount"))
+    assert os.path.samefile(through_alias, base / "srv" / "alias" / ".." / "mount")
 
 
 def test_handler_errors_are_logged_and_answered(cache, caplog):

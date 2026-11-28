@@ -68,15 +68,26 @@ def _owner_socket(path: Path) -> os.stat_result:
 def canonical_mountpoint(mountpoint: str) -> str:
     """The absolute mountpoint a mount reports and a profile is matched against.
 
-    The parent directory's symlinks are resolved; the final component is
-    not, so this never stats the mount root itself (a hung mount would
-    block the CLI). The mount and the CLI apply the same rule, so a
-    relative mountpoint matches only when both resolve it from the same
-    working directory, as for the cache path.
+    The parent directory is resolved the way the kernel resolves it:
+    symlinks first, then each `..` against what they point to, so nothing
+    is normalized lexically (abspath would make `alias/../m` the sibling of
+    `alias` even when `alias` links elsewhere). The final component is not
+    resolved, so this never stats the mount root itself (a hung mount would
+    block the CLI), unless it is `.` or `..`, which only full resolution
+    can place. The mount and the CLI apply the same rule, so a relative
+    mountpoint matches only when both resolve it from the same working
+    directory, as for the cache path.
     """
-    absolute = os.path.abspath(os.fsdecode(mountpoint))
-    parent, name = os.path.split(absolute)
-    return os.path.join(os.path.realpath(parent), name)
+    path = os.fsdecode(mountpoint)
+    if not os.path.isabs(path):
+        path = os.path.join(os.getcwd(), path)
+    path = path.rstrip("/")
+    if not path:
+        return "/"
+    parent, name = path.rsplit("/", 1)
+    if name in (".", ".."):
+        return os.path.realpath(path)
+    return os.path.join(os.path.realpath(parent or "/"), name)
 
 
 def _check_peer(sock: socket.socket):
