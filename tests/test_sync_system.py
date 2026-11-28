@@ -547,11 +547,11 @@ class TestKernelCacheRefetch(_MountedCase):
         finally:
             os.close(c)
 
-    # Known limitation, older than dropping auto_cache (which kept stale
-    # pages too). strict, so a fix turns this red and the marker comes off;
+    # Known limitation (#206), older than dropping auto_cache (which kept
+    # stale pages too). strict, so a fix turns this red and the marker comes off;
     # raises, so a setup failure (RuntimeError) is not an expected failure.
     @pytest.mark.xfail(strict=True, raises=AssertionError,
-                       reason="a reader held open across invalidation refills the "
+                       reason="#206: a reader held open across invalidation refills the "
                               "shared FUSE pages from its old cache file")
     def test_stale_refill_by_held_reader_reaches_new_reader(self):
         a, b = self._held_reader_and_new_reader("held-refill.bin")
