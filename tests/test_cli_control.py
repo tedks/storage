@@ -203,6 +203,21 @@ def test_request_goes_through_the_given_cache_fd(cache):
         moved.rmdir()
 
 
+def test_request_needs_only_search_permission_on_the_cache(cache):
+    # As connecting by path did: a cache whose read bit was removed while
+    # the mount runs stays reachable for its owner.
+    server = server_for(cache, lambda frame: {"via": frame})
+    server.start()
+    try:
+        cache.chmod(0o300)
+        try:
+            assert request_control_payload(cache, b"search-only", 2) == {"via": "search-only"}
+        finally:
+            cache.chmod(0o700)
+    finally:
+        server.stop()
+
+
 def test_cli_identifies_and_connects_through_one_cache_open(cache, monkeypatch):
     server, requests = recording_server(cache, None)
     server.start()

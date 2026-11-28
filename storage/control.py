@@ -103,8 +103,13 @@ def _check_peer(sock: socket.socket):
 
 
 def open_cache_directory(cache_root: Path) -> int:
-    """Open a cache directory for request_control_payload(cache_fd=...)."""
-    return os.open(cache_root, os.O_RDONLY | os.O_DIRECTORY)
+    """Open a cache directory for request_control_payload(cache_fd=...).
+
+    O_PATH: fstat, the relative socket lookup and the /proc/self/fd connect
+    need only search permission on the directory, as connecting by path
+    always did; a read-only open would also need read permission.
+    """
+    return os.open(cache_root, os.O_PATH | os.O_DIRECTORY)
 
 
 def request_control_payload(cache_root: Path, request: bytes, timeout: float,
