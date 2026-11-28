@@ -60,7 +60,10 @@ class StateManager:
     # dirty_generation: when the stored generation is newer than the one in
     # the incoming row, a write() landed after that row was read, and those
     # columns keep the stored values. Policy columns take the new values;
-    # an older access timestamp never replaces a newer one. Parameters are
+    # an older access timestamp never replaces a newer one. A timestamp
+    # taken during a forward wall-clock jump therefore sticks (the file
+    # looks recently read) until real time catches up with it; that is
+    # accepted, since it only delays one file's eviction. Parameters are
     # a _metadata_row tuple.
     _UPSERT_FILES_SQL = '''
         INSERT INTO files
