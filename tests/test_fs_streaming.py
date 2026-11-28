@@ -1827,6 +1827,21 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.assertEqual((stat_module.S_IMODE(attrs["st_mode"]), attrs["st_uid"]), (0o640, 4242))
         self._assert_warm_and_offline("partial.bin", payload)
 
+    def test_cold_streaming_open_without_owner_read_is_refused(self):
+        import stat as stat_module
+        from types import SimpleNamespace
+        for mode in (0o200, 0o040):
+            with self.subTest(mode=oct(mode)):
+                name = f"noread{mode:o}.bin"
+                (self.backend_dir / name).write_bytes(os.urandom(64 * 1024))
+                real = self.backend.stat
+                with patch.object(self.backend, "stat", side_effect=lambda path: SimpleNamespace(
+                        st_size=real(path).st_size, st_mtime_ns=real(path).st_mtime_ns,
+                        st_mtime=real(path).st_mtime, st_mode=stat_module.S_IFREG | mode)):
+                    with self.assertRaises(FuseOSError) as raised:
+                        self.fs.open("/" + name, os.O_RDONLY)  # the first, cold open
+                self.assertEqual(raised.exception.errno, errno.EACCES)
+
     def test_streaming_fill_with_an_unconfirmed_mode_grants_no_write(self):
         # No version token, a mode only the probe reported: the staging
         # file's own owner write is not granted through the mount.

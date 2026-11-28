@@ -2562,6 +2562,14 @@ class StorageFS(Operations):
                 resolved.canonical_path,
             )
             if prefetch_session:
+                # A streaming descriptor is on Storage's own staging file: the
+                # member's mode (as the session probed it) decides read, as a
+                # cached file's recorded mode does (_require_imported_permission).
+                mode = getattr(prefetch_session.member_stat, "st_mode", None)
+                if (os.geteuid() != 0 and type(mode) is int
+                        and not mode & stat.S_IRUSR):
+                    self._release_prefetch_session(prefetch_session)
+                    raise FuseOSError(errno.EACCES)
                 cache_path = prefetch_session.partial_cache_path
                 if not cache_path.exists() and prefetch_session.final_cache_path.exists():
                     # Session finished before open() reached os.open.
