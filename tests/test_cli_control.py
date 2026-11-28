@@ -224,3 +224,44 @@ def test_handler_errors_are_logged_and_answered(cache, caplog):
     finally:
         server.stop()
 
+
+def test_restart_while_a_stopped_thread_is_still_in_a_request(cache, monkeypatch, caplog):
+    # stop() gives up on a handler that outlasts its join; a later start()
+    # must still publish and serve, and the old thread must not serve again.
+    monkeypatch.setattr("storage.control.REQUEST_TIMEOUT", 0.2)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def dispatch(command):
+        if command == "block":
+            entered.set()
+            assert release.wait(30)
+        return {"command": command}
+
+    server = server_for(cache, dispatch)
+    server.start()
+    old_thread = server._thread
+    try:
+        with socket_for(cache) as blocked:
+            blocked.settimeout(30.0)
+            blocked.sendall(b"block\n")
+            assert entered.wait(30)
+            with caplog.at_level(logging.WARNING, logger=__name__):
+                server.stop()
+            assert old_thread.is_alive()
+            assert any("still in a request" in r.getMessage() for r in caplog.records)
+
+            server.start()
+            assert server._thread is not old_thread
+            assert request_control_payload(cache, b"after-restart", 5) == {
+                "command": "after-restart",
+            }
+            release.set()
+            assert read_response(blocked) == {"command": "block"}
+        old_thread.join(30)
+        assert not old_thread.is_alive()
+        assert request_control_payload(cache, b"still-served", 5) == {"command": "still-served"}
+    finally:
+        release.set()
+        server.stop()
+    assert not (cache / CONTROL_SOCKET_NAME).exists()

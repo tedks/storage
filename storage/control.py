@@ -181,7 +181,7 @@ class ControlServer:
 
     def start(self):
         with self._lock:
-            if self._thread is not None and self._thread.is_alive():
+            if self._listener is not None:
                 return
             listener = None
             try:
@@ -192,10 +192,13 @@ class ControlServer:
                     listener.close()
                 self._logger.warning("failed to start control socket at %s: %s", self.path, exc)
                 return
-            self._stop.clear()
+            # Each listener gets its own stop event, so a thread that outlived
+            # an earlier stop() still sees its own stop and never serves again.
+            self._stop = threading.Event()
             self._listener = listener
             self._thread = threading.Thread(
-                target=self._serve, args=(listener,), daemon=True, name="storage-control-socket",
+                target=self._serve, args=(listener, self._stop), daemon=True,
+                name="storage-control-socket",
             )
             self._thread.start()
 
@@ -214,10 +217,19 @@ class ControlServer:
                 pass
             self._listener.close()
             self._listener = None
-            self._thread.join(timeout=REQUEST_TIMEOUT + 0.25)
+            timeout = REQUEST_TIMEOUT + 0.25
+            self._thread.join(timeout=timeout)
+            if self._thread.is_alive():
+                # Its listener is closed and its stop event set, so it exits
+                # after the request it is in; only that request is answered.
+                self._logger.warning(
+                    "control socket thread still in a request after %.2fs; it exits when that returns",
+                    timeout,
+                )
+            self._thread = None
 
-    def _serve(self, listener: socket.socket):
-        while not self._stop.is_set():
+    def _serve(self, listener: socket.socket, stop: threading.Event):
+        while not stop.is_set():
             try:
                 conn, _ = listener.accept()
             except socket.timeout:
@@ -225,9 +237,9 @@ class ControlServer:
             except OSError:
                 return
             with conn:
-                self._serve_connection(conn)
+                self._serve_connection(conn, stop)
 
-    def _serve_connection(self, conn: socket.socket):
+    def _serve_connection(self, conn: socket.socket, stop: threading.Event):
         try:
             _check_peer(conn)
         except (ControlError, OSError):
@@ -245,7 +257,7 @@ class ControlServer:
         except OSError:
             return
         else:
-            if frame is None or self._stop.is_set():
+            if frame is None or stop.is_set():
                 return
             try:
                 request = frame.decode("utf-8")
