@@ -152,6 +152,10 @@ class _FakeRemoteFile:
     def seek(self, offset: int):
         self._offset = offset
 
+    def prefetch(self, file_size=None, max_concurrent_requests=None):
+        # paramiko 4 queues read-ahead for [0, file_size) only.
+        self._sftp.server.prefetches.append(file_size)
+
     def read(self, size: int):
         chunk = self._data[self._offset:self._offset + size]
         self._offset += len(chunk)
@@ -298,6 +302,7 @@ class _FakeServer:
         self.requests = []
         self.concurrent_use = []
         self.opens = []
+        self.prefetches = []
         self.create_errors = {}
         self.transports = []
         self.ssh_clients = []

@@ -120,8 +120,20 @@ def _copy_file(src: Path, dst: Path, *, download: bool = False):
         # One open of the source, at most bound.cap bytes (CopyBound): a
         # writer appending meanwhile cannot make the copy unbounded. Mode
         # and times come from that same open.
-        with open(src, "rb") as fin, open(dst, "wb") as fout:
-            st = os.fstat(fin.fileno())
+        # O_NONBLOCK so a FIFO or device put at the name cannot block the
+        # open; the same descriptor's fstat must say regular file, and only
+        # then is blocking restored and anything read.
+        fd = os.open(src, os.O_RDONLY | os.O_NONBLOCK)
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                raise OSError(errno.EINVAL, "not a regular file", str(src))
+            os.set_blocking(fd, True)
+            fin = os.fdopen(fd, "rb")
+        except BaseException:
+            os.close(fd)
+            raise
+        with fin, open(dst, "wb") as fout:
             copy_bounded_stream(fin.read, fout.write, bound)
     keep = {name for name in _listxattr(src) if not _is_internal_xattr(name)}
     for name in _listxattr(dst):

@@ -578,14 +578,20 @@ class SSHBackend(Backend):
 
         def bounded(sftp):
             # One open of the remote file, at most bound.cap bytes and one
-            # probe read (CopyBound); no prefetch, which would read ahead
-            # without a bound. A retry after a lost connection starts over.
-            bound.grew, bound.read, bound.written = False, 0, 0
+            # probe read (CopyBound). prefetch(cap) queues read-ahead only for
+            # [0, cap) (paramiko 4: SFTPFile.prefetch(file_size)), so it stays
+            # bounded; the probe at cap is an ordinary request afterwards.
+            # Without prefetch, paramiko 4 dispatches each read as synchronous
+            # 32 KiB SFTP requests (one round trip each).
             with sftp.open(remote_path, "rb") as fin, open(local_path, "wb") as fout:
+                fin.prefetch(bound.cap)
                 copy_bounded_stream(fin.read, fout.write, bound)
 
+        # Not retried: a copy whose connection drops after the source was
+        # opened fails with that error, never reopens and copies again (one
+        # source, opened once). The open's own failure fails it too.
         self._with_sftp("copy_to_local", virtual_path, bounded,
-                        timeout=self.sftp_operation_timeout, retry=True)
+                        timeout=self.sftp_operation_timeout)
 
     def copy_from_local(self, local_path: Path, virtual_path: str):
         """Copy a local file to remote"""

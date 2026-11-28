@@ -307,8 +307,18 @@ class TestBoundedCopy(unittest.TestCase):
                 offset["at"] += len(chunk)
                 return chunk
 
+            def prefetch(self, file_size=None, max_concurrent_requests=None):
+                prefetches.append(file_size)
+
+        prefetches = []
         remote = GrowingRemote()
-        remote.read = self.appending_reader(remote.read, lambda: data.extend(b"+" * 7) or 7)
+        requested = []
+        read = remote.read
+
+        def recorded(n):
+            requested.append(n)
+            return read(n)
+        remote.read = self.appending_reader(recorded, lambda: data.extend(b"+" * 7) or 7)
         sftp = SimpleNamespace(open=lambda path, mode: remote,
                                get=lambda *a: self.fail("an unbounded get"))
         backend = SSHBackend.__new__(SSHBackend)
@@ -319,6 +329,68 @@ class TestBoundedCopy(unittest.TestCase):
         with patch.object(base, "COPY_CHUNK", 8), base.bounded_copy(self.CAP) as bound:
             backend.copy_to_local("/f.log", dst)
         self.check(bound, dst)
+        # Read-ahead queued for the cap only, never for an open-ended size,
+        # and no more than the cap requested before the one-byte probe.
+        self.assertEqual(prefetches, [self.CAP])
+        self.assertEqual(sum(requested[:-1]), self.CAP)
+        self.assertEqual(requested[-1], 1)
+
+    def test_ssh_copy_is_not_replayed_after_the_source_opened(self):
+        from types import SimpleNamespace
+        from storage.backends import base
+        from storage.backends.ssh import SSHBackend
+        opens = []
+
+        class Dropping:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def prefetch(self, file_size=None, max_concurrent_requests=None):
+                pass
+
+            def read(self, n):
+                raise ConnectionResetError("connection dropped mid-copy")
+
+        sftp = SimpleNamespace(open=lambda path, mode: opens.append(path) or Dropping())
+        backend = SSHBackend.__new__(SSHBackend)
+        backend._resolve_path = lambda path: "/remote" + path
+        backend.sftp_operation_timeout = 1.0
+
+        def with_sftp(what, path, fn, retry=False, **kw):
+            # As _with_sftp: with retry, a connection error runs fn again.
+            for attempt in range(2 if retry else 1):
+                try:
+                    return fn(sftp)
+                except ConnectionResetError:
+                    if not retry or attempt:
+                        raise
+        backend._with_sftp = with_sftp
+        with base.bounded_copy(self.CAP), self.assertRaises(ConnectionResetError):
+            backend.copy_to_local("/f.log", self.temp_dir / "copy")
+        self.assertEqual(len(opens), 1)
+
+    def test_local_copy_refuses_a_fifo_without_blocking(self):
+        from storage.backends import base
+        root = self.temp_dir / "member"
+        root.mkdir()
+        os.mkfifo(root / "f.log")  # the name became a FIFO after the probe
+        result = {}
+
+        def copy():
+            try:
+                with base.bounded_copy(self.CAP):
+                    LocalBackend("m", str(root)).copy_to_local("/f.log", self.temp_dir / "copy")
+            except OSError as exc:
+                result["errno"] = exc.errno
+
+        worker = threading.Thread(target=copy, daemon=True)
+        worker.start()
+        worker.join(5)
+        self.assertFalse(worker.is_alive(), "the copy blocked on a FIFO")
+        self.assertEqual(result.get("errno"), errno.EINVAL)
 
     def test_a_source_of_exactly_the_cap_copies_whole(self):
         from storage.backends import base
