@@ -13,7 +13,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 from fuse import FuseOSError
 
-from .backends.base import Backend, capacity_wait_cancellation
+from .backends.base import Backend, capacity_wait_cancellation, interactive_request
 from .backends.local import NOREPLACE_UNSUPPORTED
 from .backends.local import rename_noreplace as _rename_noreplace
 from .backends.ssh_pool import BulkCapacityCancelled, BulkCapacityTimeout
@@ -176,10 +176,12 @@ class _DownloadPool:
     separate readers turns even if one is far ahead.
 
     A session offered as local has every byte or has stopped: its turn only
-    publishes (finalize, or the cleanup of a failed session), local I/O
-    with no member channel. Local turns are taken first (at most
-    ACTIVE_DOWNLOAD_BURST in a row while a range read is runnable) and
-    neither count against nor wait for the member's bulk ceiling.
+    publishes (finalize, or the cleanup of a failed session). That is local
+    I/O plus, for a finalize, one member stat confirming the version, made
+    as an interactive request (the member's reserve channel, bounded by its
+    connect deadline), never on a bulk channel. Local turns are taken first
+    (at most ACTIVE_DOWNLOAD_BURST in a row while a range read is runnable)
+    and neither count against nor wait for the member's bulk ceiling.
     """
 
     def __init__(self, limit, run_turn, logger):
@@ -1534,14 +1536,28 @@ class StreamingReadManager:
             # the partial is dropped, and the next open fetches the file
             # again, so no stat pairs the newer version's attributes with
             # these bytes.
+            #
+            # As an interactive request, wherever finalize runs (a worker's
+            # publication turn, an inline publication on release, destroy):
+            # it uses the member's interactive reserve and its connect
+            # deadline, never a bulk channel, so a publication cannot wait
+            # behind sync's bulk leases with no yield. A deadline failure is
+            # retried once, then the probe stands in when the size matches
+            # (confirm_member_stat); with no probe the file is installed
+            # with no member attributes, which fails closed on mode.
             try:
-                confirmed, agreed = confirm_member_stat(
-                    session.backend, session.canonical_path, session.member_stat,
-                    os.fstat(io_fd).st_size)
+                with interactive_request():
+                    confirmed, agreed = confirm_member_stat(
+                        session.backend, session.canonical_path, session.member_stat,
+                        os.fstat(io_fd).st_size)
             except (BulkCapacityCancelled, BulkCapacityTimeout) as exc:
+                # Not raised for an interactive request today. If one
+                # escapes, nothing was confirmed or disagreed, so it is not
+                # member-changed: the session fails (EINTR or EAGAIN) and
+                # its readers are woken, as for any failed finalize.
                 raise OSError(errno.EINTR if isinstance(exc, BulkCapacityCancelled)
                               else errno.EAGAIN, str(exc)) from exc
-            if not agreed:
+            if not agreed and confirmed is not None:
                 self._discard_superseded_session(session, "member-changed")
                 # Counted once the partial is gone and the session finished.
                 self._record_streaming_stat("streaming_member_changed_discards", 1)
@@ -1733,9 +1749,10 @@ class StreamingReadManager:
                 self._schedule_background(session, finished_turn=True)
                 return
 
-        # Its lease is released: publication is local I/O, and must not
-        # hold the member's bulk slot (a stalled fsync would block other
-        # files on the member).
+        # Its lease is released: publication is local I/O and one
+        # interactive member stat (see _finalize_streaming_session), and
+        # must not hold the member's bulk slot (a stalled fsync would block
+        # other files on the member).
         self._download_pool.move_to_local(session)
         try:
             self._finish_background_session(session)
@@ -1758,7 +1775,8 @@ class StreamingReadManager:
 
         It ends the wait when the session stops, fails, or has every byte:
         readers on the interactive reserve can fetch the rest while the
-        turn waits, and a complete file needs no channel, only publication.
+        turn waits, and a complete file needs no bulk channel, only
+        publication (whose confirming stat is an interactive request).
         Otherwise it ends a wait that has lasted DOWNLOAD_TURN_YIELD_SECONDS
         while other work has no worker: another member's runnable session,
         or a queued publication on any member. Without that, every worker
@@ -1915,7 +1933,11 @@ class StreamingReadManager:
         """Whether a new reader's session fits; with displaced, make it fit.
 
         Caller holds prefetch_sessions_lock. Files with readers are bounded
-        by max_streaming_sessions. All registered sessions (with readers,
+        by max_streaming_sessions. This is asked only for a new session: an
+        open of a file whose session is registered (a reopen of a retained
+        fill, a second reader) attaches to it without this check, even when
+        that brings the files with readers over max_streaming_sessions; it
+        adds no partial or descriptor. All registered sessions (with readers,
         retained, and complete or failed ones still publishing) are bounded
         by that plus max_retained_streaming_sessions, which bounds partials
         and descriptors. Readers come first: a retained fill never keeps a

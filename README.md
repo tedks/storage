@@ -254,7 +254,9 @@ priority and reuses the bytes it already has.
 
 `max_streaming_sessions` (`--max-streaming-sessions`, default 8) limits new
 streaming sessions when that many distinct files have open readers. A new
-open above that limit uses the whole-file cache path. A separate
+open above that limit uses the whole-file cache path. Opening a file that
+already has a session (a second reader, or reopening a retained fill)
+joins that session and is exempt from the limit, since it adds no partial. A separate
 `max_retained_streaming_sessions` (`--max-retained-streaming-sessions`,
 default 64) limits unfinished fills that continue after the last close.
 Each retains one partial inode and descriptor. The file's entire length
@@ -287,9 +289,11 @@ a worker goes to those files, so a member whose bulk channels are taken
 (by sync, say) cannot hold every worker.
 A worker waiting for a bulk channel stops waiting once foreground reads
 have fetched every byte of its file. Publishing a complete file into the
-cache uses no member channel, so it does not count against or wait for a
-member's bulk capacity, and it takes precedence for the next free worker
-(at most four in a row while range reads are waiting).
+cache needs one member stat to confirm the version, made on the
+interactive reserve with its connection deadline and no bulk channel, so
+publication does not count against or wait for a member's bulk capacity.
+It takes precedence for the next free worker (at most four in a row while
+range reads are waiting).
 
 A cached file that has been synced is checked against its member when it
 is opened and was last checked more than `revalidate_after` seconds ago

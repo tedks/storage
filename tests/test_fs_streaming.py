@@ -14,9 +14,9 @@ from unittest.mock import patch
 
 from fuse import FuseOSError
 
-from storage.backends.base import current_capacity_cancel_probe
+from storage.backends.base import current_capacity_cancel_probe, is_interactive_request
 from storage.backends.local import LocalBackend
-from storage.backends.ssh_pool import BulkCapacityCancelled
+from storage.backends.ssh_pool import BulkCapacityCancelled, BulkCapacityTimeout
 from storage.cache_metadata import MEMBER_ATTRS_XATTR
 from storage.fs import StorageFS
 from storage.models import SyncStatus
@@ -934,6 +934,107 @@ class TestFSStreamingIntegration(unittest.TestCase):
             with patch.object(pool, "_refresh_contention"):
                 self.assertIs(pool._take(), publication)
         self.assertEqual(checks, ["/active-0", "/retained-0"])
+
+    def _bulk_gated_stat(self, gate, applies):
+        """A stat that waits on gate when called as a bulk request and applies()."""
+        real_stat = self.backend.stat
+        bulk_calls = []
+
+        def stat(path):
+            if not is_interactive_request() and applies():
+                bulk_calls.append(path)
+                gate.wait(timeout=10)
+            return real_stat(path)
+
+        return stat, bulk_calls
+
+    def test_confirming_stat_on_a_worker_cannot_wedge_the_pool(self):
+        manager = self.fs._streaming_manager
+        manager.update_download_limits(max_download_workers=1)
+        other = SlowRangeLocalBackend("other", str(self.backend_dir), range_delay=0.0)
+        payload = os.urandom(64 * 1024)
+        for name in ("gated.bin", "free.bin"):
+            (self.backend_dir / name).write_bytes(payload)
+        gate = threading.Event()
+        self.addCleanup(gate.set)
+        # Like sync holding every bulk channel: a bulk stat from a download
+        # worker would wait for the whole test.
+        stat, bulk_calls = self._bulk_gated_stat(
+            gate, lambda: threading.current_thread().name.startswith("storage-prefetch-"))
+
+        def select(path):
+            return other if path == "/free.bin" else self.backend
+
+        with patch.object(manager, "select_backend_for_read", side_effect=select), \
+                patch.object(self.backend, "stat", side_effect=stat):
+            gated_fd = self.fs.open("/gated.bin", os.O_RDONLY)
+            gated = self._session_for(gated_fd)
+            # One chunk read; the worker fetches the rest, then finalizes.
+            self.assertEqual(self.fs.read("/gated.bin", 32 * 1024, 0, gated_fd), payload[:32 * 1024])
+            self.assertTrue(gated.background_finished.wait(timeout=5))
+            self.assertTrue(gated.finalized)
+            free_fd = self.fs.open("/free.bin", os.O_RDONLY)
+            free = self._session_for(free_fd)
+            self.assertEqual(self.fs.read("/free.bin", 32 * 1024, 0, free_fd), payload[:32 * 1024])
+            self.assertTrue(free.background_finished.wait(timeout=5))
+            self.assertTrue(free.finalized)
+            self.assertEqual(bulk_calls, [])
+            self.fs.release("/free.bin", free_fd)
+            self.fs.release("/gated.bin", gated_fd)
+        self.assertEqual((self.cache_dir / "gated.bin").read_bytes(), payload)
+
+    def test_inline_publication_on_release_makes_no_bulk_stat(self):
+        start, _ = self._fail_worker_starts(after=0)
+        payload = os.urandom(8192)
+        (self.backend_dir / "inline.bin").write_bytes(payload)
+        gate = threading.Event()
+        self.addCleanup(gate.set)
+        armed = threading.Event()
+        stat, bulk_calls = self._bulk_gated_stat(gate, armed.is_set)
+        with patch.object(threading.Thread, "start", start), \
+                patch.object(self.backend, "stat", side_effect=stat):
+            fd = self.fs.open("/inline.bin", os.O_RDONLY)
+            session = self._session_for(fd)
+            self.assertEqual(self.fs.read("/inline.bin", len(payload), 0, fd), payload)
+            armed.set()
+            closer = threading.Thread(target=self.fs.release, args=("/inline.bin", fd), daemon=True)
+            closer.start()
+            closer.join(timeout=3)
+            self.assertFalse(closer.is_alive(), "release waited for a bulk channel")
+        self.assertEqual(bulk_calls, [])
+        self.assertTrue(session.finalized)
+        self.assertEqual((self.cache_dir / "inline.bin").read_bytes(), payload)
+
+    def test_retained_fill_whose_version_changed_releases_its_charge(self):
+        manager = self.fs._streaming_manager
+        self.backend.worker_gate = threading.Event()
+        real_stat = self.backend.stat
+
+        def stat(path):
+            st = real_stat(path)
+            if not threading.current_thread().name.startswith("storage-prefetch-"):
+                return st
+            # The confirming stat sees a newer version (one second later).
+            fields = {key: getattr(st, key) for key in (
+                "st_mode", "st_uid", "st_gid", "st_nlink", "st_size", "st_atime", "st_ctime",
+                "st_atime_ns")}
+            fields.update(st_mtime=st.st_mtime + 1, st_mtime_ns=st.st_mtime_ns + 1_000_000_000)
+            return SimpleNamespace(**fields)
+
+        with patch.object(self.backend, "stat", side_effect=stat):
+            retained = self._open_retained_fill("changed.bin", os.urandom(256 * 1024))
+            self.backend.worker_gate.set()
+            self.assertTrue(retained.background_finished.wait(timeout=5))
+        stats = self.fs._streaming_stats_snapshot()
+        self.assertEqual(stats.get("streaming_member_changed_discards"), 1)
+        self.assertFalse([key for key in stats if key.startswith("streaming_retained_")
+                          and key.endswith("_cancellations")])
+        self.assertTrue(retained.detached)
+        self.assertEqual(retained.io_fd, -1)
+        self.assertEqual(manager.list_download_sessions(), [])
+        self.assertFalse((self.cache_dir / "changed.bin").exists())
+        self.assertEqual(list(self.cache_dir.rglob("*.storage.partial")), [])
+        self.assertEqual(self.fs.cache_manager.get_total_cache_size(), 0)
 
     def test_bulk_wait_yield_interval_restarts_for_each_acquisition(self):
         manager = self.fs._streaming_manager
