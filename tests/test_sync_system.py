@@ -19,6 +19,8 @@ import shutil
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from storage.fs import StorageFS
 from storage.backends.local import LocalBackend
 from storage.models import SyncStatus
@@ -519,6 +521,123 @@ class TestKernelCacheRefetch(_MountedCase):
         with open(target, "rb") as reader:
             self.assertEqual(after, reader.read())
             self.assertEqual(stamp, os.fstat(reader.fileno()).st_mtime)
+
+    # A reader held open across a same-stat invalidation keeps its old cache
+    # file (_invalidate_file_cache unlinks it under the descriptor), but the
+    # page cache belongs to the FUSE inode, which every descriptor shares.
+    # 4 MiB with probes at 0 and 3 MiB: far beyond the kernel's FUSE
+    # readahead window, so a read at one offset never fills the other.
+    HELD_SIZE = 4 * 1024 * 1024
+    HELD_TAIL = 3 * 1024 * 1024
+    OLD, NEW = b"a", b"b"
+
+    def _bytes_at(self, fd, offset, size=4096):
+        """The distinct byte values a fresh pread sees."""
+        data = os.pread(fd, size, offset)
+        if len(data) != size:
+            raise RuntimeError(f"short read at {offset}: {len(data)} of {size}")
+        return set(data)
+
+    def _held_reader_and_new_reader(self, name):
+        """Reader A primed with OLD, the member rewritten to NEW with the same
+        size and mtime, the watcher's invalidation, then reader B opened.
+
+        Returns (a, b) as raw descriptors (no Python buffering); the caller
+        closes both. B's open refetched the file and dropped the pages.
+        """
+        source = self.backend1_dir / name
+        target = self.mount_dir / name
+        stamp = 1_000_000_000
+        source.write_bytes(self.OLD * self.HELD_SIZE)
+        os.utime(source, (stamp, stamp))
+        a = os.open(target, os.O_RDONLY)
+        try:
+            if self._bytes_at(a, 0, self.HELD_SIZE) != set(self.OLD):
+                raise RuntimeError("reader A did not see the original bytes")
+            source.write_bytes(self.NEW * self.HELD_SIZE)
+            os.utime(source, (stamp, stamp))
+            self.fs._on_remote_change("/" + name)
+            if (self.cache_dir / name).exists():
+                raise RuntimeError("invalidation kept the clean cache copy")
+            b = os.open(target, os.O_RDONLY)
+        except BaseException:
+            os.close(a)
+            raise
+        try:
+            st = os.stat(target)
+            if st.st_size != self.HELD_SIZE or st.st_mtime != stamp:
+                raise RuntimeError("the rewrite changed the file's size or mtime")
+        except BaseException:
+            os.close(a)
+            os.close(b)
+            raise
+        return a, b
+
+    def test_held_reader_over_the_same_range_leaves_new_reader_fresh(self):
+        a, b = self._held_reader_and_new_reader("held-same.bin")
+        try:
+            self.assertEqual(set(self.NEW), self._bytes_at(b, 0, self.HELD_SIZE))
+            # B's read filled every page with NEW before A asked again, so
+            # A's read is a page cache hit that never reaches A's old cache
+            # file. Not asserted: A sees NEW today, and either answer is
+            # legitimate for A. The read matters for B's check below.
+            self._bytes_at(a, 0, self.HELD_SIZE)
+            self.assertEqual(set(self.NEW), self._bytes_at(b, 0, self.HELD_SIZE))
+        finally:
+            os.close(a)
+            os.close(b)
+
+    def test_stale_refill_by_held_reader_is_gone_after_reopen(self):
+        name = "held-reopen.bin"
+        a, b = self._held_reader_and_new_reader(name)
+        try:
+            self.assertEqual(set(self.NEW), self._bytes_at(b, 0))
+            # A page B has not read: the miss goes to the daemon on A's
+            # handle, which reads A's old cache file into the shared pages
+            # (#206). That stale fill is this test's precondition, not its
+            # claim: once #206 is fixed and A reads NEW there is nothing
+            # stale for the reopen to drop, so the test skips; any other
+            # payload (mixed, zero-filled) is a failure, not a skip.
+            held = self._bytes_at(a, self.HELD_TAIL)
+            if held == set(self.NEW):
+                self.skipTest("#206 fixed: a held reader no longer refills stale pages")
+            self.assertEqual(set(self.OLD), held)
+        finally:
+            os.close(a)
+            os.close(b)
+        # No descriptor holds the old file now: an open drops the stale
+        # pages and the whole file reads NEW.
+        c = os.open(self.mount_dir / name, os.O_RDONLY)
+        try:
+            self.assertEqual(set(self.NEW), self._bytes_at(c, 0, self.HELD_SIZE))
+        finally:
+            os.close(c)
+
+    # Known limitation (#206), older than dropping auto_cache (which kept
+    # stale pages too). strict, so a fix (B reads NEW) turns this red and the
+    # marker comes off; raises=_StaleRefill, so only the #206 shape (A and B
+    # both read OLD at the tail) is the expected failure: a setup failure or
+    # any other payload fails the test.
+    class _StaleRefill(Exception):
+        pass
+
+    @pytest.mark.xfail(strict=True, raises=_StaleRefill,
+                       reason="#206: a reader held open across invalidation refills the "
+                              "shared FUSE pages from its old cache file")
+    def test_stale_refill_by_held_reader_reaches_new_reader(self):
+        a, b = self._held_reader_and_new_reader("held-refill.bin")
+        try:
+            if self._bytes_at(b, 0) != set(self.NEW):
+                raise RuntimeError("reader B did not see the refetched bytes")
+            held = self._bytes_at(a, self.HELD_TAIL)  # into the shared pages
+            seen = self._bytes_at(b, self.HELD_TAIL)
+            if held == set(self.OLD) and seen == set(self.OLD):
+                raise self._StaleRefill(
+                    "reader B read a page a held reader filled from its old cache file")
+            self.assertEqual(set(self.NEW), seen)
+        finally:
+            os.close(a)
+            os.close(b)
 
     def test_watcher_invalidation_keeps_real_writer_on_clean_backing(self):
         name = "writer.bin"

@@ -3642,7 +3642,10 @@ def fuse_mount_options(backends: Dict[str, Backend], *, enable_watchers: bool,
     opens. A member refetch can replace bytes while preserving size and
     mtime, so auto_cache's comparison can keep old pages after a refetch.
     Warm opens still use Storage's local backing file. Repeated reads
-    across opens can require FUSE callbacks again.
+    across opens can require FUSE callbacks again. kernel_cache would
+    avoid that cost but keeps pages across opens with no check at all,
+    stale ones included; direct_io gives up readahead and shared mmap and
+    makes the cost worse. Do not add either.
 
     Writes through the mount stay visible at once: create, mkdir, unlink,
     rmdir and rename update the kernel's entries themselves. (symlink is
