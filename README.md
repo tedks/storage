@@ -345,21 +345,22 @@ it remembers names for the listing's fresh window, so a path walk inside
 that window does not reach the mount at all; with watchers on it keeps
 them for 1 s, because the mount cannot evict the kernel's entries when a
 watcher reports a change. A name that does not exist is remembered as
-missing for 10 s. Attributes are not kept: each `stat` reaches the mount,
-which answers it from the cached file or from the parent's listing, and
-asks a member only when neither knows the name. (Kept
+missing for 10 s. Attributes are not kept: each `stat` reaches the
+mount, which answers it from the cached file or from the parent's
+listing, and asks a member only when neither knows the name. (Kept
 attributes would hold a file's old size past a refetch, and reads would
 stop there.) Each new open discards the mount's buffered pages from
 earlier opens so a refetch can return fresh bytes with the same size and
 mtime. Repeated opens can incur additional local FUSE reads. A warm open
-still uses Storage's backing cache and requires no download of the cached
-file; a file the mount has not kept (a short read of an uncached file,
-discarded at close) is read from the member again on each open. Changes made through the mount are visible at once. A file added
-directly on a member can stay hidden for up to
-10 s after a lookup missed it, and a name removed on a member can still
-be walked through for up to the fresh window. The profile keys
-`entry_timeout` and `negative_timeout` (seconds) override the first two
-timeouts; attributes have no override.
+still uses Storage's backing cache and requires no download of the
+cached file; a file the mount has not kept (a short read of an uncached
+file, discarded at close) is read from the member again on each open.
+Changes made through the mount are visible at once. A file added
+directly on a member can stay hidden for up to 10 s after a lookup
+missed it, and a name removed on a member can still be walked through
+for up to the fresh window. The profile keys `entry_timeout` and
+`negative_timeout` (seconds) override the first two timeouts; attributes
+have no override.
 
 Members may share an SSH host; that only means more connections to it.
 What the mount warns about, on stderr, is two or more member roots on one

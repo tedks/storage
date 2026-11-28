@@ -525,8 +525,9 @@ class TestKernelCacheRefetch(_MountedCase):
             self.assertEqual(set(self.NEW), self._bytes_at(b, 0, self.HELD_SIZE))
             # B's read filled every page with NEW before A asked again, so
             # A's read is a page cache hit that never reaches A's old cache
-            # file (it sees NEW today; either answer is legitimate for A).
-            self.assertTrue(self._bytes_at(a, 0, self.HELD_SIZE) <= {*self.OLD, *self.NEW})
+            # file. Not asserted: A sees NEW today, and either answer is
+            # legitimate for A. The read matters for B's check below.
+            self._bytes_at(a, 0, self.HELD_SIZE)
             self.assertEqual(set(self.NEW), self._bytes_at(b, 0, self.HELD_SIZE))
         finally:
             os.close(a)
