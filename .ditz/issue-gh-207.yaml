@@ -1,0 +1,16 @@
+id: gh-207
+title: 'Correct member-attribute regressions from #184'
+desc: ""
+type: bugfix
+component: attributes
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-28T10:12:23-00:00
+references: []
+log_events:
+- time: 2026-11-28T10:12:23-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
