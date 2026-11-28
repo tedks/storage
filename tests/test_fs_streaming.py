@@ -4071,6 +4071,13 @@ class TestControlRequests(unittest.TestCase):
         finally:
             fs.destroy('/')
 
+    def test_request_during_stop_says_the_mount_is_stopping(self):
+        self.manager._control_server.cache_identity = None  # As stop() leaves it.
+        with self.assertRaisesRegex(ControlError, "^This mount is stopping"):
+            self.handle({"command": "streaming.set", "cache": [1, 2],
+                         "limits": {"max_download_workers": 2}})
+        self.assertEqual(self.manager.download_limits(), self.initial_limits)
+
     def test_update_download_limits_takes_a_dict_or_keywords(self):
         expected = {**self.initial_limits, "max_download_workers": 2, "max_streaming_sessions": 3}
         self.assertEqual(self.manager.update_download_limits({"max_download_workers": 2},

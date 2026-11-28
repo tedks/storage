@@ -976,7 +976,10 @@ class StreamingReadManager:
                     or any(type(value) is not int for value in expected)):
                 raise ControlError("Expected the target cache identity as [device, inode]")
             published = self._control_server.cache_identity
-            if published is None or tuple(expected) != published:
+            if published is None:
+                # Cleared by stop(): a request still in flight at unmount.
+                raise ControlError("This mount is stopping; its control socket no longer serves requests")
+            if tuple(expected) != published:
                 raise ControlError("This control socket was published in a different cache directory")
         if "mountpoint" in arguments:
             # The client names the mount it means; refuse before acting
