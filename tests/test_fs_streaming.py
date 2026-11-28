@@ -2794,6 +2794,58 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.assertEqual(cache_path.read_bytes(), b"whole recomputed file")
         self.assertEqual(list(self.cache_dir.glob(".storage-prefix-*")), [])
 
+    def test_cold_opens_of_one_file_are_serialized_through_staging(self):
+        # R3-I1 (disputed): a second open of the same file cannot fail
+        # admission against a first open paused between staging and
+        # registration, because fs.open holds the file's path lock for the
+        # whole open; it then joins the first open's session.
+        manager = self.fs._streaming_manager
+        payload = os.urandom(64 * 1024)
+        (self.backend_dir / "serial.bin").write_bytes(payload)
+        real_truncate = os.ftruncate
+        staged = threading.Event()
+        go = threading.Event()
+        self.addCleanup(go.set)
+        entered = []
+        real_create = manager._create_or_attach_prefetch_session
+
+        def paused_truncate(fd, size):
+            if not staged.is_set():
+                staged.set()
+                go.wait(timeout=10.0)
+            return real_truncate(fd, size)
+
+        def counted(virtual_path, canonical_path):
+            entered.append(threading.current_thread().name)
+            return real_create(virtual_path, canonical_path)
+
+        results = {}
+
+        def open_as(name):
+            try:
+                results[name] = self.fs.open('/serial.bin', os.O_RDONLY)
+            except Exception as exc:
+                results[name] = exc
+
+        with patch("storage.streaming.os.ftruncate", side_effect=paused_truncate), \
+                patch.object(manager, "_create_or_attach_prefetch_session", side_effect=counted):
+            first = threading.Thread(target=open_as, args=("first",), name="first")
+            first.start()
+            self.assertTrue(staged.wait(timeout=3.0))
+            second = threading.Thread(target=open_as, args=("second",), name="second")
+            second.start()
+            second.join(timeout=0.3)
+            self.assertTrue(second.is_alive())
+            self.assertEqual(entered, ["first"])
+            go.set()
+            first.join(timeout=5.0)
+            second.join(timeout=5.0)
+        self.assertIsInstance(results["first"], int)
+        self.assertIsInstance(results["second"], int)
+        self.assertIs(self._session_for(results["first"]), self._session_for(results["second"]))
+        for name in ("second", "first"):
+            self.fs.release('/serial.bin', results[name])
+
     def test_replaced_session_is_charged_before_its_partial_is_unlinked(self):
         # R3-I2: a cache scan between the unlink and the charge would see
         # the space as free while the old reader still pins it.
