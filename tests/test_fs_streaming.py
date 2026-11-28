@@ -1063,6 +1063,29 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.assertTrue(read.called)
         self.assertEqual((self.cache_dir / "inline.bin").read_bytes(), payload)
 
+    def test_inline_publication_without_a_token_is_never_versioned_and_kept(self):
+        # A-N4: a probe with no version token (no mtime) gives nothing an
+        # inline publication could fail to confirm: NEVER_VERSIONED, kept
+        # with conservative attributes (no write bits, no member mtime).
+        import stat
+        start, _ = self._fail_worker_starts(after=0)
+        payload = os.urandom(8192)
+        (self.backend_dir / "plain.bin").write_bytes(payload)
+        size_only = lambda path: SimpleNamespace(  # noqa: E731
+            st_size=len(payload), st_mode=stat.S_IFREG | 0o644)
+        with patch.object(threading.Thread, "start", start), \
+                patch.object(self.backend, "stat", side_effect=size_only):
+            fd = self.fs.open("/plain.bin", os.O_RDONLY)
+            session = self._session_for(fd)
+            self.assertEqual(self.fs.read("/plain.bin", len(payload), 0, fd), payload)
+            self.fs.release("/plain.bin", fd)
+        self.assertTrue(session.finalized)
+        self.assertEqual((self.cache_dir / "plain.bin").read_bytes(), payload)
+        self.assertEqual(self.fs._streaming_stats_snapshot().get("streaming_unconfirmed_discards", 0), 0)
+        with self.assertRaises(FuseOSError) as raised:
+            self.fs.open("/plain.bin", os.O_WRONLY)
+        self.assertEqual(raised.exception.errno, errno.EACCES)
+
     def test_retained_fill_whose_version_changed_releases_its_charge(self):
         manager = self.fs._streaming_manager
         self.backend.worker_gate = threading.Event()

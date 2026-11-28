@@ -776,6 +776,17 @@ for line in sys.stdin:
             data += chunk
         out = {"sha": hashlib.sha256(data).hexdigest(), "len": len(data),
                "fstat": os.fstat(fd).st_size}
+    elif cmd == "mmap":
+        import mmap
+        flags = mmap.MAP_PRIVATE if args[2] == "private" else mmap.MAP_SHARED
+        try:
+            m = mmap.mmap(fds[args[0]], int(args[1]), flags=flags, prot=mmap.PROT_READ)
+        except OSError as exc:
+            out = {"errno": exc.errno}
+        else:
+            data = m[:]
+            m.close()
+            out = {"sha": hashlib.sha256(data).hexdigest(), "len": len(data)}
     elif cmd == "close":
         os.close(fds.pop(args[0]))
         out = None
@@ -853,6 +864,69 @@ class TestPrivateReadMounted(_MountedCase):
         self.assertFalse((self.cache_dir / name).exists())
         self.assertEqual(self.fs.cache_manager._reserved_bytes, 0)
 
+
+    def test_mmap_of_a_private_handle(self):
+        """S8 probe: MAP_SHARED and MAP_PRIVATE on a private (direct_io)
+        handle, then beside a buffered reader of a newer installed version
+        of the same length and mtime."""
+        import hashlib
+        name = "live.log"
+        source = self.backend1_dir / name
+        first, second = b"first version\n" * 400, b"other version\n" * 400
+        stamp = 1_700_000_000
+        source.write_bytes(first)
+        os.utime(source, (stamp, stamp))
+        self.fs._on_remote_change("/" + name)
+        backend = self.fs.backends["backend1"]
+        real_stat = backend.stat
+
+        def off_by_one(path):
+            st = real_stat(path)
+            return type("St", (), {"st_size": st.st_size + 1, "st_mtime": st.st_mtime,
+                                   "st_mtime_ns": st.st_mtime_ns, "st_mode": st.st_mode})()
+
+        sha = {b: hashlib.sha256(b).hexdigest() for b in (first, second)}
+        client = subprocess.Popen([sys.executable, "-c", _PRIVATE_CLIENT],
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        try:
+            with patch.object(backend, "stat", side_effect=off_by_one):
+                self._call(client, f"open a {self.mount_dir / name}")
+            n = len(first)
+            observed = {"shared": self._call(client, f"mmap a {n} shared"),
+                        "private": self._call(client, f"mmap a {n} private")}
+            # The member settles at another version of the same length and
+            # mtime: an ordinary (buffered, page-cached) reader b opens it.
+            source.write_bytes(second)
+            os.utime(source, (stamp, stamp))
+            self.fs._on_remote_change("/" + name)
+            self._call(client, f"open b {self.mount_dir / name}")
+            observed["b"] = self._call(client, "read b")
+            observed["private_beside_b"] = self._call(client, f"mmap a {n} private")
+            observed["b_after"] = self._call(client, "read b")
+            observed["a_read"] = self._call(client, "read a")
+            self._call(client, "close a")
+            self._call(client, "close b")
+        finally:
+            client.stdin.close()
+            client.wait(30)
+            client.stdout.close()
+        names = {v: k for k, v in sha.items()}
+        summary = {k: (names.get(v.get("sha"), v) if "sha" in v else v)
+                   for k, v in observed.items()}
+        # MAP_SHARED: refused (direct_io without FUSE_DIRECT_IO_ALLOW_MMAP).
+        self.assertEqual(summary["shared"], {"errno": errno.ENODEV}, summary)
+        # MAP_PRIVATE alone: the handle's own bytes (faulted through it).
+        self.assertEqual(summary["private"], first, summary)
+        self.assertEqual(summary["b"], second, summary)
+        # direct_io read(): always the handle's own bytes.
+        self.assertEqual(summary["a_read"], first, summary)
+        # The documented limit (README): MAP_PRIVATE faults through the
+        # inode's shared page cache with the private handle, so a buffered
+        # reader of the installed version then reads the private copy's
+        # bytes. If this fails, the kernel stopped mixing them: update the
+        # README's limit.
+        self.assertEqual(summary["private_beside_b"], first, summary)
+        self.assertEqual(summary["b_after"], first, summary)
 
     def _two_readers(self, first, second):
         """Reader a opens a private copy of first, the member becomes second,

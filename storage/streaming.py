@@ -22,7 +22,7 @@ from .backends.local import rename_noreplace as _rename_noreplace
 from .backends.ssh_pool import BulkCapacityCancelled, BulkCapacityTimeout
 from .cache_metadata import (
     PREFIX_XATTR, FillAction, MemberVersion, confirm_member_stat, copy_member_attributes,
-    fill_action,
+    fill_action, verdict_without_confirmation,
 )
 from .models import FileLocation, FileMetadata, StreamingKeepAfterClose, SyncStatus
 
