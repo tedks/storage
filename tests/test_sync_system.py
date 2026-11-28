@@ -596,11 +596,12 @@ class TestKernelCacheRefetch(_MountedCase):
             # handle, which reads A's old cache file into the shared pages
             # (#206). That stale fill is this test's precondition, not its
             # claim: once #206 is fixed and A reads NEW there is nothing
-            # stale for the reopen to drop, so the test skips instead of
-            # failing.
+            # stale for the reopen to drop, so the test skips; any other
+            # payload (mixed, zero-filled) is a failure, not a skip.
             held = self._bytes_at(a, self.HELD_TAIL)
-            if held != set(self.OLD):
+            if held == set(self.NEW):
                 self.skipTest("#206 fixed: a held reader no longer refills stale pages")
+            self.assertEqual(set(self.OLD), held)
         finally:
             os.close(a)
             os.close(b)
