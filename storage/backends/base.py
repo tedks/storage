@@ -154,7 +154,11 @@ class Backend(ABC):
         return None
 
     def run_background_range_read(self, virtual_path, fetch):
-        """Hold member capacity before claiming a speculative byte range."""
+        """Hold member capacity before claiming a speculative byte range.
+
+        fetch claims and reads the range; local work on the bytes belongs
+        after this returns, once the capacity is released.
+        """
         return fetch()
 
     @property

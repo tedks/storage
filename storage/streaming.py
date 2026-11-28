@@ -982,43 +982,47 @@ class StreamingReadManager:
                         raise OSError(errno.EIO, "partial cache write made no progress")
                     remaining = remaining[written:]
 
-    def _fetch_range_into_session(
-        self,
-        session: PrefetchSession,
-        start: int,
-        end: int,
-        source: str,
-    ) -> int:
+    def _read_member_range(self, session: PrefetchSession, start: int, end: int):
+        """The member's bytes for [start, end): (chunks, fetched end), or None if stopped.
+
+        Member reads only; _store_member_range writes them. The caller holds
+        the range's claim across both. Raises if the member returns nothing
+        at start.
+        """
         target_end = min(end, session.file_size)
         if start >= target_end:
-            return start
+            return [], start
 
         cursor = start
         chunks: List[Tuple[int, bytes]] = []
-        total_bytes = 0
-
         while cursor < target_end:
             if session.stop_requested:
-                return start
+                return None
             remaining = target_end - cursor
             chunk = session.backend.read_file(session.canonical_path, cursor, remaining)
             if not chunk:
                 break
             chunk = chunk[:remaining]
-
             chunks.append((cursor, chunk))
             cursor += len(chunk)
-            total_bytes += len(chunk)
-
-        fetched_end = cursor
 
         if session.stop_requested:
-            return start
-        if start < session.file_size and fetched_end == start:
+            return None
+        if start < session.file_size and cursor == start:
             raise IOError(
                 f"range fetch returned no data for {session.canonical_path} at offset {start}"
             )
+        return chunks, cursor
 
+    def _store_member_range(self, session: PrefetchSession, start: int, chunks, fetched_end: int,
+                            source: str) -> int:
+        """Write bytes read by _read_member_range to the partial; return their end.
+
+        Returns start, writing nothing, for an empty read or a session
+        stopped since the read.
+        """
+        if fetched_end == start or session.stop_requested:
+            return start
         for chunk_offset, chunk_data in chunks:
             self._write_session_bytes(session, chunk_offset, chunk_data)
 
@@ -1029,9 +1033,22 @@ class StreamingReadManager:
             session.condition.notify_all()
 
         self._record_streaming_stat(f"{source}_fetches", 1)
-        self._record_streaming_stat(f"{source}_remote_bytes", total_bytes)
+        self._record_streaming_stat(f"{source}_remote_bytes", fetched_end - start)
         self._update_streaming_state_xattr(session, "prefetching")
         return fetched_end
+
+    def _fetch_range_into_session(
+        self,
+        session: PrefetchSession,
+        start: int,
+        end: int,
+        source: str,
+    ) -> int:
+        read = self._read_member_range(session, start, end)
+        if read is None:
+            return start
+        chunks, fetched_end = read
+        return self._store_member_range(session, start, chunks, fetched_end, source)
 
     def _keep_after_close_threshold(self, session: PrefetchSession) -> int:
         return self.keep_after_close.threshold(session.file_size)
@@ -1688,23 +1705,28 @@ class StreamingReadManager:
         )
         self._download_pool.offer(session, ready, finished_turn=finished_turn, local=terminal)
 
-    def _fetch_background_chunk(self, session: PrefetchSession):
+    def _claim_background_chunk(self, session: PrefetchSession):
+        """Claim the next background range: (range, wrapped), or None if none is due."""
         with session.lock:
             next_fetch = self._next_background_fetch(session)
-            if next_fetch is None:
-                return
-            fetch, wrapped = next_fetch
-            session.in_flight_ranges.append(fetch)
+            if next_fetch is not None:
+                session.in_flight_ranges.append(next_fetch[0])
+            return next_fetch
 
-        try:
-            fetched_end = self._fetch_range_into_session(session, *fetch, source="background")
-            with session.lock:
-                session.background_cursor = max(fetched_end, fetch[0] + 1)
-                session.background_wrapped = wrapped
-        finally:
-            with session.lock:
-                session.in_flight_ranges.remove(fetch)
-                session.condition.notify_all()
+    @staticmethod
+    def _release_claim(session: PrefetchSession, fetch: Tuple[int, int]):
+        with session.lock:
+            session.in_flight_ranges.remove(fetch)
+            session.condition.notify_all()
+
+    def _store_background_chunk(self, session: PrefetchSession, fetch, wrapped: bool, read):
+        """Write a background read to the partial; the caller still holds its claim."""
+        if read is None:
+            return
+        fetched_end = self._store_member_range(session, fetch[0], *read, source="background")
+        with session.lock:
+            session.background_cursor = max(fetched_end, fetch[0] + 1)
+            session.background_wrapped = wrapped
 
     def _run_download_turn(self, session: PrefetchSession):
         with session.lock:
@@ -1712,18 +1734,33 @@ class StreamingReadManager:
 
         if fetch_due:
             probe, restart_wait = self._bulk_wait_probe(session)
+            # (range, wrapped, read) for a range claimed and read under the
+            # lease: written after the lease is back, still claimed.
+            done = []
 
             def fetch():
                 # A lease is held now. A retry after a lost connection
                 # acquires again, and waits its own yield interval.
                 restart_wait()
-                self._fetch_background_chunk(session)
+                claim = self._claim_background_chunk(session)
+                if claim is None:
+                    return
+                try:
+                    read = self._read_member_range(session, *claim[0])
+                except BaseException:
+                    self._release_claim(session, claim[0])
+                    raise
+                done.append((claim[0], claim[1], read))
 
             try:
                 # Do not own a range while waiting for a bulk lease. A
                 # reader can claim the bytes and use the interactive reserve.
                 with capacity_wait_cancellation(probe):
                     session.backend.run_background_range_read(session.canonical_path, fetch)
+                # The member channel is returned; the local write to the
+                # partial holds only the range's claim.
+                for fetch_range, wrapped, read in done:
+                    self._store_background_chunk(session, fetch_range, wrapped, read)
             except BulkCapacityCancelled:
                 # This session's stop request, its readers having fetched
                 # every byte, or a yield to other work (_bulk_wait_probe);
@@ -1746,6 +1783,9 @@ class StreamingReadManager:
                         session.canonical_path, session.backend.name, exc,
                     )
                     self._update_streaming_state_xattr(session, "error")
+            finally:
+                for fetch_range, _, _ in done:
+                    self._release_claim(session, fetch_range)
 
         with session.lock:
             if not self._download_terminal(session):

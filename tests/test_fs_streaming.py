@@ -1064,6 +1064,39 @@ class TestFSStreamingIntegration(unittest.TestCase):
             self.fs.release("/raced.bin", fd)
         self.assertEqual((self.cache_dir / "raced.bin").read_bytes(), payload)
 
+    def test_background_bytes_are_written_after_the_member_channel_is_returned(self):
+        manager = self.fs._streaming_manager
+        state = {"held": False}
+        writes = []
+        real_write = manager._write_session_bytes
+
+        def lease(_path, fetch):
+            state["held"] = True
+            try:
+                return fetch()
+            finally:
+                state["held"] = False
+
+        def write(session, offset, data):
+            if threading.current_thread().name.startswith("storage-prefetch-"):
+                writes.append(state["held"])
+            return real_write(session, offset, data)
+
+        payload = os.urandom(128 * 1024)
+        (self.backend_dir / "lease.bin").write_bytes(payload)
+        with patch.object(self.backend, "run_background_range_read", side_effect=lease), \
+                patch.object(manager, "_write_session_bytes", side_effect=write):
+            fd = self.fs.open("/lease.bin", os.O_RDONLY)
+            session = self._session_for(fd)
+            # Half the file: consumed, so the worker fetches the rest.
+            self.assertEqual(self.fs.read("/lease.bin", 64 * 1024, 0, fd), payload[:64 * 1024])
+            self.assertTrue(session.readers_consumed)
+            self.assertTrue(session.background_finished.wait(timeout=5))
+            self.fs.release("/lease.bin", fd)
+        self.assertTrue(writes)
+        self.assertEqual(set(writes), {False})
+        self.assertEqual((self.cache_dir / "lease.bin").read_bytes(), payload)
+
     def test_bulk_wait_yield_interval_restarts_for_each_acquisition(self):
         manager = self.fs._streaming_manager
         session = SimpleNamespace(stop_requested=False, prefetch_complete=False, error=None,

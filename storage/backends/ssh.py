@@ -202,6 +202,8 @@ class SSHBackend(Backend):
         # read_file reuses this lease. A range may be claimed only after
         # capacity is acquired, so a reader can use the interactive reserve
         # while background work is still queued behind other bulk transfers.
+        # fetch only reads; the caller writes the bytes to its partial after
+        # this returns the channel.
         return self._with_sftp("background read", virtual_path, lambda sftp: fetch(),
                                timeout=self.sftp_operation_timeout, retry=True)
 
