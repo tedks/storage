@@ -1883,6 +1883,51 @@ class TestRecomputeRecordsStat(unittest.TestCase):
                          (5, 2.0, SyncStatus.DIRTY, before.dirty_generation))
 
 
+class TestEvictionAccessRace(RevalidateTestBase):
+    def _assert_eviction_rechecks_recent_read(self, *, flush):
+        hot, cold = "/hot.txt", "/cold.txt"
+        self.rewrite_member(hot[1:], b"hot")
+        self.rewrite_member(cold[1:], b"cold")
+        with patch("storage.fs.time.time", return_value=10.0):
+            fh = self.fs.open(hot, os.O_RDONLY)
+        state = self.fs.state_manager
+        cache = self.fs.cache_manager
+        real_guard = cache.path_guard
+
+        def read_and_release_before_guard(path):
+            if path == hot:
+                self.assertEqual(state.get_file_metadata(hot).last_access, 10.0)
+                with patch("storage.fs.time.time", return_value=40.0):
+                    self.assertEqual(self.fs.read(hot, 3, 0, fh), b"hot")
+                self.fs.release(hot, fh)
+                if flush:
+                    state._flush_access_updates(force=True)
+                self.assertEqual(state.get_file_metadata(hot).last_access, 40.0 if flush else 10.0)
+            return real_guard(path)
+
+        try:
+            with patch("storage.fs.time.time", return_value=20.0):
+                self.assertEqual(self.read_through(cold), b"cold")
+            # A one-row page selects hot first. Its demand read and release
+            # happen after that selection, before the real path guard.
+            with patch.object(state, "WRITE_BATCH_SIZE", 1), \
+                    patch.object(state, "ACCESS_FLUSH_INTERVAL_SECONDS", float("inf")), \
+                    patch.object(cache, "path_guard", side_effect=read_and_release_before_guard), \
+                    patch("storage.fs.time.time", return_value=30.0):
+                self.assertTrue(cache.evict_lru_files(1))
+        finally:
+            self.fs.release(hot, fh)
+
+        self.assertTrue((self.cache_dir / hot[1:]).is_file(), "evicted the newly accessed file")
+        self.assertFalse((self.cache_dir / cold[1:]).exists())
+
+    def test_eviction_rechecks_pending_access_after_selection(self):
+        self._assert_eviction_rechecks_recent_read(flush=False)
+
+    def test_eviction_rechecks_flushed_access_after_selection(self):
+        self._assert_eviction_rechecks_recent_read(flush=True)
+
+
 class TestMountStartupClearsEvictionHints(unittest.TestCase):
     """A mark left by a crashed mount does not survive into the next one."""
 

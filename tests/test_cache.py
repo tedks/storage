@@ -464,12 +464,12 @@ class TestEvictionSkipsStaleClean(unittest.TestCase):
     def test_file_made_dirty_after_selection_is_kept(self):
         """The LRU list is a snapshot; the row is re-checked before the unlink."""
         turned = self._clean_cached("turned.txt", b"v1")
-        snapshot = list(self.state_manager.iter_lru_paths())
+        snapshot = list(self.state_manager.iter_lru_candidates())
         # A write lands after the snapshot was taken, through the real path.
         turned.write_bytes(b"v2")
         self.cache_manager.mark_file_dirty("/turned.txt", turned)
 
-        with patch.object(self.state_manager, "iter_lru_paths", return_value=snapshot):
+        with patch.object(self.state_manager, "iter_lru_candidates", return_value=snapshot):
             self.cache_manager.evict_lru_files(bytes_needed=1)
 
         self.assertTrue(turned.exists())

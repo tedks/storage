@@ -391,7 +391,8 @@ class CacheManager:
             # after an upgrade finds every row ever evicted.
             absent: List[Tuple[str, Path]] = []
             try:
-                for virtual_path in self.state_manager.iter_lru_paths(recomputable=recomputable):
+                candidates = self.state_manager.iter_lru_candidates(recomputable=recomputable)
+                for virtual_path, selected_access in candidates:
                     cache_path = self.get_cache_path(virtual_path)
                     with self._path_guard(virtual_path) as free:
                         if not free:
@@ -405,6 +406,7 @@ class CacheManager:
                         try:
                             freed += self._evict_if_still_clean(
                                 virtual_path, cache_path, recomputable=recomputable,
+                                selected_access=selected_access,
                             )
                         except OSError as e:
                             print(f"Warning: Failed to evict {virtual_path}: {e}")
@@ -664,19 +666,23 @@ class CacheManager:
 
     def _evict_if_still_clean(
         self, virtual_path: str, cache_path: Path, *, recomputable: bool = False,
+        selected_access: Optional[float] = None,
     ) -> int:
         """Reclaim cache bytes if the row is still CLEAN and describes the file.
 
-        Recheck after selection under the index lock, which mark_file_dirty
-        also takes. A stale CLEAN is marked and kept. Hold descriptor_guard
-        across the stat and the unlink or truncation, so no open descriptor
-        can be missed or registered in between. Forget listing attributes
-        before changing the cache inode. Lock order is the cache lock, the
-        index lock, then the descriptor lock. Returns the bytes freed.
+        Recheck under the index lock, which mark_file_dirty also takes.
+        Mark and keep a stale CLEAN file. Defer a candidate whose access time
+        advanced since selection and continue to colder rows.
+        Hold descriptor_guard across the stat and the unlink or truncation
+        so a descriptor cannot be registered in between. Forget listing
+        attributes before changing the cache inode. Lock order is cache,
+        access, index, then descriptor. Returns the bytes freed.
         """
-        with self.state_manager.metadata_lock:
-            row = self.state_manager.get_file_metadata(virtual_path)
-            if (row is None or row.sync_status != SyncStatus.CLEAN or row.link_target is not None
+        with self.state_manager.eviction_metadata(virtual_path) as candidate:
+            if candidate is None:
+                return 0
+            row, last_access = candidate
+            if (row.sync_status != SyncStatus.CLEAN or row.link_target is not None
                     or row.recomputable != recomputable or (recomputable and not row.recompute_cmd)):
                 return 0
             # A member that missed a rename may hold these bytes only under
@@ -693,6 +699,8 @@ class CacheManager:
                 stale = st.st_size != row.size or st.st_mtime != row.last_modified
                 if not stale:
                     if st.st_size == 0:
+                        return 0
+                    if selected_access is not None and last_access > selected_access:
                         return 0
                     if self.forget_listed_attrs:
                         self.forget_listed_attrs(virtual_path)

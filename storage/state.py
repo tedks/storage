@@ -14,6 +14,7 @@ import os
 import threading
 import sqlite3
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
@@ -981,6 +982,21 @@ class StateManager:
             )
         self._flush_access_updates()
 
+    @contextmanager
+    def eviction_metadata(self, virtual_path: str) -> Iterator[Optional[Tuple[FileMetadata, float]]]:
+        """Hold a candidate's row and effective access time stable during eviction.
+
+        Take the locks in flush order so a demand mark is visible either in
+        the pending batch or in the row, even if a flush just moved it.
+        """
+        with self._access_lock, self._db_lock:
+            row = self.get_file_metadata(virtual_path)
+            if row is None:
+                yield None
+            else:
+                pending = self._pending_access_updates.get(virtual_path, row.last_access)
+                yield row, max(row.last_access, pending)
+
     def mark_cache_absent(self, virtual_paths: Iterable[str]):
         """Mark rows whose cache file eviction found missing, in one commit.
 
@@ -1032,7 +1048,12 @@ class StateManager:
     '''
 
     def iter_lru_paths(self, *, recomputable: bool = False) -> Iterator[str]:
-        """Walk CLEAN regular-file rows with bytes to free, in access order.
+        """Walk candidate paths in access order."""
+        for path, _ in self.iter_lru_candidates(recomputable=recomputable):
+            yield path
+
+    def iter_lru_candidates(self, *, recomputable: bool = False) -> Iterator[Tuple[str, float]]:
+        """Walk CLEAN regular-file candidates as (path, selected access time).
 
         The cache tree is authoritative for whether the bytes are present,
         so evicted rows are walked too, except rows whose file eviction
@@ -1093,7 +1114,7 @@ class StateManager:
                     bound, self.WRITE_BATCH_SIZE,
                 )).fetchall()
             for row in rows:
-                yield row['virtual_path']
+                yield row['virtual_path'], row['last_access']
             if len(rows) < self.WRITE_BATCH_SIZE:
                 return
             cursor = (rows[-1]['last_access'], rows[-1]['virtual_path'])
