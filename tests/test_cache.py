@@ -484,6 +484,32 @@ class TestCacheAccounting(unittest.TestCase):
         finally:
             os.close(reader)
 
+    def test_publication_counts_a_sparse_inode_with_an_xattr_block_once(self):
+        """One data block, one hole, and possibly an external xattr block:
+        the tree scan counts what streaming charged, not st_blocks."""
+        manager = self.cache_manager
+        block = manager.block_size
+        path = self.cache_dir / ("xattr" + PARTIAL_SUFFIX)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            os.ftruncate(fd, 2 * block)
+            try:
+                os.setxattr(path, "user.test-large", b"x" * (block // 2))
+            except OSError:
+                pass  # no large xattrs here: the data-only case still holds
+            manager.mark_cache_size_dirty()
+            self.assertEqual(manager.get_total_cache_size(), 0)
+            self.assertTrue(manager.write_streaming_chunk(fd, 0, b"d"))
+            self.assertEqual(manager.get_total_cache_size(), block)
+            final = self.cache_dir / "xattr"
+            os.link(path, final)
+            path.unlink()
+            manager.publish_streaming_fd(fd)
+            self.assertEqual(manager.get_total_cache_size(), block)
+        finally:
+            manager.close_streaming_fd(fd)
+        self.assertEqual(manager.get_total_cache_size(), block)
+
     def test_direct_writer_uses_space_before_the_next_stream_grant(self):
         manager = self.cache_manager
         block = manager.block_size

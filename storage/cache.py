@@ -182,11 +182,10 @@ class CacheManager:
         if st.st_size == 0 or st.st_blocks == 0:
             return 0
         rounded = self._round_up(st.st_size)
-        if st.st_blocks * 512 >= rounded:
-            # Allocated for its whole length: no extent query needed. A
-            # sparse file whose metadata blocks reach its length is counted
-            # at its length, which only overstates it.
-            return rounded
+        # No shortcut on st_blocks alone: it counts metadata (an external
+        # xattr block) as well as data, and a sparse inode charged by its
+        # data extents while streaming must be counted the same once it is
+        # a named file.
         try:
             fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
             try:
