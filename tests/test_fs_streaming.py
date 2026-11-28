@@ -4003,6 +4003,24 @@ class TestControlRequests(unittest.TestCase):
             {"id": self.VALID_ID, "result": "not-found"},
         )
 
+    def test_mount_through_a_symlink_reports_its_target(self):
+        target = self.temp_dir / "mounted here"
+        target.mkdir()
+        (self.temp_dir / "link").symlink_to(target)
+        fs = StorageFS(
+            cache_root=self.temp_dir / "cache",
+            state_db=self.temp_dir / "linked.db",
+            backends={"backend": LocalBackend("backend", str(self.temp_dir / "backend"))},
+            cache_size=1024 * 1024,
+            num_sync_workers=0,
+            start_sync=False,
+            mountpoint=str(self.temp_dir / "link"),
+        )
+        try:
+            self.assertEqual(fs._streaming_manager.mountpoint, str(target.resolve()))
+        finally:
+            fs.destroy('/')
+
     def test_final_dot_mountpoint_publishes_without_a_mountpoint(self):
         fs = StorageFS(
             cache_root=self.temp_dir / "cache",

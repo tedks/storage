@@ -656,10 +656,68 @@ def test_canonical_mountpoint(tmp_path, monkeypatch):
     assert canonical_mountpoint(str(tmp_path / "alias" / "mount") + "/") == str(real / "mount")
     assert canonical_mountpoint("mount") == str(real / "mount")
     assert canonical_mountpoint("./x/../mount") == str(real / "mount")
-    # The final component is never resolved, so a hung mount root is not touched.
-    assert canonical_mountpoint(str(tmp_path / "alias" / "final")) == str(real / "final")
+    # A final symlink is followed (readlink), to the directory mounted on.
+    assert canonical_mountpoint(str(tmp_path / "alias" / "final")) == str(real / "mount")
+    (real / "relative").symlink_to("final")
+    assert canonical_mountpoint(str(real / "relative")) == str(real / "mount")
+    (real / "dangling").symlink_to(real / "not yet")
+    assert canonical_mountpoint(str(real / "dangling")) == str(real / "not yet")
+    (real / "loop").symlink_to(real / "loop")
+    with pytest.raises(ControlError, match="too many levels"):
+        canonical_mountpoint(str(real / "loop"))
+    (real / "dotted").symlink_to(str(real / "mount") + "/.")
+    with pytest.raises(ControlError, match="without a final"):
+        canonical_mountpoint(str(real / "dotted"))
     assert canonical_mountpoint("/") == "/"
     assert canonical_mountpoint("//") == "/"
+
+
+def test_canonical_mountpoint_never_stats_the_final_directory(tmp_path, monkeypatch):
+    # Only readlink touches the last component; a stat there would ask a
+    # hung mount's filesystem.
+    (tmp_path / "mount").mkdir()
+    (tmp_path / "link").symlink_to(tmp_path / "mount")
+    final = str(tmp_path.resolve() / "mount")
+    real_realpath = os.path.realpath
+
+    def guarded_realpath(path, *args, **kwargs):
+        assert not str(path).startswith(final), f"resolved through {path!r}"
+        return real_realpath(path, *args, **kwargs)
+
+    monkeypatch.setattr("storage.control.os.path.realpath", guarded_realpath)
+    assert canonical_mountpoint(str(tmp_path / "link")) == final
+    assert canonical_mountpoint(final) == final
+
+
+def test_profile_follows_a_retargeted_mountpoint_symlink(cache, tmp_path):
+    # The mount was made through /…/media -> a; the link now points at b.
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    link = tmp_path / "media"
+    link.symlink_to(tmp_path / "a")
+    mounted_on = canonical_mountpoint(str(link))
+    assert mounted_on == str((tmp_path / "a").resolve())
+    config = write_profile(cache, link)
+    server, requests = recording_server(cache, mounted_on)
+    server.start()
+    try:
+        runner = CliRunner()
+        options = ["control", "--profile", "example", "--config", str(config), "--json-output"]
+        assert runner.invoke(main, options + ["set", "--max-download-workers", "2"]).exit_code == 0
+        link.unlink()
+        link.symlink_to(tmp_path / "b")
+        requests.clear()
+        result = runner.invoke(main, options + ["set", "--max-download-workers", "2"])
+        assert result.exit_code == 1, result.output
+        assert "belongs to the mount at" in result.output
+        assert [request["command"] for request in requests] == ["status"]
+        requests.clear()
+        result = runner.invoke(main, ["control", "--cache", str(cache), "--json-output",
+                                      "set", "--max-download-workers", "2"])
+        assert result.exit_code == 0, result.output
+        assert [request["command"] for request in requests] == ["status", "streaming.set"]
+    finally:
+        server.stop()
 
 
 @pytest.mark.parametrize("suffix", ["/.", "/..", "/./", "/../", "/.//"])

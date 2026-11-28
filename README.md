@@ -577,9 +577,11 @@ profile's mountpoint and the mount refuses one that names another mount;
 the change. `--cache` reaches whichever mount owns that cache's socket;
 `status` shows its mountpoint. With either option, every request also names
 the cache directory (by device and inode), and both the mount and the CLI
-refuse a socket that was published in a different cache and moved here. Mountpoints are compared as absolute paths with
-the parent directory's symlinks resolved, so a relative mountpoint matches only
-from the working directory the mount was started in. A mountpoint whose last
+refuse a socket that was published in a different cache and moved here. Mountpoints are compared as the directory
+mounted on: an absolute path with symlinks resolved, including a symlink as the
+last component, so a profile whose mountpoint link now points elsewhere no
+longer matches the mount made through its old target. A relative mountpoint
+matches only from the working directory the mount was started in. A mountpoint whose last
 component is `.` or `..` cannot be matched without looking inside the mount:
 such a mount still publishes its control socket but reports no mountpoint, so
 `--cache` and `storage debug streaming-stats` reach it while `--profile`

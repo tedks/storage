@@ -79,31 +79,47 @@ def _require_owner_socket(entry: os.stat_result, path: Path) -> os.stat_result:
     return entry
 
 
+# The kernel's own limit on symlinks followed in one lookup.
+_MAX_SYMLINKS = 40
+
+
 def canonical_mountpoint(mountpoint: str) -> str:
     """The absolute mountpoint a mount reports and a profile is matched against.
 
-    The parent directory is resolved the way the kernel resolves it:
-    symlinks first, then each `..` against what they point to, so nothing
-    is normalized lexically (abspath would make `alias/../m` the sibling of
-    `alias` even when `alias` links elsewhere). The final component is
-    never resolved, so this never stats the mount root itself (a hung mount
-    would block the CLI). A final `.` or `..` could be placed only by
-    resolving through it, so such a mountpoint is refused. The mount and
-    the CLI apply the same rule, so a relative mountpoint matches only when
-    both resolve it from the same working directory, as for the cache path.
+    The directory the mount is on, as the kernel reaches it: the parent is
+    resolved symlinks first, then each `..` against what they point to, so
+    nothing is normalized lexically (abspath would make `alias/../m` the
+    sibling of `alias` even when `alias` links elsewhere). A final component
+    that is a symlink is followed too, with readlink, so a profile whose
+    mountpoint link is retargeted no longer matches the mount made through
+    its old target. The final directory itself is never stat'ed: readlink
+    on a mount root fails with EINVAL without asking the filesystem, so a
+    hung mount does not block the CLI. A final `.` or `..` could be placed
+    only by resolving through it, so such a mountpoint is refused. The
+    mount and the CLI apply the same rule, so a relative mountpoint matches
+    only when both resolve it from the same working directory, as for the
+    cache path.
     """
-    path = os.fsdecode(mountpoint)
-    if not os.path.isabs(path):
-        path = os.path.join(os.getcwd(), path)
-    path = path.rstrip("/")
-    if not path:
-        return "/"
-    parent, name = path.rsplit("/", 1)
-    if name in (".", ".."):
-        raise ControlError(
-            f"Mountpoint {os.fsdecode(mountpoint)!r} ends in {name!r}; give it without a final '.' or '..'"
-        )
-    return os.path.join(os.path.realpath(parent or "/"), name)
+    original = os.fsdecode(mountpoint)
+    path = original if os.path.isabs(original) else os.path.join(os.getcwd(), original)
+    for _ in range(_MAX_SYMLINKS + 1):
+        path = path.rstrip("/")
+        if not path:
+            return "/"
+        parent, name = path.rsplit("/", 1)
+        if name in (".", ".."):
+            raise ControlError(
+                f"Mountpoint {original!r} ends in {name!r}; give it without a final '.' or '..'"
+            )
+        candidate = os.path.join(os.path.realpath(parent or "/"), name)
+        try:
+            target = os.readlink(candidate)
+        except OSError as exc:
+            if exc.errno in (errno.EINVAL, errno.ENOENT, errno.ENOTDIR):
+                return candidate  # Not a symlink, or nothing there yet.
+            raise
+        path = target if os.path.isabs(target) else os.path.join(os.path.dirname(candidate), target)
+    raise ControlError(f"Mountpoint {original!r}: too many levels of symbolic links")
 
 
 def _check_peer(sock: socket.socket):
