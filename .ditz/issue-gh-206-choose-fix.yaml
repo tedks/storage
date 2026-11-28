@@ -1,0 +1,18 @@
+id: gh-206-choose-fix
+title: Choose the fix for stale page refill by held readers
+desc: 'Pick among the options in #206 (per-open direct_io, notify_inval, defer invalidation
+  while readers are open, re-point old descriptors) and record the design; strict
+  xfail test_stale_refill_by_held_reader_reaches_new_reader is the acceptance test.'
+type: task
+component: cache
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-28T08:27:10-00:00
+references: []
+log_events:
+- time: 2026-11-28T08:27:10-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
