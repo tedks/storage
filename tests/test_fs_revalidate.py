@@ -2484,5 +2484,170 @@ class TestRevalidateFromListing(RevalidateTestBase):
         self.assertEqual(1, stat.call_count)
 
 
+class TestRefreshRound5(RevalidateTestBase):
+    """#208 round 5: the stale mark's coverage, a refreshed inode's own
+    record, read denials, the copied descriptor's evidence, the refresh's
+    pin, private times, errnos and failures by exception."""
+
+    growing_copy = TestLiveRead.growing_copy
+    partials = TestLiveRead.partials
+    stale_copy = TestLiveRead.stale_copy
+
+    def stale_mark(self, name="live.log"):
+        from storage.cache_metadata import STALE_LAST_GOOD_XATTR
+        try:
+            os.getxattr(self.cache_dir / name, STALE_LAST_GOOD_XATTR)
+        except OSError:
+            return False
+        return True
+
+    def assert_errno(self, code, fn, *args):
+        with self.assertRaises(FuseOSError) as raised:
+            fn(*args)
+        self.assertEqual(raised.exception.errno, code)
+
+    def changed_v1(self):
+        """v1 cached and checked, the member at v2, the check past the age."""
+        self.rewrite_member("live.log", b"version 1", mtime=1_000_000_000)
+        self.assertEqual(self.read_through("/live.log"), b"version 1")
+        self.rewrite_member("live.log", b"version 2!", mtime=1_100_000_000)
+        self.age_checks()
+
+    def test_the_copy_is_marked_before_the_refresh_stages(self):
+        # A daemon restarting offline mid-refresh finds the copy marked: no
+        # writer is admitted on bytes known to be old.
+        self.changed_v1()
+        copy, seen = self.member.copy_to_local, {}
+
+        def crash_point(path, temp):
+            seen["marked"] = self.stale_mark()
+            copy(path, temp)
+            restarted = self._make_fs()
+            try:
+                self.member.set_available(False)
+                with self.assertRaises(FuseOSError) as raised:
+                    restarted.open("/live.log", os.O_RDWR)
+                seen["errno"] = raised.exception.errno
+                seen["read"] = restarted.read(
+                    "/live.log", 64, 0, fh := restarted.open("/live.log", os.O_RDONLY))
+                restarted.release("/live.log", fh)
+            finally:
+                self.member.set_available(True)
+                restarted.sync_manager.stop()
+                restarted.state_manager.close()
+
+        with patch.object(self.member, "copy_to_local", side_effect=crash_point):
+            self.read_through("/live.log")
+        self.assertEqual(seen, {"marked": True, "errno": errno.EAGAIN, "read": b"version 1"})
+        # The restart swept the in-flight copy, so that refresh failed and the
+        # copy stays marked (a transfer's own ENOENT is not the member's
+        # absence). The next refresh's verified copy is a new inode, never
+        # marked.
+        self.assertTrue(self.stale_mark())
+        self.age_checks()
+        self.assertEqual(self.read_through("/live.log"), b"version 2!")
+        self.assertFalse(self.stale_mark())
+
+    def test_a_mark_that_cannot_be_written_takes_the_invalidation(self):
+        import storage.fs as fs_module
+        from storage.cache_metadata import STALE_LAST_GOOD_XATTR
+        self.changed_v1()
+        real = os.setxattr
+
+        def refuse(path, name, *a, **kw):
+            if name == STALE_LAST_GOOD_XATTR:
+                raise OSError(errno.ENOSPC, "no xattr space")
+            return real(path, name, *a, **kw)
+
+        with patch.object(fs_module.os, "setxattr", side_effect=refuse), self.growing_copy():
+            # Not kept named and unmarked: the copy is dropped, so the reader
+            # gets the fill's own (private) bytes, never v1 as last good ...
+            self.assertNotEqual(self.read_through("/live.log"), b"version 1")
+            # ... and a writer is never admitted on v1.
+            self.assert_errno(errno.EAGAIN, self.fs.open, "/live.log", os.O_RDWR)
+        self.assertFalse((self.cache_dir / "live.log").exists())
+
+    def test_touch_of_a_marked_copy_is_refused_and_records_nothing(self):
+        cached = self.stale_copy()
+        before = cached.stat().st_mtime
+        self.assert_errno(errno.EAGAIN, self.fs.utimens, "/live.log", (5.0, 5.0))
+        self.assertEqual(cached.stat().st_mtime, before)
+        self.assertEqual(self.fs.state_manager.get_file_metadata("/live.log").sync_status,
+                         SyncStatus.CLEAN)
+        # Read-only stays served.
+        self.assertEqual(self.read_through("/live.log"), b"version 1")
+
+    def test_a_link_of_a_marked_copy_is_refused(self):
+        # The mount has no hard links at all (fusepy's default, EROFS); a
+        # marked copy is no exception, and nothing is recorded.
+        self.stale_copy()
+        self.assert_errno(errno.EROFS, self.fs.link, "/other.log", "/live.log")
+        self.assertEqual(self.fs.state_manager.get_file_metadata("/live.log").sync_status,
+                         SyncStatus.CLEAN)
+        self.assertIsNone(self.fs.state_manager.get_file_metadata("/other.log"))
+
+    def test_the_mark_clears_when_the_member_is_back_at_the_copys_version(self):
+        self.stale_copy()
+        self.rewrite_member("live.log", b"version 1", mtime=1_000_000_000)
+        self.age_checks()
+        self.assertEqual(self.read_through("/live.log"), b"version 1")
+        self.assertFalse(self.stale_mark())
+        self.fs.release("/live.log", self.fs.open("/live.log", os.O_RDWR))
+
+    def test_the_mark_clears_when_the_member_no_longer_has_the_file(self):
+        self.stale_copy()
+        (self.member_dir / "live.log").unlink()
+        self.age_checks()
+        self.assertEqual(self.read_through("/live.log"), b"version 1")
+        self.assertFalse(self.stale_mark())
+        self.fs.release("/live.log", self.fs.open("/live.log", os.O_RDWR))
+
+    def refreshed_with_checksums(self):
+        from storage.models import FileLocation
+        self.changed_v1()
+        row = self.fs.state_manager.get_file_metadata("/live.log")
+        row.checksum = "hash-of-v1"
+        self.fs.state_manager.set_file_metadata(row)
+        for name in ("member", "cache"):
+            self.fs.state_manager.add_file_location(FileLocation(
+                virtual_path="/live.log", backend_name=name, checksum="hash-of-v1",
+                last_synced=time.time(), is_cached=name == "cache"))
+        self.fs.cache_manager.sync_cache_metadata(
+            "/live.log", self.fs.state_manager.get_file_metadata("/live.log"),
+            cache_path=self.cache_dir / "live.log")
+        return self.cache_inode("live.log")
+
+    def refresh_raising(self, method, exc, writer_errno):
+        self.changed_v1()
+        with patch.object(self.member, method, side_effect=exc):
+            self.assertEqual(self.read_through("/live.log"), b"version 1")
+        self.assertTrue(self.stale_mark())
+        # The failure counts as the check: within the age, the writer finds
+        # the mark without asking the member.
+        with self.count_fetches() as fetches:
+            self.assert_errno(errno.EAGAIN, self.fs.open, "/live.log", os.O_RDWR)
+        self.assertEqual(fetches.call_count, 0)
+        # Past the age, a writer whose refresh raises gets its class.
+        self.age_checks()
+        with patch.object(self.member, method, side_effect=exc):
+            self.assert_errno(writer_errno, self.fs.open, "/live.log", os.O_RDWR)
+        self.assertEqual((self.cache_dir / "live.log").read_bytes(), b"version 1")
+
+    def test_a_no_baseline_check_reads_st_mtime_ns_alone(self):
+        self.rewrite_member("f.txt", b"original", mtime=1_000_000_000)
+        self.assertEqual(self.read_through("/f.txt"), b"original")
+        with self.fs._member_checks_lock:
+            for path, check in list(self.fs._member_checks.items()):
+                self.fs._member_checks[path] = dataclasses.replace(
+                    check, members={}, verified_at=check.verified_at - 3600)
+        real = self.member.stat
+        ns_only = lambda path: SimpleNamespace(  # noqa: E731
+            st_size=real(path).st_size, st_mtime=None, st_mtime_ns=real(path).st_mtime_ns)
+        with patch.object(self.member, "stat", side_effect=ns_only), \
+                self.count_fetches() as fetches:
+            self.assertEqual(self.read_through("/f.txt"), b"original")
+        self.assertEqual(fetches.call_count, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

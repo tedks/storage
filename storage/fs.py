@@ -1859,6 +1859,9 @@ class StorageFS(Operations):
             # may be the only one left, so it stays.
             self.logger.info("revalidate: %s no longer has %s; keeping the cached copy",
                              backend.label, canonical_path)
+            # No newer version can replace it: a stale mark would only wedge
+            # writers on the one copy left.
+            self._clear_stale_last_good(cache_path)
             self._store_member_check(canonical_path, cache_path, identity, {})
             return
         except Exception as exc:
@@ -1896,9 +1899,11 @@ class StorageFS(Operations):
         elif baseline is not None:
             changed = observed != baseline
         else:
-            changed = (member_stat.st_size != cache_stat.st_size
-                       or member_stat.st_mtime > cache_stat.st_mtime)
+            changed = (size != cache_stat.st_size or mtime > cache_stat.st_mtime)
         if not changed:
+            # The member is at the copy's own version: a stale mark (a refresh
+            # that failed before) no longer applies.
+            self._clear_stale_last_good(cache_path)
             self._store_member_check(canonical_path, cache_path, identity,
                                      {backend.name: observed})
             return
@@ -1909,10 +1914,15 @@ class StorageFS(Operations):
             # (_clear_recheck): the invalidation below may be refused.
             self._refetch_pins[canonical_path] = backend
             self._pinned_stats[canonical_path] = (backend, member_stat)
-        if keep_named and self._may_refresh_in_place(resolved, cache_stat):
+        if (keep_named and self._may_refresh_in_place(resolved, cache_stat)
+                and self._mark_last_good_stale(cache_path)):
             # The copy stays named (the last good one) while the open stages
-            # the refetch beside it; only a verified copy replaces it
-            # (_ensure_file_in_cache, replace_identity).
+            # the refetch beside it; only a verified copy (a new inode, never
+            # marked) replaces it (_ensure_file_in_cache, replace_identity).
+            # It is marked stale first, so a crash mid-refresh restarts with
+            # the copy marked; if the mark cannot be written, the copy takes
+            # the invalidation below instead (no writer is ever admitted on
+            # unmarked bytes known to be old).
             self._refresh_pending[canonical_path] = identity
             return
         self._invalidate_file_cache(resolved.requested_path)
@@ -1950,7 +1960,7 @@ class StorageFS(Operations):
                 and not self._is_read_only_open(entry.flags)
                 for entry in self._fd_map.values())
 
-    def _mark_last_good_stale(self, cache_path: Path) -> None:
+    def _mark_last_good_stale(self, cache_path: Path) -> bool:
         """The cached copy is the last good one but known stale (its refresh
         could not be verified): writable opens and truncates get EAGAIN until
         a verified fill replaces it; read-only opens read it. The mark is an
@@ -1961,6 +1971,8 @@ class StorageFS(Operations):
             os.setxattr(str(cache_path), STALE_LAST_GOOD_XATTR, b"1", follow_symlinks=False)
         except OSError as exc:
             self.logger.warning("could not mark %s stale: %s", cache_path, exc)
+            return False
+        return True
 
     @staticmethod
     def _is_stale_last_good(cache_path: Path) -> bool:
@@ -3655,6 +3667,10 @@ class StorageFS(Operations):
         """Update file timestamps"""
         resolved = self._resolve_path(path)
         cache_path = resolved.cache_path
+        if not resolved.backend_name and self._is_stale_last_good(cache_path):
+            # A known stale copy is no baseline for a change (a touch would
+            # record a modification of old bytes).
+            raise FuseOSError(errno.EAGAIN)
 
         try:
             before = os.lstat(str(cache_path))
