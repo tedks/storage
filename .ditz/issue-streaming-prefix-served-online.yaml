@@ -29,3 +29,13 @@ log_events:
   comment: 'Lead review of #190 (2026-11-28) recommends treating this as a deploy
     blocker for the #184-#191 stack: an ordinary open serves a short file while the
     member is online. Escalated to the CTO with the train report.'
+- time: 2026-11-28T16:03:23-00:00
+  who: Ted Smith
+  what: commented
+  comment: "CTO ruling for deployment of the #184\u2013191 stack: block rollout while
+    an ordinary open can expose a promoted partial download as a complete file with
+    its source member reachable. Acceptance requires a mounted regression that first
+    leaves a known prefix, then opens the same file through the ordinary path with
+    the member online and verifies the remaining bytes and true EOF. Retain a separate
+    offline-prefix control. This is a deployment decision; the existing PR review
+    and integration order still apply."
