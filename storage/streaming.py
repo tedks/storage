@@ -1660,7 +1660,15 @@ class StreamingReadManager:
         with self.prefetch_sessions_lock:
             with session.lock:
                 if session.cache_full and session.refcount == 0 and not self._download_terminal(session):
-                    self._stop_background_locked(session)
+                    # This runs inside the session's own pool turn, so the
+                    # pool cannot report it idle and nothing here completes
+                    # the cancellation: _run_download_turn sees
+                    # stop_requested next and _finish_background_session
+                    # cleans up, closing the descriptor (which releases the
+                    # partial's charge). Calling this from anywhere else
+                    # would need _complete_cancellation, as a release does.
+                    idle = self._stop_background_locked(session)
+                    assert not idle, "a session stopped from its own turn cannot be idle"
 
     def _run_download_turn(self, session: PrefetchSession):
         with session.lock:
