@@ -55,3 +55,13 @@ log_events:
   who: Ted Smith
   what: created
   comment: ""
+- time: 2026-11-28T11:10:21-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Fixed in #187 at 95f88fb (branch fix/cache-access-eviction): the eviction
+    records size 0 at the old mtime durably (row with synchronous=FULL, xattr with
+    the recorded stat, fsync) before the ftruncate, then records the new mtime, all
+    through record_cached_stat at the row''s generation; stat_matches_record treats
+    a CLEAN recomputable size-0 record over a 0-byte file as consistent in heal_stale_clean,
+    eviction, is_stale_for/to_file_metadata, index_audit and invalidation. Crash tests
+    at both boundaries in tests/test_cache.py.'
