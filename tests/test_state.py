@@ -605,8 +605,18 @@ class TestCacheAbsentCandidacy(unittest.TestCase):
         ).fetchone()
         return row['cache_absent']
 
-    def test_recursive_triggers_stay_off(self):
-        self.assertEqual(self.state_manager.conn.execute('PRAGMA recursive_triggers').fetchone()[0], 0)
+    def test_clearing_terminates_with_recursive_triggers_on(self):
+        conn = self.state_manager.conn
+        conn.execute('PRAGMA recursive_triggers = ON')
+        self.assertEqual(conn.execute('PRAGMA recursive_triggers').fetchone()[0], 1)
+        self._row("/a")
+        self.state_manager.mark_cache_absent(["/a"])
+        self.assertEqual(self._absent("/a"), 1)
+        # The trigger's own 1-to-0 update fails its WHEN, so it fires once.
+        self.state_manager.update_access_time("/a", accessed_at=5.0)
+        self.state_manager._flush_access_updates(force=True)
+        self.assertEqual(self._absent("/a"), 0)
+        self.assertEqual(self.state_manager.get_file_metadata("/a").last_access, 5.0)
 
     def test_reopening_the_index_drops_every_mark(self):
         # A crash between the mark's commit and the second stat can leave
