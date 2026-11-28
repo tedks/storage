@@ -111,3 +111,11 @@ log_events:
     8. **Rollback and downgrade.** Sentinel records are unknown to older builds, so
     recovery must run before a downgrade, and the rollback must be tested from that
     state.'
+- time: 2026-11-28T11:28:52-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Also include (Lead-N4, #187 lead review): the truncation record in CacheManager''s
+    recomputable tier rewrites content columns through set_file_metadata, a read-modify-write
+    that AGENTS.md reserves for creating rows and changing policy. The fix should
+    go through the generation-conditioned record_cached_stat (extended to clear the
+    checksum).'
