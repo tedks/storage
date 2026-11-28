@@ -1011,6 +1011,30 @@ class TestFSStreamingIntegration(unittest.TestCase):
         cache.mark_cache_size_dirty()
         self.assertEqual(cache.get_total_cache_size(), expected)
 
+    def test_a_refused_background_chunk_leaves_the_cursor_at_its_first_byte(self):
+        """Lead nit: the cursor used to step one byte past a refused
+        chunk, so the next unbounded chunk started unaligned and skipped
+        that byte until the wrap pass."""
+        streaming = self.fs._streaming_manager
+        payload = os.urandom(256 * 1024)
+        (self.backend_dir / "cursor.bin").write_bytes(payload)
+        self.backend.worker_gate = threading.Event()  # pool reads wait
+        reader = self.fs.open("/cursor.bin", os.O_RDONLY)
+        session = self._session_for(reader)
+        fetch = (64 * 1024, 96 * 1024)
+        try:
+            with patch.object(streaming, "_next_background_fetch", return_value=(fetch, False)), \
+                    patch.object(self.fs.cache_manager, "write_streaming_chunk", return_value=False):
+                streaming._fetch_background_chunk(session)
+            with session.lock:
+                self.assertEqual(session.background_cursor, fetch[0])
+                self.assertTrue(session.cache_full)
+                cursor_chunk, _ = streaming._unbounded_read_ahead_chunk(session, fetch[0], False)
+            self.assertEqual(cursor_chunk % session.chunk_size, 0)
+        finally:
+            self.backend.worker_gate.set()
+            self.fs.release("/cursor.bin", reader)
+
     def test_an_append_write_is_charged_where_it_lands(self):
         """pwrite on an O_APPEND descriptor writes at end of file, not at
         the offset given; the charge follows the bytes."""

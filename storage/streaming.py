@@ -1654,7 +1654,12 @@ class StreamingReadManager:
         try:
             fetched_end, _ = self._fetch_range_into_session(session, *fetch, source="background")
             with session.lock:
-                session.background_cursor = max(fetched_end, fetch[0] + 1)
+                # The first byte this turn did not keep: a refused chunk is
+                # fetched again from its start. Progress does not need a
+                # step past it: a turn that keeps nothing has raised (no
+                # data), stopped, or set cache_full, which pauses background
+                # fetches until a kept write clears it.
+                session.background_cursor = fetched_end
                 session.background_wrapped = wrapped
         finally:
             with session.lock:
