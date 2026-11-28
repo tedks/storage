@@ -960,6 +960,57 @@ class TestFSStreamingIntegration(unittest.TestCase):
         cache.mark_cache_size_dirty()
         self.assertEqual(cache.get_total_cache_size(), 4 * block)
 
+    def test_a_stuck_stream_write_does_not_stall_a_write_to_another_file(self):
+        """Lead delta: a streaming chunk's local pwrite into its partial is
+        stuck; with ample room an ordinary write to a different file must
+        still complete (no eviction, no pressure scan)."""
+        cache = self.fs.cache_manager
+        block = 4096  # a literal, so the same test runs against the base too
+        payload = os.urandom(64 * 1024)
+        (self.backend_dir / "stream.bin").write_bytes(payload)
+        fb = self.fs.create("/b.bin", 0o644)
+        reader = self.fs.open("/stream.bin", os.O_RDONLY)
+        session = self._session_for(reader)
+        io_fd = session.io_fd
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        real_pwrite = os.pwrite
+
+        def pwrite(fd, data, offset):
+            if fd == io_fd:
+                entered.set()
+                release.wait(timeout=10.0)
+            return real_pwrite(fd, data, offset)
+
+        read_result, write_result = [], []
+        try:
+            with patch("os.pwrite", side_effect=pwrite), \
+                    patch.object(cache, "_evict_if_still_clean",
+                                 side_effect=AssertionError("evicted with ample room")):
+                streaming = threading.Thread(
+                    target=lambda: read_result.append(self.fs.read("/stream.bin", 4096, 0, reader)))
+                streaming.start()
+                self.assertTrue(entered.wait(timeout=5.0))
+                writer = threading.Thread(
+                    target=lambda: write_result.append(
+                        self.fs.write("/b.bin", b"b" * (2 * block), 0, fb)))
+                writer.start()
+                writer.join(timeout=3.0)
+                b_finished_while_stream_stuck = not writer.is_alive()
+                release.set()
+                streaming.join(timeout=5.0)
+                writer.join(timeout=5.0)
+            self.assertTrue(b_finished_while_stream_stuck,
+                            "a write to b.bin waited for a stuck streaming write")
+            self.assertEqual(write_result, [2 * block])
+            self.assertEqual(read_result, [payload[:4096]])
+        finally:
+            self.fs.release("/b.bin", fb)
+            self.fs.release("/stream.bin", reader)
+        expected = cache.get_total_cache_size()
+        cache.mark_cache_size_dirty()
+        self.assertEqual(cache.get_total_cache_size(), expected)
+
     def test_an_append_write_is_charged_where_it_lands(self):
         """pwrite on an O_APPEND descriptor writes at end of file, not at
         the offset given; the charge follows the bytes."""
