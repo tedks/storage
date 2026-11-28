@@ -3823,6 +3823,7 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.assertEqual(manager._not_installed_reason("taken"), "cache-path-filled")
         self.assertEqual(manager._not_installed_reason("unsupported"), "unsupported")
 
+
 class TestControlRequests(unittest.TestCase):
     """The mount control dispatcher, called directly: no socket, no mount."""
 
