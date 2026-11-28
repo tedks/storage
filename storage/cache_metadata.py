@@ -8,7 +8,7 @@ import stat
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Callable, Iterator, List, Optional
+from typing import Callable, Iterator, List, Optional, Tuple
 
 from .file_config import get_inherited_config
 from .models import FileLocation, FileMetadata, SyncStatus
@@ -378,6 +378,34 @@ _INTERNAL_CACHE_SUFFIXES = (
 )
 
 
+def stat_matches_record(
+    *,
+    recorded_size: int,
+    recorded_mtime: float,
+    sync_status: SyncStatus,
+    recomputable: bool,
+    stat_size: int,
+    stat_mtime: float,
+) -> bool:
+    """Whether a live stat is the one a row or xattr records (no write since).
+
+    Exact size and mtime, with one equivalence: a CLEAN recomputable record
+    of size 0 over a file of size 0 matches whatever the mtime. That is an
+    evicted placeholder. Recomputable eviction records size 0 at the old
+    mtime before it truncates, because ftruncate moves the mtime, and
+    records the new mtime after; a crash between the truncate and that
+    second record leaves exactly this state, which must not read as a
+    lost write (it would sync an empty file over the members). The rule
+    hides nothing: an empty file under a size-0 record has the recorded
+    content whatever its mtime. A file truncated to 0 under a record of
+    size N still differs.
+    """
+    if stat_size == recorded_size and stat_mtime == recorded_mtime:
+        return True
+    return (sync_status == SyncStatus.CLEAN and bool(recomputable)
+            and recorded_size == 0 and stat_size == 0)
+
+
 def regular_file_stat(path) -> Optional[os.stat_result]:
     """The lstat of path when it is a regular file, else None.
 
@@ -498,9 +526,15 @@ class CacheMetadataRecord:
         is exact: both sides come from stat and round-trip unchanged through
         JSON and SQLite, and any tolerance could only hide a write. What it
         cannot see is a same-size write in the same timestamp tick as the
-        record (a few ms on kernels without fine-grained timestamps).
+        record (a few ms on kernels without fine-grained timestamps). The
+        one equivalence, an evicted recomputable placeholder, is described
+        at stat_matches_record.
         """
-        return stat_size != self.size or stat_mtime != self.last_modified
+        return not stat_matches_record(
+            recorded_size=self.size, recorded_mtime=self.last_modified,
+            sync_status=self.sync_status, recomputable=self.recomputable,
+            stat_size=stat_size, stat_mtime=stat_mtime,
+        )
 
     def to_file_metadata(
         self,
@@ -607,21 +641,25 @@ def write_cache_metadata(
     metadata: FileMetadata,
     *,
     virtual_path: Optional[str] = None,
+    recorded_stat: Optional[Tuple[int, float]] = None,
 ) -> CacheMetadataRecord:
     """Write the cache metadata xattr for a cache file.
 
     Only on a regular file, and never through a link: a symlink is refused
     with EINVAL, and the setxattr does not follow one swapped in after the
-    lstat.
+    lstat. The record carries the live size and mtime, unless
+    `recorded_stat` gives the (size, mtime) to record instead: a
+    recomputable eviction records its placeholder before the truncate.
     """
     st = os.lstat(str(cache_path))
     if not stat.S_ISREG(st.st_mode):
         raise OSError(errno.EINVAL, "not a regular file", str(cache_path))
+    stat_size, stat_mtime = recorded_stat if recorded_stat is not None else (st.st_size, st.st_mtime)
     record = CacheMetadataRecord.from_file_metadata(
         metadata,
         virtual_path=virtual_path,
-        stat_size=st.st_size,
-        stat_mtime=st.st_mtime,
+        stat_size=stat_size,
+        stat_mtime=stat_mtime,
     )
     os.setxattr(
         str(cache_path),
