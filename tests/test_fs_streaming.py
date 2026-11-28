@@ -2794,6 +2794,64 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.assertEqual(cache_path.read_bytes(), b"whole recomputed file")
         self.assertEqual(list(self.cache_dir.glob(".storage-prefix-*")), [])
 
+    def _prefix_and_resolved(self, name):
+        from storage.cache_metadata import PREFIX_XATTR
+        cache_path = self.cache_dir / name
+        cache_path.write_bytes(b"prefix")
+        os.setxattr(str(cache_path), PREFIX_XATTR, b"1")
+        return cache_path, self.fs._resolve_path('/' + name)
+
+    def _assert_prefix_restored(self, cache_path):
+        from storage.cache_metadata import PREFIX_XATTR
+        self.assertEqual(cache_path.read_bytes(), b"prefix")
+        os.getxattr(str(cache_path), PREFIX_XATTR)
+        self.assertEqual(list(self.cache_dir.glob(".storage-prefix-*")), [])
+
+    def test_failed_recompute_output_is_replaced_by_the_saved_prefix(self):
+        # R4-I1: a command that writes some output and then fails left a
+        # file the restore could not link over, and the saved prefix was
+        # discarded. Its output is not the file: removed, prefix restored.
+        from types import SimpleNamespace
+        cache_path, resolved = self._prefix_and_resolved("partial-output.bin")
+        engine = self.fs.recompute_engine
+
+        def leaves_output(requested_path, path, timeout):
+            Path(path).write_bytes(b"half a file")
+            return SimpleNamespace(success=False)
+
+        with patch.object(engine, "can_recompute", return_value=True), \
+                patch.object(engine, "recompute_file", side_effect=leaves_output):
+            self.assertFalse(self.fs._try_recompute(resolved))
+        self._assert_prefix_restored(cache_path)
+
+    def test_prefix_restore_without_hard_links_uses_rename_noreplace(self):
+        from types import SimpleNamespace
+        cache_path, resolved = self._prefix_and_resolved("nolinks.bin")
+        engine = self.fs.recompute_engine
+        with patch.object(engine, "can_recompute", return_value=True), \
+                patch.object(engine, "recompute_file", return_value=SimpleNamespace(success=False)), \
+                patch("storage.fs.os.link", side_effect=OSError(errno.EPERM, "no hard links")):
+            self.assertFalse(self.fs._try_recompute(resolved))
+        self._assert_prefix_restored(cache_path)
+
+    def test_failed_prefix_restore_keeps_the_saved_copy(self):
+        # Neither hard links nor RENAME_NOREPLACE: the prefix cannot go back
+        # without a check-then-rename, so the saved copy stays (logged)
+        # instead of being deleted.
+        from types import SimpleNamespace
+        cache_path, resolved = self._prefix_and_resolved("stuck-prefix.bin")
+        engine = self.fs.recompute_engine
+        with patch.object(engine, "can_recompute", return_value=True), \
+                patch.object(engine, "recompute_file", return_value=SimpleNamespace(success=False)), \
+                patch("storage.fs.os.link", side_effect=OSError(errno.EPERM, "no hard links")), \
+                patch("storage.fs.rename_noreplace", side_effect=OSError(errno.EINVAL, "unsupported")), \
+                self.assertLogs(self.fs.logger, level="WARNING"):
+            self.assertFalse(self.fs._try_recompute(resolved))
+        self.assertFalse(cache_path.exists())
+        saved = list(self.cache_dir.glob(".storage-prefix-*"))
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(saved[0].read_bytes(), b"prefix")
+
     def test_cold_opens_of_one_file_are_serialized_through_staging(self):
         # R3-I1 (disputed): a second open of the same file cannot fail
         # admission against a first open paused between staging and

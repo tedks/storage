@@ -35,6 +35,7 @@ from .backends.base import (
     Backend, ChecksumUnavailable, capacity_wait_cancellation,
     interactive_request,
 )
+from .backends.local import rename_noreplace
 from .backends.rsync import RsyncBackend
 from .backends.ssh_mux import close_shared_control_sockets
 from .backends.ssh_pool import (
@@ -2053,21 +2054,60 @@ class StorageFS(Operations):
                     return None
         return aside
 
-    def _restore_set_aside_prefix(self, aside: Path, cache_path: Path, restore: bool):
-        """Put a set-aside prefix back if restore and the cache path is still vacant; else discard it."""
-        if restore:
+    def _restore_set_aside_prefix(self, canonical_path: str, aside: Path, cache_path: Path, restore: bool):
+        """Put a set-aside prefix back (restore) or discard it after a recompute.
+
+        The saved copy is removed only once it is back at the cache path or
+        a recompute replaced it. Whatever a failed command left at the path
+        is not the file and is removed for the prefix, under the guards the
+        drop takes: not while the path has an index row (something else now
+        describes it) or a descriptor open. If the prefix cannot go back
+        (the guards, or a cache filesystem with neither hard links nor
+        RENAME_NOREPLACE), it stays beside the path under the partial
+        suffix, which the restart sweep removes, and a warning is logged.
+        """
+        if not restore:
             try:
-                # No-replace: whatever took the path meanwhile is newer.
-                os.link(aside, cache_path)
-            except FileExistsError:
+                aside.unlink()
+            except OSError:
                 pass
-            except OSError as exc:
-                self.logger.warning("could not restore a cached prefix after recompute: %r", exc)
+            self.cache_manager.mark_cache_size_dirty()
+            return
+        restored = False
+        with self.state_manager.metadata_lock:
+            if self.state_manager.get_file_metadata(canonical_path) is None:
+                with self._descriptor_guard(canonical_path) as is_open:
+                    if not is_open:
+                        restored = self._put_back_prefix(aside, cache_path)
+        if not restored:
+            self.logger.warning(
+                "a cached prefix could not be restored after a failed recompute; kept beside its path",
+            )
+        self.cache_manager.mark_cache_size_dirty()
+
+    def _put_back_prefix(self, aside: Path, cache_path: Path) -> bool:
+        """Move aside back onto cache_path without replacing; caller holds the guards."""
+        try:
+            if os.path.lexists(cache_path):
+                os.unlink(cache_path)  # a failed command's output
+        except OSError:
+            return False
+        try:
+            os.link(aside, cache_path)
+        except FileExistsError:
+            return False
+        except OSError as exc:
+            if exc.errno not in _LINK_UNSUPPORTED:
+                return False
+            try:
+                return rename_noreplace(aside, cache_path)
+            except OSError:
+                return False
         try:
             aside.unlink()
         except OSError:
-            pass
-        self.cache_manager.mark_cache_size_dirty()
+            pass  # a second name for the restored prefix; the restart sweep removes it
+        return True
 
     def _ensure_file_in_cache(self, resolved: ResolvedPath) -> bool:
         """
@@ -2310,7 +2350,9 @@ class StorageFS(Operations):
             return recomputed
         finally:
             if aside is not None:
-                self._restore_set_aside_prefix(aside, resolved.cache_path, restore=not recomputed)
+                self._restore_set_aside_prefix(
+                    resolved.canonical_path, aside, resolved.cache_path, restore=not recomputed,
+                )
 
     # Filesystem methods
 
@@ -3703,6 +3745,11 @@ def _sigpipe_survives_fuse():
         yield
     finally:
         signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+
+
+# link() errors meaning the cache filesystem has no hard links; a restore
+# then tries RENAME_NOREPLACE (as StreamingReadManager._install_partial does).
+_LINK_UNSUPPORTED = (errno.EPERM, errno.EOPNOTSUPP, errno.ENOTSUP, errno.ENOSYS, errno.EMLINK)
 
 
 def raise_descriptor_limit(logger: logging.Logger) -> Optional[int]:
