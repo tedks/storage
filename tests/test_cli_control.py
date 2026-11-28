@@ -466,6 +466,39 @@ def test_swapped_stage_never_redirects_and_refuses(cache):
         assert swapped.is_symlink()
 
 
+@pytest.mark.parametrize("victim_mode", [0o755, 0o700])
+def test_directory_substituted_for_the_new_stage_is_left_alone(cache, monkeypatch, victim_mode):
+    # A group writer replaces the stage name between mkdir and open with
+    # another directory of ours. Before, the server chmodded it to 0700 and,
+    # when the bind failed on its "socket", unlinked that file.
+    cache.chmod(0o775)
+    victim = cache / "victim"
+    victim.mkdir()
+    (victim / "socket").write_text("user data")
+    victim.chmod(victim_mode)
+    real_mkdir = os.mkdir
+    replaced = []
+
+    def mkdir_then_substitute(path, mode=0o777, *, dir_fd=None):
+        real_mkdir(path, mode, dir_fd=dir_fd)
+        if dir_fd is not None and not replaced:
+            os.rename(path, "ours, moved away", src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+            os.rename("victim", path, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+            replaced.append(cache / path)
+
+    server = server_for(cache, lambda _: {})
+    monkeypatch.setattr("storage.control.os.mkdir", mkdir_then_substitute)
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+        with pytest.raises(ControlError, match="not the one this mount created"):
+            server._publish(listener)
+    monkeypatch.undo()
+    substituted, = replaced
+    assert stat.S_IMODE(substituted.stat().st_mode) == victim_mode
+    assert (substituted / "socket").read_text() == "user data"
+    assert not (cache / CONTROL_SOCKET_NAME).exists()
+    cache.chmod(0o700)
+
+
 @pytest.mark.parametrize("mode", [0o707, 0o777, 0o702])
 def test_refuses_a_world_writable_cache(cache, mode, caplog):
     cache.chmod(mode)

@@ -191,13 +191,27 @@ def _entry_at(dir_fd: int, name: str) -> os.stat_result:
     return os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
 
 
-def _remove_stage(root_fd: int, name: str, stage_fd: int, stage: tuple[int, int]):
-    # Best effort: the socket name inside our stage, then the stage itself
-    # only while its name in the cache is still our directory.
-    try:
-        os.unlink("socket", dir_fd=stage_fd)
-    except OSError:
-        pass
+def _require_new_stage(entry: os.stat_result, stage_fd: int):
+    # A group writer can replace the name between mkdir and open, so only
+    # a directory that looks exactly like the one mkdir just made is used:
+    # ours, nothing for group or other, owner rwx, and empty. Nothing
+    # touches it before this passes, and it is never chmodded.
+    mode = stat.S_IMODE(entry.st_mode)
+    if (not stat.S_ISDIR(entry.st_mode) or entry.st_uid != os.geteuid()
+            or mode & 0o077 or mode & 0o700 != 0o700 or os.listdir(stage_fd)):
+        raise ControlError("control socket stage directory is not the one this mount created")
+
+
+def _remove_stage(root_fd: int, name: str, stage_fd: int, stage: tuple[int, int],
+                  bound: tuple[int, int] | None):
+    # Best effort: only the socket this attempt bound, then the stage only
+    # while its name in the cache still names the directory we verified.
+    if bound is not None:
+        try:
+            if _identity(_entry_at(stage_fd, "socket")) == bound:
+                os.unlink("socket", dir_fd=stage_fd)
+        except OSError:
+            pass
     try:
         if _identity(_entry_at(root_fd, name)) == stage:
             os.rmdir(name, dir_fd=root_fd)
@@ -239,32 +253,26 @@ class ControlServer:
             stale = self._stale_entry(root)
             # Every step below goes through the cache and stage fds, never a
             # path through the cache, so a renamed or swapped stage cannot
-            # redirect chmod, stat, link or rename. The stage is private even
-            # under umask 0, and binding through its fd keeps the longer
-            # stage path out of the Unix address limit.
+            # redirect chmod, stat, link or rename. Binding through the stage
+            # fd keeps the longer stage path out of the Unix address limit.
             name = f".storage.mount.{secrets.token_hex(8)}"
+            # 0700 at most under any umask; a umask that strips owner bits
+            # fails the check below instead of being chmodded around.
             os.mkdir(name, 0o700, dir_fd=root)
+            # If the open fails, the name may no longer be ours: leave it.
+            stage_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root)
+            stage = bound = None
             try:
-                stage_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root)
-            except OSError:
-                try:
-                    os.rmdir(name, dir_fd=root)
-                except OSError:
-                    pass
-                raise
-            stage = None
-            try:
-                os.fchmod(stage_fd, 0o700)
                 entry = os.fstat(stage_fd)
+                _require_new_stage(entry, stage_fd)
                 stage = _identity(entry)
-                if (not stat.S_ISDIR(entry.st_mode) or entry.st_uid != os.geteuid()
-                        or stat.S_IMODE(entry.st_mode) != 0o700):
-                    raise ControlError("control socket stage directory is not private")
                 staged = f"/proc/self/fd/{stage_fd}/socket"
                 listener.bind(staged)
+                # Nobody else can write the verified stage, so the entry is
+                # the socket just bound; cleanup removes only that.
+                bound = _identity(_require_owner_socket(_entry_at(stage_fd, "socket"), self.path))
                 # Follows a final symlink, but only we can write the stage.
                 os.chmod(staged, 0o600)
-                owned = _identity(_require_owner_socket(_entry_at(stage_fd, "socket"), self.path))
                 listener.listen(8)
                 listener.settimeout(0.25)
                 # Our socket is still safe in the pinned stage, but a stage
@@ -281,15 +289,10 @@ class ControlServer:
                     if _identity(current) != stale:
                         raise ControlError("control socket changed during startup")
                     os.rename("socket", CONTROL_SOCKET_NAME, src_dir_fd=stage_fd, dst_dir_fd=root)
-                return owned
+                return bound
             finally:
-                if stage is None:
-                    try:
-                        os.rmdir(name, dir_fd=root)
-                    except OSError:
-                        pass
-                else:
-                    _remove_stage(root, name, stage_fd, stage)
+                if stage is not None:
+                    _remove_stage(root, name, stage_fd, stage, bound)
                 os.close(stage_fd)
 
     def start(self):
