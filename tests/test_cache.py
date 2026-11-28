@@ -907,6 +907,130 @@ class TestCacheAccounting(unittest.TestCase):
         manager.mark_cache_size_dirty()
         self.assertEqual(manager.get_total_cache_size(), block)
 
+    def _blocked_change(self, *, blocking_pwrite_after=False, **target):
+        """Run a cache_size_change in a thread whose body waits on a gate.
+
+        Returns (thread, inside, gate, run): `run(body)` is set before
+        start; the body runs, then the thread waits for the gate while
+        still inside the change."""
+        manager = self.cache_manager
+        inside, gate = threading.Event(), threading.Event()
+        self.addCleanup(gate.set)
+        errors = []
+
+        def run(body):
+            def target_fn():
+                try:
+                    with manager.cache_size_change(**target):
+                        body()
+                        inside.set()
+                        gate.wait(timeout=10.0)
+                except BaseException as exc:  # reported by the test
+                    errors.append(exc)
+            thread = threading.Thread(target=target_fn)
+            thread.start()
+            self.assertTrue(inside.wait(timeout=5.0))
+            return thread
+
+        return run, gate, errors
+
+    def test_writes_to_one_inode_are_serialized_and_charged_once(self):
+        """Two descriptors, and a hard-link alias, change one inode: each
+        waits for the change in flight, so no change measures the inode
+        between another's before and after."""
+        manager = self.cache_manager
+        block = manager.block_size
+        path = self.cache_dir / "shared"
+        path.write_bytes(b"")
+        alias = self.cache_dir / "shared-alias"
+        first, second = os.open(path, os.O_RDWR), os.open(path, os.O_RDWR)
+        try:
+            manager.mark_cache_size_dirty()
+            self.assertEqual(manager.get_total_cache_size(), 0)
+            run, gate, errors = self._blocked_change(fd=first, span=(0, 2 * block))
+            writer = run(lambda: os.pwrite(first, b"1" * (2 * block), 0))
+            other = threading.Thread(target=lambda: self._change_fd(second, 2 * block, b"2"))
+            other.start()
+            other.join(timeout=0.5)
+            self.assertTrue(other.is_alive(), "a second change to the inode did not wait")
+            # A grant does not wait for either.
+            self.assertTrue(manager.ensure_space(block))
+            gate.set()
+            writer.join(timeout=5.0)
+            other.join(timeout=5.0)
+            self.assertEqual(errors, [])
+            self.assertEqual(manager.get_total_cache_size(), 4 * block)
+            manager.mark_cache_size_dirty()
+            self.assertEqual(manager.get_total_cache_size(), 4 * block)
+            # Through an alias (two names: a rescan, but the same lock).
+            os.link(path, alias)
+            run, gate, errors = self._blocked_change(fd=first, span=(4 * block, 5 * block))
+            writer = run(lambda: os.pwrite(first, b"3" * block, 4 * block))
+            truncate = threading.Thread(target=lambda: self._truncate_path(alias, block))
+            truncate.start()
+            truncate.join(timeout=0.5)
+            self.assertTrue(truncate.is_alive(), "a truncate through an alias did not wait")
+            gate.set()
+            writer.join(timeout=5.0)
+            truncate.join(timeout=5.0)
+            self.assertEqual(errors, [])
+            self.assertEqual(os.fstat(first).st_size, block)
+            self.assertEqual(manager.get_total_cache_size(), block)
+        finally:
+            os.close(first)
+            os.close(second)
+
+    def _change_fd(self, fd, offset, byte):
+        block = self.cache_manager.block_size
+        with self.cache_manager.cache_size_change(fd=fd, span=(offset, offset + 2 * block)):
+            os.pwrite(fd, byte * (2 * block), offset)
+
+    def _truncate_path(self, path, size):
+        with self.cache_manager.cache_size_change(path):
+            os.truncate(path, size)
+
+    def test_a_rescan_during_a_change_is_not_added_to(self):
+        """A rescan that runs while a change is in flight counts part of
+        it; the change then leaves the total to another rescan instead of
+        adding its delta again."""
+        manager = self.cache_manager
+        block = manager.block_size
+        path = self.cache_dir / "rescanned"
+        path.write_bytes(b"")
+        fd = os.open(path, os.O_RDWR)
+        try:
+            manager.mark_cache_size_dirty()
+            self.assertEqual(manager.get_total_cache_size(), 0)
+            run, gate, errors = self._blocked_change(fd=fd, span=(0, 2 * block))
+            writer = run(lambda: os.pwrite(fd, b"r" * (2 * block), 0))
+            manager.mark_cache_size_dirty()
+            self.assertEqual(manager.get_total_cache_size(), 2 * block)  # the scan saw it
+            gate.set()
+            writer.join(timeout=5.0)
+            self.assertEqual(errors, [])
+            self.assertEqual(manager.get_total_cache_size(), 2 * block)
+        finally:
+            os.close(fd)
+
+    def test_eviction_skips_an_inode_with_a_change_in_flight(self):
+        manager = self.cache_manager
+        block = manager.block_size
+        victim = self.cache_dir / "victim"
+        victim.write_bytes(b"v" * (2 * block))
+        self._clean_row("victim", last_access=1.0)
+        manager.mark_cache_size_dirty()
+        manager.max_size_bytes = manager.get_total_cache_size()
+        run, gate, errors = self._blocked_change(path=victim)
+        truncating = run(lambda: os.truncate(victim, block))
+        self.assertFalse(manager.ensure_space(block))
+        self.assertTrue(victim.exists())
+        gate.set()
+        truncating.join(timeout=5.0)
+        self.assertEqual(errors, [])
+        self.assertEqual(manager.get_total_cache_size(), block)
+        manager.mark_cache_size_dirty()
+        self.assertEqual(manager.get_total_cache_size(), block)
+
     def test_direct_writer_uses_space_before_the_next_stream_grant(self):
         manager = self.cache_manager
         block = manager.block_size

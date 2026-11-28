@@ -216,6 +216,14 @@ class CacheManager:
         # than that fails without walking the index again (see
         # _known_shortfall). Only a request it would fail anyway is refused.
         self._shortfall: Optional[Tuple[int, int, float, int]] = None
+        # Direct changes in flight, by inode identity (or by path for a
+        # target that does not exist yet): [lock, users]. See
+        # cache_size_change. The mutex guards only the table.
+        self._inode_locks: dict = {}
+        self._inode_locks_mutex = threading.Lock()
+        # Moves at every tree rescan, so a direct change that measured its
+        # inode before a rescan does not add its delta on top of it.
+        self._scan_epoch = 0
         self._evictable_epoch = 0
         self._grant_warning_logged = False
 
@@ -367,6 +375,7 @@ class CacheManager:
         if self._size_dirty:
             self._current_size_bytes = self._scan_total_cache_size()
             self._size_dirty = False
+            self._scan_epoch += 1
 
     def recover_views(self, member_names: List[str]):
         """At mount start, before any worker, eviction or FUSE request: drop
@@ -605,33 +614,79 @@ class CacheManager:
         a create) or an open descriptor, and for a pwrite the byte span
         [start, end) it covers. The data blocks are measured before and
         after the change under the cache lock and the difference charged,
-        so the next grant needs no rescan. With no target, a target that
-        does not qualify (see _direct_charge), or a path whose inode
-        changed in between, the change is unknown and the next allocation
-        rescans the tree. An inode a streaming descriptor holds (an
+        so the next grant needs no rescan. The change itself runs without
+        the cache lock, so a slow write to one file does not stall grants
+        or writes to others: changes to one inode (through any name or
+        descriptor) are serialized by a per-inode lock instead, eviction
+        skips an inode with a change in flight, and a rescan in between
+        makes the change rescan again rather than add its delta. With no
+        target, a target that does not qualify (see _direct_charge), or a
+        path whose inode changed in between, the change is unknown and the
+        next allocation rescans the tree. An inode a streaming descriptor holds (an
         installed download a reader still has open) is charged only through
         that descriptor: it is recognized by a stat alone, measured nowhere
         before the change, and recharged absolutely after it
         (_recharge_held), never charged a second time for the name. A
         change's own error propagates unchanged.
         """
-        with self._lock:
-            if path is None and fd is None:
-                try:
-                    yield
-                finally:
-                    self._size_dirty = True
-                return
-            held = self._held_identities() if self._streaming_fds else set()
-            st_before, failed_before = self._target_stat(path, fd)
-            id_before = (st_before.st_dev, st_before.st_ino) if st_before is not None else None
-            before = None
-            if id_before not in held and not failed_before:
-                before = self._direct_charge(path, fd, span, st_before)
+        if path is None and fd is None:
             try:
                 yield
             finally:
-                self._settle_direct_change(path, fd, span, held, id_before, failed_before, before)
+                with self._lock:
+                    self._size_dirty = True
+            return
+        st_key, _ = self._target_stat(path, fd)
+        key = (st_key.st_dev, st_key.st_ino) if st_key is not None else ("path", str(path))
+        with self._inode_lock(key):
+            with self._lock:
+                held = self._held_identities() if self._streaming_fds else set()
+                st_before, failed_before = self._target_stat(path, fd)
+                id_before = (st_before.st_dev, st_before.st_ino) if st_before is not None else None
+                if st_key is not None and id_before != key:
+                    failed_before = True  # the name moved to another inode: unknown
+                before = None
+                if id_before not in held and not failed_before:
+                    before = self._direct_charge(path, fd, span, st_before)
+                epoch = self._scan_epoch
+            try:
+                yield
+            finally:
+                with self._lock:
+                    if epoch != self._scan_epoch:
+                        before = None  # a rescan counted part of this change
+                    self._settle_direct_change(path, fd, span, held, id_before,
+                                               failed_before, before)
+
+    @contextmanager
+    def _inode_lock(self, key):
+        """Serialize direct changes to one inode, never holding the cache lock.
+
+        Lock order: an inode lock, then the cache lock. Nothing holding the
+        cache lock waits for an inode lock; eviction only checks the table
+        (_inode_busy) and skips a busy inode.
+        """
+        with self._inode_locks_mutex:
+            entry = self._inode_locks.setdefault(key, [threading.RLock(), 0])
+            entry[1] += 1
+        try:
+            with entry[0]:
+                yield
+        finally:
+            with self._inode_locks_mutex:
+                entry[1] -= 1
+                if entry[1] == 0:
+                    del self._inode_locks[key]
+
+    def _inode_busy(self, identity) -> bool:
+        """Whether a direct change to the inode is in flight or waiting.
+
+        Caller holds the cache lock. A change that registers after this
+        check measures before it changes anything, under the cache lock, so
+        it measures after whatever the caller does now.
+        """
+        with self._inode_locks_mutex:
+            return identity in self._inode_locks
 
     def _settle_direct_change(self, path, fd, span, held, id_before, failed_before, before):
         """The second half of cache_size_change; never raises, so the
@@ -1146,12 +1201,15 @@ class CacheManager:
                 st = regular_file_stat(cache_path)
                 if st is None:
                     return 0
-                if (st.st_dev, st.st_ino) in self._held_identities():
+                identity = (st.st_dev, st.st_ino)
+                if identity in self._held_identities() or self._inode_busy(identity):
                     # A streaming descriptor holds the inode (a readerless
                     # fill installed before its session closed, which no
                     # FUSE descriptor pins): unlinking the name would
                     # reclaim nothing yet. close_streaming_fd notes the
-                    # change, so the next allocation can take it.
+                    # change, so the next allocation can take it. Or a
+                    # direct change is in flight: it measured the inode
+                    # before and charges its delta after.
                     return 0
                 stale = st.st_size != row.size or st.st_mtime != row.last_modified
                 if not stale:
