@@ -91,8 +91,9 @@ Storage will prefer to read from a local cache over a remote filesystem in all c
 Storage limits local cache data to a configured budget. Streaming fills
 charge the data blocks each write materializes. Eviction reclaims whole
 files in least recently accessed order, counting reads and writes.
-Recoverable copies include recomputable files with a recorded member
-copy. Dirty, open, repair-pinned, and recompute-only files are kept under
+A copy is recoverable only when a member is recorded to hold it,
+recomputable or not. Dirty, open, repair-pinned, and recompute-only files,
+and clean copies with no recorded member location, are kept under
 pressure. A streaming reader can receive fetched bytes directly when the
 cache cannot keep them, and speculative reads pause.
 

@@ -368,6 +368,8 @@ class TestCacheAccounting(unittest.TestCase):
         self._fill_with_dirty_bytes()
         self.assertFalse(manager.ensure_space(block))
         row = self.state_manager.get_file_metadata("/dirty.bin")
+        # A sync publishes CLEAN with the member it reached.
+        self.state_manager.add_file_location(FileLocation("/dirty.bin", "member", "c", 1.0, False))
         self.assertTrue(self.state_manager.publish_sync_status(
             "/dirty.bin", row.dirty_generation, SyncStatus.CLEAN))
         self.assertTrue(manager.ensure_space(block))
@@ -887,6 +889,8 @@ class TestEvictionSkipsStaleClean(unittest.TestCase):
     def test_missing_rows_cannot_hide_the_oldest_cached_copy_under_pressure(self):
         oldest = self._clean_cached("oldest.txt", b"old", last_access=2.0)
         newer = self._clean_cached("newer.txt", b"new", last_access=3.0)
+        for name in ("/oldest.txt", "/newer.txt"):
+            self.state_manager.add_file_location(FileLocation(name, "member", "c", 1.0, False))
         template = self.state_manager.get_file_metadata("/oldest.txt")
         for i in range(1001):
             # Previously evicted rows share one timestamp, spanning a page.
@@ -949,6 +953,23 @@ class TestEvictionSkipsStaleClean(unittest.TestCase):
         self.assertEqual([location.backend_name for location in self.state_manager.get_file_locations(
             "/recoverable.txt",
         )], ["member"])
+
+    def test_pressure_keeps_a_clean_copy_no_member_is_recorded_to_hold(self):
+        """A CLEAN row is not evidence of a member copy: without a recorded
+        member location the cached file may be the only copy."""
+        unrecorded = self._clean_cached("unrecorded.txt", b"sole", last_access=1.0)
+        recorded = self._clean_cached("recorded.txt", b"held", last_access=2.0)
+        self.state_manager.add_file_location(FileLocation("/recorded.txt", "member", "c", 1.0, False))
+        self.state_manager.add_file_location(FileLocation("/unrecorded.txt", "cache", "c", 1.0, True))
+        manager = self.cache_manager
+        manager.mark_cache_size_dirty()
+        manager.max_size_bytes = manager.get_total_cache_size()
+
+        self.assertTrue(manager.ensure_space(manager.block_size))
+        self.assertEqual(unrecorded.read_bytes(), b"sole")
+        self.assertFalse(recorded.exists())
+        self.assertFalse(manager.ensure_space(2 * manager.block_size))
+        self.assertEqual(unrecorded.read_bytes(), b"sole")
 
     def test_insufficient_victims_keep_existing_clean_bytes(self):
         ordinary = self._clean_cached("ordinary.txt", b"keep", last_access=1.0)

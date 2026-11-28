@@ -684,7 +684,7 @@ Configuration is hierarchical - child directories inherit from parents, with the
 **Cache Management:**
 1. Track file access times for LRU
 2. Reclaim clean, recoverable copies in access order as new data needs space
-3. Keep dirty, open, repair-pinned, and recompute-only files under cache pressure
+3. Keep dirty, open, repair-pinned, and recompute-only files, and copies no member is recorded to hold, under cache pressure
 
 **Metadata and Recovery:**
 1. File/directory policy remains xattr-defined via `user.storage.config`

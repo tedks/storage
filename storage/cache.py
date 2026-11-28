@@ -870,11 +870,14 @@ class CacheManager:
             truncate = recomputable is True
             if truncate and not row.recompute_cmd:
                 return 0
-            if recomputable is None and row.recomputable and not any(
+            if recomputable is None and not any(
                 not location.is_cached for location in self.state_manager.get_file_locations(virtual_path)
             ):
-                # The cache cannot recreate a recompute-only placeholder on
-                # demand yet. A member-backed copy can be fetched normally.
+                # Pressure eviction reclaims only a copy a member is recorded
+                # to hold, so the next open can fetch it again. A CLEAN row
+                # alone is not that evidence (a status published without a
+                # location, a rebuilt index), and the cache cannot recreate
+                # a recompute-only placeholder on demand yet.
                 return 0
             # A member that missed a rename may hold these bytes only under
             # the old name: the cached copy stays until the repair is resolved.
