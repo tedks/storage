@@ -1,0 +1,25 @@
+id: streaming-prefix-served-online
+title: An ordinary open serves a promoted streaming prefix as the whole file while
+  its member is reachable
+desc: 'From council on #190 (2026-11-28, OpenAI gpt-6.2-sol R2-C2 and the lead''s
+  verification). A failed streaming session promotes its contiguous prefix (PREFIX_XATTR,
+  no index row). A later ordinary open finds it cached: _ensure_file_in_cache returns
+  at is_cached and _drop_unindexed_prefix runs only when a fresh fetch''s link finds
+  ALREADY_CACHED, so read(2) returns a short file even with the member online. #190
+  keeps the streaming open paths from returning a prefix (PREFIX_CACHED, EAGAIN, never
+  short) and documents the limit; the ordinary path is pre-existing design (offline
+  prefix reuse, tests test_streaming_failure_reuses_cached_prefix_offline). Decide
+  whether online opens should refetch or stream past a prefix.'
+type: bugfix
+component: cache
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-28T08:53:29-00:00
+references: []
+log_events:
+- time: 2026-11-28T08:53:29-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
