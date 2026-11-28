@@ -19,10 +19,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from click.testing import CliRunner
-
 from storage.backends.local import LocalBackend
-from storage.cli import main
 from storage.fs import StorageFS
 from tests.fuse_mount import run_fuse, stop_fuse
 
@@ -82,23 +79,6 @@ class TestStreamingSystemRegression(unittest.TestCase):
         for index in range(10):
             (self.backend_dir / f"reader-{index}.bin").write_bytes(self.reader_payload)
 
-        profile = Path(self.temp_dir) / "legacy.toml"
-        profile.write_text(
-            '[mounts.legacy]\n'
-            f'mountpoint = {json.dumps(str(self.mount_dir), ensure_ascii=False)}\n'
-            f'cache = {json.dumps(str(self.cache_dir), ensure_ascii=False)}\n'
-            f'backends = [{json.dumps(str(self.backend_dir), ensure_ascii=False)}]\n'
-            'max_streaming_sessions = 8\n'
-            'max_retained_streaming_sessions = 64\n',
-        )
-        with patch("storage.cli_mount.mount_storage") as mount:
-            result = CliRunner().invoke(main, ["mount", "--config", str(profile), "legacy"])
-        self.assertEqual(result.exit_code, 0, result.output)
-        self.assertIn("max_streaming_sessions is obsolete and ignored", result.output)
-        self.assertIn("max_retained_streaming_sessions is obsolete and ignored", result.output)
-        self.assertNotIn("max_streaming_sessions", mount.call_args.kwargs)
-        self.assertIsNone(mount.call_args.kwargs["max_download_workers"])
-
         self.backend = SlowRemoteLoopbackBackend("remote0", str(self.backend_dir), range_delay=0.003)
         self.fs = StorageFS(
             cache_root=self.cache_dir,
@@ -109,7 +89,9 @@ class TestStreamingSystemRegression(unittest.TestCase):
             start_sync=False,
             streaming_reads=True,
             streaming_chunk_size=64 * 1024,
-            max_download_workers=mount.call_args.kwargs["max_download_workers"],
+            # Automatic, as a profile that sets no max_download_workers mounts
+            # (tests/test_cli_mount.py checks the obsolete slot settings).
+            max_download_workers=None,
         )
 
         self.mount_thread = threading.Thread(
@@ -265,6 +247,9 @@ class TestStreamingSystemRegression(unittest.TestCase):
             self.assertEqual(error.exception.errno, errno.ENOSPC)
             copies.assert_not_called()
         self.assertEqual(list(self.cache_dir.glob("*.storage.partial")), [])
+        # pathlib's "*" matches dot files, so the glob above sees staging
+        # files too; named here so a change to either pattern is noticed.
+        self.assertEqual(list(self.cache_dir.glob(".storage-staging-*")), [])
         self.assertEqual(self.fs._streaming_stats_snapshot()["streaming_open_error_cache_space"], 1)
         with path.open("rb", buffering=0) as handle:
             self.assertEqual(handle.read(4096), self.reader_payload[:4096])

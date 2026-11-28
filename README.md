@@ -244,21 +244,44 @@ a 2 GiB file, a 1 MiB contiguous read opens a speculative window of up to
 (644,245,095 bytes) qualifies the file to keep downloading after close.
 
 Streaming read-ahead and retained fills share an adaptive pool. Workers
-start as chunks become runnable and retire after 30 idle seconds. Set
-`max_download_workers` (`--max-download-workers`) to a positive integer
-to throttle background transfers across the mount.
+start as chunks become runnable and retire after 30 idle seconds. By
+default the pool grows with demand up to each member's own limit: bulk
+SFTP capacity for SSH and rsync members, and four workers for a local
+member, which sets no limit of its own. Set `max_download_workers`
+(`--max-download-workers`) to a positive integer to throttle background
+transfers across the mount instead; that number then bounds local
+members too.
 Each worker takes one chunk before checking the queue again. Files with
 open readers take precedence, with a turn for a waiting closed file
 after four reader turns. Reopening a retained fill gives it reader
 priority and reuses the bytes it already has.
 
-The kernel governs resources for open files and retained fills. Each
-cached partial uses an inode and a descriptor. The old mount settings
-`max_streaming_sessions` and `max_retained_streaming_sessions` are obsolete.
-Existing profiles still load and warn that the settings are ignored.
+No setting limits how many files stream at once or how many fills are
+retained. The old mount settings `max_streaming_sessions` and
+`max_retained_streaming_sessions` are obsolete; existing profiles still
+load and warn that the settings are ignored. Two resources bound
+streaming instead:
+
+- Cache space. A cold streaming open is admitted against `cache_size`
+  for the file's full length, even while the partial is still sparse. If
+  the cache cannot make that much room, even after discarding unfinished
+  retained fills, the open fails with `ENOSPC`; it does not fall back to
+  a whole-file copy.
+- Descriptors. Each streaming file holds one descriptor on its partial
+  while it fills, with or without readers, and each open handle holds
+  another. At mount the soft `RLIMIT_NOFILE` is raised to the hard limit
+  (logged; a failure to raise it is logged and the mount continues). A
+  fill is not retained after its last close once streaming files hold
+  half the soft limit; it is discarded as an unqualified one is. A mount
+  that reaches the limit anyway returns `EMFILE` from opens.
+
 On range-capable reads, a storage or member error returns its errno to
-the caller. A selected member without range support uses the whole-file
-cache path, as do write opens and opens with streaming disabled.
+the caller; a file that disappears from its member during a read returns
+`ESTALE`. A new open of a file whose streaming download failed starts a
+fresh download instead of returning the old error. A recomputable file
+whose members cannot be reached is recomputed. A selected member without
+range support uses the whole-file cache path, as do write opens and opens
+with streaming disabled.
 
 SSH read-ahead and retained fills use bulk SFTP capacity, as do rsync
 members' range reads. A worker claims bytes only after getting a bulk
