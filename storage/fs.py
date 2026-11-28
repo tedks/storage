@@ -2214,10 +2214,11 @@ class StorageFS(Operations):
         that another descriptor holds cannot be dropped, and the open is
         EAGAIN rather than serve the prefix as the file.
         """
-        for attempt in range(2):
+        canonical_path, cache_path = resolved.canonical_path, resolved.cache_path
+        for attempt in range(3):
             try:
                 stream = self._create_or_attach_prefetch_session(
-                    resolved.requested_path, resolved.canonical_path,
+                    resolved.requested_path, canonical_path,
                 )
             except StreamSourceError as exc:
                 # No member could be probed. A recomputable file is
@@ -2232,11 +2233,18 @@ class StorageFS(Operations):
             except Exception as exc:
                 self.logger.exception("streaming open failed unexpectedly")
                 raise FuseOSError(errno.EIO) from exc
+            if stream == StreamingOpen.RANGE_UNSUPPORTED and self._is_unindexed_prefix(canonical_path, cache_path):
+                # The open found the file uncached, so this prefix was
+                # promoted during it; the whole-file path would take it for
+                # the file (it serves whatever is cached).
+                stream = StreamingOpen.PREFIX_CACHED
             if stream != StreamingOpen.PREFIX_CACHED:
                 return stream
             self._record_streaming_stat("streaming_prefix_refetches", 1)
-            if attempt or not self._drop_unindexed_prefix(resolved.canonical_path, resolved.cache_path):
-                break
+            if (not self._drop_unindexed_prefix(canonical_path, cache_path)
+                    and self._is_unindexed_prefix(canonical_path, cache_path)):
+                break  # a descriptor holds it
+            # Dropped, or no longer a prefix (indexed or replaced): try again.
         raise FuseOSError(errno.EAGAIN)
 
     def _whole_file_cached(self, resolved: ResolvedPath) -> bool:

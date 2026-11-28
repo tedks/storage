@@ -2668,6 +2668,95 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.assertEqual(stats["streaming_open_cleanup_waits"], 1)
         self.assertEqual(stats["streaming_prefix_refetches"], 1)
 
+    def _hold_promotion(self, name, payload):
+        """Fail a session on name after a 4 KiB prefix and hold its promotion.
+
+        Returns (session, in_promote, go_promote, stack); the caller enters
+        stack (it holds the patches) before calling.
+        """
+        manager = self.fs._streaming_manager
+        real_promote = manager._promote_failed_session_cache_prefix
+        in_promote = threading.Event()
+        go_promote = threading.Event()
+        self.addCleanup(go_promote.set)
+
+        def held_promote(session):
+            in_promote.set()
+            go_promote.wait(timeout=10.0)
+            return real_promote(session)
+
+        stack = ExitStack()
+        stack.enter_context(patch.object(manager, "_promote_failed_session_cache_prefix", side_effect=held_promote))
+        hold, at_finalize, go_tail = self._hold_finalize()
+        stack.enter_context(hold)
+        vfd = self.fs.open('/' + name, os.O_RDONLY)
+        session = self._session_for(vfd)
+        self.assertEqual(self.fs.read('/' + name, 4096, 0, vfd), payload[:4096])
+        with session.lock:
+            session.error = OSError(errno.EIO, "simulated failure")
+            manager._schedule_background(session)
+        self.assertTrue(at_finalize.wait(timeout=3.0))
+        # The worker is short of its tail, so this release leaves cleanup
+        # (and the held promotion) to the worker.
+        self.fs.release('/' + name, vfd)
+        go_tail.set()
+        return session, in_promote, go_promote, stack
+
+    def test_post_wait_retry_on_a_nonrange_member_does_not_take_the_prefix(self):
+        # R3-C1: the open waits out a failed session's cleanup; meanwhile
+        # the range member is gone and the retry selects a member without
+        # range reads. The whole-file path would serve the promoted prefix
+        # as the cached file; the open drops it and copies the whole file.
+        self.backend.copy_delay = 0
+        payload = os.urandom(192 * 1024)
+        (self.backend_dir / "nonrange-wait.bin").write_bytes(payload)
+        results = {}
+
+        def opener():
+            try:
+                results["open"] = self.fs.open('/nonrange-wait.bin', os.O_RDONLY)
+            except Exception as exc:
+                results["open"] = exc
+
+        with patch.object(self.backend, "copy_to_local", wraps=self.backend.copy_to_local) as copy:
+            session, in_promote, go_promote, stack = self._hold_promotion("nonrange-wait.bin", payload)
+            with stack:
+                self.assertTrue(in_promote.wait(timeout=3.0))
+                thread = threading.Thread(target=opener, name="waiting-open")
+                with patch.object(self.backend, "supports_range_reads", return_value=False):
+                    thread.start()
+                    thread.join(timeout=0.3)
+                    self.assertTrue(thread.is_alive())
+                    go_promote.set()
+                    thread.join(timeout=5.0)
+                self.assertFalse(thread.is_alive())
+            copy.assert_called_once()
+        fd = results["open"]
+        self.assertIsInstance(fd, int)
+        self.assertEqual(self.fs.read('/nonrange-wait.bin', len(payload), 0, fd), payload)
+        self.fs.release('/nonrange-wait.bin', fd)
+        self.assertEqual((self.cache_dir / "nonrange-wait.bin").read_bytes(), payload)
+        self.assertEqual(self.fs._streaming_stats_snapshot()["streaming_prefix_refetches"], 1)
+
+    def test_prefix_that_is_no_longer_a_prefix_is_retried_not_eagain(self):
+        # R3-N1: the drop finds no prefix any more (indexed or replaced):
+        # the open tries again instead of returning EAGAIN.
+        manager = self.fs._streaming_manager
+        payload = os.urandom(64 * 1024)
+        (self.backend_dir / "changed.bin").write_bytes(payload)
+        real_create = manager._create_or_attach_prefetch_session
+        outcomes = [StreamingOpen.PREFIX_CACHED]
+
+        def first_prefix(virtual_path, canonical_path):
+            if outcomes:
+                return outcomes.pop()
+            return real_create(virtual_path, canonical_path)
+
+        with patch.object(manager, "_create_or_attach_prefetch_session", side_effect=first_prefix):
+            fd = self.fs.open('/changed.bin', os.O_RDONLY)
+        self.assertEqual(self.fs.read('/changed.bin', len(payload), 0, fd), payload)
+        self.fs.release('/changed.bin', fd)
+
     def test_streaming_open_never_serves_a_prefix_it_cannot_replace(self):
         # A promoted prefix lands at the cache path after the open's cache
         # check. Dropped and streamed again when nothing holds it; EAGAIN,
