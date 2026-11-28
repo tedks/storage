@@ -2831,6 +2831,38 @@ class TestRefreshRound5(RevalidateTestBase):
             self.assertEqual(self.fs.state_manager.get_file_metadata("/live.log").sync_status,
                              SyncStatus.CLEAN)
 
+    def test_eviction_heals_verified_replacement_before_the_sweep(self):
+        self.refreshed_with_checksums()
+        with patch.object(self.fs, "_record_fetched", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.fs.open("/live.log", os.O_RDONLY)
+        self.restart()
+        cached = self.cache_dir / "live.log"
+        self.assertEqual(cached.read_bytes(), b"version 2!")
+        state = self.fs.state_manager
+        self.assertEqual(state.get_file_metadata("/live.log").size, 9)
+        with patch.object(self.fs.sync_manager, "queue_sync") as sync:
+            self.assertTrue(self.fs.cache_manager.evict_lru_files(bytes_needed=10))
+        sync.assert_not_called()
+        self.assertFalse(cached.exists())
+        row = state.get_file_metadata("/live.log")
+        self.assertEqual((row.size, row.last_modified, row.sync_status, row.checksum),
+                         (10, 1_100_000_000, SyncStatus.CLEAN, None))
+        self.assertEqual(row.dirty_generation, 0)
+        for location in state.get_file_locations("/live.log"):
+            self.assertNotEqual(location.backend_name, "cache")
+            self.assertFalse(location.checksum)
+
+    def test_startup_scan_snapshot_can_predate_a_verified_refresh(self):
+        self.refreshed_with_checksums()
+        cached = self.cache_dir / "live.log"
+        old_stat = cached.stat()
+        self.assertEqual(self.read_through("/live.log"), b"version 2!")
+        self.assertFalse(self.fs.cache_manager.heal_stale_clean(
+            "/live.log", cached, stat_size=old_stat.st_size, stat_mtime=old_stat.st_mtime))
+        self.assertEqual(self.fs.state_manager.get_file_metadata("/live.log").sync_status,
+                         SyncStatus.CLEAN)
+
     def test_a_crash_after_equal_stat_replacement_forgets_the_old_checksums(self):
         old_inode = self.refreshed_with_checksums()
         self.rewrite_member("live.log", b"version 2", mtime=1_000_000_000)

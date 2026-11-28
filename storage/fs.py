@@ -3783,10 +3783,10 @@ class StorageFS(Operations):
 
         Run after an unclean shutdown: a write whose bytes landed but whose
         row update was lost leaves a CLEAN row with an older size or mtime
-        than the file. One lstat, one getxattr and one row read per cached
-        file. Safe alongside FUSE operations and the sync monitor: it only
-        ever records a modification through mark_file_dirty. Returns the
-        number of files marked.
+        than the file. A verified replacement can also leave an older row
+        and be recovered as CLEAN. The scan's stat is only a hint for
+        heal_stale_clean, which rechecks a suspect row under the index lock.
+        Returns the number of files marked DIRTY.
         """
         marked = 0
         for entry in scan_cache_entries(self.cache_manager.cache_root):

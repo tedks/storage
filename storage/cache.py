@@ -980,7 +980,8 @@ class CacheManager:
         and none can be opened on the file before the unlink (open() takes
         the same lock across its os.open and registration), since bytes
         written through one after the stat would die with the unlinked
-        inode. A stale CLEAN is marked and kept. The listing attributes for
+        inode. A stale CLEAN is marked and kept unless the inode carries
+        the verified replacement's CLEAN record. The listing attributes for
         the path are forgotten before the unlink (forget_listed_attrs). Lock
         order: the caller's
         self._lock, the index lock, then the descriptor lock; nothing under
@@ -1000,11 +1001,17 @@ class CacheManager:
                     return 0
                 st = os.lstat(str(cache_path))
                 stale = st.st_size != row.size or st.st_mtime != row.last_modified
-                if not stale:
+                recovered = stale and self.clean_record_for(
+                    cache_path, st.st_size, st.st_mtime) is not None
+                if not stale or recovered:
                     if self.forget_listed_attrs:
                         self.forget_listed_attrs(virtual_path)
                     cache_path.unlink()
-            if stale:
+            if recovered:
+                # The proof and unlink were protected by the descriptor
+                # guard. Repair the row while its lock is still held.
+                self._forget_replaced_version(virtual_path, row, st.st_size, st.st_mtime)
+            elif stale:
                 self.mark_file_dirty(virtual_path, cache_path)
                 return 0
             self._current_size_bytes = max(0, self._current_size_bytes - st.st_size)
@@ -1036,49 +1043,33 @@ class CacheManager:
         stat_size: Optional[int] = None,
         stat_mtime: Optional[float] = None,
     ) -> bool:
-        """Mark a CLEAN row DIRTY when the cache file was written after it.
+        """Repair a CLEAN row that may describe a previous cache version.
 
-        The row's size and mtime are the stat recorded by the last
-        mark_file_dirty (or the last fetch). A CLEAN row whose stat differs
-        from the file means a write landed and its row update was lost (a
-        crash between the two), or something wrote to the cache directory
-        behind the mount; in that second case a sync may publish CLEAN for
-        a half-written file and the next open heals it again. One row read
-        and one lstat, unless the caller passes a stat it already has. The
-        read and the stat are not under the index lock: a writer racing
-        them bumps the generation, and mark_file_dirty's own bump keeps the
-        row at the newer write. Returns True when the file was marked.
+        A verified refresh puts a matching CLEAN record on the new inode
+        before naming it. A local write leaves a DIRTY or outdated record.
+        Check the live stat under the row lock before acting on a scan's
+        snapshot. Return True when a local modification was marked DIRTY.
         """
-        row = self.state_manager.get_file_metadata(virtual_path)
-        if row is None or row.sync_status != SyncStatus.CLEAN:
-            return False
-        if stat_size is None or stat_mtime is None:
-            try:
-                st = os.lstat(str(cache_path))
-            except OSError:
+        with self.state_manager.metadata_lock:
+            row = self.state_manager.get_file_metadata(virtual_path)
+            if row is None or row.sync_status != SyncStatus.CLEAN:
                 return False
-            stat_size, stat_mtime = st.st_size, st.st_mtime
-        if stat_size == row.size and stat_mtime == row.last_modified:
-            if row.checksum:
-                # A refresh with the same size and mtime may still have
-                # replaced the bytes: its own CLEAN record has no checksum.
+            if stat_size != row.size or stat_mtime != row.last_modified or row.checksum:
+                st = regular_file_stat(cache_path)
+                if st is None:
+                    return False
+                stat_size, stat_mtime = st.st_size, st.st_mtime
+            stale = stat_size != row.size or stat_mtime != row.last_modified
+            if stale or row.checksum:
                 record = self.clean_record_for(cache_path, stat_size, stat_mtime)
-                if record is not None and record.checksum is None:
+                # An equal-stat replacement is detectable if the old row
+                # still carries a checksum the replacement's record lacks.
+                if record is not None and (stale or record.checksum is None):
                     self._forget_replaced_version(virtual_path, row, stat_size, stat_mtime)
+                    return False
+            if stale:
+                return self.mark_file_dirty(virtual_path, cache_path) is not None
             return False
-        # A refresh in place names a verified copy that already carries its
-        # own CLEAN record; a crash before the row followed leaves the row
-        # describing the old version. The file's record then matches its
-        # stat: the row is brought up to it (CLEAN, no checksum, no location
-        # checksums), not marked dirty. A write leaves no such record
-        # (mark_file_dirty records DIRTY), and a change behind the mount has
-        # a stale one. This is the one exception to "a stat that differs
-        # from the row is dirty" (AGENTS.md, Repo specifics).
-        record = self.clean_record_for(cache_path, stat_size, stat_mtime)
-        if record is not None:
-            self._forget_replaced_version(virtual_path, row, stat_size, stat_mtime)
-            return False
-        return self.mark_file_dirty(virtual_path, cache_path) is not None
 
     def _forget_replaced_version(self, virtual_path: str, row, size: int, mtime: float) -> None:
         """Bring a CLEAN row up to a refreshed copy whose row update was lost:
