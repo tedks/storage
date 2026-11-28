@@ -91,8 +91,10 @@ class FDEntry:
     view_refused: bool = False
     # A private copy (FillAction.PRIVATE): its captured length, reserved
     # in the cache budget until the descriptor closes; cache_path is the
-    # copy, never indexed or uploaded, removed at close or teardown.
+    # copy, never indexed or uploaded, unlinked once the descriptor holds
+    # it. private_attrs: the member's mode, uid and gid as last reported.
     private_size: Optional[int] = None
+    private_attrs: Optional[dict] = None
 
 
 @dataclass(frozen=True)
@@ -2288,15 +2290,33 @@ class StorageFS(Operations):
 
     def getattr(self, path, fh=None):
         """Get file attributes"""
-        attrs = self.namespace.getattr(path)
         if fh is not None:
             with self._fd_lock:
                 entry = self._fd_map.get(fh)
             if entry is not None and entry.private_size is not None:
-                # A private copy's handle reports the length it captured,
-                # so its reads end at that EOF.
-                attrs = dict(attrs, st_size=entry.private_size)
+                return self._private_attrs(entry)
+        return self.namespace.getattr(path)
+
+    @staticmethod
+    def _private_attrs(entry: FDEntry) -> dict:
+        """A private handle's attributes, from its captured descriptor alone
+        (never the live path): its length, its own times, and the member's
+        mode and ids as last reported, without write (read-only copy)."""
+        st = os.fstat(entry.real_fd)
+        known = entry.private_attrs or {}
+        mode = known.get("st_mode")
+        mode = stat.S_IMODE(st.st_mode if type(mode) is not int else mode)
+        attrs = {key: getattr(st, key) for key in ("st_atime", "st_mtime", "st_ctime", "st_size")}
+        attrs.update(st_mode=stat.S_IFREG | (mode & 0o7555 & ~(stat.S_ISUID | stat.S_ISGID)),
+                     st_nlink=1,
+                     st_uid=known.get("st_uid") if type(known.get("st_uid")) is int else st.st_uid,
+                     st_gid=known.get("st_gid") if type(known.get("st_gid")) is int else st.st_gid)
         return attrs
+
+    def is_private_handle(self, fh) -> bool:
+        with self._fd_lock:
+            entry = self._fd_map.get(fh)
+        return entry is not None and entry.private_size is not None
 
     def readdir(self, path, fh):
         """Read directory contents"""
