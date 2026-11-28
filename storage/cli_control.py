@@ -28,7 +28,10 @@ class ControlTarget:
             raise click.UsageError("--config requires --profile")
         if self.profile:
             resolved = resolve_member_configuration(self.profile, self.config_path, (), None, None)
-            return resolved.cache_root, canonical_mountpoint(resolved.mountpoint)
+            try:
+                return resolved.cache_root, canonical_mountpoint(resolved.mountpoint)
+            except ControlError as exc:
+                raise click.ClickException(str(exc)) from exc
         return self.cache.resolve(), None
 
     @staticmethod

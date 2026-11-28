@@ -57,7 +57,6 @@ from .sync_tasks import DirOperation
 from .recompute import RecomputeEngine
 from .checksum_queue import DEFAULT_CHECKSUM_REVERIFY_INTERVAL, MemberHashQueues
 from .checksums import ChecksumBasis, ChecksumRecord
-from .control import canonical_mountpoint
 from .member_repairs import CARRIER_DIR, is_carrier_path
 from .pathing import ResolvedPath, resolve_path
 from .links import LinkRefused, intermediate_paths, link_checksum, resolve_link_target
@@ -263,9 +262,9 @@ class StorageFS(Operations):
             streaming_reads: Enable uncached range streaming + background prefetch
             max_download_workers: Ceiling for adaptive streaming download workers
             max_retained_streaming_sessions: Maximum retained fills without readers
-            mountpoint: Where this filesystem is mounted, as canonical_mountpoint
-                gives it; reported by the control socket so a client can
-                refuse another mount's socket. None when not mounted
+            mountpoint: Where this filesystem is mounted; reported by the
+                control socket, as canonical_mountpoint gives it, so a client
+                can refuse another mount's socket. None when not mounted
             streaming_chunk_size: Unit of background read-ahead (foreground
                 reads fetch only what the reader asked for); read-ahead
                 starts once readers have read one chunk
@@ -3881,7 +3880,7 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
         bulk_cold_copies=fuse_threads,
         max_foreground_operations=max_foreground_operations,
         max_sync_workers=max_sync_workers,
-        mountpoint=canonical_mountpoint(mountpoint),
+        mountpoint=str(mountpoint),
     )
     fs.mount_lock_file = lock_file
     if unclean_shutdown:

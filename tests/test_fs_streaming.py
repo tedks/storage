@@ -3974,6 +3974,27 @@ class TestControlRequests(unittest.TestCase):
             {"id": self.VALID_ID, "result": "not-found"},
         )
 
+    def test_final_dot_mountpoint_runs_without_a_control_socket(self):
+        fs = StorageFS(
+            cache_root=self.temp_dir / "cache",
+            state_db=self.temp_dir / "other.db",
+            backends={"backend": LocalBackend("backend", str(self.temp_dir / "backend"))},
+            cache_size=1024 * 1024,
+            num_sync_workers=0,
+            start_sync=False,
+            mountpoint="/mnt/example/..",
+        )
+        try:
+            manager = fs._streaming_manager
+            self.assertIsNone(manager.mountpoint)
+            with self.assertLogs(manager.logger, "WARNING") as logged:
+                manager.init()
+            self.assertIn("not starting the control socket", logged.output[0])
+            self.assertIn("without a final '.' or '..'", logged.output[0])
+            self.assertIsNone(manager._control_server._listener)
+        finally:
+            fs.destroy('/')
+
     def test_set_after_shutdown_is_refused(self):
         self.fs.destroy('/')
         with self.assertRaisesRegex(ControlError, "^mount is shutting down$"):

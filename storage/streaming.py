@@ -21,7 +21,7 @@ from .backends.local import NOREPLACE_UNSUPPORTED
 from .backends.local import rename_noreplace as _rename_noreplace
 from .backends.ssh_pool import BulkCapacityCancelled, BulkCapacityTimeout
 from .cache_metadata import PREFIX_XATTR, confirm_member_stat, copy_member_attributes
-from .control import ControlError, ControlServer
+from .control import ControlError, ControlServer, canonical_mountpoint
 from .models import FileLocation, FileMetadata, StreamingKeepAfterClose, SyncStatus
 
 # A foreground read fetches only the bytes the reader asked for that are not
@@ -517,7 +517,14 @@ class StreamingReadManager:
         self.cache_manager = cache_manager
         # Reported to control clients, which refuse a socket that answers
         # for another mount sharing this cache. None when not mounted.
-        self.mountpoint = mountpoint
+        self.mountpoint = None
+        self._control_refusal = None
+        if mountpoint is not None:
+            try:
+                self.mountpoint = canonical_mountpoint(mountpoint)
+            except ControlError as exc:
+                # Clients could not match it, so run without a socket.
+                self._control_refusal = str(exc)
         # Called once the complete file is in the cache (StorageFS records
         # the member baseline for revalidation on open).
         self.on_finalized = on_finalized
@@ -574,6 +581,9 @@ class StreamingReadManager:
         self.cache_manager.reclaim_space = self._reclaim_retained_space_for_cache
 
     def init(self):
+        if self._control_refusal is not None:
+            self.logger.warning("not starting the control socket: %s", self._control_refusal)
+            return
         self._control_server.start()
 
     def download_limits(self):

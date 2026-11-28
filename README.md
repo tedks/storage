@@ -579,7 +579,10 @@ the change. `--cache` reaches whichever mount owns that cache's socket;
 the cache directory (by device and inode), and both the mount and the CLI
 refuse a socket that was published in a different cache and moved here. Mountpoints are compared as absolute paths with
 the parent directory's symlinks resolved, so a relative mountpoint matches only
-from the working directory the mount was started in.
+from the working directory the mount was started in. A mountpoint whose last
+component is `.` or `..` cannot be matched without looking inside the mount, so
+the mount runs without a control socket and the CLI refuses such a profile;
+give the path without it.
 
 ```bash
 storage control --profile media

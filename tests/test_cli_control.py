@@ -380,8 +380,36 @@ def test_canonical_mountpoint(tmp_path, monkeypatch):
     assert canonical_mountpoint(str(tmp_path / "alias" / "final")) == str(real / "final")
     assert canonical_mountpoint("/") == "/"
     assert canonical_mountpoint("//") == "/"
-    assert canonical_mountpoint(str(real / "mount" / ".")) == str(real / "mount")
-    assert canonical_mountpoint(str(real / "mount" / "..")) == str(real)
+
+
+@pytest.mark.parametrize("suffix", ["/.", "/..", "/./", "/../", "/.//"])
+def test_canonical_mountpoint_refuses_a_final_dot_component(tmp_path, monkeypatch, suffix):
+    # Literal strings: Path("x") / "." would drop the suffix. Resolving a
+    # final '.' or '..' would stat the mount root, which can hang.
+    mountpoint = str(tmp_path / "mount") + suffix
+
+    def no_resolution(path):
+        raise AssertionError(f"resolved {path!r}")
+
+    monkeypatch.setattr("storage.control.os.path.realpath", no_resolution)
+    with pytest.raises(ControlError, match="without a final '.' or '..'"):
+        canonical_mountpoint(mountpoint)
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(ControlError, match="without a final '.' or '..'"):
+        canonical_mountpoint("mount" + suffix)
+
+
+def test_profile_with_a_final_dot_mountpoint_is_refused(cache):
+    config = write_profile(cache, "/mnt/profile/.")
+    server, requests = recording_server(cache, "/mnt/profile")
+    server.start()
+    try:
+        result = CliRunner().invoke(main, ["control", "--profile", "example", "--config", str(config)])
+        assert result.exit_code == 1, result.output
+        assert "without a final '.' or '..'" in result.output
+        assert requests == []
+    finally:
+        server.stop()
 
 
 def test_canonical_mountpoint_resolves_dotdot_after_symlinks(tmp_path):

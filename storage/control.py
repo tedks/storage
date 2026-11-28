@@ -76,12 +76,12 @@ def canonical_mountpoint(mountpoint: str) -> str:
     The parent directory is resolved the way the kernel resolves it:
     symlinks first, then each `..` against what they point to, so nothing
     is normalized lexically (abspath would make `alias/../m` the sibling of
-    `alias` even when `alias` links elsewhere). The final component is not
-    resolved, so this never stats the mount root itself (a hung mount would
-    block the CLI), unless it is `.` or `..`, which only full resolution
-    can place. The mount and the CLI apply the same rule, so a relative
-    mountpoint matches only when both resolve it from the same working
-    directory, as for the cache path.
+    `alias` even when `alias` links elsewhere). The final component is
+    never resolved, so this never stats the mount root itself (a hung mount
+    would block the CLI). A final `.` or `..` could be placed only by
+    resolving through it, so such a mountpoint is refused. The mount and
+    the CLI apply the same rule, so a relative mountpoint matches only when
+    both resolve it from the same working directory, as for the cache path.
     """
     path = os.fsdecode(mountpoint)
     if not os.path.isabs(path):
@@ -91,7 +91,9 @@ def canonical_mountpoint(mountpoint: str) -> str:
         return "/"
     parent, name = path.rsplit("/", 1)
     if name in (".", ".."):
-        return os.path.realpath(path)
+        raise ControlError(
+            f"Mountpoint {os.fsdecode(mountpoint)!r} ends in {name!r}; give it without a final '.' or '..'"
+        )
     return os.path.join(os.path.realpath(parent or "/"), name)
 
 
