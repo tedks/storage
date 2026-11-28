@@ -2042,7 +2042,8 @@ class TestFSStreamingIntegration(unittest.TestCase):
         vfd = self.fs.open('/zero.bin', os.O_RDONLY)
         self.assertEqual(self.fs.read('/zero.bin', 4096, 0, vfd), payload[:4096])
         cache_path = self.cache_dir / "zero.bin"
-        self.assertTrue(self._wait_for(cache_path.exists, timeout=8.0))
+        # 32 sequential turns; generous for loaded gate hosts.
+        self.assertTrue(self._wait_for(cache_path.exists, timeout=30.0))
         self.assertEqual(cache_path.read_bytes(), payload)
         self.fs.release('/zero.bin', vfd)
 

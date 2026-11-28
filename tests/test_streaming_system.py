@@ -23,6 +23,10 @@ from storage.backends.local import LocalBackend
 from storage.fs import StorageFS
 from tests.fuse_mount import run_fuse, stop_fuse
 
+# The control CLI starts an interpreter per call; loaded gate hosts need room.
+CONTROL_CLI_TIMEOUT = 60
+CONTROL_REQUEST_TIMEOUT = 30
+
 
 class SlowRemoteLoopbackBackend(LocalBackend):
     """Local backend test double flagged as remote with controllable read delay."""
@@ -326,11 +330,16 @@ class TestStreamingSystemRegression(unittest.TestCase):
             self.assertEqual(cached.read_bytes(), payloads[name])
 
     def _run_control_cli(self, *args, expected=0):
+        # Generous: each call starts an interpreter, and the gates run on
+        # loaded hosts (this test timed out at load average 38 with 8 s).
         cli = Path(os.environ["TEST_SRCDIR"]) / os.environ["TEST_WORKSPACE"] / "storage_cli"
         result = subprocess.run([str(cli), *args], check=False, capture_output=True,
-                                text=True, timeout=8)
+                                text=True, timeout=CONTROL_CLI_TIMEOUT)
         self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
         return result
+
+    def _one_retained_session(self):
+        return self.fs._streaming_stats_snapshot()["retained_streaming_sessions"] == 1
 
     def test_live_mount_control(self):
         self.assertTrue(os.path.ismount(self.mount_dir), "requires a live scratch FUSE mount")
@@ -342,7 +351,8 @@ class TestStreamingSystemRegression(unittest.TestCase):
         self.backend.hold_past = (name, 1024 * 1024, entered, resume)
 
         def command(*args, expected=0, json_output=True):
-            options = ["control", "--cache", str(self.cache_dir)]
+            options = ["control", "--cache", str(self.cache_dir),
+                       "--timeout", str(CONTROL_REQUEST_TIMEOUT)]
             if json_output:
                 options += ["--json-output"]
             result = self._run_control_cli(*options, *args, expected=expected)
@@ -386,12 +396,12 @@ class TestStreamingSystemRegression(unittest.TestCase):
 
                 legacy = json.loads(self._run_control_cli(
                     "debug", "streaming-stats", "--cache", str(self.cache_dir), "--json-output",
+                    "--timeout", str(CONTROL_REQUEST_TIMEOUT),
                 ).stdout)
                 self.assertEqual(legacy["pid"], status["stats"]["pid"])
                 self.assertEqual(legacy["active_streaming_sessions"], 1)
-            self.assertTrue(self._wait_for(
-                lambda: command("status")["stats"]["retained_streaming_sessions"] == 1,
-            ))
+            # Polled in-process: the CLI is not what this wait tests.
+            self.assertTrue(self._wait_for(self._one_retained_session, timeout=30.0))
             self.assertTrue(partial.exists())
             self.assertEqual(command("cancel", original), {"id": original, "result": "cancelled"})
             self.assertEqual(command("downloads")["downloads"], [])
@@ -403,7 +413,7 @@ class TestStreamingSystemRegression(unittest.TestCase):
                 self.assertNotEqual(row["id"], original)
                 self.assertEqual(command("cancel", original, expected=1)["result"], "not-found")
                 self.assertEqual(command("downloads")["downloads"][0]["id"], row["id"])
-            self.assertTrue(self._wait_for(lambda: command("status")["stats"]["retained_streaming_sessions"] == 1))
+            self.assertTrue(self._wait_for(self._one_retained_session, timeout=30.0))
             self.assertEqual(command("cancel", row["id"])["result"], "cancelled")
             self.assertEqual(command("downloads")["downloads"], [])
             self.assertFalse(partial.exists())
@@ -419,7 +429,8 @@ class TestStreamingSystemRegression(unittest.TestCase):
 
         def command(*args):
             return json.loads(self._run_control_cli(
-                "control", "--cache", str(self.cache_dir), "--json-output", *args,
+                "control", "--cache", str(self.cache_dir), "--json-output",
+                "--timeout", str(CONTROL_REQUEST_TIMEOUT), *args,
             ).stdout)
 
         defaults = command("get")["limits"]
@@ -457,9 +468,8 @@ class TestStreamingSystemRegression(unittest.TestCase):
                 self.assertTrue(entered.wait(5), "existing read span should now qualify")
                 command("set", "--streaming-keep-after-close", "100%")
 
-            self.assertTrue(self._wait_for(
-                lambda: command("status")["stats"]["retained_streaming_sessions"] == 1,
-            ))
+            # Polled in-process: the CLI is not what this wait tests.
+            self.assertTrue(self._wait_for(self._one_retained_session, timeout=30.0))
         finally:
             resume.set()
         cache_path = self.cache_dir / name
