@@ -53,6 +53,9 @@ STREAMING_MAX_TRACKED_READ_SPANS = 64
 DOWNLOAD_WORKER_IDLE_SECONDS = 30.0
 # Yield a turn to a queued closed file after this many active-reader turns.
 ACTIVE_DOWNLOAD_BURST = 4
+# How long an open waits for a claimed failed-session cleanup (a local
+# truncate, fsync and link of the prefix) before it returns EAGAIN.
+STREAMING_CLEANUP_WAIT_SECONDS = 30.0
 
 # link() errors after which _install_partial tries RENAME_NOREPLACE: no
 # hard links on the cache filesystem (EMLINK cannot happen on a fresh
@@ -96,6 +99,14 @@ class StreamSourceError(OSError):
     Distinct from the other open errors so StorageFS can still recompute a
     recomputable file, as the whole-file path does when no member serves it.
     """
+
+
+class _CleanupPending(Exception):
+    """The registered session's failed cleanup is claimed; wait for it to leave the registry."""
+
+    def __init__(self, session):
+        super().__init__("streaming cleanup in progress")
+        self.session = session
 
 
 def streaming_errno(exc: Exception) -> int:
@@ -1182,6 +1193,8 @@ class StreamingReadManager:
         with self.prefetch_sessions_lock:
             with session.lock:
                 claimed = self._claim_detach(session)
+                # An open waiting for this cleanup (_wait_for_cleanup) retries.
+                session.condition.notify_all()
             if claimed:
                 self._unregister_and_unlink(session)
         self._close_streaming_session_resources(session)
@@ -1634,16 +1647,50 @@ class StreamingReadManager:
                 self._record_streaming_stat("streaming_unstaffed_cancellations")
         self._run_download_turn(session)
 
-    def _attach(self, session: PrefetchSession):
-        """Add a reader to an existing session under the registry lock."""
+    def _attach(self, session: PrefetchSession) -> Optional[PrefetchSession]:
+        """Add a reader to the registered session; None if it was failed and is now replaced.
+
+        Caller holds prefetch_sessions_lock. A failed session lacks bytes it
+        will never fetch, so a new open does not join it: it leaves the
+        registry here (claimed, its partial unlinked, as a stop does) and
+        the caller starts a fresh session. Readers still attached keep
+        their descriptors on its inode and its error; the last release, or
+        the worker's tail, closes its descriptor (see _stop_and_detach_session).
+        Without this, one transient member failure seen by a reader that
+        stays open would fail every later open of the file until it closed.
+        A failed session that has every byte is still joined: only its
+        finalize failed.
+
+        Raises _CleanupPending once the failed cleanup is claimed: the
+        claimer is promoting the prefix by the partial's path, so the
+        session must not be detached from under it (a successor's partial
+        at that path could be installed in its place).
+        """
         with session.lock:
             if session.failed_cleanup_claimed:
-                raise OSError(errno.EAGAIN, "streaming cleanup in progress")
+                raise _CleanupPending(session)
             if session.error is not None and not session.prefetch_complete:
-                raise OSError(streaming_errno(session.error), "streaming read failed") from session.error
+                if self._claim_detach(session):
+                    self._unregister_and_unlink(session)
+                self._record_streaming_stat("streaming_failed_sessions_replaced")
+                self.logger.info(
+                    "streaming replacing failed session errno=%d", streaming_errno(session.error),
+                )
+                return None
             session.refcount += 1
             self._schedule_background(session)
         return session
+
+    def _wait_for_cleanup(self, session: PrefetchSession) -> bool:
+        """Wait, holding no registry lock, until a claimed cleanup leaves the registry."""
+        deadline = time.monotonic() + STREAMING_CLEANUP_WAIT_SECONDS
+        with session.lock:
+            while not session.detached:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                session.condition.wait(remaining)
+        return True
 
     def report_open_error(self, reason: str, exc: Exception):
         error = streaming_errno(exc)
@@ -1652,12 +1699,6 @@ class StreamingReadManager:
         self._record_streaming_stat(f"streaming_open_error_{reason}")
         self.logger.warning("streaming open failed reason=%s errno=%d", reason, error)
 
-    def _attach_for_open(self, session: PrefetchSession):
-        try:
-            return self._attach(session)
-        except OSError as exc:
-            self.report_open_error("existing_session", exc)
-            raise
 
     def _download_session_counts(self):
         """Counts of files with readers and retained fills. Caller holds the registry lock."""
@@ -1706,12 +1747,38 @@ class StreamingReadManager:
         virtual_path: str,
         canonical_path: str,
     ) -> PrefetchSession | StreamingOpen:
+        """Attach to the file's session or start one; see StreamingOpen for the other outcomes.
+
+        A failed session whose cleanup is claimed is waited out (the
+        cleanup does local I/O only), then the open starts over: by then the
+        cleanup has promoted the prefix, which the open then finds cached,
+        or removed the session.
+        """
+        while True:
+            try:
+                return self._create_or_attach_once(virtual_path, canonical_path)
+            except _CleanupPending as pending:
+                if not self._wait_for_cleanup(pending.session):
+                    exc = OSError(errno.EAGAIN, "streaming cleanup in progress")
+                    self.report_open_error("existing_session", exc)
+                    raise exc from None
+                self._record_streaming_stat("streaming_open_cleanup_waits")
+                if self.cache_manager.is_cached(virtual_path):
+                    return StreamingOpen.CACHED
+
+    def _create_or_attach_once(
+        self,
+        virtual_path: str,
+        canonical_path: str,
+    ) -> PrefetchSession | StreamingOpen:
         with self.prefetch_sessions_lock:
             if self._destroying:
                 raise OSError(errno.EINTR, "streaming manager is shutting down")
             existing = self.prefetch_sessions.get(canonical_path)
             if existing:
-                return self._attach_for_open(existing)
+                attached = self._attach(existing)
+                if attached is not None:
+                    return attached
 
         try:
             source = self.select_backend_for_read(canonical_path)
@@ -1795,8 +1862,15 @@ class StreamingReadManager:
                 raise OSError(errno.EINTR, "streaming manager is shutting down")
             existing = self.prefetch_sessions.get(canonical_path)
             if existing:
-                self._discard_unregistered_prefetch_session(session)
-                return self._attach_for_open(existing)
+                try:
+                    attached = self._attach(existing)
+                except _CleanupPending:
+                    self._discard_unregistered_prefetch_session(session)
+                    raise
+                if attached is not None:
+                    self._discard_unregistered_prefetch_session(session)
+                    return attached
+                # A failed session left the registry: register this one.
             if os.path.lexists(final_cache_path):
                 # A concurrent fill or local writer already owns the final path.
                 self._discard_unregistered_prefetch_session(session)
@@ -1883,16 +1957,20 @@ class StreamingReadManager:
                     return ""
                 if session.finalized:
                     return "close"
+                # Decided with the decrement, not after it: see worker_done.
+                # Before the detached check: a failed session that a new
+                # open replaced (_attach) is detached with readers still on
+                # it, and its last release closes its descriptor here
+                # (cleanup skips the path of a detached session).
+                if (session.error is not None and session.worker_done
+                        and self._claim_failed_cleanup(session)):
+                    return "cleanup-failed"
                 if session.detached:
                     return ""
 
                 if self._should_stop_on_last_close(session):
                     idle = self._stop_background_locked(session)
                     return "stopped" if idle else "stopped-in-flight"
-                # Decided with the decrement, not after it: see worker_done.
-                if (session.error is not None and session.worker_done
-                        and self._claim_failed_cleanup(session)):
-                    return "cleanup-failed"
                 self._schedule_background(session)
                 return ""
 

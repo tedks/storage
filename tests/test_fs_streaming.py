@@ -2393,11 +2393,13 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.fs.release('/during.bin', vfd_a)
         self._assert_not_cached("during.bin")
 
-    def test_streaming_open_does_not_attach_to_a_session_being_cleaned_up(self):
+    def test_streaming_open_waits_for_a_session_being_cleaned_up(self):
         # The worker's tail has decided to clean up a failed session (no
         # readers) and is promoting its prefix when an open comes in. The
-        # open must not attach: promotion truncates the partial to its
-        # contiguous prefix, so reads past it would come back short.
+        # open must not attach (promotion truncates the partial to its
+        # contiguous prefix, so reads past it would come back short), and
+        # must not detach the session from under the promotion. It waits
+        # for the cleanup and then opens what the cleanup left.
         self.backend.copy_delay = 0
         manager = self.fs._streaming_manager
         real_promote = manager._promote_failed_session_cache_prefix
@@ -2413,6 +2415,14 @@ class TestFSStreamingIntegration(unittest.TestCase):
         payload = os.urandom(192 * 1024)
         (self.backend_dir / "cleanup.bin").write_bytes(payload)
         hold, at_finalize, go_tail = self._hold_finalize()
+        results = {}
+
+        def opener():
+            try:
+                results["open"] = self.fs.open('/cleanup.bin', os.O_RDONLY)
+            except Exception as exc:
+                results["open"] = exc
+
         with hold, patch.object(manager, "_promote_failed_session_cache_prefix", side_effect=held_promote):
             vfd_a = self.fs.open('/cleanup.bin', os.O_RDONLY)
             session = self._session_for(vfd_a)
@@ -2430,36 +2440,94 @@ class TestFSStreamingIntegration(unittest.TestCase):
             go_tail.set()
             self.assertTrue(in_promote.wait(timeout=3.0))
 
-            with patch.object(self.backend, "copy_to_local") as copy, self.assertRaises(FuseOSError) as retry:
-                self.fs.open('/cleanup.bin', os.O_RDONLY)
-            self.assertEqual(retry.exception.errno, errno.EAGAIN)
-            copy.assert_not_called()
-            go_promote.set()
+            with patch.object(self.backend, "copy_to_local") as copy:
+                thread = threading.Thread(target=opener, name="waiting-open")
+                thread.start()
+                thread.join(timeout=0.3)
+                self.assertTrue(thread.is_alive(), "open did not wait for the claimed cleanup")
+                self.assertEqual(session.refcount, 0)
+                go_promote.set()
+                thread.join(timeout=5.0)
+                self.assertFalse(thread.is_alive())
+                copy.assert_not_called()
             self.assertTrue(session.background_finished.wait(timeout=5.0))
         self.assertTrue(session.detached)
+        vfd_b = results["open"]
+        self.assertIsInstance(vfd_b, int)
+        with self.fs._fd_lock:
+            self.assertIsNone(self.fs._fd_map[vfd_b].prefetch_session)
+        # The opener sees what any open after the cleanup does: the promoted prefix.
+        self.assertEqual(self.fs.read('/cleanup.bin', 8192, 0, vfd_b), payload[:4096])
+        self.fs.release('/cleanup.bin', vfd_b)
         self.assertEqual((self.cache_dir / "cleanup.bin").read_bytes(), payload[:4096])
+        self.assertEqual(self.fs._streaming_stats_snapshot()["streaming_open_cleanup_waits"], 1)
 
-    def test_streaming_open_does_not_attach_to_a_failed_session(self):
-        # The session has an error and a reader still attached, so its
-        # cleanup is not claimed yet. An open attaching now would get EIO on
-        # every range the session lacks; report the original error at open.
+    def test_streaming_open_gives_up_on_a_cleanup_that_does_not_finish(self):
+        manager = self.fs._streaming_manager
+        payload = os.urandom(64 * 1024)
+        (self.backend_dir / "stuck.bin").write_bytes(payload)
+        vfd_a = self.fs.open('/stuck.bin', os.O_RDONLY)
+        session = self._session_for(vfd_a)
+        with session.lock:
+            session.failed_cleanup_claimed = True
+        with patch("storage.streaming.STREAMING_CLEANUP_WAIT_SECONDS", 0.1), \
+                patch.object(self.backend, "copy_to_local") as copy, \
+                self.assertRaises(FuseOSError) as retry:
+            self.fs.open('/stuck.bin', os.O_RDONLY)
+        self.assertEqual(retry.exception.errno, errno.EAGAIN)
+        copy.assert_not_called()
+        self.assertEqual(self.fs._streaming_stats_snapshot()["streaming_open_error_existing_session"], 1)
+        with session.lock:
+            session.failed_cleanup_claimed = False
+        self.fs.release('/stuck.bin', vfd_a)
+
+    def test_streaming_open_replaces_a_failed_session_a_reader_still_holds(self):
+        # The session failed (a transient member error) while a reader keeps
+        # it open. A new open must not inherit that error for as long as the
+        # reader stays: it gets a fresh session, and the old reader keeps
+        # its descriptor and its error.
         self.backend.copy_delay = 0
         manager = self.fs._streaming_manager
         payload = os.urandom(192 * 1024)
         (self.backend_dir / "failed.bin").write_bytes(payload)
         vfd_a = self.fs.open('/failed.bin', os.O_RDONLY)
-        session = self._session_for(vfd_a)
+        session_a = self._session_for(vfd_a)
         self.assertEqual(self.fs.read('/failed.bin', 4096, 0, vfd_a), payload[:4096])
-        with session.lock:
-            session.error = OSError(errno.EIO, "simulated failure")
-            manager._schedule_background(session)
-            self.assertFalse(session.failed_cleanup_claimed)
+        with session_a.lock:
+            session_a.error = OSError(errno.EHOSTUNREACH, "simulated transient drop")
+            manager._schedule_background(session_a)
+            self.assertFalse(session_a.failed_cleanup_claimed)
+        self.assertTrue(session_a.background_finished.wait(timeout=3.0))
+        self.assertGreaterEqual(session_a.io_fd, 0)
 
-        with patch.object(self.backend, "copy_to_local") as copy, self.assertRaises(FuseOSError) as failure:
-            self.fs.open('/failed.bin', os.O_RDONLY)
-        self.assertEqual(failure.exception.errno, errno.EIO)
-        copy.assert_not_called()
+        with patch.object(self.backend, "copy_to_local") as copy:
+            vfd_b = self.fs.open('/failed.bin', os.O_RDONLY)
+            copy.assert_not_called()
+        session_b = self._session_for(vfd_b)
+        self.assertIsNot(session_b, session_a)
+        self.assertTrue(session_a.detached)
+        self.assertEqual(self.fs._streaming_stats_snapshot()["streaming_failed_sessions_replaced"], 1)
+        partial = self.cache_dir / "failed.bin.storage.partial"
+        self.assertEqual(os.stat(partial).st_ino, os.fstat(session_b.io_fd).st_ino)
+
+        # The old reader keeps its bytes and its error; the new one reads everything.
+        self.assertEqual(self.fs.read('/failed.bin', 4096, 0, vfd_a), payload[:4096])
+        with self.assertRaises(FuseOSError) as old_error:
+            self.fs.read('/failed.bin', 4096, 128 * 1024, vfd_a)
+        self.assertEqual(old_error.exception.errno, errno.EHOSTUNREACH)
+        for offset in range(0, len(payload), 32 * 1024):
+            self.assertEqual(
+                self.fs.read('/failed.bin', 32 * 1024, offset, vfd_b), payload[offset:offset + 32 * 1024],
+            )
+
+        # The old session's last release closes its descriptor and leaves
+        # the successor's partial and cache file alone.
         self.fs.release('/failed.bin', vfd_a)
+        self.assertEqual(session_a.io_fd, -1)
+        self.assertFalse(session_b.detached)
+        self.fs.release('/failed.bin', vfd_b)
+        self.assertTrue(session_b.background_finished.wait(timeout=5.0))
+        self.assertEqual((self.cache_dir / "failed.bin").read_bytes(), payload)
 
     def test_streaming_open_attaches_to_an_errored_session_with_every_byte(self):
         # Only its finalize failed: the session lacks no range, so an attach
