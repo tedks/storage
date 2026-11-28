@@ -16,6 +16,7 @@ from storage.cli import main
 from storage.control import (
     CONTROL_SOCKET_NAME,
     MAX_REQUEST_BYTES,
+    ControlError,
     ControlServer,
     request_control_payload,
 )
@@ -198,3 +199,27 @@ backends = ["/no-member-probe"]
         assert len(requests) == 2
     finally:
         server.stop()
+
+
+def test_handler_errors_are_logged_and_answered(cache, caplog):
+    # An OSError from the handler is a server bug, not a client hangup.
+    def dispatch(command):
+        if command == "control-error":
+            raise ControlError("rejected request")
+        raise OSError(5, "handler failed")
+
+    server = server_for(cache, dispatch)
+    server.start()
+    try:
+        with caplog.at_level(logging.ERROR, logger=__name__):
+            with pytest.raises(ControlError, match="^Mount control request failed$"):
+                request_control_payload(cache, b"os-error", 2)
+            assert [r.getMessage() for r in caplog.records] == ["mount control request failed"]
+            assert isinstance(caplog.records[0].exc_info[1], OSError)
+            caplog.clear()
+            with pytest.raises(ControlError, match="^rejected request$"):
+                request_control_payload(cache, b"control-error", 2)
+            assert caplog.records == []
+    finally:
+        server.stop()
+

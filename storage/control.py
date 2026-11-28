@@ -228,20 +228,30 @@ class ControlServer:
             _check_peer(conn)
         except (ControlError, OSError):
             return
+        # Transport errors on the request are the client's problem and end
+        # the connection quietly; anything the handler raises other than a
+        # ControlError, OSError included, is a server bug and is logged.
         try:
             frame = _read_line(conn, MAX_REQUEST_BYTES, time.monotonic() + REQUEST_TIMEOUT)
-            if frame is None or self._stop.is_set():
-                return
-            response = self._dispatch(frame.decode("utf-8"))
-        except UnicodeDecodeError:
-            response = {"error": "Control request must be UTF-8"}
         except (ControlError, TimeoutError) as exc:
             response = {"error": str(exc)}
         except OSError:
             return
-        except Exception:
-            self._logger.exception("mount control request failed")
-            response = {"error": "Mount control request failed"}
+        else:
+            if frame is None or self._stop.is_set():
+                return
+            try:
+                request = frame.decode("utf-8")
+            except UnicodeDecodeError:
+                response = {"error": "Control request must be UTF-8"}
+            else:
+                try:
+                    response = self._dispatch(request)
+                except ControlError as exc:
+                    response = {"error": str(exc)}
+                except Exception:
+                    self._logger.exception("mount control request failed")
+                    response = {"error": "Mount control request failed"}
         try:
             encoded = json.dumps(response, sort_keys=True).encode("ascii")
         except (TypeError, ValueError, RecursionError):
