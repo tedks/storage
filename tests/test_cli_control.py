@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
+from storage import control as control_module
 from storage.cli import main
 from storage.control import (
     CONTROL_SOCKET_NAME,
@@ -182,6 +183,48 @@ def test_stop_cleans_up_in_the_published_directory_after_a_rename(cache):
         server.stop()
     assert not (moved / CONTROL_SOCKET_NAME).exists()
     moved.rmdir()
+
+
+def test_request_goes_through_the_given_cache_fd(cache):
+    server = server_for(cache, lambda frame: {"via": frame})
+    server.start()
+    moved = cache.with_name(cache.name + "-moved")
+    fd = os.open(cache, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        # The path now names an empty directory; the fd still names ours.
+        cache.rename(moved)
+        cache.mkdir()
+        assert request_control_payload(cache, b"pinned", 2, cache_fd=fd) == {"via": "pinned"}
+        with pytest.raises(ControlError, match="No running mount control socket"):
+            request_control_payload(cache, b"by path", 2)
+    finally:
+        os.close(fd)
+        server.stop()
+        moved.rmdir()
+
+
+def test_cli_identifies_and_connects_through_one_cache_open(cache, monkeypatch):
+    server, requests = recording_server(cache, None)
+    server.start()
+    opened = []
+    real_open = control_module.open_cache_directory
+
+    def counting_open(path):
+        fd = real_open(path)
+        opened.append(fd)
+        return fd
+
+    monkeypatch.setattr("storage.cli_control.open_cache_directory", counting_open)
+    try:
+        result = CliRunner().invoke(main, ["control", "--cache", str(cache), "--json-output",
+                                           "set", "--max-download-workers", "2"])
+        assert result.exit_code == 0, result.output
+        assert len(opened) == 1
+        assert [request["command"] for request in requests] == ["status", "streaming.set"]
+        # Closed when the command is done: only the server's pin is left.
+        assert fds_open_on(cache) == [server._cache_fd]
+    finally:
+        server.stop()
 
 
 def test_never_replaces_arbitrary_entries(cache):

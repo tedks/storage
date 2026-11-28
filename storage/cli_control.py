@@ -2,13 +2,14 @@
 
 import json
 import os
-import stat
 from dataclasses import dataclass
 from pathlib import Path
 
 import click
 
-from .control import ControlError, REQUEST_TIMEOUT, canonical_mountpoint, request_control_payload
+from .control import (
+    ControlError, REQUEST_TIMEOUT, canonical_mountpoint, open_cache_directory, request_control_payload,
+)
 from .mount_profiles import resolve_member_configuration
 
 
@@ -35,19 +36,17 @@ class ControlTarget:
         return self.cache.resolve(), None
 
     @staticmethod
-    def _cache_identity(cache: Path) -> list[int]:
+    def _open_cache(cache: Path) -> int:
         # The cache directory, not the mount, so following symlinks is safe.
         try:
-            entry = os.stat(cache)
+            return open_cache_directory(cache)
         except OSError as exc:
-            raise click.ClickException(f"Cannot read cache directory {str(cache)!r}: {exc.strerror}") from exc
-        if not stat.S_ISDIR(entry.st_mode):
-            raise click.ClickException(f"Cache {str(cache)!r} is not a directory")
-        return [entry.st_dev, entry.st_ino]
+            raise click.ClickException(f"Cannot open cache directory {str(cache)!r}: {exc.strerror}") from exc
 
-    def _send(self, cache: Path, request: dict) -> dict:
+    def _send(self, cache: Path, cache_fd: int, request: dict) -> dict:
         try:
-            return request_control_payload(cache, json.dumps(request).encode("ascii"), self.timeout)
+            return request_control_payload(cache, json.dumps(request).encode("ascii"), self.timeout,
+                                           cache_fd=cache_fd)
         except ControlError as exc:
             raise click.ClickException(str(exc)) from exc
 
@@ -78,17 +77,24 @@ class ControlTarget:
 
     def request(self, command: str, *, mutation: bool = False, **arguments) -> dict:
         cache, mountpoint = self._resolve()
-        # Every request names the cache directory (and, with --profile, the
-        # mountpoint) it means; the mount refuses one naming another.
-        identity = {"cache": self._cache_identity(cache)}
-        if mountpoint is not None:
-            identity["mountpoint"] = mountpoint
-        if mutation:
-            # Confirm the mount before changing anything, even if the
-            # server were to ignore the identity sent with the change.
-            self._require_mount(self._send(cache, {"command": "status", **identity}),
-                                mountpoint, identity["cache"])
-        payload = self._send(cache, {"command": command, **arguments, **identity})
+        # One open of the cache directory gives both the identity sent with
+        # every request and the directory every connect goes through.
+        cache_fd = self._open_cache(cache)
+        try:
+            entry = os.fstat(cache_fd)
+            # Every request names the cache directory (and, with --profile,
+            # the mountpoint) it means; the mount refuses one naming another.
+            identity = {"cache": [entry.st_dev, entry.st_ino]}
+            if mountpoint is not None:
+                identity["mountpoint"] = mountpoint
+            if mutation:
+                # Confirm the mount before changing anything, even if the
+                # server were to ignore the identity sent with the change.
+                self._require_mount(self._send(cache, cache_fd, {"command": "status", **identity}),
+                                    mountpoint, identity["cache"])
+            payload = self._send(cache, cache_fd, {"command": command, **arguments, **identity})
+        finally:
+            os.close(cache_fd)
         if command == "status":
             self._require_mount(payload, mountpoint, identity["cache"])
         if self.json_output:

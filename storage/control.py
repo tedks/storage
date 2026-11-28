@@ -66,10 +66,6 @@ def _require_owner_socket(entry: os.stat_result, path: Path) -> os.stat_result:
     return entry
 
 
-def _owner_socket(path: Path) -> os.stat_result:
-    return _require_owner_socket(path.lstat(), path)
-
-
 def canonical_mountpoint(mountpoint: str) -> str:
     """The absolute mountpoint a mount reports and a profile is matched against.
 
@@ -106,19 +102,37 @@ def _check_peer(sock: socket.socket):
         raise ControlError("Control socket peer is not the mount owner")
 
 
-def request_control_payload(cache_root: Path, request: bytes, timeout: float) -> dict:
-    """Send one request and read a bounded JSON response."""
+def open_cache_directory(cache_root: Path) -> int:
+    """Open a cache directory for request_control_payload(cache_fd=...)."""
+    return os.open(cache_root, os.O_RDONLY | os.O_DIRECTORY)
+
+
+def request_control_payload(cache_root: Path, request: bytes, timeout: float,
+                            cache_fd: int | None = None) -> dict:
+    """Send one request and read a bounded JSON response.
+
+    The socket is checked and reached through an fd of the cache directory
+    (cache_fd, or one opened here), so a caller that identified the cache
+    by fstat on the same fd talks to the socket in that directory, even if
+    the path is renamed meanwhile. cache_root names it in messages. The
+    /proc/self/fd path is short, so the Unix address limit applies only to
+    clients that connect by path, which the server's 107-byte check keeps
+    working.
+    """
     path = cache_root / CONTROL_SOCKET_NAME
     if not math.isfinite(timeout) or timeout <= 0:
         raise ControlError("Control socket timeout must be a positive finite number")
     if len(request) > MAX_REQUEST_BYTES or b"\n" in request:
         raise ControlError("Invalid outgoing control socket frame")
+    opened = None
     try:
-        _owner_socket(path)
+        if cache_fd is None:
+            cache_fd = opened = open_cache_directory(cache_root)
+        _require_owner_socket(os.stat(CONTROL_SOCKET_NAME, dir_fd=cache_fd, follow_symlinks=False), path)
         deadline = time.monotonic() + timeout
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
             _set_deadline(sock, deadline)
-            sock.connect(str(path))
+            sock.connect(f"/proc/self/fd/{cache_fd}/{CONTROL_SOCKET_NAME}")
             _check_peer(sock)
             _set_deadline(sock, deadline)
             sock.sendall(request + b"\n")
@@ -127,6 +141,9 @@ def request_control_payload(cache_root: Path, request: bytes, timeout: float) ->
         raise ControlError(f"No running mount control socket at {path}") from exc
     except (OSError, OverflowError) as exc:
         raise ControlError(f"Failed to query control socket {path}: {exc}") from exc
+    finally:
+        if opened is not None:
+            os.close(opened)
 
     if response is None:
         raise ControlError(f"No response from control socket {path}")
