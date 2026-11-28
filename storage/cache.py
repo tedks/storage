@@ -658,6 +658,11 @@ class CacheManager:
                 if not st.st_mode & stat_module.S_IRUSR:
                     os.chmod(temp_path, stat_module.S_IMODE(st.st_mode) | stat_module.S_IRUSR,
                              follow_symlinks=False)
+                if attempt and reserved is not None and st.st_size > reserved + extra_reserved:
+                    # The retry's version grew again past what is reserved.
+                    print(f"Warning: Insufficient cache space for {source_virtual_path}")
+                    raise OSError(errno.ENOSPC, "the member's version grew past the "
+                                  "cache reservation", source_virtual_path)
                 # The member's stat after the transfer (MemberVersion): an
                 # unconfirmed version gets one more confirmation; positive
                 # evidence of another version fetches once more against the
@@ -670,9 +675,10 @@ class CacheManager:
                 if version != MemberVersion.CHANGED or member_stat is None or attempt:
                     break
                 member_stat = newest
-                # Reserve for the retry: the newer size (pre-#191 budget).
+                # Reserve for the retry: the newer size, or at least what
+                # this transfer was, when no stat gave one (pre-#191 budget).
                 newest_size = getattr(newest, "st_size", None)
-                target = newest_size if isinstance(newest_size, int) else 0
+                target = max(newest_size if isinstance(newest_size, int) else 0, st.st_size)
                 more = max(0, target - (reserved + extra_reserved)) if reserved is not None else 0
                 if more:
                     if not self._reserve_more(more):
