@@ -95,6 +95,10 @@ class StreamingOpen(Enum):
     SOURCE_MISSING = auto()
 
 
+# The largest file size a partial can be truncated to (off_t is signed 64-bit).
+_MAX_PARTIAL_SIZE = (1 << 63) - 1
+
+
 @dataclass(frozen=True)
 class StreamSource:
     backend: Backend
@@ -1897,6 +1901,10 @@ class StreamingReadManager:
             exc = OSError(errno.EIO, "streaming source returned an invalid size")
             self.report_open_error("source_size", exc)
             raise exc
+        if file_size > _MAX_PARTIAL_SIZE:
+            exc = OSError(errno.EFBIG, "streaming source size exceeds the largest local file")
+            self.report_open_error("source_size", exc)
+            raise exc
 
         final_cache_path = self.cache_manager.get_cache_path(virtual_path)
         partial_cache_path = self._partial_cache_path(final_cache_path)
@@ -1935,10 +1943,13 @@ class StreamingReadManager:
                     if os.path.lexists(final_cache_path):
                         return self._final_path_outcome(canonical_path, final_cache_path)
                     raise OSError(errno.ENOSPC, "streaming cache budget exhausted")
-        except OSError as exc:
+        except BaseException as exc:
+            # Until the session owns it, the staging file is ours to remove,
+            # whatever was raised (OverflowError from ftruncate, say).
             if io_fd >= 0:
                 self._discard_staging_file(io_fd, staging_path)
-            self.report_open_error("cache_space" if exc.errno == errno.ENOSPC else "cache_prepare", exc)
+            if isinstance(exc, OSError):
+                self.report_open_error("cache_space" if exc.errno == errno.ENOSPC else "cache_prepare", exc)
             raise
 
         try:

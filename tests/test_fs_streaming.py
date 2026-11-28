@@ -307,6 +307,29 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.fs.release("/contended.bin", fd)
         manager._release_prefetch_session(winner["session"])
 
+    def test_staging_cleanup_survives_non_oserror_and_unrepresentable_sizes(self):
+        # R2-I3: whatever is raised after the staging file is opened, it is
+        # removed and its descriptor closed; a size no local file can have
+        # is refused before anything is created.
+        from storage.streaming import StreamSource
+        manager = self.fs._streaming_manager
+        (self.backend_dir / "huge.bin").write_bytes(b"x" * 4096)
+        before = manager.session_descriptor_count()
+        with patch("storage.streaming.os.ftruncate", side_effect=OverflowError("too big")), \
+                self.assertLogs(self.fs.logger, level="ERROR"), \
+                self.assertRaises(FuseOSError) as overflow:
+            self.fs.open("/huge.bin", os.O_RDONLY)
+        self.assertEqual(overflow.exception.errno, errno.EIO)
+        self.assertEqual(list(self.cache_dir.glob(".storage-staging-*")), [])
+        self.assertEqual(manager.session_descriptor_count(), before)
+
+        with patch.object(manager, "select_stream_source",
+                          return_value=StreamSource(self.backend, None, 1 << 63)), \
+                self.assertRaises(FuseOSError) as too_big:
+            self.fs.open("/huge.bin", os.O_RDONLY)
+        self.assertEqual(too_big.exception.errno, errno.EFBIG)
+        self.assertEqual(list(self.cache_dir.glob(".storage-staging-*")), [])
+
     def test_probe_failure_is_not_counted_when_recompute_serves_the_open(self):
         (self.backend_dir / "counted.bin").write_bytes(b"member")
         with patch.object(self.backend, "stat", side_effect=OSError(errno.EACCES, "denied")):
