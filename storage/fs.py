@@ -471,8 +471,9 @@ class StorageFS(Operations):
             max_streaming_sessions=max_streaming_sessions,
             keep_after_close=streaming_keep_after_close,
             on_finalized=lambda session: self._record_fetched(
-                session.canonical_path, session.final_cache_path,
-                session.backend, session.member_stat,
+                session.canonical_path, session.final_cache_path, session.backend,
+                session.confirmed_stat if session.confirmed_stat is not None
+                else session.member_stat,
             ),
             partial_suffix=self._PARTIAL_SUFFIX,
             stream_state_xattr=self._STREAM_STATE_XATTR,
@@ -1531,12 +1532,16 @@ class StorageFS(Operations):
 
     def _record_fetched(self, canonical_path: str, cache_path: Path, backend: Backend,
                         member_stat: Optional[os.stat_result]):
-        """A full fetch from backend just finished; member_stat was taken before it.
+        """A full fetch from backend just finished; member_stat is its baseline.
 
-        Stat before copy: a change landing in between leaves a baseline older
-        than the copy, which costs one needless refetch at the next check;
-        the other order could pair a new baseline with old bytes and never
-        see the change.
+        Normally the member's stat after the transfer that agreed with the
+        one taken before it (cache_metadata.confirm_member_stat): agreement
+        makes their size and mtime identical, so it describes the bytes
+        fetched. Otherwise the stat taken before the transfer: a change
+        landing in between then leaves a baseline older than the copy, which
+        costs one refetch at the next check; a baseline taken after the copy
+        alone could pair a new baseline with old bytes and never see the
+        change.
 
         Also called off the FUSE thread, from a stream's on_finalized. It can
         then land after the FUSE thread's own refetch of the same path and

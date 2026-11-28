@@ -35,6 +35,43 @@ class SlowRemoteLoopbackBackend(LocalBackend):
         return super().read_file(virtual_path, offset, size)
 
 
+# A client process for reads through the mount: this process runs the FUSE
+# loop, so it never reads mounted data itself (a blocked fault or read here
+# could wait on a callback that needs this interpreter). One JSON line per
+# command on stdin, one JSON line back.
+_STREAM_CLIENT = """
+import hashlib, json, os, sys
+path = sys.argv[1]
+fd = None
+for line in sys.stdin:
+    cmd = line.strip()
+    if cmd == "open_read":
+        fd = os.open(path, os.O_RDONLY)
+        data = b""
+        while True:
+            chunk = os.read(fd, 1 << 16)
+            if not chunk:
+                break
+            data += chunk
+        out = {"sha": hashlib.sha256(data).hexdigest(), "size": len(data)}
+    elif cmd == "stats":
+        out = {"fstat": os.fstat(fd).st_mtime, "stat": os.stat(path).st_mtime}
+    elif cmd == "reopen":
+        os.close(fd)
+        fd = os.open(path, os.O_RDONLY)
+        data = b""
+        while True:
+            chunk = os.read(fd, 1 << 16)
+            if not chunk:
+                break
+            data += chunk
+        out = {"sha": hashlib.sha256(data).hexdigest()}
+    else:
+        break
+    print(json.dumps(out), flush=True)
+"""
+
+
 class TestStreamingSystemRegression(unittest.TestCase):
     """Mounted-FUSE streaming regression checks."""
 
@@ -181,6 +218,84 @@ class TestStreamingSystemRegression(unittest.TestCase):
         stream_state = self._read_stream_state(cache_path, partial_path)
         if stream_state is not None:
             self.assertNotIn(stream_state.get("status"), {"error", "failed"})
+
+
+    def _client_call(self, client, command, timeout=60.0):
+        client.stdin.write(command + "\n")
+        client.stdin.flush()
+        ready = threading.Event()
+        result = {}
+
+        def read_line():
+            result["line"] = client.stdout.readline()
+            ready.set()
+
+        threading.Thread(target=read_line, daemon=True).start()
+        if not ready.wait(timeout):
+            client.kill()
+            self.fail(f"mount client did not answer {command!r} in {timeout} s")
+        if not result["line"]:
+            client.wait(timeout=30)
+            self.fail(f"mount client exited on {command!r}: {client.stderr.read()}")
+        return json.loads(result["line"])
+
+    def test_member_replaced_before_finalize_reports_only_member_mtimes(self):
+        """A stream whose member is replaced before it finishes is not kept:
+        a client holding the descriptor sees only genuine member mtimes, and
+        a reopen reads the replacement with its own."""
+        import hashlib
+        import subprocess
+        import sys
+        from unittest.mock import patch
+
+        old, new = b"o" * (256 * 1024), b"n" * (256 * 1024)
+        old_mtime, new_mtime = 1_600_000_000, 1_650_000_000
+        member = self.backend_dir / "swap.bin"
+        member.write_bytes(old)
+        os.utime(member, (old_mtime, old_mtime))
+        # Written behind the mount after setUp listed the root: drop that
+        # listing as the member's watcher would.
+        self.fs._on_remote_change("/swap.bin")
+        backend = self.fs.backends["remote0"]
+        real_stat, calls = backend.stat, []
+
+        def stat(path):
+            if path == "/swap.bin":
+                calls.append(path)
+                if len(calls) == 2:  # the stream's confirmation: replaced first
+                    member.write_bytes(new)
+                    os.utime(member, (new_mtime, new_mtime))
+            return real_stat(path)
+
+        client = subprocess.Popen(
+            [sys.executable, "-c", _STREAM_CLIENT, str(self.mount_dir / "swap.bin")],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            with patch.object(backend, "stat", side_effect=stat):
+                first = self._client_call(client, "open_read")
+                self.assertEqual(first["sha"], hashlib.sha256(old).hexdigest())
+                self.assertTrue(self._wait_for(
+                    lambda: self.fs._streaming_stats_snapshot().get(
+                        "streaming_member_changed_discards") == 1, timeout=30.0))
+            self.assertFalse((self.cache_dir / "swap.bin").exists())
+            held = self._client_call(client, "stats")
+            for name, mtime in held.items():
+                self.assertIn(mtime, (old_mtime, new_mtime), name)
+            again = self._client_call(client, "reopen")
+            self.assertEqual(again["sha"], hashlib.sha256(new).hexdigest())
+            # Once the replacement's stream is installed, the cached file
+            # answers with the replacement's own mtime.
+            self.assertTrue(self._wait_for(
+                lambda: (self.cache_dir / "swap.bin").exists(), timeout=30.0))
+            installed = self._client_call(client, "stats")
+            self.assertEqual((installed["fstat"], installed["stat"]), (new_mtime, new_mtime))
+        finally:
+            try:
+                client.stdin.close()
+                client.wait(timeout=30)
+            except Exception:
+                client.kill()
+                client.wait(timeout=30)
 
 
 class TestStreamingSystemRegressionThreaded(TestStreamingSystemRegression):

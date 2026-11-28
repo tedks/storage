@@ -122,8 +122,11 @@ class PrefetchSession:
     last_logged_downloaded_bytes: int = 0
     last_foreground_offset: int = 0
     # The member's stat at session start (None when the member has no
-    # stat); handed to on_finalized as the revalidation baseline.
+    # stat).
     member_stat: Optional[object] = None
+    # The member's stat after the stream, when it agreed with member_stat
+    # (cache_metadata.confirm_member_stat): on_finalized's baseline.
+    confirmed_stat: Optional[object] = None
 
     def __post_init__(self):
         self.lock = threading.RLock()
@@ -1145,9 +1148,11 @@ class StreamingReadManager:
                 raise OSError(errno.EINTR if isinstance(exc, BulkCapacityCancelled)
                               else errno.EAGAIN, str(exc)) from exc
             if not agreed:
-                self._record_streaming_stat("streaming_member_changed_discards", 1)
                 self._discard_superseded_session(session, "member-changed")
+                # Counted once the partial is gone and the session finished.
+                self._record_streaming_stat("streaming_member_changed_discards", 1)
                 return
+            session.confirmed_stat = confirmed
             copy_member_attributes(io_fd, confirmed)
             os.fsync(io_fd)
             session.final_cache_path.parent.mkdir(parents=True, exist_ok=True)

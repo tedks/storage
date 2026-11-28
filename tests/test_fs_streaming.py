@@ -199,6 +199,9 @@ class TestFSStreamingIntegration(unittest.TestCase):
 
         with patch.object(self.backend, "stat", side_effect=stat):
             data, session = self._stream_and_finish("moved.bin", len(old))
+            # Counted once the partial is gone and the session finished.
+            self.assertTrue(self._wait_for(lambda: self.fs._streaming_manager._streaming_stats.get(
+                "streaming_member_changed_discards") == 1, timeout=8.0))
         self.assertEqual(data, old)  # the reader kept its bytes
         cache_path = self.cache_dir / "moved.bin"
         self.assertFalse(cache_path.exists())  # nothing pairs 1_650_000_000 with old bytes

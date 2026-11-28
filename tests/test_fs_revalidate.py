@@ -1565,10 +1565,12 @@ class TestRevalidateStreamedFetch(RevalidateTestBase):
             # Read it all, so the stream finishes (keep-after-close).
             mixed = self.read_through("/m.bin")
             stats = self.fs._streaming_manager._streaming_stats
+            # Counted only once the session finished and its partial is gone.
             deadline = time.monotonic() + 10
             while (time.monotonic() < deadline
                    and not stats.get("streaming_member_changed_discards")):
                 time.sleep(0.05)
+            self.assertFalse((self.cache_dir / "m.bin.storage.partial").exists())
         # The first range came from the old version, the rest from the new.
         self.assertNotEqual(new, mixed)
         self.assertEqual(stats.get("streaming_member_changed_discards"), 1)
