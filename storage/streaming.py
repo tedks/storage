@@ -430,19 +430,22 @@ class _DownloadPool:
                 self.run_turn(session)
             except Exception:
                 self.logger.exception("Streaming download turn failed for %s", session.canonical_path)
-                with self.condition:
-                    self.running.pop(session, None)
-                    self._refresh_contention()
-                    self.condition.notify_all()
                 if self.on_turn_failure is not None:
                     # Nothing else would offer the session again: a
                     # readerless fill would keep its partial and
-                    # descriptor forever.
+                    # descriptor forever. Run while the session is still
+                    # in running (without this pool's lock), so an offer
+                    # meanwhile (a reader's read) starts no second turn
+                    # that races the recovery.
                     try:
                         self.on_turn_failure(session)
                     except Exception:
                         self.logger.exception(
                             "Streaming download turn cleanup failed for %s", session.canonical_path)
+                with self.condition:
+                    self.running.pop(session, None)
+                    self._refresh_contention()
+                    self.condition.notify_all()
 
     def shutdown(self, timeout):
         with self.condition:
@@ -1876,7 +1879,8 @@ class StreamingReadManager:
     def _fail_raised_turn(self, session: PrefetchSession):
         """A turn raised out of _run_download_turn: fail the session and finish it.
 
-        The pool has already dropped the turn. Unless the turn's own tail
+        The pool still holds the turn (the session is in running), so no
+        offer starts another until this returns. Unless the turn's own tail
         ran (background_finished), a session still missing bytes is errored
         and finished like any failed one: without readers its prefix is
         promoted or dropped and it leaves the registry; with readers their
@@ -1889,7 +1893,6 @@ class StreamingReadManager:
             if session.error is None and not session.prefetch_complete:
                 session.error = RuntimeError("streaming download turn failed")
             session.condition.notify_all()
-            self._download_pool.offer(session, False)
         try:
             self._finish_background_session(session)
         finally:

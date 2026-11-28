@@ -1223,6 +1223,40 @@ class TestFSStreamingIntegration(unittest.TestCase):
             with self.subTest(limits=limits):
                 validate_download_limits(limits)
 
+    def test_offer_during_turn_failure_recovery_starts_no_second_turn(self):
+        manager = self.fs._streaming_manager
+        pool = manager._download_pool
+        self.backend.worker_gate = threading.Event()
+        raise_now = threading.Event()
+        real_probe = manager._bulk_wait_probe
+        real_recover = pool.on_turn_failure
+        seen = []
+
+        def probe(session):
+            if raise_now.is_set():
+                raise RuntimeError("unexpected turn failure")
+            return real_probe(session)
+
+        def recover(session):
+            # A reader's read offers the session between the exception and
+            # the recovery.
+            with session.lock:
+                manager._schedule_background(session)
+            with pool.condition:
+                seen.append((session in pool.running, session in pool.ready))
+            return real_recover(session)
+
+        with patch.object(manager, "_bulk_wait_probe", side_effect=probe), \
+                patch.object(pool, "on_turn_failure", recover):
+            retained = self._open_retained_fill("recovering.bin", os.urandom(384 * 1024))
+            raise_now.set()
+            self.backend.worker_gate.set()
+            self.assertTrue(retained.background_finished.wait(timeout=5))
+        self.assertEqual(seen, [(True, False)])
+        self.assertIsNotNone(retained.error)
+        self.assertEqual(manager.list_download_sessions(), [])
+        self.assertTrue(self._wait_for(lambda: pool.snapshot()[1:] == (0, 0)))
+
     def test_bulk_wait_yield_interval_restarts_for_each_acquisition(self):
         manager = self.fs._streaming_manager
         session = SimpleNamespace(stop_requested=False, prefetch_complete=False, error=None,
