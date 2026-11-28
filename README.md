@@ -617,7 +617,7 @@ Configuration is hierarchical - child directories inherit from parents, with the
 **Cache Management:**
 1. Track file access times for LRU
 2. Evict clean files when space needed
-3. Prefer evicting recomputable files
+3. Evict non-recomputable files first, least recently read first; reclaim recomputable files only after that, in the same order, by truncating them in place so their xattrs stay
 4. Never evict dirty (unsynced) files
 
 **Metadata and Recovery:**
