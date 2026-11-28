@@ -2578,8 +2578,15 @@ class StorageFS(Operations):
                     raise FuseOSError(errno.EACCES)
                 cache_path = prefetch_session.partial_cache_path
                 if not cache_path.exists() and prefetch_session.final_cache_path.exists():
-                    # Session finished before open() reached os.open.
+                    # Session finished before open() reached os.open: the
+                    # installed inode's recorded mode decides, as for any
+                    # cached file.
                     cache_path = prefetch_session.final_cache_path
+                    try:
+                        self._require_imported_permission(cache_path, stat.S_IRUSR)
+                    except FuseOSError:
+                        self._release_prefetch_session(prefetch_session)
+                        raise
             else:
                 self._record_streaming_stat("streaming_fallback_opens", 1)
                 self.logger.info(
@@ -2607,6 +2614,7 @@ class StorageFS(Operations):
                 except FileNotFoundError:
                     if prefetch_session is not None and prefetch_session.final_cache_path.exists():
                         cache_path = prefetch_session.final_cache_path
+                        self._require_imported_permission(cache_path, stat.S_IRUSR)
                         real_fd = os.open(str(cache_path), flags)
                     else:
                         raise

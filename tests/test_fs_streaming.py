@@ -1842,6 +1842,44 @@ class TestFSStreamingIntegration(unittest.TestCase):
                         self.fs.open("/" + name, os.O_RDONLY)  # the first, cold open
                 self.assertEqual(raised.exception.errno, errno.EACCES)
 
+    def test_open_that_finds_the_stream_finished_checks_the_installed_inode(self):
+        # The probe has no mode, the confirmation reports 0o200 (same size and
+        # mtime): the installed inode records 0o200. An open that attaches to
+        # the finished session and falls back to that inode is refused.
+        import stat as stat_module
+        from types import SimpleNamespace
+        payload = os.urandom(64 * 1024)
+        (self.backend_dir / "late.bin").write_bytes(payload)
+        real, seen = self.backend.stat, []
+
+        def stats(path):
+            seen.append(path)
+            st = real(path)
+            mode = None if len(seen) == 1 else stat_module.S_IFREG | 0o200
+            return SimpleNamespace(st_size=st.st_size, st_mtime=st.st_mtime,
+                                   st_mtime_ns=st.st_mtime_ns, st_mode=mode)
+
+        with patch.object(self.backend, "stat", side_effect=stats):
+            vfd = self.fs.open("/late.bin", os.O_RDONLY)
+            with self.fs._fd_lock:
+                session = self.fs._fd_map[vfd].prefetch_session
+            self.fs.read("/late.bin", len(payload), 0, vfd)
+            self.assertTrue(self._wait_for(lambda: session.finalized, timeout=8.0))
+
+        def attach_finished(requested, canonical):
+            with session.lock:
+                session.refcount += 1
+            return session
+
+        # The race: the open saw no cached file and attached to the session,
+        # which then finished and installed before os.open.
+        with patch.object(self.fs, "_create_or_attach_prefetch_session", side_effect=attach_finished), \
+                patch.object(self.fs.cache_manager, "is_cached", return_value=False):
+            with self.assertRaises(FuseOSError) as raised:
+                self.fs.open("/late.bin", os.O_RDONLY)
+        self.assertEqual(raised.exception.errno, errno.EACCES)
+        self.fs.release("/late.bin", vfd)
+
     def test_streaming_fill_with_an_unconfirmed_mode_grants_no_write(self):
         # No version token, a mode only the probe reported: the staging
         # file's own owner write is not granted through the mount.
