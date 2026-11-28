@@ -1,0 +1,23 @@
+id: gh-207-view-flush-release-window
+title: Conflict-view repair recorded between a writer's flush and its release
+desc: 'From #208 round 5 (O-I6, S6). Predates #208: at fa274d4 (#184) and master 77f2983
+  flush() refuses with EBUSY only a repair already recorded; one recorded after the
+  writer''s last flush and before its release is handled by release (_release_view),
+  which keeps the bytes durably as a view-write repair, after close() has returned
+  0. Nothing reports the refusal to that writer; storage debug member-repairs lists
+  the kept bytes. Closing it needs the send-or-keep decision made in an operation
+  that can fail (for example flush taking a reservation that release honours), a conflict-view
+  design change. README item 6 names the window.'
+type: task
+component: storage
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-28T12:53:08-00:00
+references: []
+log_events:
+- time: 2026-11-28T12:53:08-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
