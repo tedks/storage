@@ -476,6 +476,73 @@ class TestImportedPermissions(RevalidateTestBase):
             self.assertEqual(raised.exception.errno, errno.EACCES)
         self.assertEqual(cached.read_bytes(), b"original")
 
+    def fill_with_reported_mode(self, mode):
+        """A full fill whose member reports mode (synthetic; the file stays
+        readable to the transfer, as one readable through a group would)."""
+        src = self.rewrite_member("g.txt", b"guarded", mtime=1_000_000_000)
+        real = self.member.stat
+
+        def reported(path):
+            st = real(path)
+            return SimpleNamespace(st_size=st.st_size, st_mtime=st.st_mtime,
+                                   st_mtime_ns=st.st_mtime_ns, st_mode=stat.S_IFREG | mode,
+                                   st_uid=54321, st_gid=54322)
+
+        with patch.object(self.member, "stat", side_effect=reported):
+            self.assertTrue(self.fs._ensure_file_in_cache(self.fs._resolve_path("/g.txt")))
+        cached = self.cache_dir / "g.txt"
+        # Storage's own owner read and write on the backing file.
+        self.assertEqual(cached.stat().st_mode & 0o600, 0o600)
+        return src, cached
+
+    def test_synthesized_owner_read_bit_grants_no_read(self):
+        for mode in (0o200, 0o044, 0o000):
+            with self.subTest(mode=oct(mode)):
+                src, cached = self.fill_with_reported_mode(mode)
+                self.assertEqual(stat.S_IMODE(self.fs.getattr("/g.txt")["st_mode"]), mode)
+                for flags in (os.O_RDONLY, os.O_RDWR):
+                    with self.assertRaises(FuseOSError) as raised:
+                        self.fs.open("/g.txt", flags)
+                    self.assertEqual(raised.exception.errno, errno.EACCES)
+                if mode & stat.S_IWUSR:  # write-only stays writable
+                    self.fs.release("/g.txt", self.fs.open("/g.txt", os.O_WRONLY))
+                self.fs.cache_manager.delete_cached_file("/g.txt")
+                self.fs.state_manager.delete_file("/g.txt")
+
+    def test_readable_member_modes_still_read(self):
+        for mode in (0o400, 0o644, 0o600):
+            with self.subTest(mode=oct(mode)):
+                self.fill_with_reported_mode(mode)
+                self.assertEqual(self.read_through("/g.txt"), b"guarded")
+                self.fs.cache_manager.delete_cached_file("/g.txt")
+                self.fs.state_manager.delete_file("/g.txt")
+
+    def test_stale_writable_probe_does_not_survive_a_failed_confirmation(self):
+        # Writable when probed; read-only (same length) by the time the copy
+        # runs; the confirming stat then fails twice.
+        src = self.rewrite_member("f.txt", b"original", mtime=1_000_000_000)
+        os.chmod(src, 0o644)
+        copy_to_local = self.member.copy_to_local
+        real_stat, seen = self.member.stat, []
+
+        def turned_read_only(path, temp):
+            os.chmod(src, 0o444)
+            copy_to_local(path, temp)
+
+        def probe_then_fail(path):
+            seen.append(path)
+            if len(seen) == 1:
+                return real_stat(path)
+            raise OSError(errno.EIO, "stat failed")
+
+        with patch.object(self.member, "copy_to_local", side_effect=turned_read_only), \
+                patch.object(self.member, "stat", side_effect=probe_then_fail):
+            self.assertEqual(self.read_through("/f.txt"), b"original")
+        self.assertEqual(self.fs.getattr("/f.txt")["st_mode"] & 0o222, 0)
+        with self.assertRaises(FuseOSError) as raised:
+            self.fs.open("/f.txt", os.O_WRONLY)
+        self.assertEqual(raised.exception.errno, errno.EACCES)
+
     def test_read_only_member_mode_is_enforced(self):
         self.assert_write_refused(self.fill_read_only({"wraps": self.member.stat}))
 

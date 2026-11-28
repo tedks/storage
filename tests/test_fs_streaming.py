@@ -1827,6 +1827,22 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.assertEqual((stat_module.S_IMODE(attrs["st_mode"]), attrs["st_uid"]), (0o640, 4242))
         self._assert_warm_and_offline("partial.bin", payload)
 
+    def test_streaming_fill_without_owner_read_grants_no_read(self):
+        import stat as stat_module
+        from types import SimpleNamespace
+        payload = os.urandom(64 * 1024)
+        (self.backend_dir / "noread.bin").write_bytes(payload)
+        real = self.backend.stat
+        with patch.object(self.backend, "stat", side_effect=lambda path: SimpleNamespace(
+                st_size=real(path).st_size, st_mtime_ns=real(path).st_mtime_ns,
+                st_mtime=real(path).st_mtime, st_mode=stat_module.S_IFREG | 0o200)):
+            self._stream_and_finish("noread.bin", len(payload))
+            self.assertTrue(self._wait_for((self.cache_dir / "noread.bin").exists, timeout=8.0))
+        self.assertEqual(stat_module.S_IMODE(self.fs.getattr("/noread.bin")["st_mode"]), 0o200)
+        with self.assertRaises(FuseOSError) as raised:
+            self.fs.open("/noread.bin", os.O_RDONLY)
+        self.assertEqual(raised.exception.errno, errno.EACCES)
+
     def test_stream_whose_size_only_stat_changes_size_is_discarded(self):
         # Control: positive evidence of another version still discards.
         from types import SimpleNamespace

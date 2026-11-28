@@ -45,7 +45,7 @@ from .locks import NamespaceLock, PathLocks, UploadLocks
 from .cache_metadata import (
     MEMBER_ATTRS_XATTR, MEMBER_STAT_XATTR as CACHE_MEMBER_STAT_XATTR,
     PREFIX_XATTR, XATTR_CACHE_METADATA_NAME,
-    cache_identity, forget_cached_member_fields, imported_mode_denies_write,
+    cache_identity, forget_cached_member_fields, imported_mode_denies, imported_mode_denies_write,
     read_member_baselines, record_native_attributes, regular_file_stat, scan_cache_entries,
 )
 from .file_config import FileConfig, get_inherited_config
@@ -2421,14 +2421,22 @@ class StorageFS(Operations):
 
     @staticmethod
     def _require_imported_write_permission(cache_path: Path):
+        StorageFS._require_imported_permission(cache_path, stat.S_IWUSR)
+
+    @staticmethod
+    def _require_imported_permission(cache_path: Path, bit: int):
         # Without default_permissions, native opens enforce the daemon's
-        # file permissions. The imported backing mode has an owner write
-        # bit for Storage's xattrs; don't grant that bit through the mount.
+        # file permissions. The imported backing mode has owner read and
+        # write bits for Storage to read the copy and keep its xattrs;
+        # neither is granted through the mount when the member's mode, as
+        # recorded and reported, withholds it. (Who may reach the mount at
+        # all, allow_other and a root daemon, is the mount's identity model,
+        # not this check's.)
         if os.geteuid() == 0:
             return
         local = regular_file_stat(cache_path)
         if (local is not None and local.st_uid == os.geteuid()
-                and imported_mode_denies_write(cache_path, local)):
+                and imported_mode_denies(cache_path, local, bit)):
             raise FuseOSError(errno.EACCES)
 
     def _mark_cache_file_dirty(self, canonical_path: str, cache_path: Path) -> None:
@@ -2558,6 +2566,8 @@ class StorageFS(Operations):
             cache_path = resolved.cache_path
             if not self._is_read_only_open(flags):
                 self._require_imported_write_permission(cache_path)
+            if flags & os.O_ACCMODE != os.O_WRONLY:
+                self._require_imported_permission(cache_path, stat.S_IRUSR)
 
         try:
             # Hold _fd_lock across os.open AND _fd_map registration so that

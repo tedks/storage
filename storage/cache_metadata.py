@@ -153,6 +153,10 @@ def copy_member_attributes(fd: int, source) -> None:
     # version the transfer may not have read is the caller's to refetch,
     # never a reason to report local times.
     mode = getattr(source, "st_mode", None)
+    if mode is not None and getattr(source, "mode_unconfirmed", False):
+        # A stale probe never grants write the transferred file lacks
+        # (a local member's copy carries the source's mode at the copy).
+        mode &= ~(stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH) | local.st_mode
     permissions = local.st_mode if mode is None else mode
     # Without a member mode, an import fails closed: the downloaded file's
     # own mode (a local member's copy, a transfer's or a streaming staging
@@ -257,12 +261,18 @@ def stale_record_mode(path: Path, local: os.stat_result) -> Optional[int]:
     return None
 
 
-def imported_mode_denies_write(path: Path, local: os.stat_result) -> bool:
-    """Whether a recorded member mode withholds owner write from this file,
-    as stat reports it (cached_member_attributes, else stale_record_mode)."""
+def imported_mode_denies(path: Path, local: os.stat_result, bit: int) -> bool:
+    """Whether a recorded member mode withholds an owner bit (S_IRUSR or
+    S_IWUSR) from this file, as stat reports it (cached_member_attributes,
+    else stale_record_mode). The backing inode always has owner read and
+    write for Storage itself; those synthesized bits never decide."""
     attrs = cached_member_attributes(path, local)
     mode = attrs.get("st_mode") if attrs is not None else stale_record_mode(path, local)
-    return type(mode) is int and not mode & stat.S_IWUSR
+    return type(mode) is int and not mode & bit
+
+
+def imported_mode_denies_write(path: Path, local: os.stat_result) -> bool:
+    return imported_mode_denies(path, local, stat.S_IWUSR)
 
 
 def cached_member_attributes(path: Path, local: os.stat_result) -> Optional[dict]:
