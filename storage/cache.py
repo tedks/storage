@@ -593,7 +593,7 @@ class CacheManager:
         try:
             installed = self.fetch_into_cache(
                 backend, source_virtual_path, self.get_cache_path(virtual_path), member_stat,
-                confirmed=confirmed,
+                confirmed=confirmed, reserved=file_size,
             )
             self.state_manager.update_access_time(virtual_path)
             return CacheFetch.INSTALLED if installed else CacheFetch.ALREADY_CACHED
@@ -606,8 +606,17 @@ class CacheManager:
             with self._lock:
                 self._reserved_bytes -= file_size
 
+    def _reserve_more(self, nbytes: int) -> bool:
+        """Reserve nbytes more for a fill in progress, if there is room."""
+        with self._lock:
+            if not self.ensure_space(nbytes):
+                return False
+            self._reserved_bytes += nbytes
+            return True
+
     def fetch_into_cache(self, backend: Backend, source_virtual_path: str, cache_path: Path,
-                         member_stat=None, *, confirmed: Optional[list] = None) -> bool:
+                         member_stat=None, *, confirmed: Optional[list] = None,
+                         reserved: Optional[int] = None) -> bool:
         """Copy a member file to cache_path through a temp file beside it.
 
         The copy runs without the cache lock into a fresh name that ends in
@@ -618,7 +627,9 @@ class CacheManager:
         replaced, and the existing inode keeps its bytes and xattrs. The
         link and the size accounting run under the lock. The cache
         filesystem must support hard links (it must support xattrs anyway).
-        No space is reserved here (cache_file does that).
+        Space is reserved by the caller (cache_file_result: reserved bytes);
+        a retry for a confirmed larger version reserves the difference
+        first (_reserve_more) and fails the fill if it cannot.
 
         Returns True when this copy was installed, False when a file was
         already there and this copy was discarded. When installed, a given
@@ -631,6 +642,7 @@ class CacheManager:
         temp_path = cache_path.parent / f".{secrets.token_hex(8)}{PARTIAL_SUFFIX}"
         with self._lock:
             scans = self._scan_count
+        extra_reserved = 0
         try:
             for attempt in range(2):
                 if attempt:
@@ -657,6 +669,18 @@ class CacheManager:
                 if version != MemberVersion.CHANGED:
                     break
                 member_stat = newest
+                newest_size = getattr(newest, "st_size", None)
+                if attempt == 0 and reserved is not None and isinstance(newest_size, int):
+                    # The retry fetches a version confirmed larger than the
+                    # reservation: reserve the difference first, as the first
+                    # transfer's reservation was (pre-#191 budget).
+                    more = max(0, newest_size - (reserved + extra_reserved))
+                    if more:
+                        if not self._reserve_more(more):
+                            print(f"Warning: Insufficient cache space for {source_virtual_path}")
+                            raise OSError(errno.ENOSPC, "insufficient cache space for the "
+                                          "member's larger version", source_virtual_path)
+                        extra_reserved += more
             fd = os.open(temp_path, os.O_RDONLY | os.O_NOFOLLOW)
             try:
                 copy_member_attributes(fd, newest)
@@ -681,6 +705,9 @@ class CacheManager:
                 self._size_dirty = True
             raise
         finally:
+            if extra_reserved:
+                with self._lock:
+                    self._reserved_bytes -= extra_reserved
             try:
                 temp_path.unlink(missing_ok=True)
             except OSError:

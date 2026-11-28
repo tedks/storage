@@ -236,6 +236,51 @@ class _GatedBackend(LocalBackend):
             f.write(data[len(data) // 2:])
 
 
+class TestConfirmedLargerRetryBudget(unittest.TestCase):
+    """A full fill whose member is confirmed to have grown is fetched again
+    only within the cache budget (pre-#191: reserve the difference first)."""
+
+    def make(self, max_size):
+        self.temp_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.temp_dir, True)
+        cache_dir = Path(self.temp_dir) / "cache"
+        backend_dir = Path(self.temp_dir) / "backend"
+        cache_dir.mkdir()
+        backend_dir.mkdir()
+        state = StateManager(str(Path(self.temp_dir) / "state.db"))
+        self.addCleanup(state.close)
+        self.cache = CacheManager(cache_dir, state, max_size)
+        self.backend = LocalBackend("backend", str(backend_dir))
+        self.source = backend_dir / "f.bin"
+        self.source.write_bytes(b"x" * 100)
+        self.cache_dir = cache_dir
+        copy = self.backend.copy_to_local
+        self.reserved_during = []
+
+        def grows_once(path, temp):
+            self.reserved_during.append(self.cache._reserved_bytes)
+            if len(self.reserved_during) == 1:
+                self.source.write_bytes(b"y" * 400)  # after the probe: larger
+            copy(path, temp)
+
+        return patch.object(self.backend, "copy_to_local", side_effect=grows_once)
+
+    def test_confirmed_larger_retry_reserves_the_difference(self):
+        with self.make(max_size=10_000):
+            self.assertTrue(self.cache.cache_file("/f.bin", self.backend))
+        self.assertEqual(self.reserved_during, [100, 400])
+        self.assertEqual(self.cache._reserved_bytes, 0)
+        self.assertEqual(self.cache.get_cache_path("/f.bin").read_bytes(), b"y" * 400)
+
+    def test_confirmed_larger_retry_fails_when_it_cannot_reserve(self):
+        with self.make(max_size=300):
+            self.assertFalse(self.cache.cache_file("/f.bin", self.backend))
+        self.assertEqual(self.reserved_during, [100])  # no second transfer
+        self.assertEqual(self.cache._reserved_bytes, 0)
+        self.assertFalse(self.cache.get_cache_path("/f.bin").exists())
+        self.assertEqual(sorted(p.name for p in self.cache_dir.rglob(f"*{PARTIAL_SUFFIX}")), [])
+
+
 class TestFetchThroughTempFile(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.mkdtemp()
