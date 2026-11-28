@@ -243,8 +243,12 @@ latest contiguous read span by up to `streaming_read_ahead_window`
 (`--streaming-read-ahead-window`). The default is 4 MiB, independent of
 file size and chunk size. In a profile it may be a size string or an
 integer of bytes (`streaming_read_ahead_window = 4194304`). Use `0` to
-disable speculative reads before qualification. If the last reader closes before the file qualifies and
-the file is still incomplete, Storage discards the partial download. On
+disable speculative reads before qualification. Earlier builds used
+`streaming_keep_after_close` as this window too, so a profile that set,
+say, `100%` to read ahead to the end of a file while it is open now gets
+4 MiB; set `streaming_read_ahead_window` to restore a wider window. If
+the last reader closes before the file qualifies and the file is still
+incomplete, Storage discards the partial download. On
 a 2 GiB file, a 1 MiB contiguous read opens a speculative window of up to
 4 MiB after that span, while a contiguous read of about 614.4 MiB
 (644,245,095 bytes) qualifies the file to keep downloading after close.

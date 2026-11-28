@@ -53,7 +53,7 @@ Use a **partial local cache file + range-availability map**:
 
 1. For uncached opens, create or attach to `PrefetchSession`.
 2. Session creates `cache_path + ".storage.partial"`, pre-sizes/truncates to full remote size. It prepares the file under a unique `.<random>.storage.partial` in the same directory and renames it onto the shared name when it registers, so two opens that both miss the registry cannot clobber each other's file; the one that loses attaches and removes its own.
-3. Background prefetch thread streams chunks sequentially (e.g., 1 MiB). Until the readers consumed the file (see the release path below), it stays within `streaming_keep_after_close` past the end of the span the latest read belongs to and waits there; once they have, it runs to the end of the file and then fills what is missing before the readers' offset.
+3. Background prefetch thread streams chunks sequentially (e.g., 1 MiB). Until the readers consumed the file (see the release path below), it stays within `streaming_read_ahead_window` past the end of the span the latest read belongs to and waits there (as built by #188; earlier builds used `streaming_keep_after_close` as this window); once they have, it runs to the end of the file and then fills what is missing before the readers' offset.
 4. Foreground `read()` ensures requested range exists:
    - if already available: read locally
    - else synchronously fetch missing chunks via `Backend.read_file`, write to partial file, mark range available
@@ -138,9 +138,9 @@ Edge handling:
    - if no readers and prefetch failed: cleanup partial file + registry
    - if no readers and prefetch running: continue only if the readers
      consumed the file, meaning the longest contiguous span they read
-     reached the mount's `streaming_keep_after_close` (default 4 chunks or
-     50% of the file, whichever is reached first; `0` continues after any
-     read); otherwise cancel and discard the partial, so a content sniff or
+     reached the mount's `streaming_keep_after_close` (default since #188
+     `all:32M,30%`, the larger of 32 MiB and 30% of the file, capped at
+     the file size; see the README; `0` continues after any read); otherwise cancel and discard the partial, so a content sniff or
      thumbnail never becomes a full download
 
 ### Phase 5: Cache Accounting and Eviction Compatibility
