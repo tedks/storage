@@ -293,6 +293,8 @@ starts streaming never takes a prefix that appears meanwhile for the
 file: it drops the prefix and streams again, or returns `EAGAIN` while
 another descriptor holds it. A prefix already cached when the file is
 opened is served as it is, which is what lets it be read offline.
+Recomputing a file moves such a prefix aside while the command runs and
+puts it back if the command produces no file.
 A recomputable file whose members cannot be reached is recomputed. A selected member without
 range support uses the whole-file cache path, as do write opens and opens
 with streaming disabled.

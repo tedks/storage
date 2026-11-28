@@ -2757,6 +2757,43 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.assertEqual(self.fs.read('/changed.bin', len(payload), 0, fd), payload)
         self.fs.release('/changed.bin', fd)
 
+    def test_failed_recompute_keeps_a_cached_prefix(self):
+        # R3-I4: recompute moves the prefix aside for the command and puts
+        # it back when the command fails, so offline opens keep its bytes;
+        # a successful recompute replaces it; a held prefix is not touched.
+        from types import SimpleNamespace
+        from storage.cache_metadata import PREFIX_XATTR
+        cache_path = self.cache_dir / "derived-prefix.bin"
+        cache_path.write_bytes(b"prefix")
+        os.setxattr(str(cache_path), PREFIX_XATTR, b"1")
+        resolved = self.fs._resolve_path('/derived-prefix.bin')
+        engine = self.fs.recompute_engine
+        seen = []
+
+        def failing(requested_path, path, timeout):
+            seen.append(Path(path).exists())
+            return SimpleNamespace(success=False)
+
+        with patch.object(engine, "can_recompute", return_value=True), \
+                patch.object(engine, "recompute_file", side_effect=failing):
+            self.assertFalse(self.fs._try_recompute(resolved))
+        self.assertEqual(seen, [False])  # the command ran with the path vacant
+        self.assertEqual(cache_path.read_bytes(), b"prefix")
+        os.getxattr(str(cache_path), PREFIX_XATTR)
+        self.assertEqual(list(self.cache_dir.glob(".storage-prefix-*")), [])
+
+        held = self.fs.open('/derived-prefix.bin', os.O_RDONLY)
+        with patch.object(engine, "can_recompute", return_value=True), \
+                patch.object(engine, "recompute_file") as never:
+            self.assertFalse(self.fs._try_recompute(resolved))
+            never.assert_not_called()
+        self.fs.release('/derived-prefix.bin', held)
+
+        with self._recompute_into_cache(b"whole recomputed file"):
+            self.assertTrue(self.fs._try_recompute(resolved))
+        self.assertEqual(cache_path.read_bytes(), b"whole recomputed file")
+        self.assertEqual(list(self.cache_dir.glob(".storage-prefix-*")), [])
+
     def test_replaced_session_is_charged_before_its_partial_is_unlinked(self):
         # R3-I2: a cache scan between the unlink and the charge would see
         # the space as free while the old reader still pins it.

@@ -23,6 +23,7 @@ import concurrent.futures
 import contextlib
 import ctypes
 import resource
+import secrets
 import signal
 from dataclasses import dataclass, field
 import fuse as fusepy
@@ -2031,6 +2032,43 @@ class StorageFS(Operations):
             self.cache_manager.mark_cache_size_dirty()
         return removed
 
+    def _set_aside_unindexed_prefix(self, canonical_path: str, cache_path: Path) -> Optional[Path]:
+        """Move a promoted prefix off the cache path; the name it now has, or None.
+
+        As _drop_unindexed_prefix, but the bytes are kept beside the path
+        (under the partial suffix, so a restart sweeps a leftover) for
+        _restore_set_aside_prefix. None if the path holds no unindexed
+        prefix or a descriptor has it open.
+        """
+        aside = cache_path.parent / f".storage-prefix-{secrets.token_hex(8)}{self._PARTIAL_SUFFIX}"
+        with self.state_manager.metadata_lock:
+            if not self._is_unindexed_prefix(canonical_path, cache_path):
+                return None
+            with self._descriptor_guard(canonical_path) as is_open:
+                if is_open:
+                    return None
+                try:
+                    os.rename(cache_path, aside)
+                except OSError:
+                    return None
+        return aside
+
+    def _restore_set_aside_prefix(self, aside: Path, cache_path: Path, restore: bool):
+        """Put a set-aside prefix back if restore and the cache path is still vacant; else discard it."""
+        if restore:
+            try:
+                # No-replace: whatever took the path meanwhile is newer.
+                os.link(aside, cache_path)
+            except FileExistsError:
+                pass
+            except OSError as exc:
+                self.logger.warning("could not restore a cached prefix after recompute: %r", exc)
+        try:
+            aside.unlink()
+        except OSError:
+            pass
+        self.cache_manager.mark_cache_size_dirty()
+
     def _ensure_file_in_cache(self, resolved: ResolvedPath) -> bool:
         """
         Ensure a file is in the cache, downloading or recomputing if necessary
@@ -2254,14 +2292,25 @@ class StorageFS(Operations):
     def _try_recompute(self, resolved: ResolvedPath) -> bool:
         if not self.recompute_engine.can_recompute(resolved.requested_path, resolved.cache_path):
             return False
-        # A promoted prefix at the path is not the file; recompute replaces
-        # it, unless a descriptor holds it.
-        if (self._is_unindexed_prefix(resolved.canonical_path, resolved.cache_path)
-                and not self._drop_unindexed_prefix(resolved.canonical_path, resolved.cache_path)):
-            return False
-        return self.recompute_engine.recompute_file(
-            resolved.requested_path, resolved.cache_path, timeout=30.0,
-        ).success
+        # A promoted prefix at the path is not the file, and the command's
+        # success is judged by the path existing: move the prefix aside for
+        # the run and put it back if no file replaced it, so a failed
+        # recompute does not lose the bytes offline opens read. Refused
+        # while a descriptor holds the prefix.
+        aside = None
+        if self._is_unindexed_prefix(resolved.canonical_path, resolved.cache_path):
+            aside = self._set_aside_unindexed_prefix(resolved.canonical_path, resolved.cache_path)
+            if aside is None:
+                return False
+        recomputed = False
+        try:
+            recomputed = self.recompute_engine.recompute_file(
+                resolved.requested_path, resolved.cache_path, timeout=30.0,
+            ).success
+            return recomputed
+        finally:
+            if aside is not None:
+                self._restore_set_aside_prefix(aside, resolved.cache_path, restore=not recomputed)
 
     # Filesystem methods
 
