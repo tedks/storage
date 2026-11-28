@@ -74,6 +74,12 @@ class FDEntry:
     backend_name: Optional[str]
     canonical_path: str
     prefetch_session: Optional[PrefetchSession] = None
+    # A conflict view's copy as this descriptor found it (st_ino, st_size,
+    # st_mtime_ns), and whether a change through the mount (a write through
+    # it, a truncate of its path) was recorded since. None: no baseline, so
+    # its close sends the copy. See StorageFS._view_changed.
+    view_opened: Optional[Tuple[int, int, int]] = None
+    view_changed: bool = False
 
 
 @dataclass(frozen=True)
@@ -2396,12 +2402,24 @@ class StorageFS(Operations):
         try:
             self._require_imported_write_permission(cache_path)
             with open(cache_path, 'r+b') as f:
-                f.truncate(length)
+                resized = os.fstat(f.fileno()).st_size != length
+                # A view's close sends a copy whose stat changed; a no-op
+                # truncate (which can still move the mtime) changes nothing.
+                if resized or not resolved.backend_name:
+                    f.truncate(length)
             self.cache_manager.mark_cache_size_dirty()
 
             # Mark as dirty
             if not resolved.backend_name:
                 self._mark_cache_file_dirty(resolved.canonical_path, cache_path)
+            elif resized:
+                # A view's copy reaches its member when a descriptor open on
+                # it closes (_view_changed); a truncate by path, with none
+                # open, stays in the cached copy, as on master.
+                with self._fd_lock:
+                    for other in self._fd_map.values():
+                        if other.backend_name and other.cache_path == cache_path:
+                            other.view_changed = True
 
         except OSError as e:
             raise FuseOSError(e.errno)
@@ -2490,6 +2508,12 @@ class StorageFS(Operations):
             if not self._is_read_only_open(flags):
                 self._require_imported_write_permission(cache_path)
 
+        view_opened = None
+        if resolved.backend_name:
+            before = regular_file_stat(cache_path)
+            if before is not None:
+                view_opened = (before.st_ino, before.st_size, before.st_mtime_ns)
+
         try:
             # Hold _fd_lock across os.open AND _fd_map registration so that
             # _invalidate_file_cache (which also holds _fd_lock) cannot
@@ -2514,6 +2538,8 @@ class StorageFS(Operations):
                     backend_name=resolved.backend_name,
                     canonical_path=resolved.canonical_path,
                     prefetch_session=prefetch_session,
+                    view_opened=view_opened,
+                    view_changed=bool(flags & os.O_TRUNC) and resolved.backend_name is not None,
                 )
 
             if resolved.backend_name is None:
@@ -2679,6 +2705,7 @@ class StorageFS(Operations):
                     written = os.pwrite(entry.real_fd, data, offset)
                 except OSError as e:
                     raise FuseOSError(e.errno)
+                entry.view_changed = True
                 self.cache_manager.mark_cache_size_dirty()
                 return written
 
@@ -2687,7 +2714,8 @@ class StorageFS(Operations):
 
         Holds the path's lock (the descriptor's current path, read again
         once the lock is held, since a rename re-points it): closing a
-        writable member copy (a conflict-suffixed path) uploads it, and no rename,
+        member copy (a conflict-suffixed path) whose bytes changed while it
+        was open (_view_changed) uploads it, and no rename,
         unlink, refetch or watcher invalidation may run under the upload; a
         canonical close reads the path's row and queues its sync, which a
         rename must not move in between. A streaming descriptor takes no
@@ -2715,13 +2743,14 @@ class StorageFS(Operations):
 
         close_error: Optional[OSError] = None
         inode: Optional[str] = None
-        view_write = entry.backend_name and not self._is_read_only_open(entry.flags)
-        if view_write:
+        view_write = False
+        if entry.backend_name:
             try:
                 st = os.fstat(entry.real_fd)
                 inode = f"{st.st_dev}:{st.st_ino}"
             except OSError:
-                pass
+                st = None
+            view_write = self._view_changed(entry, st)
         try:
             os.close(entry.real_fd)
         except OSError as exc:
@@ -2760,6 +2789,22 @@ class StorageFS(Operations):
 
         except OSError as e:
             raise FuseOSError(e.errno)
+
+    @staticmethod
+    def _view_changed(entry: FDEntry, st: Optional[os.stat_result]) -> bool:
+        """Whether a conflict view's copy changed while entry was open.
+
+        Decided by what happened to the copy, not by the descriptor's open
+        flags: a read-only descriptor's close sends a copy that a truncate
+        of its path changed, and a writable one that changed nothing sends
+        nothing, so it cannot replace a newer member edit with the bytes it
+        was opened on. A recorded change covers a write in the same
+        timestamp tick as the open; the stat comparison covers changes
+        recorded elsewhere. No baseline (or no stat) sends the copy.
+        """
+        if entry.view_changed or entry.view_opened is None or st is None:
+            return True
+        return (st.st_ino, st.st_size, st.st_mtime_ns) != entry.view_opened
 
     def _release_view(self, entry: FDEntry, inode: Optional[str]):
         """Send a closed conflict view to its member, or keep it for a repair."""
@@ -2838,10 +2883,14 @@ class StorageFS(Operations):
         with self._fd_lock:
             entry = self._fd_map.get(fh)
         if (entry is not None and entry.backend_name
-                and not self._is_read_only_open(entry.flags)
                 and entry.backend_name in self.cache_manager.member_repairs.backends_for(
                     [entry.canonical_path])):
-            raise FuseOSError(errno.EBUSY)
+            try:
+                st = os.fstat(entry.real_fd)
+            except OSError:
+                st = None
+            if self._view_changed(entry, st):
+                raise FuseOSError(errno.EBUSY)
         return 0
 
     def fsync(self, path, datasync, fh):

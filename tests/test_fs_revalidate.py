@@ -584,6 +584,61 @@ class TestCreatedAndChangedFiles(RevalidateTestBase):
         self.assertEqual(stat.S_IMODE(cached.stat().st_mode), 0o444)
 
 
+class TestConflictViewClose(RevalidateTestBase):
+    """A conflict view's close sends its copy to the member when the copy
+    changed while the descriptor was open, whatever its open flags."""
+
+    def setUp(self):
+        super().setUp()
+        self.member_file = self.rewrite_member("f.txt", b"member bytes")
+        self.view = self.fs.cache_manager.get_cache_path("/f.txt.member")
+        self.view.write_bytes(b"member bytes")
+        patcher = patch.object(self.member, "copy_from_local", wraps=self.member.copy_from_local)
+        self.copies = patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_path_truncate_under_a_read_only_handle_is_sent_at_close(self):
+        fh = self.fs.open("/f.txt.member", os.O_RDONLY)
+        self.fs.truncate("/f.txt.member", 6)
+        self.assertEqual(self.member_file.read_bytes(), b"member bytes")  # not in the callback
+        self.fs.release("/f.txt.member", fh)
+        self.assertEqual(self.member_file.read_bytes(), b"member")
+        self.assertEqual(self.copies.call_count, 1)
+
+    def test_unchanged_read_only_close_keeps_a_newer_member_edit(self):
+        fh = self.fs.open("/f.txt.member", os.O_RDONLY)
+        self.fs.truncate("/f.txt.member", len(b"member bytes"))  # no-op length
+        self.member_file.write_bytes(b"newer edit")
+        self.fs.release("/f.txt.member", fh)
+        self.assertEqual(self.member_file.read_bytes(), b"newer edit")
+        self.assertEqual(self.copies.call_count, 0)
+
+    def test_unwritten_writable_close_sends_nothing(self):
+        fh = self.fs.open("/f.txt.member", os.O_RDWR)
+        self.member_file.write_bytes(b"newer edit")
+        self.fs.flush("/f.txt.member", fh)
+        self.fs.release("/f.txt.member", fh)
+        self.assertEqual(self.member_file.read_bytes(), b"newer edit")
+        self.assertEqual(self.copies.call_count, 0)
+
+    def test_write_in_the_same_timestamp_tick_is_sent(self):
+        fh = self.fs.open("/f.txt.member", os.O_WRONLY)
+        st = self.view.stat()
+        self.fs.write("/f.txt.member", b"MEMBER", 0, fh)
+        # Same size, and the mtime of the open: only the recorded write shows it.
+        os.utime(self.view, ns=(st.st_atime_ns, st.st_mtime_ns))
+        self.fs.release("/f.txt.member", fh)
+        self.assertEqual(self.member_file.read_bytes(), b"MEMBER bytes")
+        self.assertEqual(self.copies.call_count, 1)
+
+    def test_path_truncate_without_a_handle_stays_in_the_cached_copy(self):
+        # As on master: nothing closes, so nothing is sent (a known gap).
+        self.fs.truncate("/f.txt.member", 0)
+        self.assertEqual(self.view.read_bytes(), b"")
+        self.assertEqual(self.member_file.read_bytes(), b"member bytes")
+        self.assertEqual(self.copies.call_count, 0)
+
+
 class TestRevalidateOnOpen(RevalidateTestBase):
     def setUp(self):
         super().setUp()
