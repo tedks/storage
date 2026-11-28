@@ -1,0 +1,22 @@
+id: gh-207-displaced-inode-accounting
+title: Count a refresh's displaced inode while readers hold it open
+desc: 'Deferred from #208 round 5 (S5), against #191''s boundary. An in-place refresh
+  os.replace()s the cached copy; readers that opened the old inode keep it alive on
+  disk until they close, but the cache size accounting subtracts it at the replace
+  (_current_size_bytes += new - old) and the size scan never sees an unlinked inode.
+  Exact accounting would need the size scan or eviction to count displaced inodes
+  held by descriptors (or a reservation per displaced inode released at the last close),
+  which is the #191 boundary. Documented in README Status item 7.'
+type: bugfix
+component: storage
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-28T12:53:08-00:00
+references: []
+log_events:
+- time: 2026-11-28T12:53:08-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
