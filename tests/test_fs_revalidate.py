@@ -854,13 +854,12 @@ class TestFillConfirmsMemberVersion(RevalidateTestBase):
 
         with patch.object(self.member, "stat", side_effect=stat_once), \
                 patch.object(self.member, "get_size", return_value=99):
-            # Another size than probed, no newer token to retry against: a
-            # read-only opener reads the copy privately; nothing is cached.
-            self.assertEqual(self.read_through("/f.txt"), b"original")
-            seen.clear()  # the writable open probes the same way
-            with self.assertRaises(FuseOSError) as raised:
-                self.fs.open("/f.txt", os.O_WRONLY)
-        self.assertEqual(raised.exception.errno, errno.EAGAIN)
+            # Another size than probed, with no newer token to retry against.
+            for flags in (os.O_RDONLY, os.O_WRONLY):
+                seen.clear()
+                with self.assertRaises(FuseOSError) as raised:
+                    self.fs.open("/f.txt", flags)
+                self.assertEqual(raised.exception.errno, errno.EAGAIN)
         self.assertFalse((self.cache_dir / "f.txt").exists())
         self.assertIsNone(self.fs.state_manager.get_file_metadata("/f.txt"))
 
@@ -1122,8 +1121,7 @@ class TestConflictViewClose(RevalidateTestBase):
 
 class TestStickyVersioning(RevalidateTestBase):
     """Once any stat seen for a fill carries a version token, the fill is
-    published only on AGREED; read-only opens then fall back to a last good
-    copy or a private copy (CTO-208-LIVE-READ), writable ones to EAGAIN."""
+    published only on AGREED. An unstable cold fill fails with EAGAIN."""
 
     def partials(self):
         return sorted(p.name for p in self.cache_dir.rglob("*.storage.partial"))
@@ -1248,31 +1246,21 @@ class TestLiveRead(RevalidateTestBase):
     def partials(self):
         return sorted(p.name for p in self.cache_dir.rglob("*.storage.partial"))
 
-    def test_private_reader_gets_the_captured_copy_and_nothing_is_published(self):
+    def test_unstable_cold_reader_gets_eagain_and_nothing_is_published(self):
         self.rewrite_member("live.log", b"line 1\n")
-        uploads = patch.object(self.member, "copy_from_local",
-                               side_effect=AssertionError("upload of a private copy"))
-        with self.growing_copy(), uploads:
-            fh = self.fs.open("/live.log", os.O_RDONLY)
-            try:
-                # The copy's name is gone at once; only the descriptor holds it.
-                self.assertEqual(self.partials(), [])
-                captured = self.fs.read("/live.log", 1 << 20, 0, fh)
-                # Two transfers (one retry against the newer stat), served
-                # from the last one, to its captured EOF.
-                self.assertEqual(captured, b"line 1\n+more")
-                self.assertEqual(self.fs.getattr("/live.log", fh)["st_size"], len(captured))
-                self.assertGreater(self.fs.cache_manager._reserved_bytes, 0)
-            finally:
-                self.fs.release("/live.log", fh)
+        with self.growing_copy() as copies, patch.object(self.member, "copy_from_local") as uploads:
+            with self.assertRaises(FuseOSError) as raised:
+                self.fs.open("/live.log", os.O_RDONLY)
+        self.assertEqual(raised.exception.errno, errno.EAGAIN)
+        self.assertEqual(copies.call_count, 2)
+        uploads.assert_not_called()
         self.assertEqual(self.fs.cache_manager._reserved_bytes, 0)
         self.assertFalse((self.cache_dir / "live.log").exists())
         self.assertIsNone(self.fs.state_manager.get_file_metadata("/live.log"))
         self.assertEqual(self.partials(), [])
 
     def test_retry_that_does_not_fit_reports_enospc_and_leaves_nothing(self):
-        # The private copy carries the fill's own reservation; a retry whose
-        # newer version does not fit fails the fill with ENOSPC instead.
+        # The retry must reserve room for the larger version before copying.
         self.rewrite_member("live.log", b"line 1\n")
         with self.growing_copy(), patch.object(self.fs.cache_manager, "_reserve_more",
                                                return_value=False):
@@ -1303,33 +1291,28 @@ class TestLiveRead(RevalidateTestBase):
         self.bounds = []
         return [patch.object(base, "COPY_CHUNK", 8), patch.object(local, "copy_bounded_stream", stream)]
 
-    def test_source_appending_during_the_copy_is_served_bounded(self):
+    def test_source_appending_during_the_copy_is_bounded_and_refused(self):
         import contextlib
         self.rewrite_member("live.log", b"0123456789" * 4)
-        uploads = patch.object(self.member, "copy_from_local",
-                               side_effect=AssertionError("upload of a private copy"))
         with contextlib.ExitStack() as stack:
-            for patcher in self.appending_during_copy() + [uploads]:
+            uploads = stack.enter_context(patch.object(self.member, "copy_from_local"))
+            for patcher in self.appending_during_copy():
                 stack.enter_context(patcher)
-            # Writable: no baseline to edit, EAGAIN.
-            with self.assertRaises(FuseOSError) as raised:
-                self.fs.open("/live.log", os.O_RDWR)
-            self.assertEqual(raised.exception.errno, errno.EAGAIN)
-            # Cold read-only: exactly the bounded copy, its EOF the cap.
-            fh = self.fs.open("/live.log", os.O_RDONLY)
-            try:
-                bound = self.bounds[-1]
-                data = self.fs.read("/live.log", 1 << 20, 0, fh)
-                self.assertEqual(len(data), bound.cap)
-                self.assertEqual(self.fs.getattr("/live.log", fh)["st_size"], bound.cap)
-                self.assertTrue(bound.grew)
-                self.assertLessEqual(bound.read, bound.cap + 1)
-                self.assertEqual(data, (self.member_dir / "live.log").read_bytes()[:bound.cap])
-            finally:
-                self.fs.release("/live.log", fh)
+            for flags in (os.O_RDWR, os.O_RDONLY):
+                self.bounds.clear()
+                with self.assertRaises(FuseOSError) as raised:
+                    self.fs.open("/live.log", flags)
+                self.assertEqual(raised.exception.errno, errno.EAGAIN)
+                self.assertEqual(len(self.bounds), 2)
+                for bound in self.bounds:
+                    self.assertTrue(bound.grew)
+                    self.assertEqual(bound.written, bound.cap)
+                    self.assertEqual(bound.read, bound.cap + 1)
+        uploads.assert_not_called()
         self.assertFalse((self.cache_dir / "live.log").exists())
         self.assertIsNone(self.fs.state_manager.get_file_metadata("/live.log"))
         self.assertEqual(self.partials(), [])
+        self.assertEqual(self.fs.cache_manager._reserved_bytes, 0)
 
     def test_growth_the_stats_do_not_show_still_blocks_publication(self):
         # The member's stat keeps reporting the probed version (a lagging
@@ -1359,7 +1342,7 @@ class TestLiveRead(RevalidateTestBase):
             self.assertEqual(self.read_through("/live.log"), b"version 1")
         self.assertTrue(all(b.written <= b.cap for b in self.bounds))
 
-    def test_private_copy_of_a_member_without_owner_read_is_refused(self):
+    def test_unstable_fill_of_a_member_without_owner_read_is_refused(self):
         real = self.member.stat
         for mode in (0o200, 0o040):
             with self.subTest(mode=oct(mode)):
@@ -1377,88 +1360,9 @@ class TestLiveRead(RevalidateTestBase):
                 self.assertEqual(self.partials(), [])
                 self.assertEqual(self.fs.cache_manager._reserved_bytes, 0)
 
-    def test_private_copy_carries_the_fills_reservation(self):
-        self.rewrite_member("live.log", b"line 1\n")
-        reserve_more = self.fs.cache_manager._reserve_more
-        calls = []
-
-        def counted(nbytes):
-            calls.append(nbytes)
-            return reserve_more(nbytes)
-
-        with self.growing_copy(), patch.object(self.fs.cache_manager, "_reserve_more",
-                                               side_effect=counted):
-            fh = self.fs.open("/live.log", os.O_RDONLY)
-        try:
-            size = self.fs.getattr("/live.log", fh)["st_size"]
-            self.assertEqual(self.fs.cache_manager._reserved_bytes, size)
-            self.assertEqual(len(calls), 1)  # the retry's; none taken again for the copy
-        finally:
-            self.fs.release("/live.log", fh)
-        self.assertEqual(self.fs.cache_manager._reserved_bytes, 0)
-
-    def test_a_failed_private_rename_keeps_its_errno(self):
-        self.rewrite_member("live.log", b"line 1\n")
-        import storage.cache as cache_module
-        real_rename = os.rename
-
-        def rename(src, dst, *a, **kw):
-            if ".private" in str(dst):
-                raise OSError(errno.EXDEV, "cross-device")
-            return real_rename(src, dst, *a, **kw)
-
-        with self.growing_copy(), patch.object(cache_module.os, "rename", side_effect=rename):
-            with self.assertRaises(FuseOSError) as raised:
-                self.fs.open("/live.log", os.O_RDONLY)
-        self.assertEqual(raised.exception.errno, errno.EXDEV)
-        self.assertEqual(self.partials(), [])
-        self.assertEqual(self.fs.cache_manager._reserved_bytes, 0)
-
-    def test_private_copy_whose_name_cannot_be_removed_stays_charged(self):
-        # The descriptor still opens, reads and closes; the name that could
-        # not be removed stays charged until production code removes it.
-        self.rewrite_member("live.log", b"line 1\n")
-        real_unlink = Path.unlink
-        blocked = {"on": True}
-
-        def unlink(path, *a, **kw):
-            if ".private" in path.name and blocked["on"]:
-                raise OSError(errno.EBUSY, "busy")
-            return real_unlink(path, *a, **kw)
-
-        with self.growing_copy(), patch.object(Path, "unlink", unlink), \
-                self.assertLogs("storage.fs", level="WARNING"):
-            fh = self.fs.open("/live.log", os.O_RDONLY)
-            size = self.fs.getattr("/live.log", fh)["st_size"]
-            self.assertEqual(self.fs.read("/live.log", 1 << 20, 0, fh)[:6], b"line 1")
-            self.fs.release("/live.log", fh)
-            # Not removed: still charged, and still named.
-            self.assertEqual(self.fs.cache_manager._reserved_bytes, size)
-            self.assertEqual(len(list(self.cache_dir.rglob("*.private*"))), 1)
-        with self.fs._fd_lock:
-            self.assertEqual(self.fs._fd_map, {})
-
-    def test_failed_lstat_after_the_private_rename_leaves_nothing(self):
-        self.rewrite_member("live.log", b"line 1\n")
-        import storage.cache as cache_module
-        real_lstat = os.lstat
-
-        def lstat(path, *a, **kw):
-            if ".private" in str(path):
-                raise OSError(errno.EIO, "lstat failed")
-            return real_lstat(path, *a, **kw)
-
-        with self.growing_copy(), patch.object(cache_module.os, "lstat", side_effect=lstat):
-            with self.assertRaises(FuseOSError) as raised:
-                self.fs.open("/live.log", os.O_RDONLY)
-        self.assertEqual(raised.exception.errno, errno.EIO)
-        self.assertEqual(self.partials(), [])
-        self.assertEqual(list(self.cache_dir.rglob("*.private*")), [])
-        self.assertEqual(self.fs.cache_manager._reserved_bytes, 0)
-
     def test_any_read_denial_of_the_fill_wins(self):
         # R5: a size-only probe, a confirmation with 0o200, then a size-only
-        # second confirmation: the private copy is refused.
+        # second confirmation: the read denial still applies.
         self.rewrite_member("live.log", b"line 1\n")
         real, seen = self.member.stat, []
 
@@ -2487,7 +2391,7 @@ class TestRevalidateFromListing(RevalidateTestBase):
 class TestRefreshRound5(RevalidateTestBase):
     """#208 round 5: the stale mark's coverage, a refreshed inode's own
     record, read denials, the copied descriptor's evidence, the refresh's
-    pin, private times, errnos and failures by exception."""
+    pin, errnos and failures by exception."""
 
     growing_copy = TestLiveRead.growing_copy
     partials = TestLiveRead.partials
@@ -2560,12 +2464,48 @@ class TestRefreshRound5(RevalidateTestBase):
             return real(path, name, *a, **kw)
 
         with patch.object(fs_module.os, "setxattr", side_effect=refuse), self.growing_copy():
-            # Not kept named and unmarked: the copy is dropped, so the reader
-            # gets the fill's own (private) bytes, never v1 as last good ...
-            self.assertNotEqual(self.read_through("/live.log"), b"version 1")
-            # ... and a writer is never admitted on v1.
+            # The unmarked copy is dropped. The unstable refetch has no
+            # last-good copy to fall back to.
+            self.assert_errno(errno.EAGAIN, self.fs.open, "/live.log", os.O_RDONLY)
             self.assert_errno(errno.EAGAIN, self.fs.open, "/live.log", os.O_RDWR)
         self.assertFalse((self.cache_dir / "live.log").exists())
+
+    def test_an_unreadable_stale_mark_refuses_writes(self):
+        from storage.cache_metadata import STALE_LAST_GOOD_XATTR
+        self.stale_copy()
+        getxattr = os.getxattr
+
+        def read(path, name, *args, **kwargs):
+            if name == STALE_LAST_GOOD_XATTR:
+                raise OSError(errno.EIO, "xattr could not be read")
+            return getxattr(path, name, *args, **kwargs)
+
+        with patch.object(os, "getxattr", side_effect=read):
+            self.assert_errno(errno.EAGAIN, self.fs.open, "/live.log", os.O_RDWR)
+            self.assertEqual(self.read_through("/live.log"), b"version 1")
+
+    def test_older_same_size_evidence_does_not_clear_a_mark_without_a_baseline(self):
+        cached = self.stale_copy()
+        with self.fs._member_checks_lock:
+            check = self.fs._member_checks["/live.log"]
+            self.fs._member_checks["/live.log"] = dataclasses.replace(check, members={})
+        self.rewrite_member("live.log", b"older!!!!", mtime=900_000_000)
+        for _ in range(2):
+            self.age_checks()
+            self.assert_errno(errno.EAGAIN, self.fs.open, "/live.log", os.O_RDWR)
+            self.assertTrue(self.stale_mark())
+        self.assertEqual(cached.read_bytes(), b"version 1")
+
+    def test_size_only_can_confirm_a_never_versioned_copy(self):
+        from storage.cache_metadata import STALE_LAST_GOOD_XATTR
+        self.rewrite_member("live.log", b"version 1")
+        size_and_mode = SimpleNamespace(st_size=9, st_mode=stat.S_IFREG | 0o644)
+        with patch.object(self.member, "stat", return_value=size_and_mode):
+            self.assertEqual(self.read_through("/live.log"), b"version 1")
+            os.setxattr(self.cache_dir / "live.log", STALE_LAST_GOOD_XATTR, b"1")
+            self.age_checks()
+            self.fs.release("/live.log", self.fs.open("/live.log", os.O_RDWR))
+        self.assertFalse(self.stale_mark())
 
     def test_touch_of_a_marked_copy_is_refused_and_records_nothing(self):
         cached = self.stale_copy()
@@ -2606,12 +2546,10 @@ class TestRefreshRound5(RevalidateTestBase):
         # Gone between the check and the fill: the copy is the one left.
         self.stale_copy()
         self.age_checks()
-        real_copy = self.member.copy_to_local
-        with patch.object(self.member, "exists", return_value=False):
+        with patch.object(self.member, "exists_or_raise", return_value=False):
             fh = self.fs.open("/live.log", os.O_RDWR)
             self.fs.release("/live.log", fh)
         self.assertFalse(self.stale_mark())
-        del real_copy
 
     def refreshed_with_checksums(self):
         from storage.models import FileLocation
@@ -2660,9 +2598,28 @@ class TestRefreshRound5(RevalidateTestBase):
             row = self.fs.state_manager.get_file_metadata("/live.log")
             self.assertEqual((row.size, row.sync_status, row.checksum),
                              (10, SyncStatus.CLEAN, None))
+            self.assertTrue(all(not loc.checksum for loc in
+                                self.fs.state_manager.get_file_locations("/live.log")))
             self.assertEqual(self.read_through("/live.log"), b"version 2!")
             self.assertEqual(self.fs.state_manager.get_file_metadata("/live.log").sync_status,
                              SyncStatus.CLEAN)
+
+    def test_a_crash_after_equal_stat_replacement_forgets_the_old_checksums(self):
+        old_inode = self.refreshed_with_checksums()
+        self.rewrite_member("live.log", b"version 2", mtime=1_000_000_000)
+        self.fs._recheck["/live.log"] = {"member"}
+        with patch.object(self.fs, "_record_fetched", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.fs.open("/live.log", os.O_RDONLY)
+        self.assertNotEqual(self.cache_inode("live.log"), old_inode)
+        self.restart()
+        self.assertEqual(self.fs.sweep_stale_cache_metadata(), 0)
+        row = self.fs.state_manager.get_file_metadata("/live.log")
+        self.assertEqual((row.size, row.last_modified, row.sync_status, row.checksum),
+                         (9, 1_000_000_000, SyncStatus.CLEAN, None))
+        self.assertTrue(all(not loc.checksum for loc in
+                            self.fs.state_manager.get_file_locations("/live.log")))
+        self.assertEqual(self.read_through("/live.log"), b"version 2")
 
     def test_an_invalidation_after_a_lost_row_update_does_not_mark_dirty(self):
         # The same crash, then a change found before any sweep: the copy is
@@ -2714,6 +2671,40 @@ class TestRefreshRound5(RevalidateTestBase):
         self.assertEqual(len(calls), 3)
         # Whatever is installed is never readable through the mount.
         self.assert_errno(errno.EACCES, self.fs.open, "/f.txt", os.O_RDONLY)
+
+    def test_a_read_denial_does_not_import_the_earlier_write_grant(self):
+        self.rewrite_member("f.txt", b"secret", mtime=1_000_000_000)
+        probe = SimpleNamespace(st_size=6, st_mtime=1_000_000_000)
+        denies_read = SimpleNamespace(st_size=6, st_mode=stat.S_IFREG | 0o200)
+        denies_write = SimpleNamespace(st_size=6, st_mtime=1_000_000_000,
+                                      st_mode=stat.S_IFREG | 0o400)
+        with patch.object(self.member, "stat", side_effect=[probe, denies_read, denies_write]):
+            self.assert_errno(errno.EACCES, self.fs.open, "/f.txt", os.O_WRONLY)
+        self.assert_errno(errno.EACCES, self.fs.open, "/f.txt", os.O_RDONLY)
+
+    def test_aged_check_enforces_a_read_denial_at_the_same_stat(self):
+        source = self.rewrite_member("f.txt", b"secret", mtime=1_000_000_000)
+        self.assertEqual(self.read_through("/f.txt"), b"secret")
+        source.chmod(0o200)
+        self.age_checks()
+        self.assert_errno(errno.EACCES, self.fs.open, "/f.txt", os.O_RDONLY)
+        self.assertFalse((self.cache_dir / "f.txt").exists())
+
+    def test_descriptor_change_with_size_only_path_stats_cannot_publish(self):
+        from storage.backends import local
+        source = self.rewrite_member("f.txt", b"original", mtime=1_000_000_000)
+        real_stream = local.copy_bounded_stream
+
+        def rewrite_after_copy(read, write, bound):
+            real_stream(read, write, bound)
+            self.rewrite_member("f.txt", b"newbytes", mtime=1_100_000_000)
+
+        with patch.object(self.member, "stat", return_value=SimpleNamespace(st_size=8)), \
+                patch.object(local, "copy_bounded_stream", side_effect=rewrite_after_copy):
+            self.assert_errno(errno.EAGAIN, self.fs.open, "/f.txt", os.O_RDONLY)
+        self.assertEqual(source.read_bytes(), b"newbytes")
+        self.assertFalse((self.cache_dir / "f.txt").exists())
+        self.assertIsNone(self.fs.state_manager.get_file_metadata("/f.txt"))
 
     def test_the_copied_descriptor_contradicting_the_path_publishes_nothing(self):
         # A is renamed away and a same-size B with another mtime opened; A
@@ -2774,53 +2765,21 @@ class TestRefreshRound5(RevalidateTestBase):
         self.assertTrue(self.stale_mark())
         self.assertEqual(self.fs._refreshing, set())
 
-    def test_a_private_handle_reports_the_member_mtime_not_the_staging_time(self):
-        self.member = NoMtimeBackend("member", str(self.member_dir))
-        self.fs.sync_manager.stop()
-        self.fs.state_manager.close()
-        self.fs = self._make_fs()
-        self.rewrite_member("live.log", b"line 1\n", mtime=1_000_000_000)
-        src = self.member_dir / "live.log"
-        copy = self.member.copy_to_local
+    def test_fallback_stays_pinned_until_its_descriptor_is_registered(self):
+        self.changed_v1()
+        cached = self.cache_dir / "live.log"
+        require = self.fs._require_imported_permission
+        attempts = []
 
-        def grows(path, temp):
-            copy(path, temp)  # staging mtime: now
-            with open(src, "ab") as f:
-                f.write(b"+")
-            os.utime(src, (1_200_000_000, 1_200_000_000))
+        def try_evict(path, mode):
+            attempts.append(self.fs.cache_manager._evict_if_still_clean("/live.log", cached))
+            return require(path, mode)
 
-        with patch.object(self.member, "copy_to_local", side_effect=grows):
-            fh = self.fs.open("/live.log", os.O_RDONLY)
-        try:
-            self.assertTrue(self.fs.is_private_handle(fh))
-            attrs = self.fs.getattr("/live.log", fh)
-            # The member's own (its ctime is genuinely now, a local member's).
-            self.assertEqual(attrs["st_mtime"], 1_200_000_000)
-            self.assertEqual(attrs["st_ctime"], os.stat(src).st_ctime)
-        finally:
-            self.fs.release("/live.log", fh)
-
-    def test_a_private_handle_with_no_member_time_reports_none_newer(self):
-        self.rewrite_member("live.log", b"line 1\n")
-        src = self.member_dir / "live.log"
-        copy = self.member.copy_to_local
-
-        def grows(path, temp):
-            copy(path, temp)
-            with open(src, "ab") as f:
-                f.write(b"+")
-
-        size_only = lambda path: SimpleNamespace(st_size=os.stat(src).st_size + 1)  # noqa: E731
-        with patch.object(self.member, "copy_to_local", side_effect=grows), \
-                patch.object(self.member, "stat", side_effect=size_only):
-            fh = self.fs.open("/live.log", os.O_RDONLY)
-        try:
-            self.assertTrue(self.fs.is_private_handle(fh))
-            attrs = self.fs.getattr("/live.log", fh)
-            self.assertEqual((attrs["st_mtime"], attrs["st_atime"], attrs["st_ctime"]),
-                             (0.0, 0.0, 0.0))
-        finally:
-            self.fs.release("/live.log", fh)
+        with self.growing_copy(), patch.object(
+                self.fs, "_require_imported_permission", side_effect=try_evict):
+            self.assertEqual(self.read_through("/live.log"), b"version 1")
+        self.assertEqual(attempts, [0])
+        self.assertEqual(self.fs._refreshing, set())
 
     def test_a_conflict_view_whose_member_has_no_file_is_enoent(self):
         self.assert_errno(errno.ENOENT, self.fs.open, "/absent.txt.member", os.O_RDONLY)
@@ -2851,6 +2810,21 @@ class TestRefreshRound5(RevalidateTestBase):
             self.assertEqual(self.read_through("/f.txt"), b"member bytes")
         self.assertEqual(stats.call_count, 0)
 
+    def test_failed_reservation_cannot_claim_a_concurrent_install(self):
+        self.rewrite_member("f.txt", b"member bytes")
+        cached = self.cache_dir / "f.txt"
+
+        def concurrent_install(_size):
+            cached.write_bytes(b"stream bytes")
+            return False
+
+        with patch.object(self.fs.cache_manager, "ensure_space", side_effect=concurrent_install), \
+                patch.object(self.fs.cache_manager, "reclaim_space", None), \
+                patch.object(self.fs, "_record_fetched") as record_fetched:
+            self.assert_errno(errno.ENOSPC, self.fs.open, "/f.txt", os.O_RDWR)
+        record_fetched.assert_not_called()
+        self.assertIsNone(self.fs.state_manager.get_file_metadata("/f.txt"))
+
     def refresh_raising(self, method, exc, writer_errno):
         self.changed_v1()
         with patch.object(self.member, method, side_effect=exc):
@@ -2873,7 +2847,7 @@ class TestRefreshRound5(RevalidateTestBase):
 
     def test_a_refresh_whose_member_is_unreachable_keeps_last_good(self):
         from storage.backends.ssh_pool import MemberUnavailable
-        self.refresh_raising("exists", MemberUnavailable("down"), errno.EHOSTUNREACH)
+        self.refresh_raising("exists_or_raise", MemberUnavailable("down"), errno.EHOSTUNREACH)
 
     def test_a_no_baseline_check_reads_st_mtime_ns_alone(self):
         self.rewrite_member("f.txt", b"original", mtime=1_000_000_000)

@@ -67,8 +67,8 @@ from .streaming import (
 )
 
 
-def _refresh_errno(exc: BaseException) -> int:
-    """The errno a writer gets for a refresh that raised (its readers keep last-good)."""
+def _full_fill_errno(exc: BaseException) -> int:
+    """The errno an open gets when its full fill raises."""
     if isinstance(exc, BulkCapacityTimeout):
         return errno.EAGAIN
     if isinstance(exc, (FuseOSError, OSError)) and exc.errno:
@@ -100,16 +100,7 @@ class FDEntry:
     # Another descriptor's close kept this one's change off its member for
     # an open repair: this descriptor's flush reports EBUSY.
     view_refused: bool = False
-    # A private copy (FillAction.PRIVATE): its captured length, reserved
-    # in the cache budget until the descriptor closes; cache_path is the
-    # copy, never indexed or uploaded, unlinked once the descriptor holds
-    # it. private_attrs: the member's mode, uid and gid as last reported.
-    private_size: Optional[int] = None
-    private_reservation: Optional[object] = None
-    private_attrs: Optional[dict] = None
-    # A private copy's name that could not be removed yet: it stays charged
-    # until it is (retried at close).
-    private_name: Optional[Path] = None
+
 
 
 @dataclass(frozen=True)
@@ -501,6 +492,7 @@ class StorageFS(Operations):
             negative_window=listing_fresh_window(readdir_ttl, revalidate_after),
         )
         self.cache_manager.forget_listed_attrs = self._forget_cached_copy_attrs
+        self.cache_manager.forget_checksums = lambda path: self._forget_checksums({path})
         self.cache_manager.path_guard = self._try_path_locked
 
         self._streaming_manager = StreamingReadManager(
@@ -1904,6 +1896,12 @@ class StorageFS(Operations):
         with self._member_checks_lock:
             # The last refetch for a change here came from another member.
             must_refetch = backend.name in self._recheck.get(canonical_path, ())
+        mode = getattr(member_stat, "st_mode", None)
+        if os.geteuid() != 0 and type(mode) is int and not mode & stat.S_IRUSR:
+            # The member now withholds read, whatever the version: refetched,
+            # so the fill sees the denial (EACCES) and the copy goes.
+            must_refetch = True
+        baseline = members.get(backend.name)
         if mtime is None and not must_refetch:
             # No mtime: only a known size that differs from the cached copy's
             # is evidence of a change (refetched below); otherwise a member
@@ -1911,10 +1909,13 @@ class StorageFS(Operations):
             # kept and the check counted, and the next opens within the age
             # are free.
             if size is None or size == cache_stat.st_size:
+                if size is not None and baseline is None and not members:
+                    # A size is sufficient for a member that has never
+                    # supplied a version. It cannot confirm a known token.
+                    self._clear_stale_last_good(cache_path)
                 self._store_member_check(canonical_path, cache_path, identity, {})
                 return
             must_refetch = True
-        baseline = members.get(backend.name)
         if must_refetch:
             changed = True
         elif baseline is not None:
@@ -1922,11 +1923,19 @@ class StorageFS(Operations):
         else:
             changed = (size != cache_stat.st_size or mtime > cache_stat.st_mtime)
         if not changed:
-            # The member is at the copy's own version: a stale mark (a refresh
-            # that failed before) no longer applies.
-            self._clear_stale_last_good(cache_path)
-            self._store_member_check(canonical_path, cache_path, identity,
-                                     {backend.name: observed})
+            # Not newer. Only matching version evidence (the recorded
+            # baseline, or else the copy's own size and mtime) shows the
+            # member back at the copy's version, where a stale mark (a
+            # refresh that failed before) no longer applies; an older mtime
+            # keeps it.
+            matches = (observed == baseline if baseline is not None
+                       else size == cache_stat.st_size and mtime_ns == cache_stat.st_mtime_ns)
+            if matches:
+                self._clear_stale_last_good(cache_path)
+            # Do not turn an older observation into matching evidence on
+            # the next check while the copy is known stale.
+            updates = {backend.name: observed} if matches or not self._is_stale_last_good(cache_path) else {}
+            self._store_member_check(canonical_path, cache_path, identity, updates)
             return
 
         self.logger.info("revalidate: %s changed on %s; refetching", canonical_path, backend.label)
@@ -1935,8 +1944,15 @@ class StorageFS(Operations):
             # (_clear_recheck): the invalidation below may be refused.
             self._refetch_pins[canonical_path] = backend
             self._pinned_stats[canonical_path] = (backend, member_stat)
-        if (keep_named and self._may_refresh_in_place(resolved, cache_stat)
-                and self._mark_last_good_stale(cache_path)):
+        if keep_named and self._may_refresh_in_place(resolved, cache_stat):
+            # Hold the eviction pin from the stale mark through registration
+            # of the replacement or fallback descriptor, even if filling fails.
+            with self._fd_lock:
+                self._refreshing.add(canonical_path)
+            marked = self._mark_last_good_stale(cache_path)
+        else:
+            marked = False
+        if marked:
             # The copy stays named (the last good one) while the open stages
             # the refetch beside it; only a verified copy (a new inode, never
             # marked) replaces it (_ensure_file_in_cache, replace_identity).
@@ -1997,11 +2013,16 @@ class StorageFS(Operations):
 
     @staticmethod
     def _is_stale_last_good(cache_path: Path) -> bool:
+        """Whether the copy is marked. Only a regular file carries the mark;
+        on one, any error but "no such attribute" counts as marked, so an
+        unreadable mark refuses writers rather than admitting them."""
+        if regular_file_stat(cache_path) is None:
+            return False
         try:
             os.getxattr(str(cache_path), STALE_LAST_GOOD_XATTR, follow_symlinks=False)
             return True
-        except OSError:
-            return False
+        except OSError as exc:
+            return exc.errno not in (errno.ENODATA, getattr(errno, "ENOATTR", errno.ENODATA))
 
     def _clear_stale_last_good(self, cache_path: Path) -> None:
         try:
@@ -2130,7 +2151,7 @@ class StorageFS(Operations):
             self.cache_manager.mark_cache_size_dirty()
         return removed
 
-    def _ensure_file_in_cache(self, resolved: ResolvedPath, private: Optional[list] = None,
+    def _ensure_file_in_cache(self, resolved: ResolvedPath,
                               replace_identity: Optional[tuple] = None) -> bool:
         """
         Ensure a file is in the cache, downloading or recomputing if necessary
@@ -2156,7 +2177,7 @@ class StorageFS(Operations):
 
             # The probe stays outside the try: its errors propagate, as
             # they always have; only a failed transfer falls back below.
-            if backend and backend.exists(canonical_path):
+            if backend and backend.exists_or_raise(canonical_path):
                 try:
                     if self.cache_manager.cache_file(
                         resolved.requested_path, backend, source_virtual_path=canonical_path,
@@ -2164,12 +2185,8 @@ class StorageFS(Operations):
                         return True
                 except (BulkCapacityCancelled, BulkCapacityTimeout):
                     raise
-                except Exception:
-                    pass
-                # A failed transfer noted its own errno; the one failure
-                # cache_file reports without one, with the member holding
-                # the file, is a reservation that did not fit.
-                self.cache_manager.note_fill_errno(errno.ENOSPC)
+                except Exception as exc:
+                    self.cache_manager.note_fill_errno(_full_fill_errno(exc))
             elif backend:
                 self.cache_manager.note_fill_errno(errno.ENOENT)
 
@@ -2198,10 +2215,11 @@ class StorageFS(Operations):
                     member_stat = None
             # Download to cache
             confirmed: list = []
-            before = regular_file_stat(cache_path)
+            with self._member_checks_lock:
+                pinned = self._refetch_pins.get(canonical_path)
             outcome = self.cache_manager.cache_file_result(
                 resolved.requested_path, backend, canonical_path, member_stat=member_stat,
-                confirmed=confirmed, private=private, replace_identity=replace_identity,
+                confirmed=confirmed, replace_identity=replace_identity,
             )
             if outcome == CacheFetch.ALREADY_CACHED and self._drop_unindexed_prefix(canonical_path, cache_path):
                 # A failed stream's prefix was installed before this copy
@@ -2215,26 +2233,15 @@ class StorageFS(Operations):
                 # and state rows belong to them, even for an unindexed prefix.
                 return True
             if outcome == CacheFetch.FAILED:
-                # cache_file_result reports two failures without an errno
-                # (its mapping stays as it is, #191): a member that does not
-                # have the file (ENOENT, confirmed here) and a reservation
-                # that did not fit (ENOSPC).
-                # (One more exists() round trip, on this failure path only.)
-                # A third: the copy was installed and only the access-time
-                # update after it raised. Every failure inside the fill notes
-                # an errno, and a create or another fill of this path waits
-                # for the path lock this open holds, so a new file at the
-                # name with no errno noted is this fill's.
-                after = regular_file_stat(cache_path)
-                if not self.cache_manager.fill_errno_noted() and after is not None and (
-                        before is None or cache_identity(after) != cache_identity(before)):
-                    outcome = CacheFetch.INSTALLED
-                elif not self.cache_manager.fill_errno_noted():
-                    try:
-                        present = backend.exists(canonical_path)
-                    except Exception:  # noqa: BLE001 - cannot confirm absence
-                        present = True
-                    self.cache_manager.note_fill_errno(errno.ENOSPC if present else errno.ENOENT)
+                if pinned is not None and backend is not pinned:
+                    self.cache_manager.clear_fill_absence()
+                # Only the inode this fill named can turn an access-time
+                # failure into an install. A stream can finalize concurrently.
+                installed = self.cache_manager.fill_installed_identity()
+                if installed is not None and not self.cache_manager.fill_errno_noted():
+                    after = regular_file_stat(cache_path)
+                    if after is not None and cache_identity(after) == installed:
+                        outcome = CacheFetch.INSTALLED
             if outcome == CacheFetch.INSTALLED:
                 # Fresh from the member: no check needed until revalidate_after.
                 # The baseline is the stat the copy was confirmed against (the
@@ -2304,8 +2311,10 @@ class StorageFS(Operations):
                             canonical_path, metadata, cache_path=cache_path,
                         )
                     if replace_identity is not None:
-                        # The checksum records described the old version, as
-                        # for the invalidation a refresh replaces.
+                        # The checksum records and every location's checksum
+                        # described the old version, as for the invalidation
+                        # a refresh replaces.
+                        self.state_manager.clear_location_checksums(canonical_path)
                         self._forget_checksums({canonical_path})
 
                 # Record locations
@@ -2362,54 +2371,7 @@ class StorageFS(Operations):
 
     def getattr(self, path, fh=None):
         """Get file attributes"""
-        if fh is not None:
-            with self._fd_lock:
-                entry = self._fd_map.get(fh)
-            if entry is not None and entry.private_size is not None:
-                return self._private_attrs(entry)
         return self.namespace.getattr(path)
-
-    @staticmethod
-    def _private_attrs(entry: FDEntry) -> dict:
-        """A private handle's attributes: its length from its captured
-        descriptor (never the live path), and the member's mode, ids and
-        times as last reported, without write (read-only copy).
-
-        The times are the newest member stat's (st_mtime_ns where it has
-        one), never the staging file's, which only say when this host copied
-        the bytes. With no member time at all they are 0, so no tool takes
-        the copy for newer than anything (CTO-208-PRIVATE-STAT). A source
-        that grew during the copy may hold bytes newer than the reported
-        mtime: the copy is unverified, which is why it is private.
-        """
-        st = os.fstat(entry.real_fd)
-        known = entry.private_attrs or {}
-        mode = known.get("st_mode")
-        mode = stat.S_IMODE(st.st_mode if type(mode) is not int else mode)
-
-        def seconds(key):
-            ns = known.get(key + "_ns")
-            if type(ns) is int:
-                return ns / 1e9
-            value = known.get(key)
-            return value if isinstance(value, (int, float)) and math.isfinite(value) else None
-
-        mtime = seconds("st_mtime")
-        mtime = 0.0 if mtime is None else mtime
-        atime, ctime = seconds("st_atime"), seconds("st_ctime")
-        attrs = {"st_size": st.st_size, "st_mtime": mtime,
-                 "st_atime": mtime if atime is None else atime,
-                 "st_ctime": mtime if ctime is None else ctime}
-        attrs.update(st_mode=stat.S_IFREG | (mode & 0o7555 & ~(stat.S_ISUID | stat.S_ISGID)),
-                     st_nlink=1,
-                     st_uid=known.get("st_uid") if type(known.get("st_uid")) is int else st.st_uid,
-                     st_gid=known.get("st_gid") if type(known.get("st_gid")) is int else st.st_gid)
-        return attrs
-
-    def is_private_handle(self, fh) -> bool:
-        with self._fd_lock:
-            entry = self._fd_map.get(fh)
-        return entry is not None and entry.private_size is not None
 
     def readdir(self, path, fh):
         """Read directory contents"""
@@ -2715,6 +2677,12 @@ class StorageFS(Operations):
                 # A refresh this open did not perform stays undone: the copy
                 # was never dropped, and the next check finds the change.
                 self.__dict__.get("_refresh_pending", {}).pop(canonical_path, None)
+                # The refresh pin (_refreshing) lasts until here: past the
+                # fallback descriptor's registration, which protects the
+                # copy itself from then on.
+                if "_refreshing" in self.__dict__:
+                    with self._fd_lock:
+                        self._refreshing.discard(canonical_path)
                 # The pin belongs to this open (_select_backend_for_read):
                 # one no fetch used (the open attached to a running stream,
                 # or the file was kept) must not steer a later fetch.
@@ -2808,89 +2776,65 @@ class StorageFS(Operations):
                 )
 
         # Fallback path: preserve existing full-file cache semantics.
-        private_size = private_attrs = private_reservation = None
         if prefetch_session is None:
             self.cache_manager.take_fill_errno()
             read_only = self._is_read_only_open(flags)
-            private: Optional[list] = [] if read_only and not resolved.backend_name else None
             refresh = self._refresh_pending.pop(resolved.canonical_path, None)
-            if refresh is not None:
-                with self._fd_lock:
-                    self._refreshing.add(resolved.canonical_path)
             try:
-                try:
-                    installed = self._ensure_file_in_cache(
-                        resolved, private=private, replace_identity=refresh)
-                except BulkCapacityCancelled:
-                    raise
-                except Exception as exc:
-                    if refresh is None or not self.cache_manager.is_cached(resolved.requested_path):
-                        raise
-                    # A refresh that raised (no capacity in time, a member
-                    # gone, a transfer error) fails as one that returned:
-                    # the last good copy stays, marked, for readers.
-                    installed = False
-                    self.cache_manager.take_fill_errno()
-                    self.cache_manager.note_fill_errno(_refresh_errno(exc))
-                if installed:
+                installed = self._ensure_file_in_cache(resolved, replace_identity=refresh)
+            except BulkCapacityCancelled:
+                raise
+            except Exception as exc:
+                if refresh is None or not self.cache_manager.is_cached(resolved.requested_path):
+                    raise FuseOSError(_full_fill_errno(exc)) from exc
+                # A refresh that raised (no capacity in time, a member gone,
+                # a transfer error) fails as one that returned: the last
+                # good copy stays, marked, for readers.
+                installed = False
+                self.cache_manager.take_fill_errno()
+                self.cache_manager.note_fill_errno(_full_fill_errno(exc))
+            if installed:
+                cache_path = resolved.cache_path
+            else:
+                # Not installed (fill_action): an unverified version gives
+                # EAGAIN, read-only or writable (CTO-208-MMAP-FALLBACK);
+                # otherwise the fill's own errno. A refresh leaves the last
+                # good copy named: a read-only opener keeps reading it, and
+                # it is marked stale for writers.
+                absent = self.cache_manager.fill_absent()
+                code = self.cache_manager.take_fill_errno() or errno.EIO
+                kept = refresh is not None and self.cache_manager.is_cached(
+                    resolved.requested_path)
+                if kept and code == errno.EACCES:
+                    # The member now withholds read: the copy goes (a CLEAN
+                    # one, the member holds its bytes), so later opens ask
+                    # the member again rather than read it.
+                    self._mark_last_good_stale(resolved.cache_path)
+                    self._invalidate_file_cache(resolved.requested_path)
+                elif kept:
+                    if code == errno.ENOENT and absent:
+                        # The member it was pinned to no longer has the file:
+                        # no newer version can replace the copy, the one left
+                        # (as a revalidation that finds it gone keeps it).
+                        self._clear_stale_last_good(resolved.cache_path)
+                    else:
+                        self._mark_last_good_stale(resolved.cache_path)
+                    self._store_member_check(resolved.canonical_path, resolved.cache_path,
+                                             refresh, {})
+                if kept and code == errno.ENOENT and absent:
+                    cache_path = resolved.cache_path
+                elif code == errno.EACCES:
+                    # A read denial seen by the refresh: no copy is served,
+                    # the last good one included.
+                    raise FuseOSError(code)
+                elif read_only and kept:
                     cache_path = resolved.cache_path
                 else:
-                    # Not installed (fill_action): an unverified version gives
-                    # EAGAIN; otherwise the fill's own errno. A refresh leaves
-                    # the last good copy named: a read-only opener keeps
-                    # reading it, and it is marked stale for writers. With
-                    # none, a read-only opener may read the completed,
-                    # bounded copy privately.
-                    code = self.cache_manager.take_fill_errno() or errno.EIO
-                    kept = refresh is not None and self.cache_manager.is_cached(
-                        resolved.requested_path)
-                    if kept and code == errno.EACCES:
-                        # The member now withholds read: the copy goes (a
-                        # CLEAN one, the member holds its bytes), so later
-                        # opens ask the member again rather than read it.
-                        self._mark_last_good_stale(resolved.cache_path)
-                        self._invalidate_file_cache(resolved.requested_path)
-                    elif kept:
-                        if code == errno.ENOENT:
-                            # The member no longer has the file: no newer
-                            # version can replace the copy, the one left (as
-                            # a revalidation that finds it gone keeps it).
-                            self._clear_stale_last_good(resolved.cache_path)
-                        else:
-                            self._mark_last_good_stale(resolved.cache_path)
-                        self._store_member_check(resolved.canonical_path, resolved.cache_path,
-                                                 refresh, {})
-                    if kept and code == errno.ENOENT:
-                        cache_path = resolved.cache_path
-                    elif code == errno.EACCES:
-                        # A read denial seen by the refresh: no copy is served,
-                        # the last good one included.
-                        raise FuseOSError(code)
-                    elif read_only and kept:
-                        cache_path = resolved.cache_path
-                    elif read_only and private:
-                        copy, reservation, known = private[0]
-                        mode = known.get("st_mode")
-                        if (os.geteuid() != 0 and type(mode) is int
-                                and not mode & stat.S_IRUSR):
-                            raise FuseOSError(errno.EACCES)
-                        private.pop(0)  # served: this descriptor owns it now
-                        cache_path, private_attrs = copy, known
-                        private_size, private_reservation = reservation.size, reservation
-                    else:
-                        raise FuseOSError(code)
-            finally:
-                if refresh is not None:
-                    with self._fd_lock:
-                        self._refreshing.discard(resolved.canonical_path)
-                for copy, reservation, _known in private or ():
-                    if self._drop_private_copy(copy):
-                        self.cache_manager.release_new_file(reservation)
-            if private_size is None:
-                if not self._is_read_only_open(flags):
-                    self._require_imported_write_permission(cache_path)
-                if flags & os.O_ACCMODE != os.O_WRONLY:
-                    self._require_imported_permission(cache_path, stat.S_IRUSR)
+                    raise FuseOSError(code)
+            if not self._is_read_only_open(flags):
+                self._require_imported_write_permission(cache_path)
+            if flags & os.O_ACCMODE != os.O_WRONLY:
+                self._require_imported_permission(cache_path, stat.S_IRUSR)
 
         try:
             # Hold _fd_lock across os.open AND _fd_map registration so that
@@ -2918,18 +2862,9 @@ class StorageFS(Operations):
                     canonical_path=resolved.canonical_path,
                     prefetch_session=prefetch_session,
                     view_ino=os.fstat(real_fd).st_ino if resolved.backend_name else None,
-                    private_size=private_size,
-                    private_reservation=private_reservation,
-                    private_attrs=private_attrs,
                 )
             if clear_stale:
                 self._clear_stale_last_good(cache_path)
-            if private_size is not None:
-                # The descriptor holds the copy; its name goes at once, so
-                # nothing else can reach it and its last close frees it.
-                if not self._drop_private_copy(cache_path):
-                    self._fd_map[vfd].private_name = cache_path
-                return vfd
             if resolved.backend_name and flags & os.O_TRUNC:
                 opened = self._fd_map[vfd]
                 self._mark_view_changed(cache_path, opened.view_ino, opened)
@@ -2942,23 +2877,7 @@ class StorageFS(Operations):
         except OSError as e:
             if prefetch_session is not None:
                 self._release_prefetch_session(prefetch_session)
-            if private_size is not None and self._drop_private_copy(cache_path):
-                self.cache_manager.release_new_file(private_reservation)
             raise FuseOSError(e.errno)
-
-    def _drop_private_copy(self, copy: Optional[Path]) -> bool:
-        """Unlink a private copy's name; True once it is gone. A failure is
-        logged (the startup sweep removes partial names), never raised."""
-        if copy is None:
-            return True
-        try:
-            copy.unlink()
-        except FileNotFoundError:
-            pass
-        except OSError as exc:
-            self.logger.warning("could not remove the private copy %s: %s", copy, exc)
-            return False
-        return True
 
     def create(self, path, mode, fi=None):
         """Create a file"""
@@ -3186,16 +3105,6 @@ class StorageFS(Operations):
 
         if entry.prefetch_session is not None:
             self._release_prefetch_session(entry.prefetch_session)
-            if close_error is not None:
-                raise FuseOSError(close_error.errno)
-            return 0
-
-        if entry.private_size is not None:
-            # A private copy: its bytes leave the budget once its name is
-            # gone too (a name that still cannot be removed stays charged
-            # until the startup sweep).
-            if self._drop_private_copy(entry.private_name):
-                self.cache_manager.release_new_file(entry.private_reservation)
             if close_error is not None:
                 raise FuseOSError(close_error.errno)
             return 0
@@ -4123,17 +4032,6 @@ def _native_capacity_cancel_reason():
 
 class FUSE(_FusePyFUSE):
     """Give pool waits a same-thread cancellation probe during callbacks."""
-
-    def open(self, path, fip):
-        # As fusepy's open; a private copy's handle (StorageFS._open) gets
-        # direct_io, so its reads bypass the page cache the path's other
-        # handles share, and its short read at the captured length is EOF.
-        fi = fip.contents
-        fi.fh = self.operations("open", path.decode(self.encoding), fi.flags)
-        if getattr(self.operations, "is_private_handle", None) and \
-                self.operations.is_private_handle(fi.fh):
-            fi.direct_io = 1
-        return 0
 
     @staticmethod
     def _wrapper(func, *args, **kwargs):

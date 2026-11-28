@@ -757,126 +757,55 @@ class TestKernelCacheRefetchThreaded(TestKernelCacheRefetch):
     fuse_threads = True
 
 
-# A client for private-copy reads through the mount (never read in the FUSE
-# process): one JSON command per line on stdin, one JSON answer per line.
-_PRIVATE_CLIENT = """
-import hashlib, json, os, sys
+# Read through the actual FUSE client, including buffered reads and faults
+# from read-only mappings. Keeping both descriptors open lets this reproduce
+# the page-cache contamination on the old private-fill implementation.
+_UNSTABLE_FILL_CLIENT = """
+import json, mmap, os, sys
+
 fds = {}
 for line in sys.stdin:
-    cmd, *args = line.split()
-    if cmd == "open":
-        fds[args[0]] = os.open(args[1], os.O_RDONLY)
-        out = None
-    elif cmd == "read":
-        fd, data = fds[args[0]], b""
-        while True:
-            chunk = os.pread(fd, 1 << 16, len(data))
-            if not chunk:
-                break
-            data += chunk
-        out = {"sha": hashlib.sha256(data).hexdigest(), "len": len(data),
-               "fstat": os.fstat(fd).st_size}
-    elif cmd == "mmap":
-        import mmap
-        flags = mmap.MAP_PRIVATE if args[2] == "private" else mmap.MAP_SHARED
-        try:
-            m = mmap.mmap(fds[args[0]], int(args[1]), flags=flags, prot=mmap.PROT_READ)
-        except OSError as exc:
-            out = {"errno": exc.errno}
-        else:
-            data = m[:]
-            m.close()
-            out = {"sha": hashlib.sha256(data).hexdigest(), "len": len(data)}
-    elif cmd == "close":
-        os.close(fds.pop(args[0]))
-        out = None
-    else:
-        break
+    cmd, name, arg = json.loads(line)
+    try:
+        if cmd == "open":
+            fds[name] = os.open(arg, os.O_RDONLY)
+            out = None
+        elif cmd == "read":
+            out = os.pread(fds[name], arg + 1, 0).hex()
+        elif cmd == "mmap":
+            with mmap.mmap(fds[name], arg, flags=mmap.MAP_PRIVATE,
+                           prot=mmap.PROT_READ) as mapped:
+                out = mapped[:].hex()
+    except OSError as exc:
+        out = {"errno": exc.errno}
     print(json.dumps(out), flush=True)
 """
 
 
-class TestPrivateReadMounted(_MountedCase):
-    """A live file read privately (CTO-208-LIVE-READ): each reader's bytes,
-    EOF and fstat are its own captured copy, through the mount."""
-
+class TestUnstableFullFillMounted(_MountedCase):
     START_SYNC = False
 
-    def _call(self, client, command):
-        client.stdin.write(command + "\n")
+    def _call(self, client, cmd, name, arg):
+        client.stdin.write(json.dumps((cmd, name, arg)) + "\n")
         client.stdin.flush()
         line = []
-        reader = threading.Thread(target=lambda: line.append(client.stdout.readline()))
+        reader = threading.Thread(target=lambda: line.append(client.stdout.readline()), daemon=True)
         reader.start()
         reader.join(60)
-        self.assertTrue(line and line[0], f"client gave no answer to {command!r}")
+        self.assertTrue(line and line[0], f"client gave no answer to {cmd!r}")
         return json.loads(line[0])
 
-    def test_two_private_readers_each_see_their_own_copy(self):
-        import hashlib
+    def test_unstable_cold_fill_cannot_contaminate_buffered_replacement(self):
+        self.assertTrue(os.path.ismount(self.mount_dir))
         name = "live.log"
-        source = self.backend1_dir / name
-        # Same length and mtime: only the bytes differ, so the kernel sees no
-        # attribute change between the two copies and nothing but direct_io
-        # keeps one reader's pages from the other.
-        first, second = b"first version\n" * 50, b"other version\n" * 50
-        stamp = 1_700_000_000
-        source.write_bytes(first)
-        os.utime(source, (stamp, stamp))
-        self.fs._on_remote_change("/" + name)  # written behind the mount
-        backend = self.fs.backends["backend1"]
-        real_stat = backend.stat
-
-        def off_by_one(path):
-            st = real_stat(path)
-            # Always another size than any transfer: the file never settles.
-            return type("St", (), {"st_size": st.st_size + 1, "st_mtime": st.st_mtime,
-                                   "st_mtime_ns": st.st_mtime_ns, "st_mode": st.st_mode})()
-
-        client = subprocess.Popen([sys.executable, "-c", _PRIVATE_CLIENT],
-                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
-        try:
-            with patch.object(backend, "stat", side_effect=off_by_one):
-                self._call(client, f"open a {self.mount_dir / name}")
-                a = self._call(client, "read a")
-                source.write_bytes(second)
-                os.utime(source, (stamp, stamp))
-                self._call(client, f"open b {self.mount_dir / name}")
-                b = self._call(client, "read b")
-                a_again = self._call(client, "read a")
-                b_again = self._call(client, "read b")
-            self.assertEqual((a["sha"], a["len"]), (hashlib.sha256(first).hexdigest(), len(first)))
-            self.assertEqual((b["sha"], b["len"]), (hashlib.sha256(second).hexdigest(), len(second)))
-            self.assertEqual(a_again["sha"], a["sha"])
-            self.assertEqual(b_again["sha"], b["sha"])
-            # With one private handle open, fstat reports its captured length.
-            self.assertEqual(a["fstat"], len(first))
-            # Not asserted for b: FUSE keeps attributes per inode, not per
-            # handle, so with two handles of different lengths open on one
-            # path the kernel asks with either handle (here a's). Each
-            # reader's EOF is its own (direct_io short reads), as above.
-            self._call(client, "close a")
-            self._call(client, "close b")
-        finally:
-            client.stdin.close()
-            client.wait(30)
-            client.stdout.close()
-        self.assertFalse((self.cache_dir / name).exists())
-        self.assertEqual(self.fs.cache_manager._reserved_bytes, 0)
-
-
-    def test_mmap_of_a_private_handle(self):
-        """S8 probe: MAP_SHARED and MAP_PRIVATE on a private (direct_io)
-        handle, then beside a buffered reader of a newer installed version
-        of the same length and mtime."""
-        import hashlib
-        name = "live.log"
+        path = f"/{name}"
+        mounted = str(self.mount_dir / name)
         source = self.backend1_dir / name
         first, second = b"first version\n" * 400, b"other version\n" * 400
         stamp = 1_700_000_000
         source.write_bytes(first)
         os.utime(source, (stamp, stamp))
-        self.fs._on_remote_change("/" + name)
+        self.fs._on_remote_change(path)
         backend = self.fs.backends["backend1"]
         real_stat = backend.stat
 
@@ -885,100 +814,48 @@ class TestPrivateReadMounted(_MountedCase):
             return type("St", (), {"st_size": st.st_size + 1, "st_mtime": st.st_mtime,
                                    "st_mtime_ns": st.st_mtime_ns, "st_mode": st.st_mode})()
 
-        sha = {b: hashlib.sha256(b).hexdigest() for b in (first, second)}
-        client = subprocess.Popen([sys.executable, "-c", _PRIVATE_CLIENT],
+        client = subprocess.Popen([sys.executable, "-c", _UNSTABLE_FILL_CLIENT],
                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
         try:
-            with patch.object(backend, "stat", side_effect=off_by_one):
-                self._call(client, f"open a {self.mount_dir / name}")
-            n = len(first)
-            observed = {"shared": self._call(client, f"mmap a {n} shared"),
-                        "private": self._call(client, f"mmap a {n} private")}
-            # The member settles at another version of the same length and
-            # mtime: an ordinary (buffered, page-cached) reader b opens it.
+            with patch.object(backend, "stat", side_effect=off_by_one), \
+                    patch.object(backend, "copy_to_local", wraps=backend.copy_to_local) as copies, \
+                    patch.object(self.fs.sync_manager, "queue_sync") as queue_sync:
+                unstable = self._call(client, "open", "unstable", mounted)
+                self.assertEqual(copies.call_count, 2)
+                queue_sync.assert_not_called()
+            self.assertEqual(source.read_bytes(), first)
+            self.assertFalse((self.backend2_dir / name).exists())
+            self.assertFalse((self.cache_dir / name).exists())
+            self.assertEqual(list(self.cache_dir.rglob("*.storage.partial")), [])
+            if unstable is not None:
+                self.assertEqual(self.fs.cache_manager._reserved_bytes, 0)
+            self.assertIsNone(self.fs.state_manager.get_file_metadata(path))
+            self.assertEqual(self.fs.state_manager.get_file_locations(path), [])
+
             source.write_bytes(second)
             os.utime(source, (stamp, stamp))
-            self.fs._on_remote_change("/" + name)
-            self._call(client, f"open b {self.mount_dir / name}")
-            observed["b"] = self._call(client, "read b")
-            observed["private_beside_b"] = self._call(client, f"mmap a {n} private")
-            observed["b_after"] = self._call(client, "read b")
-            observed["a_read"] = self._call(client, "read a")
-            self._call(client, "close a")
-            self._call(client, "close b")
+            self.fs._on_remote_change(path)
+            self.assertIsNone(self._call(client, "open", "verified", mounted))
+            size = len(second)
+            before = bytes.fromhex(self._call(client, "read", "verified", size))
+            self.assertTrue(before == second, "initial buffered read differed from the replacement")
+            if unstable is None:
+                # On 1334047 the private handle can fault its old bytes into
+                # the pages the verified buffered handle uses.
+                self._call(client, "mmap", "unstable", size)
+            after = bytes.fromhex(self._call(client, "read", "verified", size))
+            self.assertTrue(after == second, f"buffered read after unstable mmap: {after[:40]!r}")
+            mapped = bytes.fromhex(self._call(client, "mmap", "verified", size))
+            self.assertTrue(mapped == second, f"verified mmap returned {mapped[:40]!r}")
+            self.assertEqual(unstable, {"errno": errno.EAGAIN})
         finally:
             client.stdin.close()
             client.wait(30)
             client.stdout.close()
-        names = {v: k for k, v in sha.items()}
-        summary = {k: (names.get(v.get("sha"), v) if "sha" in v else v)
-                   for k, v in observed.items()}
-        # MAP_SHARED: refused (direct_io without FUSE_DIRECT_IO_ALLOW_MMAP).
-        self.assertEqual(summary["shared"], {"errno": errno.ENODEV}, summary)
-        # MAP_PRIVATE alone: the handle's own bytes (faulted through it).
-        self.assertEqual(summary["private"], first, summary)
-        self.assertEqual(summary["b"], second, summary)
-        # direct_io read(): always the handle's own bytes.
-        self.assertEqual(summary["a_read"], first, summary)
-        # The documented limit (README): MAP_PRIVATE faults through the
-        # inode's shared page cache with the private handle, so a buffered
-        # reader of the installed version then reads the private copy's
-        # bytes. If this fails, the kernel stopped mixing them: update the
-        # README's limit.
-        self.assertEqual(summary["private_beside_b"], first, summary)
-        self.assertEqual(summary["b_after"], first, summary)
-
-    def _two_readers(self, first, second):
-        """Reader a opens a private copy of first, the member becomes second,
-        reader b opens a private copy of that; each reads to EOF twice."""
-        import hashlib
-        name = "live.log"
-        source = self.backend1_dir / name
-        source.write_bytes(first)
-        self.fs._on_remote_change("/" + name)
-        backend = self.fs.backends["backend1"]
-        real_stat = backend.stat
-
-        def off_by_one(path):
-            st = real_stat(path)
-            return type("St", (), {"st_size": st.st_size + 1, "st_mtime": st.st_mtime,
-                                   "st_mtime_ns": st.st_mtime_ns, "st_mode": st.st_mode})()
-
-        client = subprocess.Popen([sys.executable, "-c", _PRIVATE_CLIENT],
-                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
-        try:
-            with patch.object(backend, "stat", side_effect=off_by_one):
-                self._call(client, f"open a {self.mount_dir / name}")
-                a = self._call(client, "read a")
-                source.write_bytes(second)
-                self._call(client, f"open b {self.mount_dir / name}")
-                b = self._call(client, "read b")
-                a_again = self._call(client, "read a")
-                b_again = self._call(client, "read b")
-            for got, want in ((a, first), (b, second), (a_again, first), (b_again, second)):
-                # Its own bytes, and its read EOF (bytes read until a 0-byte read).
-                self.assertEqual((got["sha"], got["len"]),
-                                 (hashlib.sha256(want).hexdigest(), len(want)))
-            self._call(client, "close a")
-            self._call(client, "close b")
-        finally:
-            client.stdin.close()
-            client.wait(30)
-            client.stdout.close()
-        self.assertFalse((self.cache_dir / name).exists())
-        self.assertEqual(self.fs.cache_manager._reserved_bytes, 0)
-
-    def test_longer_then_shorter_private_readers(self):
-        # Overlapping private handles of different lengths (CTO-208-PRIVATE-
-        # STAT): each keeps its own bytes and EOF; the second's fstat is not
-        # asserted (attributes are per inode).
-        self._two_readers(b"long version\n" * 120, b"short\n" * 30)
-
-    def test_shorter_then_longer_private_readers(self):
-        self._two_readers(b"short\n" * 30, b"long version\n" * 120)
+        self.assertEqual((self.cache_dir / name).read_bytes(), second)
 
 
-class TestPrivateReadMountedThreaded(TestPrivateReadMounted):
+class TestUnstableFullFillMountedThreaded(TestUnstableFullFillMounted):
     fuse_threads = True
 
 

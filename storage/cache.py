@@ -84,14 +84,10 @@ class NewFileReservation:
         self.inode = inode  # (st_dev, st_ino)
 
 
-def _denying_mode(st, current: Optional[int]) -> Optional[int]:
-    """The first mode a fill's stats reported without owner read (root aside)."""
-    if current is not None:
-        return current
+def _denies_read(st) -> bool:
+    """Whether a stat reports a mode without owner read (a root daemon aside)."""
     mode = getattr(st, "st_mode", None)
-    if os.geteuid() != 0 and type(mode) is int and not mode & stat_module.S_IRUSR:
-        return mode
-    return None
+    return os.geteuid() != 0 and type(mode) is int and not mode & stat_module.S_IRUSR
 
 
 def _token_contradicts(fd_st, path_st) -> bool:
@@ -102,13 +98,21 @@ def _token_contradicts(fd_st, path_st) -> bool:
             or _member_mtime_ns(fd_st) != _member_mtime_ns(path_st))
 
 
-def _with_mode(st, mode: int):
-    """A copy of a member stat (or None) that reports mode."""
+def _without_owner_read(st):
+    """A copy of the verified member stat (or None) whose mode lacks owner
+    read: only the denial is applied, the stat's own grants otherwise, and
+    mode_unconfirmed is kept. Without a verified mode it is a mode that
+    grants nothing (unconfirmed, so no write either): an earlier stat's
+    grants are never imported."""
     from types import SimpleNamespace
     fields = {key: getattr(st, key, None) for key in (
         "st_uid", "st_gid", "st_nlink", "st_ctime", "st_size", "st_mtime", "st_mtime_ns",
         "st_atime", "st_atime_ns")}
-    fields["st_mode"] = mode
+    mode = getattr(st, "st_mode", None)
+    fields["mode_unconfirmed"] = bool(getattr(st, "mode_unconfirmed", False))
+    if type(mode) is not int:
+        mode, fields["mode_unconfirmed"] = stat_module.S_IFREG, True
+    fields["st_mode"] = mode & ~stat_module.S_IRUSR
     return SimpleNamespace(**fields)
 
 
@@ -160,6 +164,9 @@ class CacheManager:
         # predate its last write. It takes only a leaf lock and is safe
         # under every lock here. None (no StorageFS) means no listings.
         self.forget_listed_attrs: Optional[Callable[..., None]] = None
+        # Set by StorageFS: drops a path's checksum records and tasks (a
+        # refreshed copy's lost row update is healed). None: nothing to drop.
+        self.forget_checksums: Optional[Callable[[str], None]] = None
         # Set by StorageFS: a context manager that try-acquires the outer
         # locks of a canonical path (storage/locks.py) and yields whether it
         # got them. Eviction runs under self._lock, inside those locks'
@@ -578,7 +585,7 @@ class CacheManager:
     def cache_file_result(
         self, virtual_path: str, backend: Backend, source_virtual_path: str = None,
         *, member_stat=_STAT_NOT_PROBED, confirmed: Optional[list] = None,
-        private: Optional[list] = None, replace_identity: Optional[tuple] = None,
+        replace_identity: Optional[tuple] = None,
     ) -> CacheFetch:
         """
         Download a file from backend into cache
@@ -602,7 +609,9 @@ class CacheManager:
         """
         source_virtual_path = source_virtual_path or virtual_path
         # Member probes: no lock, and their errors propagate as before.
-        if not backend.exists(source_virtual_path):
+        if not backend.exists_or_raise(source_virtual_path):
+            self.note_fill_errno(errno.ENOENT)
+            self.note_fill_absent()
             return CacheFetch.FAILED
         if member_stat is _STAT_NOT_PROBED:
             try:
@@ -623,11 +632,12 @@ class CacheManager:
             reclaim = self.reclaim_space
             if attempt or reclaim is None or not reclaim(file_size):
                 print(f"Warning: Insufficient cache space for {virtual_path}")
+                self.note_fill_errno(errno.ENOSPC)
                 return CacheFetch.FAILED
         try:
             installed = self.fetch_into_cache(
                 backend, source_virtual_path, self.get_cache_path(virtual_path), member_stat,
-                confirmed=confirmed, reserved=file_size, private=private,
+                confirmed=confirmed, reserved=file_size,
                 replace_identity=replace_identity,
             )
             self.state_manager.update_access_time(virtual_path)
@@ -650,10 +660,28 @@ class CacheManager:
             self._fill_errno.code = code
 
     def take_fill_errno(self) -> Optional[int]:
-        """The errno this thread's last failed fill reported, once (cleared)."""
+        """The errno this thread's last failed fill reported, once (cleared,
+        with the absence and installed notes below)."""
         code = getattr(self._fill_errno, "code", None)
         self._fill_errno.code = None
+        self._fill_errno.absent = False
+        self._fill_errno.installed = None
         return code
+
+    def note_fill_absent(self) -> None:
+        """Record that the member the fill was pinned to confirmed absence."""
+        self._fill_errno.absent = True
+
+    def clear_fill_absence(self) -> None:
+        """A different member's answer cannot confirm the pinned holder's absence."""
+        self._fill_errno.absent = False
+
+    def fill_absent(self) -> bool:
+        return bool(getattr(self._fill_errno, "absent", False))
+
+    def fill_installed_identity(self) -> Optional[tuple]:
+        """The cache identity of the inode this thread's fill last named, if any."""
+        return getattr(self._fill_errno, "installed", None)
 
     def _reserve_more(self, nbytes: int) -> bool:
         """Reserve nbytes more for a fill in progress, if there is room."""
@@ -665,7 +693,7 @@ class CacheManager:
 
     def fetch_into_cache(self, backend: Backend, source_virtual_path: str, cache_path: Path,
                          member_stat=None, *, confirmed: Optional[list] = None,
-                         reserved: Optional[int] = None, private: Optional[list] = None,
+                         reserved: Optional[int] = None,
                          replace_identity: Optional[tuple] = None) -> bool:
         """Copy a member file to cache_path through a temp file beside it.
 
@@ -695,12 +723,13 @@ class CacheManager:
         extra_reserved = 0
         try:
             token_seen = has_version_token(member_stat)
-            # Any stat of the fill that withheld owner read: a private copy
-            # is then refused, whatever a later stat (or none) reports.
-            denying_mode = _denying_mode(member_stat, None)
             for attempt in range(2):
                 if attempt:
                     temp_path.unlink(missing_ok=True)
+                # Any stat of this attempt (the one whose bytes may be
+                # installed) that withheld owner read: the denial stands,
+                # whatever a later stat of the attempt (or none) reports.
+                read_denied = _denies_read(member_stat)
                 # The reservation is the copy's bound (CTO-208-BOUNDED): one
                 # open of the source, at most that many bytes, one probe read
                 # for growth. A member that cannot bound its copy gives no
@@ -732,12 +761,25 @@ class CacheManager:
                 newest, version = confirm_member_stat(
                     backend, source_virtual_path, member_stat, st.st_size, budget)
                 token_seen = token_seen or has_version_token(newest)
-                denying_mode = _denying_mode(newest, denying_mode)
+                read_denied = read_denied or _denies_read(newest)
                 if version == MemberVersion.UNCONFIRMED and budget.remaining:
                     newest, version = confirm_member_stat(
                         backend, source_virtual_path, member_stat, st.st_size, budget)
                     token_seen = token_seen or has_version_token(newest)
-                    denying_mode = _denying_mode(newest, denying_mode)
+                    read_denied = read_denied or _denies_read(newest)
+                # The copied descriptor's own stats (local fstat at open and
+                # at the end, the SFTP handle's stat) are evidence like the
+                # others: their modes join the denial check, and their tokens
+                # the sticky set, unless they bracket the copy consistently
+                # (two that agree), which is a read of one version.
+                fd_stats = list(bound.source_stats) if bound is not None else []
+                read_denied = read_denied or any(_denies_read(fd_st) for fd_st in fd_stats)
+                bracketed = (len(fd_stats) >= 2
+                             and all(has_version_token(fd_st) for fd_st in fd_stats)
+                             and not any(_token_contradicts(a, b)
+                                         for a, b in zip(fd_stats, fd_stats[1:])))
+                if not bracketed:
+                    token_seen = token_seen or any(has_version_token(fd_st) for fd_st in fd_stats)
                 # A stat that showed another version with a token: the only
                 # one a retry may be confirmed against.
                 newer = newest if version == MemberVersion.CHANGED else None
@@ -746,15 +788,15 @@ class CacheManager:
                 if bound is not None and bound.grew:
                     # The source outran the bounded copy: another version.
                     version = MemberVersion.CHANGED
-                if bound is not None and any(
+                if any(_token_contradicts(a, b) for a, b in zip(fd_stats, fd_stats[1:])) or any(
                         _token_contradicts(fd_st, other)
-                        for fd_st in bound.source_stats for other in (member_stat, newest)):
+                        for fd_st in fd_stats for other in (member_stat, newest)):
                     # The descriptor actually copied was at another version
                     # than the pathname stats (renamed away and back, or
                     # written during the copy): whatever they agree on, these
                     # bytes are not theirs.
                     version = MemberVersion.CHANGED
-                if fill_action(version, read_only=False) == FillAction.INSTALL:
+                if fill_action(version) == FillAction.INSTALL:
                     break
                 # A CHANGED version is fetched once more, only against a
                 # probe and a newer stat that carries a token (it becomes the
@@ -774,54 +816,29 @@ class CacheManager:
                         raise OSError(errno.ENOSPC, "insufficient cache space for the "
                                       "member's larger version", source_virtual_path)
                     extra_reserved += more
-            if fill_action(version, read_only=False) != FillAction.INSTALL:
-                # Not a verified generation: nothing is installed, and a copy
-                # already cached (the last good one) stays as it is. The open
-                # reports EAGAIN (retryable; CTO-208-LIVE-READ). A read-only
-                # opener may take the completed, bounded copy privately: it
-                # leaves under a partial name (hidden, swept at startup), is
-                # never linked into the cache, and takes over this fill's
-                # reservation for its size before cache_file_result releases
-                # its own (no window).
-                if denying_mode is not None:
-                    # A read denial seen in this fill wins over any copy, the
-                    # last good one included (the open reports EACCES).
+            if fill_action(version) != FillAction.INSTALL:
+                # Not a verified generation: nothing is installed or served,
+                # and a copy already cached (the last good one) stays as it
+                # is. The open reports EAGAIN, retryable, for read-only and
+                # writable opens alike (CTO-208-MMAP-FALLBACK).
+                if read_denied:
+                    # A read denial seen in this attempt wins over any copy,
+                    # the last good one included (the open reports EACCES).
                     self._fill_errno.code = errno.EACCES
                     raise OSError(errno.EACCES, f"the member withheld read of {source_virtual_path}",
                                   source_virtual_path)
-                if private is not None and cap is not None:
-                    kept = temp_path.with_name(f".{secrets.token_hex(8)}.private{PARTIAL_SUFFIX}")
-                    os.rename(temp_path, kept)
-                    try:
-                        # Owned from the rename on: a failure here removes it.
-                        kept_st = os.lstat(kept)
-                    except BaseException:
-                        kept.unlink(missing_ok=True)
-                        raise
-                    # Charged by inode (reserve_new_file, as a stream's
-                    # partial is): a scan skips it under any name, so it is
-                    # counted once, by this reservation, until released.
-                    reservation = self.reserve_new_file(kept_st.st_size, kept_st)
-                    # The member's own attributes for the private handle,
-                    # newest first; its times never the staging file's.
-                    known = {}
-                    for key in ("st_mode", "st_uid", "st_gid", "st_mtime", "st_mtime_ns",
-                                "st_atime", "st_atime_ns", "st_ctime"):
-                        value = getattr(newest, key, None)
-                        known[key] = getattr(member_stat, key, None) if value is None else value
-                    private.append((kept, reservation, known))
                 self._fill_errno.code = errno.EAGAIN
                 raise OSError(errno.EAGAIN, f"the member's version of {source_virtual_path} "
                               f"could not be confirmed ({version})", source_virtual_path)
-            if denying_mode is not None:
-                # Installed although a stat of this fill withheld owner read
-                # (say, a confirmation without a mode after one with 0o200):
-                # the recorded mode keeps that denial.
-                newest = _with_mode(newest, denying_mode)
+            if read_denied:
+                # Installed although a stat of this attempt withheld owner
+                # read (say, a confirmation without a mode after one with
+                # 0o200): the recorded mode keeps that denial, and only it.
+                newest = _without_owner_read(newest)
             fd = os.open(temp_path, os.O_RDONLY | os.O_NOFOLLOW)
             try:
                 copy_member_attributes(fd, newest)
-                size = os.fstat(fd).st_size
+                staged = os.fstat(fd)
             finally:
                 os.close(fd)
             with self._lock:
@@ -841,8 +858,13 @@ class CacheManager:
                         write_cache_metadata(temp_path, dataclasses.replace(
                             row, checksum=None, sync_status=SyncStatus.CLEAN,
                         ), virtual_path=source_virtual_path)
+                    # Clear location evidence before naming the replacement.
+                    # An interruption can require rechecking the old copy,
+                    # but cannot pair its checksums with a same-stat new one.
+                    self.state_manager.clear_location_checksums(source_virtual_path)
                     os.replace(temp_path, cache_path)
-                    self._current_size_bytes += size - current.st_size
+                    self._fill_errno.installed = cache_identity(staged)
+                    self._current_size_bytes += staged.st_size - current.st_size
                     if version == MemberVersion.AGREED and newest is not None and confirmed is not None:
                         confirmed.append(newest)
                     return True
@@ -854,7 +876,8 @@ class CacheManager:
                     if not (cache_path.is_file() and not cache_path.is_symlink()):
                         raise
                     return False
-                self._current_size_bytes += size
+                self._fill_errno.installed = cache_identity(staged)
+                self._current_size_bytes += staged.st_size
             if version == MemberVersion.AGREED and newest is not None and confirmed is not None:
                 confirmed.append(newest)
             return True
@@ -1012,20 +1035,44 @@ class CacheManager:
                 return False
             stat_size, stat_mtime = st.st_size, st.st_mtime
         if stat_size == row.size and stat_mtime == row.last_modified:
+            if row.checksum:
+                # A refresh with the same size and mtime may still have
+                # replaced the bytes: its own CLEAN record has no checksum.
+                record = self.clean_record_for(cache_path, stat_size, stat_mtime)
+                if record is not None and record.checksum is None:
+                    self._forget_replaced_version(virtual_path, row, stat_size, stat_mtime)
             return False
         # A refresh in place names a verified copy that already carries its
         # own CLEAN record; a crash before the row followed leaves the row
         # describing the old version. The file's record then matches its
-        # stat: the row is brought up to it (CLEAN, no checksum), not
-        # marked dirty. A write leaves no such record (mark_file_dirty
-        # records DIRTY), and a change behind the mount has a stale one.
+        # stat: the row is brought up to it (CLEAN, no checksum, no location
+        # checksums), not marked dirty. A write leaves no such record
+        # (mark_file_dirty records DIRTY), and a change behind the mount has
+        # a stale one. This is the one exception to "a stat that differs
+        # from the row is dirty" (AGENTS.md, Repo specifics).
         record = self.clean_record_for(cache_path, stat_size, stat_mtime)
         if record is not None:
-            self.state_manager.record_cached_stat(
-                virtual_path, row.dirty_generation, size=stat_size, last_modified=stat_mtime,
-                last_access=time.time(), clear_checksum=record.checksum is None)
+            self._forget_replaced_version(virtual_path, row, stat_size, stat_mtime)
             return False
         return self.mark_file_dirty(virtual_path, cache_path) is not None
+
+    def _forget_replaced_version(self, virtual_path: str, row, size: int, mtime: float) -> None:
+        """Bring a CLEAN row up to a refreshed copy whose row update was lost:
+        its stat, no checksum, and no checksum at any location or in the
+        checksum records (forget_checksums) for the version it replaced."""
+        with self.state_manager.metadata_lock:
+            # Invalidate old evidence before clearing the row's checksum.
+            # In an equal-stat heal that checksum makes the repair retryable.
+            current = self.state_manager.get_file_metadata(virtual_path)
+            if (current is None or current.sync_status != SyncStatus.CLEAN
+                    or current.dirty_generation != row.dirty_generation):
+                return
+            self.state_manager.clear_location_checksums(virtual_path)
+            self.state_manager.record_cached_stat(
+                virtual_path, row.dirty_generation, size=size, last_modified=mtime,
+                last_access=time.time(), clear_checksum=True)
+        if self.forget_checksums:
+            self.forget_checksums(virtual_path)
 
     def store_file_metadata(
         self,

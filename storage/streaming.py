@@ -1674,7 +1674,7 @@ class StreamingReadManager:
             # only the attributes it reported.
             # (fill_action: a stream's readers already have their bytes, so a
             # copy that may not be installed is simply not kept.)
-            if fill_action(version, read_only=True) != FillAction.INSTALL:
+            if fill_action(version) != FillAction.INSTALL:
                 self._discard_unverified(session, version)
                 return
             if version == MemberVersion.AGREED:

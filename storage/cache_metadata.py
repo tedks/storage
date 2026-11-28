@@ -100,22 +100,23 @@ class FillAction:
     """What a completed transfer's MemberVersion allows (fill_action)."""
 
     INSTALL = "install"   # publish in the shared cache (AGREED, NEVER_VERSIONED)
-    PRIVATE = "private"   # serve the completed copy to this one read-only opener
     FAIL = "fail"         # nothing served from it: EAGAIN (retryable)
 
 
-def fill_action(version: str, *, read_only: bool) -> str:
-    """The one verdict-to-action contract (CTO-208-LIVE-READ), for full
-    fills (fs._open) and, on adoption, streams.
+def fill_action(version: str) -> str:
+    """The one verdict-to-action contract, for full fills
+    (CacheManager.fetch_into_cache) and streams.
 
     AGREED and NEVER_VERSIONED install. CHANGED and UNCONFIRMED never
-    publish: a read-only opener with no last-good copy may read the
-    completed copy privately (one source, opened once, its captured length;
-    never indexed, uploaded or shared); a writable opener fails with EAGAIN.
+    publish and serve nothing from the copy: a cold open, read-only or
+    writable, fails with EAGAIN; a warm read-only open keeps the last good
+    copy (CTO-208-MMAP-FALLBACK, which withdrew CTO-208-LIVE-READ's private
+    serve: a private copy shared the path's page cache with its other
+    handles through mmap).
     """
     if version in (MemberVersion.AGREED, MemberVersion.NEVER_VERSIONED):
         return FillAction.INSTALL
-    return FillAction.PRIVATE if read_only else FillAction.FAIL
+    return FillAction.FAIL
 
 
 def has_version_token(st) -> bool:

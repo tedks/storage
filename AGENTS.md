@@ -356,6 +356,16 @@ ExecPlans for non-trivial work follow the format in
   timestamps. Anything that changes a cached file's bytes or mtime goes
   through `CacheManager.mark_file_dirty`, which keeps the records in step;
   a change that bypasses it looks like a lost write and gets resynced.
+  One exception: a CLEAN index row whose stat differs from the file, when
+  the file's own metadata xattr says CLEAN for exactly the live stat. Only
+  an in-place refresh writes such a record (onto the verified copy, before
+  `os.replace` names it), so this is a refresh whose row update a crash
+  lost (`CacheManager.clean_record_for` recognises it). `heal_stale_clean`
+  then brings the row up to the file (its stat, no checksum, no location
+  checksums) instead of marking it dirty, and `_invalidate_file_cache`
+  drops the file as CLEAN instead of keeping it as a lost write. A write records
+  DIRTY in the xattr, and a change behind the mount leaves the xattr at an
+  older stat, so neither looks like this.
 - Sync status is owned by `files.dirty_generation`. Record a modification
   with `StateManager.mark_dirty` (one UPDATE that bumps the generation) and
   a sync outcome with `publish_sync_status` (conditioned on the generation

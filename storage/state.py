@@ -382,6 +382,16 @@ class StateManager:
             self.conn.commit()
             return cursor.rowcount == 1
 
+    def clear_location_checksums(self, virtual_path: str) -> None:
+        """Forget every location's checksum for a path (another version was
+        installed; the old checksums describe nothing that is there)."""
+        with self._db_lock:
+            self.conn.execute(
+                "UPDATE file_locations SET checksum = '' WHERE virtual_path = ?",
+                (virtual_path,),
+            )
+            self.conn.commit()
+
     def get_file_locations(self, virtual_path: str) -> List[FileLocation]:
         """Get all locations where a file is stored"""
         with self._db_lock:
