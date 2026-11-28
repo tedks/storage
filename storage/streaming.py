@@ -407,6 +407,10 @@ class StreamingReadManager:
         self._control_socket_lock = threading.Lock()
         self._control_socket: Optional[socket.socket] = None
         self._control_thread: Optional[threading.Thread] = None
+        # Whole-file fills (CacheManager.cache_file_result) can make room by
+        # stopping readerless retained fills, which the cache's own eviction
+        # cannot touch: they have no index row.
+        self.cache_manager.reclaim_space = self._reclaim_retained_space_for_cache
 
     def init(self):
         control_thread = self._control_thread
@@ -1763,8 +1767,19 @@ class StreamingReadManager:
         for session, idle in displaced:
             self._complete_cancellation(session, idle)
 
-    def _reclaim_retained_space(self, file_size: int) -> bool:
-        """Make space for a reader by yielding unfinished readerless partials."""
+    def _reclaim_retained_space_for_cache(self, file_size: int) -> bool:
+        """CacheManager.reclaim_space: room for a whole-file fill.
+
+        Called by cache_file_result without the cache lock held, after its
+        eviction fell short. It takes the registry and session locks, then
+        (cancelling) the cache lock briefly, the order every streaming path
+        uses. True means it stopped enough fills, or space was already
+        there: the caller asks the cache again.
+        """
+        return self._reclaim_retained_space(file_size, for_reader=False)
+
+    def _reclaim_retained_space(self, file_size: int, for_reader: bool = True) -> bool:
+        """Make space for a reader or a whole-file fill by stopping retained fills."""
         missing = self.cache_manager.get_free_space_needed(file_size)
         if missing == 0:
             return True
@@ -1773,7 +1788,7 @@ class StreamingReadManager:
         with self.prefetch_sessions_lock:
             # A reader that would be refused a session anyway gets no
             # cancellations made for it.
-            if self._destroying or not self._reader_fits_locked():
+            if self._destroying or (for_reader and not self._reader_fits_locked()):
                 return False
             candidates = []
             for session in self.prefetch_sessions.values():

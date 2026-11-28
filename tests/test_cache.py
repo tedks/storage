@@ -173,6 +173,41 @@ class TestCacheAccounting(unittest.TestCase):
         self.assertEqual(self.cache_manager.get_total_cache_size(), 4)
         self.assertTrue(self.cache_manager.ensure_space(1))
 
+    def _fill_with_unindexed_file(self, size):
+        # Like a streaming partial: counted by the scan, unknown to eviction.
+        held = self.cache_dir / "held.storage.partial"
+        held.write_bytes(b"\0" * size)
+        self.cache_manager.mark_cache_size_dirty()
+        return held
+
+    def test_reclaim_hook_runs_without_the_cache_lock_and_allows_one_retry(self):
+        self.cache_manager.max_size_bytes = 1000
+        held = self._fill_with_unindexed_file(800)
+        (self.backend_dir / "w.bin").write_bytes(b"w" * 500)
+        calls = []
+
+        def reclaim(size):
+            calls.append((size, self.cache_manager._lock._is_owned()))
+            held.unlink()
+            self.cache_manager.mark_cache_size_dirty()
+            return True
+
+        self.cache_manager.reclaim_space = reclaim
+        self.assertTrue(self.cache_manager.cache_file("/w.bin", self.backend))
+        self.assertEqual(calls, [(500, False)])
+        self.assertEqual(self.cache_manager.get_total_cache_size(), 500)
+
+    def test_reclaim_hook_that_frees_nothing_fails_the_fill_once(self):
+        self.cache_manager.max_size_bytes = 1000
+        self._fill_with_unindexed_file(800)
+        (self.backend_dir / "w.bin").write_bytes(b"w" * 500)
+        for result in (False, True):
+            calls = []
+            self.cache_manager.reclaim_space = lambda size: calls.append(size) or result
+            self.assertFalse(self.cache_manager.cache_file("/w.bin", self.backend))
+            self.assertEqual(calls, [500])
+        self.assertFalse(self.cache_manager.is_cached("/w.bin"))
+
 
 if __name__ == "__main__":
     unittest.main()

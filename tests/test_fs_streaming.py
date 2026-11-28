@@ -298,6 +298,35 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.fs.release("/second.bin", other)
         self.fs.release("/first.bin", fd)
 
+    def test_whole_file_fill_reclaims_space_held_by_retained_fills(self):
+        self.fs.cache_manager.max_size_bytes = 512 * 1024
+        self.backend.worker_gate = threading.Event()
+        payload = os.urandom(384 * 1024)
+        retained = self._open_retained_fill("retained.bin", payload)
+
+        written = os.urandom(384 * 1024)
+        (self.backend_dir / "write-open.bin").write_bytes(written)
+        fd = self.fs.open("/write-open.bin", os.O_RDWR)
+        self.assertTrue(retained.detached)
+        self.assertEqual(self.fs.read("/write-open.bin", len(written), 0, fd), written)
+        self.fs.release("/write-open.bin", fd)
+        self.assertEqual((self.cache_dir / "write-open.bin").read_bytes(), written)
+        self.assertEqual(self.fs._streaming_stats_snapshot()["streaming_retained_space_cancellations"], 1)
+
+        self.backend.worker_gate.set()
+        self.assertTrue(retained.background_finished.wait(timeout=3))
+        self.assertEqual(retained.io_fd, -1)
+
+    def test_whole_file_fill_still_fails_when_retained_fills_cannot_cover_it(self):
+        self.fs.cache_manager.max_size_bytes = 512 * 1024
+        self.backend.worker_gate = threading.Event()
+        retained = self._open_retained_fill("retained.bin", os.urandom(256 * 1024))
+        (self.backend_dir / "too-big.bin").write_bytes(os.urandom(768 * 1024))
+        with self.assertRaises(FuseOSError):
+            self.fs.open("/too-big.bin", os.O_RDWR)
+        # Nothing is cancelled for a fill it cannot make room for.
+        self.assertFalse(retained.detached)
+
     def test_closed_fill_is_not_retained_when_no_worker_can_start(self):
         manager = self.fs._streaming_manager
         real_start = threading.Thread.start

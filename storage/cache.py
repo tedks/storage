@@ -128,6 +128,15 @@ class CacheManager:
         # path the evicting thread holds itself is not). None (no
         # StorageFS) means no contention.
         self.path_guard: Optional[Callable[[str], ContextManager[bool]]] = None
+        # Set by StreamingReadManager: frees cache space held by readerless
+        # streaming fills (sparse partials with no index row, so eviction
+        # cannot see them) for a whole-file fill whose eviction fell short.
+        # Takes a byte count; True means the caller should ask again.
+        # cache_file_result calls it without self._lock: it takes the
+        # streaming registry and session locks, and the streaming paths
+        # take self._lock inside those, never the other way.
+        # None (no streaming manager: tests, CLI tools) means nothing to free.
+        self.reclaim_space: Optional[Callable[[int], bool]] = None
         self.state_manager = state_manager
         self.bulk_cold_copies = bulk_cold_copies
         self.max_size_bytes = max_size_bytes
@@ -506,11 +515,17 @@ class CacheManager:
         if file_size is None:
             file_size = backend.get_size(source_virtual_path)
 
-        with self._lock:
-            if not self.ensure_space(file_size):
+        for attempt in range(2):
+            with self._lock:
+                if self.ensure_space(file_size):
+                    self._reserved_bytes += file_size
+                    break
+            # Outside self._lock (see reclaim_space), and once: what it
+            # frees can be taken by another fill before the retry.
+            reclaim = self.reclaim_space
+            if attempt or reclaim is None or not reclaim(file_size):
                 print(f"Warning: Insufficient cache space for {virtual_path}")
                 return CacheFetch.FAILED
-            self._reserved_bytes += file_size
         try:
             installed = self.fetch_into_cache(
                 backend, source_virtual_path, self.get_cache_path(virtual_path), member_stat,
