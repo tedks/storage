@@ -665,8 +665,10 @@ class CacheManager:
                 # probe) makes the next revalidation refetch.
                 newest, version = confirm_member_stat(
                     backend, source_virtual_path, member_stat, st.st_size)
-                # Only positive evidence of another version is fetched again.
-                if version != MemberVersion.CHANGED:
+                # Only positive evidence of another version is fetched again,
+                # and only against a probe (without one, as at fa274d4, the
+                # first transfer stands).
+                if version != MemberVersion.CHANGED or member_stat is None:
                     break
                 member_stat = newest
                 newest_size = getattr(newest, "st_size", None)
