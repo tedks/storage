@@ -346,6 +346,27 @@ def test_reported_mountpoints_are_quoted(cache):
         server.stop()
 
 
+def test_mount_without_a_mountpoint_is_reached_only_by_cache(cache):
+    # A mount whose mountpoint could not be canonicalized reports null.
+    config = write_profile(cache)
+    server, requests = recording_server(cache, None)
+    server.start()
+    try:
+        runner = CliRunner()
+        result = runner.invoke(main, ["control", "--profile", "example", "--config", str(config),
+                                      "set", "--max-download-workers", "2"])
+        assert result.exit_code == 1, result.output
+        assert "reports no mountpoint" in result.output
+        assert [request["command"] for request in requests] == ["status"]
+        requests.clear()
+        result = runner.invoke(main, ["control", "--cache", str(cache), "--json-output",
+                                      "set", "--max-download-workers", "2"])
+        assert result.exit_code == 0, result.output
+        assert [request["command"] for request in requests] == ["status", "streaming.set"]
+    finally:
+        server.stop()
+
+
 def test_profile_refuses_a_socket_that_reports_no_mount(cache):
     config = write_profile(cache)
     requests = []

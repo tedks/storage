@@ -516,15 +516,16 @@ class StreamingReadManager:
     ):
         self.cache_manager = cache_manager
         # Reported to control clients, which refuse a socket that answers
-        # for another mount sharing this cache. None when not mounted.
+        # for another mount sharing this cache. None when not mounted, or
+        # when the spelling cannot be matched (_mountpoint_unavailable says
+        # why): the socket still serves requests that name only the cache.
         self.mountpoint = None
-        self._control_refusal = None
+        self._mountpoint_unavailable = None
         if mountpoint is not None:
             try:
                 self.mountpoint = canonical_mountpoint(mountpoint)
             except ControlError as exc:
-                # Clients could not match it, so run without a socket.
-                self._control_refusal = str(exc)
+                self._mountpoint_unavailable = str(exc)
         # Called once the complete file is in the cache (StorageFS records
         # the member baseline for revalidation on open).
         self.on_finalized = on_finalized
@@ -581,9 +582,11 @@ class StreamingReadManager:
         self.cache_manager.reclaim_space = self._reclaim_retained_space_for_cache
 
     def init(self):
-        if self._control_refusal is not None:
-            self.logger.warning("not starting the control socket: %s", self._control_refusal)
-            return
+        if self._mountpoint_unavailable is not None:
+            self.logger.warning(
+                "control socket will report no mountpoint, so --profile cannot reach this mount: %s",
+                self._mountpoint_unavailable,
+            )
         self._control_server.start()
 
     def download_limits(self):
@@ -967,6 +970,11 @@ class StreamingReadManager:
             expected = arguments.pop("mountpoint")
             if not isinstance(expected, str):
                 raise ControlError("Expected the target mountpoint as a string")
+            if self._mountpoint_unavailable is not None:
+                raise ControlError(
+                    f"This mount reports no mountpoint ({self._mountpoint_unavailable}); "
+                    "use --cache to reach it"
+                )
             if expected != self.mountpoint:
                 raise ControlError(
                     f"This control socket belongs to the mount at {self.mountpoint!r}, not {expected!r}"

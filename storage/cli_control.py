@@ -66,7 +66,10 @@ class ControlTarget:
         # Two mounts can share a cache; only one of them owns its socket.
         reported = mount["mountpoint"]
         if not isinstance(reported, str):
-            raise click.ClickException("The control socket did not report which mount it belongs to")
+            raise click.ClickException(
+                "The mount reached through this profile's cache reports no mountpoint, so it "
+                "cannot be matched to the profile; use --cache to reach it"
+            )
         if reported != mountpoint:
             raise click.ClickException(
                 f"The control socket in this profile's cache belongs to the mount at {reported!r}, "

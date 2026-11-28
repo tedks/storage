@@ -3974,7 +3974,7 @@ class TestControlRequests(unittest.TestCase):
             {"id": self.VALID_ID, "result": "not-found"},
         )
 
-    def test_final_dot_mountpoint_runs_without_a_control_socket(self):
+    def test_final_dot_mountpoint_publishes_without_a_mountpoint(self):
         fs = StorageFS(
             cache_root=self.temp_dir / "cache",
             state_db=self.temp_dir / "other.db",
@@ -3987,11 +3987,29 @@ class TestControlRequests(unittest.TestCase):
         try:
             manager = fs._streaming_manager
             self.assertIsNone(manager.mountpoint)
-            with self.assertLogs(manager.logger, "WARNING") as logged:
-                manager.init()
-            self.assertIn("not starting the control socket", logged.output[0])
+            # The socket still starts, for --cache and streaming-stats.
+            with patch.object(manager._control_server, "start") as start:
+                with self.assertLogs(manager.logger, "WARNING") as logged:
+                    manager.init()
+            start.assert_called_once_with()
+            self.assertIn("report no mountpoint", logged.output[0])
             self.assertIn("without a final '.' or '..'", logged.output[0])
-            self.assertIsNone(manager._control_server._listener)
+
+            manager._control_server.cache_identity = (1, 2)
+            status = manager._handle_control_request(json.dumps({"command": "status", "cache": [1, 2]}))
+            self.assertIsNone(status["mount"]["mountpoint"])
+            self.assertEqual(status["mount"]["cache"], [1, 2])
+            changed = manager._handle_control_request(json.dumps({
+                "command": "streaming.set", "cache": [1, 2], "limits": {"max_download_workers": 2},
+            }))
+            self.assertEqual(changed["limits"]["max_download_workers"], 2)
+            for named in ("/mnt/example/..", "/mnt", "/mnt/example"):
+                with self.assertRaisesRegex(ControlError, "reports no mountpoint .*use --cache"):
+                    manager._handle_control_request(json.dumps({
+                        "command": "streaming.set", "mountpoint": named,
+                        "limits": {"max_download_workers": 3},
+                    }))
+            self.assertEqual(manager.download_limits()["max_download_workers"], 2)
         finally:
             fs.destroy('/')
 
