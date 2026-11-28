@@ -394,9 +394,13 @@ class TestCacheAccounting(unittest.TestCase):
             manager.note_evictable_change()
             self.assertFalse(manager.ensure_space(block))
             self.assertEqual(walks, [True, True])
-            # An index row changed (a sync published CLEAN, say): walk again.
+            # An access-time flush alone changes nothing a walk counted.
             self.state_manager.update_access_time("/dirty.bin", accessed_at=5.0)
             self.state_manager._flush_access_updates(force=True)
+            self.assertFalse(manager.ensure_space(block))
+            self.assertEqual(walks, [True, True])
+            # An index row changed (a member location recorded): walk again.
+            self.state_manager.add_file_location(FileLocation("/dirty.bin", "member", "c", 1.0, False))
             self.assertFalse(manager.ensure_space(block))
             self.assertEqual(walks, [True, True, True])
             # And once the shortfall is old.
