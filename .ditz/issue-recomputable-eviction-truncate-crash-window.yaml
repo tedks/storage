@@ -1,0 +1,57 @@
+id: recomputable-eviction-truncate-crash-window
+title: 'Recomputable eviction: a crash between truncate and the row store marks the
+  placeholder DIRTY at 0 bytes'
+desc: 'Found by the Anthropic council seat on PR #187 (round b2e50e02765c-20261128T075409Z-6a57b2).
+  The bug predates #187. #187 fixed the live-race half (heal_stale_clean now rechecks
+  under the index lock); this item tracks the crash half.
+
+
+  CacheManager._evict_if_still_clean (recomputable tier) runs os.ftruncate, then store_file_metadata(size=0,
+  mtime=new). A crash between the two leaves a 0-byte file under a CLEAN row, and
+  a user.storage.metadata xattr, that still record the old size and mtime. Both the
+  post-crash sweep (heal_stale_clean) and rebuild-index (CacheMetadataRecord.to_file_metadata)
+  treat that as a lost write: the row becomes DIRTY at size 0, and sync uploads an
+  empty file over the members'' copies. Reordering the two steps does not help, because
+  ftruncate always moves the mtime.
+
+
+  Proposed design, with no change to the user.storage.metadata schema:
+
+  1. Under the index lock, before truncating, set a separate intent xattr, user.storage.evicting,
+  on the selected inode. It records the row''s (size, last_modified). Then fsync.
+
+  2. ftruncate.
+
+  3. Store the row and the metadata xattr.
+
+  4. Remove the intent xattr.
+
+
+  Recovery checks the intent in three places: heal_stale_clean (under the index lock,
+  after its recheck), to_file_metadata, and the eviction stale check.
+
+  - Roll forward (store size 0, checksum None and the file''s mtime, then drop the
+  intent) when all of these hold: the row is CLEAN and recomputable, the file is 0
+  bytes, and the intent matches the row''s recorded stat.
+
+  - If an intent exists but the file is not empty, the crash came before the truncate:
+  drop the intent.
+
+  - A lost truncate-to-zero by a user carries no intent and stays a lost write.
+
+
+  Cost: one xattr set and one fsync per recomputable eviction. Tests: inject a crash
+  after the truncate, for both the sweep and rebuild-index.'
+type: bugfix
+component: cache
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-28T08:21:07-00:00
+references: []
+log_events:
+- time: 2026-11-28T08:21:07-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
