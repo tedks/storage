@@ -2786,6 +2786,8 @@ class StorageFS(Operations):
                 raise
             except Exception as exc:
                 if refresh is None or not self.cache_manager.is_cached(resolved.requested_path):
+                    if isinstance(exc, OSError) and exc.errno:
+                        raise
                     raise FuseOSError(_full_fill_errno(exc)) from exc
                 # A refresh that raised (no capacity in time, a member gone,
                 # a transfer error) fails as one that returned: the last
