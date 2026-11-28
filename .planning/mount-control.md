@@ -71,7 +71,7 @@ The parent lane maintains the CTO roster. Its mission and these tests prohibit t
 
 ## Interfaces and Dependencies
 
-Depend on `StreamingReadManager.download_limits`, `update_download_limits` (a dict of limits and/or keywords), `list_download_sessions`, and `cancel_download_session` with `cancel_download_session_with_reason` (on `master` since #185). `storage/control.py` owns the socket: `ControlServer`, `request_control_payload`, `open_cache_directory` and `canonical_mountpoint`. The socket handler validates command and argument shape, and the streaming manager validates parameter values and applies updates in one operation. The initial live parameters are `max_streaming_sessions` (1 to 1024), `max_retained_streaming_sessions` (0 to 1024), and `max_download_workers` (1 to 32).
+Depend on `StreamingReadManager.download_limits`, `update_download_limits` (a dict of limits and/or keywords), `list_download_sessions`, and `cancel_download_session` (on `master` since #185), plus `cancel_download_session_with_reason`, which this PR adds (5acb47a) for the busy reasons. `storage/control.py` owns the socket: `ControlServer`, `request_control_payload`, `open_cache_directory` and `canonical_mountpoint`. The socket handler validates command and argument shape, and the streaming manager validates parameter values and applies updates in one operation. The initial live parameters are `max_streaming_sessions` (1 to 1024), `max_retained_streaming_sessions` (0 to 1024), and `max_download_workers` (1 to 32).
 
 2026-11-19: Recorded the assigned worktree, agreed API, and mount-level test. Recorded the fast gate results and the rebase onto the integrated scheduler.
 
