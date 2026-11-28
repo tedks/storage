@@ -1047,14 +1047,19 @@ class CacheManager:
         if self._known_shortfall(needed):
             return False
         # The epoch is read before the walk, so a close during it voids the
-        # result. The index count is read after: the walk flushes pending
-        # access times itself. A row change during the walk is caught by the
-        # TTL.
+        # result. The index's content count (access-time flushes excluded:
+        # access order cannot change what an exhaustive walk found
+        # eligible) is read before and after it: a status, row or location
+        # change during the walk may have made a copy eligible behind it,
+        # so the shortfall is then not remembered at all.
         epoch = self._evictable_epoch
+        changes = self.state_manager.content_change_count()
         freeable = self._freeable_bytes(needed)
         if freeable < needed:
-            self._shortfall = (epoch, self.state_manager.change_count(),
-                               time.monotonic(), freeable)
+            if changes == self.state_manager.content_change_count():
+                self._shortfall = (epoch, changes, time.monotonic(), freeable)
+            else:
+                self._shortfall = None
             return False
         self._shortfall = None
         if must_cover is not None and freeable < must_cover:
@@ -1067,7 +1072,7 @@ class CacheManager:
             return False
         epoch, changes, at, freeable = shortfall
         if (epoch != self._evictable_epoch
-                or changes != self.state_manager.change_count()
+                or changes != self.state_manager.content_change_count()
                 or time.monotonic() - at >= self.SHORTFALL_TTL_SECONDS):
             self._shortfall = None
             return False

@@ -4,6 +4,7 @@ import os
 import shutil
 import tempfile
 import threading
+import time
 import unittest
 from contextlib import contextmanager
 from dataclasses import replace
@@ -1491,6 +1492,77 @@ class TestCacheAccounting(unittest.TestCase):
         self.assertEqual(outcome, [True])
         self.assertFalse(victim.exists())
         self.assertEqual((self.cache_dir / "grown").read_bytes(), b"g" * block)
+
+    def _shortfall_cache(self):
+        """A full cache whose only copy has no member location (not
+        eligible), so a grant is a remembered victim shortfall."""
+        manager = self.cache_manager
+        block = manager.block_size
+        kept = self.cache_dir / "kept"
+        kept.write_bytes(b"k" * block)
+        st = kept.lstat()
+        self.state_manager.set_file_metadata(FileMetadata(
+            virtual_path="/kept", size=st.st_size, checksum="c", last_access=1.0,
+            last_modified=st.st_mtime, sync_status=SyncStatus.CLEAN, replica_count=1,
+            recomputable=False, recompute_cmd=None, encrypted=False, encryption_key_id=None,
+        ))
+        manager.max_size_bytes = block
+        manager.mark_cache_size_dirty()
+        self._assert_total(block)
+        walks = []
+        real = manager._freeable_bytes
+
+        def counting(needed):
+            walks.append(needed)
+            return real(needed)
+
+        patcher = patch.object(manager, "_freeable_bytes", side_effect=counting)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return kept, walks
+
+    def test_access_only_churn_keeps_a_victim_shortfall(self):
+        manager = self.cache_manager
+        kept, walks = self._shortfall_cache()
+        with self._partial("b") as (_, b):
+            self.assertFalse(manager.write_streaming_chunk(b, 0, b"x"))
+            for _ in range(3):
+                self.state_manager.update_access_time("/kept")
+                self.state_manager._flush_access_updates(force=True)
+                self.assertFalse(manager.write_streaming_chunk(b, 0, b"x"))
+        self.assertEqual(len(walks), 1)
+
+    def test_an_eligibility_change_forgets_a_victim_shortfall(self):
+        manager = self.cache_manager
+        kept, walks = self._shortfall_cache()
+        with self._partial("b") as (_, b):
+            self.assertFalse(manager.write_streaming_chunk(b, 0, b"x"))
+            self.state_manager.add_file_location(FileLocation("/kept", "member", "c", 1.0, False))
+            self.assertTrue(manager.write_streaming_chunk(b, 0, b"x"))
+        self.assertEqual(len(walks), 2)
+        self.assertFalse(kept.exists())
+
+    def test_an_eligibility_change_during_the_walk_is_not_remembered_against(self):
+        """The location lands while the dry run walks (after it passed the
+        row): the walk's shortfall is not remembered, so the next grant
+        walks again and takes the copy."""
+        manager = self.cache_manager
+        kept, walks = self._shortfall_cache()
+        counting = manager._freeable_bytes
+
+        def walk_then_change(needed):
+            found = counting(needed)
+            if len(walks) == 1:
+                self.state_manager.add_file_location(
+                    FileLocation("/kept", "member", "c", 1.0, False))
+            return found
+
+        with self._partial("b") as (_, b), \
+                patch.object(manager, "_freeable_bytes", side_effect=walk_then_change):
+            self.assertFalse(manager.write_streaming_chunk(b, 0, b"x"))
+            self.assertIsNone(manager._shortfall)
+            self.assertTrue(manager.write_streaming_chunk(b, 0, b"x"))
+        self.assertEqual(len(walks), 2)
 
     def test_direct_writer_uses_space_before_the_next_stream_grant(self):
         manager = self.cache_manager
