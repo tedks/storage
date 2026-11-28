@@ -292,11 +292,12 @@ def test_server_drops_a_peer_that_is_not_the_mount_owner(cache, monkeypatch):
         # Applied after start: publication checks ownership too.
         monkeypatch.setattr("storage.control.os.geteuid", other_uid_in("_check_peer"))
         with socket_for(cache) as conn:
-            conn.sendall(b"status\n")
+            # The server may close before, during or after our send.
             try:
+                conn.sendall(b"status\n")
                 answer = conn.recv(4096)
-            except ConnectionResetError:
-                answer = b""  # Closed with our request unread.
+            except (BrokenPipeError, ConnectionResetError):
+                answer = b""
             assert answer == b""
         assert dispatched == []
         monkeypatch.undo()
