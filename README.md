@@ -324,10 +324,12 @@ missing for 10 s. Attributes are not kept: each `stat` reaches the mount,
 which answers it from the cached file or from the parent's listing, and
 asks a member only when neither knows the name. (Kept
 attributes would hold a file's old size past a refetch, and reads would
-stop there.) A file's pages stay in the page cache across opens while
-its size and mtime are unchanged and are dropped when they change, so a
-refetched file is read fresh. Changes made through the mount are visible
-at once. A file added directly on a member can stay hidden for up to
+stop there.) Each new open discards the mount's buffered pages from
+earlier opens so a refetch can return fresh bytes with the same size and
+mtime. Repeated opens can incur additional local FUSE reads. A warm open
+still uses Storage's backing cache and requires no download of the cached
+file. Changes made through the mount are visible at once. A file added
+directly on a member can stay hidden for up to
 10 s after a lookup missed it, and a name removed on a member can still
 be walked through for up to the fresh window. The profile keys
 `entry_timeout` and `negative_timeout` (seconds) override the first two

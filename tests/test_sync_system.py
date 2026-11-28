@@ -15,9 +15,11 @@ import subprocess
 import threading
 import shutil
 from pathlib import Path
+from unittest.mock import patch
 
 from storage.fs import StorageFS
 from storage.backends.local import LocalBackend
+from storage.models import SyncStatus
 from tests.fuse_mount import run_fuse, stop_fuse
 
 
@@ -436,6 +438,55 @@ class TestKernelCacheRefetch(_MountedCase):
 
     def test_shrunk_file_reads_short(self):
         self._read_after_revalidation("shrink.bin", b"a" * 200, b"d" * 50)
+
+    def test_same_stat_refetch_reads_fresh_bytes_and_reuses_warm_backing(self):
+        name = "same-stat.bin"
+        source = self.backend1_dir / name
+        target = self.mount_dir / name
+        cached = self.cache_dir / name
+        before, after = b"a" * 16384, b"b" * 16384
+        stamp = 1_000_000_000
+        source.write_bytes(before)
+        os.utime(source, (stamp, stamp))
+        backend = self.fs.backends["backend1"]
+        with patch.object(backend, "copy_to_local", wraps=backend.copy_to_local) as download:
+            self.assertEqual(before, target.read_bytes())
+            self.assertEqual(before, target.read_bytes())
+            self.assertEqual(1, download.call_count)
+
+            source.write_bytes(after)
+            os.utime(source, (stamp, stamp))
+            self.fs._on_remote_change("/" + name)
+            self.assertFalse(cached.exists())
+
+            with target.open("rb") as reader:
+                self.assertEqual(after, cached.read_bytes())
+                self.assertEqual(stamp, target.stat().st_mtime)
+                self.assertEqual(after, reader.read())
+            self.assertEqual(after, target.read_bytes())
+            self.assertEqual(2, download.call_count)
+
+    def test_watcher_invalidation_keeps_real_writer_on_clean_backing(self):
+        name = "writer.bin"
+        source = self.backend1_dir / name
+        target = self.mount_dir / name
+        cached = self.cache_dir / name
+        source.write_bytes(b"original")
+        self.assertEqual(b"original", target.read_bytes())
+
+        with target.open("r+b", buffering=0) as writer:
+            inode = cached.stat().st_ino
+            row = self.fs.state_manager.get_file_metadata("/" + name)
+            self.assertEqual(SyncStatus.CLEAN, row.sync_status)
+
+            source.write_bytes(b"whatever")
+            self.fs._on_remote_change("/" + name)
+            self.assertEqual(inode, cached.stat().st_ino)
+            self.assertEqual(8, writer.write(b"mount-ed"))
+
+        self.assertEqual(inode, cached.stat().st_ino)
+        self.assertEqual(b"mount-ed", cached.read_bytes())
+        self.assertEqual(b"mount-ed", target.read_bytes())
 
 
 class TestMemberSymlinks(_MountedCase):

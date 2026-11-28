@@ -315,8 +315,8 @@ class TestMountKernelCacheOptions(unittest.TestCase):
         self.assertEqual(0.0, kwargs['attr_timeout'])
         self.assertEqual(45.0, kwargs['entry_timeout'])
         self.assertEqual(3.0, kwargs['negative_timeout'])
-        self.assertIs(True, kwargs['auto_cache'])
-        self.assertEqual(0.0, kwargs['ac_attr_timeout'])
+        self.assertNotIn('auto_cache', kwargs)
+        self.assertNotIn('kernel_cache', kwargs)
         self.assertTrue(kwargs['nothreads'])
 
     @patch('storage.fs.FUSE')

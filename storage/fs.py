@@ -3492,12 +3492,11 @@ def fuse_mount_options(backends: Dict[str, Backend], *, enable_watchers: bool,
     a remembered miss hides a name added behind the mount's back (on a
     member, or a conflict copy such as name.member0 after a split).
 
-    auto_cache keeps a file's pages across opens while its mtime and size
-    are unchanged and drops them otherwise, so a refetch after revalidation
-    is not read through old pages (kernel_cache would keep them). libfuse
-    compares against attributes it fetched within ac_attr_timeout, which
-    defaults to attr_timeout; ac_attr_timeout=0 states that a getattr
-    follows every open rather than leaving it implied.
+    Use libfuse's default buffered I/O without retaining pages across
+    opens. A member refetch can replace bytes while preserving size and
+    mtime, so auto_cache's comparison can keep old pages after a refetch.
+    Warm opens still use Storage's local backing file. Repeated reads
+    across opens can require FUSE callbacks again.
 
     Writes through the mount stay visible at once: create, mkdir, unlink,
     rmdir and rename update the kernel's entries themselves. (symlink is
@@ -3516,8 +3515,6 @@ def fuse_mount_options(backends: Dict[str, Backend], *, enable_watchers: bool,
         DEFAULT_NEGATIVE_TIMEOUT if negative_timeout is None
         else _kernel_timeout("negative_timeout", negative_timeout)
     )
-    options["auto_cache"] = True
-    options["ac_attr_timeout"] = 0.0
     return options
 
 

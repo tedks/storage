@@ -1188,6 +1188,39 @@ def test_mounted_browse_keeps_member_attributes(remote, mounted_factory, streami
         assert remote.exec(member, snapshot).stdout == before
 
 
+def test_mounted_same_stat_refetch_reads_fresh_bytes(remote, mounted_factory):
+    member = remote.members[0]
+    name = "same-stat.bin"
+    path = f"{REMOTE_ROOT}/{name}"
+    before, after = b"a" * 16384, b"b" * 16384
+    stamp = 1_000_000_000
+    remote.write_remote(member, name, before)
+    remote.exec(member, f"touch -d @{stamp} {path}")
+
+    mnt = mounted_factory(streaming_reads=False)
+    target = mnt.mount / name
+    cached = mnt.cache / name
+    backend = mnt.backends[member.name]
+    with mock.patch.object(backend, "copy_to_local", wraps=backend.copy_to_local) as download:
+        assert target.read_bytes() == before
+        assert target.read_bytes() == before
+        assert download.call_count == 1
+
+        remote.write_remote(member, name, after)
+        remote.exec(member, f"touch -d @{stamp} {path}")
+        # Deliver the watcher's change deterministically, without waiting
+        # for remote inotify delivery or racing its file state.
+        mnt.fs._on_remote_change("/" + name)
+        assert not cached.exists()
+
+        with target.open("rb") as reader:
+            assert cached.read_bytes() == after
+            assert target.stat().st_mtime == stamp
+            assert reader.read() == after
+        assert target.read_bytes() == after
+        assert download.call_count == 2
+
+
 def test_mounted_read_only_conflict_close_keeps_newer_member_bytes(
         remote, mounted_factory, monkeypatch):
     left, right = remote.members
