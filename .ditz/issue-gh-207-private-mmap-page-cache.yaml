@@ -4,11 +4,22 @@ desc: 'From #208 round 5 (L-I3, S8), confirmed mounted (tests/test_sync_system.p
   test_mmap_of_a_private_handle, both loop modes). A private (direct_io) handle''s
   MAP_PRIVATE mapping is filled through the inode''s one page cache using the private
   fh; a buffered reader of the installed copy opened beside it then reads the private
-  copy''s bytes (and vice versa). FUSE has no mmap callback to refuse it. Partial
-  prevention: give every open of a path direct_io while a private handle is open on
-  it, and refuse (EAGAIN) a private open while a buffered handle is open; two private
-  handles with MAP_PRIVATE would still share the cache. CTO to choose; documented
-  in README item 7 meanwhile.'
+  copy''s bytes (and vice versa). FUSE has no mmap callback to refuse it.
+
+  CTO-208-MMAP-FALLBACK supersedes private full-fill handles: after bounded attempts,
+  a cold CHANGED or UNCONFIRMED full fill returns EAGAIN for both readers and writers.
+  Keep the reproduction at 1334047f9323697bbaa9b1275452d301dc7e169c and the replacement
+  regression in tests/test_sync_system.py, which exercises buffered read and mmap
+  on the verified same-size/mtime replacement in both FUSE loops.
+
+
+  Before offering private fills again, prove that their pages are isolated across
+  versions and from the ordinary buffered path. Use independently identified FUSE
+  inodes or an equivalently proven mechanism. Exercise overlapping private mappings
+  in both orders, with both equal and different lengths, plus buffered reads and mappings
+  of the verified replacement. Include mappings that outlive their originating descriptors
+  and run in both FUSE loops. Path-level admission or direct I/O alone is insufficient
+  while pages remain shared.'
 type: bugfix
 component: storage
 release:
@@ -29,4 +40,8 @@ log_events:
 - time: 2026-11-28T12:53:48-00:00
   who: Ted Smith
   what: no longer blocks gh-207
+  comment: ""
+- time: 2026-11-28T13:22:40-00:00
+  who: Ted Smith
+  what: updated description
   comment: ""
