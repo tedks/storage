@@ -1025,40 +1025,63 @@ def test_empty_private_directory_substituted_for_the_stage(cache, monkeypatch):
         cache.chmod(0o700)
 
 
-def write_stage(cache, name, *, nonce=True, socket_state=None, extra=None, mode=0o700):
-    stage = cache / name
+def socket_at(path):
+    """A dead socket of ours at path: bound, then closed."""
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as stale:
+        stale.bind(str(path))
+
+
+def write_stage(cache, nonce_hex, *, nonce=None, sockets=(), live=None, extra=None, mode=0o700,
+                name=None):
+    """A leftover stage: by default named for nonce_hex, with a matching
+    nonce file. `sockets` are dead sockets, `live` a listening one."""
+    stage = cache / (name or f".storage.mount.{nonce_hex}")
     stage.mkdir()
     stage.chmod(mode)
-    if nonce:
-        (stage / "nonce").write_text("0" * 32)
-    if socket_state is not None:
+    if nonce is not False:
+        (stage / "nonce").write_text(nonce_hex if nonce is None else nonce)
+    for item in sockets:
+        socket_at(stage / item)
+    listener = None
+    if live is not None:
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        listener.bind(str(stage / "socket"))
-        if socket_state == "live":
-            listener.listen(1)
-            return stage, listener
-        listener.close()
+        listener.bind(str(stage / live))
+        listener.listen(1)
     if extra is not None:
         (stage / extra).write_text("user data")
-    return stage, None
+    return stage, listener
 
 
-def test_publication_sweeps_only_stages_a_crash_left(cache):
+def test_publication_sweeps_only_stages_it_can_prove_it_made(cache):
+    hexes = iter(f"{n:032x}" for n in range(1, 100))
     swept = [
-        write_stage(cache, ".storage.mount.0000000000000001", socket_state="dead")[0],
-        write_stage(cache, ".storage.mount.0000000000000002")[0],
-        write_stage(cache, ".storage.mount.0000000000000003", nonce=False, socket_state="dead")[0],
+        write_stage(cache, next(hexes), sockets=["socket"])[0],
+        write_stage(cache, next(hexes))[0],
+        # A crash after a dead socket was taken off the control name.
+        write_stage(cache, next(hexes), sockets=["moved"])[0],
+        write_stage(cache, next(hexes), sockets=["socket", "moved"])[0],
     ]
+    renamed_hex = next(hexes)
     kept = [
-        write_stage(cache, ".storage.mount.0000000000000004", extra="moved")[0],
-        write_stage(cache, ".storage.mount.0000000000000005", nonce=False)[0],  # empty
-        write_stage(cache, ".storage.mount.0000000000000006", mode=0o750)[0],
+        write_stage(cache, next(hexes), extra="moved")[0],         # moved is not a socket
+        write_stage(cache, next(hexes), nonce=False, sockets=["socket"])[0],  # no nonce
+        write_stage(cache, next(hexes), mode=0o750)[0],           # not private
+        write_stage(cache, next(hexes), nonce="f" * 32)[0],       # nonce does not match
+        write_stage(cache, next(hexes), nonce=next(hexes) + "\n")[0],  # not exactly 32 bytes
+        # A private directory renamed to a stage-like name, holding a nonce
+        # file that does not match it.
+        write_stage(cache, renamed_hex, nonce="0" * 32)[0],
+        write_stage(cache, "ab" * 8, name=".storage.mount." + "ab" * 8)[0],  # old 16-hex name
     ]
-    live_stage, live = write_stage(cache, ".storage.mount.0000000000000007", socket_state="live")
+    linked_hex = next(hexes)
+    linked, _ = write_stage(cache, linked_hex)
+    os.link(linked / "nonce", cache / "second name")  # st_nlink 2
+    kept.append(linked)
+    live_stage, live = write_stage(cache, next(hexes), live="socket")
     kept.append(live_stage)
     lock = cache / ".storage.mount.0123456789ab.lock"
     lock.write_text("4242")
-    link = cache / ".storage.mount.0000000000000008"
+    link = cache / f".storage.mount.{next(hexes)}"
     link.symlink_to(kept[0])
     try:
         server = server_for(cache, lambda _: {})
@@ -1077,27 +1100,162 @@ def test_publication_sweeps_only_stages_a_crash_left(cache):
         live.close()
 
 
-def socket_at(path):
-    """A dead socket of ours at path: bound, then closed."""
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as stale:
-        stale.bind(str(path))
+class FailingProbe(socket.socket):
+    """A socket whose connect fails as configured, for the liveness probe."""
+
+    error = None
+
+    def connect(self, address):
+        raise self.error
 
 
-def test_startup_swap_after_the_final_check_keeps_the_new_entry(cache, monkeypatch):
-    # A stale socket is replaced, but a group writer puts an unrelated file at
-    # the control name right after the stale socket was checked (moved into
-    # our stage and found dead). Publication must not clobber it.
+@pytest.mark.parametrize("error", [BlockingIOError(11, "busy"), TimeoutError("timed out"),
+                                   PermissionError(13, "denied"), InterruptedError(4, "interrupted")])
+def test_a_probe_that_proves_nothing_leaves_the_entry(cache, monkeypatch, error):
+    # Only a refused connect proves a socket dead; any other failure leaves
+    # it at the name, unmoved, and publication refuses.
     path = cache / CONTROL_SOCKET_NAME
     socket_at(path)
-    real_refused = control_module._refused_socket
+    before = path.lstat()
+    FailingProbe.error = error
+    renames = []
+    real_rename = os.rename
 
-    def refused_then_swap(dir_fd, name, expected):
-        result = real_refused(dir_fd, name, expected)
-        if not path.exists():
+    def recording_rename(src, dst, **kwargs):
+        renames.append(src)
+        return real_rename(src, dst, **kwargs)
+
+    server = server_for(cache, lambda _: {})
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+        monkeypatch.setattr("storage.control.socket.socket", FailingProbe)
+        monkeypatch.setattr("storage.control.os.rename", recording_rename)
+        with pytest.raises(ControlError, match="leaving it in place"):
+            server._publish(listener)
+        monkeypatch.undo()
+    after = path.lstat()
+    assert (after.st_dev, after.st_ino) == (before.st_dev, before.st_ino)
+    assert CONTROL_SOCKET_NAME not in renames
+    assert sorted(os.listdir(cache)) == [CONTROL_SOCKET_NAME]
+
+
+@pytest.mark.parametrize("kind", ["file", "directory", "symlink", "fifo"])
+def test_an_entry_that_is_not_a_socket_is_never_moved(cache, monkeypatch, kind):
+    path = cache / CONTROL_SOCKET_NAME
+    if kind == "file":
+        path.write_text("unrelated")
+    elif kind == "directory":
+        path.mkdir()
+        (path / "inside").write_text("unrelated")
+    elif kind == "symlink":
+        socket_at(cache / "dead.sock")
+        path.symlink_to(cache / "dead.sock")
+    else:
+        os.mkfifo(path)
+    before = path.lstat()
+    renames = []
+    real_rename = os.rename
+
+    def recording_rename(src, dst, **kwargs):
+        renames.append(src)
+        return real_rename(src, dst, **kwargs)
+
+    monkeypatch.setattr("storage.control.os.rename", recording_rename)
+    server = server_for(cache, lambda _: {})
+    server.start()
+    server.stop()
+    monkeypatch.undo()
+    assert server._cache_fd is None
+    assert CONTROL_SOCKET_NAME not in renames
+    after = path.lstat()
+    assert (after.st_dev, after.st_ino) == (before.st_dev, before.st_ino)
+
+
+def test_a_failure_after_the_move_puts_the_entry_back(cache, monkeypatch):
+    path = cache / CONTROL_SOCKET_NAME
+    socket_at(path)
+    before = path.lstat()
+    real_entry_at = control_module._entry_at
+
+    def failing_entry_at(dir_fd, name):
+        if name == control_module.STAGE_MOVED:
+            raise OSError(5, "simulated failure after the move")
+        return real_entry_at(dir_fd, name)
+
+    monkeypatch.setattr("storage.control._entry_at", failing_entry_at)
+    server = server_for(cache, lambda _: {})
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+        with pytest.raises(OSError, match="simulated failure after the move"):
+            server._publish(listener)
+    monkeypatch.undo()
+    after = path.lstat()
+    assert (after.st_dev, after.st_ino) == (before.st_dev, before.st_ino)
+    assert sorted(os.listdir(cache)) == [CONTROL_SOCKET_NAME]
+
+
+def test_a_failure_after_the_move_at_stop_puts_our_socket_back(cache, monkeypatch):
+    path = cache / CONTROL_SOCKET_NAME
+    server = server_for(cache, lambda _: {})
+    server.start()
+    ours = path.lstat()
+    real_entry_at = control_module._entry_at
+
+    def failing_entry_at(dir_fd, name):
+        if name == control_module.STAGE_MOVED:
+            raise OSError(5, "simulated failure after the move")
+        return real_entry_at(dir_fd, name)
+
+    monkeypatch.setattr("storage.control._entry_at", failing_entry_at)
+    server.stop()
+    monkeypatch.undo()
+    # Left as a dead socket of ours, which the next start takes over.
+    after = path.lstat()
+    assert (after.st_dev, after.st_ino) == (ours.st_dev, ours.st_ino)
+    assert sorted(os.listdir(cache)) == [CONTROL_SOCKET_NAME]
+    server.start()
+    try:
+        assert request_control_payload(cache, b"status", 2) == {}
+    finally:
+        server.stop()
+    assert os.listdir(cache) == []
+
+
+def test_startup_swap_after_the_probe_keeps_the_new_entry(cache, monkeypatch):
+    # The stale socket is proven dead, then a group writer replaces it with
+    # an unrelated file before the move: that file is moved, found not to be
+    # the probed inode, and put back.
+    path = cache / CONTROL_SOCKET_NAME
+    socket_at(path)
+    real_probe = control_module._dead_socket_of_ours
+
+    def probe_then_swap(dir_fd, name):
+        result = real_probe(dir_fd, name)
+        if name == CONTROL_SOCKET_NAME:
+            path.unlink()
             path.write_text("unrelated")
         return result
 
-    monkeypatch.setattr("storage.control._refused_socket", refused_then_swap)
+    monkeypatch.setattr("storage.control._dead_socket_of_ours", probe_then_swap)
+    server = server_for(cache, lambda _: {})
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+        with pytest.raises(ControlError, match="changed during startup"):
+            server._publish(listener)
+    assert path.read_text() == "unrelated"
+    assert sorted(os.listdir(cache)) == [CONTROL_SOCKET_NAME]
+
+
+def test_startup_swap_after_the_final_check_keeps_the_new_entry(cache, monkeypatch):
+    # The dead socket is removed, but a group writer puts an unrelated file
+    # at the control name before ours is placed. Publication must not
+    # clobber it.
+    path = cache / CONTROL_SOCKET_NAME
+    socket_at(path)
+    real_discard = ControlServer._discard_moved
+
+    def discard_then_swap(self, *args):
+        real_discard(self, *args)
+        path.write_text("unrelated")
+
+    monkeypatch.setattr(ControlServer, "_discard_moved", discard_then_swap)
     server = server_for(cache, lambda _: {})
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
         with pytest.raises(ControlError, match="changed during startup"):
