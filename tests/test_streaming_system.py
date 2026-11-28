@@ -66,18 +66,29 @@ def sha256(data: bytes) -> str:
 
 
 class HeldReader:
-    """A reader of a mounted file in a subprocess, holding it open until close()."""
+    """A reader of a mounted file in a subprocess, holding it open until close().
 
-    def __init__(self, path: Path, count: int):
+    `release` (the backend's release_held_reads) is called before the child
+    is killed, so a member read the test holds cannot keep it in the kernel.
+    Every wait is bounded by MOUNTED_STEP_TIMEOUT.
+    """
+
+    def __init__(self, path: Path, count: int, release=None):
+        self._release = release
         self._process = subprocess.Popen(
             [sys.executable, "-I", "-c", _HELD_READER, os.fsencode(path), str(count)],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
         )
-        self._lines = queue.Queue()
-        threading.Thread(target=self._pump, daemon=True).start()
-        word, self.first_digest = self._line().split()
-        if word != "ready":
-            raise AssertionError(f"reader said {word!r}")
+        # From here on, any failure (readiness included) reaps the child.
+        try:
+            self._lines = queue.Queue()
+            threading.Thread(target=self._pump, daemon=True).start()
+            word, self.first_digest = self._line().split()
+            if word != "ready":
+                raise AssertionError(f"reader said {word!r}")
+        except BaseException:
+            self.kill()
+            raise
 
     def _pump(self):
         for line in self._process.stdout:
@@ -90,8 +101,14 @@ class HeldReader:
         except queue.Empty:
             raise AssertionError("mounted file reader did not answer") from None
         if line is None:
-            raise AssertionError(f"mounted file reader exited with {self._process.wait()}")
+            raise AssertionError(f"mounted file reader exited with {self._reap()}")
         return line
+
+    def _reap(self):
+        try:
+            return self._process.wait(timeout=MOUNTED_STEP_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            raise AssertionError("mounted file reader did not exit") from None
 
     def read_digest(self, offset: int, count: int) -> str:
         self._process.stdin.write(f"{offset} {count}\n")
@@ -100,17 +117,23 @@ class HeldReader:
 
     def close(self):
         """Close the handle (by closing stdin) and wait for the reader to exit."""
-        if self._process.poll() is None and not self._process.stdin.closed:
-            self._process.stdin.close()
-            if self._line() != "closed":
-                raise AssertionError("mounted file reader did not close its handle")
-        if self._process.wait(timeout=MOUNTED_STEP_TIMEOUT) != 0:
-            raise AssertionError(f"mounted file reader exited with {self._process.returncode}")
+        try:
+            if self._process.poll() is None and not self._process.stdin.closed:
+                self._process.stdin.close()
+                if self._line() != "closed":
+                    raise AssertionError("mounted file reader did not close its handle")
+            if self._reap() != 0:
+                raise AssertionError(f"mounted file reader exited with {self._process.returncode}")
+        except BaseException:
+            self.kill()
+            raise
 
     def kill(self):
+        if self._release is not None:
+            self._release()
         if self._process.poll() is None:
             self._process.kill()
-            self._process.wait()
+        self._reap()
 
     def __enter__(self):
         return self
@@ -471,12 +494,19 @@ class TestStreamingSystemRegression(unittest.TestCase):
 
     def test_live_mount_control(self):
         self.assertTrue(os.path.ismount(self.mount_dir), "requires a live scratch FUSE mount")
+        control_socket = os.fsencode(self.cache_dir / ".storage.control.sock")
+        self.assertLessEqual(
+            len(control_socket), 107,
+            f"the cache path is too long for a Unix socket ({len(control_socket)} bytes); "
+            "run with a shorter TMPDIR",
+        )
         name = "recording 演奏.bin"
         second = "second file.bin"
         partial = self.cache_dir / f"{name}.storage.partial"
         entered = threading.Event()
         resume = threading.Event()
         self.backend.hold_past = (name, 1024 * 1024, entered, resume)
+        release = self.backend.release_held_reads
 
         def command(*args, expected=0, json_output=True):
             options = ["control", "--cache", str(self.cache_dir)]
@@ -486,7 +516,7 @@ class TestStreamingSystemRegression(unittest.TestCase):
             return json.loads(result.stdout) if json_output else result
 
         try:
-            with HeldReader(self.mount_dir / name, 512 * 1024) as handle:
+            with HeldReader(self.mount_dir / name, 512 * 1024, release) as handle:
                 self.assertEqual(handle.first_digest, sha256(self.payload[:512 * 1024]))
                 self.assertTrue(entered.wait(MOUNTED_STEP_TIMEOUT),
                                 "the background range reader must be held")
@@ -542,7 +572,7 @@ backends = [{json.dumps(str(self.backend_dir))}]
                 ).stdout)
                 self.assertEqual(mine["limits"], limits)
 
-                with HeldReader(self.mount_dir / second, 16) as fallback:
+                with HeldReader(self.mount_dir / second, 16, release) as fallback:
                     self.assertEqual(fallback.first_digest, sha256(self.payload[:16]))
                 self.assertEqual(command("status")["stats"]["streaming_fallback_opens"], 1)
 
@@ -553,20 +583,22 @@ backends = [{json.dumps(str(self.backend_dir))}]
                 self.assertEqual(legacy["active_streaming_sessions"], 1)
             self.assertTrue(self._wait_for(
                 lambda: command("status")["stats"]["retained_streaming_sessions"] == 1,
+                timeout=MOUNTED_STEP_TIMEOUT,
             ))
             self.assertTrue(partial.exists())
             self.assertEqual(command("cancel", original), {"id": original, "result": "cancelled"})
             self.assertEqual(command("downloads")["downloads"], [])
             self.assertFalse(partial.exists())
 
-            with HeldReader(self.mount_dir / name, 512 * 1024) as replacement:
+            with HeldReader(self.mount_dir / name, 512 * 1024, release) as replacement:
                 self.assertEqual(replacement.first_digest, sha256(self.payload[:512 * 1024]))
                 row, = command("downloads")["downloads"]
                 self.assertNotEqual(row["id"], original)
                 self.assertEqual(command("cancel", original, expected=4)["result"], "not-found")
                 self.assertEqual(command("downloads")["downloads"][0]["id"], row["id"])
                 command("set", "--max-retained-streaming-sessions", "0")
-            self.assertTrue(self._wait_for(lambda: not command("downloads")["downloads"]))
+            self.assertTrue(self._wait_for(lambda: not command("downloads")["downloads"],
+                                           timeout=MOUNTED_STEP_TIMEOUT))
             self.assertFalse(partial.exists())
         finally:
             resume.set()
