@@ -1827,21 +1827,65 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.assertEqual((stat_module.S_IMODE(attrs["st_mode"]), attrs["st_uid"]), (0o640, 4242))
         self._assert_warm_and_offline("partial.bin", payload)
 
-    def test_streaming_fill_without_owner_read_grants_no_read(self):
+    def test_streaming_fill_with_an_unconfirmed_mode_grants_no_write(self):
+        # No version token, a mode only the probe reported: the staging
+        # file's own owner write is not granted through the mount.
         import stat as stat_module
         from types import SimpleNamespace
         payload = os.urandom(64 * 1024)
-        (self.backend_dir / "noread.bin").write_bytes(payload)
-        real = self.backend.stat
-        with patch.object(self.backend, "stat", side_effect=lambda path: SimpleNamespace(
-                st_size=real(path).st_size, st_mtime_ns=real(path).st_mtime_ns,
-                st_mtime=real(path).st_mtime, st_mode=stat_module.S_IFREG | 0o200)):
-            self._stream_and_finish("noread.bin", len(payload))
-            self.assertTrue(self._wait_for((self.cache_dir / "noread.bin").exists, timeout=8.0))
-        self.assertEqual(stat_module.S_IMODE(self.fs.getattr("/noread.bin")["st_mode"]), 0o200)
-        with self.assertRaises(FuseOSError) as raised:
-            self.fs.open("/noread.bin", os.O_RDONLY)
-        self.assertEqual(raised.exception.errno, errno.EACCES)
+        (self.backend_dir / "staged.bin").write_bytes(payload)
+        seen = []
+
+        def probe_then_fail(path):
+            seen.append(path)
+            if len(seen) == 1:
+                return SimpleNamespace(st_size=len(payload), st_mode=stat_module.S_IFREG | 0o644)
+            raise OSError(errno.EIO, "stat failed")
+
+        with patch.object(self.backend, "stat", side_effect=probe_then_fail):
+            self._stream_and_finish("staged.bin", len(payload))
+            self.assertTrue(self._wait_for((self.cache_dir / "staged.bin").exists, timeout=8.0))
+        self.assertEqual(self.fs.getattr("/staged.bin")["st_mode"] & 0o222, 0)
+
+    def test_rewrite_during_range_reads_with_a_lost_final_stat_is_not_published(self):
+        # A comparable probe; the member is rewritten (same size) while the
+        # ranges are read; the stat after the stream fails. The mixed bytes
+        # are never installed under either version, and a later open with
+        # the member answering reads the new version.
+        old, new = b"o" * (96 * 1024), b"n" * (96 * 1024)
+        member = self.backend_dir / "mixed.bin"
+        member.write_bytes(old)
+        os.utime(member, (1_600_000_000, 1_600_000_000))
+        real_read, real_stat = self.backend.read_file, self.backend.stat
+        state = {"rewritten": False, "stats": 0}
+
+        def read_then_rewrite(path, offset, size):
+            data = real_read(path, offset, size)
+            if not state["rewritten"]:
+                state["rewritten"] = True
+                member.write_bytes(new)
+                os.utime(member, (1_650_000_000, 1_650_000_000))
+            return data
+
+        def probe_then_fail(path):
+            state["stats"] += 1
+            if state["stats"] == 1:
+                return real_stat(path)
+            raise OSError(errno.EIO, "stat failed")
+
+        with patch.object(self.backend, "read_file", side_effect=read_then_rewrite), \
+                patch.object(self.backend, "stat", side_effect=probe_then_fail):
+            data, session = self._stream_and_finish("mixed.bin", len(old))
+            self.assertTrue(self._wait_for(lambda: self.fs._streaming_manager._streaming_stats.get(
+                "streaming_member_changed_discards") == 1, timeout=8.0))
+        self.assertNotEqual(data, new)  # it read from both versions
+        self.assertFalse((self.cache_dir / "mixed.bin").exists())
+        self.assertIsNone(self.fs.state_manager.get_file_metadata("/mixed.bin"))
+        data2, _ = self._stream_and_finish("mixed.bin", len(new))
+        self.assertEqual(data2, new)
+        self.assertTrue(self._wait_for((self.cache_dir / "mixed.bin").exists, timeout=8.0))
+        self.assertEqual((self.cache_dir / "mixed.bin").read_bytes(), new)
+        self.assertEqual(self.fs.getattr("/mixed.bin")["st_mtime"], 1_650_000_000)
 
     def test_stream_whose_size_only_stat_changes_size_is_discarded(self):
         # Control: positive evidence of another version still discards.

@@ -517,9 +517,9 @@ class TestImportedPermissions(RevalidateTestBase):
                 self.fs.cache_manager.delete_cached_file("/g.txt")
                 self.fs.state_manager.delete_file("/g.txt")
 
-    def test_stale_writable_probe_does_not_survive_a_failed_confirmation(self):
-        # Writable when probed; read-only (same length) by the time the copy
-        # runs; the confirming stat then fails twice.
+    def _turning_read_only(self, probe_stat):
+        """Patches: the copy finds the source turned read-only (same
+        length); the first stat is probe_stat(real stat), the rest fail."""
         src = self.rewrite_member("f.txt", b"original", mtime=1_000_000_000)
         os.chmod(src, 0o644)
         copy_to_local = self.member.copy_to_local
@@ -532,16 +532,75 @@ class TestImportedPermissions(RevalidateTestBase):
         def probe_then_fail(path):
             seen.append(path)
             if len(seen) == 1:
-                return real_stat(path)
+                return probe_stat(real_stat(path))
             raise OSError(errno.EIO, "stat failed")
 
-        with patch.object(self.member, "copy_to_local", side_effect=turned_read_only), \
-                patch.object(self.member, "stat", side_effect=probe_then_fail):
+        return (patch.object(self.member, "copy_to_local", side_effect=turned_read_only),
+                patch.object(self.member, "stat", side_effect=probe_then_fail))
+
+    def test_unconfirmed_version_is_not_installed(self):
+        # A comparable probe, then no confirmation at all: not a verified
+        # generation, so nothing is published; a later open with the member
+        # answering installs its current (read-only) version.
+        copying, stats = self._turning_read_only(lambda st: st)
+        with copying, stats:
+            with self.assertRaises(FuseOSError):
+                self.read_through("/f.txt")
+        self.assertFalse((self.cache_dir / "f.txt").exists())
+        self.assertEqual(self.read_through("/f.txt"), b"original")
+        self.assertEqual(stat.S_IMODE(self.fs.getattr("/f.txt")["st_mode"]), 0o444)
+
+    def test_stale_writable_probe_does_not_survive_a_failed_confirmation(self):
+        # A probe with a mode but no version token (no mtime) installs once
+        # the confirmations fail; its unconfirmed mode grants no write, here
+        # with a receiver that sets no mode (as SFTP's get), as a staging
+        # file does not either.
+        _, stats = self._turning_read_only(
+            lambda st: SimpleNamespace(st_size=st.st_size, st_mode=stat.S_IFREG | 0o644))
+        sftp_like = patch.object(self.member, "copy_to_local", side_effect=lambda path, temp: (
+            os.chmod(self.member_dir / "f.txt", 0o444),
+            shutil.copyfile(self.member_dir / "f.txt", temp)))
+        with sftp_like, stats:
             self.assertEqual(self.read_through("/f.txt"), b"original")
         self.assertEqual(self.fs.getattr("/f.txt")["st_mode"] & 0o222, 0)
         with self.assertRaises(FuseOSError) as raised:
             self.fs.open("/f.txt", os.O_WRONLY)
         self.assertEqual(raised.exception.errno, errno.EACCES)
+        self.fs.chmod("/f.txt", 0o644)  # an explicit chmod grants write
+        self.fs.release("/f.txt", self.fs.open("/f.txt", os.O_WRONLY))
+
+    def test_confirmation_without_mode_keeps_the_probes_read_denial(self):
+        src = self.rewrite_member("f.txt", b"original", mtime=1_000_000_000)
+        real, seen = self.member.stat, []
+
+        def probe_with_mode_then_without(path):
+            st = real(path)
+            seen.append(path)
+            mode = stat.S_IFREG | 0o200 if len(seen) == 1 else None
+            return SimpleNamespace(st_size=st.st_size, st_mtime=st.st_mtime,
+                                   st_mtime_ns=st.st_mtime_ns, st_mode=mode)
+
+        with patch.object(self.member, "stat", side_effect=probe_with_mode_then_without):
+            self.assertTrue(self.fs._ensure_file_in_cache(self.fs._resolve_path("/f.txt")))
+        self.assertEqual(self.fs.getattr("/f.txt")["st_mode"] & 0o400, 0)
+        with self.assertRaises(FuseOSError) as raised:
+            self.fs.open("/f.txt", os.O_RDONLY)
+        self.assertEqual(raised.exception.errno, errno.EACCES)
+
+    def test_never_versioned_fill_keeps_the_probes_atime(self):
+        self.rewrite_member("f.txt", b"original")
+        real, seen = self.member.stat, []
+
+        def stats(path):
+            st = real(path)
+            seen.append(path)
+            atime = 900_000_000 if len(seen) == 1 else 1_700_000_000
+            return SimpleNamespace(st_size=st.st_size, st_atime=atime,
+                                   st_atime_ns=atime * 1_000_000_000)
+
+        with patch.object(self.member, "stat", side_effect=stats):
+            self.assertTrue(self.fs._ensure_file_in_cache(self.fs._resolve_path("/f.txt")))
+        self.assertEqual((self.cache_dir / "f.txt").stat().st_atime, 900_000_000)
 
     def test_read_only_member_mode_is_enforced(self):
         self.assert_write_refused(self.fill_read_only({"wraps": self.member.stat}))
@@ -791,11 +850,12 @@ class TestFillConfirmsMemberVersion(RevalidateTestBase):
         with patch.object(self.member, "stat", return_value=fake), \
                 patch.object(self.member, "get_size", return_value=99), \
                 self.count_fetches() as fetches:
-            self.assertEqual(self.read_through("/f.txt"), b"original")
+            with self.assertRaises(FuseOSError):
+                self.read_through("/f.txt")
         self.assertEqual(fetches.call_count, 2)
-        # Still the member's own (reported) attributes, never local ones.
-        attrs = self.fs.getattr("/f.txt")
-        self.assertEqual((attrs["st_mtime"], stat.S_IMODE(attrs["st_mode"])), (1_200_000_000, 0o600))
+        # Still another size after the retry: never installed under a token
+        # its bytes do not match.
+        self.assertFalse((self.cache_dir / "f.txt").exists())
 
     def test_unchanged_member_keeps_its_attributes(self):
         src = self.rewrite_member("f.txt", b"original", mtime=1_000_000_000)

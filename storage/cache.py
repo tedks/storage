@@ -658,31 +658,37 @@ class CacheManager:
                 if not st.st_mode & stat_module.S_IRUSR:
                     os.chmod(temp_path, stat_module.S_IMODE(st.st_mode) | stat_module.S_IRUSR,
                              follow_symlinks=False)
-                # The member's stat after the transfer: the newest genuine
-                # attributes. If it disagrees with the version probed before,
-                # fetch once more against it; a second disagreement keeps the
-                # newest attributes, and the caller's baseline (the first
-                # probe) makes the next revalidation refetch.
+                # The member's stat after the transfer (MemberVersion): an
+                # unconfirmed version gets one more confirmation; positive
+                # evidence of another version fetches once more against the
+                # newer stat. Only AGREED and NEVER_VERSIONED are installed.
                 newest, version = confirm_member_stat(
                     backend, source_virtual_path, member_stat, st.st_size)
-                # Only positive evidence of another version is fetched again,
-                # and only against a probe (without one, as at fa274d4, the
-                # first transfer stands).
-                if version != MemberVersion.CHANGED or member_stat is None:
+                if version == MemberVersion.UNCONFIRMED:
+                    newest, version = confirm_member_stat(
+                        backend, source_virtual_path, member_stat, st.st_size)
+                if version != MemberVersion.CHANGED or member_stat is None or attempt:
                     break
                 member_stat = newest
+                # Reserve for the retry: the newer size (pre-#191 budget).
                 newest_size = getattr(newest, "st_size", None)
-                if attempt == 0 and reserved is not None and isinstance(newest_size, int):
-                    # The retry fetches a version confirmed larger than the
-                    # reservation: reserve the difference first, as the first
-                    # transfer's reservation was (pre-#191 budget).
-                    more = max(0, newest_size - (reserved + extra_reserved))
-                    if more:
-                        if not self._reserve_more(more):
-                            print(f"Warning: Insufficient cache space for {source_virtual_path}")
-                            raise OSError(errno.ENOSPC, "insufficient cache space for the "
-                                          "member's larger version", source_virtual_path)
-                        extra_reserved += more
+                target = newest_size if isinstance(newest_size, int) else 0
+                more = max(0, target - (reserved + extra_reserved)) if reserved is not None else 0
+                if more:
+                    if not self._reserve_more(more):
+                        print(f"Warning: Insufficient cache space for {source_virtual_path}")
+                        raise OSError(errno.ENOSPC, "insufficient cache space for the "
+                                      "member's larger version", source_virtual_path)
+                    extra_reserved += more
+            if version == MemberVersion.CHANGED and member_stat is None:
+                # No probe to confirm against: the bytes are kept, but no
+                # stat's token or mode is attached to them.
+                newest = None
+            elif version in (MemberVersion.CHANGED, MemberVersion.UNCONFIRMED):
+                # Not a verified generation: nothing is installed, and a copy
+                # already cached (the last good one) stays as it is.
+                raise OSError(errno.EAGAIN, f"the member's version of {source_virtual_path} "
+                              f"could not be confirmed ({version})", source_virtual_path)
             fd = os.open(temp_path, os.O_RDONLY | os.O_NOFOLLOW)
             try:
                 copy_member_attributes(fd, newest)

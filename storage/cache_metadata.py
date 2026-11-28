@@ -65,35 +65,52 @@ def _member_mtime_ns(st) -> Optional[int]:
 
 
 class MemberVersion:
-    """confirm_member_stat's verdict on what a transfer read."""
+    """confirm_member_stat's verdict on what a transfer read.
 
-    AGREED = "agreed"    # the probed version, confirmed by comparable stats
-    CHANGED = "changed"  # positive evidence of another version
-    UNKNOWN = "unknown"  # no evidence either way: metadata missing or unreadable
+    Consumed by CacheManager.fetch_into_cache (full fills) and
+    StreamingReadManager._finalize_streaming_session (streams): only
+    AGREED and NEVER_VERSIONED copies are installed in the cache.
+    """
+
+    # The probe's version token (size and mtime) was confirmed after the
+    # transfer: install with the confirming stat's attributes.
+    AGREED = "agreed"
+    # Positive evidence of another version (a size, or two mtimes or modes,
+    # that differ): a full fill fetches once more, a stream is discarded.
+    CHANGED = "changed"
+    # The probe carried a token but no compatible confirmation could be had
+    # (the stat failed, or lost its mtime): bytes assembled over a transfer
+    # are not a verified generation. Not installed; any cached copy stays.
+    UNCONFIRMED = "unconfirmed"
+    # The member never supplied a token (no stat, a size-only stat, no
+    # mtime): the complete bytes are installed with conservative attributes.
+    NEVER_VERSIONED = "never-versioned"
+
+
+def _has_token(st) -> bool:
+    return st is not None and getattr(st, "st_size", None) is not None \
+        and _member_mtime_ns(st) is not None
 
 
 def confirm_member_stat(backend, virtual_path: str, probe, transferred_size: int):
     """(stat to record, MemberVersion) for a transfer probed before it began.
 
-    The member is stat'ed again after the transfer (retried once if the stat
-    raises). Only positive evidence counts as another version (CHANGED): a
-    known size other than the transfer's, or two stats that both report an
-    mtime, or a mode, and disagree. A refetch (full fill) or a discard
-    (streaming) follows, and the newest stat is returned. When every
-    comparison that matters can be made and holds (sizes, mtimes, modes),
-    the version is AGREED and the confirming stat's attributes are recorded
-    with the probe's atime (the confirming stat's may be the transfer's own
-    read).
+    The member is stat'ed again after the transfer (retried once if the
+    stat raises; not after NotImplementedError). CHANGED needs positive
+    evidence: a known size other than the transfer's, or two stats that
+    both report an mtime, or a mode, and disagree; the newest stat is
+    returned. With a probe that carried a token, AGREED needs a confirming
+    stat with a size and mtime (nothing disagreeing); its attributes are
+    returned with the probe's atime (the confirming stat's may be the
+    transfer's own read). Without such a confirmation it is UNCONFIRMED.
+    A probe without a token (or none) is NEVER_VERSIONED: the attributes
+    some stat reported are returned, newest first, the atime the probe's.
 
-    Anything else is UNKNOWN: a member without stat (sized by get_size),
-    a size-only stat, a stat without mtime, a confirming stat that failed
-    twice. The file is kept, with only the attributes some stat reported
-    (the newest first). A mode only the pre-transfer probe reported, with
-    the confirming stat failed, may be stale: it is marked so that
-    copy_member_attributes never grants write the transferred file did
-    not have. No mode at all fails closed on write as before.
-    BulkCapacityCancelled and BulkCapacityTimeout propagate: an
-    interrupted request is not a fill.
+    A mode only the probe reported (the confirming stat lacked one) is
+    marked mode_unconfirmed, and copy_member_attributes records it without
+    write bits: its denials stand, its grants of write do not. No mode at
+    all fails closed on write as before. BulkCapacityCancelled and
+    BulkCapacityTimeout propagate: an interrupted request is not a fill.
     """
     from .backends.ssh_pool import BulkCapacityCancelled, BulkCapacityTimeout
 
@@ -120,23 +137,25 @@ def confirm_member_stat(backend, virtual_path: str, probe, transferred_size: int
                or (None not in modes and modes[0] != modes[1]))
     if changed:
         return after, MemberVersion.CHANGED
-    if probe is not None and after is not None and None not in sizes and None not in mtimes:
-        fields = {key: getattr(after, key, None) for key in (
-            "st_mode", "st_uid", "st_gid", "st_nlink", "st_ctime", "st_size",
-            "st_mtime", "st_mtime_ns")}
-        fields["st_atime"] = getattr(probe, "st_atime", None)
-        fields["st_atime_ns"] = getattr(probe, "st_atime_ns", None)
-        return SimpleNamespace(**fields), MemberVersion.AGREED
+    if _has_token(probe):
+        verdict = MemberVersion.AGREED if _has_token(after) else MemberVersion.UNCONFIRMED
+    else:
+        verdict = MemberVersion.NEVER_VERSIONED
     if probe is None and after is None:
-        return None, MemberVersion.UNKNOWN
+        return None, verdict
     fields = {}
     for key in ("st_mode", "st_uid", "st_gid", "st_nlink", "st_ctime", "st_size",
-                "st_mtime", "st_mtime_ns", "st_atime", "st_atime_ns"):
+                "st_mtime", "st_mtime_ns"):
         value = known(after, key)
         fields[key] = known(probe, key) if value is None else value
-    # A mode seen only before the transfer: it may have lost write since.
+    # The atime the member reported before the transfer read it, seconds
+    # and nanoseconds from the same stat.
+    atime_from = probe if (known(probe, "st_atime") is not None
+                           or known(probe, "st_atime_ns") is not None) else after
+    fields["st_atime"] = known(atime_from, "st_atime")
+    fields["st_atime_ns"] = known(atime_from, "st_atime_ns")
     fields["mode_unconfirmed"] = known(after, "st_mode") is None and fields["st_mode"] is not None
-    return SimpleNamespace(**fields), MemberVersion.UNKNOWN
+    return SimpleNamespace(**fields), verdict
 
 
 def copy_member_attributes(fd: int, source) -> None:
@@ -154,9 +173,11 @@ def copy_member_attributes(fd: int, source) -> None:
     # never a reason to report local times.
     mode = getattr(source, "st_mode", None)
     if mode is not None and getattr(source, "mode_unconfirmed", False):
-        # A stale probe never grants write the transferred file lacks
-        # (a local member's copy carries the source's mode at the copy).
-        mode &= ~(stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH) | local.st_mode
+        # A mode no stat after the transfer reported keeps its denials but
+        # grants no write: it fails closed, as a missing mode does (the
+        # receiving file's own mode, an SFTP or staging default, says
+        # nothing of the member's). A chmod through the mount grants write.
+        mode &= ~(stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH)
     permissions = local.st_mode if mode is None else mode
     # Without a member mode, an import fails closed: the downloaded file's
     # own mode (a local member's copy, a transfer's or a streaming staging

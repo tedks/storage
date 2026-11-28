@@ -1647,10 +1647,13 @@ class StreamingReadManager:
                 raise OSError(errno.EINTR, str(exc)) from exc
             except BulkCapacityTimeout as exc:
                 raise OSError(errno.EAGAIN, str(exc)) from exc
-            # Only positive evidence of another version discards: a member
-            # without comparable metadata (no stat, a size-only stat) keeps
-            # its stream, with only the attributes it reported.
-            if version == MemberVersion.CHANGED:
+            # Positive evidence of another version, or a token the stream
+            # started with that could not be confirmed, discards it: bytes
+            # assembled over many reads are not a verified generation. (The
+            # simplest correct choice: the next open fetches again.) A
+            # member that never supplied a token keeps its stream, with
+            # only the attributes it reported.
+            if version in (MemberVersion.CHANGED, MemberVersion.UNCONFIRMED):
                 self._discard_superseded_session(session, "member-changed")
                 # Counted once the partial is gone and the session finished.
                 self._record_streaming_stat("streaming_member_changed_discards", 1)
