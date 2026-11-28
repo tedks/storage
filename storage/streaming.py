@@ -14,7 +14,6 @@ from typing import Callable, Dict, List, Optional, Tuple
 from fuse import FuseOSError
 
 from .backends.base import Backend, capacity_wait_cancellation
-from .backends.ssh_pool import BulkCapacityCancelled
 from .backends.local import NOREPLACE_UNSUPPORTED
 from .backends.local import rename_noreplace as _rename_noreplace
 from .backends.ssh_pool import BulkCapacityCancelled, BulkCapacityTimeout
