@@ -88,17 +88,36 @@ def parse_keep_after_close(text: str) -> StreamingKeepAfterClose:
     return StreamingKeepAfterClose(tuple(byte_thresholds), tuple(percent_thresholds), match_all)
 
 
+_WINDOW = re.compile(r"(\d+)(?:\.(\d+))?([KMGT]?)", re.IGNORECASE | re.ASCII)
+_SIZE_MULTIPLIERS = {"": 1, "K": 1024, "M": 1024 ** 2, "G": 1024 ** 3, "T": 1024 ** 4}
+# Bounds that keep the window a sane byte count: a 64-bit size, written
+# with at most this many significant digits on either side of the point.
+MAX_READ_AHEAD_WINDOW = 2 ** 63 - 1
+_MAX_WINDOW_DIGITS = 40
+
+
 def parse_read_ahead_window(value: Union[str, int]) -> int:
     """A size string such as 4M, or a non-negative int of bytes.
 
     The int form lets a JSON control client send back the integer that
     streaming.get reports, and a TOML profile use a bare integer. bool is an
-    int subclass and is rejected.
+    int subclass and is rejected. A string is converted exactly and
+    truncated to whole bytes ("0.999999999999999999K" is 1023), unlike
+    parse_size, which goes through float.
     """
+    expected = "expected a non-negative size such as 4M or 0"
     if isinstance(value, int) and not isinstance(value, bool):
         if value < 0:
-            raise ValueError(f"expected a non-negative size such as 4M or 0, got {value}")
-        return value
-    if not isinstance(value, str) or not _SIZE.fullmatch(value.strip()):
-        raise ValueError("expected a non-negative size such as 4M or 0")
-    return parse_size(value)
+            raise ValueError(f"{expected}, got {value}")
+        size = value
+    elif isinstance(value, str) and (match := _WINDOW.fullmatch(value.strip())):
+        whole, decimals = match.group(1).lstrip("0"), (match.group(2) or "").rstrip("0")
+        if len(whole) > _MAX_WINDOW_DIGITS or len(decimals) > _MAX_WINDOW_DIGITS:
+            raise ValueError(f"{expected}, with at most {_MAX_WINDOW_DIGITS} digits on each side of the point")
+        number = Fraction(f"{whole or '0'}.{decimals or '0'}")
+        size = int(number * _SIZE_MULTIPLIERS[match.group(3).upper()])
+    else:
+        raise ValueError(expected)
+    if size > MAX_READ_AHEAD_WINDOW:
+        raise ValueError(f"read-ahead window above {MAX_READ_AHEAD_WINDOW} bytes")
+    return size

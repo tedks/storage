@@ -176,12 +176,21 @@ class TestParseReadAheadWindow(unittest.TestCase):
 
     def test_non_negative_integers_are_bytes(self):
         # streaming.get reports an int; a JSON client can send it back.
-        for value in (0, 1, 4 * 1024 ** 2, 2 ** 70):
+        for value in (0, 1, 4 * 1024 ** 2, 2 ** 63 - 1):
             with self.subTest(value=value):
                 self.assertEqual(value, parse_read_ahead_window(value))
 
+    def test_strings_are_exact_and_truncate_to_whole_bytes(self):
+        # parse_size goes through float and would round this up to 1024.
+        self.assertEqual(1023, parse_read_ahead_window("0.999999999999999999K"))
+        self.assertEqual(2560 * 1024, parse_read_ahead_window("2.5m"))
+        self.assertEqual(1, parse_read_ahead_window("1.9"))
+        self.assertEqual(8796082027091, parse_read_ahead_window("7.99999T"))
+        self.assertEqual(7, parse_read_ahead_window("0" * 5000 + "7"))
+
     def test_bad_values_rejected(self):
-        for value in (-1, True, False, 4.0, None, [4], "", "-1M", "25%", "4X"):
+        for value in (-1, True, False, 4.0, None, [4], "", "-1M", "25%", "4X", "8E",
+                      2 ** 63, "8388608T", "9" * 41, "0." + "1" * 41):
             with self.subTest(value=value):
                 with self.assertRaises(ValueError):
                     parse_read_ahead_window(value)
