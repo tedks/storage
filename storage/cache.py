@@ -576,6 +576,13 @@ class CacheManager:
         network bytes before entering. The cache lock orders the grant and
         the local write against every other allocation. Size accounting only
         inspects the blocks this write can change.
+
+        The charge is only as good as SEEK_DATA/SEEK_HOLE. Every grant
+        checks that the extents it reports for the whole inode fit in the
+        blocks it has allocated (st_blocks): a filesystem that reports holes
+        as data (the generic llseek, or OpenZFS while a file has dirty data)
+        fails that check, and the chunk is refused (served transient)
+        rather than charged as if it were already there.
         """
         if not data:
             return True
@@ -587,20 +594,19 @@ class CacheManager:
                 return False
             try:
                 before = self._data_bytes(fd, start, end)
-                if fd not in self._streaming_fds:
-                    initial = self._data_bytes(fd, 0, self._round_up(st.st_size))
-                    if initial > st.st_blocks * 512:
-                        return False  # filesystem reports sparse holes as data
+                whole = self._data_bytes(fd, 0, self._round_up(st.st_size))
             except OSError as exc:
                 if exc.errno in (errno.EINVAL, errno.ENOTSUP, errno.ENOSYS):
-                    return False  # no reliable sparse-block grant
+                    return self._grants_unavailable(f"extent seeks failed ({exc.strerror})")
                 raise
+            if whole > st.st_blocks * 512:
+                return self._grants_unavailable("the filesystem reports sparse holes as data")
             self._ensure_size_current_locked()
             required = end - start - before
             if required and not self.ensure_space(required):
                 return False
             if fd not in self._streaming_fds:
-                self._streaming_fds[fd] = initial
+                self._streaming_fds[fd] = whole
             try:
                 remaining = memoryview(data)
                 while remaining:
@@ -610,18 +616,33 @@ class CacheManager:
                     remaining = remaining[written:]
                     offset += written
             finally:
-                growth = self._data_bytes(fd, start, end) - before
+                # Never raise from here: that would replace the write's own
+                # error. Blocks that cannot be measured are charged at the
+                # grant, the most this write can have allocated.
+                try:
+                    growth = max(0, self._data_bytes(fd, start, end) - before)
+                except OSError:
+                    growth = required
                 self._streaming_fds[fd] += growth
                 self._current_size_bytes += growth
         return True
 
     def close_streaming_fd(self, fd: int):
-        """Release a partial's charge once its unlinked inode can be freed."""
+        """Release a partial's charge once its unlinked inode can be freed.
+
+        Only the session's own descriptor is tracked: a reader descriptor
+        still open on the unlinked inode keeps its blocks past this close,
+        uncharged, until that reader closes too.
+        """
         with self._lock:
             allocated = self._streaming_fds.pop(fd, 0)
-            if allocated and os.fstat(fd).st_nlink == 0:
-                self._current_size_bytes -= allocated
-            os.close(fd)
+            try:
+                if allocated and os.fstat(fd).st_nlink == 0:
+                    self._current_size_bytes = max(0, self._current_size_bytes - allocated)
+            except OSError:
+                self._size_dirty = True
+            finally:
+                os.close(fd)
 
     def publish_streaming_fd(self, fd: int):
         """Move a completed inode's existing charge into tree accounting."""

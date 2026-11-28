@@ -373,6 +373,74 @@ class TestCacheAccounting(unittest.TestCase):
         self.assertTrue(manager.ensure_space(block))
         self.assertFalse((self.cache_dir / "dirty.bin").exists())
 
+    def test_streaming_grant_refused_when_extents_exceed_allocation(self):
+        """A filesystem that starts reporting holes as data (OpenZFS with
+        dirty data) is caught at the next grant, not only the first."""
+        manager = self.cache_manager
+        block = manager.block_size
+        real = manager._data_bytes
+        holes_as_data = []
+
+        def data_bytes(fd, start, end):
+            if holes_as_data:
+                return end - start
+            return real(fd, start, end)
+
+        with self._partial("zfs") as (_, fd), \
+                patch.object(manager, "_data_bytes", side_effect=data_bytes), \
+                self.assertLogs("storage.cache", "WARNING") as logged:
+            self.assertTrue(manager.write_streaming_chunk(fd, 0, b"x"))
+            holes_as_data.append(True)
+            self.assertFalse(manager.write_streaming_chunk(fd, 1 << 29, b"y"))
+            self.assertFalse(manager.write_streaming_chunk(fd, 1 << 28, b"z"))
+            self.assertEqual(manager.get_total_cache_size(), block)
+            self.assertEqual(os.pread(fd, 1, 1 << 29), b"\0")
+        self.assertEqual(len(logged.output), 1)
+        self.assertIn("holes as data", logged.output[0])
+
+    def test_streaming_grant_refused_without_extent_seeks(self):
+        manager = self.cache_manager
+        with self._partial("noseek") as (_, fd), \
+                patch.object(manager, "_data_bytes", side_effect=OSError(errno.EINVAL, "no seek")), \
+                self.assertLogs("storage.cache", "WARNING"):
+            self.assertFalse(manager.write_streaming_chunk(fd, 0, b"x"))
+        self.assertEqual(manager.get_total_cache_size(), 0)
+
+    def test_failed_measurement_after_a_failed_write_keeps_the_write_error(self):
+        manager = self.cache_manager
+        block = manager.block_size
+        real = manager._data_bytes
+        calls = []
+
+        def measure(fd, start, end):
+            calls.append((start, end))
+            if len(calls) > 2:  # the measurement after the write
+                raise OSError(errno.EIO, "extent query failed")
+            return real(fd, start, end)
+
+        with self._partial("masked") as (_, fd):
+            with patch("storage.cache.os.pwrite", side_effect=OSError(errno.ENOSPC, "disk full")), \
+                    patch.object(manager, "_data_bytes", side_effect=measure):
+                with self.assertRaises(OSError) as raised:
+                    manager.write_streaming_chunk(fd, 0, b"x")
+            self.assertEqual(raised.exception.errno, errno.ENOSPC)
+            # Unmeasured: charged at the grant, never less.
+            self.assertEqual(manager._streaming_fds[fd], block)
+            self.assertEqual(manager.get_total_cache_size(), block)
+
+    def test_close_streaming_fd_closes_even_when_fstat_fails(self):
+        manager = self.cache_manager
+        path = self.cache_dir / ("closing" + PARTIAL_SUFFIX)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        self.assertTrue(manager.write_streaming_chunk(fd, 0, b"x"))
+        with patch("storage.cache.os.fstat", side_effect=OSError(errno.EIO, "fstat failed")):
+            manager.close_streaming_fd(fd)
+        with self.assertRaises(OSError) as closed:
+            os.fstat(fd)
+        self.assertEqual(closed.exception.errno, errno.EBADF)
+        self.assertNotIn(fd, manager._streaming_fds)
+        self.assertEqual(manager.get_total_cache_size(), manager.block_size)
+
     def test_direct_writer_uses_space_before_the_next_stream_grant(self):
         manager = self.cache_manager
         block = manager.block_size
