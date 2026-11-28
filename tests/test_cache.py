@@ -475,6 +475,57 @@ class TestEvictionSkipsStaleClean(unittest.TestCase):
         self.assertTrue(turned.exists())
         self.assertEqual(self.state_manager.get_file_metadata("/turned.txt").sync_status, SyncStatus.DIRTY)
 
+    @contextmanager
+    def _touch_during_eviction(self, path, *, continually=False):
+        visits = []
+
+        @contextmanager
+        def guard(candidate):
+            if candidate == path:
+                visits.append(candidate)
+                self.assertLessEqual(len(visits), 2, "eviction retried more than once")
+                if continually or len(visits) == 1:
+                    clock.return_value += 1
+                    self.cache_manager.mark_accessed(path)
+            yield True
+
+        with patch("storage.state.time.time", return_value=10.0) as clock, \
+                patch.object(self.cache_manager, "path_guard", guard):
+            yield visits
+
+    def test_eviction_retry_reclaims_the_only_eligible_copy(self):
+        hot = self._clean_cached("hot.txt", b"hot")
+        with self._touch_during_eviction("/hot.txt"):
+            self.assertTrue(self.cache_manager.evict_lru_files(3))
+        self.assertFalse(hot.exists())
+
+    def test_eviction_retry_prefers_an_ordinary_copy_over_recomputable(self):
+        hot = self._clean_cached("hot.txt", b"hot")
+        derived = self._clean_cached("derived.txt", b"derived", recomputable=True)
+        self.cache_manager.mark_cache_size_dirty()
+        self.cache_manager.max_size_bytes = self.cache_manager.get_total_cache_size()
+
+        with self._touch_during_eviction("/hot.txt"):
+            self.assertTrue(self.cache_manager.ensure_space(3))
+
+        self.assertEqual(derived.read_bytes(), b"derived")
+        self.assertFalse(hot.exists())
+
+    def test_eviction_retry_counts_bytes_already_reclaimed(self):
+        hot = self._clean_cached("hot.txt", b"hot")
+        cold = self._clean_cached("cold.txt", b"xx", last_access=2.0)
+        with self._touch_during_eviction("/hot.txt"):
+            self.assertTrue(self.cache_manager.evict_lru_files(5))
+        self.assertFalse(cold.exists())
+        self.assertFalse(hot.exists())
+
+    def test_eviction_retry_stops_under_continual_touches(self):
+        hot = self._clean_cached("hot.txt", b"hot")
+        with self._touch_during_eviction("/hot.txt", continually=True) as visits:
+            self.assertFalse(self.cache_manager.evict_lru_files(3))
+        self.assertEqual(visits, ["/hot.txt", "/hot.txt"])
+        self.assertEqual(hot.read_bytes(), b"hot")
+
     def test_missing_rows_cannot_hide_the_oldest_cached_copy_under_pressure(self):
         oldest = self._clean_cached("oldest.txt", b"old", last_access=2.0)
         newer = self._clean_cached("newer.txt", b"new", last_access=3.0)

@@ -386,36 +386,51 @@ class CacheManager:
         if bytes_needed <= 0:
             return True
         with self._lock:
-            freed = 0
-            # Paths found missing, marked a page at a time: the first scan
-            # after an upgrade finds every row ever evicted.
-            absent: List[Tuple[str, Path]] = []
-            try:
-                candidates = self.state_manager.iter_lru_candidates(recomputable=recomputable)
-                for virtual_path, selected_access in candidates:
-                    cache_path = self.get_cache_path(virtual_path)
-                    with self._path_guard(virtual_path) as free:
-                        if not free:
-                            continue
-                        if regular_file_stat(cache_path) is None:
-                            absent.append((virtual_path, cache_path))
-                            if len(absent) >= self.state_manager.WRITE_BATCH_SIZE:
-                                self._note_cache_absent(absent)
-                                absent.clear()
-                            continue
-                        try:
-                            freed += self._evict_if_still_clean(
-                                virtual_path, cache_path, recomputable=recomputable,
-                                selected_access=selected_access,
-                            )
-                        except OSError as e:
-                            print(f"Warning: Failed to evict {virtual_path}: {e}")
-                    if freed >= bytes_needed:
-                        return True
-                return False
-            finally:
-                if absent:
-                    self._note_cache_absent(absent)
+            freed, deferred = self._evict_access_pass(bytes_needed, recomputable=recomputable)
+            if deferred and freed < bytes_needed:
+                # Refresh the ordering once before giving up on this tier.
+                more_freed, _ = self._evict_access_pass(bytes_needed - freed, recomputable=recomputable)
+                freed += more_freed
+            return freed >= bytes_needed
+
+    def _evict_access_pass(self, bytes_needed: int, *, recomputable: bool) -> Tuple[int, bool]:
+        """Return the bytes reclaimed and whether recency delayed an eligible copy."""
+        freed = 0
+        deferred = False
+        # Paths found missing, marked a page at a time: the first scan
+        # after an upgrade finds every row ever evicted.
+        absent: List[Tuple[str, Path]] = []
+        try:
+            candidates = self.state_manager.iter_lru_candidates(recomputable=recomputable)
+            for virtual_path, selected_access in candidates:
+                cache_path = self.get_cache_path(virtual_path)
+                with self._path_guard(virtual_path) as free:
+                    if not free:
+                        continue
+                    if regular_file_stat(cache_path) is None:
+                        absent.append((virtual_path, cache_path))
+                        if len(absent) >= self.state_manager.WRITE_BATCH_SIZE:
+                            self._note_cache_absent(absent)
+                            absent.clear()
+                        continue
+                    try:
+                        reclaimed = self._evict_if_still_clean(
+                            virtual_path, cache_path, recomputable=recomputable,
+                            selected_access=selected_access,
+                        )
+                    except OSError as e:
+                        print(f"Warning: Failed to evict {virtual_path}: {e}")
+                        continue
+                if reclaimed is None:
+                    deferred = True
+                else:
+                    freed += reclaimed
+                if freed >= bytes_needed:
+                    break
+        finally:
+            if absent:
+                self._note_cache_absent(absent)
+        return freed, deferred
 
     def ensure_space(self, bytes_needed: int) -> bool:
         """
@@ -667,7 +682,7 @@ class CacheManager:
     def _evict_if_still_clean(
         self, virtual_path: str, cache_path: Path, *, recomputable: bool = False,
         selected_access: Optional[float] = None,
-    ) -> int:
+    ) -> Optional[int]:
         """Reclaim cache bytes if the row is still CLEAN and describes the file.
 
         Recheck under the index lock, which mark_file_dirty also takes.
@@ -676,7 +691,8 @@ class CacheManager:
         Hold descriptor_guard across the stat and the unlink or truncation
         so a descriptor cannot be registered in between. Forget listing
         attributes before changing the cache inode. Lock order is cache,
-        access, index, then descriptor. Returns the bytes freed.
+        access, index, then descriptor. Return the bytes freed, or None
+        when recency alone deferred reclamation.
         """
         with self.state_manager.eviction_metadata(virtual_path) as candidate:
             if candidate is None:
@@ -701,7 +717,7 @@ class CacheManager:
                     if st.st_size == 0:
                         return 0
                     if selected_access is not None and last_access > selected_access:
-                        return 0
+                        return None
                     if self.forget_listed_attrs:
                         self.forget_listed_attrs(virtual_path)
                     if recomputable:
