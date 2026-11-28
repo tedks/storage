@@ -80,12 +80,15 @@ class _PartialCharge:
     The ranges are what this cache wrote (plus the extents the inode had
     when its first grant measured them), so each later grant knows which
     of its blocks are new without asking the filesystem. Bounded by the
-    number of disjoint spans the session fetched.
+    number of disjoint spans the session fetched. identity is the inode's
+    (st_dev, st_ino): while the descriptor is open, eviction leaves any
+    name for that inode alone (see CacheManager._held_identities).
     """
 
-    __slots__ = ("ranges", "bytes")
+    __slots__ = ("ranges", "bytes", "identity")
 
-    def __init__(self, ranges):
+    def __init__(self, ranges, identity=None):
+        self.identity = identity
         self.ranges = list(ranges)
         self.bytes = sum(end - start for start, end in self.ranges)
 
@@ -263,6 +266,16 @@ class CacheManager:
             # Use allocated sectors when the file cannot be opened for an
             # extent query or the filesystem does not support extent seeks.
             return min(rounded, st.st_blocks * 512)
+
+    def _held_identities(self):
+        """Inodes a streaming descriptor still holds; caller holds the lock.
+
+        Such an inode is charged through its descriptor until
+        close_streaming_fd, even once it has a name in the tree (an
+        installed fill, a promoted prefix): unlinking that name frees no
+        blocks while the descriptor is open, so eviction skips it and a
+        direct change to it is left to a rescan."""
+        return {charge.identity for charge in self._streaming_fds.values()}
 
     def _scan_total_cache_size(self) -> int:
         """Reconcile data blocks, counting named and held inodes only once."""
@@ -460,7 +473,9 @@ class CacheManager:
 
         Only a regular file with exactly one name qualifies: the tree scan
         counts such an inode once, at that name. A hard-linked or unlinked
-        inode, or a measurement error, makes the caller rescan instead. With a span only the data blocks it touches are measured,
+        inode, one a streaming descriptor still holds (counted through the
+        descriptor), or a measurement error, makes the caller rescan
+        instead. With a span only the data blocks it touches are measured,
         and the stat is returned for _span_delta.
         """
         try:
@@ -473,6 +488,8 @@ class CacheManager:
             if not stat_module.S_ISREG(st.st_mode) or st.st_nlink != 1:
                 return None
             identity = (st.st_dev, st.st_ino)
+            if identity in self._held_identities():
+                return None
             if fd is None:
                 return identity, self._path_data_bytes(path, st), None
             if span is None:
@@ -709,7 +726,7 @@ class CacheManager:
                     if exc.errno in (errno.EINVAL, errno.ENOTSUP, errno.ENOSYS):
                         return self._grants_unavailable(f"extent seeks failed ({exc.strerror})")
                     raise
-                charge = _PartialCharge(extents)
+                charge = _PartialCharge(extents, (st.st_dev, st.st_ino))
                 if charge.bytes > st.st_blocks * 512:
                     return self._grants_unavailable("the filesystem reports sparse holes as data")
                 # The tree scan counted this inode at its path; from here it
@@ -737,29 +754,38 @@ class CacheManager:
         return True
 
     def close_streaming_fd(self, fd: int):
-        """Release a partial's charge once its unlinked inode can be freed.
+        """Close a session descriptor and settle its inode's charge.
 
-        The charge stays until the session descriptor closes, which is after
+        The charge stays with the descriptor until it closes, which is after
         every reader's: a FUSE reader of the partial holds a session
         reference, StorageFS._release closes the reader's descriptor before
         it drops that reference, and the session closes this descriptor only
-        once no references remain (or at unmount).
+        once no references remain (or at unmount). It stays there even once
+        the inode is named in the tree (an installed fill, a promoted
+        prefix), so eviction leaves it alone until now (_held_identities).
+
+        An unlinked inode's charge is released. A named one moves into tree
+        accounting: with one name, the charge becomes what the scan counts
+        for it; otherwise the next allocation rescans. Either way a copy may
+        be evictable now, so a remembered shortfall is forgotten.
         """
         with self._lock:
             charge = self._streaming_fds.pop(fd, None)
             try:
-                if charge is not None and charge.bytes and os.fstat(fd).st_nlink == 0:
-                    self._current_size_bytes = max(0, self._current_size_bytes - charge.bytes)
+                if charge is not None:
+                    st = os.fstat(fd)
+                    if st.st_nlink == 0:
+                        self._current_size_bytes = max(0, self._current_size_bytes - charge.bytes)
+                    elif st.st_nlink == 1 and not self._size_dirty:
+                        self._current_size_bytes = max(
+                            0, self._current_size_bytes + self._fd_data_bytes(fd, st) - charge.bytes)
+                    else:
+                        self._size_dirty = True
             except OSError:
                 self._size_dirty = True
             finally:
+                self.note_evictable_change()
                 os.close(fd)
-
-    def publish_streaming_fd(self, fd: int):
-        """Move a completed inode's existing charge into tree accounting."""
-        with self._lock:
-            self._streaming_fds.pop(fd, None)
-            self._size_dirty = True
 
     def truncate_streaming_fd(self, fd: int, size: int):
         """Keep accounting in step when a failed fill preserves only a prefix.
@@ -1012,6 +1038,13 @@ class CacheManager:
                 st = regular_file_stat(cache_path)
                 if st is None:
                     return 0
+                if (st.st_dev, st.st_ino) in self._held_identities():
+                    # A streaming descriptor holds the inode (a readerless
+                    # fill installed before its session closed, which no
+                    # FUSE descriptor pins): unlinking the name would
+                    # reclaim nothing yet. close_streaming_fd notes the
+                    # change, so the next allocation can take it.
+                    return 0
                 stale = st.st_size != row.size or st.st_mtime != row.last_modified
                 if not stale:
                     try:
@@ -1175,9 +1208,14 @@ class CacheManager:
                 try:
                     # A link is removed, not followed; it was never counted.
                     st = regular_file_stat(cache_path)
-                    file_size = self._path_data_bytes(cache_path, st) if st is not None else 0
+                    # An inode a streaming descriptor holds is charged
+                    # through it; close_streaming_fd refunds it.
+                    held = st is not None and (st.st_dev, st.st_ino) in self._held_identities()
+                    file_size = 0
+                    if st is not None and not held:
+                        file_size = self._path_data_bytes(cache_path, st)
                     cache_path.unlink()
-                    if st is not None and st.st_nlink > 1:
+                    if st is not None and st.st_nlink > 1 and not held:
                         self._size_dirty = True
                     else:
                         self._current_size_bytes = max(0, self._current_size_bytes - file_size)

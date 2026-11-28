@@ -98,16 +98,18 @@ pressure. A streaming reader can receive fetched bytes directly when the
 cache cannot keep them, and speculative reads pause.
 
 The budget is kept incrementally. A streaming download is charged the
-blocks it has written, tracked per descriptor, until its partial is
-published or its descriptor closes (after every reader's). Local writes
-and truncates are charged by the change in the data blocks they touch
-(the whole file for an O_APPEND write), capped like the tree scan at the
-blocks the file has allocated, and an eviction pass that finds too few
-victims is remembered until a descriptor closes, the index changes or a
-second passes. Charging needs exact `SEEK_DATA`/`SEEK_HOLE` from the cache
-filesystem (see README.md). A whole-file copy reserves its expected size
-up front, and publishing it needs room only for any growth of its measured
-data beyond that reservation.
+blocks it has written, tracked per descriptor, until its descriptor
+closes (after every reader's), even once the finished file is installed:
+eviction skips an inode a download descriptor still holds, since unlinking
+its name would free nothing yet. Local writes and truncates are charged by
+the change in the data blocks they touch (the whole file for an O_APPEND
+write), capped like the tree scan at the blocks the file has allocated,
+and an eviction pass that finds too few victims is remembered until a
+descriptor closes, the index changes or a second passes. Charging needs
+exact `SEEK_DATA`/`SEEK_HOLE` from the cache filesystem (see README.md). A
+whole-file copy reserves its expected size up front, and publishing it
+needs room only for any growth of its measured data beyond that
+reservation.
 
 # Write Path
 

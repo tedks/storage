@@ -289,7 +289,6 @@ class TestCacheAccounting(unittest.TestCase):
             manager.mark_cache_size_dirty()
             self.assertEqual(manager.get_total_cache_size(), block)
             temporary.unlink()
-            manager.publish_streaming_fd(fd)
             self.assertEqual(manager.get_total_cache_size(), block)
 
         restarted = CacheManager(self.cache_dir, self.state_manager, block)
@@ -515,7 +514,6 @@ class TestCacheAccounting(unittest.TestCase):
             final = self.cache_dir / "prefix"
             os.link(path, final)
             path.unlink()
-            manager.publish_streaming_fd(fd)
             self.assertEqual(manager.get_total_cache_size(), 2 * block)
         self.assertEqual(manager.get_total_cache_size(), 2 * block)
 
@@ -572,7 +570,6 @@ class TestCacheAccounting(unittest.TestCase):
             final = self.cache_dir / "xattr"
             os.link(path, final)
             path.unlink()
-            manager.publish_streaming_fd(fd)
             self.assertEqual(manager.get_total_cache_size(), block)
         finally:
             manager.close_streaming_fd(fd)
@@ -635,6 +632,103 @@ class TestCacheAccounting(unittest.TestCase):
                 self.assertEqual(incremental, 3 * block)
         finally:
             os.close(fd)
+
+    def _clean_row(self, name, *, last_access):
+        cache_path = self.cache_dir / name
+        st = cache_path.lstat()
+        self.state_manager.set_file_metadata(FileMetadata(
+            virtual_path=f"/{name}", size=st.st_size, checksum="c", last_access=last_access,
+            last_modified=st.st_mtime, sync_status=SyncStatus.CLEAN, replica_count=1,
+            recomputable=False, recompute_cmd=None, encrypted=False, encryption_key_id=None,
+        ))
+        self.state_manager.add_file_location(FileLocation(f"/{name}", "member", "c", 1.0, False))
+
+    def test_an_installed_inode_is_not_evicted_while_its_session_descriptor_holds_it(self):
+        """A readerless fill installs its inode, CLEAN with a member
+        location, before its session descriptor closes. No FUSE descriptor
+        pins it, but unlinking the name then would free nothing: eviction
+        skips it, keeps reclaiming unrelated copies, and reclaims it once
+        the descriptor has closed."""
+        manager = self.cache_manager
+        block = manager.block_size
+        manager.max_size_bytes = 3 * block
+        partial = self.cache_dir / ("installed" + PARTIAL_SUFFIX)
+        fd = os.open(partial, os.O_RDWR | os.O_CREAT, 0o600)
+        closed = False
+        try:
+            self.assertTrue(manager.write_streaming_chunk(fd, 0, b"i" * (2 * block)))
+            final = self.cache_dir / "installed"
+            os.link(partial, final)
+            partial.unlink()
+            self._clean_row("installed", last_access=1.0)  # least recently used
+            other = self.cache_dir / "other"
+            with manager.cache_size_change(other):
+                other.write_bytes(b"o" * block)
+            self._clean_row("other", last_access=2.0)
+            self.assertEqual(manager.get_total_cache_size(), 3 * block)
+
+            # Only the installed inode could cover two blocks: refused, and
+            # nothing is unlinked or credited.
+            self.assertFalse(manager.ensure_space(2 * block))
+            self.assertTrue(final.exists())
+            self.assertTrue(other.exists())
+            self.assertEqual(manager.get_total_cache_size(), 3 * block)
+            manager.mark_cache_size_dirty()
+            self.assertEqual(manager.get_total_cache_size(), 3 * block)
+
+            # An unrelated copy still makes progress.
+            self.assertTrue(manager.ensure_space(block))
+            self.assertFalse(other.exists())
+            self.assertTrue(final.exists())
+            self.assertEqual(manager.get_total_cache_size(), 2 * block)
+
+            # A direct write to the held inode leaves the total to a rescan.
+            writer = os.open(final, os.O_RDWR)
+            try:
+                with manager.cache_size_change(fd=writer, span=(0, 1)):
+                    os.pwrite(writer, b"I", 0)
+            finally:
+                os.close(writer)
+            self._clean_row("installed", last_access=1.0)  # the write was synced
+            self.assertEqual(manager.get_total_cache_size(), 2 * block)
+
+            manager.close_streaming_fd(fd)
+            closed = True
+            self.assertEqual(manager.get_total_cache_size(), 2 * block)
+            manager.mark_cache_size_dirty()
+            self.assertEqual(manager.get_total_cache_size(), 2 * block)
+            # Released: the next allocation reclaims it at once (no
+            # remembered shortfall stands in the way).
+            self.assertTrue(manager.ensure_space(3 * block))
+            self.assertFalse(final.exists())
+            self.assertEqual(manager.get_total_cache_size(), 0)
+            manager.mark_cache_size_dirty()
+            self.assertEqual(manager.get_total_cache_size(), 0)
+        finally:
+            if not closed:
+                manager.close_streaming_fd(fd)
+
+    def test_deleting_a_held_installed_inode_refunds_its_charge_once(self):
+        """Nit 4: a promoted prefix is named while its session descriptor
+        stays open; deleting the name, then closing, refunds the blocks
+        once."""
+        manager = self.cache_manager
+        block = manager.block_size
+        partial = self.cache_dir / ("promoted" + PARTIAL_SUFFIX)
+        fd = os.open(partial, os.O_RDWR | os.O_CREAT, 0o600)
+        self.assertTrue(manager.write_streaming_chunk(fd, 0, b"p" * (2 * block)))
+        other = self.cache_dir / "other"
+        with manager.cache_size_change(other):
+            other.write_bytes(b"o" * block)
+        os.link(partial, self.cache_dir / "promoted")
+        partial.unlink()
+        self.assertEqual(manager.get_total_cache_size(), 3 * block)
+        manager.delete_cached_file("/promoted")
+        self.assertEqual(manager.get_total_cache_size(), 3 * block)  # still held
+        manager.close_streaming_fd(fd)
+        self.assertEqual(manager.get_total_cache_size(), block)
+        manager.mark_cache_size_dirty()
+        self.assertEqual(manager.get_total_cache_size(), block)
 
     def test_direct_writer_uses_space_before_the_next_stream_grant(self):
         manager = self.cache_manager

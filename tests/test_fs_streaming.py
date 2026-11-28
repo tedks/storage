@@ -710,6 +710,94 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.assertEqual(manager.get_total_cache_size(), block)
         self.assertEqual((self.cache_dir / "superseded.bin").read_bytes(), b"winner")
 
+    def test_readerless_publication_keeps_its_blocks_until_the_session_closes(self):
+        """R3-I2: a readerless fill installs its file (CLEAN, with a member
+        location) while its session descriptor still holds the inode, and
+        no FUSE descriptor pins the path. A grant at capacity in that
+        window, whether it reaches the index lock while finalize holds it or
+        runs after the rows are stored, frees nothing it cannot reclaim, and
+        the next grant after the last close does."""
+        cache = self.fs.cache_manager
+        streaming = self.fs._streaming_manager
+        block = cache.block_size
+        payload = os.urandom(64 * 1024)
+        (self.backend_dir / "published.bin").write_bytes(payload)
+        cache.max_size_bytes = len(payload)
+        final = self.cache_dir / "published.bin"
+
+        in_rows, rows_go = threading.Event(), threading.Event()
+        at_record, record_go = threading.Event(), threading.Event()
+        self.addCleanup(rows_go.set)
+        self.addCleanup(record_go.set)
+        real_locations = streaming._add_finalized_locations
+        real_on_finalized = streaming.on_finalized
+
+        def held_locations(session, metadata):
+            real_locations(session, metadata)
+            in_rows.set()
+            rows_go.wait(timeout=10.0)
+
+        def held_record(session):
+            at_record.set()
+            record_go.wait(timeout=10.0)
+            return real_on_finalized(session)
+
+        reached = threading.Event()
+        real_evict = cache._evict_if_still_clean
+
+        def reaching_evict(*args, **kwargs):
+            reached.set()
+            return real_evict(*args, **kwargs)
+
+        def competing_grant(results):
+            with patch.object(cache, "_evict_if_still_clean", side_effect=reaching_evict):
+                results.append(cache.ensure_space(block))
+
+        hold, at_finalize, go_tail = self._hold_finalize()
+        with hold, patch.object(streaming, "_add_finalized_locations", side_effect=held_locations), \
+                patch.object(streaming, "on_finalized", side_effect=held_record):
+            vfd = self.fs.open("/published.bin", os.O_RDONLY)
+            session = self._session_for(vfd)
+            self.assertEqual(self.fs.read("/published.bin", len(payload), 0, vfd), payload)
+            self.assertTrue(at_finalize.wait(timeout=3.0))
+            self.fs.release("/published.bin", vfd)
+            go_tail.set()
+
+            # Inside finalize's index-lock section: the grant takes the cache
+            # lock, then waits for the index lock finalize holds. Finalize
+            # takes no cache lock before it lets go, so both finish.
+            self.assertTrue(in_rows.wait(timeout=3.0))
+            first = []
+            grant = threading.Thread(target=competing_grant, args=(first,))
+            grant.start()
+            # Usually it is waiting there by now; the outcome does not
+            # depend on it.
+            reached.wait(timeout=1.0)
+            rows_go.set()
+            grant.join(timeout=5.0)
+            self.assertFalse(grant.is_alive(), "the grant and finalize deadlocked")
+            self.assertEqual(first, [False])
+
+            # After the rows and before the session descriptor closes.
+            self.assertTrue(at_record.wait(timeout=3.0))
+            self.assertGreaterEqual(session.io_fd, 0)
+            self.assertEqual(self.fs.state_manager.get_file_metadata("/published.bin").sync_status,
+                             SyncStatus.CLEAN)
+            self.assertFalse(cache.ensure_space(block))
+            self.assertEqual(final.read_bytes(), payload)
+            self.assertEqual(cache.get_total_cache_size(), len(payload))
+            cache.mark_cache_size_dirty()
+            self.assertEqual(cache.get_total_cache_size(), len(payload))
+            record_go.set()
+            self.assertTrue(session.background_finished.wait(timeout=5.0))
+        self.assertEqual(session.io_fd, -1)
+        self.assertEqual(cache.get_total_cache_size(), len(payload))
+        self.assertTrue(cache.ensure_space(block))
+        self.assertFalse(final.exists())
+        self.assertEqual(cache.get_total_cache_size(), 0)
+        cache.mark_cache_size_dirty()
+        self.assertEqual(cache.get_total_cache_size(), 0)
+
     def test_an_append_write_is_charged_where_it_lands(self):
         """pwrite on an O_APPEND descriptor writes at end of file, not at
         the offset given; the charge follows the bytes."""

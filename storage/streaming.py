@@ -1510,7 +1510,7 @@ class StreamingReadManager:
         # queues no sync (ditz streaming-finalize-row-window). The location
         # rows go in the same section, so an eviction or rename cannot run
         # between the row and them. Only local file calls run under it (no
-        # fsync); the cache lock is taken after. Only the install and the
+        # fsync), and no cache lock is taken under it. Only the install and the
         # calls before it raise OSError here: the row and location stores
         # catch their own.
         metadata = None
@@ -1534,7 +1534,10 @@ class StreamingReadManager:
             self._discard_superseded_session(session, outcome)
             return
 
-        self.cache_manager.publish_streaming_fd(io_fd)
+        # The installed inode stays charged through io_fd, and pinned
+        # against eviction, until _close_streaming_session_resources closes
+        # it (CacheManager.close_streaming_fd): until then unlinking the
+        # name would free nothing.
 
         with session.lock:
             session.prefetch_complete = True
