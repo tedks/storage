@@ -1446,7 +1446,9 @@ class StorageFS(Operations):
                 if error is None:
                     error = exc
         if error is not None:
-            raise error
+            if error.errno:
+                raise error
+            raise FuseOSError(_full_fill_errno(error)) from error
         return None
 
     # ------------------------------------------------------------------ #
