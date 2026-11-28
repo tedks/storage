@@ -116,9 +116,10 @@ def request_control_payload(cache_root: Path, request: bytes, timeout: float,
                             cache_fd: int | None = None) -> dict:
     """Send one request and read a bounded JSON response.
 
-    The socket is checked and reached through an fd of the cache directory
-    (cache_fd, or one opened here), so a caller that identified the cache
-    by fstat on the same fd talks to the socket in that directory, even if
+    The socket entry is opened (O_PATH) through an fd of the cache
+    directory (cache_fd, or one opened here), then checked and connected
+    through that one fd, so a caller that identified the cache by fstat on
+    the same directory fd talks to the socket in that directory, even if
     the path is renamed meanwhile. cache_root names it in messages. The
     /proc/self/fd path is short, so the Unix address limit applies only to
     clients that connect by path, which the server's 107-byte check keeps
@@ -133,15 +134,22 @@ def request_control_payload(cache_root: Path, request: bytes, timeout: float,
     try:
         if cache_fd is None:
             cache_fd = opened = open_cache_directory(cache_root)
-        _require_owner_socket(os.stat(CONTROL_SOCKET_NAME, dir_fd=cache_fd, follow_symlinks=False), path)
-        deadline = time.monotonic() + timeout
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-            _set_deadline(sock, deadline)
-            sock.connect(f"/proc/self/fd/{cache_fd}/{CONTROL_SOCKET_NAME}")
-            _check_peer(sock)
-            _set_deadline(sock, deadline)
-            sock.sendall(request + b"\n")
-            response = _read_line(sock, MAX_RESPONSE_BYTES, deadline)
+        # Pin the entry, then check and connect to that same inode, so a
+        # group writer cannot swap the name between the check and connect.
+        # O_NOFOLLOW opens a symlink itself, which the check then refuses.
+        socket_fd = os.open(CONTROL_SOCKET_NAME, os.O_PATH | os.O_NOFOLLOW, dir_fd=cache_fd)
+        try:
+            _require_owner_socket(os.fstat(socket_fd), path)
+            deadline = time.monotonic() + timeout
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                _set_deadline(sock, deadline)
+                sock.connect(f"/proc/self/fd/{socket_fd}")
+                _check_peer(sock)
+                _set_deadline(sock, deadline)
+                sock.sendall(request + b"\n")
+                response = _read_line(sock, MAX_RESPONSE_BYTES, deadline)
+        finally:
+            os.close(socket_fd)
     except FileNotFoundError as exc:
         raise ControlError(f"No running mount control socket at {path}") from exc
     except (OSError, OverflowError) as exc:
