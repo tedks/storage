@@ -645,7 +645,7 @@ class StorageFS(Operations):
         """Remove a directory entry from the cached listing."""
         self.namespace.invalidate_dir_cache_entry(path)
 
-    def _invalidate_file_cache(self, virtual_path: str):
+    def _invalidate_file_cache(self, virtual_path: str) -> Optional[OSError]:
         """
         Invalidate a cached file, forcing the next access to re-fetch
         from the backend.  Used by the remote watcher on push events.
@@ -668,6 +668,8 @@ class StorageFS(Operations):
 
         The checksum records for the path go whether or not it is cached, is
         dirty or has a writer open: they describe the members, which changed.
+        Return a verified replacement's repair error so revalidation can
+        refuse stale write admission while the inode is still recoverable.
         """
         # Resolve canonical path for metadata lookup.  Suffixed conflict
         # paths (e.g. /foo.remote0) store metadata under the canonical
@@ -708,8 +710,11 @@ class StorageFS(Operations):
                         # Content not yet sent to its member: kept, as for a writer.
                         return
                     if meta and not resolved.backend_name:
-                        stale = self.cache_manager.clean_row_has_local_change(
-                            meta, cache_path, st.st_size, st.st_mtime)
+                        try:
+                            stale = self.cache_manager.clean_row_has_local_change(
+                                meta, cache_path, st.st_size, st.st_mtime)
+                        except OSError as repair_error:
+                            return repair_error
                     if not stale:
                         # Before the unlink: no getattr may find the copy
                         # gone and its name still in the parent's listing.
@@ -1829,7 +1834,8 @@ class StorageFS(Operations):
             return None
         return listed_at
 
-    def _revalidate_cached_file(self, resolved: ResolvedPath, keep_named: bool = False):
+    def _revalidate_cached_file(self, resolved: ResolvedPath,
+                                keep_named: bool = False) -> Optional[OSError]:
         """Refetch a CLEAN cached file whose member copy changed.
 
         Called by open() for a canonical path. Within revalidate_after of the
@@ -2025,7 +2031,13 @@ class StorageFS(Operations):
             # unmarked bytes known to be old).
             self._refresh_pending[canonical_path] = identity
             return
-        self._invalidate_file_cache(resolved.requested_path)
+        repair_error = self._invalidate_file_cache(resolved.requested_path)
+        if repair_error is not None:
+            # The member was observed to have another version. A failed
+            # repair kept the inode, but cannot make it a writable baseline
+            # or count as a fresh check.
+            self._mark_last_good_stale(cache_path)
+            return repair_error
         if self.cache_manager.is_cached(resolved.requested_path):
             # Kept (a writer is open, or it turned out to be a lost write):
             # do not stat again before the age passes; the baselines stay,
@@ -2773,7 +2785,8 @@ class StorageFS(Operations):
     def _open(self, path, flags):
         """Open a file"""
         resolved = self._resolve_path(path)
-        if not self._is_read_only_open(flags):
+        read_only = self._is_read_only_open(flags)
+        if not read_only:
             self._refuse_fenced_view_write(resolved)
         cache_path = resolved.cache_path
         prefetch_session: Optional[PrefetchSession] = None
@@ -2790,8 +2803,10 @@ class StorageFS(Operations):
             # changed copy is dropped and streamed again (as before #208; a
             # discarded stream leaves the file to fetch again). Otherwise the
             # copy stays named until a verified refetch replaces it.
-            streams = self._streaming_reads and self._is_read_only_open(flags)
-            self._revalidate_cached_file(resolved, keep_named=not streams)
+            streams = self._streaming_reads and read_only
+            repair_error = self._revalidate_cached_file(resolved, keep_named=not streams)
+            if repair_error is not None and not read_only:
+                raise FuseOSError(_full_fill_errno(repair_error)) from repair_error
         clear_stale = False
         if (not self._is_read_only_open(flags) and resolved.backend_name is None
                 and self._is_stale_last_good(cache_path)):
@@ -2843,7 +2858,6 @@ class StorageFS(Operations):
         # Fallback path: preserve existing full-file cache semantics.
         if prefetch_session is None:
             self.cache_manager.take_fill_errno()
-            read_only = self._is_read_only_open(flags)
             refresh = self._refresh_pending.pop(resolved.canonical_path, None)
             try:
                 installed = self._ensure_file_in_cache(resolved, replace_identity=refresh)

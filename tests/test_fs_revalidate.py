@@ -2889,6 +2889,51 @@ class TestRefreshRound5(RevalidateTestBase):
             self.assertEqual(self.fs.state_manager.get_file_metadata("/live.log").sync_status,
                              SyncStatus.CLEAN)
 
+    def test_failed_invalidation_repair_cannot_admit_a_stale_writer(self):
+        import sqlite3
+
+        path = "/live.log"
+        self.refreshed_with_checksums()
+        with patch.object(self.fs, "_record_fetched", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.fs.open(path, os.O_RDONLY)
+        self.restart()
+        self.rewrite_member("live.log", b"version 3 is newest", mtime=1_200_000_000)
+        cached = self.cache_dir / "live.log"
+        state = self.fs.state_manager
+        record = state.record_cached_stat
+        calls = []
+
+        def fail_once(*args, **kwargs):
+            calls.append(args[0])
+            if len(calls) == 1:
+                raise sqlite3.OperationalError("row repair failed once")
+            return record(*args, **kwargs)
+
+        with patch.object(state, "record_cached_stat", side_effect=fail_once), \
+                patch.object(self.fs.sync_manager, "queue_sync") as sync:
+            self.assert_errno(errno.EIO, self.fs.open, path, os.O_RDWR)
+            self.assertEqual(calls, [path])
+            self.assertEqual(cached.read_bytes(), b"version 2!")
+            self.assertEqual(state.get_file_metadata(path).size, 9)
+            self.assertNotIn(path, self.fs._member_checks)
+            sync.assert_not_called()
+
+            # A reader can still recover the inode offline. Completing that
+            # repair does not make it a safe write baseline for v3.
+            self.member.set_available(False)
+            try:
+                self.assertEqual(self.read_through(path), b"version 2!")
+                self.assert_errno(errno.EAGAIN, self.fs.open, path, os.O_RDWR)
+            finally:
+                self.member.set_available(True)
+
+            fh = self.fs.open(path, os.O_RDWR)
+            try:
+                self.assertEqual(self.fs.read(path, 64, 0, fh), b"version 3 is newest")
+            finally:
+                self.fs.release(path, fh)
+
     def test_eviction_heals_verified_replacement_before_the_sweep(self):
         self.refreshed_with_checksums()
         with patch.object(self.fs, "_record_fetched", side_effect=KeyboardInterrupt):
