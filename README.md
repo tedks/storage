@@ -270,7 +270,8 @@ cache cannot make enough space for a new reader, or for a whole-file fill
 (a write-open of an uncached file, an open that gets no streaming session),
 it discards unfinished retained fills to make room, fewest bytes first. If no
 download worker can start, a closed fill is discarded rather than retained,
-and a file that has every byte is published by the closing call instead.
+and so is a file that has every byte: only a worker confirms a file with
+its member before publishing it, so the next open fetches it again.
 
 All three limits are checked when the mount configuration loads: an
 integer from 1 to 1024 for `max_streaming_sessions`, 0 to 1024 for
@@ -288,12 +289,16 @@ while files on another member, or a complete file on any member, wait for
 a worker goes to those files, so a member whose bulk channels are taken
 (by sync, say) cannot hold every worker.
 A worker waiting for a bulk channel stops waiting once foreground reads
-have fetched every byte of its file. Publishing a complete file into the
-cache needs one member stat to confirm the version, made on the
+have fetched every byte of its file. A worker publishing a complete file
+into the cache makes one member stat to confirm the version, on the
 interactive reserve with its connection deadline and no bulk channel, so
 publication does not count against or wait for a member's bulk capacity.
-It takes precedence for the next free worker (at most four in a row while
-range reads are waiting).
+If that stat has waited half a second for a channel while other work waits
+for a worker, the worker moves on and the publication is queued again.
+Publication takes precedence for the next free worker (at most four in a
+row while range reads are waiting). A complete file finished without a
+worker (a close when no worker could start, or unmount) is not confirmed,
+so it is discarded rather than published; the next open fetches it again.
 
 A cached file that has been synced is checked against its member when it
 is opened and was last checked more than `revalidate_after` seconds ago

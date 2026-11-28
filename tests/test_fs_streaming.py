@@ -410,7 +410,7 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.assertEqual((self.cache_dir / "free.bin").read_bytes(), payload)
         self.assertEqual((self.cache_dir / "blocked.bin").read_bytes(), payload)
 
-    def test_download_worker_start_retry_and_local_publication_on_release(self):
+    def test_download_worker_start_retry_and_inline_discard_on_release(self):
         manager = self.fs._streaming_manager
         manager._download_pool.idle_seconds = 0.05
         real_start = threading.Thread.start
@@ -437,7 +437,11 @@ class TestFSStreamingIntegration(unittest.TestCase):
             path, fd, payload = read_file("no-workers.bin")
             self.assertGreaterEqual(attempts, 2)
             self.fs.release(path, fd)
-            self.assertEqual((self.cache_dir / "no-workers.bin").read_bytes(), payload)
+            # Finished by the release with no worker: not confirmed, so
+            # discarded, not published.
+            self.assertFalse((self.cache_dir / "no-workers.bin").exists())
+            self.assertEqual(list(self.cache_dir.rglob("*.storage.partial")), [])
+            self.assertEqual(self.fs._streaming_stats_snapshot()["streaming_unconfirmed_discards"], 1)
             self.assertEqual(manager._download_pool.snapshot(), (0, 0, 0))
 
             start_failures = False
@@ -632,7 +636,7 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.assertEqual((self.cache_dir / "free.bin").read_bytes(), payload)
         self.assertEqual((self.cache_dir / "blocked.bin").read_bytes(), payload)
 
-    def test_concurrent_last_closes_without_workers_publish_both_files(self):
+    def test_concurrent_last_closes_without_workers_finish_both_files(self):
         manager = self.fs._streaming_manager
         manager.update_download_limits(max_download_workers=1)
         start, _ = self._fail_worker_starts(after=0)
@@ -675,10 +679,13 @@ class TestFSStreamingIntegration(unittest.TestCase):
                 closer.join(timeout=5)
             self.assertFalse(closer.is_alive())
         for name, (_, _, session, payload) in files.items():
+            # Both finished (inline, so discarded, not published).
             self.assertTrue(session.finalized, name)
             self.assertTrue(session.background_finished.is_set(), name)
             self.assertEqual(session.io_fd, -1, name)
-            self.assertEqual((self.cache_dir / name).read_bytes(), payload)
+            self.assertFalse((self.cache_dir / name).exists(), name)
+        self.assertEqual(list(self.cache_dir.rglob("*.storage.partial")), [])
+        self.assertEqual(self.fs._streaming_stats_snapshot()["streaming_unconfirmed_discards"], 2)
         self.assertEqual(manager.list_download_sessions(), [])
         self.assertEqual(manager._download_pool.snapshot(), (0, 0, 0))
 
@@ -1018,26 +1025,41 @@ class TestFSStreamingIntegration(unittest.TestCase):
             self.fs.release("/gated.bin", gated_fd)
         self.assertEqual((self.cache_dir / "gated.bin").read_bytes(), payload)
 
-    def test_inline_publication_on_release_makes_no_bulk_stat(self):
+    def test_inline_publication_makes_no_member_stat_and_discards(self):
         start, _ = self._fail_worker_starts(after=0)
         payload = os.urandom(8192)
         (self.backend_dir / "inline.bin").write_bytes(payload)
-        gate = threading.Event()
-        self.addCleanup(gate.set)
+        real_stat = self.backend.stat
         armed = threading.Event()
-        stat, bulk_calls = self._bulk_gated_stat(gate, armed.is_set)
+        stats = []
+
+        def stat(path):
+            if armed.is_set():
+                stats.append(path)
+            return real_stat(path)
+
         with patch.object(threading.Thread, "start", start), \
                 patch.object(self.backend, "stat", side_effect=stat):
             fd = self.fs.open("/inline.bin", os.O_RDONLY)
             session = self._session_for(fd)
             self.assertEqual(self.fs.read("/inline.bin", len(payload), 0, fd), payload)
             armed.set()
-            closer = threading.Thread(target=self.fs.release, args=("/inline.bin", fd), daemon=True)
-            closer.start()
-            closer.join(timeout=3)
-            self.assertFalse(closer.is_alive(), "release waited for a bulk channel")
-        self.assertEqual(bulk_calls, [])
+            self.fs.release("/inline.bin", fd)
+        # The member could be stat'ed, but an inline publication does not.
+        self.assertEqual(stats, [])
         self.assertTrue(session.finalized)
+        self.assertEqual(session.io_fd, -1)
+        self.assertFalse((self.cache_dir / "inline.bin").exists())
+        self.assertEqual(list(self.cache_dir.rglob("*.storage.partial")), [])
+        self.assertEqual(self.fs._streaming_stats_snapshot()["streaming_unconfirmed_discards"], 1)
+        # The next open (with workers) fetches the file again.
+        with patch.object(self.backend, "read_file", wraps=self.backend.read_file) as read:
+            fd = self.fs.open("/inline.bin", os.O_RDONLY)
+            again = self._session_for(fd)
+            self.assertEqual(self.fs.read("/inline.bin", len(payload), 0, fd), payload)
+            self.assertTrue(again.background_finished.wait(timeout=5))
+            self.fs.release("/inline.bin", fd)
+        self.assertTrue(read.called)
         self.assertEqual((self.cache_dir / "inline.bin").read_bytes(), payload)
 
     def test_retained_fill_whose_version_changed_releases_its_charge(self):
@@ -1286,29 +1308,84 @@ class TestFSStreamingIntegration(unittest.TestCase):
             self.fs.release("/waiting.bin", waiting_fd)
         self.assertEqual((self.cache_dir / "waiting.bin").read_bytes(), payload)
 
-    def test_inline_publication_takes_no_channel_wait(self):
-        start, _ = self._fail_worker_starts(after=0)
-        payload = os.urandom(8192)
-        (self.backend_dir / "inline-busy.bin").write_bytes(payload)
+    def test_yielded_confirmation_is_not_held_by_the_members_bulk_ceiling(self):
+        manager = self.fs._streaming_manager
+        manager.update_download_limits(max_download_workers=2, max_streaming_sessions=3)
+        other = SlowRangeLocalBackend("other", str(self.backend_dir), range_delay=0.0)
+        payload = os.urandom(64 * 1024)
+        for name in ("bulk.bin", "confirming.bin", "free.bin"):
+            (self.backend_dir / name).write_bytes(payload)
+        busy = threading.Event()
+        self.addCleanup(busy.clear)
+        stat, reasons = self._channel_busy_stat(busy, lambda path: path == "/confirming.bin")
+        await_bulk, released, waiting, _ = self._bulk_gate(poll_probe=False)
+
+        def select(path):
+            return other if path == "/free.bin" else self.backend
+
+        with patch.object(manager, "select_backend_for_read", side_effect=select), \
+                patch.object(self.backend, "stat", side_effect=stat), \
+                patch.object(self.backend, "background_range_capacity", return_value=1), \
+                patch.object(self.backend, "run_background_range_read", side_effect=await_bulk):
+            # One worker holds the member's only bulk slot, and keeps it.
+            bulk_fd = self.fs.open("/bulk.bin", os.O_RDONLY)
+            self.assertEqual(self.fs.read("/bulk.bin", 32 * 1024, 0, bulk_fd), payload[:32 * 1024])
+            self.assertTrue(waiting.wait(timeout=3))
+            # The other publishes a complete file; its confirmation waits
+            # for a channel and yields to a file on another member.
+            confirming_fd = self.fs.open("/confirming.bin", os.O_RDONLY)
+            confirming = self._session_for(confirming_fd)
+            busy.set()
+            self.assertEqual(self.fs.read("/confirming.bin", len(payload), 0, confirming_fd), payload)
+            free_fd = self.fs.open("/free.bin", os.O_RDONLY)
+            free = self._session_for(free_fd)
+            self.assertEqual(self.fs.read("/free.bin", 32 * 1024, 0, free_fd), payload[:32 * 1024])
+            self.assertTrue(free.background_finished.wait(timeout=5))
+            self.assertTrue(reasons)
+            self.assertFalse(confirming.finalized)
+            # The interactive reserve frees while bulk stays saturated.
+            busy.clear()
+            self.assertTrue(confirming.background_finished.wait(timeout=5))
+            self.assertTrue(confirming.finalized)
+            self.assertFalse(released.is_set())
+            released.set()
+            for path, fd in (("/free.bin", free_fd), ("/confirming.bin", confirming_fd),
+                             ("/bulk.bin", bulk_fd)):
+                self.fs.release(path, fd)
+        self.assertEqual((self.cache_dir / "confirming.bin").read_bytes(), payload)
+
+    def test_stop_during_a_confirmation_wait_cleans_up_the_session(self):
+        payload = os.urandom(64 * 1024)
+        (self.backend_dir / "unmounting.bin").write_bytes(payload)
         busy = threading.Event()
         self.addCleanup(busy.clear)
         stat, reasons = self._channel_busy_stat(busy)
-        with patch.object(threading.Thread, "start", start), \
-                patch.object(self.backend, "stat", side_effect=stat):
-            fd = self.fs.open("/inline-busy.bin", os.O_RDONLY)
+        real_finalize = self.fs._streaming_manager._finalize_streaming_session
+        confirming = threading.Event()
+
+        def finalize(session):
+            confirming.set()
+            return real_finalize(session)
+
+        with patch.object(self.backend, "stat", side_effect=stat), \
+                patch.object(self.fs._streaming_manager, "_finalize_streaming_session", side_effect=finalize):
+            fd = self.fs.open("/unmounting.bin", os.O_RDONLY)
             session = self._session_for(fd)
-            probe = session.member_stat
-            self.assertEqual(self.fs.read("/inline-busy.bin", len(payload), 0, fd), payload)
             busy.set()
-            closer = threading.Thread(target=self.fs.release, args=("/inline-busy.bin", fd), daemon=True)
-            closer.start()
-            closer.join(timeout=3)
-            self.assertFalse(closer.is_alive(), "release waited for a member channel")
-        self.assertTrue(reasons)
-        self.assertTrue(session.finalized)
-        # #184's fallback: the probe stands in (its size matches).
-        self.assertIs(session.confirmed_stat, probe)
-        self.assertEqual((self.cache_dir / "inline-busy.bin").read_bytes(), payload)
+            self.assertEqual(self.fs.read("/unmounting.bin", len(payload), 0, fd), payload)
+            self.fs.release("/unmounting.bin", fd)
+            self.assertTrue(confirming.wait(timeout=3))
+            # Unmount while the worker's confirmation waits for a channel.
+            stopper = threading.Thread(target=self.fs.destroy, args=("/",), daemon=True)
+            stopper.start()
+            stopper.join(timeout=10)
+            self.assertFalse(stopper.is_alive(), "destroy did not finish")
+        # The stop ends the wait (its reason is the session, not a yield).
+        self.assertTrue(session.background_finished.wait(timeout=3))
+        self.assertEqual(reasons[-1:], ["streaming session"])
+        self.assertEqual(session.io_fd, -1)
+        self.assertFalse(session.finalized)
+        self.assertFalse((self.cache_dir / "unmounting.bin").exists())
 
     def test_offer_during_turn_failure_recovery_starts_no_second_turn(self):
         manager = self.fs._streaming_manager
