@@ -731,6 +731,10 @@ class CacheManager:
                 before = None
                 if id_before not in held and not failed_before:
                     before = self._direct_charge(path, fd, span, st_before)
+                if before is not None and before[2] is not None:
+                    # A pwrite can add no data where its span already has
+                    # some: the span's data blocks were just measured.
+                    allowance = max(0, allowance - before[1])
                 token = object()
                 record = _InFlight(before, whole_before, self._scan_epoch, id_before in held,
                                    allowance, withhold,
@@ -752,7 +756,10 @@ class CacheManager:
         most the data it writes plus any existing data the allocation cap
         hides now: an overwrite that stops compressing lifts it. With the
         rounded size within the allocation nothing is hidden and the bound
-        is the block-aligned span, an append's bytes plus a block, or 0
+        is the block-aligned span (less the data already in it, which the
+        caller subtracts once it has measured the span for a named inode;
+        unknown or held targets keep the whole span), an append's bytes
+        plus a block, or 0
         for a path change (a truncate, O_TRUNC or create shrinks or extends
         sparsely). When the cap may bind the inode's extents are measured
         once (the settlement reuses them) and the hidden part added. A

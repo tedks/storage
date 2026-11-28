@@ -1645,6 +1645,46 @@ class TestCacheAccounting(unittest.TestCase):
             self.assertTrue(manager.write_streaming_chunk(b, 0, b"x"))
         self.assertEqual(len(walks), 2)
 
+    def test_a_pure_overwrite_in_flight_holds_back_nothing(self):
+        """R9 lead: an overwrite of a named file's allocated blocks can add
+        no data, so an exactly fitting stream and whole copy are admitted
+        while it is in flight; the same write over a hole still holds back
+        its span (countercontrol)."""
+        manager = self.cache_manager
+        block = manager.block_size
+        manager.ALLOWANCE_WAIT_SECONDS = 0.2
+        path = self.cache_dir / "overwritten"
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        self.addCleanup(os.close, fd)
+        os.pwrite(fd, b"a" * (2 * block), 0)
+        os.ftruncate(fd, 4 * block)  # blocks 2-3 are a hole
+        manager.max_size_bytes = 4 * block
+        manager.mark_cache_size_dirty()
+        self._assert_total(2 * block)
+        run, gate, errors = self._blocked_change(fd=fd, span=(0, 2 * block))
+        writer = run(lambda: os.pwrite(fd, b"o" * (2 * block), 0))
+        with self._partial("stream") as (_, b):
+            self.assertTrue(manager.write_streaming_chunk(b, 0, b"s"))
+        backend_file = self.backend_dir / "copy.bin"
+        backend_file.write_bytes(b"c" * block)
+        self.assertTrue(manager.fetch_into_cache(
+            self.backend, "/copy.bin", self.cache_dir / "copy.bin", expected_size=block))
+        gate.set()
+        writer.join(timeout=5.0)
+        self.assertEqual(errors, [])
+        self._assert_total(4 * block)
+        # Countercontrol: room for one block, a write into the hole in flight.
+        (self.cache_dir / "copy.bin").unlink()
+        manager.mark_cache_size_dirty()
+        self._assert_total(3 * block)
+        run, gate, errors = self._blocked_change(fd=fd, span=(2 * block, 3 * block))
+        writer = run(lambda: os.pwrite(fd, b"h" * block, 2 * block))
+        with self._partial("stream2") as (_, b):
+            self.assertFalse(manager.write_streaming_chunk(b, 0, b"s"))
+        gate.set()
+        writer.join(timeout=5.0)
+        self.assertEqual(errors, [])
+
     def test_direct_writer_uses_space_before_the_next_stream_grant(self):
         manager = self.cache_manager
         block = manager.block_size
