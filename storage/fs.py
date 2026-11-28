@@ -303,9 +303,9 @@ class StorageFS(Operations):
             if max_foreground_operations is not None else None
         )
         self.state_manager = StateManager(str(state_db))
-        # Eviction hints never outlive the mount that set them (see
-        # StateManager.reset_cache_absent). The mount lock is held by now,
-        # so no other mount of this cache is marking.
+        # Eviction hints never outlive the process that set them (see
+        # StateManager.reset_cache_absent). Clearing a mark is always safe:
+        # it only costs a rescan of that row, whoever else uses the index.
         self.state_manager.reset_cache_absent()
         self.cache_manager = CacheManager(
             cache_root, self.state_manager, cache_size,
@@ -2200,9 +2200,6 @@ class StorageFS(Operations):
 
         # File not in cache or backends - try recomputation
         if self.recompute_engine.can_recompute(resolved.requested_path, cache_path):
-            # Read before the command runs: its generation is the one the
-            # recomputed stat is recorded against.
-            before = self.state_manager.get_file_metadata(canonical_path)
             # Recompute the file synchronously (blocks until complete)
             result = self.recompute_engine.recompute_file(
                 resolved.requested_path,
@@ -2211,7 +2208,17 @@ class StorageFS(Operations):
             )
 
             if result.success:
-                self._record_recomputed(canonical_path, cache_path, before)
+                # As master's next open would: a file that matches the
+                # row's stat (a recipe that restores a preserved copy with
+                # its mtime) stays CLEAN, and one that does not is marked
+                # DIRTY now rather than at that open. heal_stale_clean
+                # rechecks under the index lock and skips a row that is not
+                # CLEAN, so a write recorded meanwhile keeps its own DIRTY.
+                # A DIRTY row is not evictable; once the sync publishes
+                # CLEAN, the new size makes it a candidate. Whether recompute
+                # output should be uploaded at all is open (ditz
+                # recompute-output-sync-semantics).
+                self.cache_manager.heal_stale_clean(canonical_path, cache_path)
                 return True
 
         available_backends, _ = self._backend_availability()
@@ -2220,38 +2227,6 @@ class StorageFS(Operations):
 
         # File not available
         return False
-
-    def _record_recomputed(self, canonical_path: str, cache_path: Path,
-                           before: Optional[FileMetadata]):
-        """Record a file the recompute command just wrote over a CLEAN row as a modification.
-
-        The row described the old copy (size 0 for an evicted placeholder or
-        an invalidated copy), and nothing says the command reproduced the
-        members' bytes. Without a record, the next open's heal_stale_clean
-        would find the stat changed and mark the file DIRTY; this reaches
-        the same outcome eagerly through mark_file_dirty (DIRTY, the new
-        size and mtime, a new generation, the xattr mirrored), so the
-        recompute does not change sync semantics. The checksum column is
-        left as every write leaves it; the sync's CLEAN publish replaces
-        it. A DIRTY row is not evictable; once the sync publishes CLEAN, the
-        new size makes it a candidate again. Whether recompute output
-        should be uploaded at all is an open question (ditz
-        recompute-output-sync-semantics).
-
-        Only when the row was CLEAN before the command ran and no write has
-        been recorded since (same dirty_generation): a write's own mark
-        already describes the file. A path with no row, a link or a row
-        that was not CLEAN is left as it was.
-        """
-        if before is None or before.sync_status != SyncStatus.CLEAN or before.link_target is not None:
-            return
-        if regular_file_stat(cache_path) is None:
-            return
-        with self.state_manager.metadata_lock:
-            row = self.state_manager.get_file_metadata(canonical_path)
-            if row is None or row.dirty_generation != before.dirty_generation:
-                return
-            self.cache_manager.mark_file_dirty(canonical_path, cache_path)
 
     # Filesystem methods
 

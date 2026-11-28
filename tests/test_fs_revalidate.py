@@ -1819,11 +1819,13 @@ class TestRecomputeRecordsStat(unittest.TestCase):
         self.fs.state_manager.close()
         shutil.rmtree(self.temp_dir)
 
-    def _recompute(self, output):
+    def _recompute(self, output, *, mtime=None):
         cache_path = self.cache_dir / "derived.bin"
 
         def run(virtual_path, path, timeout=None):
             path.write_bytes(output)
+            if mtime is not None:  # like cp -p from a preserved copy
+                os.utime(path, (mtime, mtime))
             return SimpleNamespace(success=True, output="", error="", duration=0.0, timed_out=False)
 
         engine = self.fs.recompute_engine
@@ -1860,6 +1862,17 @@ class TestRecomputeRecordsStat(unittest.TestCase):
             "/derived.bin", row.dirty_generation, SyncStatus.CLEAN, checksum="synced"))
         self.assertEqual(list(self.fs.state_manager.iter_lru_paths(recomputable=True)), ["/derived.bin"])
         self.assertFalse(self.fs.cache_manager.heal_stale_clean("/derived.bin", cache_path))
+
+    def test_recompute_that_restores_the_recorded_stat_stays_clean(self):
+        output = b"preserved output"
+        self._row(size=len(output), last_modified=1_600_000_000.0, checksum="synced")
+        before = self.fs.state_manager.get_file_metadata("/derived.bin")
+        cache_path = self._recompute(output, mtime=1_600_000_000.0)
+        row = self.fs.state_manager.get_file_metadata("/derived.bin")
+        self.assertEqual((row.sync_status, row.dirty_generation, row.size, row.checksum),
+                         (SyncStatus.CLEAN, before.dirty_generation, len(output), "synced"))
+        self.assertEqual(cache_path.stat().st_mtime, row.last_modified)
+        self.assertEqual(list(self.fs.state_manager.iter_lru_paths(recomputable=True)), ["/derived.bin"])
 
     def test_recompute_leaves_a_dirty_row_alone(self):
         self._row(sync_status=SyncStatus.DIRTY, size=5, last_modified=2.0)
