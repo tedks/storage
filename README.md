@@ -630,6 +630,17 @@ user and is not writable by all users unless sticky (group write, as under umask
 socket.
 `storage debug streaming-stats` continues to query it.
 
+Publishing and withdrawing the socket happen in a private staging directory
+in the cache, `.storage.mount.<16 hex digits>`, which exists only for that
+moment. A mount killed at that moment can leave one behind. The next
+publication removes leftovers that hold only a `nonce` file and/or a dead
+`socket`, both owned by the mount's user. A staging directory holding a
+`moved` entry kept something that was at the socket's name and could not be
+put back; inspect it before removing it. To clean up by hand, with no mount
+of that cache starting or stopping, remove such directories after checking
+they hold nothing else (`ls -la` on each); the `.storage.mount.<hash>.lock`
+files are mount locks, not staging directories.
+
 ### debug
 
 Inspect or repair local cache/index state:

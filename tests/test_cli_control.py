@@ -1,5 +1,6 @@
 """Control socket framing, ownership, and CLI routing without a FUSE mount."""
 
+import errno
 import fcntl
 import json
 import logging
@@ -811,6 +812,23 @@ def test_swapped_stage_never_redirects_and_refuses(cache):
         assert swapped.is_symlink()
 
 
+def substitute_on_mkdir(monkeypatch, cache, victim):
+    """Wrap mkdir: right after the server's stage mkdir, a group writer
+    renames our new directory away and puts `victim` at its name."""
+    real_mkdir = os.mkdir
+    replaced = []
+
+    def mkdir_then_substitute(path, mode=0o777, *, dir_fd=None):
+        real_mkdir(path, mode, dir_fd=dir_fd)
+        if dir_fd is not None and not replaced:
+            os.rename(path, "ours, moved away", src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+            os.rename(victim.name, path, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+            replaced.append(cache / path)
+
+    monkeypatch.setattr("storage.control.os.mkdir", mkdir_then_substitute)
+    return replaced
+
+
 @pytest.mark.parametrize("victim_mode", [0o755, 0o700])
 def test_directory_substituted_for_the_new_stage_is_left_alone(cache, monkeypatch, victim_mode):
     # A group writer replaces the stage name between mkdir and open with
@@ -821,27 +839,192 @@ def test_directory_substituted_for_the_new_stage_is_left_alone(cache, monkeypatc
     victim.mkdir()
     (victim / "socket").write_text("user data")
     victim.chmod(victim_mode)
-    real_mkdir = os.mkdir
-    replaced = []
-
-    def mkdir_then_substitute(path, mode=0o777, *, dir_fd=None):
-        real_mkdir(path, mode, dir_fd=dir_fd)
-        if dir_fd is not None and not replaced:
-            os.rename(path, "ours, moved away", src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
-            os.rename("victim", path, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
-            replaced.append(cache / path)
-
     server = server_for(cache, lambda _: {})
-    monkeypatch.setattr("storage.control.os.mkdir", mkdir_then_substitute)
+    replaced = substitute_on_mkdir(monkeypatch, cache, victim)
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
         with pytest.raises(ControlError, match="not the one this mount created"):
             server._publish(listener)
     monkeypatch.undo()
     substituted, = replaced
     assert stat.S_IMODE(substituted.stat().st_mode) == victim_mode
+    assert sorted(os.listdir(substituted)) == ["socket"]
     assert (substituted / "socket").read_text() == "user data"
     assert not (cache / CONTROL_SOCKET_NAME).exists()
     cache.chmod(0o700)
+
+
+def test_empty_private_directory_substituted_for_the_stage(cache, monkeypatch):
+    # Indistinguishable from the stage mkdir made: it is used, gets only our
+    # nonce and socket, and those are all that is removed from it (then the
+    # empty directory itself, which its mover could rmdir anyway).
+    cache.chmod(0o775)
+    victim = cache / "victim"
+    victim.mkdir(0o700)
+    victim.chmod(0o700)
+    server = server_for(cache, lambda _: {"published": True})
+    replaced = substitute_on_mkdir(monkeypatch, cache, victim)
+    server.start()
+    monkeypatch.undo()
+    try:
+        assert request_control_payload(cache, b"status", 2) == {"published": True}
+        substituted, = replaced
+        assert not substituted.exists()
+        # Our own mkdir'd directory, moved away, is not removed: it cannot be
+        # told from anyone else's.
+        assert (cache / "ours, moved away").is_dir()
+        assert sorted(os.listdir(cache)) == sorted([CONTROL_SOCKET_NAME, "ours, moved away"])
+    finally:
+        server.stop()
+        cache.chmod(0o700)
+
+
+def write_stage(cache, name, *, nonce=True, socket_state=None, extra=None, mode=0o700):
+    stage = cache / name
+    stage.mkdir()
+    stage.chmod(mode)
+    if nonce:
+        (stage / "nonce").write_text("0" * 32)
+    if socket_state is not None:
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(str(stage / "socket"))
+        if socket_state == "live":
+            listener.listen(1)
+            return stage, listener
+        listener.close()
+    if extra is not None:
+        (stage / extra).write_text("user data")
+    return stage, None
+
+
+def test_publication_sweeps_only_stages_a_crash_left(cache):
+    swept = [
+        write_stage(cache, ".storage.mount.0000000000000001", socket_state="dead")[0],
+        write_stage(cache, ".storage.mount.0000000000000002")[0],
+        write_stage(cache, ".storage.mount.0000000000000003", nonce=False, socket_state="dead")[0],
+    ]
+    kept = [
+        write_stage(cache, ".storage.mount.0000000000000004", extra="moved")[0],
+        write_stage(cache, ".storage.mount.0000000000000005", nonce=False)[0],  # empty
+        write_stage(cache, ".storage.mount.0000000000000006", mode=0o750)[0],
+    ]
+    live_stage, live = write_stage(cache, ".storage.mount.0000000000000007", socket_state="live")
+    kept.append(live_stage)
+    lock = cache / ".storage.mount.0123456789ab.lock"
+    lock.write_text("4242")
+    link = cache / ".storage.mount.0000000000000008"
+    link.symlink_to(kept[0])
+    try:
+        server = server_for(cache, lambda _: {})
+        server.start()
+        try:
+            assert server._listener is not None
+            for stage in swept:
+                assert not stage.exists(), stage
+            for stage in kept:
+                assert stage.is_dir(), stage
+            assert (kept[0] / "moved").read_text() == "user data"
+            assert lock.read_text() == "4242" and link.is_symlink()
+        finally:
+            server.stop()
+    finally:
+        live.close()
+
+
+def socket_at(path):
+    """A dead socket of ours at path: bound, then closed."""
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as stale:
+        stale.bind(str(path))
+
+
+def test_startup_swap_after_the_final_check_keeps_the_new_entry(cache, monkeypatch):
+    # A stale socket is replaced, but a group writer puts an unrelated file at
+    # the control name right after the stale socket was checked (moved into
+    # our stage and found dead). Publication must not clobber it.
+    path = cache / CONTROL_SOCKET_NAME
+    socket_at(path)
+    real_refused = control_module._refused_socket
+
+    def refused_then_swap(dir_fd, name, expected):
+        result = real_refused(dir_fd, name, expected)
+        if not path.exists():
+            path.write_text("unrelated")
+        return result
+
+    monkeypatch.setattr("storage.control._refused_socket", refused_then_swap)
+    server = server_for(cache, lambda _: {})
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+        with pytest.raises(ControlError, match="changed during startup"):
+            server._publish(listener)
+    assert path.read_text() == "unrelated"
+    assert sorted(os.listdir(cache)) == [CONTROL_SOCKET_NAME]
+
+
+def test_shutdown_swap_after_the_final_check_keeps_the_new_entry(cache, monkeypatch):
+    # Our socket is withdrawn, and a group writer puts an unrelated file at
+    # the control name right after our entry was moved out and checked.
+    path = cache / CONTROL_SOCKET_NAME
+    server = server_for(cache, lambda _: {})
+    server.start()
+    real_entry_at = control_module._entry_at
+
+    def entry_at_then_swap(dir_fd, name):
+        found = real_entry_at(dir_fd, name)
+        if name == control_module.STAGE_MOVED and not path.exists():
+            path.write_text("unrelated")
+        return found
+
+    monkeypatch.setattr("storage.control._entry_at", entry_at_then_swap)
+    server.stop()
+    monkeypatch.undo()
+    assert path.read_text() == "unrelated"
+    assert sorted(os.listdir(cache)) == [CONTROL_SOCKET_NAME]
+
+
+def test_shutdown_puts_back_an_entry_that_replaced_ours(cache):
+    path = cache / CONTROL_SOCKET_NAME
+    server = server_for(cache, lambda _: {})
+    server.start()
+    path.unlink()
+    socket_at(path)  # Someone else's stale socket, of our uid.
+    replaced = path.lstat()
+    server.stop()
+    assert (path.lstat().st_dev, path.lstat().st_ino) == (replaced.st_dev, replaced.st_ino)
+    assert sorted(os.listdir(cache)) == [CONTROL_SOCKET_NAME]
+
+
+def test_publication_without_no_replace_rename_falls_back_to_link(cache, monkeypatch):
+    def unsupported(src, dst):
+        raise OSError(errno.EINVAL, "renameat2 flags unsupported here")
+
+    monkeypatch.setattr("storage.control.rename_noreplace", unsupported)
+    path = cache / CONTROL_SOCKET_NAME
+    socket_at(path)
+    server = server_for(cache, lambda _: {"linked": True})
+    server.start()
+    try:
+        assert request_control_payload(cache, b"status", 2) == {"linked": True}
+        assert sorted(os.listdir(cache)) == [CONTROL_SOCKET_NAME]
+    finally:
+        server.stop()
+    assert os.listdir(cache) == []
+
+
+def test_publication_without_rename_noreplace_or_hard_links_refuses(cache, monkeypatch, caplog):
+    def unsupported(src, dst):
+        raise OSError(errno.ENOSYS, "renameat2 unavailable")
+
+    def no_links(*args, **kwargs):
+        raise OSError(errno.EPERM, "hard links not supported")
+
+    monkeypatch.setattr("storage.control.rename_noreplace", unsupported)
+    monkeypatch.setattr("storage.control.os.link", no_links)
+    server = server_for(cache, lambda _: {})
+    with caplog.at_level(logging.WARNING, logger=__name__):
+        server.start()
+    monkeypatch.undo()
+    assert server._listener is None
+    assert any("neither no-replace rename nor hard links" in r.getMessage() for r in caplog.records)
+    assert os.listdir(cache) == []
 
 
 @pytest.mark.parametrize("mode", [0o707, 0o777, 0o702])
