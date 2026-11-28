@@ -1578,6 +1578,7 @@ class StorageFS(Operations):
         install the older stream-start baseline over the newer one. That is
         conservative: the next check sees a difference and refetches once.
         """
+        self._clear_stale_last_good(canonical_path)
         try:
             identity = self._cache_identity(os.lstat(str(cache_path)))
         except OSError:
@@ -1904,7 +1905,12 @@ class StorageFS(Operations):
             # (_clear_recheck): the invalidation below may be refused.
             self._refetch_pins[canonical_path] = backend
             self._pinned_stats[canonical_path] = (backend, member_stat)
-        self._stash_last_good(resolved)
+        if not self._stash_last_good(resolved):
+            # The copy could not be kept aside: it is not dropped either.
+            # The refresh fails; read-only opens keep reading it, writable
+            # ones get EAGAIN, and the next check is after the age.
+            self._mark_last_good_stale(resolved, identity)
+            return
         self._invalidate_file_cache(resolved.requested_path)
         if self.cache_manager.is_cached(resolved.requested_path):
             self._settle_last_good(resolved, reinstate=False)
@@ -1924,28 +1930,47 @@ class StorageFS(Operations):
             with self._member_checks_lock:
                 self._member_checks.pop(canonical_path, None)
 
-    def _stash_last_good(self, resolved: ResolvedPath) -> None:
+    def _stash_last_good(self, resolved: ResolvedPath) -> bool:
         """Keep the cached copy a revalidation is about to drop, until the
-        refetch that replaces it is installed (_settle_last_good).
+        refetch that replaces it is installed (_settle_last_good). False:
+        it could not be kept aside, so it must not be dropped.
 
-        A hard link under a partial name beside it (hidden from listings,
-        swept at startup after a crash), with its index row and cache
-        location. Called under the path's lock, as the open is.
+        A hard link under a partial name beside it (hidden from listings),
+        with its index row and cache location. Called under the path's lock,
+        as the open is. Crash limit: the startup sweep removes partial names,
+        so a crash between the drop and the settle loses the kept copy (its
+        row was zeroed by the drop); the next open fetches the file again.
         """
         cache_path = resolved.cache_path
         st = regular_file_stat(cache_path)
         if st is None:
-            return
+            return True
         stash = cache_path.parent / f".{os.urandom(8).hex()}{self._PARTIAL_SUFFIX}"
         try:
             os.link(cache_path, stash)
         except OSError as exc:
-            self.logger.debug("could not keep %s while it is refetched: %s", cache_path, exc)
-            return
+            self.logger.warning("could not keep %s aside while it is refetched: %s",
+                                cache_path, exc)
+            return False
         row = self.state_manager.get_file_metadata(resolved.canonical_path)
         locations = [loc for loc in self.state_manager.get_file_locations(resolved.requested_path)
                      if loc.backend_name == "cache"]
         self._last_good[resolved.canonical_path] = (stash, st, row, locations)
+        return True
+
+    def _mark_last_good_stale(self, resolved: ResolvedPath, identity) -> None:
+        """The cached copy is the last good one but known stale: writable
+        opens (and truncates) get EAGAIN until a verified fill replaces it;
+        read-only opens read it; the check is recorded, so opens within the
+        age neither stat the member nor transfer the file again."""
+        self.__dict__.setdefault("_stale_last_good", set()).add(resolved.canonical_path)
+        self._store_member_check(resolved.canonical_path, resolved.cache_path, identity, {})
+
+    def _is_stale_last_good(self, canonical_path: str) -> bool:
+        return canonical_path in self.__dict__.get("_stale_last_good", ())
+
+    def _clear_stale_last_good(self, canonical_path: str) -> None:
+        self.__dict__.get("_stale_last_good", set()).discard(canonical_path)
 
     def _settle_last_good(self, resolved: ResolvedPath, reinstate: bool) -> None:
         """Drop the stashed copy, or (the refetch was not installed) put it
@@ -1966,6 +1991,7 @@ class StorageFS(Operations):
                 self.cache_manager.mark_cache_size_dirty()
                 self.logger.info("refetch of %s not verified; the cached copy is kept",
                                  resolved.canonical_path)
+                self._mark_last_good_stale(resolved, self._cache_identity(st))
         except OSError as exc:
             self.logger.warning("could not reinstate the cached copy of %s: %s",
                                 resolved.canonical_path, exc)
@@ -2572,6 +2598,11 @@ class StorageFS(Operations):
                 and resolved.backend_name in repairs.backends_for([resolved.canonical_path])):
             raise FuseOSError(errno.EBUSY)
 
+        if self._is_stale_last_good(resolved.canonical_path):
+            if length:
+                # A known stale last good copy is no baseline to edit.
+                raise FuseOSError(errno.EAGAIN)
+            self._clear_stale_last_good(resolved.canonical_path)
         try:
             self._require_imported_write_permission(cache_path)
             with open(cache_path, 'r+b') as f:
@@ -2654,10 +2685,19 @@ class StorageFS(Operations):
             and self.cache_manager.is_cached(resolved.requested_path)
         ):
             self._revalidate_cached_file(resolved)
+        if self._is_stale_last_good(resolved.canonical_path) and not self._is_read_only_open(flags):
+            if flags & os.O_TRUNC:
+                # Its bytes are discarded, so no stale baseline is edited.
+                self._clear_stale_last_good(resolved.canonical_path)
+            elif self.cache_manager.is_cached(resolved.requested_path):
+                raise FuseOSError(errno.EAGAIN)
 
-        # Streaming mode applies only to canonical read-only opens of uncached files.
+        # Streaming mode applies only to canonical read-only opens of uncached
+        # files. A refresh that keeps the last good copy aside is a full fill
+        # (its outcome settles that copy here, under the path's lock).
         if (
             self._streaming_reads
+            and resolved.canonical_path not in self.__dict__.get("_last_good", {})
             and resolved.backend_name is None
             and self._is_read_only_open(flags)
             and not self.cache_manager.is_cached(resolved.requested_path)
@@ -2667,8 +2707,6 @@ class StorageFS(Operations):
                 resolved.canonical_path,
             )
             if prefetch_session:
-                # A stream replaces the dropped copy.
-                self._settle_last_good(resolved, reinstate=False)
                 # A streaming descriptor is on Storage's own staging file: the
                 # member's mode (as the session probed it) decides read, as a
                 # cached file's recorded mode does (_require_imported_permission).
@@ -2811,6 +2849,7 @@ class StorageFS(Operations):
         """Create a file"""
         resolved = self._resolve_path(path)
         self._refuse_fenced_view_write(resolved)
+        self._clear_stale_last_good(resolved.canonical_path)  # its bytes are replaced
         # O_CREAT on an existing read-only member file is refused natively.
         self._require_imported_write_permission(resolved.cache_path)
         cache_path = self.cache_manager.create_cached_file(resolved.requested_path)

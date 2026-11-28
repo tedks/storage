@@ -1311,6 +1311,12 @@ class TestLiveRead(RevalidateTestBase):
         # The refresh never settles (the member keeps growing).
         with self.growing_copy():
             self.assertEqual(self.read_through("/live.log"), b"version 1")
+            # Within the age, a writable open finds the copy known stale.
+            with self.count_fetches() as fetches:
+                with self.assertRaises(FuseOSError) as raised:
+                    self.fs.open("/live.log", os.O_RDWR)
+            self.assertEqual(raised.exception.errno, errno.EAGAIN)
+            self.assertEqual(fetches.call_count, 0)
             self.age_checks()
             with self.assertRaises(FuseOSError) as raised:
                 self.fs.open("/live.log", os.O_RDWR)
@@ -1320,10 +1326,16 @@ class TestLiveRead(RevalidateTestBase):
         self.assertEqual((kept.size, kept.last_modified, kept.sync_status),
                          (row.size, row.last_modified, row.sync_status))
         self.assertEqual(self.partials(), [])
-        # Settled: the next open past the age publishes the member's version.
+        # Within the age the failed refresh counts as the check: no transfer.
+        with self.count_fetches() as fetches:
+            self.assertEqual(self.read_through("/live.log"), b"version 1")
+        self.assertEqual(fetches.call_count, 0)
+        # Settled: the next open past the age publishes the member's version,
+        # and the stale mark goes with it (a writable open works again).
         self.age_checks()
         self.assertEqual(self.read_through("/live.log"),
                          (self.member_dir / "live.log").read_bytes())
+        self.fs.release("/live.log", self.fs.open("/live.log", os.O_RDWR))
 
 
 class TestRevalidateOnOpen(RevalidateTestBase):
@@ -1860,6 +1872,7 @@ class TestRevalidateTwoMembers(RevalidateTestBase):
         # Selected but never delivered: the forced refetch is still owed.
         self.assertEqual({"fast"}, self.fs._recheck["/f.txt"])
         (fast_dir / "f.txt").write_bytes(b"CHANGED ON FAST")
+        self.age_checks()  # the failed refresh was a check: next one after the age
         self.assertEqual(b"CHANGED ON FAST", self.read_through("/f.txt"))
         self.assertNotIn("/f.txt", self.fs._recheck)
 

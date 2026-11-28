@@ -1880,6 +1880,42 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.assertEqual(raised.exception.errno, errno.EACCES)
         self.fs.release("/late.bin", vfd)
 
+    def test_failed_refresh_with_streaming_on_keeps_the_last_good_copy(self):
+        # A refresh that keeps the copy aside is a full fill even with
+        # streaming on; when it is not verified, the copy is served on.
+        import dataclasses
+        first = os.urandom(64 * 1024)
+        member = self.backend_dir / "kept.bin"
+        member.write_bytes(first)
+        os.utime(member, (1_600_000_000, 1_600_000_000))
+        self._stream_and_finish("kept.bin", len(first))
+        self.assertTrue(self._wait_for((self.cache_dir / "kept.bin").exists, timeout=8.0))
+        member.write_bytes(os.urandom(64 * 1024))
+        os.utime(member, (1_650_000_000, 1_650_000_000))
+        with self.fs._member_checks_lock:
+            for path, check in list(self.fs._member_checks.items()):
+                self.fs._member_checks[path] = dataclasses.replace(
+                    check, verified_at=check.verified_at - 10_000)
+        copy = self.backend.copy_to_local
+
+        def keeps_growing(path, temp):
+            copy(path, temp)
+            with open(member, "ab") as f:
+                f.write(b"+")
+
+        with patch.object(self.backend, "copy_to_local", side_effect=keeps_growing):
+            vfd = self.fs.open("/kept.bin", os.O_RDONLY)
+            try:
+                with self.fs._fd_lock:
+                    self.assertIsNone(self.fs._fd_map[vfd].prefetch_session)
+                self.assertEqual(self.fs.read("/kept.bin", len(first), 0, vfd), first)
+            finally:
+                self.fs.release("/kept.bin", vfd)
+            with self.assertRaises(FuseOSError) as raised:
+                self.fs.open("/kept.bin", os.O_RDWR)
+            self.assertEqual(raised.exception.errno, errno.EAGAIN)
+        self.assertEqual((self.cache_dir / "kept.bin").read_bytes(), first)
+
     def test_streaming_fill_with_an_unconfirmed_mode_grants_no_write(self):
         # No version token, a mode only the probe reported: the staging
         # file's own owner write is not granted through the mount.
