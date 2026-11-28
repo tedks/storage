@@ -330,6 +330,23 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.assertEqual(too_big.exception.errno, errno.EFBIG)
         self.assertEqual(list(self.cache_dir.glob(".storage-staging-*")), [])
 
+    def test_enospc_at_registration_counts_as_cache_space(self):
+        (self.backend_dir / "full.bin").write_bytes(b"x" * 8192)
+        real_replace = os.replace
+
+        def full(src, dst):
+            if Path(src).name.startswith(".storage-staging-"):
+                raise OSError(errno.ENOSPC, "cache filesystem full")
+            return real_replace(src, dst)
+
+        with patch("storage.streaming.os.replace", side_effect=full), \
+                self.assertRaises(FuseOSError) as nospace:
+            self.fs.open("/full.bin", os.O_RDONLY)
+        self.assertEqual(nospace.exception.errno, errno.ENOSPC)
+        stats = self.fs._streaming_stats_snapshot()
+        self.assertEqual(stats["streaming_open_error_cache_space"], 1)
+        self.assertNotIn("streaming_open_error_cache_register", stats)
+
     def test_probe_failure_is_not_counted_when_recompute_serves_the_open(self):
         (self.backend_dir / "counted.bin").write_bytes(b"member")
         with patch.object(self.backend, "stat", side_effect=OSError(errno.EACCES, "denied")):
@@ -367,6 +384,16 @@ class TestFSStreamingIntegration(unittest.TestCase):
             self.fs.read("/vanish.bin", 4096, 96 * 1024, fd)
         self.assertEqual(again.exception.errno, errno.ESTALE)
         self.fs.release("/vanish.bin", fd)
+
+    def test_file_not_found_without_an_errno_is_stale_too(self):
+        payload = os.urandom(128 * 1024)
+        (self.backend_dir / "noerrno.bin").write_bytes(payload)
+        fd = self.fs.open("/noerrno.bin", os.O_RDONLY)
+        with patch.object(self.backend, "read_file", side_effect=FileNotFoundError("/noerrno.bin")), \
+                self.assertRaises(FuseOSError) as stale:
+            self.fs.read("/noerrno.bin", 4096, 64 * 1024, fd)
+        self.assertEqual(stale.exception.errno, errno.ESTALE)
+        self.fs.release("/noerrno.bin", fd)
 
     def test_retained_fill_is_dropped_when_sessions_near_the_descriptor_limit(self):
         manager = self.fs._streaming_manager
@@ -1193,6 +1220,24 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.assertEqual(self.fs.read('/race.bin', 4096, 0, retry_vfd), payload[:4096])
         self.fs.release('/race.bin', retry_vfd)
         self.fs.release('/race.bin', seed_vfd)
+
+    def test_state_xattr_is_written_to_the_session_inode_not_its_path(self):
+        # R2-N5: a session's state never lands on another file at its path.
+        manager = self.fs._streaming_manager
+        (self.backend_dir / "state.bin").write_bytes(os.urandom(64 * 1024))
+        vfd = self.fs.open('/state.bin', os.O_RDONLY)
+        session = self._session_for(vfd)
+        partial = session.partial_cache_path
+        os.rename(partial, self.cache_dir / "aside")
+        partial.write_bytes(b"successor")
+        manager._update_streaming_state_xattr(session, "probe-state")
+        with self.assertRaises(OSError):
+            os.getxattr(str(partial), self.fs._STREAM_STATE_XATTR)
+        state = json.loads(os.getxattr(session.io_fd, self.fs._STREAM_STATE_XATTR))
+        self.assertEqual(state["status"], "probe-state")
+        partial.unlink()
+        os.rename(self.cache_dir / "aside", partial)
+        self.fs.release('/state.bin', vfd)
 
     def test_attached_open_keeps_its_session_inode_when_a_successor_takes_the_path(self):
         # Council round 2 on #190 (R2-C1): an open attaches to session A and,

@@ -129,6 +129,8 @@ def streaming_read_errno(exc: Exception) -> int:
 
     ENOENT from read(2) would tell the caller its open file does not exist.
     """
+    if isinstance(exc, FileNotFoundError):
+        return errno.ESTALE
     error = streaming_errno(exc)
     return errno.ESTALE if error == errno.ENOENT else error
 
@@ -812,26 +814,28 @@ class StreamingReadManager:
         payload = self._snapshot_streaming_state(session, status)
         self._log_streaming_state_change(session, payload)
 
-        # The detached check is not atomic with the setxattr below: a session
-        # detached in between could write one stale state onto a successor's
-        # partial. The successor would have to finish a remote get_size in
-        # that gap, and the xattr is informational, so it is not locked out.
-        # No fallback to the final path when the partial is gone: the
-        # final path may hold another file by then (a superseded session,
-        # see _install_partial), and the state describes this session only.
-        with session.lock:
-            if session.detached:
-                return
-            target_path = session.final_cache_path if session.finalized else session.partial_cache_path
-
-        try:
-            os.setxattr(
-                str(target_path),
-                self.stream_state_xattr,
-                json.dumps(payload, sort_keys=True).encode("utf-8"),
-            )
-        except OSError:
-            pass
+        # Written through the session's own descriptor, under io_lock so
+        # it stays open: a successor's partial at the same path (after a
+        # replacement, _attach) is never written, whatever the timing. Once
+        # the descriptor is closed only a finalized session writes, to its
+        # final path. A detached session writes nothing; its state is no
+        # longer anyone's.
+        value = json.dumps(payload, sort_keys=True).encode("utf-8")
+        with session.io_lock:
+            with session.lock:
+                if session.detached:
+                    return
+                io_fd = session.io_fd
+                target_path = session.final_cache_path if session.finalized else None
+            try:
+                if io_fd >= 0:
+                    # The session's own inode: a successor's partial at the
+                    # same path is never written, detached or not.
+                    os.setxattr(io_fd, self.stream_state_xattr, value)
+                elif target_path is not None:
+                    os.setxattr(str(target_path), self.stream_state_xattr, value)
+            except OSError:
+                pass
 
     def _streaming_stats_snapshot(self) -> Dict[str, object]:
         with self._streaming_stats_lock:
@@ -1784,6 +1788,9 @@ class StreamingReadManager:
         error = streaming_errno(exc)
         if error in (errno.EMFILE, errno.ENFILE):
             reason = "descriptors"
+        elif error == errno.ENOSPC and reason in ("cache_prepare", "cache_register", "cache_open"):
+            # The local cache filesystem is full, whichever stage saw it.
+            reason = "cache_space"
         self._record_streaming_stat(f"streaming_open_error_{reason}")
         self.logger.warning("streaming open failed reason=%s errno=%d", reason, error)
 

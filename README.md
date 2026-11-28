@@ -270,16 +270,27 @@ streaming instead:
 - Descriptors. Each streaming file holds one descriptor on its partial
   while it fills, with or without readers, and each open handle holds
   another. At mount the soft `RLIMIT_NOFILE` is raised to the hard limit
-  (logged; a failure to raise it is logged and the mount continues). A
-  fill is not retained after its last close once streaming files hold
-  half the soft limit; it is discarded as an unqualified one is. A mount
-  that reaches the limit anyway returns `EMFILE` from opens.
+  (logged; a failure to raise it is logged and the mount continues).
+  Processes the mount starts (recompute commands, `ssh`, `rsync`) inherit
+  the raised limit; a program that still uses `select(2)` cannot handle
+  descriptors numbered 1024 or above. A fill is not retained after its
+  last close once streaming descriptors reach half the soft limit; it is
+  discarded as an unqualified one is. A mount that reaches the limit
+  anyway returns `EMFILE` from opens.
 
 On range-capable reads, a storage or member error returns its errno to
 the caller; a file that disappears from its member during a read returns
 `ESTALE`. A new open of a file whose streaming download failed starts a
-fresh download instead of returning the old error. A recomputable file
-whose members cannot be reached is recomputed. A selected member without
+fresh download instead of returning the old error. Readers still holding
+the failed download keep its bytes and its error; its partial, unlinked,
+stays charged against `cache_size` and counted among streaming
+descriptors until they close. A failed download keeps the contiguous
+prefix it fetched in the cache. An open that finds the file uncached and
+starts streaming never takes a prefix that appears meanwhile for the
+file: it drops the prefix and streams again, or returns `EAGAIN` while
+another descriptor holds it. A prefix already cached when the file is
+opened is served as it is, which is what lets it be read offline.
+A recomputable file whose members cannot be reached is recomputed. A selected member without
 range support uses the whole-file cache path, as do write opens and opens
 with streaming disabled.
 
