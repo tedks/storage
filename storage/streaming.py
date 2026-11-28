@@ -208,15 +208,39 @@ class _DownloadPool:
                 retried = True
 
     def offer(self, session, ready, finished_turn=False):
+        """Queue or withdraw a session after its readiness may have changed.
+
+        Every FUSE read offers its session, so an offer that changes
+        nothing (the session already queued at the same priority, running,
+        or neither queued nor ready) recomputes no demand and wakes at most
+        one worker. It still retries a worker start when the pool has no
+        thread at all, which is how a failed start is retried while readers
+        keep reading.
+        """
         with self.condition:
             if finished_turn:
                 self.running.remove(session)
-            if session not in self.running:
-                if ready and not self.closing:
-                    self.ready[session] = session.refcount > 0
-                    self._grow()
-                else:
-                    self.ready.pop(session, None)
+            elif session in self.running:
+                # Its turn offers it again when it ends.
+                return
+            else:
+                queued = self.ready.get(session)
+                wanted = session.refcount > 0 if ready and not self.closing else None
+                if queued == wanted:
+                    if wanted is not None:
+                        if self.threads:
+                            # One worker rechecks member headroom, which can
+                            # come back without any offer (a channel refusal
+                            # ends); not a wake of every idle worker.
+                            self.condition.notify()
+                        else:
+                            self._grow()
+                    return
+            if ready and not self.closing:
+                self.ready[session] = session.refcount > 0
+                self._grow()
+            else:
+                self.ready.pop(session, None)
             self.condition.notify_all()
 
     def set_limit(self, limit):
