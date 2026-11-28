@@ -97,8 +97,11 @@ and clean copies with no recorded member location, are kept under
 pressure. A streaming reader can receive fetched bytes directly when the
 cache cannot keep them, and speculative reads pause.
 
-The budget is kept incrementally. Local writes and truncates are charged
-by the change in the blocks they touch, and an eviction pass that finds
+The budget is kept incrementally. A streaming download is charged the
+blocks it has written, tracked per descriptor, until its partial is
+published or its descriptor closes (after every reader's). Local writes
+and truncates are charged by the change in the data blocks they touch
+(the whole file for an O_APPEND write), and an eviction pass that finds
 too few victims is remembered until a descriptor closes, the index changes
 or a second passes. Charging needs exact `SEEK_DATA`/`SEEK_HOLE` from the
 cache filesystem (see README.md). A whole-file copy reserves its expected

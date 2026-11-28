@@ -250,15 +250,15 @@ copies, foreground reads can return the fetched bytes directly and
 preloading pauses.
 
 Block charging needs a cache filesystem whose `SEEK_DATA`/`SEEK_HOLE`
-report allocated extents exactly: ext4, xfs, btrfs and tmpfs do. Each
-grant checks the reported extents against the blocks the file has
-allocated. A filesystem that reports holes as data, such as one with only
-the generic `lseek`, fails that check, and so can OpenZFS while a file
-has changes not yet synced (with `zfs_dmu_offset_next_sync=0`). Streaming
-reads that fail it are served without being cached, and the mount logs
-one warning. With `zfs_dmu_offset_next_sync=1` an extent query on a
-changed file can force a transaction group sync, which makes every
-streamed chunk slow. OpenZFS is not a supported cache filesystem.
+report allocated extents exactly: ext4, xfs, btrfs and tmpfs do. A
+download's first grant checks the reported extents against the blocks the
+file has allocated; later grants charge the blocks the download itself
+has written, with no extent query. A filesystem that reports holes as
+data, such as one with only the generic `lseek`, fails that check, and so
+can OpenZFS while a file has changes not yet synced (with
+`zfs_dmu_offset_next_sync=0`). Downloads that fail it are served without
+being cached, and the mount logs one warning. OpenZFS is not a supported
+cache filesystem.
 
 Streaming read-ahead and retained fills share an adaptive pool. Workers
 start as chunks become runnable and retire after 30 idle seconds. By
