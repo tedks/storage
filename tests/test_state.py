@@ -618,15 +618,17 @@ class TestCacheAbsentCandidacy(unittest.TestCase):
         self.assertEqual(self._absent("/a"), 0)
         self.assertEqual(self.state_manager.get_file_metadata("/a").last_access, 5.0)
 
-    def test_reopening_the_index_drops_every_mark(self):
-        # A crash between the mark's commit and the second stat can leave
-        # a populated file marked; the next process must not inherit it.
+    def test_opening_the_index_keeps_marks_and_the_mount_reset_clears_them(self):
+        # A diagnostic open (verify-index) must not change the index; the
+        # mount's startup reset is what keeps a crash's mark from lasting.
         self._row("/populated")
         self.state_manager.mark_cache_absent(["/populated"])
-        self.assertEqual(list(self.state_manager.iter_lru_paths()), [])
         db = self.state_manager.db_path
         self.state_manager.close()
         self.state_manager = StateManager(str(db))
+        self.assertEqual(self._absent("/populated"), 1)
+        self.assertEqual(list(self.state_manager.iter_lru_paths()), [])
+        self.state_manager.reset_cache_absent()
         self.assertEqual(self._absent("/populated"), 0)
         self.assertEqual(list(self.state_manager.iter_lru_paths()), ["/populated"])
 

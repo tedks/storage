@@ -231,12 +231,6 @@ class StateManager:
             self.conn.execute(
                 'ALTER TABLE files ADD COLUMN cache_absent INTEGER NOT NULL DEFAULT 0'
             )
-        # A hint never outlives the process that set it. A mark commits
-        # before eviction's second stat; a crash between them could keep a
-        # mark on a file a fill placed meanwhile, whose row then matches the
-        # file and is never written again. Opening starts every row as a
-        # candidate, at the cost of one full scan.
-        self.conn.execute('UPDATE files SET cache_absent = 0 WHERE cache_absent = 1')
         # The side table and the first eviction index of this branch, never
         # released; dropped so an index opened by that build converges.
         self.conn.executescript('''
@@ -999,6 +993,18 @@ class StateManager:
                 [(path,) for path in virtual_paths],
             )
             self.conn.commit()
+
+    def reset_cache_absent(self):
+        """Make every row an eviction candidate again; the mount calls it at startup.
+
+        A mark commits before eviction's second stat, so a crash between
+        them could keep a mark on a file a fill placed meanwhile, whose row
+        then matches the file and is never written again. Clearing every
+        mark when a mount starts means a hint never outlives the mount that
+        set it, at the cost of one full scan. Opening the index does not
+        call this, so diagnostic commands leave the marks as they are.
+        """
+        self._execute_write('UPDATE files SET cache_absent = 0 WHERE cache_absent = 1')
 
     def clear_cache_absent(self, virtual_paths: Iterable[str]):
         with self._db_lock:

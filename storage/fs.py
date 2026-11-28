@@ -303,6 +303,10 @@ class StorageFS(Operations):
             if max_foreground_operations is not None else None
         )
         self.state_manager = StateManager(str(state_db))
+        # Eviction hints never outlive the mount that set them (see
+        # StateManager.reset_cache_absent). The mount lock is held by now,
+        # so no other mount of this cache is marking.
+        self.state_manager.reset_cache_absent()
         self.cache_manager = CacheManager(
             cache_root, self.state_manager, cache_size,
             bulk_cold_copies=bulk_cold_copies,

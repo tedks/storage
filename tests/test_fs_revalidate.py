@@ -1861,3 +1861,46 @@ class TestRecomputeRecordsStat(unittest.TestCase):
         self._recompute(b"recomputed bytes")
         row = self.fs.state_manager.get_file_metadata("/derived.bin")
         self.assertEqual((row.size, row.last_modified, row.sync_status), (5, 2.0, SyncStatus.DIRTY))
+
+
+class TestMountStartupClearsEvictionHints(unittest.TestCase):
+    """A mark left by a crashed mount does not survive into the next one."""
+
+    def test_storage_fs_startup_clears_marks_left_in_the_index(self):
+        from storage.state import StateManager
+
+        temp_dir = Path(tempfile.mkdtemp())
+        try:
+            cache_dir = temp_dir / "cache"
+            cache_dir.mkdir()
+            member_dir = temp_dir / "member"
+            member_dir.mkdir()
+            db = temp_dir / "state.db"
+            cached = cache_dir / "populated.bin"
+            cached.write_bytes(b"bytes")
+            st = cached.stat()
+            previous = StateManager(str(db))
+            previous.set_file_metadata(FileMetadata(
+                virtual_path="/populated.bin", size=st.st_size, checksum="c", last_access=1.0,
+                last_modified=st.st_mtime, sync_status=SyncStatus.CLEAN, replica_count=1,
+                recomputable=False, recompute_cmd=None, encrypted=False, encryption_key_id=None,
+            ))
+            # The crash: the mark committed, the second stat never ran.
+            previous.mark_cache_absent(["/populated.bin"])
+            previous.close()
+
+            fs = StorageFS(
+                cache_root=cache_dir, state_db=db,
+                backends={"member": LocalBackend("member", str(member_dir))},
+                cache_size=10 * 1024 * 1024, start_sync=False,
+            )
+            try:
+                self.assertEqual(list(fs.state_manager.iter_lru_paths()), ["/populated.bin"])
+                fs.cache_manager.max_size_bytes = st.st_size
+                self.assertTrue(fs.cache_manager.ensure_space(1))
+                self.assertFalse(cached.exists())
+            finally:
+                fs.sync_manager.stop()
+                fs.state_manager.close()
+        finally:
+            shutil.rmtree(temp_dir)
