@@ -1728,7 +1728,18 @@ class StreamingReadManager:
                 metadata.sync_status = SyncStatus.CLEAN
         # Mirrors the row as stored: a write during the fill keeps its
         # DIRTY in SQLite, and the xattr must say the same.
-        return self.cache_manager.store_file_metadata(metadata, cache_path=session.final_cache_path)
+        stored = self.cache_manager.store_file_metadata(metadata, cache_path=session.final_cache_path)
+        # A read between the snapshot above and the store advanced
+        # session.last_access, and its batched update may already have
+        # flushed against no row. Replay the latest value through the
+        # MAX-merging access path now that the row exists. A read whose
+        # session update this misses queues its own update after the store,
+        # so that one finds the row.
+        with session.lock:
+            latest = session.last_access
+        if latest > last_access:
+            self.state_manager.update_access_time(session.canonical_path, accessed_at=latest)
+        return stored
 
     def _add_finalized_locations(self, session: PrefetchSession, metadata: FileMetadata):
         """Record the member and the cache as holding the file; caller holds the index lock."""
