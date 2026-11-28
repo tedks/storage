@@ -509,10 +509,14 @@ class TestKernelCacheRefetch(_MountedCase):
         except BaseException:
             os.close(a)
             raise
-        if os.stat(target).st_size != self.HELD_SIZE or os.stat(target).st_mtime != stamp:
+        try:
+            st = os.stat(target)
+            if st.st_size != self.HELD_SIZE or st.st_mtime != stamp:
+                raise RuntimeError("the rewrite changed the file's size or mtime")
+        except BaseException:
             os.close(a)
             os.close(b)
-            raise RuntimeError("the rewrite changed the file's size or mtime")
+            raise
         return a, b
 
     def test_held_reader_over_the_same_range_leaves_new_reader_fresh(self):
@@ -548,9 +552,14 @@ class TestKernelCacheRefetch(_MountedCase):
             os.close(c)
 
     # Known limitation (#206), older than dropping auto_cache (which kept
-    # stale pages too). strict, so a fix turns this red and the marker comes off;
-    # raises, so a setup failure (RuntimeError) is not an expected failure.
-    @pytest.mark.xfail(strict=True, raises=AssertionError,
+    # stale pages too). strict, so a fix (B reads NEW) turns this red and the
+    # marker comes off; raises=_StaleRefill, so only the #206 shape (A and B
+    # both read OLD at the tail) is the expected failure: a setup failure or
+    # any other payload fails the test.
+    class _StaleRefill(Exception):
+        pass
+
+    @pytest.mark.xfail(strict=True, raises=_StaleRefill,
                        reason="#206: a reader held open across invalidation refills the "
                               "shared FUSE pages from its old cache file")
     def test_stale_refill_by_held_reader_reaches_new_reader(self):
@@ -558,10 +567,12 @@ class TestKernelCacheRefetch(_MountedCase):
         try:
             if self._bytes_at(b, 0) != set(self.NEW):
                 raise RuntimeError("reader B did not see the refetched bytes")
-            self._bytes_at(a, self.HELD_TAIL)  # OLD, into the shared pages
-            self.assertEqual(set(self.NEW), self._bytes_at(b, self.HELD_TAIL),
-                             "reader B read pages a held reader filled from "
-                             "its old cache file")
+            held = self._bytes_at(a, self.HELD_TAIL)  # into the shared pages
+            seen = self._bytes_at(b, self.HELD_TAIL)
+            if held == set(self.OLD) and seen == set(self.OLD):
+                raise self._StaleRefill(
+                    "reader B read a page a held reader filled from its old cache file")
+            self.assertEqual(set(self.NEW), seen)
         finally:
             os.close(a)
             os.close(b)
