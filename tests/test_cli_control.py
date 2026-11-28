@@ -672,6 +672,26 @@ def test_canonical_mountpoint(tmp_path, monkeypatch):
     assert canonical_mountpoint("//") == "/"
 
 
+def test_canonical_mountpoint_errors_are_control_errors(tmp_path, monkeypatch):
+    with pytest.raises(ControlError, match="Cannot resolve mountpoint"):
+        canonical_mountpoint("/mnt/with\0nul")
+
+    def gone():
+        raise FileNotFoundError(2, "No such file or directory")
+
+    monkeypatch.setattr("storage.control.os.getcwd", gone)
+    with pytest.raises(ControlError, match="Cannot resolve mountpoint 'relative'"):
+        canonical_mountpoint("relative")
+
+    def denied(path, *args, **kwargs):
+        raise PermissionError(13, "Permission denied", path)
+
+    monkeypatch.undo()
+    monkeypatch.setattr("storage.control.os.readlink", denied)
+    with pytest.raises(ControlError, match="Permission denied"):
+        canonical_mountpoint(str(tmp_path / "x"))
+
+
 def test_canonical_mountpoint_never_stats_the_final_directory(tmp_path, monkeypatch):
     # Only readlink touches the last component; a stat there would ask a
     # hung mount's filesystem.

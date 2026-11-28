@@ -100,6 +100,18 @@ def canonical_mountpoint(mountpoint: str) -> str:
     only when both resolve it from the same working directory, as for the
     cache path.
     """
+    try:
+        return _canonical_mountpoint(mountpoint)
+    except ControlError:
+        raise
+    except (OSError, ValueError) as exc:
+        # A vanished working directory, an embedded NUL, EACCES on a link:
+        # the callers (the CLI, the mount's control setup) handle only
+        # ControlError.
+        raise ControlError(f"Cannot resolve mountpoint {os.fsdecode(mountpoint)!r}: {exc}") from exc
+
+
+def _canonical_mountpoint(mountpoint: str) -> str:
     original = os.fsdecode(mountpoint)
     path = original if os.path.isabs(original) else os.path.join(os.getcwd(), original)
     for _ in range(_MAX_SYMLINKS + 1):
