@@ -1,0 +1,20 @@
+id: streaming-rlimit-child-inherit
+title: Raised RLIMIT_NOFILE soft limit is inherited by child processes
+desc: 'From council on #190 (round-2 Anthropic nit). mount raises soft RLIMIT_NOFILE
+  to the hard limit; recompute commands, ssh/rsync, the watcher and the ssh mux inherit
+  it, and select(2) users break on descriptors >= 1024. There is no central spawn
+  point (subprocess fork_exec runs no Python at-fork hooks); #190 documents it. Fix:
+  pass a preexec/restore through a shared spawn helper.'
+type: task
+component: default
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-28T08:53:29-00:00
+references: []
+log_events:
+- time: 2026-11-28T08:53:29-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
