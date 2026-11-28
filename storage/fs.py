@@ -2945,14 +2945,16 @@ class StorageFS(Operations):
                 raise FuseOSError(errno.ENOTDIR)
             self._force_verify(self._resolve_path(path).canonical_path)
             return
-        cache_path = self._resolve_path(path).cache_path
-        # A user xattr needs write permission on a file, as natively.
-        self._require_imported_write_permission(cache_path)
-
-        try:
-            os.setxattr(str(cache_path), name, value, follow_symlinks=False)
-        except OSError as e:
-            raise FuseOSError(e.errno)
+        resolved = self._resolve_path(path)
+        # A user xattr needs write permission on a file, as natively. The
+        # path's lock spans the check and the change, so no refetch can
+        # install a read-only import between them.
+        with self._path_locked(resolved.canonical_path):
+            self._require_imported_write_permission(resolved.cache_path)
+            try:
+                os.setxattr(str(resolved.cache_path), name, value, follow_symlinks=False)
+            except OSError as e:
+                raise FuseOSError(e.errno)
 
     def listxattr(self, path):
         """List extended attributes"""
@@ -2980,13 +2982,13 @@ class StorageFS(Operations):
                     self.MEMBER_STAT_XATTR, MEMBER_ATTRS_XATTR}:
             # Derived; ignore removals.
             return
-        cache_path = self._resolve_path(path).cache_path
-        self._require_imported_write_permission(cache_path)
-
-        try:
-            os.removexattr(str(cache_path), name, follow_symlinks=False)
-        except OSError as e:
-            raise FuseOSError(e.errno)
+        resolved = self._resolve_path(path)
+        with self._path_locked(resolved.canonical_path):  # as setxattr
+            self._require_imported_write_permission(resolved.cache_path)
+            try:
+                os.removexattr(str(resolved.cache_path), name, follow_symlinks=False)
+            except OSError as e:
+                raise FuseOSError(e.errno)
 
     # Symbolic links
 

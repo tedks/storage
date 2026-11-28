@@ -639,6 +639,28 @@ class TestFillConfirmsMemberVersion(RevalidateTestBase):
         self.assertEqual((attrs["st_mtime"], stat.S_IMODE(attrs["st_mode"])), (1_000_000_000, 0o640))
 
 
+class TestXattrChangesHoldThePathLock(RevalidateTestBase):
+
+    def test_check_and_change_run_under_the_path_lock(self):
+        self.rewrite_member("f.txt", b"original")
+        self.read_through("/f.txt")
+        held = []
+        real_set, real_remove = os.setxattr, os.removexattr
+
+        def observed(real):
+            def call(path, *args, **kwargs):
+                if str(path).endswith("f.txt"):
+                    held.append("/f.txt" in self.fs._path_locks._entries)
+                return real(path, *args, **kwargs)
+            return call
+
+        with patch("storage.fs.os.setxattr", side_effect=observed(real_set)), \
+                patch("storage.fs.os.removexattr", side_effect=observed(real_remove)):
+            self.fs.setxattr("/f.txt", "user.note", b"x", 0)
+            self.fs.removexattr("/f.txt", "user.note")
+        self.assertEqual(held, [True, True])
+
+
 class TestConflictViewClose(RevalidateTestBase):
     """A conflict view's close sends its copy to the member when the copy
     changed while the descriptor was open, whatever its open flags."""
