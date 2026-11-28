@@ -621,8 +621,9 @@ profile or startup flags to persist settings across restarts.
 
 To cancel, copy the exact ID from `downloads`. `cancelled` means the mount
 abandoned the download, including its partial cache file. A download with a
-reader or in finalization reports `busy`. Close its readers or wait for it to
-finish before retrying. A vanished ID reports `not-found`, including when a new
+reader, in finalization, or still cleaning up after a failure or an earlier
+cancel reports `busy` and says which (`reason` in the JSON: `readers`,
+`finalizing` or `stopping`). Close its readers, or wait, before retrying. A vanished ID reports `not-found`, including when a new
 download has started for the same path. `busy` exits with status 3 and
 `not-found` with status 4; other errors exit with 1, usage errors with 2.
 The endpoint is the private `.storage.control.sock` in the mount cache.

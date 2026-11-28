@@ -504,9 +504,9 @@ class TestStreamingSystemRegression(unittest.TestCase):
                 original = row["id"]
 
                 outcome = command("cancel", original, expected=3)
-                self.assertEqual(outcome, {"id": original, "result": "busy"})
+                self.assertEqual(outcome, {"id": original, "result": "busy", "reason": "readers"})
                 human = command("cancel", original, expected=3, json_output=False)
-                self.assertIn("Close its readers or wait for finalization", human.stderr)
+                self.assertIn("it has open readers. Close its readers and retry.", human.stderr)
                 self.assertEqual(handle.read_digest(512 * 1024, 64),
                                  sha256(self.payload[512 * 1024:512 * 1024 + 64]))
 

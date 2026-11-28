@@ -637,19 +637,28 @@ class StreamingReadManager:
         return "reading" if session.refcount > 0 else "retained"
 
     def cancel_download_session(self, selector: str):
+        return self.cancel_download_session_with_reason(selector)[0]
+
+    def cancel_download_session_with_reason(self, selector: str):
+        """(outcome, reason): reason says why a busy download is busy
+        ("readers", "finalizing", or "stopping" for a failed or already
+        stopped download still being cleaned up), else None."""
         with self.prefetch_sessions_lock:
             for session in self.prefetch_sessions.values():
                 if session.session_id != selector:
                     continue
                 with session.lock:
-                    if session.refcount > 0 or self._download_terminal(session):
-                        return "busy"
+                    if session.refcount > 0:
+                        return "busy", "readers"
+                    if self._download_terminal(session):
+                        stopping = session.stop_requested or session.error is not None
+                        return "busy", "stopping" if stopping else "finalizing"
                     idle = self._stop_background_locked(session)
                 break
             else:
-                return "not-found"
+                return "not-found", None
         self._complete_cancellation(session, idle)
-        return "cancelled"
+        return "cancelled", None
 
     def destroy(self):
         """Stop every session; from here on, opens get no session (full-file path).
@@ -1011,7 +1020,11 @@ class StreamingReadManager:
             if (set(arguments) != {"id"} or not isinstance(session_id, str)
                     or re.fullmatch(r"[0-9a-f]{32}", session_id) is None):
                 raise ControlError("Provide a complete download ID from 'storage control ... downloads'")
-            return {"id": session_id, "result": self.cancel_download_session(session_id)}
+            outcome, reason = self.cancel_download_session_with_reason(session_id)
+            response = {"id": session_id, "result": outcome}
+            if reason is not None:
+                response["reason"] = reason
+            return response
         raise ControlError("Unknown mount control command")
 
     def _record_streaming_stat(self, key: str, value: int = 1):

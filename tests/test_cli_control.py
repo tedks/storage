@@ -607,6 +607,31 @@ def test_status_says_how_to_reach_a_mount_without_a_mountpoint(cache):
         server.stop()
 
 
+@pytest.mark.parametrize("reason, text", [
+    ("readers", "it has open readers"),
+    ("finalizing", "it is being finalized"),
+    ("stopping", "finishing a failed or cancelled download; retry shortly"),
+    (None, "close its readers or wait for finalization"),
+])
+def test_busy_cancel_says_why(cache, reason, text):
+    def dispatch(frame):
+        if json.loads(frame)["command"] == "status":
+            return full_status(cache, None)
+        reply = {"id": "0" * 32, "result": "busy"}
+        if reason is not None:
+            reply["reason"] = reason
+        return reply
+
+    server = server_for(cache, dispatch)
+    server.start()
+    try:
+        result = CliRunner().invoke(main, ["control", "--cache", str(cache), "cancel", "0" * 32])
+        assert result.exit_code == 3, result.output
+        assert text in result.output
+    finally:
+        server.stop()
+
+
 @pytest.mark.parametrize("outcome, code", [("cancelled", 0), ("busy", 3), ("not-found", 4),
                                            ("unexpected", 1)])
 def test_cancel_outcomes_have_distinct_exit_codes(cache, outcome, code):

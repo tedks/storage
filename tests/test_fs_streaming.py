@@ -2480,10 +2480,21 @@ class TestFSStreamingIntegration(unittest.TestCase):
                 session.prefetch_complete = True
             try:
                 self.assertEqual(manager.cancel_download_session(session.session_id), "busy")
+                self.assertEqual(manager.cancel_download_session_with_reason(session.session_id),
+                                 ("busy", "finalizing"))
                 with session.lock:
                     self.assertFalse(session.stop_requested)
                 row, = manager.list_download_sessions()
                 self.assertEqual(row["status"], "finalizing")
+                with session.lock:
+                    session.prefetch_complete = False
+                    session.error = OSError(5, "simulated member failure")
+                try:
+                    self.assertEqual(manager.cancel_download_session_with_reason(session.session_id),
+                                     ("busy", "stopping"))
+                finally:
+                    with session.lock:
+                        session.error = None
             finally:
                 with session.lock:
                     session.refcount = readers

@@ -193,6 +193,12 @@ def control_downloads(target):
         )
 
 
+BUSY_REASONS = {
+    "readers": "it has open readers. Close its readers and retry.",
+    "finalizing": "all of it has arrived and it is being finalized; it cannot be cancelled now.",
+    "stopping": "finishing a failed or cancelled download; retry shortly.",
+    None: "close its readers or wait for finalization, then retry.",
+}
 # 1 is any error and 2 a usage error, as for other commands.
 CANCEL_EXIT_CODES = {"busy": 3, "not-found": 4}
 
@@ -208,7 +214,8 @@ def control_cancel(target, session_id):
         if outcome == "cancelled":
             click.echo(f"Cancelled download {session_id}")
         elif outcome == "busy":
-            click.echo(f"Download {session_id} is busy. Close its readers or wait for finalization.", err=True)
+            reason = BUSY_REASONS.get(payload.get("reason"), BUSY_REASONS[None])
+            click.echo(f"Download {session_id} is busy: {reason}", err=True)
         elif outcome == "not-found":
             click.echo(f"Download {session_id} is no longer present. Run 'downloads' for current IDs.", err=True)
         else:
