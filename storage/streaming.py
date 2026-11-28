@@ -1609,8 +1609,11 @@ class StreamingReadManager:
                 return
             # A worker's stat is an interactive request: the member's
             # interactive reserve and its connect deadline, never a bulk
-            # channel, so it cannot wait behind sync's bulk leases. Its
-            # channel wait yields under contention (_publication_wait_probe).
+            # lease. It can still wait behind a bulk lease when SSH
+            # negotiated a single shared channel, or behind other
+            # confirmations on the reserve; that wait yields under
+            # contention and is bounded across yields
+            # (_publication_wait_probe).
             # A deadline failure is retried once, then the probe stands in
             # when the size matches (confirm_member_stat); what an
             # unconfirmed result means beyond that is the decision below,

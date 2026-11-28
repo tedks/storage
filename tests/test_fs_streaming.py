@@ -1519,6 +1519,39 @@ class TestFSStreamingIntegration(unittest.TestCase):
             with pool.condition:
                 pool.contended = saved
 
+    def test_failed_rename_leaves_the_planted_partial_charged(self):
+        cache = self.fs.cache_manager
+        cache.max_size_bytes = 1024 * 1024
+        payload = os.urandom(384 * 1024)
+        (self.backend_dir / "planted.bin").write_bytes(payload)
+        planted = self.cache_dir / "planted.bin.storage.partial"
+        planted.write_bytes(b"p" * (128 * 1024))
+        cache.mark_cache_size_dirty()
+        real_replace = os.replace
+        needed = []
+
+        def replace(src, dst):
+            if ".storage-staging-" in str(src):
+                with cache._lock:
+                    cache._size_dirty = True
+                    # The planted file and one reservation for the new one.
+                    needed.append(cache.get_free_space_needed(600 * 1024))
+                raise OSError(errno.EIO, "simulated rename failure")
+            return real_replace(src, dst)
+
+        with patch("storage.streaming.os.replace", side_effect=replace):
+            fd = self.fs.open("/planted.bin", os.O_RDONLY)
+        self.assertEqual(needed, [88 * 1024])
+        with self.fs._fd_lock:
+            self.assertIsNone(self.fs._fd_map[fd].prefetch_session)
+        self.fs.release("/planted.bin", fd)
+        self.assertTrue(planted.exists())
+        self.assertEqual(cache._reserved_bytes, 0)
+        on_disk = sum(path.stat().st_size for path in self.cache_dir.rglob("*")
+                      if path.is_file() and not path.is_symlink())
+        self.assertEqual(cache.get_total_cache_size(), on_disk)
+        self.assertGreaterEqual(on_disk, 128 * 1024)
+
     def test_offer_during_turn_failure_recovery_starts_no_second_turn(self):
         manager = self.fs._streaming_manager
         pool = manager._download_pool
