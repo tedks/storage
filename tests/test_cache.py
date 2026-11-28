@@ -273,6 +273,106 @@ class TestCacheAccounting(unittest.TestCase):
             path.unlink()
         self.assertEqual(manager.get_total_cache_size(), 0)
 
+    def _no_rescan(self):
+        return patch.object(self.cache_manager, "_scan_total_cache_size",
+                            side_effect=AssertionError("unexpected full cache scan"))
+
+    def test_direct_writes_and_truncates_are_charged_without_a_rescan(self):
+        manager = self.cache_manager
+        block = manager.block_size
+        path = self.cache_dir / "local.bin"
+        with self._no_rescan():
+            with manager.cache_size_change(path):
+                path.touch()
+            fd = os.open(path, os.O_RDWR)
+            try:
+                with manager.cache_size_change(fd=fd, span=(0, 3 * block)):
+                    os.pwrite(fd, b"x" * (3 * block), 0)
+                self.assertEqual(manager.get_total_cache_size(), 3 * block)
+                # An overwrite allocates nothing; a write into a hole one block.
+                with manager.cache_size_change(fd=fd, span=(10, 20)):
+                    os.pwrite(fd, b"y" * 10, 10)
+                with manager.cache_size_change(fd=fd, span=(9 * block + 1, 9 * block + 2)):
+                    os.pwrite(fd, b"z", 9 * block + 1)
+                self.assertEqual(manager.get_total_cache_size(), 4 * block)
+                with manager.cache_size_change(path):
+                    os.truncate(path, block)
+                self.assertEqual(manager.get_total_cache_size(), block)
+            finally:
+                os.close(fd)
+        manager.mark_cache_size_dirty()
+        self.assertEqual(manager.get_total_cache_size(), block)
+
+    def test_a_hard_linked_or_unknown_target_falls_back_to_a_rescan(self):
+        manager = self.cache_manager
+        block = manager.block_size
+        path = self.cache_dir / "linked.bin"
+        path.write_bytes(b"a")
+        os.link(path, self.cache_dir / "alias.bin")
+        manager.mark_cache_size_dirty()
+        self.assertEqual(manager.get_total_cache_size(), block)
+        with manager.cache_size_change(path):
+            with open(path, "ab") as f:
+                f.write(b"b" * block)
+        self.assertTrue(manager._size_dirty)
+        self.assertEqual(manager.get_total_cache_size(), 2 * block)
+        with manager.cache_size_change():
+            (self.cache_dir / "other.bin").write_bytes(b"c")
+        self.assertTrue(manager._size_dirty)
+        self.assertEqual(manager.get_total_cache_size(), 3 * block)
+
+    def _fill_with_dirty_bytes(self):
+        manager = self.cache_manager
+        dirty = self.cache_dir / "dirty.bin"
+        dirty.write_bytes(b"d")
+        self.state_manager.set_file_metadata(FileMetadata(
+            virtual_path="/dirty.bin", size=1, checksum=None, last_access=1.0,
+            last_modified=dirty.stat().st_mtime, sync_status=SyncStatus.DIRTY, replica_count=1,
+            recomputable=False, recompute_cmd=None, encrypted=False, encryption_key_id=None,
+        ))
+        manager.mark_cache_size_dirty()
+        manager.max_size_bytes = manager.get_total_cache_size()
+
+    def test_a_victim_shortfall_is_remembered_until_something_changes(self):
+        manager = self.cache_manager
+        block = manager.block_size
+        self._fill_with_dirty_bytes()
+        walks = []
+        real = manager._evict_by_access
+
+        def counting(*args, **kwargs):
+            walks.append(kwargs.get("dry_run", False))
+            return real(*args, **kwargs)
+
+        with patch.object(manager, "_evict_by_access", side_effect=counting):
+            self.assertFalse(manager.ensure_space(block))
+            self.assertFalse(manager.ensure_space(block))
+            self.assertEqual(walks, [True])
+            # A descriptor closed: walk again.
+            manager.note_evictable_change()
+            self.assertFalse(manager.ensure_space(block))
+            self.assertEqual(walks, [True, True])
+            # An index row changed (a sync published CLEAN, say): walk again.
+            self.state_manager.update_access_time("/dirty.bin", accessed_at=5.0)
+            self.state_manager._flush_access_updates(force=True)
+            self.assertFalse(manager.ensure_space(block))
+            self.assertEqual(walks, [True, True, True])
+            # And once the shortfall is old.
+            with patch.object(manager, "SHORTFALL_TTL_SECONDS", 0):
+                self.assertFalse(manager.ensure_space(block))
+            self.assertEqual(walks, [True, True, True, True])
+
+    def test_a_remembered_shortfall_still_lets_a_copy_turn_clean(self):
+        manager = self.cache_manager
+        block = manager.block_size
+        self._fill_with_dirty_bytes()
+        self.assertFalse(manager.ensure_space(block))
+        row = self.state_manager.get_file_metadata("/dirty.bin")
+        self.assertTrue(self.state_manager.publish_sync_status(
+            "/dirty.bin", row.dirty_generation, SyncStatus.CLEAN))
+        self.assertTrue(manager.ensure_space(block))
+        self.assertFalse((self.cache_dir / "dirty.bin").exists())
+
     def test_direct_writer_uses_space_before_the_next_stream_grant(self):
         manager = self.cache_manager
         block = manager.block_size

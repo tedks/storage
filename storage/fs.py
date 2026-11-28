@@ -2570,7 +2570,7 @@ class StorageFS(Operations):
 
         try:
             self._require_imported_write_permission(cache_path)
-            with self.cache_manager.cache_size_change(), open(cache_path, 'r+b') as f:
+            with self.cache_manager.cache_size_change(cache_path), open(cache_path, 'r+b') as f:
                 f.truncate(length)
 
             # Mark as dirty
@@ -2679,7 +2679,7 @@ class StorageFS(Operations):
             # so that _invalidate_file_cache (which also holds _fd_lock)
             # cannot unlink the cache file between os.open and registration.
             # An O_TRUNC open frees blocks: it is a cache size change.
-            allocation = (self.cache_manager.cache_size_change() if flags & os.O_TRUNC
+            allocation = (self.cache_manager.cache_size_change(cache_path) if flags & os.O_TRUNC
                           else contextlib.nullcontext())
             with allocation, self._fd_lock:
                 if real_fd < 0:
@@ -2732,7 +2732,7 @@ class StorageFS(Operations):
         cache_path = self.cache_manager.create_cached_file(resolved.requested_path)
 
         try:
-            with self.cache_manager.cache_size_change(), self._fd_lock:
+            with self.cache_manager.cache_size_change(cache_path), self._fd_lock:
                 real_fd = os.open(str(cache_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
                 vfd = self._fd_counter
                 self._fd_counter += 1
@@ -2840,7 +2840,9 @@ class StorageFS(Operations):
         try:
             # Positional: a descriptor's offset is shared state, and
             # concurrent writes through one fh must not move each other's.
-            with self.cache_manager.cache_size_change():
+            with self.cache_manager.cache_size_change(
+                fd=entry.real_fd, span=(offset, offset + len(data)),
+            ):
                 written = os.pwrite(entry.real_fd, data, offset)
 
             if entry.backend_name is None:
@@ -2882,7 +2884,9 @@ class StorageFS(Operations):
                     # (an alias that survived, then moved out of the fence).
                     raise FuseOSError(errno.EBUSY)
                 try:
-                    with self.cache_manager.cache_size_change():
+                    with self.cache_manager.cache_size_change(
+                        fd=entry.real_fd, span=(offset, offset + len(data)),
+                    ):
                         written = os.pwrite(entry.real_fd, data, offset)
                 except OSError as e:
                     raise FuseOSError(e.errno)
@@ -2932,6 +2936,8 @@ class StorageFS(Operations):
             os.close(entry.real_fd)
         except OSError as exc:
             close_error = exc
+        # The copy may be an eviction victim now that this descriptor is gone.
+        self.cache_manager.note_evictable_change()
 
         if entry.prefetch_session is not None:
             self._release_prefetch_session(entry.prefetch_session)

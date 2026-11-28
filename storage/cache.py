@@ -15,7 +15,7 @@ import threading
 from pathlib import Path
 from contextlib import contextmanager, nullcontext
 from enum import Enum
-from typing import Callable, ContextManager, Optional, List, Set
+from typing import Callable, ContextManager, Optional, List, Set, Tuple
 
 from .backends.base import Backend, bulk_request
 from .backends.ssh_pool import BulkCapacityCancelled, BulkCapacityTimeout
@@ -142,6 +142,19 @@ class CacheManager:
         self._streaming_fds: dict[int, int] = {}
         self._current_size_bytes = self._scan_total_cache_size()
         self._size_dirty = False
+        # The last eviction dry run that found too few victims: (epoch,
+        # index change count, monotonic time, bytes it could free). Until
+        # one of those moves, or SHORTFALL_TTL passes, a request for more
+        # than that fails without walking the index again (see
+        # _known_shortfall). Only a request it would fail anyway is refused.
+        self._shortfall: Optional[Tuple[int, int, float, int]] = None
+        self._evictable_epoch = 0
+        self._grant_warning_logged = False
+
+    # How long a dry run's "too few victims" stands without any change the
+    # cache or the index can see (a path lock released, a member repair
+    # resolved). A stale answer only keeps a stream transient for this long.
+    SHORTFALL_TTL_SECONDS = 1.0
 
     def _round_up(self, size: int) -> int:
         return (size + self.block_size - 1) // self.block_size * self.block_size
@@ -169,6 +182,11 @@ class CacheManager:
         if st.st_size == 0 or st.st_blocks == 0:
             return 0
         rounded = self._round_up(st.st_size)
+        if st.st_blocks * 512 >= rounded:
+            # Allocated for its whole length: no extent query needed. A
+            # sparse file whose metadata blocks reach its length is counted
+            # at its length, which only overstates it.
+            return rounded
         try:
             fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
             try:
@@ -364,14 +382,72 @@ class CacheManager:
         with self._lock:
             self._size_dirty = True
 
+    def note_evictable_change(self):
+        """Forget a remembered victim shortfall: a copy may be evictable now
+        (a descriptor closed, a copy was installed).
+
+        Takes no lock, so a release never waits behind an eviction pass. A
+        lost race between two notes still moves the epoch.
+        """
+        self._evictable_epoch += 1
+
+    def _direct_charge(self, path: Optional[Path], fd: Optional[int],
+                       span: Optional[Tuple[int, int]]):
+        """(inode identity or None, data bytes) for cache_size_change, or
+        None when the change cannot be charged incrementally.
+
+        Only a regular file with exactly one name qualifies: the tree scan
+        counts such an inode once, at that name. A hard-linked or unlinked
+        inode, or a measurement error, makes the caller rescan instead.
+        With a span only the blocks it touches are measured.
+        """
+        try:
+            if fd is not None:
+                st = os.fstat(fd)
+            else:
+                st = regular_file_stat(path)
+                if st is None:
+                    return (None, 0)
+            if not stat_module.S_ISREG(st.st_mode) or st.st_nlink != 1:
+                return None
+            identity = (st.st_dev, st.st_ino)
+            if fd is None:
+                return identity, self._path_data_bytes(path, st)
+            if span is None:
+                return identity, min(self._data_bytes(fd, 0, self._round_up(st.st_size)),
+                                     st.st_blocks * 512)
+            start = span[0] // self.block_size * self.block_size
+            return identity, self._data_bytes(fd, start, self._round_up(span[1]))
+        except OSError:
+            return None
+
     @contextmanager
-    def cache_size_change(self):
-        """Serialize a direct write or truncate with incremental cache grants."""
+    def cache_size_change(self, path: Optional[Path] = None, *, fd: Optional[int] = None,
+                          span: Optional[Tuple[int, int]] = None):
+        """Serialize a direct write or truncate with grants, charging its blocks.
+
+        Give the cache file it changes: a path (a truncate, an O_TRUNC open,
+        a create) or an open descriptor, and for a pwrite the byte span
+        [start, end) it covers. The data blocks are measured before and
+        after the change under the cache lock and the difference charged,
+        so the next grant needs no rescan. With no target, a target that
+        does not qualify (see _direct_charge), or a path whose inode
+        changed in between, the change is unknown and the next allocation
+        rescans the tree.
+        """
         with self._lock:
+            known = path is not None or fd is not None
+            before = self._direct_charge(path, fd, span) if known else None
             try:
                 yield
             finally:
-                self._size_dirty = True
+                after = self._direct_charge(path, fd, span) if before is not None else None
+                if (after is None or after[0] is None
+                        or (before[0] is not None and before[0] != after[0])):
+                    self._size_dirty = True
+                else:
+                    self._current_size_bytes = max(
+                        0, self._current_size_bytes + after[1] - before[1])
 
     def get_free_space_needed(self, required_bytes: int) -> int:
         """
@@ -407,9 +483,12 @@ class CacheManager:
 
     def _evict_by_access(
         self, bytes_needed: int, *, recomputable: Optional[bool], dry_run: bool = False,
-    ) -> bool:
+        count: bool = False,
+    ):
+        """Whether bytes_needed were freed (or, dry, could be); with count,
+        the bytes found instead, stopping once they reach bytes_needed."""
         if bytes_needed <= 0:
-            return True
+            return 0 if count else True
         with self._lock:
             freed = 0
             for virtual_path in self.state_manager.iter_lru_paths(recomputable=recomputable):
@@ -424,21 +503,71 @@ class CacheManager:
                     except OSError as e:
                         print(f"Warning: Failed to evict {virtual_path}: {e}")
                 if freed >= bytes_needed:
-                    return True
-            return False
+                    return freed if count else True
+            return freed if count else False
 
     def ensure_space(self, bytes_needed: int) -> bool:
         """Free the minimum whole-file LRU victims for a cache allocation."""
         with self._lock:
             if bytes_needed > self.max_size_bytes:
                 return False
-            needed = self.get_free_space_needed(bytes_needed)
-            if not needed:
-                return True
-            # Keep useful cached copies when even all eligible victims would
-            # leave the next allocation over budget.
-            return (self._evict_by_access(needed, recomputable=None, dry_run=True)
-                    and self._evict_by_access(needed, recomputable=None))
+            return self._free_space(self.get_free_space_needed(bytes_needed))
+
+    def _free_space(self, needed: int) -> bool:
+        """Evict CLEAN copies in access order until `needed` bytes are freed.
+
+        A dry run first keeps useful copies when even every eligible victim
+        would leave the allocation over budget. It is best effort, not a
+        guarantee: opens, closes and index changes do not take the cache
+        lock, so the real pass can find fewer victims than the dry run did,
+        evict some copies, and still fail. A dry run that falls short is
+        remembered (see _known_shortfall), so a stream asking chunk after
+        chunk does not walk the whole index each time. Caller holds the lock.
+        """
+        if needed <= 0:
+            return True
+        if self._known_shortfall(needed):
+            return False
+        # The epoch is read before the walk, so a close during it voids the
+        # result. The index count is read after: the walk flushes pending
+        # access times itself. A row change during the walk is caught by the
+        # TTL.
+        epoch = self._evictable_epoch
+        freeable = self._freeable_bytes(needed)
+        if freeable < needed:
+            self._shortfall = (epoch, self.state_manager.change_count(),
+                               time.monotonic(), freeable)
+            return False
+        self._shortfall = None
+        return self._evict_by_access(needed, recomputable=None)
+
+    def _known_shortfall(self, needed: int) -> bool:
+        shortfall = self._shortfall
+        if shortfall is None:
+            return False
+        epoch, changes, at, freeable = shortfall
+        if (epoch != self._evictable_epoch
+                or changes != self.state_manager.change_count()
+                or time.monotonic() - at >= self.SHORTFALL_TTL_SECONDS):
+            self._shortfall = None
+            return False
+        return needed > freeable
+
+    def _freeable_bytes(self, needed: int) -> int:
+        """Bytes a real eviction pass could free, counted up to `needed`."""
+        return self._evict_by_access(needed, recomputable=None, dry_run=True, count=True)
+
+    def _grants_unavailable(self, reason: str) -> bool:
+        """Refuse a streaming grant the filesystem cannot measure; log it once."""
+        if not self._grant_warning_logged:
+            self._grant_warning_logged = True
+            logger.warning(
+                "Streaming reads will not be cached in %s: %s. Reads are served "
+                "from the member without keeping their bytes. Use a cache "
+                "filesystem with exact SEEK_DATA/SEEK_HOLE (ext4, xfs, btrfs, tmpfs).",
+                self.cache_root, reason,
+            )
+        return False
 
     def write_streaming_chunk(self, fd: int, offset: int, data: bytes) -> bool:
         """Keep a chunk when its new data blocks fit, else leave the inode alone.

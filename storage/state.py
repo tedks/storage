@@ -124,6 +124,18 @@ class StateManager:
         """Commit the current transaction while the caller holds _db_lock."""
         self.conn.commit()
 
+    def change_count(self) -> int:
+        """Rows inserted, updated or deleted through the index connection so far.
+
+        Monotonic for the life of this StateManager (sqlite3 total_changes),
+        so an unchanged count means no row of files or file_locations moved
+        in between: no CLEAN transition, new row, rename or delete. The
+        member_checksums connection is not counted. A caller that cached an
+        answer derived from the index compares counts to know it still holds.
+        """
+        with self._db_lock:
+            return self.conn.total_changes
+
     @property
     def metadata_lock(self) -> threading.RLock:
         """The re-entrant lock that orders row writes.

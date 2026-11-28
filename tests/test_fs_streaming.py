@@ -593,6 +593,26 @@ class TestFSStreamingIntegration(unittest.TestCase):
         finally:
             self.fs.release("/dirty.bin", dirty)
 
+    def test_local_writes_and_truncates_are_charged_without_a_rescan(self):
+        manager = self.fs.cache_manager
+        block = manager.block_size
+        manager.get_total_cache_size()
+        with patch.object(manager, "_scan_total_cache_size",
+                          side_effect=AssertionError("unexpected full cache scan")):
+            fh = self.fs.create("/local.bin", 0o644)
+            try:
+                self.fs.write("/local.bin", b"x" * (3 * block), 0, fh)
+                self.fs.write("/local.bin", b"y" * 10, block, fh)
+                self.fs.truncate("/local.bin", block + 1)
+                self.assertEqual(manager.get_total_cache_size(), 2 * block)
+            finally:
+                self.fs.release("/local.bin", fh)
+            reopened = self.fs.open("/local.bin", os.O_WRONLY | os.O_TRUNC)
+            self.fs.release("/local.bin", reopened)
+            self.assertEqual(manager.get_total_cache_size(), 0)
+        manager.mark_cache_size_dirty()
+        self.assertEqual(manager.get_total_cache_size(), 0)
+
     def test_download_worker_start_retry_and_local_publication_on_release(self):
         manager = self.fs._streaming_manager
         manager._download_pool.idle_seconds = 0.05
