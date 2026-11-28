@@ -19,6 +19,48 @@ from storage.models import FileLocation, FileMetadata, SyncStatus
 from storage.state import StateManager
 
 
+class _ReportedBlocks:
+    """Report chosen st_blocks for chosen inodes, as a compressing
+    filesystem or an external xattr block would, while the extents
+    (SEEK_DATA/SEEK_HOLE) stay the real ones. Patches os.fstat and
+    os.lstat for the duration of the with block."""
+
+    def __init__(self):
+        self.sectors = {}
+        self._real_fstat = os.fstat
+        self._real_lstat = os.lstat
+
+    def set(self, path, allocated_bytes):
+        st = self._real_lstat(path)
+        self.sectors[(st.st_dev, st.st_ino)] = allocated_bytes // 512
+
+    def _wrap(self, st):
+        sectors = self.sectors.get((st.st_dev, st.st_ino))
+        return st if sectors is None else _StatWithBlocks(st, sectors)
+
+    def __enter__(self):
+        self._patches = [
+            patch("os.fstat", lambda fd: self._wrap(self._real_fstat(fd))),
+            patch("os.lstat", lambda path, *a, **k: self._wrap(self._real_lstat(path, *a, **k))),
+        ]
+        for p in self._patches:
+            p.start()
+        return self
+
+    def __exit__(self, *exc):
+        for p in reversed(self._patches):
+            p.stop()
+
+
+class _StatWithBlocks:
+    def __init__(self, st, sectors):
+        self._st = st
+        self.st_blocks = sectors
+
+    def __getattr__(self, name):
+        return getattr(self._st, name)
+
+
 class TestCacheLinks(unittest.TestCase):
     """Symlinks in the cache tree are not cached copies
     (ditz cache-scans-follow-symlinks)."""
@@ -536,6 +578,64 @@ class TestCacheAccounting(unittest.TestCase):
             manager.close_streaming_fd(fd)
         self.assertEqual(manager.get_total_cache_size(), block)
 
+    def test_positional_write_keeps_the_total_a_scan_counts_when_allocation_changes(self):
+        """A named file is charged min(data extents, allocated blocks). A
+        pwrite that leaves the extents alone but changes the allocation
+        (a rewrite that compresses differently) moves the charge, and the
+        incremental total must stay what a fresh scan counts."""
+        manager = self.cache_manager
+        block = manager.block_size
+        path = self.cache_dir / "capped"
+        path.write_bytes(b"a" * (2 * block))
+        fd = os.open(path, os.O_RDWR)
+        try:
+            with _ReportedBlocks() as reported:
+                reported.set(path, block)  # two data blocks compressed into one
+                manager.mark_cache_size_dirty()
+                self.assertEqual(manager.get_total_cache_size(), block)
+                with manager.cache_size_change(fd=fd, span=(0, block)):
+                    os.pwrite(fd, b"b" * block, 0)
+                    reported.set(path, 2 * block)
+                grown = manager.get_total_cache_size()
+                manager.mark_cache_size_dirty()
+                self.assertEqual(grown, manager.get_total_cache_size())
+                self.assertEqual(grown, 2 * block)
+                with manager.cache_size_change(fd=fd, span=(block, 2 * block)):
+                    os.pwrite(fd, b"c" * block, block)
+                    reported.set(path, block)
+                shrunk = manager.get_total_cache_size()
+                manager.mark_cache_size_dirty()
+                self.assertEqual(shrunk, manager.get_total_cache_size())
+                self.assertEqual(shrunk, block)
+                # Deleting refunds what was charged: nothing phantom stays.
+                manager.delete_cached_file("/capped")
+                self.assertEqual(manager.get_total_cache_size(), 0)
+        finally:
+            os.close(fd)
+
+    def test_positional_write_past_the_cap_is_charged_from_one_measure(self):
+        """The cap binds before the write but not after (the write fills a
+        compressed file's tail with incompressible bytes and extends it)."""
+        manager = self.cache_manager
+        block = manager.block_size
+        path = self.cache_dir / "extended"
+        path.write_bytes(b"a" * (2 * block))
+        fd = os.open(path, os.O_RDWR)
+        try:
+            with _ReportedBlocks() as reported:
+                reported.set(path, block)
+                manager.mark_cache_size_dirty()
+                self.assertEqual(manager.get_total_cache_size(), block)
+                with manager.cache_size_change(fd=fd, span=(2 * block, 3 * block)):
+                    os.pwrite(fd, b"z" * block, 2 * block)
+                    reported.set(path, 3 * block)
+                incremental = manager.get_total_cache_size()
+                manager.mark_cache_size_dirty()
+                self.assertEqual(incremental, manager.get_total_cache_size())
+                self.assertEqual(incremental, 3 * block)
+        finally:
+            os.close(fd)
+
     def test_direct_writer_uses_space_before_the_next_stream_grant(self):
         manager = self.cache_manager
         block = manager.block_size
@@ -764,6 +864,34 @@ class TestFetchThroughTempFile(unittest.TestCase):
         self.assertEqual(self.cache_path.read_bytes(), b"winner")
         self.assertEqual(self._partials(), [])
         self.assertEqual(manager.get_total_cache_size(), block)
+
+    def test_a_grown_copy_that_exactly_fits_is_installed(self):
+        """The growth check counts the finished copy by its measured data
+        blocks, the measure the total then charges, not by its allocation
+        (which here includes an external xattr block)."""
+        manager = self.cache_manager
+        block = manager.block_size
+        manager.max_size_bytes = 2 * block
+        reported = _ReportedBlocks()
+
+        class SparseBackend(LocalBackend):
+            def copy_to_local(self, virtual_path, local_path):
+                with open(local_path, "wb") as f:
+                    f.write(b"d" * block)
+                    f.seek(3 * block)
+                    f.write(b"e" * block)
+                # Two data blocks, three allocated (one for an xattr).
+                reported.set(local_path, 3 * block)
+
+        backend = SparseBackend("backend", str(self.backend_dir))
+        with reported:
+            self.assertTrue(manager.fetch_into_cache(
+                backend, "/f.bin", self.cache_path, expected_size=block))
+            self.assertEqual(manager.get_total_cache_size(), 2 * block)
+            manager.mark_cache_size_dirty()
+            self.assertEqual(manager.get_total_cache_size(), 2 * block)
+        self.assertEqual(self._partials(), [])
+        self.assertEqual(os.path.getsize(self.cache_path), 4 * block)
 
     def test_no_room_for_a_copy_raises_enospc_before_downloading(self):
         manager = self.cache_manager

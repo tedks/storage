@@ -454,13 +454,14 @@ class CacheManager:
 
     def _direct_charge(self, path: Optional[Path], fd: Optional[int],
                        span: Optional[Tuple[int, int]]):
-        """(inode identity or None, data bytes) for cache_size_change, or
-        None when the change cannot be charged incrementally.
+        """(inode identity or None, data bytes, stat or None) for
+        cache_size_change, or None when the change cannot be charged
+        incrementally.
 
         Only a regular file with exactly one name qualifies: the tree scan
         counts such an inode once, at that name. A hard-linked or unlinked
-        inode, or a measurement error, makes the caller rescan instead.
-        With a span only the blocks it touches are measured.
+        inode, or a measurement error, makes the caller rescan instead. With a span only the data blocks it touches are measured,
+        and the stat is returned for _span_delta.
         """
         try:
             if fd is not None:
@@ -473,14 +474,45 @@ class CacheManager:
                 return None
             identity = (st.st_dev, st.st_ino)
             if fd is None:
-                return identity, self._path_data_bytes(path, st)
+                return identity, self._path_data_bytes(path, st), None
             if span is None:
-                return identity, min(self._data_bytes(fd, 0, self._round_up(st.st_size)),
-                                     st.st_blocks * 512)
+                return identity, self._fd_data_bytes(fd, st), None
             start = span[0] // self.block_size * self.block_size
-            return identity, self._data_bytes(fd, start, self._round_up(span[1]))
+            return identity, self._data_bytes(fd, start, self._round_up(span[1])), st
         except OSError:
             return None
+
+    def _fd_data_bytes(self, fd: int, st: os.stat_result) -> int:
+        """What the tree scan charges a named inode (_path_data_bytes): its
+        data extents, at most its allocated blocks."""
+        return min(self._data_bytes(fd, 0, self._round_up(st.st_size)), st.st_blocks * 512)
+
+    def _span_delta(self, fd: int, before, after) -> Optional[int]:
+        """The change in a named inode's charge across a pwrite of a span,
+        from the span's data blocks measured before and after it.
+
+        The charge is min(data extents, allocated blocks). While the
+        rounded size is within the allocation on both sides, the extents
+        are below the cap, and the change is the span's. Otherwise (a
+        compressed or sparse inode with metadata blocks) the cap may bind,
+        and the whole inode is measured once, after: the extents outside
+        the span did not change (every write to a named cache inode runs
+        under the cache lock), so the extents before are those after minus
+        the span's growth. None when the measurement fails.
+        """
+        _, span_before, st_before = before
+        _, span_after, st_after = after
+        cap_before = st_before.st_blocks * 512
+        cap_after = st_after.st_blocks * 512
+        if (self._round_up(st_before.st_size) <= cap_before
+                and self._round_up(st_after.st_size) <= cap_after):
+            return span_after - span_before
+        try:
+            whole_after = self._data_bytes(fd, 0, self._round_up(st_after.st_size))
+        except OSError:
+            return None
+        whole_before = max(0, whole_after - span_after + span_before)
+        return min(whole_after, cap_after) - min(whole_before, cap_before)
 
     @contextmanager
     def cache_size_change(self, path: Optional[Path] = None, *, fd: Optional[int] = None,
@@ -503,16 +535,26 @@ class CacheManager:
                 yield
             finally:
                 after = self._direct_charge(path, fd, span) if before is not None else None
-                if (after is None or after[0] is None
-                        or (before[0] is not None and before[0] != after[0])):
+                delta = None
+                if (after is not None and after[0] is not None
+                        and (before[0] is None or before[0] == after[0])):
+                    delta = after[1] - before[1]
+                    if after[2] is not None and before[2] is not None:
+                        delta = self._span_delta(fd, before, after)
+                if delta is None:
                     self._size_dirty = True
                 else:
-                    self._current_size_bytes = max(
-                        0, self._current_size_bytes + after[1] - before[1])
+                    self._current_size_bytes = max(0, self._current_size_bytes + delta)
 
-    def get_free_space_needed(self, required_bytes: int) -> int:
+    def get_free_space_needed(self, required_bytes: int, *,
+                              finishing: Optional[Tuple[Path, int]] = None) -> int:
         """
         Calculate how much space needs to be freed
+
+        An in-flight whole copy counts at least its reservation, or its
+        apparent allocation if larger. finishing, (temp path, data bytes),
+        counts a finished copy by the data bytes measured for it instead:
+        what the total charges it once installed.
 
         Returns:
             Bytes to free (0 if enough space available)
@@ -521,6 +563,9 @@ class CacheManager:
             self._ensure_size_current_locked()
             reserved = 0
             for path, size in self._whole_file_temps.items():
+                if finishing is not None and path == finishing[0]:
+                    reserved += finishing[1]
+                    continue
                 st = regular_file_stat(path)
                 apparent_growth = min(self._round_up(st.st_size), st.st_blocks * 512) if st else 0
                 reserved += max(size, apparent_growth)
@@ -849,7 +894,7 @@ class CacheManager:
                     # fill, a writer) wins at the link below, and this copy
                     # is discarded without evicting anything for it.
                     if (size > reserved and not os.path.lexists(cache_path)
-                            and not self._fits_beyond_reservation(size - reserved, size)):
+                            and not self._fits_beyond_reservation(temp_path, size - reserved, size)):
                         raise OSError(errno.ENOSPC, "insufficient cache space")
                     try:
                         os.link(temp_path, cache_path)
@@ -868,17 +913,18 @@ class CacheManager:
                     self._drop_whole_temp(temp_path)
             raise
 
-    def _fits_beyond_reservation(self, excess: int, size: int) -> bool:
+    def _fits_beyond_reservation(self, temp_path: Path, excess: int, size: int) -> bool:
         """Make room for a finished copy's `excess` bytes past its reservation.
 
-        Caller holds the lock with the temp file still reserved, so the
-        shortfall counts the copy at its full size. Only the part of that
+        Caller holds the lock with the temp file still reserved, and the
+        shortfall counts the copy at `size`, its measured data bytes (what
+        the total will charge), not its allocation. Only the part of that
         shortfall the excess accounts for is evicted for: what other writers
         overspent is not this copy's to free.
         """
         if size > self.max_size_bytes:
             return False
-        return self._free_space(min(excess, self.get_free_space_needed(0)))
+        return self._free_space(min(excess, self.get_free_space_needed(0, finishing=(temp_path, size))))
 
     def _drop_whole_temp(self, path: Path):
         """Release the temp reservation under the cache lock."""
