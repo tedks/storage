@@ -1654,9 +1654,13 @@ class StreamingReadManager:
             # member that never supplied a token keeps its stream, with
             # only the attributes it reported.
             if version in (MemberVersion.CHANGED, MemberVersion.UNCONFIRMED):
-                self._discard_superseded_session(session, "member-changed")
+                reason = ("member-changed" if version == MemberVersion.CHANGED
+                          else "member-unconfirmed")
+                self._discard_superseded_session(session, reason)
                 # Counted once the partial is gone and the session finished.
-                self._record_streaming_stat("streaming_member_changed_discards", 1)
+                self._record_streaming_stat(
+                    "streaming_member_changed_discards" if version == MemberVersion.CHANGED
+                    else "streaming_member_unconfirmed_discards", 1)
                 return
             if version == MemberVersion.AGREED:
                 session.confirmed_stat = confirmed

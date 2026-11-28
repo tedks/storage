@@ -1877,6 +1877,12 @@ class TestSSHBackendOnThePool(_BackendTestCase):
             observed.append(is_interactive_request())
             raise RuntimeError("copy failed")
 
+        # No probe here: a stat after the copy that carried a version token
+        # would make the fill unconfirmed (sticky versioning), so the member
+        # has no stat, as the copy context is what this test is about.
+        no_stat = patch.object(backend, "stat", side_effect=NotImplementedError)
+        no_stat.start()
+        self.addCleanup(no_stat.stop)
         with interactive_request():
             with patch.object(backend, "copy_to_local", side_effect=copy_ok):
                 self.assertTrue(fs.cache_manager.fetch_into_cache(

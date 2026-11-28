@@ -45,8 +45,8 @@ from .locks import NamespaceLock, PathLocks, UploadLocks
 from .cache_metadata import (
     MEMBER_ATTRS_XATTR, MEMBER_STAT_XATTR as CACHE_MEMBER_STAT_XATTR,
     PREFIX_XATTR, XATTR_CACHE_METADATA_NAME,
-    cache_identity, forget_cached_member_fields, imported_mode_denies, imported_mode_denies_write,
-    read_member_baselines, record_native_attributes, regular_file_stat, scan_cache_entries,
+    _member_mtime_ns, cache_identity, forget_cached_member_fields, imported_mode_denies,
+    imported_mode_denies_write, read_member_baselines, record_native_attributes, regular_file_stat, scan_cache_entries,
 )
 from .file_config import FileConfig, get_inherited_config
 from .models import FileLocation, FileMetadata, StreamingKeepAfterClose, SyncStatus
@@ -89,6 +89,10 @@ class FDEntry:
     # Another descriptor's close kept this one's change off its member for
     # an open repair: this descriptor's flush reports EBUSY.
     view_refused: bool = False
+    # A private copy (FillAction.PRIVATE): its captured length, reserved
+    # in the cache budget until the descriptor closes; cache_path is the
+    # copy, never indexed or uploaded, removed at close or teardown.
+    private_size: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -358,6 +362,9 @@ class StorageFS(Operations):
         # _member_checks_lock.
         self._refetch_pins: Dict[str, Backend] = {}
         self._recheck: Dict[str, Set[str]] = {}
+        # A cached copy a revalidation dropped, kept until its refetch is
+        # installed (_stash_last_good). Under the path's lock.
+        self._last_good: Dict[str, tuple] = {}
         # Conflict views whose cached copy has content not yet sent to its
         # member: (cache path, st_ino) -> generation, under _fd_lock. See
         # _mark_view_changed.
@@ -1857,18 +1864,26 @@ class StorageFS(Operations):
             self._revalidate_outages.discard(backend.name)
             self.logger.info("Revalidating cached files against %s again", backend.label)
 
-        observed = (getattr(member_stat, "st_size", None), getattr(member_stat, "st_mtime", None))
-        if None in observed:
-            # A member stat without a size or mtime cannot tell a change
-            # (a member that never supplies a version token): keep the copy,
-            # and count it as a check so the next open within the age is
-            # free.
-            self._store_member_check(canonical_path, cache_path, identity, {})
-            return
-        baseline = members.get(backend.name)
+        size = getattr(member_stat, "st_size", None)
+        mtime_ns = _member_mtime_ns(member_stat)
+        mtime = None if mtime_ns is None else (
+            member_stat.st_mtime if getattr(member_stat, "st_mtime", None) is not None
+            else mtime_ns / 1e9)
+        observed = (size, mtime)
         with self._member_checks_lock:
             # The last refetch for a change here came from another member.
             must_refetch = backend.name in self._recheck.get(canonical_path, ())
+        if mtime is None and not must_refetch:
+            # No mtime: only a known size that differs from the cached copy's
+            # is evidence of a change (refetched below); otherwise a member
+            # that supplies no version token cannot tell one, so the copy is
+            # kept and the check counted, and the next opens within the age
+            # are free.
+            if size is None or size == cache_stat.st_size:
+                self._store_member_check(canonical_path, cache_path, identity, {})
+                return
+            must_refetch = True
+        baseline = members.get(backend.name)
         if must_refetch:
             changed = True
         elif baseline is not None:
@@ -1887,8 +1902,10 @@ class StorageFS(Operations):
             # (_clear_recheck): the invalidation below may be refused.
             self._refetch_pins[canonical_path] = backend
             self._pinned_stats[canonical_path] = (backend, member_stat)
+        self._stash_last_good(resolved)
         self._invalidate_file_cache(resolved.requested_path)
         if self.cache_manager.is_cached(resolved.requested_path):
+            self._settle_last_good(resolved, reinstate=False)
             # Kept (a writer is open, or it turned out to be a lost write):
             # do not stat again before the age passes; the baselines stay,
             # so the next check still sees the change.
@@ -1904,6 +1921,57 @@ class StorageFS(Operations):
         else:
             with self._member_checks_lock:
                 self._member_checks.pop(canonical_path, None)
+
+    def _stash_last_good(self, resolved: ResolvedPath) -> None:
+        """Keep the cached copy a revalidation is about to drop, until the
+        refetch that replaces it is installed (_settle_last_good).
+
+        A hard link under a partial name beside it (hidden from listings,
+        swept at startup after a crash), with its index row and cache
+        location. Called under the path's lock, as the open is.
+        """
+        cache_path = resolved.cache_path
+        st = regular_file_stat(cache_path)
+        if st is None:
+            return
+        stash = cache_path.parent / f".{os.urandom(8).hex()}{self._PARTIAL_SUFFIX}"
+        try:
+            os.link(cache_path, stash)
+        except OSError as exc:
+            self.logger.debug("could not keep %s while it is refetched: %s", cache_path, exc)
+            return
+        row = self.state_manager.get_file_metadata(resolved.canonical_path)
+        locations = [loc for loc in self.state_manager.get_file_locations(resolved.requested_path)
+                     if loc.backend_name == "cache"]
+        self._last_good[resolved.canonical_path] = (stash, st, row, locations)
+
+    def _settle_last_good(self, resolved: ResolvedPath, reinstate: bool) -> None:
+        """Drop the stashed copy, or (the refetch was not installed) put it
+        back at the name it had, with its row and location, if the name is
+        still free. The next open checks the member again."""
+        kept = self.__dict__.get("_last_good", {}).pop(resolved.canonical_path, None)
+        if kept is None:
+            return
+        stash, st, row, locations = kept
+        try:
+            if reinstate and regular_file_stat(resolved.cache_path) is None:
+                with self.state_manager.metadata_lock:
+                    os.link(stash, resolved.cache_path)
+                    if row is not None:
+                        self.state_manager.set_file_metadata(row)
+                    for location in locations:
+                        self.state_manager.add_file_location(location)
+                self.cache_manager.mark_cache_size_dirty()
+                self.logger.info("refetch of %s not verified; the cached copy is kept",
+                                 resolved.canonical_path)
+        except OSError as exc:
+            self.logger.warning("could not reinstate the cached copy of %s: %s",
+                                resolved.canonical_path, exc)
+        finally:
+            try:
+                stash.unlink()
+            except OSError:
+                pass
 
     @staticmethod
     def _is_range_available(ranges: List[Tuple[int, int]], start: int, end: int) -> bool:
@@ -2025,7 +2093,7 @@ class StorageFS(Operations):
             self.cache_manager.mark_cache_size_dirty()
         return removed
 
-    def _ensure_file_in_cache(self, resolved: ResolvedPath) -> bool:
+    def _ensure_file_in_cache(self, resolved: ResolvedPath, private: Optional[list] = None) -> bool:
         """
         Ensure a file is in the cache, downloading or recomputing if necessary
 
@@ -2088,7 +2156,7 @@ class StorageFS(Operations):
             confirmed: list = []
             outcome = self.cache_manager.cache_file_result(
                 resolved.requested_path, backend, canonical_path, member_stat=member_stat,
-                confirmed=confirmed,
+                confirmed=confirmed, private=private,
             )
             if outcome == CacheFetch.ALREADY_CACHED and self._drop_unindexed_prefix(canonical_path, cache_path):
                 # A failed stream's prefix was installed before this copy
@@ -2220,7 +2288,15 @@ class StorageFS(Operations):
 
     def getattr(self, path, fh=None):
         """Get file attributes"""
-        return self.namespace.getattr(path)
+        attrs = self.namespace.getattr(path)
+        if fh is not None:
+            with self._fd_lock:
+                entry = self._fd_map.get(fh)
+            if entry is not None and entry.private_size is not None:
+                # A private copy's handle reports the length it captured,
+                # so its reads end at that EOF.
+                attrs = dict(attrs, st_size=entry.private_size)
+        return attrs
 
     def readdir(self, path, fh):
         """Read directory contents"""
@@ -2516,6 +2592,9 @@ class StorageFS(Operations):
             except BulkCapacityTimeout as exc:
                 raise FuseOSError(errno.EAGAIN) from exc
             finally:
+                # A copy a revalidation dropped goes back if the open ended
+                # before anything replaced it (a no-op once settled).
+                self._settle_last_good(self._resolve_path(path), reinstate=True)
                 # The pin belongs to this open (_select_backend_for_read):
                 # one no fetch used (the open attached to a running stream,
                 # or the file was kept) must not steer a later fetch.
@@ -2568,6 +2647,8 @@ class StorageFS(Operations):
                 resolved.canonical_path,
             )
             if prefetch_session:
+                # A stream replaces the dropped copy.
+                self._settle_last_good(resolved, reinstate=False)
                 # A streaming descriptor is on Storage's own staging file: the
                 # member's mode (as the session probed it) decides read, as a
                 # cached file's recorded mode does (_require_imported_permission).
@@ -2595,14 +2676,40 @@ class StorageFS(Operations):
                 )
 
         # Fallback path: preserve existing full-file cache semantics.
+        private_size = None
         if prefetch_session is None:
-            if not self._ensure_file_in_cache(resolved):
-                raise FuseOSError(errno.ENOENT)
-            cache_path = resolved.cache_path
-            if not self._is_read_only_open(flags):
-                self._require_imported_write_permission(cache_path)
-            if flags & os.O_ACCMODE != os.O_WRONLY:
-                self._require_imported_permission(cache_path, stat.S_IRUSR)
+            self.cache_manager.take_fill_errno()
+            read_only = self._is_read_only_open(flags)
+            private: Optional[list] = [] if read_only and not resolved.backend_name else None
+            if self._ensure_file_in_cache(resolved, private=private):
+                self._settle_last_good(resolved, reinstate=False)
+                cache_path = resolved.cache_path
+            else:
+                # Not installed (fill_action): an unverified version gives
+                # EAGAIN, a plain failure ENOENT. A copy the revalidation
+                # dropped goes back, and a read-only opener keeps reading
+                # it; with none, it may read the completed copy privately.
+                code = self.cache_manager.take_fill_errno() or errno.ENOENT
+                had_last_good = resolved.canonical_path in self._last_good
+                self._settle_last_good(resolved, reinstate=True)
+                kept_copy = private[0] if private else None
+                if read_only and had_last_good and self.cache_manager.is_cached(
+                        resolved.requested_path):
+                    self._drop_private_copy(kept_copy)
+                    cache_path = resolved.cache_path
+                elif read_only and kept_copy is not None:
+                    private_size = self._reserve_private_copy(kept_copy)
+                    if private_size is None:
+                        raise FuseOSError(errno.EAGAIN)
+                    cache_path = kept_copy
+                else:
+                    self._drop_private_copy(kept_copy)
+                    raise FuseOSError(code)
+            if private_size is None:
+                if not self._is_read_only_open(flags):
+                    self._require_imported_write_permission(cache_path)
+                if flags & os.O_ACCMODE != os.O_WRONLY:
+                    self._require_imported_permission(cache_path, stat.S_IRUSR)
 
         try:
             # Hold _fd_lock across os.open AND _fd_map registration so that
@@ -2630,7 +2737,13 @@ class StorageFS(Operations):
                     canonical_path=resolved.canonical_path,
                     prefetch_session=prefetch_session,
                     view_ino=os.fstat(real_fd).st_ino if resolved.backend_name else None,
+                    private_size=private_size,
                 )
+            if private_size is not None:
+                # The descriptor holds the copy; its name goes at once, so
+                # nothing else can reach it and its last close frees it.
+                self._drop_private_copy(cache_path)
+                return vfd
             if resolved.backend_name and flags & os.O_TRUNC:
                 opened = self._fd_map[vfd]
                 self._mark_view_changed(cache_path, opened.view_ino, opened)
@@ -2643,7 +2756,31 @@ class StorageFS(Operations):
         except OSError as e:
             if prefetch_session is not None:
                 self._release_prefetch_session(prefetch_session)
+            if private_size is not None:
+                self._drop_private_copy(cache_path)
+                self.cache_manager.release_reserved(private_size)
             raise FuseOSError(e.errno)
+
+    def _reserve_private_copy(self, copy: Path) -> Optional[int]:
+        """Account a private copy's captured length in the cache budget for
+        as long as its descriptor is open; None (copy removed) if it does
+        not fit."""
+        try:
+            size = os.lstat(copy).st_size
+        except OSError:
+            return None
+        if not self.cache_manager._reserve_more(size):
+            self._drop_private_copy(copy)
+            return None
+        return size
+
+    @staticmethod
+    def _drop_private_copy(copy: Optional[Path]) -> None:
+        if copy is not None:
+            try:
+                copy.unlink()
+            except FileNotFoundError:
+                pass
 
     def create(self, path, mode, fi=None):
         """Create a file"""
@@ -2868,6 +3005,13 @@ class StorageFS(Operations):
 
         if entry.prefetch_session is not None:
             self._release_prefetch_session(entry.prefetch_session)
+            if close_error is not None:
+                raise FuseOSError(close_error.errno)
+            return 0
+
+        if entry.private_size is not None:
+            # A private copy (already unlinked): its bytes leave the budget.
+            self.cache_manager.release_reserved(entry.private_size)
             if close_error is not None:
                 raise FuseOSError(close_error.errno)
             return 0

@@ -72,24 +72,56 @@ class MemberVersion:
     AGREED and NEVER_VERSIONED copies are installed in the cache.
     """
 
-    # The probe's version token (size and mtime) was confirmed after the
-    # transfer: install with the confirming stat's attributes.
+    # Sticky versioning: once any stat seen for a fill carries a version
+    # token (size and mtime), the fill is published only on AGREED.
+    #
+    # The probe's token was confirmed after the transfer: install with the
+    # confirming stat's attributes.
     AGREED = "agreed"
     # Positive evidence of another version (a size, or two mtimes or modes,
-    # that differ): a full fill fetches once more, a stream is discarded.
+    # that differ): never installed. A full fill fetches once more only
+    # against a newer stat that carries a token; a stream is discarded.
     CHANGED = "changed"
-    # The probe carried a token but no compatible confirmation could be had
-    # (the stat failed, or lost its mtime): bytes assembled over a transfer
-    # are not a verified generation. Not installed; any cached copy stays.
+    # Some stat carried a token but no compatible pair confirmed it (the
+    # confirming stat failed or lost its mtime, or only the stat after the
+    # transfer had one): not a verified generation, never installed; any
+    # cached copy stays.
     UNCONFIRMED = "unconfirmed"
-    # The member never supplied a token (no stat, a size-only stat, no
-    # mtime): the complete bytes are installed with conservative attributes.
+    # No stat seen carried a token (no stat, size-only, no mtime): the
+    # complete bytes are installed with conservative attributes and no
+    # member mtime.
     NEVER_VERSIONED = "never-versioned"
 
 
-def _has_token(st) -> bool:
+class FillAction:
+    """What a completed transfer's MemberVersion allows (fill_action)."""
+
+    INSTALL = "install"   # publish in the shared cache (AGREED, NEVER_VERSIONED)
+    PRIVATE = "private"   # serve the completed copy to this one read-only opener
+    FAIL = "fail"         # nothing served from it: EAGAIN (retryable)
+
+
+def fill_action(version: str, *, read_only: bool) -> str:
+    """The one verdict-to-action contract (CTO-208-LIVE-READ), for full
+    fills (fs._open) and, on adoption, streams.
+
+    AGREED and NEVER_VERSIONED install. CHANGED and UNCONFIRMED never
+    publish: a read-only opener with no last-good copy may read the
+    completed copy privately (one source, opened once, its captured length;
+    never indexed, uploaded or shared); a writable opener fails with EAGAIN.
+    """
+    if version in (MemberVersion.AGREED, MemberVersion.NEVER_VERSIONED):
+        return FillAction.INSTALL
+    return FillAction.PRIVATE if read_only else FillAction.FAIL
+
+
+def has_version_token(st) -> bool:
+    """Whether a member stat carries a version token: a size and an mtime."""
     return st is not None and getattr(st, "st_size", None) is not None \
         and _member_mtime_ns(st) is not None
+
+
+_has_token = has_version_token
 
 
 def confirm_member_stat(backend, virtual_path: str, probe, transferred_size: int):
@@ -99,12 +131,14 @@ def confirm_member_stat(backend, virtual_path: str, probe, transferred_size: int
     stat raises; not after NotImplementedError). CHANGED needs positive
     evidence: a known size other than the transfer's, or two stats that
     both report an mtime, or a mode, and disagree; the newest stat is
-    returned. With a probe that carried a token, AGREED needs a confirming
-    stat with a size and mtime (nothing disagreeing); its attributes are
+    returned. AGREED needs a probe and a confirming stat that both carry a
+    token (size and mtime) with nothing disagreeing; the attributes are
     returned with the probe's atime (the confirming stat's may be the
-    transfer's own read). Without such a confirmation it is UNCONFIRMED.
-    A probe without a token (or none) is NEVER_VERSIONED: the attributes
-    some stat reported are returned, newest first, the atime the probe's.
+    transfer's own read). If only one of them carries a token it is
+    UNCONFIRMED (sticky versioning: a token seen anywhere in a fill makes
+    AGREED the only verdict that publishes). If neither does it is
+    NEVER_VERSIONED: the attributes some stat reported, newest first, the
+    probe's atime, and no mtime (none was compared).
 
     A mode only the probe reported (the confirming stat lacked one) is
     marked mode_unconfirmed, and copy_member_attributes records it without
@@ -137,8 +171,10 @@ def confirm_member_stat(backend, virtual_path: str, probe, transferred_size: int
                or (None not in modes and modes[0] != modes[1]))
     if changed:
         return after, MemberVersion.CHANGED
-    if _has_token(probe):
-        verdict = MemberVersion.AGREED if _has_token(after) else MemberVersion.UNCONFIRMED
+    if _has_token(probe) and _has_token(after):
+        verdict = MemberVersion.AGREED
+    elif _has_token(probe) or _has_token(after):
+        verdict = MemberVersion.UNCONFIRMED
     else:
         verdict = MemberVersion.NEVER_VERSIONED
     if probe is None and after is None:
@@ -155,6 +191,9 @@ def confirm_member_stat(backend, virtual_path: str, probe, transferred_size: int
     fields["st_atime"] = known(atime_from, "st_atime")
     fields["st_atime_ns"] = known(atime_from, "st_atime_ns")
     fields["mode_unconfirmed"] = known(after, "st_mode") is None and fields["st_mode"] is not None
+    if verdict == MemberVersion.NEVER_VERSIONED:
+        # No stat's mtime was compared with another: none is recorded.
+        fields["st_mtime"] = fields["st_mtime_ns"] = None
     return SimpleNamespace(**fields), verdict
 
 

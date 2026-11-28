@@ -272,50 +272,80 @@ class TestConfirmedLargerRetryBudget(unittest.TestCase):
         self.assertEqual(self.cache._reserved_bytes, 0)
         self.assertEqual(self.cache.get_cache_path("/f.bin").read_bytes(), b"y" * 400)
 
-    def test_confirmed_larger_retry_reserves_for_a_changed_verdict_without_stat(self):
-        # The confirming stat fails, but the transfer itself came out larger
-        # than the probe said (CHANGED, no newer stat): the retry reserves at
-        # least what that transfer was.
+    def probe_then(self, after):
+        """Member stat: a probe of the original 100 bytes, then after(path)."""
         from types import SimpleNamespace
+        real, seen = self.backend.stat, []
+
+        def stats(path):
+            seen.append(path)
+            if len(seen) == 1:
+                st = real(path)
+                return SimpleNamespace(st_size=100, st_mtime=st.st_mtime, st_mode=st.st_mode)
+            return after(path)
+        return patch.object(self.backend, "stat", side_effect=stats)
+
+    def test_confirmed_larger_retry_reserves_the_newer_stats_size(self):
+        # The member grows after the first copy: the retry is reserved for
+        # the newer stat's size, not for what the first transfer was.
         with self.make(max_size=10_000):
-            real, seen = self.backend.stat, []
+            real_copy = LocalBackend.copy_to_local.__get__(self.backend)
+            calls = []
 
-            def probe_then_fail(path):
-                seen.append(path)
-                if len(seen) == 1:
-                    return SimpleNamespace(st_size=100, st_mtime=1.0)
-                raise OSError(5, "stat failed")
+            def grows_after(path, temp):
+                calls.append(self.cache._reserved_bytes)
+                real_copy(path, temp)
+                if len(calls) == 1:
+                    self.source.write_bytes(b"y" * 400)
 
-            with patch.object(self.backend, "stat", side_effect=probe_then_fail):
-                self.cache.cache_file("/f.bin", self.backend)
-        self.assertEqual(self.reserved_during, [100, 400])
+            with patch.object(self.backend, "copy_to_local", side_effect=grows_after):
+                self.assertTrue(self.cache.cache_file("/f.bin", self.backend))
+        self.assertEqual(calls, [100, 400])
         self.assertEqual(self.cache._reserved_bytes, 0)
 
-    def test_confirmed_larger_retry_that_grows_again_fails(self):
-        # The retry has no stat to be confirmed against (the confirming stats
-        # fail), so its own size is all there is: one that grew again past
-        # the reservation is not installed.
+    def test_confirmed_larger_retry_needs_a_newer_token(self):
+        # CHANGED (the transfer is another size) and the stat after it has no
+        # token (it failed, or reports a size but no mtime): nothing to retry
+        # against, so no retry and nothing installed.
         from types import SimpleNamespace
+
+        def fails(path):
+            raise OSError(5, "stat failed")
+        for after in (fails, lambda path: SimpleNamespace(st_size=400)):
+            with self.subTest(after=after):
+                with self.make(max_size=10_000), self.probe_then(after):
+                    self.assertFalse(self.cache.cache_file("/f.bin", self.backend))
+                self.assertEqual(self.reserved_during, [100])
+                self.assertEqual(self.cache._reserved_bytes, 0)
+                self.assertFalse(self.cache.get_cache_path("/f.bin").exists())
+
+    def test_confirmed_larger_retry_that_changes_again_fails(self):
+        # The retry's probe is the newer stat (400 bytes, reserved); its
+        # transfer then finds another size again: never installed.
         with self.make(max_size=10_000):
             copy = self.backend.copy_to_local.side_effect
-            seen = []
-
-            def probe_then_fail(path):
-                seen.append(path)
-                if len(seen) == 1:
-                    return SimpleNamespace(st_size=100, st_mtime=1.0)
-                raise OSError(5, "stat failed")
 
             def grows_twice(path, temp):
                 if len(self.reserved_during) == 1:
-                    self.source.write_bytes(b"z" * 500)  # grew again
+                    self.source.write_bytes(b"z" * 500)
                 copy(path, temp)
 
-            with patch.object(self.backend, "copy_to_local", side_effect=grows_twice), \
-                    patch.object(self.backend, "stat", side_effect=probe_then_fail):
+            with patch.object(self.backend, "copy_to_local", side_effect=grows_twice):
                 self.assertFalse(self.cache.cache_file("/f.bin", self.backend))
         self.assertEqual(self.reserved_during, [100, 400])
         self.assertEqual(self.cache._reserved_bytes, 0)
+        self.assertFalse(self.cache.get_cache_path("/f.bin").exists())
+
+    def test_confirmed_larger_retry_without_a_probe_never_installs_another_size(self):
+        # No probe, and the stat after the copy reports another size.
+        from types import SimpleNamespace
+        with self.make(max_size=10_000):
+            with patch.object(self.backend, "stat", side_effect=lambda path: SimpleNamespace(
+                    st_size=999, st_mtime=1.0)):
+                with self.assertRaises(OSError):
+                    self.cache.fetch_into_cache(self.backend, "/f.bin",
+                                                self.cache.get_cache_path("/f.bin"), None)
+        self.assertEqual(len(self.reserved_during), 1)  # one transfer, no retry
         self.assertFalse(self.cache.get_cache_path("/f.bin").exists())
 
     def test_confirmed_larger_retry_fails_when_it_cannot_reserve(self):

@@ -21,7 +21,7 @@ from .backends.base import Backend, bulk_request
 from .backends.ssh_pool import BulkCapacityCancelled, BulkCapacityTimeout
 from .cache_metadata import (
     PARTIAL_SUFFIX, PREFIX_XATTR, MemberVersion, confirm_member_stat, copy_member_attributes,
-    regular_file_stat, write_cache_metadata,
+    has_version_token, regular_file_stat, write_cache_metadata,
 )
 from .member_repairs import VIEW_WRITE, MemberRepairs, is_at_or_under
 from .pathing import resolve_path
@@ -151,6 +151,9 @@ class CacheManager:
         self.bulk_cold_copies = bulk_cold_copies
         self.max_size_bytes = max_size_bytes
         self._lock = threading.RLock()
+        # Per thread: why the last fill this thread ran was not installed,
+        # when it was not a plain failure (take_fill_errno).
+        self._fill_errno = threading.local()
         # Bytes promised to fetches in flight (cache_file): counted against
         # max_size_bytes so concurrent fetches cannot each see the same free
         # space. Under _lock.
@@ -545,6 +548,7 @@ class CacheManager:
     def cache_file_result(
         self, virtual_path: str, backend: Backend, source_virtual_path: str = None,
         *, member_stat=_STAT_NOT_PROBED, confirmed: Optional[list] = None,
+        private: Optional[list] = None,
     ) -> CacheFetch:
         """
         Download a file from backend into cache
@@ -593,7 +597,7 @@ class CacheManager:
         try:
             installed = self.fetch_into_cache(
                 backend, source_virtual_path, self.get_cache_path(virtual_path), member_stat,
-                confirmed=confirmed, reserved=file_size,
+                confirmed=confirmed, reserved=file_size, private=private,
             )
             self.state_manager.update_access_time(virtual_path)
             return CacheFetch.INSTALLED if installed else CacheFetch.ALREADY_CACHED
@@ -606,6 +610,17 @@ class CacheManager:
             with self._lock:
                 self._reserved_bytes -= file_size
 
+    def take_fill_errno(self) -> Optional[int]:
+        """The errno this thread's last failed fill reported, once (cleared)."""
+        code = getattr(self._fill_errno, "code", None)
+        self._fill_errno.code = None
+        return code
+
+    def release_reserved(self, nbytes: int) -> None:
+        """Give back bytes _reserve_more reserved (a private copy closed)."""
+        with self._lock:
+            self._reserved_bytes -= nbytes
+
     def _reserve_more(self, nbytes: int) -> bool:
         """Reserve nbytes more for a fill in progress, if there is room."""
         with self._lock:
@@ -616,7 +631,7 @@ class CacheManager:
 
     def fetch_into_cache(self, backend: Backend, source_virtual_path: str, cache_path: Path,
                          member_stat=None, *, confirmed: Optional[list] = None,
-                         reserved: Optional[int] = None) -> bool:
+                         reserved: Optional[int] = None, private: Optional[list] = None) -> bool:
         """Copy a member file to cache_path through a temp file beside it.
 
         The copy runs without the cache lock into a fresh name that ends in
@@ -664,35 +679,45 @@ class CacheManager:
                     raise OSError(errno.ENOSPC, "the member's version grew past the "
                                   "cache reservation", source_virtual_path)
                 # The member's stat after the transfer (MemberVersion): an
-                # unconfirmed version gets one more confirmation; positive
-                # evidence of another version fetches once more against the
-                # newer stat. Only AGREED and NEVER_VERSIONED are installed.
+                # unconfirmed version gets one more confirmation. Only AGREED
+                # and NEVER_VERSIONED are installed (sticky versioning).
                 newest, version = confirm_member_stat(
                     backend, source_virtual_path, member_stat, st.st_size)
                 if version == MemberVersion.UNCONFIRMED:
                     newest, version = confirm_member_stat(
                         backend, source_virtual_path, member_stat, st.st_size)
-                if version != MemberVersion.CHANGED or member_stat is None or attempt:
+                if version in (MemberVersion.AGREED, MemberVersion.NEVER_VERSIONED):
+                    break
+                # A CHANGED version is fetched once more, only against a
+                # probe and a newer stat that carries a token (it becomes the
+                # retry's probe); anything else fails below.
+                if (attempt or version != MemberVersion.CHANGED or member_stat is None
+                        or not has_version_token(newest)):
                     break
                 member_stat = newest
-                # Reserve for the retry: the newer size, or at least what
-                # this transfer was, when no stat gave one (pre-#191 budget).
-                newest_size = getattr(newest, "st_size", None)
-                target = max(newest_size if isinstance(newest_size, int) else 0, st.st_size)
-                more = max(0, target - (reserved + extra_reserved)) if reserved is not None else 0
+                # Reserve for the retry: the newer stat's size (pre-#191 budget).
+                more = (max(0, newest.st_size - (reserved + extra_reserved))
+                        if reserved is not None else 0)
                 if more:
                     if not self._reserve_more(more):
                         print(f"Warning: Insufficient cache space for {source_virtual_path}")
                         raise OSError(errno.ENOSPC, "insufficient cache space for the "
                                       "member's larger version", source_virtual_path)
                     extra_reserved += more
-            if version == MemberVersion.CHANGED and member_stat is None:
-                # No probe to confirm against: the bytes are kept, but no
-                # stat's token or mode is attached to them.
-                newest = None
-            elif version in (MemberVersion.CHANGED, MemberVersion.UNCONFIRMED):
+            if version not in (MemberVersion.AGREED, MemberVersion.NEVER_VERSIONED):
                 # Not a verified generation: nothing is installed, and a copy
-                # already cached (the last good one) stays as it is.
+                # already cached (the last good one) stays as it is. The open
+                # reports EAGAIN (unconfirmed, may succeed later) or EIO
+                # (another version than any confirmed: CHANGED).
+                # The open reports EAGAIN (retryable; CTO-208-LIVE-READ). A
+                # read-only opener may take the completed copy privately: it
+                # leaves under a partial name (hidden, swept at startup) and
+                # is never linked into the cache.
+                self._fill_errno.code = errno.EAGAIN
+                if private is not None:
+                    kept = temp_path.with_name(f".{secrets.token_hex(8)}.private{PARTIAL_SUFFIX}")
+                    os.rename(temp_path, kept)
+                    private.append(kept)
                 raise OSError(errno.EAGAIN, f"the member's version of {source_virtual_path} "
                               f"could not be confirmed ({version})", source_virtual_path)
             fd = os.open(temp_path, os.O_RDONLY | os.O_NOFOLLOW)
@@ -712,11 +737,16 @@ class CacheManager:
             if version == MemberVersion.AGREED and newest is not None and confirmed is not None:
                 confirmed.append(newest)
             return True
-        except BaseException:
+        except BaseException as exc:
             # Whatever the copy wrote may have been counted by a rescan,
             # and a failure after the link leaves the sum unknown.
             with self._lock:
                 self._size_dirty = True
+            if getattr(self._fill_errno, "code", None) is None:
+                # What the open reports (take_fill_errno): the transfer's own
+                # error (EIO when it carries none), never "absent".
+                self._fill_errno.code = (exc.errno if isinstance(exc, OSError) and exc.errno
+                                         else errno.EIO)
             raise
         finally:
             if extra_reserved:
