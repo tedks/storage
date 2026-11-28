@@ -296,6 +296,9 @@ class TestStreamingSystemRegression(unittest.TestCase):
             except Exception:
                 client.kill()
                 client.wait(timeout=30)
+            finally:
+                client.stdout.close()
+                client.stderr.close()
 
 
 class TestStreamingSystemRegressionThreaded(TestStreamingSystemRegression):
