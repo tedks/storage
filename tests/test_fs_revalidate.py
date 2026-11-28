@@ -2465,6 +2465,43 @@ class TestRefreshRound5(RevalidateTestBase):
         reserve.assert_not_called()
         self.assertFalse((self.cache_dir / "live.log").exists())
 
+    def test_larger_confirmation_denial_precedes_retry_space(self):
+        path = "/live.log"
+        self.changed_v1()
+        copy = self.member.copy_to_local
+
+        def grow_and_revoke(virtual_path, staging):
+            copy(virtual_path, staging)
+            self.rewrite_member("live.log", b"version 3 is larger", mtime=1_200_000_000).chmod(0o200)
+
+        with patch.object(self.member, "copy_to_local", side_effect=grow_and_revoke) as copies, \
+                patch.object(self.fs.cache_manager, "_reserve_more", return_value=False) as reserve, \
+                patch.object(self.fs, "_record_fetched") as publish, \
+                patch.object(self.member, "copy_from_local") as upload, \
+                patch.object(self.fs.sync_manager, "queue_sync") as queue:
+            self.assert_errno(errno.EACCES, self.read_through, path)
+        copies.assert_called_once()
+        reserve.assert_not_called()
+        publish.assert_not_called()
+        upload.assert_not_called()
+        queue.assert_not_called()
+        self.assertFalse((self.cache_dir / "live.log").exists())
+        self.assertEqual(self.partials(), [])
+        self.assertEqual(self.fs.cache_manager._reserved_bytes, 0)
+
+    def test_readable_larger_confirmation_preserves_retry_enospc(self):
+        path = "/live.log"
+        self.changed_v1()
+        with self.growing_copy(), patch.object(
+                self.fs.cache_manager, "_reserve_more", return_value=False) as reserve:
+            self.assert_errno(errno.ENOSPC, self.fs.open, path, os.O_RDWR)
+            self.age_checks()
+            self.assertEqual(self.read_through(path), b"version 1")
+        self.assertEqual(reserve.call_count, 2)
+        self.assertTrue(self.stale_mark())
+        self.assertEqual(self.partials(), [])
+        self.assertEqual(self.fs.cache_manager._reserved_bytes, 0)
+
     def test_aged_same_version_write_denial_survives_the_read_that_observed_it(self):
         src = self.rewrite_member("f.txt", b"original", mtime=1_000_000_000)
         src.chmod(0o644)

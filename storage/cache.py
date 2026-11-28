@@ -819,8 +819,9 @@ class CacheManager:
                     break
                 # A CHANGED version is fetched once more, only against a
                 # probe and a newer stat that carries a token (it becomes the
-                # retry's probe and its bound); anything else fails below.
-                if (attempt or version != MemberVersion.CHANGED or member_stat is None
+                # retry's probe and its bound). A denied attempt fails below
+                # before retry admission can mask the denial with ENOSPC.
+                if (read_denied or attempt or version != MemberVersion.CHANGED or member_stat is None
                         or not has_version_token(newer)):
                     break
                 member_stat = newest
