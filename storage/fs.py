@@ -2668,16 +2668,18 @@ class StorageFS(Operations):
         try:
             if prefetch_session is not None:
                 # The session's own inode, whatever its path names now. Not
-                # under _fd_lock: it waits for the session's io_lock, and an
-                # inode needs no protection from an unlink of its path.
+                # under _fd_lock: it waits for the session's io_lock, and a
+                # descriptor reopened on an inode needs no protection from
+                # an unlink of its path. -1 means the session is finalized
+                # and its descriptor closed: its file is opened by name below.
                 real_fd = self._streaming_manager.open_session_inode(prefetch_session, flags)
                 if prefetch_session.finalized:
                     cache_path = prefetch_session.final_cache_path
-            # Hold _fd_lock across os.open AND _fd_map registration so that
-            # _invalidate_file_cache (which also holds _fd_lock) cannot
-            # unlink the cache file between os.open and registration.
+            # Hold _fd_lock across a by-name os.open AND _fd_map registration
+            # so that _invalidate_file_cache (which also holds _fd_lock)
+            # cannot unlink the cache file between os.open and registration.
             with self._fd_lock:
-                if prefetch_session is None:
+                if real_fd < 0:
                     real_fd = os.open(str(cache_path), flags)
 
                 vfd = self._fd_counter

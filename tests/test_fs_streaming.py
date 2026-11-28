@@ -2980,13 +2980,64 @@ class TestFSStreamingIntegration(unittest.TestCase):
             go.set()
             self.assertTrue(session.background_finished.wait(timeout=5.0))
         self.assertEqual(session.io_fd, -1)
-        fd = manager.open_session_inode(session, os.O_RDONLY)
-        try:
-            self.assertEqual(os.pread(fd, len(payload), 0), payload)
-            self.assertEqual(os.fstat(fd).st_ino, os.stat(self.cache_dir / "window.bin").st_ino)
-        finally:
-            os.close(fd)
+        # The caller opens the installed file by name (under _fd_lock).
+        self.assertEqual(manager.open_session_inode(session, os.O_RDONLY), -1)
         manager._release_prefetch_session(session)
+
+    def test_fs_open_in_the_finalize_window_reads_the_installed_file(self):
+        # R4-N2: the same window through fs.open: the entry records the
+        # final path, the by-name open happens under _fd_lock (R4-I2), and
+        # a read through the handle returns the whole file.
+        self.backend.copy_delay = 0
+        manager = self.fs._streaming_manager
+        payload = os.urandom(64 * 1024)
+        (self.backend_dir / "fswindow.bin").write_bytes(payload)
+        in_record = threading.Event()
+        go = threading.Event()
+        self.addCleanup(go.set)
+        real_on_finalized = manager.on_finalized
+        real_create = manager._create_or_attach_prefetch_session
+        real_os_open = os.open
+        by_name_under_fd_lock = []
+
+        def held_record(session):
+            in_record.set()
+            go.wait(timeout=10.0)
+            return real_on_finalized(session)
+
+        def attach_then_finish(virtual_path, canonical_path):
+            attached = real_create(virtual_path, canonical_path)
+            go.set()
+            self.assertTrue(attached.background_finished.wait(timeout=5.0))
+            return attached
+
+        def watched_open(path, *args, **kwargs):
+            if str(path) == str(self.cache_dir / "fswindow.bin"):
+                by_name_under_fd_lock.append(self.fs._fd_lock.locked())
+            return real_os_open(path, *args, **kwargs)
+
+        hold, at_finalize, go_tail = self._hold_finalize()
+        with hold, patch.object(manager, "on_finalized", side_effect=held_record):
+            vfd = self.fs.open('/fswindow.bin', os.O_RDONLY)
+            session = self._session_for(vfd)
+            self.assertEqual(self.fs.read('/fswindow.bin', len(payload), 0, vfd), payload)
+            self.assertTrue(at_finalize.wait(timeout=3.0))
+            self.fs.release('/fswindow.bin', vfd)
+            go_tail.set()
+            self.assertTrue(in_record.wait(timeout=3.0))
+            # The open's cache check ran before the install.
+            with patch.object(self.fs.cache_manager, "is_cached", return_value=False), \
+                    patch.object(manager, "_create_or_attach_prefetch_session", side_effect=attach_then_finish), \
+                    patch("storage.fs.os.open", side_effect=watched_open):
+                vfd_b = self.fs.open('/fswindow.bin', os.O_RDONLY)
+        self.assertEqual(session.io_fd, -1)
+        self.assertEqual(by_name_under_fd_lock, [True])
+        with self.fs._fd_lock:
+            entry = self.fs._fd_map[vfd_b]
+        self.assertIs(entry.prefetch_session, session)
+        self.assertEqual(entry.cache_path, session.final_cache_path)
+        self.assertEqual(self.fs.read('/fswindow.bin', len(payload), 0, vfd_b), payload)
+        self.fs.release('/fswindow.bin', vfd_b)
 
     def test_session_reopen_waits_for_its_io_lock_outside_the_descriptor_table_lock(self):
         # R3-N2: a reopen blocked on a busy session must not hold _fd_lock.

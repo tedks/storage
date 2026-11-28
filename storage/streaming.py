@@ -1197,8 +1197,8 @@ class StreamingReadManager:
         writes, linked, renamed into the cache or unlinked. io_lock keeps
         the descriptor from closing meanwhile; it closes at the last
         release, at destroy (the open gets ENOENT), or when finalize saw no
-        readers (the open then takes the installed cache file). Without
-        procfs the open is EIO, logged.
+        readers: then -1, and the caller opens the installed cache file by
+        name. Without procfs the open is EIO, logged.
         """
         with session.io_lock:
             io_fd = session.io_fd
@@ -1215,8 +1215,9 @@ class StreamingReadManager:
         if finalized:
             # Finalize closes the descriptor when it saw no readers, which a
             # reader attaching after that decision does not change; the
-            # session's inode is then the cache file it installed.
-            return os.open(str(session.final_cache_path), flags)
+            # session's inode is then the cache file it installed, which the
+            # caller opens by name under its descriptor-table lock (-1).
+            return -1
         raise FileNotFoundError(errno.ENOENT, "streaming session closed")
 
     def _remove_prefetch_session(self, session: PrefetchSession):
