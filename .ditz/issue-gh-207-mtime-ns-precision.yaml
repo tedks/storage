@@ -1,0 +1,21 @@
+id: gh-207-mtime-ns-precision
+title: Compare revalidation mtimes in integer nanoseconds
+desc: 'Tracked precision limit (CTO-208-PRIVATE-STAT, deferred from #208): revalidation
+  baselines in the member_stat xattr, listing comparisons and legacy mtime recovery
+  store mtimes as float seconds, so same-size rewrites whose mtimes round to the same
+  float compare equal and are not refetched. Smallest fix (lead): an optional st_mtime_ns
+  field in the member_stat xattr, compared when both sides have it, with float seconds
+  as the fallback for existing records.'
+type: bugfix
+component: storage
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-28T12:00:32-00:00
+references: []
+log_events:
+- time: 2026-11-28T12:00:32-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
