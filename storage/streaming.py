@@ -949,7 +949,7 @@ class StreamingReadManager:
                 raise ControlError("Expected the target mountpoint as a string")
             if expected != self.mountpoint:
                 raise ControlError(
-                    f"This control socket belongs to the mount at {self.mountpoint}, not {expected}"
+                    f"This control socket belongs to the mount at {self.mountpoint!r}, not {expected!r}"
                 )
         if command in ("status", "streaming.get", "downloads.list") and arguments:
             raise ControlError("Unexpected arguments for control command")

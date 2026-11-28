@@ -3908,16 +3908,16 @@ class TestControlRequests(unittest.TestCase):
             ({"command": "downloads.cancel", "id": self.VALID_ID, "force": True}, cancel_message),
             ({"command": "streaming.set", "limits": {"max_download_workers": 2},
               "mountpoint": "/mnt/other"},
-             "This control socket belongs to the mount at /mnt/example, not /mnt/other"),
+             "This control socket belongs to the mount at '/mnt/example', not '/mnt/other'"),
             ({"command": "streaming.set", "limits": {"max_download_workers": 2},
               "mountpoint": "/mnt/example/"},
-             "This control socket belongs to the mount at /mnt/example, not /mnt/example/"),
+             "This control socket belongs to the mount at '/mnt/example', not '/mnt/example/'"),
             ({"command": "streaming.set", "limits": {"max_download_workers": 2},
               "mountpoint": None}, "Expected the target mountpoint as a string"),
             ({"command": "downloads.cancel", "id": self.VALID_ID, "mountpoint": "/mnt/other"},
-             "This control socket belongs to the mount at /mnt/example, not /mnt/other"),
+             "This control socket belongs to the mount at '/mnt/example', not '/mnt/other'"),
             ({"command": "status", "mountpoint": "/mnt/other"},
-             "This control socket belongs to the mount at /mnt/example, not /mnt/other"),
+             "This control socket belongs to the mount at '/mnt/example', not '/mnt/other'"),
         ]
         for request, message in cases:
             with self.subTest(request=request):

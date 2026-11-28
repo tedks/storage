@@ -237,8 +237,8 @@ def test_profile_refuses_a_socket_answering_for_another_mount(cache):
             requests.clear()
             result = runner.invoke(main, options + command)
             assert result.exit_code == 1, result.output
-            assert "belongs to the mount at /mnt/profile-a" in result.output
-            assert "/mnt/profile-b" in result.output
+            assert "belongs to the mount at '/mnt/profile-a'" in result.output
+            assert "mountpoint '/mnt/profile-b'" in result.output
             # Only the identity check (or the status itself) was sent.
             assert requests == [{"command": "status", "mountpoint": "/mnt/profile-b"}]
     finally:
@@ -274,6 +274,36 @@ def test_worst_case_escaped_mountpoint_fits_a_request(cache):
     server.start()
     try:
         assert request_control_payload(cache, request, 2) == {"mountpoint": mountpoint}
+    finally:
+        server.stop()
+
+
+def test_reported_mountpoints_are_quoted(cache):
+    # A mountpoint with control characters cannot forge output lines.
+    config = write_profile(cache, "/mnt/profile-b")
+    server, _ = recording_server(cache, "/mnt/a\nError: forged line")
+    server.start()
+    try:
+        result = CliRunner().invoke(main, ["control", "--profile", "example", "--config", str(config)])
+        assert result.exit_code == 1, result.output
+        assert "'/mnt/a\\nError: forged line'" in result.output
+        assert "\nError: forged" not in result.output
+    finally:
+        server.stop()
+
+    stats = dict.fromkeys(["pid", "active_reader_sessions", "retained_streaming_sessions",
+                           "download_workers_running", "download_workers",
+                           "download_sessions_queued"], 0)
+    server = server_for(cache, lambda _: {
+        "mount": {"mountpoint": "/mnt/a\nQueued downloads: 0", "pid": 0},
+        "stats": stats, "limits": {}, "restart_only": {},
+    })
+    server.start()
+    try:
+        result = CliRunner().invoke(main, ["control", "--cache", str(cache)])
+        assert result.exit_code == 0, result.output
+        assert "  Mountpoint: '/mnt/a\\nQueued downloads: 0'\n" in result.output
+        assert result.output.count("Queued downloads: 0") == 2
     finally:
         server.stop()
 

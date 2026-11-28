@@ -44,8 +44,8 @@ class ControlTarget:
             raise click.ClickException("The control socket did not report which mount it belongs to")
         if reported != mountpoint:
             raise click.ClickException(
-                f"The control socket in this profile's cache belongs to the mount at {reported}, "
-                f"not this profile's mountpoint {mountpoint}"
+                f"The control socket in this profile's cache belongs to the mount at {reported!r}, "
+                f"not this profile's mountpoint {mountpoint!r}"
             )
 
     def request(self, command: str, *, mutation: bool = False, **arguments) -> dict:
@@ -101,7 +101,8 @@ def control_status(target):
         return
     stats = payload["stats"]
     click.echo(f"Mount PID {stats['pid']}")
-    click.echo(f"  Mountpoint: {payload['mount']['mountpoint']}")
+    # Quoted like download paths, so control characters cannot forge lines.
+    click.echo(f"  Mountpoint: {payload['mount']['mountpoint']!r}")
     click.echo(f"  Streaming files with readers: {stats['active_reader_sessions']}")
     click.echo(f"  Retained downloads: {stats['retained_streaming_sessions']}")
     click.echo(f"  Download workers running: {stats['download_workers_running']}/{stats['download_workers']}")
