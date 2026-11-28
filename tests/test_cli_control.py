@@ -503,8 +503,8 @@ def test_profile_selection_and_atomic_set_request(cache):
 
 def test_profile_refuses_a_socket_answering_for_another_mount(cache):
     # Two mounts sharing one cache: the socket belongs to the other one.
-    config = write_profile(cache, "/mnt/profile-b")
-    server, requests = recording_server(cache, "/mnt/profile-a")
+    config = write_profile(cache, "/profile-b")
+    server, requests = recording_server(cache, "/profile-a")
     server.start()
     try:
         runner = CliRunner()
@@ -513,10 +513,10 @@ def test_profile_refuses_a_socket_answering_for_another_mount(cache):
             requests.clear()
             result = runner.invoke(main, options + command)
             assert result.exit_code == 1, result.output
-            assert "belongs to the mount at '/mnt/profile-a'" in result.output
-            assert "mountpoint '/mnt/profile-b'" in result.output
+            assert "belongs to the mount at '/profile-a'" in result.output
+            assert "mountpoint '/profile-b'" in result.output
             # Only the identity check (or the status itself) was sent.
-            assert requests == [{"command": "status", "mountpoint": "/mnt/profile-b",
+            assert requests == [{"command": "status", "mountpoint": "/profile-b",
                                  "cache": cache_identity(cache)}]
     finally:
         server.stop()
@@ -548,10 +548,16 @@ def test_refuses_a_socket_published_in_another_cache(cache, by_profile):
 
 
 def test_long_multibyte_mountpoint_fits_a_request(cache):
-    # 16 components of 63 four-byte characters: 4048 bytes on disk, each
-    # character escaped to a twelve-byte surrogate pair in the request.
-    mountpoint = "/" + "/".join(["\U00020000" * 63] * 16)
-    assert len(os.fsencode(mountpoint)) == 4048
+    # Directories of 63 four-byte characters (252 bytes each) to nearly
+    # PATH_MAX, each character escaped to a twelve-byte surrogate pair in
+    # the request. They exist: the mountpoint's parents must.
+    component = "\U00020000" * 63
+    path = str(cache)
+    while len(os.fsencode(path)) + 2 * (len(os.fsencode(component)) + 1) < 4090:
+        path = f"{path}/{component}"
+        os.mkdir(path)
+    mountpoint = canonical_mountpoint(f"{path}/{component}")
+    assert 3800 < len(os.fsencode(mountpoint)) < 4096
     config = write_profile(cache, mountpoint)
     server, requests = recording_server(cache, mountpoint)
     server.start()
@@ -582,7 +588,7 @@ def test_worst_case_escaped_mountpoint_fits_a_request(cache):
 
 def test_reported_mountpoints_are_quoted(cache):
     # A mountpoint with control characters cannot forge output lines.
-    config = write_profile(cache, "/mnt/profile-b")
+    config = write_profile(cache, "/profile-b")
     server, _ = recording_server(cache, "/mnt/a\nError: forged line")
     server.start()
     try:
@@ -724,6 +730,7 @@ def test_canonical_mountpoint(tmp_path, monkeypatch):
     monkeypatch.chdir(real)
     assert canonical_mountpoint(str(tmp_path / "alias" / "mount") + "/") == str(real / "mount")
     assert canonical_mountpoint("mount") == str(real / "mount")
+    (real / "x").mkdir()
     assert canonical_mountpoint("./x/../mount") == str(real / "mount")
     # A final symlink is followed (readlink), to the directory mounted on.
     assert canonical_mountpoint(str(tmp_path / "alias" / "final")) == str(real / "mount")
@@ -759,6 +766,19 @@ def test_canonical_mountpoint_errors_are_control_errors(tmp_path, monkeypatch):
     monkeypatch.setattr("storage.control.os.readlink", denied)
     with pytest.raises(ControlError, match="Permission denied"):
         canonical_mountpoint(str(tmp_path / "x"))
+
+
+def test_a_link_through_a_missing_directory_is_refused(tmp_path):
+    # Without strict resolution, missing/../a would be read as the sibling a,
+    # matching a mount there.
+    (tmp_path / "a").mkdir()
+    link = tmp_path / "media"
+    link.symlink_to(tmp_path / "missing" / ".." / "a")
+    with pytest.raises(ControlError, match="Cannot resolve mountpoint"):
+        canonical_mountpoint(str(link))
+    with pytest.raises(ControlError, match="Cannot resolve mountpoint"):
+        canonical_mountpoint(str(tmp_path / "missing" / ".." / "a"))
+    assert canonical_mountpoint(str(tmp_path / "a")) == str((tmp_path / "a").resolve())
 
 
 def test_canonical_mountpoint_never_stats_the_final_directory(tmp_path, monkeypatch):

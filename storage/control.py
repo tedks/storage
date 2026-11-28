@@ -96,7 +96,8 @@ def canonical_mountpoint(mountpoint: str) -> str:
     its old target. The final directory itself is never stat'ed: readlink
     on a mount root fails with EINVAL without asking the filesystem, so a
     hung mount does not block the CLI. A final `.` or `..` could be placed
-    only by resolving through it, so such a mountpoint is refused. The
+    only by resolving through it, so such a mountpoint is refused, and so
+    is one whose parent directories do not all exist. The
     mount and the CLI apply the same rule, so a relative mountpoint matches
     only when both resolve it from the same working directory, as for the
     cache path.
@@ -124,7 +125,9 @@ def _canonical_mountpoint(mountpoint: str) -> str:
             raise ControlError(
                 f"Mountpoint {original!r} ends in {name!r}; give it without a final '.' or '..'"
             )
-        candidate = os.path.join(os.path.realpath(parent or "/"), name)
+        # strict: every directory up to the final component must exist, so
+        # a link to missing/../a cannot be read as the sibling a.
+        candidate = os.path.join(os.path.realpath(parent or "/", strict=True), name)
         try:
             target = os.readlink(candidate)
         except OSError as exc:

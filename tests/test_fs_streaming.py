@@ -3881,7 +3881,7 @@ class TestControlRequests(unittest.TestCase):
             streaming_reads=True,
             streaming_chunk_size=32 * 1024,
             max_streaming_sessions=2,
-            mountpoint="/mnt/example",
+            mountpoint="/example",
         )
         self.manager = self.fs._streaming_manager
         # As if published; the socket itself is not started here.
@@ -3949,15 +3949,15 @@ class TestControlRequests(unittest.TestCase):
             ({"command": "downloads.cancel", "id": [self.VALID_ID]}, cancel_message),
             ({"command": "downloads.cancel", "id": self.VALID_ID, "force": True}, cancel_message),
             ({"command": "streaming.set", "limits": {"max_download_workers": 2},
-              "mountpoint": "/mnt/other"},
-             "This control socket belongs to the mount at '/mnt/example', not '/mnt/other'"),
+              "mountpoint": "/other"},
+             "This control socket belongs to the mount at '/example', not '/other'"),
             ({"command": "streaming.set", "limits": {"max_download_workers": 2},
-              "mountpoint": "/mnt/example/"},
-             "This control socket belongs to the mount at '/mnt/example', not '/mnt/example/'"),
+              "mountpoint": "/example/"},
+             "This control socket belongs to the mount at '/example', not '/example/'"),
             ({"command": "streaming.set", "limits": {"max_download_workers": 2},
               "mountpoint": None}, "Expected the target mountpoint as a string"),
-            ({"command": "downloads.cancel", "id": self.VALID_ID, "mountpoint": "/mnt/other"},
-             "This control socket belongs to the mount at '/mnt/example', not '/mnt/other'"),
+            ({"command": "downloads.cancel", "id": self.VALID_ID, "mountpoint": "/other"},
+             "This control socket belongs to the mount at '/example', not '/other'"),
             ({"command": "streaming.set", "limits": {"max_download_workers": 2}, "cache": [1, 3]},
              "This control socket was published in a different cache directory"),
             ({"command": "downloads.cancel", "id": self.VALID_ID, "cache": [2, 2]},
@@ -3968,8 +3968,8 @@ class TestControlRequests(unittest.TestCase):
              "Expected the target cache identity as [device, inode]"),
             ({"command": "streaming.set", "limits": {"max_download_workers": 2}, "cache": [1, 2, 3]},
              "Expected the target cache identity as [device, inode]"),
-            ({"command": "status", "mountpoint": "/mnt/other"},
-             "This control socket belongs to the mount at '/mnt/example', not '/mnt/other'"),
+            ({"command": "status", "mountpoint": "/other"},
+             "This control socket belongs to the mount at '/example', not '/other'"),
         ]
         for request, message in cases:
             with self.subTest(request=request):
@@ -3986,9 +3986,9 @@ class TestControlRequests(unittest.TestCase):
 
         status = self.handle({"command": "status"})
         self.assertEqual(set(status), {"mount", "stats", "limits", "restart_only"})
-        self.assertEqual(status["mount"], {"mountpoint": "/mnt/example", "pid": os.getpid(),
+        self.assertEqual(status["mount"], {"mountpoint": "/example", "pid": os.getpid(),
                                            "cache": [1, 2]})
-        named = self.handle({"command": "status", "mountpoint": "/mnt/example"})
+        named = self.handle({"command": "status", "mountpoint": "/example"})
         self.assertEqual(named["mount"], status["mount"])
         self.assertEqual(named["limits"], status["limits"])
         self.assertEqual(status["limits"], self.initial_limits)
@@ -4000,7 +4000,7 @@ class TestControlRequests(unittest.TestCase):
             {"limits": self.initial_limits, "restart_only": status["restart_only"]},
         )
 
-        changed = self.handle({"command": "streaming.set", "mountpoint": "/mnt/example",
+        changed = self.handle({"command": "streaming.set", "mountpoint": "/example",
                                "cache": [1, 2], "limits": {
             "max_streaming_sessions": 3, "max_download_workers": 2,
         }})
@@ -4040,7 +4040,7 @@ class TestControlRequests(unittest.TestCase):
             cache_size=1024 * 1024,
             num_sync_workers=0,
             start_sync=False,
-            mountpoint="/mnt/example/..",
+            mountpoint="/example/..",
         )
         try:
             manager = fs._streaming_manager
@@ -4061,7 +4061,7 @@ class TestControlRequests(unittest.TestCase):
                 "command": "streaming.set", "cache": [1, 2], "limits": {"max_download_workers": 2},
             }))
             self.assertEqual(changed["limits"]["max_download_workers"], 2)
-            for named in ("/mnt/example/..", "/mnt", "/mnt/example"):
+            for named in ("/example/..", "/mnt", "/example"):
                 with self.assertRaisesRegex(ControlError, "reports no mountpoint .*use --cache"):
                     manager._handle_control_request(json.dumps({
                         "command": "streaming.set", "mountpoint": named,
