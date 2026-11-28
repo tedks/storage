@@ -854,6 +854,56 @@ class TestPrivateReadMounted(_MountedCase):
         self.assertEqual(self.fs.cache_manager._reserved_bytes, 0)
 
 
+    def _two_readers(self, first, second):
+        """Reader a opens a private copy of first, the member becomes second,
+        reader b opens a private copy of that; each reads to EOF twice."""
+        import hashlib
+        name = "live.log"
+        source = self.backend1_dir / name
+        source.write_bytes(first)
+        self.fs._on_remote_change("/" + name)
+        backend = self.fs.backends["backend1"]
+        real_stat = backend.stat
+
+        def off_by_one(path):
+            st = real_stat(path)
+            return type("St", (), {"st_size": st.st_size + 1, "st_mtime": st.st_mtime,
+                                   "st_mtime_ns": st.st_mtime_ns, "st_mode": st.st_mode})()
+
+        client = subprocess.Popen([sys.executable, "-c", _PRIVATE_CLIENT],
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        try:
+            with patch.object(backend, "stat", side_effect=off_by_one):
+                self._call(client, f"open a {self.mount_dir / name}")
+                a = self._call(client, "read a")
+                source.write_bytes(second)
+                self._call(client, f"open b {self.mount_dir / name}")
+                b = self._call(client, "read b")
+                a_again = self._call(client, "read a")
+                b_again = self._call(client, "read b")
+            for got, want in ((a, first), (b, second), (a_again, first), (b_again, second)):
+                # Its own bytes, and its read EOF (bytes read until a 0-byte read).
+                self.assertEqual((got["sha"], got["len"]),
+                                 (hashlib.sha256(want).hexdigest(), len(want)))
+            self._call(client, "close a")
+            self._call(client, "close b")
+        finally:
+            client.stdin.close()
+            client.wait(30)
+            client.stdout.close()
+        self.assertFalse((self.cache_dir / name).exists())
+        self.assertEqual(self.fs.cache_manager._reserved_bytes, 0)
+
+    def test_longer_then_shorter_private_readers(self):
+        # Overlapping private handles of different lengths (CTO-208-PRIVATE-
+        # STAT): each keeps its own bytes and EOF; the second's fstat is not
+        # asserted (attributes are per inode).
+        self._two_readers(b"long version\n" * 120, b"short\n" * 30)
+
+    def test_shorter_then_longer_private_readers(self):
+        self._two_readers(b"short\n" * 30, b"long version\n" * 120)
+
+
 class TestPrivateReadMountedThreaded(TestPrivateReadMounted):
     fuse_threads = True
 
