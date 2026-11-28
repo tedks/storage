@@ -839,10 +839,26 @@ class TestCacheAccounting(unittest.TestCase):
                     os.pwrite(writer, b"g" * block, block)
                 self.assertTrue(manager._streaming_fds[fd].unmeasured)
                 self.assertFalse(manager.ensure_space(block))
+                # R6: with a rescan pending, a competing stream's grant is
+                # refused (its bytes go uncached), not failed with the held
+                # descriptor's error: the scan never stats it.
+                manager.mark_cache_size_dirty()
+                with self._partial("competing") as (_, other):
+                    self.assertFalse(manager.write_streaming_chunk(other, 0, b"c"))
+                    self.assertEqual(os.pread(other, 1, 0), b"\0")
+                # The held descriptor's own failure is still its own.
+                with self.assertRaises(OSError) as raised:
+                    manager.write_streaming_chunk(fd, 0, b"x")
+                self.assertEqual(raised.exception.errno, errno.EIO)
             # Measurable again: the next allocation recharges and proceeds.
             self.assertTrue(manager.ensure_space(block))
             self.assertFalse(manager._streaming_fds[fd].unmeasured)
             self._assert_total(2 * block)
+            with self._partial("competing-after") as (competing, other):
+                self.assertTrue(manager.write_streaming_chunk(other, 0, b"c"))
+                self._assert_total(3 * block)
+            competing.unlink()  # the helper leaves the partial's name
+            manager.mark_cache_size_dirty()
         finally:
             os.close(writer)
         manager.close_streaming_fd(fd)

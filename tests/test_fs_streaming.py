@@ -769,6 +769,56 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.assertEqual(final.read_bytes(), b"t" * block)
         assert_total(block)
 
+    def test_a_reader_gets_its_bytes_while_a_held_charge_is_unmeasurable(self):
+        """R6: an installed download's session descriptor (its reader still
+        attached) cannot be stat'd after a direct write changed the inode,
+        so allocations are withheld. With a rescan pending, another file's
+        streaming reader still gets its bytes, uncached, instead of the
+        held descriptor's EIO; once the descriptor is measurable the next
+        read caches again, and the writer's own outcome is untouched."""
+        cache = self.fs.cache_manager
+        block = cache.block_size
+        held_payload = os.urandom(64 * 1024)
+        other_payload = os.urandom(64 * 1024)
+        (self.backend_dir / "held.bin").write_bytes(held_payload)
+        (self.backend_dir / "other.bin").write_bytes(other_payload)
+        held_reader, session = self._stream_whole_file("held.bin", held_payload)
+        self.assertTrue(self._wait_for(lambda: session.finalized))
+        session_fd = session.io_fd
+        self.assertGreaterEqual(session_fd, 0)
+        real_fstat = os.fstat
+
+        def fstat(target):
+            if target == session_fd:
+                raise OSError(errno.EIO, "fstat failed")
+            return real_fstat(target)
+
+        writer = self.fs.open("/held.bin", os.O_RDWR)
+        try:
+            with patch("os.fstat", side_effect=fstat):
+                self.assertEqual(self.fs.write("/held.bin", b"w" * block, len(held_payload), writer),
+                                 block)
+                self.assertTrue(cache._streaming_fds[session_fd].unmeasured)
+                cache.mark_cache_size_dirty()
+                other = self.fs.open("/other.bin", os.O_RDONLY)
+                other_session = self._session_for(other)
+                self.assertEqual(self.fs.read("/other.bin", 4096, 0, other), other_payload[:4096])
+                with other_session.lock:
+                    self.assertTrue(other_session.cache_full)
+                    self.assertEqual(other_session.available_ranges, [])
+                self.assertEqual(self.fs.read("/held.bin", 4096, 0, held_reader), held_payload[:4096])
+            self.assertEqual(self.fs.read("/other.bin", 4096, 4096, other), other_payload[4096:8192])
+            with other_session.lock:
+                self.assertNotEqual(other_session.available_ranges, [])
+            self.fs.release("/other.bin", other)
+        finally:
+            self.fs.release("/held.bin", writer)
+        self.fs.release("/held.bin", held_reader)
+        self.assertEqual((self.cache_dir / "held.bin").read_bytes(), held_payload + b"w" * block)
+        expected = cache.get_total_cache_size()
+        cache.mark_cache_size_dirty()
+        self.assertEqual(cache.get_total_cache_size(), expected)
+
     def test_readerless_publication_keeps_its_blocks_until_the_session_closes(self):
         """R3-I2: a readerless fill installs its file (CLEAN, with a member
         location) while its session descriptor still holds the inode, and

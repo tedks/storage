@@ -96,7 +96,7 @@ class _PartialCharge:
 
     __slots__ = ("ranges", "bytes", "identity", "direct", "unmeasured")
 
-    def __init__(self, ranges, identity=None):
+    def __init__(self, ranges, identity):
         self.identity = identity
         self.direct = False
         self.unmeasured = False
@@ -329,12 +329,15 @@ class CacheManager:
         return any(charge.unmeasured for charge in self._streaming_fds.values())
 
     def _scan_total_cache_size(self) -> int:
-        """Reconcile data blocks, counting named and held inodes only once."""
+        """Reconcile data blocks, counting named and held inodes only once.
+
+        A held inode is counted at its descriptor's charge and recognized
+        by the identity recorded at its first grant, which cannot change
+        while the descriptor is open: the scan makes no call on a session
+        descriptor, so one that fails (see _recharge_held) cannot fail an
+        unrelated allocation."""
         total = sum(charge.bytes for charge in self._streaming_fds.values())
-        seen = set()
-        for fd in self._streaming_fds:
-            st = os.fstat(fd)
-            seen.add((st.st_dev, st.st_ino))
+        seen = self._held_identities()
         for root, dirs, files in os.walk(self.cache_root):
             for name in files:
                 path = Path(root) / name
