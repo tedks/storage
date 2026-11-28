@@ -2757,6 +2757,34 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.assertEqual(self.fs.read('/changed.bin', len(payload), 0, fd), payload)
         self.fs.release('/changed.bin', fd)
 
+    def test_replaced_session_is_charged_before_its_partial_is_unlinked(self):
+        # R3-I2: a cache scan between the unlink and the charge would see
+        # the space as free while the old reader still pins it.
+        manager = self.fs._streaming_manager
+        payload = os.urandom(64 * 1024)
+        (self.backend_dir / "charged.bin").write_bytes(payload)
+        vfd_a = self.fs.open('/charged.bin', os.O_RDONLY)
+        session_a = self._session_for(vfd_a)
+        self.assertEqual(self.fs.read('/charged.bin', 4096, 0, vfd_a), payload[:4096])
+        with session_a.lock:
+            session_a.error = OSError(errno.EIO, "simulated failure")
+            manager._schedule_background(session_a)
+        self.assertTrue(session_a.background_finished.wait(timeout=3.0))
+        real_unlink = manager._unregister_and_unlink
+        reserved_at_unlink = []
+
+        def unlink(session):
+            if session is session_a:
+                reserved_at_unlink.append(self.fs.cache_manager._reserved_bytes)
+            return real_unlink(session)
+
+        with patch.object(manager, "_unregister_and_unlink", side_effect=unlink):
+            vfd_b = self.fs.open('/charged.bin', os.O_RDONLY)
+        self.assertEqual(reserved_at_unlink, [session_a.file_size])
+        self.fs.release('/charged.bin', vfd_a)
+        self.assertEqual(self.fs.cache_manager._reserved_bytes, 0)
+        self.fs.release('/charged.bin', vfd_b)
+
     def test_attach_in_the_finalize_window_opens_the_installed_file(self):
         # R3-I5: finalize decided to close the descriptor (no readers) and
         # is recording the file when an open attaches; the descriptor is

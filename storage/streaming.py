@@ -1774,11 +1774,13 @@ class StreamingReadManager:
                 raise _CleanupPending(session)
             if session.error is not None and not session.prefetch_complete:
                 if self._claim_detach(session):
-                    self._unregister_and_unlink(session)
                     if session.io_fd >= 0 and session.unlinked_charge == 0:
-                        # Its readers keep the unlinked partial's blocks.
+                        # Its readers keep the partial's blocks once it is
+                        # unlinked. Charged first: a cache scan after the
+                        # unlink no longer sees the file.
                         session.unlinked_charge = session.file_size
                         self.cache_manager.hold_unlinked_bytes(session.file_size)
+                    self._unregister_and_unlink(session)
                 self._record_streaming_stat("streaming_failed_sessions_replaced")
                 self.logger.info(
                     "streaming replacing failed session errno=%d", streaming_errno(session.error),
