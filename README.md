@@ -236,8 +236,9 @@ Storage counts the spans requested by the kernel, including its readahead.
 Before a file qualifies, its background worker may fetch ahead of the
 latest contiguous read span by up to `streaming_read_ahead_window`
 (`--streaming-read-ahead-window`). The default is 4 MiB, independent of
-file size and chunk size. Use `0` to disable speculative reads before
-qualification. If the last reader closes before the file qualifies and
+file size and chunk size. In a profile it may be a size string or an
+integer of bytes (`streaming_read_ahead_window = 4194304`). Use `0` to
+disable speculative reads before qualification. If the last reader closes before the file qualifies and
 the file is still incomplete, Storage discards the partial download. On
 a 2 GiB file, a 1 MiB contiguous read opens a speculative window of up to
 4 MiB after that span, while a contiguous read of about 614.4 MiB
@@ -563,6 +564,10 @@ streaming downloads independently of background sync.
 
 `get` reports chunk and window sizes in bytes and keep-after-close
 thresholds as an `any` or `all` rule with byte counts and percentages.
+A JSON client of the `streaming.set` request may send the window back as
+the integer `get` reported, or as a size string such as `4M`. The
+keep-after-close value accepts only the policy string (for example
+`all:32M,30%`), not the structure `get` reports.
 Changing `streaming_reads` or `streaming_chunk_size` requires a restart.
 Change the mount profile or startup flags to persist settings across restarts.
 

@@ -2,6 +2,7 @@
 
 import re
 from fractions import Fraction
+from typing import Union
 
 from .models import StreamingKeepAfterClose
 
@@ -74,7 +75,17 @@ def parse_keep_after_close(text: str) -> StreamingKeepAfterClose:
     return StreamingKeepAfterClose(tuple(byte_thresholds), tuple(percent_thresholds), match_all)
 
 
-def parse_read_ahead_window(text: str) -> int:
-    if not isinstance(text, str) or not _SIZE.fullmatch(text.strip()):
+def parse_read_ahead_window(value: Union[str, int]) -> int:
+    """A size string such as 4M, or a non-negative int of bytes.
+
+    The int form lets a JSON control client send back the integer that
+    streaming.get reports, and a TOML profile use a bare integer. bool is an
+    int subclass and is rejected.
+    """
+    if isinstance(value, int) and not isinstance(value, bool):
+        if value < 0:
+            raise ValueError(f"expected a non-negative size such as 4M or 0, got {value}")
+        return value
+    if not isinstance(value, str) or not _SIZE.fullmatch(value.strip()):
         raise ValueError("expected a non-negative size such as 4M or 0")
-    return parse_size(text)
+    return parse_size(value)

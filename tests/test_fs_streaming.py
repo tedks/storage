@@ -14,6 +14,7 @@ from fuse import FuseOSError
 
 from storage.backends.local import LocalBackend
 from storage.cache_metadata import MEMBER_ATTRS_XATTR
+from storage.control import ControlError
 from storage.fs import StorageFS
 from storage.models import SyncStatus
 from storage.mount_profiles import parse_keep_after_close
@@ -1565,6 +1566,40 @@ class TestFSStreamingIntegration(unittest.TestCase):
             self.assertFalse(session.readers_consumed)
             manager._record_foreground_read(session, 644_245_094, 644_245_095)
             self.assertTrue(session.readers_consumed)
+
+    def test_control_window_round_trips_the_integer_that_get_reports(self):
+        # A JSON client reads the window as an integer and can send it back.
+        manager = self.fs._streaming_manager
+        request = manager._handle_control_request
+        limits = request(json.dumps({"command": "streaming.get"}))["limits"]
+        window = limits["streaming_read_ahead_window"]
+        self.assertIsInstance(window, int)
+        updated = request(json.dumps({
+            "command": "streaming.set",
+            "limits": {"streaming_read_ahead_window": window + 1},
+        }))["limits"]
+        self.assertEqual(window + 1, updated["streaming_read_ahead_window"])
+        updated = request(json.dumps({
+            "command": "streaming.set", "limits": {"streaming_read_ahead_window": 0},
+        }))["limits"]
+        self.assertEqual(0, updated["streaming_read_ahead_window"])
+
+        for bad in (-1, True, 4.0, None, [1]):
+            with self.subTest(value=bad):
+                with self.assertRaisesRegex(ControlError, "streaming_read_ahead_window"):
+                    request(json.dumps({
+                        "command": "streaming.set",
+                        "limits": {"streaming_read_ahead_window": bad},
+                    }))
+        self.assertEqual(0, manager.download_limits()["streaming_read_ahead_window"])
+
+        # keep-after-close stays string-only: get reports a structure, not
+        # the string set accepts.
+        with self.assertRaisesRegex(ControlError, "streaming_keep_after_close"):
+            request(json.dumps({
+                "command": "streaming.set",
+                "limits": {"streaming_keep_after_close": limits["streaming_keep_after_close"]},
+            }))
 
     def test_streaming_open_sniffer_does_not_pull_whole_file(self):
         # A reader reads the first chunk, which starts read-ahead, and holds

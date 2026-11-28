@@ -56,6 +56,6 @@ Ditz tracks the implementation as `streaming-retention-qualification`. The defau
 
 ## Interfaces and Dependencies
 
-The startup and live flags are `--streaming-keep-after-close` and `--streaming-read-ahead-window`. Their profile keys replace dashes with underscores. The mount control `streaming.set` request uses the same strings as the CLI and profile. `streaming.get` reports an `any` or `all` rule with thresholds and a window size in bytes. The controls depend on the mount control branch and share its private cache-local socket.
+The startup and live flags are `--streaming-keep-after-close` and `--streaming-read-ahead-window`. Their profile keys replace dashes with underscores. The mount control `streaming.set` request uses the same strings as the CLI and profile, and also accepts the window as a non-negative integer of bytes, so a JSON client can send back what `streaming.get` reported; the profile key accepts a TOML integer for the same reason. `streaming.get` reports an `any` or `all` rule with thresholds and a window size in bytes. The keep-after-close value stays string-only in `streaming.set`, because `get` reports its parsed structure rather than the policy string. The controls depend on the mount control branch and share its private cache-local socket.
 
 2026-11-19. Recorded the implementation and the acceptance criteria for the combined branch.

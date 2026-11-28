@@ -4,7 +4,7 @@ from dataclasses import dataclass
 import math
 from pathlib import Path
 import re
-from typing import Any, Dict, Optional, Sequence, Tuple
+from typing import Any, Dict, Optional, Sequence, Tuple, Union
 
 from .backends.local import LocalBackend
 from .backends.ssh import SSHBackend
@@ -76,7 +76,9 @@ class ResolvedMountConfig:
     max_sync_workers: Optional[int] = None
     max_download_workers: int = DEFAULT_MAX_DOWNLOAD_WORKERS
     max_retained_streaming_sessions: int = DEFAULT_MAX_RETAINED_STREAMING_SESSIONS
-    streaming_read_ahead_window: Optional[str] = None
+    # A size string, or a TOML integer of bytes; parse_read_ahead_window
+    # validates either form when the mount starts.
+    streaming_read_ahead_window: Optional[Union[str, int]] = None
 
     @property
     def member_specs(self) -> Tuple[str, ...]:
@@ -146,6 +148,25 @@ def _optional_profile_string(profile: Dict[str, Any], key: str, profile_name: st
     if not isinstance(value, str) or not value.strip():
         raise click.ClickException(
             f"Mount profile '{profile_name}' must define '{key}' as a non-empty string when present"
+        )
+    return value
+
+
+def _optional_profile_size(
+    profile: Dict[str, Any], key: str, profile_name: str,
+) -> Optional[Union[str, int]]:
+    """A size string or an integer of bytes, checked only for its type here.
+
+    The value itself goes through the same parser as the flag of that name,
+    so the profile and the command line accept the same sizes.
+    """
+    value = profile.get(key)
+    if value is None or (isinstance(value, int) and not isinstance(value, bool)):
+        return value
+    if not isinstance(value, str) or not value.strip():
+        raise click.ClickException(
+            f"Mount profile '{profile_name}' must define '{key}' as a non-empty "
+            "size string or an integer of bytes when present"
         )
     return value
 
@@ -538,7 +559,7 @@ def _load_mount_profile_settings(config_path: Path, profile_name: str) -> Dict[s
         "streaming_keep_after_close": _optional_profile_string(
             config_profile, "streaming_keep_after_close", profile_name
         ),
-        "streaming_read_ahead_window": _optional_profile_string(
+        "streaming_read_ahead_window": _optional_profile_size(
             config_profile, "streaming_read_ahead_window", profile_name
         ),
         "readdir_ttl": _optional_profile_float(config_profile, "readdir_ttl", profile_name),

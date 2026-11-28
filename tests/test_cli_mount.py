@@ -424,6 +424,38 @@ backends = [
                 self.assertIn("Invalid streaming read-ahead window", result.output)
                 mock_mount.assert_not_called()
 
+    def test_window_profile_accepts_a_toml_integer(self):
+        for line, expected in (
+            ("streaming_read_ahead_window = 0", 0),
+            ("streaming_read_ahead_window = 4194304", 4 * 1024 ** 2),
+        ):
+            with self.subTest(line=line):
+                result, mock_mount = self._mount(line)
+                self.assertEqual(result.exit_code, 0, msg=result.output)
+                self.assertEqual(expected, mock_mount.call_args.kwargs["streaming_read_ahead_window"])
+                self.assertIn(f"Streaming read-ahead window: {expected:,} bytes", result.output)
+
+        # A negative integer reaches the same parser as the flag; other
+        # TOML types are refused by the profile loader.
+        result, mock_mount = self._mount("streaming_read_ahead_window = -1")
+        self.assertNotEqual(result.exit_code, 0, msg=result.output)
+        self.assertIn("Invalid streaming read-ahead window", result.output)
+        mock_mount.assert_not_called()
+        for line in ("streaming_read_ahead_window = true", "streaming_read_ahead_window = 4.5",
+                     'streaming_read_ahead_window = ""'):
+            with self.subTest(line=line):
+                result, mock_mount = self._mount(line)
+                self.assertNotEqual(result.exit_code, 0, msg=result.output)
+                self.assertIn("streaming_read_ahead_window", result.output)
+                mock_mount.assert_not_called()
+
+        # The flag overrides an integer in the profile.
+        result, mock_mount = self._mount(
+            "streaming_read_ahead_window = 4194304", ["--streaming-read-ahead-window", "1M"],
+        )
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        self.assertEqual(1024 ** 2, mock_mount.call_args.kwargs["streaming_read_ahead_window"])
+
     def test_bad_values_rejected_before_mounting(self):
         for profile_line, args in (
             ('streaming_keep_after_close = "150%"', ()),

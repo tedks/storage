@@ -20,6 +20,7 @@ from storage.mount_profiles import (
     split_storage_member_specs,
 )
 from storage.pathing import resolve_path
+from storage.streaming_settings import parse_read_ahead_window
 
 
 class TestParseSize(unittest.TestCase):
@@ -166,6 +167,24 @@ enable_watchers = true
             self.assertTrue(settings["enable_watchers"])
         finally:
             config_path.unlink()
+
+
+class TestParseReadAheadWindow(unittest.TestCase):
+    def test_size_strings(self):
+        self.assertEqual(4 * 1024 ** 2, parse_read_ahead_window("4M"))
+        self.assertEqual(0, parse_read_ahead_window(" 0 "))
+
+    def test_non_negative_integers_are_bytes(self):
+        # streaming.get reports an int; a JSON client can send it back.
+        for value in (0, 1, 4 * 1024 ** 2, 2 ** 70):
+            with self.subTest(value=value):
+                self.assertEqual(value, parse_read_ahead_window(value))
+
+    def test_bad_values_rejected(self):
+        for value in (-1, True, False, 4.0, None, [4], "", "-1M", "25%", "4X"):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    parse_read_ahead_window(value)
 
 
 class TestParseKeepAfterClose(unittest.TestCase):
