@@ -72,9 +72,13 @@ def interactive_wait_cancellation(probe):
     interactive request is never cancelled by it. A pool calls
     probe(token, waited) only while an interactive acquisition has to wait
     (never when a channel is free), and once more before it gives up at its
-    deadline. token identifies the acquisition (a retry is a new one) and
-    waited is the time this acquisition has measured in its channel waits.
-    A reason returned makes the pool raise BulkCapacityCancelled with it.
+    deadline, then reporting at least the deadline's whole span. token
+    identifies the acquisition (a retry is a new one) and waited is the
+    time this acquisition has measured in its channel waits. A reason
+    returned makes the pool raise BulkCapacityCancelled with it. An
+    acquisition that waited and then got a channel calls
+    probe(token, waited, granted=True) once, so the last interval is
+    recorded; that call cannot refuse the channel and its answer is ignored.
     """
     previous = getattr(_CAPACITY_CANCEL_PROBE, "interactive_probe", None)
     _CAPACITY_CANCEL_PROBE.interactive_probe = probe

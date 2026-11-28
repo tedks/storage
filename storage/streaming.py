@@ -1942,8 +1942,10 @@ class StreamingReadManager:
         interactive_wait_budget (its connect deadline): a yielded turn's
         wait is kept on the session, and once the session's total reaches
         the budget the stat gives up for good and finalize discards the
-        file as unconfirmed. The pool polls once more before its own
-        deadline, so a spent budget always ends that way. Without a budget,
+        file as unconfirmed. The pool polls once more at its own deadline,
+        reporting at least the whole deadline span, so a spent budget always
+        ends that way; and it reports a granted acquisition's last interval,
+        so a retry after a failed stat has only what is left. Without a budget,
         each attempt waits out the member's own deadline.
         """
         pool = self._download_pool
@@ -1954,7 +1956,12 @@ class StreamingReadManager:
         # only by the turn's own thread (the acquiring one).
         seen = {}
 
-        def probe(token, waited):
+        def probe(token, waited, granted=False):
+            if granted:
+                # The acquisition got its channel: record its whole wait,
+                # decide nothing.
+                seen[token] = waited
+                return None
             if session.stop_requested:
                 return "streaming session"
             seen[token] = waited

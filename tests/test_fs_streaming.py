@@ -1543,6 +1543,23 @@ class TestFSStreamingIntegration(unittest.TestCase):
         answers = [probe(acquisition, waited) for waited in (0.0, 0.3, 0.6, 0.9, 1.2)]
         self.assertEqual(answers, [None] * 4 + ["streaming publication's channel wait budget"])
 
+    def test_a_granted_wait_is_charged_before_the_retry(self):
+        manager = self.fs._streaming_manager
+        self._with_contention(set())
+        session = self._probe_session(1.0)
+        probe = manager._publication_wait_probe(session)
+        first = object()
+        self.assertIsNone(probe(first, 0.0))
+        self.assertIsNone(probe(first, 0.3))
+        # The channel came free at 0.7 s, after the last poll; the grant
+        # reports the whole wait, and cannot be refused.
+        self.assertIsNone(probe(first, 0.7, granted=True))
+        # The stat failed; the retry has the 0.3 s that is left.
+        retry = object()
+        self.assertIsNone(probe(retry, 0.0))
+        self.assertIsNone(probe(retry, 0.2))
+        self.assertEqual(probe(retry, 0.3), "streaming publication's channel wait budget")
+
     def test_confirmation_wait_budget_counts_only_time_spent_waiting(self):
         manager = self.fs._streaming_manager
         self._with_contention(set())

@@ -893,6 +893,12 @@ class MemberConnection:
         # waits, both passed to wait_probe (see interactive_wait_cancellation).
         wait_token = object()
         channel_waited = 0.0
+
+        def report_grant():
+            # A channel after a wait: the probe records the last interval
+            # (granted=True); it can no longer veto the channel.
+            if wait_probe and channel_waited > 0:
+                wait_probe(wait_token, channel_waited, granted=True)
         # Transports this acquisition may see installed before giving up: a
         # server that drops every new connection must not loop forever.
         connects_left = 2
@@ -913,6 +919,7 @@ class MemberConnection:
                             f"SSH member {self.name}: {reason} ended during bulk capacity wait")
                 lease = self._take_idle_locked(interactive, owner)
                 if lease is not None:
+                    report_grant()
                     return lease
                 if not self._can_open_locked(interactive):
                     if not interactive:
@@ -949,10 +956,14 @@ class MemberConnection:
                         if not self._can_open_locked(interactive) \
                                 and not self._idle_usable_locked(interactive):
                             if wait_probe:
-                                # Once more with the whole wait: a probe
-                                # whose budget is spent cancels, and the
-                                # caller does not see a member failure.
-                                reason = wait_probe(wait_token, channel_waited)
+                                # Once more, reporting at least the whole
+                                # deadline span (the time outside
+                                # cond.wait is not counted otherwise): a
+                                # probe whose budget is the deadline always
+                                # cancels, and the caller does not see a
+                                # member failure.
+                                reason = wait_probe(
+                                    wait_token, max(channel_waited, self.connect_timeout))
                                 if reason:
                                     raise BulkCapacityCancelled(
                                         f"SSH member {self.name}: {reason} ended during channel wait")
@@ -963,6 +974,7 @@ class MemberConnection:
                 self._record_sftp_turn_locked(interactive)
                 if not interactive:
                     self._bulk_leased += 1
+                report_grant()
 
             chan = None
             try:

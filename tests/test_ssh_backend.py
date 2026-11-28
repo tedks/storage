@@ -745,16 +745,24 @@ class TestMemberConnectionPool(unittest.TestCase):
         pool.close()
 
     def test_interactive_wait_probe_is_asked_once_more_at_the_deadline(self):
+        class ShortWaits(threading.Condition):
+            """Each wait returns after half its timeout, as if woken early:
+            the time inside cond.wait then falls short of the deadline."""
+
+            def wait(self, timeout=None):
+                super().wait(None if timeout is None else timeout / 2)
+                return False
+
         server = _FakeServer()
-        # A deadline shorter than one poll step: one poll before the wait,
-        # then the deadline.
         pool = _pool(server, sftp_channels=1, connect_timeout=0.05)
+        pool._cond = ShortWaits()
         holder = _Holder(pool)
         calls = []
 
-        def probe(token, waited):
-            calls.append((token, waited))
-            return "budget spent" if waited >= 0.04 else None
+        def probe(token, waited, granted=False):
+            calls.append((token, waited, granted))
+            # The budget is the deadline itself.
+            return "budget spent" if waited >= 0.05 else None
 
         def confirm():
             with interactive_wait_cancellation(probe):
@@ -763,15 +771,53 @@ class TestMemberConnectionPool(unittest.TestCase):
         waiter = _InThread(confirm, interactive=True)
         try:
             self.assertTrue(waiter.join(3))
-            # A spent budget ends as a cancellation, not a member failure.
+            # A spent budget ends as a cancellation, not a member failure,
+            # although less than the deadline was spent inside cond.wait.
             self.assertIsInstance(waiter.error, BulkCapacityCancelled)
-            self.assertEqual(2, len(calls))
-            self.assertIs(calls[0][0], calls[1][0])
             self.assertEqual(0.0, calls[0][1])
-            self.assertGreaterEqual(calls[1][1], 0.04)
+            self.assertTrue(all(call[0] is calls[0][0] for call in calls))
+            self.assertGreaterEqual(calls[-1][1], 0.05)
+            self.assertFalse(any(call[2] for call in calls))
         finally:
             holder.release()
             pool.close()
+
+    def test_granted_interactive_wait_reports_its_last_interval(self):
+        server = _FakeServer()
+        pool = _pool(server, sftp_channels=1, connect_timeout=5)
+        holder = _Holder(pool)
+        calls = []
+        polled = threading.Event()
+
+        def probe(token, waited, granted=False):
+            calls.append((token, waited, granted))
+            if waited > 0:
+                polled.set()
+            return None
+
+        def confirm():
+            with interactive_wait_cancellation(probe):
+                lease = pool.acquire_sftp(1.0)
+            pool.release(lease)
+
+        waiter = _InThread(confirm, interactive=True)
+        try:
+            self.assertTrue(polled.wait(3))
+            time.sleep(0.05)
+            holder.release()
+            self.assertTrue(waiter.join(3))
+            self.assertIsNone(waiter.error)
+        finally:
+            holder.release()
+            pool.close()
+        token = calls[0][0]
+        self.assertTrue(all(call[0] is token for call in calls))
+        polls = [waited for _token, waited, granted in calls if not granted]
+        grants = [waited for _token, waited, granted in calls if granted]
+        # The grant's report covers the wait after the last poll too.
+        self.assertEqual(1, len(grants))
+        self.assertGreaterEqual(grants[0], max(polls))
+        self.assertIs(calls[-1][2], True)
 
     def test_lease_is_reentrant_within_a_thread(self):
         server = _FakeServer()
