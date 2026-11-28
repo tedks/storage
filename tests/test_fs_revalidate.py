@@ -258,6 +258,17 @@ class RevalidateTestBase(unittest.TestCase):
     def count_fetches(self):
         return patch.object(self.member, "copy_to_local", wraps=self.member.copy_to_local)
 
+    def without_descriptor_evidence(self):
+        """Model an adapter that can copy bounded bytes but exposes no fstat."""
+        from storage.backends.base import current_copy_bound
+        copy = self.member.copy_to_local
+
+        def transfer(path, staging):
+            copy(path, staging)
+            current_copy_bound().source_stats.clear()
+
+        return patch.object(self.member, "copy_to_local", side_effect=transfer)
+
     def restart(self, start_sync=False):
         self.fs.sync_manager.stop()
         self.fs.state_manager.close()
@@ -554,23 +565,23 @@ class TestImportedPermissions(RevalidateTestBase):
         self.assertEqual(stat.S_IMODE(self.fs.getattr("/f.txt")["st_mode"]), 0o444)
 
     def test_stale_writable_probe_does_not_survive_a_failed_confirmation(self):
-        # A probe with a mode but no version token (no mtime) installs once
-        # the confirmations fail; its unconfirmed mode grants no write, here
-        # with a receiver that sets no mode (as SFTP's get), as a staging
-        # file does not either.
+        # The receiver can copy bytes without a token, but failed stat I/O
+        # does not classify the member as NEVER_VERSIONED.
         _, stats = self._turning_read_only(
             lambda st: SimpleNamespace(st_size=st.st_size, st_mode=stat.S_IFREG | 0o644))
         sftp_like = patch.object(self.member, "copy_to_local", side_effect=lambda path, temp: (
             os.chmod(self.member_dir / "f.txt", 0o444),
             shutil.copyfile(self.member_dir / "f.txt", temp)))
         with sftp_like, stats:
-            self.assertEqual(self.read_through("/f.txt"), b"original")
+            with self.assertRaises(FuseOSError) as raised:
+                self.fs.open("/f.txt", os.O_RDONLY)
+        self.assertEqual(raised.exception.errno, errno.EAGAIN)
+        self.assertFalse((self.cache_dir / "f.txt").exists())
+        self.assertEqual(self.read_through("/f.txt"), b"original")
         self.assertEqual(self.fs.getattr("/f.txt")["st_mode"] & 0o222, 0)
         with self.assertRaises(FuseOSError) as raised:
             self.fs.open("/f.txt", os.O_WRONLY)
         self.assertEqual(raised.exception.errno, errno.EACCES)
-        self.fs.chmod("/f.txt", 0o644)  # an explicit chmod grants write
-        self.fs.release("/f.txt", self.fs.open("/f.txt", os.O_WRONLY))
 
     def test_confirmation_without_mode_keeps_the_probes_read_denial(self):
         src = self.rewrite_member("f.txt", b"original", mtime=1_000_000_000)
@@ -601,15 +612,15 @@ class TestImportedPermissions(RevalidateTestBase):
             return SimpleNamespace(st_size=st.st_size, st_atime=atime,
                                    st_atime_ns=atime * 1_000_000_000)
 
-        with patch.object(self.member, "stat", side_effect=stats):
+        with self.without_descriptor_evidence(), patch.object(self.member, "stat", side_effect=stats):
             self.assertTrue(self.fs._ensure_file_in_cache(self.fs._resolve_path("/f.txt")))
         self.assertEqual((self.cache_dir / "f.txt").stat().st_atime, 900_000_000)
 
     def test_warm_open_past_the_age_with_a_stat_lacking_mtime_keeps_the_copy(self):
         self.rewrite_member("f.txt", b"original")
         size_only = lambda path: SimpleNamespace(st_size=8)  # noqa: E731
+        self.assertEqual(self.read_through("/f.txt"), b"original")
         with patch.object(self.member, "stat", side_effect=size_only):
-            self.assertEqual(self.read_through("/f.txt"), b"original")
             for limited in (SimpleNamespace(st_size=8), SimpleNamespace(st_size=8, st_mtime=None)):
                 self.age_checks()
                 with patch.object(self.member, "stat", return_value=limited), \
@@ -623,10 +634,10 @@ class TestImportedPermissions(RevalidateTestBase):
     def test_read_only_without_member_stat_fails_closed(self):
         # No member mode: the downloaded file's own (copied) mode is
         # recorded instead of the backing file's owner-writable one.
-        for kwargs in ({"side_effect": OSError(errno.EIO, "no stat")},
+        for kwargs in ({"side_effect": NotImplementedError("no stat")},
                        {"return_value": SimpleNamespace(st_size=None)}):
             with self.subTest(kwargs=kwargs):
-                with patch.object(self.member, "get_size", return_value=8):
+                with self.without_descriptor_evidence(), patch.object(self.member, "get_size", return_value=8):
                     cached = self.fill_read_only(kwargs)
                 self.assert_write_refused(cached)
                 self.fs.cache_manager.delete_cached_file("/f.txt")
@@ -1172,8 +1183,9 @@ class TestStickyVersioning(RevalidateTestBase):
         # A stat with an mtime but no size carries no token: that mtime was
         # never compared, so it is not put on the copy.
         self.rewrite_member("f.txt", b"original", mtime=1_000_000_000)
-        with patch.object(self.member, "stat", side_effect=lambda path: SimpleNamespace(
-                st_mtime=1_234_567_890, st_uid=4242)):
+        with self.without_descriptor_evidence(), patch.object(
+                self.member, "stat", return_value=SimpleNamespace(
+                    st_mtime=1_234_567_890, st_uid=4242)):
             self.assertEqual(self.read_through("/f.txt"), b"original")
         record = json.loads(os.getxattr(self.cache_dir / "f.txt", MEMBER_ATTRS_XATTR))
         self.assertEqual(record["attrs"].get("st_uid"), 4242)
@@ -1182,7 +1194,8 @@ class TestStickyVersioning(RevalidateTestBase):
     def test_genuine_no_stat_member_reuses_its_fill_warm_and_offline(self):
         # J2: no stat at all, through and past the revalidation age.
         self.rewrite_member("f.txt", b"no stat here")
-        with patch.object(self.member, "stat", side_effect=NotImplementedError):
+        with self.without_descriptor_evidence(), patch.object(
+                self.member, "stat", side_effect=NotImplementedError):
             self.assertEqual(self.read_through("/f.txt"), b"no stat here")
             self.age_checks()
             with self.count_fetches() as fetches:
@@ -1203,7 +1216,7 @@ class TestStickyVersioning(RevalidateTestBase):
         self.age_checks()
         size_only = lambda path: SimpleNamespace(st_size=14)  # noqa: E731
         with patch.object(self.member, "stat", side_effect=size_only), \
-                self.count_fetches() as fetches:
+                self.count_fetches() as fetches, self.without_descriptor_evidence():
             self.assertEqual(self.read_through("/f.txt"), b"longer content")
         self.assertEqual(fetches.call_count, 1)
 
@@ -2419,6 +2432,128 @@ class TestRefreshRound5(RevalidateTestBase):
         self.rewrite_member("live.log", b"version 2!", mtime=1_100_000_000)
         self.age_checks()
 
+    def test_discovery_preserves_unindexed_member_errors(self):
+        for code in (errno.EACCES, errno.EIO):
+            with self.subTest(code=code), patch.object(self.member, "exists", return_value=False), \
+                    patch.object(self.member, "exists_or_raise", side_effect=OSError(code, "probe")):
+                with self.assertRaises(OSError) as raised:
+                    self.fs.open("/unindexed", os.O_RDONLY)
+                self.assertEqual(raised.exception.errno, code)
+
+    def test_real_confirmation_denial_cannot_serve_last_good(self):
+        self.changed_v1()
+        new_stat = self.member.stat("/live.log")
+        with patch.object(self.member, "stat", side_effect=[
+                new_stat, PermissionError(errno.EACCES, "confirmation denied")]):
+            self.assert_errno(errno.EACCES, self.fs.open, "/live.log", os.O_RDONLY)
+        self.assertFalse((self.cache_dir / "live.log").exists())
+        self.assertEqual(self.partials(), [])
+
+    def test_aged_stat_denial_is_not_an_outage(self):
+        self.changed_v1()
+        with patch.object(self.member, "stat", side_effect=PermissionError(errno.EACCES, "denied")):
+            with self.assertRaises(OSError) as raised:
+                self.fs.open("/live.log", os.O_RDONLY)
+        self.assertEqual(raised.exception.errno, errno.EACCES)
+        self.assertFalse((self.cache_dir / "live.log").exists())
+
+    def test_read_mode_denial_wins_without_refresh_capacity(self):
+        self.changed_v1()
+        (self.member_dir / "live.log").chmod(0o200)
+        with patch.object(self.fs.cache_manager, "ensure_space", return_value=False) as reserve:
+            self.assert_errno(errno.EACCES, self.fs.open, "/live.log", os.O_RDONLY)
+        reserve.assert_not_called()
+        self.assertFalse((self.cache_dir / "live.log").exists())
+
+    def test_aged_same_version_write_denial_survives_the_read_that_observed_it(self):
+        src = self.rewrite_member("f.txt", b"original", mtime=1_000_000_000)
+        src.chmod(0o644)
+        self.assertEqual(self.read_through("/f.txt"), b"original")
+        src.chmod(0o444)
+        self.age_checks()
+        with self.count_fetches() as copies:
+            self.assertEqual(self.read_through("/f.txt"), b"original")
+            for flags in (os.O_WRONLY, os.O_RDWR):
+                self.assert_errno(errno.EACCES, self.fs.open, "/f.txt", flags)
+        copies.assert_not_called()
+        self.fs.chmod("/f.txt", 0o644)
+        self.age_checks()
+        self.fs.release("/f.txt", self.fs.open("/f.txt", os.O_RDWR))
+
+    def test_ns_only_baseline_refetches_an_older_same_size_version_after_restart(self):
+        real_stat = self.member.stat
+
+        def ns_only(path):
+            st = real_stat(path)
+            return SimpleNamespace(st_size=st.st_size, st_mtime_ns=st.st_mtime_ns,
+                                   st_mode=st.st_mode)
+
+        self.rewrite_member("f.txt", b"original", mtime=1_700_000_000)
+        with patch.object(self.member, "stat", side_effect=ns_only):
+            self.assertEqual(self.read_through("/f.txt"), b"original")
+            self.restart()
+            self.rewrite_member("f.txt", b"newbytes", mtime=1_600_000_000)
+            with self.count_fetches() as copies:
+                fh = self.fs.open("/f.txt", os.O_RDWR)
+                try:
+                    self.assertEqual(self.fs.read("/f.txt", 32, 0, fh), b"newbytes")
+                finally:
+                    self.fs.release("/f.txt", fh)
+            self.assertEqual(copies.call_count, 1)
+
+    def test_colliding_float_mtimes_do_not_clear_the_known_stale_mark(self):
+        from storage.cache_metadata import STALE_LAST_GOOD_XATTR
+        src = self.rewrite_member("f.txt", b"original")
+        initial = 1_700_000_000_000_000_000
+        os.utime(src, ns=(initial, initial))
+        self.assertEqual(self.read_through("/f.txt"), b"original")
+        cached = self.cache_dir / "f.txt"
+        os.setxattr(cached, STALE_LAST_GOOD_XATTR, b"1")
+        self.restart()
+        src.write_bytes(b"newbytes")
+        os.utime(src, ns=(initial + 1, initial + 1))
+        self.assertEqual(src.stat().st_mtime, cached.stat().st_mtime)
+        self.assertNotEqual(src.stat().st_mtime_ns, cached.stat().st_mtime_ns)
+        with patch.object(self.fs.cache_manager, "ensure_space", return_value=False):
+            self.assert_errno(errno.ENOSPC, self.fs.open, "/f.txt", os.O_RDWR)
+        self.assertEqual(os.getxattr(cached, STALE_LAST_GOOD_XATTR), b"1")
+        self.assertEqual(self.read_through("/f.txt"), b"original")
+
+    def test_stable_descriptor_cannot_confirm_the_name_after_a_replacement(self):
+        from storage.backends import local
+        src = self.rewrite_member("f.txt", b"original", mtime=1_000_000_000)
+        replacement = self.rewrite_member("replacement", b"newbytes", mtime=1_100_000_000)
+        real_stream = local.copy_bounded_stream
+
+        def replace_after_open(read, write, bound):
+            os.replace(replacement, src)
+            real_stream(read, write, bound)
+            self.assertEqual(bound.source_stats[0].st_ino, os.fstat(read.__self__.fileno()).st_ino)
+            self.assertNotEqual(bound.source_stats[0].st_ino, src.stat().st_ino)
+
+        with patch.object(self.member, "stat", return_value=SimpleNamespace(st_size=8)), \
+                patch.object(local, "copy_bounded_stream", side_effect=replace_after_open):
+            self.assert_errno(errno.EAGAIN, self.fs.open, "/f.txt", os.O_RDONLY)
+        self.assertEqual(src.read_bytes(), b"newbytes")
+        self.assertFalse((self.cache_dir / "f.txt").exists())
+        self.assertIsNone(self.fs.state_manager.get_file_metadata("/f.txt"))
+
+    def test_path_identity_can_disprove_matching_size_and_mtime(self):
+        from storage.backends import local
+
+        src = self.rewrite_member("f.txt", b"original", mtime=1_000_000_000)
+        replacement = self.rewrite_member("replacement", b"newbytes", mtime=1_000_000_000)
+        real_stream = local.copy_bounded_stream
+
+        def replace_after_open(read, write, bound):
+            os.replace(replacement, src)
+            real_stream(read, write, bound)
+
+        with patch.object(local, "copy_bounded_stream", side_effect=replace_after_open):
+            self.assert_errno(errno.EAGAIN, self.fs.open, "/f.txt", os.O_RDONLY)
+        self.assertFalse((self.cache_dir / "f.txt").exists())
+        self.assertEqual(self.read_through("/f.txt"), b"newbytes")
+
     def test_the_copy_is_marked_before_the_refresh_stages(self):
         # A daemon restarting offline mid-refresh finds the copy marked: no
         # writer is admitted on bytes known to be old.
@@ -2502,7 +2637,8 @@ class TestRefreshRound5(RevalidateTestBase):
         from storage.cache_metadata import STALE_LAST_GOOD_XATTR
         self.rewrite_member("live.log", b"version 1")
         size_and_mode = SimpleNamespace(st_size=9, st_mode=stat.S_IFREG | 0o644)
-        with patch.object(self.member, "stat", return_value=size_and_mode):
+        with self.without_descriptor_evidence(), patch.object(
+                self.member, "stat", return_value=size_and_mode):
             self.assertEqual(self.read_through("/live.log"), b"version 1")
             os.setxattr(self.cache_dir / "live.log", STALE_LAST_GOOD_XATTR, b"1")
             self.age_checks()
@@ -2579,6 +2715,58 @@ class TestRefreshRound5(RevalidateTestBase):
             self.assertNotEqual(loc.checksum, "hash-of-v1", loc.backend_name)
         record = read_cache_metadata(self.cache_dir / "live.log")
         self.assertIsNone(record.checksum)
+
+    def seed_same_stat_replacement_with_a_member_digest(self):
+        from storage.checksums import ChecksumRecord
+
+        path = "/live.log"
+        self.rewrite_member("live.log", b"version 1", mtime=1_000_000_000)
+        self.assertEqual(self.read_through(path), b"version 1")
+        state = self.fs.state_manager
+        self.assertIsNone(state.get_file_metadata(path).checksum)
+        state.put_member_checksum(path, "member", ChecksumRecord(
+            checksum="old-member-hash", timestamp=time.time(),
+            basis=(9, 1_000_000_000, None)))
+        self.rewrite_member("live.log", b"version 2", mtime=1_000_000_000)
+        self.fs._recheck[path] = {"member"}
+        self.age_checks()
+
+    def test_equal_stat_replacement_cannot_leave_old_digest_before_row_update(self):
+        self.seed_same_stat_replacement_with_a_member_digest()
+        with patch.object(self.fs, "_record_fetched", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.fs.open("/live.log", os.O_RDONLY)
+        self.restart()
+        self.assertEqual((self.cache_dir / "live.log").read_bytes(), b"version 2")
+        self.assertIsNone(self.fs.state_manager.get_member_checksum("/live.log", "member"))
+
+    def test_equal_stat_replacement_cannot_leave_old_digest_after_row_update(self):
+        self.seed_same_stat_replacement_with_a_member_digest()
+        record = self.fs.state_manager.record_cached_stat
+
+        def crash_after_row(*args, **kwargs):
+            self.assertTrue(record(*args, **kwargs))
+            raise KeyboardInterrupt
+
+        with patch.object(self.fs.state_manager, "record_cached_stat", side_effect=crash_after_row):
+            with self.assertRaises(KeyboardInterrupt):
+                self.fs.open("/live.log", os.O_RDONLY)
+        self.restart()
+        self.assertEqual(self.fs.sweep_stale_cache_metadata(), 0)
+        self.assertEqual((self.cache_dir / "live.log").read_bytes(), b"version 2")
+        self.assertIsNone(self.fs.state_manager.get_member_checksum("/live.log", "member"))
+
+    def test_refresh_does_not_replace_bytes_when_old_digest_cannot_be_removed(self):
+        import sqlite3
+
+        self.seed_same_stat_replacement_with_a_member_digest()
+        with patch.object(self.fs.state_manager, "delete_member_checksums",
+                          side_effect=sqlite3.OperationalError("database is locked")):
+            self.assertEqual(self.read_through("/live.log"), b"version 1")
+            self.age_checks()
+            self.assert_errno(errno.EIO, self.fs.open, "/live.log", os.O_RDWR)
+        self.assertEqual((self.cache_dir / "live.log").read_bytes(), b"version 1")
+        self.assertTrue(self.stale_mark())
 
     def test_a_crash_after_the_replace_heals_clean(self):
         self.refreshed_with_checksums()

@@ -46,7 +46,8 @@ from .cache_metadata import (
     MEMBER_ATTRS_XATTR, MEMBER_STAT_XATTR as CACHE_MEMBER_STAT_XATTR,
     PREFIX_XATTR, STALE_LAST_GOOD_XATTR, XATTR_CACHE_METADATA_NAME,
     _member_mtime_ns, cache_identity, forget_cached_member_fields, imported_mode_denies,
-    imported_mode_denies_write, read_member_baselines, record_native_attributes, regular_file_stat, scan_cache_entries,
+    imported_mode_denies_write, read_member_baselines, record_native_attributes, regular_file_stat,
+    restrict_cached_member_write, scan_cache_entries,
 )
 from .file_config import FileConfig, get_inherited_config
 from .models import FileLocation, FileMetadata, StreamingKeepAfterClose, SyncStatus
@@ -118,6 +119,7 @@ class MemberCheck:
     cache_identity: Tuple[int, int, int]
     verified_at: float
     members: Dict[str, Tuple[int, float]] = field(default_factory=dict)
+    mtime_ns: Dict[str, int] = field(default_factory=dict)
 
 
 class StorageFS(Operations):
@@ -493,6 +495,7 @@ class StorageFS(Operations):
         )
         self.cache_manager.forget_listed_attrs = self._forget_cached_copy_attrs
         self.cache_manager.forget_checksums = lambda path: self._forget_checksums({path})
+        self.cache_manager.replace_checksum_guard = self._replace_checksum_guard
         self.cache_manager.path_guard = self._try_path_locked
 
         self._streaming_manager = StreamingReadManager(
@@ -736,7 +739,8 @@ class StorageFS(Operations):
         if not stale:
             self.cache_manager.mark_cache_size_dirty()
 
-    def _forget_checksums(self, paths: Set[str], subtree: bool = False):
+    def _forget_checksums(self, paths: Set[str], subtree: bool = False,
+                          *, require_persisted: bool = False):
         """Drop the checksum records and tasks for paths (and, with subtree,
         everything under them), persisted records included.
 
@@ -755,7 +759,18 @@ class StorageFS(Operations):
                 del self._checksum_records[k]
             for k in [k for k in self._checksum_tasks if matches(k[0])]:
                 self._checksum_tasks.pop(k).cancel()
-            self._drop_persisted_checksums(paths, subtree=subtree)
+            if require_persisted:
+                self.state_manager.delete_member_checksums(paths, subtree=subtree)
+            else:
+                self._drop_persisted_checksums(paths, subtree=subtree)
+
+    @contextlib.contextmanager
+    def _replace_checksum_guard(self, path: str):
+        # A verified replacement can have the old copy's stat. Hold off new
+        # checksum tasks and remove old digests before publishing its name.
+        with self._checksum_lock:
+            self._forget_checksums({path}, require_persisted=True)
+            yield
 
     def _drop_persisted_checksums(self, paths, *, subtree: bool = False, backend_name: Optional[str] = None):
         """Delete persisted hashes; the caller holds _checksum_lock.
@@ -1418,12 +1433,20 @@ class StorageFS(Operations):
             candidates = [b for b in self.backends.values() if b.supports_reconnect_probe()]
 
         candidates.sort(key=lambda b: b.speed_priority)
+        error = None
         for candidate in candidates:
             try:
-                if candidate.exists(canonical_path):
+                if candidate.exists_or_raise(canonical_path):
                     return candidate
-            except Exception:
+            except FileNotFoundError:
                 continue
+            except (BulkCapacityCancelled, BulkCapacityTimeout):
+                raise
+            except OSError as exc:
+                if error is None:
+                    error = exc
+        if error is not None:
+            raise error
         return None
 
     # ------------------------------------------------------------------ #
@@ -1506,6 +1529,7 @@ class StorageFS(Operations):
     def _store_member_check(self, canonical_path: str, cache_path: Path,
                             identity: Tuple[int, int, int],
                             updates: Dict[str, Tuple[int, float]], *, replace: bool = False,
+                            exact_mtimes: Optional[Dict[str, int]] = None,
                             drop: Tuple[str, ...] = (),
                             drop_unless_checked_since: Optional[MemberCheck] = None,
                             verified_at: Optional[float] = None):
@@ -1534,13 +1558,19 @@ class StorageFS(Operations):
         """
         with self._member_checks_lock:
             previous = self._member_checks.get(canonical_path)
+            mtimes = {}
             if replace:
                 members = {}
             elif previous is not None and previous.cache_identity == identity:
                 members = dict(previous.members)
+                mtimes.update(previous.mtime_ns)
             else:
-                members = self._load_persisted_members(cache_path, identity)
+                members = self._load_persisted_members(cache_path, identity, exact_mtimes=mtimes)
             members.update(updates)
+            for name in updates:
+                mtimes.pop(name, None)
+            if exact_mtimes:
+                mtimes.update(exact_mtimes)
             dropped = []
             token = drop_unless_checked_since
             for name in drop:
@@ -1556,22 +1586,37 @@ class StorageFS(Operations):
                     if recorded_since:
                         continue
                 del members[name]
+                mtimes.pop(name, None)
                 dropped.append(name)
             check = MemberCheck(
                 cache_identity=identity,
                 verified_at=time.monotonic() if verified_at is None else verified_at,
-                members=members)
+                members=members, mtime_ns=mtimes)
             self._member_checks[canonical_path] = check
             if (members or dropped) and (previous is None or previous.cache_identity != identity
-                                         or previous.members != members):
+                                         or previous.members != members or previous.mtime_ns != mtimes):
                 payload = {"cache": list(identity),
                            "members": {name: list(stat) for name, stat in members.items()}}
+                if mtimes:
+                    payload["mtime_ns"] = mtimes
                 try:
                     os.setxattr(str(cache_path), self.MEMBER_STAT_XATTR,
                                 json.dumps(payload, sort_keys=True).encode("utf-8"),
                                 follow_symlinks=False)
                 except OSError as exc:
                     self.logger.debug("could not persist member baseline: %r", exc)
+
+    @staticmethod
+    def _member_baseline(name, member_stat):
+        """The historical seconds pair and, when reported, its exact mtime."""
+        size = getattr(member_stat, "st_size", None)
+        mtime_ns = _member_mtime_ns(member_stat)
+        if size is None or mtime_ns is None:
+            return {}, {}
+        mtime = getattr(member_stat, "st_mtime", None)
+        exact = getattr(member_stat, "st_mtime_ns", None)
+        return ({name: (size, mtime if mtime is not None else mtime_ns / 1e9)},
+                {name: exact} if type(exact) is int else {})
 
     def _record_fetched(self, canonical_path: str, cache_path: Path, backend: Backend,
                         member_stat: Optional[os.stat_result]):
@@ -1601,11 +1646,9 @@ class StorageFS(Operations):
         except OSError:
             self._forget_member_check(canonical_path)
             return
-        members = {}
-        size, mtime = getattr(member_stat, "st_size", None), getattr(member_stat, "st_mtime", None)
-        if size is not None and mtime is not None:
-            members[backend.name] = (size, mtime)
-        self._store_member_check(canonical_path, cache_path, identity, members, replace=True)
+        members, mtimes = self._member_baseline(backend.name, member_stat)
+        self._store_member_check(canonical_path, cache_path, identity, members,
+                                 exact_mtimes=mtimes, replace=True)
         self._clear_recheck(canonical_path, backend.name)
         with self._member_checks_lock:
             self._revalidate_unreachable.pop(canonical_path, None)
@@ -1652,8 +1695,10 @@ class StorageFS(Operations):
                                          drop=(backend.name,), drop_unless_checked_since=check)
             return
         self._record_uploaded_checksum(virtual_path, backend.name, checksum, member_stat)
-        self._store_member_check(virtual_path, cache_path, identity,
-                                 {backend.name: (member_stat.st_size, member_stat.st_mtime)})
+        members, mtimes = self._member_baseline(backend.name, member_stat)
+        self._store_member_check(virtual_path, cache_path, identity, members, exact_mtimes=mtimes,
+                                 drop=() if members else (backend.name,),
+                                 drop_unless_checked_since=check)
 
     def _record_uploaded_checksum(self, virtual_path: str, backend_name: str,
                                   checksum: Optional[str], member_stat):
@@ -1743,7 +1788,8 @@ class StorageFS(Operations):
         return False
 
     def _listing_confirms_baseline(self, resolved: ResolvedPath, backend: Backend,
-                                   members: Dict[str, Tuple[int, float]]) -> Optional[float]:
+                                   members: Dict[str, Tuple[int, float]],
+                                   exact_mtime: Optional[int]) -> Optional[float]:
         """The start time of a recent listing of the parent that shows backend's copy at its baseline.
 
         Saves a stat per file when a tree is walked: the listing (a member
@@ -1776,6 +1822,12 @@ class StorageFS(Operations):
             return None
         listed_at, attrs = listed
         if (attrs.get("st_size"), attrs.get("st_mtime")) != baseline:
+            return None
+        if exact_mtime is not None and attrs.get("st_mtime_ns") != exact_mtime:
+            return None
+        mode = attrs.get("st_mode")
+        owner_access = stat.S_IRUSR | stat.S_IWUSR
+        if type(mode) is int and mode & owner_access != owner_access:
             return None
         return listed_at
 
@@ -1813,9 +1865,8 @@ class StorageFS(Operations):
         by then, another supplies the bytes and the checked member is marked
         for a forced refetch at its next check (_recheck), so the change is
         never adopted as a baseline unseen. An unavailable member,
-        a failed stat or a member that no longer has the file keeps the
-        cached copy and its baselines: the open never fails here. Failures
-        are logged once per member until it answers again.
+        an inconclusive stat or a member that no longer has the file keeps
+        the cached copy. A read denial is applied before attempting a fill.
         """
         canonical_path = resolved.canonical_path
         cache_path = resolved.cache_path
@@ -1835,9 +1886,10 @@ class StorageFS(Operations):
             return
         identity = self._cache_identity(cache_stat)
         if check is not None and check.cache_identity == identity:
-            members = dict(check.members)
+            members, exact_mtimes = check.members, check.mtime_ns
         else:
-            members = self._load_persisted_members(cache_path, identity)
+            exact_mtimes = {}
+            members = self._load_persisted_members(cache_path, identity, exact_mtimes=exact_mtimes)
 
         backend, unavailable = self._member_for_revalidation(canonical_path)
         if backend is None:
@@ -1852,7 +1904,10 @@ class StorageFS(Operations):
                         time.monotonic(), tuple(unavailable))
             return
 
-        listed_at = self._listing_confirms_baseline(resolved, backend, members)
+        exact_mtime = exact_mtimes.get(backend.name)
+        marked_stale = self._is_stale_last_good(cache_path)
+        listed_at = (None if marked_stale else
+                     self._listing_confirms_baseline(resolved, backend, members, exact_mtime))
         if listed_at is not None:
             # Dated from the member read behind the listing, not from now:
             # a stat at that moment would have expired at listed_at + age,
@@ -1860,8 +1915,7 @@ class StorageFS(Operations):
             # deliberately (not rebuilt as a fresh observation): a
             # concurrent post-sync drop of it then goes through, which at
             # worst costs one refetch.
-            self._store_member_check(canonical_path, cache_path, identity,
-                                     {backend.name: members[backend.name]},
+            self._store_member_check(canonical_path, cache_path, identity, {},
                                      verified_at=listed_at)
             return
 
@@ -1877,6 +1931,9 @@ class StorageFS(Operations):
             self._clear_stale_last_good(cache_path)
             self._store_member_check(canonical_path, cache_path, identity, {})
             return
+        except PermissionError:
+            self._invalidate_file_cache(resolved.requested_path)
+            raise
         except Exception as exc:
             # Counts as a check, so a member that fails without being marked
             # unavailable is not stat'd at every open.
@@ -1888,21 +1945,23 @@ class StorageFS(Operations):
             self.logger.info("Revalidating cached files against %s again", backend.label)
 
         size = getattr(member_stat, "st_size", None)
-        mtime_ns = _member_mtime_ns(member_stat)
-        mtime = None if mtime_ns is None else (
-            member_stat.st_mtime if getattr(member_stat, "st_mtime", None) is not None
-            else mtime_ns / 1e9)
-        observed = (size, mtime)
+        updates, observed_mtimes = self._member_baseline(backend.name, member_stat)
+        observed = updates.get(backend.name)
+        observed_exact = observed_mtimes.get(backend.name)
         with self._member_checks_lock:
             # The last refetch for a change here came from another member.
             must_refetch = backend.name in self._recheck.get(canonical_path, ())
         mode = getattr(member_stat, "st_mode", None)
-        if os.geteuid() != 0 and type(mode) is int and not mode & stat.S_IRUSR:
-            # The member now withholds read, whatever the version: refetched,
-            # so the fill sees the denial (EACCES) and the copy goes.
-            must_refetch = True
+        if os.geteuid() != 0 and type(mode) is int:
+            if not mode & stat.S_IRUSR:
+                # The denial is already known. No capacity check or failed
+                # refresh may make the old copy readable again.
+                self._invalidate_file_cache(resolved.requested_path)
+                raise FuseOSError(errno.EACCES)
+            if not mode & stat.S_IWUSR:
+                restrict_cached_member_write(cache_path, cache_stat)
         baseline = members.get(backend.name)
-        if mtime is None and not must_refetch:
+        if observed is None and not must_refetch:
             # No mtime: only a known size that differs from the cached copy's
             # is evidence of a change (refetched below); otherwise a member
             # that supplies no version token cannot tell one, so the copy is
@@ -1916,26 +1975,32 @@ class StorageFS(Operations):
                 self._store_member_check(canonical_path, cache_path, identity, {})
                 return
             must_refetch = True
-        if must_refetch:
-            changed = True
-        elif baseline is not None:
-            changed = observed != baseline
+        if baseline is not None:
+            # Prefer precise observations when both are available. A legacy
+            # baseline retains the resolution of its recorded float.
+            exact_pair = exact_mtime is not None and observed_exact is not None
+            if exact_pair:
+                matches = (size, observed_exact) == (baseline[0], exact_mtime)
+            else:
+                matches = observed == baseline
+            changed = must_refetch or not matches
+            if marked_stale and exact_mtime is not None and not exact_pair:
+                matches = False  # a float observation cannot confirm an exact baseline
         else:
-            changed = (size != cache_stat.st_size or mtime > cache_stat.st_mtime)
+            matches = (size == cache_stat.st_size
+                       and _member_mtime_ns(member_stat) == cache_stat.st_mtime_ns)
+            changed = (must_refetch or size != cache_stat.st_size
+                       or observed[1] > cache_stat.st_mtime)
         if not changed:
-            # Not newer. Only matching version evidence (the recorded
-            # baseline, or else the copy's own size and mtime) shows the
-            # member back at the copy's version, where a stale mark (a
-            # refresh that failed before) no longer applies; an older mtime
-            # keeps it.
-            matches = (observed == baseline if baseline is not None
-                       else size == cache_stat.st_size and mtime_ns == cache_stat.st_mtime_ns)
             if matches:
                 self._clear_stale_last_good(cache_path)
-            # Do not turn an older observation into matching evidence on
-            # the next check while the copy is known stale.
-            updates = {backend.name: observed} if matches or not self._is_stale_last_good(cache_path) else {}
-            self._store_member_check(canonical_path, cache_path, identity, updates)
+            # Do not let a partial check replace stronger evidence or an
+            # older observation become the baseline on a marked copy.
+            if ((marked_stale and not matches)
+                    or (exact_mtime is not None and observed_exact is None)):
+                updates, observed_mtimes = {}, {}
+            self._store_member_check(canonical_path, cache_path, identity, updates,
+                                     exact_mtimes=observed_mtimes)
             return
 
         self.logger.info("revalidate: %s changed on %s; refetching", canonical_path, backend.label)
@@ -2211,7 +2276,13 @@ class StorageFS(Operations):
             if member_stat is None:
                 try:
                     member_stat = backend.stat(canonical_path)
-                except Exception:
+                except (BulkCapacityCancelled, BulkCapacityTimeout):
+                    raise
+                except OSError as exc:
+                    if exc.errno not in (errno.EIO, errno.ENOSYS, errno.ENOTSUP):
+                        raise
+                    member_stat = None
+                except NotImplementedError:
                     member_stat = None
             # Download to cache
             confirmed: list = []
@@ -2310,13 +2381,6 @@ class StorageFS(Operations):
                         self.cache_manager.sync_cache_metadata(
                             canonical_path, metadata, cache_path=cache_path,
                         )
-                    if replace_identity is not None:
-                        # The checksum records and every location's checksum
-                        # described the old version, as for the invalidation
-                        # a refresh replaces.
-                        self.state_manager.clear_location_checksums(canonical_path)
-                        self._forget_checksums({canonical_path})
-
                 # Record locations
                 try:
                     self.state_manager.add_file_location(
@@ -2344,6 +2408,9 @@ class StorageFS(Operations):
                     pass
 
                 return True
+
+            if self.cache_manager.fill_errno_noted() and not self.cache_manager.fill_absent():
+                return False
 
         # File not in cache or backends - try recomputation
         if self.recompute_engine.can_recompute(resolved.requested_path, cache_path):
@@ -2807,7 +2874,7 @@ class StorageFS(Operations):
                 code = self.cache_manager.take_fill_errno() or errno.EIO
                 kept = refresh is not None and self.cache_manager.is_cached(
                     resolved.requested_path)
-                if kept and code == errno.EACCES:
+                if kept and code in (errno.EACCES, errno.EPERM):
                     # The member now withholds read: the copy goes (a CLEAN
                     # one, the member holds its bytes), so later opens ask
                     # the member again rather than read it.
@@ -2825,7 +2892,7 @@ class StorageFS(Operations):
                                              refresh, {})
                 if kept and code == errno.ENOENT and absent:
                     cache_path = resolved.cache_path
-                elif code == errno.EACCES:
+                elif code in (errno.EACCES, errno.EPERM):
                     # A read denial seen by the refresh: no copy is served,
                     # the last good one included.
                     raise FuseOSError(code)

@@ -91,9 +91,13 @@ def _denies_read(st) -> bool:
 
 
 def _token_contradicts(fd_st, path_st) -> bool:
-    """Whether two stats that both carry a version token (size and mtime) disagree on it."""
+    """Whether two versioned stats disagree on size, time or known identity."""
     if not (has_version_token(fd_st) and has_version_token(path_st)):
         return False
+    for field in ("st_dev", "st_ino"):
+        fd_value, path_value = getattr(fd_st, field, None), getattr(path_st, field, None)
+        if fd_value is not None and path_value is not None and fd_value != path_value:
+            return True
     return (fd_st.st_size != path_st.st_size
             or _member_mtime_ns(fd_st) != _member_mtime_ns(path_st))
 
@@ -167,6 +171,9 @@ class CacheManager:
         # Set by StorageFS: drops a path's checksum records and tasks (a
         # refreshed copy's lost row update is healed). None: nothing to drop.
         self.forget_checksums: Optional[Callable[[str], None]] = None
+        # Keeps old checksum tasks and records from crossing an in-place
+        # replacement. The standalone cache has no such tasks.
+        self.replace_checksum_guard: Optional[Callable[[str], ContextManager]] = None
         # Set by StorageFS: a context manager that try-acquires the outer
         # locks of a canonical path (storage/locks.py) and yields whether it
         # got them. Eviction runs under self._lock, inside those locks'
@@ -616,7 +623,11 @@ class CacheManager:
         if member_stat is _STAT_NOT_PROBED:
             try:
                 member_stat = backend.stat(source_virtual_path)
-            except (OSError, NotImplementedError):
+            except OSError as exc:
+                if exc.errno not in (errno.EIO, errno.ENOSYS, errno.ENOTSUP):
+                    raise
+                member_stat = None
+            except NotImplementedError:
                 member_stat = None
         file_size = getattr(member_stat, "st_size", None)
         if file_size is None:
@@ -758,29 +769,34 @@ class CacheManager:
                 # At most two confirming stats per transfer, across the
                 # retry inside confirm_member_stat and the second call.
                 budget = StatBudget(2)
-                newest, version = confirm_member_stat(
-                    backend, source_virtual_path, member_stat, st.st_size, budget)
-                token_seen = token_seen or has_version_token(newest)
-                read_denied = read_denied or _denies_read(newest)
-                if version == MemberVersion.UNCONFIRMED and budget.remaining:
+                fd_stats = bound.source_stats if bound is not None else ()
+                read_denied = read_denied or any(_denies_read(fd_st) for fd_st in fd_stats)
+                try:
                     newest, version = confirm_member_stat(
-                        backend, source_virtual_path, member_stat, st.st_size, budget)
+                        backend, source_virtual_path, member_stat, st.st_size, budget,
+                        full_fill=True)
                     token_seen = token_seen or has_version_token(newest)
                     read_denied = read_denied or _denies_read(newest)
-                # The copied descriptor's own stats (local fstat at open and
-                # at the end, the SFTP handle's stat) are evidence like the
-                # others: their modes join the denial check, and their tokens
-                # the sticky set, unless they bracket the copy consistently
-                # (two that agree), which is a read of one version.
-                fd_stats = list(bound.source_stats) if bound is not None else []
-                read_denied = read_denied or any(_denies_read(fd_st) for fd_st in fd_stats)
+                    if version == MemberVersion.UNCONFIRMED and budget.remaining:
+                        newest, version = confirm_member_stat(
+                            backend, source_virtual_path, member_stat, st.st_size, budget,
+                            full_fill=True)
+                        token_seen = token_seen or has_version_token(newest)
+                        read_denied = read_denied or _denies_read(newest)
+                except OSError as exc:
+                    if read_denied:
+                        self.note_fill_errno(errno.EACCES)
+                    # A stat of the member's name confirmed absence. An
+                    # ENOENT from the transfer or staging file is still EIO.
+                    elif isinstance(exc, FileNotFoundError):
+                        self.note_fill_errno(errno.ENOENT)
+                        self.note_fill_absent()
+                    raise
+                # Descriptor tokens are evidence about the bytes, but even
+                # two stable fstats cannot confirm the pathname's version.
+                token_seen = token_seen or any(has_version_token(fd_st) for fd_st in fd_stats)
                 fd_changed = any(_token_contradicts(a, b)
                                  for a, b in zip(fd_stats, fd_stats[1:]))
-                bracketed = (len(fd_stats) >= 2
-                             and all(has_version_token(fd_st) for fd_st in fd_stats)
-                             and not fd_changed)
-                if not bracketed:
-                    token_seen = token_seen or any(has_version_token(fd_st) for fd_st in fd_stats)
                 # A stat that showed another version with a token: the only
                 # one a retry may be confirmed against.
                 newer = newest if version == MemberVersion.CHANGED else None
@@ -865,7 +881,11 @@ class CacheManager:
                     # An interruption can require rechecking the old copy,
                     # but cannot pair its checksums with a same-stat new one.
                     self.state_manager.clear_location_checksums(source_virtual_path)
-                    os.replace(temp_path, cache_path)
+                    guard = self.replace_checksum_guard
+                    with guard(source_virtual_path) if guard else nullcontext():
+                        if guard is None:
+                            self.state_manager.delete_member_checksums([source_virtual_path])
+                        os.replace(temp_path, cache_path)
                     self._fill_errno.installed = cache_identity(staged)
                     self._current_size_bytes += staged.st_size - current.st_size
                     if version == MemberVersion.AGREED and newest is not None and confirmed is not None:

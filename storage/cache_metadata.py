@@ -136,7 +136,7 @@ class StatBudget:
 
 
 def confirm_member_stat(backend, virtual_path: str, probe, transferred_size: int,
-                        budget: Optional[StatBudget] = None):
+                        budget: Optional[StatBudget] = None, *, full_fill: bool = False):
     """(stat to record, MemberVersion) for a transfer probed before it began.
 
     The member is stat'ed again after the transfer (retried once if the
@@ -159,12 +159,15 @@ def confirm_member_stat(backend, virtual_path: str, probe, transferred_size: int
     BulkCapacityTimeout propagate: an interrupted request is not a fill.
     A shared budget bounds the stats across calls for one transfer (the
     retry here and a caller's second confirmation together); by default
-    each call may make two.
+    each call may make two. A full fill preserves definitive member errors.
+    Two transient I/O failures leave the version unconfirmed, even without
+    a pathname token. Explicitly unsupported stat is missing evidence.
     """
     from .backends.ssh_pool import BulkCapacityCancelled, BulkCapacityTimeout
 
     budget = StatBudget() if budget is None else budget
     after = None
+    failed = False
     while budget.remaining > 0:
         budget.remaining -= 1
         try:
@@ -174,8 +177,16 @@ def confirm_member_stat(backend, virtual_path: str, probe, transferred_size: int
             raise
         except NotImplementedError:
             break  # no stat at all: nothing to retry
-        except Exception:  # noqa: BLE001 - retried once, then no confirmation
-            after = None
+        except OSError as exc:
+            if full_fill and exc.errno in (errno.ENOSYS, errno.ENOTSUP):
+                break
+            if full_fill and exc.errno != errno.EIO:
+                raise
+            failed = True
+        except Exception:  # noqa: BLE001 - streaming confirmation is best effort
+            if full_fill:
+                raise
+            failed = True
 
     def known(st, key):
         return getattr(st, key, None) if st is not None else None
@@ -190,7 +201,7 @@ def confirm_member_stat(backend, virtual_path: str, probe, transferred_size: int
         return after, MemberVersion.CHANGED
     if _has_token(probe) and _has_token(after):
         verdict = MemberVersion.AGREED
-    elif _has_token(probe) or _has_token(after):
+    elif _has_token(probe) or _has_token(after) or (full_fill and failed and after is None):
         verdict = MemberVersion.UNCONFIRMED
     else:
         verdict = MemberVersion.NEVER_VERSIONED
@@ -201,6 +212,8 @@ def confirm_member_stat(backend, virtual_path: str, probe, transferred_size: int
                 "st_mtime", "st_mtime_ns"):
         value = known(after, key)
         fields[key] = known(probe, key) if value is None else value
+    # Identify the confirmed pathname independently of the original probe.
+    fields["st_dev"], fields["st_ino"] = known(after, "st_dev"), known(after, "st_ino")
     # The atime the member reported before the transfer read it, seconds
     # and nanoseconds from the same stat.
     atime_from = probe if (known(probe, "st_atime") is not None
@@ -400,6 +413,24 @@ def cached_member_attributes(path: Path, local: os.stat_result) -> Optional[dict
     return attrs
 
 
+def restrict_cached_member_write(path: Path, local: os.stat_result) -> None:
+    """Apply an aged member's owner-write denial to this imported inode.
+
+    An explicit chmod retires the imported mode; leave that override on
+    the inode in force. The physical mode remains usable by the daemon.
+    """
+    record = _read_source_attrs(path, local)
+    if record is None:
+        record = {"inode": _inode(local), "basis": _source_attrs_basis(local),
+                  "attrs": {"st_mode": reported_mode(local.st_mode)}}
+    mode = record["attrs"].get("st_mode")
+    if (type(mode) is int and mode & stat.S_IWUSR
+            and record["basis"].get("st_mode") == local.st_mode):
+        record["attrs"]["st_mode"] = mode & ~stat.S_IWUSR
+        os.setxattr(path, MEMBER_ATTRS_XATTR, json.dumps(record).encode(),
+                    follow_symlinks=False)
+
+
 def forget_cached_member_fields(path: Path, local: os.stat_result, *fields: str) -> None:
     """Retire synthetic fields explicitly replaced by chmod, chown or utime."""
     if not stat.S_ISREG(local.st_mode):
@@ -412,7 +443,8 @@ def forget_cached_member_fields(path: Path, local: os.stat_result, *fields: str)
         attrs = {} if "st_mode" in fields else {"st_mode": stale_mode}
         record = {"inode": _inode(local), "basis": _source_attrs_basis(local), "attrs": attrs}
     elif record is None:
-        if "st_mtime" not in fields or not read_member_baselines(path, cache_identity(local)):
+        if "st_mode" not in fields and (
+                "st_mtime" not in fields or not read_member_baselines(path, cache_identity(local))):
             return
         # An explicit timestamp also takes precedence over a legacy
         # mtime, even when utime happened to keep the native mtime.
@@ -444,13 +476,22 @@ def cache_identity(st: os.stat_result) -> tuple:
     return (st.st_ino, st.st_size, st.st_mtime_ns)
 
 
-def read_member_baselines(path: Path, identity: tuple) -> dict:
-    """Read revalidation evidence for the same inode, size and native mtime."""
+def read_member_baselines(path: Path, identity: tuple, *, exact_mtimes=None) -> dict:
+    """Read revalidation evidence for the same inode, size and native mtime.
+
+    The optional nanosecond field records only explicitly reported source
+    nanoseconds. Older readers and xattrs use the original seconds pairs.
+    """
     try:
         payload = json.loads(os.getxattr(path, MEMBER_STAT_XATTR, follow_symlinks=False))
         if tuple(payload.get("cache")) == identity:
-            return {str(name): (int(size), float(mtime))
-                    for name, (size, mtime) in payload.get("members", {}).items()}
+            members = {str(name): (int(size), float(mtime))
+                       for name, (size, mtime) in payload.get("members", {}).items()}
+            exact = payload.get("mtime_ns", {})
+            if exact_mtimes is not None and isinstance(exact, dict):
+                exact_mtimes.update({name: ns for name, ns in exact.items()
+                                     if name in members and type(ns) is int})
+            return members
     except (OSError, ValueError, TypeError, AttributeError, OverflowError):
         pass
     return {}

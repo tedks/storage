@@ -284,6 +284,7 @@ class LocalBackend(Backend):
                         'st_mode': st.st_mode,
                         'st_size': st.st_size,
                         'st_mtime': st.st_mtime,
+                        'st_mtime_ns': st.st_mtime_ns,
                         'st_atime': st.st_atime,
                         'st_ctime': st.st_ctime,
                         'st_gid': st.st_gid,
