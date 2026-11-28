@@ -2919,6 +2919,37 @@ class TestFSStreamingIntegration(unittest.TestCase):
         for name in ("second", "first"):
             self.fs.release('/serial.bin', results[name])
 
+    def test_replacement_open_fits_a_tight_cache(self):
+        # Lead review L-I1: replacing a failed session charged its unlinked
+        # partial as a reservation but left the last scan counting it too,
+        # so on a cache with room for two such partials (not three) the
+        # replacement's admission failed with ENOSPC, every time, while
+        # the old reader stayed open.
+        manager = self.fs._streaming_manager
+        size = 4 * 1024 * 1024
+        payload = os.urandom(size)
+        (self.backend_dir / "tight.bin").write_bytes(payload)
+        self.fs.cache_manager.max_size_bytes = 10 * 1024 * 1024
+        vfd_a = self.fs.open('/tight.bin', os.O_RDONLY)
+        session_a = self._session_for(vfd_a)
+        self.assertEqual(self.fs.read('/tight.bin', 4096, 0, vfd_a), payload[:4096])
+        with session_a.lock:
+            session_a.error = OSError(errno.EIO, "simulated failure")
+            manager._schedule_background(session_a)
+        self.assertTrue(session_a.background_finished.wait(timeout=3.0))
+        # A scan now counts A's partial, as any admission meanwhile would.
+        self.assertEqual(self.fs.cache_manager.get_free_space_needed(0), 0)
+
+        vfd_b = self.fs.open('/tight.bin', os.O_RDONLY)
+        session_b = self._session_for(vfd_b)
+        self.assertIsNot(session_b, session_a)
+        self.assertEqual(self.fs.read('/tight.bin', 4096, 0, vfd_b), payload[:4096])
+        stats = self.fs._streaming_stats_snapshot()
+        self.assertNotIn("streaming_retained_space_cancellations", stats)
+        self.assertEqual(stats.get("streaming_open_error_cache_space", 0), 0)
+        self.fs.release('/tight.bin', vfd_a)
+        self.fs.release('/tight.bin', vfd_b)
+
     def test_replaced_session_is_charged_before_its_partial_is_unlinked(self):
         # R3-I2: a cache scan between the unlink and the charge would see
         # the space as free while the old reader still pins it.

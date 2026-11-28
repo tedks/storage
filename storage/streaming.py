@@ -1278,6 +1278,12 @@ class StreamingReadManager:
         registry here is one destroy() claims after its worker stopped
         short of finalizing; destroy refuses every open from its start, so
         no successor owns the path and the unlink is still ours.
+
+        The cache size is marked dirty here, after the unlink, so no caller
+        can leave the last scan counting a partial that is gone: for a
+        replaced session (_attach) that partial is also charged as a
+        reservation, and the stale total would count it twice and refuse
+        the replacement's own admission. Marking twice is harmless.
         """
         if self.prefetch_sessions.get(session.canonical_path) is session:
             self.prefetch_sessions.pop(session.canonical_path, None)
@@ -1289,6 +1295,7 @@ class StreamingReadManager:
             self.logger.warning(
                 "streaming could not remove partial %s: %r", session.partial_cache_path, exc,
             )
+        self.cache_manager.mark_cache_size_dirty()
 
     def _cleanup_prefetch_session(self, session: PrefetchSession, status: str):
         # Single-shot: release and the worker's tail can both reach cleanup
