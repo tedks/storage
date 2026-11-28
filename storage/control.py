@@ -5,10 +5,10 @@ import json
 import logging
 import math
 import os
+import secrets
 import socket
 import stat
 import struct
-import tempfile
 import threading
 import time
 from collections.abc import Callable
@@ -55,11 +55,14 @@ def _read_line(sock: socket.socket, max_bytes: int, deadline: float) -> bytes | 
             raise ControlError("Control socket frame is too large")
 
 
-def _owner_socket(path: Path) -> os.stat_result:
-    entry = path.lstat()
+def _require_owner_socket(entry: os.stat_result, path: Path) -> os.stat_result:
     if not stat.S_ISSOCK(entry.st_mode) or entry.st_uid != os.geteuid():
         raise ControlError(f"Expected a mount control socket owned by this user at {path}")
     return entry
+
+
+def _owner_socket(path: Path) -> os.stat_result:
+    return _require_owner_socket(path.lstat(), path)
 
 
 def _check_peer(sock: socket.socket):
@@ -108,22 +111,64 @@ def request_control_payload(cache_root: Path, request: bytes, timeout: float) ->
 
 @contextmanager
 def _locked_cache(cache_root: Path):
-    # Exclude concurrent socket publication and cleanup by cache, including
-    # two mountpoints configured with the same cache. The lock does not wait:
-    # whoever holds it wins, and the other side fails with BlockingIOError
-    # (start logs a warning and runs without a socket; stop leaves the entry,
-    # which a later start takes over once its listener is gone). The cache
-    # directory itself is the lock, so no new lockfile is needed.
-    fd = os.open(cache_root, os.O_RDONLY | os.O_DIRECTORY)
+    """Yield a locked fd for the cache directory.
+
+    Exclude concurrent socket publication and cleanup by cache, including
+    two mountpoints configured with the same cache. The lock does not wait:
+    whoever holds it wins, and the other side fails with BlockingIOError
+    (start logs a warning and runs without a socket; stop leaves the entry,
+    which a later start takes over once its listener is gone). The cache
+    directory itself is the lock, so no new lockfile is needed. Callers work
+    relative to the fd, so renaming the cache path afterwards cannot move
+    them to another directory.
+    """
+    fd = os.open(cache_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        yield
+        yield fd
     finally:
         os.close(fd)
 
 
+def _require_private_cache(root_fd: int):
+    """Refuse a cache directory where another user can rename our entries.
+
+    The rule: the directory is owned by the mount's effective uid, and is
+    either writable by its owner only or sticky. In a sticky directory we
+    own, nobody else can rename or remove the stage directory or the socket
+    (they can still create a name first, which makes publication fail, not
+    redirect). Ancestors are not checked: everything below runs relative to
+    this directory's fd, so renaming an ancestor moves the whole cache, and
+    the CLI then finds no socket rather than another user's.
+    """
+    entry = os.fstat(root_fd)
+    if entry.st_uid != os.geteuid():
+        raise ControlError("cache directory is not owned by the mount's user")
+    mode = stat.S_IMODE(entry.st_mode)
+    if mode & (stat.S_IWGRP | stat.S_IWOTH) and not mode & stat.S_ISVTX:
+        raise ControlError("cache directory is writable by other users and not sticky")
+
+
 def _identity(entry: os.stat_result) -> tuple[int, int]:
     return entry.st_dev, entry.st_ino
+
+
+def _entry_at(dir_fd: int, name: str) -> os.stat_result:
+    return os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+
+
+def _remove_stage(root_fd: int, name: str, stage_fd: int, stage: tuple[int, int]):
+    # Best effort: the socket name inside our stage, then the stage itself
+    # only while its name in the cache is still our directory.
+    try:
+        os.unlink("socket", dir_fd=stage_fd)
+    except OSError:
+        pass
+    try:
+        if _identity(_entry_at(root_fd, name)) == stage:
+            os.rmdir(name, dir_fd=root_fd)
+    except OSError:
+        pass
 
 
 class ControlServer:
@@ -137,9 +182,9 @@ class ControlServer:
         self._listener = None
         self._owned_entry = None
 
-    def _stale_entry(self) -> tuple[int, int] | None:
+    def _stale_entry(self, root_fd: int) -> tuple[int, int] | None:
         try:
-            entry = _owner_socket(self.path)
+            entry = _require_owner_socket(_entry_at(root_fd, CONTROL_SOCKET_NAME), self.path)
         except FileNotFoundError:
             return None
         # Also protect a live listener started by a version that didn't take
@@ -147,7 +192,7 @@ class ControlServer:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
             probe.settimeout(0.25)
             try:
-                probe.connect(str(self.path))
+                probe.connect(f"/proc/self/fd/{root_fd}/{CONTROL_SOCKET_NAME}")
             except ConnectionRefusedError:
                 return _identity(entry)
         raise ControlError("a mount control socket is already listening")
@@ -155,29 +200,63 @@ class ControlServer:
     def _publish(self, listener: socket.socket) -> tuple[int, int]:
         if len(os.fsencode(self.path)) > 107:
             raise ControlError("control socket path exceeds the 107-byte Unix socket limit")
-        with _locked_cache(self.path.parent):
-            stale = self._stale_entry()
-            # The stage is private even under umask 0. Bind through its fd
-            # so the longer stage path doesn't reduce the Unix address limit.
-            with tempfile.TemporaryDirectory(prefix=".storage.mount.", dir=self.path.parent) as stage:
-                staged = Path(stage) / "socket"
-                fd = os.open(stage, os.O_RDONLY | os.O_DIRECTORY)
+        with _locked_cache(self.path.parent) as root:
+            _require_private_cache(root)
+            stale = self._stale_entry(root)
+            # Every step below goes through the cache and stage fds, never a
+            # path through the cache, so a renamed or swapped stage cannot
+            # redirect chmod, stat, link or rename. The stage is private even
+            # under umask 0, and binding through its fd keeps the longer
+            # stage path out of the Unix address limit.
+            name = f".storage.mount.{secrets.token_hex(8)}"
+            os.mkdir(name, 0o700, dir_fd=root)
+            try:
+                stage_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root)
+            except OSError:
                 try:
-                    listener.bind(f"/proc/self/fd/{fd}/socket")
-                finally:
-                    os.close(fd)
-                staged.chmod(0o600)
+                    os.rmdir(name, dir_fd=root)
+                except OSError:
+                    pass
+                raise
+            stage = None
+            try:
+                os.fchmod(stage_fd, 0o700)
+                entry = os.fstat(stage_fd)
+                stage = _identity(entry)
+                if (not stat.S_ISDIR(entry.st_mode) or entry.st_uid != os.geteuid()
+                        or stat.S_IMODE(entry.st_mode) != 0o700):
+                    raise ControlError("control socket stage directory is not private")
+                staged = f"/proc/self/fd/{stage_fd}/socket"
+                listener.bind(staged)
+                # Follows a final symlink, but only we can write the stage.
+                os.chmod(staged, 0o600)
+                owned = _identity(_require_owner_socket(_entry_at(stage_fd, "socket"), self.path))
                 listener.listen(8)
                 listener.settimeout(0.25)
-                owned = _identity(staged.lstat())
+                # Our socket is still safe in the pinned stage, but a stage
+                # name that no longer names it means someone is tampering
+                # with the cache: refuse rather than publish beside them.
+                if _identity(_entry_at(root, name)) != stage:
+                    raise ControlError("control socket stage directory changed during startup")
                 if stale is None:
                     # Keep arbitrary existing entries intact on a racing bind.
-                    os.link(staged, self.path)
+                    os.link("socket", CONTROL_SOCKET_NAME, src_dir_fd=stage_fd,
+                            dst_dir_fd=root, follow_symlinks=False)
                 else:
-                    if _identity(_owner_socket(self.path)) != stale:
+                    current = _require_owner_socket(_entry_at(root, CONTROL_SOCKET_NAME), self.path)
+                    if _identity(current) != stale:
                         raise ControlError("control socket changed during startup")
-                    os.replace(staged, self.path)
+                    os.rename("socket", CONTROL_SOCKET_NAME, src_dir_fd=stage_fd, dst_dir_fd=root)
                 return owned
+            finally:
+                if stage is None:
+                    try:
+                        os.rmdir(name, dir_fd=root)
+                    except OSError:
+                        pass
+                else:
+                    _remove_stage(root, name, stage_fd, stage)
+                os.close(stage_fd)
 
     def start(self):
         with self._lock:
@@ -208,9 +287,10 @@ class ControlServer:
                 return
             self._stop.set()
             try:
-                with _locked_cache(self.path.parent):
-                    if _identity(_owner_socket(self.path)) == self._owned_entry:
-                        self.path.unlink()
+                with _locked_cache(self.path.parent) as root:
+                    entry = _require_owner_socket(_entry_at(root, CONTROL_SOCKET_NAME), self.path)
+                    if _identity(entry) == self._owned_entry:
+                        os.unlink(CONTROL_SOCKET_NAME, dir_fd=root)
             except (OSError, ControlError):
                 # A replacement belongs to its publisher. A stale socket
                 # left by an interrupted cleanup can be taken over at start.

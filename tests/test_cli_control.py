@@ -2,6 +2,7 @@
 
 import json
 import logging
+import os
 import socket
 import stat
 import tempfile
@@ -265,3 +266,89 @@ def test_restart_while_a_stopped_thread_is_still_in_a_request(cache, monkeypatch
         release.set()
         server.stop()
     assert not (cache / CONTROL_SOCKET_NAME).exists()
+
+
+class _StageSwappingSocket(socket.socket):
+    """Renames the stage away at bind and leaves a symlink to `outside` in its place."""
+
+    def __init__(self, cache, outside):
+        super().__init__(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.cache = cache
+        self.outside = outside
+        self.stage = None
+
+    def bind(self, address):
+        stage, = [entry for entry in self.cache.iterdir() if entry.name.startswith(".storage.mount.")]
+        stage.rename(self.cache / "moved stage")
+        stage.symlink_to(self.outside, target_is_directory=True)
+        self.stage = stage
+        super().bind(address)
+
+
+def test_swapped_stage_never_redirects_and_refuses(cache):
+    # Before the fix, chmod after bind went through the stage's path and
+    # followed this symlink to the outside file.
+    with tempfile.TemporaryDirectory(prefix="storage-outside-", dir="/tmp") as directory:
+        outside = Path(directory)
+        victim = outside / "socket"
+        victim.write_text("not ours to chmod")
+        victim.chmod(0o644)
+        server = server_for(cache, lambda _: {})
+        with _StageSwappingSocket(cache, outside) as listener:
+            with pytest.raises(ControlError, match="stage directory changed"):
+                server._publish(listener)
+            swapped = listener.stage
+        assert stat.S_IMODE(victim.stat().st_mode) == 0o644
+        assert victim.read_text() == "not ours to chmod"
+        assert not (cache / CONTROL_SOCKET_NAME).exists()
+        assert not (cache / CONTROL_SOCKET_NAME).is_symlink()
+        # Our own socket was removed from the stage that was moved away;
+        # the stage name, now someone else's symlink, is left alone.
+        assert list((cache / "moved stage").iterdir()) == []
+        assert sorted(os.listdir(outside)) == ["socket"]
+        assert swapped.is_symlink()
+
+
+@pytest.mark.parametrize("mode", [0o770, 0o707, 0o777, 0o720])
+def test_refuses_a_cache_others_can_rename_in(cache, mode, caplog):
+    cache.chmod(mode)
+    server = server_for(cache, lambda _: {})
+    with caplog.at_level(logging.WARNING, logger=__name__):
+        server.start()
+    try:
+        assert server._listener is None
+        assert any("writable by other users" in r.getMessage() for r in caplog.records)
+        assert sorted(os.listdir(cache)) == []
+    finally:
+        server.stop()
+        cache.chmod(0o700)
+
+
+@pytest.mark.parametrize("mode", [0o700, 0o755, 0o1777, 0o1770])
+def test_publishes_in_a_private_or_sticky_cache(cache, mode):
+    cache.chmod(mode)
+    server = server_for(cache, lambda _: {"mode": mode})
+    server.start()
+    try:
+        assert request_control_payload(cache, b"status", 2) == {"mode": mode}
+        # Only the socket: the stage directory is gone.
+        assert sorted(os.listdir(cache)) == [CONTROL_SOCKET_NAME]
+    finally:
+        server.stop()
+        cache.chmod(0o700)
+    assert sorted(os.listdir(cache)) == []
+
+
+def test_refuses_a_cache_owned_by_another_user(cache, monkeypatch, caplog):
+    real = os.geteuid()
+    server = server_for(cache, lambda _: {})
+    monkeypatch.setattr("storage.control.os.geteuid", lambda: real + 1)
+    with caplog.at_level(logging.WARNING, logger=__name__):
+        server.start()
+    monkeypatch.undo()
+    try:
+        assert server._listener is None
+        assert any("not owned by the mount's user" in r.getMessage() for r in caplog.records)
+        assert sorted(os.listdir(cache)) == []
+    finally:
+        server.stop()
