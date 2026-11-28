@@ -10,9 +10,11 @@ A mount owner can inspect live download activity, change limits without restarti
 
 - [x] (2026-11-19 00:09Z) Created Codex lane worktree `mount-control` on `feat/mount-control` at `59e8d28` and agreed on the streaming manager API with the reader-downloads lane.
 - [x] (2026-11-19 00:19Z) Implemented the control socket framing and owner checks, the CLI, and operator documentation.
-- [ ] Verify the CLI and server contract and run a real scratch FUSE mount in both loop modes. Bazel built the CLI, passed the source manifest check, and passed 5 control and 37 debug tests on the control lane before rebasing.
+- [x] (2026-11-19) Added the CLI and server contract tests and the scratch FUSE mount test, which runs the built CLI in both loop modes (`tests/test_streaming_system.py`). Before the rebase, Bazel built the CLI, passed the source manifest check, and passed 5 control and 37 debug tests.
 - [x] (2026-11-19 00:22Z) Rebased on the integrated scheduler and member-attribute changes.
-- [ ] Run the full integrated gate and push a draft stacked PR. The PR and tracking issue carry the final test receipt and published revision.
+- [x] Opened draft PR #186, stacked on `feat/adaptive-reader-downloads`.
+- [x] (2026-11-28) Fixed council round 1 findings: the control dispatcher's rejections are tested in the sandboxed fast gate, handler errors are logged and answered instead of dropped, the read timeout reply is a fixed message, the cache lock comment says it does not wait, and the server restarts after a stop whose join timed out.
+- [ ] Run the full gate (`scripts/run-gates.sh`) on the final head. That result, and the revision it covers, is recorded on PR #186, not here.
 
 ## Surprises & Discoveries
 
@@ -25,7 +27,7 @@ The current control socket uses one `recv` on a stream, which can yield partial 
 
 ## Outcomes & Retrospective
 
-The operator command, socket transport, documentation, and scratch tests are implemented. Publish the final verification result with the draft PR.
+The operator command, socket transport, documentation, and scratch tests are implemented and in draft PR #186. Council round 1 found missing fast-gate coverage of the dispatcher and four smaller transport issues, all fixed on the branch. The full-gate result for the head that merges is recorded on the PR.
 
 ## Context and Orientation
 
@@ -44,7 +46,7 @@ Run these commands from the `mount-control` worktree. Use the shared runtime loc
     nix develop --command bazel build //:storage_cli
     nix develop --command bazel test //tests:storage_test_cli_control //tests:storage_test_cli_debug //tests:storage_tests_streaming_system //:storage_build_srcs_check --test_output=all
 
-Run `scripts/run-gates.sh` from the final clean worktree to record full-gate evidence. A mounted run should report passes from both the default and threaded FUSE modes. Rebase and target the draft PR on `feat/adaptive-reader-downloads` once its API is published.
+Run `scripts/run-gates.sh` from the final clean worktree to record full-gate evidence. A mounted run should report passes from both the default and threaded FUSE modes. The branch is stacked on `feat/adaptive-reader-downloads`; when that merges, rebase onto `master` and rerun the gates.
 
 ## Validation and Acceptance
 
@@ -63,3 +65,5 @@ The parent lane maintains the CTO roster. Its mission and these tests prohibit t
 Depend on `StreamingReadManager.download_limits`, `update_download_limits`, `list_download_sessions`, and `cancel_download_session` from the reader-downloads branch. The socket handler validates command and argument shape, and the streaming manager validates parameter values and applies updates in one operation. The initial live parameters are `max_streaming_sessions` (1 to 1024), `max_retained_streaming_sessions` (0 to 1024), and `max_download_workers` (1 to 32).
 
 2026-11-19: Recorded the assigned worktree, agreed API, and mount-level test. Recorded the fast gate results and the rebase onto the integrated scheduler.
+
+2026-11-28: Marked the contract tests and draft PR done, recorded the council round 1 fixes, and pointed the final gate result at the PR. Replaced the stale instruction to rebase onto the reader-downloads branch, which is done.
