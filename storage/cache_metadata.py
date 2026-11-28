@@ -127,7 +127,15 @@ def has_version_token(st) -> bool:
 _has_token = has_version_token
 
 
-def confirm_member_stat(backend, virtual_path: str, probe, transferred_size: int):
+class StatBudget:
+    """Member stats a transfer's confirmation may still make (shared across calls)."""
+
+    def __init__(self, stats: int = 2):
+        self.remaining = stats
+
+
+def confirm_member_stat(backend, virtual_path: str, probe, transferred_size: int,
+                        budget: Optional[StatBudget] = None):
     """(stat to record, MemberVersion) for a transfer probed before it began.
 
     The member is stat'ed again after the transfer (retried once if the
@@ -148,11 +156,16 @@ def confirm_member_stat(backend, virtual_path: str, probe, transferred_size: int
     write bits: its denials stand, its grants of write do not. No mode at
     all fails closed on write as before. BulkCapacityCancelled and
     BulkCapacityTimeout propagate: an interrupted request is not a fill.
+    A shared budget bounds the stats across calls for one transfer (the
+    retry here and a caller's second confirmation together); by default
+    each call may make two.
     """
     from .backends.ssh_pool import BulkCapacityCancelled, BulkCapacityTimeout
 
+    budget = StatBudget() if budget is None else budget
     after = None
-    for _attempt in range(2):
+    while budget.remaining > 0:
+        budget.remaining -= 1
         try:
             after = backend.stat(virtual_path)
             break

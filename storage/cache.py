@@ -5,6 +5,7 @@ Manages the local cache of files from remote backing filesystems.
 Files are cached on first access and evicted using LRU when space is needed.
 """
 
+import dataclasses
 import errno
 import logging
 import os
@@ -20,9 +21,9 @@ from typing import Callable, ContextManager, Optional, List, Set
 from .backends.base import Backend, bounded_copy, bulk_request
 from .backends.ssh_pool import BulkCapacityCancelled, BulkCapacityTimeout
 from .cache_metadata import (
-    PARTIAL_SUFFIX, PREFIX_XATTR, FillAction, MemberVersion, confirm_member_stat,
+    PARTIAL_SUFFIX, PREFIX_XATTR, StatBudget, _member_mtime_ns, FillAction, MemberVersion, confirm_member_stat,
     cache_identity, copy_member_attributes, fill_action, has_version_token, regular_file_stat,
-    write_cache_metadata,
+    read_cache_metadata, write_cache_metadata,
 )
 from .member_repairs import VIEW_WRITE, MemberRepairs, is_at_or_under
 from .pathing import resolve_path
@@ -784,7 +785,18 @@ class CacheManager:
                 if current is not None and cache_identity(current) == replace_identity:
                     # A refresh in place: the last good copy stayed named
                     # until now and is replaced atomically by this verified
-                    # one (open descriptors keep the old inode).
+                    # one (open descriptors keep the old inode). The new inode
+                    # carries its own CLEAN record (its size and mtime, no
+                    # checksum: the old version's never describes it) before
+                    # it is named, so a crash before the index row follows is
+                    # healed from it as CLEAN (heal_stale_clean), never read
+                    # as a lost local write.
+                    row = self.state_manager.get_file_metadata(source_virtual_path)
+                    if row is not None:
+                        # The record takes the staged file's own size and mtime.
+                        write_cache_metadata(temp_path, dataclasses.replace(
+                            row, checksum=None, sync_status=SyncStatus.CLEAN,
+                        ), virtual_path=source_virtual_path)
                     os.replace(temp_path, cache_path)
                     self._current_size_bytes += size - current.st_size
                     if version == MemberVersion.AGREED and newest is not None and confirmed is not None:
@@ -902,6 +914,23 @@ class CacheManager:
             self.state_manager.remove_file_location(virtual_path, "cache")
             return st.st_size
 
+    @staticmethod
+    def clean_record_for(cache_path: Path, stat_size: int, stat_mtime: float):
+        """The file's own metadata record, if it says CLEAN for exactly this stat.
+
+        A refresh in place names a verified copy carrying such a record
+        (fetch_into_cache); a write records DIRTY, and a change behind the
+        mount leaves a record for another stat.
+        """
+        try:
+            record = read_cache_metadata(cache_path)
+        except (OSError, ValueError):
+            return None
+        if (record is None or record.sync_status != SyncStatus.CLEAN
+                or record.is_stale_for(stat_size, stat_mtime)):
+            return None
+        return record
+
     def heal_stale_clean(
         self,
         virtual_path: str,
@@ -933,6 +962,18 @@ class CacheManager:
                 return False
             stat_size, stat_mtime = st.st_size, st.st_mtime
         if stat_size == row.size and stat_mtime == row.last_modified:
+            return False
+        # A refresh in place names a verified copy that already carries its
+        # own CLEAN record; a crash before the row followed leaves the row
+        # describing the old version. The file's record then matches its
+        # stat: the row is brought up to it (CLEAN, no checksum), not
+        # marked dirty. A write leaves no such record (mark_file_dirty
+        # records DIRTY), and a change behind the mount has a stale one.
+        record = self.clean_record_for(cache_path, stat_size, stat_mtime)
+        if record is not None:
+            self.state_manager.record_cached_stat(
+                virtual_path, row.dirty_generation, size=stat_size, last_modified=stat_mtime,
+                last_access=time.time(), clear_checksum=record.checksum is None)
             return False
         return self.mark_file_dirty(virtual_path, cache_path) is not None
 

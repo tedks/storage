@@ -697,7 +697,11 @@ class StorageFS(Operations):
                         # Content not yet sent to its member: kept, as for a writer.
                         return
                     if meta and not resolved.backend_name:
-                        stale = st.st_size != meta.size or st.st_mtime != meta.last_modified
+                        stale = ((st.st_size != meta.size or st.st_mtime != meta.last_modified)
+                                 # A refreshed copy whose row update a crash
+                                 # lost carries its own CLEAN record.
+                                 and self.cache_manager.clean_record_for(
+                                     cache_path, st.st_size, st.st_mtime) is None)
                     if not stale:
                         # Before the unlink: no getattr may find the copy
                         # gone and its name still in the parent's listing.
@@ -2251,17 +2255,24 @@ class StorageFS(Operations):
                     # above; a write recorded since keeps its own stat. The
                     # mirror rewrites the xattr the evicted file lost.
                     with self.state_manager.metadata_lock:
+                        # A refresh in place installed another version: the
+                        # old one's checksum goes (rows and locations below).
                         self.state_manager.record_cached_stat(
                             canonical_path,
                             metadata.dirty_generation,
                             size=st.st_size,
                             last_modified=st.st_mtime,
                             last_access=time.time(),
+                            clear_checksum=replace_identity is not None,
                         )
                         metadata = self.state_manager.get_file_metadata(canonical_path) or metadata
                         self.cache_manager.sync_cache_metadata(
                             canonical_path, metadata, cache_path=cache_path,
                         )
+                    if replace_identity is not None:
+                        # The checksum records described the old version, as
+                        # for the invalidation a refresh replaces.
+                        self._forget_checksums({canonical_path})
 
                 # Record locations
                 try:

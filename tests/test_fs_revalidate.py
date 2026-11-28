@@ -2617,6 +2617,55 @@ class TestRefreshRound5(RevalidateTestBase):
             cache_path=self.cache_dir / "live.log")
         return self.cache_inode("live.log")
 
+    def test_an_in_place_refresh_carries_no_old_checksum(self):
+        inode = self.refreshed_with_checksums()
+        self.assertEqual(self.read_through("/live.log"), b"version 2!")
+        self.assertNotEqual(self.cache_inode("live.log"), inode)
+        row = self.fs.state_manager.get_file_metadata("/live.log")
+        self.assertIsNone(row.checksum)
+        self.assertEqual((row.size, row.sync_status), (10, SyncStatus.CLEAN))
+        for loc in self.fs.state_manager.get_file_locations("/live.log"):
+            self.assertNotEqual(loc.checksum, "hash-of-v1", loc.backend_name)
+        record = read_cache_metadata(self.cache_dir / "live.log")
+        self.assertIsNone(record.checksum)
+
+    def test_a_crash_after_the_replace_heals_clean(self):
+        self.refreshed_with_checksums()
+
+        class Crash(BaseException):  # a crash, not a failure the open handles
+            pass
+
+        uploads = patch.object(self.member, "copy_from_local",
+                               side_effect=AssertionError("upload of a refreshed copy"))
+        with patch.object(self.fs, "_record_fetched", side_effect=Crash):
+            with self.assertRaises(Crash):
+                self.fs.open("/live.log", os.O_RDONLY)
+        # Named, the row still describing v1.
+        self.assertEqual((self.cache_dir / "live.log").read_bytes(), b"version 2!")
+        self.assertEqual(self.fs.state_manager.get_file_metadata("/live.log").size, 9)
+        self.restart()
+        with uploads:
+            self.assertEqual(self.fs.sweep_stale_cache_metadata(), 0)
+            row = self.fs.state_manager.get_file_metadata("/live.log")
+            self.assertEqual((row.size, row.sync_status, row.checksum),
+                             (10, SyncStatus.CLEAN, None))
+            self.assertEqual(self.read_through("/live.log"), b"version 2!")
+            self.assertEqual(self.fs.state_manager.get_file_metadata("/live.log").sync_status,
+                             SyncStatus.CLEAN)
+
+    def test_an_invalidation_after_a_lost_row_update_does_not_mark_dirty(self):
+        # The same crash, then a change found before any sweep: the copy is
+        # dropped as CLEAN, not kept as a lost write.
+        self.refreshed_with_checksums()
+        with patch.object(self.fs, "_record_fetched", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.fs.open("/live.log", os.O_RDONLY)
+        self.restart()
+        self.fs._invalidate_file_cache("/live.log")
+        self.assertFalse((self.cache_dir / "live.log").exists())
+        self.assertEqual(self.fs.state_manager.get_file_metadata("/live.log").sync_status,
+                         SyncStatus.CLEAN)
+
     def refresh_raising(self, method, exc, writer_errno):
         self.changed_v1()
         with patch.object(self.member, method, side_effect=exc):
