@@ -1014,13 +1014,18 @@ class CacheManager:
         self._refused_for_allowance = True
         return False
 
-    def _admit_whole_copy(self, admit) -> bool:
-        """Run a whole copy's admit; if it is refused only for pending
-        allowances, wait for direct changes to settle, at most
-        ALLOWANCE_WAIT_SECONDS in all, and try again. A copy has no
-        transient fallback, and a write in flight is normally brief; a
-        stuck one costs the copy this bound, then ENOSPC as before.
-        Caller holds the lock (released while waiting)."""
+    _WINNER = "winner"
+
+    def _admit_whole_copy(self, admit, cache_path: Path):
+        """Run a whole copy's admit: True (admitted), False (refused), or
+        _WINNER. If it is refused only for pending allowances, wait for
+        direct changes to settle, at most ALLOWANCE_WAIT_SECONDS in all,
+        and try again. A copy has no transient fallback, and a write in
+        flight is normally brief; a stuck one costs the copy this bound,
+        then ENOSPC as before. Before each retry the cache path is checked
+        again: if anything was installed there while the copy waited, the
+        copy cannot win, so _WINNER is returned with nothing evicted or
+        admitted for it. Caller holds the lock (released while waiting)."""
         deadline = time.monotonic() + self.ALLOWANCE_WAIT_SECONDS
         while True:
             self._refused_for_allowance = False
@@ -1030,6 +1035,8 @@ class CacheManager:
             if not self._refused_for_allowance or remaining <= 0:
                 return False
             self._settled.wait(remaining)
+            if os.path.lexists(cache_path):
+                return self._WINNER
 
     def _free_space(self, needed: int, must_cover: Optional[int] = None) -> bool:
         """Evict CLEAN copies in access order until `needed` bytes are freed.
@@ -1316,7 +1323,16 @@ class CacheManager:
         temp_path = cache_path.parent / f".{secrets.token_hex(8)}{PARTIAL_SUFFIX}"
         with self._lock:
             reserved = self._round_up(expected_size)
-            if not self._admit_whole_copy(lambda: self.ensure_space(reserved)):
+            admitted = self._admit_whole_copy(lambda: self.ensure_space(reserved), cache_path)
+            if admitted == self._WINNER:
+                # Installed while this copy waited: nothing to download. A
+                # file there is the cached copy; anything else fails as the
+                # no-replace link below would.
+                if regular_file_stat(cache_path) is not None:
+                    return False
+                raise FileExistsError(errno.EEXIST, "cache path is not a regular file",
+                                      str(cache_path))
+            if not admitted:
                 raise OSError(errno.ENOSPC, "insufficient cache space")
             self._whole_file_temps[temp_path] = reserved
         try:
@@ -1343,9 +1359,11 @@ class CacheManager:
                     # installed: something already at the path (another
                     # fill, a writer) wins at the link below, and this copy
                     # is discarded without evicting anything for it.
+                    # A winner found while waiting (_WINNER) also goes on to
+                    # the link, which keeps it and its semantics.
                     if (size > reserved and not os.path.lexists(cache_path)
-                            and not self._admit_whole_copy(lambda: self._fits_beyond_reservation(
-                                temp_path, size - reserved, size))):
+                            and self._admit_whole_copy(lambda: self._fits_beyond_reservation(
+                                temp_path, size - reserved, size), cache_path) is False):
                         raise OSError(errno.ENOSPC, "insufficient cache space")
                     try:
                         os.link(temp_path, cache_path)

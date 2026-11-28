@@ -1493,6 +1493,87 @@ class TestCacheAccounting(unittest.TestCase):
         self.assertFalse(victim.exists())
         self.assertEqual((self.cache_dir / "grown").read_bytes(), b"g" * block)
 
+    def _copy_waiting_for_allowance(self, expected_size, grows):
+        """A whole copy refused only for a pending allowance, waiting in
+        _admit_whole_copy (at the reservation, or at its growth check when
+        `grows`). Returns (fetching thread, outcome list, copied list,
+        victim, writer, gate, errors)."""
+        manager = self.cache_manager
+        block = manager.block_size
+        copied, grow = [], threading.Event()
+        self.addCleanup(grow.set)
+
+        class Backend(LocalBackend):
+            def copy_to_local(self, virtual_path, local_path):
+                copied.append(1)
+                if grows:
+                    assert grow.wait(10.0)
+                Path(local_path).write_bytes(b"g" * block)
+
+        backend = Backend("member", str(self.backend_dir))
+        outcome, waiting = [], threading.Event()
+        real_wait = manager._settled.wait
+
+        def noting_wait(timeout=None):
+            waiting.set()
+            return real_wait(timeout)
+
+        def fetch():
+            try:
+                outcome.append(manager.fetch_into_cache(
+                    backend, "/won", self.cache_dir / "won", expected_size=expected_size))
+            except OSError as exc:
+                outcome.append(exc.errno)
+
+        patcher = patch.object(manager._settled, "wait", side_effect=noting_wait)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        fetching = threading.Thread(target=fetch)
+        if grows:
+            before = lambda: (fetching.start(), self.assertTrue(self._wait_copy(copied)))
+            victim, writer, gate, errors = self._full_with_victim(1, before_write=before)
+            grow.set()
+        else:
+            victim, writer, gate, errors = self._full_with_victim(1)
+            fetching.start()
+        self.assertTrue(waiting.wait(5.0))
+        return fetching, outcome, copied, victim, writer, gate, errors
+
+    @staticmethod
+    def _wait_copy(copied):
+        deadline = time.monotonic() + 5.0
+        while not copied and time.monotonic() < deadline:
+            time.sleep(0.01)
+        return bool(copied)
+
+    def test_a_winner_installed_while_a_grown_copy_waits_keeps_the_victim(self):
+        """Another fill installs the file while the grown copy waits for an
+        allowance; its retry sees the winner and goes straight to the
+        no-replace link, which keeps it: no eviction for a losing copy."""
+        fetching, outcome, copied, victim, writer, gate, errors = \
+            self._copy_waiting_for_allowance(0, grows=True)
+        (self.cache_dir / "won").write_bytes(b"winner")
+        gate.set()
+        fetching.join(timeout=5.0)
+        writer.join(timeout=5.0)
+        self.assertEqual(errors, [])
+        self.assertEqual(outcome, [False])
+        self.assertTrue(victim.exists())
+        self.assertEqual((self.cache_dir / "won").read_bytes(), b"winner")
+
+    def test_a_winner_installed_while_a_reservation_waits_downloads_nothing(self):
+        manager = self.cache_manager
+        fetching, outcome, copied, victim, writer, gate, errors = \
+            self._copy_waiting_for_allowance(manager.block_size, grows=False)
+        (self.cache_dir / "won").write_bytes(b"winner")
+        gate.set()
+        fetching.join(timeout=5.0)
+        writer.join(timeout=5.0)
+        self.assertEqual(errors, [])
+        self.assertEqual(outcome, [False])
+        self.assertEqual(copied, [])
+        self.assertTrue(victim.exists())
+
     def _shortfall_cache(self):
         """A full cache whose only copy has no member location (not
         eligible), so a grant is a remembered victim shortfall."""
