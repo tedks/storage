@@ -276,7 +276,10 @@ streaming instead:
   descriptors numbered 1024 or above. A fill is not retained after its
   last close once streaming descriptors reach half the soft limit; it is
   discarded as an unqualified one is. A mount that reaches the limit
-  anyway returns `EMFILE` from opens.
+  anyway returns `EMFILE` from opens. A reader's descriptor is opened on
+  its download's own file through `/proc/self/fd`, so streaming needs
+  procfs mounted in the mount's namespace; without it streaming opens
+  fail with `EIO` (logged).
 
 On range-capable reads, a storage or member error returns its errno to
 the caller; a file that disappears from its member during a read returns

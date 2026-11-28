@@ -2573,18 +2573,21 @@ class StorageFS(Operations):
             if not self._is_read_only_open(flags):
                 self._require_imported_write_permission(cache_path)
 
+        real_fd = -1
         try:
+            if prefetch_session is not None:
+                # The session's own inode, whatever its path names now. Not
+                # under _fd_lock: it waits for the session's io_lock, and an
+                # inode needs no protection from an unlink of its path.
+                real_fd = self._streaming_manager.open_session_inode(prefetch_session, flags)
+                if prefetch_session.finalized:
+                    cache_path = prefetch_session.final_cache_path
             # Hold _fd_lock across os.open AND _fd_map registration so that
             # _invalidate_file_cache (which also holds _fd_lock) cannot
             # unlink the cache file between os.open and registration.
             with self._fd_lock:
                 if prefetch_session is None:
                     real_fd = os.open(str(cache_path), flags)
-                else:
-                    # The session's own inode, whatever its path names now.
-                    real_fd = self._streaming_manager.open_session_inode(prefetch_session, flags)
-                    if prefetch_session.finalized:
-                        cache_path = prefetch_session.final_cache_path
 
                 vfd = self._fd_counter
                 self._fd_counter += 1
@@ -2597,17 +2600,29 @@ class StorageFS(Operations):
                     canonical_path=resolved.canonical_path,
                     prefetch_session=prefetch_session,
                 )
-
-            if resolved.backend_name is None:
-                self._mark_demand_access(resolved.canonical_path, prefetch_session)
-
-            return vfd
-
-        except OSError as e:
+        except BaseException as e:
+            # Until the descriptor table holds them, the descriptor and the
+            # session ref are this open's to give back, whatever was raised.
+            if real_fd >= 0:
+                try:
+                    os.close(real_fd)
+                except OSError:
+                    pass
             if prefetch_session is not None:
-                self._streaming_manager.report_open_error("cache_open", e)
+                if isinstance(e, OSError):
+                    self._streaming_manager.report_open_error("cache_open", e)
                 self._release_prefetch_session(prefetch_session)
-            raise FuseOSError(e.errno)
+            if isinstance(e, OSError):
+                raise FuseOSError(e.errno or errno.EIO) from e
+            raise
+
+        if resolved.backend_name is None:
+            # Bookkeeping only: the open has succeeded and owns its entry.
+            try:
+                self._mark_demand_access(resolved.canonical_path, prefetch_session)
+            except Exception:
+                self.logger.exception("recording demand access failed")
+        return vfd
 
     def create(self, path, mode, fi=None):
         """Create a file"""

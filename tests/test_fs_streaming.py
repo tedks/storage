@@ -2757,6 +2757,101 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.assertEqual(self.fs.read('/changed.bin', len(payload), 0, fd), payload)
         self.fs.release('/changed.bin', fd)
 
+    def test_attach_in_the_finalize_window_opens_the_installed_file(self):
+        # R3-I5: finalize decided to close the descriptor (no readers) and
+        # is recording the file when an open attaches; the descriptor is
+        # then closed under the attached reader. Its open takes the cache
+        # file finalize installed instead of failing with ENOENT.
+        self.backend.copy_delay = 0
+        manager = self.fs._streaming_manager
+        payload = os.urandom(64 * 1024)
+        (self.backend_dir / "window.bin").write_bytes(payload)
+        in_record = threading.Event()
+        go = threading.Event()
+        self.addCleanup(go.set)
+        real_on_finalized = manager.on_finalized
+
+        def held_record(session):
+            in_record.set()
+            go.wait(timeout=10.0)
+            return real_on_finalized(session)
+
+        hold, at_finalize, go_tail = self._hold_finalize()
+        with hold, patch.object(manager, "on_finalized", side_effect=held_record):
+            vfd = self.fs.open('/window.bin', os.O_RDONLY)
+            session = self._session_for(vfd)
+            self.assertEqual(self.fs.read('/window.bin', len(payload), 0, vfd), payload)
+            self.assertTrue(at_finalize.wait(timeout=3.0))
+            self.fs.release('/window.bin', vfd)
+            go_tail.set()
+            self.assertTrue(in_record.wait(timeout=3.0))
+            attached = manager._create_or_attach_prefetch_session('/window.bin', '/window.bin')
+            self.assertIs(attached, session)
+            go.set()
+            self.assertTrue(session.background_finished.wait(timeout=5.0))
+        self.assertEqual(session.io_fd, -1)
+        fd = manager.open_session_inode(session, os.O_RDONLY)
+        try:
+            self.assertEqual(os.pread(fd, len(payload), 0), payload)
+            self.assertEqual(os.fstat(fd).st_ino, os.stat(self.cache_dir / "window.bin").st_ino)
+        finally:
+            os.close(fd)
+        manager._release_prefetch_session(session)
+
+    def test_session_reopen_waits_for_its_io_lock_outside_the_descriptor_table_lock(self):
+        # R3-N2: a reopen blocked on a busy session must not hold _fd_lock.
+        manager = self.fs._streaming_manager
+        payload = os.urandom(64 * 1024)
+        (self.backend_dir / "busy.bin").write_bytes(payload)
+        vfd_a = self.fs.open('/busy.bin', os.O_RDONLY)
+        session = self._session_for(vfd_a)
+        real_reopen = manager.open_session_inode
+        reopening = threading.Event()
+
+        def reopen(sess, flags):
+            reopening.set()
+            return real_reopen(sess, flags)
+
+        results = {}
+        with patch.object(manager, "open_session_inode", side_effect=reopen):
+            session.io_lock.acquire()
+            try:
+                thread = threading.Thread(
+                    target=lambda: results.setdefault("fd", self.fs.open('/busy.bin', os.O_RDONLY)),
+                )
+                thread.start()
+                self.assertTrue(reopening.wait(timeout=3.0))
+                thread.join(timeout=0.2)
+                self.assertTrue(thread.is_alive())
+                self.assertTrue(self.fs._fd_lock.acquire(timeout=1.0))
+                self.fs._fd_lock.release()
+            finally:
+                session.io_lock.release()
+            thread.join(timeout=5.0)
+        self.fs.release('/busy.bin', results["fd"])
+        self.fs.release('/busy.bin', vfd_a)
+
+    def test_session_reopen_without_procfs_is_eio(self):
+        # R3-N3: streaming opens need /proc/self/fd; without it, a logged EIO.
+        payload = os.urandom(64 * 1024)
+        (self.backend_dir / "noproc.bin").write_bytes(payload)
+        real_open = os.open
+
+        def no_proc(path, *args, **kwargs):
+            if str(path).startswith("/proc/self/fd/"):
+                raise FileNotFoundError(errno.ENOENT, "no procfs", path)
+            return real_open(path, *args, **kwargs)
+
+        real_isdir = os.path.isdir
+        with patch("storage.streaming.os.open", side_effect=no_proc), \
+                patch("storage.streaming.os.path.isdir",
+                      side_effect=lambda p: False if p == "/proc/self/fd" else real_isdir(p)), \
+                self.assertLogs(self.fs.logger, level="ERROR"), \
+                self.assertRaises(FuseOSError) as failure:
+            self.fs.open('/noproc.bin', os.O_RDONLY)
+        self.assertEqual(failure.exception.errno, errno.EIO)
+        self.assertEqual(self.fs._streaming_manager.list_download_sessions(), [])
+
     def test_streaming_open_never_serves_a_prefix_it_cannot_replace(self):
         # A promoted prefix lands at the cache path after the open's cache
         # check. Dropped and streamed again when nothing holds it; EAGAIN,

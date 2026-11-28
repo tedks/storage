@@ -1195,14 +1195,29 @@ class StreamingReadManager:
         not this session's (ranges this session has would read as the
         successor's holes). /proc/self/fd reopens the inode the session
         writes, linked, renamed into the cache or unlinked. io_lock keeps
-        the descriptor from closing meanwhile; it closes only at the last
-        release (or destroy, when the open gets ENOENT).
+        the descriptor from closing meanwhile; it closes at the last
+        release, at destroy (the open gets ENOENT), or when finalize saw no
+        readers (the open then takes the installed cache file). Without
+        procfs the open is EIO, logged.
         """
         with session.io_lock:
             io_fd = session.io_fd
-            if io_fd < 0:
-                raise FileNotFoundError(errno.ENOENT, "streaming session closed")
-            return os.open(f"/proc/self/fd/{io_fd}", flags & ~os.O_NOFOLLOW)
+            if io_fd >= 0:
+                try:
+                    return os.open(f"/proc/self/fd/{io_fd}", flags & ~os.O_NOFOLLOW)
+                except FileNotFoundError:
+                    if os.path.isdir("/proc/self/fd"):
+                        raise
+                    self.logger.error("streaming needs /proc/self/fd to open a session's file")
+                    raise OSError(errno.EIO, "procfs unavailable") from None
+            with session.lock:
+                finalized = session.finalized
+        if finalized:
+            # Finalize closes the descriptor when it saw no readers, which a
+            # reader attaching after that decision does not change; the
+            # session's inode is then the cache file it installed.
+            return os.open(str(session.final_cache_path), flags)
+        raise FileNotFoundError(errno.ENOENT, "streaming session closed")
 
     def _remove_prefetch_session(self, session: PrefetchSession):
         with self.prefetch_sessions_lock:
