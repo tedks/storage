@@ -2198,6 +2198,9 @@ class StreamingReadManager:
                     if admitted:
                         io_fd = os.open(str(staging_path), os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o644)
                         os.ftruncate(io_fd, file_size)
+                        # Released after registration (below), once the
+                        # file has its final name and the size is stale.
+                        self.cache_manager.reserve_bytes(file_size)
                         break
                 if attempt or not self._reclaim_retained_space(file_size):
                     self.logger.warning(
@@ -2237,7 +2240,11 @@ class StreamingReadManager:
         try:
             return self._register_prefetch_session(session, displaced)
         finally:
-            # After the registry lock: cancellation takes the cache lock.
+            # After the registry lock: both take the cache lock. By now the
+            # file is registered under its partial name or discarded, and
+            # either way the cache size was marked stale, so the next scan
+            # counts what the reservation stood in for.
+            self.cache_manager.release_bytes(file_size)
             self._complete_displacements(displaced)
 
     def _register_prefetch_session(self, session: PrefetchSession, displaced: list) -> Optional[PrefetchSession]:

@@ -482,7 +482,14 @@ class CacheManager:
 
     @contextmanager
     def admit_streaming_partial(self, file_size: int):
-        """Charge the new sparse file's apparent size before another open can allocate."""
+        """Charge the new sparse file's apparent size before another open can allocate.
+
+        Yields whether it fits. The caller creates the file inside the block
+        and, once it exists, takes a reservation for it (reserve_bytes)
+        until it is at its final name and the size is marked stale: the
+        file is renamed outside this lock, so a scan in between can see
+        neither name, and the reservation keeps it charged meanwhile.
+        """
         with self._lock:
             admitted = self.ensure_space(file_size)
             try:
@@ -490,6 +497,15 @@ class CacheManager:
             finally:
                 if admitted:
                     self._size_dirty = True
+
+    def reserve_bytes(self, size: int):
+        """Charge size bytes that no scan may see yet; undo with release_bytes."""
+        with self._lock:
+            self._reserved_bytes += size
+
+    def release_bytes(self, size: int):
+        with self._lock:
+            self._reserved_bytes -= size
 
     def cache_file(self, virtual_path: str, backend: Backend, source_virtual_path: str = None) -> bool:
         """Ensure a member file is cached, including when another fill won."""
