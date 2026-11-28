@@ -5,6 +5,7 @@ Manages the local cache of files from remote backing filesystems.
 Files are cached on first access and evicted using LRU when space is needed.
 """
 
+import bisect
 import errno
 import logging
 import os
@@ -15,12 +16,13 @@ import threading
 from pathlib import Path
 from contextlib import contextmanager, nullcontext
 from enum import Enum
-from typing import Callable, ContextManager, Optional, List, Set
+from typing import Callable, ContextManager, Optional, List, Set, Tuple
 
 from .backends.base import Backend, bulk_request
 from .backends.ssh_pool import BulkCapacityCancelled, BulkCapacityTimeout
 from .cache_metadata import (
-    PARTIAL_SUFFIX, PREFIX_XATTR, copy_member_attributes, regular_file_stat, write_cache_metadata,
+    PARTIAL_SUFFIX, PREFIX_XATTR, copy_member_attributes, read_cache_metadata, regular_file_stat,
+    write_cache_metadata,
 )
 from .member_repairs import VIEW_WRITE, MemberRepairs, is_at_or_under
 from .pathing import resolve_path
@@ -69,6 +71,59 @@ def _remove_prefix_marker(path: Path):
     finally:
         if usable != mode:
             os.chmod(path, mode)
+
+
+class _PartialCharge:
+    """The data blocks one streaming descriptor has written, as sorted,
+    disjoint, block-aligned [start, end) ranges, and their total.
+
+    The ranges are what this cache wrote (plus the extents the inode had
+    when its first grant measured them), so each later grant knows which
+    of its blocks are new without asking the filesystem. Bounded by the
+    number of disjoint spans the session fetched.
+    """
+
+    __slots__ = ("ranges", "bytes")
+
+    def __init__(self, ranges):
+        self.ranges = list(ranges)
+        self.bytes = sum(end - start for start, end in self.ranges)
+
+    def overlap(self, start: int, end: int) -> int:
+        ranges = self.ranges
+        i = bisect.bisect_left(ranges, (start, -1))
+        if i and ranges[i - 1][1] > start:
+            i -= 1
+        covered = 0
+        while i < len(ranges) and ranges[i][0] < end:
+            covered += min(end, ranges[i][1]) - max(start, ranges[i][0])
+            i += 1
+        return covered
+
+    def add(self, start: int, end: int) -> int:
+        """Record [start, end) as written; return the bytes it added."""
+        if start >= end:
+            return 0
+        added = end - start - self.overlap(start, end)
+        ranges = self.ranges
+        i = bisect.bisect_left(ranges, (start, -1))
+        if i and ranges[i - 1][1] >= start:
+            i -= 1
+        j = bisect.bisect_right(ranges, (end, float("inf")))
+        if i < j:
+            start = min(start, ranges[i][0])
+            end = max(end, ranges[j - 1][1])
+        ranges[i:j] = [(start, end)]
+        self.bytes += added
+        return added
+
+    def trim(self, end: int) -> int:
+        """Drop everything at or past end; return the bytes dropped."""
+        kept = [(s, min(e, end)) for s, e in self.ranges if s < end]
+        dropped = self.bytes - sum(e - s for s, e in kept)
+        self.ranges = kept
+        self.bytes -= dropped
+        return dropped
 
 
 class CacheFetch(Enum):
@@ -131,32 +186,105 @@ class CacheManager:
         self.bulk_cold_copies = bulk_cold_copies
         self.max_size_bytes = max_size_bytes
         self._lock = threading.RLock()
-        # Bytes promised to fetches in flight (cache_file): counted against
-        # max_size_bytes so concurrent fetches cannot each see the same free
-        # space. Under _lock.
-        self._reserved_bytes = 0
-        # Bumped by every rescan; a fetch that sees it move knows the scan
-        # may have counted its temp file (see _replace_into_cache).
-        self._scan_count = 0
-
-        # Ensure cache root exists
         self.cache_root.mkdir(parents=True, exist_ok=True)
+        filesystem = os.statvfs(self.cache_root)
+        self.block_size = filesystem.f_frsize or filesystem.f_bsize
+        # Keep whole-copy reservations separate from the normal tree scan.
+        # Streaming data is charged immediately, including an unlinked
+        # partial until its last session descriptor closes.
+        self._whole_file_temps: dict[Path, int] = {}
+        self._streaming_fds: dict[int, _PartialCharge] = {}
         self._current_size_bytes = self._scan_total_cache_size()
         self._size_dirty = False
+        # The last eviction dry run that found too few victims: (epoch,
+        # index change count, monotonic time, bytes it could free). Until
+        # one of those moves, or SHORTFALL_TTL passes, a request for more
+        # than that fails without walking the index again (see
+        # _known_shortfall). Only a request it would fail anyway is refused.
+        self._shortfall: Optional[Tuple[int, int, float, int]] = None
+        self._evictable_epoch = 0
+        self._grant_warning_logged = False
+
+    # How long a dry run's "too few victims" stands without any change the
+    # cache or the index can see (a path lock released, a member repair
+    # resolved). A stale answer only keeps a stream transient for this long.
+    SHORTFALL_TTL_SECONDS = 1.0
+
+    def _round_up(self, size: int) -> int:
+        return (size + self.block_size - 1) // self.block_size * self.block_size
+
+    def _extent_ranges(self, fd: int, start: int, end: int) -> List[Tuple[int, int]]:
+        """Allocated data extents within a block-aligned interval, as
+        sorted, disjoint, block-aligned ranges (SEEK_DATA/SEEK_HOLE)."""
+        ranges = []
+        while start < end:
+            try:
+                data = os.lseek(fd, start, os.SEEK_DATA)
+            except OSError as exc:
+                if exc.errno == errno.ENXIO:  # no data before EOF
+                    break
+                raise
+            start = data // self.block_size * self.block_size
+            if start >= end:
+                break
+            hole = os.lseek(fd, data, os.SEEK_HOLE)
+            next_block = min(end, self._round_up(hole))
+            if ranges and ranges[-1][1] == start:
+                ranges[-1] = (ranges[-1][0], next_block)
+            else:
+                ranges.append((start, next_block))
+            start = next_block
+        return ranges
+
+    def _data_bytes(self, fd: int, start: int, end: int) -> int:
+        """Count allocated data blocks intersecting a block-aligned interval."""
+        return sum(stop - begin for begin, stop in self._extent_ranges(fd, start, end))
+
+    def _path_data_bytes(self, path: Path, st: os.stat_result) -> int:
+        if st.st_size == 0 or st.st_blocks == 0:
+            return 0
+        rounded = self._round_up(st.st_size)
+        # No shortcut on st_blocks alone: it counts metadata (an external
+        # xattr block) as well as data, and a sparse inode charged by its
+        # data extents while streaming must be counted the same once it is
+        # a named file.
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            try:
+                opened = os.fstat(fd)
+                if (opened.st_dev, opened.st_ino) != (st.st_dev, st.st_ino):
+                    return 0
+                return min(self._data_bytes(fd, 0, rounded), opened.st_blocks * 512)
+            finally:
+                os.close(fd)
+        except OSError as exc:
+            if exc.errno == errno.ENOENT:
+                return 0
+            # Use allocated sectors when the file cannot be opened for an
+            # extent query or the filesystem does not support extent seeks.
+            return min(rounded, st.st_blocks * 512)
 
     def _scan_total_cache_size(self) -> int:
-        """Calculate total size of cache in bytes by scanning the filesystem.
-
-        Counts regular files only, by lstat: a symlink in the cache tree is
-        not a cached copy, and following it would charge its target's size
-        (anything on the host) against a cache that can never evict it.
-        """
-        total = 0
+        """Reconcile data blocks, counting named and held inodes only once."""
+        total = sum(charge.bytes for charge in self._streaming_fds.values())
+        seen = set()
+        for fd in self._streaming_fds:
+            st = os.fstat(fd)
+            seen.add((st.st_dev, st.st_ino))
         for root, dirs, files in os.walk(self.cache_root):
             for name in files:
-                st = regular_file_stat(Path(root) / name)
-                if st is not None:
-                    total += st.st_size
+                path = Path(root) / name
+                if path in self._whole_file_temps:
+                    continue
+                st = regular_file_stat(path)
+                if st is None:
+                    continue
+                identity = (st.st_dev, st.st_ino)
+                if identity in seen:
+                    continue
+                if st.st_nlink > 1:
+                    seen.add(identity)
+                total += self._path_data_bytes(path, st)
         return total
 
     def _ensure_size_current_locked(self):
@@ -164,7 +292,6 @@ class CacheManager:
         if self._size_dirty:
             self._current_size_bytes = self._scan_total_cache_size()
             self._size_dirty = False
-            self._scan_count += 1
 
     def recover_views(self, member_names: List[str]):
         """At mount start, before any worker, eviction or FUSE request: drop
@@ -300,15 +427,88 @@ class CacheManager:
         return st.st_size if st is not None else 0
 
     def get_total_cache_size(self) -> int:
-        """Calculate total size of cache in bytes"""
+        """Return materialized data bytes, including in-flight whole copies."""
         with self._lock:
             self._ensure_size_current_locked()
-            return self._current_size_bytes
+            return self._current_size_bytes + sum(
+                self._temp_data_bytes(path) for path in self._whole_file_temps
+            )
+
+    def _temp_data_bytes(self, path: Path) -> int:
+        st = regular_file_stat(path)
+        return self._path_data_bytes(path, st) if st is not None else 0
 
     def mark_cache_size_dirty(self):
         """Mark cache size accounting as stale after direct external file mutations."""
         with self._lock:
             self._size_dirty = True
+
+    def note_evictable_change(self):
+        """Forget a remembered victim shortfall: a copy may be evictable now
+        (a descriptor closed, a copy was installed).
+
+        Takes no lock, so a release never waits behind an eviction pass. A
+        lost race between two notes still moves the epoch.
+        """
+        self._evictable_epoch += 1
+
+    def _direct_charge(self, path: Optional[Path], fd: Optional[int],
+                       span: Optional[Tuple[int, int]]):
+        """(inode identity or None, data bytes) for cache_size_change, or
+        None when the change cannot be charged incrementally.
+
+        Only a regular file with exactly one name qualifies: the tree scan
+        counts such an inode once, at that name. A hard-linked or unlinked
+        inode, or a measurement error, makes the caller rescan instead.
+        With a span only the blocks it touches are measured.
+        """
+        try:
+            if fd is not None:
+                st = os.fstat(fd)
+            else:
+                st = regular_file_stat(path)
+                if st is None:
+                    return (None, 0)
+            if not stat_module.S_ISREG(st.st_mode) or st.st_nlink != 1:
+                return None
+            identity = (st.st_dev, st.st_ino)
+            if fd is None:
+                return identity, self._path_data_bytes(path, st)
+            if span is None:
+                return identity, min(self._data_bytes(fd, 0, self._round_up(st.st_size)),
+                                     st.st_blocks * 512)
+            start = span[0] // self.block_size * self.block_size
+            return identity, self._data_bytes(fd, start, self._round_up(span[1]))
+        except OSError:
+            return None
+
+    @contextmanager
+    def cache_size_change(self, path: Optional[Path] = None, *, fd: Optional[int] = None,
+                          span: Optional[Tuple[int, int]] = None):
+        """Serialize a direct write or truncate with grants, charging its blocks.
+
+        Give the cache file it changes: a path (a truncate, an O_TRUNC open,
+        a create) or an open descriptor, and for a pwrite the byte span
+        [start, end) it covers. The data blocks are measured before and
+        after the change under the cache lock and the difference charged,
+        so the next grant needs no rescan. With no target, a target that
+        does not qualify (see _direct_charge), or a path whose inode
+        changed in between, the change is unknown and the next allocation
+        rescans the tree.
+        """
+        with self._lock:
+            known = path is not None or fd is not None
+            before = self._direct_charge(path, fd, span) if known else None
+            try:
+                yield
+            finally:
+                after = self._direct_charge(path, fd, span) if before is not None else None
+                if (after is None or after[0] is None
+                        or (before[0] is not None and before[0] != after[0])):
+                    self._size_dirty = True
+                else:
+                    self._current_size_bytes = max(
+                        0, self._current_size_bytes + after[1] - before[1])
 
     def get_free_space_needed(self, required_bytes: int) -> int:
         """
@@ -319,7 +519,12 @@ class CacheManager:
         """
         with self._lock:
             self._ensure_size_current_locked()
-            available = self.max_size_bytes - self._current_size_bytes - self._reserved_bytes
+            reserved = 0
+            for path, size in self._whole_file_temps.items():
+                st = regular_file_stat(path)
+                apparent_growth = min(self._round_up(st.st_size), st.st_blocks * 512) if st else 0
+                reserved += max(size, apparent_growth)
+            available = self.max_size_bytes - self._current_size_bytes - reserved
 
         if available >= required_bytes:
             return 0
@@ -337,9 +542,14 @@ class CacheManager:
         """Reclaim CLEAN, recomputable cache entries in access order."""
         return self._evict_by_access(bytes_needed, recomputable=True)
 
-    def _evict_by_access(self, bytes_needed: int, *, recomputable: bool) -> bool:
+    def _evict_by_access(
+        self, bytes_needed: int, *, recomputable: Optional[bool], dry_run: bool = False,
+        count: bool = False,
+    ):
+        """Whether bytes_needed were freed (or, dry, could be); with count,
+        the bytes found instead, stopping once they reach bytes_needed."""
         if bytes_needed <= 0:
-            return True
+            return 0 if count else True
         with self._lock:
             freed = 0
             for virtual_path in self.state_manager.iter_lru_paths(recomputable=recomputable):
@@ -349,64 +559,176 @@ class CacheManager:
                         continue
                     try:
                         freed += self._evict_if_still_clean(
-                            virtual_path, cache_path, recomputable=recomputable,
+                            virtual_path, cache_path, recomputable=recomputable, dry_run=dry_run,
                         )
                     except OSError as e:
                         print(f"Warning: Failed to evict {virtual_path}: {e}")
                 if freed >= bytes_needed:
-                    return True
-            return False
+                    return freed if count else True
+            return freed if count else False
 
     def ensure_space(self, bytes_needed: int) -> bool:
+        """Free the minimum whole-file LRU victims for a cache allocation."""
+        with self._lock:
+            if bytes_needed > self.max_size_bytes:
+                return False
+            return self._free_space(self.get_free_space_needed(bytes_needed))
+
+    def _free_space(self, needed: int) -> bool:
+        """Evict CLEAN copies in access order until `needed` bytes are freed.
+
+        A dry run first keeps useful copies when even every eligible victim
+        would leave the allocation over budget. It is best effort, not a
+        guarantee: opens, closes and index changes do not take the cache
+        lock, so the real pass can find fewer victims than the dry run did,
+        evict some copies, and still fail. A dry run that falls short is
+        remembered (see _known_shortfall), so a stream asking chunk after
+        chunk does not walk the whole index each time. Caller holds the lock.
         """
-        Ensure enough cache space is available
-
-        Attempts eviction in this order:
-        1. LRU non-recomputable files
-        2. LRU recomputable files
-
-        Args:
-            bytes_needed: Amount of space needed in bytes
-
-        Returns:
-            True if space was made available, False if insufficient space
-        """
-        space_needed = self.get_free_space_needed(bytes_needed)
-
-        if space_needed <= 0:
-            return True  # Already have enough space
-
-        # Try evicting LRU files first
-        if self.evict_lru_files(space_needed):
+        if needed <= 0:
             return True
+        if self._known_shortfall(needed):
+            return False
+        # The epoch is read before the walk, so a close during it voids the
+        # result. The index count is read after: the walk flushes pending
+        # access times itself. A row change during the walk is caught by the
+        # TTL.
+        epoch = self._evictable_epoch
+        freeable = self._freeable_bytes(needed)
+        if freeable < needed:
+            self._shortfall = (epoch, self.state_manager.change_count(),
+                               time.monotonic(), freeable)
+            return False
+        self._shortfall = None
+        return self._evict_by_access(needed, recomputable=None)
 
-        # The first tier may have freed some of the space.
-        return self.evict_recomputable_files(self.get_free_space_needed(bytes_needed))
+    def _known_shortfall(self, needed: int) -> bool:
+        shortfall = self._shortfall
+        if shortfall is None:
+            return False
+        epoch, changes, at, freeable = shortfall
+        if (epoch != self._evictable_epoch
+                or changes != self.state_manager.change_count()
+                or time.monotonic() - at >= self.SHORTFALL_TTL_SECONDS):
+            self._shortfall = None
+            return False
+        return needed > freeable
 
-    def hold_unlinked_bytes(self, size: int):
-        """Charge bytes of an unlinked file that descriptors still hold.
+    def _freeable_bytes(self, needed: int) -> int:
+        """Bytes a real eviction pass could free, counted up to `needed`."""
+        return self._evict_by_access(needed, recomputable=None, dry_run=True, count=True)
 
-        A cache-path scan cannot see such a file (a replaced streaming
-        session's partial, kept by its readers), so it is charged like a
-        reservation until release_unlinked_bytes.
+    def _grants_unavailable(self, reason: str) -> bool:
+        """Refuse a streaming grant the filesystem cannot measure; log it once."""
+        if not self._grant_warning_logged:
+            self._grant_warning_logged = True
+            logger.warning(
+                "Some streaming reads are not being cached in %s: %s. Those "
+                "reads are served from the member without keeping their bytes. "
+                "Use a cache filesystem with exact SEEK_DATA/SEEK_HOLE (ext4, "
+                "xfs, btrfs, tmpfs). Logged once.",
+                self.cache_root, reason,
+            )
+        return False
+
+    def write_streaming_chunk(self, fd: int, offset: int, data: bytes) -> bool:
+        """Keep a chunk when its new data blocks fit, else leave the inode alone.
+
+        The caller serializes writes on this sparse inode and fetches the
+        network bytes before entering. The cache lock orders the grant and
+        the local write against every other allocation.
+
+        The first grant on a descriptor measures the inode's extents once
+        (SEEK_DATA/SEEK_HOLE) and refuses, logging once, when they exceed
+        the blocks it has allocated (st_blocks): a filesystem that reports
+        holes as data cannot be charged. From then on the charge is the
+        blocks this descriptor has written (_PartialCharge), so a grant
+        costs a lookup in that range list, not an extent walk, and an
+        extent report that goes wrong later cannot hide a block the budget
+        has not paid for. On a filesystem that allocates less than it is
+        given (compression), that only overstates the charge.
+        """
+        if not data:
+            return True
+        start = offset // self.block_size * self.block_size
+        end = self._round_up(offset + len(data))
+        with self._lock:
+            st = os.fstat(fd)
+            if st.st_nlink == 0:
+                return False
+            charge = self._streaming_fds.get(fd)
+            if charge is None:
+                try:
+                    extents = self._extent_ranges(fd, 0, self._round_up(st.st_size))
+                except OSError as exc:
+                    if exc.errno in (errno.EINVAL, errno.ENOTSUP, errno.ENOSYS):
+                        return self._grants_unavailable(f"extent seeks failed ({exc.strerror})")
+                    raise
+                charge = _PartialCharge(extents)
+                if charge.bytes > st.st_blocks * 512:
+                    return self._grants_unavailable("the filesystem reports sparse holes as data")
+                # The tree scan counted this inode at its path; from here it
+                # is counted through the descriptor, at the same bytes.
+                self._streaming_fds[fd] = charge
+            self._ensure_size_current_locked()
+            required = end - start - charge.overlap(start, end)
+            if required and not self.ensure_space(required):
+                return False
+            cursor = offset
+            try:
+                remaining = memoryview(data)
+                while remaining:
+                    written = os.pwrite(fd, remaining, cursor)
+                    if written <= 0:
+                        raise OSError(errno.EIO, "partial cache write made no progress")
+                    remaining = remaining[written:]
+                    cursor += written
+            finally:
+                # Only the blocks bytes reached; nothing here can raise and
+                # replace the write's own error.
+                if cursor > offset:
+                    growth = charge.add(start, self._round_up(cursor))
+                    self._current_size_bytes += growth
+        return True
+
+    def close_streaming_fd(self, fd: int):
+        """Release a partial's charge once its unlinked inode can be freed.
+
+        The charge stays until the session descriptor closes, which is after
+        every reader's: a FUSE reader of the partial holds a session
+        reference, StorageFS._release closes the reader's descriptor before
+        it drops that reference, and the session closes this descriptor only
+        once no references remain (or at unmount).
         """
         with self._lock:
-            self._reserved_bytes += size
-
-    def release_unlinked_bytes(self, size: int):
-        with self._lock:
-            self._reserved_bytes -= size
-
-    @contextmanager
-    def admit_streaming_partial(self, file_size: int):
-        """Charge the new sparse file's apparent size before another open can allocate."""
-        with self._lock:
-            admitted = self.ensure_space(file_size)
+            charge = self._streaming_fds.pop(fd, None)
             try:
-                yield admitted
+                if charge is not None and charge.bytes and os.fstat(fd).st_nlink == 0:
+                    self._current_size_bytes = max(0, self._current_size_bytes - charge.bytes)
+            except OSError:
+                self._size_dirty = True
             finally:
-                if admitted:
-                    self._size_dirty = True
+                os.close(fd)
+
+    def publish_streaming_fd(self, fd: int):
+        """Move a completed inode's existing charge into tree accounting."""
+        with self._lock:
+            self._streaming_fds.pop(fd, None)
+            self._size_dirty = True
+
+    def truncate_streaming_fd(self, fd: int, size: int):
+        """Keep accounting in step when a failed fill preserves only a prefix.
+
+        The charge drops the blocks past the new end from what this
+        descriptor wrote; nothing is measured, so once the truncate has
+        succeeded nothing here can fail.
+        """
+        with self._lock:
+            os.ftruncate(fd, size)
+            charge = self._streaming_fds.get(fd)
+            if charge is not None:
+                self._current_size_bytes = max(
+                    0, self._current_size_bytes - charge.trim(self._round_up(size)))
 
     def cache_file(self, virtual_path: str, backend: Backend, source_virtual_path: str = None) -> bool:
         """Ensure a member file is cached, including when another fill won."""
@@ -433,6 +755,11 @@ class CacheManager:
 
         Returns:
             Whether this copy was installed, another copy won, or the fetch failed.
+
+        Raises:
+            OSError with ENOSPC or EDQUOT when the cache has no room for the
+            copy (its budget or the filesystem), and what the member probes
+            raise.
         """
         source_virtual_path = source_virtual_path or virtual_path
         # Member probes: no lock, and their errors propagate as before.
@@ -447,27 +774,28 @@ class CacheManager:
         if file_size is None:
             file_size = backend.get_size(source_virtual_path)
 
-        with self._lock:
-            if not self.ensure_space(file_size):
-                print(f"Warning: Insufficient cache space for {virtual_path}")
-                return CacheFetch.FAILED
-            self._reserved_bytes += file_size
         try:
             installed = self.fetch_into_cache(
                 backend, source_virtual_path, self.get_cache_path(virtual_path), member_stat,
+                expected_size=file_size,
             )
             return CacheFetch.INSTALLED if installed else CacheFetch.ALREADY_CACHED
         except (BulkCapacityCancelled, BulkCapacityTimeout):
             raise
+        except OSError as e:
+            if e.errno in (errno.ENOSPC, errno.EDQUOT):
+                # No room in the cache is not a failed member: another
+                # member or a retry would only download the file again to
+                # hit the same limit. The open reports it as it is.
+                raise
+            print(f"Error caching {virtual_path} from {backend.name}: {e}")
+            return CacheFetch.FAILED
         except Exception as e:
             print(f"Error caching {virtual_path} from {backend.name}: {e}")
             return CacheFetch.FAILED
-        finally:
-            with self._lock:
-                self._reserved_bytes -= file_size
 
     def fetch_into_cache(self, backend: Backend, source_virtual_path: str, cache_path: Path,
-                         member_stat=None) -> bool:
+                         member_stat=None, *, expected_size: int = 0) -> bool:
         """Copy a member file to cache_path through a temp file beside it.
 
         The copy runs without the cache lock into a fresh name that ends in
@@ -478,7 +806,11 @@ class CacheManager:
         replaced, and the existing inode keeps its bytes and xattrs. The
         link and the size accounting run under the lock. The cache
         filesystem must support hard links (it must support xattrs anyway).
-        No space is reserved here (cache_file does that).
+        The reservation covers this temp file until publication or cleanup.
+        Publication needs room only for data beyond the reservation (a
+        member file that grew during the copy): an unbudgeted local write
+        that took the cache over its limit meanwhile does not undo a copy
+        whose space was already promised to it.
 
         Returns True when this copy was installed, False when a file was
         already there and this copy was discarded. Raises what the copy or
@@ -488,7 +820,10 @@ class CacheManager:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         temp_path = cache_path.parent / f".{secrets.token_hex(8)}{PARTIAL_SUFFIX}"
         with self._lock:
-            scans = self._scan_count
+            reserved = self._round_up(expected_size)
+            if not self.ensure_space(reserved):
+                raise OSError(errno.ENOSPC, "insufficient cache space")
+            self._whole_file_temps[temp_path] = reserved
         try:
             with bulk_request() if self.bulk_cold_copies else nullcontext():
                 backend.copy_to_local(source_virtual_path, temp_path)
@@ -504,35 +839,55 @@ class CacheManager:
             fd = os.open(temp_path, os.O_RDONLY | os.O_NOFOLLOW)
             try:
                 copy_member_attributes(fd, member_stat)
-                size = os.fstat(fd).st_size
             finally:
                 os.close(fd)
             with self._lock:
                 try:
-                    os.link(temp_path, cache_path)
-                except FileExistsError:
-                    if not (cache_path.is_file() and not cache_path.is_symlink()):
-                        raise
-                    return False
-                self._current_size_bytes += size
-            return True
+                    size = self._temp_data_bytes(temp_path)
+                    # A copy that grew spends space only if it can still be
+                    # installed: something already at the path (another
+                    # fill, a writer) wins at the link below, and this copy
+                    # is discarded without evicting anything for it.
+                    if (size > reserved and not os.path.lexists(cache_path)
+                            and not self._fits_beyond_reservation(size - reserved, size)):
+                        raise OSError(errno.ENOSPC, "insufficient cache space")
+                    try:
+                        os.link(temp_path, cache_path)
+                    except FileExistsError:
+                        if regular_file_stat(cache_path) is None:
+                            raise
+                        return False
+                    self._current_size_bytes += size
+                    self.note_evictable_change()
+                    return True
+                finally:
+                    self._drop_whole_temp(temp_path)
         except BaseException:
-            # Whatever the copy wrote may have been counted by a rescan,
-            # and a failure after the link leaves the sum unknown.
             with self._lock:
-                self._size_dirty = True
+                if temp_path in self._whole_file_temps:
+                    self._drop_whole_temp(temp_path)
             raise
+
+    def _fits_beyond_reservation(self, excess: int, size: int) -> bool:
+        """Make room for a finished copy's `excess` bytes past its reservation.
+
+        Caller holds the lock with the temp file still reserved, so the
+        shortfall counts the copy at its full size. Only the part of that
+        shortfall the excess accounts for is evicted for: what other writers
+        overspent is not this copy's to free.
+        """
+        if size > self.max_size_bytes:
+            return False
+        return self._free_space(min(excess, self.get_free_space_needed(0)))
+
+    def _drop_whole_temp(self, path: Path):
+        """Release the temp reservation under the cache lock."""
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            self._size_dirty = True
         finally:
-            try:
-                temp_path.unlink(missing_ok=True)
-            except OSError:
-                with self._lock:
-                    self._size_dirty = True
-            with self._lock:
-                if self._scan_count != scans:
-                    # A rescan during the copy may have counted the temp
-                    # file as well as the linked copy.
-                    self._size_dirty = True
+            del self._whole_file_temps[path]
 
     def mark_accessed(self, virtual_path: str, *, accessed_at: Optional[float] = None):
         """Mark a file as accessed (update LRU)"""
@@ -564,12 +919,19 @@ class CacheManager:
         return generation
 
     def _evict_if_still_clean(
-        self, virtual_path: str, cache_path: Path, *, recomputable: bool = False,
+        self, virtual_path: str, cache_path: Path, *, recomputable: Optional[bool] = False,
+        dry_run: bool = False,
     ) -> int:
         """Reclaim cache bytes if the row is still CLEAN and describes the file.
 
         Recheck after selection under the index lock, which mark_file_dirty
-        also takes. A stale CLEAN is marked and kept. Hold descriptor_guard
+        also takes. A stale CLEAN is marked and kept: a file is stale when
+        its live size or mtime differs from the stat in its row or in its
+        metadata xattr (CacheMetadataRecord.is_stale_for), whatever status
+        either records. A file whose xattr cannot be read or parsed is kept
+        unmarked: nothing vouches for it. One without the xattr (a mirror
+        that was never possible, such as on a read-only copy) has only its
+        row to go by. Hold descriptor_guard
         across the stat and the unlink or truncation, so no open descriptor
         can be missed or registered in between. Forget listing attributes
         before changing the cache inode. Lock order is the cache lock, the
@@ -577,8 +939,21 @@ class CacheManager:
         """
         with self.state_manager.metadata_lock:
             row = self.state_manager.get_file_metadata(virtual_path)
-            if (row is None or row.sync_status != SyncStatus.CLEAN or row.link_target is not None
-                    or row.recomputable != recomputable or (recomputable and not row.recompute_cmd)):
+            if row is None or row.sync_status != SyncStatus.CLEAN or row.link_target is not None:
+                return 0
+            if recomputable is not None and row.recomputable != recomputable:
+                return 0
+            truncate = recomputable is True
+            if truncate and not row.recompute_cmd:
+                return 0
+            if recomputable is None and not any(
+                not location.is_cached for location in self.state_manager.get_file_locations(virtual_path)
+            ):
+                # Pressure eviction reclaims only a copy a member is recorded
+                # to hold, so the next open can fetch it again. A CLEAN row
+                # alone is not that evidence (a status published without a
+                # location, a rebuilt index), and the cache cannot recreate
+                # a recompute-only placeholder on demand yet.
                 return 0
             # A member that missed a rename may hold these bytes only under
             # the old name: the cached copy stays until the repair is resolved.
@@ -593,28 +968,39 @@ class CacheManager:
                     return 0
                 stale = st.st_size != row.size or st.st_mtime != row.last_modified
                 if not stale:
-                    if st.st_size == 0:
+                    try:
+                        record = read_cache_metadata(cache_path)
+                    except (OSError, ValueError, TypeError, KeyError):
                         return 0
+                    stale = record is not None and record.is_stale_for(st.st_size, st.st_mtime)
+                if not stale:
+                    if st.st_nlink > 1 and not truncate:
+                        return 0  # unlinking one alias cannot reclaim its blocks
+                    freed = self._path_data_bytes(cache_path, st)
+                    if dry_run or freed == 0:
+                        return freed
                     if self.forget_listed_attrs:
                         self.forget_listed_attrs(virtual_path)
-                    if recomputable:
+                    if truncate:
                         truncated = self._truncate_recomputable(cache_path, st)
                         if truncated is None:
                             return 0
                     else:
                         cache_path.unlink()
             if stale:
+                # Even in a dry run: the mismatch is verified, and the dirty
+                # transition is what makes the file sync. Nothing is reclaimed.
                 self.mark_file_dirty(virtual_path, cache_path)
                 return 0
-            self._current_size_bytes = max(0, self._current_size_bytes - st.st_size)
-            if recomputable:
+            self._current_size_bytes = max(0, self._current_size_bytes - freed)
+            if truncate:
                 row.size = 0
                 row.checksum = None
                 row.last_modified = truncated.st_mtime
                 self.store_file_metadata(row, cache_path=cache_path)
             else:
                 self.state_manager.remove_file_location(virtual_path, "cache")
-            return st.st_size
+            return freed
 
     @staticmethod
     def _truncate_recomputable(cache_path: Path, st: os.stat_result) -> Optional[os.stat_result]:
@@ -727,11 +1113,8 @@ class CacheManager:
         """
         with self._lock:
             cache_path = self.get_cache_path(virtual_path)
-            existing_size = cache_path.stat().st_size if cache_path.exists() else 0
             cache_path.parent.mkdir(parents=True, exist_ok=True)
             cache_path.touch()
-            new_size = cache_path.stat().st_size if cache_path.exists() else 0
-            self._current_size_bytes += (new_size - existing_size)
 
             # Mark as accessed
             self.mark_accessed(virtual_path)
@@ -746,9 +1129,12 @@ class CacheManager:
                 try:
                     # A link is removed, not followed; it was never counted.
                     st = regular_file_stat(cache_path)
-                    file_size = st.st_size if st is not None else 0
+                    file_size = self._path_data_bytes(cache_path, st) if st is not None else 0
                     cache_path.unlink()
-                    self._current_size_bytes = max(0, self._current_size_bytes - file_size)
+                    if st is not None and st.st_nlink > 1:
+                        self._size_dirty = True
+                    else:
+                        self._current_size_bytes = max(0, self._current_size_bytes - file_size)
                 except OSError as e:
                     self._size_dirty = True
                     print(f"Warning: Failed to delete cache file {virtual_path}: {e}")

@@ -88,7 +88,25 @@ Storage will prefer to read from a local cache over a remote filesystem in all c
 
 ## Cache Eviction
 
-Storage can allocate (as configured) some amount of local cache space to mirror content from remote filesystems. If some backing filesystems are remote and some are local, the local filesystem serves as this local cache unless an additional local cache on a different path is configured. Storage manages this cache as an LRU cache over whole files. A read anywhere in a file causes the whole file to be downloaded to the cache, evicting the least recently used (reads and writes count). Storage will not evict a file that has not yet been synchronized as per the configuration of the file or directory and will fail to read the file that would have evicted un-flushed changes if this occurs, unless there is a file that can be recomputed that can be deleted to clear space (if this is what prevents the file from being successfully replicated). 
+Storage limits local cache data to a configured budget. Streaming fills
+charge the data blocks each write materializes. Eviction reclaims whole
+files in least recently accessed order, counting reads and writes.
+A copy is recoverable only when a member is recorded to hold it,
+recomputable or not. Dirty, open, repair-pinned, and recompute-only files,
+and clean copies with no recorded member location, are kept under
+pressure. A streaming reader can receive fetched bytes directly when the
+cache cannot keep them, and speculative reads pause.
+
+The budget is kept incrementally. A streaming download is charged the
+blocks it has written, tracked per descriptor, until its partial is
+published or its descriptor closes (after every reader's). Local writes
+and truncates are charged by the change in the data blocks they touch
+(the whole file for an O_APPEND write), and an eviction pass that finds
+too few victims is remembered until a descriptor closes, the index changes
+or a second passes. Charging needs exact `SEEK_DATA`/`SEEK_HOLE` from the
+cache filesystem (see README.md). A whole-file copy reserves its expected
+size up front, and publishing it needs room only for any growth beyond
+that reservation.
 
 # Write Path
 

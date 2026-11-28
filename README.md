@@ -243,6 +243,23 @@ a 2 GiB file, a 1 MiB contiguous read opens a speculative window of up to
 4 MiB after that span, while a contiguous read of about 614.4 MiB
 (644,245,095 bytes) qualifies the file to keep downloading after close.
 
+The cache budget charges data blocks as the partial download writes them.
+An open or a sparse seek reserves space only when bytes arrive and need
+new blocks. When the next write cannot fit after reclaiming eligible
+copies, foreground reads can return the fetched bytes directly and
+preloading pauses.
+
+Block charging needs a cache filesystem whose `SEEK_DATA`/`SEEK_HOLE`
+report allocated extents exactly: ext4, xfs, btrfs and tmpfs do. A
+download's first grant checks the reported extents against the blocks the
+file has allocated; later grants charge the blocks the download itself
+has written, with no extent query. A filesystem that reports holes as
+data, such as one with only the generic `lseek`, fails that check, and so
+can OpenZFS while a file has changes not yet synced (with
+`zfs_dmu_offset_next_sync=0`). Downloads that fail it are served without
+being cached, and the mount logs one warning. OpenZFS is not a supported
+cache filesystem.
+
 Streaming read-ahead and retained fills share an adaptive pool. Workers
 start as chunks become runnable and retire after 30 idle seconds. By
 default the pool grows with demand up to each member's own limit: bulk
@@ -666,9 +683,8 @@ Configuration is hierarchical - child directories inherit from parents, with the
 
 **Cache Management:**
 1. Track file access times for LRU
-2. Evict clean files when space needed
-3. Prefer evicting recomputable files
-4. Never evict dirty (unsynced) files
+2. Reclaim clean, recoverable copies in access order as new data needs space
+3. Keep dirty, open, repair-pinned, and recompute-only files, and copies no member is recorded to hold, under cache pressure
 
 **Metadata and Recovery:**
 1. File/directory policy remains xattr-defined via `user.storage.config`

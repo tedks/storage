@@ -537,7 +537,7 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.assertEqual(session.io_fd, -1)
         self._assert_not_cached("unavailable-worker.bin")
 
-    def test_reader_reclaims_retained_space_without_touching_local_writes(self):
+    def test_small_read_keeps_an_unrelated_retained_fill_and_local_writes(self):
         self.fs.cache_manager.max_size_bytes = 512 * 1024
         self.backend.worker_gate = threading.Event()
         payload = os.urandom(384 * 1024)
@@ -558,13 +558,199 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self._session_for(fd)
         self.assertEqual(self.fs.read("/new-reader.bin", 4096, 0, fd), payload[:4096])
         self.fs.release("/new-reader.bin", fd)
-        self.assertTrue(retained.detached)
+        self.assertFalse(retained.detached)
         self.assertEqual((self.cache_dir / "dirty.bin").read_bytes(), b"local write")
-        self.assertEqual(self.fs._streaming_stats_snapshot()["streaming_retained_space_cancellations"], 1)
 
         self.backend.worker_gate.set()
         self.assertTrue(retained.background_finished.wait(timeout=3))
         self.assertEqual(retained.io_fd, -1)
+        self.assertEqual((self.cache_dir / "retained.bin").read_bytes(), payload)
+
+    def test_full_cache_returns_mixed_cached_and_transient_ranges(self):
+        manager = self.fs.cache_manager
+        block = manager.block_size
+        manager.max_size_bytes = 2 * block
+        payload = b"a" * block + b"b" * block + b"c" * block
+        (self.backend_dir / "mixed.bin").write_bytes(payload)
+        dirty = self.fs.create("/dirty.bin", 0o644)
+        self.fs.write("/dirty.bin", b"local bytes", 0, dirty)
+        try:
+            reader = self.fs.open("/mixed.bin", os.O_RDONLY)
+            session = self._session_for(reader)
+            try:
+                self.assertEqual(manager.get_total_cache_size(), block)
+                self.assertEqual(self.fs.read("/mixed.bin", block, 0, reader), payload[:block])
+                self.assertEqual(self.fs.read("/mixed.bin", 2 * block, 0, reader), payload[:2 * block])
+                self.assertEqual(self.fs.read("/mixed.bin", block, 2 * block, reader), payload[2 * block:])
+                with session.lock:
+                    self.assertEqual(session.available_ranges, [(0, block)])
+                    self.assertTrue(session.cache_full)
+                    self.assertFalse(session.prefetch_complete)
+                    # Speculation pauses while the cache is full, and only
+                    # because of it: bytes are still missing.
+                    self.assertTrue(session.read_ahead_started)
+                    next_fetch = self.fs._streaming_manager._next_background_fetch
+                    self.assertIsNone(next_fetch(session))
+                    session.cache_full = False
+                    self.assertIsNotNone(next_fetch(session))
+                    session.cache_full = True
+                self.assertEqual(manager.get_total_cache_size(), 2 * block)
+                self.assertEqual((self.cache_dir / "dirty.bin").read_bytes(), b"local bytes")
+            finally:
+                self.fs.release("/mixed.bin", reader)
+        finally:
+            self.fs.release("/dirty.bin", dirty)
+
+    def _fill_cache_but_one_block(self, name, blocks):
+        """A member file of `blocks` blocks and a dirty local block, with a
+        budget of three blocks: the dirty block and two of the file fit."""
+        manager = self.fs.cache_manager
+        block = manager.block_size
+        manager.max_size_bytes = 3 * block
+        payload = bytes([65 + index for index in range(blocks) for _ in range(block)])
+        (self.backend_dir / name).write_bytes(payload)
+        dirty = self.fs.create("/dirty.bin", 0o644)
+        self.fs.write("/dirty.bin", b"local bytes", 0, dirty)
+        self.fs.release("/dirty.bin", dirty)
+        self.assertEqual(manager.get_total_cache_size(), block)
+        self.assertEqual(self.fs.state_manager.get_file_metadata("/dirty.bin").sync_status,
+                         SyncStatus.DIRTY)
+        return payload
+
+    def test_last_close_stops_a_qualified_fill_the_foreground_found_full(self):
+        """No background fetch in flight: the last close itself stops a
+        qualified fill that cannot be cached, releasing its partial and
+        charge, instead of retaining it with nothing left to run."""
+        manager = self.fs.cache_manager
+        block = manager.block_size
+        payload = self._fill_cache_but_one_block("full.bin", 4)
+        streaming = self.fs._streaming_manager
+        with patch.object(streaming, "_next_background_fetch", return_value=None):
+            reader = self.fs.open("/full.bin", os.O_RDONLY)
+            session = self._session_for(reader)
+            self.assertEqual(self.fs.read("/full.bin", 2 * block, 0, reader), payload[:2 * block])
+            self.assertEqual(self.fs.read("/full.bin", block, 2 * block, reader),
+                             payload[2 * block:3 * block])
+            with session.lock:
+                self.assertTrue(session.readers_consumed)
+                self.assertTrue(session.cache_full)
+                self.assertEqual(session.in_flight_ranges, [])
+            self.assertEqual(manager.get_total_cache_size(), 3 * block)
+            self.fs.release("/full.bin", reader)
+        self.assertTrue(session.stop_requested)
+        self.assertTrue(session.detached)
+        self.assertTrue(session.background_finished.wait(timeout=3))
+        self.assertEqual(session.io_fd, -1)
+        self._assert_not_cached("full.bin")
+        self.assertEqual(manager.get_total_cache_size(), block)
+
+    def test_readerless_fill_stops_when_its_background_chunk_does_not_fit(self):
+        manager = self.fs.cache_manager
+        block = manager.block_size
+        payload = self._fill_cache_but_one_block("retained.bin", 4)
+        self.backend.worker_gate = threading.Event()
+        reader = self.fs.open("/retained.bin", os.O_RDONLY)
+        session = self._session_for(reader)
+        self.assertEqual(self.fs.read("/retained.bin", 2 * block, 0, reader), payload[:2 * block])
+        self.assertTrue(self.backend.worker_in_read.wait(timeout=3))
+        self.fs.release("/retained.bin", reader)
+        with session.lock:
+            self.assertTrue(session.readers_consumed)
+            self.assertFalse(session.stop_requested)  # retained: a qualified fill
+        self.assertEqual(manager.get_total_cache_size(), 3 * block)
+
+        self.backend.worker_gate.set()
+        self.assertTrue(session.background_finished.wait(timeout=3))
+        self.assertTrue(session.stop_requested)
+        self.assertTrue(session.detached)
+        self.assertEqual(session.io_fd, -1)
+        self._assert_not_cached("retained.bin")
+        self.assertEqual(manager.get_total_cache_size(), block)
+
+    def test_write_open_reports_a_full_cache_as_enospc(self):
+        manager = self.fs.cache_manager
+        (self.backend_dir / "big.bin").write_bytes(b"b" * (4 * manager.block_size))
+        manager.max_size_bytes = 2 * manager.block_size
+        with patch.object(self.backend, "copy_to_local") as copy:
+            with self.assertRaises(FuseOSError) as raised:
+                self.fs.open("/big.bin", os.O_RDWR)
+        self.assertEqual(raised.exception.errno, errno.ENOSPC)
+        copy.assert_not_called()
+
+    def test_superseded_partial_stays_charged_until_its_last_reader_closes(self):
+        """R2-I1: a FUSE reader of a superseded session holds a ref, and its
+        release closes its own descriptor before dropping it, so the
+        session descriptor (and with it the charge) outlives every reader."""
+        manager = self.fs.cache_manager
+        block = manager.block_size
+        payload = os.urandom(96 * 1024)
+        (self.backend_dir / "superseded.bin").write_bytes(payload)
+        held, at_finalize, go = self._hold_finalize()
+        with held:
+            vfd_a, session = self._stream_whole_file("superseded.bin", payload)
+            self.assertTrue(at_finalize.wait(timeout=5))
+            vfd_b = self.fs.open("/superseded.bin", os.O_RDONLY)
+            self.assertIs(self._session_for(vfd_b), session)
+            (self.cache_dir / "superseded.bin").write_bytes(b"winner")
+            manager.mark_cache_size_dirty()
+            go.set()
+            self.assertTrue(self._wait_for(lambda: session.finalized))
+        self.assertTrue(session.detached)
+        self.assertGreaterEqual(session.io_fd, 0)
+        self.assertEqual(os.fstat(session.io_fd).st_nlink, 0)
+        expected = len(payload) + block
+        manager.mark_cache_size_dirty()
+        self.assertEqual(manager.get_total_cache_size(), expected)
+        self.fs.release("/superseded.bin", vfd_a)
+        self.assertGreaterEqual(session.io_fd, 0)
+        self.assertEqual(manager.get_total_cache_size(), expected)
+        self.assertEqual(self.fs.read("/superseded.bin", 4096, 0, vfd_b), payload[:4096])
+        self.fs.release("/superseded.bin", vfd_b)
+        self.assertEqual(session.io_fd, -1)
+        self.assertEqual(manager.get_total_cache_size(), block)
+        self.assertEqual((self.cache_dir / "superseded.bin").read_bytes(), b"winner")
+
+    def test_an_append_write_is_charged_where_it_lands(self):
+        """pwrite on an O_APPEND descriptor writes at end of file, not at
+        the offset given; the charge follows the bytes."""
+        manager = self.fs.cache_manager
+        block = manager.block_size
+        fh = self.fs.create("/append.bin", 0o644)
+        self.fs.write("/append.bin", b"a" * block, 0, fh)
+        self.fs.release("/append.bin", fh)
+        manager.mark_cache_size_dirty()
+        self.assertEqual(manager.get_total_cache_size(), block)
+        with patch.object(manager, "_scan_total_cache_size",
+                          side_effect=AssertionError("unexpected full cache scan")):
+            fh = self.fs.open("/append.bin", os.O_WRONLY | os.O_APPEND)
+            try:
+                self.assertEqual(self.fs.write("/append.bin", b"b" * block, 0, fh), block)
+                self.assertEqual(manager.get_total_cache_size(), 2 * block)
+            finally:
+                self.fs.release("/append.bin", fh)
+        self.assertEqual((self.cache_dir / "append.bin").read_bytes(), b"a" * block + b"b" * block)
+        manager.mark_cache_size_dirty()
+        self.assertEqual(manager.get_total_cache_size(), 2 * block)
+
+    def test_local_writes_and_truncates_are_charged_without_a_rescan(self):
+        manager = self.fs.cache_manager
+        block = manager.block_size
+        manager.get_total_cache_size()
+        with patch.object(manager, "_scan_total_cache_size",
+                          side_effect=AssertionError("unexpected full cache scan")):
+            fh = self.fs.create("/local.bin", 0o644)
+            try:
+                self.fs.write("/local.bin", b"x" * (3 * block), 0, fh)
+                self.fs.write("/local.bin", b"y" * 10, block, fh)
+                self.fs.truncate("/local.bin", block + 1)
+                self.assertEqual(manager.get_total_cache_size(), 2 * block)
+            finally:
+                self.fs.release("/local.bin", fh)
+            reopened = self.fs.open("/local.bin", os.O_WRONLY | os.O_TRUNC)
+            self.fs.release("/local.bin", reopened)
+            self.assertEqual(manager.get_total_cache_size(), 0)
+        manager.mark_cache_size_dirty()
+        self.assertEqual(manager.get_total_cache_size(), 0)
 
     def test_download_worker_start_retry_and_local_publication_on_release(self):
         manager = self.fs._streaming_manager
@@ -2920,8 +3106,12 @@ class TestFSStreamingIntegration(unittest.TestCase):
 
     def test_replaced_session_is_charged_before_its_partial_is_unlinked(self):
         # R3-I2: a cache scan between the unlink and the charge would see
-        # the space as free while the old reader still pins it.
+        # the space as free while the old reader still pins it. The block
+        # the old session wrote is charged through its descriptor, which
+        # stays open until its reader's last release.
         manager = self.fs._streaming_manager
+        cache = self.fs.cache_manager
+        block = cache.block_size
         payload = os.urandom(64 * 1024)
         (self.backend_dir / "charged.bin").write_bytes(payload)
         vfd_a = self.fs.open('/charged.bin', os.O_RDONLY)
@@ -2931,19 +3121,15 @@ class TestFSStreamingIntegration(unittest.TestCase):
             session_a.error = OSError(errno.EIO, "simulated failure")
             manager._schedule_background(session_a)
         self.assertTrue(session_a.background_finished.wait(timeout=3.0))
-        real_unlink = manager._unregister_and_unlink
-        reserved_at_unlink = []
-
-        def unlink(session):
-            if session is session_a:
-                reserved_at_unlink.append(self.fs.cache_manager._reserved_bytes)
-            return real_unlink(session)
-
-        with patch.object(manager, "_unregister_and_unlink", side_effect=unlink):
-            vfd_b = self.fs.open('/charged.bin', os.O_RDONLY)
-        self.assertEqual(reserved_at_unlink, [session_a.file_size])
+        vfd_b = self.fs.open('/charged.bin', os.O_RDONLY)
+        self.assertTrue(session_a.detached)
+        self.assertEqual(os.fstat(session_a.io_fd).st_nlink, 0)
+        cache.mark_cache_size_dirty()
+        self.assertEqual(cache.get_total_cache_size(), block)
         self.fs.release('/charged.bin', vfd_a)
-        self.assertEqual(self.fs.cache_manager._reserved_bytes, 0)
+        self.assertEqual(session_a.io_fd, -1)
+        cache.mark_cache_size_dirty()
+        self.assertEqual(cache.get_total_cache_size(), 0)
         self.fs.release('/charged.bin', vfd_b)
 
     def test_non_oserror_at_registration_leaves_nothing_behind(self):
@@ -3215,7 +3401,9 @@ class TestFSStreamingIntegration(unittest.TestCase):
         # charged while its reader holds them.
         self.assertEqual(manager.session_descriptor_count(), 2)
         self.assertEqual(self.fs._streaming_stats_snapshot()["streaming_session_descriptors"], 2)
-        self.assertEqual(self.fs.cache_manager._reserved_bytes, session_a.file_size)
+        block = self.fs.cache_manager.block_size
+        self.fs.cache_manager.mark_cache_size_dirty()
+        self.assertEqual(self.fs.cache_manager.get_total_cache_size(), block)
 
         # The old reader keeps its bytes and its error; the new one reads everything.
         self.assertEqual(self.fs.read('/failed.bin', 4096, 0, vfd_a), payload[:4096])
@@ -3231,8 +3419,7 @@ class TestFSStreamingIntegration(unittest.TestCase):
         # the successor's partial and cache file alone.
         self.fs.release('/failed.bin', vfd_a)
         self.assertEqual(session_a.io_fd, -1)
-        self.assertEqual(session_a.unlinked_charge, 0)
-        self.assertEqual(self.fs.cache_manager._reserved_bytes, 0)
+        self.assertEqual(self.fs.cache_manager.get_total_cache_size(), len(payload))
         self.assertEqual(manager.session_descriptor_count(), 1)
         self.assertFalse(session_b.detached)
         self.fs.release('/failed.bin', vfd_b)

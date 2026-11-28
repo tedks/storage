@@ -124,6 +124,18 @@ class StateManager:
         """Commit the current transaction while the caller holds _db_lock."""
         self.conn.commit()
 
+    def change_count(self) -> int:
+        """Rows inserted, updated or deleted through the index connection so far.
+
+        Monotonic for the life of this StateManager (sqlite3 total_changes),
+        so an unchanged count means no row of files or file_locations moved
+        in between: no CLEAN transition, new row, rename or delete. The
+        member_checksums connection is not counted. A caller that cached an
+        answer derived from the index compares counts to know it still holds.
+        """
+        with self._db_lock:
+            return self.conn.total_changes
+
     @property
     def metadata_lock(self) -> threading.RLock:
         """The re-entrant lock that orders row writes.
@@ -218,6 +230,11 @@ class StateManager:
         self.conn.execute('''
             CREATE INDEX IF NOT EXISTS idx_cache_eviction
             ON files(sync_status, recomputable, last_access, virtual_path)
+            WHERE link_target IS NULL
+        ''')
+        self.conn.execute('''
+            CREATE INDEX IF NOT EXISTS idx_clean_cache_access
+            ON files(sync_status, last_access, virtual_path)
             WHERE link_target IS NULL
         ''')
         self.conn.commit()
@@ -932,23 +949,25 @@ class StateManager:
             )
         self._flush_access_updates()
 
-    def iter_lru_paths(self, *, recomputable: bool = False) -> Iterator[str]:
+    def iter_lru_paths(self, *, recomputable: Optional[bool] = False) -> Iterator[str]:
         """Walk CLEAN regular-file rows in access order, including evicted rows.
 
         The cache tree is authoritative for whether the bytes are present.
         Page past missing and pinned paths without loading the whole index.
         """
         self._flush_access_updates(force=True)
+        kind = 'recomputable = ? AND ' if recomputable is not None else ''
+        kind_params = (int(recomputable),) if recomputable is not None else ()
         last_access, last_path = float('-inf'), ''
         while True:
             with self._db_lock:
-                rows = self.conn.execute('''
+                rows = self.conn.execute(f'''
                     SELECT virtual_path, last_access FROM files
-                    WHERE sync_status = ? AND recomputable = ? AND link_target IS NULL
+                    WHERE sync_status = ? AND {kind}link_target IS NULL
                       AND (last_access, virtual_path) > (?, ?)
                     ORDER BY last_access ASC, virtual_path ASC
                     LIMIT ?
-                ''', (SyncStatus.CLEAN.value, int(recomputable), last_access, last_path,
+                ''', (SyncStatus.CLEAN.value, *kind_params, last_access, last_path,
                       self.WRITE_BATCH_SIZE)).fetchall()
             for row in rows:
                 yield row['virtual_path']

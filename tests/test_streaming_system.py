@@ -61,6 +61,10 @@ class TestStreamingSystemRegression(unittest.TestCase):
         for path in (self.mount_dir, self.cache_dir, self.backend_dir):
             path.mkdir(parents=True, exist_ok=True)
 
+        block = os.statvfs(self.cache_dir).f_frsize
+        (self.backend_dir / "warm.bin").write_bytes(b"w" * block)
+        (self.backend_dir / "recipe.bin").write_bytes(b"r" * block)
+
         payload_size = 12 * 1024 * 1024
         unit = b"abcdefghijklmnopqrstuvwxyz012345"
         repeats = (payload_size // len(unit)) + 1
@@ -148,6 +152,67 @@ class TestStreamingSystemRegression(unittest.TestCase):
             raise
 
         return json.loads(raw.decode("utf-8"))
+
+    def test_cache_pressure_waits_for_data_and_evicts_the_least_recent_copy(self):
+        manager = self.fs.cache_manager
+        block = os.statvfs(self.cache_dir).f_frsize
+        manager.max_size_bytes = 3 * block
+        warm = self.cache_dir / "warm.bin"
+        recipe = self.cache_dir / "recipe.bin"
+        ordinary_bytes, recipe_bytes = b"w" * block, b"r" * block
+        for name, content in ((warm.name, ordinary_bytes), (recipe.name, recipe_bytes)):
+            with open(self.mount_dir / name, "rb", buffering=0) as source:
+                self.assertEqual(source.read(), content)
+            self.assertTrue(self._wait_for(lambda: self.fs.state_manager.get_file_metadata("/" + name)))
+        row = self.fs.state_manager.get_file_metadata("/recipe.bin")
+        row.recomputable = True
+        row.recompute_cmd = "true"
+        manager.store_file_metadata(row)
+        # The second file was older after this actual open/read, despite
+        # having been cached later and being a different eviction type.
+        with open(self.mount_dir / warm.name, "rb", buffering=0) as source:
+            self.assertEqual(source.read(), ordinary_bytes)
+
+        reader = os.open(self.mount_dir / "movie.bin", os.O_RDONLY)
+        try:
+            os.posix_fadvise(reader, 0, 0, os.POSIX_FADV_RANDOM)
+            self.assertEqual(manager.get_total_cache_size(), 2 * block)
+            self.assertTrue(warm.exists() and recipe.exists())
+            far = 256 * block
+            self.assertEqual(os.pread(reader, block, far), self.payload[far:far + block])
+            self.assertEqual(manager.get_total_cache_size(), 3 * block)
+            self.assertTrue(warm.exists() and recipe.exists())
+            self.assertEqual(os.pread(reader, block, 0), self.payload[:block])
+            self.assertEqual(manager.get_total_cache_size(), 3 * block)
+            self.assertTrue(warm.exists())
+            self.assertFalse(recipe.exists())
+        finally:
+            os.close(reader)
+
+        with open(self.mount_dir / recipe.name, "rb", buffering=0) as source:
+            self.assertEqual(source.read(), recipe_bytes)
+        self.assertEqual(self.fs.state_manager.get_file_metadata("/recipe.bin").recompute_cmd, "true")
+
+    def test_full_cache_with_only_open_dirty_bytes_still_serves_cold_reads(self):
+        manager = self.fs.cache_manager
+        block = os.statvfs(self.cache_dir).f_frsize
+        manager.max_size_bytes = block
+        dirty = os.open(self.mount_dir / "local-only.bin", os.O_CREAT | os.O_WRONLY, 0o644)
+        try:
+            self.assertEqual(os.write(dirty, b"d" * block), block)
+            reader = os.open(self.mount_dir / "movie.bin", os.O_RDONLY)
+            try:
+                os.posix_fadvise(reader, 0, 0, os.POSIX_FADV_RANDOM)
+                offset = 256 * block
+                self.assertEqual(os.pread(reader, block, offset), self.payload[offset:offset + block])
+                self.assertEqual(os.pread(reader, block, 0), self.payload[:block])
+                self.assertEqual(manager.get_total_cache_size(), block)
+                self.assertFalse((self.cache_dir / "movie.bin").exists())
+                self.assertEqual((self.cache_dir / "local-only.bin").read_bytes(), b"d" * block)
+            finally:
+                os.close(reader)
+        finally:
+            os.close(dirty)
 
     def test_streaming_seek_and_reopen_during_prefetch(self):
         """

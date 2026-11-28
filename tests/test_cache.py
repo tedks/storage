@@ -1,3 +1,5 @@
+import errno
+import json
 import os
 import shutil
 import tempfile
@@ -10,8 +12,10 @@ from pathlib import Path
 
 from storage.backends.local import LocalBackend
 from storage.cache import PARTIAL_SUFFIX, CacheManager
-from storage.cache_metadata import MEMBER_ATTRS_XATTR, read_cache_metadata
-from storage.models import FileMetadata, SyncStatus
+from storage.cache_metadata import (
+    MEMBER_ATTRS_XATTR, XATTR_CACHE_METADATA_NAME, CacheMetadataRecord, read_cache_metadata,
+)
+from storage.models import FileLocation, FileMetadata, SyncStatus
 from storage.state import StateManager
 
 
@@ -36,8 +40,8 @@ class TestCacheLinks(unittest.TestCase):
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     def test_size_scan_does_not_charge_a_link_target(self):
-        self.assertEqual(self.cache_manager._scan_total_cache_size(), 5)
-        self.assertEqual(self.cache_manager.get_total_cache_size(), 5)
+        self.assertEqual(self.cache_manager._scan_total_cache_size(), self.cache_manager.block_size)
+        self.assertEqual(self.cache_manager.get_total_cache_size(), self.cache_manager.block_size)
 
     def test_a_link_is_not_cached(self):
         self.assertTrue(self.cache_manager.is_cached("/small.txt"))
@@ -77,7 +81,7 @@ class TestCacheLinks(unittest.TestCase):
         real_open = os.open
 
         def swap_then_open(path, flags, *args, **kwargs):
-            if Path(path) == swapped:
+            if Path(path) == swapped and flags & os.O_WRONLY:
                 swapped.unlink()
                 swapped.symlink_to(self.outside)
             return real_open(path, flags, *args, **kwargs)
@@ -95,7 +99,7 @@ class TestCacheLinks(unittest.TestCase):
         real_open = os.open
 
         def swap_then_open(path, flags, *args, **kwargs):
-            if Path(path) == swapped:
+            if Path(path) == swapped and flags & os.O_WRONLY:
                 replacement = self.cache_dir / "replacement"
                 replacement.write_bytes(b"z" * 20)
                 os.replace(replacement, swapped)
@@ -117,7 +121,7 @@ class TestCacheLinks(unittest.TestCase):
         self.cache_manager.delete_cached_file("/big-link")
         self.assertFalse(os.path.lexists(self.cache_dir / "big-link"))
         self.assertTrue(self.outside.exists())
-        self.assertEqual(self.cache_manager.get_total_cache_size(), 5)
+        self.assertEqual(self.cache_manager.get_total_cache_size(), self.cache_manager.block_size)
 
 
 class TestCacheAccounting(unittest.TestCase):
@@ -143,7 +147,7 @@ class TestCacheAccounting(unittest.TestCase):
 
         self.assertEqual(self.cache_manager.get_total_cache_size(), 0)
         self.assertTrue(self.cache_manager.cache_file("/f.txt", self.backend))
-        self.assertEqual(self.cache_manager.get_total_cache_size(), 10)
+        self.assertEqual(self.cache_manager.get_total_cache_size(), self.cache_manager.block_size)
 
         self.cache_manager.delete_cached_file("/f.txt")
         self.assertEqual(self.cache_manager.get_total_cache_size(), 0)
@@ -152,28 +156,396 @@ class TestCacheAccounting(unittest.TestCase):
         source_path = self.backend_dir / "x.bin"
         source_path.write_bytes(b"1234567890")
         self.assertTrue(self.cache_manager.cache_file("/x.bin", self.backend))
-        self.assertEqual(self.cache_manager.get_total_cache_size(), 10)
+        block = self.cache_manager.block_size
+        self.assertEqual(self.cache_manager.get_total_cache_size(), block)
 
         cache_path = self.cache_manager.get_cache_path("/x.bin")
         with open(cache_path, "ab") as f:
-            f.write(b"12345")
+            f.write(b"1" * block)
 
         self.cache_manager.mark_cache_size_dirty()
-        self.assertEqual(self.cache_manager.get_total_cache_size(), 15)
+        self.assertEqual(self.cache_manager.get_total_cache_size(), 2 * block)
 
     def test_clean_reads_do_not_rescan(self):
         source_path = self.backend_dir / "n.txt"
         source_path.write_bytes(b"1234")
         self.assertTrue(self.cache_manager.cache_file("/n.txt", self.backend))
-        self.assertEqual(self.cache_manager.get_total_cache_size(), 4)
+        self.assertEqual(self.cache_manager.get_total_cache_size(), self.cache_manager.block_size)
 
         def _raise_if_scanned():
             raise AssertionError("unexpected full cache scan")
 
         self.cache_manager._scan_total_cache_size = _raise_if_scanned
 
-        self.assertEqual(self.cache_manager.get_total_cache_size(), 4)
+        self.assertEqual(self.cache_manager.get_total_cache_size(), self.cache_manager.block_size)
         self.assertTrue(self.cache_manager.ensure_space(1))
+
+    @contextmanager
+    def _partial(self, name):
+        path = self.cache_dir / (name + PARTIAL_SUFFIX)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            os.ftruncate(fd, 1 << 30)
+            yield path, fd
+        finally:
+            self.cache_manager.close_streaming_fd(fd)
+
+    def test_sparse_budget_counts_new_blocks_once_and_survives_a_scan(self):
+        manager = self.cache_manager
+        block = manager.block_size
+        manager.max_size_bytes = 2 * block
+        with self._partial("sparse") as (path, fd):
+            os.setxattr(path, "user.storage.stream", b"x" * 450)
+            manager.mark_cache_size_dirty()
+            self.assertEqual(manager.get_total_cache_size(), 0)
+            far = (1 << 29) + block
+            with patch.object(manager, "_scan_total_cache_size", side_effect=AssertionError("repeated scan")):
+                self.assertTrue(manager.write_streaming_chunk(fd, far, b"ABC"))
+                self.assertEqual(manager.get_total_cache_size(), block)
+                self.assertTrue(manager.write_streaming_chunk(fd, far + 1, b"xyz"))
+                self.assertEqual(manager.get_total_cache_size(), block)
+                self.assertTrue(manager.write_streaming_chunk(fd, 0, b"near"))
+                self.assertEqual(manager.get_total_cache_size(), 2 * block)
+                self.assertFalse(manager.write_streaming_chunk(fd, block, b"overflow"))
+                self.assertEqual(os.pread(fd, 4, far), b"Axyz")
+                self.assertEqual(os.pread(fd, 8, block), b"\0" * 8)
+            manager.mark_cache_size_dirty()
+            self.assertEqual(manager.get_total_cache_size(), 2 * block)
+            path.unlink()
+            manager.mark_cache_size_dirty()
+            self.assertEqual(manager.get_total_cache_size(), 2 * block)
+        self.assertEqual(manager.get_total_cache_size(), 0)
+
+    def test_concurrent_chunks_compete_for_one_allocation(self):
+        manager = self.cache_manager
+        manager.max_size_bytes = manager.block_size
+        ready = threading.Barrier(3)
+        results = []
+
+        def write(fd):
+            ready.wait(timeout=3)
+            results.append(manager.write_streaming_chunk(fd, 0, b"x"))
+
+        with self._partial("left") as (_, left), self._partial("right") as (_, right):
+            workers = [threading.Thread(target=write, args=(fd,)) for fd in (left, right)]
+            for worker in workers:
+                worker.start()
+            ready.wait(timeout=3)
+            for worker in workers:
+                worker.join(timeout=3)
+                self.assertFalse(worker.is_alive())
+            self.assertEqual(sorted(results), [False, True])
+            self.assertEqual(manager.get_total_cache_size(), manager.block_size)
+
+    def test_published_inode_and_restart_count_sparse_data_once(self):
+        manager = self.cache_manager
+        block = manager.block_size
+        final = self.cache_dir / "published"
+        with self._partial("sparse") as (temporary, fd):
+            self.assertTrue(manager.write_streaming_chunk(fd, 1 << 29, b"far"))
+            os.link(temporary, final)
+            manager.mark_cache_size_dirty()
+            self.assertEqual(manager.get_total_cache_size(), block)
+            temporary.unlink()
+            manager.publish_streaming_fd(fd)
+            self.assertEqual(manager.get_total_cache_size(), block)
+
+        restarted = CacheManager(self.cache_dir, self.state_manager, block)
+        self.assertEqual(restarted.get_total_cache_size(), block)
+        self.assertEqual(restarted.get_free_space_needed(block), block)
+
+    def test_failed_partial_write_charges_only_the_blocks_it_wrote(self):
+        manager = self.cache_manager
+        block = manager.block_size
+        manager.max_size_bytes = 2 * block
+        real_pwrite = os.pwrite
+
+        def short_then_fail(fd, data, offset):
+            if offset == 0:
+                return real_pwrite(fd, data[:block], offset)
+            raise OSError(errno.ENOSPC, "short backing write")
+
+        with self._partial("failed") as (path, fd):
+            with patch("storage.cache.os.pwrite", side_effect=short_then_fail):
+                with self.assertRaises(OSError):
+                    manager.write_streaming_chunk(fd, 0, b"x" * (2 * block))
+            self.assertEqual(manager.get_total_cache_size(), block)
+            path.unlink()
+        self.assertEqual(manager.get_total_cache_size(), 0)
+
+    def _no_rescan(self):
+        return patch.object(self.cache_manager, "_scan_total_cache_size",
+                            side_effect=AssertionError("unexpected full cache scan"))
+
+    def test_direct_writes_and_truncates_are_charged_without_a_rescan(self):
+        manager = self.cache_manager
+        block = manager.block_size
+        path = self.cache_dir / "local.bin"
+        with self._no_rescan():
+            with manager.cache_size_change(path):
+                path.touch()
+            fd = os.open(path, os.O_RDWR)
+            try:
+                with manager.cache_size_change(fd=fd, span=(0, 3 * block)):
+                    os.pwrite(fd, b"x" * (3 * block), 0)
+                self.assertEqual(manager.get_total_cache_size(), 3 * block)
+                # An overwrite allocates nothing; a write into a hole one block.
+                with manager.cache_size_change(fd=fd, span=(10, 20)):
+                    os.pwrite(fd, b"y" * 10, 10)
+                with manager.cache_size_change(fd=fd, span=(9 * block + 1, 9 * block + 2)):
+                    os.pwrite(fd, b"z", 9 * block + 1)
+                self.assertEqual(manager.get_total_cache_size(), 4 * block)
+                with manager.cache_size_change(path):
+                    os.truncate(path, block)
+                self.assertEqual(manager.get_total_cache_size(), block)
+            finally:
+                os.close(fd)
+        manager.mark_cache_size_dirty()
+        self.assertEqual(manager.get_total_cache_size(), block)
+
+    def test_a_hard_linked_or_unknown_target_falls_back_to_a_rescan(self):
+        manager = self.cache_manager
+        block = manager.block_size
+        path = self.cache_dir / "linked.bin"
+        path.write_bytes(b"a")
+        os.link(path, self.cache_dir / "alias.bin")
+        manager.mark_cache_size_dirty()
+        self.assertEqual(manager.get_total_cache_size(), block)
+        with manager.cache_size_change(path):
+            with open(path, "ab") as f:
+                f.write(b"b" * block)
+        self.assertTrue(manager._size_dirty)
+        self.assertEqual(manager.get_total_cache_size(), 2 * block)
+        with manager.cache_size_change():
+            (self.cache_dir / "other.bin").write_bytes(b"c")
+        self.assertTrue(manager._size_dirty)
+        self.assertEqual(manager.get_total_cache_size(), 3 * block)
+
+    def _fill_with_dirty_bytes(self):
+        manager = self.cache_manager
+        dirty = self.cache_dir / "dirty.bin"
+        dirty.write_bytes(b"d")
+        self.state_manager.set_file_metadata(FileMetadata(
+            virtual_path="/dirty.bin", size=1, checksum=None, last_access=1.0,
+            last_modified=dirty.stat().st_mtime, sync_status=SyncStatus.DIRTY, replica_count=1,
+            recomputable=False, recompute_cmd=None, encrypted=False, encryption_key_id=None,
+        ))
+        manager.mark_cache_size_dirty()
+        manager.max_size_bytes = manager.get_total_cache_size()
+
+    def test_a_victim_shortfall_is_remembered_until_something_changes(self):
+        manager = self.cache_manager
+        block = manager.block_size
+        self._fill_with_dirty_bytes()
+        walks = []
+        real = manager._evict_by_access
+
+        def counting(*args, **kwargs):
+            walks.append(kwargs.get("dry_run", False))
+            return real(*args, **kwargs)
+
+        with patch.object(manager, "_evict_by_access", side_effect=counting):
+            self.assertFalse(manager.ensure_space(block))
+            self.assertFalse(manager.ensure_space(block))
+            self.assertEqual(walks, [True])
+            # A descriptor closed: walk again.
+            manager.note_evictable_change()
+            self.assertFalse(manager.ensure_space(block))
+            self.assertEqual(walks, [True, True])
+            # An index row changed (a sync published CLEAN, say): walk again.
+            self.state_manager.update_access_time("/dirty.bin", accessed_at=5.0)
+            self.state_manager._flush_access_updates(force=True)
+            self.assertFalse(manager.ensure_space(block))
+            self.assertEqual(walks, [True, True, True])
+            # And once the shortfall is old.
+            with patch.object(manager, "SHORTFALL_TTL_SECONDS", 0):
+                self.assertFalse(manager.ensure_space(block))
+            self.assertEqual(walks, [True, True, True, True])
+
+    def test_a_remembered_shortfall_still_lets_a_copy_turn_clean(self):
+        manager = self.cache_manager
+        block = manager.block_size
+        self._fill_with_dirty_bytes()
+        self.assertFalse(manager.ensure_space(block))
+        row = self.state_manager.get_file_metadata("/dirty.bin")
+        # A sync publishes CLEAN with the member it reached.
+        self.state_manager.add_file_location(FileLocation("/dirty.bin", "member", "c", 1.0, False))
+        self.assertTrue(self.state_manager.publish_sync_status(
+            "/dirty.bin", row.dirty_generation, SyncStatus.CLEAN))
+        self.assertTrue(manager.ensure_space(block))
+        self.assertFalse((self.cache_dir / "dirty.bin").exists())
+
+    def test_first_grant_refused_when_extents_exceed_allocation(self):
+        """A filesystem that reports holes as data (the generic llseek)
+        cannot be charged: the first grant refuses, logging once."""
+        manager = self.cache_manager
+
+        def holes_as_data(fd, start, end):
+            return [(start, end)] if start < end else []
+
+        with self._partial("llseek") as (_, fd), \
+                patch.object(manager, "_extent_ranges", side_effect=holes_as_data), \
+                self.assertLogs("storage.cache", "WARNING") as logged:
+            self.assertFalse(manager.write_streaming_chunk(fd, 0, b"x"))
+            self.assertFalse(manager.write_streaming_chunk(fd, 1 << 29, b"y"))
+            self.assertNotIn(fd, manager._streaming_fds)
+        self.assertEqual(manager.get_total_cache_size(), 0)
+        self.assertEqual(len(logged.output), 1)
+        self.assertIn("holes as data", logged.output[0])
+        self.assertIn("Some streaming reads are not being cached", logged.output[0])
+
+    def test_later_extent_misreports_cannot_hide_unpaid_blocks(self):
+        """After the first grant the charge is what this descriptor wrote,
+        so a filesystem that starts reporting holes as data (OpenZFS with
+        dirty data) neither stops the budget nor is consulted."""
+        manager = self.cache_manager
+        block = manager.block_size
+        manager.max_size_bytes = 2 * block
+        with self._partial("zfs") as (_, fd):
+            self.assertTrue(manager.write_streaming_chunk(fd, 0, b"x"))
+            with patch.object(manager, "_extent_ranges",
+                              side_effect=AssertionError("extent walk on a later grant")):
+                self.assertTrue(manager.write_streaming_chunk(fd, 1 << 29, b"y"))
+                self.assertTrue(manager.write_streaming_chunk(fd, 1, b"z"))  # same block
+                self.assertFalse(manager.write_streaming_chunk(fd, 1 << 28, b"over"))
+                self.assertEqual(manager.get_total_cache_size(), 2 * block)
+
+    def test_a_fragmented_partial_grants_without_walking_its_extents(self):
+        manager = self.cache_manager
+        block = manager.block_size
+        with self._partial("fragmented") as (_, fd):
+            self.assertTrue(manager.write_streaming_chunk(fd, 0, b"0"))
+            with patch.object(manager, "_extent_ranges",
+                              side_effect=AssertionError("extent walk on a later grant")):
+                for index in range(1, 200):
+                    self.assertTrue(manager.write_streaming_chunk(fd, 2 * index * block, b"x"))
+                # Bridging two written blocks adds one block, not three.
+                self.assertTrue(manager.write_streaming_chunk(fd, block, b"b" * block))
+            self.assertEqual(manager.get_total_cache_size(), 201 * block)
+            manager.mark_cache_size_dirty()
+            self.assertEqual(manager.get_total_cache_size(), 201 * block)
+
+    def test_streaming_grant_refused_without_extent_seeks(self):
+        manager = self.cache_manager
+        with self._partial("noseek") as (_, fd), \
+                patch.object(manager, "_extent_ranges", side_effect=OSError(errno.EINVAL, "no seek")), \
+                self.assertLogs("storage.cache", "WARNING"):
+            self.assertFalse(manager.write_streaming_chunk(fd, 0, b"x"))
+        self.assertEqual(manager.get_total_cache_size(), 0)
+
+    def test_a_failed_write_charges_nothing_and_keeps_its_error(self):
+        manager = self.cache_manager
+        with self._partial("failed-write") as (_, fd):
+            with patch("storage.cache.os.pwrite", side_effect=OSError(errno.ENOSPC, "disk full")):
+                with self.assertRaises(OSError) as raised:
+                    manager.write_streaming_chunk(fd, 0, b"x")
+            self.assertEqual(raised.exception.errno, errno.ENOSPC)
+            self.assertEqual(manager._streaming_fds[fd].bytes, 0)
+            self.assertEqual(manager.get_total_cache_size(), 0)
+
+    def test_close_streaming_fd_closes_even_when_fstat_fails(self):
+        manager = self.cache_manager
+        path = self.cache_dir / ("closing" + PARTIAL_SUFFIX)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        self.assertTrue(manager.write_streaming_chunk(fd, 0, b"x"))
+        with patch("storage.cache.os.fstat", side_effect=OSError(errno.EIO, "fstat failed")):
+            manager.close_streaming_fd(fd)
+        with self.assertRaises(OSError) as closed:
+            os.fstat(fd)
+        self.assertEqual(closed.exception.errno, errno.EBADF)
+        self.assertNotIn(fd, manager._streaming_fds)
+        self.assertEqual(manager.get_total_cache_size(), manager.block_size)
+
+    def test_truncated_prefix_keeps_only_its_blocks_charged(self):
+        manager = self.cache_manager
+        block = manager.block_size
+        with self._partial("prefix") as (path, fd):
+            self.assertTrue(manager.write_streaming_chunk(fd, 0, b"p" * (2 * block)))
+            self.assertTrue(manager.write_streaming_chunk(fd, 1 << 29, b"far"))
+            self.assertEqual(manager.get_total_cache_size(), 3 * block)
+            with self._no_rescan():
+                manager.truncate_streaming_fd(fd, block + 1)
+                self.assertEqual(manager.get_total_cache_size(), 2 * block)
+                self.assertEqual(manager._streaming_fds[fd].bytes, 2 * block)
+            manager.mark_cache_size_dirty()
+            self.assertEqual(manager.get_total_cache_size(), 2 * block)
+            # Promoted: the prefix is a named file the tree scan counts.
+            final = self.cache_dir / "prefix"
+            os.link(path, final)
+            path.unlink()
+            manager.publish_streaming_fd(fd)
+            self.assertEqual(manager.get_total_cache_size(), 2 * block)
+        self.assertEqual(manager.get_total_cache_size(), 2 * block)
+
+    def test_prefix_truncate_cannot_fail_after_the_truncate(self):
+        """Nothing is measured after the truncate, so an extent query that
+        would fail cannot stop the caller's prefix marker."""
+        manager = self.cache_manager
+        block = manager.block_size
+        with self._partial("prefix-measure") as (_, fd):
+            self.assertTrue(manager.write_streaming_chunk(fd, 0, b"p" * (3 * block)))
+            with patch.object(manager, "_extent_ranges",
+                              side_effect=OSError(errno.EIO, "extent query failed")):
+                manager.truncate_streaming_fd(fd, block)
+            self.assertEqual(os.fstat(fd).st_size, block)
+            self.assertEqual(manager.get_total_cache_size(), block)
+
+    def test_superseded_partial_charge_is_released_at_its_session_close(self):
+        """A reader still holding an unlinked partial keeps its bytes, but
+        the charge belongs to the session descriptor (close_streaming_fd)."""
+        manager = self.cache_manager
+        block = manager.block_size
+        path = self.cache_dir / ("superseded" + PARTIAL_SUFFIX)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        self.assertTrue(manager.write_streaming_chunk(fd, 0, b"s" * block))
+        reader = os.open(path, os.O_RDONLY)
+        try:
+            path.unlink()
+            self.assertEqual(manager.get_total_cache_size(), block)
+            manager.close_streaming_fd(fd)
+            self.assertEqual(manager.get_total_cache_size(), 0)
+            self.assertEqual(os.pread(reader, block, 0), b"s" * block)
+            manager.mark_cache_size_dirty()
+            self.assertEqual(manager.get_total_cache_size(), 0)
+        finally:
+            os.close(reader)
+
+    def test_publication_counts_a_sparse_inode_with_an_xattr_block_once(self):
+        """One data block, one hole, and possibly an external xattr block:
+        the tree scan counts what streaming charged, not st_blocks."""
+        manager = self.cache_manager
+        block = manager.block_size
+        path = self.cache_dir / ("xattr" + PARTIAL_SUFFIX)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            os.ftruncate(fd, 2 * block)
+            try:
+                os.setxattr(path, "user.test-large", b"x" * (block // 2))
+            except OSError:
+                pass  # no large xattrs here: the data-only case still holds
+            manager.mark_cache_size_dirty()
+            self.assertEqual(manager.get_total_cache_size(), 0)
+            self.assertTrue(manager.write_streaming_chunk(fd, 0, b"d"))
+            self.assertEqual(manager.get_total_cache_size(), block)
+            final = self.cache_dir / "xattr"
+            os.link(path, final)
+            path.unlink()
+            manager.publish_streaming_fd(fd)
+            self.assertEqual(manager.get_total_cache_size(), block)
+        finally:
+            manager.close_streaming_fd(fd)
+        self.assertEqual(manager.get_total_cache_size(), block)
+
+    def test_direct_writer_uses_space_before_the_next_stream_grant(self):
+        manager = self.cache_manager
+        block = manager.block_size
+        manager.max_size_bytes = block
+        with self._partial("new") as (_, fd):
+            with manager.cache_size_change():
+                (self.cache_dir / "dirty").write_bytes(b"local content")
+            self.assertFalse(manager.write_streaming_chunk(fd, 0, b"x"))
+            self.assertEqual(manager.get_total_cache_size(), block)
+            self.assertEqual((self.cache_dir / "dirty").read_bytes(), b"local content")
 
 
 if __name__ == "__main__":
@@ -298,7 +670,7 @@ class TestFetchThroughTempFile(unittest.TestCase):
         self.assertEqual(self.cache_path.read_bytes(), b"W" + written[1:])
         self.assertEqual(os.getxattr(self.cache_path, MEMBER_ATTRS_XATTR), b"winning inode")
         self.assertEqual(self._partials(), [])
-        self.assertEqual(self.cache_manager.get_total_cache_size(), len(written))
+        self.assertEqual(self.cache_manager.get_total_cache_size(), self.cache_manager.block_size)
 
     def test_fetch_onto_a_directory_fails(self):
         self.cache_path.mkdir()
@@ -331,6 +703,96 @@ class TestFetchThroughTempFile(unittest.TestCase):
             worker.join(10)
         self.assertEqual(self.results, [True])
         self.assertEqual(self.cache_manager.get_total_cache_size(), len(self.payload))
+
+    def test_local_write_during_a_reserved_copy_does_not_undo_it(self):
+        """The reservation owns its space: a dirty write that takes the
+        cache over budget mid-copy does not discard the finished copy."""
+        manager = self.cache_manager
+        manager.max_size_bytes = len(self.payload)
+        dirty = self.cache_dir / "dirty.bin"
+        worker = self._start_fetch()
+        try:
+            with manager.cache_size_change(dirty):
+                dirty.write_bytes(b"local write")
+            self.assertGreater(manager.get_free_space_needed(0), 0)
+        finally:
+            self.backend.gate.set()
+            worker.join(10)
+        self.assertEqual(self.results, [True])
+        self.assertEqual(self.cache_path.read_bytes(), self.payload)
+        self.assertEqual(dirty.read_bytes(), b"local write")
+        self.assertEqual(self._partials(), [])
+        self.assertEqual(manager.get_total_cache_size(), len(self.payload) + manager.block_size)
+
+    def test_growth_beyond_the_reservation_must_fit(self):
+        manager = self.cache_manager
+        manager.max_size_bytes = len(self.payload)
+        (self.backend_dir / "f.bin").write_bytes(self.payload)
+        grown = self.payload + b"g" * manager.block_size
+        real_copy = LocalBackend.copy_to_local
+
+        def grow_then_copy(backend, virtual_path, local_path):
+            (self.backend_dir / "f.bin").write_bytes(grown)
+            return real_copy(backend, virtual_path, local_path)
+
+        with patch.object(_GatedBackend, "copy_to_local", grow_then_copy):
+            with self.assertRaises(OSError) as raised:
+                manager.cache_file_result("/f.bin", self.backend)
+        self.assertEqual(raised.exception.errno, errno.ENOSPC)
+        self.assertFalse(self.cache_path.exists())
+        self.assertEqual(self._partials(), [])
+        self.assertEqual(manager.get_total_cache_size(), 0)
+        self.assertEqual(manager.get_free_space_needed(0), 0)
+
+    def test_grown_copy_losing_to_an_installed_file_spends_nothing(self):
+        manager = self.cache_manager
+        block = manager.block_size
+        manager.max_size_bytes = len(self.payload) + block
+        grown = self.payload + b"g" * (2 * block)
+        real_copy = LocalBackend.copy_to_local
+
+        def winner_then_grow(backend, virtual_path, local_path):
+            self.cache_path.write_bytes(b"winner")
+            manager.mark_cache_size_dirty()
+            (self.backend_dir / "f.bin").write_bytes(grown)
+            return real_copy(backend, virtual_path, local_path)
+
+        with patch.object(_GatedBackend, "copy_to_local", winner_then_grow), \
+                patch.object(manager, "_fits_beyond_reservation",
+                             side_effect=AssertionError("spent space for a losing copy")):
+            self.assertEqual(manager.cache_file_result("/f.bin", self.backend).name, "ALREADY_CACHED")
+        self.assertEqual(self.cache_path.read_bytes(), b"winner")
+        self.assertEqual(self._partials(), [])
+        self.assertEqual(manager.get_total_cache_size(), block)
+
+    def test_no_room_for_a_copy_raises_enospc_before_downloading(self):
+        manager = self.cache_manager
+        manager.max_size_bytes = len(self.payload) - 1
+        with patch.object(self.backend, "copy_to_local") as copy:
+            with self.assertRaises(OSError) as raised:
+                manager.cache_file("/f.bin", self.backend)
+        self.assertEqual(raised.exception.errno, errno.ENOSPC)
+        copy.assert_not_called()
+        self.assertEqual(self._partials(), [])
+
+    def test_partial_cannot_spend_a_whole_copy_reservation(self):
+        manager = self.cache_manager
+        manager.max_size_bytes = len(self.payload)
+        self.backend.fail = True
+        worker = self._start_fetch()
+        fd = os.open(self.cache_dir / ("range" + PARTIAL_SUFFIX), os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            os.ftruncate(fd, 1 << 30)
+            self.assertFalse(manager.write_streaming_chunk(fd, 0, b"x"))
+        finally:
+            self.backend.gate.set()
+            worker.join(10)
+        try:
+            self.assertEqual(self.results, [False])
+            self.assertTrue(manager.write_streaming_chunk(fd, 0, b"x"))
+            self.assertEqual(manager.get_total_cache_size(), manager.block_size)
+        finally:
+            manager.close_streaming_fd(fd)
 
 
 class TestStoreFileMetadata(unittest.TestCase):
@@ -408,6 +870,64 @@ class TestEvictionSkipsStaleClean(unittest.TestCase):
         self.assertEqual(self.state_manager.get_file_metadata("/stale.txt").sync_status, SyncStatus.DIRTY)
         self.assertFalse(fresh.exists())
 
+    def _mirror(self, cache_path, **stat):
+        """Write the metadata xattr from the row, at the given stat."""
+        row = self.state_manager.get_file_metadata("/" + cache_path.name)
+        record = CacheMetadataRecord.from_file_metadata(row, **stat)
+        os.setxattr(cache_path, XATTR_CACHE_METADATA_NAME,
+                    json.dumps(record.to_dict(), sort_keys=True).encode())
+
+    def test_xattr_recording_another_stat_marks_dirty_and_keeps_the_copy(self):
+        """The row matches the file but the xattr does not: either record
+        disagreeing with the live stat makes the file dirty (AGENTS.md)."""
+        written = self._clean_cached("written.txt", b"v1")
+        fresh = self._clean_cached("fresh.txt", b"v1", last_access=2.0)
+        st = written.stat()
+        self._mirror(written, stat_size=st.st_size + 1, stat_mtime=st.st_mtime)
+        self._mirror(fresh, stat_size=fresh.stat().st_size, stat_mtime=fresh.stat().st_mtime)
+
+        self.assertTrue(self.cache_manager.evict_lru_files(bytes_needed=1))
+
+        self.assertEqual(written.read_bytes(), b"v1")
+        self.assertEqual(self.state_manager.get_file_metadata("/written.txt").sync_status,
+                         SyncStatus.DIRTY)
+        self.assertFalse(fresh.exists())
+
+    def test_dry_run_marks_an_xattr_stale_copy_dirty_without_reclaiming_it(self):
+        written = self._clean_cached("written.txt", b"v1")
+        self.state_manager.add_file_location(FileLocation("/written.txt", "member", "c", 1.0, False))
+        st = written.stat()
+        self._mirror(written, stat_size=st.st_size, stat_mtime=st.st_mtime + 1)
+        manager = self.cache_manager
+        manager.mark_cache_size_dirty()
+        manager.max_size_bytes = manager.get_total_cache_size()
+
+        self.assertFalse(manager.ensure_space(manager.block_size))
+        self.assertEqual(written.read_bytes(), b"v1")
+        self.assertEqual(self.state_manager.get_file_metadata("/written.txt").sync_status,
+                         SyncStatus.DIRTY)
+
+    def test_unreadable_metadata_xattr_keeps_the_copy_unmarked(self):
+        garbled = self._clean_cached("garbled.txt", b"v1")
+        os.setxattr(garbled, XATTR_CACHE_METADATA_NAME, b"{not json")
+        other = self._clean_cached("other.txt", b"v1", last_access=2.0)
+
+        self.assertTrue(self.cache_manager.evict_lru_files(bytes_needed=1))
+
+        self.assertEqual(garbled.read_bytes(), b"v1")
+        self.assertEqual(self.state_manager.get_file_metadata("/garbled.txt").sync_status,
+                         SyncStatus.CLEAN)
+        self.assertFalse(other.exists())
+
+    def test_copy_whose_xattr_matches_is_evicted(self):
+        mirrored = self._clean_cached("mirrored.txt", b"v1")
+        row = self.state_manager.get_file_metadata("/mirrored.txt")
+        self.cache_manager.sync_cache_metadata("/mirrored.txt", row, cache_path=mirrored)
+        self.assertIsNotNone(read_cache_metadata(mirrored))
+
+        self.assertTrue(self.cache_manager.evict_lru_files(bytes_needed=1))
+        self.assertFalse(mirrored.exists())
+
     def test_path_with_an_open_descriptor_is_kept(self):
         held = self._clean_cached("held.txt", b"v1")
         other = self._clean_cached("other.txt", b"v1")
@@ -443,6 +963,8 @@ class TestEvictionSkipsStaleClean(unittest.TestCase):
     def test_missing_rows_cannot_hide_the_oldest_cached_copy_under_pressure(self):
         oldest = self._clean_cached("oldest.txt", b"old", last_access=2.0)
         newer = self._clean_cached("newer.txt", b"new", last_access=3.0)
+        for name in ("/oldest.txt", "/newer.txt"):
+            self.state_manager.add_file_location(FileLocation(name, "member", "c", 1.0, False))
         template = self.state_manager.get_file_metadata("/oldest.txt")
         for i in range(1001):
             # Previously evicted rows share one timestamp, spanning a page.
@@ -474,7 +996,8 @@ class TestEvictionSkipsStaleClean(unittest.TestCase):
         self.cache_manager.descriptor_guard = guard
         self.cache_manager.mark_cache_size_dirty()
         self.cache_manager.max_size_bytes = self.cache_manager.get_total_cache_size()
-        self.assertTrue(self.cache_manager.ensure_space(8))
+        self.assertTrue(self.cache_manager.evict_lru_files(1))
+        self.assertTrue(self.cache_manager.evict_recomputable_files(1))
         self.assertFalse(ordinary.exists())
         self.assertEqual(oldest.read_bytes(), b"")
         self.assertEqual(os.getxattr(oldest, "user.test-recompute"), b"preserve")
@@ -485,3 +1008,50 @@ class TestEvictionSkipsStaleClean(unittest.TestCase):
         self.assertEqual(dirty.read_bytes(), b"d")
         self.assertEqual(held.read_bytes(), b"h")
         self.assertEqual(pinned.read_bytes(), b"p")
+
+    def test_cache_pressure_uses_global_recency_among_recoverable_copies(self):
+        only_recipe = self._clean_cached("recipe.txt", b"unique", last_access=1.0, recomputable=True)
+        recoverable = self._clean_cached("recoverable.txt", b"member", last_access=2.0, recomputable=True)
+        ordinary = self._clean_cached("ordinary.txt", b"ordinary", last_access=3.0)
+        self.state_manager.add_file_location(FileLocation("/recoverable.txt", "member", "c", 1.0, False))
+        manager = self.cache_manager
+        manager.mark_cache_size_dirty()
+        manager.max_size_bytes = manager.get_total_cache_size()
+
+        self.assertTrue(manager.ensure_space(manager.block_size))
+        self.assertFalse(recoverable.exists())
+        self.assertEqual(ordinary.read_bytes(), b"ordinary")
+        self.assertEqual(only_recipe.read_bytes(), b"unique")
+        row = self.state_manager.get_file_metadata("/recoverable.txt")
+        self.assertEqual(row.recompute_cmd, "true")
+        self.assertEqual([location.backend_name for location in self.state_manager.get_file_locations(
+            "/recoverable.txt",
+        )], ["member"])
+
+    def test_pressure_keeps_a_clean_copy_no_member_is_recorded_to_hold(self):
+        """A CLEAN row is not evidence of a member copy: without a recorded
+        member location the cached file may be the only copy."""
+        unrecorded = self._clean_cached("unrecorded.txt", b"sole", last_access=1.0)
+        recorded = self._clean_cached("recorded.txt", b"held", last_access=2.0)
+        self.state_manager.add_file_location(FileLocation("/recorded.txt", "member", "c", 1.0, False))
+        self.state_manager.add_file_location(FileLocation("/unrecorded.txt", "cache", "c", 1.0, True))
+        manager = self.cache_manager
+        manager.mark_cache_size_dirty()
+        manager.max_size_bytes = manager.get_total_cache_size()
+
+        self.assertTrue(manager.ensure_space(manager.block_size))
+        self.assertEqual(unrecorded.read_bytes(), b"sole")
+        self.assertFalse(recorded.exists())
+        self.assertFalse(manager.ensure_space(2 * manager.block_size))
+        self.assertEqual(unrecorded.read_bytes(), b"sole")
+
+    def test_insufficient_victims_keep_existing_clean_bytes(self):
+        ordinary = self._clean_cached("ordinary.txt", b"keep", last_access=1.0)
+        dirty = self._clean_cached("dirty.txt", b"unsynced", last_access=2.0)
+        self.cache_manager.mark_file_dirty("/dirty.txt", dirty)
+        self.cache_manager.mark_cache_size_dirty()
+        self.cache_manager.max_size_bytes = self.cache_manager.get_total_cache_size()
+
+        self.assertFalse(self.cache_manager.ensure_space(2 * self.cache_manager.block_size))
+        self.assertEqual(ordinary.read_bytes(), b"keep")
+        self.assertEqual(dirty.read_bytes(), b"unsynced")
