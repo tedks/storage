@@ -27,6 +27,11 @@ log_events:
   who: Ted Smith
   what: blocked by gh-207-view-refusal
   comment: ""
+- time: 2026-11-28T10:12:41-00:00
+  who: Ted Smith
+  what: blocked by gh-207-read-bit
+  comment: ""
 blocked_by:
 - gh-207-stream-no-timestamp
 - gh-207-view-refusal
+- gh-207-read-bit
