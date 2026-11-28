@@ -2464,6 +2464,33 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.assertIsNotNone(session)
         return session
 
+    def test_cancel_refuses_a_finalizing_download(self):
+        # All bytes arrived (prefetch_complete) but finalize has not run: a
+        # cancel then would race finalize, so it reports busy and changes
+        # nothing, even with no readers.
+        (self.backend_dir / "finalizing.bin").write_bytes(os.urandom(128 * 1024))
+        manager = self.fs._streaming_manager
+        vfd = self.fs.open('/finalizing.bin', os.O_RDONLY)
+        session = self._session_for(vfd)
+        try:
+            with session.lock:
+                # As if the last reader had closed: refcount 0 is otherwise
+                # cancellable, so only prefetch_complete makes this busy.
+                readers, session.refcount = session.refcount, 0
+                session.prefetch_complete = True
+            try:
+                self.assertEqual(manager.cancel_download_session(session.session_id), "busy")
+                with session.lock:
+                    self.assertFalse(session.stop_requested)
+                row, = manager.list_download_sessions()
+                self.assertEqual(row["status"], "finalizing")
+            finally:
+                with session.lock:
+                    session.refcount = readers
+                    session.prefetch_complete = False
+        finally:
+            self.fs.release('/finalizing.bin', vfd)
+
     def test_streaming_unread_session_uses_no_worker_and_reopens_fresh(self):
         payload = os.urandom(128 * 1024)
         (self.backend_dir / "reopen.bin").write_bytes(payload)
