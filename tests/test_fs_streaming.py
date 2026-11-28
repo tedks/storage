@@ -3694,6 +3694,54 @@ class TestFSStreamingIntegration(unittest.TestCase):
             session.failed_cleanup_claimed = False
         self.fs.release('/stuck.bin', vfd_a)
 
+    def test_prefix_promotion_truncates_the_session_inode_it_read(self):
+        """Promotion reads session.io_fd before it takes io_lock. Nothing
+        can close that descriptor in between: the failed cleanup is
+        claimed only with no readers and the worker done (or by the
+        worker's own tail), an open meanwhile waits for the claim and is
+        refused rather than attached, and unmount closes only idle
+        sessions once the FUSE loop has stopped. Pinned through the
+        release path with the truncate held and an open racing it."""
+        self.backend.copy_delay = 0
+        manager = self.fs._streaming_manager
+        payload = os.urandom(192 * 1024)
+        (self.backend_dir / "promoted.bin").write_bytes(payload)
+        vfd = self.fs.open('/promoted.bin', os.O_RDONLY)
+        session = self._session_for(vfd)
+        self.assertEqual(self.fs.read('/promoted.bin', 4096, 0, vfd), payload[:4096])
+        with session.lock:
+            session.error = OSError(errno.EHOSTUNREACH, "simulated transient drop")
+            manager._schedule_background(session)
+        self.assertTrue(session.background_finished.wait(timeout=3.0))
+        io_fd = session.io_fd
+        inode = os.fstat(io_fd).st_ino
+        cache = self.fs.cache_manager
+        real_truncate = cache.truncate_streaming_fd
+        entered, go = threading.Event(), threading.Event()
+        self.addCleanup(go.set)
+        truncated = []
+
+        def held_truncate(fd, size):
+            entered.set()
+            go.wait(timeout=10.0)
+            truncated.append(os.fstat(fd).st_ino)
+            return real_truncate(fd, size)
+
+        with patch.object(cache, "truncate_streaming_fd", side_effect=held_truncate), \
+                patch("storage.streaming.STREAMING_CLEANUP_WAIT_SECONDS", 0.1):
+            releasing = threading.Thread(target=lambda: self.fs.release('/promoted.bin', vfd))
+            releasing.start()
+            self.assertTrue(entered.wait(timeout=5.0))
+            with self.assertRaises(FuseOSError) as racing:
+                self.fs.open('/promoted.bin', os.O_RDONLY)
+            self.assertEqual(racing.exception.errno, errno.EAGAIN)
+            self.assertEqual(session.io_fd, io_fd)
+            self.assertEqual(os.fstat(io_fd).st_ino, inode)
+            go.set()
+            releasing.join(timeout=5.0)
+        self.assertEqual(truncated, [inode])
+        self.assertEqual(session.io_fd, -1)
+
     def test_streaming_open_replaces_a_failed_session_a_reader_still_holds(self):
         # The session failed (a transient member error) while a reader keeps
         # it open. A new open must not inherit that error for as long as the
