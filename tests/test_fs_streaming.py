@@ -1489,12 +1489,24 @@ class TestFSStreamingIntegration(unittest.TestCase):
         for name in ("first-held.bin", "second-held.bin"):
             self.assertFalse((self.cache_dir / name).exists())
 
+    def _fake_clock_probe_session(self, budget):
+        backend = SimpleNamespace(name="backend", interactive_wait_budget=lambda: budget)
+        return SimpleNamespace(stop_requested=False, backend=backend,
+                               confirmation_waited=0.0, confirmation_timed_out=False)
+
+    @staticmethod
+    def _poll_until(probe, clock, until):
+        """Poll as a waiting pool does, every 0.1 s, up to until; the last answer."""
+        answer = None
+        while clock[0] < until - 1e-9 and answer is None:
+            clock[0] = round(clock[0] + 0.1, 6)
+            answer = probe()
+        return answer
+
     def test_confirmation_wait_budget_is_not_reset_by_a_yield(self):
         manager = self.fs._streaming_manager
         pool = manager._download_pool
-        backend = SimpleNamespace(name="backend", interactive_wait_budget=lambda: 1.0)
-        session = SimpleNamespace(stop_requested=False, backend=backend,
-                                  confirmation_waited=0.0, confirmation_timed_out=False)
+        session = self._fake_clock_probe_session(1.0)
         clock = [0.0]
         with pool.condition:
             saved, pool.contended = pool.contended, frozenset({"other"})
@@ -1502,19 +1514,45 @@ class TestFSStreamingIntegration(unittest.TestCase):
             with patch("storage.streaming.time.monotonic", side_effect=lambda: clock[0]):
                 probe = manager._publication_wait_probe(session)
                 self.assertIsNone(probe())
-                clock[0] = 0.6
-                self.assertEqual(probe(), "streaming publication yielded to other work")
-                # The requeued attempt has 0.4 s left, not a fresh second.
+                # Yields once it has waited DOWNLOAD_TURN_YIELD_SECONDS.
+                self.assertEqual(self._poll_until(probe, clock, 0.6),
+                                 "streaming publication yielded to other work")
+                self.assertEqual(clock[0], 0.5)
+                # The requeued attempt has 0.5 s left, not a fresh second.
                 probe = manager._publication_wait_probe(session)
                 clock[0] = 10.0
                 self.assertIsNone(probe())
                 with pool.condition:
                     pool.contended = frozenset()
-                clock[0] = 10.3
-                self.assertIsNone(probe())
-                clock[0] = 10.4
-                self.assertEqual(probe(), "streaming publication's channel wait budget")
+                self.assertIsNone(self._poll_until(probe, clock, 10.4))
+                self.assertEqual(self._poll_until(probe, clock, 10.5),
+                                 "streaming publication's channel wait budget")
                 self.assertTrue(session.confirmation_timed_out)
+        finally:
+            with pool.condition:
+                pool.contended = saved
+
+    def test_confirmation_wait_budget_counts_only_time_spent_waiting(self):
+        manager = self.fs._streaming_manager
+        pool = manager._download_pool
+        session = self._fake_clock_probe_session(1.0)
+        clock = [0.0]
+        with pool.condition:
+            saved, pool.contended = pool.contended, frozenset()
+        try:
+            with patch("storage.streaming.time.monotonic", side_effect=lambda: clock[0]):
+                probe = manager._publication_wait_probe(session)
+                # A short wait (0.1 s), then a channel: no polls while the
+                # stat runs and fails, then the retry waits again.
+                self.assertIsNone(probe())
+                self.assertIsNone(self._poll_until(probe, clock, 0.1))
+                clock[0] = 5.0
+                self.assertIsNone(probe(), "the stat's own time was charged as waiting")
+                self.assertIsNone(self._poll_until(probe, clock, 5.8))
+                self.assertFalse(session.confirmation_timed_out)
+                # 0.1 s + 0.9 s of waiting reach the budget.
+                self.assertEqual(self._poll_until(probe, clock, 6.0),
+                                 "streaming publication's channel wait budget")
         finally:
             with pool.condition:
                 pool.contended = saved

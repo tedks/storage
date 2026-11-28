@@ -71,6 +71,11 @@ ACTIVE_DOWNLOAD_BURST = 4
 # back while another member has runnable work and no free worker (see
 # StreamingReadManager._bulk_wait_probe).
 DOWNLOAD_TURN_YIELD_SECONDS = 0.5
+# A pool polls a waiting request's probe every 0.1 s; a longer silence
+# between two polls of a confirmation's probe means the wait ended (a
+# channel was had, and the stat ran and was retried), so the next poll
+# starts a new wait (see _publication_wait_probe).
+CONFIRMATION_POLL_GAP_SECONDS = 0.25
 # In _DownloadPool.contended, paired with the member's name, for a queued
 # publication-only turn: (LOCAL_PUBLICATION, member). It needs no bulk
 # channel, so a range turn waiting for bulk on any member yields to it; a
@@ -1933,8 +1938,11 @@ class StreamingReadManager:
         worker forever).
 
         The wait is bounded across yields by the member's
-        interactive_wait_budget (its connect deadline): the time spent in
-        earlier attempts is kept on the session, and once the total
+        interactive_wait_budget (its connect deadline): the time spent
+        waiting in earlier attempts is kept on the session (and only
+        waiting: a silence between polls longer than
+        CONFIRMATION_POLL_GAP_SECONDS, such as the stat itself before a
+        retry, closes one wait and the next poll opens another), and once the total
         reaches the budget the stat gives up for good and finalize
         discards the file as unconfirmed. Without a budget, each attempt
         waits out the member's own deadline.
@@ -1943,15 +1951,21 @@ class StreamingReadManager:
         member = session.backend.name
         own_publications = (LOCAL_PUBLICATION, member)
         budget = session.backend.interactive_wait_budget()
-        waiting_since = None
+        waiting_since = last_poll = None
 
         def probe():
-            nonlocal waiting_since
+            nonlocal waiting_since, last_poll
             if session.stop_requested:
                 return "streaming session"
             now = time.monotonic()
+            if last_poll is not None and now - last_poll > CONFIRMATION_POLL_GAP_SECONDS:
+                # The previous wait ended at its last poll (the stat ran,
+                # and is being retried): only waiting counts.
+                session.confirmation_waited += last_poll - waiting_since
+                waiting_since = None
             if waiting_since is None:
                 waiting_since = now
+            last_poll = now
             waited = now - waiting_since
             if budget is not None and session.confirmation_waited + waited >= budget:
                 session.confirmation_timed_out = True
