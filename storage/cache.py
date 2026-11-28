@@ -650,10 +650,18 @@ class CacheManager:
         crash between the two), or something wrote to the cache directory
         behind the mount; in that second case a sync may publish CLEAN for
         a half-written file and the next open heals it again. One row read
-        and one lstat, unless the caller passes a stat it already has. The
-        read and the stat are not under the index lock: a writer racing
-        them bumps the generation, and mark_file_dirty's own bump keeps the
-        row at the newer write. Returns True when the file was marked.
+        and one lstat, unless the caller passes a stat it already has; the
+        common case, no difference, takes no lock.
+
+        A difference is confirmed under the index lock with a fresh row
+        and a fresh lstat before anything is marked. Without that, a row
+        read before a recomputable eviction and a stat taken after it would
+        look like a lost write: the eviction truncates the file and then
+        stores size 0, and mark_file_dirty would record the truncated
+        placeholder as DIRTY and sync an empty file over the members. The
+        eviction truncates and stores in one section under the index lock,
+        so the recheck sees both or neither. Returns True when the file was
+        marked.
         """
         row = self.state_manager.get_file_metadata(virtual_path)
         if row is None or row.sync_status != SyncStatus.CLEAN:
@@ -666,7 +674,17 @@ class CacheManager:
             stat_size, stat_mtime = st.st_size, st.st_mtime
         if stat_size == row.size and stat_mtime == row.last_modified:
             return False
-        return self.mark_file_dirty(virtual_path, cache_path) is not None
+        with self.state_manager.metadata_lock:
+            row = self.state_manager.get_file_metadata(virtual_path)
+            if row is None or row.sync_status != SyncStatus.CLEAN:
+                return False
+            try:
+                st = os.lstat(str(cache_path))
+            except OSError:
+                return False
+            if st.st_size == row.size and st.st_mtime == row.last_modified:
+                return False
+            return self.mark_file_dirty(virtual_path, cache_path) is not None
 
     def store_file_metadata(
         self,

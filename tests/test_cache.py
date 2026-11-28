@@ -533,6 +533,44 @@ class TestEvictionSkipsStaleClean(unittest.TestCase):
         self.assertFalse(self.cache_manager.evict_recomputable_files(1))
         self.assertEqual(attempts, [])
 
+    def test_heal_racing_a_recomputable_eviction_does_not_mark_the_placeholder_dirty(self):
+        # The heal reads the row, then the eviction truncates the file and
+        # stores size 0, then the heal stats the file: old row, new file.
+        cached = self._clean_cached("recompute.txt", b"derived", recomputable=True)
+        real_get = self.state_manager.get_file_metadata
+        evicted = []
+
+        def read_then_evict(path):
+            row = real_get(path)
+            if not evicted:
+                evicted.append(True)
+                self.assertTrue(self.cache_manager.evict_recomputable_files(1))
+            return row
+
+        with patch.object(self.state_manager, "get_file_metadata", side_effect=read_then_evict):
+            self.assertFalse(self.cache_manager.heal_stale_clean("/recompute.txt", cached))
+        self.assertEqual(evicted, [True])
+        self.assertEqual(cached.read_bytes(), b"")
+        row = self.state_manager.get_file_metadata("/recompute.txt")
+        self.assertEqual((row.sync_status, row.size), (SyncStatus.CLEAN, 0))
+
+    def test_sweep_stat_taken_before_a_recomputable_eviction_does_not_mark_it(self):
+        cached = self._clean_cached("swept.txt", b"derived", recomputable=True)
+        old = cached.lstat()  # the sweep's scan, before the eviction
+        self.assertTrue(self.cache_manager.evict_recomputable_files(1))
+        # Its stat no longer matches the row, which now says size 0.
+        self.assertFalse(self.cache_manager.heal_stale_clean(
+            "/swept.txt", cached, stat_size=old.st_size, stat_mtime=old.st_mtime,
+        ))
+        self.assertEqual(self.state_manager.get_file_metadata("/swept.txt").sync_status, SyncStatus.CLEAN)
+
+    def test_heal_still_marks_a_real_lost_write(self):
+        cached = self._clean_cached("lost.txt", b"v1")
+        cached.write_bytes(b"v2, row update lost")
+        self.assertTrue(self.cache_manager.heal_stale_clean("/lost.txt", cached))
+        row = self.state_manager.get_file_metadata("/lost.txt")
+        self.assertEqual((row.sync_status, row.size), (SyncStatus.DIRTY, cached.stat().st_size))
+
     def test_recomputable_pressure_preserves_pinned_and_dirty_bytes(self):
         ordinary = self._clean_cached("ordinary.txt", b"one", last_access=20.0)
         oldest = self._clean_cached("older.txt", b"older", last_access=4.0, recomputable=True)
