@@ -718,6 +718,27 @@ class TestFetchThroughTempFile(unittest.TestCase):
         self.assertEqual(manager.get_total_cache_size(), 0)
         self.assertEqual(manager.get_free_space_needed(0), 0)
 
+    def test_grown_copy_losing_to_an_installed_file_spends_nothing(self):
+        manager = self.cache_manager
+        block = manager.block_size
+        manager.max_size_bytes = len(self.payload) + block
+        grown = self.payload + b"g" * (2 * block)
+        real_copy = LocalBackend.copy_to_local
+
+        def winner_then_grow(backend, virtual_path, local_path):
+            self.cache_path.write_bytes(b"winner")
+            manager.mark_cache_size_dirty()
+            (self.backend_dir / "f.bin").write_bytes(grown)
+            return real_copy(backend, virtual_path, local_path)
+
+        with patch.object(_GatedBackend, "copy_to_local", winner_then_grow), \
+                patch.object(manager, "_fits_beyond_reservation",
+                             side_effect=AssertionError("spent space for a losing copy")):
+            self.assertEqual(manager.cache_file_result("/f.bin", self.backend).name, "ALREADY_CACHED")
+        self.assertEqual(self.cache_path.read_bytes(), b"winner")
+        self.assertEqual(self._partials(), [])
+        self.assertEqual(manager.get_total_cache_size(), block)
+
     def test_no_room_for_a_copy_raises_enospc_before_downloading(self):
         manager = self.cache_manager
         manager.max_size_bytes = len(self.payload) - 1

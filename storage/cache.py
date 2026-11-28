@@ -772,7 +772,12 @@ class CacheManager:
             with self._lock:
                 try:
                     size = self._temp_data_bytes(temp_path)
-                    if size > reserved and not self._fits_beyond_reservation(size - reserved, size):
+                    # A copy that grew spends space only if it can still be
+                    # installed: something already at the path (another
+                    # fill, a writer) wins at the link below, and this copy
+                    # is discarded without evicting anything for it.
+                    if (size > reserved and not os.path.lexists(cache_path)
+                            and not self._fits_beyond_reservation(size - reserved, size)):
                         raise OSError(errno.ENOSPC, "insufficient cache space")
                     try:
                         os.link(temp_path, cache_path)
