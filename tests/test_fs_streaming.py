@@ -727,6 +727,75 @@ class TestFSStreamingIntegration(unittest.TestCase):
                 for session in sessions:
                     manager.prefetch_sessions.pop(session.canonical_path, None)
 
+    def test_registration_survives_a_retained_fill_completing_before_the_victim_scan(self):
+        manager = self.fs._streaming_manager
+        manager.update_download_limits(
+            max_streaming_sessions=1, max_retained_streaming_sessions=1, max_download_workers=1,
+        )
+        self.backend.worker_gate = threading.Event()
+        retained = self._open_retained_fill("retained.bin", os.urandom(384 * 1024))
+        manager.update_download_limits(max_retained_streaming_sessions=0)
+        payload = os.urandom(64 * 1024)
+        (self.backend_dir / "reader.bin").write_bytes(payload)
+        real_counts = manager._download_session_counts
+        counted = []
+
+        def counts():
+            result = real_counts()
+            # In the displacing call: the fill completes (under its own
+            # lock only) after the count and before the victim scan.
+            if not counted and sys._getframe(1).f_locals.get("displaced") is not None:
+                counted.append(result)
+                with retained.lock:
+                    retained.prefetch_complete = True
+            return result
+
+        with patch.object(manager, "_download_session_counts", counts):
+            fd = self.fs.open("/reader.bin", os.O_RDONLY)
+        self.assertEqual(counted, [(0, 1)])
+        with self.fs._fd_lock:
+            # Refused (the completed fill still holds the slot): the
+            # whole-file path, with the renamed partial unlinked.
+            self.assertIsNone(self.fs._fd_map[fd].prefetch_session)
+        self.assertFalse(retained.detached)
+        self.assertEqual(sorted(path.name for path in self.cache_dir.rglob("*.storage.partial")),
+                         ["retained.bin.storage.partial"])
+        self.assertEqual(self.fs.read("/reader.bin", len(payload), 0, fd), payload)
+        self.fs.release("/reader.bin", fd)
+
+    def test_reclaim_selects_again_when_a_cancellation_shrinks_the_deficit(self):
+        manager = self.fs._streaming_manager
+        cache = self.fs.cache_manager
+        cache.max_size_bytes = 1024 * 1024
+        self.backend.worker_gate = threading.Event()
+        large = self._open_retained_fill("large.bin", os.urandom(512 * 1024))
+        small = self._open_retained_fill("small.bin", os.urandom(192 * 1024), read_bytes=96 * 1024)
+        written = os.urandom(896 * 1024)
+        (self.backend_dir / "write-open.bin").write_bytes(written)
+        real_needed = cache.get_free_space_needed
+        injected = []
+
+        def needed(required):
+            result = real_needed(required)
+            # The large fill is cancelled by hand after reclaim's first
+            # look: the deficit drops from 576 KiB, which the small fill
+            # cannot cover, to 64 KiB, which it can.
+            if not injected and sys._getframe(1).f_code.co_name == "_reclaim_retained_space":
+                injected.append(result)
+                self.assertEqual(manager.cancel_download_session(large.session_id), "cancelled")
+            return result
+
+        with patch.object(cache, "get_free_space_needed", needed):
+            fd = self.fs.open("/write-open.bin", os.O_RDWR)
+        self.assertEqual(injected, [576 * 1024])
+        self.assertTrue(small.detached)
+        self.assertEqual(self.fs._streaming_stats_snapshot()["streaming_retained_space_cancellations"], 1)
+        self.assertEqual(self.fs.read("/write-open.bin", len(written), 0, fd), written)
+        self.fs.release("/write-open.bin", fd)
+        self.backend.worker_gate.set()
+        self.assertTrue(small.background_finished.wait(timeout=3))
+        self.assertTrue(large.background_finished.wait(timeout=3))
+
     def test_bulk_wait_yield_interval_restarts_for_each_acquisition(self):
         manager = self.fs._streaming_manager
         session = SimpleNamespace(stop_requested=False, prefetch_complete=False, error=None,

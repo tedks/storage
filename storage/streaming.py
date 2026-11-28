@@ -73,6 +73,8 @@ DOWNLOAD_TURN_YIELD_SECONDS = 0.5
 # no member (see _DownloadPool): never a member name, so a turn on any
 # member yields to one.
 LOCAL_PUBLICATION = object()
+# Candidate selections in one space reclaim (see _reclaim_retained_space).
+RECLAIM_ATTEMPTS = 3
 
 # link() errors after which _install_partial tries RENAME_NOREPLACE: no
 # hard links on the cache filesystem (EMLINK cannot happen on a fresh
@@ -1919,6 +1921,12 @@ class StreamingReadManager:
                         have = self._downloaded_bytes(session)
                         if victim is None or have < fewest:
                             victim, fewest = session, have
+            if victim is None:
+                # The fills counted as retained completed or failed since
+                # the count (neither takes this lock). Count again: the
+                # loop ends, since retained fills only leave while this
+                # lock is held, each pass stops one or sees fewer.
+                continue
             with victim.lock:
                 # Re-checked under its lock: a fill that completed since
                 # the scan is never stopped (see _claim_detach).
@@ -1948,8 +1956,10 @@ class StreamingReadManager:
         Fills are stopped fewest bytes first, as for a reader's slot (see
         _reader_fits_locked). The deficit is measured before the registry
         lock, so space can come free while the candidates are chosen (a
-        cancellation, a finalize, an eviction); a decline measures again
-        and reports the space if it is now there. A stop unlinks its
+        cancellation, a finalize, an eviction). A selection whose fills fall
+        short measures again: True if the space is there now, another
+        selection against the new deficit if it shrank (up to
+        RECLAIM_ATTEMPTS in all), False otherwise. A stop unlinks its
         partial under the registry lock and marks the cache size stale
         there (_unregister_and_unlink), so that measurement counts it. The
         measurement is not taken under the registry lock because a stale
@@ -1960,30 +1970,41 @@ class StreamingReadManager:
         if missing == 0:
             return True
 
-        cancelled = []
-        with self.prefetch_sessions_lock:
-            # A reader that would be refused a session anyway gets no
-            # cancellations made for it.
-            if self._destroying or (for_reader and not self._reader_fits_locked()):
-                return False
-            candidates = []
-            for session in self.prefetch_sessions.values():
-                with session.lock:
-                    if self._retained(session):
-                        candidates.append((self._downloaded_bytes(session), session))
-            candidates = [session for _, session in sorted(candidates, key=lambda entry: entry[0])]
-            short = sum(session.file_size for session in candidates) < missing
-            if not short:
-                for session in candidates:
+        for _ in range(RECLAIM_ATTEMPTS):
+            cancelled = []
+            with self.prefetch_sessions_lock:
+                # A reader that would be refused a session anyway gets no
+                # cancellations made for it.
+                if self._destroying or (for_reader and not self._reader_fits_locked()):
+                    return False
+                candidates = []
+                for session in self.prefetch_sessions.values():
                     with session.lock:
                         if self._retained(session):
-                            cancelled.append((session, self._stop_background_locked(session)))
-                            missing -= session.file_size
-                            if missing <= 0:
-                                break
-        if short:
+                            candidates.append((self._downloaded_bytes(session), session))
+                candidates = [session for _, session in sorted(candidates, key=lambda entry: entry[0])]
+                short = sum(session.file_size for session in candidates) < missing
+                if not short:
+                    for session in candidates:
+                        with session.lock:
+                            if self._retained(session):
+                                cancelled.append((session, self._stop_background_locked(session)))
+                                missing -= session.file_size
+                                if missing <= 0:
+                                    break
+            if not short:
+                break
             # After the lock: a stale size means a scan of the cache.
-            return self.cache_manager.get_free_space_needed(file_size) == 0
+            now = self.cache_manager.get_free_space_needed(file_size)
+            if now == 0:
+                return True
+            if now >= missing:
+                return False
+            # Space came free meanwhile but not enough: the fills that
+            # could not cover the old deficit may cover this one.
+            missing = now
+        else:
+            return False
         for session, idle in cancelled:
             self._record_streaming_stat("streaming_retained_space_cancellations")
             self._complete_cancellation(session, idle)
@@ -2181,7 +2202,15 @@ class StreamingReadManager:
             session.partial_cache_path = partial_cache_path
             # Refuses after the check above only if a retained fill
             # completed or failed in between, which takes no registry lock.
-            if not self._reader_fits_locked(displaced):
+            try:
+                fits = self._reader_fits_locked(displaced)
+            except BaseException:
+                # Not registered: nothing else would close the descriptor
+                # or unlink the partial. Fills already stopped are
+                # completed by the caller (_complete_displacements).
+                self._discard_unregistered_prefetch_session(session)
+                raise
+            if not fits:
                 refuse()
                 return None
             self.prefetch_sessions[canonical_path] = session
