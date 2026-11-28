@@ -1,0 +1,16 @@
+id: gh-207-retry-budget
+title: Verify reservation on a retried larger full transfer
+desc: ""
+type: bugfix
+component: attributes
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-28T10:12:43-00:00
+references: []
+log_events:
+- time: 2026-11-28T10:12:43-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
