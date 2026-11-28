@@ -9,6 +9,7 @@ streaming stays healthy under sustained reads and does not regress to the
 import errno
 import hashlib
 import json
+import logging
 import queue
 import os
 import shutil
@@ -129,11 +130,16 @@ class HeldReader:
             raise
 
     def kill(self):
-        if self._release is not None:
-            self._release()
-        if self._process.poll() is None:
-            self._process.kill()
-        self._reap()
+        """Cleanup on a failure path: never raises, so the failure that got
+        here is the one reported. close() keeps the strict reap."""
+        try:
+            if self._release is not None:
+                self._release()
+            if self._process.poll() is None:
+                self._process.kill()
+            self._reap()
+        except Exception as exc:
+            logging.getLogger(__name__).warning("could not reap the mounted file reader: %s", exc)
 
     def __enter__(self):
         return self
