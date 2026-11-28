@@ -3748,12 +3748,17 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
                  max_foreground_operations: Optional[int] = None,
                  max_sync_workers: Optional[int] = None,
                  max_download_workers: int = DEFAULT_MAX_DOWNLOAD_WORKERS,
-                 max_retained_streaming_sessions: int = DEFAULT_MAX_RETAINED_STREAMING_SESSIONS):
+                 max_retained_streaming_sessions: int = DEFAULT_MAX_RETAINED_STREAMING_SESSIONS,
+                 reported_mountpoint: Optional[str] = None):
     """
     Mount a Storage filesystem
 
     Args:
         mountpoint: Where to mount the filesystem
+        reported_mountpoint: The mountpoint as the user spelled it (the
+            profile string), canonicalized and reported by the control
+            socket so it matches what 'storage control --profile' computes
+            from the same string; defaults to mountpoint
         cache_root: Root directory for cache
         state_db: Path to state database
         backends: Dictionary of backends
@@ -3880,7 +3885,7 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
         bulk_cold_copies=fuse_threads,
         max_foreground_operations=max_foreground_operations,
         max_sync_workers=max_sync_workers,
-        mountpoint=str(mountpoint),
+        mountpoint=str(mountpoint if reported_mountpoint is None else reported_mountpoint),
     )
     fs.mount_lock_file = lock_file
     if unclean_shutdown:

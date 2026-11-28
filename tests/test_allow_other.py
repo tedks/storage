@@ -38,6 +38,20 @@ class TestAllowOther(unittest.TestCase):
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     @patch('storage.fs.FUSE')
+    def test_reported_mountpoint_reaches_the_control_socket(self, mock_fuse):
+        for reported, expected in ((None, str(self.mount_point)),
+                                   (f"{self.mount_point}/", str(self.mount_point)),
+                                   (f"{self.mount_point}/.", None)):
+            with self.subTest(reported=reported):
+                mock_fuse.reset_mock()
+                kwargs = {} if reported is None else {"reported_mountpoint": reported}
+                mount_storage(str(self.mount_point), self.cache_root, self.state_db,
+                              self.backends, 1024 * 1024, foreground=True, **kwargs)
+                fs, mounted = mock_fuse.call_args.args[:2]
+                self.assertEqual(mounted, str(self.mount_point))
+                self.assertEqual(fs._streaming_manager.mountpoint, expected)
+
+    @patch('storage.fs.FUSE')
     @patch('os.geteuid')
     def test_allow_other_auto_detect_root(self, mock_geteuid, mock_fuse):
         """Test that allow_other=True when running as root"""

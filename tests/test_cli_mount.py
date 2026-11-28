@@ -45,6 +45,26 @@ backends = [
         self.assertEqual("Second root (remote1)", backends["remote1"].label)
         self.assertIn("Added SSH storage member: Archive (remote0)", result.output)
 
+    def test_control_socket_reports_the_profile_spelling_of_the_mountpoint(self):
+        # Path() turns ".../mount/." into ".../mount", so the mount would
+        # report a mountpoint the control CLI refuses to compute from the
+        # same profile string. The mount gets the raw string to report.
+        (self.temp_dir / "backend").mkdir()
+        spelled = f"{self.temp_dir / 'mount'}/."
+        profile = self.temp_dir / "storage.toml"
+        profile.write_text(f'''
+[mounts.dotted]
+mountpoint = "{spelled}"
+cache = "{self.temp_dir / "cache"}"
+backends = ["{self.temp_dir / "backend"}"]
+''')
+        with patch("storage.cli_mount.mount_storage") as mock_mount, \
+             patch("storage.cli_mount.shared_filesystems", return_value=[]):
+            result = self.runner.invoke(main, ["mount", "--config", str(profile), "dotted"])
+        self.assertEqual(0, result.exit_code, result.output)
+        self.assertEqual(mock_mount.call_args.args[0], str(self.temp_dir / "mount"))
+        self.assertEqual(mock_mount.call_args.kwargs["reported_mountpoint"], spelled)
+
     def test_bulk_capacity_wait_reaches_only_ssh_member_and_defaults_off(self):
         profile = self.temp_dir / "storage.toml"
         profile.write_text(f'''
