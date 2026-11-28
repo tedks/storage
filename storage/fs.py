@@ -2853,7 +2853,7 @@ class StorageFS(Operations):
             # Positional: a descriptor's offset is shared state, and
             # concurrent writes through one fh must not move each other's.
             with self.cache_manager.cache_size_change(
-                fd=entry.real_fd, span=(offset, offset + len(data)),
+                fd=entry.real_fd, span=self._write_span(entry, offset, data),
             ):
                 written = os.pwrite(entry.real_fd, data, offset)
 
@@ -2897,12 +2897,23 @@ class StorageFS(Operations):
                     raise FuseOSError(errno.EBUSY)
                 try:
                     with self.cache_manager.cache_size_change(
-                        fd=entry.real_fd, span=(offset, offset + len(data)),
+                        fd=entry.real_fd, span=self._write_span(entry, offset, data),
                     ):
                         written = os.pwrite(entry.real_fd, data, offset)
                 except OSError as e:
                     raise FuseOSError(e.errno)
                 return written
+
+    @staticmethod
+    def _write_span(entry: "FDEntry", offset: int, data: bytes):
+        """The byte span a pwrite through entry changes, for cache charging.
+
+        None (measure the whole file) for an O_APPEND descriptor: Linux
+        pwrite on one writes at end of file whatever offset it is given.
+        """
+        if entry.flags & os.O_APPEND:
+            return None
+        return (offset, offset + len(data))
 
     def release(self, path, fh):
         """Release (close) a file

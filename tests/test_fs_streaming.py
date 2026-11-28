@@ -677,6 +677,28 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.assertEqual(raised.exception.errno, errno.ENOSPC)
         copy.assert_not_called()
 
+    def test_an_append_write_is_charged_where_it_lands(self):
+        """pwrite on an O_APPEND descriptor writes at end of file, not at
+        the offset given; the charge follows the bytes."""
+        manager = self.fs.cache_manager
+        block = manager.block_size
+        fh = self.fs.create("/append.bin", 0o644)
+        self.fs.write("/append.bin", b"a" * block, 0, fh)
+        self.fs.release("/append.bin", fh)
+        manager.mark_cache_size_dirty()
+        self.assertEqual(manager.get_total_cache_size(), block)
+        with patch.object(manager, "_scan_total_cache_size",
+                          side_effect=AssertionError("unexpected full cache scan")):
+            fh = self.fs.open("/append.bin", os.O_WRONLY | os.O_APPEND)
+            try:
+                self.assertEqual(self.fs.write("/append.bin", b"b" * block, 0, fh), block)
+                self.assertEqual(manager.get_total_cache_size(), 2 * block)
+            finally:
+                self.fs.release("/append.bin", fh)
+        self.assertEqual((self.cache_dir / "append.bin").read_bytes(), b"a" * block + b"b" * block)
+        manager.mark_cache_size_dirty()
+        self.assertEqual(manager.get_total_cache_size(), 2 * block)
+
     def test_local_writes_and_truncates_are_charged_without_a_rescan(self):
         manager = self.fs.cache_manager
         block = manager.block_size
