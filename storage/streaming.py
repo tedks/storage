@@ -1894,6 +1894,14 @@ class StreamingReadManager:
                         io_fd = os.open(str(staging_path), os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o644)
                         os.ftruncate(io_fd, file_size)
                         break
+                # No room for a partial of our own. A concurrent open of the
+                # same file may have registered one since the lookup above
+                # (its partial is what filled the budget): join it.
+                with self.prefetch_sessions_lock:
+                    existing = None if self._destroying else self.prefetch_sessions.get(canonical_path)
+                    attached = self._attach(existing) if existing is not None else None
+                if attached is not None:
+                    return attached
                 if attempt or not self._reclaim_retained_space(file_size):
                     # A concurrent cache winner needs no additional space.
                     if os.path.lexists(final_cache_path):

@@ -278,6 +278,35 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.fs.release("/pinned.bin", fd)
         self.assertNotIn("/pinned.bin", self.fs._refetch_pins)
 
+    def test_open_that_loses_admission_joins_the_session_that_won(self):
+        # R2-I1: two cold opens of one file both miss the registry; the
+        # cache has room for one partial. The loser must attach to the
+        # winner's session, not fail with ENOSPC.
+        manager = self.fs._streaming_manager
+        size = 4 * 1024 * 1024
+        with open(self.backend_dir / "contended.bin", "wb") as handle:
+            handle.truncate(size)
+        self.fs.cache_manager.max_size_bytes = size + 64 * 1024
+        real_select = manager.select_stream_source
+        winner = {}
+
+        def other_open_registers_first(canonical_path):
+            source = real_select(canonical_path)
+            if not winner:
+                winner["session"] = None
+                winner["session"] = manager._create_or_attach_prefetch_session(canonical_path, canonical_path)
+            return source
+
+        with patch.object(manager, "select_stream_source", side_effect=other_open_registers_first):
+            fd = self.fs.open("/contended.bin", os.O_RDONLY)
+        self.assertIsInstance(winner["session"], PrefetchSession)
+        self.assertIs(self._session_for(fd), winner["session"])
+        self.assertEqual(winner["session"].refcount, 2)
+        self.assertEqual(self.fs._streaming_stats_snapshot().get("streaming_open_error_cache_space", 0), 0)
+        self.assertEqual(list(self.cache_dir.glob(".storage-staging-*")), [])
+        self.fs.release("/contended.bin", fd)
+        manager._release_prefetch_session(winner["session"])
+
     def test_probe_failure_is_not_counted_when_recompute_serves_the_open(self):
         (self.backend_dir / "counted.bin").write_bytes(b"member")
         with patch.object(self.backend, "stat", side_effect=OSError(errno.EACCES, "denied")):
