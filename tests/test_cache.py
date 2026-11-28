@@ -1121,6 +1121,104 @@ class TestCacheAccounting(unittest.TestCase):
             writer.join(timeout=5.0)
         self.assertEqual(errors, [])
 
+    def test_r7_growth_landing_between_a_scan_and_its_rebase_is_counted(self):
+        """R7 (1): a write lands after the rescan measured its inode and
+        before the in-flight record is re-based; neither may miss it."""
+        manager = self.cache_manager
+        block = manager.block_size
+        path = self.cache_dir / "between"
+        path.write_bytes(b"")
+        fd = os.open(path, os.O_RDWR)
+        self.addCleanup(os.close, fd)
+        self._assert_total(0)
+        go, landed = threading.Event(), threading.Event()
+        run, gate, errors = self._blocked_change(fd=fd, span=(0, 2 * block))
+
+        def body():
+            # Inside the change, outside the cache lock.
+            threading.Thread(target=lambda: (go.wait(5.0), os.pwrite(fd, b"l" * (2 * block), 0),
+                                             landed.set())).start()
+
+        writer = run(body)
+        real_scan = manager._scan_total_cache_size
+
+        def scan_then_land():
+            total = real_scan()
+            go.set()
+            self.assertTrue(landed.wait(5.0))
+            return total
+
+        manager.mark_cache_size_dirty()
+        with patch.object(manager, "_scan_total_cache_size", side_effect=scan_then_land):
+            manager.get_total_cache_size()
+        gate.set()
+        writer.join(timeout=5.0)
+        self.assertEqual(errors, [])
+        self.assertEqual(manager.get_total_cache_size(), 2 * block)
+
+    def test_r7_last_close_during_a_direct_write_keeps_its_growth(self):
+        """R7 (2): the download's last close moves a held inode to the tree
+        while a direct write to it is in flight; what the write adds after
+        the close must still be charged."""
+        manager = self.cache_manager
+        block = manager.block_size
+        fd, final = self._held_installed("closing", 1)
+        writer_fd = os.open(final, os.O_RDWR)
+        self.addCleanup(os.close, writer_fd)
+        self._assert_total(block)
+        run, gate, errors = self._blocked_change(fd=writer_fd, span=(block, 3 * block))
+        after_close, landed = threading.Event(), threading.Event()
+
+        def body():
+            threading.Thread(target=lambda: (after_close.wait(5.0),
+                                             os.pwrite(writer_fd, b"g" * (2 * block), block),
+                                             landed.set())).start()
+
+        writer = run(body)
+        manager.close_streaming_fd(fd)
+        after_close.set()
+        self.assertTrue(landed.wait(5.0))  # the pwrite lands before settlement
+        gate.set()
+        writer.join(timeout=5.0)
+        self.assertEqual(errors, [])
+        self.assertEqual(os.fstat(writer_fd).st_size, 3 * block)
+        self.assertEqual(manager.get_total_cache_size(), 3 * block)
+
+    def test_r7_an_unmeasured_in_flight_write_is_not_counted_as_zero(self):
+        """R7 (3): the write's measurement before failed, so its record is
+        unknown; the blocks it then puts on disk must still stop a grant
+        that only fits without them."""
+        manager = self.cache_manager
+        block = manager.block_size
+        manager.max_size_bytes = 3 * block
+        self._assert_total(0)
+        path = self.cache_dir / "unknown"
+        path.write_bytes(b"")
+        fd = os.open(path, os.O_RDWR)
+        self.addCleanup(os.close, fd)
+        real_extents = manager._extent_ranges
+        failing = [True]
+
+        def extents(*args, **kwargs):
+            if failing[0]:
+                raise OSError(errno.EIO, "extent query failed")
+            return real_extents(*args, **kwargs)
+
+        with patch.object(manager, "_extent_ranges", side_effect=extents):
+            run, gate, errors = self._blocked_change(fd=fd, span=(0, 2 * block))
+
+            def body():
+                failing[0] = False
+                os.pwrite(fd, b"u" * (2 * block), 0)
+
+            writer = run(body)
+        with self._partial("b") as (_, b):
+            self.assertTrue(manager.write_streaming_chunk(b, 0, b"x"))
+            self.assertFalse(manager.write_streaming_chunk(b, block, b"y"))
+            gate.set()
+            writer.join(timeout=5.0)
+        self.assertEqual(errors, [])
+
     def test_direct_writer_uses_space_before_the_next_stream_grant(self):
         manager = self.cache_manager
         block = manager.block_size
