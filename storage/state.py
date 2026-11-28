@@ -1007,7 +1007,7 @@ class StateManager:
         SELECT virtual_path, last_access FROM files
         WHERE sync_status = ? AND recomputable = ?
           AND link_target IS NULL AND size > 0 AND cache_absent = 0
-          AND (last_access, virtual_path) > (?, ?)
+          AND (last_access, virtual_path) > (?, ?) AND last_access <= ?
         ORDER BY last_access ASC, virtual_path ASC
         LIMIT ?
     '''
@@ -1027,14 +1027,22 @@ class StateManager:
         idx_cache_eviction_candidates, so each page reads only live
         candidates. Page past missing and pinned paths without loading the
         whole index.
+
+        A pass ends at the time it started (taken after the forced flush):
+        a busy file read during the pass gets a newer timestamp and would
+        otherwise come back in a later page, again and again while reads
+        continue. A file read since the pass began is recently used, so
+        skipping it is right. So is a row stamped ahead of the clock (see
+        _UPSERT_FILES_SQL): it is skipped until real time catches up.
         """
         self._flush_access_updates(force=True)
+        started = time.time()
         last_access, last_path = float('-inf'), ''
         while True:
             with self._db_lock:
                 rows = self.conn.execute(self._LRU_PAGE_SQL, (
                     SyncStatus.CLEAN.value, int(recomputable), last_access, last_path,
-                    self.WRITE_BATCH_SIZE,
+                    started, self.WRITE_BATCH_SIZE,
                 )).fetchall()
             for row in rows:
                 yield row['virtual_path']

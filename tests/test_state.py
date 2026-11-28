@@ -620,6 +620,21 @@ class TestCacheAbsentCandidacy(unittest.TestCase):
         self.assertEqual(self._absent("/populated"), 0)
         self.assertEqual(list(self.state_manager.iter_lru_paths()), ["/populated"])
 
+    def test_a_pass_ends_although_busy_files_are_read_while_it_runs(self):
+        # Rows a guard skips as busy are read again whenever visited: each
+        # gets a newer flushed timestamp, past the page cursor.
+        sm = self.state_manager
+        sm.WRITE_BATCH_SIZE = 3
+        for i in range(sm.WRITE_BATCH_SIZE):
+            self._row(f"/busy-{i}", last_access=1.0 + i)
+        visits = []
+        for path in sm.iter_lru_paths():
+            visits.append(path)
+            self.assertLess(len(visits), 50, "the pass did not end")
+            sm.update_access_time(path)
+            sm._flush_access_updates(force=True)
+        self.assertEqual(visits, [f"/busy-{i}" for i in range(sm.WRITE_BATCH_SIZE)])
+
     def test_marked_rows_leave_the_scan_and_the_model_ignores_the_column(self):
         self._row("/a")
         self._row("/b", last_access=2.0)
@@ -674,7 +689,7 @@ class TestCacheAbsentCandidacy(unittest.TestCase):
     def test_eviction_page_uses_the_candidate_index(self):
         plan = [tuple(row)[-1] for row in self.state_manager.conn.execute(
             'EXPLAIN QUERY PLAN ' + StateManager._LRU_PAGE_SQL,
-            (SyncStatus.CLEAN.value, 0, 0.0, '', 10),
+            (SyncStatus.CLEAN.value, 0, 0.0, '', 1e12, 10),
         )]
         self.assertTrue(any("idx_cache_eviction_candidates" in step for step in plan), plan)
         self.assertFalse(any("TEMP B-TREE" in step for step in plan), plan)
@@ -690,7 +705,7 @@ class TestCacheAbsentCandidacy(unittest.TestCase):
         conn.set_progress_handler(count, 1)
         try:
             rows = conn.execute(StateManager._LRU_PAGE_SQL, (
-                SyncStatus.CLEAN.value, 0, float('-inf'), '', StateManager.WRITE_BATCH_SIZE,
+                SyncStatus.CLEAN.value, 0, float('-inf'), '', 1e12, StateManager.WRITE_BATCH_SIZE,
             )).fetchall()
         finally:
             conn.set_progress_handler(None, 1)
