@@ -13,7 +13,7 @@ from fuse import FuseOSError
 
 from .backends.base import Backend, MemberSourceMissing
 from .cache_metadata import (
-    cached_member_attributes, legacy_member_mtime, regular_file_stat,
+    cached_member_attributes, legacy_member_mtime, regular_file_stat, reported_mode,
 )
 from .checksums import ChecksumBasis, ChecksumRecord
 from .models import SyncStatus
@@ -783,7 +783,22 @@ class NamespaceService:
         return visible
 
     def getattr(self, path: str):
-        """Get file attributes."""
+        """Get file attributes, never with set-ID bits on a regular file.
+
+        Whatever answers (the cache file, its member record, a listing or a
+        member's stat), a member's setuid or setgid bit, which the kernel
+        would honour with the member's uid on a mount without nosuid, is
+        not reported (cache_metadata.reported_mode).
+        """
+        attrs = self._getattr(path)
+        mode = attrs.get("st_mode")
+        if type(mode) is int:
+            stripped = reported_mode(mode)
+            if stripped != mode:
+                attrs = dict(attrs, st_mode=stripped)
+        return attrs
+
+    def _getattr(self, path: str):
         resolved = self.resolve_path(path)
 
         try:
@@ -808,7 +823,7 @@ class NamespaceService:
                 elif resolved.backend_name is None:
                     recovered = legacy_member_mtime(
                         resolved.cache_path, st,
-                        self.state_manager.get_file_metadata(resolved.canonical_path),
+                        lambda: self.state_manager.get_file_metadata(resolved.canonical_path),
                     )
                     if recovered is not None:
                         attrs["st_mtime"] = recovered

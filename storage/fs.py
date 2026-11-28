@@ -44,8 +44,8 @@ from .locks import NamespaceLock, PathLocks, UploadLocks
 from .cache_metadata import (
     MEMBER_ATTRS_XATTR, MEMBER_STAT_XATTR as CACHE_MEMBER_STAT_XATTR,
     PREFIX_XATTR, XATTR_CACHE_METADATA_NAME,
-    cache_identity, cached_member_attributes, forget_cached_member_fields,
-    read_member_baselines, regular_file_stat, scan_cache_entries,
+    cache_identity, forget_cached_member_fields, imported_mode_denies_write,
+    read_member_baselines, record_native_attributes, regular_file_stat, scan_cache_entries,
 )
 from .file_config import FileConfig, get_inherited_config
 from .models import FileLocation, FileMetadata, StreamingKeepAfterClose, SyncStatus
@@ -2372,9 +2372,9 @@ class StorageFS(Operations):
             try:
                 before = os.lstat(resolved.cache_path)
                 os.chmod(resolved.cache_path, mode)
-                forget_cached_member_fields(resolved.cache_path, before, "st_mode", "st_ctime")
             except OSError as e:
                 raise FuseOSError(e.errno)
+            self._forget_member_fields(resolved.cache_path, before, "st_mode", "st_ctime")
 
     def chown(self, path, uid, gid):
         """Change file owner"""
@@ -2385,14 +2385,27 @@ class StorageFS(Operations):
             try:
                 before = os.lstat(resolved.cache_path)
                 os.chown(resolved.cache_path, uid, gid, follow_symlinks=False)
-                fields = ["st_ctime"]
-                if uid != -1:
-                    fields.append("st_uid")
-                if gid != -1:
-                    fields.append("st_gid")
-                forget_cached_member_fields(resolved.cache_path, before, *fields)
             except OSError as e:
                 raise FuseOSError(e.errno)
+            fields = ["st_ctime"]
+            if uid != -1:
+                fields.append("st_uid")
+            if gid != -1:
+                fields.append("st_gid")
+            self._forget_member_fields(resolved.cache_path, before, *fields)
+
+    def _forget_member_fields(self, cache_path: Path, before: os.stat_result, *fields: str):
+        """Retire reported member fields after chmod, chown or utimens.
+
+        The change itself has happened, so a failure to update the record
+        is logged, not reported to the caller: the field it leaves is still
+        masked while the backing stat differs from the record's basis.
+        """
+        try:
+            forget_cached_member_fields(cache_path, before, *fields)
+        except OSError as exc:
+            self.logger.warning("could not retire member fields %s of %s: %s",
+                                ",".join(fields), cache_path, exc)
 
     @staticmethod
     def _require_imported_write_permission(cache_path: Path):
@@ -2402,10 +2415,9 @@ class StorageFS(Operations):
         if os.geteuid() == 0:
             return
         local = regular_file_stat(cache_path)
-        if local is not None and local.st_uid == os.geteuid():
-            mode = (cached_member_attributes(cache_path, local) or {}).get("st_mode")
-            if mode is not None and not mode & stat.S_IWUSR:
-                raise FuseOSError(errno.EACCES)
+        if (local is not None and local.st_uid == os.geteuid()
+                and imported_mode_denies_write(cache_path, local)):
+            raise FuseOSError(errno.EACCES)
 
     def _mark_cache_file_dirty(self, canonical_path: str, cache_path: Path) -> None:
         """Record a modification of a cached file (see CacheManager.mark_file_dirty)."""
@@ -2599,6 +2611,8 @@ class StorageFS(Operations):
         """Create a file"""
         resolved = self._resolve_path(path)
         self._refuse_fenced_view_write(resolved)
+        # O_CREAT on an existing read-only member file is refused natively.
+        self._require_imported_write_permission(resolved.cache_path)
         cache_path = self.cache_manager.create_cached_file(resolved.requested_path)
 
         try:
@@ -2615,6 +2629,11 @@ class StorageFS(Operations):
                     canonical_path=resolved.canonical_path,
                     prefetch_session=None,
                 )
+            try:
+                # No member fields: stat skips legacy recovery and its index read.
+                record_native_attributes(real_fd)
+            except OSError as exc:
+                self.logger.debug("no attribute record for %s: %s", cache_path, exc)
 
             config = self._get_config(resolved.canonical_path)
             metadata = FileMetadata(
@@ -2964,6 +2983,8 @@ class StorageFS(Operations):
             self._force_verify(self._resolve_path(path).canonical_path)
             return
         cache_path = self._resolve_path(path).cache_path
+        # A user xattr needs write permission on a file, as natively.
+        self._require_imported_write_permission(cache_path)
 
         try:
             os.setxattr(str(cache_path), name, value, follow_symlinks=False)
@@ -2997,6 +3018,7 @@ class StorageFS(Operations):
             # Derived; ignore removals.
             return
         cache_path = self._resolve_path(path).cache_path
+        self._require_imported_write_permission(cache_path)
 
         try:
             os.removexattr(str(cache_path), name, follow_symlinks=False)
@@ -3257,10 +3279,7 @@ class StorageFS(Operations):
             and after.st_mtime != before.st_mtime
         ):
             self._mark_cache_file_dirty(resolved.canonical_path, cache_path)
-        try:
-            forget_cached_member_fields(cache_path, before, "st_mtime", "st_ctime")
-        except OSError as e:
-            raise FuseOSError(e.errno)
+        self._forget_member_fields(cache_path, before, "st_mtime", "st_ctime")
 
     def sweep_stale_cache_metadata(self) -> int:
         """Mark DIRTY every cached file written after its row last said CLEAN.

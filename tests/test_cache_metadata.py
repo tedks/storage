@@ -1,4 +1,5 @@
 import errno
+import json
 import os
 import shutil
 import stat
@@ -12,8 +13,10 @@ from storage.cache_metadata import (
     XATTR_CACHE_METADATA_NAME,
     cache_file_would_be_scanned,
     cache_path_to_virtual_path,
+    MEMBER_ATTRS_XATTR,
     cached_member_attributes,
     copy_member_attributes,
+    record_native_attributes,
     read_cache_metadata,
     scan_cache_entries,
     write_cache_metadata,
@@ -58,6 +61,39 @@ class TestCacheMetadata(unittest.TestCase):
         self.assertEqual(acl, os.getxattr(path, acl_xattr))
         self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o640)
         self.assertEqual(cached_member_attributes(path, path.stat())["st_mode"], source.st_mode)
+
+    def test_import_records_no_set_id_bits(self):
+        path = self.cache_root / "from-member"
+        path.write_bytes(b"file")
+        os.chmod(path, 0o755)
+        source = SimpleNamespace(st_size=4, st_mode=stat.S_IFREG | 0o7755)
+        with path.open("rb") as handle:
+            copy_member_attributes(handle.fileno(), source)
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o755)
+        # Sticky means nothing on a regular file and is kept as reported.
+        self.assertEqual(cached_member_attributes(path, path.stat())["st_mode"],
+                         stat.S_IFREG | 0o1755)
+        # A record written with them (an earlier build) is read without them.
+        record = json.loads(os.getxattr(path, MEMBER_ATTRS_XATTR))
+        record["attrs"]["st_mode"] = stat.S_IFREG | 0o6755
+        os.setxattr(path, MEMBER_ATTRS_XATTR, json.dumps(record).encode())
+        self.assertEqual(cached_member_attributes(path, path.stat())["st_mode"],
+                         stat.S_IFREG | 0o755)
+
+    def test_native_record_is_empty_and_keeps_an_existing_one(self):
+        path = self.cache_root / "made-here"
+        path.write_bytes(b"file")
+        fd = os.open(path, os.O_RDWR)
+        try:
+            record_native_attributes(fd)
+            self.assertEqual(cached_member_attributes(path, path.stat()), {})
+            source = SimpleNamespace(st_size=4, st_mode=stat.S_IFREG | 0o600, st_uid=4242)
+            os.removexattr(path, MEMBER_ATTRS_XATTR)
+            copy_member_attributes(fd, source)
+            record_native_attributes(fd)  # O_TRUNC over an imported file
+        finally:
+            os.close(fd)
+        self.assertEqual(cached_member_attributes(path, path.stat())["st_uid"], 4242)
 
     def test_write_and_read_round_trip(self):
         cache_path = self.cache_root / "video.mp4"

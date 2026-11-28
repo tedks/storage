@@ -8,6 +8,7 @@ checks instead of sleeping.
 """
 
 import dataclasses
+import errno
 import logging
 import stat
 import os
@@ -18,6 +19,8 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+
+from fuse import FuseOSError
 
 from storage.backends.local import LocalBackend
 from storage.backends.rsync import RsyncBackend, RsyncError
@@ -280,8 +283,9 @@ class TestMemberAttributes(RevalidateTestBase):
         self.assertEqual((local.st_mtime_ns, local.st_atime_ns), (mtime_ns, atime_ns))
         self.assertEqual((stat.S_IMODE(local.st_mode), local.st_uid, local.st_gid),
                          (0o640, os.geteuid(), os.getegid()))
+        # Every member field but the setuid bit, which is never reported.
         self.assertEqual((attrs["st_mode"], attrs["st_uid"], attrs["st_gid"]),
-                         (fake.st_mode, fake.st_uid, fake.st_gid))
+                         (stat.S_IFREG | 0o640, fake.st_uid, fake.st_gid))
         self.assertEqual(attrs["st_ctime"], fake.st_ctime)
         self.assertEqual(attrs["st_nlink"], local.st_nlink)
         self.assertEqual(source.read_bytes(), cached.read_bytes())
@@ -440,6 +444,144 @@ class TestMemberAttributes(RevalidateTestBase):
                 self.assertEqual(self.fs.getattr("/f.txt")["st_mtime"], native.st_mtime)
                 self.fs.cache_manager.delete_cached_file("/f.txt")
                 self.fs.state_manager.delete_file("/f.txt")
+
+
+class TestImportedPermissions(RevalidateTestBase):
+    """What a fill imports never grants more through the mount than the
+    member file had: no set-ID bits, no write to a read-only file."""
+
+    def fill_read_only(self, member_stat):
+        src = self.member_dir / "f.txt"
+        if src.exists():
+            src.unlink()
+        src = self.rewrite_member("f.txt", b"original", mtime=1_000_000_000)
+        os.chmod(src, 0o444)
+        with patch.object(self.member, "stat", **member_stat):
+            self.assertEqual(self.read_through("/f.txt"), b"original")
+        cached = self.cache_dir / "f.txt"
+        # The daemon keeps owner write on its backing file.
+        self.assertTrue(cached.stat().st_mode & stat.S_IWUSR)
+        return cached
+
+    def assert_write_refused(self, cached):
+        self.assertEqual(stat.S_IMODE(self.fs.getattr("/f.txt")["st_mode"]), 0o444)
+        for attempt in (lambda: self.fs.open("/f.txt", os.O_WRONLY),
+                        lambda: self.fs.truncate("/f.txt", 0),
+                        lambda: self.fs.create("/f.txt", 0o644),
+                        lambda: self.fs.setxattr("/f.txt", "user.note", b"x", 0),
+                        lambda: self.fs.removexattr("/f.txt", "user.note")):
+            with self.assertRaises(FuseOSError) as raised:
+                attempt()
+            self.assertEqual(raised.exception.errno, errno.EACCES)
+        self.assertEqual(cached.read_bytes(), b"original")
+
+    def test_read_only_member_mode_is_enforced(self):
+        self.assert_write_refused(self.fill_read_only({"wraps": self.member.stat}))
+
+    def test_read_only_without_member_stat_fails_closed(self):
+        # No member mode: the downloaded file's own (copied) mode is
+        # recorded instead of the backing file's owner-writable one.
+        for kwargs in ({"side_effect": OSError(errno.EIO, "no stat")},
+                       {"return_value": SimpleNamespace(st_size=None)},
+                       {"return_value": SimpleNamespace(st_size=99, st_mode=stat.S_IFREG | 0o644)}):
+            with self.subTest(kwargs=kwargs):
+                with patch.object(self.member, "get_size", return_value=8):
+                    cached = self.fill_read_only(kwargs)
+                self.assert_write_refused(cached)
+                self.fs.cache_manager.delete_cached_file("/f.txt")
+                self.fs.state_manager.delete_file("/f.txt")
+
+    def test_set_id_bits_are_never_reported(self):
+        src = self.rewrite_member("f.txt", b"original")
+        os.chmod(src, 0o6755)
+        self.assertEqual(stat.S_IMODE(self.fs.getattr("/f.txt")["st_mode"]), 0o755)  # uncached
+        self.read_through("/f.txt")
+        cached = self.cache_dir / "f.txt"
+        self.assertEqual(stat.S_IMODE(cached.stat().st_mode), 0o755)
+        self.assertEqual(stat.S_IMODE(self.fs.getattr("/f.txt")["st_mode"]), 0o755)
+        # chown keeps the member mode, still without them; a chmod through
+        # the mount cannot add them to what is reported either.
+        self.fs.chown("/f.txt", -1, os.getegid())
+        self.assertEqual(stat.S_IMODE(self.fs.getattr("/f.txt")["st_mode"]), 0o755)
+        self.fs.chmod("/f.txt", 0o6750)
+        self.assertEqual(stat.S_IMODE(self.fs.getattr("/f.txt")["st_mode"]), 0o750)
+
+    def test_record_matches_after_device_number_changes(self):
+        self.fill_read_only({"wraps": self.member.stat})
+        cached = self.cache_dir / "f.txt"
+        real = os.lstat
+        remounted = lambda path, *a, **kw: _with_dev(real(path, *a, **kw), 12345)
+        with patch("storage.namespace.os.lstat", side_effect=remounted),                 patch("storage.cache_metadata.os.lstat", side_effect=remounted):
+            self.assertEqual(stat.S_IMODE(self.fs.getattr("/f.txt")["st_mode"]), 0o444)
+        self.assertTrue(cached.exists())
+
+    def test_copied_record_still_refuses_write(self):
+        cached = self.fill_read_only({"wraps": self.member.stat})
+        # The cache file moved to another inode with its xattrs (cp -a).
+        copy = cached.with_name("copy")
+        shutil.copy2(cached, copy)
+        for name in os.listxattr(cached):
+            os.setxattr(copy, name, os.getxattr(cached, name))
+        os.replace(copy, cached)
+        with self.assertRaises(FuseOSError) as raised:
+            self.fs.open("/f.txt", os.O_WRONLY)
+        self.assertEqual(raised.exception.errno, errno.EACCES)
+
+
+def _with_dev(st, dev):
+    fields = list(st)
+    fields[2] = dev  # st_dev
+    return os.stat_result(fields, {name: getattr(st, name) for name in (
+        "st_atime", "st_mtime", "st_ctime", "st_atime_ns", "st_mtime_ns", "st_ctime_ns",
+        "st_blksize", "st_blocks")})
+
+
+class TestCreatedAndChangedFiles(RevalidateTestBase):
+
+    def test_created_file_stat_reads_no_index_row(self):
+        fh = self.fs.create("/new.txt", 0o644)
+        self.fs.write("/new.txt", b"made here", 0, fh)
+        self.fs.release("/new.txt", fh)
+        with patch.object(self.fs.state_manager, "get_file_metadata",
+                          wraps=self.fs.state_manager.get_file_metadata) as rows:
+            attrs = self.fs.getattr("/new.txt")
+        self.assertEqual(rows.call_count, 0)
+        self.assertEqual(attrs["st_size"], 9)
+        self.assertEqual(attrs["st_mode"], (self.cache_dir / "new.txt").stat().st_mode)
+
+    def test_record_update_failure_after_chmod_is_logged(self):
+        self.rewrite_member("f.txt", b"original")
+        self.read_through("/f.txt")
+        with patch("storage.fs.forget_cached_member_fields",
+                   side_effect=OSError(errno.ENOSPC, "full")), \
+                self.assertLogs("storage.fs", level="WARNING"):
+            self.fs.chmod("/f.txt", 0o600)
+            self.fs.chown("/f.txt", -1, os.getegid())
+            self.fs.utimens("/f.txt", (1_200_000_000, 1_200_000_000))
+        self.assertEqual(stat.S_IMODE((self.cache_dir / "f.txt").stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(self.fs.getattr("/f.txt")["st_mode"]), 0o600)
+
+    def test_explicit_utime_beats_legacy_mtime_on_read_only_backing_file(self):
+        # A legacy fill copied a read-only mode onto its backing file; an
+        # explicit utime that keeps the native mtime still retires recovery.
+        self.rewrite_member("f.txt", b"original", mtime=1_000_000_000)
+        self.read_through("/f.txt")
+        cached = self.cache_dir / "f.txt"
+        os.removexattr(cached, MEMBER_ATTRS_XATTR)
+        os.utime(cached, (1_700_000_000, 1_700_000_000))
+        local = cached.stat()
+        row = self.fs.state_manager.get_file_metadata("/f.txt")
+        self.assertTrue(self.fs.state_manager.record_cached_stat(
+            "/f.txt", row.dirty_generation, size=local.st_size, last_modified=local.st_mtime,
+            last_access=local.st_atime,
+        ))
+        self.fs._store_member_check("/f.txt", cached, self.fs._cache_identity(local),
+                                    {"member": (8, 1_000_000_000)}, replace=True)
+        os.chmod(cached, 0o444)
+        self.assertEqual(self.fs.getattr("/f.txt")["st_mtime"], 1_000_000_000)
+        self.fs.utimens("/f.txt", (local.st_atime, local.st_mtime))
+        self.assertEqual(self.fs.getattr("/f.txt")["st_mtime"], local.st_mtime)
+        self.assertEqual(stat.S_IMODE(cached.stat().st_mode), 0o444)
 
 
 class TestKernelPageDrop(RevalidateTestBase):
