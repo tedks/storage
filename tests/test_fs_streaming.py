@@ -677,6 +677,39 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.assertEqual(raised.exception.errno, errno.ENOSPC)
         copy.assert_not_called()
 
+    def test_superseded_partial_stays_charged_until_its_last_reader_closes(self):
+        """R2-I1: a FUSE reader of a superseded session holds a ref, and its
+        release closes its own descriptor before dropping it, so the
+        session descriptor (and with it the charge) outlives every reader."""
+        manager = self.fs.cache_manager
+        block = manager.block_size
+        payload = os.urandom(96 * 1024)
+        (self.backend_dir / "superseded.bin").write_bytes(payload)
+        held, at_finalize, go = self._hold_finalize()
+        with held:
+            vfd_a, session = self._stream_whole_file("superseded.bin", payload)
+            self.assertTrue(at_finalize.wait(timeout=5))
+            vfd_b = self.fs.open("/superseded.bin", os.O_RDONLY)
+            self.assertIs(self._session_for(vfd_b), session)
+            (self.cache_dir / "superseded.bin").write_bytes(b"winner")
+            manager.mark_cache_size_dirty()
+            go.set()
+            self.assertTrue(self._wait_for(lambda: session.finalized))
+        self.assertTrue(session.detached)
+        self.assertGreaterEqual(session.io_fd, 0)
+        self.assertEqual(os.fstat(session.io_fd).st_nlink, 0)
+        expected = len(payload) + block
+        manager.mark_cache_size_dirty()
+        self.assertEqual(manager.get_total_cache_size(), expected)
+        self.fs.release("/superseded.bin", vfd_a)
+        self.assertGreaterEqual(session.io_fd, 0)
+        self.assertEqual(manager.get_total_cache_size(), expected)
+        self.assertEqual(self.fs.read("/superseded.bin", 4096, 0, vfd_b), payload[:4096])
+        self.fs.release("/superseded.bin", vfd_b)
+        self.assertEqual(session.io_fd, -1)
+        self.assertEqual(manager.get_total_cache_size(), block)
+        self.assertEqual((self.cache_dir / "superseded.bin").read_bytes(), b"winner")
+
     def test_an_append_write_is_charged_where_it_lands(self):
         """pwrite on an O_APPEND descriptor writes at end of file, not at
         the offset given; the charge follows the bytes."""
