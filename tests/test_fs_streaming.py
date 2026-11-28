@@ -1567,6 +1567,23 @@ class TestFSStreamingIntegration(unittest.TestCase):
             manager._record_foreground_read(session, 644_245_094, 644_245_095)
             self.assertTrue(session.readers_consumed)
 
+    def test_constructor_refuses_a_window_that_set_would_refuse(self):
+        # Checked before the download pool starts, so nothing is left running.
+        from unittest import mock
+        from storage.streaming import StreamingReadManager
+        from storage.streaming_settings import MAX_READ_AHEAD_WINDOW
+        for bad in (MAX_READ_AHEAD_WINDOW + 1, -1, True):
+            with self.subTest(value=bad):
+                with self.assertRaisesRegex(ValueError, "read-ahead window"):
+                    StreamingReadManager(
+                        cache_manager=mock.Mock(), state_manager=mock.Mock(),
+                        logger=mock.Mock(), get_config=mock.Mock(),
+                        select_backend_for_read=mock.Mock(), streaming_reads=True,
+                        streaming_chunk_size=1024 * 1024, max_streaming_sessions=4,
+                        partial_suffix=".partial", stream_state_xattr="user.storage.stream",
+                        read_ahead_window=bad,
+                    )
+
     def test_control_window_round_trips_the_integer_that_get_reports(self):
         # A JSON client reads the window as an integer and can send it back.
         manager = self.fs._streaming_manager

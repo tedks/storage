@@ -234,7 +234,8 @@ threshold reached and round percentages down. For example, `4M,50%`
 qualifies at 4 MiB on a large file and halfway through a small one.
 To adopt the new default in a profile that sets the old rule explicitly,
 remove that setting or change it to `all:32M,30%`. Use `0` to qualify after
-any read or `100%` to require a full-file read.
+any read or `100%` to require a full-file read. A percentage may have up to
+100 significant decimal places.
 Storage counts the spans requested by the kernel, including its readahead.
 
 Before a file qualifies, its background worker may fetch ahead of the

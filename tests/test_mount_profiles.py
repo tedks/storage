@@ -237,13 +237,19 @@ class TestParseKeepAfterClose(unittest.TestCase):
                          parse_keep_after_close("all:0.000001%").percent_thresholds)
         self.assertEqual((Fraction(100),), parse_keep_after_close("0" * 5000 + "100%").percent_thresholds)
         self.assertEqual((Fraction(101, 2),), parse_keep_after_close("050.500000%").percent_thresholds)
-        for value in ("0.0000001%", "all:0." + "0" * 4299 + "1%", "1" + "0" * 5000 + "%",
+        # Trailing zeros are not significant, and any realistic precision parses.
+        self.assertEqual((Fraction(50),), parse_keep_after_close("50.0000000%").percent_thresholds)
+        self.assertEqual((Fraction(123456789, 10 ** 7),),
+                         parse_keep_after_close("4M,12.3456789%").percent_thresholds)
+        self.assertEqual((Fraction(1, 10 ** 100),),
+                         parse_keep_after_close("0." + "0" * 99 + "1" + "0" * 5000 + "%").percent_thresholds)
+        for value in ("0." + "0" * 100 + "1%", "all:0." + "0" * 4299 + "1%", "1" + "0" * 5000 + "%",
                       "0" * 5000 + "101%", "100.000001%"):
             with self.subTest(value=value[:40]):
                 with self.assertRaises(ValueError):
                     parse_keep_after_close(value)
-        with self.assertRaisesRegex(ValueError, "more than 6 decimal places"):
-            parse_keep_after_close("all:32M,0.1234567%")
+        with self.assertRaisesRegex(ValueError, "more than 100 significant decimal places"):
+            parse_keep_after_close("all:32M,0." + "1" * 101 + "%")
 
     def test_unknown_term_error_names_the_expected_form(self):
         with self.assertRaisesRegex(ValueError, r"'lots'.*such as all:32M,30%"):

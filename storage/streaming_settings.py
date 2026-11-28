@@ -37,10 +37,12 @@ def parse_size(size_str: str) -> int:
 
 _SIZE = re.compile(r"\d+(\.\d+)?[KMGT]?", re.IGNORECASE | re.ASCII)
 _KEEP_AFTER_CLOSE_PERCENT = re.compile(r"(\d+)(?:\.(\d+))?%", re.ASCII)
-# A percentage has at most this many decimal places. The bound keeps the
-# Fraction small enough to serialize: streaming.get reports it with str(),
-# and an int over 4300 digits cannot be converted to a string.
-MAX_PERCENT_DECIMALS = 6
+# A percentage has at most this many significant decimal places (trailing
+# zeros do not count). The bound keeps the Fraction small enough to
+# serialize: streaming.get reports it with str(), and an int over 4300
+# digits cannot be converted to a string. 100 is far beyond any useful
+# precision, so no realistic policy is refused.
+MAX_PERCENT_DECIMALS = 100
 _KEEP_AFTER_CLOSE_ALL = re.compile(r"all\s*:", re.IGNORECASE | re.ASCII)
 
 
@@ -64,10 +66,10 @@ def parse_keep_after_close(text: str) -> StreamingKeepAfterClose:
     for term in terms:
         percent = _KEEP_AFTER_CLOSE_PERCENT.fullmatch(term)
         if percent:
-            whole, decimals = percent.group(1).lstrip("0"), percent.group(2) or ""
+            whole, decimals = percent.group(1).lstrip("0"), (percent.group(2) or "").rstrip("0")
             if len(decimals) > MAX_PERCENT_DECIMALS:
                 raise ValueError(
-                    f"percentage with more than {MAX_PERCENT_DECIMALS} decimal places: {term!r}"
+                    f"percentage with more than {MAX_PERCENT_DECIMALS} significant decimal places: {term!r}"
                 )
             # Leading zeros are dropped before conversion, so the whole part
             # of a percentage at most 100 has at most three digits.

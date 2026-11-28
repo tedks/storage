@@ -21,7 +21,7 @@ from .control import ControlError, ControlServer
 from .models import FileLocation, FileMetadata, StreamingKeepAfterClose, SyncStatus
 from .streaming_settings import (
     DEFAULT_STREAMING_KEEP_AFTER_CLOSE, DEFAULT_STREAMING_READ_AHEAD_WINDOW,
-    parse_keep_after_close, parse_read_ahead_window,
+    MAX_READ_AHEAD_WINDOW, parse_keep_after_close, parse_read_ahead_window,
 )
 
 # A foreground read fetches only the bytes the reader asked for that are not
@@ -342,14 +342,17 @@ class StreamingReadManager:
             "max_download_workers": max_download_workers,
         }
         validate_download_limits(limits)
+        if (type(read_ahead_window) is not int or read_ahead_window < 0
+                or read_ahead_window > MAX_READ_AHEAD_WINDOW):
+            # The same bound as parse_read_ahead_window, so the window
+            # streaming.get reports can always be sent back to streaming.set.
+            raise ValueError("read-ahead window must be a byte count from 0 to 2**63 - 1")
         self._download_limits = limits
         self._download_pool = _DownloadPool(
             max_download_workers,
             self._run_download_turn,
             logger,
         )
-        if type(read_ahead_window) is not int or read_ahead_window < 0:
-            raise ValueError("read-ahead window must be a non-negative byte count")
         if keep_after_close is None:
             keep_after_close = parse_keep_after_close(DEFAULT_STREAMING_KEEP_AFTER_CLOSE)
         self._read_ahead_settings = _ReadAheadSettings(keep_after_close, read_ahead_window)
