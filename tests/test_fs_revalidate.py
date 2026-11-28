@@ -2899,7 +2899,17 @@ class TestRefreshRound5(RevalidateTestBase):
         self.assertEqual(cached.read_bytes(), b"version 2!")
         state = self.fs.state_manager
         self.assertEqual(state.get_file_metadata("/live.log").size, 9)
-        with patch.object(self.fs.sync_manager, "queue_sync") as sync:
+        unlink = Path.unlink
+
+        def inspect_before_unlink(path, *args, **kwargs):
+            if path == cached:
+                repaired = state.get_file_metadata("/live.log")
+                self.assertEqual((repaired.size, repaired.checksum), (10, None))
+                self.assertTrue(all(not loc.checksum for loc in state.get_file_locations("/live.log")))
+            return unlink(path, *args, **kwargs)
+
+        with patch.object(self.fs.sync_manager, "queue_sync") as sync, \
+                patch.object(Path, "unlink", inspect_before_unlink):
             self.assertTrue(self.fs.cache_manager.evict_lru_files(bytes_needed=10))
         sync.assert_not_called()
         self.assertFalse(cached.exists())
@@ -2922,6 +2932,53 @@ class TestRefreshRound5(RevalidateTestBase):
                          SyncStatus.CLEAN)
 
     def test_a_crash_after_equal_stat_replacement_forgets_the_old_checksums(self):
+        self.crash_after_installing_equal_stat_refresh()
+        self.assertEqual(self.fs.sweep_stale_cache_metadata(), 0)
+        row = self.fs.state_manager.get_file_metadata("/live.log")
+        self.assertEqual((row.size, row.last_modified, row.sync_status, row.checksum),
+                         (9, 1_000_000_000, SyncStatus.CLEAN, None))
+        self.assertTrue(all(not loc.checksum for loc in
+                            self.fs.state_manager.get_file_locations("/live.log")))
+        self.assertEqual(self.read_through("/live.log"), b"version 2")
+
+    def test_equal_stat_replacement_refills_without_old_checksum_after_eviction_crash(self):
+        self.crash_after_installing_equal_stat_refresh()
+        cached = self.cache_dir / "live.log"
+        unlink = Path.unlink
+
+        def crash_after_unlink(path, *args, **kwargs):
+            unlink(path, *args, **kwargs)
+            if path == cached:
+                raise KeyboardInterrupt
+
+        with patch.object(Path, "unlink", crash_after_unlink):
+            with self.assertRaises(KeyboardInterrupt):
+                self.fs.cache_manager.evict_lru_files(bytes_needed=9)
+        self.assertFalse(cached.exists())
+        self.restart()
+        self.assertEqual(self.read_through("/live.log"), b"version 2")
+        row = self.fs.state_manager.get_file_metadata("/live.log")
+        self.assertEqual((row.sync_status, row.checksum, row.dirty_generation),
+                         (SyncStatus.CLEAN, None, 0))
+
+    def test_eviction_keeps_a_verified_copy_when_its_row_repair_fails(self):
+        import sqlite3
+
+        self.crash_after_installing_equal_stat_refresh()
+        cached = self.cache_dir / "live.log"
+        state = self.fs.state_manager
+        inode = cached.stat().st_ino
+        with patch.object(state, "record_cached_stat",
+                          side_effect=sqlite3.OperationalError("row write failed")) as repair:
+            self.assertFalse(self.fs.cache_manager.evict_lru_files(bytes_needed=9))
+        repair.assert_called_once()
+        self.assertEqual(cached.stat().st_ino, inode)
+        self.assertEqual(cached.read_bytes(), b"version 2")
+        self.assertEqual(state.get_file_metadata("/live.log").checksum, "hash-of-v1")
+        self.assertTrue(self.fs.cache_manager.evict_lru_files(bytes_needed=9))
+        self.assertIsNone(state.get_file_metadata("/live.log").checksum)
+
+    def crash_after_installing_equal_stat_refresh(self):
         old_inode = self.refreshed_with_checksums()
         self.rewrite_member("live.log", b"version 2", mtime=1_000_000_000)
         self.fs._recheck["/live.log"] = {"member"}
@@ -2930,13 +2987,7 @@ class TestRefreshRound5(RevalidateTestBase):
                 self.fs.open("/live.log", os.O_RDONLY)
         self.assertNotEqual(self.cache_inode("live.log"), old_inode)
         self.restart()
-        self.assertEqual(self.fs.sweep_stale_cache_metadata(), 0)
-        row = self.fs.state_manager.get_file_metadata("/live.log")
-        self.assertEqual((row.size, row.last_modified, row.sync_status, row.checksum),
-                         (9, 1_000_000_000, SyncStatus.CLEAN, None))
-        self.assertTrue(all(not loc.checksum for loc in
-                            self.fs.state_manager.get_file_locations("/live.log")))
-        self.assertEqual(self.read_through("/live.log"), b"version 2")
+        self.assertEqual(self.fs.state_manager.get_file_metadata("/live.log").checksum, "hash-of-v1")
 
     def test_an_invalidation_after_a_lost_row_update_does_not_mark_dirty(self):
         # The same crash, then a change found before any sweep: the copy is

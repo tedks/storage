@@ -11,6 +11,7 @@ import logging
 import os
 import stat as stat_module
 import secrets
+import sqlite3
 import time
 import threading
 from pathlib import Path
@@ -168,11 +169,8 @@ class CacheManager:
         # predate its last write. It takes only a leaf lock and is safe
         # under every lock here. None (no StorageFS) means no listings.
         self.forget_listed_attrs: Optional[Callable[..., None]] = None
-        # Set by StorageFS: drops a path's checksum records and tasks (a
-        # refreshed copy's lost row update is healed). None: nothing to drop.
-        self.forget_checksums: Optional[Callable[[str], None]] = None
         # Keeps old checksum tasks and records from crossing an in-place
-        # replacement. The standalone cache has no such tasks.
+        # replacement or its recovery. The standalone cache has no such tasks.
         self.replace_checksum_guard: Optional[Callable[[str], ContextManager]] = None
         # Set by StorageFS: a context manager that try-acquires the outer
         # locks of a canonical path (storage/locks.py) and yields whether it
@@ -987,8 +985,9 @@ class CacheManager:
         the same lock across its os.open and registration), since bytes
         written through one after the stat would die with the unlinked
         inode. A stale CLEAN is marked and kept unless the inode carries
-        the verified replacement's CLEAN record. The listing attributes for
-        the path are forgotten before the unlink (forget_listed_attrs). Lock
+        a verified replacement's CLEAN record. Repair the row and checksums
+        under both guards before unlinking that evidence. Forget the path's
+        listing attributes before unlinking (forget_listed_attrs). Lock
         order: the caller's
         self._lock, the index lock, then the descriptor lock; nothing under
         the descriptor lock takes the other two. Returns the bytes freed.
@@ -1006,18 +1005,13 @@ class CacheManager:
                 if is_open:
                     return 0
                 st = os.lstat(str(cache_path))
-                stale = st.st_size != row.size or st.st_mtime != row.last_modified
-                recovered = stale and self.clean_record_for(
-                    cache_path, st.st_size, st.st_mtime) is not None
-                if not stale or recovered:
+                local_change = self.clean_row_has_local_change(
+                    row, cache_path, st.st_size, st.st_mtime)
+                if not local_change:
                     if self.forget_listed_attrs:
                         self.forget_listed_attrs(virtual_path)
                     cache_path.unlink()
-            if recovered:
-                # The proof and unlink were protected by the descriptor
-                # guard. Repair the row while its lock is still held.
-                self._forget_replaced_version(virtual_path, row, st.st_size, st.st_mtime)
-            elif stale:
+            if local_change:
                 self.mark_file_dirty(virtual_path, cache_path)
                 return 0
             self._current_size_bytes = max(0, self._current_size_bytes - st.st_size)
@@ -1040,6 +1034,41 @@ class CacheManager:
                 or record.is_stale_for(stat_size, stat_mtime)):
             return None
         return record
+
+    def clean_row_has_local_change(self, row: FileMetadata, cache_path: Path,
+                                   size: int, mtime: float) -> bool:
+        """Check a CLEAN row against the inode, repairing a verified replacement.
+
+        The caller holds the row lock from reading the row through repair,
+        and protects the stat and pathname through unlink if discarding it.
+        A repair error leaves the inode available as recovery evidence.
+        """
+        stale = size != row.size or mtime != row.last_modified
+        if not stale and not row.checksum:
+            return False
+        record = self.clean_record_for(cache_path, size, mtime)
+        # An equal-stat replacement has its own CLEAN record without the
+        # old row's checksum.
+        if record is None or (not stale and record.checksum is not None):
+            return stale
+
+        virtual_path = row.virtual_path
+        guard = self.replace_checksum_guard
+        try:
+            with guard(virtual_path) if guard else nullcontext():
+                if guard is None:
+                    self.state_manager.delete_member_checksums([virtual_path])
+                self.state_manager.clear_location_checksums(virtual_path)
+                # Reset the old row checksum last: it is what makes an
+                # interrupted equal-stat repair detectable on the next try.
+                repaired = self.state_manager.record_cached_stat(
+                    virtual_path, row.dirty_generation, size=size, last_modified=mtime,
+                    last_access=time.time(), clear_checksum=True)
+        except sqlite3.Error as exc:
+            raise OSError(errno.EIO, "could not repair refreshed cache row", cache_path) from exc
+        if not repaired:
+            raise OSError(errno.EIO, "refreshed cache row changed before repair", cache_path)
+        return False
 
     def heal_stale_clean(
         self,
@@ -1065,35 +1094,9 @@ class CacheManager:
                 if st is None:
                     return False
                 stat_size, stat_mtime = st.st_size, st.st_mtime
-            stale = stat_size != row.size or stat_mtime != row.last_modified
-            if stale or row.checksum:
-                record = self.clean_record_for(cache_path, stat_size, stat_mtime)
-                # An equal-stat replacement is detectable if the old row
-                # still carries a checksum the replacement's record lacks.
-                if record is not None and (stale or record.checksum is None):
-                    self._forget_replaced_version(virtual_path, row, stat_size, stat_mtime)
-                    return False
-            if stale:
+            if self.clean_row_has_local_change(row, cache_path, stat_size, stat_mtime):
                 return self.mark_file_dirty(virtual_path, cache_path) is not None
             return False
-
-    def _forget_replaced_version(self, virtual_path: str, row, size: int, mtime: float) -> None:
-        """Bring a CLEAN row up to a refreshed copy whose row update was lost:
-        its stat, no checksum, and no checksum at any location or in the
-        checksum records (forget_checksums) for the version it replaced."""
-        with self.state_manager.metadata_lock:
-            # Invalidate old evidence before clearing the row's checksum.
-            # In an equal-stat heal that checksum makes the repair retryable.
-            current = self.state_manager.get_file_metadata(virtual_path)
-            if (current is None or current.sync_status != SyncStatus.CLEAN
-                    or current.dirty_generation != row.dirty_generation):
-                return
-            self.state_manager.clear_location_checksums(virtual_path)
-            self.state_manager.record_cached_stat(
-                virtual_path, row.dirty_generation, size=size, last_modified=mtime,
-                last_access=time.time(), clear_checksum=True)
-        if self.forget_checksums:
-            self.forget_checksums(virtual_path)
 
     def store_file_metadata(
         self,

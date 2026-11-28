@@ -494,7 +494,6 @@ class StorageFS(Operations):
             negative_window=listing_fresh_window(readdir_ttl, revalidate_after),
         )
         self.cache_manager.forget_listed_attrs = self._forget_cached_copy_attrs
-        self.cache_manager.forget_checksums = lambda path: self._forget_checksums({path})
         self.cache_manager.replace_checksum_guard = self._replace_checksum_guard
         self.cache_manager.path_guard = self._try_path_locked
 
@@ -662,8 +661,8 @@ class StorageFS(Operations):
         across the open-writer check, the stat and the unlink, so no writer
         can get a descriptor in between either (open() takes _fd_lock across
         its os.open and registration). The path's listing attributes are
-        forgotten before the unlink. A CLEAN row older than the file is a
-        write whose row update was lost: it is marked dirty and kept. The
+        forgotten before the unlink. A verified refresh repairs its row
+        before unlink, and a lost local write is marked dirty and kept. The
         cache lock is taken only after the index lock is released, keeping the
         order cache lock, index lock, _fd_lock.
 
@@ -709,11 +708,8 @@ class StorageFS(Operations):
                         # Content not yet sent to its member: kept, as for a writer.
                         return
                     if meta and not resolved.backend_name:
-                        stale = ((st.st_size != meta.size or st.st_mtime != meta.last_modified)
-                                 # A refreshed copy whose row update a crash
-                                 # lost carries its own CLEAN record.
-                                 and self.cache_manager.clean_record_for(
-                                     cache_path, st.st_size, st.st_mtime) is None)
+                        stale = self.cache_manager.clean_row_has_local_change(
+                            meta, cache_path, st.st_size, st.st_mtime)
                     if not stale:
                         # Before the unlink: no getattr may find the copy
                         # gone and its name still in the parent's listing.
