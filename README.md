@@ -353,7 +353,8 @@ stop there.) Each new open discards the mount's buffered pages from
 earlier opens so a refetch can return fresh bytes with the same size and
 mtime. Repeated opens can incur additional local FUSE reads. A warm open
 still uses Storage's backing cache and requires no download of the cached
-file. Changes made through the mount are visible at once. A file added
+file; a file the mount has not kept (a short read of an uncached file,
+discarded at close) is read from the member again on each open. Changes made through the mount are visible at once. A file added
 directly on a member can stay hidden for up to
 10 s after a lookup missed it, and a name removed on a member can still
 be walked through for up to the fresh window. The profile keys
