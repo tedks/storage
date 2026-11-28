@@ -711,7 +711,12 @@ class TestCacheAbsentCandidacy(unittest.TestCase):
                 visits.append(path)
                 self.assertLess(len(visits), 50, "the pass did not end")
                 clock()  # the busy files are read again while the pass runs
-        self.assertEqual(visits, busy + ["/late"])
+        # The rewind meets the busy rows once more, on the tie at the new
+        # bound; after that their stamps are above it. Nothing else repeats.
+        self.assertEqual(visits[-1], "/late")
+        self.assertEqual(visits.count("/late"), 1)
+        for path in busy:
+            self.assertLessEqual(visits.count(path), 2)
 
     def test_marked_rows_leave_the_scan_and_the_model_ignores_the_column(self):
         self._row("/a")

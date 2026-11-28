@@ -1061,23 +1061,26 @@ class StateManager:
         is below the bound (the clock stepped back), rows above it are
         clamped down to it, the bound is lowered to it, and the cursor is
         rewound to (bound, '') if it is past that, since the clamp can move
-        an unvisited row below the cursor. Paths already yielded in this
-        pass are not yielded again (no stat, no path lock), so a revisit
-        costs only SQL. A row comes back only with a stamp in (cursor,
-        bound]. A read stamped after a page query is stamped at or above
-        that query's clock reading, which is at or above the bound, so it
-        comes back only on an exact tie or after a further backward step,
-        and each step lowers the bound once, at the next page. A read taken
-        before a query and flushed after it can come back once, and is
-        skipped as visited. So with the clock running forward between
-        steps, every page advances the cursor through rows that cannot be
-        refilled, and the pass ends.
+        an unvisited row below the cursor. Between rewinds the cursor only
+        moves forward in (last_access, virtual_path) order, and a row comes
+        back only with a stamp in (cursor, bound]. A read stamped after a
+        page query is stamped at or above that query's clock reading, which
+        is at or above the bound, so it comes back only on an exact tie
+        (walked once, by path) or after a further backward step, and each
+        step lowers the bound once, at the next page. A read taken before a
+        query and flushed after it can come back once. So with the clock
+        running forward between steps, every page advances the cursor
+        through rows that cannot be refilled, and the pass ends. A row that
+        does come back is yielded again: one more stat and path try-lock,
+        which the caller handles like any other visit. Nothing is kept per
+        path, so a pass needs O(page) memory however many rows it walks
+        (the first pass after a mount starts can walk every row evicted
+        before, since startup clears the absence marks).
         """
         self._flush_access_updates(force=True)
         bound = time.time()
         self._clamp_future_access(bound)
         cursor: Tuple[float, str] = (float('-inf'), '')
-        visited: Set[str] = set()
         while True:
             now = time.time()
             if now < bound:
@@ -1090,11 +1093,7 @@ class StateManager:
                     bound, self.WRITE_BATCH_SIZE,
                 )).fetchall()
             for row in rows:
-                path = row['virtual_path']
-                if path in visited:
-                    continue
-                visited.add(path)
-                yield path
+                yield row['virtual_path']
             if len(rows) < self.WRITE_BATCH_SIZE:
                 return
             cursor = (rows[-1]['last_access'], rows[-1]['virtual_path'])
