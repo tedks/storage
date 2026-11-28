@@ -832,6 +832,22 @@ class TestFSStreamingIntegration(unittest.TestCase):
         for fill in fills:
             self.assertTrue(fill.background_finished.wait(timeout=3))
 
+    def test_reclaim_without_retained_fills_measures_once_more_and_stops(self):
+        # No retained fill exists; unrelated activity keeps shrinking the
+        # deficit without clearing it. Reclaim remeasures once, then gives
+        # up instead of rescanning for as long as the deficit shrinks.
+        manager = self.fs._streaming_manager
+        deficits = iter([5000, 4000, 3000, 2000, 1000])
+        measured = []
+
+        def needed(required):
+            measured.append(required)
+            return next(deficits)
+
+        with patch.object(self.fs.cache_manager, "get_free_space_needed", needed):
+            self.assertFalse(manager._reclaim_retained_space(4096, for_reader=False))
+        self.assertEqual(len(measured), 2)
+
     def test_stalled_publication_does_not_hold_the_members_range_slot(self):
         manager = self.fs._streaming_manager
         real_finalize = manager._finalize_streaming_session

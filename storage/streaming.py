@@ -2032,7 +2032,11 @@ class StreamingReadManager:
             now = self.cache_manager.get_free_space_needed(file_size)
             if now == 0:
                 return True
-            if now >= missing:
+            if now >= missing or not candidates:
+                # With no retained fill left to stop, another pass could
+                # only rescan the cache while unrelated activity (a dirty
+                # file truncated in steps) shrinks the deficit: one
+                # remeasurement catches space freed meanwhile, then stop.
                 return False
             # Space came free meanwhile but not enough: the fills that
             # could not cover the old deficit may cover this one.
