@@ -25,6 +25,11 @@ from storage.fs import StorageFS
 from tests.fuse_mount import run_fuse, stop_fuse
 
 
+# Only a backstop for a test that never releases a held read: the test and
+# tearDown release it explicitly, so a slow host never sees the hold expire.
+HELD_READ_SAFETY_TIMEOUT = 600.0
+
+
 class SlowRemoteLoopbackBackend(LocalBackend):
     """Local backend test double flagged as remote with controllable read delay."""
 
@@ -34,12 +39,16 @@ class SlowRemoteLoopbackBackend(LocalBackend):
         self.range_delay = range_delay
         self.hold_past = None
 
+    def release_held_reads(self):
+        if self.hold_past is not None:
+            self.hold_past[3].set()
+
     def read_file(self, virtual_path: str, offset: int, size: int) -> bytes:
         if self.hold_past is not None:
             name, boundary, entered, resume = self.hold_past
             if virtual_path.lstrip("/") == name and offset >= boundary:
                 entered.set()
-                if not resume.wait(20):
+                if not resume.wait(HELD_READ_SAFETY_TIMEOUT):
                     raise TimeoutError("test did not release the held range read")
         if self.range_delay:
             time.sleep(self.range_delay)
@@ -173,6 +182,9 @@ class TestStreamingSystemRegression(unittest.TestCase):
             self.skipTest(f"Mount unavailable in this environment: {exc}")
 
     def tearDown(self):
+        # A held member read would otherwise keep its download, and so the
+        # unmount, waiting for the safety timeout.
+        self.backend.release_held_reads()
         # After the FUSE thread has finished, so this destroy never runs
         # beside libfuse's own (or a request still in flight).
         problems = stop_fuse(self.mount_dir, self.mount_thread, fs=self.fs)
