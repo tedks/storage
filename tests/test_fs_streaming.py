@@ -238,6 +238,32 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.assertTrue(retained.background_finished.wait(timeout=3))
         self.assertEqual(retained.io_fd, -1)
 
+    def test_closed_fill_is_not_retained_when_no_worker_can_start(self):
+        manager = self.fs._streaming_manager
+        real_start = threading.Thread.start
+
+        def start(thread):
+            if thread.name == "storage-prefetch-worker":
+                raise RuntimeError("worker creation failed")
+            return real_start(thread)
+
+        payload = os.urandom(384 * 1024)
+        (self.backend_dir / "unstaffed.bin").write_bytes(payload)
+        with patch.object(threading.Thread, "start", start):
+            fd = self.fs.open("/unstaffed.bin", os.O_RDONLY)
+            session = self._session_for(fd)
+            self.assertEqual(self.fs.read("/unstaffed.bin", 128 * 1024, 0, fd), payload[:128 * 1024])
+            self.assertTrue(session.readers_consumed)
+            self.assertEqual(manager._download_pool.snapshot(), (0, 0, 1))
+            self.fs.release("/unstaffed.bin", fd)
+        self.assertTrue(session.detached)
+        self.assertTrue(session.background_finished.is_set())
+        self.assertEqual(session.io_fd, -1)
+        self.assertEqual(manager.list_download_sessions(), [])
+        self.assertEqual(manager._download_pool.snapshot(), (0, 0, 0))
+        self.assertFalse((self.cache_dir / "unstaffed.bin.storage.partial").exists())
+        self.assertEqual(self.fs._streaming_stats_snapshot()["streaming_unstaffed_cancellations"], 1)
+
     def test_download_worker_start_retry_and_local_publication_on_release(self):
         manager = self.fs._streaming_manager
         manager._download_pool.idle_seconds = 0.05

@@ -243,6 +243,16 @@ class _DownloadPool:
                 self.ready.pop(session, None)
             self.condition.notify_all()
 
+    def unstaffed(self, session):
+        """Whether the session is queued while the pool has no worker thread.
+
+        True only after a start has failed for every attempt so far (each
+        offer of a queued session retries one); a pool with any thread
+        reaches every queued session in turn.
+        """
+        with self.condition:
+            return not self.threads and session in self.ready
+
     def set_limit(self, limit):
         with self.condition:
             self.limit = limit
@@ -1993,6 +2003,20 @@ class StreamingReadManager:
                         and self._claim_failed_cleanup(session)):
                     return "cleanup-failed"
                 self._schedule_background(session)
+                if not self._download_terminal(session) and self._download_pool.unstaffed(session):
+                    # No worker thread could start, and that offer retried
+                    # once more. Nothing would offer a readerless fill again,
+                    # so it would keep its partial and descriptor forever;
+                    # it is dropped like any fill that is not retained. (A
+                    # terminal session is published by the caller instead,
+                    # see _finish_unstaffed_download.)
+                    self.logger.warning(
+                        "streaming fill not retained path=%s backend=%s: no download worker could start",
+                        session.canonical_path, session.backend.name,
+                    )
+                    self._record_streaming_stat("streaming_unstaffed_cancellations")
+                    idle = self._stop_background_locked(session)
+                    return "stopped" if idle else "stopped-in-flight"
                 return ""
 
     def _release_prefetch_session(self, session: PrefetchSession):
