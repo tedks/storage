@@ -621,7 +621,8 @@ To cancel, copy the exact ID from `downloads`. `cancelled` means the mount
 abandoned the download, including its partial cache file. A download with a
 reader or in finalization reports `busy`. Close its readers or wait for it to
 finish before retrying. A vanished ID reports `not-found`, including when a new
-download has started for the same path. `busy` and `not-found` exit with status 1.
+download has started for the same path. `busy` exits with status 3 and
+`not-found` with status 4; other errors exit with 1, usage errors with 2.
 The endpoint is the private `.storage.control.sock` in the mount cache.
 The mount publishes it only when the cache directory is owned by the mount's
 user and is not writable by all users unless sticky (group write, as under umask

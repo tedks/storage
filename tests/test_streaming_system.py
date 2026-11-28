@@ -410,9 +410,9 @@ class TestStreamingSystemRegression(unittest.TestCase):
                 self.assertEqual(row["readers"], 1)
                 original = row["id"]
 
-                outcome = command("cancel", original, expected=1)
+                outcome = command("cancel", original, expected=3)
                 self.assertEqual(outcome, {"id": original, "result": "busy"})
-                human = command("cancel", original, expected=1, json_output=False)
+                human = command("cancel", original, expected=3, json_output=False)
                 self.assertIn("Close its readers or wait for finalization", human.stderr)
                 self.assertEqual(handle.read(64), self.payload[512 * 1024:512 * 1024 + 64])
 
@@ -469,7 +469,7 @@ backends = [{json.dumps(str(self.backend_dir))}]
                 self.assertEqual(replacement.read(512 * 1024), self.payload[:512 * 1024])
                 row, = command("downloads")["downloads"]
                 self.assertNotEqual(row["id"], original)
-                self.assertEqual(command("cancel", original, expected=1)["result"], "not-found")
+                self.assertEqual(command("cancel", original, expected=4)["result"], "not-found")
                 self.assertEqual(command("downloads")["downloads"][0]["id"], row["id"])
                 command("set", "--max-retained-streaming-sessions", "0")
             self.assertTrue(self._wait_for(lambda: not command("downloads")["downloads"]))

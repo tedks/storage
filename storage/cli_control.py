@@ -138,7 +138,9 @@ def control_status(target):
     stats = payload["stats"]
     click.echo(f"Mount PID {stats['pid']}")
     # Quoted like download paths, so control characters cannot forge lines.
-    click.echo(f"  Mountpoint: {payload['mount']['mountpoint']!r}")
+    mountpoint = payload["mount"]["mountpoint"]
+    click.echo("  Mountpoint: " + ("(not reported; reach it with --cache)" if mountpoint is None
+                                   else repr(mountpoint)))
     click.echo(f"  Streaming files with readers: {stats['active_reader_sessions']}")
     click.echo(f"  Retained downloads: {stats['retained_streaming_sessions']}")
     click.echo(f"  Download workers running: {stats['download_workers_running']}/{stats['download_workers']}")
@@ -191,6 +193,10 @@ def control_downloads(target):
         )
 
 
+# 1 is any error and 2 a usage error, as for other commands.
+CANCEL_EXIT_CODES = {"busy": 3, "not-found": 4}
+
+
 @control.command("cancel")
 @click.argument("session_id", metavar="DOWNLOAD_ID")
 @click.pass_obj
@@ -208,4 +214,4 @@ def control_cancel(target, session_id):
         else:
             raise click.ClickException("Unexpected cancellation result")
     if outcome != "cancelled":
-        raise click.exceptions.Exit(1)
+        raise click.exceptions.Exit(CANCEL_EXIT_CODES.get(outcome, 1))

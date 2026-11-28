@@ -585,6 +585,45 @@ def test_mount_without_a_mountpoint_is_reached_only_by_cache(cache):
         server.stop()
 
 
+def full_status(cache, mountpoint):
+    stats = dict.fromkeys(["pid", "active_reader_sessions", "retained_streaming_sessions",
+                           "download_workers_running", "download_workers",
+                           "download_sessions_queued"], 0)
+    return {"mount": {"mountpoint": mountpoint, "pid": 0, "cache": cache_identity(cache)},
+            "stats": stats, "limits": {}, "restart_only": {}}
+
+
+def test_status_says_how_to_reach_a_mount_without_a_mountpoint(cache):
+    server = server_for(cache, lambda _: full_status(cache, None))
+    server.start()
+    try:
+        result = CliRunner().invoke(main, ["control", "--cache", str(cache)])
+        assert result.exit_code == 0, result.output
+        assert "  Mountpoint: (not reported; reach it with --cache)\n" in result.output
+        assert "None" not in result.output
+    finally:
+        server.stop()
+
+
+@pytest.mark.parametrize("outcome, code", [("cancelled", 0), ("busy", 3), ("not-found", 4),
+                                           ("unexpected", 1)])
+def test_cancel_outcomes_have_distinct_exit_codes(cache, outcome, code):
+    def dispatch(frame):
+        if json.loads(frame)["command"] == "status":
+            return full_status(cache, None)
+        return {"id": "0" * 32, "result": outcome}
+
+    server = server_for(cache, dispatch)
+    server.start()
+    try:
+        for json_output in ([], ["--json-output"]):
+            result = CliRunner().invoke(main, ["control", "--cache", str(cache), *json_output,
+                                               "cancel", "0" * 32])
+            assert result.exit_code == code, result.output
+    finally:
+        server.stop()
+
+
 def test_profile_refuses_a_socket_that_reports_no_mount(cache):
     config = write_profile(cache)
     requests = []
