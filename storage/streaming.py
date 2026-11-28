@@ -1673,6 +1673,8 @@ class StreamingReadManager:
             self._discard_superseded_session(session, outcome)
             return
 
+        if metadata is not None:
+            self._replay_session_access(session)
         self.cache_manager.mark_cache_size_dirty()
 
         with session.lock:
@@ -1728,18 +1730,25 @@ class StreamingReadManager:
                 metadata.sync_status = SyncStatus.CLEAN
         # Mirrors the row as stored: a write during the fill keeps its
         # DIRTY in SQLite, and the xattr must say the same.
-        stored = self.cache_manager.store_file_metadata(metadata, cache_path=session.final_cache_path)
-        # A read between the snapshot above and the store advanced
-        # session.last_access, and its batched update may already have
-        # flushed against no row. Replay the latest value through the
-        # MAX-merging access path now that the row exists. A read whose
-        # session update this misses queues its own update after the store,
-        # so that one finds the row.
+        return self.cache_manager.store_file_metadata(metadata, cache_path=session.final_cache_path)
+
+    def _replay_session_access(self, session: PrefetchSession):
+        """Carry a read that raced the row store into the stored row.
+
+        A read between _store_finalized_row's snapshot and its store
+        advanced session.last_access, and its batched update may have
+        flushed before the row existed and matched nothing. Called once the
+        row is stored, and outside the index lock: the access batch takes
+        its own lock and then the index lock, so taking them the other way
+        round could deadlock with a flush. The access path keeps the
+        larger timestamp, so replaying one already recorded changes
+        nothing. A read whose session update this misses queues its own
+        update after the store, and that one finds the row.
+        """
         with session.lock:
             latest = session.last_access
-        if latest > last_access:
+        if latest > 0:
             self.state_manager.update_access_time(session.canonical_path, accessed_at=latest)
-        return stored
 
     def _add_finalized_locations(self, session: PrefetchSession, metadata: FileMetadata):
         """Record the member and the cache as holding the file; caller holds the index lock."""
