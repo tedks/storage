@@ -22,6 +22,8 @@ import json
 import concurrent.futures
 import contextlib
 import ctypes
+import resource
+import secrets
 import signal
 from dataclasses import dataclass, field
 import fuse as fusepy
@@ -33,6 +35,7 @@ from .backends.base import (
     Backend, ChecksumUnavailable, capacity_wait_cancellation,
     interactive_request,
 )
+from .backends.local import rename_noreplace
 from .backends.rsync import RsyncBackend
 from .backends.ssh_mux import close_shared_control_sockets
 from .backends.ssh_pool import (
@@ -61,8 +64,8 @@ from .pathing import ResolvedPath, resolve_path
 from .links import LinkRefused, intermediate_paths, link_checksum, resolve_link_target
 from .namespace import DEFAULT_LISTING_MAX_STALE, NamespaceService
 from .streaming import (
-    DEFAULT_MAX_DOWNLOAD_WORKERS, DEFAULT_MAX_RETAINED_STREAMING_SESSIONS,
-    PrefetchSession, StreamingReadManager,
+    LINK_UNSUPPORTED, PrefetchSession, StreamingOpen, StreamingReadManager, StreamSource,
+    StreamSourceError,
 )
 from .streaming_settings import DEFAULT_STREAMING_READ_AHEAD_WINDOW
 
@@ -233,7 +236,6 @@ class StorageFS(Operations):
     def __init__(self, cache_root: Path, state_db: Path, backends: Dict[str, Backend],
                  cache_size: int, num_sync_workers: int = 2, start_sync: bool = True,
                  streaming_reads: bool = False, streaming_chunk_size: int = 1024 * 1024,
-                 max_streaming_sessions: int = 8,
                  readdir_ttl: Optional[float] = None,
                  enable_watchers: bool = False,
                  streaming_keep_after_close: Optional[StreamingKeepAfterClose] = None,
@@ -243,8 +245,7 @@ class StorageFS(Operations):
                  bulk_cold_copies: bool = False,
                  max_foreground_operations: Optional[int] = None,
                  max_sync_workers: Optional[int] = None,
-                 max_download_workers: int = DEFAULT_MAX_DOWNLOAD_WORKERS,
-                 max_retained_streaming_sessions: int = DEFAULT_MAX_RETAINED_STREAMING_SESSIONS,
+                 max_download_workers: Optional[int] = None,
                  streaming_read_ahead_window: int = DEFAULT_STREAMING_READ_AHEAD_WINDOW):
         """
         Initialize Storage filesystem
@@ -258,11 +259,9 @@ class StorageFS(Operations):
             max_sync_workers: Optional upper limit for demand-driven sync workers
             streaming_reads: Enable uncached range streaming + background prefetch
             max_download_workers: Ceiling for adaptive streaming download workers
-            max_retained_streaming_sessions: Maximum retained fills without readers
             streaming_chunk_size: Unit of background read-ahead (foreground
                 reads fetch only what the reader asked for); read-ahead
                 starts once readers have read one chunk
-            max_streaming_sessions: Maximum concurrent streaming sessions
             streaming_keep_after_close: When read-ahead outlives the last
                 close of a streaming session; None for the default
             streaming_read_ahead_window: Maximum bytes beyond a read span
@@ -467,12 +466,11 @@ class StorageFS(Operations):
             state_manager=self.state_manager,
             logger=self.logger,
             get_config=self._get_config,
-            select_backend_for_read=self._select_backend_for_read,
+            select_stream_source=self._select_stream_source,
+            is_unindexed_prefix=self._is_unindexed_prefix,
             streaming_reads=streaming_reads,
             streaming_chunk_size=streaming_chunk_size,
-            max_streaming_sessions=max_streaming_sessions,
             max_download_workers=max_download_workers,
-            max_retained_streaming_sessions=max_retained_streaming_sessions,
             keep_after_close=streaming_keep_after_close,
             read_ahead_window=streaming_read_ahead_window,
             on_finalized=lambda session: self._record_fetched(
@@ -1326,15 +1324,8 @@ class StorageFS(Operations):
     def _select_backend_for_read(self, canonical_path: str) -> Optional[Backend]:
         """Pick a readable backend, preferring existing replication metadata.
 
-        A refetch after revalidation reads from the member that was checked
-        (see _revalidate_cached_file) while it is available. The pin stays
-        until open() ends, so selection is idempotent within one open: a
-        stream that bails out after selecting and the full-file fallback
-        both honour it. Within a streaming open the pinned member is the
-        only one tried: if its stream setup fails, the fallback fetch asks
-        it again rather than another holder, which keeps the guarantee that
-        a change seen on the checked member is never adopted unseen (the
-        non-streaming path always behaved so).
+        Revalidation pins the member whose change was checked until the
+        open ends. Streaming uses the same pin in _select_stream_source.
         """
         with self._member_checks_lock:
             pinned = self._refetch_pins.get(canonical_path)
@@ -1348,6 +1339,63 @@ class StorageFS(Operations):
             with self._member_checks_lock:
                 self._recheck.setdefault(canonical_path, set()).add(pinned.name)
         return backend
+
+    def _select_stream_source(self, canonical_path: str) -> Optional[StreamSource]:
+        """Find a streaming source with one stat per candidate, preserving why it failed.
+
+        None means no member has the file. A revalidation-pinned member is
+        the only one asked while it is available, so a missing file there
+        is None too: another member's copy is not adopted unchecked.
+        """
+        def probe(backend):
+            if not backend.supports_range_reads():
+                # Its open takes the whole-file path, which needs no size;
+                # only whether this member has the file, as there.
+                if not backend.exists(canonical_path):
+                    raise FileNotFoundError(errno.ENOENT, "not on member", canonical_path)
+                return StreamSource(backend, None, None)
+            try:
+                member_stat = backend.stat(canonical_path)
+            except NotImplementedError:
+                member_stat = None
+            size = getattr(member_stat, "st_size", None)
+            if size is None:
+                size = backend.get_size(canonical_path)
+            return StreamSource(backend, member_stat, size)
+
+        with self._member_checks_lock:
+            pinned = self._refetch_pins.get(canonical_path)
+        if pinned is not None:
+            if pinned.is_available():
+                try:
+                    return probe(pinned)
+                except FileNotFoundError:
+                    return None
+            with self._member_checks_lock:
+                self._recheck.setdefault(canonical_path, set()).add(pinned.name)
+
+        known = {location.backend_name for location in self.state_manager.get_file_locations(canonical_path)}
+        available = [backend for backend in self.backends.values() if backend.is_available()]
+        candidates = available or [backend for backend in self.backends.values()
+                                   if backend.supports_reconnect_probe()]
+        errors = []
+        for backend in sorted(candidates, key=lambda b: (b.name not in known, b.speed_priority)):
+            try:
+                return probe(backend)
+            except FileNotFoundError:
+                continue
+            except Exception as exc:
+                errors.append(exc)
+        if errors:
+            # Prefer a concrete error from a member over a failed connection
+            # to another candidate. An alternate working member wins above.
+            raise next((exc for exc in errors
+                        if not isinstance(exc, ConnectionError) and not is_connection_error(exc)), errors[0])
+        if not available and self.backends and not candidates:
+            raise OSError(errno.EHOSTUNREACH, "all streaming sources unavailable")
+        if any(backend.name in known and backend not in candidates for backend in self.backends.values()):
+            raise OSError(errno.EHOSTUNREACH, "known streaming source unavailable")
+        return None
 
     def _pinned_stat(self, canonical_path: str, backend: Backend) -> Optional[os.stat_result]:
         """The stat revalidation just took of backend, when this open is refetching from it."""
@@ -1942,7 +1990,7 @@ class StorageFS(Operations):
     def _finalize_streaming_session(self, session: PrefetchSession):
         self._streaming_manager._finalize_streaming_session(session)
 
-    def _create_or_attach_prefetch_session(self, virtual_path: str, canonical_path: str) -> Optional[PrefetchSession]:
+    def _create_or_attach_prefetch_session(self, virtual_path: str, canonical_path: str) -> PrefetchSession | StreamingOpen:
         return self._streaming_manager._create_or_attach_prefetch_session(
             virtual_path,
             canonical_path,
@@ -1985,6 +2033,82 @@ class StorageFS(Operations):
         if removed:
             self.cache_manager.mark_cache_size_dirty()
         return removed
+
+    def _set_aside_unindexed_prefix(self, canonical_path: str, cache_path: Path) -> Optional[Path]:
+        """Move a promoted prefix off the cache path; the name it now has, or None.
+
+        As _drop_unindexed_prefix, but the bytes are kept beside the path
+        (under the partial suffix, so a restart sweeps a leftover) for
+        _restore_set_aside_prefix. None if the path holds no unindexed
+        prefix or a descriptor has it open.
+        """
+        aside = cache_path.parent / f".storage-prefix-{secrets.token_hex(8)}{self._PARTIAL_SUFFIX}"
+        with self.state_manager.metadata_lock:
+            if not self._is_unindexed_prefix(canonical_path, cache_path):
+                return None
+            with self._descriptor_guard(canonical_path) as is_open:
+                if is_open:
+                    return None
+                try:
+                    os.rename(cache_path, aside)
+                except OSError:
+                    return None
+        return aside
+
+    def _restore_set_aside_prefix(self, canonical_path: str, aside: Path, cache_path: Path, restore: bool):
+        """Put a set-aside prefix back (restore) or discard it after a recompute.
+
+        The saved copy is removed only once it is back at the cache path or
+        a recompute replaced it. Whatever a failed command left at the path
+        is not the file and is removed for the prefix, under the guards the
+        drop takes: not while the path has an index row (something else now
+        describes it) or a descriptor open. If the prefix cannot go back
+        (the guards, or a cache filesystem with neither hard links nor
+        RENAME_NOREPLACE), it stays beside the path under the partial
+        suffix, which the restart sweep removes, and a warning is logged.
+        """
+        if not restore:
+            try:
+                aside.unlink()
+            except OSError:
+                pass
+            self.cache_manager.mark_cache_size_dirty()
+            return
+        restored = False
+        with self.state_manager.metadata_lock:
+            if self.state_manager.get_file_metadata(canonical_path) is None:
+                with self._descriptor_guard(canonical_path) as is_open:
+                    if not is_open:
+                        restored = self._put_back_prefix(aside, cache_path)
+        if not restored:
+            self.logger.warning(
+                "a cached prefix could not be restored after a failed recompute; kept beside its path",
+            )
+        self.cache_manager.mark_cache_size_dirty()
+
+    def _put_back_prefix(self, aside: Path, cache_path: Path) -> bool:
+        """Move aside back onto cache_path without replacing; caller holds the guards."""
+        try:
+            if os.path.lexists(cache_path):
+                os.unlink(cache_path)  # a failed command's output
+        except OSError:
+            return False
+        try:
+            os.link(aside, cache_path)
+        except FileExistsError:
+            return False
+        except OSError as exc:
+            if exc.errno not in LINK_UNSUPPORTED:
+                return False
+            try:
+                return rename_noreplace(aside, cache_path)
+            except OSError:
+                return False
+        try:
+            aside.unlink()
+        except OSError:
+            pass  # a second name for the restored prefix; the restart sweep removes it
+        return True
 
     def _ensure_file_in_cache(self, resolved: ResolvedPath) -> bool:
         """
@@ -2149,17 +2273,8 @@ class StorageFS(Operations):
 
                 return True
 
-        # File not in cache or backends - try recomputation
-        if self.recompute_engine.can_recompute(resolved.requested_path, cache_path):
-            # Recompute the file synchronously (blocks until complete)
-            result = self.recompute_engine.recompute_file(
-                resolved.requested_path,
-                cache_path,
-                timeout=30.0,
-            )
-
-            if result.success:
-                return True
+        if self._try_recompute(resolved):
+            return True
 
         available_backends, _ = self._backend_availability()
         if not available_backends and self.backends:
@@ -2167,6 +2282,78 @@ class StorageFS(Operations):
 
         # File not available
         return False
+
+    def _open_stream(self, resolved: ResolvedPath):
+        """Attach to or start the file's streaming session; FuseOSError on failure.
+
+        Returns the session, a StreamingOpen outcome other than
+        PREFIX_CACHED, or None when the file was recomputed into the cache.
+        A promoted prefix at the cache path is dropped and the open tried
+        once more, as the whole-file path does (_ensure_file_in_cache); one
+        that another descriptor holds cannot be dropped, and the open is
+        EAGAIN rather than serve the prefix as the file.
+        """
+        canonical_path, cache_path = resolved.canonical_path, resolved.cache_path
+        for attempt in range(3):
+            try:
+                stream = self._create_or_attach_prefetch_session(
+                    resolved.requested_path, canonical_path,
+                )
+            except StreamSourceError as exc:
+                # No member could be probed. A recomputable file is
+                # recomputed, as the whole-file path does; only an open that
+                # still fails counts as a probe failure.
+                if self._try_recompute(resolved):
+                    return None
+                self._streaming_manager.report_open_error("source_probe", exc)
+                raise FuseOSError(exc.errno or errno.EIO) from exc
+            except OSError as exc:
+                raise FuseOSError(exc.errno or errno.EIO) from exc
+            except Exception as exc:
+                self.logger.exception("streaming open failed unexpectedly")
+                raise FuseOSError(errno.EIO) from exc
+            if stream == StreamingOpen.RANGE_UNSUPPORTED and self._is_unindexed_prefix(canonical_path, cache_path):
+                # The open found the file uncached, so this prefix was
+                # promoted during it; the whole-file path would take it for
+                # the file (it serves whatever is cached).
+                stream = StreamingOpen.PREFIX_CACHED
+            if stream != StreamingOpen.PREFIX_CACHED:
+                return stream
+            self._record_streaming_stat("streaming_prefix_refetches", 1)
+            if (not self._drop_unindexed_prefix(canonical_path, cache_path)
+                    and self._is_unindexed_prefix(canonical_path, cache_path)):
+                break  # a descriptor holds it
+            # Dropped, or no longer a prefix (indexed or replaced): try again.
+        raise FuseOSError(errno.EAGAIN)
+
+    def _whole_file_cached(self, resolved: ResolvedPath) -> bool:
+        return (self.cache_manager.is_cached(resolved.requested_path)
+                and not self._is_unindexed_prefix(resolved.canonical_path, resolved.cache_path))
+
+    def _try_recompute(self, resolved: ResolvedPath) -> bool:
+        if not self.recompute_engine.can_recompute(resolved.requested_path, resolved.cache_path):
+            return False
+        # A promoted prefix at the path is not the file, and the command's
+        # success is judged by the path existing: move the prefix aside for
+        # the run and put it back if no file replaced it, so a failed
+        # recompute does not lose the bytes offline opens read. Refused
+        # while a descriptor holds the prefix.
+        aside = None
+        if self._is_unindexed_prefix(resolved.canonical_path, resolved.cache_path):
+            aside = self._set_aside_unindexed_prefix(resolved.canonical_path, resolved.cache_path)
+            if aside is None:
+                return False
+        recomputed = False
+        try:
+            recomputed = self.recompute_engine.recompute_file(
+                resolved.requested_path, resolved.cache_path, timeout=30.0,
+            ).success
+            return recomputed
+        finally:
+            if aside is not None:
+                self._restore_set_aside_prefix(
+                    resolved.canonical_path, aside, resolved.cache_path, restore=not recomputed,
+                )
 
     # Filesystem methods
 
@@ -2454,43 +2641,47 @@ class StorageFS(Operations):
             and self._is_read_only_open(flags)
             and not self.cache_manager.is_cached(resolved.requested_path)
         ):
-            prefetch_session = self._create_or_attach_prefetch_session(
-                resolved.requested_path,
-                resolved.canonical_path,
-            )
-            if prefetch_session:
-                cache_path = prefetch_session.partial_cache_path
-                if not cache_path.exists() and prefetch_session.final_cache_path.exists():
-                    # Session finished before open() reached os.open.
-                    cache_path = prefetch_session.final_cache_path
+            stream = self._open_stream(resolved)
+            if stream is None:
+                pass  # recomputed into the cache path
+            elif isinstance(stream, PrefetchSession):
+                prefetch_session = stream
+                cache_path = stream.partial_cache_path
+            elif stream == StreamingOpen.CACHED:
+                self.cache_manager.heal_stale_clean(resolved.canonical_path, cache_path)
+            elif stream == StreamingOpen.SOURCE_MISSING:
+                # A promoted prefix is not the file: recompute (which
+                # drops it) or ENOENT, never a short file.
+                if not self._whole_file_cached(resolved) and not self._try_recompute(resolved):
+                    raise FuseOSError(errno.ENOENT)
             else:
                 self._record_streaming_stat("streaming_fallback_opens", 1)
-                self.logger.info(
-                    "streaming fallback path=%s reason=unavailable-session",
-                    resolved.canonical_path,
-                )
-
-        # Fallback path: preserve existing full-file cache semantics.
-        if prefetch_session is None:
+                self.logger.info("streaming whole-file copy reason=range_unsupported")
+                if not self._ensure_file_in_cache(resolved):
+                    raise FuseOSError(errno.ENOENT)
+        else:
             if not self._ensure_file_in_cache(resolved):
                 raise FuseOSError(errno.ENOENT)
-            cache_path = resolved.cache_path
             if not self._is_read_only_open(flags):
                 self._require_imported_write_permission(cache_path)
 
+        real_fd = -1
         try:
-            # Hold _fd_lock across os.open AND _fd_map registration so that
-            # _invalidate_file_cache (which also holds _fd_lock) cannot
-            # unlink the cache file between os.open and registration.
+            if prefetch_session is not None:
+                # The session's own inode, whatever its path names now. Not
+                # under _fd_lock: it waits for the session's io_lock, and a
+                # descriptor reopened on an inode needs no protection from
+                # an unlink of its path. -1 means the session is finalized
+                # and its descriptor closed: its file is opened by name below.
+                real_fd = self._streaming_manager.open_session_inode(prefetch_session, flags)
+                if prefetch_session.finalized:
+                    cache_path = prefetch_session.final_cache_path
+            # Hold _fd_lock across a by-name os.open AND _fd_map registration
+            # so that _invalidate_file_cache (which also holds _fd_lock)
+            # cannot unlink the cache file between os.open and registration.
             with self._fd_lock:
-                try:
+                if real_fd < 0:
                     real_fd = os.open(str(cache_path), flags)
-                except FileNotFoundError:
-                    if prefetch_session is not None and prefetch_session.final_cache_path.exists():
-                        cache_path = prefetch_session.final_cache_path
-                        real_fd = os.open(str(cache_path), flags)
-                    else:
-                        raise
 
                 vfd = self._fd_counter
                 self._fd_counter += 1
@@ -2503,16 +2694,29 @@ class StorageFS(Operations):
                     canonical_path=resolved.canonical_path,
                     prefetch_session=prefetch_session,
                 )
-
-            if resolved.backend_name is None:
-                self._mark_demand_access(resolved.canonical_path, prefetch_session)
-
-            return vfd
-
-        except OSError as e:
+        except BaseException as e:
+            # Until the descriptor table holds them, the descriptor and the
+            # session ref are this open's to give back, whatever was raised.
+            if real_fd >= 0:
+                try:
+                    os.close(real_fd)
+                except OSError:
+                    pass
             if prefetch_session is not None:
+                if isinstance(e, OSError):
+                    self._streaming_manager.report_open_error("cache_open", e)
                 self._release_prefetch_session(prefetch_session)
-            raise FuseOSError(e.errno)
+            if isinstance(e, OSError):
+                raise FuseOSError(e.errno or errno.EIO) from e
+            raise
+
+        if resolved.backend_name is None:
+            # Bookkeeping only: the open has succeeded and owns its entry.
+            try:
+                self._mark_demand_access(resolved.canonical_path, prefetch_session)
+            except Exception:
+                self.logger.exception("recording demand access failed")
+        return vfd
 
     def create(self, path, mode, fi=None):
         """Create a file"""
@@ -2581,7 +2785,6 @@ class StorageFS(Operations):
                 raise FuseOSError(errno.EBADF)
 
         session = entry.prefetch_session
-
         if session is not None:
             read_start = max(0, offset)
             read_end = min(session.file_size, offset + size)
@@ -3550,6 +3753,33 @@ def _sigpipe_survives_fuse():
         signal.signal(signal.SIGPIPE, signal.SIG_IGN)
 
 
+def raise_descriptor_limit(logger: logging.Logger) -> Optional[int]:
+    """Raise the soft RLIMIT_NOFILE to the hard limit; return the soft limit in force afterwards.
+
+    Streaming holds a descriptor per file being filled, retained fills
+    included, bounded by cache_size rather than a count, so the common
+    default soft limit of 1024 can be reached long before the hard one.
+    Never fails the mount: an error is logged and the limit left as it was
+    (None if it could not be read). An infinite limit is left alone (Linux
+    caps the hard limit at fs.nr_open, so this is not expected there).
+    """
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    except (OSError, ValueError) as exc:
+        logger.warning("could not read the descriptor limit: %r", exc)
+        return None
+    if resource.RLIM_INFINITY in (soft, hard) or soft >= hard:
+        logger.info("descriptor limit soft=%d hard=%d", soft, hard)
+        return soft
+    try:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
+    except (OSError, ValueError) as exc:
+        logger.warning("could not raise the descriptor limit from %d to %d: %r", soft, hard, exc)
+        return soft
+    logger.info("raised the descriptor limit from %d to %d", soft, hard)
+    return hard
+
+
 def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
                  backends: Dict[str, Backend], cache_size: int,
                  foreground: bool = False, num_sync_workers: int = 2,
@@ -3557,7 +3787,6 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
                  debug: bool = False,
                  streaming_reads: bool = False,
                  streaming_chunk_size: int = 1024 * 1024,
-                 max_streaming_sessions: int = 8,
                  readdir_ttl: Optional[float] = None,
                  enable_watchers: bool = False,
                  streaming_keep_after_close: Optional[StreamingKeepAfterClose] = None,
@@ -3569,8 +3798,7 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
                  checksum_reverify_interval: float = DEFAULT_CHECKSUM_REVERIFY_INTERVAL,
                  max_foreground_operations: Optional[int] = None,
                  max_sync_workers: Optional[int] = None,
-                 max_download_workers: int = DEFAULT_MAX_DOWNLOAD_WORKERS,
-                 max_retained_streaming_sessions: int = DEFAULT_MAX_RETAINED_STREAMING_SESSIONS,
+                 max_download_workers: Optional[int] = None,
                  streaming_read_ahead_window: int = DEFAULT_STREAMING_READ_AHEAD_WINDOW):
     """
     Mount a Storage filesystem
@@ -3589,9 +3817,7 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
         debug: Enable verbose debug logging
         streaming_reads: Enable uncached range streaming + background prefetch
         streaming_chunk_size: Chunk size used for remote range reads
-        max_streaming_sessions: Maximum streaming sessions with live readers
         max_download_workers: Ceiling for adaptive streaming download workers
-        max_retained_streaming_sessions: Maximum retained fills without readers
         streaming_keep_after_close: When read-ahead outlives the last close;
             None for the default
         streaming_read_ahead_window: Pre-qualification read-ahead in bytes
@@ -3683,6 +3909,8 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
         logger.error(str(e))
         raise
 
+    raise_descriptor_limit(logger)
+
     fs = StorageFS(
         cache_root,
         state_db,
@@ -3692,9 +3920,7 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
         start_sync=False,
         streaming_reads=streaming_reads,
         streaming_chunk_size=streaming_chunk_size,
-        max_streaming_sessions=max_streaming_sessions,
         max_download_workers=max_download_workers,
-        max_retained_streaming_sessions=max_retained_streaming_sessions,
         readdir_ttl=readdir_ttl,
         enable_watchers=enable_watchers,
         streaming_keep_after_close=streaming_keep_after_close,

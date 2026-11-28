@@ -132,8 +132,10 @@ backends = [
         self.assertTrue(kwargs["foreground"])
         self.assertTrue(kwargs["streaming_reads"])
         self.assertEqual(2 * 1024 ** 2, kwargs["streaming_chunk_size"])
-        self.assertEqual(16, kwargs["max_streaming_sessions"])
-        self.assertEqual(120, kwargs["max_retained_streaming_sessions"])
+        self.assertNotIn("max_streaming_sessions", kwargs)
+        self.assertNotIn("max_retained_streaming_sessions", kwargs)
+        self.assertIn("max_streaming_sessions is obsolete and ignored", result.output)
+        self.assertIn("max_retained_streaming_sessions is obsolete and ignored", result.output)
         self.assertEqual(3, kwargs["max_download_workers"])
         self.assertEqual(3, kwargs["max_sync_workers"])
 

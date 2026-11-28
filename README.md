@@ -243,25 +243,64 @@ a 2 GiB file, a 1 MiB contiguous read opens a speculative window of up to
 4 MiB after that span, while a contiguous read of about 614.4 MiB
 (644,245,095 bytes) qualifies the file to keep downloading after close.
 
-Streaming read-ahead and retained fills share an adaptive pool of up to
-`max_download_workers` (`--max-download-workers`, default 4, range 1–32).
-Workers start when chunks are runnable and retire after 30 idle seconds.
+Streaming read-ahead and retained fills share an adaptive pool. Workers
+start as chunks become runnable and retire after 30 idle seconds. By
+default the pool grows with demand up to each member's own limit: bulk
+SFTP capacity for SSH and rsync members, and four workers for a local
+member, which sets no limit of its own. Set `max_download_workers`
+(`--max-download-workers`) to a positive integer to throttle background
+transfers across the mount instead; that number then bounds local
+members too.
 Each worker takes one chunk before checking the queue again. Files with
 open readers take precedence, with a turn for a waiting closed file
 after four reader turns. Reopening a retained fill gives it reader
 priority and reuses the bytes it already has.
 
-`max_streaming_sessions` (`--max-streaming-sessions`, default 8) limits new
-streaming sessions when that many distinct files have open readers. A new
-open above that limit uses the whole-file cache path. A separate
-`max_retained_streaming_sessions` (`--max-retained-streaming-sessions`,
-default 64) limits unfinished fills that continue after the last close.
-Each retains one partial inode and descriptor. The file's entire length
-counts against `cache_size`, even while the partial is sparse. When the
-retained limit is full, the newest close discards its incomplete partial.
-Set the retained limit to 0 to discard every incomplete fill on last close.
-If the cache cannot make enough space for a new reader, it can discard
-unfinished retained fills to make room.
+No setting limits how many files stream at once or how many fills are
+retained. The old mount settings `max_streaming_sessions` and
+`max_retained_streaming_sessions` are obsolete; existing profiles still
+load and warn that the settings are ignored. Two resources bound
+streaming instead:
+
+- Cache space. A cold streaming open is admitted against `cache_size`
+  for the file's full length, even while the partial is still sparse. If
+  the cache cannot make that much room, even after discarding unfinished
+  retained fills, the open fails with `ENOSPC`; it does not fall back to
+  a whole-file copy.
+- Descriptors. Each streaming file holds one descriptor on its partial
+  while it fills, with or without readers, and each open handle holds
+  another. At mount the soft `RLIMIT_NOFILE` is raised to the hard limit
+  (logged; a failure to raise it is logged and the mount continues).
+  Processes the mount starts (recompute commands, `ssh`, `rsync`) inherit
+  the raised limit; a program that still uses `select(2)` cannot handle
+  descriptors numbered 1024 or above. A fill is not retained after its
+  last close once streaming descriptors reach half the soft limit; it is
+  discarded as an unqualified one is. A mount that reaches the limit
+  anyway returns `EMFILE` from opens. A reader's descriptor is opened on
+  its download's own file through `/proc/self/fd`, so streaming needs
+  procfs mounted in the mount's namespace; without it streaming opens
+  fail with `EIO` (logged).
+
+On range-capable reads, a storage or member error returns its errno to
+the caller; a file that disappears from its member during a read returns
+`ESTALE`. A new open of a file whose streaming download failed starts a
+fresh download instead of returning the old error. Readers still holding
+the failed download keep its bytes and its error; its partial, unlinked,
+stays charged against `cache_size` and counted among streaming
+descriptors until they close. A failed download keeps the contiguous
+prefix it fetched in the cache. An open that finds the file uncached and
+starts streaming never takes a prefix that appears meanwhile for the
+file: it drops the prefix and streams again, or returns `EAGAIN` while
+another descriptor holds it. A prefix already cached when the file is
+opened is served as it is, which is what lets it be read offline.
+Recomputing a file moves such a prefix aside while the command runs and
+puts it back if the command produces no file. A prefix that cannot be put
+back stays beside its path, counts toward the cache size, and is removed
+by the restart sweep; it is only an offline convenience, since the member
+holds the file.
+A recomputable file whose members cannot be reached is recomputed. A selected member without
+range support uses the whole-file cache path, as do write opens and opens
+with streaming disabled.
 
 SSH read-ahead and retained fills use bulk SFTP capacity, as do rsync
 members' range reads. A worker claims bytes only after getting a bulk
@@ -542,7 +581,7 @@ override or the profile now points to a different cache.
 ```bash
 storage control --profile media
 storage control --profile media --config ./storage.toml get
-storage control --cache '/var/cache/my media' set --max-streaming-sessions 4 --max-download-workers 2
+storage control --cache '/var/cache/my media' set --max-download-workers 2
 storage control --profile media set --streaming-keep-after-close 'all:32M,30%' --streaming-read-ahead-window 4M
 storage control --profile media downloads
 storage control --profile media cancel 474b595adc054281bced844067939d97
@@ -559,9 +598,7 @@ streaming downloads independently of background sync.
 
 | Live limit | Range | Effect |
 | --- | --- | --- |
-| `--max-streaming-sessions` | 1–1024 | Concurrent streaming files with readers. Additional cold opens fall back to a whole-file fetch. |
-| `--max-retained-streaming-sessions` | 0–1024 | Reader-free downloads retained after close. Set to `0` to discard unfinished downloads at future last closes. Existing retained downloads can finish. |
-| `--max-download-workers` | 1–32 | Ceiling for background download workers. When lowered, transfers in progress finish their current chunks before the lower cap applies. |
+| `--max-download-workers` | Positive integer or `auto` | Optional background transfer throttle. In-progress chunks finish when the throttle is lowered. Use `auto` to restore demand-driven growth. |
 | `--streaming-keep-after-close` | Sizes and percentages | Re-evaluates open, unqualified files using the read spans already observed. Files that qualify stay qualified for that download. |
 | `--streaming-read-ahead-window` | Non-negative size | Speculative window before qualification. A background range request already in flight can finish under the previous window. |
 

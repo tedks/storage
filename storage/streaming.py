@@ -2,18 +2,20 @@ import errno
 import json
 import os
 import re
+import resource
 import secrets
 import threading
 import time
 from collections import Counter
 from dataclasses import dataclass, field
+from enum import Enum, auto
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
 from fuse import FuseOSError
 
 from .backends.base import Backend, capacity_wait_cancellation
-from .backends.ssh_pool import BulkCapacityCancelled
+from .backends.ssh_pool import BulkCapacityCancelled, BulkCapacityTimeout, is_connection_error
 from .backends.local import NOREPLACE_UNSUPPORTED
 from .backends.local import rename_noreplace as _rename_noreplace
 from .cache_metadata import PREFIX_XATTR, copy_member_attributes
@@ -49,34 +51,104 @@ STREAMING_MAX_FOREGROUND_FRAGMENTS = 1024
 # scattered reads gets here, and losing a short span can only delay the
 # threshold, never fake it.
 STREAMING_MAX_TRACKED_READ_SPANS = 64
-DEFAULT_MAX_DOWNLOAD_WORKERS = 4
-MAX_DOWNLOAD_WORKERS = 32
-DEFAULT_MAX_RETAINED_STREAMING_SESSIONS = 64
-MAX_STREAMING_SESSION_LIMIT = 1024
 DOWNLOAD_WORKER_IDLE_SECONDS = 30.0
 # Yield a turn to a queued closed file after this many active-reader turns.
 ACTIVE_DOWNLOAD_BURST = 4
+# Automatic worker mode: turns at once on a member that reports no
+# background_range_capacity of its own (local directories). SSH and rsync
+# members are bounded by their bulk SFTP capacity instead.
+AUTOMATIC_UNLIMITED_MEMBER_WORKERS = 4
+# Retained fills stop being kept once registered sessions (one partial
+# descriptor each) reach 1/this of the soft RLIMIT_NOFILE.
+STREAMING_DESCRIPTOR_SHARE = 2
+# How long an open waits for a claimed failed-session cleanup (a local
+# truncate, fsync and link of the prefix) before it returns EAGAIN.
+STREAMING_CLEANUP_WAIT_SECONDS = 30.0
 
-# link() errors after which _install_partial tries RENAME_NOREPLACE: no
-# hard links on the cache filesystem (EMLINK cannot happen on a fresh
+# link() errors after which _install_partial (and StorageFS's prefix
+# restore) tries RENAME_NOREPLACE: no hard links on the cache filesystem (EMLINK cannot happen on a fresh
 # partial, but the rename would work there too); renameat2 errors meaning
 # it has no RENAME_NOREPLACE either.
-_LINK_UNSUPPORTED = (errno.EPERM, errno.EOPNOTSUPP, errno.ENOTSUP, errno.ENOSYS, errno.EMLINK)
+LINK_UNSUPPORTED = (errno.EPERM, errno.EOPNOTSUPP, errno.ENOTSUP, errno.ENOSYS, errno.EMLINK)
 _NOREPLACE_UNSUPPORTED = NOREPLACE_UNSUPPORTED
 
 
+OBSOLETE_STREAMING_LIMITS = ("max_streaming_sessions", "max_retained_streaming_sessions")
+
+
 def validate_download_limits(limits):
-    bounds = {
-        "max_streaming_sessions": (1, MAX_STREAMING_SESSION_LIMIT),
-        "max_retained_streaming_sessions": (0, MAX_STREAMING_SESSION_LIMIT),
-        "max_download_workers": (1, MAX_DOWNLOAD_WORKERS),
-    }
     for name, value in limits.items():
-        if name not in bounds:
+        if name in OBSOLETE_STREAMING_LIMITS:
+            raise ValueError(f"obsolete streaming setting: {name}")
+        if name != "max_download_workers":
             raise ValueError(f"unknown download limit: {name}")
-        low, high = bounds[name]
-        if type(value) is not int or not low <= value <= high:
-            raise ValueError(f"{name} must be an integer between {low} and {high}")
+        if value is not None and (type(value) is not int or value < 1):
+            raise ValueError(f"{name} must be a positive integer or automatic")
+
+
+class StreamingOpen(Enum):
+    CACHED = auto()
+    # The cache path holds a failed stream's promoted prefix that the index
+    # does not describe: not the file. The opener drops it and tries again.
+    PREFIX_CACHED = auto()
+    RANGE_UNSUPPORTED = auto()
+    SOURCE_MISSING = auto()
+
+
+# The largest file size a partial can be truncated to (off_t is signed 64-bit).
+_MAX_PARTIAL_SIZE = (1 << 63) - 1
+
+
+@dataclass(frozen=True)
+class StreamSource:
+    backend: Backend
+    # None when the member has no stat. Both are None for a member without
+    # range reads: it is never probed for a size it does not need.
+    member_stat: Optional[os.stat_result]
+    file_size: Optional[int]
+
+
+class StreamSourceError(OSError):
+    """No streaming source could be probed: the cause's errno, raised at open.
+
+    Distinct from the other open errors so StorageFS can still recompute a
+    recomputable file, as the whole-file path does when no member serves it.
+    """
+
+
+class _CleanupPending(Exception):
+    """The registered session's failed cleanup is claimed; wait for it to leave the registry."""
+
+    def __init__(self, session):
+        super().__init__("streaming cleanup in progress")
+        self.session = session
+
+
+def streaming_read_errno(exc: Exception) -> int:
+    """The errno read(2) returns for exc: a file gone from the member mid-read is stale, not absent.
+
+    ENOENT from read(2) would tell the caller its open file does not exist.
+    """
+    if isinstance(exc, FileNotFoundError):
+        return errno.ESTALE
+    error = streaming_errno(exc)
+    return errno.ESTALE if error == errno.ENOENT else error
+
+
+def streaming_errno(exc: Exception) -> int:
+    if isinstance(exc, BulkCapacityCancelled):
+        return errno.EINTR
+    if isinstance(exc, BulkCapacityTimeout):
+        return errno.EAGAIN
+    if isinstance(exc, OSError) and exc.errno:
+        return exc.errno
+    if isinstance(exc, TimeoutError):
+        return errno.ETIMEDOUT
+    if isinstance(exc, ConnectionError) or is_connection_error(exc):
+        return errno.EHOSTUNREACH
+    if isinstance(exc, MemoryError):
+        return errno.ENOMEM
+    return errno.EIO
 
 
 def _unique_control_fields(pairs):
@@ -156,6 +228,10 @@ class PrefetchSession:
     # Demand access can arrive before the index row exists. Carry the last
     # timestamp into the new row even if the pending index batch has flushed.
     last_access: float = 0.0
+    # Bytes charged to the cache (CacheManager.hold_unlinked_bytes) while
+    # this session is replaced with readers still on its unlinked partial;
+    # released when its descriptor closes.
+    unlinked_charge: int = 0
 
     def __post_init__(self):
         self.lock = threading.RLock()
@@ -185,11 +261,25 @@ class _DownloadPool:
         self.active_turns = 0
         self.closing = False
 
+    def _member_capacity(self, session):
+        """Concurrent turns allowed on the session's member; None for no member bound.
+
+        A member that sets no limit of its own (a local directory) gets
+        AUTOMATIC_UNLIMITED_MEMBER_WORKERS while the pool is automatic, so
+        demand alone (one ready file each) cannot start a thread per
+        retained fill. Under an explicit max_download_workers that limit is
+        such a member's only bound, as before.
+        """
+        capacity = session.backend.background_range_capacity()
+        if capacity is None and self.limit is None:
+            return AUTOMATIC_UNLIMITED_MEMBER_WORKERS
+        return capacity
+
     def _eligible(self):
         running_by_member = Counter(session.backend.name for session in self.running)
         for session in self.ready:
             member = session.backend.name
-            capacity = session.backend.background_range_capacity()
+            capacity = self._member_capacity(session)
             if capacity is None or running_by_member[member] < capacity:
                 yield session
                 running_by_member[member] += 1
@@ -197,14 +287,18 @@ class _DownloadPool:
     def _grow(self):
         demand = len(self.running) + sum(1 for _ in self._eligible())
         retried = False
-        while len(self.threads) < min(self.limit, demand):
-            worker = threading.Thread(target=self._run, name="storage-prefetch-worker", daemon=True)
-            self.threads.add(worker)
+        target = demand if self.limit is None else min(self.limit, demand)
+        while len(self.threads) < target:
+            worker = None
             try:
+                worker = threading.Thread(target=self._run, name="storage-prefetch-worker", daemon=True)
+                self.threads.add(worker)
                 worker.start()
-            except RuntimeError:
-                self.threads.remove(worker)
-                self.logger.exception("Could not start streaming download worker")
+            except (RuntimeError, OSError, MemoryError) as exc:
+                self.threads.discard(worker)
+                # Thread.start may report resource exhaustion as RuntimeError without an errno.
+                error = errno.ENOMEM if isinstance(exc, MemoryError) else getattr(exc, "errno", None)
+                self.logger.warning("streaming worker start failed errno=%s", error or "unknown")
                 # There may never be another offer to retry the first
                 # worker, e.g. when a complete file is queued to publish.
                 if self.threads or retried:
@@ -238,7 +332,7 @@ class _DownloadPool:
     def take_unstaffed(self, session):
         """Let a caller finish a local-only publication when no thread starts."""
         with self.condition:
-            if self.threads or len(self.running) >= self.limit or session not in self.ready:
+            if self.threads or session not in self.ready:
                 return False
             self.ready.pop(session)
             self.running.add(session)
@@ -249,14 +343,14 @@ class _DownloadPool:
             return len(self.threads), len(self.running), len(self.ready)
 
     def _take(self):
-        if len(self.running) >= self.limit:
+        if self.limit is not None and len(self.running) >= self.limit:
             return None
         active = closed = None
         # Member headroom is based on in-flight work. Each priority gets
         # its first choice of that headroom before either is selected.
         running_by_member = Counter(session.backend.name for session in self.running)
         for session, has_reader in self.ready.items():
-            capacity = session.backend.background_range_capacity()
+            capacity = self._member_capacity(session)
             if capacity is not None and running_by_member[session.backend.name] >= capacity:
                 continue
             if has_reader and active is None:
@@ -314,17 +408,16 @@ class StreamingReadManager:
         state_manager,
         logger,
         get_config,
-        select_backend_for_read,
+        select_stream_source: Callable[[str], Optional[StreamSource]],
         streaming_reads: bool,
         streaming_chunk_size: int,
-        max_streaming_sessions: int,
         partial_suffix: str,
         stream_state_xattr: str,
         keep_after_close: Optional[StreamingKeepAfterClose] = None,
         on_finalized: Optional[Callable[["PrefetchSession"], None]] = None,
-        max_download_workers: int = DEFAULT_MAX_DOWNLOAD_WORKERS,
-        max_retained_streaming_sessions: int = DEFAULT_MAX_RETAINED_STREAMING_SESSIONS,
+        max_download_workers: Optional[int] = None,
         read_ahead_window: int = DEFAULT_STREAMING_READ_AHEAD_WINDOW,
+        is_unindexed_prefix: Optional[Callable[[str, Path], bool]] = None,
     ):
         self.cache_manager = cache_manager
         # Called once the complete file is in the cache (StorageFS records
@@ -333,14 +426,19 @@ class StreamingReadManager:
         self.state_manager = state_manager
         self.logger = logger
         self.get_config = get_config
-        self.select_backend_for_read = select_backend_for_read
+        # Probes the members for a source: None when no member has the
+        # file; raises when none could be probed.
+        self.select_stream_source = select_stream_source
+        # Whether the file at a cache path is a promoted prefix the index
+        # does not describe (StorageFS._is_unindexed_prefix).
+        self.is_unindexed_prefix = is_unindexed_prefix or (lambda canonical_path, cache_path: False)
+        # Descriptors held by streaming sessions and their staging files,
+        # registered or not (a replaced session's readers keep one open).
+        self._session_descriptors = 0
+        self._session_descriptors_lock = threading.Lock()
         self.streaming_reads = streaming_reads
         self.chunk_size = max(4096, int(streaming_chunk_size))
-        limits = {
-            "max_streaming_sessions": max_streaming_sessions,
-            "max_retained_streaming_sessions": max_retained_streaming_sessions,
-            "max_download_workers": max_download_workers,
-        }
+        limits = {"max_download_workers": max_download_workers}
         validate_download_limits(limits)
         self._download_limits = limits
         self._download_pool = _DownloadPool(
@@ -367,6 +465,9 @@ class StreamingReadManager:
         self._streaming_stats = {
             "streaming_sessions_started": 0,
             "streaming_fallback_opens": 0,
+            "streaming_open_error_source_probe": 0,
+            "streaming_open_error_descriptors": 0,
+            "streaming_open_error_cache_space": 0,
             "foreground_remote_bytes": 0,
             "background_remote_bytes": 0,
             "foreground_fetches": 0,
@@ -475,7 +576,7 @@ class StreamingReadManager:
         return "cancelled"
 
     def destroy(self):
-        """Stop every session; from here on, opens get no session (full-file path).
+        """Stop every session and reject subsequent streaming opens.
 
         The refusal is set in the same prefetch_sessions_lock section that
         takes the sessions, so an open racing destroy either registered
@@ -713,26 +814,28 @@ class StreamingReadManager:
         payload = self._snapshot_streaming_state(session, status)
         self._log_streaming_state_change(session, payload)
 
-        # The detached check is not atomic with the setxattr below: a session
-        # detached in between could write one stale state onto a successor's
-        # partial. The successor would have to finish a remote get_size in
-        # that gap, and the xattr is informational, so it is not locked out.
-        # No fallback to the final path when the partial is gone: the
-        # final path may hold another file by then (a superseded session,
-        # see _install_partial), and the state describes this session only.
-        with session.lock:
-            if session.detached:
-                return
-            target_path = session.final_cache_path if session.finalized else session.partial_cache_path
-
-        try:
-            os.setxattr(
-                str(target_path),
-                self.stream_state_xattr,
-                json.dumps(payload, sort_keys=True).encode("utf-8"),
-            )
-        except OSError:
-            pass
+        # Written through the session's own descriptor, under io_lock so
+        # it stays open: a successor's partial at the same path (after a
+        # replacement, _attach) is never written, whatever the timing. Once
+        # the descriptor is closed only a finalized session writes, to its
+        # final path. A detached session writes nothing; its state is no
+        # longer anyone's.
+        value = json.dumps(payload, sort_keys=True).encode("utf-8")
+        with session.io_lock:
+            with session.lock:
+                if session.detached:
+                    return
+                io_fd = session.io_fd
+                target_path = session.final_cache_path if session.finalized else None
+            try:
+                if io_fd >= 0:
+                    # The session's own inode: a successor's partial at the
+                    # same path is never written, detached or not.
+                    os.setxattr(io_fd, self.stream_state_xattr, value)
+                elif target_path is not None:
+                    os.setxattr(str(target_path), self.stream_state_xattr, value)
+            except OSError:
+                pass
 
     def _streaming_stats_snapshot(self) -> Dict[str, object]:
         with self._streaming_stats_lock:
@@ -745,6 +848,7 @@ class StreamingReadManager:
 
         stats.update({
             "active_streaming_sessions": active_streaming_sessions,
+            "streaming_session_descriptors": self.session_descriptor_count(),
             "active_reader_sessions": active_reader_sessions,
             "retained_streaming_sessions": retained_sessions,
             "download_workers": workers,
@@ -1014,7 +1118,7 @@ class StreamingReadManager:
                 if session.stop_requested:
                     raise FuseOSError(errno.EINTR)
                 if session.error is not None:
-                    raise FuseOSError(errno.EIO)
+                    raise FuseOSError(streaming_read_errno(session.error))
 
                 # Only what the reader asked for: not rounded up to a chunk,
                 # which is what made a 4 KiB sniff cost a whole chunk.
@@ -1045,43 +1149,95 @@ class StreamingReadManager:
                     source="foreground",
                 )
             except Exception as exc:
-                self.logger.warning(
-                    "streaming foreground fetch failed path=%s backend=%s range=[%d,%d): %r",
-                    session.canonical_path,
-                    session.backend.name,
-                    fetch[0],
-                    fetch[1],
-                    exc,
-                )
+                self.logger.warning("streaming foreground range failed errno=%d", streaming_errno(exc))
                 with session.lock:
                     if session.error is None:
                         session.error = exc
                     session.condition.notify_all()
                 self._update_streaming_state_xattr(session, "error")
-                raise FuseOSError(errno.EIO)
+                raise FuseOSError(streaming_read_errno(exc)) from exc
             finally:
                 with session.lock:
                     session.in_flight_ranges.remove(fetch)
                     self._schedule_background(session)
                     session.condition.notify_all()
 
+    def _count_session_descriptor(self, delta: int):
+        with self._session_descriptors_lock:
+            self._session_descriptors += delta
+
+    def session_descriptor_count(self) -> int:
+        with self._session_descriptors_lock:
+            return self._session_descriptors
+
     def _close_streaming_session_resources(self, session: PrefetchSession):
         with session.io_lock:
             with session.lock:
                 io_fd = session.io_fd
                 session.io_fd = -1
+                charge = session.unlinked_charge
+                session.unlinked_charge = 0
 
         if io_fd >= 0:
             try:
                 os.close(io_fd)
             except OSError:
                 pass
+            self._count_session_descriptor(-1)
+        if charge:
+            self.cache_manager.release_unlinked_bytes(charge)
+
+    def open_session_inode(self, session: PrefetchSession, flags: int) -> int:
+        """Open the session's own file for a reader that holds a ref on it.
+
+        Never by its path: once a session fails and a later open replaces
+        it, its partial path names the successor's file, whose range map is
+        not this session's (ranges this session has would read as the
+        successor's holes). /proc/self/fd reopens the inode the session
+        writes, linked, renamed into the cache or unlinked. io_lock keeps
+        the descriptor from closing meanwhile; it closes at the last
+        release, at destroy (the open gets ENOENT), or when finalize saw no
+        readers: then -1, and the caller opens the installed cache file by
+        name. Without procfs the open is EIO, logged.
+        """
+        with session.io_lock:
+            io_fd = session.io_fd
+            if io_fd >= 0:
+                try:
+                    return os.open(f"/proc/self/fd/{io_fd}", flags & ~os.O_NOFOLLOW)
+                except FileNotFoundError:
+                    if os.path.isdir("/proc/self/fd"):
+                        raise
+                    self.logger.error("streaming needs /proc/self/fd to open a session's file")
+                    raise OSError(errno.EIO, "procfs unavailable") from None
+            with session.lock:
+                finalized = session.finalized
+        if finalized:
+            # Finalize closes the descriptor when it saw no readers, which a
+            # reader attaching after that decision does not change; the
+            # session's inode is then the cache file it installed, which the
+            # caller opens by name under its descriptor-table lock (-1).
+            return -1
+        raise FileNotFoundError(errno.ENOENT, "streaming session closed")
 
     def _remove_prefetch_session(self, session: PrefetchSession):
         with self.prefetch_sessions_lock:
             current = self.prefetch_sessions.get(session.canonical_path)
             if current is session:
                 self.prefetch_sessions.pop(session.canonical_path, None)
+
+    def _discard_staging_file(self, io_fd: int, path: Path):
+        # Best effort cleanup must preserve the failure which brought us here.
+        try:
+            os.close(io_fd)
+        except OSError:
+            pass
+        self._count_session_descriptor(-1)
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        self.cache_manager.mark_cache_size_dirty()
 
     def _discard_unregistered_prefetch_session(self, session: PrefetchSession):
         self._close_streaming_session_resources(session)
@@ -1141,6 +1297,8 @@ class StreamingReadManager:
         with self.prefetch_sessions_lock:
             with session.lock:
                 claimed = self._claim_detach(session)
+                # An open waiting for this cleanup (_wait_for_cleanup) retries.
+                session.condition.notify_all()
             if claimed:
                 self._unregister_and_unlink(session)
         self._close_streaming_session_resources(session)
@@ -1170,7 +1328,7 @@ class StreamingReadManager:
         except FileExistsError:
             return "taken"
         except OSError as exc:
-            if exc.errno not in _LINK_UNSUPPORTED:
+            if exc.errno not in LINK_UNSUPPORTED:
                 raise
             try:
                 return "installed" if _rename_noreplace(partial_path, final_path) else "taken"
@@ -1581,60 +1739,79 @@ class StreamingReadManager:
         session.background_finished.set()
 
     def _finish_unstaffed_download(self, session: PrefetchSession):
-        with session.lock:
-            claimed = self._download_terminal(session) and self._download_pool.take_unstaffed(session)
-        if claimed:
-            self._run_download_turn(session)
+        with self.prefetch_sessions_lock, session.lock:
+            if not self._download_terminal(session) and session.refcount > 0:
+                return
+            if not self._download_pool.take_unstaffed(session):
+                return
+            if not self._download_terminal(session):
+                # Thread creation failed for all workers. Readers can fetch
+                # their own ranges, but a closed file cannot make progress.
+                self._stop_background_locked(session)
+                self._record_streaming_stat("streaming_unstaffed_cancellations")
+        self._run_download_turn(session)
 
-    def _attach(self, session: PrefetchSession) -> bool:
-        """Add a reader to a registered session; False if it failed or its cleanup is claimed.
+    def _attach(self, session: PrefetchSession) -> Optional[PrefetchSession]:
+        """Add a reader to the registered session; None if it was failed and is now replaced.
 
-        Caller holds prefetch_sessions_lock. The claim is read under
-        session.lock, where it is taken together with the no-readers
-        decision (see _claim_failed_cleanup), so either this reader counts
-        in that decision or it does not attach. A refused open takes the
-        full-file path: if its fetch fills the final path first, promotion
-        leaves that file alone (see _install_partial); if promotion links
-        first, the opener gets the promoted prefix as the cached file, as
-        any open after a failed session's cleanup does.
+        Caller holds prefetch_sessions_lock. A failed session lacks bytes it
+        will never fetch, so a new open does not join it: it leaves the
+        registry here (claimed, its partial unlinked, as a stop does) and
+        the caller starts a fresh session. Readers still attached keep
+        their descriptors on its inode and its error; the last release, or
+        the worker's tail, closes its descriptor (see _stop_and_detach_session).
+        Without this, one transient member failure seen by a reader that
+        stays open would fail every later open of the file until it closed.
+        A failed session that has every byte is still joined: only its
+        finalize failed.
 
-        A session with an error set is refused too, before its cleanup is
-        claimed: an attach would get EIO on every range the session lacks,
-        where the full-file path may succeed. A session that has every byte
-        (prefetch_complete; only its finalize failed) is not refused: it
-        lacks no range. The costs of a refusal: the opener's open() fetches
-        the whole file before it returns (on the single-threaded loop that
-        holds up the mount, for a large file), and with the member down that
-        fetch fails after the SFTP timeout, so the opener gets the open's
-        error instead of the ranges the session had already cached. An
-        attach to an errored session with every byte leaves the cache with
-        the promoted file and no index row (as for a lone reader), where a
-        refusal would have run a full fetch that stores one.
+        Raises _CleanupPending once the failed cleanup is claimed: the
+        claimer is promoting the prefix by the partial's path, so the
+        session must not be detached from under it (a successor's partial
+        at that path could be installed in its place).
         """
         with session.lock:
-            if session.failed_cleanup_claimed or (
-                session.error is not None and not session.prefetch_complete
-            ):
-                refused = True
-            else:
-                refused = False
-                session.refcount += 1
-                readers = session.refcount
-                self._schedule_background(session)
-        if refused:
-            self.logger.info(
-                "streaming attach refused path=%s backend=%s: session failed or being cleaned up",
-                session.canonical_path,
-                session.backend.name,
-            )
-            return False
-        self.logger.info(
-            "streaming attach path=%s backend=%s readers=%d",
-            session.canonical_path,
-            session.backend.name,
-            readers,
-        )
+            if session.failed_cleanup_claimed:
+                raise _CleanupPending(session)
+            if session.error is not None and not session.prefetch_complete:
+                if self._claim_detach(session):
+                    if session.io_fd >= 0 and session.unlinked_charge == 0:
+                        # Its readers keep the partial's blocks once it is
+                        # unlinked. Charged first: a cache scan after the
+                        # unlink no longer sees the file.
+                        session.unlinked_charge = session.file_size
+                        self.cache_manager.hold_unlinked_bytes(session.file_size)
+                    self._unregister_and_unlink(session)
+                self._record_streaming_stat("streaming_failed_sessions_replaced")
+                self.logger.info(
+                    "streaming replacing failed session errno=%d", streaming_errno(session.error),
+                )
+                return None
+            session.refcount += 1
+            self._schedule_background(session)
+        return session
+
+    def _wait_for_cleanup(self, session: PrefetchSession) -> bool:
+        """Wait, holding no registry lock, until a claimed cleanup leaves the registry."""
+        deadline = time.monotonic() + STREAMING_CLEANUP_WAIT_SECONDS
+        with session.lock:
+            while not session.detached:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                session.condition.wait(remaining)
         return True
+
+    def report_open_error(self, reason: str, exc: Exception):
+        error = streaming_errno(exc)
+        if error in (errno.EMFILE, errno.ENFILE):
+            reason = "descriptors"
+        elif error == errno.ENOSPC and reason in ("cache_prepare", "cache_register", "cache_open"):
+            # The local cache filesystem is full, whichever stage saw it.
+            reason = "cache_space"
+        self._record_streaming_stat(f"streaming_open_error_{reason}")
+        self.logger.warning("streaming open failed reason=%s errno=%d", reason, error)
+
 
     def _download_session_counts(self):
         """Counts of files with readers and retained fills. Caller holds the registry lock."""
@@ -1647,15 +1824,6 @@ class StreamingReadManager:
                     retained += 1
         return active, retained
 
-    def _has_session_capacity(self):
-        """Reserve room for readers while bounding retained partials and descriptors."""
-        active, _ = self._download_session_counts()
-        limit = self._download_limits["max_streaming_sessions"]
-        retained_limit = self._download_limits["max_retained_streaming_sessions"]
-        # Complete/failed sessions can be waiting on local publication. Count
-        # them against the hard allocation bound even after their last close.
-        return active < limit and len(self.prefetch_sessions) < limit + retained_limit
-
     def _reclaim_retained_space(self, file_size: int) -> bool:
         """Make space for a reader by yielding unfinished readerless partials."""
         missing = self.cache_manager.get_free_space_needed(file_size)
@@ -1664,7 +1832,7 @@ class StreamingReadManager:
 
         cancelled = []
         with self.prefetch_sessions_lock:
-            if self._destroying or not self._has_session_capacity():
+            if self._destroying:
                 return False
             candidates = []
             for session in self.prefetch_sessions.values():
@@ -1691,67 +1859,80 @@ class StreamingReadManager:
         self,
         virtual_path: str,
         canonical_path: str,
-    ) -> Optional[PrefetchSession]:
+    ) -> PrefetchSession | StreamingOpen:
+        """Attach to the file's session or start one; see StreamingOpen for the other outcomes.
+
+        A failed session whose cleanup is claimed is waited out (the
+        cleanup does local I/O only), then the open starts over: by then the
+        cleanup has promoted its prefix or removed it. A promoted prefix is
+        reported as PREFIX_CACHED, never CACHED: it is not the file.
+        """
+        while True:
+            try:
+                return self._create_or_attach_once(virtual_path, canonical_path)
+            except _CleanupPending as pending:
+                if not self._wait_for_cleanup(pending.session):
+                    exc = OSError(errno.EAGAIN, "streaming cleanup in progress")
+                    self.report_open_error("existing_session", exc)
+                    raise exc from None
+                self._record_streaming_stat("streaming_open_cleanup_waits")
+                # Start over: a promoted prefix is then PREFIX_CACHED, never CACHED.
+
+    def _cached_outcome(self, virtual_path: str, canonical_path: str) -> Optional[StreamingOpen]:
+        """CACHED for a whole cached file, PREFIX_CACHED for a promoted prefix, None for none."""
+        if not self.cache_manager.is_cached(virtual_path):
+            return None
+        return self._final_path_outcome(canonical_path, self.cache_manager.get_cache_path(virtual_path))
+
+    def _final_path_outcome(self, canonical_path: str, final_cache_path: Path) -> StreamingOpen:
+        if self.is_unindexed_prefix(canonical_path, final_cache_path):
+            return StreamingOpen.PREFIX_CACHED
+        return StreamingOpen.CACHED
+
+    def _create_or_attach_once(
+        self,
+        virtual_path: str,
+        canonical_path: str,
+    ) -> PrefetchSession | StreamingOpen:
         with self.prefetch_sessions_lock:
             if self._destroying:
-                return None
+                raise OSError(errno.EINTR, "streaming manager is shutting down")
             existing = self.prefetch_sessions.get(canonical_path)
             if existing:
-                if not self._attach(existing):
-                    return None
-                return existing
+                attached = self._attach(existing)
+                if attached is not None:
+                    return attached
 
-            if not self._has_session_capacity():
-                self.logger.warning(
-                    "Streaming session limit reached (%d); falling back to full-file cache for %s",
-                    self._download_limits["max_streaming_sessions"],
-                    canonical_path,
-                )
-                return None
-
-        backend = self.select_backend_for_read(canonical_path)
-        if not backend:
-            self.logger.debug("streaming session unavailable: no readable backend for %s", canonical_path)
-            return None
-
-        if not backend.supports_range_reads():
-            self.logger.debug(
-                "streaming session unavailable: backend %s lacks range-read support for %s",
-                backend.name,
-                canonical_path,
-            )
-            return None
-
-        member_stat = None
         try:
-            # One round trip either way: get_size is a stat on every member.
-            try:
-                member_stat = backend.stat(canonical_path)
-            except NotImplementedError:
-                pass
-            file_size = getattr(member_stat, "st_size", None)
-            if file_size is None:
-                file_size = backend.get_size(canonical_path)
+            source = self.select_stream_source(canonical_path)
         except Exception as exc:
-            self.logger.debug(
-                "streaming session unavailable: failed to stat %s on %s: %s",
-                canonical_path,
-                backend.name,
-                exc,
-            )
-            return None
+            # A whole file cached meanwhile serves the open; a promoted
+            # prefix does not. The caller reports the error (it may still
+            # recompute the file).
+            if self._cached_outcome(virtual_path, canonical_path) == StreamingOpen.CACHED:
+                return StreamingOpen.CACHED
+            raise StreamSourceError(streaming_errno(exc), "streaming source probe failed") from exc
+        if source is None:
+            if self._cached_outcome(virtual_path, canonical_path) == StreamingOpen.CACHED:
+                return StreamingOpen.CACHED
+            self._record_streaming_stat("streaming_source_not_found")
+            self.logger.debug("streaming source unavailable reason=not_found")
+            return StreamingOpen.SOURCE_MISSING
 
-        if file_size < 0:
-            self.logger.debug(
-                "streaming session unavailable: invalid size %s for %s",
-                file_size,
-                canonical_path,
-            )
-            return None
+        backend, member_stat, file_size = source.backend, source.member_stat, source.file_size
+        if not backend.supports_range_reads():
+            return StreamingOpen.RANGE_UNSUPPORTED
+        if type(file_size) is not int or file_size < 0:
+            exc = OSError(errno.EIO, "streaming source returned an invalid size")
+            self.report_open_error("source_size", exc)
+            raise exc
+        if file_size > _MAX_PARTIAL_SIZE:
+            exc = OSError(errno.EFBIG, "streaming source size exceeds the largest local file")
+            self.report_open_error("source_size", exc)
+            raise exc
 
         final_cache_path = self.cache_manager.get_cache_path(virtual_path)
         partial_cache_path = self._partial_cache_path(final_cache_path)
-        final_cache_path.parent.mkdir(parents=True, exist_ok=True)
         # Prepared under a name of its own and renamed onto the partial path
         # at registration, inside prefetch_sessions_lock: another open that
         # also missed the registry prepares its own file meanwhile, and only
@@ -1766,102 +1947,101 @@ class StreamingReadManager:
 
         io_fd = -1
         try:
+            final_cache_path.parent.mkdir(parents=True, exist_ok=True)
             for attempt in range(2):
                 with self.cache_manager.admit_streaming_partial(file_size) as admitted:
                     if admitted:
                         io_fd = os.open(str(staging_path), os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o644)
+                        self._count_session_descriptor(1)
                         os.ftruncate(io_fd, file_size)
                         break
+                # No room for a partial of our own. A concurrent open of the
+                # same file may have registered one since the lookup above
+                # (its partial is what filled the budget): join it.
+                with self.prefetch_sessions_lock:
+                    existing = None if self._destroying else self.prefetch_sessions.get(canonical_path)
+                    attached = self._attach(existing) if existing is not None else None
+                if attached is not None:
+                    return attached
                 if attempt or not self._reclaim_retained_space(file_size):
-                    self.logger.warning(
-                        "streaming session unavailable: insufficient cache space for %s (%d bytes)",
-                        canonical_path, file_size,
-                    )
-                    return None
-        except OSError as exc:
-            self.logger.debug(
-                "streaming session unavailable: failed to prepare partial cache file %s for %s: %s",
-                staging_path,
-                final_cache_path,
-                exc,
-            )
+                    # A concurrent cache winner needs no additional space.
+                    if os.path.lexists(final_cache_path):
+                        return self._final_path_outcome(canonical_path, final_cache_path)
+                    raise OSError(errno.ENOSPC, "streaming cache budget exhausted")
+        except BaseException as exc:
+            # Until the session owns it, the staging file is ours to remove,
+            # whatever was raised (OverflowError from ftruncate, say).
             if io_fd >= 0:
-                os.close(io_fd)
+                self._discard_staging_file(io_fd, staging_path)
+            if isinstance(exc, OSError):
+                self.report_open_error("cache_space" if exc.errno == errno.ENOSPC else "cache_prepare", exc)
+            raise
+
+        try:
+            session = PrefetchSession(
+                canonical_path=canonical_path,
+                virtual_path=virtual_path,
+                backend=backend,
+                file_size=file_size,
+                final_cache_path=final_cache_path,
+                partial_cache_path=staging_path,
+                chunk_size=self.chunk_size,
+                io_fd=io_fd,
+                refcount=1,
+                member_stat=member_stat,
+            )
+        except BaseException as exc:
+            self._discard_staging_file(io_fd, staging_path)
+            if isinstance(exc, MemoryError):
+                self.report_open_error("cache_prepare", exc)
+                raise OSError(errno.ENOMEM, "streaming session allocation failed") from exc
+            raise
+
+        # Until it is registered, the staging session (its descriptor and
+        # file) is this open's: every way out below that does not register
+        # it discards it, whatever was raised.
+        registered = False
+        try:
+            with self.prefetch_sessions_lock:
+                if self._destroying:
+                    raise OSError(errno.EINTR, "streaming manager is shutting down")
+                existing = self.prefetch_sessions.get(canonical_path)
+                if existing:
+                    attached = self._attach(existing)
+                    if attached is not None:
+                        return attached
+                    # A failed session left the registry: register this one.
+                if os.path.lexists(final_cache_path):
+                    # A concurrent fill or local writer already owns the final path.
+                    return self._final_path_outcome(canonical_path, final_cache_path)
+                # No registered session owns the name. An orphan left by an
+                # earlier unlink failure can be replaced safely here.
                 try:
-                    staging_path.unlink(missing_ok=True)
-                except OSError:
-                    pass
-            return None
-
-        session = PrefetchSession(
-            canonical_path=canonical_path,
-            virtual_path=virtual_path,
-            backend=backend,
-            file_size=file_size,
-            final_cache_path=final_cache_path,
-            partial_cache_path=staging_path,
-            chunk_size=self.chunk_size,
-            io_fd=io_fd,
-            refcount=1,
-            member_stat=member_stat,
-        )
-
-        with self.prefetch_sessions_lock:
-            if self._destroying:
+                    os.replace(staging_path, partial_cache_path)
+                except OSError as exc:
+                    self.report_open_error("cache_register", exc)
+                    raise
+                session.partial_cache_path = partial_cache_path
+                self.prefetch_sessions[canonical_path] = session
+                registered = True
+        finally:
+            if not registered:
                 self._discard_unregistered_prefetch_session(session)
-                return None
-            existing = self.prefetch_sessions.get(canonical_path)
-            if existing:
-                self._discard_unregistered_prefetch_session(session)
-                if not self._attach(existing):
-                    return None
-                return existing
-            if os.path.lexists(final_cache_path):
-                # Filled since open() found the file uncached: a full-file
-                # fetch by a writer or another open, or create(). That file
-                # is the one to read (see _install_partial).
-                self.logger.info(
-                    "streaming session unavailable: %s was cached during setup",
-                    canonical_path,
-                )
-                self._discard_unregistered_prefetch_session(session)
-                return None
-            if not self._has_session_capacity():
-                self.logger.warning(
-                    "Streaming session limit reached (%d) during registration; falling back to full-file cache for %s",
-                    self._download_limits["max_streaming_sessions"],
-                    canonical_path,
-                )
-                self._discard_unregistered_prefetch_session(session)
-                return None
-            # Replaces any partial a detached session failed to unlink. No
-            # registered session owns the path: detaching unlinks it inside
-            # this lock, and a registered one would have been attached above.
-            try:
-                os.replace(staging_path, partial_cache_path)
-            except OSError as exc:
-                self.logger.debug(
-                    "streaming session unavailable: failed to install partial cache file %s: %s",
-                    partial_cache_path,
-                    exc,
-                )
-                self._discard_unregistered_prefetch_session(session)
-                return None
-            session.partial_cache_path = partial_cache_path
-            self.prefetch_sessions[canonical_path] = session
 
-        self.cache_manager.mark_cache_size_dirty()
-        self._record_streaming_stat("streaming_sessions_started", 1)
-
-        self.logger.info(
-            "streaming session started for %s via backend %s (size=%d, chunk=%d)",
-            canonical_path,
-            backend.name,
-            file_size,
-            session.chunk_size,
-        )
-        self._update_streaming_state_xattr(session, "awaiting-read")
-
+        # Registered: the caller owns the ref, and bookkeeping does not fail the open.
+        try:
+            self.cache_manager.mark_cache_size_dirty()
+            self._record_streaming_stat("streaming_sessions_started", 1)
+            self.logger.info(
+                "streaming session started for %s via backend %s (size=%d, chunk=%d)",
+                canonical_path,
+                backend.name,
+                file_size,
+                session.chunk_size,
+            )
+            self._update_streaming_state_xattr(session, "awaiting-read")
+        except Exception:
+            self.logger.exception("streaming session start bookkeeping failed")
         return session
 
     def _should_stop_on_last_close(self, session: PrefetchSession) -> bool:
@@ -1879,8 +2059,37 @@ class StreamingReadManager:
             and not session.finalized
             and not session.prefetch_complete
             and session.error is None
-            and not session.readers_consumed
+            and (not session.readers_consumed or self._retained_descriptors_low(session))
         )
+
+    def _retained_descriptors_low(self, session: PrefetchSession) -> bool:
+        """Whether retaining this fill would leave too few descriptors for the mount.
+
+        Caller holds prefetch_sessions_lock. Every session holds one
+        descriptor on its partial whether or not it has readers, and so does
+        a replaced session while its readers keep it, out of the registry;
+        session_descriptor_count counts them all, staging files included.
+        Retained fills are refused once those reach
+        1 / STREAMING_DESCRIPTOR_SHARE of the soft RLIMIT_NOFILE: the rest
+        stays for readers' descriptors, the database, member connections
+        and whole-file copies. The fill is discarded as an unqualified one
+        is; nothing else changes.
+        """
+        try:
+            soft, _hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        except (OSError, ValueError):
+            return False
+        if soft == resource.RLIM_INFINITY or soft <= 0:
+            return False
+        held = self.session_descriptor_count()
+        if held * STREAMING_DESCRIPTOR_SHARE < soft:
+            return False
+        self._record_streaming_stat("streaming_retained_descriptor_cancellations")
+        self.logger.warning(
+            "streaming not retaining an unfinished fill: sessions hold %d descriptors (soft limit %d)",
+            held, soft,
+        )
+        return True
 
     def _stop_background_locked(self, session: PrefetchSession) -> bool:
         """Unregister a stopped session. Caller holds the registry and session locks."""
@@ -1921,22 +2130,20 @@ class StreamingReadManager:
                     return ""
                 if session.finalized:
                     return "close"
-                if session.detached:
-                    return ""
-
-                if not self._download_terminal(session) and not self._should_stop_on_last_close(session):
-                    _, retained = self._download_session_counts()
-                    if retained > self._download_limits["max_retained_streaming_sessions"]:
-                        self._record_streaming_stat("streaming_retained_limit_cancellations")
-                        idle = self._stop_background_locked(session)
-                        return "stopped" if idle else "stopped-in-flight"
-                if self._should_stop_on_last_close(session):
-                    idle = self._stop_background_locked(session)
-                    return "stopped" if idle else "stopped-in-flight"
                 # Decided with the decrement, not after it: see worker_done.
+                # Before the detached check: a failed session that a new
+                # open replaced (_attach) is detached with readers still on
+                # it, and its last release closes its descriptor here
+                # (cleanup skips the path of a detached session).
                 if (session.error is not None and session.worker_done
                         and self._claim_failed_cleanup(session)):
                     return "cleanup-failed"
+                if session.detached:
+                    return ""
+
+                if self._should_stop_on_last_close(session):
+                    idle = self._stop_background_locked(session)
+                    return "stopped" if idle else "stopped-in-flight"
                 self._schedule_background(session)
                 return ""
 

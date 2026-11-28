@@ -383,6 +383,20 @@ class CacheManager:
         # The first tier may have freed some of the space.
         return self.evict_recomputable_files(self.get_free_space_needed(bytes_needed))
 
+    def hold_unlinked_bytes(self, size: int):
+        """Charge bytes of an unlinked file that descriptors still hold.
+
+        A cache-path scan cannot see such a file (a replaced streaming
+        session's partial, kept by its readers), so it is charged like a
+        reservation until release_unlinked_bytes.
+        """
+        with self._lock:
+            self._reserved_bytes += size
+
+    def release_unlinked_bytes(self, size: int):
+        with self._lock:
+            self._reserved_bytes -= size
+
     @contextmanager
     def admit_streaming_partial(self, file_size: int):
         """Charge the new sparse file's apparent size before another open can allocate."""

@@ -8,6 +8,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from contextlib import ExitStack
 from unittest.mock import patch
 
 from fuse import FuseOSError
@@ -17,7 +18,7 @@ from storage.cache_metadata import MEMBER_ATTRS_XATTR
 from storage.fs import StorageFS
 from storage.models import SyncStatus
 from storage.mount_profiles import parse_keep_after_close
-from storage.streaming import PrefetchSession
+from storage.streaming import PrefetchSession, StreamingOpen
 
 
 class SlowRangeLocalBackend(LocalBackend):
@@ -83,7 +84,6 @@ class TestFSStreamingIntegration(unittest.TestCase):
             start_sync=False,
             streaming_reads=True,
             streaming_chunk_size=chunk_size,
-            max_streaming_sessions=2,
             **({
                 "streaming_keep_after_close": parse_keep_after_close(keep_after_close),
                 "streaming_read_ahead_window": 4 * chunk_size,
@@ -113,7 +113,7 @@ class TestFSStreamingIntegration(unittest.TestCase):
 
     def test_download_workers_grow_for_runnable_files_and_retire_when_idle(self):
         manager = self.fs._streaming_manager
-        manager.update_download_limits(max_streaming_sessions=3, max_download_workers=2)
+        manager.update_download_limits(max_download_workers=2)
         manager._download_pool.idle_seconds = 0.05
         self.backend.worker_gate = threading.Event()
         sessions = []
@@ -136,6 +136,296 @@ class TestFSStreamingIntegration(unittest.TestCase):
             self.assertTrue(session.background_finished.wait(timeout=3))
             self.assertEqual(session.io_fd, -1)
         self.assertTrue(self._wait_for(lambda: manager._download_pool.snapshot() == (0, 0, 0)))
+
+    def test_open_preserves_descriptor_and_member_probe_errors_without_copy(self):
+        name = "failure.bin"
+        path = "/" + name
+        payload = os.urandom(128 * 1024)
+        (self.backend_dir / name).write_bytes(payload)
+        actual_open = os.open
+
+        def cannot_create(path, *args, **kwargs):
+            if Path(path).name.startswith(".storage-staging-"):
+                raise OSError(errno.EMFILE, "synthetic descriptor budget", path)
+            return actual_open(path, *args, **kwargs)
+
+        with patch.object(self.backend, "copy_to_local") as copy:
+            with patch("storage.streaming.os.open", side_effect=cannot_create), \
+                    self.assertRaises(FuseOSError) as fd_error:
+                self.fs.open(path, os.O_RDONLY)
+            self.assertEqual(fd_error.exception.errno, errno.EMFILE)
+            with patch.object(self.backend, "stat", side_effect=OSError(errno.EACCES, "denied", path)), \
+                    self.assertLogs(self.fs.logger, level="WARNING") as logs, self.assertRaises(FuseOSError) as denied:
+                self.fs.open(path, os.O_RDONLY)
+            self.assertEqual(denied.exception.errno, errno.EACCES)
+            self.assertNotIn(name, "\n".join(logs.output))
+            copy.assert_not_called()
+        stats = self.fs._streaming_stats_snapshot()
+        self.assertEqual(stats["streaming_open_error_descriptors"], 1)
+        self.assertEqual(stats["streaming_open_error_source_probe"], 1)
+        self._assert_not_cached(name)
+        self.assertEqual(self.fs._streaming_manager.list_download_sessions(), [])
+
+        fd = self.fs.open(path, os.O_RDONLY)
+        self.assertEqual(self.fs.read(path, 4096, 0, fd), payload[:4096])
+        with patch.object(self.backend, "read_file", side_effect=OSError(errno.EACCES, "denied")), \
+                self.assertRaises(FuseOSError) as denied:
+            self.fs.read(path, 4096, 4096, fd)
+        self.assertEqual(denied.exception.errno, errno.EACCES)
+        self.fs.release(path, fd)
+
+    def test_member_probe_failure_can_use_an_alternate_member(self):
+        payload = os.urandom(128 * 1024)
+        (self.backend_dir / "alternate.bin").write_bytes(payload)
+        alternate = LocalBackend("alternate", str(self.backend_dir), speed_priority=99)
+        self.fs.backends[alternate.name] = alternate
+        with patch.object(self.backend, "stat", side_effect=OSError(errno.EACCES, "denied")):
+            fd = self.fs.open("/alternate.bin", os.O_RDONLY)
+            self.assertIs(self._session_for(fd).backend, alternate)
+            self.assertEqual(self.fs.read("/alternate.bin", 4096, 0, fd), payload[:4096])
+            self.fs.release("/alternate.bin", fd)
+
+    def test_nonrange_member_goes_whole_file_without_a_stream_probe(self):
+        # The whole-file copy tolerates a failed stat (it sizes the file
+        # another way); the streaming probe must not fail the open first.
+        payload = os.urandom(96 * 1024)
+        (self.backend_dir / "nonrange.bin").write_bytes(payload)
+        self.backend.copy_delay = 0
+        with patch.object(self.backend, "supports_range_reads", return_value=False), \
+                patch.object(self.backend, "stat", side_effect=OSError(errno.EIO, "stat failed")):
+            fd = self.fs.open("/nonrange.bin", os.O_RDONLY)
+        with self.fs._fd_lock:
+            self.assertIsNone(self.fs._fd_map[fd].prefetch_session)
+        self.assertEqual(self.fs.read("/nonrange.bin", len(payload), 0, fd), payload)
+        self.fs.release("/nonrange.bin", fd)
+        self.assertEqual(self.fs._streaming_stats_snapshot()["streaming_fallback_opens"], 1)
+
+    def test_nonrange_member_without_the_file_leaves_a_range_member_to_stream(self):
+        payload = os.urandom(96 * 1024)
+        other_dir = self.temp_dir / "other"
+        other_dir.mkdir()
+        (other_dir / "elsewhere.bin").write_bytes(payload)
+        other = LocalBackend("other", str(other_dir), speed_priority=99)
+        self.fs.backends[other.name] = other
+        with patch.object(self.backend, "supports_range_reads", return_value=False):
+            fd = self.fs.open("/elsewhere.bin", os.O_RDONLY)
+        self.assertIs(self._session_for(fd).backend, other)
+        self.assertEqual(self.fs.read("/elsewhere.bin", 4096, 0, fd), payload[:4096])
+        self.fs.release("/elsewhere.bin", fd)
+
+    def _recompute_into_cache(self, payload):
+        """Patch the recompute engine to write payload into the cache path; returns the patcher."""
+        from types import SimpleNamespace
+
+        def recompute(requested_path, cache_path, timeout):
+            Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
+            Path(cache_path).write_bytes(payload)
+            return SimpleNamespace(success=True)
+
+        engine = self.fs.recompute_engine
+        stack = ExitStack()
+        stack.enter_context(patch.object(engine, "can_recompute", return_value=True))
+        self.recompute = stack.enter_context(patch.object(engine, "recompute_file", side_effect=recompute))
+        return stack
+
+    def test_unreachable_stream_sources_still_recompute_a_recomputable_file(self):
+        payload = os.urandom(32 * 1024)
+        (self.backend_dir / "derived.bin").write_bytes(payload)
+        with patch.object(self.backend, "is_available", return_value=False), \
+                patch.object(self.backend, "supports_reconnect_probe", return_value=False):
+            with self.assertRaises(FuseOSError) as unreachable:
+                self.fs.open("/derived.bin", os.O_RDONLY)
+            self.assertEqual(unreachable.exception.errno, errno.EHOSTUNREACH)
+            with self._recompute_into_cache(b"recomputed"):
+                fd = self.fs.open("/derived.bin", os.O_RDONLY)
+                self.recompute.assert_called_once()
+        with self.fs._fd_lock:
+            self.assertIsNone(self.fs._fd_map[fd].prefetch_session)
+        self.assertEqual(self.fs.read("/derived.bin", 4096, 0, fd), b"recomputed")
+        self.fs.release("/derived.bin", fd)
+
+    def test_failed_source_probe_still_recomputes_a_recomputable_file(self):
+        (self.backend_dir / "probe.bin").write_bytes(b"member")
+        with patch.object(self.backend, "stat", side_effect=OSError(errno.EACCES, "denied")):
+            with self.assertRaises(FuseOSError) as denied:
+                self.fs.open("/probe.bin", os.O_RDONLY)
+            self.assertEqual(denied.exception.errno, errno.EACCES)
+            with self._recompute_into_cache(b"recomputed"):
+                fd = self.fs.open("/probe.bin", os.O_RDONLY)
+        self.assertEqual(self.fs.read("/probe.bin", 4096, 0, fd), b"recomputed")
+        self.fs.release("/probe.bin", fd)
+
+    def test_pinned_member_missing_the_file_recomputes_without_another_member(self):
+        # Revalidation pinned the member it checked; the file is gone there
+        # by the time the stream probes it. Another member's copy is not
+        # adopted unchecked: the file is recomputed, or the open is ENOENT.
+        other_dir = self.temp_dir / "other"
+        other_dir.mkdir()
+        (other_dir / "pinned.bin").write_bytes(b"unchecked copy")
+        other = LocalBackend("other", str(other_dir), speed_priority=99)
+        self.fs.backends[other.name] = other
+        with patch.object(other, "read_file") as other_read, patch.object(other, "copy_to_local") as other_copy:
+            self.fs._refetch_pins["/pinned.bin"] = self.backend
+            with self.assertRaises(FuseOSError) as missing:
+                self.fs.open("/pinned.bin", os.O_RDONLY)
+            self.assertEqual(missing.exception.errno, errno.ENOENT)
+            self.fs._refetch_pins["/pinned.bin"] = self.backend
+            with self._recompute_into_cache(b"recomputed"):
+                fd = self.fs.open("/pinned.bin", os.O_RDONLY)
+            other_read.assert_not_called()
+            other_copy.assert_not_called()
+        self.assertEqual(self.fs.read("/pinned.bin", 4096, 0, fd), b"recomputed")
+        self.fs.release("/pinned.bin", fd)
+        self.assertNotIn("/pinned.bin", self.fs._refetch_pins)
+
+    def test_open_that_loses_admission_joins_the_session_that_won(self):
+        # R2-I1: two cold opens of one file both miss the registry; the
+        # cache has room for one partial. The loser must attach to the
+        # winner's session, not fail with ENOSPC.
+        manager = self.fs._streaming_manager
+        size = 4 * 1024 * 1024
+        with open(self.backend_dir / "contended.bin", "wb") as handle:
+            handle.truncate(size)
+        self.fs.cache_manager.max_size_bytes = size + 64 * 1024
+        real_select = manager.select_stream_source
+        winner = {}
+
+        def other_open_registers_first(canonical_path):
+            source = real_select(canonical_path)
+            if not winner:
+                winner["session"] = None
+                winner["session"] = manager._create_or_attach_prefetch_session(canonical_path, canonical_path)
+            return source
+
+        with patch.object(manager, "select_stream_source", side_effect=other_open_registers_first):
+            fd = self.fs.open("/contended.bin", os.O_RDONLY)
+        self.assertIsInstance(winner["session"], PrefetchSession)
+        self.assertIs(self._session_for(fd), winner["session"])
+        self.assertEqual(winner["session"].refcount, 2)
+        self.assertEqual(self.fs._streaming_stats_snapshot().get("streaming_open_error_cache_space", 0), 0)
+        self.assertEqual(list(self.cache_dir.glob(".storage-staging-*")), [])
+        self.fs.release("/contended.bin", fd)
+        manager._release_prefetch_session(winner["session"])
+
+    def test_staging_cleanup_survives_non_oserror_and_unrepresentable_sizes(self):
+        # R2-I3: whatever is raised after the staging file is opened, it is
+        # removed and its descriptor closed; a size no local file can have
+        # is refused before anything is created.
+        from storage.streaming import StreamSource
+        manager = self.fs._streaming_manager
+        (self.backend_dir / "huge.bin").write_bytes(b"x" * 4096)
+        before = manager.session_descriptor_count()
+        with patch("storage.streaming.os.ftruncate", side_effect=OverflowError("too big")), \
+                self.assertLogs(self.fs.logger, level="ERROR"), \
+                self.assertRaises(FuseOSError) as overflow:
+            self.fs.open("/huge.bin", os.O_RDONLY)
+        self.assertEqual(overflow.exception.errno, errno.EIO)
+        self.assertEqual(list(self.cache_dir.glob(".storage-staging-*")), [])
+        self.assertEqual(manager.session_descriptor_count(), before)
+
+        with patch.object(manager, "select_stream_source",
+                          return_value=StreamSource(self.backend, None, 1 << 63)), \
+                self.assertRaises(FuseOSError) as too_big:
+            self.fs.open("/huge.bin", os.O_RDONLY)
+        self.assertEqual(too_big.exception.errno, errno.EFBIG)
+        self.assertEqual(list(self.cache_dir.glob(".storage-staging-*")), [])
+
+    def test_enospc_at_registration_counts_as_cache_space(self):
+        (self.backend_dir / "full.bin").write_bytes(b"x" * 8192)
+        real_replace = os.replace
+
+        def full(src, dst):
+            if Path(src).name.startswith(".storage-staging-"):
+                raise OSError(errno.ENOSPC, "cache filesystem full")
+            return real_replace(src, dst)
+
+        with patch("storage.streaming.os.replace", side_effect=full), \
+                self.assertRaises(FuseOSError) as nospace:
+            self.fs.open("/full.bin", os.O_RDONLY)
+        self.assertEqual(nospace.exception.errno, errno.ENOSPC)
+        stats = self.fs._streaming_stats_snapshot()
+        self.assertEqual(stats["streaming_open_error_cache_space"], 1)
+        self.assertNotIn("streaming_open_error_cache_register", stats)
+
+    def test_probe_failure_is_not_counted_when_recompute_serves_the_open(self):
+        (self.backend_dir / "counted.bin").write_bytes(b"member")
+        with patch.object(self.backend, "stat", side_effect=OSError(errno.EACCES, "denied")):
+            with self._recompute_into_cache(b"recomputed"):
+                fd = self.fs.open("/counted.bin", os.O_RDONLY)
+            self.fs.release("/counted.bin", fd)
+            self.assertEqual(self.fs._streaming_stats_snapshot()["streaming_open_error_source_probe"], 0)
+            (self.cache_dir / "counted.bin").unlink()
+            with self.assertRaises(FuseOSError):
+                self.fs.open("/counted.bin", os.O_RDONLY)
+        self.assertEqual(self.fs._streaming_stats_snapshot()["streaming_open_error_source_probe"], 1)
+
+    def test_unexpected_session_error_is_eio_at_open(self):
+        (self.backend_dir / "odd.bin").write_bytes(b"x" * 4096)
+        with patch.object(self.fs._streaming_manager, "_create_or_attach_prefetch_session",
+                          side_effect=RuntimeError("unexpected")), \
+                self.assertLogs(self.fs.logger, level="ERROR"), \
+                self.assertRaises(FuseOSError) as failure:
+            self.fs.open("/odd.bin", os.O_RDONLY)
+        self.assertEqual(failure.exception.errno, errno.EIO)
+
+    def test_file_gone_from_member_mid_read_is_stale_not_absent(self):
+        # Other member errnos pass through read() unchanged
+        # (test_open_preserves_descriptor_and_member_probe_errors_without_copy).
+        payload = os.urandom(128 * 1024)
+        (self.backend_dir / "vanish.bin").write_bytes(payload)
+        fd = self.fs.open("/vanish.bin", os.O_RDONLY)
+        self.assertEqual(self.fs.read("/vanish.bin", 4096, 0, fd), payload[:4096])
+        (self.backend_dir / "vanish.bin").unlink()
+        with self.assertRaises(FuseOSError) as stale:
+            self.fs.read("/vanish.bin", 4096, 64 * 1024, fd)
+        self.assertEqual(stale.exception.errno, errno.ESTALE)
+        # The session error is reported the same way to a later read.
+        with self.assertRaises(FuseOSError) as again:
+            self.fs.read("/vanish.bin", 4096, 96 * 1024, fd)
+        self.assertEqual(again.exception.errno, errno.ESTALE)
+        self.fs.release("/vanish.bin", fd)
+
+    def test_file_not_found_without_an_errno_is_stale_too(self):
+        payload = os.urandom(128 * 1024)
+        (self.backend_dir / "noerrno.bin").write_bytes(payload)
+        fd = self.fs.open("/noerrno.bin", os.O_RDONLY)
+        with patch.object(self.backend, "read_file", side_effect=FileNotFoundError("/noerrno.bin")), \
+                self.assertRaises(FuseOSError) as stale:
+            self.fs.read("/noerrno.bin", 4096, 64 * 1024, fd)
+        self.assertEqual(stale.exception.errno, errno.ESTALE)
+        self.fs.release("/noerrno.bin", fd)
+
+    def test_retained_fill_is_dropped_when_sessions_near_the_descriptor_limit(self):
+        manager = self.fs._streaming_manager
+        self.backend.worker_gate = threading.Event()
+        payload = os.urandom(384 * 1024)
+        for name in ("kept.bin", "dropped.bin"):
+            (self.backend_dir / name).write_bytes(payload)
+        open_fds = []
+        for name in ("kept.bin", "dropped.bin"):
+            fd = self.fs.open("/" + name, os.O_RDONLY)
+            open_fds.append(("/" + name, fd, self._session_for(fd)))
+            self.assertEqual(self.fs.read("/" + name, 256 * 1024, 0, fd), payload[:256 * 1024])
+            self.assertTrue(self._session_for(fd).readers_consumed)
+        kept, dropped = open_fds
+        # Two registered sessions: a soft limit of 5 leaves room to retain
+        # one (they hold under half of it); a soft limit of 2 does not.
+        with patch("storage.streaming.resource.getrlimit", return_value=(5, 4096)):
+            self.fs.release(kept[0], kept[1])
+        self.assertFalse(kept[2].detached)
+        with patch("storage.streaming.resource.getrlimit", return_value=(2, 4096)), \
+                self.assertLogs(self.fs.logger, level="WARNING"):
+            self.fs.release(dropped[0], dropped[1])
+        self.assertTrue(dropped[2].detached)
+        self.assertEqual(
+            self.fs._streaming_stats_snapshot()["streaming_retained_descriptor_cancellations"], 1,
+        )
+        self.backend.worker_gate.set()
+        self.assertTrue(kept[2].background_finished.wait(timeout=5))
+        self.assertTrue(dropped[2].background_finished.wait(timeout=5))
+        self.assertEqual((self.cache_dir / "kept.bin").read_bytes(), payload)
+        self._assert_not_cached("dropped.bin")
+        self.assertEqual(manager.list_download_sessions(), [])
 
     def test_foreground_overlapping_range_can_use_interactive_reserve(self):
         payload = os.urandom(512 * 1024)
@@ -178,38 +468,74 @@ class TestFSStreamingIntegration(unittest.TestCase):
             self.assertTrue(session.background_finished.wait(timeout=3))
             self.assertEqual([call.args for call in read.call_args_list], [(path, 0, chunk), (path, chunk, chunk)])
 
-    def test_lower_retained_limit_drains_existing_fill_and_applies_to_new_closes(self):
+    def test_more_than_sixty_four_qualified_fills_can_remain_parked(self):
         manager = self.fs._streaming_manager
-        manager.update_download_limits(max_download_workers=1, max_retained_streaming_sessions=1)
+        manager.update_download_limits(max_download_workers=1)
         self.backend.worker_gate = threading.Event()
+        self.backend.range_delay = 0
         payload = os.urandom(384 * 1024)
-
-        def open_and_read(name):
+        retained = []
+        for index in range(70):
+            name = f"retained-{index}.bin"
             (self.backend_dir / name).write_bytes(payload)
             path = "/" + name
             fd = self.fs.open(path, os.O_RDONLY)
+            retained.append(self._session_for(fd))
+            self.assertEqual(self.fs.read(path, 128 * 1024, 0, fd), payload[:128 * 1024])
+            self.fs.release(path, fd)
+        self.assertTrue(self.backend.worker_in_read.wait(timeout=3))
+        self.assertEqual(self.fs._streaming_stats_snapshot()["retained_streaming_sessions"], 70)
+        self.assertEqual(manager._download_pool.snapshot(), (1, 1, 69))
+        for session in retained:
+            self.assertEqual(manager.cancel_download_session(session.session_id), "cancelled")
+        self.backend.worker_gate.set()
+        for session in retained:
+            self.assertTrue(session.background_finished.wait(timeout=3))
+            self.assertEqual(session.io_fd, -1)
+        self.assertEqual(manager.list_download_sessions(), [])
+
+    def test_automatic_workers_grow_beyond_an_explicit_throttle(self):
+        manager = self.fs._streaming_manager
+        self.backend.worker_gate = threading.Event()
+        payload = os.urandom(384 * 1024)
+        manager.update_download_limits(max_download_workers=1)
+        handles = []
+        for index in range(6):
+            path = f"/automatic-{index}.bin"
+            (self.backend_dir / path[1:]).write_bytes(payload)
+            fd = self.fs.open(path, os.O_RDONLY)
+            handles.append((path, fd, self._session_for(fd)))
+            self.assertEqual(self.fs.read(path, 32 * 1024, 0, fd), payload[:32 * 1024])
+        self.assertTrue(self._wait_for(lambda: manager._download_pool.snapshot() == (1, 1, 5)))
+        self.assertIsNone(manager.update_download_limits(max_download_workers=None)["max_download_workers"])
+        # A local member sets no capacity of its own: automatic mode gives it
+        # AUTOMATIC_UNLIMITED_MEMBER_WORKERS, not a thread per ready file.
+        self.assertTrue(self._wait_for(lambda: manager._download_pool.snapshot() == (4, 4, 2)))
+        # A member's own capacity governs where it sets one.
+        with patch.object(self.backend, "background_range_capacity", return_value=6):
+            manager.update_download_limits(max_download_workers=None)
+            self.assertTrue(self._wait_for(lambda: manager._download_pool.snapshot() == (6, 6, 0)))
+        for path, fd, _ in handles:
+            self.fs.release(path, fd)
+        self.backend.worker_gate.set()
+        for _, _, session in handles:
+            self.assertTrue(session.background_finished.wait(timeout=3))
+
+    def test_no_worker_available_closes_retained_partial_without_copying(self):
+        payload = os.urandom(384 * 1024)
+        (self.backend_dir / "unavailable-worker.bin").write_bytes(payload)
+        path = "/unavailable-worker.bin"
+        with patch.object(threading.Thread, "start", side_effect=OSError(errno.EAGAIN, "thread limit")), \
+                patch.object(self.backend, "copy_to_local") as copy:
+            fd = self.fs.open(path, os.O_RDONLY)
             session = self._session_for(fd)
             self.assertEqual(self.fs.read(path, 128 * 1024, 0, fd), payload[:128 * 1024])
-            return path, fd, session
-
-        older, fd, old_session = open_and_read("old-retained.bin")
-        self.assertTrue(self.backend.worker_in_read.wait(timeout=3))
-        self.fs.release(older, fd)
-        self.assertEqual(manager.update_download_limits(max_retained_streaming_sessions=0)
-                         ["max_retained_streaming_sessions"], 0)
-        self.assertFalse(old_session.detached)
-
-        newer, fd, new_session = open_and_read("new-retained.bin")
-        self.assertTrue(new_session.readers_consumed)
-        self.fs.release(newer, fd)
-        self.assertTrue(new_session.detached)
-        self.assertTrue(new_session.background_finished.wait(timeout=3))
-        self.assertFalse((self.cache_dir / "new-retained.bin.storage.partial").exists())
-        self.assertEqual(manager.list_download_sessions()[0]["id"], old_session.session_id)
-
-        self.backend.worker_gate.set()
-        self.assertTrue(old_session.background_finished.wait(timeout=3))
-        self.assertEqual((self.cache_dir / "old-retained.bin").read_bytes(), payload)
+            self.assertTrue(session.readers_consumed)
+            self.fs.release(path, fd)
+        copy.assert_not_called()
+        self.assertTrue(session.background_finished.is_set())
+        self.assertEqual(session.io_fd, -1)
+        self._assert_not_cached("unavailable-worker.bin")
 
     def test_reader_reclaims_retained_space_without_touching_local_writes(self):
         self.fs.cache_manager.max_size_bytes = 512 * 1024
@@ -873,34 +1199,85 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.assertTrue(cache_path.exists())
         self.assertFalse(partial_path.exists())
 
-    def test_streaming_open_retries_on_partial_enoent_with_final_fallback(self):
+    def _real_fd(self, vfd):
+        with self.fs._fd_lock:
+            return self.fs._fd_map[vfd].real_fd
+
+    def test_streaming_open_reads_the_session_inode_when_its_path_is_gone(self):
+        # The attached session's partial path no longer names its file (a
+        # rename race, or the path was removed); the reader still opens the
+        # session's own inode instead of failing or opening another file.
         payload = os.urandom(256 * 1024)
         (self.backend_dir / "race.bin").write_bytes(payload)
-
         seed_vfd = self.fs.open('/race.bin', os.O_RDONLY)
-        with self.fs._fd_lock:
-            seed_entry = self.fs._fd_map[seed_vfd]
-        self.assertIsNotNone(seed_entry.prefetch_session)
-        session = seed_entry.prefetch_session
+        session = self._session_for(seed_vfd)
+        self.assertEqual(self.fs.read('/race.bin', 4096, 0, seed_vfd), payload[:4096])
+        session.partial_cache_path.unlink()
 
-        session.final_cache_path.parent.mkdir(parents=True, exist_ok=True)
-        session.final_cache_path.write_bytes(payload)
-
-        real_os_open = os.open
-        partial_path = str(session.partial_cache_path)
-        raised_once = {"value": False}
-
-        def flaky_open(path, flags, mode=0o777):
-            if path == partial_path and not raised_once["value"]:
-                raised_once["value"] = True
-                raise FileNotFoundError(errno.ENOENT, "simulated partial rename race", path)
-            return real_os_open(path, flags, mode)
-
-        with patch("storage.fs.os.open", side_effect=flaky_open):
-            retry_vfd = self.fs.open('/race.bin', os.O_RDONLY)
-
+        retry_vfd = self.fs.open('/race.bin', os.O_RDONLY)
+        self.assertIs(self._session_for(retry_vfd), session)
+        self.assertEqual(os.fstat(self._real_fd(retry_vfd)).st_ino, os.fstat(session.io_fd).st_ino)
+        self.assertEqual(self.fs.read('/race.bin', 4096, 0, retry_vfd), payload[:4096])
         self.fs.release('/race.bin', retry_vfd)
         self.fs.release('/race.bin', seed_vfd)
+
+    def test_state_xattr_is_written_to_the_session_inode_not_its_path(self):
+        # R2-N5: a session's state never lands on another file at its path.
+        manager = self.fs._streaming_manager
+        (self.backend_dir / "state.bin").write_bytes(os.urandom(64 * 1024))
+        vfd = self.fs.open('/state.bin', os.O_RDONLY)
+        session = self._session_for(vfd)
+        partial = session.partial_cache_path
+        os.rename(partial, self.cache_dir / "aside")
+        partial.write_bytes(b"successor")
+        manager._update_streaming_state_xattr(session, "probe-state")
+        with self.assertRaises(OSError):
+            os.getxattr(str(partial), self.fs._STREAM_STATE_XATTR)
+        state = json.loads(os.getxattr(session.io_fd, self.fs._STREAM_STATE_XATTR))
+        self.assertEqual(state["status"], "probe-state")
+        partial.unlink()
+        os.rename(self.cache_dir / "aside", partial)
+        self.fs.release('/state.bin', vfd)
+
+    def test_attached_open_keeps_its_session_inode_when_a_successor_takes_the_path(self):
+        # Council round 2 on #190 (R2-C1): an open attaches to session A and,
+        # before it opens a descriptor, A fails and another open replaces it
+        # with B at the same partial path. Opened by path, the first opener
+        # would read B's sparse file through A's range map: zeros for bytes
+        # A has. It must get A's inode.
+        self.backend.copy_delay = 0
+        manager = self.fs._streaming_manager
+        payload = os.urandom(192 * 1024)
+        (self.backend_dir / "swap.bin").write_bytes(payload)
+        vfd_a = self.fs.open('/swap.bin', os.O_RDONLY)
+        session_a = self._session_for(vfd_a)
+        self.assertEqual(self.fs.read('/swap.bin', 4096, 0, vfd_a), payload[:4096])
+
+        real_create = manager._create_or_attach_prefetch_session
+        successor = {}
+
+        def attach_then_replace(virtual_path, canonical_path):
+            attached = real_create(virtual_path, canonical_path)
+            self.assertIs(attached, session_a)
+            with session_a.lock:
+                session_a.error = OSError(errno.EHOSTUNREACH, "simulated drop")
+                manager._schedule_background(session_a)
+            successor["session"] = real_create(virtual_path, canonical_path)
+            return attached
+
+        with patch.object(manager, "_create_or_attach_prefetch_session", side_effect=attach_then_replace):
+            vfd_c = self.fs.open('/swap.bin', os.O_RDONLY)
+        session_b = successor["session"]
+        self.assertIsInstance(session_b, PrefetchSession)
+        self.assertIsNot(session_b, session_a)
+        self.assertIs(self._session_for(vfd_c), session_a)
+        self.assertEqual(os.stat(session_a.partial_cache_path).st_ino, os.fstat(session_b.io_fd).st_ino)
+        self.assertEqual(os.fstat(self._real_fd(vfd_c)).st_ino, os.fstat(session_a.io_fd).st_ino)
+        # A's bytes, not B's hole.
+        self.assertEqual(self.fs.read('/swap.bin', 4096, 0, vfd_c), payload[:4096])
+        self.fs.release('/swap.bin', vfd_c)
+        self.fs.release('/swap.bin', vfd_a)
+        manager._release_prefetch_session(session_b)
 
     def test_streaming_release_drops_reader_ref_when_close_fails(self):
         payload = os.urandom(128 * 1024)
@@ -2093,7 +2470,7 @@ class TestFSStreamingIntegration(unittest.TestCase):
         # a stream of the member's older bytes that would later replace it.
         self.backend.copy_delay = 0
         manager = self.fs._streaming_manager
-        real_select = manager.select_backend_for_read
+        real_select = manager.select_stream_source
         in_setup = threading.Event()
         go = threading.Event()
         self.addCleanup(go.set)
@@ -2119,7 +2496,7 @@ class TestFSStreamingIntegration(unittest.TestCase):
             except Exception as exc:
                 results["reader"] = exc
 
-        with patch.object(manager, "select_backend_for_read", side_effect=paused_select):
+        with patch.object(manager, "select_stream_source", side_effect=paused_select):
             late = threading.Thread(target=reader, name="late-reader")
             late.start()
             self.assertTrue(in_setup.wait(timeout=3.0))
@@ -2140,7 +2517,7 @@ class TestFSStreamingIntegration(unittest.TestCase):
     def test_streaming_open_racing_destroy_registers_no_session(self):
         # An open misses the registry and prepares its partial; destroy runs
         # to the end before the open registers. The open must not register
-        # a session (nothing would ever stop it): it takes the full-file path.
+        # a session or retry the interrupted open as a whole-file copy.
         self.backend.copy_delay = 0
         manager = self.fs._streaming_manager
         import storage.streaming as streaming_module
@@ -2173,13 +2550,10 @@ class TestFSStreamingIntegration(unittest.TestCase):
             thread.join(timeout=5.0)
         self.assertFalse(thread.is_alive())
 
-        vfd = results["open"]
-        self.assertIsInstance(vfd, int, vfd)
-        with self.fs._fd_lock:
-            self.assertIsNone(self.fs._fd_map[vfd].prefetch_session)
-        self.assertEqual(self.fs.read('/unmount.bin', len(payload), 0, vfd), payload)
-        self.fs.release('/unmount.bin', vfd)
-        self._assert_cache_holds("unmount.bin", payload, dirty=False)
+        self.assertIsInstance(results["open"], FuseOSError)
+        self.assertEqual(results["open"].errno, errno.EINTR)
+        self.assertEqual(list(self.cache_dir.glob("*.storage.partial")), [])
+        self._assert_not_cached("unmount.bin")
 
     def test_streaming_destroy_leaves_an_open_during_destroy_alone(self):
         # destroy has taken the sessions and is waiting for a worker when an
@@ -2206,24 +2580,25 @@ class TestFSStreamingIntegration(unittest.TestCase):
             destroyer = threading.Thread(target=manager.destroy, name="destroyer")
             destroyer.start()
             self.assertTrue(in_join.wait(timeout=3.0))
-            vfd_b = self.fs.open('/during.bin', os.O_RDONLY)
+            with self.assertRaises(FuseOSError) as interrupted:
+                self.fs.open('/during.bin', os.O_RDONLY)
+            self.assertEqual(interrupted.exception.errno, errno.EINTR)
             go.set()
             destroyer.join(timeout=5.0)
         self.assertFalse(destroyer.is_alive())
-
-        with self.fs._fd_lock:
-            self.assertIsNone(self.fs._fd_map[vfd_b].prefetch_session)
         self.assertTrue(session_a.detached)
-        self.assertEqual(self.fs.read('/during.bin', len(payload), 0, vfd_b), payload)
         self.fs.release('/during.bin', vfd_a)
-        self.fs.release('/during.bin', vfd_b)
-        self._assert_cache_holds("during.bin", payload, dirty=False)
+        self._assert_not_cached("during.bin")
 
-    def test_streaming_open_does_not_attach_to_a_session_being_cleaned_up(self):
+    def test_streaming_open_waits_for_a_session_being_cleaned_up(self):
         # The worker's tail has decided to clean up a failed session (no
         # readers) and is promoting its prefix when an open comes in. The
-        # open must not attach: promotion truncates the partial to its
-        # contiguous prefix, so reads past it would come back short.
+        # open must not attach (promotion truncates the partial to its
+        # contiguous prefix, so reads past it would come back short), and
+        # must not detach the session from under the promotion. It waits
+        # for the cleanup, and then the prefix the cleanup promoted is not
+        # the file (council round 2 on #190, R2-C2): the open drops it and
+        # streams the whole file again, never serving the short prefix.
         self.backend.copy_delay = 0
         manager = self.fs._streaming_manager
         real_promote = manager._promote_failed_session_cache_prefix
@@ -2239,6 +2614,14 @@ class TestFSStreamingIntegration(unittest.TestCase):
         payload = os.urandom(192 * 1024)
         (self.backend_dir / "cleanup.bin").write_bytes(payload)
         hold, at_finalize, go_tail = self._hold_finalize()
+        results = {}
+
+        def opener():
+            try:
+                results["open"] = self.fs.open('/cleanup.bin', os.O_RDONLY)
+            except Exception as exc:
+                results["open"] = exc
+
         with hold, patch.object(manager, "_promote_failed_session_cache_prefix", side_effect=held_promote):
             vfd_a = self.fs.open('/cleanup.bin', os.O_RDONLY)
             session = self._session_for(vfd_a)
@@ -2256,44 +2639,605 @@ class TestFSStreamingIntegration(unittest.TestCase):
             go_tail.set()
             self.assertTrue(in_promote.wait(timeout=3.0))
 
-            vfd_b = self.fs.open('/cleanup.bin', os.O_RDONLY)
-            go_promote.set()
+            with patch.object(self.backend, "copy_to_local") as copy:
+                thread = threading.Thread(target=opener, name="waiting-open")
+                thread.start()
+                thread.join(timeout=0.3)
+                self.assertTrue(thread.is_alive(), "open did not wait for the claimed cleanup")
+                self.assertEqual(session.refcount, 0)
+                go_promote.set()
+                thread.join(timeout=5.0)
+                self.assertFalse(thread.is_alive())
+                copy.assert_not_called()
             self.assertTrue(session.background_finished.wait(timeout=5.0))
-        self.assertTrue(session.background_finished.is_set())
         self.assertTrue(session.detached)
-
-        with self.fs._fd_lock:
-            self.assertIsNone(self.fs._fd_map[vfd_b].prefetch_session)
-        self.assertEqual(
-            self.fs.read('/cleanup.bin', 4096, 16 * 1024, vfd_b), payload[16 * 1024:20 * 1024],
-        )
+        vfd_b = results["open"]
+        self.assertIsInstance(vfd_b, int)
+        session_b = self._session_for(vfd_b)
+        self.assertIsNot(session_b, session)
+        data = b""
+        while len(data) < len(payload):
+            chunk = self.fs.read('/cleanup.bin', 32 * 1024, len(data), vfd_b)
+            self.assertTrue(chunk)
+            data += chunk
+        self.assertEqual(data, payload)
         self.fs.release('/cleanup.bin', vfd_b)
-        # The full fetch filled the path first; the promotion left it alone.
-        self._assert_cache_holds("cleanup.bin", payload, dirty=False)
+        self.assertTrue(session_b.background_finished.wait(timeout=5.0))
+        self.assertEqual((self.cache_dir / "cleanup.bin").read_bytes(), payload)
+        stats = self.fs._streaming_stats_snapshot()
+        self.assertEqual(stats["streaming_open_cleanup_waits"], 1)
+        self.assertEqual(stats["streaming_prefix_refetches"], 1)
 
-    def test_streaming_open_does_not_attach_to_a_failed_session(self):
-        # The session has an error and a reader still attached, so its
-        # cleanup is not claimed yet. An open attaching now would get EIO on
-        # every range the session lacks; it takes the full-file path.
+    def _hold_promotion(self, name, payload):
+        """Fail a session on name after a 4 KiB prefix and hold its promotion.
+
+        Returns (session, in_promote, go_promote, stack); the caller enters
+        stack (it holds the patches) before calling.
+        """
+        manager = self.fs._streaming_manager
+        real_promote = manager._promote_failed_session_cache_prefix
+        in_promote = threading.Event()
+        go_promote = threading.Event()
+        self.addCleanup(go_promote.set)
+
+        def held_promote(session):
+            in_promote.set()
+            go_promote.wait(timeout=10.0)
+            return real_promote(session)
+
+        stack = ExitStack()
+        # Closed even if the setup below fails before the caller gets the stack.
+        self.addCleanup(stack.close)
+        stack.enter_context(patch.object(manager, "_promote_failed_session_cache_prefix", side_effect=held_promote))
+        hold, at_finalize, go_tail = self._hold_finalize()
+        stack.enter_context(hold)
+        vfd = self.fs.open('/' + name, os.O_RDONLY)
+        session = self._session_for(vfd)
+        self.assertEqual(self.fs.read('/' + name, 4096, 0, vfd), payload[:4096])
+        with session.lock:
+            session.error = OSError(errno.EIO, "simulated failure")
+            manager._schedule_background(session)
+        self.assertTrue(at_finalize.wait(timeout=3.0))
+        # The worker is short of its tail, so this release leaves cleanup
+        # (and the held promotion) to the worker.
+        self.fs.release('/' + name, vfd)
+        go_tail.set()
+        return session, in_promote, go_promote, stack
+
+    def test_post_wait_retry_on_a_nonrange_member_does_not_take_the_prefix(self):
+        # R3-C1: the open waits out a failed session's cleanup; meanwhile
+        # the range member is gone and the retry selects a member without
+        # range reads. The whole-file path would serve the promoted prefix
+        # as the cached file; the open drops it and copies the whole file.
+        self.backend.copy_delay = 0
+        payload = os.urandom(192 * 1024)
+        (self.backend_dir / "nonrange-wait.bin").write_bytes(payload)
+        results = {}
+
+        def opener():
+            try:
+                results["open"] = self.fs.open('/nonrange-wait.bin', os.O_RDONLY)
+            except Exception as exc:
+                results["open"] = exc
+
+        with patch.object(self.backend, "copy_to_local", wraps=self.backend.copy_to_local) as copy:
+            session, in_promote, go_promote, stack = self._hold_promotion("nonrange-wait.bin", payload)
+            with stack:
+                self.assertTrue(in_promote.wait(timeout=3.0))
+                thread = threading.Thread(target=opener, name="waiting-open")
+                with patch.object(self.backend, "supports_range_reads", return_value=False):
+                    thread.start()
+                    thread.join(timeout=0.3)
+                    self.assertTrue(thread.is_alive())
+                    go_promote.set()
+                    thread.join(timeout=5.0)
+                self.assertFalse(thread.is_alive())
+            copy.assert_called_once()
+        fd = results["open"]
+        self.assertIsInstance(fd, int)
+        self.assertEqual(self.fs.read('/nonrange-wait.bin', len(payload), 0, fd), payload)
+        self.fs.release('/nonrange-wait.bin', fd)
+        self.assertEqual((self.cache_dir / "nonrange-wait.bin").read_bytes(), payload)
+        self.assertEqual(self.fs._streaming_stats_snapshot()["streaming_prefix_refetches"], 1)
+
+    def test_prefix_that_is_no_longer_a_prefix_is_retried_not_eagain(self):
+        # R3-N1: the drop finds no prefix any more (indexed or replaced):
+        # the open tries again instead of returning EAGAIN.
+        manager = self.fs._streaming_manager
+        payload = os.urandom(64 * 1024)
+        (self.backend_dir / "changed.bin").write_bytes(payload)
+        real_create = manager._create_or_attach_prefetch_session
+        outcomes = [StreamingOpen.PREFIX_CACHED]
+
+        def first_prefix(virtual_path, canonical_path):
+            if outcomes:
+                return outcomes.pop()
+            return real_create(virtual_path, canonical_path)
+
+        with patch.object(manager, "_create_or_attach_prefetch_session", side_effect=first_prefix):
+            fd = self.fs.open('/changed.bin', os.O_RDONLY)
+        self.assertEqual(self.fs.read('/changed.bin', len(payload), 0, fd), payload)
+        self.fs.release('/changed.bin', fd)
+
+    def test_failed_recompute_keeps_a_cached_prefix(self):
+        # R3-I4: recompute moves the prefix aside for the command and puts
+        # it back when the command fails, so offline opens keep its bytes;
+        # a successful recompute replaces it; a held prefix is not touched.
+        from types import SimpleNamespace
+        from storage.cache_metadata import PREFIX_XATTR
+        cache_path = self.cache_dir / "derived-prefix.bin"
+        cache_path.write_bytes(b"prefix")
+        os.setxattr(str(cache_path), PREFIX_XATTR, b"1")
+        resolved = self.fs._resolve_path('/derived-prefix.bin')
+        engine = self.fs.recompute_engine
+        seen = []
+
+        def failing(requested_path, path, timeout):
+            seen.append(Path(path).exists())
+            return SimpleNamespace(success=False)
+
+        with patch.object(engine, "can_recompute", return_value=True), \
+                patch.object(engine, "recompute_file", side_effect=failing):
+            self.assertFalse(self.fs._try_recompute(resolved))
+        self.assertEqual(seen, [False])  # the command ran with the path vacant
+        self.assertEqual(cache_path.read_bytes(), b"prefix")
+        os.getxattr(str(cache_path), PREFIX_XATTR)
+        self.assertEqual(list(self.cache_dir.glob(".storage-prefix-*")), [])
+
+        held = self.fs.open('/derived-prefix.bin', os.O_RDONLY)
+        with patch.object(engine, "can_recompute", return_value=True), \
+                patch.object(engine, "recompute_file") as never:
+            self.assertFalse(self.fs._try_recompute(resolved))
+            never.assert_not_called()
+        self.fs.release('/derived-prefix.bin', held)
+
+        with self._recompute_into_cache(b"whole recomputed file"):
+            self.assertTrue(self.fs._try_recompute(resolved))
+        self.assertEqual(cache_path.read_bytes(), b"whole recomputed file")
+        self.assertEqual(list(self.cache_dir.glob(".storage-prefix-*")), [])
+
+    def _prefix_and_resolved(self, name):
+        from storage.cache_metadata import PREFIX_XATTR
+        cache_path = self.cache_dir / name
+        cache_path.write_bytes(b"prefix")
+        os.setxattr(str(cache_path), PREFIX_XATTR, b"1")
+        return cache_path, self.fs._resolve_path('/' + name)
+
+    def _assert_prefix_restored(self, cache_path):
+        from storage.cache_metadata import PREFIX_XATTR
+        self.assertEqual(cache_path.read_bytes(), b"prefix")
+        os.getxattr(str(cache_path), PREFIX_XATTR)
+        self.assertEqual(list(self.cache_dir.glob(".storage-prefix-*")), [])
+
+    def test_failed_recompute_output_is_replaced_by_the_saved_prefix(self):
+        # R4-I1: a command that writes some output and then fails left a
+        # file the restore could not link over, and the saved prefix was
+        # discarded. Its output is not the file: removed, prefix restored.
+        from types import SimpleNamespace
+        cache_path, resolved = self._prefix_and_resolved("partial-output.bin")
+        engine = self.fs.recompute_engine
+
+        def leaves_output(requested_path, path, timeout):
+            Path(path).write_bytes(b"half a file")
+            return SimpleNamespace(success=False)
+
+        with patch.object(engine, "can_recompute", return_value=True), \
+                patch.object(engine, "recompute_file", side_effect=leaves_output):
+            self.assertFalse(self.fs._try_recompute(resolved))
+        self._assert_prefix_restored(cache_path)
+
+    def test_prefix_restore_without_hard_links_uses_rename_noreplace(self):
+        from types import SimpleNamespace
+        cache_path, resolved = self._prefix_and_resolved("nolinks.bin")
+        engine = self.fs.recompute_engine
+        renamed = []
+
+        def noreplace(src, dst):
+            # A stand-in, so the test does not depend on the host's renameat2.
+            renamed.append((Path(src).name.startswith(".storage-prefix-"), Path(dst)))
+            if os.path.lexists(dst):
+                return False
+            os.rename(src, dst)
+            return True
+
+        with patch.object(engine, "can_recompute", return_value=True), \
+                patch.object(engine, "recompute_file", return_value=SimpleNamespace(success=False)), \
+                patch("storage.fs.os.link", side_effect=OSError(errno.EPERM, "no hard links")), \
+                patch("storage.fs.rename_noreplace", side_effect=noreplace):
+            self.assertFalse(self.fs._try_recompute(resolved))
+        self.assertEqual(renamed, [(True, cache_path)])
+        self._assert_prefix_restored(cache_path)
+
+    def test_failed_prefix_restore_keeps_the_saved_copy(self):
+        # Neither hard links nor RENAME_NOREPLACE: the prefix cannot go back
+        # without a check-then-rename, so the saved copy stays (logged)
+        # instead of being deleted.
+        from types import SimpleNamespace
+        cache_path, resolved = self._prefix_and_resolved("stuck-prefix.bin")
+        engine = self.fs.recompute_engine
+        with patch.object(engine, "can_recompute", return_value=True), \
+                patch.object(engine, "recompute_file", return_value=SimpleNamespace(success=False)), \
+                patch("storage.fs.os.link", side_effect=OSError(errno.EPERM, "no hard links")), \
+                patch("storage.fs.rename_noreplace", side_effect=OSError(errno.EINVAL, "unsupported")), \
+                self.assertLogs(self.fs.logger, level="WARNING"):
+            self.assertFalse(self.fs._try_recompute(resolved))
+        self.assertFalse(cache_path.exists())
+        saved = list(self.cache_dir.glob(".storage-prefix-*"))
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(saved[0].read_bytes(), b"prefix")
+
+    def test_cold_opens_of_one_file_are_serialized_through_staging(self):
+        # R3-I1 (disputed): a second open of the same file cannot fail
+        # admission against a first open paused between staging and
+        # registration, because fs.open holds the file's path lock for the
+        # whole open; it then joins the first open's session.
+        manager = self.fs._streaming_manager
+        payload = os.urandom(64 * 1024)
+        (self.backend_dir / "serial.bin").write_bytes(payload)
+        real_truncate = os.ftruncate
+        staged = threading.Event()
+        go = threading.Event()
+        self.addCleanup(go.set)
+        entered = []
+        real_create = manager._create_or_attach_prefetch_session
+
+        def paused_truncate(fd, size):
+            if not staged.is_set():
+                staged.set()
+                go.wait(timeout=10.0)
+            return real_truncate(fd, size)
+
+        def counted(virtual_path, canonical_path):
+            entered.append(threading.current_thread().name)
+            return real_create(virtual_path, canonical_path)
+
+        results = {}
+
+        def open_as(name):
+            try:
+                results[name] = self.fs.open('/serial.bin', os.O_RDONLY)
+            except Exception as exc:
+                results[name] = exc
+
+        with patch("storage.streaming.os.ftruncate", side_effect=paused_truncate), \
+                patch.object(manager, "_create_or_attach_prefetch_session", side_effect=counted):
+            first = threading.Thread(target=open_as, args=("first",), name="first")
+            first.start()
+            self.assertTrue(staged.wait(timeout=3.0))
+            second = threading.Thread(target=open_as, args=("second",), name="second")
+            second.start()
+            second.join(timeout=0.3)
+            self.assertTrue(second.is_alive())
+            self.assertEqual(entered, ["first"])
+            go.set()
+            first.join(timeout=5.0)
+            second.join(timeout=5.0)
+        self.assertIsInstance(results["first"], int)
+        self.assertIsInstance(results["second"], int)
+        self.assertIs(self._session_for(results["first"]), self._session_for(results["second"]))
+        for name in ("second", "first"):
+            self.fs.release('/serial.bin', results[name])
+
+    def test_replaced_session_is_charged_before_its_partial_is_unlinked(self):
+        # R3-I2: a cache scan between the unlink and the charge would see
+        # the space as free while the old reader still pins it.
+        manager = self.fs._streaming_manager
+        payload = os.urandom(64 * 1024)
+        (self.backend_dir / "charged.bin").write_bytes(payload)
+        vfd_a = self.fs.open('/charged.bin', os.O_RDONLY)
+        session_a = self._session_for(vfd_a)
+        self.assertEqual(self.fs.read('/charged.bin', 4096, 0, vfd_a), payload[:4096])
+        with session_a.lock:
+            session_a.error = OSError(errno.EIO, "simulated failure")
+            manager._schedule_background(session_a)
+        self.assertTrue(session_a.background_finished.wait(timeout=3.0))
+        real_unlink = manager._unregister_and_unlink
+        reserved_at_unlink = []
+
+        def unlink(session):
+            if session is session_a:
+                reserved_at_unlink.append(self.fs.cache_manager._reserved_bytes)
+            return real_unlink(session)
+
+        with patch.object(manager, "_unregister_and_unlink", side_effect=unlink):
+            vfd_b = self.fs.open('/charged.bin', os.O_RDONLY)
+        self.assertEqual(reserved_at_unlink, [session_a.file_size])
+        self.fs.release('/charged.bin', vfd_a)
+        self.assertEqual(self.fs.cache_manager._reserved_bytes, 0)
+        self.fs.release('/charged.bin', vfd_b)
+
+    def test_non_oserror_at_registration_leaves_nothing_behind(self):
+        # R3-I3: whatever the registration rename raises, the staging file
+        # and descriptor go and nothing is registered.
+        manager = self.fs._streaming_manager
+        (self.backend_dir / "audit.bin").write_bytes(b"x" * 8192)
+        before = manager.session_descriptor_count()
+        with patch("storage.streaming.os.replace", side_effect=RuntimeError("audit hook")), \
+                self.assertLogs(self.fs.logger, level="ERROR"), \
+                self.assertRaises(FuseOSError) as failure:
+            self.fs.open('/audit.bin', os.O_RDONLY)
+        self.assertEqual(failure.exception.errno, errno.EIO)
+        self.assertEqual(list(self.cache_dir.glob("*.storage.partial")), [])
+        self.assertEqual(manager.session_descriptor_count(), before)
+        self.assertEqual(manager.list_download_sessions(), [])
+
+    def test_attach_in_the_finalize_window_opens_the_installed_file(self):
+        # R3-I5: finalize decided to close the descriptor (no readers) and
+        # is recording the file when an open attaches; the descriptor is
+        # then closed under the attached reader. Its open takes the cache
+        # file finalize installed instead of failing with ENOENT.
+        self.backend.copy_delay = 0
+        manager = self.fs._streaming_manager
+        payload = os.urandom(64 * 1024)
+        (self.backend_dir / "window.bin").write_bytes(payload)
+        in_record = threading.Event()
+        go = threading.Event()
+        self.addCleanup(go.set)
+        real_on_finalized = manager.on_finalized
+
+        def held_record(session):
+            in_record.set()
+            go.wait(timeout=10.0)
+            return real_on_finalized(session)
+
+        hold, at_finalize, go_tail = self._hold_finalize()
+        with hold, patch.object(manager, "on_finalized", side_effect=held_record):
+            vfd = self.fs.open('/window.bin', os.O_RDONLY)
+            session = self._session_for(vfd)
+            self.assertEqual(self.fs.read('/window.bin', len(payload), 0, vfd), payload)
+            self.assertTrue(at_finalize.wait(timeout=3.0))
+            self.fs.release('/window.bin', vfd)
+            go_tail.set()
+            self.assertTrue(in_record.wait(timeout=3.0))
+            attached = manager._create_or_attach_prefetch_session('/window.bin', '/window.bin')
+            self.assertIs(attached, session)
+            go.set()
+            self.assertTrue(session.background_finished.wait(timeout=5.0))
+        self.assertEqual(session.io_fd, -1)
+        # The caller opens the installed file by name (under _fd_lock).
+        self.assertEqual(manager.open_session_inode(session, os.O_RDONLY), -1)
+        manager._release_prefetch_session(session)
+
+    def test_fs_open_in_the_finalize_window_reads_the_installed_file(self):
+        # R4-N2: the same window through fs.open: the entry records the
+        # final path, the by-name open happens under _fd_lock (R4-I2), and
+        # a read through the handle returns the whole file.
+        self.backend.copy_delay = 0
+        manager = self.fs._streaming_manager
+        payload = os.urandom(64 * 1024)
+        (self.backend_dir / "fswindow.bin").write_bytes(payload)
+        in_record = threading.Event()
+        go = threading.Event()
+        self.addCleanup(go.set)
+        real_on_finalized = manager.on_finalized
+        real_create = manager._create_or_attach_prefetch_session
+        real_os_open = os.open
+        by_name_under_fd_lock = []
+
+        def held_record(session):
+            in_record.set()
+            go.wait(timeout=10.0)
+            return real_on_finalized(session)
+
+        def attach_then_finish(virtual_path, canonical_path):
+            attached = real_create(virtual_path, canonical_path)
+            go.set()
+            self.assertTrue(attached.background_finished.wait(timeout=5.0))
+            return attached
+
+        def watched_open(path, *args, **kwargs):
+            if str(path) == str(self.cache_dir / "fswindow.bin"):
+                by_name_under_fd_lock.append(self.fs._fd_lock.locked())
+            return real_os_open(path, *args, **kwargs)
+
+        hold, at_finalize, go_tail = self._hold_finalize()
+        with hold, patch.object(manager, "on_finalized", side_effect=held_record):
+            vfd = self.fs.open('/fswindow.bin', os.O_RDONLY)
+            session = self._session_for(vfd)
+            self.assertEqual(self.fs.read('/fswindow.bin', len(payload), 0, vfd), payload)
+            self.assertTrue(at_finalize.wait(timeout=3.0))
+            self.fs.release('/fswindow.bin', vfd)
+            go_tail.set()
+            self.assertTrue(in_record.wait(timeout=3.0))
+            # The open's cache check ran before the install.
+            with patch.object(self.fs.cache_manager, "is_cached", return_value=False), \
+                    patch.object(manager, "_create_or_attach_prefetch_session", side_effect=attach_then_finish), \
+                    patch("storage.fs.os.open", side_effect=watched_open):
+                vfd_b = self.fs.open('/fswindow.bin', os.O_RDONLY)
+        self.assertEqual(session.io_fd, -1)
+        self.assertEqual(by_name_under_fd_lock, [True])
+        with self.fs._fd_lock:
+            entry = self.fs._fd_map[vfd_b]
+        self.assertIs(entry.prefetch_session, session)
+        self.assertEqual(entry.cache_path, session.final_cache_path)
+        self.assertEqual(self.fs.read('/fswindow.bin', len(payload), 0, vfd_b), payload)
+        self.fs.release('/fswindow.bin', vfd_b)
+
+    def test_session_reopen_waits_for_its_io_lock_outside_the_descriptor_table_lock(self):
+        # R3-N2: a reopen blocked on a busy session must not hold _fd_lock.
+        manager = self.fs._streaming_manager
+        payload = os.urandom(64 * 1024)
+        (self.backend_dir / "busy.bin").write_bytes(payload)
+        vfd_a = self.fs.open('/busy.bin', os.O_RDONLY)
+        session = self._session_for(vfd_a)
+        real_reopen = manager.open_session_inode
+        reopening = threading.Event()
+
+        def reopen(sess, flags):
+            reopening.set()
+            return real_reopen(sess, flags)
+
+        results = {}
+        with patch.object(manager, "open_session_inode", side_effect=reopen):
+            session.io_lock.acquire()
+            try:
+                thread = threading.Thread(
+                    target=lambda: results.setdefault("fd", self.fs.open('/busy.bin', os.O_RDONLY)),
+                )
+                thread.start()
+                self.assertTrue(reopening.wait(timeout=3.0))
+                thread.join(timeout=0.2)
+                self.assertTrue(thread.is_alive())
+                self.assertTrue(self.fs._fd_lock.acquire(timeout=1.0))
+                self.fs._fd_lock.release()
+            finally:
+                session.io_lock.release()
+            thread.join(timeout=5.0)
+        self.fs.release('/busy.bin', results["fd"])
+        self.fs.release('/busy.bin', vfd_a)
+
+    def test_session_reopen_without_procfs_is_eio(self):
+        # R3-N3: streaming opens need /proc/self/fd; without it, a logged EIO.
+        payload = os.urandom(64 * 1024)
+        (self.backend_dir / "noproc.bin").write_bytes(payload)
+        real_open = os.open
+
+        def no_proc(path, *args, **kwargs):
+            if str(path).startswith("/proc/self/fd/"):
+                raise FileNotFoundError(errno.ENOENT, "no procfs", path)
+            return real_open(path, *args, **kwargs)
+
+        real_isdir = os.path.isdir
+        with patch("storage.streaming.os.open", side_effect=no_proc), \
+                patch("storage.streaming.os.path.isdir",
+                      side_effect=lambda p: False if p == "/proc/self/fd" else real_isdir(p)), \
+                self.assertLogs(self.fs.logger, level="ERROR"), \
+                self.assertRaises(FuseOSError) as failure:
+            self.fs.open('/noproc.bin', os.O_RDONLY)
+        self.assertEqual(failure.exception.errno, errno.EIO)
+        self.assertEqual(self.fs._streaming_manager.list_download_sessions(), [])
+
+    def test_streaming_open_never_serves_a_prefix_it_cannot_replace(self):
+        # A promoted prefix lands at the cache path after the open's cache
+        # check. Dropped and streamed again when nothing holds it; EAGAIN,
+        # not the short file, when a descriptor does.
+        from storage.cache_metadata import PREFIX_XATTR
+        manager = self.fs._streaming_manager
+        payload = os.urandom(96 * 1024)
+        (self.backend_dir / "short.bin").write_bytes(payload)
+        cache_path = self.cache_dir / "short.bin"
+        real_select = manager.select_stream_source
+        planted = []
+
+        def plant_prefix(canonical_path):
+            source = real_select(canonical_path)
+            if not planted:
+                planted.append(True)
+                cache_path.write_bytes(payload[:4096])
+                os.setxattr(str(cache_path), PREFIX_XATTR, b"1")
+            return source
+
+        with patch.object(manager, "select_stream_source", side_effect=plant_prefix):
+            fd = self.fs.open('/short.bin', os.O_RDONLY)
+        self.assertIsNotNone(self._session_for(fd))
+        self.assertEqual(self.fs.read('/short.bin', len(payload), 0, fd), payload)
+        self.fs.release('/short.bin', fd)
+        self.assertEqual(self.fs._streaming_stats_snapshot()["streaming_prefix_refetches"], 1)
+
+        other = self.cache_dir / "held.bin"
+        other.write_bytes(b"p" * 100)
+        os.setxattr(str(other), PREFIX_XATTR, b"1")
+        held = self.fs.open('/held.bin', os.O_RDONLY)  # an ordinary open of the prefix
+        resolved = self.fs._resolve_path('/held.bin')
+        with patch.object(manager, "_create_or_attach_prefetch_session",
+                          return_value=StreamingOpen.PREFIX_CACHED), \
+                self.assertRaises(FuseOSError) as busy:
+            self.fs._open_stream(resolved)
+        self.assertEqual(busy.exception.errno, errno.EAGAIN)
+        self.assertEqual(other.read_bytes(), b"p" * 100)
+        self.fs.release('/held.bin', held)
+
+    def test_failed_probe_does_not_serve_a_prefix_cached_meanwhile(self):
+        from storage.cache_metadata import PREFIX_XATTR
+        manager = self.fs._streaming_manager
+        cache_path = self.cache_dir / "gone.bin"
+        (self.backend_dir / "gone.bin").write_bytes(b"x" * 8192)
+
+        def prefix_then_fail(canonical_path):
+            cache_path.write_bytes(b"x" * 100)
+            os.setxattr(str(cache_path), PREFIX_XATTR, b"1")
+            raise OSError(errno.EHOSTUNREACH, "member down")
+
+        with patch.object(manager, "select_stream_source", side_effect=prefix_then_fail), \
+                self.assertRaises(FuseOSError) as down:
+            self.fs.open('/gone.bin', os.O_RDONLY)
+        self.assertEqual(down.exception.errno, errno.EHOSTUNREACH)
+        self.assertTrue(cache_path.exists())  # kept for offline opens
+
+    def test_streaming_open_gives_up_on_a_cleanup_that_does_not_finish(self):
+        manager = self.fs._streaming_manager
+        payload = os.urandom(64 * 1024)
+        (self.backend_dir / "stuck.bin").write_bytes(payload)
+        vfd_a = self.fs.open('/stuck.bin', os.O_RDONLY)
+        session = self._session_for(vfd_a)
+        with session.lock:
+            session.failed_cleanup_claimed = True
+        with patch("storage.streaming.STREAMING_CLEANUP_WAIT_SECONDS", 0.1), \
+                patch.object(self.backend, "copy_to_local") as copy, \
+                self.assertRaises(FuseOSError) as retry:
+            self.fs.open('/stuck.bin', os.O_RDONLY)
+        self.assertEqual(retry.exception.errno, errno.EAGAIN)
+        copy.assert_not_called()
+        self.assertEqual(self.fs._streaming_stats_snapshot()["streaming_open_error_existing_session"], 1)
+        with session.lock:
+            session.failed_cleanup_claimed = False
+        self.fs.release('/stuck.bin', vfd_a)
+
+    def test_streaming_open_replaces_a_failed_session_a_reader_still_holds(self):
+        # The session failed (a transient member error) while a reader keeps
+        # it open. A new open must not inherit that error for as long as the
+        # reader stays: it gets a fresh session, and the old reader keeps
+        # its descriptor and its error.
         self.backend.copy_delay = 0
         manager = self.fs._streaming_manager
         payload = os.urandom(192 * 1024)
         (self.backend_dir / "failed.bin").write_bytes(payload)
         vfd_a = self.fs.open('/failed.bin', os.O_RDONLY)
-        session = self._session_for(vfd_a)
+        session_a = self._session_for(vfd_a)
         self.assertEqual(self.fs.read('/failed.bin', 4096, 0, vfd_a), payload[:4096])
-        with session.lock:
-            session.error = OSError(errno.EIO, "simulated failure")
-            manager._schedule_background(session)
-            self.assertFalse(session.failed_cleanup_claimed)
+        with session_a.lock:
+            session_a.error = OSError(errno.EHOSTUNREACH, "simulated transient drop")
+            manager._schedule_background(session_a)
+            self.assertFalse(session_a.failed_cleanup_claimed)
+        self.assertTrue(session_a.background_finished.wait(timeout=3.0))
+        self.assertGreaterEqual(session_a.io_fd, 0)
 
-        vfd_b = self.fs.open('/failed.bin', os.O_RDONLY)
+        with patch.object(self.backend, "copy_to_local") as copy:
+            vfd_b = self.fs.open('/failed.bin', os.O_RDONLY)
+            copy.assert_not_called()
+        session_b = self._session_for(vfd_b)
+        self.assertIsNot(session_b, session_a)
+        self.assertTrue(session_a.detached)
+        self.assertEqual(self.fs._streaming_stats_snapshot()["streaming_failed_sessions_replaced"], 1)
+        partial = self.cache_dir / "failed.bin.storage.partial"
+        self.assertEqual(os.stat(partial).st_ino, os.fstat(session_b.io_fd).st_ino)
+        # R2-I2: the replaced session's descriptor and unlinked partial stay
+        # charged while its reader holds them.
+        self.assertEqual(manager.session_descriptor_count(), 2)
+        self.assertEqual(self.fs._streaming_stats_snapshot()["streaming_session_descriptors"], 2)
+        self.assertEqual(self.fs.cache_manager._reserved_bytes, session_a.file_size)
 
-        with self.fs._fd_lock:
-            self.assertIsNone(self.fs._fd_map[vfd_b].prefetch_session)
-        self.assertEqual(self.fs.read('/failed.bin', len(payload), 0, vfd_b), payload)
-        self.fs.release('/failed.bin', vfd_b)
+        # The old reader keeps its bytes and its error; the new one reads everything.
+        self.assertEqual(self.fs.read('/failed.bin', 4096, 0, vfd_a), payload[:4096])
+        with self.assertRaises(FuseOSError) as old_error:
+            self.fs.read('/failed.bin', 4096, 128 * 1024, vfd_a)
+        self.assertEqual(old_error.exception.errno, errno.EHOSTUNREACH)
+        for offset in range(0, len(payload), 32 * 1024):
+            self.assertEqual(
+                self.fs.read('/failed.bin', 32 * 1024, offset, vfd_b), payload[offset:offset + 32 * 1024],
+            )
+
+        # The old session's last release closes its descriptor and leaves
+        # the successor's partial and cache file alone.
         self.fs.release('/failed.bin', vfd_a)
+        self.assertEqual(session_a.io_fd, -1)
+        self.assertEqual(session_a.unlinked_charge, 0)
+        self.assertEqual(self.fs.cache_manager._reserved_bytes, 0)
+        self.assertEqual(manager.session_descriptor_count(), 1)
+        self.assertFalse(session_b.detached)
+        self.fs.release('/failed.bin', vfd_b)
+        self.assertTrue(session_b.background_finished.wait(timeout=5.0))
+        self.assertEqual((self.cache_dir / "failed.bin").read_bytes(), payload)
 
     def test_streaming_open_attaches_to_an_errored_session_with_every_byte(self):
         # Only its finalize failed: the session lacks no range, so an attach
@@ -2425,6 +3369,62 @@ class TestFSStreamingIntegration(unittest.TestCase):
             self.fs.release('/' + name, vfd)
         self.assertEqual(manager._not_installed_reason("taken"), "cache-path-filled")
         self.assertEqual(manager._not_installed_reason("unsupported"), "unsupported")
+
+
+
+class TestDescriptorLimit(unittest.TestCase):
+    """mount_storage raises the soft RLIMIT_NOFILE, since streaming descriptors have no count limit."""
+
+    def setUp(self):
+        import logging
+        self.logger = logging.getLogger("test-descriptor-limit")
+
+    def test_soft_limit_is_raised_to_the_hard_limit(self):
+        import resource
+        from storage.fs import raise_descriptor_limit
+        with patch("storage.fs.resource.getrlimit", return_value=(1024, 524288)), \
+                patch("storage.fs.resource.setrlimit") as setrlimit, \
+                self.assertLogs(self.logger, level="INFO") as logs:
+            self.assertEqual(raise_descriptor_limit(self.logger), 524288)
+        setrlimit.assert_called_once_with(resource.RLIMIT_NOFILE, (524288, 524288))
+        self.assertIn("from 1024 to 524288", "\n".join(logs.output))
+
+    def test_a_refused_raise_keeps_the_soft_limit_and_never_fails(self):
+        from storage.fs import raise_descriptor_limit
+        with patch("storage.fs.resource.getrlimit", return_value=(1024, 4096)), \
+                patch("storage.fs.resource.setrlimit", side_effect=ValueError("not permitted")), \
+                self.assertLogs(self.logger, level="WARNING"):
+            self.assertEqual(raise_descriptor_limit(self.logger), 1024)
+        with patch("storage.fs.resource.getrlimit", side_effect=OSError(errno.EPERM, "no")), \
+                self.assertLogs(self.logger, level="WARNING"):
+            self.assertIsNone(raise_descriptor_limit(self.logger))
+
+    def test_limits_already_at_the_ceiling_or_infinite_are_left_alone(self):
+        import resource
+        from storage.fs import raise_descriptor_limit
+        for limits in ((4096, 4096), (resource.RLIM_INFINITY, resource.RLIM_INFINITY),
+                       (1024, resource.RLIM_INFINITY)):
+            with patch("storage.fs.resource.getrlimit", return_value=limits), \
+                    patch("storage.fs.resource.setrlimit") as setrlimit:
+                self.assertEqual(raise_descriptor_limit(self.logger), limits[0])
+            setrlimit.assert_not_called()
+
+    def test_mount_raises_the_limit_before_serving(self):
+        from storage.fs import mount_storage
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for name in ("cache", "mount", "member"):
+                (root / name).mkdir()
+            calls = []
+            with patch("storage.fs.raise_descriptor_limit", side_effect=lambda logger: calls.append("limit")), \
+                    patch("storage.fs.FUSE", side_effect=lambda *a, **k: calls.append("fuse")):
+                mount_storage(
+                    str(root / "mount"), root / "cache", root / "cache" / "state.db",
+                    {"local0": LocalBackend("local0", str(root / "member"))},
+                    1024 * 1024, foreground=True, allow_other=False,
+                )
+        self.assertEqual(calls, ["limit", "fuse"])
+
 
 if __name__ == '__main__':
     unittest.main()

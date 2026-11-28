@@ -23,12 +23,9 @@ key_file = "/home/user/.ssh/id_ed25519"
 foreground = true
 streaming_reads = true
 streaming_chunk_size = "1M"
-max_streaming_sessions = 8
-# Retained files without readers share the download pool. Each retains one
-# partial file and its descriptor; the partial's full size counts against cache_size.
-max_retained_streaming_sessions = 64
-# Workers appear as chunks become runnable and retire after 30 idle seconds.
-max_download_workers = 4
+# Workers start as chunks become runnable and retire after 30 idle seconds.
+# Set a positive number to throttle background transfers.
+# max_download_workers = 4
 # Retain unfinished downloads after the longest contiguous requested span
 # reaches the larger of 32 MiB and 30% of the file, capped at the file size.
 # Without "all:" a comma-separated list uses the first threshold reached.

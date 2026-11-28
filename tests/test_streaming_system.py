@@ -7,6 +7,7 @@ streaming stays healthy under sustained reads and does not regress to the
 """
 
 import errno
+from contextlib import ExitStack
 import json
 import os
 import shutil
@@ -74,6 +75,10 @@ class TestStreamingSystemRegression(unittest.TestCase):
         (self.backend_dir / "recording 演奏.bin").write_bytes(self.payload)
         (self.backend_dir / "second file.bin").write_bytes(self.payload)
 
+        self.reader_payload = os.urandom(768 * 1024)
+        for index in range(10):
+            (self.backend_dir / f"reader-{index}.bin").write_bytes(self.reader_payload)
+
         self.backend = SlowRemoteLoopbackBackend("remote0", str(self.backend_dir), range_delay=0.003)
         self.fs = StorageFS(
             cache_root=self.cache_dir,
@@ -84,7 +89,9 @@ class TestStreamingSystemRegression(unittest.TestCase):
             start_sync=False,
             streaming_reads=True,
             streaming_chunk_size=64 * 1024,
-            max_streaming_sessions=4,
+            # Automatic, as a profile that sets no max_download_workers mounts
+            # (tests/test_cli_mount.py checks the obsolete slot settings).
+            max_download_workers=None,
         )
 
         self.mount_thread = threading.Thread(
@@ -200,10 +207,57 @@ class TestStreamingSystemRegression(unittest.TestCase):
         if stream_state is not None:
             self.assertNotIn(stream_state.get("status"), {"error", "failed"})
 
+    def test_legacy_eight_slots_do_not_limit_open_readers_or_preempt_a_transfer(self):
+        manager = self.fs._streaming_manager
+        manager.update_download_limits(max_download_workers=1)
+        blocked = threading.Event()
+        resume = threading.Event()
+        self.backend.hold_past = ("reader-0.bin", 256 * 1024, blocked, resume)
+        with patch.object(self.backend, "background_range_capacity", return_value=1), \
+                patch.object(self.backend, "copy_to_local") as copies, ExitStack() as handles:
+            try:
+                first = handles.enter_context(open(self.mount_dir / "reader-0.bin", "rb", buffering=0))
+                self.assertEqual(first.read(128 * 1024), self.reader_payload[:128 * 1024])
+                self.assertTrue(blocked.wait(timeout=5), "first speculative transfer never reached barrier")
+                for index in range(1, 10):
+                    other = handles.enter_context(open(self.mount_dir / f"reader-{index}.bin", "rb", buffering=0))
+                    self.assertEqual(os.pread(other.fileno(), 4096, 512 * 1024),
+                                     self.reader_payload[512 * 1024:516 * 1024])
+                stats = self.fs._streaming_stats_snapshot()
+                self.assertEqual(stats["active_reader_sessions"], 10)
+                self.assertEqual(stats["download_workers_running"], 1)
+                self.assertEqual(stats["streaming_fallback_opens"], 0)
+                copies.assert_not_called()
+            finally:
+                resume.set()
+
+    def test_staging_enospc_fails_open_and_leaves_the_next_attempt_clean(self):
+        path = self.mount_dir / "reader-0.bin"
+        real_truncate = os.ftruncate
+
+        def refuse_staging(fd, size):
+            if Path(os.readlink(f"/proc/self/fd/{fd}")).name.startswith(".storage-staging-"):
+                raise OSError(errno.ENOSPC, "synthetic disk allocation failure")
+            return real_truncate(fd, size)
+
+        with patch("storage.streaming.os.ftruncate", side_effect=refuse_staging), \
+                patch.object(self.backend, "copy_to_local") as copies:
+            with self.assertRaises(OSError) as error:
+                path.open("rb")
+            self.assertEqual(error.exception.errno, errno.ENOSPC)
+            copies.assert_not_called()
+        self.assertEqual(list(self.cache_dir.glob("*.storage.partial")), [])
+        # pathlib's "*" matches dot files, so the glob above sees staging
+        # files too; named here so a change to either pattern is noticed.
+        self.assertEqual(list(self.cache_dir.glob(".storage-staging-*")), [])
+        self.assertEqual(self.fs._streaming_stats_snapshot()["streaming_open_error_cache_space"], 1)
+        with path.open("rb", buffering=0) as handle:
+            self.assertEqual(handle.read(4096), self.reader_payload[:4096])
+
     def test_reader_opens_and_reopened_fill_overtakes_closed_downloads(self):
         manager = self.fs._streaming_manager
         manager.update_download_limits(
-            max_streaming_sessions=2, max_download_workers=1, streaming_keep_after_close="256K,50%",
+            max_download_workers=1, streaming_keep_after_close="256K,50%",
         )
         payloads = self.contended_payloads
 
@@ -315,24 +369,20 @@ class TestStreamingSystemRegression(unittest.TestCase):
                 self.assertIn("Close its readers or wait for finalization", human.stderr)
                 self.assertEqual(handle.read(64), self.payload[512 * 1024:512 * 1024 + 64])
 
-                limits = command("set", "--max-streaming-sessions", "1",
-                                 "--max-retained-streaming-sessions", "3",
-                                 "--max-download-workers", "1")["limits"]
+                limits = command("set", "--max-download-workers", "1")["limits"]
                 self.assertEqual(limits, {
-                    "max_streaming_sessions": 1,
-                    "max_retained_streaming_sessions": 3,
                     "max_download_workers": 1,
                     "streaming_keep_after_close": {"mode": "any", "bytes": [256 * 1024], "percent": ["50"]},
                     "streaming_read_ahead_window": 4 * 1024 ** 2,
                 })
-                rejected = command("set", "--max-streaming-sessions", "2",
-                                   "--max-download-workers", "33", expected=1, json_output=False)
-                self.assertIn("max_download_workers", rejected.stderr)
+                rejected = command("set", "--max-download-workers", "0", expected=2, json_output=False)
+                self.assertIn("--max-download-workers", rejected.stderr)
                 self.assertEqual(command("get")["limits"], limits)
 
-                with (self.mount_dir / second).open("rb") as fallback:
-                    self.assertEqual(fallback.read(16), self.payload[:16])
-                self.assertEqual(command("status")["stats"]["streaming_fallback_opens"], 1)
+                with (self.mount_dir / second).open("rb") as reader:
+                    self.assertEqual(reader.read(16), self.payload[:16])
+                self.assertEqual(command("status")["stats"]["streaming_fallback_opens"], 0)
+                self.assertIsNone(command("set", "--max-download-workers", "auto")["limits"]["max_download_workers"])
 
                 legacy = json.loads(self._run_control_cli(
                     "debug", "streaming-stats", "--cache", str(self.cache_dir), "--json-output",
@@ -353,8 +403,9 @@ class TestStreamingSystemRegression(unittest.TestCase):
                 self.assertNotEqual(row["id"], original)
                 self.assertEqual(command("cancel", original, expected=1)["result"], "not-found")
                 self.assertEqual(command("downloads")["downloads"][0]["id"], row["id"])
-                command("set", "--max-retained-streaming-sessions", "0")
-            self.assertTrue(self._wait_for(lambda: not command("downloads")["downloads"]))
+            self.assertTrue(self._wait_for(lambda: command("status")["stats"]["retained_streaming_sessions"] == 1))
+            self.assertEqual(command("cancel", row["id"])["result"], "cancelled")
+            self.assertEqual(command("downloads")["downloads"], [])
             self.assertFalse(partial.exists())
         finally:
             resume.set()

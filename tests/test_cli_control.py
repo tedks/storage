@@ -183,13 +183,12 @@ backends = ["/no-member-probe"]
         assert result.exit_code == 0, result.output
         assert json.loads(result.output) == {"ok": True}
 
-        result = runner.invoke(main, options + ["set", "--max-streaming-sessions", "3",
-                                                "--max-retained-streaming-sessions", "0"])
+        result = runner.invoke(main, options + ["set", "--max-download-workers", "auto"])
         assert result.exit_code == 0, result.output
         assert requests == [
             {"command": "status"},
             {"command": "streaming.set", "limits": {
-                "max_streaming_sessions": 3, "max_retained_streaming_sessions": 0,
+                "max_download_workers": None,
             }},
         ]
         assert runner.invoke(main, options + ["--cache", str(cache)]).exit_code == 2

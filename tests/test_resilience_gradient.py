@@ -100,7 +100,6 @@ class TestResilienceGradient(unittest.TestCase):
             start_sync=False,
             streaming_reads=True,
             streaming_chunk_size=32 * 1024,
-            max_streaming_sessions=4,
         )
 
         return SimpleNamespace(
