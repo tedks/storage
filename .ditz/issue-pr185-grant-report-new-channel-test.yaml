@@ -1,0 +1,21 @@
+id: pr185-grant-report-new-channel-test
+title: Test the new-channel grant report order in the SSH pool
+desc: 'PR #185 round 15 nit (gpt-6.2-sol): the raising-grant-probe test covers idle-channel
+  reuse only. Add a test that forces a channel-open refusal after a measured wait,
+  then a successful open, and asserts only the accepted channel produces a granted=True
+  report (storage/backends/ssh_pool.py report_grant at the fresh-channel return).
+  Also reword _publication_wait_probe''s docstring to note that the grant report may
+  run without the member pool''s lock (Opus nit; currently accurate for polls).'
+type: task
+component: storage
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-28T11:59:24-00:00
+references: []
+log_events:
+- time: 2026-11-28T11:59:24-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
