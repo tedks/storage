@@ -288,16 +288,19 @@ fresh download instead of returning the old error. Readers still holding
 the failed download keep its bytes and its error; its partial, unlinked,
 stays charged against `cache_size` and counted among streaming
 descriptors until they close. A failed download keeps the contiguous
-prefix it fetched in the cache. An open that finds the file uncached and
+prefix it fetched in the cache, for best-effort offline access to a file
+that was never cached whole. An open that finds the file uncached and
 starts streaming never takes a prefix that appears meanwhile for the
 file: it drops the prefix and streams again, or returns `EAGAIN` while
 another descriptor holds it. A prefix already cached when the file is
-opened is served as it is, which is what lets it be read offline.
-Recomputing a file moves such a prefix aside while the command runs and
-puts it back if the command produces no file. A prefix that cannot be put
-back stays beside its path, counts toward the cache size, and is removed
-by the restart sweep; it is only an offline convenience, since the member
-holds the file.
+opened is currently served as the file even while its member is
+reachable; that is a known limit, tracked as ditz
+`streaming-prefix-served-online`. Recomputing a file moves such a prefix
+aside while the command runs and puts it back if the command produces no
+file. A prefix that cannot be put back stays beside its path, counts
+toward the cache size, and is removed by the restart sweep. Losing it
+loses no writes: a prefix is never dirty or user-written, only bytes
+fetched from a member.
 A recomputable file whose members cannot be reached is recomputed. A selected member without
 range support uses the whole-file cache path, as do write opens and opens
 with streaming disabled.
