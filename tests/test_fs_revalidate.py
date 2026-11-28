@@ -1927,6 +1927,75 @@ class TestEvictionAccessRace(RevalidateTestBase):
     def test_eviction_rechecks_flushed_access_after_selection(self):
         self._assert_eviction_rechecks_recent_read(flush=True)
 
+    def _evict_when_an_access_moves_past_the_page_bound(self, *, keep_touching):
+        pinned, hot, derived = "/pinned.txt", "/hot.txt", "/derived.txt"
+        for path, content in ((pinned, b"pinned"), (hot, b"hot"), (derived, b"derived")):
+            self.rewrite_member(path[1:], content)
+        cache = self.fs.cache_manager
+        state = self.fs.state_manager
+        real_guard = cache.path_guard
+        pinned_visits = 0
+
+        def read_during_first_page(path):
+            nonlocal pinned_visits
+            if path == pinned:
+                pinned_visits += 1
+                self.assertLessEqual(pinned_visits, 2, "eviction retried more than once")
+                if pinned_visits == 1 or keep_touching:
+                    fh = hot_fh if pinned_visits == 1 else self.fs.open(hot, os.O_RDONLY)
+                    clock.return_value += 10.0
+                    try:
+                        self.assertEqual(self.fs.read(hot, 3, 0, fh), b"hot")
+                    finally:
+                        self.fs.release(hot, fh)
+                    state._flush_access_updates(force=True)
+                    self.assertEqual(state.get_file_metadata(hot).last_access, clock.return_value)
+            return real_guard(path)
+
+        with patch("storage.fs.time.time", return_value=10.0) as clock:
+            pinned_fh = self.fs.open(pinned, os.O_RDONLY)
+            try:
+                clock.return_value = 20.0
+                hot_fh = self.fs.open(hot, os.O_RDONLY)
+                try:
+                    self.assertEqual(self.read_through(derived), b"derived")
+                    state.set_file_metadata(dataclasses.replace(
+                        state.get_file_metadata(derived), recomputable=True, recompute_cmd="true",
+                    ))
+                    cache.max_size_bytes = cache.get_total_cache_size()
+                    # Only the pinned row fits on page one. The read advances
+                    # hot's committed timestamp before its page can be fetched.
+                    clock.return_value = 30.0
+                    with patch.object(state, "WRITE_BATCH_SIZE", 1), \
+                            patch.object(cache, "path_guard", side_effect=read_during_first_page):
+                        self.assertTrue(cache.ensure_space(3))
+                finally:
+                    self.fs.release(hot, hot_fh)
+            finally:
+                self.fs.release(pinned, pinned_fh)
+
+        self.assertEqual((self.cache_dir / derived[1:]).read_bytes(), b"" if keep_touching else b"derived")
+        self.assertEqual((self.cache_dir / hot[1:]).exists(), keep_touching)
+        self.assertEqual(pinned_visits, 2)
+
+    def test_later_page_access_preserves_ordinary_tier_priority(self):
+        self._evict_when_an_access_moves_past_the_page_bound(keep_touching=False)
+
+    def test_later_page_access_causes_at_most_one_retry(self):
+        self._evict_when_an_access_moves_past_the_page_bound(keep_touching=True)
+
+    def test_pinned_tier_without_newer_rows_is_walked_once(self):
+        pinned = "/pinned.txt"
+        self.rewrite_member(pinned[1:], b"pinned")
+        fh = self.fs.open(pinned, os.O_RDONLY)
+        cache = self.fs.cache_manager
+        try:
+            with patch.object(cache, "path_guard", wraps=cache.path_guard) as guard:
+                self.assertFalse(cache.evict_lru_files(1))
+            guard.assert_called_once_with(pinned)
+        finally:
+            self.fs.release(pinned, fh)
+
 
 class TestMountStartupClearsEvictionHints(unittest.TestCase):
     """A mark left by a crashed mount does not survive into the next one."""

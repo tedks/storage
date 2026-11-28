@@ -779,6 +779,14 @@ class TestCacheAbsentCandidacy(unittest.TestCase):
         self.assertTrue(any("idx_cache_eviction_candidates" in step for step in plan), plan)
         self.assertFalse(any("TEMP B-TREE" in step for step in plan), plan)
 
+    def test_eviction_newer_probe_seeks_the_candidate_index(self):
+        plan = [tuple(row)[-1] for row in self.state_manager.conn.execute(
+            'EXPLAIN QUERY PLAN ' + StateManager._LRU_NEWER_SQL,
+            (SyncStatus.CLEAN.value, 0, 1e12),
+        )]
+        self.assertTrue(any("idx_cache_eviction_candidates" in step and "last_access>?" in step
+                            for step in plan), plan)
+
     def _page_steps(self):
         steps = [0]
 

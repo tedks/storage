@@ -394,7 +394,7 @@ class CacheManager:
             return freed >= bytes_needed
 
     def _evict_access_pass(self, bytes_needed: int, *, recomputable: bool) -> Tuple[int, bool]:
-        """Return the bytes reclaimed and whether recency delayed an eligible copy."""
+        """Return the bytes reclaimed and whether recency calls for a fresh pass."""
         freed = 0
         deferred = False
         # Paths found missing, marked a page at a time: the first scan
@@ -402,7 +402,12 @@ class CacheManager:
         absent: List[Tuple[str, Path]] = []
         try:
             candidates = self.state_manager.iter_lru_candidates(recomputable=recomputable)
-            for virtual_path, selected_access in candidates:
+            for candidate in candidates:
+                if candidate is None:
+                    # The index has a newer row that this walk never considered.
+                    deferred = True
+                    break
+                virtual_path, selected_access = candidate
                 cache_path = self.get_cache_path(virtual_path)
                 with self._path_guard(virtual_path) as free:
                     if not free:

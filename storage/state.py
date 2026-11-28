@@ -1038,22 +1038,36 @@ class StateManager:
             self.conn.execute(self._CLAMP_ACCESS_SQL, (now, now))
             self.conn.commit()
 
-    _LRU_PAGE_SQL = '''
-        SELECT virtual_path, last_access FROM files
+    _LRU_CANDIDATES_SQL = '''
+        FROM files
         WHERE sync_status = ? AND recomputable = ?
           AND link_target IS NULL AND size > 0 AND cache_absent = 0
+    '''
+    _LRU_PAGE_SQL = f'''
+        SELECT virtual_path, last_access {_LRU_CANDIDATES_SQL}
           AND (last_access, virtual_path) > (?, ?) AND last_access <= ?
         ORDER BY last_access ASC, virtual_path ASC
         LIMIT ?
     '''
+    _LRU_NEWER_SQL = f'''
+        SELECT 1 {_LRU_CANDIDATES_SQL}
+          AND last_access > ?
+        LIMIT 1
+    '''
 
     def iter_lru_paths(self, *, recomputable: bool = False) -> Iterator[str]:
         """Walk candidate paths in access order."""
-        for path, _ in self.iter_lru_candidates(recomputable=recomputable):
-            yield path
+        for candidate in self.iter_lru_candidates(recomputable=recomputable):
+            if candidate is not None:
+                yield candidate[0]
 
-    def iter_lru_candidates(self, *, recomputable: bool = False) -> Iterator[Tuple[str, float]]:
+    def iter_lru_candidates(
+        self, *, recomputable: bool = False,
+    ) -> Iterator[Optional[Tuple[str, float]]]:
         """Walk CLEAN regular-file candidates as (path, selected access time).
+
+        Yield None at exhaustion if the same index has a candidate past
+        the bound. Its access may have advanced before we reached its page.
 
         The cache tree is authoritative for whether the bytes are present,
         so evicted rows are walked too, except rows whose file eviction
@@ -1116,6 +1130,12 @@ class StateManager:
             for row in rows:
                 yield row['virtual_path'], row['last_access']
             if len(rows) < self.WRITE_BATCH_SIZE:
+                with self._db_lock:
+                    newer = self.conn.execute(self._LRU_NEWER_SQL, (
+                        SyncStatus.CLEAN.value, int(recomputable), bound,
+                    )).fetchone()
+                if newer is not None:
+                    yield None
                 return
             cursor = (rows[-1]['last_access'], rows[-1]['virtual_path'])
 
