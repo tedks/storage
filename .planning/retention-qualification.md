@@ -11,8 +11,10 @@ Opening a large file to inspect its first few megabytes can make Storage downloa
 - [x] (2026-11-19 00:20Z) Started in a dedicated worktree from the mount control branch and confirmed the existing qualification also bounded speculation.
 - [x] (2026-11-19 00:32Z) Implemented independent settings, documented their usage, and added synthetic and mounted cases. Rebased on the cache eviction branch, which includes mount control.
 - [x] (2026-11-19 00:34Z) Passed five focused Bazel suites, including 72 streaming unit tests.
-- [ ] Verify all four Bazel gates in the Nix development shell.
-- [ ] Publish the verified branch as a draft pull request against the cache eviction branch.
+- [x] Verified all four Bazel gates in the Nix development shell at 0f02210 (49 of 49 targets passed, as reported in the PR #188 body).
+- [x] Published the branch as draft pull request #188 against the cache eviction branch.
+- [x] (2026-11-28) Addressed council round 1 nits: an integer read-ahead window from `streaming.set` and from profiles, a case-insensitive `all:` prefix with an error that names the expected form, the sub-chunk read-ahead note in the README, and this record. Focused suites for the changed modules pass.
+- [ ] Re-run all four Bazel gates on the commit that carries the round 1 fixes.
 
 ## Surprises & Discoveries
 
@@ -22,9 +24,11 @@ The previous worker rounded the speculative boundary up to the end of a chunk an
 
 On 2026-11-19 the implementation used `all:` to opt in to requiring every term, with percentages rounded up and the result capped at the file size. Explicit comma lists retain their original first-term-reached behavior, including rounding percentages down. The independent 4 MiB byte window preserves the old default distance on large files at the default chunk size. A live change reuses the observed spans of open unqualified sessions. Qualification stays in effect once earned, so increasing the threshold cannot interrupt downloads already authorized to finish.
 
+On 2026-11-28, after council round 1, the read-ahead window accepts a non-negative integer of bytes as well as a size string, in `streaming.set` and in a profile, because `streaming.get` reports an integer and a JSON client should be able to send it back. The profile loader checks only the type and leaves the value to the parser the flag uses. The keep-after-close value stays string-only, since `get` reports its parsed structure, not a policy string. The `all:` prefix is matched case-insensitively and allows whitespace before the colon.
+
 ## Outcomes & Retrospective
 
-Implementation and documentation are ready for gate verification. The 2 GiB case uses a synthetic session with a declared size. The mounted cases use scratch files and the same control commands an operator runs.
+The four Bazel gates passed at 0f02210 and the branch is published as draft PR #188. The round 1 fixes after that commit passed their focused suites and still need the four gates re-run on their head. The 2 GiB case uses a synthetic session with a declared size. The mounted cases use scratch files and the same control commands an operator runs.
 
 ## Context and Orientation
 
@@ -59,3 +63,5 @@ Ditz tracks the implementation as `streaming-retention-qualification`. The defau
 The startup and live flags are `--streaming-keep-after-close` and `--streaming-read-ahead-window`. Their profile keys replace dashes with underscores. The mount control `streaming.set` request uses the same strings as the CLI and profile, and also accepts the window as a non-negative integer of bytes, so a JSON client can send back what `streaming.get` reported; the profile key accepts a TOML integer for the same reason. `streaming.get` reports an `any` or `all` rule with thresholds and a window size in bytes. The keep-after-close value stays string-only in `streaming.set`, because `get` reports its parsed structure rather than the policy string. The controls depend on the mount control branch and share its private cache-local socket.
 
 2026-11-19. Recorded the implementation and the acceptance criteria for the combined branch.
+
+2026-11-28. Recorded the gate pass at 0f02210, the draft PR, and the council round 1 fixes awaiting a gate re-run.
