@@ -20,7 +20,9 @@ from .backends.base import (
 from .backends.local import NOREPLACE_UNSUPPORTED
 from .backends.local import rename_noreplace as _rename_noreplace
 from .backends.ssh_pool import BulkCapacityCancelled, BulkCapacityTimeout
-from .cache_metadata import PREFIX_XATTR, confirm_member_stat, copy_member_attributes
+from .cache_metadata import (
+    PREFIX_XATTR, MemberVersion, confirm_member_stat, copy_member_attributes,
+)
 from .models import FileLocation, FileMetadata, StreamingKeepAfterClose, SyncStatus
 
 # A foreground read fetches only the bytes the reader asked for that are not
@@ -1620,7 +1622,7 @@ class StreamingReadManager:
             # unchanged from master.
             try:
                 with interactive_request():
-                    confirmed, agreed = confirm_member_stat(
+                    confirmed, version = confirm_member_stat(
                         session.backend, session.canonical_path, session.member_stat,
                         os.fstat(io_fd).st_size)
             except BulkCapacityCancelled as exc:
@@ -1645,12 +1647,16 @@ class StreamingReadManager:
                 raise OSError(errno.EINTR, str(exc)) from exc
             except BulkCapacityTimeout as exc:
                 raise OSError(errno.EAGAIN, str(exc)) from exc
-            if not agreed:
+            # Only positive evidence of another version discards: a member
+            # without comparable metadata (no stat, a size-only stat) keeps
+            # its stream, with only the attributes it reported.
+            if version == MemberVersion.CHANGED:
                 self._discard_superseded_session(session, "member-changed")
                 # Counted once the partial is gone and the session finished.
                 self._record_streaming_stat("streaming_member_changed_discards", 1)
                 return
-            session.confirmed_stat = confirmed
+            if version == MemberVersion.AGREED:
+                session.confirmed_stat = confirmed
             copy_member_attributes(io_fd, confirmed)
             os.fsync(io_fd)
             session.final_cache_path.parent.mkdir(parents=True, exist_ok=True)

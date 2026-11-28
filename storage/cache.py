@@ -20,8 +20,8 @@ from typing import Callable, ContextManager, Optional, List, Set
 from .backends.base import Backend, bulk_request
 from .backends.ssh_pool import BulkCapacityCancelled, BulkCapacityTimeout
 from .cache_metadata import (
-    PARTIAL_SUFFIX, PREFIX_XATTR, confirm_member_stat, copy_member_attributes, regular_file_stat,
-    write_cache_metadata,
+    PARTIAL_SUFFIX, PREFIX_XATTR, MemberVersion, confirm_member_stat, copy_member_attributes,
+    regular_file_stat, write_cache_metadata,
 )
 from .member_repairs import VIEW_WRITE, MemberRepairs, is_at_or_under
 from .pathing import resolve_path
@@ -651,10 +651,11 @@ class CacheManager:
                 # fetch once more against it; a second disagreement keeps the
                 # newest attributes, and the caller's baseline (the first
                 # probe) makes the next revalidation refetch.
-                newest, agreed = confirm_member_stat(
+                newest, version = confirm_member_stat(
                     backend, source_virtual_path, member_stat, st.st_size)
-                if agreed or member_stat is None:
-                    break  # (no probe: a second transfer confirms nothing more)
+                # Only positive evidence of another version is fetched again.
+                if version != MemberVersion.CHANGED:
+                    break
                 member_stat = newest
             fd = os.open(temp_path, os.O_RDONLY | os.O_NOFOLLOW)
             try:
@@ -670,7 +671,7 @@ class CacheManager:
                         raise
                     return False
                 self._current_size_bytes += size
-            if agreed and newest is not None and confirmed is not None:
+            if version == MemberVersion.AGREED and newest is not None and confirmed is not None:
                 confirmed.append(newest)
             return True
         except BaseException:

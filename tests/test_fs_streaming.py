@@ -1766,6 +1766,81 @@ class TestFSStreamingIntegration(unittest.TestCase):
             self.fs.release("/" + name, vfd)
         return data, session
 
+    def _no_timestamp_fill(self, name, stat_kwargs):
+        """Stream name whole from a member whose stat gives no comparable
+        timestamp; return (bytes read, cache path) once it is installed."""
+        payload = os.urandom(96 * 1024)
+        (self.backend_dir / name).write_bytes(payload)
+        with patch.object(self.backend, "stat", **stat_kwargs):
+            data, session = self._stream_and_finish(name, len(payload))
+        cache_path = self.cache_dir / name
+        self.assertTrue(self._wait_for(cache_path.exists, timeout=8.0), "stream not installed")
+        self.assertEqual(data, payload)
+        self.assertEqual(cache_path.read_bytes(), payload)
+        return payload, cache_path
+
+    def _assert_warm_and_offline(self, name, payload):
+        with patch.object(self.backend, "read_file",
+                          side_effect=AssertionError("member read on a warm open")), \
+                patch.object(self.backend, "copy_to_local",
+                             side_effect=AssertionError("member download on a warm open")):
+            vfd = self.fs.open("/" + name, os.O_RDONLY)
+            try:
+                self.assertEqual(self.fs.read("/" + name, len(payload), 0, vfd), payload)
+            finally:
+                self.fs.release("/" + name, vfd)
+            self.backend.set_available(False)
+            try:
+                vfd = self.fs.open("/" + name, os.O_RDONLY)
+                try:
+                    self.assertEqual(self.fs.read("/" + name, len(payload), 0, vfd), payload)
+                finally:
+                    self.fs.release("/" + name, vfd)
+            finally:
+                self.backend.set_available(True)
+
+    def test_stream_from_a_member_without_stat_is_installed(self):
+        # The member has no stat: the session sized the file by get_size.
+        payload, _ = self._no_timestamp_fill(
+            "nostat.bin", {"side_effect": NotImplementedError()})
+        self._assert_warm_and_offline("nostat.bin", payload)
+        attrs = self.fs.getattr("/nostat.bin")
+        self.assertEqual(attrs["st_size"], len(payload))
+        self.assertEqual(attrs["st_mode"] & 0o222, 0)  # no member mode: fails closed
+
+    def test_stream_from_a_size_only_stat_is_installed(self):
+        from types import SimpleNamespace
+        payload, _ = self._no_timestamp_fill(
+            "sizeonly.bin", {"side_effect": lambda path: SimpleNamespace(
+                st_size=(self.backend_dir / "sizeonly.bin").stat().st_size)})
+        self._assert_warm_and_offline("sizeonly.bin", payload)
+        self.assertEqual(self.fs.getattr("/sizeonly.bin")["st_mode"] & 0o222, 0)
+
+    def test_stream_with_size_and_mode_but_no_mtime_keeps_the_mode(self):
+        import stat as stat_module
+        from types import SimpleNamespace
+        payload, _ = self._no_timestamp_fill(
+            "partial.bin", {"side_effect": lambda path: SimpleNamespace(
+                st_size=(self.backend_dir / "partial.bin").stat().st_size,
+                st_mode=stat_module.S_IFREG | 0o640, st_uid=4242)})
+        attrs = self.fs.getattr("/partial.bin")
+        self.assertEqual((stat_module.S_IMODE(attrs["st_mode"]), attrs["st_uid"]), (0o640, 4242))
+        self._assert_warm_and_offline("partial.bin", payload)
+
+    def test_stream_whose_size_only_stat_changes_size_is_discarded(self):
+        # Control: positive evidence of another version still discards.
+        from types import SimpleNamespace
+        payload = os.urandom(96 * 1024)
+        (self.backend_dir / "grew.bin").write_bytes(payload)
+        sizes = iter([len(payload), len(payload) + 1, len(payload) + 1, len(payload) + 1])
+        with patch.object(self.backend, "stat",
+                          side_effect=lambda path: SimpleNamespace(st_size=next(sizes))):
+            data, session = self._stream_and_finish("grew.bin", len(payload))
+            self.assertTrue(self._wait_for(lambda: self.fs._streaming_manager._streaming_stats.get(
+                "streaming_member_changed_discards") == 1, timeout=8.0))
+        self.assertEqual(data, payload)
+        self.assertFalse((self.cache_dir / "grew.bin").exists())
+
     def test_streaming_fill_of_a_member_changed_since_its_probe_is_discarded(self):
         old, new = b"o" * (64 * 1024), b"n" * (64 * 1024)
         member = self.backend_dir / "moved.bin"

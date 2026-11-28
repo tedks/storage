@@ -64,19 +64,34 @@ def _member_mtime_ns(st) -> Optional[int]:
     return round(seconds * 1_000_000_000)
 
 
-def confirm_member_stat(backend, virtual_path: str, probe, transferred_size: int):
-    """(stat to record, agreed) for a transfer whose probe was taken before it.
+class MemberVersion:
+    """confirm_member_stat's verdict on what a transfer read."""
 
-    The member is stat'ed again after the transfer. When that stat reports
-    the probe's size, mtime and mode, the transfer read that version and the
-    newer stat's genuine attributes are recorded (agreed), with the probe's
-    atime: the confirming stat's may be the transfer's own read. A
-    disagreement, even a mode-only change, returns the newer stat with
-    agreed False, for the caller to refetch (full fill) or discard
-    (streaming). A stat that raises is retried once; if it fails again the
-    probe is used when the transfer's size matches it, and otherwise no
-    member attributes at all (None: the fill fails closed on mode). A
-    transfer of another size than the stat reports is a disagreement too.
+    AGREED = "agreed"    # the probed version, confirmed by comparable stats
+    CHANGED = "changed"  # positive evidence of another version
+    UNKNOWN = "unknown"  # no evidence either way: metadata missing or unreadable
+
+
+def confirm_member_stat(backend, virtual_path: str, probe, transferred_size: int):
+    """(stat to record, MemberVersion) for a transfer probed before it began.
+
+    The member is stat'ed again after the transfer (retried once if the stat
+    raises). Only positive evidence counts as another version (CHANGED): a
+    known size other than the transfer's, or two stats that both report an
+    mtime, or a mode, and disagree. A refetch (full fill) or a discard
+    (streaming) follows, and the newest stat is returned. When every
+    comparison that matters can be made and holds (sizes, mtimes, modes),
+    the version is AGREED and the confirming stat's attributes are recorded
+    with the probe's atime (the confirming stat's may be the transfer's own
+    read).
+
+    Anything else is UNKNOWN: a member without stat (sized by get_size),
+    a size-only stat, a stat without mtime, a confirming stat that failed
+    twice. The file is kept, with only the attributes some stat reported
+    (the newest first). A mode only the pre-transfer probe reported, with
+    the confirming stat failed, may be stale: it is marked so that
+    copy_member_attributes never grants write the transferred file did
+    not have. No mode at all fails closed on write as before.
     BulkCapacityCancelled and BulkCapacityTimeout propagate: an
     interrupted request is not a fill.
     """
@@ -89,29 +104,39 @@ def confirm_member_stat(backend, virtual_path: str, probe, transferred_size: int
             break
         except (BulkCapacityCancelled, BulkCapacityTimeout):
             raise
-        except Exception:  # noqa: BLE001 - retried once, then the probe stands
+        except NotImplementedError:
+            break  # no stat at all: nothing to retry
+        except Exception:  # noqa: BLE001 - retried once, then no confirmation
             after = None
-    if after is None:
-        if getattr(probe, "st_size", None) == transferred_size:
-            return probe, True
-        return None, False
-    if probe is None:
-        # Nothing taken before the transfer to compare against.
-        return after, getattr(after, "st_size", None) == transferred_size
-    agreed = (getattr(after, "st_size", None) == transferred_size
-              and getattr(probe, "st_size", None) is not None
-              and getattr(after, "st_size", None) == getattr(probe, "st_size", None)
-              and _member_mtime_ns(probe) is not None
-              and _member_mtime_ns(after) == _member_mtime_ns(probe)
-              and getattr(after, "st_mode", None) == getattr(probe, "st_mode", None))
-    if not agreed:
-        return after, False
-    fields = {key: getattr(after, key, None) for key in (
-        "st_mode", "st_uid", "st_gid", "st_nlink", "st_ctime", "st_size",
-        "st_mtime", "st_mtime_ns")}
-    fields["st_atime"] = getattr(probe, "st_atime", None)
-    fields["st_atime_ns"] = getattr(probe, "st_atime_ns", None)
-    return SimpleNamespace(**fields), True
+
+    def known(st, key):
+        return getattr(st, key, None) if st is not None else None
+
+    sizes = [known(st, "st_size") for st in (probe, after)]
+    mtimes = [_member_mtime_ns(st) if st is not None else None for st in (probe, after)]
+    modes = [known(st, "st_mode") for st in (probe, after)]
+    changed = (any(size is not None and size != transferred_size for size in sizes)
+               or (None not in mtimes and mtimes[0] != mtimes[1])
+               or (None not in modes and modes[0] != modes[1]))
+    if changed:
+        return after, MemberVersion.CHANGED
+    if probe is not None and after is not None and None not in sizes and None not in mtimes:
+        fields = {key: getattr(after, key, None) for key in (
+            "st_mode", "st_uid", "st_gid", "st_nlink", "st_ctime", "st_size",
+            "st_mtime", "st_mtime_ns")}
+        fields["st_atime"] = getattr(probe, "st_atime", None)
+        fields["st_atime_ns"] = getattr(probe, "st_atime_ns", None)
+        return SimpleNamespace(**fields), MemberVersion.AGREED
+    if probe is None and after is None:
+        return None, MemberVersion.UNKNOWN
+    fields = {}
+    for key in ("st_mode", "st_uid", "st_gid", "st_nlink", "st_ctime", "st_size",
+                "st_mtime", "st_mtime_ns", "st_atime", "st_atime_ns"):
+        value = known(after, key)
+        fields[key] = known(probe, key) if value is None else value
+    # A mode seen only before the transfer: it may have lost write since.
+    fields["mode_unconfirmed"] = known(after, "st_mode") is None and fields["st_mode"] is not None
+    return SimpleNamespace(**fields), MemberVersion.UNKNOWN
 
 
 def copy_member_attributes(fd: int, source) -> None:
