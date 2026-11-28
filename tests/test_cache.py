@@ -1280,6 +1280,40 @@ class TestCacheAccounting(unittest.TestCase):
             writer.join(timeout=5.0)
         self.assertEqual(errors, [])
 
+    def test_a_stuck_stream_write_keeps_its_grant_reserved(self):
+        """The partial's pwrite runs without the cache lock: its grant is
+        reserved first, so another stream cannot be granted the same
+        blocks meanwhile, and the reservation settles to the blocks the
+        bytes reached."""
+        manager = self.cache_manager
+        block = manager.block_size
+        manager.max_size_bytes = 2 * block
+        with self._partial("stuck") as (_, a), self._partial("other") as (_, b):
+            entered, release = threading.Event(), threading.Event()
+            self.addCleanup(release.set)
+            real_pwrite = os.pwrite
+
+            def pwrite(fd, data, offset):
+                if fd == a:
+                    entered.set()
+                    release.wait(timeout=10.0)
+                return real_pwrite(fd, data, offset)
+
+            results = []
+            with patch("os.pwrite", side_effect=pwrite):
+                writer = threading.Thread(
+                    target=lambda: results.append(manager.write_streaming_chunk(a, 0, b"a" * (2 * block))))
+                writer.start()
+                self.assertTrue(entered.wait(timeout=5.0))
+                self.assertFalse(manager.write_streaming_chunk(b, 0, b"b"))  # not blocked, refused
+                self.assertEqual(manager.get_total_cache_size(), 0)
+                release.set()
+                writer.join(timeout=5.0)
+            self.assertEqual(results, [True])
+            self.assertEqual(manager._stream_reserved, 0)
+            self._assert_total(2 * block)
+            self.assertFalse(manager.write_streaming_chunk(b, 0, b"b"))
+
     def test_direct_writer_uses_space_before_the_next_stream_grant(self):
         manager = self.cache_manager
         block = manager.block_size

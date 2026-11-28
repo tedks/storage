@@ -246,6 +246,8 @@ class CacheManager:
         # Their allowances hold back admits until they settle
         # (_admit_pending).
         self._in_flight: dict = {}
+        # New blocks granted to streaming writes not yet settled.
+        self._stream_reserved = 0
         # Moves at every tree rescan: a change that measured before a
         # rescan settles to another rescan instead of adding its delta.
         self._scan_epoch = 0
@@ -859,7 +861,8 @@ class CacheManager:
                 st = regular_file_stat(path)
                 apparent_growth = min(self._round_up(st.st_size), st.st_blocks * 512) if st else 0
                 reserved += max(size, apparent_growth)
-            available = self.max_size_bytes - self._current_size_bytes - reserved
+            available = (self.max_size_bytes - self._current_size_bytes - reserved
+                         - self._stream_reserved)
 
         if available >= required_bytes:
             return 0
@@ -977,9 +980,16 @@ class CacheManager:
     def write_streaming_chunk(self, fd: int, offset: int, data: bytes) -> bool:
         """Keep a chunk when its new data blocks fit, else leave the inode alone.
 
-        The caller serializes writes on this sparse inode and fetches the
-        network bytes before entering. The cache lock orders the grant and
-        the local write against every other allocation.
+        The caller serializes writes on this sparse inode (the session's
+        io_lock, which close_streaming_fd and truncate_streaming_fd also
+        run under, so the descriptor stays open) and fetches the network
+        bytes before entering. The grant is made under the cache lock and
+        its new blocks reserved there (_stream_reserved, counted by every
+        other allocation); the local write runs without the lock, so a slow
+        write to the partial stalls no write or grant for another file.
+        The settlement, under the lock again, charges the blocks the bytes
+        reached and releases the reservation, whether the write completed,
+        was short or failed.
 
         The first grant on a descriptor measures the inode's extents once
         (SEEK_DATA/SEEK_HOLE) and refuses, logging once, when they exceed
@@ -1019,21 +1029,23 @@ class CacheManager:
             required = end - start - charge.overlap(start, end)
             if required and not self.ensure_space(required):
                 return False
-            cursor = offset
-            try:
-                remaining = memoryview(data)
-                while remaining:
-                    written = os.pwrite(fd, remaining, cursor)
-                    if written <= 0:
-                        raise OSError(errno.EIO, "partial cache write made no progress")
-                    remaining = remaining[written:]
-                    cursor += written
-            finally:
-                # Only the blocks bytes reached; nothing here can raise and
-                # replace the write's own error.
+            self._stream_reserved += required
+        cursor = offset
+        try:
+            remaining = memoryview(data)
+            while remaining:
+                written = os.pwrite(fd, remaining, cursor)
+                if written <= 0:
+                    raise OSError(errno.EIO, "partial cache write made no progress")
+                remaining = remaining[written:]
+                cursor += written
+        finally:
+            # Only the blocks bytes reached; nothing here can raise and
+            # replace the write's own error.
+            with self._lock:
+                self._stream_reserved -= required
                 if cursor > offset:
-                    growth = charge.add(start, self._round_up(cursor))
-                    self._current_size_bytes += growth
+                    self._current_size_bytes += charge.add(start, self._round_up(cursor))
         return True
 
     def close_streaming_fd(self, fd: int):
