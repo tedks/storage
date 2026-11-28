@@ -39,6 +39,10 @@ log_events:
   who: Ted Smith
   what: blocked by gh-207-retry-budget
   comment: ""
+- time: 2026-11-28T10:34:10-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Draft PR #208 (fix/member-attributes-followup) at a0169ce.'
 blocked_by:
 - gh-207-stream-no-timestamp
 - gh-207-view-refusal
