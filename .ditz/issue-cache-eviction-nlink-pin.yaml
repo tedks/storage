@@ -1,0 +1,20 @@
+id: cache-eviction-nlink-pin
+title: A cached copy with st_nlink>1 after a failed partial unlink is never an eviction
+  victim until restart
+desc: 'From council on #191 (round-1 Anthropic N6). _evict_if_still_clean skips st_nlink>1
+  copies so it never claims bytes that unlinking one name would leave allocated. A
+  partial whose unlink failed after install therefore pins its cached file until the
+  startup sweep. Fix: retry the partial unlink in streaming cleanup.'
+type: bugfix
+component: cache
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-28T08:53:29-00:00
+references: []
+log_events:
+- time: 2026-11-28T08:53:29-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
