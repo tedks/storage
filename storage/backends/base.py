@@ -64,6 +64,36 @@ def current_capacity_cancel_probe():
     return getattr(_CAPACITY_CANCEL_PROBE, "probe", None)
 
 
+@contextmanager
+def interactive_wait_cancellation(probe):
+    """Let probe end an interactive request's wait for a channel, for this block.
+
+    Separate from capacity_wait_cancellation, which bulk waits poll: an
+    interactive request is never cancelled by it. A pool calls
+    probe(token, waited) only while an interactive acquisition has to wait
+    (never when a channel is free), and once more before it gives up at its
+    deadline, then reporting at least the deadline's whole span. token
+    identifies the acquisition (a retry is a new one) and waited is the
+    time this acquisition has measured in its channel waits. A reason
+    returned makes the pool raise BulkCapacityCancelled with it. An
+    acquisition that waited and then got a channel calls
+    probe(token, waited, granted=True) once, after the channel is held, so
+    the last interval is recorded. That call is record-only: it cannot
+    refuse the channel, its answer is ignored, and so is anything it
+    raises.
+    """
+    previous = getattr(_CAPACITY_CANCEL_PROBE, "interactive_probe", None)
+    _CAPACITY_CANCEL_PROBE.interactive_probe = probe
+    try:
+        yield
+    finally:
+        _CAPACITY_CANCEL_PROBE.interactive_probe = previous
+
+
+def current_interactive_cancel_probe():
+    return getattr(_CAPACITY_CANCEL_PROBE, "interactive_probe", None)
+
+
 class MemberSourceMissing(FileNotFoundError):
     """A member rename found nothing at the old name on the member: nothing
     moved. Raised only on positive evidence (the member's own check of the
@@ -148,6 +178,25 @@ class Backend(ABC):
         configuration, or None when it sets no such limit. Nominal, from
         configuration: never a live probe."""
         return None
+
+    def background_range_capacity(self) -> Optional[int]:
+        """The member's limit on concurrent background range reads, if any."""
+        return None
+
+    def interactive_wait_budget(self) -> Optional[float]:
+        """Seconds an interactive request may wait for a channel, if bounded.
+
+        None for a member whose requests never wait for one.
+        """
+        return None
+
+    def run_background_range_read(self, virtual_path, fetch):
+        """Hold member capacity before claiming a speculative byte range.
+
+        fetch claims and reads the range; local work on the bytes belongs
+        after this returns, once the capacity is released.
+        """
+        return fetch()
 
     @property
     def label(self) -> str:

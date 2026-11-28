@@ -244,6 +244,62 @@ latest read to the end of the file. Empty terms,
 negative sizes, unknown suffixes and percentages above 100 are rejected
 when the mount configuration loads.
 
+Streaming read-ahead and retained fills share an adaptive pool of up to
+`max_download_workers` (`--max-download-workers`, default 4, range 1–32).
+Workers start when chunks are runnable and retire after 30 idle seconds.
+Each worker takes one chunk before checking the queue again. Files with
+open readers take precedence, with a turn for a waiting closed file
+after four reader turns. Reopening a retained fill gives it reader
+priority and reuses the bytes it already has.
+
+`max_streaming_sessions` (`--max-streaming-sessions`, default 8) limits new
+streaming sessions when that many distinct files have open readers. A new
+open above that limit uses the whole-file cache path. Opening a file that
+already has a session (a second reader, or reopening a retained fill)
+joins that session and is exempt from the limit, since it adds no partial. A separate
+`max_retained_streaming_sessions` (`--max-retained-streaming-sessions`,
+default 64) limits unfinished fills that continue after the last close.
+Each retains one partial inode and descriptor. The file's entire length
+counts against `cache_size`, even while the partial is sparse. When the
+retained limit is full, the newest close discards its incomplete partial.
+Set the retained limit to 0 to discard every incomplete fill on last close.
+Lowering the retained limit on a live mount lets the fills already retained
+finish. Readers come first: a new reader that would fit but for retained
+fills discards the one with the fewest bytes to get its session. If the
+cache cannot make enough space for a new reader, or for a whole-file fill
+(a write-open of an uncached file, an open that gets no streaming session),
+it discards unfinished retained fills to make room, fewest bytes first. If no
+download worker can start, a closed fill is discarded rather than retained,
+and so is a file that has every byte: only a worker confirms a file with
+its member before publishing it, so the next open fetches it again.
+
+All three limits are checked when the mount configuration loads: an
+integer from 1 to 1024 for `max_streaming_sessions`, 0 to 1024 for
+`max_retained_streaming_sessions` and 1 to 32 for `max_download_workers`.
+Values outside those ranges are rejected. Earlier versions silently raised
+a `max_streaming_sessions` of 0 or less to 1 and had no upper bound.
+
+SSH read-ahead and retained fills use bulk SFTP capacity, as do rsync
+members' range reads. A worker claims bytes only after getting a bulk
+channel, so a waiting worker leaves those bytes available to foreground
+reads on the interactive reserve. If a member can open only one channel,
+the current operation finishes before that channel is passed to a waiter.
+A worker that has waited half a second for one member's bulk capacity
+while files on another member, or a complete file on any member, wait for
+a worker goes to those files, so a member whose bulk channels are taken
+(by sync, say) cannot hold every worker.
+A worker waiting for a bulk channel stops waiting once foreground reads
+have fetched every byte of its file. A worker publishing a complete file
+into the cache makes one member stat to confirm the version, on the
+interactive reserve with its connection deadline and no bulk channel, so
+publication does not count against or wait for a member's bulk capacity.
+If that stat has waited half a second for a channel while other work waits
+for a worker, the worker moves on and the publication is queued again.
+Publication takes precedence for the next free worker (at most four in a
+row while range reads are waiting). A complete file finished without a
+worker (a close when no worker could start, or unmount) is not confirmed,
+so it is discarded rather than published; the next open fetches it again.
+
 A cached file that has been synced is checked against its member when it
 is opened and was last checked more than `revalidate_after` seconds ago
 (`--revalidate-after`, default 60; `0` checks at every open). The check is

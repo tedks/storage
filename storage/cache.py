@@ -13,7 +13,7 @@ import secrets
 import time
 import threading
 from pathlib import Path
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from enum import Enum
 from typing import Callable, ContextManager, Optional, List, Set
 
@@ -72,6 +72,16 @@ def _remove_prefix_marker(path: Path):
             os.chmod(path, mode)
 
 
+class NewFileReservation:
+    """A new file's charge: its size, and the inode a scan must not count."""
+
+    __slots__ = ("size", "inode")
+
+    def __init__(self, size: int, inode):
+        self.size = size
+        self.inode = inode  # (st_dev, st_ino)
+
+
 class CacheFetch(Enum):
     FAILED = 0
     INSTALLED = 1
@@ -128,6 +138,15 @@ class CacheManager:
         # path the evicting thread holds itself is not). None (no
         # StorageFS) means no contention.
         self.path_guard: Optional[Callable[[str], ContextManager[bool]]] = None
+        # Set by StreamingReadManager: frees cache space held by readerless
+        # streaming fills (sparse partials with no index row, so eviction
+        # cannot see them) for a whole-file fill whose eviction fell short.
+        # Takes a byte count; True means the caller should ask again.
+        # cache_file_result calls it without self._lock: it takes the
+        # streaming registry and session locks, and the streaming paths
+        # take self._lock inside those, never the other way.
+        # None (no streaming manager: tests, CLI tools) means nothing to free.
+        self.reclaim_space: Optional[Callable[[int], bool]] = None
         self.state_manager = state_manager
         self.bulk_cold_copies = bulk_cold_copies
         self.max_size_bytes = max_size_bytes
@@ -136,6 +155,10 @@ class CacheManager:
         # max_size_bytes so concurrent fetches cannot each see the same free
         # space. Under _lock.
         self._reserved_bytes = 0
+        # Reservations for new files (reserve_new_file), each charging one
+        # inode; the scan skips that inode under any name, so each new file
+        # is charged once. Added and removed under _lock.
+        self._new_file_reservations: Set["NewFileReservation"] = set()
         # Bumped by every rescan; a fetch that sees it move knows the scan
         # may have counted its temp file (see _replace_into_cache).
         self._scan_count = 0
@@ -153,18 +176,31 @@ class CacheManager:
         (anything on the host) against a cache that can never evict it.
         """
         total = 0
+        # Stable during the scan: the caller holds _lock.
+        reserved = {reservation.inode for reservation in self._new_file_reservations}
         for root, dirs, files in os.walk(self.cache_root):
             for name in files:
                 st = regular_file_stat(Path(root) / name)
+                if st is not None and (st.st_dev, st.st_ino) in reserved:
+                    continue
                 if st is not None:
                     total += st.st_size
         return total
 
     def _ensure_size_current_locked(self):
-        """Refresh tracked size if it has been marked dirty by direct writes."""
+        """Refresh tracked size if it has been marked dirty by direct writes.
+
+        The flag is cleared before the scan, not after: mark_cache_size_dirty
+        sets it without the lock, so a mark landing during the scan (whose
+        change the scan may have missed) stays set for the next caller.
+        """
         if self._size_dirty:
-            self._current_size_bytes = self._scan_total_cache_size()
             self._size_dirty = False
+            try:
+                self._current_size_bytes = self._scan_total_cache_size()
+            except BaseException:
+                self._size_dirty = True
+                raise
             self._scan_count += 1
 
     def recover_views(self, member_names: List[str]):
@@ -307,9 +343,17 @@ class CacheManager:
             return self._current_size_bytes
 
     def mark_cache_size_dirty(self):
-        """Mark cache size accounting as stale after direct external file mutations."""
-        with self._lock:
-            self._size_dirty = True
+        """Mark cache size accounting as stale after direct external file mutations.
+
+        Without the cache lock, so callers holding other locks (the
+        streaming registry) never wait on a rescan or an eviction. Safe
+        because _ensure_size_current_locked, the flag's only reader,
+        clears it before it scans: a mark after the mutation either lands
+        before that clear (and the scan, which starts after it, sees the
+        mutation) or after it (and stays set). An attribute store is
+        atomic under the GIL.
+        """
+        self._size_dirty = True
 
     def get_free_space_needed(self, required_bytes: int) -> int:
         """
@@ -454,6 +498,46 @@ class CacheManager:
         # Could not free enough space
         return False
 
+    @contextmanager
+    def admit_streaming_partial(self, file_size: int):
+        """Charge the new sparse file's apparent size before another open can allocate.
+
+        Yields whether it fits. The caller creates the file inside the block
+        and, once it exists, charges it with reserve_new_file until it is at
+        its final name (see there).
+        """
+        with self._lock:
+            admitted = self.ensure_space(file_size)
+            try:
+                yield admitted
+            finally:
+                if admitted:
+                    self._size_dirty = True
+
+    def reserve_new_file(self, size: int, st: os.stat_result) -> "NewFileReservation":
+        """Charge a new file (st: its stat) as a reservation instead of by name.
+
+        For a file renamed outside this lock (a streaming partial at
+        registration): a scan in between could see the old name, the new
+        one, or neither. While reserved, the scan skips the file's inode
+        under whatever name it finds it, so it is charged exactly once, by
+        the reservation. Another file at the rename target is a different
+        inode and stays charged until the rename replaces it.
+        release_new_file ends the reservation.
+        """
+        reservation = NewFileReservation(size, (st.st_dev, st.st_ino))
+        with self._lock:
+            self._reserved_bytes += size
+            self._new_file_reservations.add(reservation)
+        return reservation
+
+    def release_new_file(self, reservation: "NewFileReservation"):
+        """End a reserve_new_file: the scan counts the file by name again."""
+        with self._lock:
+            self._new_file_reservations.discard(reservation)
+            self._reserved_bytes -= reservation.size
+            self._size_dirty = True
+
     def cache_file(self, virtual_path: str, backend: Backend, source_virtual_path: str = None) -> bool:
         """Ensure a member file is cached, including when another fill won."""
         return self.cache_file_result(virtual_path, backend, source_virtual_path) != CacheFetch.FAILED
@@ -495,11 +579,17 @@ class CacheManager:
         if file_size is None:
             file_size = backend.get_size(source_virtual_path)
 
-        with self._lock:
-            if not self.ensure_space(file_size):
+        for attempt in range(2):
+            with self._lock:
+                if self.ensure_space(file_size):
+                    self._reserved_bytes += file_size
+                    break
+            # Outside self._lock (see reclaim_space), and once: what it
+            # frees can be taken by another fill before the retry.
+            reclaim = self.reclaim_space
+            if attempt or reclaim is None or not reclaim(file_size):
                 print(f"Warning: Insufficient cache space for {virtual_path}")
                 return CacheFetch.FAILED
-            self._reserved_bytes += file_size
         try:
             installed = self.fetch_into_cache(
                 backend, source_virtual_path, self.get_cache_path(virtual_path), member_stat,

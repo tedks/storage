@@ -20,6 +20,7 @@ from storage.backends.base import (
     ChecksumUnavailable,
     MemberSourceMissing,
     bulk_request,
+    interactive_wait_cancellation,
     capacity_wait_cancellation,
     interactive_request,
     is_interactive_request,
@@ -672,6 +673,187 @@ class TestMemberConnectionPool(unittest.TestCase):
         with pool.sftp(1.0) as sftp:
             sftp.stat("/data/x")
         self.assertEqual(server.connect_calls, 1)
+        pool.close()
+
+    def test_single_channel_hands_off_to_waiting_readers_then_bulk(self):
+        server = _FakeServer()
+        pool = _pool(server, sftp_channels=1, connect_timeout=5)
+        self.addCleanup(pool.close)
+        order = []
+
+        def use_channel(kind):
+            with pool.sftp(1.0):
+                order.append(kind)
+
+        burst = ssh_pool._SFTP_INTERACTIVE_BURST
+        with pool.sftp(1.0):
+            bulk = _InThread(lambda: use_channel("bulk"))
+            readers = [_InThread(lambda: use_channel("reader"), interactive=True)
+                       for _ in range(burst + 1)]
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                with pool._cond:
+                    if pool._bulk_sftp_waiters == 1 and pool._interactive_sftp_waiters == burst + 1:
+                        break
+                time.sleep(0.01)
+            else:
+                self.fail("channel waiters did not queue")
+
+        for waiter in [bulk, *readers]:
+            self.assertTrue(waiter.join())
+            self.assertIsNone(waiter.error)
+        self.assertEqual(order, ["reader"] * burst + ["bulk", "reader"])
+        self.assertEqual(server.transport.max_open_seen, 1)
+
+    def test_interactive_wait_probe_ends_a_wait_for_the_only_channel(self):
+        server = _FakeServer()
+        pool = _pool(server, sftp_channels=1, connect_timeout=5)
+        # The member's one channel, held by a bulk transfer.
+        holder = _Holder(pool)
+        polls = []
+
+        def probe(_token, _waited):
+            polls.append(time.monotonic())
+            return "yielded" if len(polls) >= 3 else None
+
+        def confirm():
+            with interactive_wait_cancellation(probe):
+                return pool.acquire_sftp(1.0)
+
+        started = time.monotonic()
+        waiter = _InThread(confirm, interactive=True)
+        try:
+            self.assertTrue(waiter.join(3), "the wait outlived its probe")
+            self.assertIsInstance(waiter.error, BulkCapacityCancelled)
+            self.assertLess(time.monotonic() - started, 2.0)
+            self.assertEqual(3, len(polls))
+        finally:
+            holder.release()
+
+        # A free channel is taken without asking the probe at all.
+        def take_free():
+            with interactive_wait_cancellation(lambda _token, _waited: "never asked"):
+                lease = pool.acquire_sftp(1.0)
+            pool.release(lease)
+            return True
+
+        taker = _InThread(take_free, interactive=True)
+        self.assertTrue(taker.join(3))
+        self.assertIsNone(taker.error)
+        self.assertTrue(taker.result)
+        self.assertEqual(1, server.transport.max_open_seen)
+        pool.close()
+
+    def test_interactive_wait_probe_is_asked_once_more_at_the_deadline(self):
+        class ShortWaits(threading.Condition):
+            """Each wait returns after half its timeout, as if woken early:
+            the time inside cond.wait then falls short of the deadline."""
+
+            def wait(self, timeout=None):
+                super().wait(None if timeout is None else timeout / 2)
+                return False
+
+        server = _FakeServer()
+        pool = _pool(server, sftp_channels=1, connect_timeout=0.05)
+        pool._cond = ShortWaits()
+        holder = _Holder(pool)
+        calls = []
+
+        def probe(token, waited, granted=False):
+            calls.append((token, waited, granted))
+            # The budget is the deadline itself.
+            return "budget spent" if waited >= 0.05 else None
+
+        def confirm():
+            with interactive_wait_cancellation(probe):
+                return pool.acquire_sftp(1.0)
+
+        waiter = _InThread(confirm, interactive=True)
+        try:
+            self.assertTrue(waiter.join(3))
+            # A spent budget ends as a cancellation, not a member failure,
+            # although less than the deadline was spent inside cond.wait.
+            self.assertIsInstance(waiter.error, BulkCapacityCancelled)
+            self.assertEqual(0.0, calls[0][1])
+            self.assertTrue(all(call[0] is calls[0][0] for call in calls))
+            self.assertGreaterEqual(calls[-1][1], 0.05)
+            self.assertFalse(any(call[2] for call in calls))
+        finally:
+            holder.release()
+            pool.close()
+
+    def test_granted_interactive_wait_reports_its_last_interval(self):
+        server = _FakeServer()
+        pool = _pool(server, sftp_channels=1, connect_timeout=5)
+        holder = _Holder(pool)
+        calls = []
+        polled = threading.Event()
+
+        def probe(token, waited, granted=False):
+            calls.append((token, waited, granted))
+            if waited > 0:
+                polled.set()
+            return None
+
+        def confirm():
+            with interactive_wait_cancellation(probe):
+                lease = pool.acquire_sftp(1.0)
+            pool.release(lease)
+
+        waiter = _InThread(confirm, interactive=True)
+        try:
+            self.assertTrue(polled.wait(3))
+            time.sleep(0.05)
+            holder.release()
+            self.assertTrue(waiter.join(3))
+            self.assertIsNone(waiter.error)
+        finally:
+            holder.release()
+            pool.close()
+        token = calls[0][0]
+        self.assertTrue(all(call[0] is token for call in calls))
+        polls = [waited for _token, waited, granted in calls if not granted]
+        grants = [waited for _token, waited, granted in calls if granted]
+        # The grant's report covers the wait after the last poll too.
+        self.assertEqual(1, len(grants))
+        self.assertGreaterEqual(grants[0], max(polls))
+        self.assertIs(calls[-1][2], True)
+
+    def test_a_raising_grant_report_does_not_strand_the_channel(self):
+        server = _FakeServer()
+        pool = _pool(server, sftp_channels=1, connect_timeout=5)
+        holder = _Holder(pool)
+        polled = threading.Event()
+
+        def probe(_token, waited, granted=False):
+            if granted:
+                raise RuntimeError("probe bug")
+            if waited > 0:
+                polled.set()
+            return None
+
+        def confirm():
+            with interactive_wait_cancellation(probe):
+                lease = pool.acquire_sftp(1.0)
+            held = pool.snapshot()
+            pool.release(lease)
+            return held
+
+        waiter = _InThread(confirm, interactive=True)
+        try:
+            self.assertTrue(polled.wait(3))
+            holder.release()
+            self.assertTrue(waiter.join(3))
+            # The caller got its lease despite the report raising.
+            self.assertIsNone(waiter.error)
+        finally:
+            holder.release()
+        # And released, the only channel serves the next caller.
+        other = _InThread(lambda: pool.release(pool.acquire_sftp(1.0)) or True, interactive=True)
+        self.assertTrue(other.join(3))
+        self.assertIsNone(other.error)
+        self.assertEqual(1, pool.snapshot()["idle"])
+        self.assertEqual(1, server.transport.max_open_seen)
         pool.close()
 
     def test_lease_is_reentrant_within_a_thread(self):
@@ -1643,6 +1825,37 @@ class TestSSHBackendOnThePool(_BackendTestCase):
                 opener.join(3)
                 if shutdown is not None:
                     shutdown.join(3)
+
+    def test_background_range_read_waits_for_bulk_and_reuses_its_lease(self):
+        payload = b"background-range-bytes"
+        self.server.payload = payload
+        backend = self._new_backend()
+        backend.stat("/movie.bin")
+        capacity = backend.background_range_capacity()
+        self.assertEqual(backend._pool.bulk_capacity(), capacity)
+        # Every bulk lease is held elsewhere (sync, say).
+        holders = [_Holder(backend._pool) for _ in range(capacity)]
+        entered = threading.Event()
+
+        def fetch():
+            entered.set()
+            # The nested read reuses the turn's lease: no further channel.
+            return backend.read_file("/movie.bin", 0, 8)
+
+        reader = _InThread(lambda: backend.run_background_range_read("/movie.bin", fetch))
+        try:
+            self.assertFalse(entered.wait(0.3), "fetch ran without a bulk lease")
+            channels = self.server.transport.max_open_seen
+            holders[0].release()
+            self.assertTrue(reader.join(5))
+            self.assertIsNone(reader.error)
+            self.assertEqual(payload[:8], reader.result)
+            self.assertEqual(channels, self.server.transport.max_open_seen)
+            self.assertEqual(1, [name for name, *_ in self.server.requests].count("open"))
+        finally:
+            for holder in holders:
+                holder.release()
+            reader.join(3)
 
     def test_bulk_copy_and_eager_readdir_restore_context_on_error(self):
         from storage.fs import StorageFS

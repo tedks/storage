@@ -173,6 +173,41 @@ class TestCacheAccounting(unittest.TestCase):
         self.assertEqual(self.cache_manager.get_total_cache_size(), 4)
         self.assertTrue(self.cache_manager.ensure_space(1))
 
+    def _fill_with_unindexed_file(self, size):
+        # Like a streaming partial: counted by the scan, unknown to eviction.
+        held = self.cache_dir / "held.storage.partial"
+        held.write_bytes(b"\0" * size)
+        self.cache_manager.mark_cache_size_dirty()
+        return held
+
+    def test_reclaim_hook_runs_without_the_cache_lock_and_allows_one_retry(self):
+        self.cache_manager.max_size_bytes = 1000
+        held = self._fill_with_unindexed_file(800)
+        (self.backend_dir / "w.bin").write_bytes(b"w" * 500)
+        calls = []
+
+        def reclaim(size):
+            calls.append((size, self.cache_manager._lock._is_owned()))
+            held.unlink()
+            self.cache_manager.mark_cache_size_dirty()
+            return True
+
+        self.cache_manager.reclaim_space = reclaim
+        self.assertTrue(self.cache_manager.cache_file("/w.bin", self.backend))
+        self.assertEqual(calls, [(500, False)])
+        self.assertEqual(self.cache_manager.get_total_cache_size(), 500)
+
+    def test_reclaim_hook_that_frees_nothing_fails_the_fill_once(self):
+        self.cache_manager.max_size_bytes = 1000
+        self._fill_with_unindexed_file(800)
+        (self.backend_dir / "w.bin").write_bytes(b"w" * 500)
+        for result in (False, True):
+            calls = []
+            self.cache_manager.reclaim_space = lambda size: calls.append(size) or result
+            self.assertFalse(self.cache_manager.cache_file("/w.bin", self.backend))
+            self.assertEqual(calls, [500])
+        self.assertFalse(self.cache_manager.is_cached("/w.bin"))
+
 
 if __name__ == "__main__":
     unittest.main()
@@ -437,3 +472,57 @@ class TestEvictionSkipsStaleClean(unittest.TestCase):
 
         self.assertTrue(turned.exists())
         self.assertEqual(self.state_manager.get_file_metadata("/turned.txt").sync_status, SyncStatus.DIRTY)
+
+
+class TestCacheSizeMark(unittest.TestCase):
+    """mark_cache_size_dirty takes no lock and is never lost to a rescan."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.cache_dir = Path(self.temp_dir) / "cache"
+        self.cache_dir.mkdir()
+        self.state_manager = StateManager(str(Path(self.temp_dir) / "state.db"))
+        self.cache_manager = CacheManager(self.cache_dir, self.state_manager, 1024 * 1024)
+
+    def tearDown(self):
+        self.state_manager.close()
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_mark_does_not_wait_for_the_cache_lock(self):
+        held = threading.Event()
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        def hold():
+            with self.cache_manager._lock:
+                held.set()
+                release.wait(timeout=5)
+
+        holder = threading.Thread(target=hold, daemon=True)
+        holder.start()
+        self.assertTrue(held.wait(timeout=3))
+        (self.cache_dir / "new.bin").write_bytes(b"x" * 10)
+        marker = threading.Thread(target=self.cache_manager.mark_cache_size_dirty, daemon=True)
+        marker.start()
+        marker.join(timeout=1)
+        alive = marker.is_alive()
+        release.set()
+        holder.join(timeout=3)
+        self.assertFalse(alive)
+        self.assertEqual(self.cache_manager.get_total_cache_size(), 10)
+
+    def test_mark_during_a_rescan_is_not_lost(self):
+        (self.cache_dir / "first.bin").write_bytes(b"x" * 10)
+        self.cache_manager.mark_cache_size_dirty()
+        real_scan = self.cache_manager._scan_total_cache_size
+
+        def scan():
+            total = real_scan()
+            # A file lands after the scan counted, and is marked meanwhile.
+            (self.cache_dir / "second.bin").write_bytes(b"y" * 20)
+            self.cache_manager.mark_cache_size_dirty()
+            return total
+
+        with patch.object(self.cache_manager, "_scan_total_cache_size", side_effect=scan):
+            self.assertEqual(self.cache_manager.get_total_cache_size(), 10)
+        self.assertEqual(self.cache_manager.get_total_cache_size(), 30)

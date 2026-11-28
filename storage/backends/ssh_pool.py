@@ -45,7 +45,15 @@ from typing import Callable, Dict, Iterator, List, Optional, Tuple
 
 import paramiko
 
-from .base import current_capacity_cancel_probe, is_interactive_request
+from .base import current_capacity_cancel_probe, current_interactive_cancel_probe, is_interactive_request
+
+
+# When sshd leaves just one SFTP channel, interactive traffic gets the
+# next turn but cannot indefinitely starve a waiting bulk operation.
+_SFTP_INTERACTIVE_BURST = 4
+
+# How often a capacity wait with a cancellation probe polls it.
+CAPACITY_PROBE_POLL_SECONDS = 0.1
 
 
 class CommandTimeout(socket.timeout):
@@ -69,7 +77,8 @@ class BulkCapacityTimeout(MemberUnavailable):
 
 
 class BulkCapacityCancelled(MemberUnavailable):
-    """A native FUSE request or session ended while waiting for bulk capacity."""
+    """A native FUSE request or session ended while waiting for bulk capacity,
+    or an interactive wait's probe ended it (base.interactive_wait_cancellation)."""
 
 
 _TRANSIENT_ERRNOS = frozenset({
@@ -431,6 +440,9 @@ class MemberConnection:
             float(bulk_capacity_wait_timeout) if bulk_capacity_wait_timeout else None
         )
         self._interactive_reserve = max(0, interactive_reserve)
+        self._interactive_sftp_waiters = 0
+        self._bulk_sftp_waiters = 0
+        self._interactive_sftp_turns = 0
         self._stall_limit = max(1, stall_limit)
         self._on_availability = on_availability
         self._sftp_client_factory = sftp_client_factory
@@ -791,6 +803,11 @@ class MemberConnection:
         fewer (_sftp_cap), and other background callers share them."""
         return self._bulk_limit_for(self._sftp_channels)
 
+    def bulk_capacity(self) -> int:
+        """Current bulk ceiling, including channel refusals on this transport."""
+        with self._cond:
+            return self._bulk_limit()
+
     def _reserve_lost(self, cap: int) -> bool:
         """Whether, with cap SFTP channels, background transfers can hold them
         all: the bulk limit never goes below one."""
@@ -823,7 +840,8 @@ class MemberConnection:
                 held._set_timeout(timeout)
                 return held
         interactive = is_interactive_request()
-        lease = self._acquire_new_sftp(interactive, owner)
+        with self._sftp_waiter(interactive):
+            lease = self._acquire_new_sftp(interactive, owner)
         lease.depth = 1
         try:
             lease._set_timeout(timeout)
@@ -832,10 +850,61 @@ class MemberConnection:
             raise
         return lease
 
+    @contextmanager
+    def _sftp_waiter(self, interactive: bool):
+        with self._cond:
+            if interactive:
+                self._interactive_sftp_waiters += 1
+            else:
+                self._bulk_sftp_waiters += 1
+        try:
+            yield
+        finally:
+            with self._cond:
+                if interactive:
+                    self._interactive_sftp_waiters -= 1
+                else:
+                    self._bulk_sftp_waiters -= 1
+                self._cond.notify_all()
+
+    def _sftp_turn_allowed_locked(self, interactive: bool) -> bool:
+        if not self._reserve_lost(self._sftp_cap):
+            return True
+        if interactive:
+            return (self._bulk_sftp_waiters == 0
+                    or self._interactive_sftp_turns < _SFTP_INTERACTIVE_BURST)
+        return (self._interactive_sftp_waiters == 0
+                or self._interactive_sftp_turns >= _SFTP_INTERACTIVE_BURST)
+
+    def _record_sftp_turn_locked(self, interactive: bool):
+        if interactive and self._bulk_sftp_waiters and self._reserve_lost(self._sftp_cap):
+            self._interactive_sftp_turns += 1
+        else:
+            self._interactive_sftp_turns = 0
+
     def _acquire_new_sftp(self, interactive: bool, owner: int) -> SFTPLease:
         deadline = self._deadline(interactive)
         capacity_deadline = None
         cancel_probe = current_capacity_cancel_probe() if not interactive else None
+        # Polled only while an interactive acquisition waits (see
+        # base.interactive_wait_cancellation).
+        wait_probe = current_interactive_cancel_probe() if interactive else None
+        # This acquisition's identity and its measured time in channel
+        # waits, both passed to wait_probe (see interactive_wait_cancellation).
+        wait_token = object()
+        channel_waited = 0.0
+
+        def report_grant():
+            # A channel after a wait, once nothing else can fail: the probe
+            # records the last interval (granted=True). Record-only: it
+            # cannot refuse the channel, and whatever it raises is dropped,
+            # so the lease is not stranded.
+            if wait_probe and channel_waited > 0:
+                try:
+                    wait_probe(wait_token, channel_waited, granted=True)
+                except Exception:  # noqa: BLE001 - record-only
+                    self.logger.debug("SSH member %s: a granted channel-wait report failed",
+                                      self.name, exc_info=True)
         # Transports this acquisition may see installed before giving up: a
         # server that drops every new connection must not loop forever.
         connects_left = 2
@@ -856,13 +925,14 @@ class MemberConnection:
                             f"SSH member {self.name}: {reason} ended during bulk capacity wait")
                 lease = self._take_idle_locked(interactive, owner)
                 if lease is not None:
+                    report_grant()
                     return lease
                 if not self._can_open_locked(interactive):
                     if not interactive:
                         if self.bulk_capacity_wait_timeout is None:
                             # Poll only inside an actual FUSE callback: libfuse
                             # cannot run destroy until that callback returns.
-                            self._cond.wait(0.1 if cancel_probe else None)
+                            self._cond.wait(CAPACITY_PROBE_POLL_SECONDS if cancel_probe else None)
                         else:
                             if capacity_deadline is None:
                                 capacity_deadline = (
@@ -872,16 +942,42 @@ class MemberConnection:
                             if remaining <= 0:
                                 raise BulkCapacityTimeout(
                                     f"SSH member {self.name}: no bulk SFTP capacity came free")
-                            self._cond.wait(min(remaining, 0.1) if cancel_probe else remaining)
+                            self._cond.wait(min(remaining, CAPACITY_PROBE_POLL_SECONDS)
+                                            if cancel_probe else remaining)
                         continue
+                    if wait_probe:
+                        reason = wait_probe(wait_token, channel_waited)
+                        if reason:
+                            raise BulkCapacityCancelled(
+                                f"SSH member {self.name}: {reason} ended during channel wait")
                     remaining = deadline - time.monotonic()
-                    if remaining <= 0 or not self._cond.wait(remaining):
+                    step = min(remaining, CAPACITY_PROBE_POLL_SECONDS) if wait_probe else remaining
+                    timed_out = remaining <= 0
+                    if not timed_out:
+                        started = time.monotonic()
+                        woken = self._cond.wait(step)
+                        channel_waited += time.monotonic() - started
+                        timed_out = not woken and step >= remaining
+                    if timed_out:
                         if not self._can_open_locked(interactive) \
                                 and not self._idle_usable_locked(interactive):
+                            if wait_probe:
+                                # Once more, reporting at least the whole
+                                # deadline span (the time outside
+                                # cond.wait is not counted otherwise): a
+                                # probe whose budget is the deadline always
+                                # cancels, and the caller does not see a
+                                # member failure.
+                                reason = wait_probe(
+                                    wait_token, max(channel_waited, self.connect_timeout))
+                                if reason:
+                                    raise BulkCapacityCancelled(
+                                        f"SSH member {self.name}: {reason} ended during channel wait")
                             raise MemberUnavailable(
                                 f"SSH member {self.name}: no SFTP channel came free")
                     continue
                 self._sftp_open += 1
+                self._record_sftp_turn_locked(interactive)
                 if not interactive:
                     self._bulk_leased += 1
 
@@ -935,10 +1031,13 @@ class MemberConnection:
             if stale:
                 _close_quietly(client)
                 continue
+            # The server accepted the channel and the lease is held.
+            report_grant()
             return lease
 
     def _idle_usable_locked(self, interactive: bool) -> bool:
-        return bool(self._idle) and (interactive or self._bulk_leased < self._bulk_limit())
+        return (bool(self._idle) and self._sftp_turn_allowed_locked(interactive)
+                and (interactive or self._bulk_leased < self._bulk_limit()))
 
     def _take_idle_locked(self, interactive: bool, owner: int) -> Optional[SFTPLease]:
         if not self._idle_usable_locked(interactive):
@@ -950,13 +1049,14 @@ class MemberConnection:
         lease.error = None
         lease.stalled_since = None
         lease.acquired_at = time.monotonic()
+        self._record_sftp_turn_locked(interactive)
         if not interactive:
             self._bulk_leased += 1
         self._held[owner] = lease
         return lease
 
     def _can_open_locked(self, interactive: bool) -> bool:
-        if self._sftp_open >= self._sftp_cap:
+        if self._sftp_open >= self._sftp_cap or not self._sftp_turn_allowed_locked(interactive):
             return False
         return interactive or self._bulk_leased < self._bulk_limit()
 

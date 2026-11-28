@@ -99,6 +99,8 @@ foreground = true
 streaming_reads = true
 streaming_chunk_size = "2M"
 max_streaming_sessions = 16
+max_retained_streaming_sessions = 120
+max_download_workers = 3
 max_sync_workers = 3
 backends = [
   "ssh://user@storage-host.example:/srv/raid/media/",
@@ -131,6 +133,8 @@ backends = [
         self.assertTrue(kwargs["streaming_reads"])
         self.assertEqual(2 * 1024 ** 2, kwargs["streaming_chunk_size"])
         self.assertEqual(16, kwargs["max_streaming_sessions"])
+        self.assertEqual(120, kwargs["max_retained_streaming_sessions"])
+        self.assertEqual(3, kwargs["max_download_workers"])
         self.assertEqual(3, kwargs["max_sync_workers"])
 
     def test_mount_auto_loads_default_storage_toml(self):

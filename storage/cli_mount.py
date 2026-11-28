@@ -93,7 +93,17 @@ def shared_filesystems(backends: Dict[str, Backend]) -> List[List[str]]:
 @click.option(
     "--max-streaming-sessions",
     type=int,
-    help="Maximum number of concurrent streaming prefetch sessions.",
+    help="Maximum new streaming sessions with live readers (default 8).",
+)
+@click.option(
+    "--max-download-workers",
+    type=int,
+    help="Maximum adaptive workers for streaming downloads (1–32, default 4).",
+)
+@click.option(
+    "--max-retained-streaming-sessions",
+    type=int,
+    help="Maximum unfinished streaming fills retained without readers (default 64).",
 )
 @click.option(
     "--streaming-keep-after-close",
@@ -179,6 +189,8 @@ def mount(
     streaming_reads,
     streaming_chunk_size,
     max_streaming_sessions,
+    max_download_workers,
+    max_retained_streaming_sessions,
     streaming_keep_after_close,
     readdir_ttl,
     enable_watchers,
@@ -233,6 +245,8 @@ def mount(
         max_streaming_sessions,
         readdir_ttl,
         enable_watchers,
+        max_download_workers=max_download_workers,
+        max_retained_streaming_sessions=max_retained_streaming_sessions,
         streaming_keep_after_close=streaming_keep_after_close,
         revalidate_after=revalidate_after,
         fuse_threads=fuse_threads,
@@ -328,7 +342,9 @@ def mount(
     click.echo(
         f"  Streaming chunk: {resolved.streaming_chunk_size} ({streaming_chunk_bytes:,} bytes)"
     )
-    click.echo(f"  Max streaming sessions: {resolved.max_streaming_sessions}")
+    click.echo(f"  Max streaming sessions with readers: {resolved.max_streaming_sessions}")
+    click.echo(f"  Max retained streaming sessions: {resolved.max_retained_streaming_sessions}")
+    click.echo(f"  Max streaming download workers: {resolved.max_download_workers}")
     click.echo(
         "  Streaming keep after close: "
         f"{resolved.streaming_keep_after_close if keep_after_close else 'default (4 chunks or 50%)'}"
@@ -398,6 +414,8 @@ def mount(
             streaming_reads=resolved.streaming_reads,
             streaming_chunk_size=streaming_chunk_bytes,
             max_streaming_sessions=resolved.max_streaming_sessions,
+            max_download_workers=resolved.max_download_workers,
+            max_retained_streaming_sessions=resolved.max_retained_streaming_sessions,
             streaming_keep_after_close=keep_after_close,
             readdir_ttl=resolved.readdir_ttl,
             enable_watchers=resolved.enable_watchers,
