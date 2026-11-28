@@ -351,11 +351,9 @@ ExecPlans for non-trivial work follow the format in
   says: the record predates a write. `CacheMetadataRecord.to_file_metadata`
   applies this for rebuild-index, `CacheManager.heal_stale_clean` for the
   open path and the post-crash sweep. The comparison is exact (both sides
-  come from `stat`), except that a CLEAN recomputable record of size 0 at
-  `EVICTING_MTIME`, the record a recomputable eviction holds only while it
-  truncates, matches any empty file (`stat_matches_record`); what it cannot
-  see is a same-size write in the same timestamp tick as the record, a few
-  ms on kernels without fine-grained timestamps. Anything that changes a cached file's bytes or mtime goes
+  come from `stat`); what it cannot see is a same-size write in the same
+  timestamp tick as the record, a few ms on kernels without fine-grained
+  timestamps. Anything that changes a cached file's bytes or mtime goes
   through `CacheManager.mark_file_dirty`, which keeps the records in step;
   a change that bypasses it looks like a lost write and gets resynced.
 - Sync status is owned by `files.dirty_generation`. Record a modification
