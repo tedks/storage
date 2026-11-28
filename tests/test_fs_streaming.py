@@ -238,6 +238,66 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.assertTrue(retained.background_finished.wait(timeout=3))
         self.assertEqual(retained.io_fd, -1)
 
+    def _open_retained_fill(self, name, payload):
+        """Open, read enough to keep it after close, and close: a retained fill.
+
+        Needs worker_gate set, so the worker is parked mid-chunk.
+        """
+        (self.backend_dir / name).write_bytes(payload)
+        path = "/" + name
+        fd = self.fs.open(path, os.O_RDONLY)
+        session = self._session_for(fd)
+        self.assertEqual(self.fs.read(path, 128 * 1024, 0, fd), payload[:128 * 1024])
+        self.assertTrue(session.readers_consumed)
+        self.assertTrue(self.backend.worker_in_read.wait(timeout=3))
+        self.fs.release(path, fd)
+        self.assertFalse(session.detached)
+        return session
+
+    def test_reader_displaces_fill_retained_over_a_lowered_limit(self):
+        manager = self.fs._streaming_manager
+        manager.update_download_limits(
+            max_streaming_sessions=1, max_retained_streaming_sessions=1, max_download_workers=1,
+        )
+        self.backend.worker_gate = threading.Event()
+        payload = os.urandom(384 * 1024)
+        retained = self._open_retained_fill("retained.bin", payload)
+        manager.update_download_limits(max_retained_streaming_sessions=0)
+        # Lowering alone lets it drain.
+        self.assertFalse(retained.detached)
+
+        (self.backend_dir / "reader.bin").write_bytes(payload)
+        fd = self.fs.open("/reader.bin", os.O_RDONLY)
+        reader = self._session_for(fd)
+        self.assertTrue(retained.detached)
+        self.assertFalse((self.cache_dir / "retained.bin.storage.partial").exists())
+        self.assertEqual(
+            self.fs._streaming_stats_snapshot()["streaming_retained_reader_cancellations"], 1)
+        self.assertEqual(self.fs.read("/reader.bin", 4096, 0, fd), payload[:4096])
+        self.assertEqual([entry["id"] for entry in manager.list_download_sessions()],
+                         [reader.session_id])
+        self.fs.release("/reader.bin", fd)
+
+        self.backend.worker_gate.set()
+        self.assertTrue(retained.background_finished.wait(timeout=3))
+        self.assertEqual(retained.io_fd, -1)
+        self.assertFalse((self.cache_dir / "retained.bin").exists())
+
+    def test_reader_is_refused_only_by_readers_not_by_retained_fills(self):
+        manager = self.fs._streaming_manager
+        manager.update_download_limits(max_streaming_sessions=1, max_retained_streaming_sessions=0)
+        payload = os.urandom(64 * 1024)
+        (self.backend_dir / "first.bin").write_bytes(payload)
+        (self.backend_dir / "second.bin").write_bytes(payload)
+        fd = self.fs.open("/first.bin", os.O_RDONLY)
+        first = self._session_for(fd)
+        other = self.fs.open("/second.bin", os.O_RDONLY)
+        with self.fs._fd_lock:
+            self.assertIsNone(self.fs._fd_map[other].prefetch_session)
+        self.assertFalse(first.detached)
+        self.fs.release("/second.bin", other)
+        self.fs.release("/first.bin", fd)
+
     def test_closed_fill_is_not_retained_when_no_worker_can_start(self):
         manager = self.fs._streaming_manager
         real_start = threading.Thread.start

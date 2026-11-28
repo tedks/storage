@@ -1712,14 +1712,56 @@ class StreamingReadManager:
                     retained += 1
         return active, retained
 
-    def _has_session_capacity(self):
-        """Reserve room for readers while bounding retained partials and descriptors."""
-        active, _ = self._download_session_counts()
+    @staticmethod
+    def _retained(session: PrefetchSession) -> bool:
+        """A readerless fill still fetching. Caller holds session.lock."""
+        return session.refcount == 0 and not StreamingReadManager._download_terminal(session)
+
+    def _reader_fits_locked(self, displaced: Optional[list] = None) -> bool:
+        """Whether a new reader's session fits; with displaced, make it fit.
+
+        Caller holds prefetch_sessions_lock. Files with readers are bounded
+        by max_streaming_sessions. All registered sessions (with readers,
+        retained, and complete or failed ones still publishing) are bounded
+        by that plus max_retained_streaming_sessions, which bounds partials
+        and descriptors. Readers come first: a retained fill never keeps a
+        reader out. Without displaced this only asks whether the reader
+        would fit once the retained fills are gone. With it, while the
+        total bound is full, the retained fill with the fewest bytes is
+        stopped and appended to displaced as (session, idle) for the caller
+        to pass to _complete_cancellation after dropping the lock. This is
+        what admits a reader when max_retained_streaming_sessions has been
+        lowered below the fills already retained, which otherwise drain.
+        """
+        active, retained = self._download_session_counts()
         limit = self._download_limits["max_streaming_sessions"]
-        retained_limit = self._download_limits["max_retained_streaming_sessions"]
-        # Complete/failed sessions can be waiting on local publication. Count
-        # them against the hard allocation bound even after their last close.
-        return active < limit and len(self.prefetch_sessions) < limit + retained_limit
+        bound = limit + self._download_limits["max_retained_streaming_sessions"]
+        if active >= limit:
+            return False
+        if displaced is None:
+            return len(self.prefetch_sessions) - retained < bound
+        while len(self.prefetch_sessions) >= bound:
+            victim = fewest = None
+            for session in self.prefetch_sessions.values():
+                with session.lock:
+                    if self._retained(session):
+                        have = sum(end - start for start, end in session.available_ranges)
+                        if victim is None or have < fewest:
+                            victim, fewest = session, have
+            if victim is None:
+                return False
+            with victim.lock:
+                # Re-checked under its lock: a fill that completed since
+                # the scan is never stopped (see _claim_detach).
+                if not self._retained(victim):
+                    continue
+                displaced.append((victim, self._stop_background_locked(victim)))
+            self._record_streaming_stat("streaming_retained_reader_cancellations")
+        return True
+
+    def _complete_displacements(self, displaced: list):
+        for session, idle in displaced:
+            self._complete_cancellation(session, idle)
 
     def _reclaim_retained_space(self, file_size: int) -> bool:
         """Make space for a reader by yielding unfinished readerless partials."""
@@ -1729,18 +1771,20 @@ class StreamingReadManager:
 
         cancelled = []
         with self.prefetch_sessions_lock:
-            if self._destroying or not self._has_session_capacity():
+            # A reader that would be refused a session anyway gets no
+            # cancellations made for it.
+            if self._destroying or not self._reader_fits_locked():
                 return False
             candidates = []
             for session in self.prefetch_sessions.values():
                 with session.lock:
-                    if session.refcount == 0 and not self._download_terminal(session):
+                    if self._retained(session):
                         candidates.append(session)
             if sum(session.file_size for session in candidates) < missing:
                 return False
             for session in candidates:
                 with session.lock:
-                    if not self._download_terminal(session):
+                    if self._retained(session):
                         cancelled.append((session, self._stop_background_locked(session)))
                         missing -= session.file_size
                         if missing <= 0:
@@ -1766,7 +1810,7 @@ class StreamingReadManager:
                     return None
                 return existing
 
-            if not self._has_session_capacity():
+            if not self._reader_fits_locked():
                 self.logger.warning(
                     "Streaming session limit reached (%d); falling back to full-file cache for %s",
                     self._download_limits["max_streaming_sessions"],
@@ -1871,6 +1915,25 @@ class StreamingReadManager:
             member_stat=member_stat,
         )
 
+        displaced = []
+        try:
+            return self._register_prefetch_session(session, displaced)
+        finally:
+            # After the registry lock: cancellation takes the cache lock.
+            self._complete_displacements(displaced)
+
+    def _register_prefetch_session(self, session: PrefetchSession, displaced: list) -> Optional[PrefetchSession]:
+        """Register a prepared session, or attach to one registered meanwhile.
+
+        Retained fills this displaces for room go to displaced (see
+        _reader_fits_locked).
+        """
+        canonical_path = session.canonical_path
+        final_cache_path = session.final_cache_path
+        partial_cache_path = self._partial_cache_path(final_cache_path)
+        staging_path = session.partial_cache_path
+        backend = session.backend
+        file_size = session.file_size
         with self.prefetch_sessions_lock:
             if self._destroying:
                 self._discard_unregistered_prefetch_session(session)
@@ -1891,7 +1954,7 @@ class StreamingReadManager:
                 )
                 self._discard_unregistered_prefetch_session(session)
                 return None
-            if not self._has_session_capacity():
+            if not self._reader_fits_locked(displaced):
                 self.logger.warning(
                     "Streaming session limit reached (%d) during registration; falling back to full-file cache for %s",
                     self._download_limits["max_streaming_sessions"],
