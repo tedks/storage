@@ -96,6 +96,8 @@ class StateManager:
         self._access_lock = threading.RLock()
         self._pending_access_updates: Dict[str, float] = {}
         self._last_access_flush_mono = time.monotonic()
+        # Rows changed by access-time flushes alone (content_change_count).
+        self._access_flush_changes = 0
         self._configure_connection()
         self._init_db()
         # member_checksums has its own connection and lock: callers hold
@@ -135,6 +137,14 @@ class StateManager:
         """
         with self._db_lock:
             return self.conn.total_changes
+
+    def content_change_count(self) -> int:
+        """change_count less the rows access-time flushes changed: it moves
+        for every other write (a status, a row, a location), never for an
+        access alone. For a cached answer that access order cannot change.
+        """
+        with self._db_lock:
+            return self.conn.total_changes - self._access_flush_changes
 
     @property
     def metadata_lock(self) -> threading.RLock:
@@ -256,11 +266,16 @@ class StateManager:
 
             rows = [(ts, path) for path, ts in self._pending_access_updates.items()]
             with self._db_lock:
+                before = self.conn.total_changes
                 self.conn.executemany(
                     'UPDATE files SET last_access = MAX(last_access, ?) WHERE virtual_path = ?',
                     rows
                 )
                 self.conn.commit()
+                # Counted only once the flush succeeded, from the same lock
+                # hold, so no other write is in the delta; a failed flush
+                # leaves whatever it changed counted as a content change.
+                self._access_flush_changes += self.conn.total_changes - before
             self._pending_access_updates.clear()
             self._last_access_flush_mono = now_mono
 
