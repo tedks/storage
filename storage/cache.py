@@ -239,6 +239,10 @@ class CacheManager:
         # (_admit_pending). Before the first scan, which reads it.
         self._in_flight: dict = {}
         self._current_size_bytes = self._scan_total_cache_size()
+        # Notified whenever a direct change settles; set when an admit was
+        # refused only for pending allowances.
+        self._settled = threading.Condition(self._lock)
+        self._refused_for_allowance = False
         self._size_dirty = False
         # The last eviction dry run that found too few victims: (epoch,
         # index change count, monotonic time, bytes it could free). Until
@@ -263,6 +267,12 @@ class CacheManager:
     # cache or the index can see (a path lock released, a member repair
     # resolved). A stale answer only keeps a stream transient for this long.
     SHORTFALL_TTL_SECONDS = 1.0
+
+    # How long a whole copy refused only because direct writes in flight
+    # hold back their allowances waits for them to settle before it
+    # reports ENOSPC (_admit_whole_copy). A stream does not wait: it
+    # serves transient bytes instead.
+    ALLOWANCE_WAIT_SECONDS = 1.0
 
     def _round_up(self, size: int) -> int:
         return (size + self.block_size - 1) // self.block_size * self.block_size
@@ -732,6 +742,7 @@ class CacheManager:
                 with self._lock:
                     del self._in_flight[token]
                     self._settle_direct_change(path, fd, span, record, id_before, failed_before)
+                    self._settled.notify_all()
 
     def _entry_allowance(self, path, fd, span, growth, st, failed):
         """(allowance, withhold, whole extents or None) for a change about to
@@ -967,6 +978,7 @@ class CacheManager:
                 return False
             pending = self._admit_pending() if self._in_flight else 0
             if pending is None:
+                self._refused_for_allowance = True  # settles with the write
                 return False
             if not pending:
                 return self._free_space(self.get_free_space_needed(bytes_needed))
@@ -991,10 +1003,33 @@ class CacheManager:
         if cover <= 0:
             return True
         if needed <= 0:
+            self._refused_for_allowance = True
             return False
         if not self._free_space(needed, must_cover=cover):
+            # Not a victim shortfall (that is remembered): the allowance.
+            self._refused_for_allowance = self._shortfall is None
             return False
-        return needed_with_pending() <= 0
+        if needed_with_pending() <= 0:
+            return True
+        self._refused_for_allowance = True
+        return False
+
+    def _admit_whole_copy(self, admit) -> bool:
+        """Run a whole copy's admit; if it is refused only for pending
+        allowances, wait for direct changes to settle, at most
+        ALLOWANCE_WAIT_SECONDS in all, and try again. A copy has no
+        transient fallback, and a write in flight is normally brief; a
+        stuck one costs the copy this bound, then ENOSPC as before.
+        Caller holds the lock (released while waiting)."""
+        deadline = time.monotonic() + self.ALLOWANCE_WAIT_SECONDS
+        while True:
+            self._refused_for_allowance = False
+            if admit():
+                return True
+            remaining = deadline - time.monotonic()
+            if not self._refused_for_allowance or remaining <= 0:
+                return False
+            self._settled.wait(remaining)
 
     def _free_space(self, needed: int, must_cover: Optional[int] = None) -> bool:
         """Evict CLEAN copies in access order until `needed` bytes are freed.
@@ -1058,10 +1093,13 @@ class CacheManager:
     def write_streaming_chunk(self, fd: int, offset: int, data: bytes) -> bool:
         """Keep a chunk when its new data blocks fit, else leave the inode alone.
 
-        The caller serializes writes on this sparse inode (the session's
-        io_lock, which close_streaming_fd and truncate_streaming_fd also
-        run under, so the descriptor stays open) and fetches the network
-        bytes before entering. The grant is made under the cache lock and
+        The caller serializes writes on this sparse inode and keeps the
+        descriptor open across the call: it holds the session's io_lock
+        from reading session.io_fd to the end of the write, and the session
+        gives its descriptor up only by swapping session.io_fd to -1 under
+        that lock (_close_streaming_session_resources) before closing it,
+        so a close waits for a write in progress and no write starts on a
+        closed descriptor. It fetches the network bytes before entering. The grant is made under the cache lock and
         its new blocks reserved there (_stream_reserved, counted by every
         other allocation); the local write runs without the lock, so a slow
         write to the partial stalls no write or grant for another file.
@@ -1273,7 +1311,7 @@ class CacheManager:
         temp_path = cache_path.parent / f".{secrets.token_hex(8)}{PARTIAL_SUFFIX}"
         with self._lock:
             reserved = self._round_up(expected_size)
-            if not self.ensure_space(reserved):
+            if not self._admit_whole_copy(lambda: self.ensure_space(reserved)):
                 raise OSError(errno.ENOSPC, "insufficient cache space")
             self._whole_file_temps[temp_path] = reserved
         try:
@@ -1301,7 +1339,8 @@ class CacheManager:
                     # fill, a writer) wins at the link below, and this copy
                     # is discarded without evicting anything for it.
                     if (size > reserved and not os.path.lexists(cache_path)
-                            and not self._fits_beyond_reservation(temp_path, size - reserved, size)):
+                            and not self._admit_whole_copy(lambda: self._fits_beyond_reservation(
+                                temp_path, size - reserved, size))):
                         raise OSError(errno.ENOSPC, "insufficient cache space")
                     try:
                         os.link(temp_path, cache_path)
@@ -1333,6 +1372,7 @@ class CacheManager:
             return False
         pending = self._admit_pending() if self._in_flight else 0
         if pending is None:
+            self._refused_for_allowance = True  # settles with the write
             return False
         finishing = (temp_path, size)
         needed = min(excess, self.get_free_space_needed(0, finishing=finishing))

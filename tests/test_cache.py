@@ -1375,9 +1375,11 @@ class TestCacheAccounting(unittest.TestCase):
     def test_a_grown_copy_the_allowance_defeats_evicts_nothing(self):
         """R8, whole-copy growth: a copy reserved 0 before the write went in
         flight grows by B; freeing B would take the victim but the
-        allowance still leaves no room, so the copy fails with ENOSPC and
-        the victim is kept."""
+        allowance still leaves no room, so the copy waits its bound for
+        the write to settle, then fails with ENOSPC, and the victim is
+        kept."""
         manager = self.cache_manager
+        manager.ALLOWANCE_WAIT_SECONDS = 0.2
         block = manager.block_size
         copying, grow = threading.Event(), threading.Event()
         self.addCleanup(grow.set)
@@ -1443,6 +1445,52 @@ class TestCacheAccounting(unittest.TestCase):
             self.assertEqual(manager.get_total_cache_size(), 5 * block)
         self.assertEqual(len(scans), 1)
         self._assert_total(5 * block)
+
+    def test_a_grown_copy_admitted_once_the_write_settles(self):
+        """R8: a whole copy refused only for a pending allowance waits
+        (bounded) for direct writes to settle and is then admitted, taking
+        the victim its own growth needs."""
+        manager = self.cache_manager
+        block = manager.block_size
+        copying, grow = threading.Event(), threading.Event()
+        self.addCleanup(grow.set)
+
+        class GrowingBackend(LocalBackend):
+            def copy_to_local(self, virtual_path, local_path):
+                copying.set()
+                assert grow.wait(10.0)
+                Path(local_path).write_bytes(b"g" * block)
+
+        backend = GrowingBackend("member", str(self.backend_dir))
+        outcome = []
+
+        def fetch():
+            try:
+                outcome.append(manager.fetch_into_cache(
+                    backend, "/grown", self.cache_dir / "grown", expected_size=0))
+            except OSError as exc:
+                outcome.append(exc.errno)
+
+        fetching = threading.Thread(target=fetch)
+        victim, writer, gate, errors = self._full_with_victim(
+            1, before_write=lambda: (fetching.start(), self.assertTrue(copying.wait(5.0))))
+        waiting = threading.Event()
+        real_wait = manager._settled.wait
+
+        def noting_wait(timeout=None):
+            waiting.set()
+            return real_wait(timeout)
+
+        with patch.object(manager._settled, "wait", side_effect=noting_wait):
+            grow.set()
+            self.assertTrue(waiting.wait(5.0))
+            gate.set()  # the write settles: its allowance goes
+            fetching.join(timeout=5.0)
+            writer.join(timeout=5.0)
+        self.assertEqual(errors, [])
+        self.assertEqual(outcome, [True])
+        self.assertFalse(victim.exists())
+        self.assertEqual((self.cache_dir / "grown").read_bytes(), b"g" * block)
 
     def test_direct_writer_uses_space_before_the_next_stream_grant(self):
         manager = self.cache_manager
