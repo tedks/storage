@@ -383,7 +383,6 @@ class StateManager:
         size: int,
         last_modified: float,
         clear_checksum: bool = False,
-        durable: bool = False,
     ) -> bool:
         """Bring a row's recorded stat up to a cache file that holds synced content.
 
@@ -392,29 +391,42 @@ class StateManager:
         placeholder the same way. Touches only the size and mtime (and the
         checksum when `clear_checksum`), and only WHERE dirty_generation =
         `generation`, so a write recorded since the caller read the row is
-        left alone. `durable` commits with synchronous=FULL, so the record
-        is on disk before the caller acts on it (the WAL is otherwise
-        synced only at checkpoints). Returns whether it applied.
+        left alone. Returns whether it applied.
         """
         checksum_sql = ", checksum = NULL" if clear_checksum else ""
         with self._db_lock:
-            previous = self.conn.execute('PRAGMA synchronous').fetchone()[0] if durable else None
-            try:
-                if durable:
-                    self.conn.execute('PRAGMA synchronous = FULL')
-                cursor = self.conn.execute(
-                    f'''
-                    UPDATE files
-                    SET size = ?, last_modified = ?{checksum_sql}
-                    WHERE virtual_path = ? AND dirty_generation = ?
-                    ''',
-                    (size, last_modified, virtual_path, generation),
-                )
-                self.conn.commit()
-            finally:
-                if durable:
-                    self.conn.execute(f'PRAGMA synchronous = {int(previous)}')
+            cursor = self.conn.execute(
+                f'''
+                UPDATE files
+                SET size = ?, last_modified = ?{checksum_sql}
+                WHERE virtual_path = ? AND dirty_generation = ?
+                ''',
+                (size, last_modified, virtual_path, generation),
+            )
+            self.conn.commit()
             return cursor.rowcount == 1
+
+    def sync_to_disk(self):
+        """fsync the database file and its WAL, so every commit so far survives power loss.
+
+        Takes no lock, so a caller can make a record durable without holding
+        the index lock across the flush. In WAL mode with synchronous=NORMAL
+        a commit has written its frames to the WAL but not synced them; an
+        fsync of the WAL file makes them durable. Frames a checkpoint has
+        already moved into the database file were synced by that checkpoint
+        before the WAL was reused, and the database file is synced here too
+        (for a journal mode other than WAL). A database with no file (an
+        in-memory one) has nothing to sync. Raises OSError if a flush fails.
+        """
+        for path in (self.db_path, f"{self.db_path}-wal"):
+            try:
+                fd = os.open(path, os.O_RDONLY)
+            except FileNotFoundError:
+                continue
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
 
     def publish_sync_status(
         self,

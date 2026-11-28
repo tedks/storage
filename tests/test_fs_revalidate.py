@@ -1874,6 +1874,25 @@ class TestRecomputeRecordsStat(unittest.TestCase):
         self.assertEqual(cache_path.stat().st_mtime, row.last_modified)
         self.assertEqual(list(self.fs.state_manager.iter_lru_paths(recomputable=True)), ["/derived.bin"])
 
+    def test_recomputable_eviction_flushes_outside_the_mounts_descriptor_lock(self):
+        cache_path = self.cache_dir / "derived.bin"
+        cache_path.write_bytes(b"derived bytes")
+        st = cache_path.stat()
+        self._row(size=st.st_size, last_modified=st.st_mtime, checksum="synced")
+        flushes = []
+        real_fsync = os.fsync
+
+        def checked_fsync(fd):
+            flushes.append((self.fs._fd_lock.locked(),
+                            self.fs.state_manager.metadata_lock._is_owned()))
+            return real_fsync(fd)
+
+        with patch("os.fsync", side_effect=checked_fsync):
+            self.assertTrue(self.fs.cache_manager.evict_recomputable_files(1))
+        self.assertEqual(cache_path.read_bytes(), b"")
+        self.assertGreaterEqual(len(flushes), 2)
+        self.assertEqual(set(flushes), {(False, False)})
+
     def test_recompute_leaves_a_dirty_row_alone(self):
         self._row(sync_status=SyncStatus.DIRTY, size=5, last_modified=2.0)
         before = self.fs.state_manager.get_file_metadata("/derived.bin")

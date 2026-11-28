@@ -671,8 +671,11 @@ class TestEvictionSkipsStaleClean(unittest.TestCase):
         self.assertNotEqual(row.last_modified, cached.stat().st_mtime)  # the window
         row, rebuilt, healed = self._after_restart("derived.txt")
         self.assertFalse(healed)
-        self.assertEqual((row.sync_status, row.size), (SyncStatus.CLEAN, 0))
-        self.assertEqual((rebuilt.sync_status, rebuilt.size), (SyncStatus.CLEAN, 0))
+        # Rolled forward: the real mtime, and exact comparisons from now on.
+        self.assertEqual((row.sync_status, row.size, row.last_modified),
+                         (SyncStatus.CLEAN, 0, cached.stat().st_mtime))
+        self.assertEqual((rebuilt.sync_status, rebuilt.size, rebuilt.last_modified),
+                         (SyncStatus.CLEAN, 0, cached.stat().st_mtime))
 
     def test_a_failed_truncate_restores_the_recorded_stat(self):
         cached = self._clean_cached("derived.txt", b"derived", recomputable=True)
@@ -683,6 +686,116 @@ class TestEvictionSkipsStaleClean(unittest.TestCase):
         self.assertFalse(healed)
         self.assertEqual((row.sync_status, row.size), (SyncStatus.CLEAN, len(b"derived")))
         self.assertEqual(rebuilt.sync_status, SyncStatus.CLEAN)
+
+    def test_a_lost_change_to_a_completed_placeholder_is_still_found(self):
+        for change in ("touch", "write-then-empty"):
+            with self.subTest(change=change):
+                name = f"{change}.txt"
+                cached = self._clean_cached(name, b"derived", recomputable=True)
+                self.assertTrue(self.cache_manager.evict_recomputable_files(1))
+                placeholder = cached.stat()
+                if change == "touch":
+                    os.utime(cached, ns=(placeholder.st_mtime_ns + 10**9,) * 2)
+                else:
+                    cached.write_bytes(b"x")
+                    os.truncate(cached, 0)
+                    os.utime(cached, ns=(placeholder.st_mtime_ns + 10**9,) * 2)
+                # The DIRTY mark of that change was lost; the mtime survived.
+                row, rebuilt, healed = self._after_restart(name)
+                self.assertTrue(healed)
+                self.assertEqual(row.sync_status, SyncStatus.DIRTY)
+                self.assertEqual(rebuilt.sync_status, SyncStatus.DIRTY)
+
+    def test_a_lost_touch_of_an_ordinary_empty_recomputable_file_is_still_found(self):
+        empty = self._clean_cached("empty.txt", b"", recomputable=True)
+        self.state_manager.publish_sync_status(
+            "/empty.txt", self.state_manager.get_file_metadata("/empty.txt").dirty_generation,
+            SyncStatus.CLEAN, checksum="e3b0c442")
+        self.cache_manager.sync_cache_metadata(
+            "/empty.txt", self.state_manager.get_file_metadata("/empty.txt"), cache_path=empty)
+        os.utime(empty, ns=(empty.stat().st_mtime_ns + 10**9,) * 2)
+        row, rebuilt, healed = self._after_restart("empty.txt")
+        self.assertTrue(healed)
+        self.assertEqual(row.sync_status, SyncStatus.DIRTY)
+        self.assertEqual(rebuilt.sync_status, SyncStatus.DIRTY)
+
+    def test_a_failed_prepared_xattr_write_aborts_and_restores(self):
+        cached = self._clean_cached("derived.txt", b"derived", recomputable=True)
+        with patch("storage.cache.write_cache_metadata_fd", side_effect=OSError(28, "ENOSPC")):
+            self.assertFalse(self.cache_manager.evict_recomputable_files(1))
+        self.assertEqual(cached.read_bytes(), b"derived")
+        row, rebuilt, healed = self._after_restart("derived.txt")
+        self.assertFalse(healed)
+        self.assertEqual((row.sync_status, row.size, row.last_modified),
+                         (SyncStatus.CLEAN, 7, cached.stat().st_mtime))
+        self.assertEqual((rebuilt.sync_status, rebuilt.size), (SyncStatus.CLEAN, 7))
+
+    def test_a_failed_flush_aborts_and_restores(self):
+        cached = self._clean_cached("derived.txt", b"derived", recomputable=True)
+        with patch.object(self.state_manager, "sync_to_disk", side_effect=OSError(5, "EIO")):
+            self.assertFalse(self.cache_manager.evict_recomputable_files(1))
+        self.assertEqual(cached.read_bytes(), b"derived")
+        row = self.state_manager.get_file_metadata("/derived.txt")
+        self.assertEqual((row.sync_status, row.size), (SyncStatus.CLEAN, 7))
+        self.assertFalse(self.cache_manager.heal_stale_clean("/derived.txt", cached))
+
+    def test_a_descriptor_opened_before_the_truncate_aborts_and_restores(self):
+        cached = self._clean_cached("derived.txt", b"derived", recomputable=True)
+        checks = []
+
+        @contextmanager
+        def guard(path):
+            checks.append(path)
+            yield len(checks) > 1  # open by the time of the second check
+
+        self.cache_manager.descriptor_guard = guard
+        self.assertFalse(self.cache_manager.evict_recomputable_files(1))
+        self.assertEqual(len(checks), 2)
+        self.assertEqual(cached.read_bytes(), b"derived")
+        row = self.state_manager.get_file_metadata("/derived.txt")
+        self.assertEqual((row.sync_status, row.size, row.last_modified),
+                         (SyncStatus.CLEAN, 7, cached.stat().st_mtime))
+
+    def test_a_truncate_that_fails_after_changing_the_size_keeps_the_prepared_record(self):
+        cached = self._clean_cached("derived.txt", b"derived", recomputable=True)
+        real_ftruncate = os.ftruncate
+
+        def truncate_then_fail(fd, length):
+            real_ftruncate(fd, length)
+            raise OSError(5, "EIO")
+
+        with patch("storage.cache.os.ftruncate", side_effect=truncate_then_fail):
+            self.assertFalse(self.cache_manager.evict_recomputable_files(1))
+        self.assertEqual(cached.read_bytes(), b"")
+        row, rebuilt, healed = self._after_restart("derived.txt")
+        # Not restored to 7 bytes over an empty file: the prepared record
+        # stays and rolls forward.
+        self.assertFalse(healed)
+        self.assertEqual((row.sync_status, row.size, row.last_modified),
+                         (SyncStatus.CLEAN, 0, cached.stat().st_mtime))
+        self.assertEqual(rebuilt.sync_status, SyncStatus.CLEAN)
+
+    def test_no_flush_runs_under_the_descriptor_or_index_lock(self):
+        self._clean_cached("derived.txt", b"derived", recomputable=True)
+        fd_lock = threading.Lock()
+
+        @contextmanager
+        def guard(path):
+            with fd_lock:
+                yield False
+
+        self.cache_manager.descriptor_guard = guard
+        flushes = []
+        real_fsync = os.fsync
+
+        def checked_fsync(fd):
+            flushes.append((fd_lock.locked(), self.state_manager.metadata_lock._is_owned()))
+            return real_fsync(fd)
+
+        with patch("os.fsync", side_effect=checked_fsync):
+            self.assertTrue(self.cache_manager.evict_recomputable_files(1))
+        self.assertGreaterEqual(len(flushes), 2)  # the database or WAL, and the file
+        self.assertEqual(set(flushes), {(False, False)})
 
     def test_a_lost_truncate_to_zero_of_a_recomputable_file_is_still_found(self):
         cached = self._clean_cached("derived.txt", b"derived", recomputable=True)
