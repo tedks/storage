@@ -912,8 +912,9 @@ class CacheManager:
                     else:
                         cache_path.unlink()
             if stale:
-                if not dry_run:
-                    self.mark_file_dirty(virtual_path, cache_path)
+                # Even in a dry run: the mismatch is verified, and the dirty
+                # transition is what makes the file sync. Nothing is reclaimed.
+                self.mark_file_dirty(virtual_path, cache_path)
                 return 0
             self._current_size_bytes = max(0, self._current_size_bytes - freed)
             if truncate:

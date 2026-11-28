@@ -820,8 +820,9 @@ class TestEvictionSkipsStaleClean(unittest.TestCase):
                          SyncStatus.DIRTY)
         self.assertFalse(fresh.exists())
 
-    def test_dry_run_does_not_count_or_mark_an_xattr_stale_copy(self):
+    def test_dry_run_marks_an_xattr_stale_copy_dirty_without_reclaiming_it(self):
         written = self._clean_cached("written.txt", b"v1")
+        self.state_manager.add_file_location(FileLocation("/written.txt", "member", "c", 1.0, False))
         st = written.stat()
         self._mirror(written, stat_size=st.st_size, stat_mtime=st.st_mtime + 1)
         manager = self.cache_manager
@@ -831,7 +832,7 @@ class TestEvictionSkipsStaleClean(unittest.TestCase):
         self.assertFalse(manager.ensure_space(manager.block_size))
         self.assertEqual(written.read_bytes(), b"v1")
         self.assertEqual(self.state_manager.get_file_metadata("/written.txt").sync_status,
-                         SyncStatus.CLEAN)
+                         SyncStatus.DIRTY)
 
     def test_unreadable_metadata_xattr_keeps_the_copy_unmarked(self):
         garbled = self._clean_cached("garbled.txt", b"v1")
