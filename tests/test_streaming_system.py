@@ -9,12 +9,14 @@ streaming stays healthy under sustained reads and does not regress to the
 import errno
 import hashlib
 import json
+import queue
 import os
 import shutil
 import subprocess
 import tempfile
 import threading
 import time
+import sys
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -28,6 +30,96 @@ from tests.fuse_mount import run_fuse, stop_fuse
 # Only a backstop for a test that never releases a held read: the test and
 # tearDown release it explicitly, so a slow host never sees the hold expire.
 HELD_READ_SAFETY_TIMEOUT = 600.0
+# Upper bounds on one step of the mounted control test (a CLI run, the
+# reader subprocess answering, the background read being entered): a slow
+# host waits longer, a broken one still fails well inside the backstop.
+MOUNTED_STEP_TIMEOUT = 120.0
+
+# Opens argv[1], reads argv[2] bytes and prints "ready <sha256>"; then, for
+# each "OFFSET COUNT" line on stdin, prints the sha256 of those bytes. Holds
+# the handle until stdin closes, then closes it and prints "closed". FUSE
+# data is read in this subprocess, never in the process serving the mount.
+_HELD_READER = r"""
+import hashlib, os, sys
+
+def read_exact(fd, offset, count):
+    data = bytearray()
+    while len(data) < count:
+        chunk = os.pread(fd, count - len(data), offset + len(data))
+        if not chunk:
+            break
+        data += chunk
+    return bytes(data)
+
+fd = os.open(sys.argv[1], os.O_RDONLY)
+print("ready", hashlib.sha256(read_exact(fd, 0, int(sys.argv[2]))).hexdigest(), flush=True)
+for line in iter(sys.stdin.readline, ""):
+    offset, count = map(int, line.split())
+    print(hashlib.sha256(read_exact(fd, offset, count)).hexdigest(), flush=True)
+os.close(fd)
+print("closed", flush=True)
+"""
+
+
+def sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+class HeldReader:
+    """A reader of a mounted file in a subprocess, holding it open until close()."""
+
+    def __init__(self, path: Path, count: int):
+        self._process = subprocess.Popen(
+            [sys.executable, "-I", "-c", _HELD_READER, os.fsencode(path), str(count)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+        )
+        self._lines = queue.Queue()
+        threading.Thread(target=self._pump, daemon=True).start()
+        word, self.first_digest = self._line().split()
+        if word != "ready":
+            raise AssertionError(f"reader said {word!r}")
+
+    def _pump(self):
+        for line in self._process.stdout:
+            self._lines.put(line.strip())
+        self._lines.put(None)
+
+    def _line(self) -> str:
+        try:
+            line = self._lines.get(timeout=MOUNTED_STEP_TIMEOUT)
+        except queue.Empty:
+            raise AssertionError("mounted file reader did not answer") from None
+        if line is None:
+            raise AssertionError(f"mounted file reader exited with {self._process.wait()}")
+        return line
+
+    def read_digest(self, offset: int, count: int) -> str:
+        self._process.stdin.write(f"{offset} {count}\n")
+        self._process.stdin.flush()
+        return self._line()
+
+    def close(self):
+        """Close the handle (by closing stdin) and wait for the reader to exit."""
+        if self._process.poll() is None and not self._process.stdin.closed:
+            self._process.stdin.close()
+            if self._line() != "closed":
+                raise AssertionError("mounted file reader did not close its handle")
+        if self._process.wait(timeout=MOUNTED_STEP_TIMEOUT) != 0:
+            raise AssertionError(f"mounted file reader exited with {self._process.returncode}")
+
+    def kill(self):
+        if self._process.poll() is None:
+            self._process.kill()
+            self._process.wait()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type is None:
+            self.close()
+        else:
+            self.kill()
 
 
 class SlowRemoteLoopbackBackend(LocalBackend):
@@ -373,7 +465,7 @@ class TestStreamingSystemRegression(unittest.TestCase):
     def _run_control_cli(self, *args, expected=0):
         cli = Path(os.environ["TEST_SRCDIR"]) / os.environ["TEST_WORKSPACE"] / "storage_cli"
         result = subprocess.run([str(cli), *args], check=False, capture_output=True,
-                                text=True, timeout=8)
+                                text=True, timeout=MOUNTED_STEP_TIMEOUT)
         self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
         return result
 
@@ -394,9 +486,10 @@ class TestStreamingSystemRegression(unittest.TestCase):
             return json.loads(result.stdout) if json_output else result
 
         try:
-            with (self.mount_dir / name).open("rb") as handle:
-                self.assertEqual(handle.read(512 * 1024), self.payload[:512 * 1024])
-                self.assertTrue(entered.wait(4), "the background range reader must be held")
+            with HeldReader(self.mount_dir / name, 512 * 1024) as handle:
+                self.assertEqual(handle.first_digest, sha256(self.payload[:512 * 1024]))
+                self.assertTrue(entered.wait(MOUNTED_STEP_TIMEOUT),
+                                "the background range reader must be held")
 
                 status = command()
                 self.assertEqual(status["stats"]["active_reader_sessions"], 1)
@@ -414,7 +507,8 @@ class TestStreamingSystemRegression(unittest.TestCase):
                 self.assertEqual(outcome, {"id": original, "result": "busy"})
                 human = command("cancel", original, expected=3, json_output=False)
                 self.assertIn("Close its readers or wait for finalization", human.stderr)
-                self.assertEqual(handle.read(64), self.payload[512 * 1024:512 * 1024 + 64])
+                self.assertEqual(handle.read_digest(512 * 1024, 64),
+                                 sha256(self.payload[512 * 1024:512 * 1024 + 64]))
 
                 limits = command("set", "--max-streaming-sessions", "1",
                                  "--max-retained-streaming-sessions", "3",
@@ -448,8 +542,8 @@ backends = [{json.dumps(str(self.backend_dir))}]
                 ).stdout)
                 self.assertEqual(mine["limits"], limits)
 
-                with (self.mount_dir / second).open("rb") as fallback:
-                    self.assertEqual(fallback.read(16), self.payload[:16])
+                with HeldReader(self.mount_dir / second, 16) as fallback:
+                    self.assertEqual(fallback.first_digest, sha256(self.payload[:16]))
                 self.assertEqual(command("status")["stats"]["streaming_fallback_opens"], 1)
 
                 legacy = json.loads(self._run_control_cli(
@@ -465,8 +559,8 @@ backends = [{json.dumps(str(self.backend_dir))}]
             self.assertEqual(command("downloads")["downloads"], [])
             self.assertFalse(partial.exists())
 
-            with (self.mount_dir / name).open("rb") as replacement:
-                self.assertEqual(replacement.read(512 * 1024), self.payload[:512 * 1024])
+            with HeldReader(self.mount_dir / name, 512 * 1024) as replacement:
+                self.assertEqual(replacement.first_digest, sha256(self.payload[:512 * 1024]))
                 row, = command("downloads")["downloads"]
                 self.assertNotEqual(row["id"], original)
                 self.assertEqual(command("cancel", original, expected=4)["result"], "not-found")
