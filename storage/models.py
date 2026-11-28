@@ -1,6 +1,6 @@
 """Data models for storage state and placement."""
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from enum import Enum
 from fractions import Fraction
 from typing import Dict, Optional, Tuple
@@ -49,9 +49,10 @@ class FileMetadata:
     @classmethod
     def from_dict(cls, data: Dict) -> "FileMetadata":
         """Build metadata from stored row data."""
-        payload = dict(data)
-        # Eviction's hint column (StateManager), not part of the model.
-        payload.pop("cache_absent", None)
+        # Only the model's own fields: the index carries columns that are
+        # not part of it (StateManager's cache_absent), and may gain more.
+        names = {f.name for f in fields(cls)}
+        payload = {key: value for key, value in dict(data).items() if key in names}
         payload["sync_status"] = SyncStatus(payload["sync_status"])
         return cls(**payload)
 

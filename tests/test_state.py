@@ -630,6 +630,14 @@ class TestCacheAbsentCandidacy(unittest.TestCase):
         self.assertEqual(self._absent("/populated"), 0)
         self.assertEqual(list(self.state_manager.iter_lru_paths()), ["/populated"])
 
+    def test_rows_read_through_the_model_ignore_unknown_columns(self):
+        self._row("/a")
+        conn = self.state_manager.conn
+        conn.execute('ALTER TABLE files ADD COLUMN some_future_column TEXT')
+        conn.commit()
+        self.assertEqual([m.virtual_path for m in self.state_manager.get_all_file_metadata()], ["/a"])
+        self.assertEqual([m.virtual_path for m in self.state_manager.iter_file_metadata()], ["/a"])
+
     def test_a_pass_ends_although_busy_files_are_read_while_it_runs(self):
         # Rows a guard skips as busy are read again whenever visited: each
         # gets a newer flushed timestamp, past the page cursor.
@@ -669,6 +677,8 @@ class TestCacheAbsentCandidacy(unittest.TestCase):
                 p, sm.get_file_metadata(p).dirty_generation, size=3, last_modified=1.0),
             "access_batch": lambda p: (sm.update_access_time(p, accessed_at=5.0),
                                        sm._flush_access_updates(force=True)),
+            "publish_sync_status": lambda p: sm.publish_sync_status(
+                p, sm.get_file_metadata(p).dirty_generation, SyncStatus.CLEAN, checksum="d"),
         }
         for name, write in writes.items():
             with self.subTest(write=name):
@@ -743,6 +753,47 @@ class TestCacheAbsentCandidacy(unittest.TestCase):
         # A visit costs several VM steps per row; 20000 hidden rows would
         # add tens of thousands.
         self.assertLess(steps, baseline + 100, (baseline, steps))
+
+    def test_an_index_with_masters_schema_gains_the_column_index_and_trigger(self):
+        import sqlite3
+
+        db = str(Path(self.temp_dir) / "master.db")
+        conn = sqlite3.connect(db)
+        # master's files table: dirty_generation and link_target, no cache_absent.
+        conn.executescript('''
+            CREATE TABLE files (
+                virtual_path TEXT PRIMARY KEY,
+                size INTEGER NOT NULL,
+                checksum TEXT,
+                last_access REAL NOT NULL,
+                last_modified REAL NOT NULL,
+                sync_status TEXT NOT NULL,
+                replica_count INTEGER NOT NULL,
+                recomputable INTEGER NOT NULL,
+                recompute_cmd TEXT,
+                encrypted INTEGER NOT NULL,
+                encryption_key_id TEXT,
+                dirty_generation INTEGER NOT NULL DEFAULT 0,
+                link_target TEXT
+            );
+            INSERT INTO files VALUES ('/old.txt', 5, 'c', 1.0, 1.0, 'clean', 1, 0, NULL, 0, NULL, 0, NULL);
+        ''')
+        conn.commit()
+        conn.close()
+        opened = StateManager(db)
+        try:
+            columns = {row['name'] for row in opened.conn.execute('PRAGMA table_info(files)')}
+            self.assertIn("cache_absent", columns)
+            names = {row['name'] for row in opened.conn.execute('SELECT name FROM sqlite_master')}
+            self.assertIn("idx_cache_eviction_candidates", names)
+            self.assertIn("files_cache_absent_clear", names)
+            self.assertEqual(list(opened.iter_lru_paths()), ["/old.txt"])
+            opened.mark_cache_absent(["/old.txt"])
+            self.assertEqual(list(opened.iter_lru_paths()), [])
+            opened.set_file_metadata(opened.get_file_metadata("/old.txt"))
+            self.assertEqual(list(opened.iter_lru_paths()), ["/old.txt"])
+        finally:
+            opened.close()
 
     def test_an_index_from_the_side_table_build_converges(self):
         db = str(Path(self.temp_dir) / "old.db")

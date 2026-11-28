@@ -222,7 +222,11 @@ class StateManager:
         # row, and nothing has written the row since. A hint for the
         # eviction scan (iter_lru_paths), never the record of anything: a
         # rebuilt index starts every row at 0, which costs one full scan.
-        # Not part of FileMetadata (from_dict drops it).
+        # Not part of FileMetadata (from_dict keeps only its own fields).
+        # To roll an index back to a build without the column:
+        #   DROP INDEX idx_cache_eviction_candidates;
+        #   DROP TRIGGER files_cache_absent_clear;
+        #   ALTER TABLE files DROP COLUMN cache_absent;
         if 'cache_absent' not in columns:
             self.conn.execute(
                 'ALTER TABLE files ADD COLUMN cache_absent INTEGER NOT NULL DEFAULT 0'
