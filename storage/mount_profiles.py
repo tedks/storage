@@ -93,6 +93,8 @@ class ResolvedMemberConfig:
     profile_name: Optional[str] = None
     profile_source: Optional[Path] = None
     member_display_names: Tuple[Optional[str], ...] = ()
+    # The profile's mountpoint as configured; None without a profile.
+    mountpoint: Optional[str] = None
 
 
 def default_mount_config_paths() -> Tuple[Path, ...]:
@@ -541,6 +543,7 @@ def resolve_member_configuration(
             profile_name=profile_name,
             profile_source=profile_source,
             member_display_names=settings["local_display_names"] + settings["remote_display_names"],
+            mountpoint=settings["mountpoint"],
         )
 
     if config_path is not None:

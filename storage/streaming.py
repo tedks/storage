@@ -1,8 +1,8 @@
 import errno
 import json
 import os
+import re
 import secrets
-import socket
 import threading
 import time
 from collections import Counter
@@ -21,6 +21,7 @@ from .backends.local import NOREPLACE_UNSUPPORTED
 from .backends.local import rename_noreplace as _rename_noreplace
 from .backends.ssh_pool import BulkCapacityCancelled, BulkCapacityTimeout
 from .cache_metadata import PREFIX_XATTR, confirm_member_stat, copy_member_attributes
+from .control import STAGE_PREFIX, STOPPING_MESSAGE, ControlError, ControlServer, canonical_mountpoint
 from .models import FileLocation, FileMetadata, StreamingKeepAfterClose, SyncStatus
 
 # A foreground read fetches only the bytes the reader asked for that are not
@@ -107,6 +108,13 @@ def validate_download_limits(limits):
         low, high = bounds[name]
         if type(value) is not int or not low <= value <= high:
             raise ValueError(f"{name} must be an integer between {low} and {high}")
+
+
+def _unique_control_fields(pairs):
+    fields = dict(pairs)
+    if len(fields) != len(pairs):
+        raise ControlError("Duplicate field in control request")
+    return fields
 
 
 @dataclass(eq=False)
@@ -504,8 +512,20 @@ class StreamingReadManager:
         on_finalized: Optional[Callable[["PrefetchSession"], None]] = None,
         max_download_workers: int = DEFAULT_MAX_DOWNLOAD_WORKERS,
         max_retained_streaming_sessions: int = DEFAULT_MAX_RETAINED_STREAMING_SESSIONS,
+        mountpoint: Optional[str] = None,
     ):
         self.cache_manager = cache_manager
+        # Reported to control clients, which refuse a socket that answers
+        # for another mount sharing this cache. None when not mounted, or
+        # when the spelling cannot be matched (_mountpoint_unavailable says
+        # why): the socket still serves requests that name only the cache.
+        self.mountpoint = None
+        self._mountpoint_unavailable = None
+        if mountpoint is not None:
+            try:
+                self.mountpoint = canonical_mountpoint(mountpoint)
+            except ControlError as exc:
+                self._mountpoint_unavailable = str(exc)
         # Called once the complete file is in the cache (StorageFS records
         # the member baseline for revalidation on open).
         self.on_finalized = on_finalized
@@ -553,26 +573,32 @@ class StreamingReadManager:
             "foreground_fetches": 0,
             "background_fetches": 0,
         }
-        self._control_socket_path = self.cache_manager.cache_root / ".storage.control.sock"
-        self._control_stop_event = threading.Event()
-        self._control_socket_lock = threading.Lock()
-        self._control_socket: Optional[socket.socket] = None
-        self._control_thread: Optional[threading.Thread] = None
+        self._control_server = ControlServer(
+            self.cache_manager.cache_root, self._handle_control_request, self.logger,
+        )
         # Whole-file fills (CacheManager.cache_file_result) can make room by
         # stopping readerless retained fills, which the cache's own eviction
         # cannot touch: they have no index row.
         self.cache_manager.reclaim_space = self._reclaim_retained_space_for_cache
 
     def init(self):
-        control_thread = self._control_thread
-        if control_thread is None or not control_thread.is_alive():
-            self._start_control_server()
+        if self._mountpoint_unavailable is not None:
+            self.logger.warning(
+                "control socket will report no mountpoint, so --profile cannot reach this mount: %s",
+                self._mountpoint_unavailable,
+            )
+        self._control_server.start()
 
     def download_limits(self):
         with self.prefetch_sessions_lock:
             return self._download_limits.copy()
 
-    def update_download_limits(self, **changes):
+    def update_download_limits(self, limits=None, /, **changes):
+        """Apply live limits from a dict (as the control socket sends them)
+        and/or keywords. Both parameters are positional-only, so a limit
+        named 'self' or 'limits' is just an unknown limit, not a TypeError.
+        """
+        changes = {**(limits or {}), **changes}
         validate_download_limits(changes)
         with self.prefetch_sessions_lock:
             if self._destroying:
@@ -611,19 +637,28 @@ class StreamingReadManager:
         return "reading" if session.refcount > 0 else "retained"
 
     def cancel_download_session(self, selector: str):
+        return self.cancel_download_session_with_reason(selector)[0]
+
+    def cancel_download_session_with_reason(self, selector: str):
+        """(outcome, reason): reason says why a busy download is busy
+        ("readers", "finalizing", or "stopping" for a failed or already
+        stopped download still being cleaned up), else None."""
         with self.prefetch_sessions_lock:
             for session in self.prefetch_sessions.values():
                 if session.session_id != selector:
                     continue
                 with session.lock:
-                    if session.refcount > 0 or self._download_terminal(session):
-                        return "busy"
+                    if session.refcount > 0:
+                        return "busy", "readers"
+                    if self._download_terminal(session):
+                        stopping = session.stop_requested or session.error is not None
+                        return "busy", "stopping" if stopping else "finalizing"
                     idle = self._stop_background_locked(session)
                 break
             else:
-                return "not-found"
+                return "not-found", None
         self._complete_cancellation(session, idle)
-        return "cancelled"
+        return "cancelled", None
 
     def destroy(self):
         """Stop every session; from here on, opens get no session (full-file path).
@@ -646,7 +681,7 @@ class StreamingReadManager:
         libfuse runs destroy after its loop has stopped serving requests,
         so the multithreaded loop does not reach this either.
         """
-        self._stop_control_server()
+        self._control_server.stop()
 
         with self.prefetch_sessions_lock:
             self._destroying = True
@@ -686,16 +721,19 @@ class StreamingReadManager:
         """Delete stale partial-cache files left by prior crashes.
 
         Startup only (StorageFS.__init__, before the mount serves anything):
-        it removes every name ending in the partial suffix, including a live
-        session's partial or staging file.
+        it removes partials and staging files. Control stages can hold
+        displaced entries for manual recovery, so skip those subtrees.
         """
         removed = 0
-        for partial_path in self.cache_manager.cache_root.rglob(f"*{self.partial_suffix}"):
-            try:
-                partial_path.unlink()
-                removed += 1
-            except OSError:
-                continue
+        for root, dirs, files in os.walk(self.cache_manager.cache_root):
+            dirs[:] = [name for name in dirs if not name.startswith(STAGE_PREFIX)]
+            for name in (*files, *dirs):
+                if name.endswith(self.partial_suffix):
+                    try:
+                        os.unlink(os.path.join(root, name))
+                        removed += 1
+                    except OSError:
+                        continue
         if removed:
             self.cache_manager.mark_cache_size_dirty()
             self.logger.info("Removed %d stale partial cache files", removed)
@@ -907,100 +945,93 @@ class StreamingReadManager:
         })
         return stats
 
-    def _handle_control_request(self, request: str) -> Dict[str, object]:
-        if request == "streaming-stats":
+    def _control_parameters(self, limits: dict) -> dict:
+        return {
+            "limits": limits,
+            "restart_only": {
+                "streaming_reads": bool(self.streaming_reads),
+                "streaming_chunk_size": self.chunk_size,
+                "streaming_keep_after_close": {
+                    "bytes": list(self.keep_after_close.byte_thresholds),
+                    "percent": [str(value) for value in self.keep_after_close.percent_thresholds],
+                },
+            },
+        }
+
+    def _handle_control_request(self, request: str) -> dict:
+        if request.strip() == "streaming-stats":  # Backward-compatible request.
             return self._streaming_stats_snapshot()
-        return {"error": f"unsupported request: {request}"}
-
-    def _control_server_loop(self):
-        while not self._control_stop_event.is_set():
-            with self._control_socket_lock:
-                control_socket = self._control_socket
-
-            if control_socket is None:
-                return
-
-            try:
-                conn, _ = control_socket.accept()
-            except socket.timeout:
-                continue
-            except OSError:
-                if self._control_stop_event.is_set():
-                    return
-                continue
-
-            with conn:
-                try:
-                    conn.settimeout(2.0)
-                    payload = conn.recv(4096)
-                    request = payload.decode("utf-8", errors="replace").strip()
-                    response = self._handle_control_request(request)
-                except Exception as exc:
-                    response = {"error": f"control request failed: {exc}"}
-
-                try:
-                    conn.sendall((json.dumps(response, sort_keys=True) + "\n").encode("utf-8"))
-                except Exception:
-                    pass
-
-    def _start_control_server(self):
-        self._control_stop_event.clear()
-
         try:
-            self._control_socket_path.unlink(missing_ok=True)
-        except OSError:
-            pass
+            arguments = json.loads(request, object_pairs_hook=_unique_control_fields)
+        except ControlError:
+            raise
+        except (ValueError, RecursionError) as exc:
+            raise ControlError("Expected a JSON control request object") from exc
+        if not isinstance(arguments, dict):
+            raise ControlError("Expected a JSON control request object")
 
-        try:
-            control_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            control_socket.bind(str(self._control_socket_path))
-            os.chmod(self._control_socket_path, 0o600)
-            control_socket.listen(8)
-            control_socket.settimeout(0.5)
-        except OSError as exc:
-            self.logger.warning(
-                "failed to start control socket at %s: %s",
-                self._control_socket_path,
-                exc,
-            )
+        command = arguments.pop("command", None)
+        if "cache" in arguments:
+            # The client names the cache directory it reached the socket
+            # through; a socket moved there from another cache refuses.
+            expected = arguments.pop("cache")
+            if (not isinstance(expected, list) or len(expected) != 2
+                    or any(type(value) is not int for value in expected)):
+                raise ControlError("Expected the target cache identity as [device, inode]")
+            published = self._control_server.cache_identity
+            if published is None:
+                # Cleared by stop(): a request still in flight at unmount.
+                raise ControlError(STOPPING_MESSAGE)
+            if tuple(expected) != published:
+                raise ControlError("This control socket was published in a different cache directory")
+        if "mountpoint" in arguments:
+            # The client names the mount it means; refuse before acting
+            # rather than answer for another mount sharing the cache.
+            expected = arguments.pop("mountpoint")
+            if not isinstance(expected, str):
+                raise ControlError("Expected the target mountpoint as a string")
+            if self._mountpoint_unavailable is not None:
+                raise ControlError(
+                    f"This mount reports no mountpoint ({self._mountpoint_unavailable}); "
+                    "use --cache to reach it"
+                )
+            if expected != self.mountpoint:
+                raise ControlError(
+                    f"This control socket belongs to the mount at {self.mountpoint!r}, not {expected!r}"
+                )
+        if command in ("status", "streaming.get", "downloads.list") and arguments:
+            raise ControlError("Unexpected arguments for control command")
+        if command == "status":
+            identity = self._control_server.cache_identity
+            published = list(identity) if identity is not None else None
+            return {
+                "mount": {"mountpoint": self.mountpoint, "pid": os.getpid(), "cache": published},
+                "stats": self._streaming_stats_snapshot(),
+                **self._control_parameters(self.download_limits()),
+            }
+        if command == "streaming.get":
+            return self._control_parameters(self.download_limits())
+        if command == "streaming.set":
+            changes = arguments.get("limits")
+            if set(arguments) != {"limits"} or not isinstance(changes, dict) or not changes:
+                raise ControlError("Provide at least one live streaming limit to set")
             try:
-                control_socket.close()
-            except Exception:
-                pass
-            return
-
-        with self._control_socket_lock:
-            self._control_socket = control_socket
-
-        self._control_thread = threading.Thread(
-            target=self._control_server_loop,
-            daemon=True,
-            name="storage-control-socket",
-        )
-        self._control_thread.start()
-
-    def _stop_control_server(self):
-        self._control_stop_event.set()
-
-        with self._control_socket_lock:
-            control_socket = self._control_socket
-            self._control_socket = None
-
-        if control_socket is not None:
-            try:
-                control_socket.close()
-            except OSError:
-                pass
-
-        control_thread = self._control_thread
-        self._control_thread = None
-        if control_thread and control_thread.is_alive():
-            control_thread.join(timeout=2.0)
-
-        try:
-            self._control_socket_path.unlink(missing_ok=True)
-        except OSError:
-            pass
+                return self._control_parameters(self.update_download_limits(changes))
+            except ValueError as exc:
+                raise ControlError(str(exc)) from exc
+        if command == "downloads.list":
+            return {"downloads": self.list_download_sessions()}
+        if command == "downloads.cancel":
+            session_id = arguments.get("id")
+            if (set(arguments) != {"id"} or not isinstance(session_id, str)
+                    or re.fullmatch(r"[0-9a-f]{32}", session_id) is None):
+                raise ControlError("Provide a complete download ID from 'storage control ... downloads'")
+            outcome, reason = self.cancel_download_session_with_reason(session_id)
+            response = {"id": session_id, "result": outcome}
+            if reason is not None:
+                response["reason"] = reason
+            return response
+        raise ControlError("Unknown mount control command")
 
     def _record_streaming_stat(self, key: str, value: int = 1):
         with self._streaming_stats_lock:

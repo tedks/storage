@@ -20,6 +20,7 @@ from storage.backends.base import (
 from storage.backends.local import LocalBackend
 from storage.backends.ssh_pool import BulkCapacityCancelled, BulkCapacityTimeout
 from storage.cache_metadata import MEMBER_ATTRS_XATTR
+from storage.control import CONTROL_SOCKET_NAME, STAGE_PREFIX, ControlError, request_control_payload
 from storage.fs import StorageFS
 from storage.models import SyncStatus
 from storage.streaming import (
@@ -118,6 +119,49 @@ class TestFSStreamingIntegration(unittest.TestCase):
                 return True
             time.sleep(0.05)
         return predicate()
+
+    def test_startup_preserves_partials_in_control_recovery_stages(self):
+        stale = self.cache_dir / "ordinary" / "fetch.storage.partial"
+        stale.parent.mkdir()
+        stale.write_bytes(b"stale")
+        retained = []
+        for digits in (16, 32):
+            displaced = self.cache_dir / (STAGE_PREFIX + "a" * digits) / "moved" / "nested"
+            displaced.mkdir(parents=True)
+            partial = displaced / "file.storage.partial"
+            partial.write_bytes(b"recovery data")
+            retained.append(partial)
+
+        self._remake_fs()
+
+        self.assertFalse(stale.exists())
+        for partial in retained:
+            self.assertEqual(partial.read_bytes(), b"recovery data")
+
+    def test_mount_init_continues_when_the_control_thread_cannot_start(self):
+        server = self.fs._streaming_manager._control_server
+        start_thread = threading.Thread.start
+
+        def reject_control_thread(thread):
+            if thread.name == "storage-control-socket":
+                raise RuntimeError("cannot start test control thread")
+            start_thread(thread)
+
+        with patch.object(threading.Thread, "start", reject_control_thread), \
+                patch.object(self.fs.sync_manager, "start") as start_sync, \
+                self.assertLogs(server._logger, "WARNING") as logged:
+            self.fs.init("/")
+        start_sync.assert_called_once_with()
+        self.assertIn("cannot start test control thread", "\n".join(logged.output))
+        self.assertFalse((self.cache_dir / CONTROL_SOCKET_NAME).exists())
+        self.assertIsNone(server._listener)
+        self.assertIsNone(server._thread)
+        self.assertIsNone(server._cache_fd)
+        self.assertIsNone(server.cache_identity)
+
+        server.start()
+        status = request_control_payload(self.cache_dir, b'{"command":"status"}', 2)
+        self.assertEqual(tuple(status["mount"]["cache"]), server.cache_identity)
 
     def test_download_workers_grow_for_runnable_files_and_retire_when_idle(self):
         manager = self.fs._streaming_manager
@@ -2463,6 +2507,44 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.assertIsNotNone(session)
         return session
 
+    def test_cancel_refuses_a_finalizing_download(self):
+        # All bytes arrived (prefetch_complete) but finalize has not run: a
+        # cancel then would race finalize, so it reports busy and changes
+        # nothing, even with no readers.
+        (self.backend_dir / "finalizing.bin").write_bytes(os.urandom(128 * 1024))
+        manager = self.fs._streaming_manager
+        vfd = self.fs.open('/finalizing.bin', os.O_RDONLY)
+        session = self._session_for(vfd)
+        try:
+            with session.lock:
+                # As if the last reader had closed: refcount 0 is otherwise
+                # cancellable, so only prefetch_complete makes this busy.
+                readers, session.refcount = session.refcount, 0
+                session.prefetch_complete = True
+            try:
+                self.assertEqual(manager.cancel_download_session(session.session_id), "busy")
+                self.assertEqual(manager.cancel_download_session_with_reason(session.session_id),
+                                 ("busy", "finalizing"))
+                with session.lock:
+                    self.assertFalse(session.stop_requested)
+                row, = manager.list_download_sessions()
+                self.assertEqual(row["status"], "finalizing")
+                with session.lock:
+                    session.prefetch_complete = False
+                    session.error = OSError(5, "simulated member failure")
+                try:
+                    self.assertEqual(manager.cancel_download_session_with_reason(session.session_id),
+                                     ("busy", "stopping"))
+                finally:
+                    with session.lock:
+                        session.error = None
+            finally:
+                with session.lock:
+                    session.refcount = readers
+                    session.prefetch_complete = False
+        finally:
+            self.fs.release('/finalizing.bin', vfd)
+
     def test_streaming_unread_session_uses_no_worker_and_reopens_fresh(self):
         payload = os.urandom(128 * 1024)
         (self.backend_dir / "reopen.bin").write_bytes(payload)
@@ -3821,6 +3903,240 @@ class TestFSStreamingIntegration(unittest.TestCase):
             self.fs.release('/' + name, vfd)
         self.assertEqual(manager._not_installed_reason("taken"), "cache-path-filled")
         self.assertEqual(manager._not_installed_reason("unsupported"), "unsupported")
+
+
+class TestControlRequests(unittest.TestCase):
+    """The mount control dispatcher, called directly: no socket, no mount."""
+
+    VALID_ID = "0123456789abcdef0123456789abcdef"
+
+    def setUp(self):
+        self.temp_dir = Path(tempfile.mkdtemp())
+        (self.temp_dir / "cache").mkdir()
+        (self.temp_dir / "backend").mkdir()
+        self.fs = StorageFS(
+            cache_root=self.temp_dir / "cache",
+            state_db=self.temp_dir / "state.db",
+            backends={"backend": LocalBackend("backend", str(self.temp_dir / "backend"))},
+            cache_size=1024 * 1024,
+            num_sync_workers=0,
+            start_sync=False,
+            streaming_reads=True,
+            streaming_chunk_size=32 * 1024,
+            max_streaming_sessions=2,
+            mountpoint="/example",
+        )
+        self.manager = self.fs._streaming_manager
+        # As if published; the socket itself is not started here.
+        self.manager._control_server.cache_identity = (1, 2)
+        self.initial_limits = self.manager.download_limits()
+
+    def tearDown(self):
+        try:
+            self.fs.destroy('/')
+        finally:
+            shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def handle(self, request):
+        if not isinstance(request, str):
+            request = json.dumps(request)
+        return self.manager._handle_control_request(request)
+
+    def test_rejected_requests(self):
+        set_message = "Provide at least one live streaming limit to set"
+        cancel_message = "Provide a complete download ID from 'storage control ... downloads'"
+        extra_message = "Unexpected arguments for control command"
+        object_message = "Expected a JSON control request object"
+        cases = [
+            ('{"command": "status", "command": "status"}', "Duplicate field in control request"),
+            ('{"command": "streaming.set", "limits": {"max_download_workers": 2, '
+             '"max_download_workers": 3}}', "Duplicate field in control request"),
+            ("not json", object_message),
+            ("[]", object_message),
+            ('"status"', object_message),
+            ("null", object_message),
+            ("[" * 100000, object_message),
+            ({}, "Unknown mount control command"),
+            ({"command": "streaming.delete"}, "Unknown mount control command"),
+            ({"command": None}, "Unknown mount control command"),
+            ({"command": ["status"]}, "Unknown mount control command"),
+            ({"command": "status", "verbose": True}, extra_message),
+            ({"command": "streaming.get", "limits": {}}, extra_message),
+            ({"command": "downloads.list", "id": self.VALID_ID}, extra_message),
+            ({"command": "streaming.set"}, set_message),
+            ({"command": "streaming.set", "limits": {}}, set_message),
+            ({"command": "streaming.set", "limits": None}, set_message),
+            ({"command": "streaming.set", "limits": [["max_download_workers", 2]]}, set_message),
+            ({"command": "streaming.set", "limits": "max_download_workers=2"}, set_message),
+            ({"command": "streaming.set", "limits": {"max_download_workers": 2}, "extra": 1},
+             set_message),
+            ({"command": "streaming.set", "limits": {"max_download_workers": 2, "bogus": 1}},
+             "unknown download limit: bogus"),
+            ({"command": "streaming.set", "limits": {"self": 1}}, "unknown download limit: self"),
+            ({"command": "streaming.set", "limits": {"limits": 1}}, "unknown download limit: limits"),
+            ({"command": "streaming.set", "limits": {"max_download_workers": True}},
+             "max_download_workers must be an integer between"),
+            ({"command": "streaming.set", "limits": {"max_streaming_sessions": 2.0}},
+             "max_streaming_sessions must be an integer between"),
+            ({"command": "streaming.set", "limits": {"max_streaming_sessions": 0}},
+             "max_streaming_sessions must be an integer between"),
+            ({"command": "streaming.set", "limits": {
+                "max_streaming_sessions": 3, "max_download_workers": 1000}},
+             "max_download_workers must be an integer between"),
+            ({"command": "downloads.cancel"}, cancel_message),
+            ({"command": "downloads.cancel", "id": self.VALID_ID[:-1]}, cancel_message),
+            ({"command": "downloads.cancel", "id": self.VALID_ID + "0"}, cancel_message),
+            ({"command": "downloads.cancel", "id": self.VALID_ID.upper()}, cancel_message),
+            ({"command": "downloads.cancel", "id": self.VALID_ID + "\n"}, cancel_message),
+            ({"command": "downloads.cancel", "id": int(self.VALID_ID, 16)}, cancel_message),
+            ({"command": "downloads.cancel", "id": [self.VALID_ID]}, cancel_message),
+            ({"command": "downloads.cancel", "id": self.VALID_ID, "force": True}, cancel_message),
+            ({"command": "streaming.set", "limits": {"max_download_workers": 2},
+              "mountpoint": "/other"},
+             "This control socket belongs to the mount at '/example', not '/other'"),
+            ({"command": "streaming.set", "limits": {"max_download_workers": 2},
+              "mountpoint": "/example/"},
+             "This control socket belongs to the mount at '/example', not '/example/'"),
+            ({"command": "streaming.set", "limits": {"max_download_workers": 2},
+              "mountpoint": None}, "Expected the target mountpoint as a string"),
+            ({"command": "downloads.cancel", "id": self.VALID_ID, "mountpoint": "/other"},
+             "This control socket belongs to the mount at '/example', not '/other'"),
+            ({"command": "streaming.set", "limits": {"max_download_workers": 2}, "cache": [1, 3]},
+             "This control socket was published in a different cache directory"),
+            ({"command": "downloads.cancel", "id": self.VALID_ID, "cache": [2, 2]},
+             "This control socket was published in a different cache directory"),
+            ({"command": "streaming.set", "limits": {"max_download_workers": 2}, "cache": "1:2"},
+             "Expected the target cache identity as [device, inode]"),
+            ({"command": "streaming.set", "limits": {"max_download_workers": 2}, "cache": [1, True]},
+             "Expected the target cache identity as [device, inode]"),
+            ({"command": "streaming.set", "limits": {"max_download_workers": 2}, "cache": [1, 2, 3]},
+             "Expected the target cache identity as [device, inode]"),
+            ({"command": "status", "mountpoint": "/other"},
+             "This control socket belongs to the mount at '/example', not '/other'"),
+        ]
+        for request, message in cases:
+            with self.subTest(request=request):
+                with self.assertRaises(ControlError) as raised:
+                    self.handle(request)
+                self.assertTrue(str(raised.exception).startswith(message), str(raised.exception))
+                # A rejected request, including a partly valid set, changes nothing.
+                self.assertEqual(self.manager.download_limits(), self.initial_limits)
+
+    def test_accepted_requests(self):
+        legacy = self.handle("streaming-stats\n")
+        self.assertEqual(legacy["active_streaming_sessions"], 0)
+        self.assertNotIn("limits", legacy)
+
+        status = self.handle({"command": "status"})
+        self.assertEqual(set(status), {"mount", "stats", "limits", "restart_only"})
+        self.assertEqual(status["mount"], {"mountpoint": "/example", "pid": os.getpid(),
+                                           "cache": [1, 2]})
+        named = self.handle({"command": "status", "mountpoint": "/example"})
+        self.assertEqual(named["mount"], status["mount"])
+        self.assertEqual(named["limits"], status["limits"])
+        self.assertEqual(status["limits"], self.initial_limits)
+        self.assertTrue(status["restart_only"]["streaming_reads"])
+        self.assertEqual(status["restart_only"]["streaming_chunk_size"], 32 * 1024)
+
+        self.assertEqual(
+            self.handle({"command": "streaming.get"}),
+            {"limits": self.initial_limits, "restart_only": status["restart_only"]},
+        )
+
+        changed = self.handle({"command": "streaming.set", "mountpoint": "/example",
+                               "cache": [1, 2], "limits": {
+            "max_streaming_sessions": 3, "max_download_workers": 2,
+        }})
+        expected = {**self.initial_limits, "max_streaming_sessions": 3, "max_download_workers": 2}
+        self.assertEqual(changed["limits"], expected)
+        self.assertEqual(self.manager.download_limits(), expected)
+
+        self.assertEqual(self.handle({"command": "downloads.list"}), {"downloads": []})
+        self.assertEqual(
+            self.handle({"command": "downloads.cancel", "id": self.VALID_ID}),
+            {"id": self.VALID_ID, "result": "not-found"},
+        )
+
+    def test_mount_through_a_symlink_reports_its_target(self):
+        target = self.temp_dir / "mounted here"
+        target.mkdir()
+        (self.temp_dir / "link").symlink_to(target)
+        fs = StorageFS(
+            cache_root=self.temp_dir / "cache",
+            state_db=self.temp_dir / "linked.db",
+            backends={"backend": LocalBackend("backend", str(self.temp_dir / "backend"))},
+            cache_size=1024 * 1024,
+            num_sync_workers=0,
+            start_sync=False,
+            mountpoint=str(self.temp_dir / "link"),
+        )
+        try:
+            self.assertEqual(fs._streaming_manager.mountpoint, str(target.resolve()))
+        finally:
+            fs.destroy('/')
+
+    def test_final_dot_mountpoint_publishes_without_a_mountpoint(self):
+        fs = StorageFS(
+            cache_root=self.temp_dir / "cache",
+            state_db=self.temp_dir / "other.db",
+            backends={"backend": LocalBackend("backend", str(self.temp_dir / "backend"))},
+            cache_size=1024 * 1024,
+            num_sync_workers=0,
+            start_sync=False,
+            mountpoint="/example/..",
+        )
+        try:
+            manager = fs._streaming_manager
+            self.assertIsNone(manager.mountpoint)
+            # The socket still starts, for --cache and streaming-stats.
+            with patch.object(manager._control_server, "start") as start:
+                with self.assertLogs(manager.logger, "WARNING") as logged:
+                    manager.init()
+            start.assert_called_once_with()
+            self.assertIn("report no mountpoint", logged.output[0])
+            self.assertIn("without a final '.' or '..'", logged.output[0])
+
+            manager._control_server.cache_identity = (1, 2)
+            status = manager._handle_control_request(json.dumps({"command": "status", "cache": [1, 2]}))
+            self.assertIsNone(status["mount"]["mountpoint"])
+            self.assertEqual(status["mount"]["cache"], [1, 2])
+            changed = manager._handle_control_request(json.dumps({
+                "command": "streaming.set", "cache": [1, 2], "limits": {"max_download_workers": 2},
+            }))
+            self.assertEqual(changed["limits"]["max_download_workers"], 2)
+            for named in ("/example/..", "/mnt", "/example"):
+                with self.assertRaisesRegex(ControlError, "reports no mountpoint .*use --cache"):
+                    manager._handle_control_request(json.dumps({
+                        "command": "streaming.set", "mountpoint": named,
+                        "limits": {"max_download_workers": 3},
+                    }))
+            self.assertEqual(manager.download_limits()["max_download_workers"], 2)
+        finally:
+            fs.destroy('/')
+
+    def test_request_during_stop_says_the_mount_is_stopping(self):
+        self.manager._control_server.cache_identity = None  # As stop() leaves it.
+        with self.assertRaisesRegex(ControlError, "^This mount is stopping"):
+            self.handle({"command": "streaming.set", "cache": [1, 2],
+                         "limits": {"max_download_workers": 2}})
+        self.assertEqual(self.manager.download_limits(), self.initial_limits)
+
+    def test_update_download_limits_takes_a_dict_or_keywords(self):
+        expected = {**self.initial_limits, "max_download_workers": 2, "max_streaming_sessions": 3}
+        self.assertEqual(self.manager.update_download_limits({"max_download_workers": 2},
+                                                             max_streaming_sessions=3), expected)
+        with self.assertRaisesRegex(ValueError, "^unknown download limit: self$"):
+            self.manager.update_download_limits({"self": 1})
+        with self.assertRaisesRegex(ValueError, "^unknown download limit: self$"):
+            self.manager.update_download_limits(**{"self": 1})
+        self.assertEqual(self.manager.download_limits(), expected)
+
+    def test_set_after_shutdown_is_refused(self):
+        self.fs.destroy('/')
+        with self.assertRaisesRegex(ControlError, "^mount is shutting down$"):
+            self.handle({"command": "streaming.set", "limits": {"max_download_workers": 2}})
+        self.assertEqual(self.manager.download_limits(), self.initial_limits)
+
 
 if __name__ == '__main__':
     unittest.main()

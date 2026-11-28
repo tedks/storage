@@ -426,6 +426,9 @@ def mount(
             fuse_threads=resolved.fuse_threads,
             max_foreground_operations=resolved.max_foreground_operations,
             checksum_reverify_interval=resolved.checksum_reverify_interval,
+            # Path() drops a trailing '/.', so report the spelling the
+            # profile has; the control CLI canonicalizes the same string.
+            reported_mountpoint=resolved.mountpoint,
         )
     except PermissionError as exc:
         click.echo(f"Permission error: {exc}", err=True)

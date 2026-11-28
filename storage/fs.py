@@ -247,7 +247,8 @@ class StorageFS(Operations):
                  max_foreground_operations: Optional[int] = None,
                  max_sync_workers: Optional[int] = None,
                  max_download_workers: int = DEFAULT_MAX_DOWNLOAD_WORKERS,
-                 max_retained_streaming_sessions: int = DEFAULT_MAX_RETAINED_STREAMING_SESSIONS):
+                 max_retained_streaming_sessions: int = DEFAULT_MAX_RETAINED_STREAMING_SESSIONS,
+                 mountpoint: Optional[str] = None):
         """
         Initialize Storage filesystem
 
@@ -261,6 +262,9 @@ class StorageFS(Operations):
             streaming_reads: Enable uncached range streaming + background prefetch
             max_download_workers: Ceiling for adaptive streaming download workers
             max_retained_streaming_sessions: Maximum retained fills without readers
+            mountpoint: Where this filesystem is mounted; reported by the
+                control socket, as canonical_mountpoint gives it, so a client
+                can refuse another mount's socket. None when not mounted
             streaming_chunk_size: Unit of background read-ahead (foreground
                 reads fetch only what the reader asked for); read-ahead
                 starts once readers have read one chunk
@@ -478,6 +482,7 @@ class StorageFS(Operations):
             max_streaming_sessions=max_streaming_sessions,
             max_download_workers=max_download_workers,
             max_retained_streaming_sessions=max_retained_streaming_sessions,
+            mountpoint=mountpoint,
             keep_after_close=streaming_keep_after_close,
             on_finalized=lambda session: self._record_fetched(
                 session.canonical_path, session.final_cache_path, session.backend,
@@ -1918,18 +1923,6 @@ class StorageFS(Operations):
 
     def _streaming_stats_snapshot(self) -> Dict[str, object]:
         return self._streaming_manager._streaming_stats_snapshot()
-
-    def _handle_control_request(self, request: str) -> Dict[str, object]:
-        return self._streaming_manager._handle_control_request(request)
-
-    def _control_server_loop(self):
-        self._streaming_manager._control_server_loop()
-
-    def _start_control_server(self):
-        self._streaming_manager._start_control_server()
-
-    def _stop_control_server(self):
-        self._streaming_manager._stop_control_server()
 
     def _record_streaming_stat(self, key: str, value: int = 1):
         self._streaming_manager._record_streaming_stat(key, value)
@@ -3755,12 +3748,17 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
                  max_foreground_operations: Optional[int] = None,
                  max_sync_workers: Optional[int] = None,
                  max_download_workers: int = DEFAULT_MAX_DOWNLOAD_WORKERS,
-                 max_retained_streaming_sessions: int = DEFAULT_MAX_RETAINED_STREAMING_SESSIONS):
+                 max_retained_streaming_sessions: int = DEFAULT_MAX_RETAINED_STREAMING_SESSIONS,
+                 reported_mountpoint: Optional[str] = None):
     """
     Mount a Storage filesystem
 
     Args:
         mountpoint: Where to mount the filesystem
+        reported_mountpoint: The mountpoint as the user spelled it (the
+            profile string), canonicalized and reported by the control
+            socket so it matches what 'storage control --profile' computes
+            from the same string; defaults to mountpoint
         cache_root: Root directory for cache
         state_db: Path to state database
         backends: Dictionary of backends
@@ -3887,6 +3885,7 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
         bulk_cold_copies=fuse_threads,
         max_foreground_operations=max_foreground_operations,
         max_sync_workers=max_sync_workers,
+        mountpoint=str(mountpoint if reported_mountpoint is None else reported_mountpoint),
     )
     fs.mount_lock_file = lock_file
     if unclean_shutdown:

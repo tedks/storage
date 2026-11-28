@@ -20,7 +20,9 @@ _INTERNAL_XATTR_PREFIX = "user.storage."
 
 
 _AT_FDCWD = -100
-_RENAME_NOREPLACE = 1
+RENAME_NOREPLACE = 1
+# Swap two existing names atomically; both must exist.
+RENAME_EXCHANGE = 2
 
 
 def _load_renameat2():
@@ -54,21 +56,31 @@ def _source_present(path) -> bool:
     return True
 
 
+def renameat2(src, dst, flags: int) -> bool:
+    """One renameat2(src, dst, flags) call, atomic in the kernel.
+
+    True on success, False when dst exists (RENAME_NOREPLACE). Raises
+    OSError otherwise, with ENOSYS where libc has no renameat2 and EINVAL
+    (among NOREPLACE_UNSUPPORTED) where the filesystem lacks the flag.
+    """
+    call = _RENAMEAT2
+    if call is None:
+        raise OSError(errno.ENOSYS, "renameat2 unavailable")
+    if call(_AT_FDCWD, os.fsencode(src), _AT_FDCWD, os.fsencode(dst), flags) == 0:
+        return True
+    err = ctypes.get_errno()
+    if flags == RENAME_NOREPLACE and err == errno.EEXIST:
+        return False
+    raise OSError(err, os.strerror(err), str(src))
+
+
 def rename_noreplace(src, dst) -> bool:
     """rename(src, dst) unless dst exists: True if renamed, False if dst exists.
 
     One renameat2(RENAME_NOREPLACE) call, atomic in the kernel. Raises
     OSError, with ENOSYS where libc has no renameat2.
     """
-    renameat2 = _RENAMEAT2
-    if renameat2 is None:
-        raise OSError(errno.ENOSYS, "renameat2 unavailable")
-    if renameat2(_AT_FDCWD, os.fsencode(src), _AT_FDCWD, os.fsencode(dst), _RENAME_NOREPLACE) == 0:
-        return True
-    err = ctypes.get_errno()
-    if err == errno.EEXIST:
-        return False
-    raise OSError(err, os.strerror(err), str(src))
+    return renameat2(src, dst, RENAME_NOREPLACE)
 
 
 def _is_internal_xattr(name: str) -> bool:

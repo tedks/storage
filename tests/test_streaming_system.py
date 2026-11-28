@@ -9,18 +9,146 @@ streaming stays healthy under sustained reads and does not regress to the
 import errno
 import hashlib
 import json
+import logging
+import queue
 import os
 import shutil
+import subprocess
 import tempfile
 import threading
 import time
+import sys
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from storage.backends.local import LocalBackend
+from storage.control import canonical_mountpoint
 from storage.fs import StorageFS
 from tests.fuse_mount import run_fuse, stop_fuse
+
+
+# Only a backstop for a test that never releases a held read: the test and
+# tearDown release it explicitly, so a slow host never sees the hold expire.
+HELD_READ_SAFETY_TIMEOUT = 600.0
+# Upper bounds on one step of the mounted control test (a CLI run, the
+# reader subprocess answering, the background read being entered): a slow
+# host waits longer, a broken one still fails well inside the backstop.
+MOUNTED_STEP_TIMEOUT = 120.0
+
+# Opens argv[1], reads argv[2] bytes and prints "ready <sha256>"; then, for
+# each "OFFSET COUNT" line on stdin, prints the sha256 of those bytes. Holds
+# the handle until stdin closes, then closes it and prints "closed". FUSE
+# data is read in this subprocess, never in the process serving the mount.
+_HELD_READER = r"""
+import hashlib, os, sys
+
+def read_exact(fd, offset, count):
+    data = bytearray()
+    while len(data) < count:
+        chunk = os.pread(fd, count - len(data), offset + len(data))
+        if not chunk:
+            break
+        data += chunk
+    return bytes(data)
+
+fd = os.open(sys.argv[1], os.O_RDONLY)
+print("ready", hashlib.sha256(read_exact(fd, 0, int(sys.argv[2]))).hexdigest(), flush=True)
+for line in iter(sys.stdin.readline, ""):
+    offset, count = map(int, line.split())
+    print(hashlib.sha256(read_exact(fd, offset, count)).hexdigest(), flush=True)
+os.close(fd)
+print("closed", flush=True)
+"""
+
+
+def sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+class HeldReader:
+    """A reader of a mounted file in a subprocess, holding it open until close().
+
+    `release` (the backend's release_held_reads) is called before the child
+    is killed, so a member read the test holds cannot keep it in the kernel.
+    Every wait is bounded by MOUNTED_STEP_TIMEOUT.
+    """
+
+    def __init__(self, path: Path, count: int, release=None):
+        self._release = release
+        self._process = subprocess.Popen(
+            [sys.executable, "-I", "-c", _HELD_READER, os.fsencode(path), str(count)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+        )
+        # From here on, any failure (readiness included) reaps the child.
+        try:
+            self._lines = queue.Queue()
+            threading.Thread(target=self._pump, daemon=True).start()
+            word, self.first_digest = self._line().split()
+            if word != "ready":
+                raise AssertionError(f"reader said {word!r}")
+        except BaseException:
+            self.kill()
+            raise
+
+    def _pump(self):
+        for line in self._process.stdout:
+            self._lines.put(line.strip())
+        self._lines.put(None)
+
+    def _line(self) -> str:
+        try:
+            line = self._lines.get(timeout=MOUNTED_STEP_TIMEOUT)
+        except queue.Empty:
+            raise AssertionError("mounted file reader did not answer") from None
+        if line is None:
+            raise AssertionError(f"mounted file reader exited with {self._reap()}")
+        return line
+
+    def _reap(self):
+        try:
+            return self._process.wait(timeout=MOUNTED_STEP_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            raise AssertionError("mounted file reader did not exit") from None
+
+    def read_digest(self, offset: int, count: int) -> str:
+        self._process.stdin.write(f"{offset} {count}\n")
+        self._process.stdin.flush()
+        return self._line()
+
+    def close(self):
+        """Close the handle (by closing stdin) and wait for the reader to exit."""
+        try:
+            if self._process.poll() is None and not self._process.stdin.closed:
+                self._process.stdin.close()
+                if self._line() != "closed":
+                    raise AssertionError("mounted file reader did not close its handle")
+            if self._reap() != 0:
+                raise AssertionError(f"mounted file reader exited with {self._process.returncode}")
+        except BaseException:
+            self.kill()
+            raise
+
+    def kill(self):
+        """Cleanup on a failure path: never raises, so the failure that got
+        here is the one reported. close() keeps the strict reap."""
+        try:
+            if self._release is not None:
+                self._release()
+            if self._process.poll() is None:
+                self._process.kill()
+            self._reap()
+        except Exception as exc:
+            logging.getLogger(__name__).warning("could not reap the mounted file reader: %s", exc)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type is None:
+            self.close()
+        else:
+            self.kill()
 
 
 class SlowRemoteLoopbackBackend(LocalBackend):
@@ -30,8 +158,19 @@ class SlowRemoteLoopbackBackend(LocalBackend):
         super().__init__(name, root_path, speed_priority=50)
         self.is_remote = True
         self.range_delay = range_delay
+        self.hold_past = None
+
+    def release_held_reads(self):
+        if self.hold_past is not None:
+            self.hold_past[3].set()
 
     def read_file(self, virtual_path: str, offset: int, size: int) -> bytes:
+        if self.hold_past is not None:
+            name, boundary, entered, resume = self.hold_past
+            if virtual_path.lstrip("/") == name and offset >= boundary:
+                entered.set()
+                if not resume.wait(HELD_READ_SAFETY_TIMEOUT):
+                    raise TimeoutError("test did not release the held range read")
         if self.range_delay:
             time.sleep(self.range_delay)
         return super().read_file(virtual_path, offset, size)
@@ -116,7 +255,7 @@ class TestStreamingSystemRegression(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.mkdtemp()
         self.mount_dir = Path(self.temp_dir) / "mount"
-        self.cache_dir = Path(self.temp_dir) / "cache"
+        self.cache_dir = Path(self.temp_dir) / "cache 演奏"
         self.backend_dir = Path(self.temp_dir) / "backend"
         self.db_path = Path(self.temp_dir) / "state.db"
 
@@ -134,6 +273,8 @@ class TestStreamingSystemRegression(unittest.TestCase):
         }
         for name, payload in self.contended_payloads.items():
             (self.backend_dir / name).write_bytes(payload)
+        (self.backend_dir / "recording 演奏.bin").write_bytes(self.payload)
+        (self.backend_dir / "second file.bin").write_bytes(self.payload)
 
         self.backend = SlowRemoteLoopbackBackend("remote0", str(self.backend_dir), range_delay=0.003)
         self.fs = StorageFS(
@@ -146,6 +287,7 @@ class TestStreamingSystemRegression(unittest.TestCase):
             streaming_reads=True,
             streaming_chunk_size=64 * 1024,
             max_streaming_sessions=4,
+            mountpoint=canonical_mountpoint(str(self.mount_dir)),
         )
 
         self.mount_thread = threading.Thread(
@@ -161,6 +303,9 @@ class TestStreamingSystemRegression(unittest.TestCase):
             self.skipTest(f"Mount unavailable in this environment: {exc}")
 
     def tearDown(self):
+        # A held member read would otherwise keep its download, and so the
+        # unmount, waiting for the safety timeout.
+        self.backend.release_held_reads()
         # After the FUSE thread has finished, so this destroy never runs
         # beside libfuse's own (or a request still in flight).
         problems = stop_fuse(self.mount_dir, self.mount_thread, fs=self.fs)
@@ -345,6 +490,124 @@ class TestStreamingSystemRegression(unittest.TestCase):
             cached = self.cache_dir / name
             self.assertTrue(self._wait_for(cached.exists))
             self.assertEqual(cached.read_bytes(), payloads[name])
+
+    def _run_control_cli(self, *args, expected=0):
+        cli = Path(os.environ["TEST_SRCDIR"]) / os.environ["TEST_WORKSPACE"] / "storage_cli"
+        result = subprocess.run([str(cli), *args], check=False, capture_output=True,
+                                text=True, timeout=MOUNTED_STEP_TIMEOUT)
+        self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+        return result
+
+    def test_live_mount_control(self):
+        self.assertTrue(os.path.ismount(self.mount_dir), "requires a live scratch FUSE mount")
+        control_socket = os.fsencode(self.cache_dir / ".storage.control.sock")
+        self.assertLessEqual(
+            len(control_socket), 107,
+            f"the cache path is too long for a Unix socket ({len(control_socket)} bytes); "
+            "run with a shorter TMPDIR",
+        )
+        name = "recording 演奏.bin"
+        second = "second file.bin"
+        partial = self.cache_dir / f"{name}.storage.partial"
+        entered = threading.Event()
+        resume = threading.Event()
+        self.backend.hold_past = (name, 1024 * 1024, entered, resume)
+        release = self.backend.release_held_reads
+
+        def command(*args, expected=0, json_output=True):
+            options = ["control", "--cache", str(self.cache_dir)]
+            if json_output:
+                options += ["--json-output"]
+            result = self._run_control_cli(*options, *args, expected=expected)
+            return json.loads(result.stdout) if json_output else result
+
+        try:
+            with HeldReader(self.mount_dir / name, 512 * 1024, release) as handle:
+                self.assertEqual(handle.first_digest, sha256(self.payload[:512 * 1024]))
+                self.assertTrue(entered.wait(MOUNTED_STEP_TIMEOUT),
+                                "the background range reader must be held")
+
+                status = command()
+                self.assertEqual(status["stats"]["active_reader_sessions"], 1)
+                self.assertNotIn(name, json.dumps(status, ensure_ascii=False))
+                self.assertTrue(status["restart_only"]["streaming_reads"])
+                self.assertEqual(status["mount"]["mountpoint"], canonical_mountpoint(str(self.mount_dir)))
+                cache_entry = os.stat(self.cache_dir)
+                self.assertEqual(status["mount"]["cache"], [cache_entry.st_dev, cache_entry.st_ino])
+                row, = command("downloads")["downloads"]
+                self.assertEqual(row["path"].lstrip("/"), name)
+                self.assertEqual(row["readers"], 1)
+                original = row["id"]
+
+                outcome = command("cancel", original, expected=3)
+                self.assertEqual(outcome, {"id": original, "result": "busy", "reason": "readers"})
+                human = command("cancel", original, expected=3, json_output=False)
+                self.assertIn("it has open readers. Close its readers and retry.", human.stderr)
+                self.assertEqual(handle.read_digest(512 * 1024, 64),
+                                 sha256(self.payload[512 * 1024:512 * 1024 + 64]))
+
+                limits = command("set", "--max-streaming-sessions", "1",
+                                 "--max-retained-streaming-sessions", "3",
+                                 "--max-download-workers", "1")["limits"]
+                self.assertEqual(limits, {
+                    "max_streaming_sessions": 1,
+                    "max_retained_streaming_sessions": 3,
+                    "max_download_workers": 1,
+                })
+                rejected = command("set", "--max-streaming-sessions", "2",
+                                   "--max-download-workers", "33", expected=1, json_output=False)
+                self.assertIn("max_download_workers", rejected.stderr)
+                self.assertEqual(command("get")["limits"], limits)
+
+                # A profile reaches this cache's socket only for its own mountpoint.
+                config = Path(self.temp_dir) / "storage.toml"
+                config.write_text("".join(f"""
+[mounts.{profile}]
+mountpoint = {json.dumps(str(mountpoint))}
+cache = {json.dumps(str(self.cache_dir))}
+backends = [{json.dumps(str(self.backend_dir))}]
+""" for profile, mountpoint in (("this", self.mount_dir),
+                                ("other", Path(self.temp_dir) / "elsewhere"))))
+                by_profile = ["control", "--config", str(config), "--profile"]
+                refused = self._run_control_cli(*by_profile, "other", "set",
+                                                "--max-download-workers", "2", expected=1)
+                self.assertIn("belongs to the mount at", refused.stderr)
+                self.assertEqual(command("get")["limits"], limits)
+                mine = json.loads(self._run_control_cli(
+                    *by_profile, "this", "--json-output", "set", "--max-download-workers", "1",
+                ).stdout)
+                self.assertEqual(mine["limits"], limits)
+
+                with HeldReader(self.mount_dir / second, 16, release) as fallback:
+                    self.assertEqual(fallback.first_digest, sha256(self.payload[:16]))
+                self.assertEqual(command("status")["stats"]["streaming_fallback_opens"], 1)
+
+                legacy = json.loads(self._run_control_cli(
+                    "debug", "streaming-stats", "--cache", str(self.cache_dir), "--json-output",
+                ).stdout)
+                self.assertEqual(legacy["pid"], status["stats"]["pid"])
+                self.assertEqual(legacy["active_streaming_sessions"], 1)
+            self.assertTrue(self._wait_for(
+                lambda: command("status")["stats"]["retained_streaming_sessions"] == 1,
+                timeout=MOUNTED_STEP_TIMEOUT,
+            ))
+            self.assertTrue(partial.exists())
+            self.assertEqual(command("cancel", original), {"id": original, "result": "cancelled"})
+            self.assertEqual(command("downloads")["downloads"], [])
+            self.assertFalse(partial.exists())
+
+            with HeldReader(self.mount_dir / name, 512 * 1024, release) as replacement:
+                self.assertEqual(replacement.first_digest, sha256(self.payload[:512 * 1024]))
+                row, = command("downloads")["downloads"]
+                self.assertNotEqual(row["id"], original)
+                self.assertEqual(command("cancel", original, expected=4)["result"], "not-found")
+                self.assertEqual(command("downloads")["downloads"][0]["id"], row["id"])
+                command("set", "--max-retained-streaming-sessions", "0")
+            self.assertTrue(self._wait_for(lambda: not command("downloads")["downloads"],
+                                           timeout=MOUNTED_STEP_TIMEOUT))
+            self.assertFalse(partial.exists())
+        finally:
+            resume.set()
 
 
     def _range_client(self):

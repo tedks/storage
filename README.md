@@ -563,6 +563,101 @@ Show storage configuration for a path:
 storage info PATH
 ```
 
+### control
+
+Inspect and tune a running mount as the user who started it. Use the mount's
+cache directory or a profile name. Profile selection reads the configured
+cache path. Use `--cache` when the running mount was started with a cache
+override or the profile now points to a different cache.
+
+Two mounts configured with the same cache share one control socket, and only
+the first to start owns it. With `--profile`, every request names the
+profile's mountpoint and the mount refuses one that names another mount;
+`set` and `cancel` also check the mount's reported mountpoint before sending
+the change. `--cache` reaches whichever mount owns that cache's socket;
+`status` shows its mountpoint. With either option, every request also names
+the cache directory (by device and inode), and both the mount and the CLI
+refuse a socket that was published in a different cache and moved here. Mountpoints are compared as the directory
+mounted on: an absolute path with symlinks resolved, including a symlink as the
+last component, so a profile whose mountpoint link now points elsewhere no
+longer matches the mount made through its old target. A relative mountpoint
+matches only from the working directory the mount was started in. A mountpoint whose last
+component is `.` or `..` cannot be matched without looking inside the mount:
+such a mount still publishes its control socket but reports no mountpoint, so
+`--cache` and `storage debug streaming-stats` reach it while `--profile`
+refuses. Write the mountpoint as the path it resolves to instead (drop a
+final `.`; replace `dir/..` with the parent of `dir`, not with `dir`). A
+running mount keeps the identity it started with, so after editing the
+profile use `--cache` until the next mount. Both sides read the profile's
+mountpoint string as written, so they agree on such a spelling.
+
+```bash
+storage control --profile media
+storage control --profile media --config ./storage.toml get
+storage control --cache '/var/cache/my media' set --max-streaming-sessions 4 --max-download-workers 2
+storage control --profile media downloads
+storage control --profile media cancel 474b595adc054281bced844067939d97
+```
+
+`status` is the default. It shows aggregate download activity and effective
+streaming settings. `downloads` explicitly shows each file's path, progress,
+reader count, and download ID. Pass `--json-output` before the command to
+consume its response programmatically.
+
+`get` shows the live limits. `set` applies all specified values together after
+validating them. Changes last until the mount stops. Use these limits to tune
+streaming downloads independently of background sync.
+
+| Live limit | Range | Effect |
+| --- | --- | --- |
+| `--max-streaming-sessions` | 1–1024 | Concurrent streaming files with readers. Additional cold opens fall back to a whole-file fetch. |
+| `--max-retained-streaming-sessions` | 0–1024 | Reader-free downloads retained after close. Set to `0` to discard unfinished downloads at future last closes. Existing retained downloads can finish. |
+| `--max-download-workers` | 1–32 | Ceiling for background download workers. When lowered, transfers in progress finish their current chunks before the lower cap applies. |
+
+`streaming_reads`, `streaming_chunk_size`, and `streaming_keep_after_close`
+require a restart. `get` reports their current values with chunk size in bytes
+and keep-after-close thresholds in bytes and percentages. Change the mount
+profile or startup flags to persist settings across restarts.
+
+To cancel, copy the exact ID from `downloads`. `cancelled` means the mount
+abandoned the download, including its partial cache file. A download with a
+reader, in finalization, or still cleaning up after a failure or an earlier
+cancel reports `busy` and says which (`reason` in the JSON: `readers`,
+`finalizing` or `stopping`). Close its readers, or wait, before retrying. A vanished ID reports `not-found`, including when a new
+download has started for the same path. `busy` exits with status 3 and
+`not-found` with status 4; other errors exit with 1, usage errors with 2.
+The endpoint is the private `.storage.control.sock` in the mount cache.
+The mount publishes it only when the cache directory is owned by the mount's
+user and is not writable by all users unless sticky (group write, as under umask
+002, is fine); otherwise the mount logs a warning and runs without a control
+socket.
+`storage debug streaming-stats` continues to query it.
+
+Storage creates a private `.storage.mount.<32 hex digits>` directory in the
+cache while publishing or withdrawing the socket. Older builds used 16 hex
+digits. Takeover of a dead socket uses an atomic exchange so the incoming
+socket is public and the displaced entry remains in the stage until it is
+verified or restored. If restoration would displace a public entry in a
+shared writable cache, Storage keeps the entry in the stage and logs its
+location. Without exchange support, startup leaves an occupied name in
+place and logs a warning. Without no-replace rename support, shutdown
+leaves its dead socket in place. Failure to start the control thread leaves
+the mount running without a control socket.
+
+An interrupted operation can leave a staging directory behind. A cache
+writable by other users can also retain empty stages after normal
+operation. Startup partial-file cleanup skips these directories so they
+remain available for manual recovery. A stage can contain `nonce`
+(the hex suffix), `socket` (the incoming or displaced entry), or `moved`
+(the entry moved during shutdown). Only the mount user should clean up,
+with no mount of that cache starting or stopping. Inspect each directory
+with `ls -la`. Preserve any unexpected entry for recovery, and verify that
+each socket is dead before removing it. `ss -xap` shows live sockets but
+may display their original bind paths after a rename. If in doubt,
+confirm a connection to the entry returns `ECONNREFUSED`. Check the public
+socket the same way before removing a dead one by hand. Leave
+`.storage.mount.<hash>.lock` mount-lock files in place.
+
 ### debug
 
 Inspect or repair local cache/index state:
@@ -678,6 +773,7 @@ Implemented:
 - On a threaded mount, whole-file SSH cache copies use bulk SFTP channel capacity while directory listing keeps the interactive reserve. `bulk_capacity_wait_timeout` optionally bounds that bulk-capacity queue (off by default); an existing cold open reports `EAGAIN` on its expiry, and an interrupted native FUSE request reports `EINTR`. Single-threaded foreground copies keep their interactive class.
 - An optional cap on admitted FUSE callbacks (`max_foreground_operations`, 4-128, off by default; setting it turns on `fuse_threads`). Two slots are reserved for reads, writes, fsync and flush on cached files (including an open of an already cached file), one for metadata reads (stat, listing, xattr reads, which may still ask a member) and one for everything else, such as cold opens, streaming reads of uncached files and namespace or metadata changes; the rest are shared. At the minimum cap a streaming read blocked on a slow member therefore holds the one ordinary slot, and cold opens and namespace changes wait behind it. A callback's class is fixed when it starts, so a cached open that turns out to refetch keeps its read slot until it finishes. Releasing a file (`release`, `releasedir`) never waits for a slot in Storage's gate and is not counted, though libfuse's own path locks can still hold closes, reads and stats behind a rename, unlink or rmdir of the file or a parent directory that is queued for a slot; `fsync` and `flush` (which `close()` sends, and which reports a conflict-view write refused by a member repair) are counted as demand, so a `close()` can wait for a demand slot, and one still waiting when the gate closes (unmount) fails with `EINTR`. The last close of a file unlinked while it was open is an exception: libfuse then removes its `.fuse_hidden` name with an unlink, which waits for an ordinary slot like any unlink. The cap bounds admitted callbacks only: callbacks in flight, counting exempt ones and waiters, and native threads can exceed it. A callback waiting for a slot keeps waiting when its caller is interrupted or the mount is unmounted, because one request can make several callbacks (a rename onto an open file hides that file first; mkdir and create look up what they made) and failing a later one would misreport a request whose first step already happened. So an interrupted caller, or an unmount, can wait for the queue to drain, which takes as many rounds as the cap needs and longer when a member stalls; there is no time limit. SSH channel capacity waits keep their own cancellation and `bulk_capacity_wait_timeout`. libfuse's own threads are not capped: a callback waiting for a slot still holds one.
 - Cache metadata xattrs, with `storage debug rebuild-index`, `reprobe-locations` and `verify-index`
+- `storage control` for a running mount, over a private socket in its cache: aggregate download status, the effective streaming settings, live streaming limits (`set`, lasting until unmount), and listing and cancelling background downloads; with `--profile` it refuses a socket that answers for another mount sharing the cache
 - File recomputation
 - Symbolic links: made through the mount, replicated to the members holding their target; links already on members show as links
 - Transparent encryption (implemented; one test covers `storage/crypto.py`, so treat it as unverified)
