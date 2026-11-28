@@ -368,9 +368,15 @@ class _DownloadPool:
         # its first choice of that headroom before either is selected.
         running_by_member = self._member_load()
         for session, (has_reader, is_local) in self.ready.items():
+            if local is not None and active is not None and closed is not None:
+                break
             if is_local:
                 if local is None:
                     local = session
+                continue
+            chosen = active if has_reader else closed
+            if chosen is not None:
+                # Its priority's choice is made; no capacity check for it.
                 continue
             capacity = session.backend.background_range_capacity()
             if capacity is not None and running_by_member[session.backend.name] >= capacity:
@@ -379,8 +385,6 @@ class _DownloadPool:
                 active = session
             if not has_reader and closed is None:
                 closed = session
-            if local is not None and active is not None and closed is not None:
-                break
         ranged = active is not None or closed is not None
         # A publication first: it is short, needs no member, and frees a
         # registry slot and a descriptor. But no more than

@@ -896,6 +896,29 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.assertTrue(all(session is not ranged for session in taken[:-1]))
         self.assertIs(taken[-1], ranged)
 
+    def test_take_checks_capacity_only_until_each_priority_has_a_choice(self):
+        checks = []
+
+        class Fake:
+            def __init__(self, name):
+                self.canonical_path = name
+                self.refcount = 0
+                self.backend = SimpleNamespace(
+                    name="member", background_range_capacity=lambda: checks.append(name))
+
+        pool = _DownloadPool(1, lambda session: None, self.fs.logger)
+        with pool.condition:
+            for index in range(3):
+                pool.ready[Fake(f"/active-{index}")] = (True, False)
+                pool.ready[Fake(f"/retained-{index}")] = (False, False)
+            publication = Fake("/published")
+            pool.ready[publication] = (False, True)
+            # Only _take's own scan: the contention refresh after a take
+            # checks every queued session by design (_eligible).
+            with patch.object(pool, "_refresh_contention"):
+                self.assertIs(pool._take(), publication)
+        self.assertEqual(checks, ["/active-0", "/retained-0"])
+
     def test_bulk_wait_yield_interval_restarts_for_each_acquisition(self):
         manager = self.fs._streaming_manager
         session = SimpleNamespace(stop_requested=False, prefetch_complete=False, error=None,
