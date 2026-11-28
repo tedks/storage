@@ -14,7 +14,10 @@ A mount owner can inspect live download activity, change limits without restarti
 - [x] (2026-11-19 00:22Z) Rebased on the integrated scheduler and member-attribute changes.
 - [x] Opened draft PR #186, stacked on `feat/adaptive-reader-downloads`.
 - [x] (2026-11-28) Fixed council round 1 findings: the control dispatcher's rejections are tested in the sandboxed fast gate, handler errors are logged and answered instead of dropped, the read timeout reply is a fixed message, the cache lock comment says it does not wait, and the server restarts after a stop whose join timed out.
-- [ ] Run the full gate (`scripts/run-gates.sh`) on the final head. That result, and the revision it covers, is recorded on PR #186, not here.
+- [x] (2026-11-28) Fixed council rounds 3 to 6 and the early lead review: fd-pinned publication, the cache-root rule, mount identity (mountpoint and cache identity) on every profile or cache request, Unicode-sized frames, the final `.`/`..` refusal, O_PATH pin-then-connect in the client, the legacy EOF frame, distinct cancel exit codes, peer-check tests with mutation checks, and a subprocess reader in the mounted test.
+- [x] (2026-11-28) Rebased onto `master` after #185 merged as `77f2983`, keeping #185's behaviour; the PR now targets `master`.
+- [x] (2026-11-28) Fixed the post-integration round (P1 to P5): replacement and withdrawal act only on an entry moved into a private stage and verified there, stages are proven by fd and an O_EXCL nonce and swept after a crash, profile matching follows a final mountpoint symlink, the mounted test reaps its reader and bounds its waits, and the response bounds are tested.
+- [ ] Run the full gate (`scripts/run-gates.sh`) on the exact head before merge. That result, and the revision it covers, is recorded on PR #186, not here.
 
 ## Surprises & Discoveries
 
@@ -24,10 +27,16 @@ The current control socket uses one `recv` on a stream, which can yield partial 
 
 - Decision (2026-11-19, Codex): Identify a mount by its cache directory or a configured profile that names the cache directory. This is the identity already encoded in the socket path. Use explicit file listing to expose session IDs, and allow cancellation only by exact ID so a replacement at the same path is unaffected.
 - Decision (2026-11-19, Codex): Keep the legacy request and response and add one JSON object per newline-terminated control request. Bound request reads by byte count and wall time. Keep the endpoint private from publication and verify Unix peer ownership.
+- Decision (2026-11-28): Every request names the cache directory by (st_dev, st_ino), taken from one O_PATH open of the cache that the client also connects through, and the mount refuses a mismatch; a socket moved into another cache cannot answer for it. The server pins its cache directory fd while listening so the identity cannot be reused.
+- Decision (2026-11-28): With `--profile`, requests also name the canonical mountpoint: the directory mounted on, with parent symlinks, `..` and a final symlink resolved by readlink, never by stat'ing the final directory (a hung mount must not block the CLI). A final `.` or `..` is refused; such a mount still publishes its socket with no mountpoint, reachable by `--cache`. The mount root's (st_dev, st_ino) is not compared: the daemon cannot stat its own root without a FUSE request to itself, and before mounting it sees the underlying directory.
+- Decision (2026-11-28): The client opens the socket entry with O_PATH | O_NOFOLLOW, checks that fd (a socket owned by this user) and connects through /proc/self/fd, so the entry checked is the entry connected to.
+- Decision (2026-11-28): An unterminated frame is accepted only when it is exactly `streaming-stats`, for older clients that ended the request with EOF.
+- Decision (2026-11-28): `cancel` exits 3 for busy and 4 for not-found (1 for other errors, 2 for usage); a busy reply says why (`readers`, `finalizing`, `stopping`).
+- Decision (2026-11-28): The cache may be group-writable (umask 002), so a group writer is the adversary. Publication and withdrawal work in a private stage (mkdir 0700, opened O_NOFOLLOW, required ours, private and empty, with an O_EXCL nonce). An entry at the socket's name is moved into the stage and decided on there: a dead socket of ours (refused connect on that inode through an O_PATH fd) is replaced, ours is unlinked at stop, anything else is put back without clobbering. Placement uses renameat2(RENAME_NOREPLACE), else link and unlink. Cleanup removes only entries this process recorded; a substituted empty private directory may be used and removed, which grants its mover nothing. Stages a crash left are swept under the cache lock when they hold only a nonce and/or a dead socket.
 
 ## Outcomes & Retrospective
 
-The operator command, socket transport, documentation, and scratch tests are implemented and in draft PR #186. Council round 1 found missing fast-gate coverage of the dispatcher and four smaller transport issues, all fixed on the branch. The full-gate result for the head that merges is recorded on the PR.
+The operator command, socket transport, documentation, and scratch tests are implemented and in draft PR #186. Council round 1 found missing fast-gate coverage of the dispatcher and four smaller transport issues, all fixed on the branch. The full-gate result for the head that merges is recorded on the PR. Later rounds hardened the socket against a group writer of the cache and against the wrong mount answering (shared caches, moved sockets, retargeted mountpoint links); each fix has a test, and the security tests were mutation-checked.
 
 ## Context and Orientation
 
@@ -46,7 +55,7 @@ Run these commands from the `mount-control` worktree. Use the shared runtime loc
     nix develop --command bazel build //:storage_cli
     nix develop --command bazel test //tests:storage_test_cli_control //tests:storage_test_cli_debug //tests:storage_tests_streaming_system //:storage_build_srcs_check --test_output=all
 
-Run `scripts/run-gates.sh` from the final clean worktree to record full-gate evidence. A mounted run should report passes from both the default and threaded FUSE modes. The branch is stacked on `feat/adaptive-reader-downloads`; when that merges, rebase onto `master` and rerun the gates.
+Run `scripts/run-gates.sh` from the final clean worktree to record full-gate evidence. A mounted run should report passes from both the default and threaded FUSE modes. The branch is on `master`; rerun the gates on the exact head before merge.
 
 ## Validation and Acceptance
 
@@ -62,8 +71,10 @@ The parent lane maintains the CTO roster. Its mission and these tests prohibit t
 
 ## Interfaces and Dependencies
 
-Depend on `StreamingReadManager.download_limits`, `update_download_limits`, `list_download_sessions`, and `cancel_download_session` from the reader-downloads branch. The socket handler validates command and argument shape, and the streaming manager validates parameter values and applies updates in one operation. The initial live parameters are `max_streaming_sessions` (1 to 1024), `max_retained_streaming_sessions` (0 to 1024), and `max_download_workers` (1 to 32).
+Depend on `StreamingReadManager.download_limits`, `update_download_limits` (a dict of limits and/or keywords), `list_download_sessions`, and `cancel_download_session` with `cancel_download_session_with_reason` (on `master` since #185). `storage/control.py` owns the socket: `ControlServer`, `request_control_payload`, `open_cache_directory` and `canonical_mountpoint`. The socket handler validates command and argument shape, and the streaming manager validates parameter values and applies updates in one operation. The initial live parameters are `max_streaming_sessions` (1 to 1024), `max_retained_streaming_sessions` (0 to 1024), and `max_download_workers` (1 to 32).
 
 2026-11-19: Recorded the assigned worktree, agreed API, and mount-level test. Recorded the fast gate results and the rebase onto the integrated scheduler.
 
 2026-11-28: Marked the contract tests and draft PR done, recorded the council round 1 fixes, and pointed the final gate result at the PR. Replaced the stale instruction to rebase onto the reader-downloads branch, which is done.
+
+2026-11-28: Recorded rounds 3 to 6, the lead review, the rebase onto master and the post-integration fixes; added their decisions and the interfaces they rely on.
