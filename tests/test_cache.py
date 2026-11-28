@@ -441,6 +441,47 @@ class TestCacheAccounting(unittest.TestCase):
         self.assertNotIn(fd, manager._streaming_fds)
         self.assertEqual(manager.get_total_cache_size(), manager.block_size)
 
+    def test_truncated_prefix_keeps_only_its_blocks_charged(self):
+        manager = self.cache_manager
+        block = manager.block_size
+        with self._partial("prefix") as (path, fd):
+            self.assertTrue(manager.write_streaming_chunk(fd, 0, b"p" * (2 * block)))
+            self.assertTrue(manager.write_streaming_chunk(fd, 1 << 29, b"far"))
+            self.assertEqual(manager.get_total_cache_size(), 3 * block)
+            with self._no_rescan():
+                manager.truncate_streaming_fd(fd, block + 1)
+                self.assertEqual(manager.get_total_cache_size(), 2 * block)
+                self.assertEqual(manager._streaming_fds[fd], 2 * block)
+            manager.mark_cache_size_dirty()
+            self.assertEqual(manager.get_total_cache_size(), 2 * block)
+            # Promoted: the prefix is a named file the tree scan counts.
+            final = self.cache_dir / "prefix"
+            os.link(path, final)
+            path.unlink()
+            manager.publish_streaming_fd(fd)
+            self.assertEqual(manager.get_total_cache_size(), 2 * block)
+        self.assertEqual(manager.get_total_cache_size(), 2 * block)
+
+    def test_superseded_partial_charge_is_released_at_its_session_close(self):
+        """A reader still holding an unlinked partial keeps its bytes, but
+        the charge belongs to the session descriptor (close_streaming_fd)."""
+        manager = self.cache_manager
+        block = manager.block_size
+        path = self.cache_dir / ("superseded" + PARTIAL_SUFFIX)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        self.assertTrue(manager.write_streaming_chunk(fd, 0, b"s" * block))
+        reader = os.open(path, os.O_RDONLY)
+        try:
+            path.unlink()
+            self.assertEqual(manager.get_total_cache_size(), block)
+            manager.close_streaming_fd(fd)
+            self.assertEqual(manager.get_total_cache_size(), 0)
+            self.assertEqual(os.pread(reader, block, 0), b"s" * block)
+            manager.mark_cache_size_dirty()
+            self.assertEqual(manager.get_total_cache_size(), 0)
+        finally:
+            os.close(reader)
+
     def test_direct_writer_uses_space_before_the_next_stream_grant(self):
         manager = self.cache_manager
         block = manager.block_size

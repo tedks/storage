@@ -586,12 +586,86 @@ class TestFSStreamingIntegration(unittest.TestCase):
                     self.assertEqual(session.available_ranges, [(0, block)])
                     self.assertTrue(session.cache_full)
                     self.assertFalse(session.prefetch_complete)
+                    # Speculation pauses while the cache is full, and only
+                    # because of it: bytes are still missing.
+                    self.assertTrue(session.read_ahead_started)
+                    next_fetch = self.fs._streaming_manager._next_background_fetch
+                    self.assertIsNone(next_fetch(session))
+                    session.cache_full = False
+                    self.assertIsNotNone(next_fetch(session))
+                    session.cache_full = True
                 self.assertEqual(manager.get_total_cache_size(), 2 * block)
                 self.assertEqual((self.cache_dir / "dirty.bin").read_bytes(), b"local bytes")
             finally:
                 self.fs.release("/mixed.bin", reader)
         finally:
             self.fs.release("/dirty.bin", dirty)
+
+    def _fill_cache_but_one_block(self, name, blocks):
+        """A member file of `blocks` blocks and a dirty local block, with a
+        budget of three blocks: the dirty block and two of the file fit."""
+        manager = self.fs.cache_manager
+        block = manager.block_size
+        manager.max_size_bytes = 3 * block
+        payload = bytes([65 + index for index in range(blocks) for _ in range(block)])
+        (self.backend_dir / name).write_bytes(payload)
+        dirty = self.fs.create("/dirty.bin", 0o644)
+        self.fs.write("/dirty.bin", b"local bytes", 0, dirty)
+        self.fs.release("/dirty.bin", dirty)
+        self.assertEqual(manager.get_total_cache_size(), block)
+        self.assertEqual(self.fs.state_manager.get_file_metadata("/dirty.bin").sync_status,
+                         SyncStatus.DIRTY)
+        return payload
+
+    def test_last_close_stops_a_qualified_fill_the_foreground_found_full(self):
+        """No background fetch in flight: the last close itself stops a
+        qualified fill that cannot be cached, releasing its partial and
+        charge, instead of retaining it with nothing left to run."""
+        manager = self.fs.cache_manager
+        block = manager.block_size
+        payload = self._fill_cache_but_one_block("full.bin", 4)
+        streaming = self.fs._streaming_manager
+        with patch.object(streaming, "_next_background_fetch", return_value=None):
+            reader = self.fs.open("/full.bin", os.O_RDONLY)
+            session = self._session_for(reader)
+            self.assertEqual(self.fs.read("/full.bin", 2 * block, 0, reader), payload[:2 * block])
+            self.assertEqual(self.fs.read("/full.bin", block, 2 * block, reader),
+                             payload[2 * block:3 * block])
+            with session.lock:
+                self.assertTrue(session.readers_consumed)
+                self.assertTrue(session.cache_full)
+                self.assertEqual(session.in_flight_ranges, [])
+            self.assertEqual(manager.get_total_cache_size(), 3 * block)
+            self.fs.release("/full.bin", reader)
+        self.assertTrue(session.stop_requested)
+        self.assertTrue(session.detached)
+        self.assertTrue(session.background_finished.wait(timeout=3))
+        self.assertEqual(session.io_fd, -1)
+        self._assert_not_cached("full.bin")
+        self.assertEqual(manager.get_total_cache_size(), block)
+
+    def test_readerless_fill_stops_when_its_background_chunk_does_not_fit(self):
+        manager = self.fs.cache_manager
+        block = manager.block_size
+        payload = self._fill_cache_but_one_block("retained.bin", 4)
+        self.backend.worker_gate = threading.Event()
+        reader = self.fs.open("/retained.bin", os.O_RDONLY)
+        session = self._session_for(reader)
+        self.assertEqual(self.fs.read("/retained.bin", 2 * block, 0, reader), payload[:2 * block])
+        self.assertTrue(self.backend.worker_in_read.wait(timeout=3))
+        self.fs.release("/retained.bin", reader)
+        with session.lock:
+            self.assertTrue(session.readers_consumed)
+            self.assertFalse(session.stop_requested)  # retained: a qualified fill
+        self.assertEqual(manager.get_total_cache_size(), 3 * block)
+
+        self.backend.worker_gate.set()
+        self.assertTrue(session.background_finished.wait(timeout=3))
+        self.assertTrue(session.stop_requested)
+        self.assertTrue(session.detached)
+        self.assertEqual(session.io_fd, -1)
+        self._assert_not_cached("retained.bin")
+        self.assertEqual(manager.get_total_cache_size(), block)
 
     def test_write_open_reports_a_full_cache_as_enospc(self):
         manager = self.fs.cache_manager
