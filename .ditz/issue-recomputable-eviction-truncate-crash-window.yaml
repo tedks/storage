@@ -73,3 +73,41 @@ log_events:
   who: Ted Smith
   what: reopened
   comment: ""
+- time: 2026-11-28T11:27:05-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Reopened 2026-11-28. A fix was attempted in #187 (95f88fb, 530238b, e3ebc14;
+    local recovery ref refs/recovery/train-20261128/187-crashsafe-e3ebc14) and then
+    reverted (d916708, 6d4bb7b, 05f97a1), because every review round found new Critical,
+    Important or Blocker problems. A real fix needs its own design and PR. It must
+    handle each of these:
+
+
+    1. **Durability.** The size-0 record has to be durable before the truncate. Under
+    WAL with synchronous=NORMAL it is not. Never open and close the main database
+    file yourself: on Linux, closing any descriptor drops the process''s fcntl locks
+    and can corrupt SQLite. Fsync only the -wal, or go through the connection (a FULL
+    commit or a checkpoint).
+
+    2. **No fsync under StorageFS._fd_lock**, and ideally none under the index lock.
+    Prepare, then flush with the locks released, then recheck and truncate.
+
+    3. **A narrow equivalence.** Any rule that treats a size-0 record over a 0-byte
+    file as consistent has to be confined to an explicit in-window marker, such as
+    a sentinel mtime. A permanent rule swallows lost empties and touches of placeholders.
+
+    4. **Fail closed when the xattr write fails.** If the prepared xattr write fails,
+    abort before the truncate.
+
+    5. **Absolute database path.** The mount daemonizes with chdir("/"), so relative
+    paths break.
+
+    6. **Converge both records.** Recovery must bring the row and the xattr into agreement:
+    an xattr left at the sentinel after the row is finalized must be repaired.
+
+    7. **Recheck policy and repair eligibility** (recompute recipe, repair pins) right
+    before the truncate, not only at prepare.
+
+    8. **Rollback and downgrade.** Sentinel records are unknown to older builds, so
+    recovery must run before a downgrade, and the rollback must be tested from that
+    state.'
