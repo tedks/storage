@@ -684,6 +684,11 @@ class CacheManager:
 
         Returns:
             Whether this copy was installed, another copy won, or the fetch failed.
+
+        Raises:
+            OSError with ENOSPC or EDQUOT when the cache has no room for the
+            copy (its budget or the filesystem), and what the member probes
+            raise.
         """
         source_virtual_path = source_virtual_path or virtual_path
         # Member probes: no lock, and their errors propagate as before.
@@ -706,6 +711,14 @@ class CacheManager:
             return CacheFetch.INSTALLED if installed else CacheFetch.ALREADY_CACHED
         except (BulkCapacityCancelled, BulkCapacityTimeout):
             raise
+        except OSError as e:
+            if e.errno in (errno.ENOSPC, errno.EDQUOT):
+                # No room in the cache is not a failed member: another
+                # member or a retry would only download the file again to
+                # hit the same limit. The open reports it as it is.
+                raise
+            print(f"Error caching {virtual_path} from {backend.name}: {e}")
+            return CacheFetch.FAILED
         except Exception as e:
             print(f"Error caching {virtual_path} from {backend.name}: {e}")
             return CacheFetch.FAILED
@@ -723,6 +736,10 @@ class CacheManager:
         link and the size accounting run under the lock. The cache
         filesystem must support hard links (it must support xattrs anyway).
         The reservation covers this temp file until publication or cleanup.
+        Publication needs room only for data beyond the reservation (a
+        member file that grew during the copy): an unbudgeted local write
+        that took the cache over its limit meanwhile does not undo a copy
+        whose space was already promised to it.
 
         Returns True when this copy was installed, False when a file was
         already there and this copy was discarded. Raises what the copy or
@@ -756,7 +773,7 @@ class CacheManager:
             with self._lock:
                 try:
                     size = self._temp_data_bytes(temp_path)
-                    if not self.ensure_space(0):
+                    if size > reserved and not self._fits_beyond_reservation(size - reserved, size):
                         raise OSError(errno.ENOSPC, "insufficient cache space")
                     try:
                         os.link(temp_path, cache_path)
@@ -765,6 +782,7 @@ class CacheManager:
                             raise
                         return False
                     self._current_size_bytes += size
+                    self.note_evictable_change()
                     return True
                 finally:
                     self._drop_whole_temp(temp_path)
@@ -773,6 +791,18 @@ class CacheManager:
                 if temp_path in self._whole_file_temps:
                     self._drop_whole_temp(temp_path)
             raise
+
+    def _fits_beyond_reservation(self, excess: int, size: int) -> bool:
+        """Make room for a finished copy's `excess` bytes past its reservation.
+
+        Caller holds the lock with the temp file still reserved, so the
+        shortfall counts the copy at its full size. Only the part of that
+        shortfall the excess accounts for is evicted for: what other writers
+        overspent is not this copy's to free.
+        """
+        if size > self.max_size_bytes:
+            return False
+        return self._free_space(min(excess, self.get_free_space_needed(0)))
 
     def _drop_whole_temp(self, path: Path):
         """Release the temp reservation under the cache lock."""

@@ -2142,6 +2142,9 @@ class StorageFS(Operations):
                         return True
                 except (BulkCapacityCancelled, BulkCapacityTimeout):
                     raise
+                except OSError as exc:
+                    if exc.errno in (errno.ENOSPC, errno.EDQUOT):
+                        raise FuseOSError(exc.errno) from exc
                 except Exception:
                     pass
 
@@ -2168,16 +2171,25 @@ class StorageFS(Operations):
                     member_stat = backend.stat(canonical_path)
                 except Exception:
                     member_stat = None
-            # Download to cache
-            outcome = self.cache_manager.cache_file_result(
-                resolved.requested_path, backend, canonical_path, member_stat=member_stat,
-            )
-            if outcome == CacheFetch.ALREADY_CACHED and self._drop_unindexed_prefix(canonical_path, cache_path):
-                # A failed stream's prefix was installed before this copy
-                # (whose link then found it): once more, for the whole file.
+            # Download to cache. No room in the cache (ENOSPC or EDQUOT,
+            # see cache_file_result) is the open's answer, not a missing file.
+            try:
                 outcome = self.cache_manager.cache_file_result(
                     resolved.requested_path, backend, canonical_path, member_stat=member_stat,
                 )
+                if (outcome == CacheFetch.ALREADY_CACHED
+                        and self._drop_unindexed_prefix(canonical_path, cache_path)):
+                    # A failed stream's prefix was installed before this copy
+                    # (whose link then found it): once more, for the whole file.
+                    outcome = self.cache_manager.cache_file_result(
+                        resolved.requested_path, backend, canonical_path, member_stat=member_stat,
+                    )
+            except FuseOSError:
+                raise
+            except OSError as exc:
+                if exc.errno in (errno.ENOSPC, errno.EDQUOT):
+                    raise FuseOSError(exc.errno) from exc
+                raise
             if outcome == CacheFetch.ALREADY_CACHED:
                 # A stream or a writer won. Their inode, source baseline
                 # and state rows belong to them, even for an unindexed prefix.

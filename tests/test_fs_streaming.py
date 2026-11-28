@@ -593,6 +593,16 @@ class TestFSStreamingIntegration(unittest.TestCase):
         finally:
             self.fs.release("/dirty.bin", dirty)
 
+    def test_write_open_reports_a_full_cache_as_enospc(self):
+        manager = self.fs.cache_manager
+        (self.backend_dir / "big.bin").write_bytes(b"b" * (4 * manager.block_size))
+        manager.max_size_bytes = 2 * manager.block_size
+        with patch.object(self.backend, "copy_to_local") as copy:
+            with self.assertRaises(FuseOSError) as raised:
+                self.fs.open("/big.bin", os.O_RDWR)
+        self.assertEqual(raised.exception.errno, errno.ENOSPC)
+        copy.assert_not_called()
+
     def test_local_writes_and_truncates_are_charged_without_a_rescan(self):
         manager = self.fs.cache_manager
         block = manager.block_size

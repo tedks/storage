@@ -609,6 +609,56 @@ class TestFetchThroughTempFile(unittest.TestCase):
         self.assertEqual(self.results, [True])
         self.assertEqual(self.cache_manager.get_total_cache_size(), len(self.payload))
 
+    def test_local_write_during_a_reserved_copy_does_not_undo_it(self):
+        """The reservation owns its space: a dirty write that takes the
+        cache over budget mid-copy does not discard the finished copy."""
+        manager = self.cache_manager
+        manager.max_size_bytes = len(self.payload)
+        dirty = self.cache_dir / "dirty.bin"
+        worker = self._start_fetch()
+        try:
+            with manager.cache_size_change(dirty):
+                dirty.write_bytes(b"local write")
+            self.assertGreater(manager.get_free_space_needed(0), 0)
+        finally:
+            self.backend.gate.set()
+            worker.join(10)
+        self.assertEqual(self.results, [True])
+        self.assertEqual(self.cache_path.read_bytes(), self.payload)
+        self.assertEqual(dirty.read_bytes(), b"local write")
+        self.assertEqual(self._partials(), [])
+        self.assertEqual(manager.get_total_cache_size(), len(self.payload) + manager.block_size)
+
+    def test_growth_beyond_the_reservation_must_fit(self):
+        manager = self.cache_manager
+        manager.max_size_bytes = len(self.payload)
+        (self.backend_dir / "f.bin").write_bytes(self.payload)
+        grown = self.payload + b"g" * manager.block_size
+        real_copy = LocalBackend.copy_to_local
+
+        def grow_then_copy(backend, virtual_path, local_path):
+            (self.backend_dir / "f.bin").write_bytes(grown)
+            return real_copy(backend, virtual_path, local_path)
+
+        with patch.object(_GatedBackend, "copy_to_local", grow_then_copy):
+            with self.assertRaises(OSError) as raised:
+                manager.cache_file_result("/f.bin", self.backend)
+        self.assertEqual(raised.exception.errno, errno.ENOSPC)
+        self.assertFalse(self.cache_path.exists())
+        self.assertEqual(self._partials(), [])
+        self.assertEqual(manager.get_total_cache_size(), 0)
+        self.assertEqual(manager.get_free_space_needed(0), 0)
+
+    def test_no_room_for_a_copy_raises_enospc_before_downloading(self):
+        manager = self.cache_manager
+        manager.max_size_bytes = len(self.payload) - 1
+        with patch.object(self.backend, "copy_to_local") as copy:
+            with self.assertRaises(OSError) as raised:
+                manager.cache_file("/f.bin", self.backend)
+        self.assertEqual(raised.exception.errno, errno.ENOSPC)
+        copy.assert_not_called()
+        self.assertEqual(self._partials(), [])
+
     def test_partial_cannot_spend_a_whole_copy_reservation(self):
         manager = self.cache_manager
         manager.max_size_bytes = len(self.payload)
