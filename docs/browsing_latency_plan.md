@@ -67,6 +67,10 @@ are never cached, and the page cache is dropped at every open.
   file stop the reads at the old size. Each stat reaches the mount and is
   answered from the cache file or the listing, or by a member stat when
   neither knows the name.
+  As built (PR #189): the mtime-checked page cache (`auto_cache`) is
+  off too. A member refetch can replace a file's bytes while keeping its
+  size and mtime, and `auto_cache` then keeps the old pages; the page
+  cache is now dropped at every open (the libfuse default).
 - **D3. Not-found answered from the listing.** A name absent from a fresh
   listing of every available member is ENOENT without a stat. Product
   consequence: a file added directly on a member and opened by its typed

@@ -127,6 +127,9 @@ class TestFuseMountOptions(unittest.TestCase):
         self.assertEqual(0.0, options["entry_timeout"])
 
     def test_use_buffered_io_without_cross_open_page_retention(self):
+        # Buffered I/O (no direct_io) for readahead and mmap; no page cache
+        # kept across opens (no kernel_cache or auto_cache), since a refetch
+        # can keep a file's size and mtime while replacing its bytes.
         for watchers in (False, True):
             options = fuse_mount_options(self.ssh, enable_watchers=watchers, fresh_window=60.0)
             self.assertFalse(options.keys() & {"kernel_cache", "auto_cache", "ac_attr_timeout", "direct_io"})
