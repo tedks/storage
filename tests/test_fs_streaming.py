@@ -2830,10 +2830,22 @@ class TestFSStreamingIntegration(unittest.TestCase):
         from types import SimpleNamespace
         cache_path, resolved = self._prefix_and_resolved("nolinks.bin")
         engine = self.fs.recompute_engine
+        renamed = []
+
+        def noreplace(src, dst):
+            # A stand-in, so the test does not depend on the host's renameat2.
+            renamed.append((Path(src).name.startswith(".storage-prefix-"), Path(dst)))
+            if os.path.lexists(dst):
+                return False
+            os.rename(src, dst)
+            return True
+
         with patch.object(engine, "can_recompute", return_value=True), \
                 patch.object(engine, "recompute_file", return_value=SimpleNamespace(success=False)), \
-                patch("storage.fs.os.link", side_effect=OSError(errno.EPERM, "no hard links")):
+                patch("storage.fs.os.link", side_effect=OSError(errno.EPERM, "no hard links")), \
+                patch("storage.fs.rename_noreplace", side_effect=noreplace):
             self.assertFalse(self.fs._try_recompute(resolved))
+        self.assertEqual(renamed, [(True, cache_path)])
         self._assert_prefix_restored(cache_path)
 
     def test_failed_prefix_restore_keeps_the_saved_copy(self):
