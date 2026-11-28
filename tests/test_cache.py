@@ -1013,23 +1013,113 @@ class TestCacheAccounting(unittest.TestCase):
             os.close(fd)
 
     def test_eviction_skips_an_inode_with_a_change_in_flight(self):
+        """A change measured the inode before and charges its delta after:
+        a recompute eviction that truncated the inode in between would be
+        subtracted twice (and would truncate under the change)."""
         manager = self.cache_manager
         block = manager.block_size
         victim = self.cache_dir / "victim"
         victim.write_bytes(b"v" * (2 * block))
-        self._clean_row("victim", last_access=1.0)
+        st = victim.lstat()
+        self.state_manager.set_file_metadata(FileMetadata(
+            virtual_path="/victim", size=st.st_size, checksum="c", last_access=1.0,
+            last_modified=st.st_mtime, sync_status=SyncStatus.CLEAN, replica_count=1,
+            recomputable=True, recompute_cmd="true", encrypted=False, encryption_key_id=None,
+        ))
+        other = self.cache_dir / "other"
+        other.write_bytes(b"o" * (3 * block))
         manager.mark_cache_size_dirty()
-        manager.max_size_bytes = manager.get_total_cache_size()
+        self._assert_total(5 * block)
         run, gate, errors = self._blocked_change(path=victim)
-        truncating = run(lambda: os.truncate(victim, block))
-        self.assertFalse(manager.ensure_space(block))
-        self.assertTrue(victim.exists())
+        changing = run(lambda: None)  # measured; about to change it
+        self.assertFalse(manager.evict_recomputable_files(block))
+        self.assertEqual(victim.stat().st_size, 2 * block)
         gate.set()
-        truncating.join(timeout=5.0)
+        changing.join(timeout=5.0)
         self.assertEqual(errors, [])
-        self.assertEqual(manager.get_total_cache_size(), block)
+        self._assert_total(5 * block)
+
+    def _in_flight_write(self, name, blocks, *, append=False):
+        """A direct write of `blocks` new blocks whose bytes are on disk,
+        held inside cache_size_change before it settles."""
+        manager = self.cache_manager
+        block = manager.block_size
+        path = self.cache_dir / name
+        path.write_bytes(b"")
+        flags = os.O_RDWR | (os.O_APPEND if append else 0)
+        fd = os.open(path, flags)
+        self.addCleanup(os.close, fd)
+        target = {"fd": fd} if append else {"fd": fd, "span": (0, blocks * block)}
+        run, gate, errors = self._blocked_change(**target)
+        if append:
+            writer = run(lambda: os.write(fd, b"w" * (blocks * block)))
+        else:
+            writer = run(lambda: os.pwrite(fd, b"w" * (blocks * block), 0))
+        self.assertEqual(os.fstat(fd).st_size, blocks * block)
+        return writer, gate, errors
+
+    def test_a_grant_counts_the_bytes_an_in_flight_write_put_on_disk(self):
+        """The written blocks of a write not yet settled are spent: a
+        stream whose chunk fits only without them is refused, and nothing
+        is evicted for blocks not on disk yet."""
+        manager = self.cache_manager
+        block = manager.block_size
+        manager.max_size_bytes = 3 * block
+        self._assert_total(0)
+        writer, gate, errors = self._in_flight_write("a", 2)
+        with self._partial("b") as (_, b):
+            self.assertTrue(manager.write_streaming_chunk(b, 0, b"x"))  # third block fits
+            self.assertFalse(manager.write_streaming_chunk(b, block, b"y"))  # a fourth does not
+            gate.set()
+            writer.join(timeout=5.0)
+            self.assertEqual(errors, [])
+            self._assert_total(3 * block)
+            self.assertFalse(manager.write_streaming_chunk(b, block, b"y"))
+
+    def test_an_in_flight_append_counts_its_written_bytes(self):
+        manager = self.cache_manager
+        block = manager.block_size
+        manager.max_size_bytes = 2 * block
+        self._assert_total(0)
+        writer, gate, errors = self._in_flight_write("appended", 2, append=True)
+        with self._partial("b") as (_, b):
+            self.assertFalse(manager.write_streaming_chunk(b, 0, b"x"))
+            gate.set()
+            writer.join(timeout=5.0)
+            self.assertEqual(errors, [])
+            self._assert_total(2 * block)
+
+    def test_a_rescan_during_an_in_flight_write_counts_it_once(self):
+        """A rescan in the interval counts the written blocks; the grant
+        and the settlement then count them no second time."""
+        manager = self.cache_manager
+        block = manager.block_size
+        manager.max_size_bytes = 3 * block
+        self._assert_total(0)
+        writer, gate, errors = self._in_flight_write("a", 2)
         manager.mark_cache_size_dirty()
-        self.assertEqual(manager.get_total_cache_size(), block)
+        self.assertEqual(manager.get_total_cache_size(), 2 * block)
+        with self._partial("b") as (_, b):
+            self.assertTrue(manager.write_streaming_chunk(b, 0, b"x"))
+            self.assertFalse(manager.write_streaming_chunk(b, block, b"y"))
+            gate.set()
+            writer.join(timeout=5.0)
+            self.assertEqual(errors, [])
+            self.assertEqual(manager.get_total_cache_size(), 3 * block)
+            self._assert_total(3 * block)
+
+    def test_unrelated_grants_with_ample_room_ignore_in_flight_writes(self):
+        manager = self.cache_manager
+        block = manager.block_size
+        self._assert_total(0)
+        writer, gate, errors = self._in_flight_write("a", 2)
+        with self._partial("b") as (_, b), \
+                patch.object(manager, "_evict_if_still_clean",
+                             side_effect=AssertionError("evicted with ample room")):
+            self.assertTrue(manager.write_streaming_chunk(b, 0, b"x" * (4 * block)))
+            gate.set()
+            writer.join(timeout=5.0)
+        self.assertEqual(errors, [])
 
     def test_direct_writer_uses_space_before_the_next_stream_grant(self):
         manager = self.cache_manager

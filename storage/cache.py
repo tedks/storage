@@ -140,6 +140,21 @@ class _PartialCharge:
         return dropped
 
 
+class _InFlight:
+    """A direct change between its two measurements (cache_size_change):
+    its target, its measurement before (None: unknown, re-based by a
+    rescan) or, for an inode a streaming descriptor holds, that identity."""
+
+    __slots__ = ("path", "fd", "span", "before", "held")
+
+    def __init__(self, path, fd, span, before, held):
+        self.path = path
+        self.fd = fd
+        self.span = span
+        self.before = before
+        self.held = held
+
+
 class CacheFetch(Enum):
     FAILED = 0
     INSTALLED = 1
@@ -221,9 +236,10 @@ class CacheManager:
         # cache_size_change. The mutex guards only the table.
         self._inode_locks: dict = {}
         self._inode_locks_mutex = threading.Lock()
-        # Moves at every tree rescan, so a direct change that measured its
-        # inode before a rescan does not add its delta on top of it.
-        self._scan_epoch = 0
+        # Direct changes between their measurements: token -> _InFlight.
+        # Grants count what each has already put on disk (see
+        # _in_flight_growth); a rescan re-bases them.
+        self._in_flight: dict = {}
         self._evictable_epoch = 0
         self._grant_warning_logged = False
 
@@ -375,7 +391,7 @@ class CacheManager:
         if self._size_dirty:
             self._current_size_bytes = self._scan_total_cache_size()
             self._size_dirty = False
-            self._scan_epoch += 1
+            self._rebase_in_flight()
 
     def recover_views(self, member_names: List[str]):
         """At mount start, before any worker, eviction or FUSE request: drop
@@ -619,7 +635,8 @@ class CacheManager:
         or writes to others: changes to one inode (through any name or
         descriptor) are serialized by a per-inode lock instead, eviction
         skips an inode with a change in flight, and a rescan in between
-        makes the change rescan again rather than add its delta. With no
+        re-bases it. While a change is in flight, grants count the bytes it
+        has already put on disk (_in_flight_growth). With no
         target, a target that does not qualify (see _direct_charge), or a
         path whose inode changed in between, the change is unknown and the
         next allocation rescans the tree. An inode a streaming descriptor holds (an
@@ -648,15 +665,77 @@ class CacheManager:
                 before = None
                 if id_before not in held and not failed_before:
                     before = self._direct_charge(path, fd, span, st_before)
-                epoch = self._scan_epoch
+                token = object()
+                record = _InFlight(path, fd, span, before,
+                                   id_before if id_before in held else None)
+                self._in_flight[token] = record
             try:
                 yield
             finally:
                 with self._lock:
-                    if epoch != self._scan_epoch:
-                        before = None  # a rescan counted part of this change
+                    del self._in_flight[token]
+                    # record.before, as re-based by any rescan meanwhile.
                     self._settle_direct_change(path, fd, span, held, id_before,
-                                               failed_before, before)
+                                               failed_before, record.before)
+
+    def _in_flight_growth(self) -> int:
+        """Data bytes direct changes in flight have already added on disk
+        but not yet charged; caller holds the lock.
+
+        Exact while the change runs: its inode lock lets no other change
+        touch the inode, and eviction skips it, so whatever its
+        measurement moved since `before` is this change's. Only bytes on
+        disk count, never a change's prospective size, and a shrink counts
+        as 0 until it settles. A held inode counts what it holds beyond its
+        descriptor's charge. A measurement that fails counts the span's
+        blocks, or the file's rounded size without a span.
+        """
+        growth = 0
+        for record in self._in_flight.values():
+            if record.held is not None:
+                growth += self._held_growth(record.held)
+                continue
+            if record.before is None:
+                continue  # unknown; settles to a rescan
+            st, failed = self._target_stat(record.path, record.fd)
+            now = None if failed else self._direct_charge(record.path, record.fd, record.span, st)
+            if now is None or now[0] != record.before[0]:
+                growth += self._growth_bound(record, st)
+                continue
+            delta = now[1] - record.before[1]
+            if now[2] is not None and record.before[2] is not None:
+                delta = self._span_delta(record.fd, record.before, now)
+                if delta is None:
+                    delta = self._growth_bound(record, st)
+            growth += max(0, delta)
+        return growth
+
+    def _growth_bound(self, record, st) -> int:
+        if record.span is not None:
+            start = record.span[0] // self.block_size * self.block_size
+            return self._round_up(record.span[1]) - start
+        return self._round_up(st.st_size) if st is not None else 0
+
+    def _held_growth(self, identity) -> int:
+        for fd, charge in self._streaming_fds.items():
+            if charge.identity == identity:
+                try:
+                    st = os.fstat(fd)
+                    return max(0, self._fd_data_bytes(fd, st) - charge.bytes)
+                except OSError:
+                    return 0  # _recharge_held withholds at settlement
+        return 0
+
+    def _rebase_in_flight(self):
+        """After a rescan, which counted every in-flight change as far as
+        it had got: measure each again, so its settlement charges only what
+        it does from here. Caller holds the lock."""
+        for record in self._in_flight.values():
+            if record.held is not None or record.before is None:
+                continue
+            st, failed = self._target_stat(record.path, record.fd)
+            record.before = None if failed else self._direct_charge(
+                record.path, record.fd, record.span, st)
 
     @contextmanager
     def _inode_lock(self, key):
@@ -741,7 +820,8 @@ class CacheManager:
                 st = regular_file_stat(path)
                 apparent_growth = min(self._round_up(st.st_size), st.st_blocks * 512) if st else 0
                 reserved += max(size, apparent_growth)
-            available = self.max_size_bytes - self._current_size_bytes - reserved
+            available = (self.max_size_bytes - self._current_size_bytes - reserved
+                         - (self._in_flight_growth() if self._in_flight else 0))
 
         if available >= required_bytes:
             return 0
