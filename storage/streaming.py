@@ -159,6 +159,9 @@ class PrefetchSession:
     # The member's stat after the stream, when it agreed with member_stat
     # (cache_metadata.confirm_member_stat): on_finalized's baseline.
     confirmed_stat: Optional[object] = None
+    # The cache's charge for the partial while registration renames it
+    # (CacheManager.reserve_new_file); released once registration is done.
+    cache_reservation: Optional[object] = None
 
     def __post_init__(self):
         self.lock = threading.RLock()
@@ -2232,9 +2235,9 @@ class StreamingReadManager:
                     if admitted:
                         io_fd = os.open(str(staging_path), os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o644)
                         os.ftruncate(io_fd, file_size)
-                        # Released after registration (below), once the
-                        # file has its final name and the size is stale.
-                        self.cache_manager.reserve_bytes(file_size)
+                        # Charged by reservation, not by name, until it is
+                        # registered or discarded (released below).
+                        reservation = self.cache_manager.reserve_new_file(file_size, staging_path)
                         break
                 if attempt or not self._reclaim_retained_space(file_size):
                     self.logger.warning(
@@ -2268,6 +2271,7 @@ class StreamingReadManager:
             io_fd=io_fd,
             refcount=1,
             member_stat=member_stat,
+            cache_reservation=reservation,
         )
 
         displaced = []
@@ -2275,10 +2279,10 @@ class StreamingReadManager:
             return self._register_prefetch_session(session, displaced)
         finally:
             # After the registry lock: both take the cache lock. By now the
-            # file is registered under its partial name or discarded, and
-            # either way the cache size was marked stale, so the next scan
-            # counts what the reservation stood in for.
-            self.cache_manager.release_bytes(file_size)
+            # file is registered under its partial name or discarded; the
+            # release marks the size stale, so the next scan counts the
+            # partial by name instead of by reservation.
+            self.cache_manager.release_new_file(reservation)
             self._complete_displacements(displaced)
 
     def _register_prefetch_session(self, session: PrefetchSession, displaced: list) -> Optional[PrefetchSession]:
@@ -2332,6 +2336,8 @@ class StreamingReadManager:
             # Replaces any partial a detached session failed to unlink. No
             # registered session owns the path: detaching unlinks it inside
             # this lock, and a registered one would have been attached above.
+            # The reservation covers the new name too (reserve_new_file).
+            self.cache_manager.reserve_rename_target(session.cache_reservation, partial_cache_path)
             try:
                 os.replace(staging_path, partial_cache_path)
             except OSError as exc:

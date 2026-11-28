@@ -1130,30 +1130,42 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.assertEqual(set(writes), {False})
         self.assertEqual((self.cache_dir / "lease.bin").read_bytes(), payload)
 
-    def test_partial_stays_charged_while_registration_renames_it(self):
+    def test_partial_is_charged_once_while_registration_renames_it(self):
         cache = self.fs.cache_manager
         cache.max_size_bytes = 512 * 1024
         payload = os.urandom(384 * 1024)
         (self.backend_dir / "charged.bin").write_bytes(payload)
         real_replace = os.replace
-        needed = []
+        needed = {}
 
-        def replace(src, dst):
-            if ".storage-staging-" in str(src):
-                # A cache scan that saw neither name: the staging file is
-                # leaving, the partial not yet there.
-                with cache._lock:
+        def scan_and_measure(label, scan):
+            with cache._lock:
+                if scan:
+                    cache._size_dirty = True
+                else:
+                    # A scan that saw neither name: the staging file is
+                    # leaving, the partial not yet there.
                     cache._current_size_bytes = 0
                     cache._size_dirty = False
-                    needed.append(cache.get_free_space_needed(256 * 1024))
-            return real_replace(src, dst)
+                needed[label] = cache.get_free_space_needed(256 * 1024)
+
+        def replace(src, dst):
+            if ".storage-staging-" not in str(src):
+                return real_replace(src, dst)
+            scan_and_measure("staging name", scan=True)
+            scan_and_measure("neither name", scan=False)
+            result = real_replace(src, dst)
+            scan_and_measure("partial name", scan=True)
+            return result
 
         with patch("storage.streaming.os.replace", side_effect=replace):
             fd = self.fs.open("/charged.bin", os.O_RDONLY)
         self._session_for(fd)
-        # 512 KiB - 384 KiB still charged leaves 128 KiB of a 256 KiB request.
-        self.assertEqual(needed, [128 * 1024])
-        # The reservation is gone once the partial is registered and counted.
+        # 512 KiB - 384 KiB charged once leaves 128 KiB of a 256 KiB
+        # request short, whichever name the scan saw, or neither.
+        self.assertEqual(needed, {label: 128 * 1024
+                                  for label in ("staging name", "neither name", "partial name")})
+        # After registration the partial is counted by name, once.
         self.assertEqual(cache._reserved_bytes, 0)
         self.assertEqual(cache.get_free_space_needed(256 * 1024), 128 * 1024)
         self.fs.release("/charged.bin", fd)

@@ -72,6 +72,16 @@ def _remove_prefix_marker(path: Path):
             os.chmod(path, mode)
 
 
+class NewFileReservation:
+    """A new file's charge: its size, and the names a scan must not count."""
+
+    __slots__ = ("size", "names")
+
+    def __init__(self, size: int, names: Set[str]):
+        self.size = size
+        self.names = names
+
+
 class CacheFetch(Enum):
     FAILED = 0
     INSTALLED = 1
@@ -145,6 +155,10 @@ class CacheManager:
         # max_size_bytes so concurrent fetches cannot each see the same free
         # space. Under _lock.
         self._reserved_bytes = 0
+        # Reservations for new files (reserve_new_file), each charging its
+        # file under the names it holds; the scan skips those names, so
+        # each new file is charged once. Added and removed under _lock.
+        self._new_file_reservations: Set["NewFileReservation"] = set()
         # Bumped by every rescan; a fetch that sees it move knows the scan
         # may have counted its temp file (see _replace_into_cache).
         self._scan_count = 0
@@ -162,9 +176,17 @@ class CacheManager:
         (anything on the host) against a cache that can never evict it.
         """
         total = 0
+        # Stable during the scan (the caller holds _lock); their names can
+        # grow (reserve_rename_target), so they are checked per file.
+        reservations = list(self._new_file_reservations)
         for root, dirs, files in os.walk(self.cache_root):
             for name in files:
-                st = regular_file_stat(Path(root) / name)
+                path = os.path.join(root, name)
+                if reservations:
+                    normalized = os.path.normpath(path)
+                    if any(normalized in reservation.names for reservation in reservations):
+                        continue
+                st = regular_file_stat(Path(path))
                 if st is not None:
                     total += st.st_size
         return total
@@ -485,10 +507,8 @@ class CacheManager:
         """Charge the new sparse file's apparent size before another open can allocate.
 
         Yields whether it fits. The caller creates the file inside the block
-        and, once it exists, takes a reservation for it (reserve_bytes)
-        until it is at its final name and the size is marked stale: the
-        file is renamed outside this lock, so a scan in between can see
-        neither name, and the reservation keeps it charged meanwhile.
+        and, once it exists, charges it with reserve_new_file until it is at
+        its final name (see there).
         """
         with self._lock:
             admitted = self.ensure_space(file_size)
@@ -498,14 +518,38 @@ class CacheManager:
                 if admitted:
                     self._size_dirty = True
 
-    def reserve_bytes(self, size: int):
-        """Charge size bytes that no scan may see yet; undo with release_bytes."""
+    def reserve_new_file(self, size: int, path: Path) -> "NewFileReservation":
+        """Charge a new file as a reservation instead of by name.
+
+        For a file renamed outside this lock (a streaming partial at
+        registration): a scan in between could see the old name, the new
+        one, or neither. While reserved, the scan skips the file's names
+        (path, and any added with reserve_rename_target), so it is charged
+        exactly once, by the reservation. release_new_file ends it.
+        """
+        reservation = NewFileReservation(size, {os.path.normpath(str(path))})
         with self._lock:
             self._reserved_bytes += size
+            self._new_file_reservations.add(reservation)
+        return reservation
 
-    def release_bytes(self, size: int):
+    @staticmethod
+    def reserve_rename_target(reservation: "NewFileReservation", path: Path):
+        """Add the name a reserved file is about to be renamed to.
+
+        Without the cache lock (the caller holds the streaming registry
+        lock): one set.add on the reservation's own names, atomic under the
+        GIL. A scan that listed the directory before the rename saw the
+        old name, which it skips too.
+        """
+        reservation.names.add(os.path.normpath(str(path)))
+
+    def release_new_file(self, reservation: "NewFileReservation"):
+        """End a reserve_new_file: the scan counts the file by name again."""
         with self._lock:
-            self._reserved_bytes -= size
+            self._new_file_reservations.discard(reservation)
+            self._reserved_bytes -= reservation.size
+            self._size_dirty = True
 
     def cache_file(self, virtual_path: str, backend: Backend, source_virtual_path: str = None) -> bool:
         """Ensure a member file is cached, including when another fill won."""
