@@ -463,7 +463,8 @@ class StorageFS(Operations):
             state_manager=self.state_manager,
             logger=self.logger,
             get_config=self._get_config,
-            select_backend_for_read=self._select_stream_source,
+            select_stream_source=self._select_stream_source,
+            is_unindexed_prefix=self._is_unindexed_prefix,
             streaming_reads=streaming_reads,
             streaming_chunk_size=streaming_chunk_size,
             max_download_workers=max_download_workers,
@@ -2203,8 +2204,52 @@ class StorageFS(Operations):
         # File not available
         return False
 
+    def _open_stream(self, resolved: ResolvedPath):
+        """Attach to or start the file's streaming session; FuseOSError on failure.
+
+        Returns the session, a StreamingOpen outcome other than
+        PREFIX_CACHED, or None when the file was recomputed into the cache.
+        A promoted prefix at the cache path is dropped and the open tried
+        once more, as the whole-file path does (_ensure_file_in_cache); one
+        that another descriptor holds cannot be dropped, and the open is
+        EAGAIN rather than serve the prefix as the file.
+        """
+        for attempt in range(2):
+            try:
+                stream = self._create_or_attach_prefetch_session(
+                    resolved.requested_path, resolved.canonical_path,
+                )
+            except StreamSourceError as exc:
+                # No member could be probed. A recomputable file is
+                # recomputed, as the whole-file path does; only an open that
+                # still fails counts as a probe failure.
+                if self._try_recompute(resolved):
+                    return None
+                self._streaming_manager.report_open_error("source_probe", exc)
+                raise FuseOSError(exc.errno or errno.EIO) from exc
+            except OSError as exc:
+                raise FuseOSError(exc.errno or errno.EIO) from exc
+            except Exception as exc:
+                self.logger.exception("streaming open failed unexpectedly")
+                raise FuseOSError(errno.EIO) from exc
+            if stream != StreamingOpen.PREFIX_CACHED:
+                return stream
+            self._record_streaming_stat("streaming_prefix_refetches", 1)
+            if attempt or not self._drop_unindexed_prefix(resolved.canonical_path, resolved.cache_path):
+                break
+        raise FuseOSError(errno.EAGAIN)
+
+    def _whole_file_cached(self, resolved: ResolvedPath) -> bool:
+        return (self.cache_manager.is_cached(resolved.requested_path)
+                and not self._is_unindexed_prefix(resolved.canonical_path, resolved.cache_path))
+
     def _try_recompute(self, resolved: ResolvedPath) -> bool:
         if not self.recompute_engine.can_recompute(resolved.requested_path, resolved.cache_path):
+            return False
+        # A promoted prefix at the path is not the file; recompute replaces
+        # it, unless a descriptor holds it.
+        if (self._is_unindexed_prefix(resolved.canonical_path, resolved.cache_path)
+                and not self._drop_unindexed_prefix(resolved.canonical_path, resolved.cache_path)):
             return False
         return self.recompute_engine.recompute_file(
             resolved.requested_path, resolved.cache_path, timeout=30.0,
@@ -2496,21 +2541,7 @@ class StorageFS(Operations):
             and self._is_read_only_open(flags)
             and not self.cache_manager.is_cached(resolved.requested_path)
         ):
-            try:
-                stream = self._create_or_attach_prefetch_session(
-                    resolved.requested_path, resolved.canonical_path,
-                )
-            except StreamSourceError as exc:
-                # No member could be probed. A recomputable file is
-                # recomputed, as the whole-file path does.
-                if not self._try_recompute(resolved):
-                    raise FuseOSError(exc.errno or errno.EIO) from exc
-                stream = None
-            except OSError as exc:
-                raise FuseOSError(exc.errno or errno.EIO) from exc
-            except Exception as exc:
-                self.logger.exception("streaming open failed unexpectedly")
-                raise FuseOSError(errno.EIO) from exc
+            stream = self._open_stream(resolved)
             if stream is None:
                 pass  # recomputed into the cache path
             elif isinstance(stream, PrefetchSession):
@@ -2519,7 +2550,9 @@ class StorageFS(Operations):
             elif stream == StreamingOpen.CACHED:
                 self.cache_manager.heal_stale_clean(resolved.canonical_path, cache_path)
             elif stream == StreamingOpen.SOURCE_MISSING:
-                if not self.cache_manager.is_cached(resolved.requested_path) and not self._try_recompute(resolved):
+                # A promoted prefix is not the file: recompute (which
+                # drops it) or ENOENT, never a short file.
+                if not self._whole_file_cached(resolved) and not self._try_recompute(resolved):
                     raise FuseOSError(errno.ENOENT)
             else:
                 self._record_streaming_stat("streaming_fallback_opens", 1)

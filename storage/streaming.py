@@ -88,6 +88,9 @@ def validate_download_limits(limits):
 
 class StreamingOpen(Enum):
     CACHED = auto()
+    # The cache path holds a failed stream's promoted prefix that the index
+    # does not describe: not the file. The opener drops it and tries again.
+    PREFIX_CACHED = auto()
     RANGE_UNSUPPORTED = auto()
     SOURCE_MISSING = auto()
 
@@ -395,7 +398,7 @@ class StreamingReadManager:
         state_manager,
         logger,
         get_config,
-        select_backend_for_read,
+        select_stream_source: Callable[[str], Optional[StreamSource]],
         streaming_reads: bool,
         streaming_chunk_size: int,
         partial_suffix: str,
@@ -404,6 +407,7 @@ class StreamingReadManager:
         on_finalized: Optional[Callable[["PrefetchSession"], None]] = None,
         max_download_workers: Optional[int] = None,
         read_ahead_window: int = DEFAULT_STREAMING_READ_AHEAD_WINDOW,
+        is_unindexed_prefix: Optional[Callable[[str, Path], bool]] = None,
     ):
         self.cache_manager = cache_manager
         # Called once the complete file is in the cache (StorageFS records
@@ -412,7 +416,12 @@ class StreamingReadManager:
         self.state_manager = state_manager
         self.logger = logger
         self.get_config = get_config
-        self.select_backend_for_read = select_backend_for_read
+        # Probes the members for a source: None when no member has the
+        # file; raises when none could be probed.
+        self.select_stream_source = select_stream_source
+        # Whether the file at a cache path is a promoted prefix the index
+        # does not describe (StorageFS._is_unindexed_prefix).
+        self.is_unindexed_prefix = is_unindexed_prefix or (lambda canonical_path, cache_path: False)
         self.streaming_reads = streaming_reads
         self.chunk_size = max(4096, int(streaming_chunk_size))
         limits = {"max_download_workers": max_download_workers}
@@ -1782,8 +1791,8 @@ class StreamingReadManager:
 
         A failed session whose cleanup is claimed is waited out (the
         cleanup does local I/O only), then the open starts over: by then the
-        cleanup has promoted the prefix, which the open then finds cached,
-        or removed the session.
+        cleanup has promoted its prefix or removed it. A promoted prefix is
+        reported as PREFIX_CACHED, never CACHED: it is not the file.
         """
         while True:
             try:
@@ -1794,8 +1803,18 @@ class StreamingReadManager:
                     self.report_open_error("existing_session", exc)
                     raise exc from None
                 self._record_streaming_stat("streaming_open_cleanup_waits")
-                if self.cache_manager.is_cached(virtual_path):
-                    return StreamingOpen.CACHED
+                # Start over: a promoted prefix is then PREFIX_CACHED, never CACHED.
+
+    def _cached_outcome(self, virtual_path: str, canonical_path: str) -> Optional[StreamingOpen]:
+        """CACHED for a whole cached file, PREFIX_CACHED for a promoted prefix, None for none."""
+        if not self.cache_manager.is_cached(virtual_path):
+            return None
+        return self._final_path_outcome(canonical_path, self.cache_manager.get_cache_path(virtual_path))
+
+    def _final_path_outcome(self, canonical_path: str, final_cache_path: Path) -> StreamingOpen:
+        if self.is_unindexed_prefix(canonical_path, final_cache_path):
+            return StreamingOpen.PREFIX_CACHED
+        return StreamingOpen.CACHED
 
     def _create_or_attach_once(
         self,
@@ -1812,14 +1831,16 @@ class StreamingReadManager:
                     return attached
 
         try:
-            source = self.select_backend_for_read(canonical_path)
+            source = self.select_stream_source(canonical_path)
         except Exception as exc:
-            if self.cache_manager.is_cached(virtual_path):
+            # A whole file cached meanwhile serves the open; a promoted
+            # prefix does not. The caller reports the error (it may still
+            # recompute the file).
+            if self._cached_outcome(virtual_path, canonical_path) == StreamingOpen.CACHED:
                 return StreamingOpen.CACHED
-            self.report_open_error("source_probe", exc)
             raise StreamSourceError(streaming_errno(exc), "streaming source probe failed") from exc
         if source is None:
-            if self.cache_manager.is_cached(virtual_path):
+            if self._cached_outcome(virtual_path, canonical_path) == StreamingOpen.CACHED:
                 return StreamingOpen.CACHED
             self._record_streaming_stat("streaming_source_not_found")
             self.logger.debug("streaming source unavailable reason=not_found")
@@ -1859,7 +1880,7 @@ class StreamingReadManager:
                 if attempt or not self._reclaim_retained_space(file_size):
                     # A concurrent cache winner needs no additional space.
                     if os.path.lexists(final_cache_path):
-                        return StreamingOpen.CACHED
+                        return self._final_path_outcome(canonical_path, final_cache_path)
                     raise OSError(errno.ENOSPC, "streaming cache budget exhausted")
         except OSError as exc:
             if io_fd >= 0:
@@ -1905,7 +1926,7 @@ class StreamingReadManager:
             if os.path.lexists(final_cache_path):
                 # A concurrent fill or local writer already owns the final path.
                 self._discard_unregistered_prefetch_session(session)
-                return StreamingOpen.CACHED
+                return self._final_path_outcome(canonical_path, final_cache_path)
             # No registered session owns the name. An orphan left by an
             # earlier unlink failure can be replaced safely here.
             try:

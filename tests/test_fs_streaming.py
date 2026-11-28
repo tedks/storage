@@ -18,7 +18,7 @@ from storage.cache_metadata import MEMBER_ATTRS_XATTR
 from storage.fs import StorageFS
 from storage.models import SyncStatus
 from storage.mount_profiles import parse_keep_after_close
-from storage.streaming import PrefetchSession
+from storage.streaming import PrefetchSession, StreamingOpen
 
 
 class SlowRangeLocalBackend(LocalBackend):
@@ -277,6 +277,18 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.assertEqual(self.fs.read("/pinned.bin", 4096, 0, fd), b"recomputed")
         self.fs.release("/pinned.bin", fd)
         self.assertNotIn("/pinned.bin", self.fs._refetch_pins)
+
+    def test_probe_failure_is_not_counted_when_recompute_serves_the_open(self):
+        (self.backend_dir / "counted.bin").write_bytes(b"member")
+        with patch.object(self.backend, "stat", side_effect=OSError(errno.EACCES, "denied")):
+            with self._recompute_into_cache(b"recomputed"):
+                fd = self.fs.open("/counted.bin", os.O_RDONLY)
+            self.fs.release("/counted.bin", fd)
+            self.assertEqual(self.fs._streaming_stats_snapshot()["streaming_open_error_source_probe"], 0)
+            (self.cache_dir / "counted.bin").unlink()
+            with self.assertRaises(FuseOSError):
+                self.fs.open("/counted.bin", os.O_RDONLY)
+        self.assertEqual(self.fs._streaming_stats_snapshot()["streaming_open_error_source_probe"], 1)
 
     def test_unexpected_session_error_is_eio_at_open(self):
         (self.backend_dir / "odd.bin").write_bytes(b"x" * 4096)
@@ -2328,7 +2340,7 @@ class TestFSStreamingIntegration(unittest.TestCase):
         # a stream of the member's older bytes that would later replace it.
         self.backend.copy_delay = 0
         manager = self.fs._streaming_manager
-        real_select = manager.select_backend_for_read
+        real_select = manager.select_stream_source
         in_setup = threading.Event()
         go = threading.Event()
         self.addCleanup(go.set)
@@ -2354,7 +2366,7 @@ class TestFSStreamingIntegration(unittest.TestCase):
             except Exception as exc:
                 results["reader"] = exc
 
-        with patch.object(manager, "select_backend_for_read", side_effect=paused_select):
+        with patch.object(manager, "select_stream_source", side_effect=paused_select):
             late = threading.Thread(target=reader, name="late-reader")
             late.start()
             self.assertTrue(in_setup.wait(timeout=3.0))
@@ -2454,7 +2466,9 @@ class TestFSStreamingIntegration(unittest.TestCase):
         # open must not attach (promotion truncates the partial to its
         # contiguous prefix, so reads past it would come back short), and
         # must not detach the session from under the promotion. It waits
-        # for the cleanup and then opens what the cleanup left.
+        # for the cleanup, and then the prefix the cleanup promoted is not
+        # the file (council round 2 on #190, R2-C2): the open drops it and
+        # streams the whole file again, never serving the short prefix.
         self.backend.copy_delay = 0
         manager = self.fs._streaming_manager
         real_promote = manager._promote_failed_session_cache_prefix
@@ -2509,13 +2523,77 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.assertTrue(session.detached)
         vfd_b = results["open"]
         self.assertIsInstance(vfd_b, int)
-        with self.fs._fd_lock:
-            self.assertIsNone(self.fs._fd_map[vfd_b].prefetch_session)
-        # The opener sees what any open after the cleanup does: the promoted prefix.
-        self.assertEqual(self.fs.read('/cleanup.bin', 8192, 0, vfd_b), payload[:4096])
+        session_b = self._session_for(vfd_b)
+        self.assertIsNot(session_b, session)
+        data = b""
+        while len(data) < len(payload):
+            chunk = self.fs.read('/cleanup.bin', 32 * 1024, len(data), vfd_b)
+            self.assertTrue(chunk)
+            data += chunk
+        self.assertEqual(data, payload)
         self.fs.release('/cleanup.bin', vfd_b)
-        self.assertEqual((self.cache_dir / "cleanup.bin").read_bytes(), payload[:4096])
-        self.assertEqual(self.fs._streaming_stats_snapshot()["streaming_open_cleanup_waits"], 1)
+        self.assertTrue(session_b.background_finished.wait(timeout=5.0))
+        self.assertEqual((self.cache_dir / "cleanup.bin").read_bytes(), payload)
+        stats = self.fs._streaming_stats_snapshot()
+        self.assertEqual(stats["streaming_open_cleanup_waits"], 1)
+        self.assertEqual(stats["streaming_prefix_refetches"], 1)
+
+    def test_streaming_open_never_serves_a_prefix_it_cannot_replace(self):
+        # A promoted prefix lands at the cache path after the open's cache
+        # check. Dropped and streamed again when nothing holds it; EAGAIN,
+        # not the short file, when a descriptor does.
+        from storage.cache_metadata import PREFIX_XATTR
+        manager = self.fs._streaming_manager
+        payload = os.urandom(96 * 1024)
+        (self.backend_dir / "short.bin").write_bytes(payload)
+        cache_path = self.cache_dir / "short.bin"
+        real_select = manager.select_stream_source
+        planted = []
+
+        def plant_prefix(canonical_path):
+            source = real_select(canonical_path)
+            if not planted:
+                planted.append(True)
+                cache_path.write_bytes(payload[:4096])
+                os.setxattr(str(cache_path), PREFIX_XATTR, b"1")
+            return source
+
+        with patch.object(manager, "select_stream_source", side_effect=plant_prefix):
+            fd = self.fs.open('/short.bin', os.O_RDONLY)
+        self.assertIsNotNone(self._session_for(fd))
+        self.assertEqual(self.fs.read('/short.bin', len(payload), 0, fd), payload)
+        self.fs.release('/short.bin', fd)
+        self.assertEqual(self.fs._streaming_stats_snapshot()["streaming_prefix_refetches"], 1)
+
+        other = self.cache_dir / "held.bin"
+        other.write_bytes(b"p" * 100)
+        os.setxattr(str(other), PREFIX_XATTR, b"1")
+        held = self.fs.open('/held.bin', os.O_RDONLY)  # an ordinary open of the prefix
+        resolved = self.fs._resolve_path('/held.bin')
+        with patch.object(manager, "_create_or_attach_prefetch_session",
+                          return_value=StreamingOpen.PREFIX_CACHED), \
+                self.assertRaises(FuseOSError) as busy:
+            self.fs._open_stream(resolved)
+        self.assertEqual(busy.exception.errno, errno.EAGAIN)
+        self.assertEqual(other.read_bytes(), b"p" * 100)
+        self.fs.release('/held.bin', held)
+
+    def test_failed_probe_does_not_serve_a_prefix_cached_meanwhile(self):
+        from storage.cache_metadata import PREFIX_XATTR
+        manager = self.fs._streaming_manager
+        cache_path = self.cache_dir / "gone.bin"
+        (self.backend_dir / "gone.bin").write_bytes(b"x" * 8192)
+
+        def prefix_then_fail(canonical_path):
+            cache_path.write_bytes(b"x" * 100)
+            os.setxattr(str(cache_path), PREFIX_XATTR, b"1")
+            raise OSError(errno.EHOSTUNREACH, "member down")
+
+        with patch.object(manager, "select_stream_source", side_effect=prefix_then_fail), \
+                self.assertRaises(FuseOSError) as down:
+            self.fs.open('/gone.bin', os.O_RDONLY)
+        self.assertEqual(down.exception.errno, errno.EHOSTUNREACH)
+        self.assertTrue(cache_path.exists())  # kept for offline opens
 
     def test_streaming_open_gives_up_on_a_cleanup_that_does_not_finish(self):
         manager = self.fs._streaming_manager
