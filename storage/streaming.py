@@ -65,11 +65,11 @@ STREAMING_DESCRIPTOR_SHARE = 2
 # truncate, fsync and link of the prefix) before it returns EAGAIN.
 STREAMING_CLEANUP_WAIT_SECONDS = 30.0
 
-# link() errors after which _install_partial tries RENAME_NOREPLACE: no
-# hard links on the cache filesystem (EMLINK cannot happen on a fresh
+# link() errors after which _install_partial (and StorageFS's prefix
+# restore) tries RENAME_NOREPLACE: no hard links on the cache filesystem (EMLINK cannot happen on a fresh
 # partial, but the rename would work there too); renameat2 errors meaning
 # it has no RENAME_NOREPLACE either.
-_LINK_UNSUPPORTED = (errno.EPERM, errno.EOPNOTSUPP, errno.ENOTSUP, errno.ENOSYS, errno.EMLINK)
+LINK_UNSUPPORTED = (errno.EPERM, errno.EOPNOTSUPP, errno.ENOTSUP, errno.ENOSYS, errno.EMLINK)
 _NOREPLACE_UNSUPPORTED = NOREPLACE_UNSUPPORTED
 
 
@@ -1328,7 +1328,7 @@ class StreamingReadManager:
         except FileExistsError:
             return "taken"
         except OSError as exc:
-            if exc.errno not in _LINK_UNSUPPORTED:
+            if exc.errno not in LINK_UNSUPPORTED:
                 raise
             try:
                 return "installed" if _rename_noreplace(partial_path, final_path) else "taken"

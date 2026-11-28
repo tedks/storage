@@ -64,7 +64,8 @@ from .pathing import ResolvedPath, resolve_path
 from .links import LinkRefused, intermediate_paths, link_checksum, resolve_link_target
 from .namespace import DEFAULT_LISTING_MAX_STALE, NamespaceService
 from .streaming import (
-    PrefetchSession, StreamingOpen, StreamingReadManager, StreamSource, StreamSourceError,
+    LINK_UNSUPPORTED, PrefetchSession, StreamingOpen, StreamingReadManager, StreamSource,
+    StreamSourceError,
 )
 from .streaming_settings import DEFAULT_STREAMING_READ_AHEAD_WINDOW
 
@@ -2097,7 +2098,7 @@ class StorageFS(Operations):
         except FileExistsError:
             return False
         except OSError as exc:
-            if exc.errno not in _LINK_UNSUPPORTED:
+            if exc.errno not in LINK_UNSUPPORTED:
                 return False
             try:
                 return rename_noreplace(aside, cache_path)
@@ -3747,11 +3748,6 @@ def _sigpipe_survives_fuse():
         yield
     finally:
         signal.signal(signal.SIGPIPE, signal.SIG_IGN)
-
-
-# link() errors meaning the cache filesystem has no hard links; a restore
-# then tries RENAME_NOREPLACE (as StreamingReadManager._install_partial does).
-_LINK_UNSUPPORTED = (errno.EPERM, errno.EOPNOTSUPP, errno.ENOTSUP, errno.ENOSYS, errno.EMLINK)
 
 
 def raise_descriptor_limit(logger: logging.Logger) -> Optional[int]:
