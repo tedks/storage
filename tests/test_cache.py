@@ -10,7 +10,7 @@ from pathlib import Path
 
 from storage.backends.local import LocalBackend
 from storage.cache import PARTIAL_SUFFIX, CacheManager
-from storage.cache_metadata import MEMBER_ATTRS_XATTR, read_cache_metadata
+from storage.cache_metadata import MEMBER_ATTRS_XATTR, read_cache_metadata, regular_file_stat
 from storage.models import FileMetadata, SyncStatus
 from storage.state import StateManager
 
@@ -490,6 +490,83 @@ class TestEvictionSkipsStaleClean(unittest.TestCase):
         self.assertTrue(self.cache_manager.ensure_space(1))
         self.assertFalse(oldest.exists())
         self.assertEqual(newer.read_bytes(), b"new")
+
+    def _counting_path_guard(self):
+        attempts = []
+
+        @contextmanager
+        def guard(path):
+            attempts.append(path)
+            yield True
+
+        self.cache_manager.path_guard = guard
+        return attempts
+
+    def test_previously_evicted_rows_are_not_rescanned(self):
+        template = FileMetadata(
+            virtual_path="/x", size=3, checksum="c", last_access=1.0, last_modified=1.0,
+            sync_status=SyncStatus.CLEAN, replica_count=1, recomputable=False,
+            recompute_cmd=None, encrypted=False, encryption_key_id=None,
+        )
+        for i in range(1001):
+            self.state_manager.set_file_metadata(replace(template, virtual_path=f"/missing-{i:04d}"))
+        first = self._clean_cached("first.txt", b"one", last_access=2.0)
+        second = self._clean_cached("second.txt", b"two", last_access=3.0)
+        attempts = self._counting_path_guard()
+
+        self.assertTrue(self.cache_manager.evict_lru_files(1))
+        self.assertFalse(first.exists())
+        self.assertEqual(len(attempts), 1002)  # every missing row once, then first
+
+        attempts.clear()
+        with patch("storage.cache.regular_file_stat", wraps=regular_file_stat) as stats:
+            self.assertTrue(self.cache_manager.evict_lru_files(1))
+        self.assertFalse(second.exists())
+        # Neither the missing rows nor the file evicted above come back.
+        self.assertEqual(attempts, ["/second.txt"])
+        self.assertEqual(
+            [Path(call.args[0]).name for call in stats.call_args_list],
+            ["second.txt"] * 3,  # selection, the recheck, the absence check
+        )
+
+    def test_a_row_write_after_the_bytes_return_readmits_the_path(self):
+        cached = self._clean_cached("back.txt", b"v1")
+        self.assertTrue(self.cache_manager.evict_lru_files(1))
+        self.assertFalse(cached.exists())
+        self.assertEqual(list(self.state_manager.iter_lru_paths()), [])
+
+        # A refetch places the bytes, then records their stat.
+        cached.write_bytes(b"v1")
+        row = self.state_manager.get_file_metadata("/back.txt")
+        self.assertTrue(self.state_manager.record_cached_stat(
+            "/back.txt", row.dirty_generation, size=2, last_modified=cached.stat().st_mtime,
+        ))
+        self.assertEqual(list(self.state_manager.iter_lru_paths()), ["/back.txt"])
+        self.assertTrue(self.cache_manager.evict_lru_files(1))
+        self.assertFalse(cached.exists())
+
+    def test_bytes_placed_between_the_stat_and_the_mark_stay_a_candidate(self):
+        cached = self._clean_cached("raced.txt", b"v1")
+        cached.unlink()
+        real_mark = self.state_manager.mark_cache_absent
+
+        def place_then_mark(path):
+            # A fetch lands its bytes and its row write before the mark.
+            cached.write_bytes(b"v1")
+            self.state_manager.clear_cache_absent(path)
+            real_mark(path)
+
+        with patch.object(self.state_manager, "mark_cache_absent", side_effect=place_then_mark):
+            self.assertFalse(self.cache_manager.evict_lru_files(1))
+        self.assertEqual(list(self.state_manager.iter_lru_paths()), ["/raced.txt"])
+
+    def test_recomputable_placeholders_are_not_rescanned(self):
+        placeholder = self._clean_cached("placeholder.txt", b"data", recomputable=True)
+        self.assertTrue(self.cache_manager.evict_recomputable_files(1))
+        self.assertEqual(placeholder.read_bytes(), b"")
+        attempts = self._counting_path_guard()
+        self.assertFalse(self.cache_manager.evict_recomputable_files(1))
+        self.assertEqual(attempts, [])
 
     def test_recomputable_pressure_preserves_pinned_and_dirty_bytes(self):
         ordinary = self._clean_cached("ordinary.txt", b"one", last_access=20.0)
