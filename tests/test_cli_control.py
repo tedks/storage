@@ -107,6 +107,50 @@ def test_legacy_stats_request_may_end_at_eof(cache):
         server.stop()
 
 
+def test_server_bounds_and_encodes_its_responses(cache, monkeypatch, caplog):
+    monkeypatch.setattr("storage.control.MAX_RESPONSE_BYTES", 256)
+
+    def dispatch(frame):
+        if frame == "large":
+            return {"data": "x" * 300}
+        return {"data": object()}  # Not JSON-encodable.
+
+    server = server_for(cache, dispatch)
+    server.start()
+    try:
+        with pytest.raises(ControlError, match="^Control response is too large$"):
+            request_control_payload(cache, b"large", 2)
+        with caplog.at_level(logging.ERROR, logger=__name__):
+            with pytest.raises(ControlError, match="^Could not encode control response$"):
+                request_control_payload(cache, b"unencodable", 2)
+        assert [r.getMessage() for r in caplog.records] == ["could not encode mount control response"]
+    finally:
+        server.stop()
+
+
+def test_client_refuses_a_response_over_its_bound(cache, monkeypatch):
+    monkeypatch.setattr("storage.control.MAX_RESPONSE_BYTES", 256)
+    with raw_listener(cache / CONTROL_SOCKET_NAME) as listener:
+        listener.settimeout(5)
+
+        def answer():
+            conn, _ = listener.accept()
+            with conn:
+                conn.recv(4096)
+                try:
+                    conn.sendall(b'{"data": "' + b"x" * 1024 + b'"}\n')
+                except OSError:
+                    pass  # The client stopped reading at its bound.
+
+        responder = threading.Thread(target=answer)
+        responder.start()
+        try:
+            with pytest.raises(ControlError, match="frame is too large"):
+                request_control_payload(cache, b"status", 2)
+        finally:
+            responder.join(10)
+
+
 def test_request_timeout_uses_a_shared_deadline(cache, monkeypatch):
     monkeypatch.setattr("storage.control.REQUEST_TIMEOUT", 0.3)
     server = server_for(cache, lambda _: {"command_ran": True})
