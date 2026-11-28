@@ -10,9 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from storage.cache_metadata import (
-    EVICTING_MTIME,
     XATTR_CACHE_METADATA_NAME,
-    CacheMetadataRecord,
     cache_file_would_be_scanned,
     cache_path_to_virtual_path,
     MEMBER_ATTRS_XATTR,
@@ -292,43 +290,24 @@ class TestStaleRecordDerivation(unittest.TestCase):
 
 
 class TestPlaceholderEquivalence(unittest.TestCase):
-    """Only the eviction's prepared placeholder record matches an empty file whatever its mtime."""
+    """An evicted recomputable placeholder matches its record whatever its mtime."""
 
     def _matches(self, **overrides):
-        args = dict(recorded_size=0, recorded_mtime=EVICTING_MTIME, sync_status=SyncStatus.CLEAN,
+        args = dict(recorded_size=0, recorded_mtime=1.0, sync_status=SyncStatus.CLEAN,
                     recomputable=True, stat_size=0, stat_mtime=2.0)
         args.update(overrides)
         return stat_matches_record(**args)
 
-    def test_the_prepared_record_over_an_empty_file_matches(self):
+    def test_a_clean_recomputable_empty_record_over_an_empty_file_matches(self):
         self.assertTrue(self._matches())
 
-    def test_only_that_record_tolerates_the_mtime(self):
-        self.assertFalse(self._matches(recorded_mtime=1.0))  # a completed placeholder: exact
-        self.assertFalse(self._matches(recorded_mtime=0.0))  # an invalidated row
+    def test_only_that_case_tolerates_the_mtime(self):
         self.assertFalse(self._matches(recomputable=False))
         self.assertFalse(self._matches(sync_status=SyncStatus.DIRTY))
-        self.assertFalse(self._matches(stat_size=3))  # bytes under the prepared record
-        self.assertFalse(self._matches(recorded_size=3))
-        self.assertTrue(self._matches(recorded_size=3, recorded_mtime=1.0, stat_size=3, stat_mtime=1.0))
-        self.assertFalse(self._matches(recorded_size=3, recorded_mtime=1.0, stat_size=3))
-
-    def test_no_file_can_carry_the_sentinel(self):
-        with tempfile.NamedTemporaryFile() as handle:
-            nearest = round(EVICTING_MTIME * 1e9)
-            for ns in (nearest - 1, nearest, nearest + 1):
-                os.utime(handle.name, ns=(ns, ns))
-                self.assertNotEqual(os.stat(handle.name).st_mtime, EVICTING_MTIME)
-
-    def test_the_sentinel_round_trips_through_the_xattr_record(self):
-        record = CacheMetadataRecord.from_file_metadata(FileMetadata(
-            virtual_path="/p", size=0, checksum=None, last_access=0.0, last_modified=EVICTING_MTIME,
-            sync_status=SyncStatus.CLEAN, replica_count=1, recomputable=True, recompute_cmd="make",
-            encrypted=False, encryption_key_id=None,
-        ))
-        import json
-        again = CacheMetadataRecord.from_dict(json.loads(json.dumps(record.to_dict())))
-        self.assertEqual(again.last_modified, EVICTING_MTIME)
+        self.assertFalse(self._matches(stat_size=3))  # bytes under a size-0 record
+        self.assertFalse(self._matches(recorded_size=3))  # a lost truncate to zero
+        self.assertTrue(self._matches(recorded_size=3, stat_size=3, stat_mtime=1.0))
+        self.assertFalse(self._matches(recorded_size=3, stat_size=3))
 
 
 class TestCacheScansDoNotFollowLinks(unittest.TestCase):

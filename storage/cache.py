@@ -20,8 +20,9 @@ from typing import Callable, ContextManager, Optional, List, Set, Tuple
 from .backends.base import Backend, bulk_request
 from .backends.ssh_pool import BulkCapacityCancelled, BulkCapacityTimeout
 from .cache_metadata import (
-    EVICTING_MTIME, PARTIAL_SUFFIX, PREFIX_XATTR, confirm_member_stat, copy_member_attributes,
-    regular_file_stat, stat_matches_record, write_cache_metadata, write_cache_metadata_fd,
+    PARTIAL_SUFFIX, PREFIX_XATTR, confirm_member_stat, copy_member_attributes, regular_file_stat,
+    stat_matches_record,
+    write_cache_metadata,
 )
 from .member_repairs import VIEW_WRITE, MemberRepairs, is_at_or_under
 from .pathing import resolve_path
@@ -669,18 +670,15 @@ class CacheManager:
 
         Recheck after selection under the index lock, which mark_file_dirty
         also takes. A stale CLEAN is marked and kept. Hold descriptor_guard
-        across the stat and the unlink, so no open descriptor can be missed
-        or registered in between. Forget listing attributes before changing
-        the cache inode. Lock order is the cache lock, the index lock, then
-        the descriptor lock. Returns the bytes freed. The recomputable tier
-        truncates instead (_reclaim_recomputable).
+        across the stat and the unlink or truncation, so no open descriptor
+        can be missed or registered in between. Forget listing attributes
+        before changing the cache inode. Lock order is the cache lock, the
+        index lock, then the descriptor lock. Returns the bytes freed.
         """
-        if recomputable:
-            return self._reclaim_recomputable(virtual_path, cache_path)
         with self.state_manager.metadata_lock:
             row = self.state_manager.get_file_metadata(virtual_path)
             if (row is None or row.sync_status != SyncStatus.CLEAN or row.link_target is not None
-                    or row.recomputable):
+                    or row.recomputable != recomputable or (recomputable and not row.recompute_cmd)):
                 return 0
             # A member that missed a rename may hold these bytes only under
             # the old name: the cached copy stays until the repair is resolved.
@@ -699,13 +697,18 @@ class CacheManager:
                         return 0
                     if self.forget_listed_attrs:
                         self.forget_listed_attrs(virtual_path)
-                    cache_path.unlink()
+                    if recomputable:
+                        if self._truncate_recomputable(virtual_path, cache_path, st, row) is None:
+                            return 0
+                    else:
+                        cache_path.unlink()
             if stale:
                 self.mark_file_dirty(virtual_path, cache_path)
                 return 0
             self._current_size_bytes = max(0, self._current_size_bytes - st.st_size)
-            self.state_manager.remove_file_location(virtual_path, "cache")
-            self._note_cache_absent([(virtual_path, cache_path)])
+            if not recomputable:
+                self.state_manager.remove_file_location(virtual_path, "cache")
+                self._note_cache_absent([(virtual_path, cache_path)])
             return st.st_size
 
     def _note_cache_absent(self, entries: List[Tuple[str, Path]]):
@@ -735,168 +738,75 @@ class CacheManager:
             stat_size=stat_size, stat_mtime=stat_mtime,
         )
 
-    def _mirror_row(self, virtual_path: str, cache_path: Path):
+    def _mirror_row(self, virtual_path: str, cache_path: Path, *, as_recorded: bool = False):
+        """Mirror the stored row; with as_recorded, the xattr takes the row's stat, not the live one."""
         row = self.state_manager.get_file_metadata(virtual_path)
         if row is not None:
-            self.sync_cache_metadata(virtual_path, row, cache_path=cache_path)
+            self.sync_cache_metadata(
+                virtual_path, row, cache_path=cache_path,
+                recorded_stat=(row.size, row.last_modified) if as_recorded else None,
+            )
 
-    @staticmethod
-    def _identity(st: os.stat_result) -> tuple:
-        return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
+    def _truncate_recomputable(
+        self, virtual_path: str, cache_path: Path, st: os.stat_result, row: FileMetadata,
+    ) -> Optional[os.stat_result]:
+        """Truncate the selected inode in place, keeping its reconstruction xattrs.
 
-    def _prepared(self, virtual_path: str, generation: int) -> bool:
-        """Whether the row is still the prepared placeholder record at `generation`."""
-        row = self.state_manager.get_file_metadata(virtual_path)
-        return (row is not None and row.dirty_generation == generation
-                and row.sync_status == SyncStatus.CLEAN and row.size == 0
-                and row.last_modified == EVICTING_MTIME)
+        Caller holds the index lock and the descriptor guard, and has
+        checked that the CLEAN row describes `st`. Crash-safe in three
+        steps, each through the generation-conditioned record_cached_stat:
 
-    def _unprepare(self, virtual_path: str, cache_path: Path, fd: int, generation: int,
-                   st: os.stat_result):
-        """Restore the selected file's stat over a prepared record; caller holds the index lock.
+        1. Record size 0, no checksum, at the old mtime, durably (row and
+           xattr, then fsync), before the truncate. A crash after it and
+           before the truncate leaves N bytes under a size-0 record: a
+           mismatch, which heals to DIRTY with the real bytes (a redundant
+           upload of unchanged content).
+        2. ftruncate, which moves the mtime. A crash after it leaves 0 bytes
+           under a CLEAN recomputable size-0 record, which
+           stat_matches_record treats as consistent whatever the mtime.
+        3. Record the new mtime and mirror it.
 
-        Only while the row is still the prepared record and the inode still
-        has the selected size and mtime. Otherwise the prepared record
-        stays: over N bytes it is a mismatch, which heals to DIRTY with the
-        real bytes, and over 0 bytes it rolls forward (stat_matches_record).
-        The cleared checksum is not restored; it is only a hint.
+        A lost truncate-to-zero by a user still has a record of size N, so
+        it is still found. Returns the truncated stat, or None if the inode
+        is not the one selected (nothing changed) or step 1 did not apply.
+        If the truncate itself fails, step 1 is undone and the OSError
+        raised.
         """
-        if not self._prepared(virtual_path, generation):
-            return
-        if self._identity(os.fstat(fd)) != self._identity(st):
-            return
-        self.state_manager.record_cached_stat(
-            virtual_path, generation, size=st.st_size, last_modified=st.st_mtime,
-        )
-        self._mirror_row(virtual_path, cache_path)
-
-    def _reclaim_recomputable(self, virtual_path: str, cache_path: Path) -> int:
-        """Truncate a CLEAN recomputable cache file in place, keeping its reconstruction xattrs.
-
-        ftruncate moves the mtime, so a crash between it and the row update
-        would leave a 0-byte file under a record of size N, which the sweep
-        and rebuild-index take for a lost write (DIRTY at 0 bytes, an empty
-        upload). So, in three steps, each row write through the
-        generation-conditioned record_cached_stat:
-
-        1. Prepare, under the index lock: record size 0, no checksum, at
-           EVICTING_MTIME, in the row and, through the selected inode's
-           descriptor, in the xattr. If the xattr write fails, restore and
-           stop.
-        2. Make that durable with no index or descriptor lock held (if no
-           caller holds the index lock): sync the database and its WAL, then
-           fsync the file for the xattr.
-        3. Under the index lock and then the descriptor guard: recheck that
-           the row is still the prepared record at the same generation, that
-           no descriptor is open and that the inode is the selected one;
-           truncate; then, after the guard, record the real mtime.
-
-        Between 1 and 3 the record says size 0 over N bytes. No descriptor
-        can be opened meanwhile: the caller holds the path's try-lock, which
-        open(), create() and a member-change invalidation take. The
-        post-crash sweep takes no path lock and would mark the file DIRTY
-        with its real bytes (a redundant upload); step 3 then sees the new
-        generation and stops. A crash in 1-2 or before the truncate leaves N
-        bytes under the prepared record: a mismatch, healed to DIRTY with
-        the real bytes. A crash after the truncate leaves 0 bytes under it,
-        which stat_matches_record accepts and heal rolls forward. After step
-        3 every comparison is exact again. Returns the bytes freed.
-        """
-        with self.state_manager.metadata_lock:
-            row = self.state_manager.get_file_metadata(virtual_path)
-            if (row is None or row.sync_status != SyncStatus.CLEAN or row.link_target is not None
-                    or not row.recomputable or not row.recompute_cmd):
-                return 0
-            # A member that missed a rename may hold these bytes only under
-            # the old name: the cached copy stays until the repair is resolved.
-            if self.member_repairs.covers(virtual_path) or self.member_repairs.kept_inode(cache_path):
-                return 0
-            guard = self.descriptor_guard(virtual_path) if self.descriptor_guard else nullcontext(False)
-            with guard as is_open:
-                if is_open:
-                    return 0
-                st = regular_file_stat(cache_path)
-            if st is None:
-                return 0
-            if not self.stat_matches_row(row, st.st_size, st.st_mtime):
-                self.mark_file_dirty(virtual_path, cache_path)
-                return 0
-            if st.st_size == 0:
-                return 0
-            fd = os.open(cache_path, os.O_WRONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-            prepared = False
-            try:
-                if self._identity(os.fstat(fd)) != self._identity(st):
-                    return 0
-                generation = row.dirty_generation
-                if not self.state_manager.record_cached_stat(
-                    virtual_path, generation, size=0, last_modified=EVICTING_MTIME,
-                    clear_checksum=True,
-                ):
-                    return 0
-                try:
-                    write_cache_metadata_fd(
-                        fd, self.state_manager.get_file_metadata(virtual_path),
-                        virtual_path=virtual_path, size=0, last_modified=EVICTING_MTIME,
-                    )
-                except OSError:
-                    # The xattr still records N bytes: truncating now would
-                    # leave a rebuild to call the placeholder a lost write.
-                    self._unprepare(virtual_path, cache_path, fd, generation, st)
-                    return 0
-                prepared = True
-            finally:
-                if not prepared:
-                    os.close(fd)
+        fd = os.open(cache_path, os.O_WRONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         try:
+            opened = os.fstat(fd)
+            if (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns) != (
+                st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns,
+            ):
+                return None
+            generation = row.dirty_generation
+            if not self.state_manager.record_cached_stat(
+                virtual_path, generation, size=0, last_modified=st.st_mtime,
+                clear_checksum=True, durable=True,
+            ):
+                return None
+            # The xattr must say size 0 too: it records the live stat by
+            # default, which is still N bytes here.
+            self._mirror_row(virtual_path, cache_path, as_recorded=True)
             try:
-                self.state_manager.sync_to_disk()
-                os.fsync(fd)
+                os.fsync(fd)  # the xattr record lands before the truncate
+                os.ftruncate(fd, 0)
             except OSError:
-                with self.state_manager.metadata_lock:
-                    self._unprepare(virtual_path, cache_path, fd, generation, st)
-                raise
-            with self.state_manager.metadata_lock:
-                if not self._prepared(virtual_path, generation):
-                    return 0  # a write was recorded meanwhile; its stat stands
-                guard = self.descriptor_guard(virtual_path) if self.descriptor_guard else nullcontext(False)
-                with guard as is_open:
-                    if is_open or self._identity(os.fstat(fd)) != self._identity(st):
-                        self._unprepare(virtual_path, cache_path, fd, generation, st)
-                        return 0
-                    if self.forget_listed_attrs:
-                        self.forget_listed_attrs(virtual_path)
-                    try:
-                        os.ftruncate(fd, 0)
-                    except OSError:
-                        # i_size can change before an error returns; restore
-                        # only what is still the selected stat.
-                        self._unprepare(virtual_path, cache_path, fd, generation, st)
-                        raise
-                truncated = os.fstat(fd)
+                # Nothing was truncated: the file still holds the synced
+                # bytes. The checksum stays cleared; it is only a hint.
                 self.state_manager.record_cached_stat(
-                    virtual_path, generation, size=0, last_modified=truncated.st_mtime,
+                    virtual_path, generation, size=st.st_size, last_modified=st.st_mtime,
                 )
                 self._mirror_row(virtual_path, cache_path)
-                self._current_size_bytes = max(0, self._current_size_bytes - st.st_size)
-                return st.st_size
+                raise
+            truncated = os.fstat(fd)
         finally:
             os.close(fd)
-
-    def _roll_forward_placeholder(self, virtual_path: str, cache_path: Path):
-        """Complete an eviction a crash interrupted after its truncate: record the real mtime."""
-        with self.state_manager.metadata_lock:
-            row = self.state_manager.get_file_metadata(virtual_path)
-            if (row is None or row.sync_status != SyncStatus.CLEAN or row.size != 0
-                    or row.last_modified != EVICTING_MTIME):
-                return
-            st = regular_file_stat(cache_path)
-            if st is None or not self.stat_matches_row(row, st.st_size, st.st_mtime):
-                return
-            if self.state_manager.record_cached_stat(
-                virtual_path, row.dirty_generation, size=0, last_modified=st.st_mtime,
-            ):
-                self._mirror_row(virtual_path, cache_path)
+        self.state_manager.record_cached_stat(
+            virtual_path, generation, size=0, last_modified=truncated.st_mtime,
+        )
+        self._mirror_row(virtual_path, cache_path)
+        return truncated
 
     def heal_stale_clean(
         self,
@@ -925,10 +835,9 @@ class CacheManager:
         placeholder as DIRTY and sync an empty file over the members. The
         eviction records and truncates in one section under the index lock,
         so the recheck sees both or neither. The comparison is
-        stat_matches_row, which accepts the eviction's prepared placeholder
-        record over an empty file (a crash after its truncate); that state
-        is rolled forward to the real mtime here. Returns True when the file
-        was marked.
+        stat_matches_row, which treats an evicted placeholder as consistent
+        whatever its mtime (a crash inside the eviction). Returns True when
+        the file was marked.
         """
         row = self.state_manager.get_file_metadata(virtual_path)
         if row is None or row.sync_status != SyncStatus.CLEAN:
@@ -940,8 +849,6 @@ class CacheManager:
                 return False
             stat_size, stat_mtime = st.st_size, st.st_mtime
         if self.stat_matches_row(row, stat_size, stat_mtime):
-            if row.last_modified == EVICTING_MTIME:
-                self._roll_forward_placeholder(virtual_path, cache_path)
             return False
         with self.state_manager.metadata_lock:
             row = self.state_manager.get_file_metadata(virtual_path)
@@ -952,8 +859,6 @@ class CacheManager:
             except OSError:
                 return False
             if self.stat_matches_row(row, st.st_size, st.st_mtime):
-                if row.last_modified == EVICTING_MTIME:
-                    self._roll_forward_placeholder(virtual_path, cache_path)
                 return False
             return self.mark_file_dirty(virtual_path, cache_path) is not None
 
@@ -984,14 +889,20 @@ class CacheManager:
         metadata: FileMetadata,
         *,
         cache_path: Optional[Path] = None,
+        recorded_stat: Optional[Tuple[int, float]] = None,
     ) -> bool:
-        """Mirror file metadata into the cache file xattr when the cache entry exists."""
+        """Mirror file metadata into the cache file xattr when the cache entry exists.
+
+        The xattr records the live stat, or `recorded_stat` (see
+        write_cache_metadata).
+        """
         target_path = cache_path or self.get_cache_path(virtual_path)
         if regular_file_stat(target_path) is None:
             return False
 
         try:
-            write_cache_metadata(target_path, metadata, virtual_path=virtual_path)
+            write_cache_metadata(target_path, metadata, virtual_path=virtual_path,
+                                 recorded_stat=recorded_stat)
             return True
         except OSError:
             return False

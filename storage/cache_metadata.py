@@ -8,7 +8,7 @@ import stat
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Callable, Iterator, List, Optional
+from typing import Callable, Iterator, List, Optional, Tuple
 
 from .file_config import get_inherited_config
 from .models import FileLocation, FileMetadata, SyncStatus
@@ -378,16 +378,6 @@ _INTERNAL_CACHE_SUFFIXES = (
 )
 
 
-# The last_modified a recomputable eviction records for its placeholder
-# while it truncates (CacheManager._reclaim_recomputable), in the row and
-# the xattr. No file has it: st_mtime is built from whole seconds and
-# nanoseconds, and the nearest instants, -1.000000001 and -1.000000000, are
-# about 0.07 ns from it, far beyond float rounding at this magnitude
-# (about 2e-16). Not 0.0, which an invalidated row records. Finite, so it
-# survives JSON and SQLite unchanged.
-EVICTING_MTIME = -1.0 - 2.0 ** -30
-
-
 def stat_matches_record(
     *,
     recorded_size: int,
@@ -399,22 +389,21 @@ def stat_matches_record(
 ) -> bool:
     """Whether a live stat is the one a row or xattr records (no write since).
 
-    Exact size and mtime, with one equivalence for the window inside a
-    recomputable eviction: a CLEAN recomputable record of size 0 at
-    EVICTING_MTIME, over a file of size 0, matches whatever the file's
-    mtime. The eviction records that state before it truncates, because
-    ftruncate moves the mtime, and records the real mtime right after; a
-    crash between the two leaves exactly this state, which must not read
-    as a lost write (it would sync an empty file over the members), and
-    rolls forward instead. Nothing else carries the sentinel, so every
-    other comparison, including one against a completed placeholder, is
-    exact: a lost empty or touch of a placeholder is still a mismatch, and
-    so are N bytes under the sentinel record (a crash before the truncate).
+    Exact size and mtime, with one equivalence: a CLEAN recomputable record
+    of size 0 over a file of size 0 matches whatever the mtime. That is an
+    evicted placeholder. Recomputable eviction records size 0 at the old
+    mtime before it truncates, because ftruncate moves the mtime, and
+    records the new mtime after; a crash between the truncate and that
+    second record leaves exactly this state, which must not read as a
+    lost write (it would sync an empty file over the members). The rule
+    hides nothing: an empty file under a size-0 record has the recorded
+    content whatever its mtime. A file truncated to 0 under a record of
+    size N still differs.
     """
     if stat_size == recorded_size and stat_mtime == recorded_mtime:
         return True
     return (sync_status == SyncStatus.CLEAN and bool(recomputable)
-            and recorded_size == 0 and recorded_mtime == EVICTING_MTIME and stat_size == 0)
+            and recorded_size == 0 and stat_size == 0)
 
 
 def regular_file_stat(path) -> Optional[os.stat_result]:
@@ -652,53 +641,31 @@ def write_cache_metadata(
     metadata: FileMetadata,
     *,
     virtual_path: Optional[str] = None,
+    recorded_stat: Optional[Tuple[int, float]] = None,
 ) -> CacheMetadataRecord:
     """Write the cache metadata xattr for a cache file.
 
     Only on a regular file, and never through a link: a symlink is refused
     with EINVAL, and the setxattr does not follow one swapped in after the
-    lstat.
+    lstat. The record carries the live size and mtime, unless
+    `recorded_stat` gives the (size, mtime) to record instead: a
+    recomputable eviction records its placeholder before the truncate.
     """
     st = os.lstat(str(cache_path))
     if not stat.S_ISREG(st.st_mode):
         raise OSError(errno.EINVAL, "not a regular file", str(cache_path))
+    stat_size, stat_mtime = recorded_stat if recorded_stat is not None else (st.st_size, st.st_mtime)
     record = CacheMetadataRecord.from_file_metadata(
         metadata,
         virtual_path=virtual_path,
-        stat_size=st.st_size,
-        stat_mtime=st.st_mtime,
+        stat_size=stat_size,
+        stat_mtime=stat_mtime,
     )
     os.setxattr(
         str(cache_path),
         XATTR_CACHE_METADATA_NAME,
         json.dumps(record.to_dict(), sort_keys=True).encode("utf-8"),
         follow_symlinks=False,
-    )
-    return record
-
-
-def write_cache_metadata_fd(
-    fd: int,
-    metadata: FileMetadata,
-    *,
-    virtual_path: str,
-    size: int,
-    last_modified: float,
-) -> CacheMetadataRecord:
-    """Write the cache metadata xattr through an open descriptor, recording the given stat.
-
-    For the recomputable eviction's prepared record (size 0 at
-    EVICTING_MTIME), written on the inode it selected rather than on
-    whatever the path names, and before the truncate, so the live stat
-    is not the one to record. Raises OSError if the xattr is not written.
-    """
-    record = CacheMetadataRecord.from_file_metadata(
-        metadata, virtual_path=virtual_path, stat_size=size, stat_mtime=last_modified,
-    )
-    os.setxattr(
-        fd,
-        XATTR_CACHE_METADATA_NAME,
-        json.dumps(record.to_dict(), sort_keys=True).encode("utf-8"),
     )
     return record
 
