@@ -1543,6 +1543,12 @@ class StorageFS(Operations):
         alone could pair a new baseline with old bytes and never see the
         change.
 
+        Limit: with no stat before the transfer (the probe failed or the
+        member has none), the confirming stat taken after it is the only
+        one, so nothing was compared and a same-size change during the
+        transfer goes unseen, as it did before confirmation existed (the
+        copy then carried that post-transfer mtime anyway).
+
         Also called off the FUSE thread, from a stream's on_finalized. It can
         then land after the FUSE thread's own refetch of the same path and
         install the older stream-start baseline over the newer one. That is
@@ -2309,13 +2315,6 @@ class StorageFS(Operations):
         target_before = regular_file_stat(target_cache)
         try:
             self.namespace.rename(old, new, on_local_moved=lambda: self._repoint_descriptors(old, new))
-            # (A rename moves canonical cache files, so it replaces a view's
-            # copy only if new names one; the moved file is another live
-            # inode, so a changed number at the name means replaced.)
-            target_after = regular_file_stat(target_cache)
-            if target_after is None or (target_before is not None
-                                        and target_after.st_ino != target_before.st_ino):
-                self._retire_view_inode(target_cache, target_before)
         except BaseException:
             # If the cached copy moved but the rename failed after (or
             # before) the members', its baselines, matched on identity alone,
@@ -2329,6 +2328,16 @@ class StorageFS(Operations):
                 self._drop_persisted_baselines(new_canonical)
             raise
         finally:
+            # Whether the rename succeeded or failed after the local move,
+            # the target's old copy is gone once its name holds another
+            # inode (or none): retire exactly that inode's pending change.
+            # A rename moves canonical cache files, so it replaces a view's
+            # copy only if new names one; the moved file is another live
+            # inode, so a changed number at the name means replaced.
+            if target_before is not None:
+                target_after = regular_file_stat(target_cache)
+                if target_after is None or target_after.st_ino != target_before.st_ino:
+                    self._retire_view_inode(target_cache, target_before)
             # Records are keyed by path, so neither name's records (nor, for a
             # directory, its children's) describe what is there now. Dropping
             # them is always safe, so a failed rename drops them too.

@@ -905,6 +905,32 @@ class TestConflictViewClose(RevalidateTestBase):
             self.fs.unlink("/f.txt.member")
         self.assertEqual(self.fs._view_pending, {})
 
+    def test_a_rename_failing_after_the_local_move_retires_the_target(self):
+        # The local move replaced the view's copy, then the rename failed
+        # (a member step): the replaced inode's pending change still goes.
+        self.fs.truncate("/f.txt.member", 6)
+        self.assertTrue(self.fs._view_pending)
+
+        def moved_then_failed(old, new, on_local_moved=None):
+            replacement = self.view.with_name("moved-in")
+            replacement.write_bytes(b"moved bytes!")
+            os.replace(replacement, self.view)
+            raise OSError(errno.EIO, "member rename failed")
+
+        with patch.object(self.fs.namespace, "rename", side_effect=moved_then_failed), \
+                self.assertRaises(OSError):
+            self.fs._rename("/elsewhere.txt", "/f.txt.member")
+        self.assertEqual(self.fs._view_pending, {})
+
+    def test_a_rename_failing_before_the_local_move_keeps_the_target(self):
+        self.fs.truncate("/f.txt.member", 6)
+        pending = dict(self.fs._view_pending)
+        with patch.object(self.fs.namespace, "rename",
+                          side_effect=OSError(errno.EIO, "refused")), \
+                self.assertRaises(OSError):
+            self.fs._rename("/elsewhere.txt", "/f.txt.member")
+        self.assertEqual(self.fs._view_pending, pending)
+
     def test_a_replaced_name_under_an_open_descriptor_sends_nothing(self):
         fh = self.fs.open("/f.txt.member", os.O_RDONLY)
         self.fs.truncate("/f.txt.member", 6)
