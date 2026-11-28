@@ -170,10 +170,19 @@ class CacheManager:
         return total
 
     def _ensure_size_current_locked(self):
-        """Refresh tracked size if it has been marked dirty by direct writes."""
+        """Refresh tracked size if it has been marked dirty by direct writes.
+
+        The flag is cleared before the scan, not after: mark_cache_size_dirty
+        sets it without the lock, so a mark landing during the scan (whose
+        change the scan may have missed) stays set for the next caller.
+        """
         if self._size_dirty:
-            self._current_size_bytes = self._scan_total_cache_size()
             self._size_dirty = False
+            try:
+                self._current_size_bytes = self._scan_total_cache_size()
+            except BaseException:
+                self._size_dirty = True
+                raise
             self._scan_count += 1
 
     def recover_views(self, member_names: List[str]):
@@ -316,9 +325,17 @@ class CacheManager:
             return self._current_size_bytes
 
     def mark_cache_size_dirty(self):
-        """Mark cache size accounting as stale after direct external file mutations."""
-        with self._lock:
-            self._size_dirty = True
+        """Mark cache size accounting as stale after direct external file mutations.
+
+        Without the cache lock, so callers holding other locks (the
+        streaming registry) never wait on a rescan or an eviction. Safe
+        because _ensure_size_current_locked, the flag's only reader,
+        clears it before it scans: a mark after the mutation either lands
+        before that clear (and the scan, which starts after it, sees the
+        mutation) or after it (and stays set). An attribute store is
+        atomic under the GIL.
+        """
+        self._size_dirty = True
 
     def get_free_space_needed(self, required_bytes: int) -> int:
         """

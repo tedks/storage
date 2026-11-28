@@ -1259,7 +1259,9 @@ class StreamingReadManager:
         The cache size is marked stale here too, not only by the callers
         after the lock: space reclaim (_reclaim_retained_space) measures the
         deficit after a scan under this lock, and must see a partial
-        unlinked before it as freed.
+        unlinked before it as freed. The mark takes no cache lock (see
+        CacheManager.mark_cache_size_dirty), so this lock never waits on a
+        rescan or an eviction.
         """
         if self.prefetch_sessions.get(session.canonical_path) is session:
             self.prefetch_sessions.pop(session.canonical_path, None)
