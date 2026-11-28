@@ -607,6 +607,14 @@ class TestEvictionSkipsStaleClean(unittest.TestCase):
         row = self.state_manager.get_file_metadata("/lost.txt")
         self.assertEqual((row.sync_status, row.size), (SyncStatus.DIRTY, cached.stat().st_size))
 
+    def test_a_file_stamped_ahead_of_the_clock_is_still_evicted_under_pressure(self):
+        import time
+        ahead = self._clean_cached("ahead.txt", b"ahead", last_access=time.time() + 86400.0)
+        self.cache_manager.mark_cache_size_dirty()
+        self.cache_manager.max_size_bytes = self.cache_manager.get_total_cache_size()
+        self.assertTrue(self.cache_manager.ensure_space(1))
+        self.assertFalse(ahead.exists())
+
     def test_recomputable_pressure_preserves_pinned_and_dirty_bytes(self):
         ordinary = self._clean_cached("ordinary.txt", b"one", last_access=20.0)
         oldest = self._clean_cached("older.txt", b"older", last_access=4.0, recomputable=True)

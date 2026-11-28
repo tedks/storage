@@ -632,6 +632,27 @@ class TestCacheAbsentCandidacy(unittest.TestCase):
         self.assertEqual(self._absent("/populated"), 0)
         self.assertEqual(list(self.state_manager.iter_lru_paths()), ["/populated"])
 
+    def test_a_pass_clamps_future_access_times_and_reaches_those_rows(self):
+        future = time.time() + 3600.0
+        self._row("/ahead", last_access=future)
+        self._row("/now", last_access=time.time() - 1.0)
+        self.assertEqual(list(self.state_manager.iter_lru_paths()), ["/now", "/ahead"])
+        clamped = self.state_manager.get_file_metadata("/ahead").last_access
+        self.assertLess(clamped, future)
+        self.assertLessEqual(clamped, time.time())
+
+    def test_the_clamp_clears_a_mark_on_a_row_it_rewrites(self):
+        self._row("/ahead", last_access=time.time() + 3600.0)
+        self.state_manager.mark_cache_absent(["/ahead"])
+        self.assertEqual(list(self.state_manager.iter_lru_paths()), ["/ahead"])
+        self.assertEqual(self._absent("/ahead"), 0)
+
+    def test_the_clamp_uses_the_access_index(self):
+        plan = [tuple(row)[-1] for row in self.state_manager.conn.execute(
+            'EXPLAIN QUERY PLAN ' + StateManager._CLAMP_ACCESS_SQL, (1.0, 1.0),
+        )]
+        self.assertTrue(any("idx_last_access" in step for step in plan), plan)
+
     def test_rows_read_through_the_model_ignore_unknown_columns(self):
         self._row("/a")
         conn = self.state_manager.conn

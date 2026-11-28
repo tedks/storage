@@ -61,10 +61,10 @@ class StateManager:
     # the incoming row, a write() landed after that row was read, and those
     # columns keep the stored values. Policy columns take the new values;
     # an older access timestamp never replaces a newer one. A timestamp
-    # taken during a forward wall-clock jump therefore sticks (the file
-    # looks recently read) until real time catches up with it; that is
-    # accepted, since it only delays one file's eviction. Parameters are
-    # a _metadata_row tuple.
+    # taken ahead of the clock (a forward jump that is later corrected)
+    # would stick under MAX; each eviction pass clamps such timestamps to
+    # its start time (iter_lru_paths), so they cannot keep a file out of
+    # eviction. Parameters are a _metadata_row tuple.
     _UPSERT_FILES_SQL = '''
         INSERT INTO files
         (virtual_path, size, checksum, last_access, last_modified,
@@ -1014,6 +1014,14 @@ class StateManager:
             )
             self.conn.commit()
 
+    _CLAMP_ACCESS_SQL = 'UPDATE files SET last_access = ? WHERE last_access > ?'
+
+    def _clamp_future_access(self, now: float):
+        """Bring access timestamps later than `now` down to it (idx_last_access)."""
+        with self._db_lock:
+            self.conn.execute(self._CLAMP_ACCESS_SQL, (now, now))
+            self.conn.commit()
+
     _LRU_PAGE_SQL = '''
         SELECT virtual_path, last_access FROM files
         WHERE sync_status = ? AND recomputable = ?
@@ -1039,15 +1047,22 @@ class StateManager:
         candidates. Page past missing and pinned paths without loading the
         whole index.
 
-        A pass ends at the time it started (taken after the forced flush):
-        a busy file read during the pass gets a newer timestamp and would
-        otherwise come back in a later page, again and again while reads
-        continue. A file read since the pass began is recently used, so
-        skipping it is right. So is a row stamped ahead of the clock (see
-        _UPSERT_FILES_SQL): it is skipped until real time catches up.
+        A pass ends at the time it started (T0, taken after the forced
+        flush): a busy file read during the pass gets a newer timestamp and
+        would otherwise come back in a later page, again and again while
+        reads continue. A file read since the pass began is recently used,
+        so skipping it is right. Rows stamped after T0 (after a backward
+        clock step, or a forward jump) are first clamped to T0, so none is
+        out of reach of the bound; that UPDATE writes the rows, so the
+        trigger clears their cache_absent marks, which costs one revisit.
+        After the clamp every row is at or below T0, and a row read during
+        the pass is stamped at or above it, so it re-enters only on an
+        exact tie (or, after a backward step during the pass, until the
+        clock passes T0 again).
         """
         self._flush_access_updates(force=True)
         started = time.time()
+        self._clamp_future_access(started)
         last_access, last_path = float('-inf'), ''
         while True:
             with self._db_lock:
