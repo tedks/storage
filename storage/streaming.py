@@ -222,6 +222,10 @@ class PrefetchSession:
     # Demand access can arrive before the index row exists. Carry the last
     # timestamp into the new row even if the pending index batch has flushed.
     last_access: float = 0.0
+    # Bytes charged to the cache (CacheManager.hold_unlinked_bytes) while
+    # this session is replaced with readers still on its unlinked partial;
+    # released when its descriptor closes.
+    unlinked_charge: int = 0
 
     def __post_init__(self):
         self.lock = threading.RLock()
@@ -422,6 +426,10 @@ class StreamingReadManager:
         # Whether the file at a cache path is a promoted prefix the index
         # does not describe (StorageFS._is_unindexed_prefix).
         self.is_unindexed_prefix = is_unindexed_prefix or (lambda canonical_path, cache_path: False)
+        # Descriptors held by streaming sessions and their staging files,
+        # registered or not (a replaced session's readers keep one open).
+        self._session_descriptors = 0
+        self._session_descriptors_lock = threading.Lock()
         self.streaming_reads = streaming_reads
         self.chunk_size = max(4096, int(streaming_chunk_size))
         limits = {"max_download_workers": max_download_workers}
@@ -832,6 +840,7 @@ class StreamingReadManager:
 
         stats.update({
             "active_streaming_sessions": active_streaming_sessions,
+            "streaming_session_descriptors": self.session_descriptor_count(),
             "active_reader_sessions": active_reader_sessions,
             "retained_streaming_sessions": retained_sessions,
             "download_workers": workers,
@@ -1145,17 +1154,30 @@ class StreamingReadManager:
                     self._schedule_background(session)
                     session.condition.notify_all()
 
+    def _count_session_descriptor(self, delta: int):
+        with self._session_descriptors_lock:
+            self._session_descriptors += delta
+
+    def session_descriptor_count(self) -> int:
+        with self._session_descriptors_lock:
+            return self._session_descriptors
+
     def _close_streaming_session_resources(self, session: PrefetchSession):
         with session.io_lock:
             with session.lock:
                 io_fd = session.io_fd
                 session.io_fd = -1
+                charge = session.unlinked_charge
+                session.unlinked_charge = 0
 
         if io_fd >= 0:
             try:
                 os.close(io_fd)
             except OSError:
                 pass
+            self._count_session_descriptor(-1)
+        if charge:
+            self.cache_manager.release_unlinked_bytes(charge)
 
     def open_session_inode(self, session: PrefetchSession, flags: int) -> int:
         """Open the session's own file for a reader that holds a ref on it.
@@ -1186,6 +1208,7 @@ class StreamingReadManager:
             os.close(io_fd)
         except OSError:
             pass
+        self._count_session_descriptor(-1)
         try:
             path.unlink(missing_ok=True)
         except OSError:
@@ -1729,6 +1752,10 @@ class StreamingReadManager:
             if session.error is not None and not session.prefetch_complete:
                 if self._claim_detach(session):
                     self._unregister_and_unlink(session)
+                    if session.io_fd >= 0 and session.unlinked_charge == 0:
+                        # Its readers keep the unlinked partial's blocks.
+                        session.unlinked_charge = session.file_size
+                        self.cache_manager.hold_unlinked_bytes(session.file_size)
                 self._record_streaming_stat("streaming_failed_sessions_replaced")
                 self.logger.info(
                     "streaming replacing failed session errno=%d", streaming_errno(session.error),
@@ -1892,6 +1919,7 @@ class StreamingReadManager:
                 with self.cache_manager.admit_streaming_partial(file_size) as admitted:
                     if admitted:
                         io_fd = os.open(str(staging_path), os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o644)
+                        self._count_session_descriptor(1)
                         os.ftruncate(io_fd, file_size)
                         break
                 # No room for a partial of our own. A concurrent open of the
@@ -1998,9 +2026,11 @@ class StreamingReadManager:
     def _retained_descriptors_low(self, session: PrefetchSession) -> bool:
         """Whether retaining this fill would leave too few descriptors for the mount.
 
-        Caller holds prefetch_sessions_lock. Every registered session holds
-        one descriptor on its partial whether or not it has readers, so
-        retained fills are refused once the registry holds
+        Caller holds prefetch_sessions_lock. Every session holds one
+        descriptor on its partial whether or not it has readers, and so does
+        a replaced session while its readers keep it, out of the registry;
+        session_descriptor_count counts them all, staging files included.
+        Retained fills are refused once those reach
         1 / STREAMING_DESCRIPTOR_SHARE of the soft RLIMIT_NOFILE: the rest
         stays for readers' descriptors, the database, member connections
         and whole-file copies. The fill is discarded as an unqualified one
@@ -2012,12 +2042,13 @@ class StreamingReadManager:
             return False
         if soft == resource.RLIM_INFINITY or soft <= 0:
             return False
-        if len(self.prefetch_sessions) * STREAMING_DESCRIPTOR_SHARE < soft:
+        held = self.session_descriptor_count()
+        if held * STREAMING_DESCRIPTOR_SHARE < soft:
             return False
         self._record_streaming_stat("streaming_retained_descriptor_cancellations")
         self.logger.warning(
-            "streaming not retaining an unfinished fill: %d sessions hold descriptors (soft limit %d)",
-            len(self.prefetch_sessions), soft,
+            "streaming not retaining an unfinished fill: sessions hold %d descriptors (soft limit %d)",
+            held, soft,
         )
         return True
 

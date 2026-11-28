@@ -2704,6 +2704,11 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.assertEqual(self.fs._streaming_stats_snapshot()["streaming_failed_sessions_replaced"], 1)
         partial = self.cache_dir / "failed.bin.storage.partial"
         self.assertEqual(os.stat(partial).st_ino, os.fstat(session_b.io_fd).st_ino)
+        # R2-I2: the replaced session's descriptor and unlinked partial stay
+        # charged while its reader holds them.
+        self.assertEqual(manager.session_descriptor_count(), 2)
+        self.assertEqual(self.fs._streaming_stats_snapshot()["streaming_session_descriptors"], 2)
+        self.assertEqual(self.fs.cache_manager._reserved_bytes, session_a.file_size)
 
         # The old reader keeps its bytes and its error; the new one reads everything.
         self.assertEqual(self.fs.read('/failed.bin', 4096, 0, vfd_a), payload[:4096])
@@ -2719,6 +2724,9 @@ class TestFSStreamingIntegration(unittest.TestCase):
         # the successor's partial and cache file alone.
         self.fs.release('/failed.bin', vfd_a)
         self.assertEqual(session_a.io_fd, -1)
+        self.assertEqual(session_a.unlinked_charge, 0)
+        self.assertEqual(self.fs.cache_manager._reserved_bytes, 0)
+        self.assertEqual(manager.session_descriptor_count(), 1)
         self.assertFalse(session_b.detached)
         self.fs.release('/failed.bin', vfd_b)
         self.assertTrue(session_b.background_finished.wait(timeout=5.0))
