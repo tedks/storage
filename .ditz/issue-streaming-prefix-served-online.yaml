@@ -23,3 +23,9 @@ log_events:
   who: Ted Smith
   what: created
   comment: ""
+- time: 2026-11-28T11:03:55-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'Lead review of #190 (2026-11-28) recommends treating this as a deploy
+    blocker for the #184-#191 stack: an ordinary open serves a short file while the
+    member is online. Escalated to the CTO with the train report.'
