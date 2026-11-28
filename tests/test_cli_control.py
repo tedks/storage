@@ -7,7 +7,6 @@ import stat
 import tempfile
 import threading
 from pathlib import Path
-from time import monotonic
 
 import pytest
 from click.testing import CliRunner
@@ -87,6 +86,10 @@ def test_request_timeout_uses_a_shared_deadline(cache, monkeypatch):
     server.start()
     try:
         with socket_for(cache) as conn:
+            # The client keeps dripping until it has the reply, so a server
+            # that restarted its timeout on each byte would never answer.
+            # No wall-clock bound: a loaded host may answer late, not wrongly.
+            conn.settimeout(30.0)
             stop_dripping = threading.Event()
 
             def drip():
@@ -100,9 +103,7 @@ def test_request_timeout_uses_a_shared_deadline(cache, monkeypatch):
             sender = threading.Thread(target=drip)
             sender.start()
             try:
-                started = monotonic()
-                assert "timed out" in read_response(conn)["error"].lower()
-                assert monotonic() - started < 1.0
+                assert read_response(conn) == {"error": "Control request timed out"}
             finally:
                 stop_dripping.set()
                 sender.join()

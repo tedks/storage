@@ -233,7 +233,10 @@ class ControlServer:
         # ControlError, OSError included, is a server bug and is logged.
         try:
             frame = _read_line(conn, MAX_REQUEST_BYTES, time.monotonic() + REQUEST_TIMEOUT)
-        except (ControlError, TimeoutError) as exc:
+        except TimeoutError:
+            # The deadline check and a recv timeout word this differently.
+            response = {"error": "Control request timed out"}
+        except ControlError as exc:
             response = {"error": str(exc)}
         except OSError:
             return
