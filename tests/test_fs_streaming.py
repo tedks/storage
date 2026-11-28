@@ -710,6 +710,65 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.assertEqual(manager.get_total_cache_size(), block)
         self.assertEqual((self.cache_dir / "superseded.bin").read_bytes(), b"winner")
 
+    def test_writes_to_a_published_inode_its_reader_holds_are_charged_once(self):
+        """R4: a download is installed while its reader still has it open,
+        so its session descriptor holds the inode and carries its charge.
+        A writable descriptor on the installed name then grows, truncates
+        and O_TRUNCs that inode. Each change moves the descriptor's charge,
+        never a second charge for the name, so the total stays what a
+        rescan counts and no grant spends the same block twice."""
+        cache = self.fs.cache_manager
+        block = cache.block_size
+        payload = os.urandom(64 * 1024)
+        (self.backend_dir / "grown.bin").write_bytes(payload)
+        cache.max_size_bytes = len(payload) + 2 * block
+        final = self.cache_dir / "grown.bin"
+
+        def assert_total(expected):
+            self.assertEqual(cache.get_total_cache_size(), expected)
+            cache.mark_cache_size_dirty()
+            self.assertEqual(cache.get_total_cache_size(), expected)
+
+        reader, session = self._stream_whole_file("grown.bin", payload)
+        self.assertTrue(self._wait_for(lambda: session.finalized))
+        self.assertGreaterEqual(session.io_fd, 0)  # the reader keeps it open
+        self.assertEqual(os.fstat(session.io_fd).st_ino, final.stat().st_ino)
+        assert_total(len(payload))
+
+        writer = self.fs.open("/grown.bin", os.O_RDWR)
+        try:
+            # Two new allocated blocks past the end.
+            self.assertEqual(self.fs.write("/grown.bin", b"g" * (2 * block), len(payload), writer),
+                             2 * block)
+            self.assertEqual(final.stat().st_size, len(payload) + 2 * block)
+            assert_total(len(payload) + 2 * block)
+            # The budget is spent: a competing grant gets nothing.
+            self.assertFalse(cache.ensure_space(block))
+            assert_total(len(payload) + 2 * block)
+
+            self.fs.truncate("/grown.bin", block)
+            assert_total(block)
+            truncating = self.fs.open("/grown.bin", os.O_WRONLY | os.O_TRUNC)
+            try:
+                assert_total(0)
+                self.assertEqual(self.fs.write("/grown.bin", b"t" * block, 0, truncating), block)
+                assert_total(block)
+            finally:
+                self.fs.release("/grown.bin", truncating)
+        finally:
+            self.fs.release("/grown.bin", writer)
+        self.assertGreaterEqual(session.io_fd, 0)
+        assert_total(block)
+
+        self.fs.release("/grown.bin", reader)
+        self.assertEqual(session.io_fd, -1)
+        assert_total(block)
+        # Exactly the rest of the budget is free, and no more.
+        self.assertTrue(cache.ensure_space(len(payload) + block))
+        self.assertFalse(cache.ensure_space(len(payload) + 2 * block))
+        self.assertEqual(final.read_bytes(), b"t" * block)
+        assert_total(block)
+
     def test_readerless_publication_keeps_its_blocks_until_the_session_closes(self):
         """R3-I2: a readerless fill installs its file (CLEAN, with a member
         location) while its session descriptor still holds the inode, and

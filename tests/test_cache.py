@@ -708,6 +708,35 @@ class TestCacheAccounting(unittest.TestCase):
             if not closed:
                 manager.close_streaming_fd(fd)
 
+    def test_a_write_to_an_unlinked_held_inode_moves_its_descriptor_charge(self):
+        """R4: another descriptor on a held inode (here with no name left)
+        grows it; the change is charged to the session descriptor, so a
+        rescan agrees, a grant cannot spend the new blocks again, and the
+        close releases all of them."""
+        manager = self.cache_manager
+        block = manager.block_size
+        manager.max_size_bytes = 3 * block
+        partial = self.cache_dir / ("held" + PARTIAL_SUFFIX)
+        fd = os.open(partial, os.O_RDWR | os.O_CREAT, 0o600)
+        writer = os.open(partial, os.O_RDWR)
+        try:
+            self.assertTrue(manager.write_streaming_chunk(fd, 0, b"h" * block))
+            partial.unlink()
+            with manager.cache_size_change(fd=writer, span=(block, 3 * block)):
+                os.pwrite(writer, b"w" * (2 * block), block)
+            self.assertEqual(manager.get_total_cache_size(), 3 * block)
+            self.assertFalse(manager.ensure_space(block))
+            manager.mark_cache_size_dirty()
+            self.assertEqual(manager.get_total_cache_size(), 3 * block)
+            # No more grants from ranges that no longer describe the inode.
+            self.assertFalse(manager.write_streaming_chunk(fd, 0, b"x"))
+        finally:
+            os.close(writer)
+        manager.close_streaming_fd(fd)
+        self.assertEqual(manager.get_total_cache_size(), 0)
+        manager.mark_cache_size_dirty()
+        self.assertEqual(manager.get_total_cache_size(), 0)
+
     def test_deleting_a_held_installed_inode_refunds_its_charge_once(self):
         """Nit 4: a promoted prefix is named while its session descriptor
         stays open; deleting the name, then closing, refunds the blocks

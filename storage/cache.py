@@ -83,12 +83,20 @@ class _PartialCharge:
     number of disjoint spans the session fetched. identity is the inode's
     (st_dev, st_ino): while the descriptor is open, eviction leaves any
     name for that inode alone (see CacheManager._held_identities).
+
+    bytes is the inode's only charge while the descriptor is open. A
+    direct change to the inode (a write, truncate or O_TRUNC through a
+    name it was installed at) moves bytes by the measured change and sets
+    direct: the ranges then no longer describe the inode, so no grant is
+    made from them (unreachable today: a session writes nothing more once
+    its inode is named).
     """
 
-    __slots__ = ("ranges", "bytes", "identity")
+    __slots__ = ("ranges", "bytes", "identity", "direct")
 
     def __init__(self, ranges, identity=None):
         self.identity = identity
+        self.direct = False
         self.ranges = list(ranges)
         self.bytes = sum(end - start for start, end in self.ranges)
 
@@ -273,9 +281,15 @@ class CacheManager:
         Such an inode is charged through its descriptor until
         close_streaming_fd, even once it has a name in the tree (an
         installed fill, a promoted prefix): unlinking that name frees no
-        blocks while the descriptor is open, so eviction skips it and a
-        direct change to it is left to a rescan."""
+        blocks while the descriptor is open, so eviction skips it, and a
+        direct change to it is charged to the descriptor (cache_size_change)."""
         return {charge.identity for charge in self._streaming_fds.values()}
+
+    def _held_charge(self, identity) -> Optional[_PartialCharge]:
+        for charge in self._streaming_fds.values():
+            if charge.identity == identity:
+                return charge
+        return None
 
     def _scan_total_cache_size(self) -> int:
         """Reconcile data blocks, counting named and held inodes only once."""
@@ -471,11 +485,12 @@ class CacheManager:
         cache_size_change, or None when the change cannot be charged
         incrementally.
 
-        Only a regular file with exactly one name qualifies: the tree scan
-        counts such an inode once, at that name. A hard-linked or unlinked
-        inode, one a streaming descriptor still holds (counted through the
-        descriptor), or a measurement error, makes the caller rescan
-        instead. With a span only the data blocks it touches are measured,
+        A regular file with exactly one name qualifies: the tree scan
+        counts such an inode once, at that name. So does one a streaming
+        descriptor holds, with any number of names: it is counted once,
+        through the descriptor, and the caller charges the change there. A
+        hard-linked or unlinked inode otherwise, or a measurement error,
+        makes the caller rescan instead. With a span only the data blocks it touches are measured,
         and the stat is returned for _span_delta.
         """
         try:
@@ -485,10 +500,10 @@ class CacheManager:
                 st = regular_file_stat(path)
                 if st is None:
                     return (None, 0)
-            if not stat_module.S_ISREG(st.st_mode) or st.st_nlink != 1:
+            if not stat_module.S_ISREG(st.st_mode):
                 return None
             identity = (st.st_dev, st.st_ino)
-            if identity in self._held_identities():
+            if st.st_nlink != 1 and identity not in self._held_identities():
                 return None
             if fd is None:
                 return identity, self._path_data_bytes(path, st), None
@@ -543,7 +558,10 @@ class CacheManager:
         so the next grant needs no rescan. With no target, a target that
         does not qualify (see _direct_charge), or a path whose inode
         changed in between, the change is unknown and the next allocation
-        rescans the tree.
+        rescans the tree. An inode a streaming descriptor holds (an
+        installed download a reader still has open) is charged only through
+        that descriptor: the change moves the descriptor's charge, never a
+        second charge for the name.
         """
         with self._lock:
             known = path is not None or fd is not None
@@ -559,9 +577,31 @@ class CacheManager:
                     if after[2] is not None and before[2] is not None:
                         delta = self._span_delta(fd, before, after)
                 if delta is None:
+                    # A rescan counts a held inode at its descriptor's
+                    # charge, which this change would leave stale: raise
+                    # that charge to a bound on what the inode now holds.
                     self._size_dirty = True
+                    held = self._held_charge(before[0]) if before is not None else None
+                    if held is not None:
+                        self._recharge_held(held, fd, path)
                 else:
                     self._current_size_bytes = max(0, self._current_size_bytes + delta)
+                    held = self._held_charge(after[0])
+                    if held is not None:
+                        held.bytes = max(0, held.bytes + delta)
+                        held.direct = True
+
+    def _recharge_held(self, charge: _PartialCharge, fd: Optional[int], path: Optional[Path]):
+        """A held inode's change could not be measured: charge it its
+        apparent allocation, which covers its data (an overstatement only
+        holds space back). The total is being rescanned anyway."""
+        charge.direct = True
+        try:
+            st = os.fstat(fd) if fd is not None else regular_file_stat(path)
+        except OSError:
+            st = None
+        if st is not None and (st.st_dev, st.st_ino) == charge.identity:
+            charge.bytes = max(charge.bytes, self._round_up(st.st_size), st.st_blocks * 512)
 
     def get_free_space_needed(self, required_bytes: int, *,
                               finishing: Optional[Tuple[Path, int]] = None) -> int:
@@ -732,6 +772,8 @@ class CacheManager:
                 # The tree scan counted this inode at its path; from here it
                 # is counted through the descriptor, at the same bytes.
                 self._streaming_fds[fd] = charge
+            if charge.direct:
+                return False
             self._ensure_size_current_locked()
             required = end - start - charge.overlap(start, end)
             if required and not self.ensure_space(required):
@@ -797,7 +839,13 @@ class CacheManager:
         with self._lock:
             os.ftruncate(fd, size)
             charge = self._streaming_fds.get(fd)
-            if charge is not None:
+            if charge is not None and charge.direct:
+                # The ranges no longer describe the inode: drop only what
+                # cannot be left, an upper bound.
+                dropped = max(0, charge.bytes - self._round_up(size))
+                charge.bytes -= dropped
+                self._current_size_bytes = max(0, self._current_size_bytes - dropped)
+            elif charge is not None:
                 self._current_size_bytes = max(
                     0, self._current_size_bytes - charge.trim(self._round_up(size)))
 
