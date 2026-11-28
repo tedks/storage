@@ -527,6 +527,28 @@ class TestImportedPermissions(RevalidateTestBase):
         with self.assertRaises(FuseOSError) as raised:
             self.fs.open("/f.txt", os.O_WRONLY)
         self.assertEqual(raised.exception.errno, errno.EACCES)
+        # stat agrees with what is enforced.
+        self.assertEqual(stat.S_IMODE(self.fs.getattr("/f.txt")["st_mode"]), 0o444)
+        return cached
+
+    def test_chmod_clears_a_copied_records_refusal(self):
+        for mode, chown_first in ((0o644, False), (0o666, False), (0o644, True)):
+            with self.subTest(mode=oct(mode), chown_first=chown_first):
+                cached = self.test_copied_record_still_refuses_write()
+                if chown_first:
+                    # Rebinding for another field keeps the refusal.
+                    self.fs.chown("/f.txt", -1, os.getegid())
+                    self.assertEqual(stat.S_IMODE(self.fs.getattr("/f.txt")["st_mode"]), 0o444)
+                self.fs.chmod("/f.txt", mode)
+                self.assertEqual(stat.S_IMODE(self.fs.getattr("/f.txt")["st_mode"]),
+                                 stat.S_IMODE(cached.stat().st_mode))
+                self.assertTrue(self.fs.getattr("/f.txt")["st_mode"] & stat.S_IWUSR)
+                fh = self.fs.open("/f.txt", os.O_WRONLY)
+                self.fs.write("/f.txt", b"O", 0, fh)
+                self.fs.release("/f.txt", fh)
+                self.assertEqual(cached.read_bytes(), b"Original")
+                self.fs.cache_manager.delete_cached_file("/f.txt")
+                self.fs.state_manager.delete_file("/f.txt")
 
 
 def _with_dev(st, dev):

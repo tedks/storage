@@ -14,6 +14,7 @@ from fuse import FuseOSError
 from .backends.base import Backend, MemberSourceMissing
 from .cache_metadata import (
     cached_member_attributes, legacy_member_mtime, regular_file_stat, reported_mode,
+    stale_record_mode,
 )
 from .checksums import ChecksumBasis, ChecksumRecord
 from .models import SyncStatus
@@ -820,7 +821,13 @@ class NamespaceService:
                 source = cached_member_attributes(resolved.cache_path, st)
                 if source is not None:
                     attrs.update(source)
-                elif resolved.backend_name is None:
+                    stale_mode = None
+                else:
+                    stale_mode = stale_record_mode(resolved.cache_path, st)
+                if stale_mode is not None:
+                    # A copied record's read-only mode, as enforced.
+                    attrs["st_mode"] = stale_mode
+                if source is None and resolved.backend_name is None:
                     recovered = legacy_member_mtime(
                         resolved.cache_path, st,
                         lambda: self.state_manager.get_file_metadata(resolved.canonical_path),

@@ -190,19 +190,30 @@ def _read_source_attrs(path: Path, local: os.stat_result) -> Optional[dict]:
     return None
 
 
-def imported_mode_denies_write(path: Path, local: os.stat_result) -> bool:
-    """Whether a recorded member mode withholds owner write from this file.
+def stale_record_mode(path: Path, local: os.stat_result) -> Optional[int]:
+    """The read-only mode a record for another inode still imposes, if any.
 
-    A record for this inode decides as stat reports it. A record that no
-    longer matches the inode (its xattr was copied with the file) still
-    refuses write when the mode it recorded did: failing closed costs a
-    chmod, failing open grants write to a read-only member's file.
+    A record whose inode no longer matches (its xattr was copied with the
+    file, as a cache migrated with cp -a) describes nothing else, but if
+    the mode it recorded withheld write, that mode is reported and
+    enforced: failing closed costs a chmod, failing open grants write to a
+    read-only member's file. A chmod through the mount rebinds the record
+    to this inode without it (forget_cached_member_fields).
     """
+    record = _read_record(path)
+    if record is None or record.get("inode") == _inode(local):
+        return None
+    mode = record["attrs"].get("st_mode")
+    if type(mode) is int and 0 <= mode < (1 << 32) and stat.S_ISREG(mode) and not mode & stat.S_IWUSR:
+        return reported_mode(mode)
+    return None
+
+
+def imported_mode_denies_write(path: Path, local: os.stat_result) -> bool:
+    """Whether a recorded member mode withholds owner write from this file,
+    as stat reports it (cached_member_attributes, else stale_record_mode)."""
     attrs = cached_member_attributes(path, local)
-    if attrs is None:
-        record = _read_record(path)
-        attrs = record["attrs"] if record is not None else {}
-    mode = attrs.get("st_mode")
+    mode = attrs.get("st_mode") if attrs is not None else stale_record_mode(path, local)
     return type(mode) is int and not mode & stat.S_IWUSR
 
 
@@ -241,7 +252,13 @@ def forget_cached_member_fields(path: Path, local: os.stat_result, *fields: str)
     if not stat.S_ISREG(local.st_mode):
         return
     record = _read_source_attrs(path, local)
-    if record is None:
+    stale_mode = stale_record_mode(path, local) if record is None else None
+    if stale_mode is not None:
+        # Rebind a copied record to this inode, keeping only what it still
+        # imposed (the read-only mode) unless this change retires that too.
+        attrs = {} if "st_mode" in fields else {"st_mode": stale_mode}
+        record = {"inode": _inode(local), "basis": _source_attrs_basis(local), "attrs": attrs}
+    elif record is None:
         if "st_mtime" not in fields or not read_member_baselines(path, cache_identity(local)):
             return
         # An explicit timestamp also takes precedence over a legacy
