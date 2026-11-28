@@ -1674,6 +1674,37 @@ class TestSSHBackendOnThePool(_BackendTestCase):
                 if shutdown is not None:
                     shutdown.join(3)
 
+    def test_background_range_read_waits_for_bulk_and_reuses_its_lease(self):
+        payload = b"background-range-bytes"
+        self.server.payload = payload
+        backend = self._new_backend()
+        backend.stat("/movie.bin")
+        capacity = backend.background_range_capacity()
+        self.assertEqual(backend._pool.bulk_capacity(), capacity)
+        # Every bulk lease is held elsewhere (sync, say).
+        holders = [_Holder(backend._pool) for _ in range(capacity)]
+        entered = threading.Event()
+
+        def fetch():
+            entered.set()
+            # The nested read reuses the turn's lease: no further channel.
+            return backend.read_file("/movie.bin", 0, 8)
+
+        reader = _InThread(lambda: backend.run_background_range_read("/movie.bin", fetch))
+        try:
+            self.assertFalse(entered.wait(0.3), "fetch ran without a bulk lease")
+            channels = self.server.transport.max_open_seen
+            holders[0].release()
+            self.assertTrue(reader.join(5))
+            self.assertIsNone(reader.error)
+            self.assertEqual(payload[:8], reader.result)
+            self.assertEqual(channels, self.server.transport.max_open_seen)
+            self.assertEqual(1, [name for name, *_ in self.server.requests].count("open"))
+        finally:
+            for holder in holders:
+                holder.release()
+            reader.join(3)
+
     def test_bulk_copy_and_eager_readdir_restore_context_on_error(self):
         from storage.fs import StorageFS
 
