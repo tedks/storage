@@ -12,7 +12,9 @@ from unittest.mock import patch
 
 from fuse import FuseOSError
 
+from storage.backends.base import current_capacity_cancel_probe
 from storage.backends.local import LocalBackend
+from storage.backends.ssh_pool import BulkCapacityCancelled
 from storage.cache_metadata import MEMBER_ATTRS_XATTR
 from storage.fs import StorageFS
 from storage.models import SyncStatus
@@ -352,6 +354,53 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.assertEqual(manager._download_pool.snapshot(), (0, 0, 0))
         self.assertFalse((self.cache_dir / "unstaffed.bin.storage.partial").exists())
         self.assertEqual(self.fs._streaming_stats_snapshot()["streaming_unstaffed_cancellations"], 1)
+
+    def test_worker_blocked_on_one_members_bulk_capacity_yields_to_another(self):
+        manager = self.fs._streaming_manager
+        manager.update_download_limits(max_download_workers=1)
+        other = SlowRangeLocalBackend("other", str(self.backend_dir), range_delay=0.0)
+        payload = os.urandom(256 * 1024)
+        for name in ("blocked.bin", "free.bin"):
+            (self.backend_dir / name).write_bytes(payload)
+        released = threading.Event()
+        self.addCleanup(released.set)
+        yields = []
+
+        def await_bulk(_path, fetch):
+            # Like the SSH pool's bulk wait: poll the turn's probe.
+            probe = current_capacity_cancel_probe()
+            while not released.is_set():
+                reason = probe()
+                if reason:
+                    yields.append(reason)
+                    raise BulkCapacityCancelled(reason)
+                time.sleep(0.02)
+            return fetch()
+
+        def select(path):
+            return other if path == "/free.bin" else self.backend
+
+        with patch.object(manager, "select_backend_for_read", side_effect=select), \
+                patch.object(self.backend, "run_background_range_read", side_effect=await_bulk):
+            blocked_fd = self.fs.open("/blocked.bin", os.O_RDONLY)
+            blocked = self._session_for(blocked_fd)
+            self.assertEqual(self.fs.read("/blocked.bin", 128 * 1024, 0, blocked_fd), payload[:128 * 1024])
+            self.assertTrue(self._wait_for(lambda: manager._download_pool.snapshot()[1] == 1))
+            free_fd = self.fs.open("/free.bin", os.O_RDONLY)
+            free = self._session_for(free_fd)
+            self.assertIs(free.backend, other)
+            self.assertEqual(self.fs.read("/free.bin", 128 * 1024, 0, free_fd), payload[:128 * 1024])
+            self.assertTrue(free.background_finished.wait(timeout=10))
+            self.assertTrue(free.finalized)
+            self.assertFalse(blocked.prefetch_complete)
+            self.assertTrue(yields)
+            released.set()
+            self.assertTrue(blocked.background_finished.wait(timeout=10))
+            self.assertTrue(blocked.finalized)
+            self.fs.release("/free.bin", free_fd)
+            self.fs.release("/blocked.bin", blocked_fd)
+        self.assertEqual((self.cache_dir / "free.bin").read_bytes(), payload)
+        self.assertEqual((self.cache_dir / "blocked.bin").read_bytes(), payload)
 
     def test_download_worker_start_retry_and_local_publication_on_release(self):
         manager = self.fs._streaming_manager

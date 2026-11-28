@@ -65,6 +65,10 @@ MAX_STREAMING_SESSION_LIMIT = 1024
 DOWNLOAD_WORKER_IDLE_SECONDS = 30.0
 # Yield a turn to a queued closed file after this many active-reader turns.
 ACTIVE_DOWNLOAD_BURST = 4
+# A turn waiting this long for its member's bulk capacity gives its worker
+# back while another member has runnable work and no free worker (see
+# StreamingReadManager._bulk_wait_probe).
+DOWNLOAD_TURN_YIELD_SECONDS = 0.5
 
 # link() errors after which _install_partial tries RENAME_NOREPLACE: no
 # hard links on the cache filesystem (EMLINK cannot happen on a fresh
@@ -180,6 +184,9 @@ class _DownloadPool:
         self.threads: set[threading.Thread] = set()
         self.active_turns = 0
         self.closing = False
+        # Members with runnable sessions and no free worker; see
+        # _refresh_contention.
+        self.contended: frozenset = frozenset()
 
     def _eligible(self):
         running_by_member = Counter(session.backend.name for session in self.running)
@@ -241,7 +248,23 @@ class _DownloadPool:
                 self._grow()
             else:
                 self.ready.pop(session, None)
+            self._refresh_contention()
             self.condition.notify_all()
+
+    def _refresh_contention(self):
+        """Publish the members whose runnable work is waiting for a worker.
+
+        Caller holds self.condition. Read without the lock by a turn's
+        bulk-capacity probe (see StreamingReadManager._bulk_wait_probe),
+        which runs under the member pool's lock: this pool already takes
+        that lock (background_range_capacity) under its own, so the probe
+        must not take this one. A frozenset is replaced, never mutated, so
+        a reader sees one whole snapshot.
+        """
+        if len(self.running) < self.limit:
+            self.contended = frozenset()
+        else:
+            self.contended = frozenset(session.backend.name for session in self._eligible())
 
     def unstaffed(self, session):
         """Whether the session is queued while the pool has no worker thread.
@@ -257,12 +280,14 @@ class _DownloadPool:
         with self.condition:
             self.limit = limit
             self._grow()
+            self._refresh_contention()
             self.condition.notify_all()
 
     def cancel(self, session):
         """Withdraw queued work; return True if no worker owns the session."""
         with self.condition:
             self.ready.pop(session, None)
+            self._refresh_contention()
             return session not in self.running
 
     def take_unstaffed(self, session):
@@ -272,6 +297,7 @@ class _DownloadPool:
                 return False
             self.ready.pop(session)
             self.running.add(session)
+            self._refresh_contention()
             return True
 
     def snapshot(self):
@@ -304,6 +330,7 @@ class _DownloadPool:
         if session is not None:
             self.ready.pop(session)
             self.running.add(session)
+            self._refresh_contention()
         return session
 
     def _run(self):
@@ -322,6 +349,7 @@ class _DownloadPool:
                 self.logger.exception("Streaming download turn failed for %s", session.canonical_path)
                 with self.condition:
                     self.running.discard(session)
+                    self._refresh_contention()
                     self.condition.notify_all()
 
     def shutdown(self, timeout):
@@ -1584,14 +1612,14 @@ class StreamingReadManager:
             try:
                 # Do not own a range while waiting for a bulk lease. A
                 # reader can claim the bytes and use the interactive reserve.
-                with capacity_wait_cancellation(
-                    lambda: "streaming session" if session.stop_requested else None
-                ):
+                with capacity_wait_cancellation(self._bulk_wait_probe(session)):
                     session.backend.run_background_range_read(
                         session.canonical_path, lambda: self._fetch_background_chunk(session),
                     )
             except BulkCapacityCancelled:
-                # Only this session's stop request can cancel the bulk wait.
+                # This session's stop request, or a yield to another member
+                # (_bulk_wait_probe); no range was claimed. A yielded
+                # session is queued again below.
                 pass
             except Exception as exc:
                 with session.lock:
@@ -1618,6 +1646,41 @@ class StreamingReadManager:
             with session.lock:
                 self._download_pool.offer(session, False, finished_turn=True)
                 session.background_finished.set()
+
+    def _bulk_wait_probe(self, session: PrefetchSession):
+        """The cancellation probe for one turn's wait for member bulk capacity.
+
+        The member pool polls it while the turn waits for a bulk lease (and
+        once before each attempt), under the member pool's lock, so it reads
+        only state that needs no lock: the session's stop flag and the
+        download pool's published contention (_DownloadPool.contended).
+        Taking the download pool's lock here would invert the order in
+        which the pool asks a member for its capacity.
+
+        Besides a stop, it ends a wait that has lasted
+        DOWNLOAD_TURN_YIELD_SECONDS while another member has runnable work
+        and every worker is busy. Without that, every worker can sit behind
+        one member's bulk leases (held by sync, say) while files on other
+        members get no turn. The yielded session claimed no range and is
+        queued again behind the work it yielded to. Two members that are
+        both out of leases trade the worker once per interval.
+        """
+        pool = self._download_pool
+        member = session.backend.name
+        waiting_since = None
+
+        def probe():
+            nonlocal waiting_since
+            if session.stop_requested:
+                return "streaming session"
+            now = time.monotonic()
+            if waiting_since is None:
+                waiting_since = now
+            elif now - waiting_since >= DOWNLOAD_TURN_YIELD_SECONDS and pool.contended - {member}:
+                return "streaming turn yielded to another member"
+            return None
+
+        return probe
 
     def _finish_background_session(self, session: PrefetchSession):
         try:
