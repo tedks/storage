@@ -2686,6 +2686,8 @@ class TestFSStreamingIntegration(unittest.TestCase):
             return real_promote(session)
 
         stack = ExitStack()
+        # Closed even if the setup below fails before the caller gets the stack.
+        self.addCleanup(stack.close)
         stack.enter_context(patch.object(manager, "_promote_failed_session_cache_prefix", side_effect=held_promote))
         hold, at_finalize, go_tail = self._hold_finalize()
         stack.enter_context(hold)
