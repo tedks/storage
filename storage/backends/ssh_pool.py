@@ -52,6 +52,9 @@ from .base import current_capacity_cancel_probe, current_interactive_cancel_prob
 # next turn but cannot indefinitely starve a waiting bulk operation.
 _SFTP_INTERACTIVE_BURST = 4
 
+# How often a capacity wait with a cancellation probe polls it.
+CAPACITY_PROBE_POLL_SECONDS = 0.1
+
 
 class CommandTimeout(socket.timeout):
     """run_command's command started on a live transport and did not finish
@@ -886,6 +889,10 @@ class MemberConnection:
         # Polled only while an interactive acquisition waits (see
         # base.interactive_wait_cancellation).
         wait_probe = current_interactive_cancel_probe() if interactive else None
+        # This acquisition's identity and its measured time in channel
+        # waits, both passed to wait_probe (see interactive_wait_cancellation).
+        wait_token = object()
+        channel_waited = 0.0
         # Transports this acquisition may see installed before giving up: a
         # server that drops every new connection must not loop forever.
         connects_left = 2
@@ -912,7 +919,7 @@ class MemberConnection:
                         if self.bulk_capacity_wait_timeout is None:
                             # Poll only inside an actual FUSE callback: libfuse
                             # cannot run destroy until that callback returns.
-                            self._cond.wait(0.1 if cancel_probe else None)
+                            self._cond.wait(CAPACITY_PROBE_POLL_SECONDS if cancel_probe else None)
                         else:
                             if capacity_deadline is None:
                                 capacity_deadline = (
@@ -922,18 +929,33 @@ class MemberConnection:
                             if remaining <= 0:
                                 raise BulkCapacityTimeout(
                                     f"SSH member {self.name}: no bulk SFTP capacity came free")
-                            self._cond.wait(min(remaining, 0.1) if cancel_probe else remaining)
+                            self._cond.wait(min(remaining, CAPACITY_PROBE_POLL_SECONDS)
+                                            if cancel_probe else remaining)
                         continue
                     if wait_probe:
-                        reason = wait_probe()
+                        reason = wait_probe(wait_token, channel_waited)
                         if reason:
                             raise BulkCapacityCancelled(
                                 f"SSH member {self.name}: {reason} ended during channel wait")
                     remaining = deadline - time.monotonic()
-                    step = min(remaining, 0.1) if wait_probe else remaining
-                    if remaining <= 0 or (not self._cond.wait(step) and step >= remaining):
+                    step = min(remaining, CAPACITY_PROBE_POLL_SECONDS) if wait_probe else remaining
+                    timed_out = remaining <= 0
+                    if not timed_out:
+                        started = time.monotonic()
+                        woken = self._cond.wait(step)
+                        channel_waited += time.monotonic() - started
+                        timed_out = not woken and step >= remaining
+                    if timed_out:
                         if not self._can_open_locked(interactive) \
                                 and not self._idle_usable_locked(interactive):
+                            if wait_probe:
+                                # Once more with the whole wait: a probe
+                                # whose budget is spent cancels, and the
+                                # caller does not see a member failure.
+                                reason = wait_probe(wait_token, channel_waited)
+                                if reason:
+                                    raise BulkCapacityCancelled(
+                                        f"SSH member {self.name}: {reason} ended during channel wait")
                             raise MemberUnavailable(
                                 f"SSH member {self.name}: no SFTP channel came free")
                     continue

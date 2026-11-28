@@ -1262,9 +1262,10 @@ class TestFSStreamingIntegration(unittest.TestCase):
         def stat(path):
             if is_interactive_request() and applies(path):
                 probe = current_interactive_cancel_probe()
-                deadline = time.monotonic() + 10
+                token, started = object(), time.monotonic()
+                deadline = started + 10
                 while busy.is_set() and time.monotonic() < deadline:
-                    reason = probe() if probe else None
+                    reason = probe(token, time.monotonic() - started) if probe else None
                     if reason:
                         reasons.append(reason)
                         raise BulkCapacityCancelled(reason)
@@ -1440,7 +1441,7 @@ class TestFSStreamingIntegration(unittest.TestCase):
                 raise
 
         def contended(_session):
-            return lambda: "streaming publication yielded to other work"
+            return lambda _token, _waited: "streaming publication yielded to other work"
 
         with patch.object(self.backend, "stat", side_effect=stat), \
                 patch.object(manager, "_publication_wait_probe", side_effect=contended), \
@@ -1489,73 +1490,78 @@ class TestFSStreamingIntegration(unittest.TestCase):
         for name in ("first-held.bin", "second-held.bin"):
             self.assertFalse((self.cache_dir / name).exists())
 
-    def _fake_clock_probe_session(self, budget):
+    @staticmethod
+    def _probe_session(budget):
         backend = SimpleNamespace(name="backend", interactive_wait_budget=lambda: budget)
         return SimpleNamespace(stop_requested=False, backend=backend,
                                confirmation_waited=0.0, confirmation_timed_out=False)
 
-    @staticmethod
-    def _poll_until(probe, clock, until):
-        """Poll as a waiting pool does, every 0.1 s, up to until; the last answer."""
-        answer = None
-        while clock[0] < until - 1e-9 and answer is None:
-            clock[0] = round(clock[0] + 0.1, 6)
-            answer = probe()
-        return answer
+    def _with_contention(self, members):
+        pool = self.fs._streaming_manager._download_pool
+        with pool.condition:
+            saved, pool.contended = pool.contended, frozenset(members)
+
+        def restore():
+            with pool.condition:
+                pool.contended = saved
+
+        self.addCleanup(restore)
+        return pool
 
     def test_confirmation_wait_budget_is_not_reset_by_a_yield(self):
         manager = self.fs._streaming_manager
-        pool = manager._download_pool
-        session = self._fake_clock_probe_session(1.0)
-        clock = [0.0]
+        pool = self._with_contention({"other"})
+        session = self._probe_session(1.0)
+        probe = manager._publication_wait_probe(session)
+        acquisition = object()
+        self.assertIsNone(probe(acquisition, 0.0))
+        self.assertIsNone(probe(acquisition, 0.4))
+        self.assertEqual(probe(acquisition, 0.6), "streaming publication yielded to other work")
+        self.assertAlmostEqual(session.confirmation_waited, 0.6)
+        # The requeued attempt (a new turn's probe) has 0.4 s left.
+        probe = manager._publication_wait_probe(session)
         with pool.condition:
-            saved, pool.contended = pool.contended, frozenset({"other"})
-        try:
-            with patch("storage.streaming.time.monotonic", side_effect=lambda: clock[0]):
-                probe = manager._publication_wait_probe(session)
-                self.assertIsNone(probe())
-                # Yields once it has waited DOWNLOAD_TURN_YIELD_SECONDS.
-                self.assertEqual(self._poll_until(probe, clock, 0.6),
-                                 "streaming publication yielded to other work")
-                self.assertEqual(clock[0], 0.5)
-                # The requeued attempt has 0.5 s left, not a fresh second.
-                probe = manager._publication_wait_probe(session)
-                clock[0] = 10.0
-                self.assertIsNone(probe())
-                with pool.condition:
-                    pool.contended = frozenset()
-                self.assertIsNone(self._poll_until(probe, clock, 10.4))
-                self.assertEqual(self._poll_until(probe, clock, 10.5),
-                                 "streaming publication's channel wait budget")
-                self.assertTrue(session.confirmation_timed_out)
-        finally:
-            with pool.condition:
-                pool.contended = saved
+            pool.contended = frozenset()
+        acquisition = object()
+        self.assertIsNone(probe(acquisition, 0.0))
+        self.assertIsNone(probe(acquisition, 0.3))
+        self.assertEqual(probe(acquisition, 0.4), "streaming publication's channel wait budget")
+        self.assertTrue(session.confirmation_timed_out)
+
+    def test_late_polls_still_reach_the_yield_and_the_budget(self):
+        manager = self.fs._streaming_manager
+        self._with_contention({"other"})
+        # Polls 0.3 s apart in one acquisition (a loaded host).
+        probe = manager._publication_wait_probe(self._probe_session(10.0))
+        acquisition = object()
+        self.assertIsNone(probe(acquisition, 0.0))
+        self.assertIsNone(probe(acquisition, 0.3))
+        self.assertEqual(probe(acquisition, 0.6), "streaming publication yielded to other work")
+        pool = self._with_contention(set())
+        session = self._probe_session(1.0)
+        probe = manager._publication_wait_probe(session)
+        answers = [probe(acquisition, waited) for waited in (0.0, 0.3, 0.6, 0.9, 1.2)]
+        self.assertEqual(answers, [None] * 4 + ["streaming publication's channel wait budget"])
 
     def test_confirmation_wait_budget_counts_only_time_spent_waiting(self):
         manager = self.fs._streaming_manager
-        pool = manager._download_pool
-        session = self._fake_clock_probe_session(1.0)
+        self._with_contention(set())
+        session = self._probe_session(1.0)
         clock = [0.0]
-        with pool.condition:
-            saved, pool.contended = pool.contended, frozenset()
-        try:
-            with patch("storage.streaming.time.monotonic", side_effect=lambda: clock[0]):
-                probe = manager._publication_wait_probe(session)
-                # A short wait (0.1 s), then a channel: no polls while the
-                # stat runs and fails, then the retry waits again.
-                self.assertIsNone(probe())
-                self.assertIsNone(self._poll_until(probe, clock, 0.1))
-                clock[0] = 5.0
-                self.assertIsNone(probe(), "the stat's own time was charged as waiting")
-                self.assertIsNone(self._poll_until(probe, clock, 5.8))
-                self.assertFalse(session.confirmation_timed_out)
-                # 0.1 s + 0.9 s of waiting reach the budget.
-                self.assertEqual(self._poll_until(probe, clock, 6.0),
-                                 "streaming publication's channel wait budget")
-        finally:
-            with pool.condition:
-                pool.contended = saved
+        with patch("storage.streaming.time.monotonic", side_effect=lambda: clock[0]):
+            probe = manager._publication_wait_probe(session)
+            # A short wait, a channel, then the stat runs and fails (5 s
+            # of wall time); the retry is a new acquisition.
+            first = object()
+            self.assertIsNone(probe(first, 0.0))
+            self.assertIsNone(probe(first, 0.1))
+            clock[0] = 5.0
+            retry = object()
+            self.assertIsNone(probe(retry, 0.0), "the stat's own time was charged as waiting")
+            self.assertIsNone(probe(retry, 0.8))
+            self.assertFalse(session.confirmation_timed_out)
+            # 0.1 s + 0.9 s of waiting reach the budget.
+            self.assertEqual(probe(retry, 0.9), "streaming publication's channel wait budget")
 
     def test_failed_rename_leaves_the_planted_partial_charged(self):
         cache = self.fs.cache_manager

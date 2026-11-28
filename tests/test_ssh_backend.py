@@ -712,7 +712,7 @@ class TestMemberConnectionPool(unittest.TestCase):
         holder = _Holder(pool)
         polls = []
 
-        def probe():
+        def probe(_token, _waited):
             polls.append(time.monotonic())
             return "yielded" if len(polls) >= 3 else None
 
@@ -732,7 +732,7 @@ class TestMemberConnectionPool(unittest.TestCase):
 
         # A free channel is taken without asking the probe at all.
         def take_free():
-            with interactive_wait_cancellation(lambda: "never asked"):
+            with interactive_wait_cancellation(lambda _token, _waited: "never asked"):
                 lease = pool.acquire_sftp(1.0)
             pool.release(lease)
             return True
@@ -743,6 +743,35 @@ class TestMemberConnectionPool(unittest.TestCase):
         self.assertTrue(taker.result)
         self.assertEqual(1, server.transport.max_open_seen)
         pool.close()
+
+    def test_interactive_wait_probe_is_asked_once_more_at_the_deadline(self):
+        server = _FakeServer()
+        # A deadline shorter than one poll step: one poll before the wait,
+        # then the deadline.
+        pool = _pool(server, sftp_channels=1, connect_timeout=0.05)
+        holder = _Holder(pool)
+        calls = []
+
+        def probe(token, waited):
+            calls.append((token, waited))
+            return "budget spent" if waited >= 0.04 else None
+
+        def confirm():
+            with interactive_wait_cancellation(probe):
+                return pool.acquire_sftp(1.0)
+
+        waiter = _InThread(confirm, interactive=True)
+        try:
+            self.assertTrue(waiter.join(3))
+            # A spent budget ends as a cancellation, not a member failure.
+            self.assertIsInstance(waiter.error, BulkCapacityCancelled)
+            self.assertEqual(2, len(calls))
+            self.assertIs(calls[0][0], calls[1][0])
+            self.assertEqual(0.0, calls[0][1])
+            self.assertGreaterEqual(calls[1][1], 0.04)
+        finally:
+            holder.release()
+            pool.close()
 
     def test_lease_is_reentrant_within_a_thread(self):
         server = _FakeServer()
