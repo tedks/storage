@@ -826,6 +826,64 @@ class TestConflictViewClose(RevalidateTestBase):
         self.fs.release("/f.txt.member", self.fs.open("/f.txt.member", os.O_RDONLY))
         self.assertEqual(self.copies.call_count, 2)
 
+    def test_unlink_retires_a_pending_change(self):
+        self.fs.truncate("/f.txt.member", 6)  # pending, with no descriptor
+        self.assertTrue(self.fs._view_pending)
+        with patch.object(self.member, "delete_file"):
+            self.fs.unlink("/f.txt.member")
+        self.assertEqual(self.fs._view_pending, {})
+        # A later copy at the name (a refetch) owes nothing, and invalidates.
+        self.view.write_bytes(b"member bytes")
+        self.fs.release("/f.txt.member", self.fs.open("/f.txt.member", os.O_RDONLY))
+        self.assertEqual(self.copies.call_count, 0)
+        self.fs._on_remote_change("/f.txt")
+        self.assertFalse(self.view.exists())
+
+    def test_a_reused_inode_number_inherits_nothing(self):
+        self.fs.truncate("/f.txt.member", 6)
+        ((path, ino),) = self.fs._view_pending
+        self.view.unlink()  # replaced behind the mount (an invalidation, a refetch)
+        self.view.write_bytes(b"member bytes")
+        self.fs._retire_view_pending(self.view)
+        self.assertEqual(self.fs._view_pending, {})
+        # Had the new file reused the number, the key would have matched it.
+        self.fs._view_pending[(path, self.view.stat().st_ino)] = 1
+        self.fs._retire_view_pending(self.view)
+        self.assertEqual(len(self.fs._view_pending), 1)  # names this inode: kept
+
+    def test_a_replaced_name_under_an_open_descriptor_sends_nothing(self):
+        fh = self.fs.open("/f.txt.member", os.O_RDONLY)
+        self.fs.truncate("/f.txt.member", 6)
+        replacement = self.view.with_name("replacement")
+        replacement.write_bytes(b"other bytes!")
+        os.replace(replacement, self.view)
+        with self.assertLogs("storage.fs", level="WARNING"):
+            self.fs.release("/f.txt.member", fh)
+        self.assertEqual(self.copies.call_count, 0)
+        self.assertEqual(self.member_file.read_bytes(), b"member bytes")
+        self.assertEqual(self.fs._view_pending, {})
+
+    def test_bookkeeping_failure_after_a_send_does_not_resend(self):
+        fh = self.fs.open("/f.txt.member", os.O_WRONLY)
+        self.fs.write("/f.txt.member", b"MEMBER", 0, fh)
+        with patch.object(self.fs, "_schedule_checksum_task", side_effect=RuntimeError("queue")), \
+                self.assertLogs("storage.fs", level="ERROR"):
+            self.fs.release("/f.txt.member", fh)
+        self.assertEqual(self.member_file.read_bytes(), b"MEMBER bytes")
+        self.member_file.write_bytes(b"newer edit")
+        self.fs.release("/f.txt.member", self.fs.open("/f.txt.member", os.O_RDONLY))
+        self.assertEqual(self.member_file.read_bytes(), b"newer edit")
+        self.assertEqual(self.copies.call_count, 1)
+
+    def test_a_view_of_a_member_no_longer_configured_clears_its_change(self):
+        fh = self.fs.open("/f.txt.member", os.O_WRONLY)
+        self.fs.write("/f.txt.member", b"MEMBER", 0, fh)
+        member = self.fs.backends.pop("member")
+        self.addCleanup(self.fs.backends.__setitem__, "member", member)
+        with self.assertLogs("storage.fs", level="ERROR"):
+            self.fs.release("/f.txt.member", fh)
+        self.assertEqual(self.fs._view_pending, {})
+
     def test_path_truncate_without_a_handle_stays_in_the_cached_copy(self):
         # As on master: nothing closes, so nothing is sent (a known gap).
         self.fs.truncate("/f.txt.member", 0)

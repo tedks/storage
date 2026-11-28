@@ -692,6 +692,8 @@ class StorageFS(Operations):
                     self.state_manager.set_file_metadata(meta)
         if not stale:
             self.cache_manager.mark_cache_size_dirty()
+            if resolved.backend_name:
+                self._retire_view_pending(cache_path)
 
     def _forget_checksums(self, paths: Set[str], subtree: bool = False):
         """Drop the checksum records and tasks for paths (and, with subtree,
@@ -2241,6 +2243,7 @@ class StorageFS(Operations):
         try:
             self.namespace.unlink(path)
         finally:
+            self._retire_view_pending(self._resolve_path(path).cache_path)
             canonical_path = self._resolve_path(path).canonical_path
             self._forget_checksums({canonical_path})
             self._forget_member_check(canonical_path, path_gone=True)
@@ -2316,6 +2319,10 @@ class StorageFS(Operations):
             # directory, its children's) describe what is there now. Dropping
             # them is always safe, so a failed rename drops them too.
             self._forget_checksums({old_canonical, new_canonical}, subtree=True)
+            # A target view's old copy was replaced (its pending change went
+            # with it); a moved copy's change follows it (_repoint_descriptors).
+            for name in (old, new):
+                self._retire_view_pending(self.cache_manager.get_cache_path(name))
         self._move_member_checks(old_canonical, new_canonical)
 
     def _repoint_descriptors(self, old, new):
@@ -2766,11 +2773,24 @@ class StorageFS(Operations):
         if entry.backend_name:
             pending = self._view_pending_generation(entry)
             if pending is not None:
+                # Send only the inode the view's name still holds (under the
+                # path's lock, release holds it): bytes of a copy unlinked or
+                # replaced since the change was recorded are not that view's.
                 try:
                     st = os.fstat(entry.real_fd)
                     inode = f"{st.st_dev}:{st.st_ino}"
+                    current = regular_file_stat(entry.cache_path)
+                    named = current is not None and (current.st_dev, current.st_ino) == (
+                        st.st_dev, st.st_ino)
                 except OSError:
-                    pass
+                    named = False
+                if not named:
+                    self.logger.warning(
+                        "conflict view %s no longer names the closed descriptor's file; "
+                        "its pending change is not sent to %s",
+                        entry.virtual_path, entry.backend_name)
+                    self._clear_view_pending(entry, None, force=True)
+                    pending = None
         view_write = pending is not None
         try:
             os.close(entry.real_fd)
@@ -2798,8 +2818,7 @@ class StorageFS(Operations):
                 mutation, _fenced = self.cache_manager.member_repairs.start_mutation(
                     [entry.backend_name], [entry.canonical_path])
                 try:
-                    if self._release_view(entry, inode):
-                        self._clear_view_pending(entry, pending)
+                    self._release_view(entry, inode, pending)
                 finally:
                     self.cache_manager.member_repairs.end_mutation(mutation)
             else:
@@ -2839,20 +2858,51 @@ class StorageFS(Operations):
         with self._fd_lock:
             return self._view_pending.get((str(entry.cache_path), entry.view_ino))
 
-    def _clear_view_pending(self, entry: FDEntry, generation: Optional[int]) -> None:
+    def _clear_view_pending(self, entry: FDEntry, generation: Optional[int],
+                            force: bool = False) -> None:
+        """Acknowledge the pending change sent at generation (or, with force,
+        drop the descriptor's claim whatever was recorded)."""
         with self._fd_lock:
             key = (str(entry.cache_path), entry.view_ino)
-            if generation is not None and self._view_pending.get(key) == generation:
-                del self._view_pending[key]
+            if force or (generation is not None and self._view_pending.get(key) == generation):
+                self._view_pending.pop(key, None)
 
-    def _release_view(self, entry: FDEntry, inode: Optional[str]) -> bool:
+    def _retire_view_pending(self, cache_path: Path) -> None:
+        """Drop pending changes recorded for inodes cache_path no longer names.
+
+        Called after a view's name was unlinked, replaced by a rename or
+        invalidated, so a later inode at the name (even one that reuses the
+        number) never inherits an earlier copy's pending change.
+        """
+        prefix = str(cache_path)
+        with self._fd_lock:
+            keys = [k for k in self._view_pending if k[0] == prefix]
+            if not keys:
+                return
+            current = regular_file_stat(cache_path)
+            for key in keys:
+                if current is None or current.st_ino != key[1]:
+                    del self._view_pending[key]
+
+    def _release_view(self, entry: FDEntry, inode: Optional[str], pending: Optional[int]):
         """Send a closed conflict view to its member, or keep it for a repair.
 
-        True when the member has the copy or a repair keeps it durably.
+        The pending change (generation pending) is acknowledged as soon as
+        the member has the copy (copy and sync returned) or a repair keeps
+        it durably, before any bookkeeping, whose failure is only logged:
+        it cannot make a completed upload be sent again. A failed send
+        stays pending for a later close.
         """
-        done = False
         backend = self.backends.get(entry.backend_name)
-        if backend and entry.backend_name in (
+        if backend is None:
+            # The view names a member this mount no longer has: nothing can
+            # ever take the change.
+            self.logger.error(
+                "conflict view %s names no configured member %s; its change is not sent",
+                entry.virtual_path, entry.backend_name)
+            self._clear_view_pending(entry, pending)
+            return
+        if entry.backend_name in (
             self.cache_manager.member_repairs.backends_for([entry.canonical_path])
         ):
             # A write through a conflict view would replace that
@@ -2869,7 +2919,7 @@ class StorageFS(Operations):
                     "the member by an open repair",
                 )
                 if kept:
-                    done = True
+                    self._clear_view_pending(entry, pending)
                     self.cache_manager.mark_cache_size_dirty()
                 else:
                     self.logger.error(
@@ -2898,13 +2948,6 @@ class StorageFS(Operations):
             try:
                 backend.copy_from_local(entry.cache_path, entry.canonical_path)
                 backend.sync()
-                # Hashed on the member's worker, not this thread.
-                self._schedule_checksum_task(backend, entry.canonical_path, replace=True)
-                # The member's listed size and mtime are now old;
-                # a size split on the name drops the parent's
-                # listing (see NamespaceService.forget_listed_attrs).
-                self.namespace.forget_listed_attrs(entry.virtual_path)
-                done = True
             except Exception as exc:
                 self.logger.error(
                     "direct sync failed for %s on %s: %s",
@@ -2912,7 +2955,19 @@ class StorageFS(Operations):
                     entry.backend_name,
                     exc,
                 )
-        return done
+                return
+            self._clear_view_pending(entry, pending)
+            try:
+                # Hashed on the member's worker, not this thread.
+                self._schedule_checksum_task(backend, entry.canonical_path, replace=True)
+                # The member's listed size and mtime are now old;
+                # a size split on the name drops the parent's
+                # listing (see NamespaceService.forget_listed_attrs).
+                self.namespace.forget_listed_attrs(entry.virtual_path)
+            except Exception as exc:  # noqa: BLE001 - the upload itself completed
+                self.logger.error(
+                    "after sending %s to %s, its checksum or listing bookkeeping failed: %s",
+                    entry.canonical_path, entry.backend_name, exc)
 
     def flush(self, path, fh):
         """Report, to close(), a conflict-view write that will not be sent.
