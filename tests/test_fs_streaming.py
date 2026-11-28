@@ -8,6 +8,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from contextlib import ExitStack
 from unittest.mock import patch
 
 from fuse import FuseOSError
@@ -183,6 +184,108 @@ class TestFSStreamingIntegration(unittest.TestCase):
             self.assertIs(self._session_for(fd).backend, alternate)
             self.assertEqual(self.fs.read("/alternate.bin", 4096, 0, fd), payload[:4096])
             self.fs.release("/alternate.bin", fd)
+
+    def test_nonrange_member_goes_whole_file_without_a_stream_probe(self):
+        # The whole-file copy tolerates a failed stat (it sizes the file
+        # another way); the streaming probe must not fail the open first.
+        payload = os.urandom(96 * 1024)
+        (self.backend_dir / "nonrange.bin").write_bytes(payload)
+        self.backend.copy_delay = 0
+        with patch.object(self.backend, "supports_range_reads", return_value=False), \
+                patch.object(self.backend, "stat", side_effect=OSError(errno.EIO, "stat failed")):
+            fd = self.fs.open("/nonrange.bin", os.O_RDONLY)
+        with self.fs._fd_lock:
+            self.assertIsNone(self.fs._fd_map[fd].prefetch_session)
+        self.assertEqual(self.fs.read("/nonrange.bin", len(payload), 0, fd), payload)
+        self.fs.release("/nonrange.bin", fd)
+        self.assertEqual(self.fs._streaming_stats_snapshot()["streaming_fallback_opens"], 1)
+
+    def test_nonrange_member_without_the_file_leaves_a_range_member_to_stream(self):
+        payload = os.urandom(96 * 1024)
+        other_dir = self.temp_dir / "other"
+        other_dir.mkdir()
+        (other_dir / "elsewhere.bin").write_bytes(payload)
+        other = LocalBackend("other", str(other_dir), speed_priority=99)
+        self.fs.backends[other.name] = other
+        with patch.object(self.backend, "supports_range_reads", return_value=False):
+            fd = self.fs.open("/elsewhere.bin", os.O_RDONLY)
+        self.assertIs(self._session_for(fd).backend, other)
+        self.assertEqual(self.fs.read("/elsewhere.bin", 4096, 0, fd), payload[:4096])
+        self.fs.release("/elsewhere.bin", fd)
+
+    def _recompute_into_cache(self, payload):
+        """Patch the recompute engine to write payload into the cache path; returns the patcher."""
+        from types import SimpleNamespace
+
+        def recompute(requested_path, cache_path, timeout):
+            Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
+            Path(cache_path).write_bytes(payload)
+            return SimpleNamespace(success=True)
+
+        engine = self.fs.recompute_engine
+        stack = ExitStack()
+        stack.enter_context(patch.object(engine, "can_recompute", return_value=True))
+        self.recompute = stack.enter_context(patch.object(engine, "recompute_file", side_effect=recompute))
+        return stack
+
+    def test_unreachable_stream_sources_still_recompute_a_recomputable_file(self):
+        payload = os.urandom(32 * 1024)
+        (self.backend_dir / "derived.bin").write_bytes(payload)
+        with patch.object(self.backend, "is_available", return_value=False), \
+                patch.object(self.backend, "supports_reconnect_probe", return_value=False):
+            with self.assertRaises(FuseOSError) as unreachable:
+                self.fs.open("/derived.bin", os.O_RDONLY)
+            self.assertEqual(unreachable.exception.errno, errno.EHOSTUNREACH)
+            with self._recompute_into_cache(b"recomputed"):
+                fd = self.fs.open("/derived.bin", os.O_RDONLY)
+                self.recompute.assert_called_once()
+        with self.fs._fd_lock:
+            self.assertIsNone(self.fs._fd_map[fd].prefetch_session)
+        self.assertEqual(self.fs.read("/derived.bin", 4096, 0, fd), b"recomputed")
+        self.fs.release("/derived.bin", fd)
+
+    def test_failed_source_probe_still_recomputes_a_recomputable_file(self):
+        (self.backend_dir / "probe.bin").write_bytes(b"member")
+        with patch.object(self.backend, "stat", side_effect=OSError(errno.EACCES, "denied")):
+            with self.assertRaises(FuseOSError) as denied:
+                self.fs.open("/probe.bin", os.O_RDONLY)
+            self.assertEqual(denied.exception.errno, errno.EACCES)
+            with self._recompute_into_cache(b"recomputed"):
+                fd = self.fs.open("/probe.bin", os.O_RDONLY)
+        self.assertEqual(self.fs.read("/probe.bin", 4096, 0, fd), b"recomputed")
+        self.fs.release("/probe.bin", fd)
+
+    def test_pinned_member_missing_the_file_recomputes_without_another_member(self):
+        # Revalidation pinned the member it checked; the file is gone there
+        # by the time the stream probes it. Another member's copy is not
+        # adopted unchecked: the file is recomputed, or the open is ENOENT.
+        other_dir = self.temp_dir / "other"
+        other_dir.mkdir()
+        (other_dir / "pinned.bin").write_bytes(b"unchecked copy")
+        other = LocalBackend("other", str(other_dir), speed_priority=99)
+        self.fs.backends[other.name] = other
+        with patch.object(other, "read_file") as other_read, patch.object(other, "copy_to_local") as other_copy:
+            self.fs._refetch_pins["/pinned.bin"] = self.backend
+            with self.assertRaises(FuseOSError) as missing:
+                self.fs.open("/pinned.bin", os.O_RDONLY)
+            self.assertEqual(missing.exception.errno, errno.ENOENT)
+            self.fs._refetch_pins["/pinned.bin"] = self.backend
+            with self._recompute_into_cache(b"recomputed"):
+                fd = self.fs.open("/pinned.bin", os.O_RDONLY)
+            other_read.assert_not_called()
+            other_copy.assert_not_called()
+        self.assertEqual(self.fs.read("/pinned.bin", 4096, 0, fd), b"recomputed")
+        self.fs.release("/pinned.bin", fd)
+        self.assertNotIn("/pinned.bin", self.fs._refetch_pins)
+
+    def test_unexpected_session_error_is_eio_at_open(self):
+        (self.backend_dir / "odd.bin").write_bytes(b"x" * 4096)
+        with patch.object(self.fs._streaming_manager, "_create_or_attach_prefetch_session",
+                          side_effect=RuntimeError("unexpected")), \
+                self.assertLogs(self.fs.logger, level="ERROR"), \
+                self.assertRaises(FuseOSError) as failure:
+            self.fs.open("/odd.bin", os.O_RDONLY)
+        self.assertEqual(failure.exception.errno, errno.EIO)
 
     def test_foreground_overlapping_range_can_use_interactive_reserve(self):
         payload = os.urandom(512 * 1024)

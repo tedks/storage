@@ -84,8 +84,18 @@ class StreamingOpen(Enum):
 @dataclass(frozen=True)
 class StreamSource:
     backend: Backend
-    member_stat: object | None
-    file_size: int
+    # None when the member has no stat. Both are None for a member without
+    # range reads: it is never probed for a size it does not need.
+    member_stat: Optional[os.stat_result]
+    file_size: Optional[int]
+
+
+class StreamSourceError(OSError):
+    """No streaming source could be probed: the cause's errno, raised at open.
+
+    Distinct from the other open errors so StorageFS can still recompute a
+    recomputable file, as the whole-file path does when no member serves it.
+    """
 
 
 def streaming_errno(exc: Exception) -> int:
@@ -1709,7 +1719,7 @@ class StreamingReadManager:
             if self.cache_manager.is_cached(virtual_path):
                 return StreamingOpen.CACHED
             self.report_open_error("source_probe", exc)
-            raise OSError(streaming_errno(exc), "streaming source probe failed") from exc
+            raise StreamSourceError(streaming_errno(exc), "streaming source probe failed") from exc
         if source is None:
             if self.cache_manager.is_cached(virtual_path):
                 return StreamingOpen.CACHED

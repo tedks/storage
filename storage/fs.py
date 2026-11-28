@@ -60,7 +60,9 @@ from .member_repairs import CARRIER_DIR, is_carrier_path
 from .pathing import ResolvedPath, resolve_path
 from .links import LinkRefused, intermediate_paths, link_checksum, resolve_link_target
 from .namespace import DEFAULT_LISTING_MAX_STALE, NamespaceService
-from .streaming import PrefetchSession, StreamingOpen, StreamingReadManager, StreamSource
+from .streaming import (
+    PrefetchSession, StreamingOpen, StreamingReadManager, StreamSource, StreamSourceError,
+)
 from .streaming_settings import DEFAULT_STREAMING_READ_AHEAD_WINDOW
 
 
@@ -1333,9 +1335,20 @@ class StorageFS(Operations):
                 self._recheck.setdefault(canonical_path, set()).add(pinned.name)
         return backend
 
-    def _select_stream_source(self, canonical_path: str):
-        """Find a streaming source with one stat per candidate, preserving why it failed."""
+    def _select_stream_source(self, canonical_path: str) -> Optional[StreamSource]:
+        """Find a streaming source with one stat per candidate, preserving why it failed.
+
+        None means no member has the file. A revalidation-pinned member is
+        the only one asked while it is available, so a missing file there
+        is None too: another member's copy is not adopted unchecked.
+        """
         def probe(backend):
+            if not backend.supports_range_reads():
+                # Its open takes the whole-file path, which needs no size;
+                # only whether this member has the file, as there.
+                if not backend.exists(canonical_path):
+                    raise FileNotFoundError(errno.ENOENT, "not on member", canonical_path)
+                return StreamSource(backend, None, None)
             try:
                 member_stat = backend.stat(canonical_path)
             except NotImplementedError:
@@ -1349,7 +1362,10 @@ class StorageFS(Operations):
             pinned = self._refetch_pins.get(canonical_path)
         if pinned is not None:
             if pinned.is_available():
-                return probe(pinned)
+                try:
+                    return probe(pinned)
+                except FileNotFoundError:
+                    return None
             with self._member_checks_lock:
                 self._recheck.setdefault(canonical_path, set()).add(pinned.name)
 
@@ -2483,9 +2499,20 @@ class StorageFS(Operations):
                 stream = self._create_or_attach_prefetch_session(
                     resolved.requested_path, resolved.canonical_path,
                 )
+            except StreamSourceError as exc:
+                # No member could be probed. A recomputable file is
+                # recomputed, as the whole-file path does.
+                if not self._try_recompute(resolved):
+                    raise FuseOSError(exc.errno or errno.EIO) from exc
+                stream = None
             except OSError as exc:
                 raise FuseOSError(exc.errno or errno.EIO) from exc
-            if isinstance(stream, PrefetchSession):
+            except Exception as exc:
+                self.logger.exception("streaming open failed unexpectedly")
+                raise FuseOSError(errno.EIO) from exc
+            if stream is None:
+                pass  # recomputed into the cache path
+            elif isinstance(stream, PrefetchSession):
                 prefetch_session = stream
                 cache_path = stream.partial_cache_path
             elif stream == StreamingOpen.CACHED:
