@@ -608,6 +608,18 @@ class TestCacheAbsentCandidacy(unittest.TestCase):
     def test_recursive_triggers_stay_off(self):
         self.assertEqual(self.state_manager.conn.execute('PRAGMA recursive_triggers').fetchone()[0], 0)
 
+    def test_reopening_the_index_drops_every_mark(self):
+        # A crash between the mark's commit and the second stat can leave
+        # a populated file marked; the next process must not inherit it.
+        self._row("/populated")
+        self.state_manager.mark_cache_absent(["/populated"])
+        self.assertEqual(list(self.state_manager.iter_lru_paths()), [])
+        db = self.state_manager.db_path
+        self.state_manager.close()
+        self.state_manager = StateManager(str(db))
+        self.assertEqual(self._absent("/populated"), 0)
+        self.assertEqual(list(self.state_manager.iter_lru_paths()), ["/populated"])
+
     def test_marked_rows_leave_the_scan_and_the_model_ignores_the_column(self):
         self._row("/a")
         self._row("/b", last_access=2.0)
