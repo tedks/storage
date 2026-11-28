@@ -537,21 +537,33 @@ class CacheManager:
         with self._lock:
             scans = self._scan_count
         try:
-            with bulk_request() if self.bulk_cold_copies else nullcontext():
-                backend.copy_to_local(source_virtual_path, temp_path)
-            st = os.lstat(temp_path)
-            if not stat_module.S_ISREG(st.st_mode):
-                raise OSError(errno.EINVAL, "download did not produce a regular file", temp_path)
-            # A whole file is never a streaming prefix, whatever xattrs the
-            # member's copy came with.
-            _remove_prefix_marker(temp_path)
-            if not st.st_mode & stat_module.S_IRUSR:
-                os.chmod(temp_path, stat_module.S_IMODE(st.st_mode) | stat_module.S_IRUSR,
-                         follow_symlinks=False)
-            member_stat = confirm_member_stat(backend, source_virtual_path, member_stat)
+            for attempt in range(2):
+                if attempt:
+                    temp_path.unlink(missing_ok=True)
+                with bulk_request() if self.bulk_cold_copies else nullcontext():
+                    backend.copy_to_local(source_virtual_path, temp_path)
+                st = os.lstat(temp_path)
+                if not stat_module.S_ISREG(st.st_mode):
+                    raise OSError(errno.EINVAL, "download did not produce a regular file", temp_path)
+                # A whole file is never a streaming prefix, whatever xattrs the
+                # member's copy came with.
+                _remove_prefix_marker(temp_path)
+                if not st.st_mode & stat_module.S_IRUSR:
+                    os.chmod(temp_path, stat_module.S_IMODE(st.st_mode) | stat_module.S_IRUSR,
+                             follow_symlinks=False)
+                # The member's stat after the transfer: the newest genuine
+                # attributes. If it disagrees with the version probed before,
+                # fetch once more against it; a second disagreement keeps the
+                # newest attributes, and the caller's baseline (the first
+                # probe) makes the next revalidation refetch.
+                confirmed, agreed = confirm_member_stat(
+                    backend, source_virtual_path, member_stat, st.st_size)
+                if agreed:
+                    break
+                member_stat = confirmed
             fd = os.open(temp_path, os.O_RDONLY | os.O_NOFOLLOW)
             try:
-                copy_member_attributes(fd, member_stat)
+                copy_member_attributes(fd, confirmed)
                 size = os.fstat(fd).st_size
             finally:
                 os.close(fd)

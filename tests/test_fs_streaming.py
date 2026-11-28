@@ -169,7 +169,7 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.fs.release("/nomode.bin", self.fs.open("/nomode.bin", os.O_WRONLY))
         self.assertTrue(stat_module.S_ISREG(attrs["st_mode"]))
 
-    def test_streaming_fill_of_a_member_changed_since_its_probe_keeps_no_old_mtime(self):
+    def test_streaming_fill_of_a_member_changed_since_its_probe_is_rechecked(self):
         from types import SimpleNamespace
         payload = os.urandom(64 * 1024)
         member = self.backend_dir / "moved.bin"
@@ -182,8 +182,16 @@ class TestFSStreamingIntegration(unittest.TestCase):
         with patch.object(self.backend, "stat", side_effect=[probe, later, later, later]):
             data, cache_path = self._stream_whole("moved.bin", len(payload))
         self.assertEqual(data, payload)
-        self.assertNotEqual(cache_path.stat().st_mtime, 1_600_000_000)
-        self.assertNotEqual(self.fs.getattr("/moved.bin")["st_mtime"], 1_600_000_000)
+        # The member's newest genuine mtime, never a local one.
+        self.assertEqual(cache_path.stat().st_mtime, 1_650_000_000)
+        self.assertEqual(self.fs.getattr("/moved.bin")["st_mtime"], 1_650_000_000)
+        with open(cache_path, "rb") as f:
+            self.assertEqual(os.fstat(f.fileno()).st_mtime, 1_650_000_000)
+        # The install owes a recheck against the probe, due at the next open.
+        self.assertTrue(self._wait_for(
+            lambda: "backend" in self.fs._recheck.get("/moved.bin", ()), timeout=5.0))
+        check = self.fs._member_checks["/moved.bin"]
+        self.assertEqual(check.verified_at, float("-inf"))
 
     def test_streaming_open_uses_cached_file_without_prefetch_session(self):
         payload = os.urandom(128 * 1024)

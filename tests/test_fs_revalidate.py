@@ -483,8 +483,7 @@ class TestImportedPermissions(RevalidateTestBase):
         # No member mode: the downloaded file's own (copied) mode is
         # recorded instead of the backing file's owner-writable one.
         for kwargs in ({"side_effect": OSError(errno.EIO, "no stat")},
-                       {"return_value": SimpleNamespace(st_size=None)},
-                       {"return_value": SimpleNamespace(st_size=99, st_mode=stat.S_IFREG | 0o644)}):
+                       {"return_value": SimpleNamespace(st_size=None)}):
             with self.subTest(kwargs=kwargs):
                 with patch.object(self.member, "get_size", return_value=8):
                     cached = self.fill_read_only(kwargs)
@@ -516,25 +515,29 @@ class TestImportedPermissions(RevalidateTestBase):
             self.assertEqual(stat.S_IMODE(self.fs.getattr("/f.txt")["st_mode"]), 0o444)
         self.assertTrue(cached.exists())
 
-    def test_copied_record_still_refuses_write(self):
+    def make_copied_record(self):
+        """A read-only fill whose cache file then moved to another inode
+        with its xattrs (a cache migrated with cp -a)."""
         cached = self.fill_read_only({"wraps": self.member.stat})
-        # The cache file moved to another inode with its xattrs (cp -a).
         copy = cached.with_name("copy")
         shutil.copy2(cached, copy)
         for name in os.listxattr(cached):
             os.setxattr(copy, name, os.getxattr(cached, name))
         os.replace(copy, cached)
+        return cached
+
+    def test_copied_record_still_refuses_write(self):
+        self.make_copied_record()
         with self.assertRaises(FuseOSError) as raised:
             self.fs.open("/f.txt", os.O_WRONLY)
         self.assertEqual(raised.exception.errno, errno.EACCES)
         # stat agrees with what is enforced.
         self.assertEqual(stat.S_IMODE(self.fs.getattr("/f.txt")["st_mode"]), 0o444)
-        return cached
 
     def test_chmod_clears_a_copied_records_refusal(self):
         for mode, chown_first in ((0o644, False), (0o666, False), (0o644, True)):
             with self.subTest(mode=oct(mode), chown_first=chown_first):
-                cached = self.test_copied_record_still_refuses_write()
+                cached = self.make_copied_record()
                 if chown_first:
                     # Rebinding for another field keeps the refusal.
                     self.fs.chown("/f.txt", -1, os.getegid())
@@ -608,33 +611,89 @@ class TestCreatedAndChangedFiles(RevalidateTestBase):
 
 
 class TestFillConfirmsMemberVersion(RevalidateTestBase):
-    """A fill attaches the probe's attributes only when the member still
-    reports that version after the transfer."""
+    """A fill records the member's newest genuine attributes, and fetches
+    again when they show the member changed after its probe."""
+
+    def rewrite_during_first_copy(self, change):
+        copy_to_local = self.member.copy_to_local
+        calls = []
+
+        def copy(path, temp):
+            if not calls:
+                change()  # after the probe, before the transfer reads it
+            calls.append(path)
+            copy_to_local(path, temp)
+
+        return patch.object(self.member, "copy_to_local", side_effect=copy), calls
 
     def test_member_rewritten_at_the_same_size_after_its_probe(self):
         src = self.rewrite_member("f.txt", b"original", mtime=1_000_000_000)
         os.chmod(src, 0o644)
-        copy_to_local = self.member.copy_to_local
 
-        def rewritten_first(path, temp):
-            src.write_bytes(b"newbytes")  # same size, after the probe
+        def change():
+            src.write_bytes(b"newbytes")
             os.utime(src, (1_100_000_000, 1_100_000_000))
-            copy_to_local(path, temp)
 
-        with patch.object(self.member, "copy_to_local", side_effect=rewritten_first):
+        patcher, calls = self.rewrite_during_first_copy(change)
+        with patcher:
             self.assertEqual(self.read_through("/f.txt"), b"newbytes")
-        cached = self.cache_dir / "f.txt"
-        # The copy's own captured mtime stays; the probe's older one is not
-        # attached to the newer bytes, and its mode is not trusted either.
-        self.assertEqual(cached.stat().st_mtime, 1_100_000_000)
+        self.assertEqual(len(calls), 2)  # fetched again against the newer stat
         attrs = self.fs.getattr("/f.txt")
         self.assertEqual(attrs["st_mtime"], 1_100_000_000)
-        self.assertEqual(attrs["st_mode"] & 0o222, 0)
+        self.assertEqual(stat.S_IMODE(attrs["st_mode"]), 0o644)
+
+    def test_mode_only_change_after_the_probe_is_a_disagreement(self):
+        src = self.rewrite_member("f.txt", b"original", mtime=1_000_000_000)
+        os.chmod(src, 0o644)
+        patcher, calls = self.rewrite_during_first_copy(lambda: os.chmod(src, 0o444))
+        with patcher:
+            self.assertEqual(self.read_through("/f.txt"), b"original")
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(stat.S_IMODE(self.fs.getattr("/f.txt")["st_mode"]), 0o444)
+
+    def test_confirming_stat_failures_fall_back_to_the_probe(self):
+        for failures in (1, 2):
+            with self.subTest(failures=failures):
+                src = self.member_dir / "f.txt"
+                src.unlink(missing_ok=True)
+                src = self.rewrite_member("f.txt", b"original", mtime=1_000_000_000)
+                os.chmod(src, 0o644)
+                real_stat, seen = self.member.stat, []
+
+                def flaky(path):
+                    seen.append(path)
+                    # The first call is the probe; the next ones confirm.
+                    if 1 < len(seen) <= 1 + failures:
+                        raise OSError(errno.EIO, "stat failed")
+                    return real_stat(path)
+
+                with patch.object(self.member, "stat", side_effect=flaky):
+                    self.assertEqual(self.read_through("/f.txt"), b"original")
+                attrs = self.fs.getattr("/f.txt")
+                self.assertEqual(stat.S_IMODE(attrs["st_mode"]), 0o644)  # still writable
+                self.assertEqual(attrs["st_mtime"], 1_000_000_000)
+                self.fs.release("/f.txt", self.fs.open("/f.txt", os.O_WRONLY))
+                self.fs.cache_manager.delete_cached_file("/f.txt")
+                self.fs.state_manager.delete_file("/f.txt")
+
+    def test_transfer_of_another_size_than_the_stat_is_fetched_again(self):
+        self.rewrite_member("f.txt", b"original", mtime=1_000_000_000)
+        fake = SimpleNamespace(st_size=99, st_mode=stat.S_IFREG | 0o600, st_mtime=1_200_000_000)
+        with patch.object(self.member, "stat", return_value=fake), \
+                patch.object(self.member, "get_size", return_value=99), \
+                self.count_fetches() as fetches:
+            self.assertEqual(self.read_through("/f.txt"), b"original")
+        self.assertEqual(fetches.call_count, 2)
+        # Still the member's own (reported) attributes, never local ones.
+        attrs = self.fs.getattr("/f.txt")
+        self.assertEqual((attrs["st_mtime"], stat.S_IMODE(attrs["st_mode"])), (1_200_000_000, 0o600))
 
     def test_unchanged_member_keeps_its_attributes(self):
         src = self.rewrite_member("f.txt", b"original", mtime=1_000_000_000)
         os.chmod(src, 0o640)
-        self.assertEqual(self.read_through("/f.txt"), b"original")
+        with self.count_fetches() as fetches:
+            self.assertEqual(self.read_through("/f.txt"), b"original")
+        self.assertEqual(fetches.call_count, 1)
         attrs = self.fs.getattr("/f.txt")
         self.assertEqual((attrs["st_mtime"], stat.S_IMODE(attrs["st_mode"])), (1_000_000_000, 0o640))
 

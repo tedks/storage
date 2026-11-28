@@ -63,28 +63,41 @@ def _member_mtime_ns(st) -> Optional[int]:
     return round(seconds * 1_000_000_000)
 
 
-def confirm_member_stat(backend, virtual_path: str, probe):
-    """The pre-transfer probe if the member still reports it, else None.
+def confirm_member_stat(backend, virtual_path: str, probe, transferred_size: int):
+    """(stat to record, agreed) for a transfer whose probe was taken before it.
 
-    Called after a transfer: a member rewritten between the probe and the
-    read, even at the same size, must not lend the probe's older mtime,
-    mode or owner to the newer bytes. Both stats must report the same size
-    and mtime; anything else (no probe, a failed stat, a field missing)
-    is no confirmation, and the fill keeps its own native attributes
-    (copy_member_attributes with no source). Costs one member stat a fill.
+    The member is stat'ed again after the transfer. When that stat reports
+    the probe's size, mtime and mode, the transfer read that version and the
+    newer stat's genuine attributes are recorded (agreed). A disagreement,
+    even a mode-only change, still records the newer stat's genuine
+    attributes, never local ones, but agreed is False: the caller refetches
+    or forces a recheck against the probe baseline. A stat that raises is
+    retried once; if it fails again the probe's attributes are used when
+    the transfer's size matches them. A transfer of another size than the
+    stat reports is a disagreement too. BulkCapacityCancelled and
+    BulkCapacityTimeout propagate: an interrupted request is not a fill.
     """
-    if probe is None:
-        return None
-    try:
-        after = backend.stat(virtual_path)
-    except Exception:  # noqa: BLE001 - no confirmation, whatever the member raised
-        return None
-    size = getattr(probe, "st_size", None)
-    mtime = _member_mtime_ns(probe)
-    if (size is None or mtime is None or getattr(after, "st_size", None) != size
-            or _member_mtime_ns(after) != mtime):
-        return None
-    return probe
+    from .backends.ssh_pool import BulkCapacityCancelled, BulkCapacityTimeout
+
+    after = None
+    for _attempt in range(2):
+        try:
+            after = backend.stat(virtual_path)
+            break
+        except (BulkCapacityCancelled, BulkCapacityTimeout):
+            raise
+        except Exception:  # noqa: BLE001 - retried once, then the probe stands
+            after = None
+    if after is None:
+        return probe, getattr(probe, "st_size", None) == transferred_size
+    agreed = (probe is not None
+              and getattr(after, "st_size", None) == transferred_size
+              and getattr(probe, "st_size", None) is not None
+              and getattr(after, "st_size", None) == getattr(probe, "st_size", None)
+              and _member_mtime_ns(probe) is not None
+              and _member_mtime_ns(after) == _member_mtime_ns(probe)
+              and getattr(after, "st_mode", None) == getattr(probe, "st_mode", None))
+    return after, agreed
 
 
 def copy_member_attributes(fd: int, source) -> None:
@@ -97,18 +110,14 @@ def copy_member_attributes(fd: int, source) -> None:
     changing the mask with chmod could grant access to other named entries.
     """
     local = os.fstat(fd)
-    member_size = getattr(source, "st_size", None)
-    if member_size is not None and member_size != local.st_size:
-        # A size mismatch shows the member changed after its probe. Keep
-        # the transfer's own stat. (Only size is compared: a same-size
-        # change during a full or streaming transfer is not seen here.)
-        source = None
+    # source is the member's newest genuine stat (confirm_member_stat); a
+    # version the transfer may not have read is the caller's to refetch,
+    # never a reason to report local times.
     mode = getattr(source, "st_mode", None)
     permissions = local.st_mode if mode is None else mode
-    # Without a member mode it can trust, an import fails closed: the
-    # downloaded file's own mode (a local member's copy, a transfer's or a
-    # streaming staging file's default otherwise) is reported and enforced
-    # without write bits, so a read-only member file never becomes
+    # Without a member mode, an import fails closed: the downloaded file's
+    # own mode (a local member's copy, a transfer's or a streaming staging
+    # file's default otherwise) is reported and enforced without write bits, so a read-only member file never becomes
     # writable. A chmod through the mount grants write explicitly.
     visible_mode = stat.S_IFREG | stat.S_IMODE(permissions)
     if mode is None:

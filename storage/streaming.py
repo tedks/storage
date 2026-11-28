@@ -123,6 +123,9 @@ class PrefetchSession:
     # The member's stat at session start (None when the member has no
     # stat); handed to on_finalized as the revalidation baseline.
     member_stat: Optional[object] = None
+    # Whether the member still reported member_stat's version when the
+    # stream finished (cache_metadata.confirm_member_stat).
+    member_confirmed: bool = True
 
     def __post_init__(self):
         self.lock = threading.RLock()
@@ -1131,8 +1134,14 @@ class StreamingReadManager:
         # catch their own.
         metadata = None
         try:
-            copy_member_attributes(io_fd, confirm_member_stat(
-                session.backend, session.canonical_path, session.member_stat))
+            # The member's newest genuine attributes. A version that
+            # disagrees with the probe is installed (the reader has its
+            # bytes) but owes a recheck against the probe baseline, so the
+            # next open refetches (on_finalized; member_confirmed).
+            confirmed, session.member_confirmed = confirm_member_stat(
+                session.backend, session.canonical_path, session.member_stat,
+                os.fstat(io_fd).st_size)
+            copy_member_attributes(io_fd, confirmed)
             os.fsync(io_fd)
             session.final_cache_path.parent.mkdir(parents=True, exist_ok=True)
             with self.state_manager.metadata_lock:
