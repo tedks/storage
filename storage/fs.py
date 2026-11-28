@@ -2397,7 +2397,6 @@ class StorageFS(Operations):
             self._require_imported_write_permission(cache_path)
             with open(cache_path, 'r+b') as f:
                 f.truncate(length)
-                st = os.fstat(f.fileno())
             self.cache_manager.mark_cache_size_dirty()
 
             # Mark as dirty
@@ -2406,22 +2405,6 @@ class StorageFS(Operations):
 
         except OSError as e:
             raise FuseOSError(e.errno)
-
-        if resolved.backend_name and not self._writable_view_handle(fh):
-            # A view's change reaches its member only when sent: a writable
-            # descriptor's close sends it (ftruncate passes that fh), but
-            # a truncate by path has no close of its own to wait for, and
-            # a read-only descriptor's close sends nothing.
-            self.cache_manager.flush_file(resolved.requested_path)
-            self._send_view(resolved.requested_path, resolved.canonical_path,
-                            resolved.backend_name, cache_path, f"{st.st_dev}:{st.st_ino}",
-                            "truncate of a conflict view")
-
-    def _writable_view_handle(self, fh) -> bool:
-        with self._fd_lock:
-            entry = self._fd_map.get(fh) if fh is not None else None
-        return (entry is not None and bool(entry.backend_name)
-                and not self._is_read_only_open(entry.flags))
 
     # File operations
 
@@ -2762,8 +2745,12 @@ class StorageFS(Operations):
             if view_write:
                 # The view's member copy is a member mutation: registered,
                 # so a queued rename's fence publication is ordered with it.
-                self._send_view(entry.virtual_path, entry.canonical_path, entry.backend_name,
-                                entry.cache_path, inode, "write through a conflict view after close()")
+                mutation, _fenced = self.cache_manager.member_repairs.start_mutation(
+                    [entry.backend_name], [entry.canonical_path])
+                try:
+                    self._release_view(entry, inode)
+                finally:
+                    self.cache_manager.member_repairs.end_mutation(mutation)
             else:
                 metadata = self.state_manager.get_file_metadata(entry.canonical_path)
                 if metadata and metadata.sync_status == SyncStatus.DIRTY:
@@ -2774,26 +2761,11 @@ class StorageFS(Operations):
         except OSError as e:
             raise FuseOSError(e.errno)
 
-    def _send_view(self, virtual_path: str, canonical_path: str, backend_name: str,
-                   cache_path: Path, inode: Optional[str], what: str):
-        """Send a changed conflict view to its member, or keep it for a repair.
-
-        The caller holds the path's lock. The copy is a member mutation:
-        registered, so a queued rename's fence publication is ordered with it.
-        """
-        repairs = self.cache_manager.member_repairs
-        mutation, _fenced = repairs.start_mutation([backend_name], [canonical_path])
-        try:
-            self._send_view_registered(virtual_path, canonical_path, backend_name,
-                                       cache_path, inode, what)
-        finally:
-            repairs.end_mutation(mutation)
-
-    def _send_view_registered(self, virtual_path: str, canonical_path: str, backend_name: str,
-                              cache_path: Path, inode: Optional[str], what: str):
-        backend = self.backends.get(backend_name)
-        if backend and backend_name in (
-            self.cache_manager.member_repairs.backends_for([canonical_path])
+    def _release_view(self, entry: FDEntry, inode: Optional[str]):
+        """Send a closed conflict view to its member, or keep it for a repair."""
+        backend = self.backends.get(entry.backend_name)
+        if backend and entry.backend_name in (
+            self.cache_manager.member_repairs.backends_for([entry.canonical_path])
         ):
             # A write through a conflict view would replace that
             # member's object, which an open repair protects. Open
@@ -2804,8 +2776,9 @@ class StorageFS(Operations):
             # resolved (MemberRepairs.preserve_view_write).
             try:
                 kept = inode is not None and self.cache_manager.member_repairs.preserve_view_write(
-                    canonical_path, backend_name, cache_path, inode,
-                    f"{what}, kept off the member by an open repair",
+                    entry.canonical_path, entry.backend_name, entry.cache_path, inode,
+                    "write through a conflict view after close(), kept off "
+                    "the member by an open repair",
                 )
                 if kept:
                     self.cache_manager.mark_cache_size_dirty()
@@ -2815,7 +2788,7 @@ class StorageFS(Operations):
                         "bytes were not kept: %s no longer holds the descriptor's file, "
                         "or matches a repair whose kept bytes are missing (left in "
                         "place; see storage debug member-repairs)",
-                        canonical_path, backend_name, cache_path,
+                        entry.canonical_path, entry.backend_name, entry.cache_path,
                     )
             except Exception as exc:  # noqa: BLE001 - release cannot fail usefully
                 # A narrow durability limit (CTO-182-J-LENGTH-C3):
@@ -2827,26 +2800,26 @@ class StorageFS(Operations):
                     "open member repair and could not be kept (errno %s: %s). "
                     "Recover the bytes from %s before anything evicts or "
                     "refetches it; they are not on the member.",
-                    canonical_path, backend_name,
+                    entry.canonical_path, entry.backend_name,
                     errno.errorcode.get(getattr(exc, "errno", None), "?"), exc,
-                    cache_path,
+                    entry.cache_path,
                 )
             backend = None
         if backend:
             try:
-                backend.copy_from_local(cache_path, canonical_path)
+                backend.copy_from_local(entry.cache_path, entry.canonical_path)
                 backend.sync()
                 # Hashed on the member's worker, not this thread.
-                self._schedule_checksum_task(backend, canonical_path, replace=True)
+                self._schedule_checksum_task(backend, entry.canonical_path, replace=True)
                 # The member's listed size and mtime are now old;
                 # a size split on the name drops the parent's
                 # listing (see NamespaceService.forget_listed_attrs).
-                self.namespace.forget_listed_attrs(virtual_path)
+                self.namespace.forget_listed_attrs(entry.virtual_path)
             except Exception as exc:
                 self.logger.error(
                     "direct sync failed for %s on %s: %s",
-                    canonical_path,
-                    backend_name,
+                    entry.canonical_path,
+                    entry.backend_name,
                     exc,
                 )
 

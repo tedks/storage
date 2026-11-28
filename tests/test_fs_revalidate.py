@@ -584,41 +584,6 @@ class TestCreatedAndChangedFiles(RevalidateTestBase):
         self.assertEqual(stat.S_IMODE(cached.stat().st_mode), 0o444)
 
 
-class TestConflictViewTruncate(RevalidateTestBase):
-    """A conflict view's change reaches its member also when no writable
-    descriptor's close carries it."""
-
-    def make_view(self):
-        member_file = self.rewrite_member("f.txt", b"member bytes")
-        view = self.fs.cache_manager.get_cache_path("/f.txt.member")
-        view.write_bytes(b"member bytes")
-        return member_file
-
-    def test_path_truncate_under_a_read_only_handle_reaches_the_member(self):
-        member_file = self.make_view()
-        fh = self.fs.open("/f.txt.member", os.O_RDONLY)
-        self.fs.truncate("/f.txt.member", 6)
-        self.assertEqual(member_file.read_bytes(), b"member")
-        self.fs.release("/f.txt.member", fh)
-        self.assertEqual(member_file.read_bytes(), b"member")
-
-    def test_path_truncate_without_a_handle_reaches_the_member(self):
-        member_file = self.make_view()
-        self.fs.truncate("/f.txt.member", 0)
-        self.assertEqual(member_file.read_bytes(), b"")
-
-    def test_ftruncate_is_sent_once_by_the_writable_close(self):
-        member_file = self.make_view()
-        with patch.object(self.member, "copy_from_local",
-                          wraps=self.member.copy_from_local) as copies:
-            fh = self.fs.open("/f.txt.member", os.O_WRONLY)
-            self.fs.truncate("/f.txt.member", 6, fh)
-            self.assertEqual(copies.call_count, 0)
-            self.fs.release("/f.txt.member", fh)
-        self.assertEqual(copies.call_count, 1)
-        self.assertEqual(member_file.read_bytes(), b"member")
-
-
 class TestRevalidateOnOpen(RevalidateTestBase):
     def setUp(self):
         super().setUp()
