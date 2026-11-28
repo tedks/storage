@@ -218,34 +218,51 @@ class StateManager:
         # replicated.
         if 'link_target' not in columns:
             self.conn.execute('ALTER TABLE files ADD COLUMN link_target TEXT')
-        self.conn.execute('''
-            CREATE INDEX IF NOT EXISTS idx_cache_eviction
-            ON files(sync_status, recomputable, last_access, virtual_path)
-            WHERE link_target IS NULL
-        ''')
-        # Rows whose cache file eviction last found missing, so the scan
-        # does not lstat every row ever evicted (iter_lru_paths). A hint,
-        # never the record of anything: any write to the row (insert,
-        # update, delete, rename) drops it through the triggers, and an
-        # empty table only costs one full scan. Every path that places
-        # bytes in the cache writes the row after the bytes are in place,
-        # which is what re-admits the path (CacheManager._note_cache_absent).
+        # cache_absent = 1: eviction found no regular cache file for the
+        # row, and nothing has written the row since. A hint for the
+        # eviction scan (iter_lru_paths), never the record of anything: a
+        # rebuilt index starts every row at 0, which costs one full scan.
+        # Not part of FileMetadata (from_dict drops it).
+        if 'cache_absent' not in columns:
+            self.conn.execute(
+                'ALTER TABLE files ADD COLUMN cache_absent INTEGER NOT NULL DEFAULT 0'
+            )
+        # The side table and the first eviction index of this branch, never
+        # released; dropped so an index opened by that build converges.
         self.conn.executescript('''
-            CREATE TABLE IF NOT EXISTS cache_absent (
-                virtual_path TEXT PRIMARY KEY
-            );
-            CREATE TRIGGER IF NOT EXISTS cache_absent_on_insert AFTER INSERT ON files
+            DROP TRIGGER IF EXISTS cache_absent_on_insert;
+            DROP TRIGGER IF EXISTS cache_absent_on_update;
+            DROP TRIGGER IF EXISTS cache_absent_on_delete;
+            DROP TABLE IF EXISTS cache_absent;
+            DROP INDEX IF EXISTS idx_cache_eviction;
+        ''')
+        # The predicate is exactly the scan's filters, so the scan reads
+        # only live candidates: marked and size-0 rows are not in it.
+        self.conn.execute('''
+            CREATE INDEX IF NOT EXISTS idx_cache_eviction_candidates
+            ON files(sync_status, recomputable, last_access, virtual_path)
+            WHERE link_target IS NULL AND size > 0 AND cache_absent = 0
+        ''')
+        # Any write to a marked row clears the mark, except the marking
+        # write itself (0 to 1, which this WHEN excludes) and this
+        # trigger's own clear (1 to 0). That covers the upsert's ON
+        # CONFLICT DO UPDATE (which leaves the column alone), mark_dirty,
+        # publish_sync_status, record_cached_stat, a rename's rewrite of
+        # virtual_path and the access batch's UPDATE of last_access. An
+        # INSERT OR REPLACE re-inserts at the default 0. Every path that
+        # places bytes in the cache writes the row after the bytes are in
+        # place: a fetch, a streaming finalize, a create, a write; a
+        # recompute writes no row itself, and is re-admitted by the access
+        # batch's UPDATE that follows the open, which counts as the row
+        # write. Recursive triggers are off (SQLite's default; this module
+        # never sets recursive_triggers), so the clear does not re-fire.
+        self.conn.execute('''
+            CREATE TRIGGER IF NOT EXISTS files_cache_absent_clear
+            AFTER UPDATE ON files
+            WHEN OLD.cache_absent = 1 AND NEW.cache_absent = 1
             BEGIN
-                DELETE FROM cache_absent WHERE virtual_path = NEW.virtual_path;
-            END;
-            CREATE TRIGGER IF NOT EXISTS cache_absent_on_update AFTER UPDATE ON files
-            BEGIN
-                DELETE FROM cache_absent WHERE virtual_path IN (OLD.virtual_path, NEW.virtual_path);
-            END;
-            CREATE TRIGGER IF NOT EXISTS cache_absent_on_delete AFTER DELETE ON files
-            BEGIN
-                DELETE FROM cache_absent WHERE virtual_path = OLD.virtual_path;
-            END;
+                UPDATE files SET cache_absent = 0 WHERE rowid = NEW.rowid;
+            END
         ''')
         self.conn.commit()
 
@@ -959,44 +976,60 @@ class StateManager:
             )
         self._flush_access_updates()
 
-    def mark_cache_absent(self, virtual_path: str):
-        """Record that eviction found no regular cache file for the row (see cache_absent)."""
-        self._execute_write(
-            'INSERT OR IGNORE INTO cache_absent (virtual_path) VALUES (?)', (virtual_path,),
-        )
+    def mark_cache_absent(self, virtual_paths: Iterable[str]):
+        """Mark rows whose cache file eviction found missing, in one commit.
 
-    def clear_cache_absent(self, virtual_path: str):
-        self._execute_write('DELETE FROM cache_absent WHERE virtual_path = ?', (virtual_path,))
+        Only rows not marked already: re-marking a marked row would be a
+        1-to-1 write, which the clearing trigger treats as a row write.
+        """
+        with self._db_lock:
+            self.conn.executemany(
+                'UPDATE files SET cache_absent = 1 WHERE virtual_path = ? AND cache_absent = 0',
+                [(path,) for path in virtual_paths],
+            )
+            self.conn.commit()
+
+    def clear_cache_absent(self, virtual_paths: Iterable[str]):
+        with self._db_lock:
+            self.conn.executemany(
+                'UPDATE files SET cache_absent = 0 WHERE virtual_path = ? AND cache_absent = 1',
+                [(path,) for path in virtual_paths],
+            )
+            self.conn.commit()
+
+    _LRU_PAGE_SQL = '''
+        SELECT virtual_path, last_access FROM files
+        WHERE sync_status = ? AND recomputable = ?
+          AND link_target IS NULL AND size > 0 AND cache_absent = 0
+          AND (last_access, virtual_path) > (?, ?)
+        ORDER BY last_access ASC, virtual_path ASC
+        LIMIT ?
+    '''
 
     def iter_lru_paths(self, *, recomputable: bool = False) -> Iterator[str]:
         """Walk CLEAN regular-file rows with bytes to free, in access order.
 
         The cache tree is authoritative for whether the bytes are present,
         so evicted rows are walked too, except rows whose file eviction
-        already found missing and that no write has touched since
-        (cache_absent). Rows of size 0 free nothing: an evicted
-        recomputable placeholder, or an empty file. A file that grew under
-        a size-0 CLEAN row is a stale CLEAN, which the open path and the
-        post-crash sweep heal; eviction would only mark it dirty and keep
-        it. Page past missing and pinned paths without loading the whole
-        index.
+        already found missing and that nothing has written since
+        (cache_absent; see the trigger in _init_db, which counts the
+        access batch's UPDATE as a write). Rows of size 0 free nothing: an
+        evicted recomputable placeholder, an invalidated copy, or an empty
+        file. A file that grew under a size-0 CLEAN row is a stale CLEAN,
+        which the open path and the post-crash sweep heal; eviction would
+        only mark it dirty and keep it. The WHERE matches the predicate of
+        idx_cache_eviction_candidates, so each page reads only live
+        candidates. Page past missing and pinned paths without loading the
+        whole index.
         """
         self._flush_access_updates(force=True)
         last_access, last_path = float('-inf'), ''
         while True:
             with self._db_lock:
-                rows = self.conn.execute('''
-                    SELECT virtual_path, last_access FROM files
-                    WHERE sync_status = ? AND recomputable = ? AND link_target IS NULL
-                      AND size > 0
-                      AND NOT EXISTS (
-                          SELECT 1 FROM cache_absent WHERE cache_absent.virtual_path = files.virtual_path
-                      )
-                      AND (last_access, virtual_path) > (?, ?)
-                    ORDER BY last_access ASC, virtual_path ASC
-                    LIMIT ?
-                ''', (SyncStatus.CLEAN.value, int(recomputable), last_access, last_path,
-                      self.WRITE_BATCH_SIZE)).fetchall()
+                rows = self.conn.execute(self._LRU_PAGE_SQL, (
+                    SyncStatus.CLEAN.value, int(recomputable), last_access, last_path,
+                    self.WRITE_BATCH_SIZE,
+                )).fetchall()
             for row in rows:
                 yield row['virtual_path']
             if len(rows) < self.WRITE_BATCH_SIZE:

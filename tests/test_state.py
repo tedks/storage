@@ -579,3 +579,154 @@ class TestMemberChecksums(unittest.TestCase):
             self.assertIsNotNone(state.get_member_checksum("/f", "m0"))
         finally:
             state.close()
+
+
+class TestCacheAbsentCandidacy(unittest.TestCase):
+    """The eviction scan's cache_absent column, its trigger and its index."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.state_manager = StateManager(str(Path(self.temp_dir) / "state.db"))
+
+    def tearDown(self):
+        self.state_manager.close()
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _row(self, path, *, size=3, last_access=1.0):
+        self.state_manager.set_file_metadata(FileMetadata(
+            virtual_path=path, size=size, checksum="c", last_access=last_access,
+            last_modified=1.0, sync_status=SyncStatus.CLEAN, replica_count=1,
+            recomputable=False, recompute_cmd=None, encrypted=False, encryption_key_id=None,
+        ))
+
+    def _absent(self, path):
+        row = self.state_manager.conn.execute(
+            'SELECT cache_absent FROM files WHERE virtual_path = ?', (path,),
+        ).fetchone()
+        return row['cache_absent']
+
+    def test_recursive_triggers_stay_off(self):
+        self.assertEqual(self.state_manager.conn.execute('PRAGMA recursive_triggers').fetchone()[0], 0)
+
+    def test_marked_rows_leave_the_scan_and_the_model_ignores_the_column(self):
+        self._row("/a")
+        self._row("/b", last_access=2.0)
+        self.state_manager.mark_cache_absent(["/a"])
+        self.assertEqual(self._absent("/a"), 1)
+        self.assertEqual(list(self.state_manager.iter_lru_paths()), ["/b"])
+        self.assertEqual([m.virtual_path for m in self.state_manager.get_all_file_metadata()], ["/a", "/b"])
+        self.assertEqual(self.state_manager.get_file_metadata("/a").size, 3)
+
+    def test_remarking_a_marked_row_keeps_the_mark(self):
+        self._row("/a")
+        self.state_manager.mark_cache_absent(["/a"])
+        self.state_manager.mark_cache_absent(["/a"])
+        self.assertEqual(self._absent("/a"), 1)
+
+    def test_every_row_write_clears_the_mark(self):
+        sm = self.state_manager
+        writes = {
+            "upsert": lambda p: sm.set_file_metadata(sm.get_file_metadata(p)),
+            "mark_dirty": lambda p: sm.mark_dirty(p, size=4, last_modified=2.0),
+            "record_cached_stat": lambda p: sm.record_cached_stat(
+                p, sm.get_file_metadata(p).dirty_generation, size=3, last_modified=1.0),
+            "access_batch": lambda p: (sm.update_access_time(p, accessed_at=5.0),
+                                       sm._flush_access_updates(force=True)),
+        }
+        for name, write in writes.items():
+            with self.subTest(write=name):
+                path = f"/{name}"
+                self._row(path)
+                sm.mark_cache_absent([path])
+                self.assertEqual(self._absent(path), 1)
+                write(path)
+                self.assertEqual(self._absent(path), 0)
+
+    def test_rename_clears_the_mark(self):
+        self._row("/old")
+        self.state_manager.mark_cache_absent(["/old"])
+        self.state_manager.rename_path("/old", "/new")
+        self.assertEqual(self._absent("/new"), 0)
+        self.assertEqual(list(self.state_manager.iter_lru_paths()), ["/new"])
+
+    def test_replace_index_starts_rows_unmarked(self):
+        self._row("/a")
+        self.state_manager.mark_cache_absent(["/a"])
+        snapshot = self.state_manager.get_all_file_metadata()
+        self.state_manager.replace_index(snapshot, [])
+        self.assertEqual(self._absent("/a"), 0)
+        self.state_manager.mark_cache_absent(["/a"])
+        self.state_manager.replace_index_from_entries((m, None) for m in snapshot)
+        self.assertEqual(self._absent("/a"), 0)
+
+    def test_eviction_page_uses_the_candidate_index(self):
+        plan = [tuple(row)[-1] for row in self.state_manager.conn.execute(
+            'EXPLAIN QUERY PLAN ' + StateManager._LRU_PAGE_SQL,
+            (SyncStatus.CLEAN.value, 0, 0.0, '', 10),
+        )]
+        self.assertTrue(any("idx_cache_eviction_candidates" in step for step in plan), plan)
+        self.assertFalse(any("TEMP B-TREE" in step for step in plan), plan)
+
+    def _page_steps(self):
+        steps = [0]
+
+        def count():
+            steps[0] += 1
+            return 0
+
+        conn = self.state_manager.conn
+        conn.set_progress_handler(count, 1)
+        try:
+            rows = conn.execute(StateManager._LRU_PAGE_SQL, (
+                SyncStatus.CLEAN.value, 0, float('-inf'), '', StateManager.WRITE_BATCH_SIZE,
+            )).fetchall()
+        finally:
+            conn.set_progress_handler(None, 1)
+        return steps[0], [row['virtual_path'] for row in rows]
+
+    def test_eviction_page_does_not_visit_marked_or_empty_rows(self):
+        self._row("/live", last_access=10.0)
+        baseline, paths = self._page_steps()
+        self.assertEqual(paths, ["/live"])
+
+        conn = self.state_manager.conn
+        # Older than the live row, so a scan that visited them would meet
+        # them first.
+        conn.executemany(
+            '''INSERT INTO files (virtual_path, size, checksum, last_access, last_modified,
+               sync_status, replica_count, recomputable, recompute_cmd, encrypted,
+               encryption_key_id, dirty_generation, link_target, cache_absent)
+               VALUES (?, ?, 'c', 1.0, 1.0, 'clean', 1, 0, NULL, 0, NULL, 0, NULL, ?)''',
+            [(f"/marked-{i:05d}", 3, 1) for i in range(10000)]
+            + [(f"/empty-{i:05d}", 0, 0) for i in range(10000)],
+        )
+        conn.commit()
+        steps, paths = self._page_steps()
+        self.assertEqual(paths, ["/live"])
+        # A visit costs several VM steps per row; 20000 hidden rows would
+        # add tens of thousands.
+        self.assertLess(steps, baseline + 100, (baseline, steps))
+
+    def test_an_index_from_the_side_table_build_converges(self):
+        db = str(Path(self.temp_dir) / "old.db")
+        old = StateManager(db)
+        old.conn.executescript('''
+            DROP TRIGGER files_cache_absent_clear;
+            DROP INDEX idx_cache_eviction_candidates;
+            CREATE TABLE cache_absent (virtual_path TEXT PRIMARY KEY);
+            CREATE TRIGGER cache_absent_on_delete AFTER DELETE ON files
+            BEGIN DELETE FROM cache_absent WHERE virtual_path = OLD.virtual_path; END;
+            CREATE INDEX idx_cache_eviction ON files(sync_status, recomputable, last_access, virtual_path)
+            WHERE link_target IS NULL;
+        ''')
+        old.close()
+        reopened = StateManager(db)
+        try:
+            names = {row['name'] for row in reopened.conn.execute('SELECT name FROM sqlite_master')}
+            self.assertNotIn("cache_absent", names)
+            self.assertNotIn("cache_absent_on_delete", names)
+            self.assertNotIn("idx_cache_eviction", names)
+            self.assertIn("idx_cache_eviction_candidates", names)
+            self.assertIn("files_cache_absent_clear", names)
+        finally:
+            reopened.close()

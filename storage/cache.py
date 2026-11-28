@@ -15,7 +15,7 @@ import threading
 from pathlib import Path
 from contextlib import contextmanager, nullcontext
 from enum import Enum
-from typing import Callable, ContextManager, Optional, List, Set
+from typing import Callable, ContextManager, Optional, List, Set, Tuple
 
 from .backends.base import Backend, bulk_request
 from .backends.ssh_pool import BulkCapacityCancelled, BulkCapacityTimeout
@@ -387,23 +387,33 @@ class CacheManager:
             return True
         with self._lock:
             freed = 0
-            for virtual_path in self.state_manager.iter_lru_paths(recomputable=recomputable):
-                cache_path = self.get_cache_path(virtual_path)
-                with self._path_guard(virtual_path) as free:
-                    if not free:
-                        continue
-                    if regular_file_stat(cache_path) is None:
-                        self._note_cache_absent(virtual_path, cache_path)
-                        continue
-                    try:
-                        freed += self._evict_if_still_clean(
-                            virtual_path, cache_path, recomputable=recomputable,
-                        )
-                    except OSError as e:
-                        print(f"Warning: Failed to evict {virtual_path}: {e}")
-                if freed >= bytes_needed:
-                    return True
-            return False
+            # Paths found missing, marked a page at a time: the first scan
+            # after an upgrade finds every row ever evicted.
+            absent: List[Tuple[str, Path]] = []
+            try:
+                for virtual_path in self.state_manager.iter_lru_paths(recomputable=recomputable):
+                    cache_path = self.get_cache_path(virtual_path)
+                    with self._path_guard(virtual_path) as free:
+                        if not free:
+                            continue
+                        if regular_file_stat(cache_path) is None:
+                            absent.append((virtual_path, cache_path))
+                            if len(absent) >= self.state_manager.WRITE_BATCH_SIZE:
+                                self._note_cache_absent(absent)
+                                absent.clear()
+                            continue
+                        try:
+                            freed += self._evict_if_still_clean(
+                                virtual_path, cache_path, recomputable=recomputable,
+                            )
+                        except OSError as e:
+                            print(f"Warning: Failed to evict {virtual_path}: {e}")
+                    if freed >= bytes_needed:
+                        return True
+                return False
+            finally:
+                if absent:
+                    self._note_cache_absent(absent)
 
     def ensure_space(self, bytes_needed: int) -> bool:
         """
@@ -703,21 +713,25 @@ class CacheManager:
                 self.store_file_metadata(row, cache_path=cache_path)
             else:
                 self.state_manager.remove_file_location(virtual_path, "cache")
-                self._note_cache_absent(virtual_path, cache_path)
+                self._note_cache_absent([(virtual_path, cache_path)])
             return st.st_size
 
-    def _note_cache_absent(self, virtual_path: str, cache_path: Path):
-        """Drop a path with no cache file from later eviction scans until its row is written.
+    def _note_cache_absent(self, entries: List[Tuple[str, Path]]):
+        """Drop paths with no cache file from later eviction scans until their rows are written.
 
-        The mark goes in before the second stat: bytes placed after that
-        stat are followed by a row write, whose trigger drops the mark,
-        and bytes placed before it are seen here. No path writes the row
-        before it places the bytes, so a mark can only hide a file the
-        cache does not hold.
+        Each path was stat'ed missing before this. The marks go in before
+        a second stat: bytes placed after that stat are followed by a row
+        write, whose trigger clears the mark (state.py, _init_db), and
+        bytes placed before it are seen here and the mark withdrawn. No
+        path writes the row before it places the bytes, and the access
+        batch's UPDATE counts as a row write: that is what re-admits a
+        recompute, which writes no row itself. So a mark can only hide a
+        file the cache does not hold.
         """
-        self.state_manager.mark_cache_absent(virtual_path)
-        if regular_file_stat(cache_path) is not None:
-            self.state_manager.clear_cache_absent(virtual_path)
+        self.state_manager.mark_cache_absent(path for path, _ in entries)
+        present = [path for path, cache_path in entries if regular_file_stat(cache_path) is not None]
+        if present:
+            self.state_manager.clear_cache_absent(present)
 
     @staticmethod
     def _truncate_recomputable(cache_path: Path, st: os.stat_result) -> Optional[os.stat_result]:

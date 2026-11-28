@@ -550,11 +550,12 @@ class TestEvictionSkipsStaleClean(unittest.TestCase):
         cached.unlink()
         real_mark = self.state_manager.mark_cache_absent
 
-        def place_then_mark(path):
+        def place_then_mark(paths):
+            paths = list(paths)
             # A fetch lands its bytes and its row write before the mark.
             cached.write_bytes(b"v1")
-            self.state_manager.clear_cache_absent(path)
-            real_mark(path)
+            self.state_manager.set_file_metadata(self.state_manager.get_file_metadata("/raced.txt"))
+            real_mark(paths)
 
         with patch.object(self.state_manager, "mark_cache_absent", side_effect=place_then_mark):
             self.assertFalse(self.cache_manager.evict_lru_files(1))

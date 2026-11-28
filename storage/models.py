@@ -50,6 +50,8 @@ class FileMetadata:
     def from_dict(cls, data: Dict) -> "FileMetadata":
         """Build metadata from stored row data."""
         payload = dict(data)
+        # Eviction's hint column (StateManager), not part of the model.
+        payload.pop("cache_absent", None)
         payload["sync_status"] = SyncStatus(payload["sync_status"])
         return cls(**payload)
 
