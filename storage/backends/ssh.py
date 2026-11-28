@@ -123,6 +123,18 @@ def _connect_via_host_resolver(host: str, port: int, timeout: float,
     raise last_error
 
 
+def _handle_stat_unsupported(exc: OSError) -> bool:
+    """Whether an SFTPFile.stat() failure means the server lacks handle stat.
+
+    paramiko raises IOError(text), without an errno, for
+    SFTP_OP_UNSUPPORTED (the text is the server's, usually "Operation
+    unsupported"); a local errno of ENOSYS or EOPNOTSUPP says the same.
+    """
+    if exc.errno in (errno.ENOSYS, errno.EOPNOTSUPP, errno.ENOTSUP):
+        return True
+    return exc.errno is None and "unsupported" in str(exc).lower()
+
+
 class SSHBackend(Backend):
     """Backend for SSH/SFTP remote filesystems.
 
@@ -588,8 +600,13 @@ class SSHBackend(Backend):
                 copy_bounded_stream(fin.read, fout.write, bound)
                 # The open handle's own attributes (one SFTP fstat round
                 # trip): the version the bytes came from, whatever the path
-                # names by the confirmation.
-                bound.source_stats.append(fin.stat())
+                # names by the confirmation. A server without handle stat
+                # gives no such evidence; any other error fails the copy.
+                try:
+                    bound.source_stats.append(fin.stat())
+                except OSError as exc:
+                    if not _handle_stat_unsupported(exc):
+                        raise
 
         # Not retried: a copy whose connection drops after the source was
         # opened fails with that error, never reopens and copies again (one

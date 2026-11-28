@@ -19,6 +19,7 @@ from storage.backends import ssh_pool
 from storage.backends.base import (
     ChecksumUnavailable,
     MemberSourceMissing,
+    bounded_copy,
     bulk_request,
     interactive_wait_cancellation,
     capacity_wait_cancellation,
@@ -1865,6 +1866,26 @@ class TestSSHBackendOnThePool(_BackendTestCase):
             for holder in holders:
                 holder.release()
             reader.join(3)
+
+    def test_bounded_copy_distinguishes_unsupported_handle_stat_from_io_failure(self):
+        backend = self._new_backend()
+        payload = b"source bytes"
+        self.server.payload = payload
+        with tempfile.TemporaryDirectory() as directory:
+            dest = Path(directory) / "download"
+            for error in (OSError("Operation unsupported"),
+                          OSError(errno.EOPNOTSUPP, "unsupported")):
+                with self.subTest(error=error), bounded_copy(len(payload)) as bound, \
+                        patch.object(_FakeRemoteFile, "stat", side_effect=error):
+                    backend.copy_to_local("/file", dest)
+                    self.assertEqual(bound.source_stats, [])
+                    self.assertEqual(dest.read_bytes(), payload)
+
+            with bounded_copy(len(payload)), \
+                    patch.object(_FakeRemoteFile, "stat", side_effect=OSError(errno.EIO, "io")):
+                with self.assertRaises(OSError) as raised:
+                    backend.copy_to_local("/file", dest)
+            self.assertEqual(raised.exception.errno, errno.EIO)
 
     def test_bulk_copy_and_eager_readdir_restore_context_on_error(self):
         from storage.fs import StorageFS
