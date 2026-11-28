@@ -1,0 +1,18 @@
+id: cache-clean-access-index-cost
+title: Measure the cost of the second clean-access LRU index on access-time flushes
+desc: 'From council on #191 (round-1 Anthropic N7). idx_clean_cache_access adds maintenance
+  to every last_access flush; the older recomputable index now only serves evict_lru_files,
+  evict_recomputable_files and spacemgmt. Benchmark before consolidating.'
+type: task
+component: cache
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-28T08:53:29-00:00
+references: []
+log_events:
+- time: 2026-11-28T08:53:29-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
