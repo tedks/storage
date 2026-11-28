@@ -1047,34 +1047,57 @@ class StateManager:
         candidates. Page past missing and pinned paths without loading the
         whole index.
 
-        A pass ends at the time it started (T0, taken after the forced
-        flush): a busy file read during the pass gets a newer timestamp and
-        would otherwise come back in a later page, again and again while
-        reads continue. A file read since the pass began is recently used,
-        so skipping it is right. Rows stamped after T0 (after a backward
-        clock step, or a forward jump) are first clamped to T0, so none is
-        out of reach of the bound; that UPDATE writes the rows, so the
-        trigger clears their cache_absent marks, which costs one revisit.
-        After the clamp every row is at or below T0, and a row read during
-        the pass is stamped at or above it, so it re-enters only on an
-        exact tie (or, after a backward step during the pass, until the
-        clock passes T0 again).
+        A pass has an upper bound on last_access, first T0, taken after
+        the forced flush: a busy file read during the pass gets a newer
+        timestamp and would otherwise come back in a later page, again and
+        again while reads continue. A file read since the pass began is
+        recently used, so skipping it is right. Rows stamped above T0 (a
+        forward jump, or a backward step before the pass) are first
+        clamped to T0, so none is out of reach of the bound. The clamp
+        writes the rows it moves, so the trigger clears their cache_absent
+        marks, which costs one revisit.
+
+        Termination. Before each page query the clock is read again. If it
+        is below the bound (the clock stepped back), rows above it are
+        clamped down to it, the bound is lowered to it, and the cursor is
+        rewound to (bound, '') if it is past that, since the clamp can move
+        an unvisited row below the cursor. Paths already yielded in this
+        pass are not yielded again (no stat, no path lock), so a revisit
+        costs only SQL. A row comes back only with a stamp in (cursor,
+        bound]. A read stamped after a page query is stamped at or above
+        that query's clock reading, which is at or above the bound, so it
+        comes back only on an exact tie or after a further backward step,
+        and each step lowers the bound once, at the next page. A read taken
+        before a query and flushed after it can come back once, and is
+        skipped as visited. So with the clock running forward between
+        steps, every page advances the cursor through rows that cannot be
+        refilled, and the pass ends.
         """
         self._flush_access_updates(force=True)
-        started = time.time()
-        self._clamp_future_access(started)
-        last_access, last_path = float('-inf'), ''
+        bound = time.time()
+        self._clamp_future_access(bound)
+        cursor: Tuple[float, str] = (float('-inf'), '')
+        visited: Set[str] = set()
         while True:
+            now = time.time()
+            if now < bound:
+                self._clamp_future_access(now)
+                bound = now
+                cursor = min(cursor, (bound, ''))
             with self._db_lock:
                 rows = self.conn.execute(self._LRU_PAGE_SQL, (
-                    SyncStatus.CLEAN.value, int(recomputable), last_access, last_path,
-                    started, self.WRITE_BATCH_SIZE,
+                    SyncStatus.CLEAN.value, int(recomputable), cursor[0], cursor[1],
+                    bound, self.WRITE_BATCH_SIZE,
                 )).fetchall()
             for row in rows:
-                yield row['virtual_path']
+                path = row['virtual_path']
+                if path in visited:
+                    continue
+                visited.add(path)
+                yield path
             if len(rows) < self.WRITE_BATCH_SIZE:
                 return
-            last_access, last_path = rows[-1]['last_access'], rows[-1]['virtual_path']
+            cursor = (rows[-1]['last_access'], rows[-1]['virtual_path'])
 
     def delete_file(self, virtual_path: str):
         """Delete file from state tracking"""

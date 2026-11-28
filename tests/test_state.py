@@ -676,6 +676,43 @@ class TestCacheAbsentCandidacy(unittest.TestCase):
             sm._flush_access_updates(force=True)
         self.assertEqual(visits, [f"/busy-{i}" for i in range(sm.WRITE_BATCH_SIZE)])
 
+    def test_a_backward_clock_step_mid_pass_cannot_keep_busy_rows_refilling_pages(self):
+        # After the first page the clock steps back below the bound but
+        # above the cursor, and readers keep stamping the busy rows at the
+        # current time, which lands them between the cursor and the bound.
+        sm = self.state_manager
+        sm.WRITE_BATCH_SIZE = 3
+        busy = [f"/busy-{i}" for i in range(3)]
+        for i, path in enumerate(busy):
+            self._row(path, last_access=1.0 + i)
+        start = 1_000_000.0
+        # Ahead of the pass start, so clamped to it, then reached after the step.
+        self._row("/late", last_access=start + 100.0)
+        readings = []
+
+        def clock():
+            n = len(readings)
+            # The pass start and the first page read the true time; then
+            # the clock steps back below the bound, above the cursor.
+            now = start + 0.001 * n if n < 2 else 500.0 + 0.001 * n
+            if n >= 2:  # readers stamp the busy rows at the current time
+                sm.conn.executemany(
+                    'UPDATE files SET last_access = ? WHERE virtual_path = ?',
+                    [(now, path) for path in busy],
+                )
+                sm.conn.commit()
+            readings.append(now)
+            self.assertLess(len(readings), 100, "the pass did not end")
+            return now
+
+        visits = []
+        with mock.patch("storage.state.time.time", side_effect=clock):
+            for path in sm.iter_lru_paths():
+                visits.append(path)
+                self.assertLess(len(visits), 50, "the pass did not end")
+                clock()  # the busy files are read again while the pass runs
+        self.assertEqual(visits, busy + ["/late"])
+
     def test_marked_rows_leave_the_scan_and_the_model_ignores_the_column(self):
         self._row("/a")
         self._row("/b", last_access=2.0)
