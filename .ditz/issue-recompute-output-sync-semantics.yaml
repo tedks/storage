@@ -1,0 +1,44 @@
+id: recompute-output-sync-semantics
+title: Decide whether a successful recompute's output is uploaded to members or kept
+  as a local CLEAN reconstruction
+desc: 'Raised by the council on PR #187 (round 62752338c9df-20261128T085930Z-5f91ba).
+  The seats disagreed.
+
+
+  - The OpenAI seat (gpt-6.2-sol) rated recording a recomputed copy as CLEAN a Critical:
+  the command can produce bytes that differ from the members'' copy.
+
+  - The Anthropic seat rated it safer than master, where heal_stale_clean marks the
+  recomputed bytes DIRTY and sync uploads them. That upload can overwrite a newer
+  member version, for example after a watcher invalidation whose refetch failed.
+
+
+  #187 keeps master''s semantics: on a successful recompute over an existing row,
+  the bytes are recorded DIRTY eagerly, so the eviction index sees the new size. It
+  does not decide the question.
+
+
+  Options:
+
+  1. Upload (today''s behaviour).
+
+  2. Keep the output CLEAN as a local reconstruction, with no checksum claim, and
+  never upload it.
+
+  3. Upload only when no member holds a copy newer than the recipe inputs.
+
+
+  Needs a product ruling from Ted.'
+type: task
+component: cache
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-28T09:02:51-00:00
+references: []
+log_events:
+- time: 2026-11-28T09:02:51-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
