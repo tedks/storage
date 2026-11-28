@@ -1914,7 +1914,18 @@ class TestFSStreamingIntegration(unittest.TestCase):
                 injected.append(self.fs.state_manager.get_file_metadata('/gap.bin'))
             return real_store(metadata, *args, **kwargs)
 
-        with patch.object(cache_manager, "store_file_metadata", side_effect=read_in_the_gap):
+        state_manager = self.fs.state_manager
+        real_update = state_manager.update_access_time
+        replay_under_index_lock = []
+
+        def record_replay(path, **kwargs):
+            if path == '/gap.bin' and kwargs.get("accessed_at") == 50.0 and len(injected) == 2:
+                # The access batch takes its lock before the index lock.
+                replay_under_index_lock.append(state_manager.metadata_lock._is_owned())
+            return real_update(path, **kwargs)
+
+        with patch.object(cache_manager, "store_file_metadata", side_effect=read_in_the_gap), \
+                patch.object(state_manager, "update_access_time", side_effect=record_replay):
             self.backend.worker_gate.set()
             self.assertTrue(session.background_finished.wait(timeout=3.0))
         self.fs.release('/gap.bin', vfd)
@@ -1922,6 +1933,7 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.assertTrue(session.finalized)
         # The snapshot predates the read, and the flush found no row.
         self.assertEqual(injected, [10.0, None])
+        self.assertEqual(replay_under_index_lock, [False])
         self.fs.state_manager._flush_access_updates(force=True)
         self.assertEqual(self.fs.state_manager.get_file_metadata('/gap.bin').last_access, 50.0)
 
