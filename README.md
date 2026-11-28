@@ -288,7 +288,8 @@ a worker goes to those files, so a member whose bulk channels are taken
 A worker waiting for a bulk channel stops waiting once foreground reads
 have fetched every byte of its file. Publishing a complete file into the
 cache uses no member channel, so it does not count against or wait for a
-member's bulk capacity, and it takes precedence for the next free worker.
+member's bulk capacity, and it takes precedence for the next free worker
+(at most four in a row while range reads are waiting).
 
 A cached file that has been synced is checked against its member when it
 is opened and was last checked more than `revalidate_after` seconds ago
