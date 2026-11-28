@@ -67,6 +67,32 @@ log_events:
   who: Ted Smith
   what: no longer blocked by gh-207-private-mmap-page-cache
   comment: ""
+- time: 2026-11-28T14:31:06-00:00
+  who: Ted Smith
+  what: commented
+  comment: 'The corrective draft is frozen at `9aec37e` on master `04082a7`. All 48
+    gate targets, the CLI build and help passed on tree `2325ced5`. This remains an
+    open correctness issue.
+
+
+    The next design review needs to settle how cached admission behaves if a member
+    revokes access and the mount cannot persist the restriction. An unreadable existing
+    marker should preserve the evidence and return the actual I/O error until it can
+    be read. A restriction kept in memory needs to identify the same inode across
+    an existing writer changing its size or mtime, hard-link aliases, and a local
+    rename followed by a member error. An unrelated replacement must be independently
+    usable.
+
+
+    One option is to retain an O_PATH descriptor only when persisting a restriction
+    fails. Before implementing that option, settle the descriptor budget, ownership
+    through unlink and shutdown, and which offline opens to refuse if another restriction
+    can neither be persisted nor pinned. Include controls for recovery when metadata
+    reads succeed again and for genuine ENODATA on ordinary cached files.
+
+
+    The PR remains draft for this design decision and the required Opus review. The
+    independent lead and OpenAI council findings are recorded on #208.'
 blocked_by:
 - gh-207-stream-no-timestamp
 - gh-207-view-refusal
