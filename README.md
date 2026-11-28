@@ -583,8 +583,11 @@ from the working directory the mount was started in. A mountpoint whose last
 component is `.` or `..` cannot be matched without looking inside the mount:
 such a mount still publishes its control socket but reports no mountpoint, so
 `--cache` and `storage debug streaming-stats` reach it while `--profile`
-refuses; give the path without the final `.` or `..`. Both sides read the
-profile's mountpoint string as written, so they agree on such a spelling.
+refuses. Write the mountpoint as the path it resolves to instead (drop a
+final `.`; replace `dir/..` with the parent of `dir`, not with `dir`). A
+running mount keeps the identity it started with, so after editing the
+profile use `--cache` until the next mount. Both sides read the profile's
+mountpoint string as written, so they agree on such a spelling.
 
 ```bash
 storage control --profile media
