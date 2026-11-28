@@ -3073,6 +3073,11 @@ class StorageFS(Operations):
             entry = self._fd_map.get(fh)
         if entry is None or not entry.backend_name:
             return 0
+        if (self._is_read_only_open(entry.flags) and entry.view_contributed is None
+                and not entry.view_refused):
+            # A read-only descriptor never contributes a change, so it is
+            # never refused: nothing to report, and no need for the lock.
+            return 0
         # Under the path's lock, which release holds while it keeps or sends
         # the view (re-read once held: a rename re-points it): the refusal
         # check below and that transition cannot interleave.

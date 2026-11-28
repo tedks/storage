@@ -748,20 +748,37 @@ class TestDirectoryRetries(SyncRaceTestBase):
         self.fs.release("/d/f.txt.member", writer)
         self.assertEqual([b"overwrite!"], self._kept_view_writes())
 
-    def test_a_path_truncate_kept_by_a_readers_close(self):
+    def _path_truncate_kept(self, flags):
         """A truncate by path (no descriptor of its own), then a repair, then
         a descriptor that changes nothing closes: its close succeeds, and the
         truncated bytes are kept once. (59e8d28: a read-only close kept
         nothing; fa274d4: that close got EBUSY.)"""
         self._synced_view()
+        # Opened before the repair: a repair refuses a writable view open.
+        closer = self.fs.open("/d/f.txt.member", flags)
         self.fs.truncate("/d/f.txt.member", 4)
         self._open_repair()
         copies = self._record_copies()
-        reader = self.fs.open("/e/f.txt.member", os.O_RDONLY)
-        self.assertEqual(0, self.fs.flush("/e/f.txt.member", reader))
-        self.fs.release("/e/f.txt.member", reader)
+        self.assertEqual(0, self.fs.flush("/e/f.txt.member", closer))
+        self.fs.release("/e/f.txt.member", closer)
         self.assertEqual([], copies)
         self.assertEqual([b"sole"], self._kept_view_writes())
+
+    def test_a_path_truncate_kept_by_a_readers_close(self):
+        for flags in (os.O_RDONLY, os.O_RDWR):
+            with self.subTest(flags=flags):
+                # One fixture per subtest: a fresh mount state each time.
+                if flags == os.O_RDWR:
+                    self.tearDown()
+                    self.setUp()
+                self._path_truncate_kept(flags)
+
+    def test_read_only_flush_takes_no_path_lock(self):
+        self._synced_view()
+        reader = self.fs.open("/d/f.txt.member", os.O_RDONLY)
+        with patch.object(self.fs, "_path_locked", side_effect=AssertionError("path lock")):
+            self.assertEqual(0, self.fs.flush("/d/f.txt.member", reader))
+        self.fs.release("/d/f.txt.member", reader)
 
     def test_a_member_known_down_during_a_rename_gets_a_repair(self):
         """A member that is unavailable when the rename runs has missed it
