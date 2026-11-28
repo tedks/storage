@@ -148,11 +148,16 @@ class _InFlight:
     epoch the scan epoch it measured in, and held whether a streaming
     descriptor held its inode then. allowance bounds the charge it can add
     before it settles; withhold means no bound is known, so admits wait.
+    identity is the inode it measured; scan_base what the latest rescan
+    counted for that inode, when it could (see _scan_total_cache_size).
     """
 
-    __slots__ = ("before", "whole_before", "epoch", "held", "allowance", "withhold")
+    __slots__ = ("before", "whole_before", "epoch", "held", "allowance", "withhold",
+                 "identity", "scan_base")
 
-    def __init__(self, before, whole_before, epoch, held, allowance, withhold):
+    def __init__(self, before, whole_before, epoch, held, allowance, withhold, identity=None):
+        self.identity = identity
+        self.scan_base = None
         self.before = before
         self.whole_before = whole_before
         self.epoch = epoch
@@ -229,6 +234,10 @@ class CacheManager:
         # partial until its last session descriptor closes.
         self._whole_file_temps: dict[Path, int] = {}
         self._streaming_fds: dict[int, _PartialCharge] = {}
+        # Direct changes between their measurements: token -> _InFlight.
+        # Their allowances hold back admits until they settle
+        # (_admit_pending). Before the first scan, which reads it.
+        self._in_flight: dict = {}
         self._current_size_bytes = self._scan_total_cache_size()
         self._size_dirty = False
         # The last eviction dry run that found too few victims: (epoch,
@@ -242,10 +251,6 @@ class CacheManager:
         # cache_size_change. The mutex guards only the table.
         self._inode_locks: dict = {}
         self._inode_locks_mutex = threading.Lock()
-        # Direct changes between their measurements: token -> _InFlight.
-        # Their allowances hold back admits until they settle
-        # (_admit_pending).
-        self._in_flight: dict = {}
         # New blocks granted to streaming writes not yet settled.
         self._stream_reserved = 0
         # Moves at every tree rescan: a change that measured before a
@@ -290,8 +295,13 @@ class CacheManager:
         return sum(stop - begin for begin, stop in self._extent_ranges(fd, start, end))
 
     def _path_data_bytes(self, path: Path, st: os.stat_result) -> int:
+        return self._path_measure(path, st)[0]
+
+    def _path_measure(self, path: Path, st: os.stat_result) -> Tuple[int, bool]:
+        """(_path_data_bytes, whether it is the exact measure: False for the
+        allocation fallback or a name that no longer holds the inode)."""
         if st.st_size == 0 or st.st_blocks == 0:
-            return 0
+            return 0, True
         rounded = self._round_up(st.st_size)
         # No shortcut on st_blocks alone: it counts metadata (an external
         # xattr block) as well as data, and a sparse inode charged by its
@@ -302,16 +312,16 @@ class CacheManager:
             try:
                 opened = os.fstat(fd)
                 if (opened.st_dev, opened.st_ino) != (st.st_dev, st.st_ino):
-                    return 0
-                return min(self._data_bytes(fd, 0, rounded), opened.st_blocks * 512)
+                    return 0, False
+                return min(self._data_bytes(fd, 0, rounded), opened.st_blocks * 512), True
             finally:
                 os.close(fd)
         except OSError as exc:
             if exc.errno == errno.ENOENT:
-                return 0
+                return 0, False
             # Use allocated sectors when the file cannot be opened for an
             # extent query or the filesystem does not support extent seeks.
-            return min(rounded, st.st_blocks * 512)
+            return min(rounded, st.st_blocks * 512), False
 
     def _held_identities(self):
         """Inodes a streaming descriptor still holds; caller holds the lock.
@@ -378,9 +388,21 @@ class CacheManager:
         by the identity recorded at its first grant, which cannot change
         while the descriptor is open: the scan makes no call on a session
         descriptor, so one that fails (see _recharge_held) cannot fail an
-        unrelated allocation."""
+        unrelated allocation.
+
+        An inode a keyed direct change has in flight (measured at entry,
+        one name, not held) is measured once like any other, and that one
+        measurement is both what the scan counts and the change's baseline
+        (scan_base): its settlement charges what it holds then minus that,
+        so the write is counted once whenever its bytes landed, and a scan
+        that overlaps writes does not make each of them rescan again."""
         total = sum(charge.bytes for charge in self._streaming_fds.values())
         seen = self._held_identities()
+        keyed = {}
+        for record in self._in_flight.values():
+            record.scan_base = None
+            if record.before is not None and not record.held and record.identity is not None:
+                keyed[record.identity] = record
         for root, dirs, files in os.walk(self.cache_root):
             for name in files:
                 path = Path(root) / name
@@ -394,7 +416,14 @@ class CacheManager:
                     continue
                 if st.st_nlink > 1:
                     seen.add(identity)
-                total += self._path_data_bytes(path, st)
+                record = keyed.get(identity)
+                if record is None:
+                    total += self._path_data_bytes(path, st)
+                    continue
+                measured, exact = self._path_measure(path, st)
+                total += measured
+                if exact and st.st_nlink == 1:
+                    record.scan_base = measured
         return total
 
     def _ensure_size_current_locked(self):
@@ -694,7 +723,8 @@ class CacheManager:
                     before = self._direct_charge(path, fd, span, st_before)
                 token = object()
                 record = _InFlight(before, whole_before, self._scan_epoch, id_before in held,
-                                   allowance, withhold)
+                                   allowance, withhold,
+                                   before[0] if before is not None else None)
                 self._in_flight[token] = record
             try:
                 yield
@@ -824,7 +854,16 @@ class CacheManager:
             return
         before = record.before
         if record.epoch != self._scan_epoch:
-            before = None  # a rescan counted part of this change
+            # A rescan counted this inode as far as the change had got. If
+            # it measured it (scan_base), charge the rest from there;
+            # otherwise leave the total to another rescan.
+            if record.scan_base is not None and not failed_after:
+                whole = self._whole_after(path, fd, st_after, record.identity)
+                if whole is not None:
+                    self._current_size_bytes = max(
+                        0, self._current_size_bytes + whole - record.scan_base)
+                    return
+            before = None
         delta = None
         if before is not None and not failed_after:
             after = self._direct_charge(path, fd, span, st_after)
@@ -837,6 +876,20 @@ class CacheManager:
             self._size_dirty = True
         else:
             self._current_size_bytes = max(0, self._current_size_bytes + delta)
+
+    def _whole_after(self, path, fd, st, identity) -> Optional[int]:
+        """The scan's measure of the changed inode now, or None when it is
+        not still that inode with one name or cannot be measured exactly."""
+        if (st is None or (st.st_dev, st.st_ino) != identity or st.st_nlink != 1
+                or not stat_module.S_ISREG(st.st_mode)):
+            return None
+        if fd is None:
+            measured, exact = self._path_measure(path, st)
+            return measured if exact else None
+        try:
+            return self._fd_data_bytes(fd, st)
+        except OSError:
+            return None
 
     def get_free_space_needed(self, required_bytes: int, *,
                               finishing: Optional[Tuple[Path, int]] = None) -> int:

@@ -1412,6 +1412,38 @@ class TestCacheAccounting(unittest.TestCase):
         writer.join(timeout=5.0)
         self.assertEqual(errors, [])
 
+    def test_writes_overlapping_grants_after_one_invalidation_scan_once(self):
+        """R8 (rescan chain): after one invalidation, a grant's rescan
+        overlaps a direct write in flight. That write's settlement must not
+        mark the total dirty again, or every later grant rescans the whole
+        tree while writes keep overlapping."""
+        manager = self.cache_manager
+        block = manager.block_size
+        path = self.cache_dir / "chained"
+        path.write_bytes(b"")
+        fd = os.open(path, os.O_RDWR)
+        self.addCleanup(os.close, fd)
+        self._assert_total(0)
+        manager.mark_cache_size_dirty()  # the one invalidation
+        real_scan = manager._scan_total_cache_size
+        scans = []
+
+        def counting_scan():
+            scans.append(1)
+            return real_scan()
+
+        with patch.object(manager, "_scan_total_cache_size", side_effect=counting_scan):
+            for k in range(5):
+                run, gate, errors = self._blocked_change(fd=fd, span=(k * block, (k + 1) * block))
+                writer = run(lambda k=k: os.pwrite(fd, b"w" * block, k * block))
+                self.assertTrue(manager.ensure_space(block))
+                gate.set()
+                writer.join(timeout=5.0)
+                self.assertEqual(errors, [])
+            self.assertEqual(manager.get_total_cache_size(), 5 * block)
+        self.assertEqual(len(scans), 1)
+        self._assert_total(5 * block)
+
     def test_direct_writer_uses_space_before_the_next_stream_grant(self):
         manager = self.cache_manager
         block = manager.block_size
