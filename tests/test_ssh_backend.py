@@ -20,6 +20,7 @@ from storage.backends.base import (
     ChecksumUnavailable,
     MemberSourceMissing,
     bulk_request,
+    interactive_wait_cancellation,
     capacity_wait_cancellation,
     interactive_request,
     is_interactive_request,
@@ -703,6 +704,45 @@ class TestMemberConnectionPool(unittest.TestCase):
             self.assertIsNone(waiter.error)
         self.assertEqual(order, ["reader"] * burst + ["bulk", "reader"])
         self.assertEqual(server.transport.max_open_seen, 1)
+
+    def test_interactive_wait_probe_ends_a_wait_for_the_only_channel(self):
+        server = _FakeServer()
+        pool = _pool(server, sftp_channels=1, connect_timeout=5)
+        # The member's one channel, held by a bulk transfer.
+        holder = _Holder(pool)
+        polls = []
+
+        def probe():
+            polls.append(time.monotonic())
+            return "yielded" if len(polls) >= 3 else None
+
+        def confirm():
+            with interactive_wait_cancellation(probe):
+                return pool.acquire_sftp(1.0)
+
+        started = time.monotonic()
+        waiter = _InThread(confirm, interactive=True)
+        try:
+            self.assertTrue(waiter.join(3), "the wait outlived its probe")
+            self.assertIsInstance(waiter.error, BulkCapacityCancelled)
+            self.assertLess(time.monotonic() - started, 2.0)
+            self.assertEqual(3, len(polls))
+        finally:
+            holder.release()
+
+        # A free channel is taken without asking the probe at all.
+        def take_free():
+            with interactive_wait_cancellation(lambda: "never asked"):
+                lease = pool.acquire_sftp(1.0)
+            pool.release(lease)
+            return True
+
+        taker = _InThread(take_free, interactive=True)
+        self.assertTrue(taker.join(3))
+        self.assertIsNone(taker.error)
+        self.assertTrue(taker.result)
+        self.assertEqual(1, server.transport.max_open_seen)
+        pool.close()
 
     def test_lease_is_reentrant_within_a_thread(self):
         server = _FakeServer()

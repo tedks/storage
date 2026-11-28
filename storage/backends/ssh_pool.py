@@ -45,7 +45,7 @@ from typing import Callable, Dict, Iterator, List, Optional, Tuple
 
 import paramiko
 
-from .base import current_capacity_cancel_probe, is_interactive_request
+from .base import current_capacity_cancel_probe, current_interactive_cancel_probe, is_interactive_request
 
 
 # When sshd leaves just one SFTP channel, interactive traffic gets the
@@ -74,7 +74,8 @@ class BulkCapacityTimeout(MemberUnavailable):
 
 
 class BulkCapacityCancelled(MemberUnavailable):
-    """A native FUSE request or session ended while waiting for bulk capacity."""
+    """A native FUSE request or session ended while waiting for bulk capacity,
+    or an interactive wait's probe ended it (base.interactive_wait_cancellation)."""
 
 
 _TRANSIENT_ERRNOS = frozenset({
@@ -882,6 +883,9 @@ class MemberConnection:
         deadline = self._deadline(interactive)
         capacity_deadline = None
         cancel_probe = current_capacity_cancel_probe() if not interactive else None
+        # Polled only while an interactive acquisition waits (see
+        # base.interactive_wait_cancellation).
+        wait_probe = current_interactive_cancel_probe() if interactive else None
         # Transports this acquisition may see installed before giving up: a
         # server that drops every new connection must not loop forever.
         connects_left = 2
@@ -920,8 +924,14 @@ class MemberConnection:
                                     f"SSH member {self.name}: no bulk SFTP capacity came free")
                             self._cond.wait(min(remaining, 0.1) if cancel_probe else remaining)
                         continue
+                    if wait_probe:
+                        reason = wait_probe()
+                        if reason:
+                            raise BulkCapacityCancelled(
+                                f"SSH member {self.name}: {reason} ended during channel wait")
                     remaining = deadline - time.monotonic()
-                    if remaining <= 0 or not self._cond.wait(remaining):
+                    step = min(remaining, 0.1) if wait_probe else remaining
+                    if remaining <= 0 or (not self._cond.wait(step) and step >= remaining):
                         if not self._can_open_locked(interactive) \
                                 and not self._idle_usable_locked(interactive):
                             raise MemberUnavailable(

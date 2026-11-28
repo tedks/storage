@@ -14,7 +14,9 @@ from unittest.mock import patch
 
 from fuse import FuseOSError
 
-from storage.backends.base import current_capacity_cancel_probe, is_interactive_request
+from storage.backends.base import (
+    current_capacity_cancel_probe, current_interactive_cancel_probe, is_interactive_request,
+)
 from storage.backends.local import LocalBackend
 from storage.backends.ssh_pool import BulkCapacityCancelled, BulkCapacityTimeout
 from storage.cache_metadata import MEMBER_ATTRS_XATTR
@@ -1222,6 +1224,91 @@ class TestFSStreamingIntegration(unittest.TestCase):
                        {"max_download_workers": 32}):
             with self.subTest(limits=limits):
                 validate_download_limits(limits)
+
+    def _channel_busy_stat(self, busy, applies=lambda path: True):
+        """A stat whose interactive requests find the member's one channel taken.
+
+        Like the SSH pool: while busy is set the request waits, polling the
+        interactive wait probe and ending with BulkCapacityCancelled when it
+        gives a reason; with no probe it waits (as for the connect
+        deadline) until busy clears.
+        """
+        real_stat = self.backend.stat
+        reasons = []
+
+        def stat(path):
+            if is_interactive_request() and applies(path):
+                probe = current_interactive_cancel_probe()
+                deadline = time.monotonic() + 10
+                while busy.is_set() and time.monotonic() < deadline:
+                    reason = probe() if probe else None
+                    if reason:
+                        reasons.append(reason)
+                        raise BulkCapacityCancelled(reason)
+                    time.sleep(0.02)
+            return real_stat(path)
+
+        return stat, reasons
+
+    def test_confirmation_waiting_for_a_channel_yields_the_worker(self):
+        manager = self.fs._streaming_manager
+        manager.update_download_limits(max_download_workers=1)
+        other = SlowRangeLocalBackend("other", str(self.backend_dir), range_delay=0.0)
+        payload = os.urandom(64 * 1024)
+        for name in ("waiting.bin", "free.bin"):
+            (self.backend_dir / name).write_bytes(payload)
+        busy = threading.Event()
+        self.addCleanup(busy.clear)
+        stat, reasons = self._channel_busy_stat(busy, lambda path: path == "/waiting.bin")
+
+        def select(path):
+            return other if path == "/free.bin" else self.backend
+
+        with patch.object(manager, "select_backend_for_read", side_effect=select), \
+                patch.object(self.backend, "stat", side_effect=stat):
+            waiting_fd = self.fs.open("/waiting.bin", os.O_RDONLY)
+            waiting = self._session_for(waiting_fd)
+            busy.set()
+            # The whole file by the reader; the worker's turn publishes,
+            # and its confirming stat finds the channel taken.
+            self.assertEqual(self.fs.read("/waiting.bin", len(payload), 0, waiting_fd), payload)
+            free_fd = self.fs.open("/free.bin", os.O_RDONLY)
+            free = self._session_for(free_fd)
+            self.assertEqual(self.fs.read("/free.bin", 32 * 1024, 0, free_fd), payload[:32 * 1024])
+            self.assertTrue(free.background_finished.wait(timeout=5))
+            self.assertTrue(free.finalized)
+            self.assertTrue(reasons)
+            self.assertFalse(waiting.finalized)
+            busy.clear()
+            self.assertTrue(waiting.background_finished.wait(timeout=5))
+            self.assertTrue(waiting.finalized)
+            self.fs.release("/free.bin", free_fd)
+            self.fs.release("/waiting.bin", waiting_fd)
+        self.assertEqual((self.cache_dir / "waiting.bin").read_bytes(), payload)
+
+    def test_inline_publication_takes_no_channel_wait(self):
+        start, _ = self._fail_worker_starts(after=0)
+        payload = os.urandom(8192)
+        (self.backend_dir / "inline-busy.bin").write_bytes(payload)
+        busy = threading.Event()
+        self.addCleanup(busy.clear)
+        stat, reasons = self._channel_busy_stat(busy)
+        with patch.object(threading.Thread, "start", start), \
+                patch.object(self.backend, "stat", side_effect=stat):
+            fd = self.fs.open("/inline-busy.bin", os.O_RDONLY)
+            session = self._session_for(fd)
+            probe = session.member_stat
+            self.assertEqual(self.fs.read("/inline-busy.bin", len(payload), 0, fd), payload)
+            busy.set()
+            closer = threading.Thread(target=self.fs.release, args=("/inline-busy.bin", fd), daemon=True)
+            closer.start()
+            closer.join(timeout=3)
+            self.assertFalse(closer.is_alive(), "release waited for a member channel")
+        self.assertTrue(reasons)
+        self.assertTrue(session.finalized)
+        # #184's fallback: the probe stands in (its size matches).
+        self.assertIs(session.confirmed_stat, probe)
+        self.assertEqual((self.cache_dir / "inline-busy.bin").read_bytes(), payload)
 
     def test_offer_during_turn_failure_recovery_starts_no_second_turn(self):
         manager = self.fs._streaming_manager

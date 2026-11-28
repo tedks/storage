@@ -64,6 +64,29 @@ def current_capacity_cancel_probe():
     return getattr(_CAPACITY_CANCEL_PROBE, "probe", None)
 
 
+@contextmanager
+def interactive_wait_cancellation(probe):
+    """Let probe end an interactive request's wait for a channel, for this block.
+
+    Separate from capacity_wait_cancellation, which bulk waits poll: an
+    interactive request is never cancelled by it. A pool polls this probe
+    only while an interactive acquisition has to wait (never when a
+    channel is free) and raises BulkCapacityCancelled with its reason. A
+    probe that always returns a reason makes the request take a free
+    channel or none.
+    """
+    previous = getattr(_CAPACITY_CANCEL_PROBE, "interactive_probe", None)
+    _CAPACITY_CANCEL_PROBE.interactive_probe = probe
+    try:
+        yield
+    finally:
+        _CAPACITY_CANCEL_PROBE.interactive_probe = previous
+
+
+def current_interactive_cancel_probe():
+    return getattr(_CAPACITY_CANCEL_PROBE, "interactive_probe", None)
+
+
 class MemberSourceMissing(FileNotFoundError):
     """A member rename found nothing at the old name on the member: nothing
     moved. Raised only on positive evidence (the member's own check of the

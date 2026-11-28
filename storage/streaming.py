@@ -13,7 +13,10 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 from fuse import FuseOSError
 
-from .backends.base import Backend, capacity_wait_cancellation, interactive_request
+from .backends.base import (
+    Backend, capacity_wait_cancellation, current_interactive_cancel_probe, interactive_request,
+    interactive_wait_cancellation,
+)
 from .backends.local import NOREPLACE_UNSUPPORTED
 from .backends.local import rename_noreplace as _rename_noreplace
 from .backends.ssh_pool import BulkCapacityCancelled, BulkCapacityTimeout
@@ -79,6 +82,15 @@ LOCAL_PUBLICATION = object()
 # it has no RENAME_NOREPLACE either.
 _LINK_UNSUPPORTED = (errno.EPERM, errno.EOPNOTSUPP, errno.ENOTSUP, errno.ENOSYS, errno.EMLINK)
 _NOREPLACE_UNSUPPORTED = NOREPLACE_UNSUPPORTED
+
+
+class _PublicationYielded(Exception):
+    """A worker's confirming stat gave up its wait for a member channel.
+
+    Raised by _finalize_streaming_session; _run_download_turn ends the
+    turn and queues the session to publish again (see
+    _publication_wait_probe).
+    """
 
 
 def validate_download_limits(limits):
@@ -159,6 +171,11 @@ class PrefetchSession:
     # The member's stat after the stream, when it agreed with member_stat
     # (cache_metadata.confirm_member_stat): on_finalized's baseline.
     confirmed_stat: Optional[object] = None
+    # Set when an inline publication (on release, or at destroy) found no
+    # member channel free at once: finalize then takes #184's fallback
+    # (the probe if its size matches; otherwise not agreed) instead of
+    # waiting for one.
+    confirm_from_probe: bool = False
     # The cache's charge for the partial while registration renames it
     # (CacheManager.reserve_new_file); released once registration is done.
     cache_reservation: Optional[object] = None
@@ -1580,18 +1597,27 @@ class StreamingReadManager:
             # retried once, then the probe stands in when the size matches
             # (confirm_member_stat); what an unconfirmed result means beyond
             # that is the decision below, unchanged from master.
+            transferred = os.fstat(io_fd).st_size
             try:
-                with interactive_request():
-                    confirmed, agreed = confirm_member_stat(
-                        session.backend, session.canonical_path, session.member_stat,
-                        os.fstat(io_fd).st_size)
-            except (BulkCapacityCancelled, BulkCapacityTimeout) as exc:
-                # Not raised for an interactive request today. If one
-                # escapes, nothing was confirmed or disagreed, so it is not
-                # member-changed: the session fails (EINTR or EAGAIN) and
-                # its readers are woken, as for any failed finalize.
-                raise OSError(errno.EINTR if isinstance(exc, BulkCapacityCancelled)
-                              else errno.EAGAIN, str(exc)) from exc
+                if session.confirm_from_probe:
+                    confirmed, agreed = self._unconfirmed_stat(session, transferred)
+                else:
+                    with interactive_request():
+                        confirmed, agreed = confirm_member_stat(
+                            session.backend, session.canonical_path, session.member_stat,
+                            transferred)
+            except BulkCapacityCancelled as exc:
+                if current_interactive_cancel_probe() is not None:
+                    # The turn's channel-wait probe gave up (contention
+                    # elsewhere, or no channel free at once inline).
+                    raise _PublicationYielded() from exc
+                # Otherwise (and a BulkCapacityTimeout, never raised for an
+                # interactive request today) nothing was confirmed or
+                # disagreed, so it is not member-changed: the session fails
+                # and its readers are woken, as for any failed finalize.
+                raise OSError(errno.EINTR, str(exc)) from exc
+            except BulkCapacityTimeout as exc:
+                raise OSError(errno.EAGAIN, str(exc)) from exc
             if not agreed:
                 self._discard_superseded_session(session, "member-changed")
                 # Counted once the partial is gone and the session finished.
@@ -1636,6 +1662,18 @@ class StreamingReadManager:
 
         if should_close:
             self._close_streaming_session_resources(session)
+
+    @staticmethod
+    def _unconfirmed_stat(session: PrefetchSession, transferred: int):
+        """#184's fallback when no confirming stat is had, as confirm_member_stat's.
+
+        (probe, True) when the probe's size matches the bytes, otherwise
+        (None, False), which finalize treats as any disagreement.
+        """
+        probe = session.member_stat
+        if probe is not None and getattr(probe, "st_size", None) == transferred:
+            return probe, True
+        return None, False
 
     def _store_finalized_row(self, session: PrefetchSession) -> Optional[FileMetadata]:
         """Store the row for a just-installed file; caller holds the index lock.
@@ -1746,7 +1784,13 @@ class StreamingReadManager:
             session.background_cursor = max(fetched_end, fetch[0] + 1)
             session.background_wrapped = wrapped
 
-    def _run_download_turn(self, session: PrefetchSession):
+    def _run_download_turn(self, session: PrefetchSession, inline: bool = False):
+        """One turn: a chunk, or the publication of a terminal session.
+
+        inline: run by a caller with no worker (a release, or destroy; see
+        _finish_unstaffed_download), whose confirming stat never waits for
+        a member channel.
+        """
         with session.lock:
             fetch_due = self._next_background_fetch(session) is not None
 
@@ -1817,12 +1861,60 @@ class StreamingReadManager:
         # must not hold the member's bulk slot (a stalled fsync would block
         # other files on the member).
         self._download_pool.move_to_local(session)
+        yielded = False
         try:
-            self._finish_background_session(session)
+            if inline:
+                # Take a channel only if one is free at once; otherwise the
+                # fallback (_unconfirmed_stat), never a wait on this thread.
+                with interactive_wait_cancellation(lambda: "inline publication"):
+                    try:
+                        self._finish_background_session(session)
+                    except _PublicationYielded:
+                        session.confirm_from_probe = True
+                        self._finish_background_session(session)
+            else:
+                with interactive_wait_cancellation(self._publication_wait_probe(session)):
+                    try:
+                        self._finish_background_session(session)
+                    except _PublicationYielded:
+                        yielded = True
         finally:
             with session.lock:
-                self._download_pool.offer(session, False, finished_turn=True)
-                session.background_finished.set()
+                if yielded:
+                    # Queued again behind the work it yielded to, as member
+                    # work: it is waiting on that member's channel.
+                    self._download_pool.offer(session, True, finished_turn=True, local=False)
+                else:
+                    self._download_pool.offer(session, False, finished_turn=True)
+                    session.background_finished.set()
+
+    def _publication_wait_probe(self, session: PrefetchSession):
+        """The channel-wait probe for a worker's confirming stat.
+
+        Polled (lock-free, as _bulk_wait_probe's) only while the stat waits
+        for an interactive channel: a member that negotiated one channel,
+        held by a bulk transfer, or a reserve taken by other confirmations.
+        After DOWNLOAD_TURN_YIELD_SECONDS with other work waiting for a
+        worker (another member's, or a publication), the stat gives up and
+        the turn queues the publication again behind that work. Without
+        that wait, the stat waits out the member's connect deadline.
+        """
+        pool = self._download_pool
+        member = session.backend.name
+        waiting_since = None
+
+        def probe():
+            nonlocal waiting_since
+            if session.stop_requested:
+                return "streaming session"
+            now = time.monotonic()
+            if waiting_since is None:
+                waiting_since = now
+            elif now - waiting_since >= DOWNLOAD_TURN_YIELD_SECONDS and pool.contended - {member}:
+                return "streaming publication yielded to other work"
+            return None
+
+        return probe
 
     def _bulk_wait_probe(self, session: PrefetchSession):
         """The cancellation probe for one turn's wait for member bulk capacity.
@@ -1901,6 +1993,9 @@ class StreamingReadManager:
     def _finish_background_session(self, session: PrefetchSession):
         try:
             self._finalize_streaming_session(session)
+        except _PublicationYielded:
+            # Nothing finished: the caller queues the publication again.
+            raise
         except Exception as exc:
             self.logger.exception("Streaming download finalize failed for %s", session.canonical_path)
             with session.lock:
@@ -1940,7 +2035,7 @@ class StreamingReadManager:
         with session.lock:
             claimed = self._download_pool.take_unstaffed(session) if self._download_terminal(session) else None
         while claimed is not None:
-            self._run_download_turn(claimed)
+            self._run_download_turn(claimed, inline=True)
             claimed = self._download_pool.take_unstaffed()
 
     def _attach(self, session: PrefetchSession) -> bool:
