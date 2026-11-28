@@ -1414,25 +1414,135 @@ class TestLiveRead(RevalidateTestBase):
         self.assertEqual(self.partials(), [])
         self.assertEqual(self.fs.cache_manager._reserved_bytes, 0)
 
-    def test_private_copy_whose_name_cannot_be_removed_still_closes_clean(self):
+    def test_private_copy_whose_name_cannot_be_removed_stays_charged(self):
+        # The descriptor still opens, reads and closes; the name that could
+        # not be removed stays charged until production code removes it.
         self.rewrite_member("live.log", b"line 1\n")
         real_unlink = Path.unlink
+        blocked = {"on": True}
 
         def unlink(path, *a, **kw):
-            if ".private" in path.name:
+            if ".private" in path.name and blocked["on"]:
                 raise OSError(errno.EBUSY, "busy")
             return real_unlink(path, *a, **kw)
 
         with self.growing_copy(), patch.object(Path, "unlink", unlink), \
                 self.assertLogs("storage.fs", level="WARNING"):
             fh = self.fs.open("/live.log", os.O_RDONLY)
+            size = self.fs.getattr("/live.log", fh)["st_size"]
             self.assertEqual(self.fs.read("/live.log", 1 << 20, 0, fh)[:6], b"line 1")
             self.fs.release("/live.log", fh)
-        self.assertEqual(self.fs.cache_manager._reserved_bytes, 0)
+            # Not removed: still charged, and still named.
+            self.assertEqual(self.fs.cache_manager._reserved_bytes, size)
+            self.assertEqual(len(list(self.cache_dir.rglob("*.private*"))), 1)
         with self.fs._fd_lock:
             self.assertEqual(self.fs._fd_map, {})
-        for leftover in self.cache_dir.rglob("*.private*"):
-            leftover.unlink()  # the startup sweep would take it
+
+    def test_failed_lstat_after_the_private_rename_leaves_nothing(self):
+        self.rewrite_member("live.log", b"line 1\n")
+        import storage.cache as cache_module
+        real_lstat = os.lstat
+
+        def lstat(path, *a, **kw):
+            if ".private" in str(path):
+                raise OSError(errno.EIO, "lstat failed")
+            return real_lstat(path, *a, **kw)
+
+        with self.growing_copy(), patch.object(cache_module.os, "lstat", side_effect=lstat):
+            with self.assertRaises(FuseOSError) as raised:
+                self.fs.open("/live.log", os.O_RDONLY)
+        self.assertEqual(raised.exception.errno, errno.EIO)
+        self.assertEqual(self.partials(), [])
+        self.assertEqual(list(self.cache_dir.rglob("*.private*")), [])
+        self.assertEqual(self.fs.cache_manager._reserved_bytes, 0)
+
+    def test_any_read_denial_of_the_fill_wins(self):
+        # R5: a size-only probe, a confirmation with 0o200, then a size-only
+        # second confirmation: the private copy is refused.
+        self.rewrite_member("live.log", b"line 1\n")
+        real, seen = self.member.stat, []
+
+        def stats(path):
+            seen.append(path)
+            st = real(path)
+            if len(seen) == 2:  # same size, a token and 0o200: no retry, unconfirmed
+                return SimpleNamespace(st_size=st.st_size, st_mtime=st.st_mtime,
+                                       st_mtime_ns=st.st_mtime_ns, st_mode=stat.S_IFREG | 0o200)
+            return SimpleNamespace(st_size=st.st_size)
+
+        with patch.object(self.member, "stat", side_effect=stats):
+            with self.assertRaises(FuseOSError) as raised:
+                self.fs.open("/live.log", os.O_RDONLY)
+        self.assertEqual(raised.exception.errno, errno.EACCES)
+        self.assertEqual(self.partials(), [])
+        self.assertEqual(self.fs.cache_manager._reserved_bytes, 0)
+
+    def test_enospc_when_the_reservation_does_not_fit(self):
+        self.rewrite_member("live.log", b"line 1\n")
+        with patch.object(self.fs.cache_manager, "ensure_space", return_value=False):
+            with self.assertRaises(FuseOSError) as raised:
+                self.fs.open("/live.log", os.O_RDONLY)
+        self.assertEqual(raised.exception.errno, errno.ENOSPC)
+
+    def stale_copy(self):
+        """A cached copy whose refresh failed: the last good one, marked stale."""
+        self.rewrite_member("live.log", b"version 1", mtime=1_000_000_000)
+        self.assertEqual(self.read_through("/live.log"), b"version 1")
+        self.rewrite_member("live.log", b"version 2!", mtime=1_100_000_000)
+        self.age_checks()
+        with self.growing_copy():
+            self.assertEqual(self.read_through("/live.log"), b"version 1")
+        return self.cache_dir / "live.log"
+
+    def test_stale_mark_follows_the_inode(self):
+        from storage.cache_metadata import STALE_LAST_GOOD_XATTR
+        cached = self.stale_copy()
+        os.getxattr(cached, STALE_LAST_GOOD_XATTR)
+        # An editor's save: a new file renamed over the name is not stale.
+        replacement = cached.with_name("save.tmp")
+        replacement.write_bytes(b"saved")
+        os.replace(replacement, cached)
+        self.fs.release("/live.log", self.fs.open("/live.log", os.O_RDWR))
+
+    def test_stale_mark_goes_with_a_rename_through_the_mount(self):
+        cached = self.stale_copy()
+        self.fs.rename("/live.log", "/moved.log")
+        with self.assertRaises(FuseOSError) as raised:
+            self.fs.open("/moved.log", os.O_RDWR)
+        self.assertEqual(raised.exception.errno, errno.EAGAIN)
+        self.assertFalse(cached.exists())
+
+    def test_a_failed_o_trunc_open_leaves_the_mark(self):
+        import storage.fs as fs_module
+        cached = self.stale_copy()
+        real_open = os.open
+
+        def failing(path, flags, *a, **kw):
+            if flags & os.O_TRUNC and str(path) == str(cached):
+                raise OSError(errno.EMFILE, "too many open files")
+            return real_open(path, flags, *a, **kw)
+
+        with patch.object(fs_module.os, "open", side_effect=failing):
+            with self.assertRaises(FuseOSError):
+                self.fs.open("/live.log", os.O_RDWR | os.O_TRUNC)
+        with self.assertRaises(FuseOSError) as raised:
+            self.fs.open("/live.log", os.O_RDWR)
+        self.assertEqual(raised.exception.errno, errno.EAGAIN)
+        # A successful O_TRUNC open clears it.
+        self.fs.release("/live.log", self.fs.open("/live.log", os.O_RDWR | os.O_TRUNC))
+        self.fs.release("/live.log", self.fs.open("/live.log", os.O_RDWR))
+
+    def test_stale_mark_survives_a_restart(self):
+        self.stale_copy()
+        self.restart()
+        self.member.set_available(False)
+        try:
+            self.assertEqual(self.read_through("/live.log"), b"version 1")
+            with self.assertRaises(FuseOSError) as raised:
+                self.fs.open("/live.log", os.O_RDWR)
+            self.assertEqual(raised.exception.errno, errno.EAGAIN)
+        finally:
+            self.member.set_available(True)
 
     def test_a_token_seen_in_the_first_confirmation_sticks(self):
         # B4: a size-only probe, a tokened first confirmation, then a
@@ -1458,20 +1568,34 @@ class TestLiveRead(RevalidateTestBase):
                 self.assertEqual(raised.exception.errno, errno.EAGAIN)
                 self.assertFalse((self.cache_dir / "f.txt").exists())
 
-    def test_last_good_that_cannot_be_kept_aside_is_not_dropped(self):
+    def test_a_daemon_restarting_offline_mid_refresh_serves_the_named_copy(self):
+        # The crash point: the refresh is still copying beside the copy.
+        # The copy stays named throughout, so a new daemon starting offline
+        # then serves it read-only.
         self.rewrite_member("live.log", b"version 1", mtime=1_000_000_000)
         self.assertEqual(self.read_through("/live.log"), b"version 1")
         self.rewrite_member("live.log", b"version 2!", mtime=1_100_000_000)
         self.age_checks()
-        import storage.fs as fs_module
-        with patch.object(fs_module.os, "link", side_effect=OSError(errno.EMLINK, "links")), \
-                self.count_fetches() as fetches:
-            self.assertEqual(self.read_through("/live.log"), b"version 1")
-            with self.assertRaises(FuseOSError) as raised:
-                self.fs.open("/live.log", os.O_RDWR)
-            self.assertEqual(raised.exception.errno, errno.EAGAIN)
-        self.assertEqual(fetches.call_count, 0)
-        self.assertEqual((self.cache_dir / "live.log").read_bytes(), b"version 1")
+        copy, seen = self.member.copy_to_local, {}
+
+        def crash_point(path, temp):
+            copy(path, temp)
+            restarted = self._make_fs()
+            try:
+                self.member.set_available(False)
+                fh = restarted.open("/live.log", os.O_RDONLY)
+                try:
+                    seen["bytes"] = restarted.read("/live.log", 64, 0, fh)
+                finally:
+                    restarted.release("/live.log", fh)
+            finally:
+                self.member.set_available(True)
+                restarted.sync_manager.stop()
+                restarted.state_manager.close()
+
+        with patch.object(self.member, "copy_to_local", side_effect=crash_point):
+            self.read_through("/live.log")
+        self.assertEqual(seen["bytes"], b"version 1")
 
     def test_writable_open_retries_then_eagain_and_a_stable_version_publishes(self):
         self.rewrite_member("live.log", b"line 1\n")

@@ -44,7 +44,7 @@ from .foreground_admission import AdmissionClosed, ForegroundAdmission, validate
 from .locks import NamespaceLock, PathLocks, UploadLocks
 from .cache_metadata import (
     MEMBER_ATTRS_XATTR, MEMBER_STAT_XATTR as CACHE_MEMBER_STAT_XATTR,
-    PREFIX_XATTR, XATTR_CACHE_METADATA_NAME,
+    PREFIX_XATTR, STALE_LAST_GOOD_XATTR, XATTR_CACHE_METADATA_NAME,
     _member_mtime_ns, cache_identity, forget_cached_member_fields, imported_mode_denies,
     imported_mode_denies_write, read_member_baselines, record_native_attributes, regular_file_stat, scan_cache_entries,
 )
@@ -95,6 +95,9 @@ class FDEntry:
     # it. private_attrs: the member's mode, uid and gid as last reported.
     private_size: Optional[int] = None
     private_attrs: Optional[dict] = None
+    # A private copy's name that could not be removed yet: it stays charged
+    # until it is (retried at close).
+    private_name: Optional[Path] = None
 
 
 @dataclass(frozen=True)
@@ -364,9 +367,10 @@ class StorageFS(Operations):
         # _member_checks_lock.
         self._refetch_pins: Dict[str, Backend] = {}
         self._recheck: Dict[str, Set[str]] = {}
-        # A cached copy a revalidation dropped, kept until its refetch is
-        # installed (_stash_last_good). Under the path's lock.
-        self._last_good: Dict[str, tuple] = {}
+        # Cached copies a revalidation found changed and left named while
+        # the open refetches them in place: canonical path -> the copy's
+        # cache identity (_refresh_in_place). Under the path's lock.
+        self._refresh_pending: Dict[str, tuple] = {}
         # Conflict views whose cached copy has content not yet sent to its
         # member: (cache path, st_ino) -> generation, under _fd_lock. See
         # _mark_view_changed.
@@ -1578,7 +1582,6 @@ class StorageFS(Operations):
         install the older stream-start baseline over the newer one. That is
         conservative: the next check sees a difference and refetches once.
         """
-        self._clear_stale_last_good(canonical_path)
         try:
             identity = self._cache_identity(os.lstat(str(cache_path)))
         except OSError:
@@ -1762,7 +1765,7 @@ class StorageFS(Operations):
             return None
         return listed_at
 
-    def _revalidate_cached_file(self, resolved: ResolvedPath):
+    def _revalidate_cached_file(self, resolved: ResolvedPath, keep_named: bool = False):
         """Refetch a CLEAN cached file whose member copy changed.
 
         Called by open() for a canonical path. Within revalidate_after of the
@@ -1905,15 +1908,14 @@ class StorageFS(Operations):
             # (_clear_recheck): the invalidation below may be refused.
             self._refetch_pins[canonical_path] = backend
             self._pinned_stats[canonical_path] = (backend, member_stat)
-        if not self._stash_last_good(resolved):
-            # The copy could not be kept aside: it is not dropped either.
-            # The refresh fails; read-only opens keep reading it, writable
-            # ones get EAGAIN, and the next check is after the age.
-            self._mark_last_good_stale(resolved, identity)
+        if keep_named and self._may_refresh_in_place(resolved, cache_stat):
+            # The copy stays named (the last good one) while the open stages
+            # the refetch beside it; only a verified copy replaces it
+            # (_ensure_file_in_cache, replace_identity).
+            self._refresh_pending[canonical_path] = identity
             return
         self._invalidate_file_cache(resolved.requested_path)
         if self.cache_manager.is_cached(resolved.requested_path):
-            self._settle_last_good(resolved, reinstate=False)
             # Kept (a writer is open, or it turned out to be a lost write):
             # do not stat again before the age passes; the baselines stay,
             # so the next check still sees the change.
@@ -1930,76 +1932,49 @@ class StorageFS(Operations):
             with self._member_checks_lock:
                 self._member_checks.pop(canonical_path, None)
 
-    def _stash_last_good(self, resolved: ResolvedPath) -> bool:
-        """Keep the cached copy a revalidation is about to drop, until the
-        refetch that replaces it is installed (_settle_last_good). False:
-        it could not be kept aside, so it must not be dropped.
-
-        A hard link under a partial name beside it (hidden from listings),
-        with its index row and cache location. Called under the path's lock,
-        as the open is. Crash limit: the startup sweep removes partial names,
-        so a crash between the drop and the settle loses the kept copy (its
-        row was zeroed by the drop); the next open fetches the file again.
-        """
-        cache_path = resolved.cache_path
-        st = regular_file_stat(cache_path)
-        if st is None:
-            return True
-        stash = cache_path.parent / f".{os.urandom(8).hex()}{self._PARTIAL_SUFFIX}"
-        try:
-            os.link(cache_path, stash)
-        except OSError as exc:
-            self.logger.warning("could not keep %s aside while it is refetched: %s",
-                                cache_path, exc)
-            return False
+    def _may_refresh_in_place(self, resolved: ResolvedPath, cache_stat: os.stat_result) -> bool:
+        """Whether a changed copy can stay named while its refetch stages:
+        only a CLEAN copy whose row describes it (no lost write) with no
+        writable descriptor open; anything dirty, unsynced or sole
+        authoritative goes the ordinary invalidation way, which keeps it."""
         row = self.state_manager.get_file_metadata(resolved.canonical_path)
-        locations = [loc for loc in self.state_manager.get_file_locations(resolved.requested_path)
-                     if loc.backend_name == "cache"]
-        self._last_good[resolved.canonical_path] = (stash, st, row, locations)
-        return True
+        if (row is None or row.sync_status != SyncStatus.CLEAN
+                or row.size != cache_stat.st_size or row.last_modified != cache_stat.st_mtime):
+            return False
+        with self._fd_lock:
+            return not any(
+                (entry.virtual_path == resolved.requested_path
+                 or entry.canonical_path == resolved.canonical_path)
+                and entry.prefetch_session is None
+                and not self._is_read_only_open(entry.flags)
+                for entry in self._fd_map.values())
 
-    def _mark_last_good_stale(self, resolved: ResolvedPath, identity) -> None:
-        """The cached copy is the last good one but known stale: writable
-        opens (and truncates) get EAGAIN until a verified fill replaces it;
-        read-only opens read it; the check is recorded, so opens within the
-        age neither stat the member nor transfer the file again."""
-        self.__dict__.setdefault("_stale_last_good", set()).add(resolved.canonical_path)
-        self._store_member_check(resolved.canonical_path, resolved.cache_path, identity, {})
-
-    def _is_stale_last_good(self, canonical_path: str) -> bool:
-        return canonical_path in self.__dict__.get("_stale_last_good", ())
-
-    def _clear_stale_last_good(self, canonical_path: str) -> None:
-        self.__dict__.get("_stale_last_good", set()).discard(canonical_path)
-
-    def _settle_last_good(self, resolved: ResolvedPath, reinstate: bool) -> None:
-        """Drop the stashed copy, or (the refetch was not installed) put it
-        back at the name it had, with its row and location, if the name is
-        still free. The next open checks the member again."""
-        kept = self.__dict__.get("_last_good", {}).pop(resolved.canonical_path, None)
-        if kept is None:
-            return
-        stash, st, row, locations = kept
+    def _mark_last_good_stale(self, cache_path: Path) -> None:
+        """The cached copy is the last good one but known stale (its refresh
+        could not be verified): writable opens and truncates get EAGAIN until
+        a verified fill replaces it; read-only opens read it. The mark is an
+        xattr on the copy's inode, so it follows the bytes (a rename away
+        keeps it, a rename over the name or a replacing fill drops it) and
+        outlives a restart."""
         try:
-            if reinstate and regular_file_stat(resolved.cache_path) is None:
-                with self.state_manager.metadata_lock:
-                    os.link(stash, resolved.cache_path)
-                    if row is not None:
-                        self.state_manager.set_file_metadata(row)
-                    for location in locations:
-                        self.state_manager.add_file_location(location)
-                self.cache_manager.mark_cache_size_dirty()
-                self.logger.info("refetch of %s not verified; the cached copy is kept",
-                                 resolved.canonical_path)
-                self._mark_last_good_stale(resolved, self._cache_identity(st))
+            os.setxattr(str(cache_path), STALE_LAST_GOOD_XATTR, b"1", follow_symlinks=False)
         except OSError as exc:
-            self.logger.warning("could not reinstate the cached copy of %s: %s",
-                                resolved.canonical_path, exc)
-        finally:
-            try:
-                stash.unlink()
-            except OSError:
-                pass
+            self.logger.warning("could not mark %s stale: %s", cache_path, exc)
+
+    @staticmethod
+    def _is_stale_last_good(cache_path: Path) -> bool:
+        try:
+            os.getxattr(str(cache_path), STALE_LAST_GOOD_XATTR, follow_symlinks=False)
+            return True
+        except OSError:
+            return False
+
+    def _clear_stale_last_good(self, cache_path: Path) -> None:
+        try:
+            os.removexattr(str(cache_path), STALE_LAST_GOOD_XATTR, follow_symlinks=False)
+        except OSError as exc:
+            if exc.errno not in (errno.ENODATA, errno.ENOENT, errno.ENOTSUP):
+                self.logger.warning("could not clear the stale mark of %s: %s", cache_path, exc)
 
     @staticmethod
     def _is_range_available(ranges: List[Tuple[int, int]], start: int, end: int) -> bool:
@@ -2121,7 +2096,8 @@ class StorageFS(Operations):
             self.cache_manager.mark_cache_size_dirty()
         return removed
 
-    def _ensure_file_in_cache(self, resolved: ResolvedPath, private: Optional[list] = None) -> bool:
+    def _ensure_file_in_cache(self, resolved: ResolvedPath, private: Optional[list] = None,
+                              replace_identity: Optional[tuple] = None) -> bool:
         """
         Ensure a file is in the cache, downloading or recomputing if necessary
 
@@ -2131,8 +2107,8 @@ class StorageFS(Operations):
         canonical_path = resolved.canonical_path
         cache_path = resolved.cache_path
 
-        # Check if already cached
-        if self.cache_manager.is_cached(resolved.requested_path):
+        # Check if already cached (a refresh in place fetches over it)
+        if replace_identity is None and self.cache_manager.is_cached(resolved.requested_path):
             if not resolved.backend_name:
                 self.cache_manager.mark_accessed(resolved.requested_path)
                 # A CLEAN row older than the file means a write's row update
@@ -2184,7 +2160,7 @@ class StorageFS(Operations):
             confirmed: list = []
             outcome = self.cache_manager.cache_file_result(
                 resolved.requested_path, backend, canonical_path, member_stat=member_stat,
-                confirmed=confirmed, private=private,
+                confirmed=confirmed, private=private, replace_identity=replace_identity,
             )
             if outcome == CacheFetch.ALREADY_CACHED and self._drop_unindexed_prefix(canonical_path, cache_path):
                 # A failed stream's prefix was installed before this copy
@@ -2610,11 +2586,10 @@ class StorageFS(Operations):
                 and resolved.backend_name in repairs.backends_for([resolved.canonical_path])):
             raise FuseOSError(errno.EBUSY)
 
-        if self._is_stale_last_good(resolved.canonical_path):
-            if length:
-                # A known stale last good copy is no baseline to edit.
-                raise FuseOSError(errno.EAGAIN)
-            self._clear_stale_last_good(resolved.canonical_path)
+        stale = self._is_stale_last_good(cache_path)
+        if stale and length:
+            # A known stale last good copy is no baseline to edit.
+            raise FuseOSError(errno.EAGAIN)
         try:
             self._require_imported_write_permission(cache_path)
             with open(cache_path, 'r+b') as f:
@@ -2624,6 +2599,9 @@ class StorageFS(Operations):
                 if resized or not resolved.backend_name:
                     f.truncate(length)
             self.cache_manager.mark_cache_size_dirty()
+
+            if stale:
+                self._clear_stale_last_good(cache_path)  # emptied: no stale bytes left
 
             # Mark as dirty
             if not resolved.backend_name:
@@ -2655,9 +2633,9 @@ class StorageFS(Operations):
             except BulkCapacityTimeout as exc:
                 raise FuseOSError(errno.EAGAIN) from exc
             finally:
-                # A copy a revalidation dropped goes back if the open ended
-                # before anything replaced it (a no-op once settled).
-                self._settle_last_good(self._resolve_path(path), reinstate=True)
+                # A refresh this open did not perform stays undone: the copy
+                # was never dropped, and the next check finds the change.
+                self.__dict__.get("_refresh_pending", {}).pop(canonical_path, None)
                 # The pin belongs to this open (_select_backend_for_read):
                 # one no fetch used (the open attached to a running stream,
                 # or the file was kept) must not steer a later fetch.
@@ -2696,20 +2674,25 @@ class StorageFS(Operations):
             and not flags & os.O_TRUNC
             and self.cache_manager.is_cached(resolved.requested_path)
         ):
-            self._revalidate_cached_file(resolved)
-        if self._is_stale_last_good(resolved.canonical_path) and not self._is_read_only_open(flags):
+            # A read-only open with streaming on takes the ordinary path: a
+            # changed copy is dropped and streamed again (as before #208; a
+            # discarded stream leaves the file to fetch again). Otherwise the
+            # copy stays named until a verified refetch replaces it.
+            streams = self._streaming_reads and self._is_read_only_open(flags)
+            self._revalidate_cached_file(resolved, keep_named=not streams)
+        clear_stale = False
+        if (not self._is_read_only_open(flags) and resolved.backend_name is None
+                and self._is_stale_last_good(cache_path)):
             if flags & os.O_TRUNC:
-                # Its bytes are discarded, so no stale baseline is edited.
-                self._clear_stale_last_good(resolved.canonical_path)
-            elif self.cache_manager.is_cached(resolved.requested_path):
+                clear_stale = True  # its bytes are discarded: once the open succeeds
+            elif resolved.canonical_path not in self._refresh_pending:
+                # Known stale and no refresh due yet (within the age): no
+                # baseline to edit. A due refresh runs first and decides.
                 raise FuseOSError(errno.EAGAIN)
 
-        # Streaming mode applies only to canonical read-only opens of uncached
-        # files. A refresh that keeps the last good copy aside is a full fill
-        # (its outcome settles that copy here, under the path's lock).
+        # Streaming mode applies only to canonical read-only opens of uncached files.
         if (
             self._streaming_reads
-            and resolved.canonical_path not in self.__dict__.get("_last_good", {})
             and resolved.backend_name is None
             and self._is_read_only_open(flags)
             and not self.cache_manager.is_cached(resolved.requested_path)
@@ -2751,21 +2734,24 @@ class StorageFS(Operations):
             self.cache_manager.take_fill_errno()
             read_only = self._is_read_only_open(flags)
             private: Optional[list] = [] if read_only and not resolved.backend_name else None
+            refresh = self._refresh_pending.pop(resolved.canonical_path, None)
             try:
-                if self._ensure_file_in_cache(resolved, private=private):
-                    self._settle_last_good(resolved, reinstate=False)
+                if self._ensure_file_in_cache(resolved, private=private, replace_identity=refresh):
                     cache_path = resolved.cache_path
                 else:
                     # Not installed (fill_action): an unverified version gives
-                    # EAGAIN; otherwise the fill's own errno. A copy the
-                    # revalidation dropped goes back, and a read-only opener
-                    # keeps reading it; with none, it may read the completed,
+                    # EAGAIN; otherwise the fill's own errno. A refresh leaves
+                    # the last good copy named: a read-only opener keeps
+                    # reading it, and it is marked stale for writers. With
+                    # none, a read-only opener may read the completed,
                     # bounded copy privately.
                     code = self.cache_manager.take_fill_errno() or errno.EIO
-                    had_last_good = resolved.canonical_path in self._last_good
-                    self._settle_last_good(resolved, reinstate=True)
-                    if read_only and had_last_good and self.cache_manager.is_cached(
-                            resolved.requested_path):
+                    if refresh is not None and self.cache_manager.is_cached(resolved.requested_path):
+                        self._mark_last_good_stale(resolved.cache_path)
+                        self._store_member_check(resolved.canonical_path, resolved.cache_path,
+                                                 refresh, {})
+                    if (read_only and refresh is not None
+                            and self.cache_manager.is_cached(resolved.requested_path)):
                         cache_path = resolved.cache_path
                     elif read_only and private:
                         copy, size, known = private[0]
@@ -2779,8 +2765,8 @@ class StorageFS(Operations):
                         raise FuseOSError(code)
             finally:
                 for copy, size, _known in private or ():
-                    self._drop_private_copy(copy)
-                    self.cache_manager.release_reserved(size)
+                    if self._drop_private_copy(copy):
+                        self.cache_manager.release_reserved(size)
             if private_size is None:
                 if not self._is_read_only_open(flags):
                     self._require_imported_write_permission(cache_path)
@@ -2816,10 +2802,13 @@ class StorageFS(Operations):
                     private_size=private_size,
                     private_attrs=private_attrs,
                 )
+            if clear_stale:
+                self._clear_stale_last_good(cache_path)
             if private_size is not None:
                 # The descriptor holds the copy; its name goes at once, so
                 # nothing else can reach it and its last close frees it.
-                self._drop_private_copy(cache_path)
+                if not self._drop_private_copy(cache_path):
+                    self._fd_map[vfd].private_name = cache_path
                 return vfd
             if resolved.backend_name and flags & os.O_TRUNC:
                 opened = self._fd_map[vfd]
@@ -2833,21 +2822,23 @@ class StorageFS(Operations):
         except OSError as e:
             if prefetch_session is not None:
                 self._release_prefetch_session(prefetch_session)
-            if private_size is not None:
-                self._drop_private_copy(cache_path)
+            if private_size is not None and self._drop_private_copy(cache_path):
                 self.cache_manager.release_reserved(private_size)
             raise FuseOSError(e.errno)
 
-    def _drop_private_copy(self, copy: Optional[Path]) -> None:
-        """Unlink a private copy's name; a failure is logged (the startup
-        sweep removes partial names), never raised past the descriptor."""
-        if copy is not None:
-            try:
-                copy.unlink()
-            except FileNotFoundError:
-                pass
-            except OSError as exc:
-                self.logger.warning("could not remove the private copy %s: %s", copy, exc)
+    def _drop_private_copy(self, copy: Optional[Path]) -> bool:
+        """Unlink a private copy's name; True once it is gone. A failure is
+        logged (the startup sweep removes partial names), never raised."""
+        if copy is None:
+            return True
+        try:
+            copy.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            self.logger.warning("could not remove the private copy %s: %s", copy, exc)
+            return False
+        return True
 
     def create(self, path, mode, fi=None):
         """Create a file"""
@@ -2858,7 +2849,6 @@ class StorageFS(Operations):
         """Create a file"""
         resolved = self._resolve_path(path)
         self._refuse_fenced_view_write(resolved)
-        self._clear_stale_last_good(resolved.canonical_path)  # its bytes are replaced
         # O_CREAT on an existing read-only member file is refused natively.
         self._require_imported_write_permission(resolved.cache_path)
         cache_path = self.cache_manager.create_cached_file(resolved.requested_path)
@@ -2882,6 +2872,9 @@ class StorageFS(Operations):
                 # A create truncates or makes the view's copy: content to send.
                 created = self._fd_map[vfd]
                 self._mark_view_changed(cache_path, created.view_ino, created)
+            # Its bytes were replaced: a stale last good mark goes (once the
+            # create succeeded).
+            self._clear_stale_last_good(cache_path)
             try:
                 # No member fields: stat skips legacy recovery and its index read.
                 record_native_attributes(real_fd)
@@ -3078,8 +3071,11 @@ class StorageFS(Operations):
             return 0
 
         if entry.private_size is not None:
-            # A private copy (already unlinked): its bytes leave the budget.
-            self.cache_manager.release_reserved(entry.private_size)
+            # A private copy: its bytes leave the budget once its name is
+            # gone too (a name that still cannot be removed stays charged
+            # until the startup sweep).
+            if self._drop_private_copy(entry.private_name):
+                self.cache_manager.release_reserved(entry.private_size)
             if close_error is not None:
                 raise FuseOSError(close_error.errno)
             return 0
@@ -3369,7 +3365,7 @@ class StorageFS(Operations):
     def setxattr(self, path, name, value, options, position=0):
         """Set extended attribute"""
         if name in {self.CHECKSUM_XATTR, self.CACHE_STATE_XATTR, self.CACHE_METADATA_XATTR,
-                    self.MEMBER_STAT_XATTR, MEMBER_ATTRS_XATTR}:
+                    self.MEMBER_STAT_XATTR, MEMBER_ATTRS_XATTR, STALE_LAST_GOOD_XATTR}:
             # Ignore manual writes for derived attrs.
             return
         if name == self.VERIFY_XATTR:
@@ -3411,7 +3407,7 @@ class StorageFS(Operations):
     def removexattr(self, path, name):
         """Remove extended attribute"""
         if name in {self.CHECKSUM_XATTR, self.CACHE_STATE_XATTR, self.CACHE_METADATA_XATTR,
-                    self.MEMBER_STAT_XATTR, MEMBER_ATTRS_XATTR}:
+                    self.MEMBER_STAT_XATTR, MEMBER_ATTRS_XATTR, STALE_LAST_GOOD_XATTR}:
             # Derived; ignore removals.
             return
         resolved = self._resolve_path(path)

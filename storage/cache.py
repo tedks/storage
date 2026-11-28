@@ -21,7 +21,7 @@ from .backends.base import Backend, bounded_copy, bulk_request
 from .backends.ssh_pool import BulkCapacityCancelled, BulkCapacityTimeout
 from .cache_metadata import (
     PARTIAL_SUFFIX, PREFIX_XATTR, FillAction, MemberVersion, confirm_member_stat,
-    copy_member_attributes, fill_action, has_version_token, regular_file_stat,
+    cache_identity, copy_member_attributes, fill_action, has_version_token, regular_file_stat,
     write_cache_metadata,
 )
 from .member_repairs import VIEW_WRITE, MemberRepairs, is_at_or_under
@@ -81,6 +81,12 @@ class NewFileReservation:
     def __init__(self, size: int, inode):
         self.size = size
         self.inode = inode  # (st_dev, st_ino)
+
+
+def _denies_owner_read(st) -> bool:
+    """Whether a member stat reports a mode without owner read (root aside)."""
+    mode = getattr(st, "st_mode", None)
+    return os.geteuid() != 0 and type(mode) is int and not mode & stat_module.S_IRUSR
 
 
 class CacheFetch(Enum):
@@ -549,7 +555,7 @@ class CacheManager:
     def cache_file_result(
         self, virtual_path: str, backend: Backend, source_virtual_path: str = None,
         *, member_stat=_STAT_NOT_PROBED, confirmed: Optional[list] = None,
-        private: Optional[list] = None,
+        private: Optional[list] = None, replace_identity: Optional[tuple] = None,
     ) -> CacheFetch:
         """
         Download a file from backend into cache
@@ -599,6 +605,7 @@ class CacheManager:
             installed = self.fetch_into_cache(
                 backend, source_virtual_path, self.get_cache_path(virtual_path), member_stat,
                 confirmed=confirmed, reserved=file_size, private=private,
+                replace_identity=replace_identity,
             )
             self.state_manager.update_access_time(virtual_path)
             return CacheFetch.INSTALLED if installed else CacheFetch.ALREADY_CACHED
@@ -640,7 +647,8 @@ class CacheManager:
 
     def fetch_into_cache(self, backend: Backend, source_virtual_path: str, cache_path: Path,
                          member_stat=None, *, confirmed: Optional[list] = None,
-                         reserved: Optional[int] = None, private: Optional[list] = None) -> bool:
+                         reserved: Optional[int] = None, private: Optional[list] = None,
+                         replace_identity: Optional[tuple] = None) -> bool:
         """Copy a member file to cache_path through a temp file beside it.
 
         The copy runs without the cache lock into a fresh name that ends in
@@ -669,6 +677,9 @@ class CacheManager:
         extra_reserved = 0
         try:
             token_seen = has_version_token(member_stat)
+            # Any stat of the fill that withheld owner read: a private copy
+            # is then refused, whatever a later stat (or none) reports.
+            read_denied = _denies_owner_read(member_stat)
             for attempt in range(2):
                 if attempt:
                     temp_path.unlink(missing_ok=True)
@@ -700,10 +711,12 @@ class CacheManager:
                 newest, version = confirm_member_stat(
                     backend, source_virtual_path, member_stat, st.st_size)
                 token_seen = token_seen or has_version_token(newest)
+                read_denied = read_denied or _denies_owner_read(newest)
                 if version == MemberVersion.UNCONFIRMED:
                     newest, version = confirm_member_stat(
                         backend, source_virtual_path, member_stat, st.st_size)
                     token_seen = token_seen or has_version_token(newest)
+                    read_denied = read_denied or _denies_owner_read(newest)
                 # A stat that showed another version with a token: the only
                 # one a retry may be confirmed against.
                 newer = newest if version == MemberVersion.CHANGED else None
@@ -740,10 +753,15 @@ class CacheManager:
                 # never linked into the cache, and takes over this fill's
                 # reservation for its size before cache_file_result releases
                 # its own (no window).
-                if private is not None and cap is not None:
+                if private is not None and cap is not None and not read_denied:
                     kept = temp_path.with_name(f".{secrets.token_hex(8)}.private{PARTIAL_SUFFIX}")
                     os.rename(temp_path, kept)
-                    size = os.lstat(kept).st_size
+                    try:
+                        # Owned from the rename on: a failure here removes it.
+                        size = os.lstat(kept).st_size
+                    except BaseException:
+                        kept.unlink(missing_ok=True)
+                        raise
                     with self._lock:
                         self._reserved_bytes += size
                     known = {}
@@ -751,6 +769,10 @@ class CacheManager:
                         value = getattr(newest, key, None)
                         known[key] = getattr(member_stat, key, None) if value is None else value
                     private.append((kept, size, known))
+                elif private is not None and read_denied:
+                    self._fill_errno.code = errno.EACCES
+                    raise OSError(errno.EACCES, f"the member withheld read of {source_virtual_path}",
+                                  source_virtual_path)
                 self._fill_errno.code = errno.EAGAIN
                 raise OSError(errno.EAGAIN, f"the member's version of {source_virtual_path} "
                               f"could not be confirmed ({version})", source_virtual_path)
@@ -761,6 +783,18 @@ class CacheManager:
             finally:
                 os.close(fd)
             with self._lock:
+                current = regular_file_stat(cache_path) if replace_identity is not None else None
+                if current is not None and cache_identity(current) == replace_identity:
+                    # A refresh in place: the last good copy stayed named
+                    # until now and is replaced atomically by this verified
+                    # one (open descriptors keep the old inode).
+                    os.replace(temp_path, cache_path)
+                    self._current_size_bytes += size - current.st_size
+                    if version == MemberVersion.AGREED and newest is not None and confirmed is not None:
+                        confirmed.append(newest)
+                    return True
+                if current is not None:
+                    return False  # changed since the check: that copy stays
                 try:
                     os.link(temp_path, cache_path)
                 except FileExistsError:
