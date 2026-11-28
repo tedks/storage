@@ -2449,6 +2449,34 @@ class TestRefreshRound5(RevalidateTestBase):
         self.assertFalse((self.cache_dir / "live.log").exists())
         self.assertEqual(self.partials(), [])
 
+    def test_descriptor_denial_survives_metadata_copy_error(self):
+        from storage.backends import local
+
+        self.changed_v1()
+        source = self.member_dir / "live.log"
+        real_stream = local.copy_bounded_stream
+
+        def revoke_after_read(read, write, bound):
+            real_stream(read, write, bound)
+            source.chmod(0o200)
+
+        with patch.object(local, "copy_bounded_stream", side_effect=revoke_after_read), \
+                patch.object(local, "_listxattr", side_effect=OSError(errno.EIO, "attrs")), \
+                patch.object(self.fs.sync_manager, "queue_sync") as sync:
+            self.assert_errno(errno.EACCES, self.read_through, "/live.log")
+        sync.assert_not_called()
+        self.assertFalse((self.cache_dir / "live.log").exists())
+        self.assertEqual(self.partials(), [])
+
+    def test_readable_source_metadata_copy_error_keeps_eio(self):
+        from storage.backends import local
+
+        self.changed_v1()
+        with patch.object(local, "_listxattr", side_effect=OSError(errno.EIO, "attrs")):
+            self.assert_errno(errno.EIO, self.fs.open, "/live.log", os.O_RDWR)
+        self.assertEqual(self.read_through("/live.log"), b"version 1")
+        self.assertEqual(self.partials(), [])
+
     def test_aged_stat_denial_is_not_an_outage(self):
         self.changed_v1()
         with patch.object(self.member, "stat", side_effect=PermissionError(errno.EACCES, "denied")):
@@ -2574,6 +2602,36 @@ class TestRefreshRound5(RevalidateTestBase):
         self.assertEqual(src.read_bytes(), b"newbytes")
         self.assertFalse((self.cache_dir / "f.txt").exists())
         self.assertIsNone(self.fs.state_manager.get_file_metadata("/f.txt"))
+
+    def test_bounded_fill_copies_xattrs_from_the_source_of_its_bytes(self):
+        from storage.backends import local
+
+        src = self.rewrite_member("f.txt", b"original", mtime=1_000_000_000)
+        replacement = self.rewrite_member("replacement", b"newbytes", mtime=1_000_000_000)
+        aside = src.with_name("aside")
+        os.setxattr(src, "user.tag", b"original attrs")
+        os.setxattr(replacement, "user.tag", b"replacement attrs")
+        real_list, real_stat = local._listxattr, self.member.stat
+        swapped = False
+
+        def list_during_swap(entry):
+            nonlocal swapped
+            if entry == src or isinstance(entry, int):
+                os.rename(src, aside)
+                os.replace(replacement, src)
+                swapped = True
+            return real_list(entry)
+
+        def restore_before_confirmation(path):
+            if swapped and aside.exists():
+                os.replace(aside, src)
+            return real_stat(path)
+
+        with patch.object(local, "_listxattr", side_effect=list_during_swap), \
+                patch.object(self.member, "stat", side_effect=restore_before_confirmation):
+            self.assertEqual(self.read_through("/f.txt"), b"original")
+        self.assertTrue(swapped)
+        self.assertEqual(os.getxattr(self.cache_dir / "f.txt", "user.tag"), b"original attrs")
 
     def test_path_identity_can_disprove_matching_size_and_mtime(self):
         from storage.backends import local

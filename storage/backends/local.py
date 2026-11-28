@@ -115,34 +115,34 @@ def _copy_file(src: Path, dst: Path, *, download: bool = False):
     bound = current_copy_bound() if download else None
     if bound is None:
         shutil.copyfile(src, dst)
-        st = os.stat(src)
-    else:
-        # One open of the source, at most bound.cap bytes (CopyBound): a
-        # writer appending meanwhile cannot make the copy unbounded. Mode
-        # and times come from that same open.
-        # O_NONBLOCK so a FIFO or device put at the name cannot block the
-        # open; the same descriptor's fstat must say regular file, and only
-        # then is blocking restored and anything read.
-        fd = os.open(src, os.O_RDONLY | os.O_NONBLOCK)
-        try:
-            st = os.fstat(fd)
-            if not stat.S_ISREG(st.st_mode):
-                raise OSError(errno.EINVAL, "not a regular file", str(src))
-            os.set_blocking(fd, True)
-            bound.source_stats.append(st)
-            # Unbuffered: every read is one read(2) of at most what
-            # copy_bounded_stream asks for, so the descriptor never reads
-            # past cap + 1 bytes.
-            fin = os.fdopen(fd, "rb", buffering=0)
-        except BaseException:
-            os.close(fd)
-            raise
-        with fin, open(dst, "wb") as fout:
+        _copy_file_metadata(src, dst, os.stat(src), download=download)
+        return
+
+    # Bound the read using one source open. O_NONBLOCK avoids hanging on a
+    # substituted FIFO before fstat verifies the descriptor is regular.
+    fd = os.open(src, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise OSError(errno.EINVAL, "not a regular file", str(src))
+        os.set_blocking(fd, True)
+        bound.source_stats.append(st)
+        # Unbuffered reads keep the descriptor within cap + 1 bytes.
+        fin = os.fdopen(fd, "rb", buffering=0)
+    except BaseException:
+        os.close(fd)
+        raise
+    with fin:
+        with open(dst, "wb") as fout:
             copy_bounded_stream(fin.read, fout.write, bound)
-            # The copied descriptor's own stat once its bytes are read: a
-            # write during the copy, or another file opened at the name,
-            # shows here even if the name is back at the probe's version.
+            # Keep the closing evidence even if the receiver subsequently
+            # fails to flush or apply metadata.
             bound.source_stats.append(os.fstat(fin.fileno()))
+        _copy_file_metadata(fin.fileno(), dst, st, download=download)
+
+
+def _copy_file_metadata(src: Path | int, dst: Path, st: os.stat_result, *, download: bool):
+    """Copy supported attributes from the path or still-open source fd."""
     keep = {name for name in _listxattr(src) if not _is_internal_xattr(name)}
     for name in _listxattr(dst):
         if name.startswith(_INTERNAL_XATTR_PREFIX) and name not in keep:

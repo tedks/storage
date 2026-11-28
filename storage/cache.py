@@ -732,15 +732,18 @@ class CacheManager:
         with self._lock:
             scans = self._scan_count
         extra_reserved = 0
+        bound = None
+        read_denied = False
         try:
             token_seen = has_version_token(member_stat)
             for attempt in range(2):
-                if attempt:
-                    temp_path.unlink(missing_ok=True)
                 # Any stat of this attempt (the one whose bytes may be
                 # installed) that withheld owner read: the denial stands,
                 # whatever a later stat of the attempt (or none) reports.
+                bound = None
                 read_denied = _denies_read(member_stat)
+                if attempt:
+                    temp_path.unlink(missing_ok=True)
                 # The reservation is the copy's bound (CTO-208-BOUNDED): one
                 # open of the source, at most that many bytes, one probe read
                 # for growth. A member that cannot bound its copy gives no
@@ -911,16 +914,19 @@ class CacheManager:
             with self._lock:
                 self._size_dirty = True
             if getattr(self._fill_errno, "code", None) is None:
-                # What the open reports (take_fill_errno): the transfer's own
-                # error (EIO when it carries none), never "absent".
-                # A transfer's ENOENT (its temp file swept, or the member
-                # file gone mid-copy) is EIO: only cache_file_result's
-                # exists() probe confirms absence (_ensure_file_in_cache).
-                self._fill_errno.code = (
-                    errno.EIO if isinstance(exc, FileNotFoundError)
-                    else exc.errno if isinstance(exc, OSError) and exc.errno
-                    else errno.EHOSTUNREACH if isinstance(exc, ConnectionError)
-                    else errno.EIO)
+                # A copy can collect descriptor evidence and then fail while
+                # applying attributes. Keep any read denial it observed.
+                if read_denied or (bound is not None and any(
+                        _denies_read(fd_st) for fd_st in bound.source_stats)):
+                    self._fill_errno.code = errno.EACCES
+                else:
+                    # The transfer's own errno, with ENOENT from a transfer
+                    # or a staging failure treated as I/O, never absence.
+                    self._fill_errno.code = (
+                        errno.EIO if isinstance(exc, FileNotFoundError)
+                        else exc.errno if isinstance(exc, OSError) and exc.errno
+                        else errno.EHOSTUNREACH if isinstance(exc, ConnectionError)
+                        else errno.EIO)
             raise
         finally:
             if extra_reserved:
