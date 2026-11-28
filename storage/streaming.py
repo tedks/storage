@@ -180,8 +180,9 @@ class _DownloadPool:
 
     A session offered as local has every byte or has stopped: its turn only
     publishes (finalize, or the cleanup of a failed session), local I/O
-    with no member channel. Local turns are taken first and neither count
-    against nor wait for the member's bulk ceiling.
+    with no member channel. Local turns are taken first (at most
+    ACTIVE_DOWNLOAD_BURST in a row while a range read is runnable) and
+    neither count against nor wait for the member's bulk ceiling.
     """
 
     def __init__(self, limit, run_turn, logger):
@@ -196,6 +197,8 @@ class _DownloadPool:
         self.running: dict[PrefetchSession, bool] = {}
         self.threads: set[threading.Thread] = set()
         self.active_turns = 0
+        # Publication turns taken in a row while a range read was runnable.
+        self.local_turns = 0
         self.closing = False
         # Members with runnable sessions and no free worker; see
         # _refresh_contention.
@@ -345,6 +348,16 @@ class _DownloadPool:
             self._refresh_contention()
             return session
 
+    def move_to_local(self, session):
+        """Count a running turn as local from here on: it has moved to publication."""
+        with self.condition:
+            if self.running.get(session) is False:
+                self.running[session] = True
+                # A member slot came free: a queued range read may now run.
+                self._grow()
+                self._refresh_contention()
+                self.condition.notify_all()
+
     def snapshot(self):
         with self.condition:
             return len(self.threads), len(self.running), len(self.ready)
@@ -352,19 +365,15 @@ class _DownloadPool:
     def _take(self):
         if len(self.running) >= self.limit:
             return None
-        # A publication first: it is short, needs no member, and frees a
-        # registry slot and a descriptor.
-        local = next((session for session, (_, is_local) in self.ready.items() if is_local), None)
-        if local is not None:
-            del self.ready[local]
-            self.running[local] = True
-            self._refresh_contention()
-            return local
-        active = closed = None
+        local = active = closed = None
         # Member headroom is based on in-flight work. Each priority gets
         # its first choice of that headroom before either is selected.
         running_by_member = self._member_load()
-        for session, (has_reader, _) in self.ready.items():
+        for session, (has_reader, is_local) in self.ready.items():
+            if is_local:
+                if local is None:
+                    local = session
+                continue
             capacity = session.backend.background_range_capacity()
             if capacity is not None and running_by_member[session.backend.name] >= capacity:
                 continue
@@ -372,8 +381,20 @@ class _DownloadPool:
                 active = session
             if not has_reader and closed is None:
                 closed = session
-            if active is not None and closed is not None:
+            if local is not None and active is not None and closed is not None:
                 break
+        ranged = active is not None or closed is not None
+        # A publication first: it is short, needs no member, and frees a
+        # registry slot and a descriptor. But no more than
+        # ACTIVE_DOWNLOAD_BURST in a row while a range read is runnable,
+        # so a stream of publications cannot starve range reads.
+        if local is not None and (not ranged or self.local_turns < ACTIVE_DOWNLOAD_BURST):
+            self.local_turns = self.local_turns + 1 if ranged else 0
+            del self.ready[local]
+            self.running[local] = True
+            self._refresh_contention()
+            return local
+        self.local_turns = 0
         if closed is not None and (active is None or self.active_turns >= ACTIVE_DOWNLOAD_BURST):
             session = closed
             self.active_turns = 0
@@ -1711,6 +1732,10 @@ class StreamingReadManager:
                 self._schedule_background(session, finished_turn=True)
                 return
 
+        # Its lease is released: publication is local I/O, and must not
+        # hold the member's bulk slot (a stalled fsync would block other
+        # files on the member).
+        self._download_pool.move_to_local(session)
         try:
             self._finish_background_session(session)
         finally:

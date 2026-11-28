@@ -20,7 +20,7 @@ from storage.backends.ssh_pool import BulkCapacityCancelled
 from storage.cache_metadata import MEMBER_ATTRS_XATTR
 from storage.fs import StorageFS
 from storage.models import SyncStatus
-from storage.streaming import PrefetchSession
+from storage.streaming import ACTIVE_DOWNLOAD_BURST, PrefetchSession, _DownloadPool
 from storage.mount_profiles import parse_keep_after_close
 
 
@@ -795,6 +795,70 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.backend.worker_gate.set()
         self.assertTrue(small.background_finished.wait(timeout=3))
         self.assertTrue(large.background_finished.wait(timeout=3))
+
+    def test_stalled_publication_does_not_hold_the_members_range_slot(self):
+        manager = self.fs._streaming_manager
+        real_finalize = manager._finalize_streaming_session
+        paused = threading.Event()
+        resume = threading.Event()
+        self.addCleanup(resume.set)
+
+        def finalize(session):
+            if session.canonical_path == "/publishing.bin":
+                paused.set()
+                resume.wait(timeout=10)
+            return real_finalize(session)
+
+        publishing_payload = os.urandom(64 * 1024)
+        (self.backend_dir / "publishing.bin").write_bytes(publishing_payload)
+        payload = os.urandom(256 * 1024)
+        (self.backend_dir / "reading.bin").write_bytes(payload)
+        with patch.object(self.backend, "background_range_capacity", return_value=1), \
+                patch.object(manager, "_finalize_streaming_session", side_effect=finalize):
+            publishing_fd = self.fs.open("/publishing.bin", os.O_RDONLY)
+            publishing = self._session_for(publishing_fd)
+            # One chunk read; the worker fetches the last one and moves
+            # on to publication, which stalls.
+            self.assertEqual(self.fs.read("/publishing.bin", 32 * 1024, 0, publishing_fd),
+                             publishing_payload[:32 * 1024])
+            self.assertTrue(paused.wait(timeout=3))
+            try:
+                reading_fd = self.fs.open("/reading.bin", os.O_RDONLY)
+                reading = self._session_for(reading_fd)
+                self.assertEqual(self.fs.read("/reading.bin", 128 * 1024, 0, reading_fd), payload[:128 * 1024])
+                self.assertTrue(reading.background_finished.wait(timeout=5))
+                self.assertTrue(reading.finalized)
+                self.assertFalse(publishing.finalized)
+            finally:
+                resume.set()
+            self.assertTrue(publishing.background_finished.wait(timeout=3))
+            self.fs.release("/reading.bin", reading_fd)
+            self.fs.release("/publishing.bin", publishing_fd)
+        self.assertEqual((self.cache_dir / "publishing.bin").read_bytes(), publishing_payload)
+        self.assertEqual((self.cache_dir / "reading.bin").read_bytes(), payload)
+
+    def test_publications_arriving_faster_than_drained_do_not_starve_range_reads(self):
+        class Fake:
+            """A queued session as the pool sees it; hashed by identity."""
+
+            def __init__(self, name):
+                self.canonical_path = name
+                self.refcount = 0
+                self.backend = SimpleNamespace(name="member", background_range_capacity=lambda: None)
+
+        pool = _DownloadPool(1, lambda session: None, self.fs.logger)
+        ranged = Fake("/retained")
+        taken = []
+        with pool.condition:
+            pool.ready[ranged] = (False, False)
+            for index in range(ACTIVE_DOWNLOAD_BURST + 1):
+                # One more publication is queued before every take.
+                pool.ready[Fake(f"/published-{index}")] = (False, True)
+                session = pool._take()
+                taken.append(session)
+                del pool.running[session]
+        self.assertTrue(all(session is not ranged for session in taken[:-1]))
+        self.assertIs(taken[-1], ranged)
 
     def test_bulk_wait_yield_interval_restarts_for_each_acquisition(self):
         manager = self.fs._streaming_manager
