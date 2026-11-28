@@ -81,6 +81,13 @@ class FDEntry:
     # A conflict view descriptor's cached inode: with cache_path, the key of
     # the view's pending content change (StorageFS._mark_view_changed).
     view_ino: Optional[int] = None
+    # This descriptor changed the view's content (a write, ftruncate, an
+    # O_TRUNC open or a create): a refusal of that change is reported to its
+    # close (flush), not to another descriptor's.
+    view_changer: bool = False
+    # Another descriptor's close kept this one's change off its member for
+    # an open repair: this descriptor's flush reports EBUSY.
+    view_refused: bool = False
 
 
 @dataclass(frozen=True)
@@ -2477,7 +2484,14 @@ class StorageFS(Operations):
                 self._mark_cache_file_dirty(resolved.canonical_path, cache_path)
             elif resized:
                 # Sent by the next close of any descriptor on this view, by
-                # path or ftruncate alike (_mark_view_changed).
+                # path or ftruncate alike (_mark_view_changed). An ftruncate's
+                # descriptor made the change (its refusal is reported to it);
+                # a truncate by path has no descriptor of its own.
+                if fh is not None:
+                    with self._fd_lock:
+                        changer = self._fd_map.get(fh)
+                        if changer is not None and changer.backend_name:
+                            changer.view_changer = True
                 self._mark_view_changed(cache_path, truncated.st_ino)
 
         except OSError as e:
@@ -2594,6 +2608,7 @@ class StorageFS(Operations):
                     canonical_path=resolved.canonical_path,
                     prefetch_session=prefetch_session,
                     view_ino=os.fstat(real_fd).st_ino if resolved.backend_name else None,
+                    view_changer=bool(resolved.backend_name and flags & os.O_TRUNC),
                 )
             if resolved.backend_name and flags & os.O_TRUNC:
                 self._mark_view_changed(cache_path, self._fd_map[vfd].view_ino)
@@ -2635,6 +2650,7 @@ class StorageFS(Operations):
                     canonical_path=resolved.canonical_path,
                     prefetch_session=None,
                     view_ino=os.fstat(real_fd).st_ino if resolved.backend_name else None,
+                    view_changer=bool(resolved.backend_name),
                 )
             if resolved.backend_name:
                 # A create truncates or makes the view's copy: content to send.
@@ -2765,6 +2781,7 @@ class StorageFS(Operations):
                     written = os.pwrite(entry.real_fd, data, offset)
                 except OSError as e:
                     raise FuseOSError(e.errno)
+                entry.view_changer = True
                 self._mark_view_changed(entry.cache_path, entry.view_ino)
                 self.cache_manager.mark_cache_size_dirty()
                 return written
@@ -2898,6 +2915,15 @@ class StorageFS(Operations):
             if force or (generation is not None and self._view_pending.get(key) == generation):
                 self._view_pending.pop(key, None)
 
+    def _refuse_view_changers(self, entry: FDEntry) -> None:
+        """Mark the open descriptors that changed entry's view inode refused."""
+        key = (str(entry.cache_path), entry.view_ino)
+        with self._fd_lock:
+            for other in self._fd_map.values():
+                if (other.backend_name and other.view_changer
+                        and (str(other.cache_path), other.view_ino) == key):
+                    other.view_refused = True
+
     @staticmethod
     def _names_descriptor_inode(entry: FDEntry) -> bool:
         """Whether the view's name still holds the descriptor's inode (dev, ino)."""
@@ -2946,6 +2972,11 @@ class StorageFS(Operations):
             # close() has already succeeded: the view's bytes are
             # kept durably as a repair of their own, listed until
             # resolved (MemberRepairs.preserve_view_write).
+            # Whichever descriptor's close gets here, the refusal belongs to
+            # the descriptors that made the change: those still open report
+            # it at their own close (flush), never this one if it changed
+            # nothing.
+            self._refuse_view_changers(entry)
             try:
                 kept = inode is not None and self.cache_manager.member_repairs.preserve_view_write(
                     entry.canonical_path, entry.backend_name, entry.cache_path, inode,
@@ -3017,12 +3048,20 @@ class StorageFS(Operations):
         """
         with self._fd_lock:
             entry = self._fd_map.get(fh)
-        if (entry is not None and entry.backend_name
+        if entry is None or not entry.backend_name:
+            return 0
+        if entry.view_refused:
+            # Another descriptor's close already kept this one's change for
+            # the repair (_refuse_view_changers).
+            raise FuseOSError(errno.EBUSY)
+        # Only a descriptor that changed the view is told of the refusal; a
+        # reader of the same changed inode closes normally.
+        if (entry.view_changer
                 and entry.backend_name in self.cache_manager.member_repairs.backends_for(
-                    [entry.canonical_path])):
-            if (self._view_pending_generation(entry) is not None
-                    and self._names_descriptor_inode(entry)):
-                raise FuseOSError(errno.EBUSY)
+                    [entry.canonical_path])
+                and self._view_pending_generation(entry) is not None
+                and self._names_descriptor_inode(entry)):
+            raise FuseOSError(errno.EBUSY)
         return 0
 
     def fsync(self, path, datasync, fh):

@@ -581,6 +581,45 @@ class TestDirectoryRetries(SyncRaceTestBase):
         self.assertEqual([], copies)
         self.assertEqual(b"sole bytes", (self.member_dir / "d" / "f.txt").read_bytes())
 
+    def test_a_reader_close_does_not_take_the_writers_refusal(self):
+        """Barrier/control: a writer and an unmodified reader share a changed
+        view; a repair appears; the reader closes first. The reader's close
+        succeeds, the writer's close (flush) reports EBUSY, the member gets
+        nothing, and the changed bytes are kept as a view-write repair.
+        (Pre-#184, 59e8d28, behaved so too: a read-only close sent nothing
+        and only writable descriptors were refused.)"""
+        self.fs.mkdir("/d", 0o755)
+        self.write_file("/d/f.txt", b"sole bytes")
+        self.start_sync()
+        self.wait_synced("/d/f.txt")
+        self.wait_idle()
+        self.fs.sync_manager.stop()
+        view = self.fs.cache_manager.get_cache_path("/d/f.txt.member")
+        view.write_bytes(b"sole bytes")
+        writer = self.fs.open("/d/f.txt.member", os.O_WRONLY)
+        reader = self.fs.open("/d/f.txt.member", os.O_RDONLY)
+        self.fs.write("/d/f.txt.member", b"overwrite!", 0, writer)
+
+        self.fail_member_once("rename")
+        self.fs.rename("/d", "/e")
+        copies = []
+        patcher = patch.object(self.member, "copy_from_local",
+                               side_effect=lambda *a: copies.append(a))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.assertEqual(0, self.fs.flush("/d/f.txt.member", reader))
+        self.fs.release("/d/f.txt.member", reader)
+        with self.assertRaises(FuseOSError) as raised:
+            self.fs.flush("/d/f.txt.member", writer)
+        self.assertEqual(errno.EBUSY, raised.exception.errno)
+        self.fs.release("/d/f.txt.member", writer)
+        self.assertEqual([], copies)
+        self.assertEqual(b"sole bytes", (self.member_dir / "d" / "f.txt").read_bytes())
+        repairs = MemberRepairs(self.cache_dir)
+        kept = [repairs.carrier_path(r.id).read_bytes()
+                for r in repairs.list() if r.kind == VIEW_WRITE]
+        self.assertEqual([b"overwrite!"], kept)
+
     def test_a_member_known_down_during_a_rename_gets_a_repair(self):
         """A member that is unavailable when the rename runs has missed it
         like one whose call failed: it must not drop out of the record."""
