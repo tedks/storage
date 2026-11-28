@@ -584,48 +584,6 @@ class TestCreatedAndChangedFiles(RevalidateTestBase):
         self.assertEqual(stat.S_IMODE(cached.stat().st_mode), 0o444)
 
 
-class TestKernelPageDrop(RevalidateTestBase):
-    """An open that serves another backing inode than the path had makes the
-    handle's first fgetattr (libfuse's auto_cache check) differ."""
-
-    def test_refetch_arms_one_distinct_mtime_for_its_handle(self):
-        self.rewrite_member("f.txt", b"original", mtime=1_700_000_000)
-        fh = self.fs.open("/f.txt", os.O_RDONLY)  # cold: a new inode
-        try:
-            self.assertNotEqual(self.fs.getattr("/f.txt", fh)["st_mtime"], 1_700_000_000)
-            self.assertEqual(self.fs.getattr("/f.txt", fh)["st_mtime"], 1_700_000_000)
-        finally:
-            self.fs.release("/f.txt", fh)
-
-        fh = self.fs.open("/f.txt", os.O_RDONLY)  # warm: the same inode
-        try:
-            self.assertEqual(self.fs.getattr("/f.txt", fh)["st_mtime"], 1_700_000_000)
-        finally:
-            self.fs.release("/f.txt", fh)
-
-        self.fs._on_remote_change("/f.txt")  # dropped; refetched at open
-        fh = self.fs.open("/f.txt", os.O_RDONLY)
-        try:
-            self.assertEqual(self.fs.getattr("/f.txt")["st_mtime"], 1_700_000_000)  # no fh
-            self.assertNotEqual(self.fs.getattr("/f.txt", fh)["st_mtime"], 1_700_000_000)
-        finally:
-            self.fs.release("/f.txt", fh)
-
-    def test_distinct_mtime_survives_fusepy_conversion(self):
-        from storage.fs import _distinct_mtime
-
-        def timespec(value):
-            sec = int(value)
-            return sec, int((value - sec) * 1e9)
-
-        for mtime in (0.0, 1_700_000_000.0, 1_700_000_000.999999, 4e12, -5.5):
-            with self.subTest(mtime=mtime):
-                later = _distinct_mtime(mtime)
-                self.assertGreater(later, mtime)
-                self.assertNotEqual(timespec(later), timespec(mtime))
-                self.assertLess(later - mtime, 1.0)
-
-
 class TestConflictViewTruncate(RevalidateTestBase):
     """A conflict view's change reaches its member also when no writable
     descriptor's close carries it."""

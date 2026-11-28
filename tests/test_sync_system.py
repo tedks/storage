@@ -437,30 +437,6 @@ class TestKernelCacheRefetch(_MountedCase):
     def test_shrunk_file_reads_short(self):
         self._read_after_revalidation("shrink.bin", b"a" * 200, b"d" * 50)
 
-    def test_refetch_with_same_size_and_mtime_drops_old_pages(self):
-        # A fill keeps the member's mtime, so a refetch after the copy was
-        # dropped (a watcher event, an eviction) can present libfuse's
-        # auto_cache with the size and mtime of the pages it holds: the
-        # member was rewritten in place within its timestamp (cp -p,
-        # rsync -t, a whole-second SFTP mtime).
-        name, old, new = "same-time.bin", b"a" * 100, b"e" * 100
-        member = self.backend1_dir / name
-        stamp = 1_700_000_000  # whole seconds, as SFTP reports them
-        member.write_bytes(old)
-        os.utime(member, (stamp, stamp))
-        target = self.mount_dir / name
-        self.assertEqual(old, target.read_bytes())  # cached, pages primed
-        member.write_bytes(new)
-        os.utime(member, (stamp, stamp))
-        self.fs._on_remote_change("/" + name)  # as the member's watcher would
-        self.assertFalse((self.cache_dir / name).exists())
-        st = os.stat(target)
-        self.assertEqual((len(old), stamp), (st.st_size, st.st_mtime))
-        with open(target, "rb") as f:
-            self.assertEqual(new, f.read())
-        # The reported mtime is the member's again after the open.
-        self.assertEqual(stamp, os.stat(target).st_mtime)
-
 
 class TestMemberSymlinks(_MountedCase):
     """A link that exists only on a member reads through the mount

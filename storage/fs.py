@@ -76,22 +76,6 @@ class FDEntry:
     prefetch_session: Optional[PrefetchSession] = None
 
 
-def _distinct_mtime(mtime: float) -> float:
-    """The smallest later mtime that fusepy's float conversion reports as
-    another timespec (fusepy without use_ns: tv_nsec from the fraction)."""
-    if not math.isfinite(mtime):
-        return mtime
-
-    def timespec(value):
-        sec = int(value)
-        return sec, int((value - sec) * 1e9)
-
-    step = 1e-6
-    while timespec(mtime + step) == timespec(mtime):
-        step *= 2
-    return mtime + step
-
-
 @dataclass(frozen=True)
 class MemberCheck:
     """What is known about a cached file's members, and since when.
@@ -2188,40 +2172,7 @@ class StorageFS(Operations):
 
     def getattr(self, path, fh=None):
         """Get file attributes"""
-        attrs = self.namespace.getattr(path)
-        if fh is not None:
-            pending = self.__dict__.get("_page_drop_pending")
-            thread = threading.get_native_id()
-            if pending is not None and pending.get(thread) == fh:
-                del pending[thread]
-                attrs = dict(attrs, st_mtime=_distinct_mtime(attrs["st_mtime"]))
-        return attrs
-
-    def _arm_page_drop(self, fh: int) -> None:
-        """Make libfuse drop the kernel's pages for the file fh opened.
-
-        auto_cache keeps a file's pages at open while the size and mtime
-        libfuse last saw are unchanged. A fill keeps the member's mtime, so
-        a refetch (after eviction, a watcher event or a revalidation) of
-        content rewritten within the same size and timestamp (cp -p,
-        rsync -t, whole-second SFTP mtimes) would be read through the old
-        pages. libfuse 2's high-level API cannot invalidate an inode, but
-        right after open() returns it calls fgetattr for the new handle on
-        the same thread (open_auto_cache, ac_attr_timeout=0), and drops
-        the pages when that answer differs. getattr answers that one call
-        with an mtime one fusepy tick later; libfuse keeps it only for its
-        comparison. Costs: the next open drops the pages once more (the
-        following getattr reports the true mtime again), and when libfuse
-        made no such call (it already meant to drop them), the descriptor's
-        first fstat or read-past-size attribute refresh on this thread
-        sees the later mtime once instead.
-
-        Keyed by the OS thread: libfuse's worker threads are not Python's,
-        so each callback on one gets a fresh Python thread state and
-        threading.local would not last from open to fgetattr. A thread
-        keeps at most one armed descriptor, replaced by its next open.
-        """
-        self.__dict__.setdefault("_page_drop_pending", {})[threading.get_native_id()] = fh
+        return self.namespace.getattr(path)
 
     def readdir(self, path, fh):
         """Read directory contents"""
@@ -2514,8 +2465,6 @@ class StorageFS(Operations):
             self._refuse_fenced_view_write(resolved)
         cache_path = resolved.cache_path
         prefetch_session: Optional[PrefetchSession] = None
-        # The inode the kernel's pages for this path may come from.
-        prior = regular_file_stat(cache_path)
 
         # Before the streaming decision: a copy dropped here is refetched
         # like any uncached file, streamed if streaming is on.
@@ -2583,14 +2532,6 @@ class StorageFS(Operations):
                     canonical_path=resolved.canonical_path,
                     prefetch_session=prefetch_session,
                 )
-
-            try:
-                opened = os.fstat(real_fd)
-                replaced = prior is None or (prior.st_dev, prior.st_ino) != (opened.st_dev, opened.st_ino)
-            except OSError:
-                replaced = True
-            if replaced:
-                self._arm_page_drop(vfd)
 
             if resolved.backend_name is None:
                 self.cache_manager.mark_accessed(resolved.requested_path)
@@ -3556,10 +3497,7 @@ def fuse_mount_options(backends: Dict[str, Backend], *, enable_watchers: bool,
     is not read through old pages (kernel_cache would keep them). libfuse
     compares against attributes it fetched within ac_attr_timeout, which
     defaults to attr_timeout; ac_attr_timeout=0 states that a getattr
-    follows every open rather than leaving it implied. A fill keeps the
-    member's mtime, so a refetch can match the old size and mtime; an open
-    of a new backing inode makes that getattr differ
-    (StorageFS._arm_page_drop).
+    follows every open rather than leaving it implied.
 
     Writes through the mount stay visible at once: create, mkdir, unlink,
     rmdir and rename update the kernel's entries themselves. (symlink is
