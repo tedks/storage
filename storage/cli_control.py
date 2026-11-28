@@ -6,7 +6,7 @@ from pathlib import Path
 
 import click
 
-from .control import ControlError, REQUEST_TIMEOUT, request_control_payload
+from .control import ControlError, REQUEST_TIMEOUT, canonical_mountpoint, request_control_payload
 from .mount_profiles import resolve_member_configuration
 
 
@@ -18,21 +18,49 @@ class ControlTarget:
     timeout: float
     json_output: bool
 
-    def _resolve_cache(self) -> Path:
+    def _resolve(self) -> tuple[Path, str | None]:
+        """The cache to reach and, with --profile, the mountpoint it must answer for."""
         if bool(self.cache) == bool(self.profile):
             raise click.UsageError("Specify one of --cache or --profile")
         if self.config_path is not None and not self.profile:
             raise click.UsageError("--config requires --profile")
         if self.profile:
-            return resolve_member_configuration(self.profile, self.config_path, (), None, None).cache_root
-        return self.cache.resolve()
+            resolved = resolve_member_configuration(self.profile, self.config_path, (), None, None)
+            return resolved.cache_root, canonical_mountpoint(resolved.mountpoint)
+        return self.cache.resolve(), None
 
-    def request(self, command: str, **arguments) -> dict:
-        request = json.dumps({"command": command, **arguments}).encode("ascii")
+    def _send(self, cache: Path, request: dict) -> dict:
         try:
-            payload = request_control_payload(self._resolve_cache(), request, self.timeout)
+            return request_control_payload(cache, json.dumps(request).encode("ascii"), self.timeout)
         except ControlError as exc:
             raise click.ClickException(str(exc)) from exc
+
+    @staticmethod
+    def _require_mount(payload: dict, mountpoint: str):
+        # Two mounts can share a cache; only one of them owns its socket.
+        mount = payload.get("mount")
+        reported = mount.get("mountpoint") if isinstance(mount, dict) else None
+        if not isinstance(reported, str):
+            raise click.ClickException("The control socket did not report which mount it belongs to")
+        if reported != mountpoint:
+            raise click.ClickException(
+                f"The control socket in this profile's cache belongs to the mount at {reported}, "
+                f"not this profile's mountpoint {mountpoint}"
+            )
+
+    def request(self, command: str, *, mutation: bool = False, **arguments) -> dict:
+        cache, mountpoint = self._resolve()
+        if mountpoint is not None:
+            if mutation:
+                # Confirm the mount before changing anything, even if the
+                # server were to ignore the mountpoint sent below.
+                self._require_mount(self._send(cache, {"command": "status", "mountpoint": mountpoint}),
+                                    mountpoint)
+            # The mount refuses a request naming another mountpoint.
+            arguments["mountpoint"] = mountpoint
+        payload = self._send(cache, {"command": command, **arguments})
+        if mountpoint is not None and command == "status":
+            self._require_mount(payload, mountpoint)
         if self.json_output:
             click.echo(json.dumps(payload, sort_keys=True, indent=2))
         return payload
@@ -73,6 +101,7 @@ def control_status(target):
         return
     stats = payload["stats"]
     click.echo(f"Mount PID {stats['pid']}")
+    click.echo(f"  Mountpoint: {payload['mount']['mountpoint']}")
     click.echo(f"  Streaming files with readers: {stats['active_reader_sessions']}")
     click.echo(f"  Retained downloads: {stats['retained_streaming_sessions']}")
     click.echo(f"  Download workers running: {stats['download_workers_running']}/{stats['download_workers']}")
@@ -102,7 +131,7 @@ def control_set(target, **limits):
     changes = {key: value for key, value in limits.items() if value is not None}
     if not changes:
         raise click.UsageError("Provide at least one live streaming limit to set")
-    payload = target.request("streaming.set", limits=changes)
+    payload = target.request("streaming.set", mutation=True, limits=changes)
     if not target.json_output:
         _print_parameters(payload)
 
@@ -130,7 +159,7 @@ def control_downloads(target):
 @click.pass_obj
 def control_cancel(target, session_id):
     """Cancel a reader-free background download by its exact session ID."""
-    payload = target.request("downloads.cancel", id=session_id)
+    payload = target.request("downloads.cancel", mutation=True, id=session_id)
     outcome = payload["result"]
     if not target.json_output:
         if outcome == "cancelled":

@@ -570,6 +570,15 @@ cache directory or a profile name. Profile selection reads the configured
 cache path. Use `--cache` when the running mount was started with a cache
 override or the profile now points to a different cache.
 
+Two mounts configured with the same cache share one control socket, and only
+the first to start owns it. With `--profile`, every request names the
+profile's mountpoint and the mount refuses one that names another mount;
+`set` and `cancel` also check the mount's reported mountpoint before sending
+the change. `--cache` reaches whichever mount owns that cache's socket;
+`status` shows its mountpoint. Mountpoints are compared as absolute paths with
+the parent directory's symlinks resolved, so a relative mountpoint matches only
+from the working directory the mount was started in.
+
 ```bash
 storage control --profile media
 storage control --profile media --config ./storage.toml get

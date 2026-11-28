@@ -512,8 +512,12 @@ class StreamingReadManager:
         on_finalized: Optional[Callable[["PrefetchSession"], None]] = None,
         max_download_workers: int = DEFAULT_MAX_DOWNLOAD_WORKERS,
         max_retained_streaming_sessions: int = DEFAULT_MAX_RETAINED_STREAMING_SESSIONS,
+        mountpoint: Optional[str] = None,
     ):
         self.cache_manager = cache_manager
+        # Reported to control clients, which refuse a socket that answers
+        # for another mount sharing this cache. None when not mounted.
+        self.mountpoint = mountpoint
         # Called once the complete file is in the cache (StorageFS records
         # the member baseline for revalidation on open).
         self.on_finalized = on_finalized
@@ -937,10 +941,21 @@ class StreamingReadManager:
             raise ControlError("Expected a JSON control request object")
 
         command = arguments.pop("command", None)
+        if "mountpoint" in arguments:
+            # The client names the mount it means; refuse before acting
+            # rather than answer for another mount sharing the cache.
+            expected = arguments.pop("mountpoint")
+            if not isinstance(expected, str):
+                raise ControlError("Expected the target mountpoint as a string")
+            if expected != self.mountpoint:
+                raise ControlError(
+                    f"This control socket belongs to the mount at {self.mountpoint}, not {expected}"
+                )
         if command in ("status", "streaming.get", "downloads.list") and arguments:
             raise ControlError("Unexpected arguments for control command")
         if command == "status":
             return {
+                "mount": {"mountpoint": self.mountpoint, "pid": os.getpid()},
                 "stats": self._streaming_stats_snapshot(),
                 **self._control_parameters(self.download_limits()),
             }

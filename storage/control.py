@@ -65,6 +65,20 @@ def _owner_socket(path: Path) -> os.stat_result:
     return _require_owner_socket(path.lstat(), path)
 
 
+def canonical_mountpoint(mountpoint: str) -> str:
+    """The absolute mountpoint a mount reports and a profile is matched against.
+
+    The parent directory's symlinks are resolved; the final component is
+    not, so this never stats the mount root itself (a hung mount would
+    block the CLI). The mount and the CLI apply the same rule, so a
+    relative mountpoint matches only when both resolve it from the same
+    working directory, as for the cache path.
+    """
+    absolute = os.path.abspath(os.fsdecode(mountpoint))
+    parent, name = os.path.split(absolute)
+    return os.path.join(os.path.realpath(parent), name)
+
+
 def _check_peer(sock: socket.socket):
     # Linux SO_PEERCRED authenticates both ends independently of the socket
     # path and any filesystem ACLs or ownership changes after bind.

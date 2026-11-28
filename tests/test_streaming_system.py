@@ -20,6 +20,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from storage.backends.local import LocalBackend
+from storage.control import canonical_mountpoint
 from storage.fs import StorageFS
 from tests.fuse_mount import run_fuse, stop_fuse
 
@@ -156,6 +157,7 @@ class TestStreamingSystemRegression(unittest.TestCase):
             streaming_reads=True,
             streaming_chunk_size=64 * 1024,
             max_streaming_sessions=4,
+            mountpoint=canonical_mountpoint(str(self.mount_dir)),
         )
 
         self.mount_thread = threading.Thread(
@@ -388,6 +390,7 @@ class TestStreamingSystemRegression(unittest.TestCase):
                 self.assertEqual(status["stats"]["active_reader_sessions"], 1)
                 self.assertNotIn(name, json.dumps(status, ensure_ascii=False))
                 self.assertTrue(status["restart_only"]["streaming_reads"])
+                self.assertEqual(status["mount"]["mountpoint"], canonical_mountpoint(str(self.mount_dir)))
                 row, = command("downloads")["downloads"]
                 self.assertEqual(row["path"].lstrip("/"), name)
                 self.assertEqual(row["readers"], 1)
@@ -411,6 +414,25 @@ class TestStreamingSystemRegression(unittest.TestCase):
                                    "--max-download-workers", "33", expected=1, json_output=False)
                 self.assertIn("max_download_workers", rejected.stderr)
                 self.assertEqual(command("get")["limits"], limits)
+
+                # A profile reaches this cache's socket only for its own mountpoint.
+                config = Path(self.temp_dir) / "storage.toml"
+                config.write_text("".join(f"""
+[mounts.{profile}]
+mountpoint = {json.dumps(str(mountpoint))}
+cache = {json.dumps(str(self.cache_dir))}
+backends = [{json.dumps(str(self.backend_dir))}]
+""" for profile, mountpoint in (("this", self.mount_dir),
+                                ("other", Path(self.temp_dir) / "elsewhere"))))
+                by_profile = ["control", "--config", str(config), "--profile"]
+                refused = self._run_control_cli(*by_profile, "other", "set",
+                                                "--max-download-workers", "2", expected=1)
+                self.assertIn("belongs to the mount at", refused.stderr)
+                self.assertEqual(command("get")["limits"], limits)
+                mine = json.loads(self._run_control_cli(
+                    *by_profile, "this", "--json-output", "set", "--max-download-workers", "1",
+                ).stdout)
+                self.assertEqual(mine["limits"], limits)
 
                 with (self.mount_dir / second).open("rb") as fallback:
                     self.assertEqual(fallback.read(16), self.payload[:16])

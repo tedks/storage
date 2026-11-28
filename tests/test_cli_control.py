@@ -18,6 +18,7 @@ from storage.control import (
     MAX_REQUEST_BYTES,
     ControlError,
     ControlServer,
+    canonical_mountpoint,
     request_control_payload,
 )
 
@@ -162,45 +163,120 @@ def test_never_replaces_arbitrary_entries(cache):
     assert path.read_text() == "another publisher"
 
 
-def test_profile_selection_and_atomic_set_request(cache):
+def write_profile(cache, mountpoint="/never-mounted"):
     config = cache / "storage.toml"
     config.write_text(f"""
 [mounts.example]
-mountpoint = "/never-mounted"
+mountpoint = {json.dumps(str(mountpoint))}
 cache = {json.dumps(str(cache))}
 backends = ["/no-member-probe"]
 """)
+    return config
+
+
+def recording_server(cache, mountpoint):
+    """A stub mount reporting `mountpoint`; it does not check requests' mountpoints."""
     requests = []
 
     def dispatch(frame):
         request = json.loads(frame)
         requests.append(request)
-        return {"ok": True}
+        return {"ok": True, "result": "cancelled", "mount": {"mountpoint": mountpoint, "pid": 1}}
 
-    server = server_for(cache, dispatch)
+    return server_for(cache, dispatch), requests
+
+
+def test_profile_selection_and_atomic_set_request(cache):
+    config = write_profile(cache)
+    server, requests = recording_server(cache, "/never-mounted")
     server.start()
     try:
         runner = CliRunner()
         options = ["control", "--profile", "example", "--config", str(config), "--json-output"]
         result = runner.invoke(main, options)
         assert result.exit_code == 0, result.output
-        assert json.loads(result.output) == {"ok": True}
+        assert json.loads(result.output)["ok"] is True
 
         result = runner.invoke(main, options + ["set", "--max-streaming-sessions", "3",
                                                 "--max-retained-streaming-sessions", "0"])
         assert result.exit_code == 0, result.output
+        # Only the mutation's own response is printed, not the identity check.
+        assert json.loads(result.output)["ok"] is True
+        identity = {"command": "status", "mountpoint": "/never-mounted"}
         assert requests == [
-            {"command": "status"},
-            {"command": "streaming.set", "limits": {
+            identity,
+            identity,
+            {"command": "streaming.set", "mountpoint": "/never-mounted", "limits": {
                 "max_streaming_sessions": 3, "max_retained_streaming_sessions": 0,
             }},
         ]
         assert runner.invoke(main, options + ["--cache", str(cache)]).exit_code == 2
         assert runner.invoke(main, options + ["set"]).exit_code == 2
         assert runner.invoke(main, ["control", "set", "--help"]).exit_code == 0
-        assert len(requests) == 2
+        assert len(requests) == 3
+
+        # --cache names the socket directly: no mountpoint to check or send.
+        requests.clear()
+        result = runner.invoke(main, ["control", "--cache", str(cache), "cancel", "0" * 32])
+        assert result.exit_code == 0, result.output
+        assert requests == [{"command": "downloads.cancel", "id": "0" * 32}]
     finally:
         server.stop()
+
+
+def test_profile_refuses_a_socket_answering_for_another_mount(cache):
+    # Two mounts sharing one cache: the socket belongs to the other one.
+    config = write_profile(cache, "/mnt/profile-b")
+    server, requests = recording_server(cache, "/mnt/profile-a")
+    server.start()
+    try:
+        runner = CliRunner()
+        options = ["control", "--profile", "example", "--config", str(config)]
+        for command in (["set", "--max-download-workers", "2"], ["cancel", "0" * 32], ["status"]):
+            requests.clear()
+            result = runner.invoke(main, options + command)
+            assert result.exit_code == 1, result.output
+            assert "belongs to the mount at /mnt/profile-a" in result.output
+            assert "/mnt/profile-b" in result.output
+            # Only the identity check (or the status itself) was sent.
+            assert requests == [{"command": "status", "mountpoint": "/mnt/profile-b"}]
+    finally:
+        server.stop()
+
+
+def test_profile_refuses_a_socket_that_reports_no_mount(cache):
+    config = write_profile(cache)
+    requests = []
+
+    def dispatch(frame):
+        requests.append(json.loads(frame))
+        return {"ok": True}
+
+    server = server_for(cache, dispatch)
+    server.start()
+    try:
+        result = CliRunner().invoke(main, ["control", "--profile", "example", "--config", str(config),
+                                           "set", "--max-download-workers", "2"])
+        assert result.exit_code == 1, result.output
+        assert "did not report which mount" in result.output
+        assert [request["command"] for request in requests] == ["status"]
+    finally:
+        server.stop()
+
+
+def test_canonical_mountpoint(tmp_path, monkeypatch):
+    real = tmp_path / "real"
+    (real / "mount").mkdir(parents=True)
+    real = real.resolve()
+    (tmp_path / "alias").symlink_to(real)
+    (real / "final").symlink_to(real / "mount")
+    monkeypatch.chdir(real)
+    assert canonical_mountpoint(str(tmp_path / "alias" / "mount") + "/") == str(real / "mount")
+    assert canonical_mountpoint("mount") == str(real / "mount")
+    assert canonical_mountpoint("./x/../mount") == str(real / "mount")
+    # The final component is never resolved, so a hung mount root is not touched.
+    assert canonical_mountpoint(str(tmp_path / "alias" / "final")) == str(real / "final")
+    assert canonical_mountpoint("/") == "/"
 
 
 def test_handler_errors_are_logged_and_answered(cache, caplog):

@@ -3843,6 +3843,7 @@ class TestControlRequests(unittest.TestCase):
             streaming_reads=True,
             streaming_chunk_size=32 * 1024,
             max_streaming_sessions=2,
+            mountpoint="/mnt/example",
         )
         self.manager = self.fs._streaming_manager
         self.initial_limits = self.manager.download_limits()
@@ -3905,6 +3906,18 @@ class TestControlRequests(unittest.TestCase):
             ({"command": "downloads.cancel", "id": int(self.VALID_ID, 16)}, cancel_message),
             ({"command": "downloads.cancel", "id": [self.VALID_ID]}, cancel_message),
             ({"command": "downloads.cancel", "id": self.VALID_ID, "force": True}, cancel_message),
+            ({"command": "streaming.set", "limits": {"max_download_workers": 2},
+              "mountpoint": "/mnt/other"},
+             "This control socket belongs to the mount at /mnt/example, not /mnt/other"),
+            ({"command": "streaming.set", "limits": {"max_download_workers": 2},
+              "mountpoint": "/mnt/example/"},
+             "This control socket belongs to the mount at /mnt/example, not /mnt/example/"),
+            ({"command": "streaming.set", "limits": {"max_download_workers": 2},
+              "mountpoint": None}, "Expected the target mountpoint as a string"),
+            ({"command": "downloads.cancel", "id": self.VALID_ID, "mountpoint": "/mnt/other"},
+             "This control socket belongs to the mount at /mnt/example, not /mnt/other"),
+            ({"command": "status", "mountpoint": "/mnt/other"},
+             "This control socket belongs to the mount at /mnt/example, not /mnt/other"),
         ]
         for request, message in cases:
             with self.subTest(request=request):
@@ -3920,7 +3933,11 @@ class TestControlRequests(unittest.TestCase):
         self.assertNotIn("limits", legacy)
 
         status = self.handle({"command": "status"})
-        self.assertEqual(set(status), {"stats", "limits", "restart_only"})
+        self.assertEqual(set(status), {"mount", "stats", "limits", "restart_only"})
+        self.assertEqual(status["mount"], {"mountpoint": "/mnt/example", "pid": os.getpid()})
+        named = self.handle({"command": "status", "mountpoint": "/mnt/example"})
+        self.assertEqual(named["mount"], status["mount"])
+        self.assertEqual(named["limits"], status["limits"])
         self.assertEqual(status["limits"], self.initial_limits)
         self.assertTrue(status["restart_only"]["streaming_reads"])
         self.assertEqual(status["restart_only"]["streaming_chunk_size"], 32 * 1024)
@@ -3930,7 +3947,7 @@ class TestControlRequests(unittest.TestCase):
             {"limits": self.initial_limits, "restart_only": status["restart_only"]},
         )
 
-        changed = self.handle({"command": "streaming.set", "limits": {
+        changed = self.handle({"command": "streaming.set", "mountpoint": "/mnt/example", "limits": {
             "max_streaming_sessions": 3, "max_download_workers": 2,
         }})
         expected = {**self.initial_limits, "max_streaming_sessions": 3, "max_download_workers": 2}
