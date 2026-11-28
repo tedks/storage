@@ -6,7 +6,6 @@ import json
 import logging
 import math
 import os
-import re
 import secrets
 import socket
 import stat
@@ -17,7 +16,7 @@ from collections.abc import Callable
 from contextlib import contextmanager
 from pathlib import Path
 
-from .backends.local import NOREPLACE_UNSUPPORTED, rename_noreplace
+from .backends.local import NOREPLACE_UNSUPPORTED, RENAME_EXCHANGE, RENAME_NOREPLACE, renameat2
 
 
 CONTROL_SOCKET_NAME = ".storage.control.sock"
@@ -288,37 +287,47 @@ def _entry_at(dir_fd: int, name: str) -> os.stat_result:
 
 # Publication and cleanup stage in a private directory of the cache, named
 # STAGE_PREFIX plus a 32-hex-digit nonce, and exist only while the cache lock
-# is held. A stage holds at most: STAGE_NONCE (a file made O_EXCL holding
-# exactly the nonce in its name), STAGE_SOCKET (the socket being published)
-# and STAGE_MOVED (a dead socket taken off the control name, or our own at
-# stop). A crash can leave one behind; publication sweeps those it can
-# prove it made (see _sweep_stale_stages).
+# is held. A stage holds at most STAGE_NONCE (a file made O_EXCL holding
+# the nonce), STAGE_SOCKET (the socket being published or the entry
+# displaced at takeover), and STAGE_MOVED (the entry moved at stop).
+# Cache walkers skip the prefix. README describes manual crash recovery.
 STAGE_PREFIX = ".storage.mount."
 STAGE_NONCE = "nonce"
 STAGE_SOCKET = "socket"
 STAGE_MOVED = "moved"
-_STAGE_NAME = re.compile(re.escape(STAGE_PREFIX) + "([0-9a-f]{32})")
 
 
 def _fd_path(dir_fd: int, name: str) -> str:
     return f"/proc/self/fd/{dir_fd}/{name}"
 
 
-def _place_noreplace(src_fd: int, src: str, dst_fd: int, dst: str) -> bool:
-    """Move src (in src_fd) to dst (in dst_fd) unless dst exists.
+def _rename(src_fd: int, src: str, dst_fd: int, dst: str, flags: int) -> bool | None:
+    """renameat2 between two directory fds: True if done, False if dst was
+    taken (RENAME_NOREPLACE), None if the kernel or filesystem lacks the
+    call or the flag. Moves of an existing control entry use only this:
+    there is no fallback that could leave an entry in two places or none."""
+    try:
+        return renameat2(_fd_path(src_fd, src), _fd_path(dst_fd, dst), flags)
+    except OSError as exc:
+        if exc.errno in NOREPLACE_UNSUPPORTED:
+            return None
+        raise
 
-    True if moved, False if dst was taken. renameat2(RENAME_NOREPLACE)
-    where the filesystem has it, else link() and unlinking src (both
-    refuse a taken name, so neither can clobber). ControlError when the
+
+def _publish_to_free_name(stage_fd: int, root_fd: int) -> bool:
+    """Place the staged socket at the control name if the name is free.
+
+    True if placed, False if the name is taken. RENAME_NOREPLACE, else (no
+    renameat2) link() then unlinking the staged name: both refuse a taken
+    name, and this moves only our own new socket. ControlError when the
     filesystem has neither.
     """
+    placed = _rename(stage_fd, STAGE_SOCKET, root_fd, CONTROL_SOCKET_NAME, RENAME_NOREPLACE)
+    if placed is not None:
+        return placed
     try:
-        return rename_noreplace(_fd_path(src_fd, src), _fd_path(dst_fd, dst))
-    except OSError as exc:
-        if exc.errno not in NOREPLACE_UNSUPPORTED:
-            raise
-    try:
-        os.link(src, dst, src_dir_fd=src_fd, dst_dir_fd=dst_fd, follow_symlinks=False)
+        os.link(STAGE_SOCKET, CONTROL_SOCKET_NAME, src_dir_fd=stage_fd, dst_dir_fd=root_fd,
+                follow_symlinks=False)
     except FileExistsError:
         return False
     except OSError as exc:
@@ -327,7 +336,7 @@ def _place_noreplace(src_fd: int, src: str, dst_fd: int, dst: str) -> bool:
                 "the cache filesystem supports neither no-replace rename nor hard links"
             ) from exc
         raise
-    os.unlink(src, dir_fd=src_fd)
+    os.unlink(STAGE_SOCKET, dir_fd=stage_fd)
     return True
 
 
@@ -354,19 +363,6 @@ def _pin_entry(dir_fd: int, name: str) -> int:
     return os.open(name, os.O_PATH | os.O_NOFOLLOW, dir_fd=dir_fd)
 
 
-def _dead_socket_of_ours(dir_fd: int, name: str) -> tuple[int, int] | None:
-    """The identity of `name` in dir_fd if it is a socket of ours whose own
-    inode refuses connections (checked through one pinned fd), else None."""
-    entry_fd = _pin_entry(dir_fd, name)
-    try:
-        entry = os.fstat(entry_fd)
-        if not stat.S_ISSOCK(entry.st_mode) or entry.st_uid != os.geteuid():
-            return None
-        return _identity(entry) if _proven_dead(entry_fd) else None
-    finally:
-        os.close(entry_fd)
-
-
 class _Stage:
     """A private directory in the cache that this process created and uses.
 
@@ -374,8 +370,7 @@ class _Stage:
     cache fd and require a directory we own, with no group or other bits,
     owner rwx and no entries; nothing touches it before that, and it is
     never chmodded. A nonce file holding the nonce in the stage's name is
-    made in it O_EXCL, which is what lets a later sweep prove a leftover
-    stage is one of ours. Cleanup removes only
+    made in it O_EXCL as a recovery aid. Cleanup removes only
     entries whose identity this process recorded when it made them, then
     the directory if it is empty and its name still names it.
 
@@ -444,71 +439,6 @@ class _Stage:
             os.close(self.fd)
 
 
-def _stage_nonce_matches(stage_fd: int, nonce: str) -> tuple[int, int] | None:
-    """The nonce file's identity if it is a regular file of ours, with one
-    link and exactly `nonce` as its 32 bytes, else None."""
-    try:
-        # O_NONBLOCK: a FIFO named nonce must not block the sweep.
-        nonce_fd = os.open(STAGE_NONCE, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=stage_fd)
-    except OSError:
-        return None
-    try:
-        entry = os.fstat(nonce_fd)
-        if (not stat.S_ISREG(entry.st_mode) or entry.st_uid != os.geteuid()
-                or entry.st_nlink != 1 or entry.st_size != len(nonce)):
-            return None
-        return _identity(entry) if os.read(nonce_fd, len(nonce) + 1) == nonce.encode("ascii") else None
-    finally:
-        os.close(nonce_fd)
-
-
-def _sweep_stale_stages(root_fd: int):
-    """Remove stages a crash left, but only those provably ours.
-
-    A stage qualifies when its name is STAGE_PREFIX plus 32 hex digits, it
-    is a private directory of ours, its nonce file holds exactly those
-    digits (only we can write inside a 0700 directory of ours, so another
-    user cannot make a directory pass by renaming it), and everything else
-    in it is a socket of ours whose own inode refuses connections. Runs
-    under the cache lock, so no live publication or cleanup owns one.
-    Anything else is left alone.
-    """
-    for name in os.listdir(root_fd):
-        match = _STAGE_NAME.fullmatch(name)
-        if match is None:
-            continue  # Lock files and anything else with the prefix.
-        try:
-            stage_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root_fd)
-        except OSError:
-            continue
-        try:
-            entry = os.fstat(stage_fd)
-            if entry.st_uid != os.geteuid() or stat.S_IMODE(entry.st_mode) & 0o077:
-                continue
-            contents = set(os.listdir(stage_fd))
-            if STAGE_NONCE not in contents or not contents <= {STAGE_NONCE, STAGE_SOCKET, STAGE_MOVED}:
-                continue
-            nonce = _stage_nonce_matches(stage_fd, match.group(1))
-            if nonce is None:
-                continue
-            leftovers = {STAGE_NONCE: nonce}
-            for item in contents - {STAGE_NONCE}:
-                dead = _dead_socket_of_ours(stage_fd, item)
-                if dead is None:
-                    break
-                leftovers[item] = dead
-            else:
-                for item, identity in leftovers.items():
-                    if _identity(_entry_at(stage_fd, item)) == identity:
-                        os.unlink(item, dir_fd=stage_fd)
-                if not os.listdir(stage_fd) and _identity(_entry_at(root_fd, name)) == _identity(entry):
-                    os.rmdir(name, dir_fd=root_fd)
-        except (OSError, ControlError):
-            continue
-        finally:
-            os.close(stage_fd)
-
-
 class ControlServer:
     def __init__(self, cache_root: Path, dispatch: Callable[[str], dict], logger: logging.Logger):
         self.path = cache_root.resolve() / CONTROL_SOCKET_NAME
@@ -547,7 +477,6 @@ class ControlServer:
                 raise
 
     def _publish_in(self, listener: socket.socket, root: int) -> tuple[int, int]:
-        _sweep_stale_stages(root)
         # Every step below goes through the cache and stage fds, never a
         # path through the cache, so a renamed or swapped stage cannot
         # redirect chmod, stat, link or rename. Binding through the stage
@@ -569,69 +498,79 @@ class ControlServer:
             # with the cache: refuse rather than publish beside them.
             if not stage.still_named():
                 raise ControlError("control socket stage directory changed during startup")
-            if _place_noreplace(stage.fd, STAGE_SOCKET, root, CONTROL_SOCKET_NAME):
-                return bound
-            # The name is taken. Move whatever is there into our stage,
-            # where nobody else can change it, and decide on that entry.
-            self._take_over(stage, root)
-            if not _place_noreplace(stage.fd, STAGE_SOCKET, root, CONTROL_SOCKET_NAME):
-                raise ControlError("control socket changed during startup")
+            if not _publish_to_free_name(stage.fd, root):
+                self._take_over(stage, root)
             return bound
         finally:
             stage.remove()
 
-    def _take_over(self, stage: "_Stage", root: int):
-        """Remove the entry at the control name only if it is proven to be a
-        dead socket of ours; otherwise leave it in place and refuse.
+    def _take_over(self, stage: _Stage, root: int):
+        """Replace the entry at the control name with our staged socket, only
+        if it is proven to be a dead socket of ours; otherwise refuse.
 
-        The proof comes first, on the entry pinned through the cache fd:
-        only a socket of ours whose inode refuses a connection is moved,
-        so nothing live and nothing that is not a socket ever leaves the
-        name. The move into our stage is then checked to have taken that
-        very inode, and on any failure after the move the entry is put
-        back without clobbering.
+        The entry is pinned (O_PATH|O_NOFOLLOW) and stays pinned until the
+        decision is final, so its inode cannot be freed and reused. It must
+        be a socket of ours that refuses a connection through the pin. Then
+        one RENAME_EXCHANGE swaps our socket onto the name and the old entry
+        into the stage. If the process dies after the exchange, our dead
+        socket is public and the displaced entry is available for recovery.
+        If the stage side cannot be verified as the pinned inode and
+        removed, try to undo the exchange. Without RENAME_EXCHANGE an
+        occupied name is left in place.
         """
         try:
-            probed = _dead_socket_of_ours(root, CONTROL_SOCKET_NAME)
+            pin = _pin_entry(root, CONTROL_SOCKET_NAME)
         except FileNotFoundError:
-            return  # Gone meanwhile: the name is free again.
-        if probed is None:
-            raise ControlError(
-                "the control socket name holds a live socket, another user's entry, "
-                "or something that is not a socket; leaving it in place"
-            )
+            # Freed meanwhile: one more no-clobber attempt, never a move.
+            if _publish_to_free_name(stage.fd, root):
+                return
+            raise ControlError("control socket changed during startup") from None
         try:
-            os.rename(CONTROL_SOCKET_NAME, STAGE_MOVED, src_dir_fd=root, dst_dir_fd=stage.fd)
-        except FileNotFoundError:
-            return
-        self._discard_moved(stage, root, probed, "control socket changed during startup")
+            entry = os.fstat(pin)
+            if not stat.S_ISSOCK(entry.st_mode) or entry.st_uid != os.geteuid() or not _proven_dead(pin):
+                raise ControlError(
+                    "the control socket name holds a live socket, another user's entry, "
+                    "or something that is not a socket; leaving it in place"
+                )
+            probed = _identity(entry)
+            exchanged = _rename(stage.fd, STAGE_SOCKET, root, CONTROL_SOCKET_NAME, RENAME_EXCHANGE)
+            if exchanged is None:
+                raise ControlError(
+                    "the cache filesystem cannot exchange entries atomically (renameat2 "
+                    "RENAME_EXCHANGE), so the dead control socket there is not replaced"
+                )
+            try:
+                if _identity(_entry_at(stage.fd, STAGE_SOCKET)) != probed:
+                    raise ControlError("control socket changed during startup")
+                os.unlink(STAGE_SOCKET, dir_fd=stage.fd)
+            except BaseException:
+                try:
+                    restored = _rename(stage.fd, STAGE_SOCKET, root, CONTROL_SOCKET_NAME,
+                                       RENAME_EXCHANGE)
+                except OSError as exc:
+                    restored = exc
+                if restored is not True:
+                    self._logger.warning(
+                        "could not undo the control socket exchange at %s; the displaced "
+                        "entry was left in %s (%s)", self.path, self.path.parent / stage.name,
+                        restored,
+                    )
+                raise
+        finally:
+            os.close(pin)
 
-    def _discard_moved(self, stage: "_Stage", root: int, expected: tuple[int, int], changed: str):
-        """Unlink the entry just moved into the stage if it is `expected`;
-        put it back (no clobber) if it is not, or on any failure."""
-        try:
-            if _identity(_entry_at(stage.fd, STAGE_MOVED)) != expected:
-                raise ControlError(changed)
-            os.unlink(STAGE_MOVED, dir_fd=stage.fd)
-        except BaseException:
-            self._put_back(stage, root)
-            raise
-
-    def _put_back(self, stage: "_Stage", root: int):
+    def _put_back(self, stage: _Stage, root: int):
         # Never raises: it runs while another error is on its way out.
         try:
-            restored = _place_noreplace(stage.fd, STAGE_MOVED, root, CONTROL_SOCKET_NAME)
-        except (OSError, ControlError) as exc:
+            restored = _rename(stage.fd, STAGE_MOVED, root, CONTROL_SOCKET_NAME, RENAME_NOREPLACE)
+        except OSError as exc:
+            restored = exc
+        if restored is not True:
+            # A newer entry took the name, or the restore failed; keep
+            # both. The moved one stays in the stage, which is then left.
             self._logger.warning(
-                "could not restore the displaced entry %s from %s: %s",
-                self.path, self.path.parent / stage.name, exc,
-            )
-            return
-        if not restored:
-            # A newer entry took the name meanwhile; keep both. The moved
-            # one stays in the stage, which is then left in the cache.
-            self._logger.warning(
-                "left an entry displaced from %s in %s", self.path, self.path.parent / stage.name,
+                "could not restore the displaced entry %s from %s (%s)",
+                self.path, self.path.parent / stage.name, restored,
             )
 
     def start(self):
@@ -690,31 +629,40 @@ class ControlServer:
             self._thread = None
 
     def _withdraw(self, root: int):
-        """Remove our published socket, and only it. The entry at the
-        control name is pinned and must be the socket we published before
-        it is moved into a fresh stage; there it must still be that inode
-        to be unlinked, and on any other outcome it is put back."""
+        """Remove our published socket, and only it.
+
+        The entry at the name is pinned and must be the socket we published.
+        It is moved with RENAME_NOREPLACE into a fresh stage, where it must
+        still be that inode to be unlinked; otherwise, or on any failure, it
+        is put back with RENAME_NOREPLACE. Without renameat2 it is left: a
+        dead socket of ours is harmless, and the next start replaces it.
+        """
         try:
-            entry_fd = _pin_entry(root, CONTROL_SOCKET_NAME)
+            pin = _pin_entry(root, CONTROL_SOCKET_NAME)
         except FileNotFoundError:
             return
         try:
-            if _identity(os.fstat(entry_fd)) != self._owned_entry:
+            if _identity(os.fstat(pin)) != self._owned_entry:
                 return  # A replacement belongs to its publisher: never moved.
-        finally:
-            os.close(entry_fd)
-        stage = _Stage(root)
-        try:
+            stage = _Stage(root)
             try:
-                os.rename(CONTROL_SOCKET_NAME, STAGE_MOVED, src_dir_fd=root, dst_dir_fd=stage.fd)
-            except FileNotFoundError:
-                return
-            try:
-                self._discard_moved(stage, root, self._owned_entry, "control socket changed during stop")
-            except ControlError:
-                pass  # Put back: someone swapped the name after the check.
+                moved = _rename(root, CONTROL_SOCKET_NAME, stage.fd, STAGE_MOVED, RENAME_NOREPLACE)
+                if not moved:
+                    # Unsupported (None), or the fresh stage already had the
+                    # name (False, impossible): leave the socket in place.
+                    return
+                try:
+                    if _identity(_entry_at(stage.fd, STAGE_MOVED)) != self._owned_entry:
+                        raise ControlError("control socket changed during stop")
+                    os.unlink(STAGE_MOVED, dir_fd=stage.fd)
+                except BaseException as exc:
+                    self._put_back(stage, root)
+                    if not isinstance(exc, ControlError):
+                        raise
+            finally:
+                stage.remove()
         finally:
-            stage.remove()
+            os.close(pin)
 
     def _serve(self, listener: socket.socket, stop: threading.Event):
         while not stop.is_set():
