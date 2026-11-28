@@ -334,7 +334,10 @@ class TestStreamingSystemRegression(unittest.TestCase):
                     self.assertEqual(call("pread", offset=512 * 1024, size=4096),
                                      digest(payloads["reopened.bin"][512 * 1024:516 * 1024]))
                 finally:
-                    call("close")
+                    # Not after a failed call (_client_call killed the
+                    # client): a BrokenPipeError would hide that failure.
+                    if client.poll() is None:
+                        call("close")
             finally:
                 let_older_continue.set()
 
@@ -355,11 +358,21 @@ class TestStreamingSystemRegression(unittest.TestCase):
 
         def stop():
             try:
-                client.stdin.close()
-                client.wait(timeout=30)
-            except Exception:
+                if client.poll() is None:
+                    try:
+                        client.stdin.close()
+                    except OSError:
+                        pass  # BrokenPipeError: it already exited
+                    client.wait(timeout=30)
+            except subprocess.TimeoutExpired:
                 client.kill()
                 client.wait(timeout=30)
+            finally:
+                for stream in (client.stdin, client.stdout, client.stderr):
+                    try:
+                        stream.close()
+                    except OSError:
+                        pass
 
         self.addCleanup(stop)
         return client
