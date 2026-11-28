@@ -31,6 +31,8 @@ MAX_REQUEST_BYTES = 32 * 1024
 # Even if JSON escapes every path byte as six ASCII bytes, the list fits.
 MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 REQUEST_TIMEOUT = 2.0
+# The reply to a request that arrives while the mount stops its socket.
+STOPPING_MESSAGE = "This mount is stopping; its control socket no longer serves requests"
 _PEER_CREDENTIALS = struct.Struct("iII")
 
 
@@ -738,20 +740,24 @@ class ControlServer:
         except OSError:
             return
         else:
-            if frame is None or stop.is_set():
+            if frame is None:
                 return
             try:
                 request = frame.decode("utf-8")
             except UnicodeDecodeError:
                 response = {"error": "Control request must be UTF-8"}
             else:
-                try:
-                    response = self._dispatch(request)
-                except ControlError as exc:
-                    response = {"error": str(exc)}
-                except Exception:
-                    self._logger.exception("mount control request failed")
-                    response = {"error": "Mount control request failed"}
+                if stop.is_set():
+                    # Complete and authenticated, but too late to act on.
+                    response = {"error": STOPPING_MESSAGE}
+                else:
+                    try:
+                        response = self._dispatch(request)
+                    except ControlError as exc:
+                        response = {"error": str(exc)}
+                    except Exception:
+                        self._logger.exception("mount control request failed")
+                        response = {"error": "Mount control request failed"}
         try:
             encoded = json.dumps(response, sort_keys=True).encode("ascii")
         except (TypeError, ValueError, RecursionError):

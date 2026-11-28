@@ -151,6 +151,31 @@ def test_client_refuses_a_response_over_its_bound(cache, monkeypatch):
             responder.join(10)
 
 
+def test_a_request_read_while_stopping_is_answered(cache, monkeypatch):
+    # A complete, authenticated request that arrives as the mount stops gets
+    # a reply saying so, not a bare EOF.
+    dispatched = []
+    server = server_for(cache, lambda frame: dispatched.append(frame) or {})
+    server.start()
+    real_read_line = control_module._read_line
+
+    def read_then_stop(sock, *args, **kwargs):
+        frame = real_read_line(sock, *args, **kwargs)
+        server._stop.set()
+        return frame
+
+    monkeypatch.setattr("storage.control._read_line", read_then_stop)
+    try:
+        with socket_for(cache) as conn:
+            conn.sendall(b"status\n")
+            reply = read_response(conn)
+        assert reply == {"error": "This mount is stopping; its control socket no longer serves requests"}
+        assert dispatched == []
+    finally:
+        monkeypatch.undo()
+        server.stop()
+
+
 def test_request_timeout_uses_a_shared_deadline(cache, monkeypatch):
     monkeypatch.setattr("storage.control.REQUEST_TIMEOUT", 0.3)
     server = server_for(cache, lambda _: {"command_ran": True})

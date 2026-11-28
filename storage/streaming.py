@@ -21,7 +21,7 @@ from .backends.local import NOREPLACE_UNSUPPORTED
 from .backends.local import rename_noreplace as _rename_noreplace
 from .backends.ssh_pool import BulkCapacityCancelled, BulkCapacityTimeout
 from .cache_metadata import PREFIX_XATTR, confirm_member_stat, copy_member_attributes
-from .control import ControlError, ControlServer, canonical_mountpoint
+from .control import STOPPING_MESSAGE, ControlError, ControlServer, canonical_mountpoint
 from .models import FileLocation, FileMetadata, StreamingKeepAfterClose, SyncStatus
 
 # A foreground read fetches only the bytes the reader asked for that are not
@@ -978,7 +978,7 @@ class StreamingReadManager:
             published = self._control_server.cache_identity
             if published is None:
                 # Cleared by stop(): a request still in flight at unmount.
-                raise ControlError("This mount is stopping; its control socket no longer serves requests")
+                raise ControlError(STOPPING_MESSAGE)
             if tuple(expected) != published:
                 raise ControlError("This control socket was published in a different cache directory")
         if "mountpoint" in arguments:
