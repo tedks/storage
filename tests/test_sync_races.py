@@ -765,13 +765,10 @@ class TestDirectoryRetries(SyncRaceTestBase):
         self.assertEqual([b"sole"], self._kept_view_writes())
 
     def test_a_path_truncate_kept_by_a_readers_close(self):
-        for flags in (os.O_RDONLY, os.O_RDWR):
-            with self.subTest(flags=flags):
-                # One fixture per subtest: a fresh mount state each time.
-                if flags == os.O_RDWR:
-                    self.tearDown()
-                    self.setUp()
-                self._path_truncate_kept(flags)
+        self._path_truncate_kept(os.O_RDONLY)
+
+    def test_a_path_truncate_kept_by_an_unchanged_writers_close(self):
+        self._path_truncate_kept(os.O_RDWR)
 
     def test_read_only_flush_takes_no_path_lock(self):
         self._synced_view()
