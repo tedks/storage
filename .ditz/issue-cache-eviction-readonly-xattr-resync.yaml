@@ -1,0 +1,21 @@
+id: cache-eviction-readonly-xattr-resync
+title: Read-only cached copy whose metadata xattr cannot be rewritten may resync on
+  every eviction pass
+desc: 'From the #191 round-1 fix (C1, eviction checks user.storage.metadata). An owner-read-only
+  copy whose xattr cannot be rewritten after a utime is marked dirty on each eviction
+  pass and resynced: wasted uploads, no data loss. Rewrite the xattr with temporary
+  owner write as prefix-marker handling does, or skip the mark when the content is
+  unchanged.'
+type: bugfix
+component: cache
+release:
+reporter: Ted Smith <tedks@riseup.net>
+status: unstarted
+disposition:
+creation_time: 2026-11-28T08:53:29-00:00
+references: []
+log_events:
+- time: 2026-11-28T08:53:29-00:00
+  who: Ted Smith
+  what: created
+  comment: ""
