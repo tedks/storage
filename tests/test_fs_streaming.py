@@ -1036,6 +1036,34 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.assertEqual(list(self.cache_dir.rglob("*.storage.partial")), [])
         self.assertEqual(self.fs.cache_manager.get_total_cache_size(), 0)
 
+    def test_bulk_timeout_after_readers_complete_the_file_is_not_an_error(self):
+        payload = os.urandom(64 * 1024)
+        (self.backend_dir / "raced.bin").write_bytes(payload)
+        waiting = threading.Event()
+        completed = threading.Event()
+        self.addCleanup(completed.set)
+
+        def timed_out(_path, _fetch):
+            waiting.set()
+            # Paused between the timeout and its handling while the reader
+            # fetches the last byte.
+            completed.wait(timeout=10)
+            raise BulkCapacityTimeout("no bulk SFTP capacity came free")
+
+        with patch.object(self.backend, "run_background_range_read", side_effect=timed_out):
+            fd = self.fs.open("/raced.bin", os.O_RDONLY)
+            session = self._session_for(fd)
+            self.assertEqual(self.fs.read("/raced.bin", 32 * 1024, 0, fd), payload[:32 * 1024])
+            self.assertTrue(waiting.wait(timeout=3))
+            self.assertEqual(self.fs.read("/raced.bin", 32 * 1024, 32 * 1024, fd), payload[32 * 1024:])
+            self.assertTrue(session.prefetch_complete)
+            completed.set()
+            self.assertTrue(session.background_finished.wait(timeout=5))
+            self.assertIsNone(session.error)
+            self.assertTrue(session.finalized)
+            self.fs.release("/raced.bin", fd)
+        self.assertEqual((self.cache_dir / "raced.bin").read_bytes(), payload)
+
     def test_bulk_wait_yield_interval_restarts_for_each_acquisition(self):
         manager = self.fs._streaming_manager
         session = SimpleNamespace(stop_requested=False, prefetch_complete=False, error=None,

@@ -1732,10 +1732,15 @@ class StreamingReadManager:
                 pass
             except Exception as exc:
                 with session.lock:
-                    if not session.stop_requested and session.error is None:
+                    # A failure that lost the race to a reader completing the
+                    # file (a bulk timeout, say, as the last foreground read
+                    # lands) fetched nothing the file still needs: it is not
+                    # the session's error, and the file is published.
+                    failed = not session.stop_requested and not session.prefetch_complete
+                    if failed and session.error is None:
                         session.error = exc
                     session.condition.notify_all()
-                if not session.stop_requested:
+                if failed:
                     self.logger.warning(
                         "streaming background fetch failed path=%s backend=%s: %r",
                         session.canonical_path, session.backend.name, exc,
