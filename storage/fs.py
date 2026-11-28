@@ -3936,6 +3936,17 @@ def _native_capacity_cancel_reason():
 class FUSE(_FusePyFUSE):
     """Give pool waits a same-thread cancellation probe during callbacks."""
 
+    def open(self, path, fip):
+        # As fusepy's open; a private copy's handle (StorageFS._open) gets
+        # direct_io, so its reads bypass the page cache the path's other
+        # handles share, and its short read at the captured length is EOF.
+        fi = fip.contents
+        fi.fh = self.operations("open", path.decode(self.encoding), fi.flags)
+        if getattr(self.operations, "is_private_handle", None) and \
+                self.operations.is_private_handle(fi.fh):
+            fi.direct_io = 1
+        return 0
+
     @staticmethod
     def _wrapper(func, *args, **kwargs):
         # fusepy enters here directly from libfuse. A thread-local scope keeps

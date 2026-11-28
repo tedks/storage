@@ -757,5 +757,106 @@ class TestKernelCacheRefetchThreaded(TestKernelCacheRefetch):
     fuse_threads = True
 
 
+# A client for private-copy reads through the mount (never read in the FUSE
+# process): one JSON command per line on stdin, one JSON answer per line.
+_PRIVATE_CLIENT = """
+import hashlib, json, os, sys
+fds = {}
+for line in sys.stdin:
+    cmd, *args = line.split()
+    if cmd == "open":
+        fds[args[0]] = os.open(args[1], os.O_RDONLY)
+        out = None
+    elif cmd == "read":
+        fd, data = fds[args[0]], b""
+        while True:
+            chunk = os.pread(fd, 1 << 16, len(data))
+            if not chunk:
+                break
+            data += chunk
+        out = {"sha": hashlib.sha256(data).hexdigest(), "len": len(data),
+               "fstat": os.fstat(fd).st_size}
+    elif cmd == "close":
+        os.close(fds.pop(args[0]))
+        out = None
+    else:
+        break
+    print(json.dumps(out), flush=True)
+"""
+
+
+class TestPrivateReadMounted(_MountedCase):
+    """A live file read privately (CTO-208-LIVE-READ): each reader's bytes,
+    EOF and fstat are its own captured copy, through the mount."""
+
+    START_SYNC = False
+
+    def _call(self, client, command):
+        client.stdin.write(command + "\n")
+        client.stdin.flush()
+        line = []
+        reader = threading.Thread(target=lambda: line.append(client.stdout.readline()))
+        reader.start()
+        reader.join(60)
+        self.assertTrue(line and line[0], f"client gave no answer to {command!r}")
+        return json.loads(line[0])
+
+    def test_two_private_readers_each_see_their_own_copy(self):
+        import hashlib
+        name = "live.log"
+        source = self.backend1_dir / name
+        # Same length and mtime: only the bytes differ, so the kernel sees no
+        # attribute change between the two copies and nothing but direct_io
+        # keeps one reader's pages from the other.
+        first, second = b"first version\n" * 50, b"other version\n" * 50
+        stamp = 1_700_000_000
+        source.write_bytes(first)
+        os.utime(source, (stamp, stamp))
+        self.fs._on_remote_change("/" + name)  # written behind the mount
+        backend = self.fs.backends["backend1"]
+        real_stat = backend.stat
+
+        def off_by_one(path):
+            st = real_stat(path)
+            # Always another size than any transfer: the file never settles.
+            return type("St", (), {"st_size": st.st_size + 1, "st_mtime": st.st_mtime,
+                                   "st_mtime_ns": st.st_mtime_ns, "st_mode": st.st_mode})()
+
+        client = subprocess.Popen([sys.executable, "-c", _PRIVATE_CLIENT],
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        try:
+            with patch.object(backend, "stat", side_effect=off_by_one):
+                self._call(client, f"open a {self.mount_dir / name}")
+                a = self._call(client, "read a")
+                source.write_bytes(second)
+                os.utime(source, (stamp, stamp))
+                self._call(client, f"open b {self.mount_dir / name}")
+                b = self._call(client, "read b")
+                a_again = self._call(client, "read a")
+                b_again = self._call(client, "read b")
+            self.assertEqual((a["sha"], a["len"]), (hashlib.sha256(first).hexdigest(), len(first)))
+            self.assertEqual((b["sha"], b["len"]), (hashlib.sha256(second).hexdigest(), len(second)))
+            self.assertEqual(a_again["sha"], a["sha"])
+            self.assertEqual(b_again["sha"], b["sha"])
+            # With one private handle open, fstat reports its captured length.
+            self.assertEqual(a["fstat"], len(first))
+            # Not asserted for b: FUSE keeps attributes per inode, not per
+            # handle, so with two handles of different lengths open on one
+            # path the kernel asks with either handle (here a's). Each
+            # reader's EOF is its own (direct_io short reads), as above.
+            self._call(client, "close a")
+            self._call(client, "close b")
+        finally:
+            client.stdin.close()
+            client.wait(30)
+            client.stdout.close()
+        self.assertFalse((self.cache_dir / name).exists())
+        self.assertEqual(self.fs.cache_manager._reserved_bytes, 0)
+
+
+class TestPrivateReadMountedThreaded(TestPrivateReadMounted):
+    fuse_threads = True
+
+
 if __name__ == '__main__':
     unittest.main()
