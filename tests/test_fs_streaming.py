@@ -796,6 +796,42 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.assertTrue(small.background_finished.wait(timeout=3))
         self.assertTrue(large.background_finished.wait(timeout=3))
 
+    def test_reclaim_keeps_selecting_while_cancellations_shrink_the_deficit(self):
+        manager = self.fs._streaming_manager
+        cache = self.fs.cache_manager
+        cache.max_size_bytes = 1024 * 1024
+        self.backend.worker_gate = threading.Event()
+        fills = [self._open_retained_fill(f"fill-{index}.bin", os.urandom(256 * 1024))
+                 for index in range(4)]
+        written = os.urandom(992 * 1024)
+        (self.backend_dir / "write-open.bin").write_bytes(written)
+        real_needed = cache.get_free_space_needed
+        measured = []
+
+        def needed(required):
+            result = real_needed(required)
+            if sys._getframe(1).f_code.co_name == "_reclaim_retained_space":
+                measured.append(result)
+                # After each of the first three measurements a different
+                # fill is cancelled by hand before reclaim scans, so each
+                # of those selections falls short of a deficit that then
+                # shrinks by a fill. The fourth is covered by the last.
+                if len(measured) <= 3:
+                    self.assertEqual(
+                        manager.cancel_download_session(fills[len(measured) - 1].session_id), "cancelled")
+            return result
+
+        with patch.object(cache, "get_free_space_needed", needed):
+            fd = self.fs.open("/write-open.bin", os.O_RDWR)
+        self.assertEqual(measured, [kib * 1024 for kib in (992, 736, 480, 224)])
+        self.assertTrue(all(fill.detached for fill in fills))
+        self.assertEqual(self.fs._streaming_stats_snapshot()["streaming_retained_space_cancellations"], 1)
+        self.assertEqual(self.fs.read("/write-open.bin", len(written), 0, fd), written)
+        self.fs.release("/write-open.bin", fd)
+        self.backend.worker_gate.set()
+        for fill in fills:
+            self.assertTrue(fill.background_finished.wait(timeout=3))
+
     def test_stalled_publication_does_not_hold_the_members_range_slot(self):
         manager = self.fs._streaming_manager
         real_finalize = manager._finalize_streaming_session

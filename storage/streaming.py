@@ -73,8 +73,6 @@ DOWNLOAD_TURN_YIELD_SECONDS = 0.5
 # no member (see _DownloadPool): never a member name, so a turn on any
 # member yields to one.
 LOCAL_PUBLICATION = object()
-# Candidate selections in one space reclaim (see _reclaim_retained_space).
-RECLAIM_ATTEMPTS = 3
 
 # link() errors after which _install_partial tries RENAME_NOREPLACE: no
 # hard links on the cache filesystem (EMLINK cannot happen on a fresh
@@ -1983,9 +1981,9 @@ class StreamingReadManager:
         lock, so space can come free while the candidates are chosen (a
         cancellation, a finalize, an eviction). A selection whose fills fall
         short measures again: True if the space is there now, another
-        selection against the new deficit if it shrank (up to
-        RECLAIM_ATTEMPTS in all), False otherwise. A stop unlinks its
-        partial under the registry lock and marks the cache size stale
+        selection against the new deficit if it shrank, False if it did
+        not (see the loop for why this ends). A stop unlinks its partial
+        under the registry lock and marks the cache size stale
         there (_unregister_and_unlink), so that measurement counts it. The
         measurement is not taken under the registry lock because a stale
         size means a scan of the whole cache. A deficit that shrank this
@@ -1995,7 +1993,14 @@ class StreamingReadManager:
         if missing == 0:
             return True
 
-        for _ in range(RECLAIM_ATTEMPTS):
+        # Bounded by progress, not by a count: every pass that goes round
+        # again found the deficit strictly smaller than the pass before, and
+        # a deficit is a whole number of bytes, at least 1 while short, so
+        # there are finitely many passes. In practice far fewer: space comes
+        # free from a finite set of sources (the finitely many retained
+        # fills and other cache files), and a pass that sees no new space
+        # returns False.
+        while True:
             cancelled = []
             with self.prefetch_sessions_lock:
                 # A reader that would be refused a session anyway gets no
@@ -2028,8 +2033,6 @@ class StreamingReadManager:
             # Space came free meanwhile but not enough: the fills that
             # could not cover the old deficit may cover this one.
             missing = now
-        else:
-            return False
         for session, idle in cancelled:
             self._record_streaming_stat("streaming_retained_space_cancellations")
             self._complete_cancellation(session, idle)
