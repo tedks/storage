@@ -1,4 +1,5 @@
 import errno
+import json
 import os
 import shutil
 import tempfile
@@ -11,7 +12,9 @@ from pathlib import Path
 
 from storage.backends.local import LocalBackend
 from storage.cache import PARTIAL_SUFFIX, CacheManager
-from storage.cache_metadata import MEMBER_ATTRS_XATTR, read_cache_metadata
+from storage.cache_metadata import (
+    MEMBER_ATTRS_XATTR, XATTR_CACHE_METADATA_NAME, CacheMetadataRecord, read_cache_metadata,
+)
 from storage.models import FileLocation, FileMetadata, SyncStatus
 from storage.state import StateManager
 
@@ -532,6 +535,63 @@ class TestEvictionSkipsStaleClean(unittest.TestCase):
         self.assertTrue(stale.exists())
         self.assertEqual(self.state_manager.get_file_metadata("/stale.txt").sync_status, SyncStatus.DIRTY)
         self.assertFalse(fresh.exists())
+
+    def _mirror(self, cache_path, **stat):
+        """Write the metadata xattr from the row, at the given stat."""
+        row = self.state_manager.get_file_metadata("/" + cache_path.name)
+        record = CacheMetadataRecord.from_file_metadata(row, **stat)
+        os.setxattr(cache_path, XATTR_CACHE_METADATA_NAME,
+                    json.dumps(record.to_dict(), sort_keys=True).encode())
+
+    def test_xattr_recording_another_stat_marks_dirty_and_keeps_the_copy(self):
+        """The row matches the file but the xattr does not: either record
+        disagreeing with the live stat makes the file dirty (AGENTS.md)."""
+        written = self._clean_cached("written.txt", b"v1")
+        fresh = self._clean_cached("fresh.txt", b"v1", last_access=2.0)
+        st = written.stat()
+        self._mirror(written, stat_size=st.st_size + 1, stat_mtime=st.st_mtime)
+        self._mirror(fresh, stat_size=fresh.stat().st_size, stat_mtime=fresh.stat().st_mtime)
+
+        self.assertTrue(self.cache_manager.evict_lru_files(bytes_needed=1))
+
+        self.assertEqual(written.read_bytes(), b"v1")
+        self.assertEqual(self.state_manager.get_file_metadata("/written.txt").sync_status,
+                         SyncStatus.DIRTY)
+        self.assertFalse(fresh.exists())
+
+    def test_dry_run_does_not_count_or_mark_an_xattr_stale_copy(self):
+        written = self._clean_cached("written.txt", b"v1")
+        st = written.stat()
+        self._mirror(written, stat_size=st.st_size, stat_mtime=st.st_mtime + 1)
+        manager = self.cache_manager
+        manager.mark_cache_size_dirty()
+        manager.max_size_bytes = manager.get_total_cache_size()
+
+        self.assertFalse(manager.ensure_space(manager.block_size))
+        self.assertEqual(written.read_bytes(), b"v1")
+        self.assertEqual(self.state_manager.get_file_metadata("/written.txt").sync_status,
+                         SyncStatus.CLEAN)
+
+    def test_unreadable_metadata_xattr_keeps_the_copy_unmarked(self):
+        garbled = self._clean_cached("garbled.txt", b"v1")
+        os.setxattr(garbled, XATTR_CACHE_METADATA_NAME, b"{not json")
+        other = self._clean_cached("other.txt", b"v1", last_access=2.0)
+
+        self.assertTrue(self.cache_manager.evict_lru_files(bytes_needed=1))
+
+        self.assertEqual(garbled.read_bytes(), b"v1")
+        self.assertEqual(self.state_manager.get_file_metadata("/garbled.txt").sync_status,
+                         SyncStatus.CLEAN)
+        self.assertFalse(other.exists())
+
+    def test_copy_whose_xattr_matches_is_evicted(self):
+        mirrored = self._clean_cached("mirrored.txt", b"v1")
+        row = self.state_manager.get_file_metadata("/mirrored.txt")
+        self.cache_manager.sync_cache_metadata("/mirrored.txt", row, cache_path=mirrored)
+        self.assertIsNotNone(read_cache_metadata(mirrored))
+
+        self.assertTrue(self.cache_manager.evict_lru_files(bytes_needed=1))
+        self.assertFalse(mirrored.exists())
 
     def test_path_with_an_open_descriptor_is_kept(self):
         held = self._clean_cached("held.txt", b"v1")

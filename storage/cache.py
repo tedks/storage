@@ -20,7 +20,8 @@ from typing import Callable, ContextManager, Optional, List, Set
 from .backends.base import Backend, bulk_request
 from .backends.ssh_pool import BulkCapacityCancelled, BulkCapacityTimeout
 from .cache_metadata import (
-    PARTIAL_SUFFIX, PREFIX_XATTR, copy_member_attributes, regular_file_stat, write_cache_metadata,
+    PARTIAL_SUFFIX, PREFIX_XATTR, copy_member_attributes, read_cache_metadata, regular_file_stat,
+    write_cache_metadata,
 )
 from .member_repairs import VIEW_WRITE, MemberRepairs, is_at_or_under
 from .pathing import resolve_path
@@ -668,7 +669,13 @@ class CacheManager:
         """Reclaim cache bytes if the row is still CLEAN and describes the file.
 
         Recheck after selection under the index lock, which mark_file_dirty
-        also takes. A stale CLEAN is marked and kept. Hold descriptor_guard
+        also takes. A stale CLEAN is marked and kept: a file is stale when
+        its live size or mtime differs from the stat in its row or in its
+        metadata xattr (CacheMetadataRecord.is_stale_for), whatever status
+        either records. A file whose xattr cannot be read or parsed is kept
+        unmarked: nothing vouches for it. One without the xattr (a mirror
+        that was never possible, such as on a read-only copy) has only its
+        row to go by. Hold descriptor_guard
         across the stat and the unlink or truncation, so no open descriptor
         can be missed or registered in between. Forget listing attributes
         before changing the cache inode. Lock order is the cache lock, the
@@ -701,6 +708,12 @@ class CacheManager:
                 if st is None:
                     return 0
                 stale = st.st_size != row.size or st.st_mtime != row.last_modified
+                if not stale:
+                    try:
+                        record = read_cache_metadata(cache_path)
+                    except (OSError, ValueError, TypeError, KeyError):
+                        return 0
+                    stale = record is not None and record.is_stale_for(st.st_size, st.st_mtime)
                 if not stale:
                     if st.st_nlink > 1 and not truncate:
                         return 0  # unlinking one alias cannot reclaim its blocks
