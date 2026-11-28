@@ -907,6 +907,59 @@ class TestFSStreamingIntegration(unittest.TestCase):
         cache.mark_cache_size_dirty()
         self.assertEqual(cache.get_total_cache_size(), 0)
 
+    def test_a_blocked_local_write_does_not_stall_a_write_to_another_file(self):
+        """Lead delta: a direct write whose pwrite is stuck (slow disk,
+        page-cache pressure) must not hold the cache lock, so a write to a
+        different file completes with ample room and no eviction. Both are
+        then charged once."""
+        cache = self.fs.cache_manager
+        block = 4096  # a literal, so the same test runs against the base too
+        cache.get_total_cache_size()
+        fa = self.fs.create("/a.bin", 0o644)
+        fb = self.fs.create("/b.bin", 0o644)
+        with self.fs._fd_lock:
+            real_fd_a = self.fs._fd_map[fa].real_fd
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        real_pwrite = os.pwrite
+
+        def pwrite(fd, data, offset):
+            if fd == real_fd_a:
+                entered.set()
+                release.wait(timeout=10.0)
+            return real_pwrite(fd, data, offset)
+
+        results = {}
+
+        def write(name, fh, byte):
+            results[name] = self.fs.write("/" + name, byte * (2 * block), 0, fh)
+
+        try:
+            with patch("os.pwrite", side_effect=pwrite), \
+                    patch.object(cache, "_evict_if_still_clean",
+                                 side_effect=AssertionError("evicted with ample room")):
+                writer_a = threading.Thread(target=write, args=("a.bin", fa, b"a"))
+                writer_a.start()
+                self.assertTrue(entered.wait(timeout=5.0))
+                writer_b = threading.Thread(target=write, args=("b.bin", fb, b"b"))
+                writer_b.start()
+                writer_b.join(timeout=3.0)
+                b_finished_while_a_blocked = not writer_b.is_alive()
+                release.set()
+                writer_a.join(timeout=5.0)
+                writer_b.join(timeout=5.0)
+            self.assertTrue(b_finished_while_a_blocked,
+                            "a write to b.bin waited for a stuck write to a.bin")
+            self.assertEqual(results, {"a.bin": 2 * block, "b.bin": 2 * block})
+        finally:
+            self.fs.release("/a.bin", fa)
+            self.fs.release("/b.bin", fb)
+        self.assertEqual((self.cache_dir / "a.bin").read_bytes(), b"a" * (2 * block))
+        self.assertEqual((self.cache_dir / "b.bin").read_bytes(), b"b" * (2 * block))
+        self.assertEqual(cache.get_total_cache_size(), 4 * block)
+        cache.mark_cache_size_dirty()
+        self.assertEqual(cache.get_total_cache_size(), 4 * block)
+
     def test_an_append_write_is_charged_where_it_lands(self):
         """pwrite on an O_APPEND descriptor writes at end of file, not at
         the offset given; the charge follows the bytes."""
