@@ -304,6 +304,38 @@ class TestFSStreamingIntegration(unittest.TestCase):
         self.assertEqual(again.exception.errno, errno.ESTALE)
         self.fs.release("/vanish.bin", fd)
 
+    def test_retained_fill_is_dropped_when_sessions_near_the_descriptor_limit(self):
+        manager = self.fs._streaming_manager
+        self.backend.worker_gate = threading.Event()
+        payload = os.urandom(384 * 1024)
+        for name in ("kept.bin", "dropped.bin"):
+            (self.backend_dir / name).write_bytes(payload)
+        open_fds = []
+        for name in ("kept.bin", "dropped.bin"):
+            fd = self.fs.open("/" + name, os.O_RDONLY)
+            open_fds.append(("/" + name, fd, self._session_for(fd)))
+            self.assertEqual(self.fs.read("/" + name, 256 * 1024, 0, fd), payload[:256 * 1024])
+            self.assertTrue(self._session_for(fd).readers_consumed)
+        kept, dropped = open_fds
+        # Two registered sessions: a soft limit of 5 leaves room to retain
+        # one (they hold under half of it); a soft limit of 2 does not.
+        with patch("storage.streaming.resource.getrlimit", return_value=(5, 4096)):
+            self.fs.release(kept[0], kept[1])
+        self.assertFalse(kept[2].detached)
+        with patch("storage.streaming.resource.getrlimit", return_value=(2, 4096)), \
+                self.assertLogs(self.fs.logger, level="WARNING"):
+            self.fs.release(dropped[0], dropped[1])
+        self.assertTrue(dropped[2].detached)
+        self.assertEqual(
+            self.fs._streaming_stats_snapshot()["streaming_retained_descriptor_cancellations"], 1,
+        )
+        self.backend.worker_gate.set()
+        self.assertTrue(kept[2].background_finished.wait(timeout=5))
+        self.assertTrue(dropped[2].background_finished.wait(timeout=5))
+        self.assertEqual((self.cache_dir / "kept.bin").read_bytes(), payload)
+        self._assert_not_cached("dropped.bin")
+        self.assertEqual(manager.list_download_sessions(), [])
+
     def test_foreground_overlapping_range_can_use_interactive_reserve(self):
         payload = os.urandom(512 * 1024)
         (self.backend_dir / "reserve.bin").write_bytes(payload)
@@ -385,7 +417,13 @@ class TestFSStreamingIntegration(unittest.TestCase):
             self.assertEqual(self.fs.read(path, 32 * 1024, 0, fd), payload[:32 * 1024])
         self.assertTrue(self._wait_for(lambda: manager._download_pool.snapshot() == (1, 1, 5)))
         self.assertIsNone(manager.update_download_limits(max_download_workers=None)["max_download_workers"])
-        self.assertTrue(self._wait_for(lambda: manager._download_pool.snapshot() == (6, 6, 0)))
+        # A local member sets no capacity of its own: automatic mode gives it
+        # AUTOMATIC_UNLIMITED_MEMBER_WORKERS, not a thread per ready file.
+        self.assertTrue(self._wait_for(lambda: manager._download_pool.snapshot() == (4, 4, 2)))
+        # A member's own capacity governs where it sets one.
+        with patch.object(self.backend, "background_range_capacity", return_value=6):
+            manager.update_download_limits(max_download_workers=None)
+            self.assertTrue(self._wait_for(lambda: manager._download_pool.snapshot() == (6, 6, 0)))
         for path, fd, _ in handles:
             self.fs.release(path, fd)
         self.backend.worker_gate.set()
@@ -2676,6 +2714,62 @@ class TestFSStreamingIntegration(unittest.TestCase):
             self.fs.release('/' + name, vfd)
         self.assertEqual(manager._not_installed_reason("taken"), "cache-path-filled")
         self.assertEqual(manager._not_installed_reason("unsupported"), "unsupported")
+
+
+
+class TestDescriptorLimit(unittest.TestCase):
+    """mount_storage raises the soft RLIMIT_NOFILE, since streaming descriptors have no count limit."""
+
+    def setUp(self):
+        import logging
+        self.logger = logging.getLogger("test-descriptor-limit")
+
+    def test_soft_limit_is_raised_to_the_hard_limit(self):
+        import resource
+        from storage.fs import raise_descriptor_limit
+        with patch("storage.fs.resource.getrlimit", return_value=(1024, 524288)), \
+                patch("storage.fs.resource.setrlimit") as setrlimit, \
+                self.assertLogs(self.logger, level="INFO") as logs:
+            self.assertEqual(raise_descriptor_limit(self.logger), 524288)
+        setrlimit.assert_called_once_with(resource.RLIMIT_NOFILE, (524288, 524288))
+        self.assertIn("from 1024 to 524288", "\n".join(logs.output))
+
+    def test_a_refused_raise_keeps_the_soft_limit_and_never_fails(self):
+        from storage.fs import raise_descriptor_limit
+        with patch("storage.fs.resource.getrlimit", return_value=(1024, 4096)), \
+                patch("storage.fs.resource.setrlimit", side_effect=ValueError("not permitted")), \
+                self.assertLogs(self.logger, level="WARNING"):
+            self.assertEqual(raise_descriptor_limit(self.logger), 1024)
+        with patch("storage.fs.resource.getrlimit", side_effect=OSError(errno.EPERM, "no")), \
+                self.assertLogs(self.logger, level="WARNING"):
+            self.assertIsNone(raise_descriptor_limit(self.logger))
+
+    def test_limits_already_at_the_ceiling_or_infinite_are_left_alone(self):
+        import resource
+        from storage.fs import raise_descriptor_limit
+        for limits in ((4096, 4096), (resource.RLIM_INFINITY, resource.RLIM_INFINITY),
+                       (1024, resource.RLIM_INFINITY)):
+            with patch("storage.fs.resource.getrlimit", return_value=limits), \
+                    patch("storage.fs.resource.setrlimit") as setrlimit:
+                self.assertEqual(raise_descriptor_limit(self.logger), limits[0])
+            setrlimit.assert_not_called()
+
+    def test_mount_raises_the_limit_before_serving(self):
+        from storage.fs import mount_storage
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for name in ("cache", "mount", "member"):
+                (root / name).mkdir()
+            calls = []
+            with patch("storage.fs.raise_descriptor_limit", side_effect=lambda logger: calls.append("limit")), \
+                    patch("storage.fs.FUSE", side_effect=lambda *a, **k: calls.append("fuse")):
+                mount_storage(
+                    str(root / "mount"), root / "cache", root / "cache" / "state.db",
+                    {"local0": LocalBackend("local0", str(root / "member"))},
+                    1024 * 1024, foreground=True, allow_other=False,
+                )
+        self.assertEqual(calls, ["limit", "fuse"])
+
 
 if __name__ == '__main__':
     unittest.main()

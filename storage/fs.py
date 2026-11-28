@@ -22,6 +22,7 @@ import json
 import concurrent.futures
 import contextlib
 import ctypes
+import resource
 import signal
 from dataclasses import dataclass, field
 import fuse as fusepy
@@ -3599,6 +3600,33 @@ def _sigpipe_survives_fuse():
         signal.signal(signal.SIGPIPE, signal.SIG_IGN)
 
 
+def raise_descriptor_limit(logger: logging.Logger) -> Optional[int]:
+    """Raise the soft RLIMIT_NOFILE to the hard limit; return the soft limit in force afterwards.
+
+    Streaming holds a descriptor per file being filled, retained fills
+    included, bounded by cache_size rather than a count, so the common
+    default soft limit of 1024 can be reached long before the hard one.
+    Never fails the mount: an error is logged and the limit left as it was
+    (None if it could not be read). An infinite limit is left alone (Linux
+    caps the hard limit at fs.nr_open, so this is not expected there).
+    """
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    except (OSError, ValueError) as exc:
+        logger.warning("could not read the descriptor limit: %r", exc)
+        return None
+    if resource.RLIM_INFINITY in (soft, hard) or soft >= hard:
+        logger.info("descriptor limit soft=%d hard=%d", soft, hard)
+        return soft
+    try:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
+    except (OSError, ValueError) as exc:
+        logger.warning("could not raise the descriptor limit from %d to %d: %r", soft, hard, exc)
+        return soft
+    logger.info("raised the descriptor limit from %d to %d", soft, hard)
+    return hard
+
+
 def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
                  backends: Dict[str, Backend], cache_size: int,
                  foreground: bool = False, num_sync_workers: int = 2,
@@ -3727,6 +3755,8 @@ def mount_storage(mountpoint: str, cache_root: Path, state_db: Path,
     except RuntimeError as e:
         logger.error(str(e))
         raise
+
+    raise_descriptor_limit(logger)
 
     fs = StorageFS(
         cache_root,

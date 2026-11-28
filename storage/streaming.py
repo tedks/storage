@@ -2,6 +2,7 @@ import errno
 import json
 import os
 import re
+import resource
 import secrets
 import threading
 import time
@@ -53,6 +54,13 @@ STREAMING_MAX_TRACKED_READ_SPANS = 64
 DOWNLOAD_WORKER_IDLE_SECONDS = 30.0
 # Yield a turn to a queued closed file after this many active-reader turns.
 ACTIVE_DOWNLOAD_BURST = 4
+# Automatic worker mode: turns at once on a member that reports no
+# background_range_capacity of its own (local directories). SSH and rsync
+# members are bounded by their bulk SFTP capacity instead.
+AUTOMATIC_UNLIMITED_MEMBER_WORKERS = 4
+# Retained fills stop being kept once registered sessions (one partial
+# descriptor each) reach 1/this of the soft RLIMIT_NOFILE.
+STREAMING_DESCRIPTOR_SHARE = 2
 # How long an open waits for a claimed failed-session cleanup (a local
 # truncate, fsync and link of the prefix) before it returns EAGAIN.
 STREAMING_CLEANUP_WAIT_SECONDS = 30.0
@@ -240,11 +248,25 @@ class _DownloadPool:
         self.active_turns = 0
         self.closing = False
 
+    def _member_capacity(self, session):
+        """Concurrent turns allowed on the session's member; None for no member bound.
+
+        A member that sets no limit of its own (a local directory) gets
+        AUTOMATIC_UNLIMITED_MEMBER_WORKERS while the pool is automatic, so
+        demand alone (one ready file each) cannot start a thread per
+        retained fill. Under an explicit max_download_workers that limit is
+        such a member's only bound, as before.
+        """
+        capacity = session.backend.background_range_capacity()
+        if capacity is None and self.limit is None:
+            return AUTOMATIC_UNLIMITED_MEMBER_WORKERS
+        return capacity
+
     def _eligible(self):
         running_by_member = Counter(session.backend.name for session in self.running)
         for session in self.ready:
             member = session.backend.name
-            capacity = session.backend.background_range_capacity()
+            capacity = self._member_capacity(session)
             if capacity is None or running_by_member[member] < capacity:
                 yield session
                 running_by_member[member] += 1
@@ -315,7 +337,7 @@ class _DownloadPool:
         # its first choice of that headroom before either is selected.
         running_by_member = Counter(session.backend.name for session in self.running)
         for session, has_reader in self.ready.items():
-            capacity = session.backend.background_range_capacity()
+            capacity = self._member_capacity(session)
             if capacity is not None and running_by_member[session.backend.name] >= capacity:
                 continue
             if has_reader and active is None:
@@ -1924,8 +1946,34 @@ class StreamingReadManager:
             and not session.finalized
             and not session.prefetch_complete
             and session.error is None
-            and not session.readers_consumed
+            and (not session.readers_consumed or self._retained_descriptors_low(session))
         )
+
+    def _retained_descriptors_low(self, session: PrefetchSession) -> bool:
+        """Whether retaining this fill would leave too few descriptors for the mount.
+
+        Caller holds prefetch_sessions_lock. Every registered session holds
+        one descriptor on its partial whether or not it has readers, so
+        retained fills are refused once the registry holds
+        1 / STREAMING_DESCRIPTOR_SHARE of the soft RLIMIT_NOFILE: the rest
+        stays for readers' descriptors, the database, member connections
+        and whole-file copies. The fill is discarded as an unqualified one
+        is; nothing else changes.
+        """
+        try:
+            soft, _hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        except (OSError, ValueError):
+            return False
+        if soft == resource.RLIM_INFINITY or soft <= 0:
+            return False
+        if len(self.prefetch_sessions) * STREAMING_DESCRIPTOR_SHARE < soft:
+            return False
+        self._record_streaming_stat("streaming_retained_descriptor_cancellations")
+        self.logger.warning(
+            "streaming not retaining an unfinished fill: %d sessions hold descriptors (soft limit %d)",
+            len(self.prefetch_sessions), soft,
+        )
+        return True
 
     def _stop_background_locked(self, session: PrefetchSession) -> bool:
         """Unregister a stopped session. Caller holds the registry and session locks."""
