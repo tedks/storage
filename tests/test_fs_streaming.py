@@ -3891,6 +3891,8 @@ class TestControlRequests(unittest.TestCase):
              set_message),
             ({"command": "streaming.set", "limits": {"max_download_workers": 2, "bogus": 1}},
              "unknown download limit: bogus"),
+            ({"command": "streaming.set", "limits": {"self": 1}}, "unknown download limit: self"),
+            ({"command": "streaming.set", "limits": {"limits": 1}}, "unknown download limit: limits"),
             ({"command": "streaming.set", "limits": {"max_download_workers": True}},
              "max_download_workers must be an integer between"),
             ({"command": "streaming.set", "limits": {"max_streaming_sessions": 2.0}},
@@ -4012,6 +4014,16 @@ class TestControlRequests(unittest.TestCase):
             self.assertEqual(manager.download_limits()["max_download_workers"], 2)
         finally:
             fs.destroy('/')
+
+    def test_update_download_limits_takes_a_dict_or_keywords(self):
+        expected = {**self.initial_limits, "max_download_workers": 2, "max_streaming_sessions": 3}
+        self.assertEqual(self.manager.update_download_limits({"max_download_workers": 2},
+                                                             max_streaming_sessions=3), expected)
+        with self.assertRaisesRegex(ValueError, "^unknown download limit: self$"):
+            self.manager.update_download_limits({"self": 1})
+        with self.assertRaisesRegex(ValueError, "^unknown download limit: self$"):
+            self.manager.update_download_limits(**{"self": 1})
+        self.assertEqual(self.manager.download_limits(), expected)
 
     def test_set_after_shutdown_is_refused(self):
         self.fs.destroy('/')

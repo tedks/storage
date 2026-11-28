@@ -593,7 +593,12 @@ class StreamingReadManager:
         with self.prefetch_sessions_lock:
             return self._download_limits.copy()
 
-    def update_download_limits(self, **changes):
+    def update_download_limits(self, limits=None, /, **changes):
+        """Apply live limits from a dict (as the control socket sends them)
+        and/or keywords. Both parameters are positional-only, so a limit
+        named 'self' or 'limits' is just an unknown limit, not a TypeError.
+        """
+        changes = {**(limits or {}), **changes}
         validate_download_limits(changes)
         with self.prefetch_sessions_lock:
             if self._destroying:
@@ -996,7 +1001,7 @@ class StreamingReadManager:
             if set(arguments) != {"limits"} or not isinstance(changes, dict) or not changes:
                 raise ControlError("Provide at least one live streaming limit to set")
             try:
-                return self._control_parameters(self.update_download_limits(**changes))
+                return self._control_parameters(self.update_download_limits(changes))
             except ValueError as exc:
                 raise ControlError(str(exc)) from exc
         if command == "downloads.list":
